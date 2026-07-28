@@ -2,17 +2,16 @@ use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use automation_runtime::GatewayCommandAckV3;
 use automation_runtime::{
     shared_gateway_control_channel_with_policy_and_invalidator_v3, GatewayAdmissionPolicyV3,
-    GatewayAdmissionSnapshotV3, GatewayConnectionEpochV3, GatewayConnectionObserverV3,
-    GatewayConnectionStateV3, GatewayControlConfigV3, GatewayControlConfigurationErrorV3,
-    GatewayControlTransitionErrorV3, GatewayDrainCauseV3, GatewayInvalidationSignalV3,
-    GatewayLifecycleEventV3, GatewayPausedConnectionV3, GatewayReadyKindV3,
-    GatewaySynchronousInvalidatorV3, SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
+    GatewayAdmissionSnapshotV3, GatewayCommandAckV3, GatewayConnectionEpochV3,
+    GatewayConnectionObserverV3, GatewayConnectionStateV3, GatewayControlConfigV3,
+    GatewayControlConfigurationErrorV3, GatewayControlTransitionErrorV3, GatewayDrainCauseV3,
+    GatewayInvalidationSignalV3, GatewayLifecycleEventV3, GatewayPauseTokenV3,
+    GatewayPausedConnectionV3, GatewayReadyKindV3, GatewaySynchronousInvalidatorV3,
+    SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
 };
 use automation_runtime_controller::{
     GatewayShardIdV1, RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayReadyAttestationV2,
@@ -34,7 +33,7 @@ use automation_runtime_worker::{
     RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryFixedPointProofV2,
 };
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{sleep_until, timeout_at, Instant as TokioInstant};
+use tokio::time::{sleep_until, timeout, timeout_at, Instant as TokioInstant};
 
 use crate::closed_recovery::RuntimeClosedRecoveryTransitionAuthorityV2;
 #[cfg(test)]
@@ -43,6 +42,10 @@ use crate::discord::{
     prepare_twilight_runtime_discord_gateway_driver_v1, start_runtime_discord_gateway_v1,
     RuntimeDiscordControlTaskV1, RuntimeDiscordGatewayActorStartV1,
     RuntimeDiscordGatewayStartErrorV1, RuntimeDiscordGatewaySupervisorV1,
+    RuntimeDiscordReservedResumeRequestV2,
+};
+use crate::discord_lifecycle::{
+    RuntimeDiscordAdmissionReservationSnapshotV2, RuntimeDiscordPauseReservationIdentityV2,
 };
 use crate::gateway_owner_startup_watchdog::{
     start_runtime_gateway_owner_startup_watchdog_v1,
@@ -59,6 +62,7 @@ use crate::{
 };
 
 const SUPPORTED_GATEWAY_SHARD_ID: &str = "shard:0";
+const DISCORD_CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_millis(400);
 
 pub(crate) fn runtime_gateway_shard_id_v1() -> GatewayShardIdV1 {
     GatewayShardIdV1::parse(SUPPORTED_GATEWAY_SHARD_ID).expect("supported gateway shard identity")
@@ -154,6 +158,9 @@ struct SharedGatewayControlAdapterV2 {
     connection_observer: GatewayConnectionObserverV3,
     discord_commands: Option<mpsc::Sender<RuntimeDiscordControlCommandV1>>,
     admission_snapshot: watch::Receiver<GatewayAdmissionSnapshotV3>,
+    discord_reservation_publisher:
+        Option<watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>>,
+    discord_reservation: watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
     closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
 }
 
@@ -166,6 +173,7 @@ struct RuntimePreparedDiscordGatewayStartV1 {
     runtime: SharedGatewayRuntimeHalfV3,
     control_task: RuntimeDiscordControlTaskV1,
     lifecycle_drained: watch::Receiver<u64>,
+    discord_reservation: watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
     stopped_sender: watch::Sender<bool>,
     stopped: watch::Receiver<bool>,
 }
@@ -400,6 +408,7 @@ impl RuntimeGatewayBootstrapV1 {
                 operation_cutoff,
                 shutdown_deadline,
                 lifecycle_drained: prepared.lifecycle_drained,
+                discord_reservation: prepared.discord_reservation,
                 runtime: prepared.runtime_handle,
                 control_task: prepared.control_task,
                 stopped_sender: prepared.stopped_sender,
@@ -460,6 +469,7 @@ impl RuntimeGatewayBootstrapV1 {
                 operation_cutoff,
                 shutdown_deadline,
                 lifecycle_drained: prepared.lifecycle_drained,
+                discord_reservation: prepared.discord_reservation,
                 runtime: prepared.runtime_handle,
                 control_task: prepared.control_task,
                 stopped_sender: prepared.stopped_sender,
@@ -519,6 +529,13 @@ impl RuntimeGatewayBootstrapV1 {
             return false;
         }
         acknowledgement.await.unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn discord_pause_reservation_for_test_v2(
+        &self,
+    ) -> Option<RuntimeDiscordPauseReservationIdentityV2> {
+        self.adapter.discord_reservation.borrow().reservation()
     }
 
     fn attach_discord_supervisor_v1(
@@ -665,17 +682,31 @@ impl RuntimeGatewayBootstrapV1 {
             let _stopped = stopped_sender.send(true);
             return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeHalfUnavailable);
         };
+        let Some(discord_reservation_publisher) = self.adapter.discord_reservation_publisher.take()
+        else {
+            let _stopped = stopped_sender.send(true);
+            return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeHalfUnavailable);
+        };
         let (discord_commands, commands) = mpsc::channel(1);
         let (lifecycle_drained_sender, lifecycle_drained) = watch::channel(1);
-        let control_task = RuntimeDiscordControlTaskV1::new(runtime_handle.spawn(
-            run_runtime_discord_control_v1(control, commands, lifecycle_drained_sender),
-        ));
+        let (reserved_resume, reserved_resume_receiver) = mpsc::channel(1);
+        let control_task = RuntimeDiscordControlTaskV1::new(
+            runtime_handle.spawn(run_runtime_discord_control_v1(
+                control,
+                commands,
+                reserved_resume_receiver,
+                lifecycle_drained_sender,
+                discord_reservation_publisher,
+            )),
+            reserved_resume,
+        );
         self.adapter.discord_commands = Some(discord_commands);
         Ok(RuntimePreparedDiscordGatewayStartV1 {
             runtime_handle,
             runtime,
             control_task,
             lifecycle_drained,
+            discord_reservation: self.adapter.discord_reservation.clone(),
             stopped_sender,
             stopped,
         })
@@ -721,6 +752,8 @@ impl RuntimeGatewayBootstrapV1 {
         let (observation, epoch) = self
             .adapter
             .map_paused_connected_observation(generation, snapshot)?;
+        self.adapter
+            .require_discord_pause_reservation_v2(snapshot, epoch)?;
         self.adapter.require_healthy_paused_control(epoch)?;
         if self
             .adapter
@@ -735,6 +768,8 @@ impl RuntimeGatewayBootstrapV1 {
             return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
         }
         self.adapter.require_healthy_paused_control(epoch)?;
+        self.adapter
+            .require_discord_pause_reservation_v2(snapshot, epoch)?;
         if self
             .adapter
             .connection_observer
@@ -979,25 +1014,119 @@ impl RuntimeGatewayBootstrapV1 {
 async fn run_runtime_discord_control_v1(
     mut control: SharedGatewayControlV3,
     mut commands: mpsc::Receiver<RuntimeDiscordControlCommandV1>,
+    mut reserved_resume: mpsc::Receiver<RuntimeDiscordReservedResumeRequestV2>,
     lifecycle_drained: watch::Sender<u64>,
+    discord_reservation: watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>,
 ) {
     let mut lifecycle_sequence = 1u64;
+    let mut pause_token: Option<GatewayPauseTokenV3> = None;
     loop {
         tokio::select! {
             biased;
+            lifecycle = control.next_lifecycle() => {
+                let Some(lifecycle) = lifecycle else {
+                    return;
+                };
+                pause_token = None;
+                discord_reservation.send_replace(
+                    RuntimeDiscordAdmissionReservationSnapshotV2::unreserved(
+                        control.current_admission_snapshot(),
+                    ),
+                );
+                if !publish_runtime_lifecycle_drain_v1(
+                    &lifecycle_drained,
+                    &mut lifecycle_sequence,
+                ) {
+                    return;
+                }
+                if matches!(
+                    lifecycle,
+                    GatewayLifecycleEventV3::Connected { paused: true, .. }
+                ) {
+                    let Ok(Ok(GatewayCommandAckV3::Paused { resume_token, .. })) = timeout(
+                        DISCORD_CONTROL_OPERATION_TIMEOUT,
+                        control.pause_admission(),
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    if !matches!(
+                        timeout(
+                            DISCORD_CONTROL_OPERATION_TIMEOUT,
+                            control.next_lifecycle(),
+                        )
+                        .await,
+                        Ok(Some(GatewayLifecycleEventV3::Paused { .. }))
+                    ) {
+                        return;
+                    }
+                    let Some(snapshot) =
+                        RuntimeDiscordAdmissionReservationSnapshotV2::reserved(
+                            control.current_admission_snapshot(),
+                            &resume_token,
+                        )
+                    else {
+                        return;
+                    };
+                    pause_token = Some(resume_token);
+                    discord_reservation.send_replace(snapshot);
+                    if !publish_runtime_lifecycle_drain_v1(
+                        &lifecycle_drained,
+                        &mut lifecycle_sequence,
+                    ) {
+                        return;
+                    }
+                }
+            }
+            request = reserved_resume.recv() => {
+                let Some(request) = request else {
+                    return;
+                };
+                let resumed = resume_reserved_discord_admission_v2(
+                    &mut control,
+                    &mut pause_token,
+                    request.expected,
+                    &lifecycle_drained,
+                    &mut lifecycle_sequence,
+                    &discord_reservation,
+                )
+                .await;
+                let _response = request.response.send(resumed);
+            }
             command = commands.recv() => {
                 let Some(command) = command else {
                     return;
                 };
                 match command {
                     RuntimeDiscordControlCommandV1::BeginDrain { response } => {
-                        let drained = if control.begin_drain().await.is_ok() {
-                            match control.next_lifecycle().await {
-                                Some(_) => publish_runtime_lifecycle_drain_v1(
+                        let drained = if matches!(
+                            timeout(
+                                DISCORD_CONTROL_OPERATION_TIMEOUT,
+                                control.begin_drain(),
+                            )
+                            .await,
+                            Ok(Ok(GatewayCommandAckV3::Draining { .. }))
+                        ) {
+                            match timeout(
+                                DISCORD_CONTROL_OPERATION_TIMEOUT,
+                                control.next_lifecycle(),
+                            )
+                            .await
+                            {
+                                Ok(Some(GatewayLifecycleEventV3::Draining { .. })) => {
+                                    pause_token = None;
+                                    discord_reservation.send_replace(
+                                        RuntimeDiscordAdmissionReservationSnapshotV2::unreserved(
+                                            control.current_admission_snapshot(),
+                                        ),
+                                    );
+                                    publish_runtime_lifecycle_drain_v1(
                                     &lifecycle_drained,
                                     &mut lifecycle_sequence,
-                                ),
-                                None => false,
+                                    )
+                                }
+                                Ok(None) | Ok(Some(_)) | Err(_) => false,
                             }
                         } else {
                             false
@@ -1006,44 +1135,91 @@ async fn run_runtime_discord_control_v1(
                     }
                     #[cfg(test)]
                     RuntimeDiscordControlCommandV1::OpenAdmission { response } => {
-                        let opened = match control.pause_admission().await {
-                            Ok(GatewayCommandAckV3::Paused { resume_token, .. }) => {
-                                let paused = control.next_lifecycle().await.is_some()
-                                    && publish_runtime_lifecycle_drain_v1(
-                                        &lifecycle_drained,
-                                        &mut lifecycle_sequence,
-                                    );
-                                paused
-                                    && control.resume_admission(&resume_token).await.is_ok()
-                                    && control.next_lifecycle().await.is_some()
-                                    && publish_runtime_lifecycle_drain_v1(
-                                        &lifecycle_drained,
-                                        &mut lifecycle_sequence,
-                                    )
-                            }
-                            Ok(
-                                GatewayCommandAckV3::AdmissionResumed { .. }
-                                | GatewayCommandAckV3::Draining { .. },
-                            )
-                            | Err(_) => false,
-                        };
+                        let opened = resume_unchecked_discord_admission_for_test_v2(
+                            &mut control,
+                            &mut pause_token,
+                            &lifecycle_drained,
+                            &mut lifecycle_sequence,
+                            &discord_reservation,
+                        )
+                        .await;
                         let _response = response.send(opened);
                     }
                 }
             }
-            lifecycle = control.next_lifecycle() => {
-                let Some(_) = lifecycle else {
-                    return;
-                };
-                if !publish_runtime_lifecycle_drain_v1(
-                    &lifecycle_drained,
-                    &mut lifecycle_sequence,
-                ) {
-                    return;
-                }
-            }
         }
     }
+}
+
+async fn resume_reserved_discord_admission_v2(
+    control: &mut SharedGatewayControlV3,
+    pause_token: &mut Option<GatewayPauseTokenV3>,
+    expected: RuntimeDiscordPauseReservationIdentityV2,
+    lifecycle_drained: &watch::Sender<u64>,
+    lifecycle_sequence: &mut u64,
+    discord_reservation: &watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>,
+) -> bool {
+    let Some(token) = pause_token.take() else {
+        return false;
+    };
+    if RuntimeDiscordPauseReservationIdentityV2::from_token(
+        &token,
+        control.current_admission_snapshot(),
+    ) != Some(expected)
+    {
+        return false;
+    }
+    if !matches!(
+        timeout(
+            DISCORD_CONTROL_OPERATION_TIMEOUT,
+            control.resume_admission(&token),
+        )
+        .await,
+        Ok(Ok(GatewayCommandAckV3::AdmissionResumed { epoch })) if epoch == expected.epoch()
+    ) || !matches!(
+        timeout(
+            DISCORD_CONTROL_OPERATION_TIMEOUT,
+            control.next_lifecycle(),
+        )
+        .await,
+        Ok(Some(GatewayLifecycleEventV3::AdmissionResumed { epoch })) if epoch == expected.epoch()
+    ) {
+        return false;
+    }
+    discord_reservation.send_replace(RuntimeDiscordAdmissionReservationSnapshotV2::unreserved(
+        control.current_admission_snapshot(),
+    ));
+    publish_runtime_lifecycle_drain_v1(lifecycle_drained, lifecycle_sequence)
+}
+
+#[cfg(test)]
+async fn resume_unchecked_discord_admission_for_test_v2(
+    control: &mut SharedGatewayControlV3,
+    pause_token: &mut Option<GatewayPauseTokenV3>,
+    lifecycle_drained: &watch::Sender<u64>,
+    lifecycle_sequence: &mut u64,
+    discord_reservation: &watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>,
+) -> bool {
+    let Some(token) = pause_token.take() else {
+        return false;
+    };
+    if !matches!(
+        timeout(
+            DISCORD_CONTROL_OPERATION_TIMEOUT,
+            control.resume_admission(&token),
+        )
+        .await,
+        Ok(Ok(GatewayCommandAckV3::AdmissionResumed { .. }))
+    ) || !matches!(
+        timeout(DISCORD_CONTROL_OPERATION_TIMEOUT, control.next_lifecycle(),).await,
+        Ok(Some(GatewayLifecycleEventV3::AdmissionResumed { .. }))
+    ) {
+        return false;
+    }
+    discord_reservation.send_replace(RuntimeDiscordAdmissionReservationSnapshotV2::unreserved(
+        control.current_admission_snapshot(),
+    ));
+    publish_runtime_lifecycle_drain_v1(lifecycle_drained, lifecycle_sequence)
 }
 
 fn publish_runtime_lifecycle_drain_v1(
@@ -1703,6 +1879,9 @@ pub(crate) fn compose_runtime_gateway_section_test_bootstrap_v2(
         RuntimeGatewaySnapshotTestInvalidatorV3,
     );
     let admission_snapshot = control.admission_snapshot_watch();
+    let (discord_reservation_publisher, discord_reservation) = watch::channel(
+        RuntimeDiscordAdmissionReservationSnapshotV2::unreserved(*admission_snapshot.borrow()),
+    );
     let connection_observer = control.connection_observer();
     RuntimeGatewayBootstrapV1 {
         adapter: SharedGatewayControlAdapterV2 {
@@ -1711,6 +1890,8 @@ pub(crate) fn compose_runtime_gateway_section_test_bootstrap_v2(
             connection_observer,
             discord_commands: None,
             admission_snapshot,
+            discord_reservation_publisher: Some(discord_reservation_publisher),
+            discord_reservation,
             closed_lifecycle: closed_lifecycle.clone(),
         },
         _runtime: Some(SharedGatewayRuntimeHalfV3 { _inner: runtime }),
@@ -1752,6 +1933,9 @@ fn compose_with_control_config(
         invalidation,
     );
     let admission_snapshot = control.admission_snapshot_watch();
+    let (discord_reservation_publisher, discord_reservation) = watch::channel(
+        RuntimeDiscordAdmissionReservationSnapshotV2::unreserved(*admission_snapshot.borrow()),
+    );
     let connection_observer = control.connection_observer();
     RuntimeGatewayBootstrapV1 {
         adapter: SharedGatewayControlAdapterV2 {
@@ -1760,6 +1944,8 @@ fn compose_with_control_config(
             connection_observer,
             discord_commands: None,
             admission_snapshot,
+            discord_reservation_publisher: Some(discord_reservation_publisher),
+            discord_reservation,
             closed_lifecycle: closed_lifecycle.clone(),
         },
         _runtime: Some(SharedGatewayRuntimeHalfV3 { _inner: runtime }),
@@ -1830,6 +2016,28 @@ impl SharedGatewayControlAdapterV2 {
             Err(error) => Err(map_transition_error(error)),
             Ok(_) => Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot),
         }
+    }
+
+    fn require_discord_pause_reservation_v2(
+        &self,
+        snapshot: GatewayAdmissionSnapshotV3,
+        epoch: GatewayConnectionEpochV3,
+    ) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+        if self.discord_commands.is_none() {
+            return Ok(());
+        }
+        let reservation = *self.discord_reservation.borrow();
+        let Some(identity) = reservation.reservation() else {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        };
+        if reservation.admission() != snapshot
+            || identity.epoch() != epoch
+            || identity.admission_revision() != snapshot.admission_revision()
+            || identity.transition_sequence() != snapshot.transition_sequence()
+        {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        Ok(())
     }
 
     fn observe_current_ready_attestation(
@@ -2041,7 +2249,9 @@ mod tests {
         RuntimeGatewayClosedLifecycleV2, RuntimeGatewayClosedSnapshotV2,
         RuntimeGatewayEmergencyCauseV2,
     };
+    use tokio::sync::watch;
 
+    use crate::discord_lifecycle::RuntimeDiscordAdmissionReservationSnapshotV2;
     use crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerEmergencyInvalidatorV1;
 
     use super::{
@@ -2077,6 +2287,9 @@ mod tests {
             PanickingInvalidatorV3,
         );
         let admission_snapshot = control.admission_snapshot_watch();
+        let (discord_reservation_publisher, discord_reservation) = watch::channel(
+            RuntimeDiscordAdmissionReservationSnapshotV2::unreserved(*admission_snapshot.borrow()),
+        );
         let connection_observer = control.connection_observer();
         RuntimeGatewayBootstrapV1 {
             adapter: SharedGatewayControlAdapterV2 {
@@ -2085,6 +2298,8 @@ mod tests {
                 connection_observer,
                 discord_commands: None,
                 admission_snapshot,
+                discord_reservation_publisher: Some(discord_reservation_publisher),
+                discord_reservation,
                 closed_lifecycle: closed_lifecycle.clone(),
             },
             _runtime: Some(SharedGatewayRuntimeHalfV3 { _inner: runtime }),

@@ -507,6 +507,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/controller_identity.rs",
             "src/database.rs",
             "src/discord.rs",
+            "src/discord_lifecycle.rs",
             "src/gateway.rs",
             "src/gateway_owner_startup.rs",
             "src/gateway_owner_startup_watchdog.rs",
@@ -993,7 +994,10 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         .map(|(_, source)| source.as_str())
         .unwrap();
     for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
-        if path == Path::new("src/gateway.rs") || path == Path::new("src/discord.rs") {
+        if path == Path::new("src/gateway.rs")
+            || path == Path::new("src/discord.rs")
+            || path == Path::new("src/discord_lifecycle.rs")
+        {
             continue;
         }
         if path == Path::new("src/registry_succession_tests.rs") {
@@ -1665,6 +1669,56 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         .map(|offset| wait + offset)
         .unwrap();
     assert!(invalidation < wait && wait < release);
+}
+
+#[test]
+fn discord_actor_handoff_is_modeful_reserved_bounded_and_non_serving() {
+    let discord = source_before_test_module(include_str!("../src/discord.rs"));
+    let lifecycle = include_str!("../src/discord_lifecycle.rs");
+    let gateway = source_before_test_module(include_str!("../src/gateway.rs"));
+    let startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+
+    for required in [
+        "RuntimeDiscordActorModeV2",
+        "StartupPaused",
+        "ProcessSupervised",
+        "Draining",
+        "RuntimeDiscordAdmissionReservationSnapshotV2",
+        "RuntimeDiscordPauseReservationIdentityV2",
+        "GatewayAdmissionSnapshotV3",
+        "GatewayPauseTokenV3",
+    ] {
+        assert!(lifecycle.contains(required), "{required}");
+    }
+    for required in [
+        "process_handoff: Option<oneshot::Sender<RuntimeDiscordProcessHandoffCommandV2>>",
+        "drain: Option<oneshot::Sender<RuntimeDiscordDrainCommandV2>>",
+        "recovery_resume: mpsc::Sender<RuntimeDiscordRecoveryResumeCommandV2>",
+        "RuntimeDiscordShutdownOnlySupervisorV2",
+        "RuntimeDiscordProcessHandoffV2::Indeterminate",
+        "wait_for_runtime_discord_acknowledgement_v2(",
+        "startup_operation_cutoff",
+        "RuntimeDiscordActorModeV2::ProcessSupervised",
+        "RuntimeDiscordActorModeV2::Draining",
+        "resume_reserved_runtime_discord_admission_v2(",
+        "RuntimeDiscordGatewayExitV1::AdmissionOpened",
+    ] {
+        assert!(discord.contains(required), "{required}");
+    }
+    for required in [
+        "DISCORD_CONTROL_OPERATION_TIMEOUT",
+        "control.pause_admission()",
+        "RuntimeDiscordAdmissionReservationSnapshotV2::reserved(",
+        "discord_reservation.send_replace(snapshot)",
+        "require_discord_pause_reservation_v2",
+        "reserved_resume_receiver",
+    ] {
+        assert!(gateway.contains(required), "{required}");
+    }
+    assert!(!startup.contains("handoff_to_process_v2"));
+    assert!(!discord.contains("execute_admitted_interaction"));
+    assert!(!discord.contains("RuntimePublicAdmissionPermit"));
+    assert!(!gateway.contains("RuntimePublicAdmissionPermit"));
 }
 
 #[test]

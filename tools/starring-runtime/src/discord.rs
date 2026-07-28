@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
@@ -11,9 +12,14 @@ use paused_discord_gateway::error::ReceiveMessageErrorType;
 use paused_discord_gateway::{
     CloseFrame, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt,
 };
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{sleep_until, timeout_at, Instant as TokioInstant};
+
+use crate::discord_lifecycle::{
+    RuntimeDiscordActorModeV2, RuntimeDiscordAdmissionReservationSnapshotV2,
+    RuntimeDiscordPauseReservationIdentityV2,
+};
 
 const DISCORD_SHUTDOWN_ABORT_RESERVE: Duration = Duration::from_millis(25);
 const DISCORD_ACTOR_TERMINATION_RESERVE: Duration = Duration::from_millis(100);
@@ -195,6 +201,71 @@ pub(crate) struct RuntimeDiscordGatewaySupervisorV1 {
     actor_abort: AbortHandle,
     control_abort: AbortHandle,
     join_task: Option<JoinHandle<bool>>,
+    startup_operation_cutoff: Instant,
+    process_handoff: Option<oneshot::Sender<RuntimeDiscordProcessHandoffCommandV2>>,
+    drain: Option<oneshot::Sender<RuntimeDiscordDrainCommandV2>>,
+    recovery_resume: mpsc::Sender<RuntimeDiscordRecoveryResumeCommandV2>,
+}
+
+pub(crate) struct RuntimeDiscordProcessSupervisorV2 {
+    inner: RuntimeDiscordGatewaySupervisorV1,
+}
+
+pub(crate) struct RuntimeDiscordShutdownOnlySupervisorV2 {
+    inner: RuntimeDiscordGatewaySupervisorV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeDiscordProcessHandoffFailureV2 {
+    CommandUnavailable,
+    ActorRejected,
+    AcknowledgementLost,
+    ActorTerminal,
+    DeadlineElapsed,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RuntimeDiscordProcessHandoffV2 {
+    Process(RuntimeDiscordProcessSupervisorV2),
+    NotApplied {
+        supervisor: RuntimeDiscordGatewaySupervisorV1,
+        failure: RuntimeDiscordProcessHandoffFailureV2,
+    },
+    Indeterminate {
+        supervisor: RuntimeDiscordShutdownOnlySupervisorV2,
+        failure: RuntimeDiscordProcessHandoffFailureV2,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeDiscordActorAcknowledgementV2 {
+    Accepted,
+    Rejected,
+    Lost,
+    Terminal,
+    DeadlineElapsed,
+}
+
+struct RuntimeDiscordProcessHandoffCommandV2 {
+    process_generation: NonZeroU64,
+    respond: bool,
+    response: oneshot::Sender<bool>,
+}
+
+struct RuntimeDiscordDrainCommandV2 {
+    shutdown_generation: NonZeroU64,
+    deadline: Instant,
+    response: oneshot::Sender<bool>,
+}
+
+struct RuntimeDiscordRecoveryResumeCommandV2 {
+    expected: RuntimeDiscordPauseReservationIdentityV2,
+    response: oneshot::Sender<bool>,
+}
+
+pub(crate) struct RuntimeDiscordReservedResumeRequestV2 {
+    pub(crate) expected: RuntimeDiscordPauseReservationIdentityV2,
+    pub(crate) response: oneshot::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -228,6 +299,37 @@ impl RuntimeDiscordGatewayObservationV1 {
     }
 }
 
+async fn wait_for_runtime_discord_acknowledgement_v2(
+    mut acknowledgement: oneshot::Receiver<bool>,
+    terminal: &mut watch::Receiver<Option<RuntimeDiscordGatewayTerminalV1>>,
+    deadline: Instant,
+) -> RuntimeDiscordActorAcknowledgementV2 {
+    if terminal.borrow().is_some() {
+        return RuntimeDiscordActorAcknowledgementV2::Terminal;
+    }
+    if Instant::now() >= deadline {
+        return RuntimeDiscordActorAcknowledgementV2::DeadlineElapsed;
+    }
+    tokio::select! {
+        biased;
+        acknowledgement = &mut acknowledgement => match acknowledgement {
+            Ok(true) => RuntimeDiscordActorAcknowledgementV2::Accepted,
+            Ok(false) => RuntimeDiscordActorAcknowledgementV2::Rejected,
+            Err(_) if terminal.borrow().is_some() => {
+                RuntimeDiscordActorAcknowledgementV2::Terminal
+            }
+            Err(_) => RuntimeDiscordActorAcknowledgementV2::Lost,
+        },
+        changed = terminal.changed() => {
+            let _changed = changed;
+            RuntimeDiscordActorAcknowledgementV2::Terminal
+        }
+        _ = sleep_until(TokioInstant::from_std(deadline)) => {
+            RuntimeDiscordActorAcknowledgementV2::DeadlineElapsed
+        },
+    }
+}
+
 impl Debug for RuntimeDiscordGatewayObservationV1 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeDiscordGatewayObservationV1(<redacted>)")
@@ -239,6 +341,7 @@ pub(crate) struct RuntimeDiscordGatewayActorStartV1 {
     pub(crate) operation_cutoff: Instant,
     pub(crate) shutdown_deadline: Instant,
     pub(crate) lifecycle_drained: watch::Receiver<u64>,
+    pub(crate) discord_reservation: watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
     pub(crate) runtime: tokio::runtime::Handle,
     pub(crate) control_task: RuntimeDiscordControlTaskV1,
     pub(crate) stopped_sender: watch::Sender<bool>,
@@ -247,15 +350,32 @@ pub(crate) struct RuntimeDiscordGatewayActorStartV1 {
 
 pub(crate) struct RuntimeDiscordControlTaskV1 {
     task: Option<JoinHandle<()>>,
+    reserved_resume: Option<mpsc::Sender<RuntimeDiscordReservedResumeRequestV2>>,
 }
 
 impl RuntimeDiscordControlTaskV1 {
-    pub(crate) fn new(task: JoinHandle<()>) -> Self {
-        Self { task: Some(task) }
+    pub(crate) fn new(
+        task: JoinHandle<()>,
+        reserved_resume: mpsc::Sender<RuntimeDiscordReservedResumeRequestV2>,
+    ) -> Self {
+        Self {
+            task: Some(task),
+            reserved_resume: Some(reserved_resume),
+        }
     }
 
-    fn into_inner(mut self) -> JoinHandle<()> {
-        self.task.take().expect("runtime Discord control task")
+    fn into_parts(
+        mut self,
+    ) -> (
+        JoinHandle<()>,
+        mpsc::Sender<RuntimeDiscordReservedResumeRequestV2>,
+    ) {
+        (
+            self.task.take().expect("runtime Discord control task"),
+            self.reserved_resume
+                .take()
+                .expect("runtime Discord reserved resume"),
+        )
     }
 }
 
@@ -314,8 +434,21 @@ impl RuntimeDiscordGatewaySupervisorV1 {
     }
 
     pub(crate) async fn shutdown_until<F>(
+        self,
+        begin_drain: F,
+        cleanup_deadline: Instant,
+    ) -> Result<RuntimeDiscordGatewayTerminalV1, RuntimeDiscordGatewayShutdownErrorV1>
+    where
+        F: Future<Output = bool>,
+    {
+        self.shutdown_until_with_generation_v2(begin_drain, NonZeroU64::MIN, cleanup_deadline)
+            .await
+    }
+
+    async fn shutdown_until_with_generation_v2<F>(
         mut self,
         begin_drain: F,
+        shutdown_generation: NonZeroU64,
         cleanup_deadline: Instant,
     ) -> Result<RuntimeDiscordGatewayTerminalV1, RuntimeDiscordGatewayShutdownErrorV1>
     where
@@ -331,6 +464,14 @@ impl RuntimeDiscordGatewaySupervisorV1 {
         let terminal = if let Some(exit) = self.terminal_status() {
             Some(exit)
         } else {
+            if !self
+                .enter_draining_v2(shutdown_generation, cleanup_deadline)
+                .await
+            {
+                self.abort_tasks();
+                let _joined = self.join_task_until(cleanup_deadline).await;
+                return Err(RuntimeDiscordGatewayShutdownErrorV1::DeadlineElapsed);
+            }
             let drain = begin_drain;
             tokio::pin!(drain);
             tokio::select! {
@@ -369,6 +510,119 @@ impl RuntimeDiscordGatewaySupervisorV1 {
         Ok(terminal)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn handoff_to_process_v2(
+        self,
+        process_generation: NonZeroU64,
+    ) -> RuntimeDiscordProcessHandoffV2 {
+        self.handoff_to_process_with_response_v2(process_generation, true)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn handoff_to_process_losing_acknowledgement_for_test_v2(
+        self,
+        process_generation: NonZeroU64,
+    ) -> RuntimeDiscordProcessHandoffV2 {
+        self.handoff_to_process_with_response_v2(process_generation, false)
+            .await
+    }
+
+    async fn handoff_to_process_with_response_v2(
+        mut self,
+        process_generation: NonZeroU64,
+        respond: bool,
+    ) -> RuntimeDiscordProcessHandoffV2 {
+        let Some(process_handoff) = self.process_handoff.take() else {
+            return RuntimeDiscordProcessHandoffV2::NotApplied {
+                supervisor: self,
+                failure: RuntimeDiscordProcessHandoffFailureV2::CommandUnavailable,
+            };
+        };
+        let (response, acknowledgement) = oneshot::channel();
+        if process_handoff
+            .send(RuntimeDiscordProcessHandoffCommandV2 {
+                process_generation,
+                respond,
+                response,
+            })
+            .is_err()
+        {
+            return RuntimeDiscordProcessHandoffV2::NotApplied {
+                supervisor: self,
+                failure: RuntimeDiscordProcessHandoffFailureV2::CommandUnavailable,
+            };
+        }
+        let mut terminal = self.terminal.clone();
+        let acknowledgement = wait_for_runtime_discord_acknowledgement_v2(
+            acknowledgement,
+            &mut terminal,
+            self.startup_operation_cutoff,
+        )
+        .await;
+        match acknowledgement {
+            RuntimeDiscordActorAcknowledgementV2::Accepted => {
+                RuntimeDiscordProcessHandoffV2::Process(RuntimeDiscordProcessSupervisorV2 {
+                    inner: self,
+                })
+            }
+            RuntimeDiscordActorAcknowledgementV2::Rejected => {
+                RuntimeDiscordProcessHandoffV2::NotApplied {
+                    supervisor: self,
+                    failure: RuntimeDiscordProcessHandoffFailureV2::ActorRejected,
+                }
+            }
+            RuntimeDiscordActorAcknowledgementV2::Lost
+            | RuntimeDiscordActorAcknowledgementV2::Terminal
+            | RuntimeDiscordActorAcknowledgementV2::DeadlineElapsed => {
+                let failure = match acknowledgement {
+                    RuntimeDiscordActorAcknowledgementV2::Lost => {
+                        RuntimeDiscordProcessHandoffFailureV2::AcknowledgementLost
+                    }
+                    RuntimeDiscordActorAcknowledgementV2::Terminal => {
+                        RuntimeDiscordProcessHandoffFailureV2::ActorTerminal
+                    }
+                    RuntimeDiscordActorAcknowledgementV2::DeadlineElapsed => {
+                        RuntimeDiscordProcessHandoffFailureV2::DeadlineElapsed
+                    }
+                    RuntimeDiscordActorAcknowledgementV2::Accepted
+                    | RuntimeDiscordActorAcknowledgementV2::Rejected => unreachable!(),
+                };
+                RuntimeDiscordProcessHandoffV2::Indeterminate {
+                    supervisor: RuntimeDiscordShutdownOnlySupervisorV2 { inner: self },
+                    failure,
+                }
+            }
+        }
+    }
+
+    async fn enter_draining_v2(
+        &mut self,
+        shutdown_generation: NonZeroU64,
+        deadline: Instant,
+    ) -> bool {
+        let Some(drain) = self.drain.take() else {
+            return self.terminal_status().is_some();
+        };
+        let (response, acknowledgement) = oneshot::channel();
+        if drain
+            .send(RuntimeDiscordDrainCommandV2 {
+                shutdown_generation,
+                deadline,
+                response,
+            })
+            .is_err()
+        {
+            return self.terminal_status().is_some();
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        timeout_at(TokioInstant::from_std(deadline), acknowledgement)
+            .await
+            .is_ok_and(|acknowledgement| acknowledgement == Ok(true))
+    }
+
     async fn wait_terminal_until(
         &mut self,
         deadline: Instant,
@@ -398,6 +652,88 @@ impl RuntimeDiscordGatewaySupervisorV1 {
     fn abort_tasks(&self) {
         self.actor_abort.abort();
         self.control_abort.abort();
+    }
+}
+
+impl RuntimeDiscordProcessSupervisorV2 {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn resume_reserved_admission_v2(
+        self,
+        expected: RuntimeDiscordPauseReservationIdentityV2,
+        deadline: Instant,
+    ) -> Result<Self, RuntimeDiscordShutdownOnlySupervisorV2> {
+        let this = self;
+        if Instant::now() >= deadline {
+            return Err(RuntimeDiscordShutdownOnlySupervisorV2 { inner: this.inner });
+        }
+        let (response, acknowledgement) = oneshot::channel();
+        if timeout_at(
+            TokioInstant::from_std(deadline),
+            this.inner
+                .recovery_resume
+                .send(RuntimeDiscordRecoveryResumeCommandV2 { expected, response }),
+        )
+        .await
+        .is_err()
+        {
+            return Err(RuntimeDiscordShutdownOnlySupervisorV2 { inner: this.inner });
+        }
+        let mut terminal = this.inner.terminal.clone();
+        match wait_for_runtime_discord_acknowledgement_v2(acknowledgement, &mut terminal, deadline)
+            .await
+        {
+            RuntimeDiscordActorAcknowledgementV2::Accepted => Ok(this),
+            RuntimeDiscordActorAcknowledgementV2::Rejected
+            | RuntimeDiscordActorAcknowledgementV2::Lost
+            | RuntimeDiscordActorAcknowledgementV2::Terminal
+            | RuntimeDiscordActorAcknowledgementV2::DeadlineElapsed => {
+                Err(RuntimeDiscordShutdownOnlySupervisorV2 { inner: this.inner })
+            }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn shutdown_until<F>(
+        self,
+        begin_drain: F,
+        shutdown_generation: NonZeroU64,
+        cleanup_deadline: Instant,
+    ) -> Result<RuntimeDiscordGatewayTerminalV1, RuntimeDiscordGatewayShutdownErrorV1>
+    where
+        F: Future<Output = bool>,
+    {
+        self.inner
+            .shutdown_until_with_generation_v2(begin_drain, shutdown_generation, cleanup_deadline)
+            .await
+    }
+}
+
+impl RuntimeDiscordShutdownOnlySupervisorV2 {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn shutdown_until<F>(
+        self,
+        begin_drain: F,
+        shutdown_generation: NonZeroU64,
+        cleanup_deadline: Instant,
+    ) -> Result<RuntimeDiscordGatewayTerminalV1, RuntimeDiscordGatewayShutdownErrorV1>
+    where
+        F: Future<Output = bool>,
+    {
+        self.inner
+            .shutdown_until_with_generation_v2(begin_drain, shutdown_generation, cleanup_deadline)
+            .await
+    }
+}
+
+impl Debug for RuntimeDiscordProcessSupervisorV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeDiscordProcessSupervisorV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeDiscordShutdownOnlySupervisorV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeDiscordShutdownOnlySupervisorV2(<redacted>)")
     }
 }
 
@@ -431,25 +767,34 @@ where
         operation_cutoff,
         shutdown_deadline,
         lifecycle_drained,
+        discord_reservation,
         runtime,
         control_task,
         stopped_sender,
         stopped,
     } = start;
-    let control_task = control_task.into_inner();
+    let (control_task, reserved_resume) = control_task.into_parts();
     let (terminal_sender, terminal) = watch::channel(None);
     let (start, start_receiver) = oneshot::channel();
+    let (process_handoff, process_handoff_receiver) = oneshot::channel();
+    let (drain, drain_receiver) = oneshot::channel();
+    let (recovery_resume, recovery_resume_receiver) = mpsc::channel(1);
     let publisher = RuntimeDiscordGatewayTerminalPublisherV1::new(terminal_sender);
     let actor_task = runtime.spawn(async move {
         let mut publisher = publisher;
         let terminal = if start_receiver.await.is_ok() {
-            run_runtime_discord_gateway_v1(
+            run_runtime_discord_gateway_v1(RuntimeDiscordGatewayActorV2 {
                 driver,
                 control,
-                operation_cutoff,
-                shutdown_deadline,
+                mode: RuntimeDiscordActorModeV2::StartupPaused { operation_cutoff },
+                failure_deadline: shutdown_deadline,
                 lifecycle_drained,
-            )
+                discord_reservation,
+                process_handoff: process_handoff_receiver,
+                drain: drain_receiver,
+                recovery_resume: recovery_resume_receiver,
+                reserved_resume,
+            })
             .await
         } else {
             RuntimeDiscordGatewayTerminalV1 {
@@ -477,6 +822,10 @@ where
         actor_abort,
         control_abort,
         join_task: Some(join_task),
+        startup_operation_cutoff: operation_cutoff,
+        process_handoff: Some(process_handoff),
+        drain: Some(drain),
+        recovery_resume,
     }
 }
 
@@ -512,34 +861,164 @@ impl Drop for RuntimeDiscordGatewayTerminalPublisherV1 {
     }
 }
 
+struct RuntimeDiscordGatewayActorV2<D> {
+    driver: D,
+    control: SharedGatewayRuntimeControlV3,
+    mode: RuntimeDiscordActorModeV2,
+    failure_deadline: Instant,
+    lifecycle_drained: watch::Receiver<u64>,
+    discord_reservation: watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
+    process_handoff: oneshot::Receiver<RuntimeDiscordProcessHandoffCommandV2>,
+    drain: oneshot::Receiver<RuntimeDiscordDrainCommandV2>,
+    recovery_resume: mpsc::Receiver<RuntimeDiscordRecoveryResumeCommandV2>,
+    reserved_resume: mpsc::Sender<RuntimeDiscordReservedResumeRequestV2>,
+}
+
 async fn run_runtime_discord_gateway_v1<D>(
-    mut driver: D,
-    mut control: SharedGatewayRuntimeControlV3,
-    operation_cutoff: Instant,
-    shutdown_deadline: Instant,
-    mut lifecycle_drained: watch::Receiver<u64>,
+    actor: RuntimeDiscordGatewayActorV2<D>,
 ) -> RuntimeDiscordGatewayTerminalV1
 where
     D: RuntimeDiscordGatewayDriverV1,
 {
+    let RuntimeDiscordGatewayActorV2 {
+        mut driver,
+        mut control,
+        mut mode,
+        failure_deadline,
+        mut lifecycle_drained,
+        mut discord_reservation,
+        mut process_handoff,
+        mut drain,
+        mut recovery_resume,
+        reserved_resume,
+    } = actor;
+    let RuntimeDiscordActorModeV2::StartupPaused { operation_cutoff } = mode else {
+        return runtime_discord_gateway_failure_terminal_v1();
+    };
     if Instant::now() >= operation_cutoff {
         return finish_runtime_discord_gateway_without_transport_v1(
             &mut control,
             RuntimeDiscordGatewayExitV1::StartDeadlineElapsed,
-            shutdown_deadline,
+            failure_deadline,
             &mut lifecycle_drained,
         )
         .await;
     }
+    let mut _suppressed_handoff_response = None;
     loop {
         let lifecycle_sequence = *lifecycle_drained.borrow();
         tokio::select! {
             biased;
-            _ = sleep_until(TokioInstant::from_std(operation_cutoff)) => {
+            handoff = &mut process_handoff, if matches!(mode, RuntimeDiscordActorModeV2::StartupPaused { .. }) => {
+                let Ok(handoff) = handoff else {
+                    return finish_runtime_discord_gateway_if_connected_v1(
+                        &mut driver,
+                        &mut control,
+                        RuntimeDiscordGatewayExitV1::RuntimeFailure,
+                        failure_deadline,
+                        &mut lifecycle_drained,
+                    )
+                    .await;
+                };
+                let accepted = match mode {
+                    RuntimeDiscordActorModeV2::StartupPaused { operation_cutoff }
+                        if Instant::now() < operation_cutoff =>
+                    {
+                        mode = RuntimeDiscordActorModeV2::ProcessSupervised {
+                            process_generation: handoff.process_generation,
+                        };
+                        true
+                    }
+                    RuntimeDiscordActorModeV2::StartupPaused { .. }
+                    | RuntimeDiscordActorModeV2::ProcessSupervised { .. }
+                    | RuntimeDiscordActorModeV2::Draining { .. } => false,
+                };
+                if handoff.respond {
+                    let _response = handoff.response.send(accepted);
+                } else {
+                    _suppressed_handoff_response = Some(handoff.response);
+                }
+            }
+            drain_command = &mut drain, if !matches!(mode, RuntimeDiscordActorModeV2::Draining { .. }) => {
+                let Ok(drain_command) = drain_command else {
+                    return finish_runtime_discord_gateway_if_connected_v1(
+                        &mut driver,
+                        &mut control,
+                        RuntimeDiscordGatewayExitV1::RuntimeFailure,
+                        failure_deadline,
+                        &mut lifecycle_drained,
+                    )
+                    .await;
+                };
+                let accepted = Instant::now() < drain_command.deadline;
+                if accepted {
+                    mode = RuntimeDiscordActorModeV2::Draining {
+                        shutdown_generation: drain_command.shutdown_generation,
+                        deadline: drain_command.deadline,
+                    };
+                }
+                let _response = drain_command.response.send(accepted);
+                if !accepted {
+                    return finish_runtime_discord_gateway_if_connected_v1(
+                        &mut driver,
+                        &mut control,
+                        RuntimeDiscordGatewayExitV1::RuntimeFailure,
+                        failure_deadline,
+                        &mut lifecycle_drained,
+                    )
+                    .await;
+                }
+            }
+            recovery = recovery_resume.recv(), if mode.process_generation().is_some() => {
+                let Some(recovery) = recovery else {
+                    return finish_runtime_discord_gateway_if_connected_v1(
+                        &mut driver,
+                        &mut control,
+                        RuntimeDiscordGatewayExitV1::RuntimeFailure,
+                        failure_deadline,
+                        &mut lifecycle_drained,
+                    )
+                    .await;
+                };
+                let resumed = resume_reserved_runtime_discord_admission_v2(
+                    &mut control,
+                    &mut lifecycle_drained,
+                    &mut discord_reservation,
+                    recovery.expected,
+                    &reserved_resume,
+                    runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
+                )
+                .await;
+                let _response = recovery.response.send(resumed);
+                if !resumed {
+                    return finish_runtime_discord_gateway_if_connected_v1(
+                        &mut driver,
+                        &mut control,
+                        RuntimeDiscordGatewayExitV1::AdmissionOpened,
+                        failure_deadline,
+                        &mut lifecycle_drained,
+                    )
+                    .await;
+                }
+            }
+            _ = sleep_until(TokioInstant::from_std(
+                mode.deadline().unwrap_or(failure_deadline)
+            )), if mode.deadline().is_some() => {
+                let reason = match mode {
+                    RuntimeDiscordActorModeV2::StartupPaused { .. } => {
+                        RuntimeDiscordGatewayExitV1::StartDeadlineElapsed
+                    }
+                    RuntimeDiscordActorModeV2::Draining { .. } => {
+                        RuntimeDiscordGatewayExitV1::RuntimeFailure
+                    }
+                    RuntimeDiscordActorModeV2::ProcessSupervised { .. } => {
+                        RuntimeDiscordGatewayExitV1::RuntimeFailure
+                    }
+                };
                 return finish_runtime_discord_gateway_without_transport_v1(
                     &mut control,
-                    RuntimeDiscordGatewayExitV1::StartDeadlineElapsed,
-                    shutdown_deadline,
+                    reason,
+                    runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                     &mut lifecycle_drained,
                 )
                 .await;
@@ -552,7 +1031,7 @@ where
                         if !wait_for_lifecycle_drain_v1(
                             &mut lifecycle_drained,
                             lifecycle_sequence,
-                            shutdown_deadline,
+                            runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                         )
                         .await
                         {
@@ -560,7 +1039,7 @@ where
                                 &mut driver,
                                 &mut control,
                                 RuntimeDiscordGatewayExitV1::RuntimeFailure,
-                                shutdown_deadline,
+                                runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                                 &mut lifecycle_drained,
                             )
                             .await;
@@ -573,7 +1052,7 @@ where
                             &mut driver,
                             &mut control,
                             RuntimeDiscordGatewayExitV1::AdmissionOpened,
-                            shutdown_deadline,
+                            runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                             &mut lifecycle_drained,
                         )
                         .await;
@@ -584,7 +1063,7 @@ where
                         let lifecycle_was_drained = wait_for_lifecycle_drain_v1(
                             &mut lifecycle_drained,
                             lifecycle_sequence,
-                            shutdown_deadline,
+                            runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                         )
                         .await;
                         return finish_runtime_discord_gateway_if_connected_v1(
@@ -595,7 +1074,7 @@ where
                             } else {
                                 RuntimeDiscordGatewayExitV1::RuntimeFailure
                             },
-                            shutdown_deadline,
+                            runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                             &mut lifecycle_drained,
                         )
                         .await;
@@ -605,7 +1084,7 @@ where
                             &mut driver,
                             &mut control,
                             RuntimeDiscordGatewayExitV1::RuntimeFailure,
-                            shutdown_deadline,
+                            runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                             &mut lifecycle_drained,
                         )
                         .await;
@@ -615,7 +1094,7 @@ where
                             &mut driver,
                             &mut control,
                             RuntimeDiscordGatewayExitV1::ControlOrphaned,
-                            shutdown_deadline,
+                            runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                             &mut lifecycle_drained,
                         )
                         .await;
@@ -651,7 +1130,7 @@ where
                             &mut driver,
                             &mut control,
                             RuntimeDiscordGatewayExitV1::RuntimeFailure,
-                            shutdown_deadline,
+                            runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                             &mut lifecycle_drained,
                         )
                         .await;
@@ -660,7 +1139,7 @@ where
                         return finish_runtime_discord_gateway_without_transport_v1(
                             &mut control,
                             RuntimeDiscordGatewayExitV1::StreamEnded,
-                            shutdown_deadline,
+                            runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                             &mut lifecycle_drained,
                         )
                         .await;
@@ -672,7 +1151,7 @@ where
                         if !wait_for_lifecycle_drain_v1(
                             &mut lifecycle_drained,
                             lifecycle_sequence,
-                            shutdown_deadline,
+                            runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                         )
                         .await =>
                     {
@@ -680,7 +1159,7 @@ where
                             &mut driver,
                             &mut control,
                             RuntimeDiscordGatewayExitV1::RuntimeFailure,
-                            shutdown_deadline,
+                            runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                             &mut lifecycle_drained,
                         )
                         .await;
@@ -690,7 +1169,7 @@ where
                             &mut driver,
                             &mut control,
                             RuntimeDiscordGatewayExitV1::RuntimeFailure,
-                            shutdown_deadline,
+                            runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                             &mut lifecycle_drained,
                         )
                         .await;
@@ -700,6 +1179,81 @@ where
             }
         }
     }
+}
+
+fn runtime_discord_gateway_failure_terminal_v1() -> RuntimeDiscordGatewayTerminalV1 {
+    RuntimeDiscordGatewayTerminalV1 {
+        exit: RuntimeDiscordGatewayExitV1::RuntimeFailure,
+        close: RuntimeDiscordGatewayCloseOutcomeV1::DeadlineElapsed,
+        control_stopped: false,
+    }
+}
+
+fn runtime_discord_cleanup_deadline_v2(
+    mode: RuntimeDiscordActorModeV2,
+    startup_cleanup_deadline: Instant,
+) -> Instant {
+    match mode {
+        RuntimeDiscordActorModeV2::StartupPaused { .. } => startup_cleanup_deadline,
+        RuntimeDiscordActorModeV2::ProcessSupervised { .. } => Instant::now()
+            .checked_add(DISCORD_GRACEFUL_CLOSE_TIMEOUT)
+            .unwrap_or(startup_cleanup_deadline),
+        RuntimeDiscordActorModeV2::Draining { deadline, .. } => deadline,
+    }
+}
+
+async fn resume_reserved_runtime_discord_admission_v2(
+    control: &mut SharedGatewayRuntimeControlV3,
+    lifecycle_drained: &mut watch::Receiver<u64>,
+    discord_reservation: &mut watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
+    expected: RuntimeDiscordPauseReservationIdentityV2,
+    reserved_resume: &mpsc::Sender<RuntimeDiscordReservedResumeRequestV2>,
+    deadline: Instant,
+) -> bool {
+    let current = *discord_reservation.borrow();
+    if current.reservation() != Some(expected)
+        || current.admission().connection().current_epoch() != Some(expected.epoch())
+    {
+        return false;
+    }
+    let lifecycle_sequence = *lifecycle_drained.borrow();
+    let (response, mut acknowledgement) = oneshot::channel();
+    if Instant::now() >= deadline
+        || timeout_at(
+            TokioInstant::from_std(deadline),
+            reserved_resume.send(RuntimeDiscordReservedResumeRequestV2 { expected, response }),
+        )
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let outcome = tokio::select! {
+        biased;
+        acknowledgement = &mut acknowledgement => {
+            return acknowledgement.unwrap_or(false);
+        }
+        outcome = control.process_next_command() => outcome,
+    };
+    if !matches!(
+        outcome,
+        GatewayRuntimeCommandOutcomeV3::Applied(GatewayCommandAckV3::AdmissionResumed { epoch })
+            if epoch == expected.epoch()
+    ) {
+        return false;
+    }
+    if !wait_for_lifecycle_drain_v1(lifecycle_drained, lifecycle_sequence, deadline).await {
+        return false;
+    }
+    if Instant::now() >= deadline
+        || timeout_at(TokioInstant::from_std(deadline), &mut acknowledgement).await != Ok(Ok(true))
+    {
+        return false;
+    }
+    let current = *discord_reservation.borrow();
+    current.reservation().is_none()
+        && current.admission().connection().current_epoch() == Some(expected.epoch())
+        && current.admission().connection().admits_interactions()
 }
 
 async fn finish_runtime_discord_gateway_if_connected_v1<D>(
@@ -812,7 +1366,7 @@ async fn wait_for_lifecycle_drain_v1(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
+    use std::num::{NonZeroU64, NonZeroUsize};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -834,7 +1388,8 @@ mod tests {
     use super::{
         RuntimeDiscordGatewayCloseOutcomeV1, RuntimeDiscordGatewayDriverV1,
         RuntimeDiscordGatewayExitV1, RuntimeDiscordGatewayShutdownErrorV1,
-        RuntimeDiscordGatewaySignalV1,
+        RuntimeDiscordGatewaySignalV1, RuntimeDiscordProcessHandoffFailureV2,
+        RuntimeDiscordProcessHandoffV2,
     };
 
     struct TestDiscordGatewayDriverV1 {
@@ -993,6 +1548,28 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    fn expect_process_handoff(
+        outcome: RuntimeDiscordProcessHandoffV2,
+    ) -> super::RuntimeDiscordProcessSupervisorV2 {
+        match outcome {
+            RuntimeDiscordProcessHandoffV2::Process(process) => process,
+            RuntimeDiscordProcessHandoffV2::NotApplied {
+                supervisor,
+                failure,
+            } => {
+                drop(supervisor);
+                panic!("Discord process handoff was not applied: {failure:?}")
+            }
+            RuntimeDiscordProcessHandoffV2::Indeterminate {
+                supervisor,
+                failure,
+            } => {
+                drop(supervisor);
+                panic!("Discord process handoff was indeterminate: {failure:?}")
+            }
+        }
     }
 
     #[tokio::test]
@@ -1220,6 +1797,197 @@ mod tests {
             supervisor
                 .shutdown_until(
                     gateway.begin_discord_drain_v1(),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await,
+            Err(RuntimeDiscordGatewayShutdownErrorV1::UnexpectedExit(terminal))
+                if terminal.exit() == RuntimeDiscordGatewayExitV1::AdmissionOpened
+        ));
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn lost_handoff_ack_is_bounded_and_returns_shutdown_only_ownership() {
+        let mut gateway = gateway_with_lifecycle_capacity(1);
+        let (_signals, driver, _polls, closes, drops) = driver();
+        let operation_cutoff = Instant::now() + Duration::from_millis(50);
+        let supervisor = gateway
+            .start_discord_gateway_with_driver_v1(
+                driver,
+                operation_cutoff,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        let shutdown_only = match supervisor
+            .handoff_to_process_losing_acknowledgement_for_test_v2(NonZeroU64::MIN)
+            .await
+        {
+            RuntimeDiscordProcessHandoffV2::Indeterminate {
+                supervisor,
+                failure: RuntimeDiscordProcessHandoffFailureV2::DeadlineElapsed,
+            } => supervisor,
+            outcome => {
+                drop(outcome);
+                panic!("lost Discord handoff acknowledgement was not indeterminate")
+            }
+        };
+        assert!(Instant::now() >= operation_cutoff);
+        let terminal = shutdown_only
+            .shutdown_until(
+                gateway.begin_discord_drain_v1(),
+                NonZeroU64::MIN,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.exit(), RuntimeDiscordGatewayExitV1::Commanded);
+        assert_eq!(closes.load(Ordering::Acquire), 0);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn process_handoff_survives_startup_cutoff_and_rearms_resume_per_epoch() {
+        let mut gateway = gateway_with_lifecycle_capacity(1);
+        let (signals, driver, _polls, closes, drops) = driver();
+        let operation_cutoff = Instant::now() + Duration::from_secs(1);
+        let startup_cleanup_deadline = operation_cutoff + Duration::from_millis(50);
+        let supervisor = gateway
+            .start_discord_gateway_with_driver_v1(
+                driver,
+                operation_cutoff,
+                startup_cleanup_deadline,
+            )
+            .await
+            .unwrap();
+        let observation = supervisor.observation_v1();
+        signals.send(RuntimeDiscordGatewaySignalV1::Ready).unwrap();
+        let _ready = wait_for_epoch(&gateway, 1).await;
+        let first_reservation = gateway
+            .discord_pause_reservation_for_test_v2()
+            .expect("first Discord pause reservation");
+        let process =
+            expect_process_handoff(supervisor.handoff_to_process_v2(NonZeroU64::MIN).await);
+
+        tokio::time::sleep_until(tokio::time::Instant::from_std(
+            operation_cutoff + Duration::from_millis(25),
+        ))
+        .await;
+        assert_eq!(observation.terminal_status(), None);
+        assert!(!observation.is_finished());
+        let process = process
+            .resume_reserved_admission_v2(
+                first_reservation,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect("first reserved resume");
+        assert!(gateway.observe_current_ready_attestation().is_ok());
+
+        signals
+            .send(RuntimeDiscordGatewaySignalV1::ReceiveError)
+            .unwrap();
+        signals
+            .send(RuntimeDiscordGatewaySignalV1::Resumed)
+            .unwrap();
+        let _resumed = wait_for_epoch(&gateway, 2).await;
+        let second_reservation = gateway
+            .discord_pause_reservation_for_test_v2()
+            .expect("second Discord pause reservation");
+        assert_ne!(first_reservation, second_reservation);
+        let process = process
+            .resume_reserved_admission_v2(
+                second_reservation,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect("second reserved resume");
+        assert!(gateway.observe_current_ready_attestation().is_ok());
+
+        let terminal = process
+            .shutdown_until(
+                gateway.begin_discord_drain_v1(),
+                NonZeroU64::MIN,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.exit(), RuntimeDiscordGatewayExitV1::Commanded);
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_process_resume_is_terminal_and_retains_shutdown_only_ownership() {
+        let mut gateway = gateway_with_lifecycle_capacity(1);
+        let (signals, driver, _polls, closes, drops) = driver();
+        let supervisor = gateway
+            .start_discord_gateway_with_driver_v1(
+                driver,
+                Instant::now() + Duration::from_secs(2),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        signals.send(RuntimeDiscordGatewaySignalV1::Ready).unwrap();
+        let _ready = wait_for_epoch(&gateway, 1).await;
+        let stale = gateway
+            .discord_pause_reservation_for_test_v2()
+            .expect("initial Discord pause reservation");
+        let process =
+            expect_process_handoff(supervisor.handoff_to_process_v2(NonZeroU64::MIN).await);
+        signals
+            .send(RuntimeDiscordGatewaySignalV1::ReceiveError)
+            .unwrap();
+        signals
+            .send(RuntimeDiscordGatewaySignalV1::Resumed)
+            .unwrap();
+        let _resumed = wait_for_epoch(&gateway, 2).await;
+
+        let shutdown_only = process
+            .resume_reserved_admission_v2(stale, Instant::now() + Duration::from_secs(1))
+            .await
+            .expect_err("stale reserved resume must fail closed");
+        assert!(matches!(
+            shutdown_only
+                .shutdown_until(
+                    gateway.begin_discord_drain_v1(),
+                    NonZeroU64::MIN,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await,
+            Err(RuntimeDiscordGatewayShutdownErrorV1::UnexpectedExit(terminal))
+                if terminal.exit() == RuntimeDiscordGatewayExitV1::AdmissionOpened
+        ));
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_process_resume_remains_terminal() {
+        let mut gateway = gateway_with_lifecycle_capacity(1);
+        let (signals, driver, _polls, closes, drops) = driver();
+        let supervisor = gateway
+            .start_discord_gateway_with_driver_v1(
+                driver,
+                Instant::now() + Duration::from_secs(2),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        signals.send(RuntimeDiscordGatewaySignalV1::Ready).unwrap();
+        let _ready = wait_for_epoch(&gateway, 1).await;
+        let process =
+            expect_process_handoff(supervisor.handoff_to_process_v2(NonZeroU64::MIN).await);
+
+        assert!(gateway.open_discord_admission_for_test_v1().await);
+        assert!(matches!(
+            process
+                .shutdown_until(
+                    gateway.begin_discord_drain_v1(),
+                    NonZeroU64::MIN,
                     Instant::now() + Duration::from_secs(1),
                 )
                 .await,

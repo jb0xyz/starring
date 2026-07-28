@@ -4,6 +4,7 @@ mod config;
 mod controller_identity;
 mod database;
 mod discord;
+mod discord_lifecycle;
 mod gateway;
 mod gateway_owner_startup;
 mod gateway_owner_startup_watchdog;
