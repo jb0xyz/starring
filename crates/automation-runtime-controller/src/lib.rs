@@ -45,6 +45,7 @@ mod v2_suspension_receipt;
 mod v2_suspension_resume;
 mod v2_suspension_sidecar;
 mod v2_writer_fence;
+mod v3_drain_teardown;
 
 pub use config::{RuntimeControllerConfigError, RuntimeControllerConfigV1};
 pub use dto::{
@@ -250,4 +251,13 @@ pub use v2_writer_fence::{
     RuntimeObserveWriterFenceV1, RuntimeObservedWriterFenceClosedV1,
     RuntimeWriterFenceClosedLeaseIdV1, RuntimeWriterFenceGenerationV1,
     RuntimeWriterFenceObservationV1,
+};
+pub use v3_drain_teardown::{
+    RuntimeCanonicalDrainIntentStateV3, RuntimeDrainActionDigestV3,
+    RuntimeDrainCanonicalStateDigestV3, RuntimeDrainIntentCanonicalStateKindV3,
+    RuntimeDrainTeardownCanonicalErrorV3, RuntimePreviousProcessDrainCertificationResolutionKindV3,
+    RuntimePreviousProcessDrainCertificationResolutionV3, RuntimePreviousProcessDrainProgressV3,
+    RuntimePreviousProcessDrainTeardownSuccessionInputV3,
+    RuntimePreviousProcessDrainTeardownSuccessionTransitionV3,
+    RuntimePreviousProcessRouteAbsenceBasisV3, RuntimeRouteAbsentAcknowledgementV3,
 };

@@ -1901,6 +1901,124 @@ fn v2_drain_intent_canonical_state_is_strict_pure_and_closed() {
 }
 
 #[test]
+fn v3_previous_process_drain_teardown_is_strict_pure_and_closed() {
+    let source = include_str!("../src/v3_drain_teardown.rs");
+    let wire = include_str!("../src/v3_drain_teardown/wire.rs");
+    let tests = include_str!("../src/v3_drain_teardown/tests.rs");
+    let library = include_str!("../src/lib.rs");
+
+    for forbidden in [
+        "sqlx",
+        "rusqlite",
+        "twilight",
+        "std::fs",
+        "std::net",
+        "SystemTime",
+        "Utc::now",
+        "impl Future",
+        "async fn",
+        "Registry",
+        "Worker",
+        "Postgres",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+        assert!(!wire.contains(forbidden), "{forbidden}");
+    }
+
+    for declaration in [
+        "pub struct RuntimeRouteAbsentAcknowledgementV3",
+        "pub struct RuntimePreviousProcessRouteAbsenceBasisV3",
+        "pub enum RuntimePreviousProcessDrainProgressV3",
+        "pub struct RuntimeDrainCanonicalStateDigestV3",
+        "pub struct RuntimeDrainActionDigestV3",
+        "pub struct RuntimePreviousProcessDrainCertificationResolutionV3",
+        "pub struct RuntimeCanonicalDrainIntentStateV3",
+        "pub struct RuntimePreviousProcessDrainTeardownSuccessionInputV3",
+        "pub struct RuntimePreviousProcessDrainTeardownSuccessionTransitionV3",
+        "const DRAIN_INTENT_STATE_MAX_OCTETS_V3: usize = 1_048_576;",
+    ] {
+        assert!(source.contains(declaration), "{declaration}");
+    }
+
+    for exact_check in [
+        "Self::build(\n            source.canonical().clone(),\n            RuntimePreviousProcessDrainProgressV3::RoutedClaimed,",
+        "Self::build(\n            source.canonical().clone(),\n            RuntimePreviousProcessDrainProgressV3::Refenced,",
+        "RuntimeDrainCanonicalStateDigestV3::from_state_bytes(\n                source.state_bytes(),\n            )",
+        "self.source_route_fence.next() != Ok(self.possible_route_fence_ceiling)",
+        "absence_basis.possible_route_fence_ceiling.next()",
+        "next_persistence_revision(\n            predecessor_claim.claim_revision(),",
+        "next_persistence_revision(\n                source.intent().intent_revision(),",
+        "if intent_revision != expected_intent_revision",
+        "validate_closed_recovery_witness(witness)",
+        "witness.gateway_owner_lease_id.lease_epoch\n        <= predecessor_claim.gateway_owner_lease_id().lease_epoch",
+        "RuntimePreviousProcessDrainCertificationResolutionV3::from_predecessor(",
+        "persisted != self.result",
+        "RuntimeDrainTeardownCanonicalErrorV3::PersistedResultMismatch",
+        "const FORMAT_VERSION: u8 = 3;",
+        "#[serde(deny_unknown_fields)]",
+        "#[serde(tag = \"kind\", deny_unknown_fields)]",
+        "if canonical.state_bytes() != encoded",
+        "deserialize_required_option",
+        "RouteAbsentAcknowledged",
+        "Consumed",
+        "Cancelled",
+    ] {
+        assert!(
+            source.contains(exact_check) || wire.contains(exact_check),
+            "{exact_check}"
+        );
+    }
+
+    assert!(!wire.contains("Pending {"));
+    assert!(wire.contains("\"previous_process_route_teardown\""));
+    assert!(wire.contains("\"routed_claimed\""));
+    assert!(wire.contains("\"refenced\""));
+
+    for test_name in [
+        "routed_teardown_is_the_exact_current_owner_successor",
+        "refenced_teardown_preserves_refence_and_predecessor_certification",
+        "no_attestation_certification_round_trips_without_successor_claim_rebinding",
+        "v3_terminal_successors_are_closed_and_round_trip_exactly",
+        "v3_decoder_dispatches_exactly_and_rejects_noncanonical_encodings",
+        "v3_decoder_rejects_missing_or_malformed_teardown_evidence",
+        "standalone_decoder_requires_exact_predecessor_intent_revision_successorship",
+        "checked_reconstruction_rejects_canonical_predecessor_and_journal_drift",
+        "checked_reconstruction_rejects_canonical_successor_owner_process_and_time_drift",
+        "committed_certification_decoder_rejects_serving_and_revision_drift",
+        "succession_rejects_owner_process_epoch_time_and_provenance_drift",
+        "succession_requires_exact_journal_shapes_and_predecessor_certification",
+        "succession_preflights_intent_fence_and_classifier_overflow_boundaries",
+        "routed_classifier_rejects_missing_or_drifted_durable_route_evidence",
+        "v3_payload_limit_matches_the_one_mebibyte_execution_frame_cap",
+        "routed_and_refenced_teardown_bytes_match_independent_goldens",
+    ] {
+        assert!(
+            tests.contains(&format!("fn {test_name}(")),
+            "missing V3 drain-teardown test: {test_name}"
+        );
+    }
+
+    for golden in [
+        "goldens/routed_claimed_teardown_v3.json",
+        "goldens/refenced_teardown_v3.json",
+        "1deb34ccff32711691a1dbd125c8ce1e14850cc6480c7ca94571087773418f59",
+        "5db6b51cf693a4ffb5ecb74569d299148492f7f64e42c5d5b25306bbadd446a1",
+    ] {
+        assert!(tests.contains(golden), "{golden}");
+    }
+
+    for exported in [
+        "RuntimeCanonicalDrainIntentStateV3",
+        "RuntimePreviousProcessDrainTeardownSuccessionInputV3",
+        "RuntimePreviousProcessDrainTeardownSuccessionTransitionV3",
+        "RuntimePreviousProcessRouteAbsenceBasisV3",
+        "RuntimeRouteAbsentAcknowledgementV3",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
     let source = include_str!("../src/v2_drain_intent_receipt.rs");
     let tests = include_str!("../src/v2_drain_intent_receipt/tests.rs");
@@ -3488,6 +3606,18 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_drain_intent_receipt/tests.rs",
             include_str!("../src/v2_drain_intent_receipt/tests.rs"),
+        ),
+        (
+            "src/v3_drain_teardown.rs",
+            include_str!("../src/v3_drain_teardown.rs"),
+        ),
+        (
+            "src/v3_drain_teardown/wire.rs",
+            include_str!("../src/v3_drain_teardown/wire.rs"),
+        ),
+        (
+            "src/v3_drain_teardown/tests.rs",
+            include_str!("../src/v3_drain_teardown/tests.rs"),
         ),
         ("src/v2_evidence.rs", include_str!("../src/v2_evidence.rs")),
         ("src/v2_gateway.rs", include_str!("../src/v2_gateway.rs")),

@@ -1,4 +1,4 @@
-mod wire;
+pub(crate) mod wire;
 
 #[cfg(test)]
 mod tests;
