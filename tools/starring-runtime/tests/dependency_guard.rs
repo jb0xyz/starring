@@ -517,6 +517,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/process_startup.rs",
             "src/recovery_identity.rs",
             "src/registry.rs",
+            "src/registry_succession_tests.rs",
             "src/secret.rs",
             "src/startup.rs",
             "src/startup_recovery_observation.rs",
@@ -838,6 +839,9 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         if path == Path::new("src/gateway.rs") || path == Path::new("src/discord.rs") {
             continue;
         }
+        if path == Path::new("src/registry_succession_tests.rs") {
+            continue;
+        }
         if path == Path::new("src/gateway_owner_startup.rs")
             || path == Path::new("src/gateway_owner_startup_watchdog.rs")
             || path == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
@@ -902,8 +906,18 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 && identifier == "automation_runtime_convergence";
             let allowed_recovery_identity = path == Path::new("src/recovery_identity.rs")
                 && identifier == "automation_runtime_controller";
+            let allowed_pending_drain_succession = matches!(
+                (path, identifier),
+                (
+                    path,
+                    "RuntimeDurablyAcknowledgedPendingDrainSuccessionV3"
+                        | "RuntimePendingDrainPreviousOwnerClaimedCandidateV3"
+                        | "RuntimeRegistryPendingDrainSuccessionSealBindingV3"
+                ) if path == Path::new("src/registry.rs")
+                    || path == Path::new("src/closed_recovery.rs")
+            );
             assert!(
-                !identifier.ends_with("V3")
+                (!identifier.ends_with("V3") || allowed_pending_drain_succession)
                     && (allowed_readiness_worker
                         || allowed_registry_adapter
                         || allowed_closed_recovery
@@ -2366,7 +2380,13 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         "enum RuntimeClosedRecoverySessionRegistryV2",
         "RuntimeClosedRecoverySessionRegistryV2::Empty",
         "RuntimeClosedRecoverySessionRegistryV2::PendingDrainSealed",
+        "RuntimeClosedRecoverySessionRegistryV2::PendingDrainSuccessionSealed",
         "RuntimeClosedRecoverySessionRegistryV2::Failed",
+        "pub(crate) fn seal_pending_drain_succession_candidate_v3(",
+        "candidate: &RuntimePendingDrainPreviousOwnerClaimedCandidateV3",
+        "pub(crate) fn unseal_pending_drain_after_durable_succession_v3(",
+        "durable: &RuntimeDurablyAcknowledgedPendingDrainSuccessionV3",
+        "fn revalidate_committed_pending_drain_succession_sealed_v3(",
         "RuntimeClosedRecoverySessionV2(<redacted>)",
         "pub(crate) struct RuntimeClosedRecoveryReadyIterationV2",
         "RuntimeClosedRecoveryReadyIterationV2(<redacted>)",
@@ -2539,6 +2559,39 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
             && committed_gateway < committed_registry
             && committed_registry < committed_final
     );
+    let v2_seal = braced_declaration(
+        committed_session,
+        "pub(crate) fn seal_pending_drain_candidate_v2(",
+    );
+    assert!(v2_seal
+        .contains("RuntimeClosedRecoverySessionRegistryV2::PendingDrainSealed(Box::new(sealed))"));
+    assert!(!v2_seal.contains("PendingDrainSuccessionSealed"));
+    let v3_seal = braced_declaration(
+        committed_session,
+        "pub(crate) fn seal_pending_drain_succession_candidate_v3(",
+    );
+    assert!(v3_seal.contains(".into_pending_drain_succession_seal_binding_v3(candidate)"));
+    assert!(v3_seal.contains(
+        "RuntimeClosedRecoverySessionRegistryV2::PendingDrainSuccessionSealed(Box::new(sealed))"
+    ));
+    assert!(!v3_seal.contains("RuntimeClosedRecoverySessionRegistryV2::PendingDrainSealed("));
+    let v2_unseal = braced_declaration(
+        committed_session,
+        "pub(crate) fn unseal_pending_drain_after_durable_ack_v2(",
+    );
+    assert!(
+        v2_unseal.contains("RuntimeClosedRecoverySessionRegistryV2::PendingDrainSealed(registry)")
+    );
+    assert!(!v2_unseal.contains("PendingDrainSuccessionSealed"));
+    let v3_unseal = braced_declaration(
+        committed_session,
+        "pub(crate) fn unseal_pending_drain_after_durable_succession_v3(",
+    );
+    assert!(v3_unseal.contains(
+        "RuntimeClosedRecoverySessionRegistryV2::PendingDrainSuccessionSealed(registry)"
+    ));
+    assert!(v3_unseal.contains(".into_empty_binding_after_durable_succession_v3(durable)"));
+    assert!(!v3_unseal.contains("RuntimeClosedRecoverySessionRegistryV2::PendingDrainSealed("));
     let readiness_refresh = braced_declaration(
         committed_session,
         "async fn refresh_iteration_readiness_in_place_with_v2<Verify, Verification, PostRefresh>(",
@@ -3559,7 +3612,9 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
     let production = registry.split("#[cfg(test)]").next().unwrap();
 
     for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
-        if path != Path::new("src/registry.rs") {
+        if path != Path::new("src/registry.rs")
+            && path != Path::new("src/registry_succession_tests.rs")
+        {
             assert!(
                 !contains_identifier(source, "automation_runtime_registry"),
                 "{}",
@@ -3614,10 +3669,20 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "pub(crate) fn into_pending_drain_seal_binding_v2(",
         "candidate: &RuntimePendingDrainCandidateV2",
         "candidate.intent_id().canonical_bytes()",
+        "pub(crate) fn into_pending_drain_succession_seal_binding_v3(",
+        "candidate: &RuntimePendingDrainPreviousOwnerClaimedCandidateV3",
+        "fn into_pending_drain_seal_binding_common_v2(",
+        "pub(crate) struct RuntimeRegistryPendingDrainSuccessionSealBindingV3",
+        "binding: RuntimeRegistryPendingDrainSealBindingV2",
+        "RuntimeRegistryPendingDrainSuccessionSealBindingV3(<redacted>)",
         "pub(crate) fn into_empty_binding_after_durable_ack_v2(",
         "durable: &RuntimeDurablyAcknowledgedPendingDrainV2",
+        "pub(crate) fn into_empty_binding_after_durable_succession_v3(",
+        "durable: &RuntimeDurablyAcknowledgedPendingDrainSuccessionV3",
+        "fn into_empty_binding_after_durable_seal_common_v2(",
         "RuntimePendingDrainRegistryUnsealWitnessV2",
-        "require_pending_drain_durable_seal_match_v2(&self.witness, durable.seal_witness())",
+        "require_pending_drain_durable_seal_match_v2(&self.witness, durable_seal)",
+        "successor_persistence_non_zero_u64_v2(",
         ".unseal_empty_recovery_drain_claim_v2(sealed)",
     ] {
         assert!(production.contains(required), "{required}");
@@ -3641,9 +3706,11 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "RuntimeRegistryRecoveryGuardV1",
         "RuntimeLockedRegistryEmptyEvidenceV2",
         "RuntimeRegistryEmptyRecoveryBindingV2",
+        "RuntimeRegistryPendingDrainSealBindingV2",
+        "RuntimeRegistryPendingDrainSuccessionSealBindingV3",
     ] {
         let attributes = declaration_attribute_block(production, name);
-        for forbidden in ["Clone", "Copy", "Default"] {
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
             assert!(
                 !contains_identifier(attributes, forbidden),
                 "{name}: {forbidden}"
@@ -3680,18 +3747,71 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
             .count(),
         1
     );
-    let unseal = braced_declaration(
+    let v2_unseal = braced_declaration(
         production,
         "pub(crate) fn into_empty_binding_after_durable_ack_v2(",
+    );
+    assert!(v2_unseal
+        .contains("self.into_empty_binding_after_durable_seal_common_v2(durable.seal_witness())"));
+    assert!(!v2_unseal.contains("RuntimeDurablyAcknowledgedPendingDrainSuccessionV3"));
+    let v3_unseal = braced_declaration(
+        production,
+        "pub(crate) fn into_empty_binding_after_durable_succession_v3(",
+    );
+    assert!(v3_unseal
+        .contains(".into_empty_binding_after_durable_seal_common_v2(durable.seal_witness())"));
+    assert!(!v3_unseal.contains("RuntimeDurablyAcknowledgedPendingDrainV2"));
+    let unseal = braced_declaration(
+        production,
+        "fn into_empty_binding_after_durable_seal_common_v2(",
     );
     let durable_match = unseal
         .find("require_pending_drain_durable_seal_match_v2")
         .unwrap();
     let exact_revalidation = unseal.find("self.revalidate_sealed_v2()?").unwrap();
+    let slot_headroom = unseal
+        .find("let expected_slot_observation_sequence")
+        .unwrap();
+    let admission_headroom = unseal.find("let expected_admission_generation").unwrap();
+    let registry_headroom = unseal
+        .find("let expected_registry_observation_sequence")
+        .unwrap();
+    let expected_projection = unseal
+        .find("accept_runtime_registry_recovery_empty_observation_v2(")
+        .unwrap();
+    let unseal_witness = unseal
+        .find("RuntimePendingDrainRegistryUnsealWitnessV2::new(")
+        .unwrap();
     let mutation = unseal
         .find(".unseal_empty_recovery_drain_claim_v2(sealed)")
         .unwrap();
-    assert!(durable_match < exact_revalidation && exact_revalidation < mutation);
+    let post_projection = unseal
+        .find("project_empty_observation_v2(&process_instance_id, registry_observation)")
+        .unwrap();
+    let post_revalidation = unseal
+        .find("binding.revalidate_empty_projection_unordered_v2()?")
+        .unwrap();
+    let actual_unseal_witness = unseal
+        .rfind("RuntimePendingDrainRegistryUnsealWitnessV2::new(")
+        .unwrap();
+    assert!(
+        durable_match < exact_revalidation
+            && exact_revalidation < slot_headroom
+            && slot_headroom < admission_headroom
+            && admission_headroom < registry_headroom
+            && registry_headroom < expected_projection
+            && expected_projection < unseal_witness
+            && unseal_witness < mutation
+            && mutation < post_projection
+            && post_projection < post_revalidation
+            && post_revalidation < actual_unseal_witness
+    );
+    assert_eq!(
+        production
+            .matches(".seal_empty_recovery_drain_claim_v2(self.cursor, &key, seal_key)")
+            .count(),
+        1
+    );
     assert_eq!(
         production
             .matches(".unseal_empty_recovery_drain_claim_v2(sealed)")
@@ -3736,6 +3856,8 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "RuntimeRegistryRecoveryGuardV1",
         "RuntimeLockedRegistryEmptyEvidenceV2",
         "RuntimeRegistryEmptyRecoveryBindingV2",
+        "RuntimeRegistryPendingDrainSealBindingV2",
+        "RuntimeRegistryPendingDrainSuccessionSealBindingV3",
     ] {
         assert!(!library.contains(forbidden), "{forbidden}");
     }
