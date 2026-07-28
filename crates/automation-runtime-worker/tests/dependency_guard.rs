@@ -62,6 +62,8 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/product_drain.rs"),
             PathBuf::from("src/recovery.rs"),
             PathBuf::from("src/registry_recovery.rs"),
+            PathBuf::from("src/startup_pending_drain/v3/tests.rs"),
+            PathBuf::from("src/startup_pending_drain/v3.rs"),
             PathBuf::from("src/startup_pending_drain.rs"),
             PathBuf::from("src/startup_recovery.rs"),
             PathBuf::from("src/startup_recovery_execution.rs"),
@@ -1306,6 +1308,121 @@ fn pending_drain_compound_authority_is_linear_and_registry_rollover_gated() {
             assert!(!port.contains(forbidden), "{port_name}: {forbidden}");
         }
     }
+}
+
+#[test]
+fn pending_drain_v3_succession_authority_is_linear_compact_and_outcome_bound() {
+    let source = include_str!("../src/startup_pending_drain/v3.rs");
+    let parent = include_str!("../src/startup_pending_drain.rs");
+    let execution = include_str!("../src/startup_recovery_execution.rs");
+    for authority in [
+        "RuntimeAuthorizedPendingDrainSelectionV3",
+        "RuntimePendingDrainFreshPreviousOwnerSelectionV3",
+        "RuntimeSelectedPendingDrainSuccessionV3",
+        "RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3",
+        "RuntimeDurablyAcknowledgedPendingDrainSuccessionV3",
+    ] {
+        let declaration = source
+            .split(&format!("pub struct {authority} {{"))
+            .next()
+            .unwrap();
+        let attributes = declaration.rsplit_once("\n\n").unwrap().1;
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!attributes.contains(forbidden), "{authority}: {forbidden}");
+            assert!(!implements_trait(source, authority, forbidden));
+        }
+        let fields = source
+            .split(&format!("pub struct {authority} {{"))
+            .nth(1)
+            .and_then(|value| value.split("}\n\n").next())
+            .unwrap();
+        assert!(!fields.contains("pub "), "{authority}");
+        assert!(source.contains(&format!("{authority}(<redacted>)")));
+    }
+
+    for required in [
+        "pub struct RuntimePendingDrainPreviousOwnerClaimedCandidateInputV3",
+        "source: RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2",
+        "pub struct RuntimePendingDrainPreviousOwnerClaimedCandidateV3",
+        "intent_id: RuntimeDrainIntentIdV2",
+        "slot: RuntimeServingSlotV2",
+        "expected_target: RuntimeDeploymentTargetV1",
+        "source_intent_revision: NonZeroU64",
+        "source_state_digest: RuntimePendingDrainStateDigestV2",
+        "predecessor_claim: RuntimeDrainClaimV2",
+        "predecessor_claim_terminal_digest: RuntimeStartupRecoveryExecutionTerminalDigestV2",
+        "RuntimePendingDrainSelectionOutcomeV3::FreshPreviousOwner(candidate)",
+        "RuntimePendingDrainSelectionOutcomeV3::ExpiredPreviousOwner(candidate)",
+        "Duration::from_secs(1)",
+        ".min(remaining_predecessor)",
+        ".min(remaining_owner)",
+        "validate_registry_rollover_v2(&self.seal, &unseal)?",
+        "RuntimePendingDrainExecutionProofV2::Succession",
+        "RuntimePendingDrainExecutionProofV2::Deferred",
+    ] {
+        assert!(source.contains(required), "{required}");
+    }
+    for forbidden in [
+        "source_state_bytes",
+        "sqlx",
+        "twilight",
+        "serde",
+        "deploy",
+        "activate",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+    }
+    let compact_candidate = source
+        .split("pub struct RuntimePendingDrainPreviousOwnerClaimedCandidateV3 {")
+        .nth(1)
+        .and_then(|value| value.split("}\n\n").next())
+        .unwrap();
+    assert!(!compact_candidate.contains("RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2"));
+    assert_eq!(
+        source
+            .matches(".pending_drain_acknowledgement_successor()")
+            .count(),
+        1
+    );
+    let unclaimed = source
+        .find("RuntimePendingDrainSelectionOutcomeV3::Unclaimed(candidate)")
+        .unwrap();
+    let acknowledgement = source
+        .find(".pending_drain_acknowledgement_successor()")
+        .unwrap();
+    assert!(unclaimed < acknowledgement);
+
+    for (port_name, method, authority, receipt) in [
+        (
+            "RuntimePendingDrainSelectionPortV3",
+            "select_pending_drain_v3",
+            "RuntimeAuthorizedPendingDrainSelectionV3",
+            "RuntimePendingDrainSelectionReceiptV3",
+        ),
+        (
+            "RuntimePendingDrainSuccessionAcknowledgementExecutionPortV3",
+            "execute_pending_drain_succession_acknowledgement",
+            "RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3",
+            "RuntimePendingDrainSuccessionAcknowledgementReceiptV3",
+        ),
+    ] {
+        let port = source
+            .split(&format!("pub trait {port_name} {{"))
+            .nth(1)
+            .and_then(|value| value.split("\n}\n\n").next())
+            .unwrap();
+        assert_eq!(port.matches(&format!("fn {method}(")).count(), 1);
+        assert!(port.contains(&format!("&{authority}")));
+        assert!(port.contains("operation_cutoff: Instant"));
+        assert!(port.contains(&format!("Result<{receipt}, Self::Error>")));
+        assert!(port.contains("impl Future"));
+        assert!(port.contains("+ Send"));
+    }
+
+    assert!(parent.contains("pub(crate) fn matches_outcome("));
+    assert!(parent.contains("Self::Deferred(proof)"));
+    assert!(parent.contains("Self::Succession(proof)"));
+    assert!(execution.contains("|| !proof.matches_outcome(&receipt.outcome)"));
 }
 
 #[test]

@@ -18,6 +18,22 @@ use crate::{
     RuntimeStartupRecoveryExecutionTerminalDigestV2,
 };
 
+mod v3;
+
+pub(crate) use v3::authorize_pending_drain_selection_v3;
+pub use v3::{
+    RuntimeAcceptedPendingDrainSelectionV3, RuntimeAuthorizedPendingDrainSelectionV3,
+    RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3,
+    RuntimeDurablyAcknowledgedPendingDrainSuccessionV3,
+    RuntimePendingDrainDeferredSelectionProofV3, RuntimePendingDrainFreshPreviousOwnerSelectionV3,
+    RuntimePendingDrainPreviousOwnerClaimedCandidateInputV3,
+    RuntimePendingDrainPreviousOwnerClaimedCandidateV3, RuntimePendingDrainSelectionOutcomeV3,
+    RuntimePendingDrainSelectionPortV3, RuntimePendingDrainSelectionReceiptV3,
+    RuntimePendingDrainSuccessionAcknowledgementExecutionPortV3,
+    RuntimePendingDrainSuccessionAcknowledgementReceiptV3, RuntimePendingDrainSuccessionProofV3,
+    RuntimeSelectedPendingDrainSuccessionV3,
+};
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct RuntimePendingDrainStateDigestV2([u8; 32]);
 
@@ -364,6 +380,8 @@ pub enum RuntimeAcceptedPendingDrainSelectionV2 {
 pub enum RuntimePendingDrainExecutionProofV2 {
     NoCandidate(RuntimePendingDrainNoCandidateProofV2),
     Compound(Box<RuntimePendingDrainCompoundProofV2>),
+    Deferred(Box<RuntimePendingDrainDeferredSelectionProofV3>),
+    Succession(Box<RuntimePendingDrainSuccessionProofV3>),
 }
 
 impl Debug for RuntimePendingDrainExecutionProofV2 {
@@ -389,11 +407,50 @@ impl RuntimePendingDrainExecutionProofV2 {
                         .pending_drain_acknowledgement_successor()
                         .is_some_and(|identity| identity == proof.acknowledgement_action_identity)
             }
+            Self::Deferred(proof) => proof.action_identity() == request.action_identity(),
+            Self::Succession(proof) => proof.action_identity() == request.action_identity(),
         }
     }
 
     pub(crate) fn requires_registry_successor(&self) -> bool {
-        matches!(self, Self::Compound(_))
+        matches!(self, Self::Compound(_) | Self::Succession(_))
+    }
+
+    pub(crate) fn matches_outcome(
+        &self,
+        outcome: &RuntimeStartupRecoveryExecutionReceiptOutcomeV2,
+    ) -> bool {
+        match (self, outcome) {
+            (
+                Self::NoCandidate(_),
+                RuntimeStartupRecoveryExecutionReceiptOutcomeV2::NoCandidate,
+            ) => true,
+            (
+                Self::Compound(proof),
+                RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed {
+                    action_identity,
+                    terminal_digest,
+                },
+            ) => {
+                action_identity == &proof.claim_action_identity
+                    && terminal_digest.as_bytes() == proof.claim_terminal_digest.as_bytes()
+            }
+            (
+                Self::Deferred(proof),
+                RuntimeStartupRecoveryExecutionReceiptOutcomeV2::RetryAfter { retry_after },
+            ) => retry_after == &proof.retry_after(),
+            (
+                Self::Succession(proof),
+                RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed {
+                    action_identity,
+                    terminal_digest,
+                },
+            ) => {
+                action_identity == proof.action_identity()
+                    && terminal_digest.as_bytes() == proof.terminal_digest().as_bytes()
+            }
+            _ => false,
+        }
     }
 }
 
@@ -1229,6 +1286,10 @@ pub enum RuntimePendingDrainCompoundErrorV2 {
     CandidateTargetMismatch,
     #[error("runtime pending drain intent revision overflows")]
     IntentRevisionOverflow,
+    #[error("runtime pending drain claim revision overflows")]
+    ClaimRevisionOverflow,
+    #[error("runtime pending drain controller fence overflows")]
+    ControllerFenceOverflow,
     #[error("runtime pending drain authority revision overflows")]
     AuthorityRevisionOverflow,
     #[error("runtime pending drain digest is zero")]
@@ -1249,4 +1310,14 @@ pub enum RuntimePendingDrainCompoundErrorV2 {
     ClaimProofMismatch,
     #[error("runtime pending drain registry rollover does not match")]
     RegistryRolloverMismatch,
+    #[error("runtime pending drain previous owner process is not distinct")]
+    PreviousOwnerProcessNotDistinct,
+    #[error("runtime pending drain previous owner gateway shard does not match")]
+    PreviousOwnerShardMismatch,
+    #[error("runtime pending drain previous owner epoch is not older")]
+    PreviousOwnerEpochNotOlder,
+    #[error("runtime pending drain previous claim classification does not match database time")]
+    PreviousClaimClassificationMismatch,
+    #[error("runtime pending drain previous claim candidate is invalid")]
+    InvalidPreviousClaimCandidate,
 }
