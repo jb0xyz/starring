@@ -2,7 +2,8 @@
 
 \if :{?runtime_enable}
 \else
-\set runtime_enable off
+\echo 'runtime_enable is required'
+SELECT 1 / 0;
 \endif
 
 \if :{?runtime_execution_role}
@@ -33,13 +34,19 @@
 \if :{?expected_database}
 \else
 \echo 'expected_database is required'
-\quit
+SELECT 1 / 0;
 \endif
 
 \if :{?expected_system_identifier}
 \else
 \echo 'expected_system_identifier is required'
-\quit
+SELECT 1 / 0;
+\endif
+
+\if :{?runtime_dedicated_cluster_acknowledgement}
+\else
+\echo 'runtime_dedicated_cluster_acknowledgement is required'
+SELECT 1 / 0;
 \endif
 
 BEGIN;
@@ -51,6 +58,8 @@ SET LOCAL search_path = pg_catalog;
 SET LOCAL starring.runtime_enable = :'runtime_enable';
 SET LOCAL starring.expected_staging_database = :'expected_database';
 SET LOCAL starring.expected_staging_system_identifier = :'expected_system_identifier';
+SET LOCAL starring.runtime_dedicated_cluster_acknowledgement =
+    :'runtime_dedicated_cluster_acknowledgement';
 
 CREATE TEMP TABLE starring_runtime_capability_roles (
     capability TEXT PRIMARY KEY,
@@ -173,6 +182,18 @@ BEGIN
             USING ERRCODE = '55000';
     END IF;
 
+    IF pg_catalog.current_setting(
+            'starring.runtime_dedicated_cluster_acknowledgement'
+        ) IS DISTINCT FROM pg_catalog.format(
+            'starring-runtime-dedicated-staging-cluster-v1:%s:%s:cluster-wide-public-acl-reset',
+            actual_system_identifier,
+            pg_catalog.current_database()
+        )
+    THEN
+        RAISE EXCEPTION 'runtime dedicated staging cluster acknowledgement is invalid'
+            USING ERRCODE = '55000';
+    END IF;
+
     IF NOT EXISTS (
         SELECT 1
         FROM pg_catalog.pg_roles AS role
@@ -240,6 +261,25 @@ BEGIN
             )
         THEN
             RAISE EXCEPTION 'runtime capability role has external ownership or membership'
+                USING ERRCODE = '55000';
+        END IF;
+
+        IF role_oid IS NOT NULL
+            AND (
+                EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_stat_activity AS activity
+                    WHERE activity.usesysid = role_oid
+                        AND activity.pid <> pg_catalog.pg_backend_pid()
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_prepared_xacts AS prepared
+                    WHERE prepared.owner = role_entry.role_name
+                )
+            )
+        THEN
+            RAISE EXCEPTION 'runtime capability role has an active session or prepared transaction'
                 USING ERRCODE = '55000';
         END IF;
     END LOOP;
