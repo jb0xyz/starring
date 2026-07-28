@@ -14,6 +14,7 @@ mod process_startup;
 mod recovery_identity;
 mod registry;
 mod secret;
+mod shutdown;
 mod startup;
 
 pub use build_revision::RuntimeBuildRevisionBootstrapErrorV1;
@@ -74,4 +75,9 @@ pub use secret::{
     RuntimeDatabasePasswordV1, RuntimeDatabaseSecretsByCapabilityV1, RuntimeDatabaseSslModeV1,
     RuntimeDatabaseUrlSecretV1, RuntimeDiscordBotTokenV1, RuntimeSecretResolutionErrorV1,
     RuntimeSecretsResolutionErrorV1,
+};
+pub use shutdown::{
+    RuntimeOsShutdownSignalsV1, RuntimeShutdownCauseV1, RuntimeShutdownObservationV1,
+    RuntimeShutdownSignalErrorV1, RuntimeShutdownSignalLatchV1, RuntimeShutdownTriggerV1,
+    RuntimeShutdownTripV1,
 };

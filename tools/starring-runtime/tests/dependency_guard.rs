@@ -519,6 +519,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/registry.rs",
             "src/registry_succession_tests.rs",
             "src/secret.rs",
+            "src/shutdown.rs",
             "src/startup.rs",
             "src/startup_recovery_observation.rs",
             "tests/dependency_guard.rs",
@@ -671,6 +672,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/process/startup_loop.rs")
             && path != Path::new("src/process/startup_loop_tests.rs")
             && path != Path::new("src/process_startup.rs")
+            && path != Path::new("src/shutdown.rs")
             && path != Path::new("src/startup_recovery_observation.rs")
         {
             assert!(!contains_identifier(&source, "tokio"), "{}", path.display());
@@ -689,6 +691,60 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             assert!(!source.contains("option_env!"), "{}", path.display());
         }
     }
+}
+
+#[test]
+fn shutdown_latch_is_single_assignment_bounded_and_non_authorizing() {
+    let shutdown = include_str!("../src/shutdown.rs");
+    let production = source_before_test_module(shutdown);
+    for required in [
+        "const RUNTIME_SHUTDOWN_WINDOW: Duration = Duration::from_secs(30);",
+        "observation: OnceLock<RuntimeShutdownObservationV1>",
+        "pub fn trip(&self, cause: RuntimeShutdownCauseV1)",
+        "self.state.observation.set(candidate)",
+        "pub fn create_startup_bounded(cleanup_deadline: Instant)",
+        "deadline.min(ceiling)",
+        "RuntimeShutdownTripV1::First(candidate)",
+        "RuntimeShutdownTripV1::Existing(",
+        "pub async fn wait(&mut self)",
+        "signal(SignalKind::interrupt())",
+        "signal(SignalKind::terminate())",
+        "RuntimeShutdownObservationV1(<redacted>)",
+        "RuntimeShutdownTriggerV1(<redacted>)",
+        "RuntimeShutdownSignalLatchV1(<redacted>)",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    for type_name in [
+        "RuntimeShutdownObservationV1",
+        "RuntimeShutdownSignalLatchV1",
+        "RuntimeOsShutdownSignalsV1",
+    ] {
+        let attributes = declaration_attribute_block(production, type_name);
+        for forbidden in ["Default", "Serialize", "Deserialize"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{type_name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(production, type_name, forbidden),
+                "{type_name}: {forbidden}"
+            );
+        }
+    }
+    let latch_attributes = declaration_attribute_block(production, "RuntimeShutdownSignalLatchV1");
+    for forbidden in ["Clone", "Copy"] {
+        assert!(
+            !contains_identifier(latch_attributes, forbidden),
+            "RuntimeShutdownSignalLatchV1: {forbidden}"
+        );
+        assert!(
+            !implements_trait(production, "RuntimeShutdownSignalLatchV1", forbidden),
+            "RuntimeShutdownSignalLatchV1: {forbidden}"
+        );
+    }
+    assert!(!production.contains("sleep("));
+    assert!(!production.contains("SystemTime"));
 }
 
 #[test]
