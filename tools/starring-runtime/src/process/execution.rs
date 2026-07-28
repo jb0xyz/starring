@@ -282,12 +282,21 @@ where
         .map_err(pending_drain_compound_failure_v2)?;
     let completed = match selection {
         RuntimeAcceptedPendingDrainSelectionV2::NoCandidate(selection) => {
-            let receipt = environment
+            let receipt = match environment
                 .record_pending_drain_no_candidate_v2(session, &selection)
                 .await
-                .map_err(|error| {
-                    map_pending_drain_database_await_failure_v2(environment, session, error)
-                })?;
+            {
+                Err(error) if pending_drain_requires_exact_finalization_v2(&error) => {
+                    revalidate_pending_drain_stage_v2(environment, session)?;
+                    environment
+                        .record_pending_drain_no_candidate_v2(session, &selection)
+                        .await
+                }
+                result => result,
+            }
+            .map_err(|error| {
+                map_pending_drain_database_await_failure_v2(environment, session, error)
+            })?;
             revalidate_pending_drain_stage_v2(environment, session)?;
             selection
                 .complete(receipt)
@@ -303,22 +312,40 @@ where
             let claim = selection
                 .bind_registry_seal(seal)
                 .map_err(pending_drain_compound_failure_v2)?;
-            let claim_receipt = environment
+            let claim_receipt = match environment
                 .execute_pending_drain_claim_v2(session, &claim)
                 .await
-                .map_err(|error| {
-                    map_pending_drain_database_await_failure_v2(environment, session, error)
-                })?;
+            {
+                Err(error) if pending_drain_requires_exact_finalization_v2(&error) => {
+                    revalidate_pending_drain_stage_v2(environment, session)?;
+                    environment
+                        .execute_pending_drain_claim_v2(session, &claim)
+                        .await
+                }
+                result => result,
+            }
+            .map_err(|error| {
+                map_pending_drain_database_await_failure_v2(environment, session, error)
+            })?;
             revalidate_pending_drain_stage_v2(environment, session)?;
             let acknowledgement = claim
                 .complete(claim_receipt)
                 .map_err(pending_drain_compound_failure_v2)?;
-            let acknowledgement_receipt = environment
+            let acknowledgement_receipt = match environment
                 .execute_pending_drain_acknowledgement_v2(session, &acknowledgement)
                 .await
-                .map_err(|error| {
-                    map_pending_drain_database_await_failure_v2(environment, session, error)
-                })?;
+            {
+                Err(error) if pending_drain_requires_exact_finalization_v2(&error) => {
+                    revalidate_pending_drain_stage_v2(environment, session)?;
+                    environment
+                        .execute_pending_drain_acknowledgement_v2(session, &acknowledgement)
+                        .await
+                }
+                result => result,
+            }
+            .map_err(|error| {
+                map_pending_drain_database_await_failure_v2(environment, session, error)
+            })?;
             revalidate_pending_drain_stage_v2(environment, session)?;
             let durable = acknowledgement
                 .complete(acknowledgement_receipt)
@@ -350,6 +377,19 @@ where
         ));
     }
     Ok(RuntimeStartupRecoveryExecutionCompletionV2)
+}
+
+fn pending_drain_requires_exact_finalization_v2(
+    error: &RuntimeStartupRecoveryExecutionAwaitFailureV2<
+        automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+    >,
+) -> bool {
+    matches!(
+        error,
+        RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(
+            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Indeterminate
+        )
+    )
 }
 
 fn revalidate_pending_drain_stage_v2<Environment>(
@@ -918,6 +958,40 @@ mod tests {
             ),
             RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed
         );
+    }
+
+    #[test]
+    fn only_indeterminate_database_outcomes_receive_exact_finalization() {
+        use automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1;
+
+        assert!(pending_drain_requires_exact_finalization_v2(
+            &RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(
+                RuntimeExecutionPersistenceErrorV1::Indeterminate,
+            ),
+        ));
+        for error in [
+            RuntimeExecutionPersistenceErrorV1::InvalidInput,
+            RuntimeExecutionPersistenceErrorV1::DatabaseAuthorityMismatch,
+            RuntimeExecutionPersistenceErrorV1::OwnershipLost,
+            RuntimeExecutionPersistenceErrorV1::AuthorityChanged,
+            RuntimeExecutionPersistenceErrorV1::PersistenceCorrupt,
+            RuntimeExecutionPersistenceErrorV1::RetryNotReady,
+            RuntimeExecutionPersistenceErrorV1::Superseded,
+            RuntimeExecutionPersistenceErrorV1::Timeout,
+            RuntimeExecutionPersistenceErrorV1::Concurrency,
+            RuntimeExecutionPersistenceErrorV1::Unavailable,
+            RuntimeExecutionPersistenceErrorV1::DatabaseFailure,
+            RuntimeExecutionPersistenceErrorV1::ObservationAmbiguous,
+        ] {
+            assert!(!pending_drain_requires_exact_finalization_v2(
+                &RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(error),
+            ));
+        }
+        assert!(!pending_drain_requires_exact_finalization_v2(
+            &RuntimeStartupRecoveryExecutionAwaitFailureV2::Transition(
+                RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed,
+            ),
+        ));
     }
 
     #[test]

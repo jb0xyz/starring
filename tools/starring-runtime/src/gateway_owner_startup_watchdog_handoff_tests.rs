@@ -18,6 +18,7 @@ use automation_runtime_controller::{
     RuntimeStartupServingStateV2,
 };
 use automation_runtime_convergence::{ProcessInstanceId, RuntimeDeploymentTargetV1};
+use automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1 as PendingDrainPersistenceErrorV1;
 use automation_runtime_worker::{
     accept_gateway_owner_acquire_v1, accept_runtime_registry_recovery_empty_observation_v2,
     RuntimeAcceptedGatewayOwnerAcquireV1, RuntimeAcceptedGatewayOwnerReceiptV1,
@@ -33,10 +34,11 @@ use automation_runtime_worker::{
     RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
     RuntimePendingDrainAcknowledgementReceiptV2, RuntimePendingDrainCandidateV2,
     RuntimePendingDrainClaimReceiptV2, RuntimePendingDrainNoCandidateReceiptV2,
-    RuntimePendingDrainSelectionOutcomeV2, RuntimePendingDrainSelectionReceiptV2,
-    RuntimePendingDrainStateDigestV2, RuntimeRegistryGlobalObservationSequenceV2,
-    RuntimeRegistryRecoveryObservationInputV2, RuntimeSelectedPendingDrainNoCandidateV2,
-    RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
+    RuntimePendingDrainRegistrySealWitnessV2, RuntimePendingDrainSelectionOutcomeV2,
+    RuntimePendingDrainSelectionReceiptV2, RuntimePendingDrainStateDigestV2,
+    RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryObservationInputV2,
+    RuntimeSelectedPendingDrainNoCandidateV2, RuntimeStartupRecoveryClassV2,
+    RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryExecutionActionIdentityV2,
     RuntimeStartupRecoveryExecutionReceiptOutcomeV2, RuntimeStartupRecoveryExecutionReceiptV2,
     RuntimeStartupRecoveryExecutionTerminalDigestV2, RuntimeStartupRecoveryObservationPortV2,
 };
@@ -682,42 +684,119 @@ enum PendingDrainTestSelectionV2 {
 #[derive(Clone, Copy)]
 enum PendingDrainTestAwaitFailureV2 {
     Transition(crate::process::RuntimeProcessStartupRecoveryLoopFailureV2),
-    Database(automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1),
+    Database(PendingDrainPersistenceErrorV1),
+}
+
+#[derive(PartialEq, Eq)]
+enum PendingDrainTestMutationFingerprintV2 {
+    NoCandidate {
+        authorization_address: usize,
+        request_address: usize,
+        action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2,
+    },
+    Claim {
+        authorization_address: usize,
+        request_address: usize,
+        action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2,
+        candidate: RuntimePendingDrainCandidateV2,
+        seal: RuntimePendingDrainRegistrySealWitnessV2,
+        minimum_database_now: DateTime<Utc>,
+    },
+    Acknowledgement {
+        authorization_address: usize,
+        request_address: usize,
+        action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2,
+        claim_action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2,
+        candidate: RuntimePendingDrainCandidateV2,
+        seal: RuntimePendingDrainRegistrySealWitnessV2,
+        claim_terminal_digest: [u8; 32],
+        claimed_intent_revision: NonZeroU64,
+        claimed_state_digest: [u8; 32],
+        minimum_database_now: DateTime<Utc>,
+    },
+}
+
+impl PendingDrainTestMutationFingerprintV2 {
+    fn stage(&self) -> PendingDrainTestStageV2 {
+        match self {
+            Self::NoCandidate { .. } => PendingDrainTestStageV2::NoCandidate,
+            Self::Claim { .. } => PendingDrainTestStageV2::Claim,
+            Self::Acknowledgement { .. } => PendingDrainTestStageV2::Acknowledgement,
+        }
+    }
 }
 
 struct FakePendingDrainRecoveryEnvironmentV2 {
     selection: PendingDrainTestSelectionV2,
-    failure: Option<(PendingDrainTestStageV2, PendingDrainTestAwaitFailureV2)>,
+    failures: VecDeque<(PendingDrainTestStageV2, PendingDrainTestAwaitFailureV2)>,
+    transition_after: Option<(
+        PendingDrainTestStageV2,
+        usize,
+        crate::process::RuntimeProcessStartupRecoveryLoopFailureV2,
+    )>,
+    session_invalidation_after: Option<(PendingDrainTestStageV2, usize)>,
     events: Vec<PendingDrainTestStageV2>,
+    mutation_fingerprints: Vec<PendingDrainTestMutationFingerprintV2>,
 }
 
 impl FakePendingDrainRecoveryEnvironmentV2 {
-    fn candidate() -> Self {
+    fn new(selection: PendingDrainTestSelectionV2) -> Self {
         Self {
-            selection: PendingDrainTestSelectionV2::Candidate,
-            failure: None,
+            selection,
+            failures: VecDeque::new(),
+            transition_after: None,
+            session_invalidation_after: None,
             events: Vec::new(),
+            mutation_fingerprints: Vec::new(),
         }
+    }
+
+    fn candidate() -> Self {
+        Self::new(PendingDrainTestSelectionV2::Candidate)
     }
 
     fn no_candidate() -> Self {
-        Self {
-            selection: PendingDrainTestSelectionV2::NoCandidate,
-            failure: None,
-            events: Vec::new(),
-        }
+        Self::new(PendingDrainTestSelectionV2::NoCandidate)
     }
 
     fn failing(stage: PendingDrainTestStageV2, failure: PendingDrainTestAwaitFailureV2) -> Self {
-        Self {
-            selection: if stage == PendingDrainTestStageV2::NoCandidate {
-                PendingDrainTestSelectionV2::NoCandidate
-            } else {
-                PendingDrainTestSelectionV2::Candidate
-            },
-            failure: Some((stage, failure)),
-            events: Vec::new(),
-        }
+        Self::failing_sequence([(stage, failure)])
+    }
+
+    fn failing_sequence(
+        failures: impl IntoIterator<Item = (PendingDrainTestStageV2, PendingDrainTestAwaitFailureV2)>,
+    ) -> Self {
+        let failures: VecDeque<_> = failures.into_iter().collect();
+        let selection = if failures
+            .iter()
+            .any(|(stage, _)| *stage == PendingDrainTestStageV2::NoCandidate)
+        {
+            PendingDrainTestSelectionV2::NoCandidate
+        } else {
+            PendingDrainTestSelectionV2::Candidate
+        };
+        let mut environment = Self::new(selection);
+        environment.failures = failures;
+        environment
+    }
+
+    fn with_transition_after(
+        mut self,
+        stage: PendingDrainTestStageV2,
+        invocation_count: usize,
+        transition: crate::process::RuntimeProcessStartupRecoveryLoopFailureV2,
+    ) -> Self {
+        self.transition_after = Some((stage, invocation_count, transition));
+        self
+    }
+
+    fn with_session_invalidation_after(
+        mut self,
+        stage: PendingDrainTestStageV2,
+        invocation_count: usize,
+    ) -> Self {
+        self.session_invalidation_after = Some((stage, invocation_count));
+        self
     }
 
     fn finish_stage_v2<T>(
@@ -727,23 +806,24 @@ impl FakePendingDrainRecoveryEnvironmentV2 {
     ) -> Result<
         T,
         crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
-            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+            PendingDrainPersistenceErrorV1,
         >,
     > {
         self.events.push(stage);
-        match self.failure {
-            Some((failed_stage, PendingDrainTestAwaitFailureV2::Transition(error)))
-                if failed_stage == stage =>
-            {
-                Err(
-                    crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2::Transition(
-                        error,
-                    ),
-                )
-            }
-            Some((failed_stage, PendingDrainTestAwaitFailureV2::Database(error)))
-                if failed_stage == stage =>
-            {
+        let failure = self
+            .failures
+            .front()
+            .copied()
+            .filter(|(failed_stage, _)| *failed_stage == stage)
+            .map(|(_, failure)| {
+                self.failures.pop_front();
+                failure
+            });
+        match failure {
+            Some(PendingDrainTestAwaitFailureV2::Transition(error)) => Err(
+                crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2::Transition(error),
+            ),
+            Some(PendingDrainTestAwaitFailureV2::Database(error)) => {
                 Err(crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(error))
             }
             _ => Ok(value),
@@ -763,9 +843,21 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
 {
     fn current_transition_v2(
         &self,
-        _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
     ) -> Option<crate::process::RuntimeProcessStartupRecoveryLoopFailureV2> {
-        None
+        if self
+            .session_invalidation_after
+            .is_some_and(|(stage, invocation_count)| {
+                self.events.iter().filter(|event| **event == stage).count() >= invocation_count
+            })
+        {
+            session.invalidate_startup_recovery_execution_v2();
+        }
+        self.transition_after
+            .filter(|(stage, invocation_count, _)| {
+                self.events.iter().filter(|event| **event == *stage).count() >= *invocation_count
+            })
+            .map(|(_, _, transition)| transition)
     }
 
     async fn select_pending_drain_v2(
@@ -775,7 +867,7 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
     ) -> Result<
         RuntimePendingDrainSelectionReceiptV2,
         crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
-            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+            PendingDrainPersistenceErrorV1,
         >,
     > {
         let outcome = match self.selection {
@@ -804,9 +896,15 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
     ) -> Result<
         RuntimePendingDrainNoCandidateReceiptV2,
         crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
-            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+            PendingDrainPersistenceErrorV1,
         >,
     > {
+        self.mutation_fingerprints
+            .push(PendingDrainTestMutationFingerprintV2::NoCandidate {
+                authorization_address: std::ptr::from_ref(selection).addr(),
+                request_address: std::ptr::from_ref(selection.request()).addr(),
+                action_identity: selection.request().action_identity().clone(),
+            });
         let receipt = RuntimePendingDrainNoCandidateReceiptV2::new(
             selection.request().action_identity().clone(),
             RuntimeStartupRecoveryExecutionTerminalDigestV2::new([46; 32]).unwrap(),
@@ -825,9 +923,18 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
     ) -> Result<
         RuntimePendingDrainClaimReceiptV2,
         crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
-            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+            PendingDrainPersistenceErrorV1,
         >,
     > {
+        self.mutation_fingerprints
+            .push(PendingDrainTestMutationFingerprintV2::Claim {
+                authorization_address: std::ptr::from_ref(authorization).addr(),
+                request_address: std::ptr::from_ref(authorization.request()).addr(),
+                action_identity: authorization.action_identity().clone(),
+                candidate: authorization.candidate().clone(),
+                seal: authorization.seal().clone(),
+                minimum_database_now: authorization.minimum_database_now(),
+            });
         let receipt = RuntimePendingDrainClaimReceiptV2::new(
             authorization.action_identity().clone(),
             authorization.candidate().clone(),
@@ -850,9 +957,22 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
     ) -> Result<
         RuntimePendingDrainAcknowledgementReceiptV2,
         crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
-            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+            PendingDrainPersistenceErrorV1,
         >,
     > {
+        self.mutation_fingerprints
+            .push(PendingDrainTestMutationFingerprintV2::Acknowledgement {
+                authorization_address: std::ptr::from_ref(authorization).addr(),
+                request_address: std::ptr::from_ref(authorization.request()).addr(),
+                action_identity: authorization.action_identity().clone(),
+                claim_action_identity: authorization.request().action_identity().clone(),
+                candidate: authorization.candidate().clone(),
+                seal: authorization.seal().clone(),
+                claim_terminal_digest: *authorization.claim_terminal_digest().as_bytes(),
+                claimed_intent_revision: authorization.claimed_intent_revision(),
+                claimed_state_digest: *authorization.claimed_state_digest().as_bytes(),
+                minimum_database_now: authorization.minimum_database_now(),
+            });
         let receipt = RuntimePendingDrainAcknowledgementReceiptV2::new(
             authorization.action_identity().clone(),
             authorization.request().action_identity().clone(),
@@ -1567,6 +1687,118 @@ async fn owner_safety_deadline_is_the_startup_observer_cutoff_minimum() {
     wait_for(|| port.release_calls() == 1).await;
 }
 
+struct PendingDrainTestRunV2 {
+    outcome: Result<(), crate::process::RuntimeProcessStartupRecoveryLoopFailureV2>,
+    source: automation_runtime_worker::RuntimeRegistryRecoveryEmptyObservationV2,
+    successor: Result<
+        automation_runtime_worker::RuntimeRegistryRecoveryEmptyObservationV2,
+        crate::RuntimeRegistryRecoveryObservationErrorV1,
+    >,
+    environment: FakePendingDrainRecoveryEnvironmentV2,
+}
+
+impl PendingDrainTestRunV2 {
+    fn assert_success(&self) {
+        assert!(self.outcome.is_ok());
+    }
+
+    fn assert_error(&self, expected: crate::process::RuntimeProcessStartupRecoveryLoopFailureV2) {
+        assert_eq!(self.outcome, Err(expected));
+    }
+
+    fn assert_events(&self, expected: &[PendingDrainTestStageV2]) {
+        assert_eq!(self.environment.events, expected);
+    }
+
+    fn assert_event_count(&self, stage: PendingDrainTestStageV2, expected: usize) {
+        assert_eq!(
+            self.environment
+                .events
+                .iter()
+                .filter(|event| **event == stage)
+                .count(),
+            expected
+        );
+    }
+
+    fn assert_exact_mutation_fingerprints(&self, stage: PendingDrainTestStageV2, expected: usize) {
+        let fingerprints: Vec<_> = self
+            .environment
+            .mutation_fingerprints
+            .iter()
+            .filter(|fingerprint| fingerprint.stage() == stage)
+            .collect();
+        assert_eq!(fingerprints.len(), expected);
+        assert!(fingerprints.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    fn assert_registry_sealed(&self, sealed: bool) {
+        if sealed {
+            assert_eq!(
+                self.successor,
+                Err(crate::RuntimeRegistryRecoveryObservationErrorV1::NotEmpty)
+            );
+        } else {
+            assert!(self.successor.is_ok());
+        }
+    }
+
+    fn assert_no_candidate_completed(&self) {
+        self.assert_registry_sealed(false);
+        assert_eq!(self.successor.as_ref().unwrap(), &self.source);
+    }
+
+    fn assert_candidate_completed(&self) {
+        let successor = self.successor.as_ref().unwrap();
+        assert_eq!(
+            successor.observation_sequence().get(),
+            self.source.observation_sequence().get() + 2
+        );
+        assert_eq!(successor.retained_slot_count(), 1);
+        assert_eq!(successor.retained_empty_tombstone_count(), 1);
+    }
+}
+
+async fn run_pending_drain_test_v2(
+    recovery_id: &str,
+    mut environment: FakePendingDrainRecoveryEnvironmentV2,
+) -> PendingDrainTestRunV2 {
+    let (gateway, registry, mut session, port) =
+        initial_pending_drain_continue_fresh_registry_fixture_v2(recovery_id).await;
+    let source = registry.observe_recovery_empty_projection_v2().unwrap();
+    let outcome = crate::process::execute_pending_drain_recovery_with_environment_v2(
+        &mut session,
+        &mut environment,
+    )
+    .await
+    .map(|_| ());
+    let successor = registry.observe_recovery_empty_projection_v2();
+    let gateway = gateway.closed_snapshot();
+    if outcome.is_ok() {
+        assert!(matches!(
+            gateway,
+            automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending { .. }
+        ));
+    } else {
+        assert!(matches!(
+            gateway,
+            automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+                cause:
+                    automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::CapabilityNotReady,
+                ..
+            }
+        ));
+    }
+    drop(session);
+    wait_for(|| port.release_calls() == 1).await;
+    PendingDrainTestRunV2 {
+        outcome,
+        source,
+        successor,
+        environment,
+    }
+}
+
 #[tokio::test]
 async fn startup_recovery_continue_requires_a_fresh_ready_iteration_before_fixed_point() {
     let (gateway, _registry, session, port) =
@@ -1667,80 +1899,328 @@ async fn startup_recovery_continue_requires_a_fresh_ready_iteration_before_fixed
 
 #[tokio::test]
 async fn production_pending_drain_driver_rolls_fresh_slot_s0_s1_s2() {
-    let (gateway, registry, mut session, port) =
-        initial_pending_drain_continue_fresh_registry_fixture_v2(
-            "36363636363636363636363636363636",
-        )
-        .await;
-    let source = registry.observe_recovery_empty_projection_v2().unwrap();
-    assert_eq!(source.retained_slot_count(), 0);
-    assert_eq!(source.retained_empty_tombstone_count(), 0);
-    let mut environment = FakePendingDrainRecoveryEnvironmentV2::candidate();
-
-    crate::process::execute_pending_drain_recovery_with_environment_v2(
-        &mut session,
-        &mut environment,
+    let run = run_pending_drain_test_v2(
+        "36363636363636363636363636363636",
+        FakePendingDrainRecoveryEnvironmentV2::candidate(),
     )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        environment.events,
-        [
-            PendingDrainTestStageV2::Selection,
-            PendingDrainTestStageV2::Claim,
-            PendingDrainTestStageV2::Acknowledgement,
-        ]
-    );
-    let successor = registry.observe_recovery_empty_projection_v2().unwrap();
-    assert_eq!(
-        successor.observation_sequence().get(),
-        source.observation_sequence().get() + 2
-    );
-    assert_eq!(successor.retained_slot_count(), 1);
-    assert_eq!(successor.retained_empty_tombstone_count(), 1);
-    assert!(matches!(
-        gateway.closed_snapshot(),
-        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending { .. }
-    ));
-    drop(session);
-    wait_for(|| port.release_calls() == 1).await;
+    .await;
+    run.assert_success();
+    assert_eq!(run.source.retained_slot_count(), 0);
+    assert_eq!(run.source.retained_empty_tombstone_count(), 0);
+    run.assert_events(&[
+        PendingDrainTestStageV2::Selection,
+        PendingDrainTestStageV2::Claim,
+        PendingDrainTestStageV2::Acknowledgement,
+    ]);
+    run.assert_candidate_completed();
 }
 
 #[tokio::test]
 async fn production_pending_drain_driver_records_no_candidate_without_sealing() {
-    let (gateway, registry, mut session, port) =
-        initial_pending_drain_continue_fresh_registry_fixture_v2(
-            "35353535353535353535353535353535",
+    let run = run_pending_drain_test_v2(
+        "35353535353535353535353535353535",
+        FakePendingDrainRecoveryEnvironmentV2::no_candidate(),
+    )
+    .await;
+    run.assert_success();
+    run.assert_events(&[
+        PendingDrainTestStageV2::Selection,
+        PendingDrainTestStageV2::NoCandidate,
+    ]);
+    run.assert_no_candidate_completed();
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_finalizes_each_indeterminate_mutation_exactly_once() {
+    let indeterminate =
+        PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate);
+    for (recovery_id, failures, events, no_candidate) in [
+        (
+            "29292929292929292929292929292929",
+            vec![(PendingDrainTestStageV2::NoCandidate, indeterminate)],
+            vec![
+                PendingDrainTestStageV2::Selection,
+                PendingDrainTestStageV2::NoCandidate,
+                PendingDrainTestStageV2::NoCandidate,
+            ],
+            true,
+        ),
+        (
+            "28282828282828282828282828282828",
+            vec![(PendingDrainTestStageV2::Claim, indeterminate)],
+            vec![
+                PendingDrainTestStageV2::Selection,
+                PendingDrainTestStageV2::Claim,
+                PendingDrainTestStageV2::Claim,
+                PendingDrainTestStageV2::Acknowledgement,
+            ],
+            false,
+        ),
+        (
+            "27272727272727272727272727272727",
+            vec![(PendingDrainTestStageV2::Acknowledgement, indeterminate)],
+            vec![
+                PendingDrainTestStageV2::Selection,
+                PendingDrainTestStageV2::Claim,
+                PendingDrainTestStageV2::Acknowledgement,
+                PendingDrainTestStageV2::Acknowledgement,
+            ],
+            false,
+        ),
+        (
+            "26262626262626262626262626262626",
+            vec![
+                (PendingDrainTestStageV2::Claim, indeterminate),
+                (PendingDrainTestStageV2::Acknowledgement, indeterminate),
+            ],
+            vec![
+                PendingDrainTestStageV2::Selection,
+                PendingDrainTestStageV2::Claim,
+                PendingDrainTestStageV2::Claim,
+                PendingDrainTestStageV2::Acknowledgement,
+                PendingDrainTestStageV2::Acknowledgement,
+            ],
+            false,
+        ),
+    ] {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing_sequence(failures),
         )
         .await;
-    let source = registry.observe_recovery_empty_projection_v2().unwrap();
-    let mut environment = FakePendingDrainRecoveryEnvironmentV2::no_candidate();
-
-    crate::process::execute_pending_drain_recovery_with_environment_v2(
-        &mut session,
-        &mut environment,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        environment.events,
-        [
-            PendingDrainTestStageV2::Selection,
+        run.assert_success();
+        run.assert_events(&events);
+        for stage in [
             PendingDrainTestStageV2::NoCandidate,
-        ]
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestStageV2::Acknowledgement,
+        ] {
+            let expected = events.iter().filter(|event| **event == stage).count();
+            if expected > 0 {
+                run.assert_exact_mutation_fingerprints(stage, expected);
+            }
+        }
+        if no_candidate {
+            run.assert_no_candidate_completed();
+        } else {
+            run.assert_candidate_completed();
+        }
+    }
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_prefers_transition_around_mutation_finalization() {
+    for (recovery_id, transition) in [
+        (
+            "abababababababababababababababab",
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed,
+        ),
+        (
+            "acacacacacacacacacacacacacacacac",
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PausedConnection(
+                crate::RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated,
+            ),
+        ),
+        (
+            "adadadadadadadadadadadadadadadad",
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PausedConnection(
+                crate::RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated,
+            ),
+        ),
+        (
+            "aeaeaeaeaeaeaeaeaeaeaeaeaeaeaeae",
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::ProtocolViolation,
+        ),
+    ] {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing_sequence([(
+                PendingDrainTestStageV2::Claim,
+                PendingDrainTestAwaitFailureV2::Database(
+                    PendingDrainPersistenceErrorV1::Indeterminate,
+                ),
+            )])
+            .with_transition_after(PendingDrainTestStageV2::Claim, 1, transition),
+        )
+        .await;
+        run.assert_error(transition);
+        run.assert_event_count(PendingDrainTestStageV2::Claim, 1);
+        assert!(!run
+            .environment
+            .events
+            .contains(&PendingDrainTestStageV2::Acknowledgement));
+        run.assert_exact_mutation_fingerprints(PendingDrainTestStageV2::Claim, 1);
+        run.assert_registry_sealed(true);
+    }
+
+    let transition =
+        crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed;
+    for (recovery_id, stage, leaves_sealed) in [
+        (
+            "afafafafafafafafafafafafafafafaf",
+            PendingDrainTestStageV2::NoCandidate,
+            false,
+        ),
+        (
+            "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+            PendingDrainTestStageV2::Claim,
+            true,
+        ),
+        (
+            "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+            PendingDrainTestStageV2::Acknowledgement,
+            true,
+        ),
+    ] {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing_sequence([(
+                stage,
+                PendingDrainTestAwaitFailureV2::Database(
+                    PendingDrainPersistenceErrorV1::Indeterminate,
+                ),
+            )])
+            .with_transition_after(stage, 2, transition),
+        )
+        .await;
+        run.assert_error(transition);
+        run.assert_event_count(stage, 2);
+        run.assert_registry_sealed(leaves_sealed);
+    }
+
+    let run = run_pending_drain_test_v2(
+        "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        FakePendingDrainRecoveryEnvironmentV2::failing_sequence([(
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate),
+        )])
+        .with_session_invalidation_after(PendingDrainTestStageV2::Claim, 1),
+    )
+    .await;
+    run.assert_error(
+        crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecutionRejected(
+            crate::RuntimeProcessClosedRecoveryCommitFailureV2::GatewayObservation(
+                crate::RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
+            ),
+        ),
     );
-    assert_eq!(
-        registry.observe_recovery_empty_projection_v2().unwrap(),
-        source
-    );
-    assert!(matches!(
-        gateway.closed_snapshot(),
-        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending { .. }
-    ));
-    drop(session);
-    wait_for(|| port.release_calls() == 1).await;
+    run.assert_event_count(PendingDrainTestStageV2::Claim, 1);
+    run.assert_registry_sealed(true);
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_stops_after_two_mutation_failures() {
+    let indeterminate =
+        PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate);
+    let cases = [
+        (
+            "25252525252525252525252525252525",
+            PendingDrainTestStageV2::NoCandidate,
+            indeterminate,
+            false,
+        ),
+        (
+            "24242424242424242424242424242424",
+            PendingDrainTestStageV2::Claim,
+            indeterminate,
+            true,
+        ),
+        (
+            "23232323232323232323232323232323",
+            PendingDrainTestStageV2::Acknowledgement,
+            indeterminate,
+            true,
+        ),
+        (
+            "22222222222222222222222222222222",
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Timeout),
+            true,
+        ),
+        (
+            "21212121212121212121212121212121",
+            PendingDrainTestStageV2::Acknowledgement,
+            PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::OwnershipLost),
+            true,
+        ),
+        (
+            "20202020202020202020202020202020",
+            PendingDrainTestStageV2::NoCandidate,
+            PendingDrainTestAwaitFailureV2::Database(
+                PendingDrainPersistenceErrorV1::PersistenceCorrupt,
+            ),
+            false,
+        ),
+    ];
+
+    for (recovery_id, stage, terminal_failure, leaves_sealed) in cases {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing_sequence([
+                (stage, indeterminate),
+                (stage, terminal_failure),
+            ]),
+        )
+        .await;
+        let PendingDrainTestAwaitFailureV2::Database(expected) = terminal_failure else {
+            unreachable!()
+        };
+        run.assert_error(
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(
+                expected,
+            ),
+        );
+        run.assert_event_count(stage, 2);
+        run.assert_registry_sealed(leaves_sealed);
+    }
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_never_finalizes_selection_or_terminal_mutation_failure() {
+    let cases = [
+        (
+            "19191919191919191919191919191919",
+            PendingDrainTestStageV2::Selection,
+            PendingDrainPersistenceErrorV1::Indeterminate,
+            false,
+        ),
+        (
+            "18181818181818181818181818181818",
+            PendingDrainTestStageV2::NoCandidate,
+            PendingDrainPersistenceErrorV1::Timeout,
+            false,
+        ),
+        (
+            "17171717171717171717171717171717",
+            PendingDrainTestStageV2::Claim,
+            PendingDrainPersistenceErrorV1::OwnershipLost,
+            true,
+        ),
+        (
+            "16161616161616161616161616161616",
+            PendingDrainTestStageV2::Acknowledgement,
+            PendingDrainPersistenceErrorV1::PersistenceCorrupt,
+            true,
+        ),
+    ];
+
+    for (recovery_id, stage, failure, leaves_sealed) in cases {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing(
+                stage,
+                PendingDrainTestAwaitFailureV2::Database(failure),
+            ),
+        )
+        .await;
+        run.assert_error(
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(
+                failure,
+            ),
+        );
+        run.assert_event_count(stage, 1);
+        run.assert_registry_sealed(leaves_sealed);
+    }
 }
 
 #[tokio::test]
@@ -1750,7 +2230,7 @@ async fn production_pending_drain_driver_invalidates_and_preserves_seal_on_every
             "34343434343434343434343434343434",
             PendingDrainTestStageV2::Selection,
             PendingDrainTestAwaitFailureV2::Database(
-                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Timeout,
+                PendingDrainPersistenceErrorV1::Timeout,
             ),
             false,
         ),
@@ -1758,7 +2238,7 @@ async fn production_pending_drain_driver_invalidates_and_preserves_seal_on_every
             "33333333333333333333333333333333",
             PendingDrainTestStageV2::NoCandidate,
             PendingDrainTestAwaitFailureV2::Database(
-                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Indeterminate,
+                PendingDrainPersistenceErrorV1::Unavailable,
             ),
             false,
         ),
@@ -1766,7 +2246,7 @@ async fn production_pending_drain_driver_invalidates_and_preserves_seal_on_every
             "32323232323232323232323232323232",
             PendingDrainTestStageV2::Claim,
             PendingDrainTestAwaitFailureV2::Database(
-                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Timeout,
+                PendingDrainPersistenceErrorV1::Timeout,
             ),
             true,
         ),
@@ -1774,7 +2254,7 @@ async fn production_pending_drain_driver_invalidates_and_preserves_seal_on_every
             "31313131313131313131313131313131",
             PendingDrainTestStageV2::Acknowledgement,
             PendingDrainTestAwaitFailureV2::Database(
-                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Indeterminate,
+                PendingDrainPersistenceErrorV1::Concurrency,
             ),
             true,
         ),
@@ -1789,48 +2269,25 @@ async fn production_pending_drain_driver_invalidates_and_preserves_seal_on_every
     ];
 
     for (recovery_id, stage, failure, leaves_sealed) in cases {
-        let (gateway, registry, mut session, port) =
-            initial_pending_drain_continue_fresh_registry_fixture_v2(recovery_id).await;
-        let mut environment = FakePendingDrainRecoveryEnvironmentV2::failing(stage, failure);
-
-        let error = match crate::process::execute_pending_drain_recovery_with_environment_v2(
-            &mut session,
-            &mut environment,
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing(stage, failure),
         )
-        .await
-        {
-            Ok(_) => panic!("pending drain recovery unexpectedly completed"),
-            Err(error) => error,
-        };
-
+        .await;
         match failure {
             PendingDrainTestAwaitFailureV2::Transition(expected) => {
-                assert_eq!(error, expected);
+                run.assert_error(expected);
             }
             PendingDrainTestAwaitFailureV2::Database(expected) => {
-                assert_eq!(
-                    error,
+                run.assert_error(
                     crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(
                         expected,
-                    )
+                    ),
                 );
             }
         }
-        assert_eq!(environment.events.last(), Some(&stage));
-        assert_eq!(
-            registry.observe_recovery_empty_projection_v2().is_err(),
-            leaves_sealed
-        );
-        assert!(matches!(
-            gateway.closed_snapshot(),
-            automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
-                cause:
-                    automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::CapabilityNotReady,
-                ..
-            }
-        ));
-        drop(session);
-        wait_for(|| port.release_calls() == 1).await;
+        assert_eq!(run.environment.events.last(), Some(&stage));
+        run.assert_registry_sealed(leaves_sealed);
     }
 }
 

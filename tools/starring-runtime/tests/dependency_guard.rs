@@ -3215,7 +3215,13 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
         pending_execution
             .matches("revalidate_pending_drain_stage_v2(environment, session)?")
             .count(),
-        4
+        7
+    );
+    assert_eq!(
+        pending_execution
+            .matches("pending_drain_requires_exact_finalization_v2(&error)")
+            .count(),
+        3
     );
     let pending_begin = pending_execution
         .find(".begin_startup_recovery_execution_v2(")
@@ -3264,10 +3270,34 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
     );
     assert_eq!(
         pending_execution
-            .matches(".record_pending_drain_no_candidate_v2(")
+            .matches(".select_pending_drain_v2(")
             .count(),
         1
     );
+    assert_eq!(
+        pending_execution
+            .matches(".record_pending_drain_no_candidate_v2(")
+            .count(),
+        2
+    );
+    assert_eq!(
+        pending_execution
+            .matches(".execute_pending_drain_claim_v2(")
+            .count(),
+        2
+    );
+    assert_eq!(
+        pending_execution
+            .matches(".execute_pending_drain_acknowledgement_v2(")
+            .count(),
+        2
+    );
+    let pending_finalization = braced_declaration(
+        execution,
+        "fn pending_drain_requires_exact_finalization_v2(",
+    );
+    assert!(pending_finalization.contains("RuntimeExecutionPersistenceErrorV1::Indeterminate"));
+    assert!(!pending_finalization.contains(".class()"));
     let production_continue = braced_declaration(
         startup_loop,
         "impl RuntimeStartupRecoveryLoopContinueStepV2 for RuntimeStartupRecoveryContinueProcessV2",
