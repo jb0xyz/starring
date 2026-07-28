@@ -19,6 +19,7 @@ pub(crate) struct RuntimeMaintenanceIngressGateSnapshotV2 {
     generation: RuntimeMaintenanceGateGenerationV2,
     stage: RuntimeMaintenanceIngressGateStageV2,
     active_permit_count: u64,
+    shutdown_sealed: bool,
     terminal_error: Option<RuntimeMaintenanceIngressGateErrorV2>,
 }
 
@@ -33,6 +34,10 @@ impl RuntimeMaintenanceIngressGateSnapshotV2 {
 
     pub(crate) fn active_permit_count(&self) -> u64 {
         self.active_permit_count
+    }
+
+    pub(crate) fn shutdown_sealed(&self) -> bool {
+        self.shutdown_sealed
     }
 
     pub(crate) fn terminal_error(&self) -> Option<RuntimeMaintenanceIngressGateErrorV2> {
@@ -52,6 +57,8 @@ pub(crate) enum RuntimeMaintenanceIngressGateErrorV2 {
     NotOpen,
     #[error("runtime maintenance ingress gate is still draining")]
     StillDraining,
+    #[error("runtime maintenance ingress gate shutdown is sealed")]
+    ShutdownSealed,
     #[error("runtime maintenance ingress gate generation overflowed")]
     GenerationOverflow,
     #[error("runtime maintenance ingress gate permit count overflowed")]
@@ -72,6 +79,7 @@ impl RuntimeMaintenanceIngressGateErrorV2 {
             Self::NotOpening => "runtime_maintenance_ingress_gate_not_opening",
             Self::NotOpen => "runtime_maintenance_ingress_gate_not_open",
             Self::StillDraining => "runtime_maintenance_ingress_gate_still_draining",
+            Self::ShutdownSealed => "runtime_maintenance_ingress_gate_shutdown_sealed",
             Self::GenerationOverflow => "runtime_maintenance_ingress_gate_generation_overflow",
             Self::PermitCountOverflow => "runtime_maintenance_ingress_gate_permit_count_overflow",
             Self::DrainDeadlineElapsed => "runtime_maintenance_ingress_gate_drain_deadline_elapsed",
@@ -129,6 +137,7 @@ impl RuntimeMaintenanceIngressGateControllerV2 {
             generation,
             stage: RuntimeMaintenanceIngressGateStageV2::Closed,
             active_permit_count: 0,
+            shutdown_sealed: false,
             terminal_error: None,
         };
         let (changes, observer) = watch::channel(snapshot);
@@ -161,6 +170,8 @@ impl RuntimeMaintenanceIngressGateControllerV2 {
             let mut state = lock_state_v2(&self.shared);
             if let Some(error) = state.snapshot.terminal_error {
                 Err(error)
+            } else if state.snapshot.shutdown_sealed {
+                Err(RuntimeMaintenanceIngressGateErrorV2::ShutdownSealed)
             } else if state.snapshot.generation != self.generation {
                 Err(RuntimeMaintenanceIngressGateErrorV2::StaleAuthority)
             } else if state.snapshot.stage != RuntimeMaintenanceIngressGateStageV2::Closed {
@@ -172,6 +183,7 @@ impl RuntimeMaintenanceIngressGateControllerV2 {
                             generation: next,
                             stage: RuntimeMaintenanceIngressGateStageV2::Opening,
                             active_permit_count: 0,
+                            shutdown_sealed: false,
                             terminal_error: None,
                         };
                         state.open_generation = Some(next);
@@ -229,6 +241,8 @@ impl RuntimeMaintenanceIngressGateOpeningAuthorityV2 {
             let mut state = lock_state_v2(shared);
             if let Some(error) = state.snapshot.terminal_error {
                 Err(error)
+            } else if state.snapshot.shutdown_sealed {
+                Err(RuntimeMaintenanceIngressGateErrorV2::ShutdownSealed)
             } else if state.snapshot.generation != self.generation {
                 Err(RuntimeMaintenanceIngressGateErrorV2::StaleAuthority)
             } else if state.snapshot.stage != RuntimeMaintenanceIngressGateStageV2::Opening {
@@ -299,6 +313,9 @@ impl RuntimeMaintenanceIngressGateOpenAuthorityV2 {
         if let Some(error) = state.snapshot.terminal_error {
             return Err(error);
         }
+        if state.snapshot.shutdown_sealed {
+            return Err(RuntimeMaintenanceIngressGateErrorV2::ShutdownSealed);
+        }
         if state.snapshot.generation != self.generation {
             return Err(RuntimeMaintenanceIngressGateErrorV2::StaleAuthority);
         }
@@ -325,6 +342,30 @@ impl RuntimeMaintenanceIngressGateOpenAuthorityV2 {
             shared: Some(shared.clone()),
             open_generation: self.generation,
         })
+    }
+
+    pub(crate) fn linearize_open_transition_v2<T>(
+        &self,
+        transition: impl FnOnce() -> T,
+    ) -> Result<T, RuntimeMaintenanceIngressGateErrorV2> {
+        let shared = self.shared.as_ref().expect("open gate authority");
+        let state = lock_state_v2(shared);
+        if let Some(error) = state.snapshot.terminal_error {
+            return Err(error);
+        }
+        if state.snapshot.shutdown_sealed {
+            return Err(RuntimeMaintenanceIngressGateErrorV2::ShutdownSealed);
+        }
+        if state.snapshot.generation != self.generation {
+            return Err(RuntimeMaintenanceIngressGateErrorV2::StaleAuthority);
+        }
+        if state.snapshot.stage != RuntimeMaintenanceIngressGateStageV2::Open {
+            return Err(RuntimeMaintenanceIngressGateErrorV2::NotOpen);
+        }
+        if state.snapshot.active_permit_count != 0 {
+            return Err(RuntimeMaintenanceIngressGateErrorV2::StillDraining);
+        }
+        Ok(transition())
     }
 }
 
@@ -436,6 +477,8 @@ impl RuntimeMaintenanceIngressGateDrainHandleV2 {
             let state = lock_state_v2(&self.shared);
             if let Some(error) = state.snapshot.terminal_error {
                 Err(error)
+            } else if state.snapshot.shutdown_sealed {
+                Err(RuntimeMaintenanceIngressGateErrorV2::ShutdownSealed)
             } else if state.snapshot.generation != self.closing_generation {
                 Err(RuntimeMaintenanceIngressGateErrorV2::StaleAuthority)
             } else if state.snapshot.stage != RuntimeMaintenanceIngressGateStageV2::Closed
@@ -489,13 +532,33 @@ pub(crate) struct RuntimeMaintenanceIngressGateShutdownHandleV2 {
 }
 
 impl RuntimeMaintenanceIngressGateShutdownHandleV2 {
-    pub(crate) fn close_v2(&self) -> RuntimeMaintenanceIngressGateSnapshotV2 {
-        let expected = {
-            let state = lock_state_v2(&self.shared);
-            state.open_generation.unwrap_or(state.snapshot.generation)
-        };
-        close_shared_v2(&self.shared, expected);
-        lock_state_v2(&self.shared).snapshot
+    pub(crate) fn seal_shutdown_v2(&self) -> RuntimeMaintenanceIngressGateSnapshotV2 {
+        let mut state = lock_state_v2(&self.shared);
+        if state.snapshot.shutdown_sealed {
+            return state.snapshot;
+        }
+        state.snapshot.shutdown_sealed = true;
+        if matches!(
+            state.snapshot.stage,
+            RuntimeMaintenanceIngressGateStageV2::Opening
+                | RuntimeMaintenanceIngressGateStageV2::Open
+        ) {
+            match next_generation_v2(state.snapshot.generation) {
+                Ok(generation) => {
+                    state.snapshot.generation = generation;
+                    state.snapshot.stage = RuntimeMaintenanceIngressGateStageV2::Closing;
+                }
+                Err(error) => {
+                    fail_closed_state_v2(&mut state, error);
+                }
+            }
+        }
+        if state.snapshot.active_permit_count == 0 {
+            state.snapshot.stage = RuntimeMaintenanceIngressGateStageV2::Closed;
+            state.open_generation = None;
+        }
+        self.shared.changes.send_replace(state.snapshot);
+        state.snapshot
     }
 }
 
@@ -666,13 +729,14 @@ mod tests {
             .unwrap();
         let permit = open.try_acquire_v2().unwrap();
         let drain = open.begin_close_v2();
-        let wait = drain.wait_closed_until_v2(Instant::now() + Duration::from_secs(1));
-        tokio::pin!(wait);
-        tokio::select! {
-            result = &mut wait => panic!("drain completed unexpectedly: {result:?}"),
-            _ = tokio::task::yield_now() => {}
+        {
+            let wait = drain.wait_closed_until_v2(Instant::now() + Duration::from_secs(1));
+            tokio::pin!(wait);
+            tokio::select! {
+                result = &mut wait => panic!("drain completed unexpectedly: {result:?}"),
+                _ = tokio::task::yield_now() => {}
+            }
         }
-        drop(wait);
         assert_eq!(
             observer.snapshot_v2().stage(),
             RuntimeMaintenanceIngressGateStageV2::Closing
@@ -686,23 +750,27 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_handle_closes_opening_and_open_states_synchronously() {
+    fn shutdown_seal_closes_opening_and_rejects_every_later_transition() {
         let (controller, observer, shutdown) = RuntimeMaintenanceIngressGateControllerV2::new_v2();
         let opening = controller.begin_open_v2().unwrap();
-        let snapshot = shutdown.close_v2();
+        let snapshot = shutdown.seal_shutdown_v2();
         assert_eq!(
             snapshot.stage(),
             RuntimeMaintenanceIngressGateStageV2::Closed
         );
         assert_eq!(snapshot.generation().get(), 3);
+        assert!(snapshot.shutdown_sealed());
         let failure = opening.commit_open_v2().unwrap_err();
         assert_eq!(
             failure.error(),
-            RuntimeMaintenanceIngressGateErrorV2::StaleAuthority
+            RuntimeMaintenanceIngressGateErrorV2::ShutdownSealed
         );
         let drain = failure.into_state().begin_close_v2();
         assert_eq!(drain.generation().get(), 3);
-        assert!(drain.into_controller_v2().is_ok());
+        assert_eq!(
+            drain.into_controller_v2().unwrap_err().error(),
+            RuntimeMaintenanceIngressGateErrorV2::ShutdownSealed
+        );
         assert_eq!(
             observer.snapshot_v2().stage(),
             RuntimeMaintenanceIngressGateStageV2::Closed
@@ -710,33 +778,154 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_open_commit_and_shutdown_finish_closed_once() {
+    fn shutdown_seal_while_closed_rejects_a_late_open() {
         let (controller, observer, shutdown) = RuntimeMaintenanceIngressGateControllerV2::new_v2();
-        let opening = controller.begin_open_v2().unwrap();
-        let barrier = Arc::new(std::sync::Barrier::new(3));
-        let opening_barrier = barrier.clone();
-        let opening_task = std::thread::spawn(move || {
-            opening_barrier.wait();
-            opening.commit_open_v2()
-        });
-        let shutdown_barrier = barrier.clone();
-        let shutdown_task = std::thread::spawn(move || {
-            shutdown_barrier.wait();
-            shutdown.close_v2()
-        });
-        barrier.wait();
-        drop(opening_task.join().unwrap());
-        let shutdown_snapshot = shutdown_task.join().unwrap();
+        let sealed = shutdown.seal_shutdown_v2();
+        assert!(sealed.shutdown_sealed());
+        assert_eq!(sealed.stage(), RuntimeMaintenanceIngressGateStageV2::Closed);
+        assert_eq!(shutdown.seal_shutdown_v2(), sealed);
+        let failure = controller.begin_open_v2().unwrap_err();
+        assert_eq!(
+            failure.error(),
+            RuntimeMaintenanceIngressGateErrorV2::ShutdownSealed
+        );
         let snapshot = observer.snapshot_v2();
+        assert!(snapshot.shutdown_sealed());
         assert_eq!(
             snapshot.stage(),
             RuntimeMaintenanceIngressGateStageV2::Closed
         );
-        assert_eq!(snapshot.generation().get(), 3);
         assert_eq!(snapshot.active_permit_count(), 0);
-        assert_eq!(snapshot.terminal_error(), None);
+    }
+
+    #[test]
+    fn shutdown_seal_and_final_open_transition_share_one_linearization_lock() {
+        let (controller, observer, shutdown) = RuntimeMaintenanceIngressGateControllerV2::new_v2();
+        let open = controller
+            .begin_open_v2()
+            .unwrap()
+            .commit_open_v2()
+            .unwrap();
+        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let entered_transition = entered.clone();
+        let release_transition = release.clone();
+        let transition = std::thread::spawn(move || {
+            open.linearize_open_transition_v2(|| {
+                entered_transition.wait();
+                release_transition.wait();
+                17
+            })
+        });
+        entered.wait();
+        let seal = std::thread::spawn(move || shutdown.seal_shutdown_v2());
+        assert!(!seal.is_finished());
+        release.wait();
+        assert_eq!(transition.join().unwrap(), Ok(17));
+        let sealed = seal.join().unwrap();
+        assert!(sealed.shutdown_sealed());
         assert_eq!(
-            shutdown_snapshot.stage(),
+            observer.snapshot_v2().stage(),
+            RuntimeMaintenanceIngressGateStageV2::Closed
+        );
+    }
+
+    #[test]
+    fn shutdown_seal_before_final_open_transition_rejects_the_transition() {
+        let (controller, _observer, shutdown) = RuntimeMaintenanceIngressGateControllerV2::new_v2();
+        let open = controller
+            .begin_open_v2()
+            .unwrap()
+            .commit_open_v2()
+            .unwrap();
+        shutdown.seal_shutdown_v2();
+        let invoked = std::cell::Cell::new(false);
+        assert_eq!(
+            open.linearize_open_transition_v2(|| invoked.set(true)),
+            Err(RuntimeMaintenanceIngressGateErrorV2::ShutdownSealed)
+        );
+        assert!(!invoked.get());
+    }
+
+    #[test]
+    fn concurrent_begin_open_and_shutdown_seal_finish_irreversibly_closed() {
+        for _ in 0..512 {
+            let (controller, observer, shutdown) =
+                RuntimeMaintenanceIngressGateControllerV2::new_v2();
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let open_barrier = barrier.clone();
+            let open_task = std::thread::spawn(move || {
+                open_barrier.wait();
+                controller.begin_open_v2()
+            });
+            let shutdown_barrier = barrier.clone();
+            let shutdown_task = std::thread::spawn(move || {
+                shutdown_barrier.wait();
+                shutdown.seal_shutdown_v2()
+            });
+            barrier.wait();
+            drop(open_task.join().unwrap());
+            let shutdown_snapshot = shutdown_task.join().unwrap();
+            let snapshot = observer.snapshot_v2();
+            assert!(snapshot.shutdown_sealed());
+            assert_eq!(
+                snapshot.stage(),
+                RuntimeMaintenanceIngressGateStageV2::Closed
+            );
+            assert_eq!(snapshot.active_permit_count(), 0);
+            assert_eq!(snapshot.terminal_error(), None);
+            assert!(shutdown_snapshot.shutdown_sealed());
+        }
+    }
+
+    #[test]
+    fn concurrent_commit_open_and_shutdown_seal_finish_irreversibly_closed() {
+        for _ in 0..512 {
+            let (controller, observer, shutdown) =
+                RuntimeMaintenanceIngressGateControllerV2::new_v2();
+            let opening = controller.begin_open_v2().unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let opening_barrier = barrier.clone();
+            let opening_task = std::thread::spawn(move || {
+                opening_barrier.wait();
+                opening.commit_open_v2()
+            });
+            let shutdown_barrier = barrier.clone();
+            let shutdown_task = std::thread::spawn(move || {
+                shutdown_barrier.wait();
+                shutdown.seal_shutdown_v2()
+            });
+            barrier.wait();
+            drop(opening_task.join().unwrap());
+            let shutdown_snapshot = shutdown_task.join().unwrap();
+            let snapshot = observer.snapshot_v2();
+            assert!(snapshot.shutdown_sealed());
+            assert_eq!(
+                snapshot.stage(),
+                RuntimeMaintenanceIngressGateStageV2::Closed
+            );
+            assert_eq!(snapshot.active_permit_count(), 0);
+            assert_eq!(snapshot.terminal_error(), None);
+            assert!(shutdown_snapshot.shutdown_sealed());
+        }
+    }
+
+    #[test]
+    fn shutdown_seal_rejects_new_permits_from_a_retained_open_authority() {
+        let (controller, observer, shutdown) = RuntimeMaintenanceIngressGateControllerV2::new_v2();
+        let open = controller
+            .begin_open_v2()
+            .unwrap()
+            .commit_open_v2()
+            .unwrap();
+        let snapshot = shutdown.seal_shutdown_v2();
+        assert!(snapshot.shutdown_sealed());
+        assert_eq!(
+            open.try_acquire_v2().unwrap_err(),
+            RuntimeMaintenanceIngressGateErrorV2::ShutdownSealed
+        );
+        assert_eq!(
+            observer.snapshot_v2().stage(),
             RuntimeMaintenanceIngressGateStageV2::Closed
         );
     }
@@ -751,6 +940,7 @@ mod tests {
             generation,
             stage: RuntimeMaintenanceIngressGateStageV2::Closed,
             active_permit_count: 0,
+            shutdown_sealed: false,
             terminal_error: None,
         };
         let (changes, observer) = watch::channel(snapshot);
@@ -827,7 +1017,7 @@ mod tests {
             panic!("poison gate state");
         });
         assert!(poisoning.join().is_err());
-        let snapshot = shutdown.close_v2();
+        let snapshot = shutdown.seal_shutdown_v2();
         assert_eq!(
             snapshot.stage(),
             RuntimeMaintenanceIngressGateStageV2::Closing
@@ -870,6 +1060,7 @@ mod tests {
             RuntimeMaintenanceIngressGateErrorV2::NotOpening,
             RuntimeMaintenanceIngressGateErrorV2::NotOpen,
             RuntimeMaintenanceIngressGateErrorV2::StillDraining,
+            RuntimeMaintenanceIngressGateErrorV2::ShutdownSealed,
             RuntimeMaintenanceIngressGateErrorV2::GenerationOverflow,
             RuntimeMaintenanceIngressGateErrorV2::PermitCountOverflow,
             RuntimeMaintenanceIngressGateErrorV2::DrainDeadlineElapsed,

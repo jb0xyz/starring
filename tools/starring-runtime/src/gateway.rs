@@ -1693,15 +1693,17 @@ async fn run_runtime_discord_control_v1(
                     return;
                 };
                 let resumed = resume_reserved_discord_admission_v2(
-                    &mut control,
-                    &mut pause_token,
+                    RuntimeDiscordReservedResumeControlContextV2 {
+                        control: &mut control,
+                        pause_token: &mut pause_token,
+                        coordinator: &coordinator,
+                        observation: &request.observation,
+                        lifecycle_drained: &lifecycle_drained,
+                        lifecycle_sequence: &mut lifecycle_sequence,
+                        discord_reservation: &discord_reservation,
+                    },
                     request.coordinator_generation,
                     request.expected,
-                    &coordinator,
-                    &request.observation,
-                    &lifecycle_drained,
-                    &mut lifecycle_sequence,
-                    &discord_reservation,
                 )
                 .await;
                 let _response = request.response.send(resumed);
@@ -1763,22 +1765,35 @@ async fn run_runtime_discord_control_v1(
     }
 }
 
+struct RuntimeDiscordReservedResumeControlContextV2<'a> {
+    control: &'a mut SharedGatewayControlV3,
+    pause_token: &'a mut Option<GatewayPauseTokenV3>,
+    coordinator: &'a RuntimeGatewayCoordinatorInterruptHandleV2,
+    observation: &'a watch::Sender<Option<RuntimeDiscordRecoveryResumeEvidenceV2>>,
+    lifecycle_drained: &'a watch::Sender<u64>,
+    lifecycle_sequence: &'a mut u64,
+    discord_reservation: &'a watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>,
+}
+
 async fn resume_reserved_discord_admission_v2(
-    control: &mut SharedGatewayControlV3,
-    pause_token: &mut Option<GatewayPauseTokenV3>,
+    context: RuntimeDiscordReservedResumeControlContextV2<'_>,
     coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
     expected: RuntimeDiscordPauseReservationIdentityV2,
-    coordinator: &RuntimeGatewayCoordinatorInterruptHandleV2,
-    observation: &watch::Sender<Option<RuntimeDiscordRecoveryResumeEvidenceV2>>,
-    lifecycle_drained: &watch::Sender<u64>,
-    lifecycle_sequence: &mut u64,
-    discord_reservation: &watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>,
 ) -> RuntimeDiscordRecoveryResumeControlOutcomeV2 {
+    let RuntimeDiscordReservedResumeControlContextV2 {
+        control,
+        pause_token,
+        coordinator,
+        observation,
+        lifecycle_drained,
+        lifecycle_sequence,
+        discord_reservation,
+    } = context;
     let Some(token) = pause_token.as_ref() else {
         return RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied;
     };
     if RuntimeDiscordPauseReservationIdentityV2::from_token(
-        &token,
+        token,
         control.current_admission_snapshot(),
     ) != Some(expected)
     {
@@ -3181,11 +3196,12 @@ mod tests {
 
     use super::{
         compose_with_control_config, resume_reserved_discord_admission_v2,
-        RuntimeGatewayBootstrapV1, RuntimeGatewayCoordinatorInterruptV2,
-        RuntimeGatewayCoordinatorMirrorV2, RuntimeGatewayCoordinatorOwnerV2,
-        RuntimeGatewayInvalidationBridgeV2, RuntimeGatewayOwnerInvalidationBridgeV2,
-        RuntimeGatewayProductionCoordinatorV2, RuntimeGatewayReadyObservationErrorV1,
-        SharedGatewayControlAdapterV2, SharedGatewayRuntimeHalfV3,
+        RuntimeDiscordReservedResumeControlContextV2, RuntimeGatewayBootstrapV1,
+        RuntimeGatewayCoordinatorInterruptV2, RuntimeGatewayCoordinatorMirrorV2,
+        RuntimeGatewayCoordinatorOwnerV2, RuntimeGatewayInvalidationBridgeV2,
+        RuntimeGatewayOwnerInvalidationBridgeV2, RuntimeGatewayProductionCoordinatorV2,
+        RuntimeGatewayReadyObservationErrorV1, SharedGatewayControlAdapterV2,
+        SharedGatewayRuntimeHalfV3,
     };
 
     struct TestPauseTokenV1(GatewayPauseTokenV3);
@@ -3399,19 +3415,21 @@ mod tests {
         .unwrap();
         let (discord_reservation, _) = watch::channel(reservation);
         let outcome = resume_reserved_discord_admission_v2(
-            bootstrap
-                .adapter
-                .control
-                .as_mut()
-                .expect("gateway control half"),
-            &mut pause_token,
+            RuntimeDiscordReservedResumeControlContextV2 {
+                control: bootstrap
+                    .adapter
+                    .control
+                    .as_mut()
+                    .expect("gateway control half"),
+                pause_token: &mut pause_token,
+                coordinator: &coordinator,
+                observation: &observation,
+                lifecycle_drained: &lifecycle_drained,
+                lifecycle_sequence: &mut lifecycle_sequence,
+                discord_reservation: &discord_reservation,
+            },
             generation,
             expected,
-            &coordinator,
-            &observation,
-            &lifecycle_drained,
-            &mut lifecycle_sequence,
-            &discord_reservation,
         )
         .await;
         assert_eq!(
@@ -3497,19 +3515,21 @@ mod tests {
         let mut lifecycle_sequence = 1;
         let (outcome, runtime_outcome) = tokio::join!(
             resume_reserved_discord_admission_v2(
-                bootstrap
-                    .adapter
-                    .control
-                    .as_mut()
-                    .expect("gateway control half"),
-                &mut pause_token,
+                RuntimeDiscordReservedResumeControlContextV2 {
+                    control: bootstrap
+                        .adapter
+                        .control
+                        .as_mut()
+                        .expect("gateway control half"),
+                    pause_token: &mut pause_token,
+                    coordinator: &coordinator,
+                    observation: &observation,
+                    lifecycle_drained: &lifecycle_drained,
+                    lifecycle_sequence: &mut lifecycle_sequence,
+                    discord_reservation: &discord_reservation,
+                },
                 predecessor,
                 expected,
-                &coordinator,
-                &observation,
-                &lifecycle_drained,
-                &mut lifecycle_sequence,
-                &discord_reservation,
             ),
             bootstrap
                 ._runtime

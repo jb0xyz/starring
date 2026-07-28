@@ -255,10 +255,26 @@ async fn stage_runtime_process_from_environment_v1(
         .into_paused_production_handoff_v2()
         .await
         .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
-    paused_production
-        .shutdown()
+    let process_bound = paused_production
+        .into_process_bound_handoff_v2()
         .await
-        .map_err(RuntimeProcessStagingErrorV1::StartupRecoveryFixedPointShutdown)?;
+        .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
+    let recovery_resume = process_bound
+        .into_recovery_resume_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
+    let admission_acknowledging = recovery_resume
+        .resume_recovery_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
+    let empty_open = admission_acknowledging
+        .enter_empty_open_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
+    empty_open
+        .run_until_shutdown_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
     Ok(RuntimeProcessStagingOutcomeV1 { _private: () })
 }
 

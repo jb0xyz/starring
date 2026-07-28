@@ -7,9 +7,14 @@ use tokio::time::{timeout_at, Instant as TokioInstant};
 
 use crate::gateway::RuntimeGatewayShutdownHandleV1;
 use crate::health::{
-    RuntimeHealthReadinessHandleV1, RuntimeHealthShutdownErrorV1, RuntimeHealthStartErrorV1,
-    RuntimeHealthSupervisorV1,
+    RuntimeHealthReadinessHandleV1, RuntimeHealthReadinessPublisherV2,
+    RuntimeHealthShutdownErrorV1, RuntimeHealthStartErrorV1, RuntimeHealthSupervisorV1,
 };
+use crate::ingress_acknowledgement_supervisor::{
+    RuntimeIngressAcknowledgementShutdownHandleV2, RuntimeIngressAcknowledgementSupervisorExitV2,
+    RuntimeIngressAcknowledgementTerminalObserverV2,
+};
+use crate::maintenance_ingress_gate::RuntimeMaintenanceIngressGateShutdownHandleV2;
 use crate::mutation_finalizer::{
     RuntimeMutationFinalizerSealHandleV1, RuntimeMutationFinalizerTerminalObserverV1,
 };
@@ -35,22 +40,29 @@ pub(crate) enum RuntimeProcessSignalTaskExitV1 {
     Commanded,
     Finalizer(crate::RuntimeSupervisorExitV1),
     Health,
+    IngressAcknowledgement(RuntimeIngressAcknowledgementSupervisorExitV2),
 }
 
 #[derive(Clone)]
 pub(crate) struct RuntimeProcessShutdownTriggerV1 {
     trigger: RuntimeShutdownTriggerV1,
     health: RuntimeHealthReadinessHandleV1,
+    maintenance_ingress: RuntimeMaintenanceIngressGateShutdownHandleV2,
+    ingress_acknowledgement: RuntimeIngressAcknowledgementShutdownHandleV2,
     finalizer: RuntimeMutationFinalizerSealHandleV1,
     gateway: RuntimeGatewayShutdownHandleV1,
 }
 
 impl RuntimeProcessShutdownTriggerV1 {
     pub(crate) fn trip(&self, cause: RuntimeShutdownCauseV1) -> RuntimeShutdownTripV1 {
-        self.health.remove_readiness();
+        let trip = self.trigger.trip(cause);
+        let deadline = trip.observation().deadline();
+        self.health.seal_readiness();
+        self.maintenance_ingress.seal_shutdown_v2();
+        self.ingress_acknowledgement.seal_until_v2(deadline);
         self.finalizer.seal_intake();
         self.gateway.enter_shutdown();
-        self.trigger.trip(cause)
+        trip
     }
 }
 
@@ -65,6 +77,7 @@ pub(crate) struct RuntimeProcessRootSupervisorV1 {
     trigger: RuntimeProcessShutdownTriggerV1,
     signal_task: Option<JoinHandle<RuntimeProcessSignalTaskExitV1>>,
     health: Option<RuntimeHealthSupervisorV1>,
+    readiness_publisher: Option<RuntimeHealthReadinessPublisherV2>,
 }
 
 impl RuntimeProcessRootSupervisorV1 {
@@ -73,17 +86,25 @@ impl RuntimeProcessRootSupervisorV1 {
         finalizer: RuntimeMutationFinalizerSealHandleV1,
         mut finalizer_terminal: RuntimeMutationFinalizerTerminalObserverV1,
         gateway: RuntimeGatewayShutdownHandleV1,
+        maintenance_ingress: RuntimeMaintenanceIngressGateShutdownHandleV2,
+        ingress_acknowledgement: RuntimeIngressAcknowledgementShutdownHandleV2,
+        mut ingress_acknowledgement_terminal: RuntimeIngressAcknowledgementTerminalObserverV2,
     ) -> Result<Self, RuntimeProcessRootSupervisorStartErrorV1> {
         let mut signals = RuntimeOsShutdownSignalsV1::register()
             .map_err(RuntimeProcessRootSupervisorStartErrorV1::Signal)?;
-        let health = RuntimeHealthSupervisorV1::start(health_bind_addr)
+        let mut health = RuntimeHealthSupervisorV1::start(health_bind_addr)
             .await
             .map_err(RuntimeProcessRootSupervisorStartErrorV1::Health)?;
+        let readiness_publisher = health
+            .take_readiness_publisher_v2()
+            .expect("fresh runtime health supervisor");
         let mut health_terminal = health.terminal_observer();
         let latch = create_runtime_process_shutdown_latch_v1();
         let trigger = RuntimeProcessShutdownTriggerV1 {
             trigger: latch.trigger(),
             health: health.readiness_handle(),
+            maintenance_ingress,
+            ingress_acknowledgement,
             finalizer,
             gateway,
         };
@@ -110,6 +131,10 @@ impl RuntimeProcessRootSupervisorV1 {
                     signal_trigger.trip(RuntimeShutdownCauseV1::HealthTerminal);
                     RuntimeProcessSignalTaskExitV1::Health
                 }
+                exit = ingress_acknowledgement_terminal.wait_v2() => {
+                    signal_trigger.trip(RuntimeShutdownCauseV1::IngressAcknowledgementTerminal);
+                    RuntimeProcessSignalTaskExitV1::IngressAcknowledgement(exit)
+                }
             }
         });
         Ok(Self {
@@ -117,6 +142,7 @@ impl RuntimeProcessRootSupervisorV1 {
             trigger,
             signal_task: Some(signal_task),
             health: Some(health),
+            readiness_publisher: Some(readiness_publisher),
         })
     }
 
@@ -126,6 +152,12 @@ impl RuntimeProcessRootSupervisorV1 {
 
     pub(crate) fn shutdown_trigger(&self) -> RuntimeProcessShutdownTriggerV1 {
         self.trigger.clone()
+    }
+
+    pub(crate) fn take_readiness_publisher_v2(
+        &mut self,
+    ) -> Option<RuntimeHealthReadinessPublisherV2> {
+        self.readiness_publisher.take()
     }
 
     pub(crate) fn trip(&self, cause: RuntimeShutdownCauseV1) -> RuntimeShutdownTripV1 {

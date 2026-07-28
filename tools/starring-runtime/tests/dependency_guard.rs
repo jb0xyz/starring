@@ -582,6 +582,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/gateway_owner_startup_watchdog_handoff_tests.rs",
             "src/health.rs",
             "src/identity_encoding.rs",
+            "src/ingress_acknowledgement_supervisor.rs",
             "src/lib.rs",
             "src/main.rs",
             "src/maintenance_ingress_gate.rs",
@@ -748,6 +749,10 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
                 "PostgresRuntimeServingLeaseV1",
                 "PostgresRuntimeInteractionV1",
             ] {
+                if path == Path::new("src/process.rs") && forbidden == "PostgresRuntimeExecutionV1"
+                {
+                    continue;
+                }
                 assert!(
                     !contains_identifier(&source, forbidden),
                     "{}: {forbidden}",
@@ -755,13 +760,29 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
                 );
             }
         }
-        if path != Path::new("src/database.rs")
+        if path == Path::new("src/process.rs") {
+            let finalizer_handoff = braced_declaration(
+                &source,
+                "pub(super) async fn seal_startup_finalizer_for_handoff_v2(",
+            );
+            assert_eq!(source.matches("tokio::").count(), 2);
+            assert_eq!(finalizer_handoff.matches("tokio::").count(), 2);
+            assert_eq!(source.matches("PostgresRuntimeExecutionV1").count(), 1);
+            assert!(source.contains(concat!(
+                "pub(super) type RuntimeProcessIngressAcknowledgementSupervisorV2 =\n",
+                "    RuntimeIngressAcknowledgementSupervisorV2<\n",
+                "        automation_runtime_execution_postgres::PostgresRuntimeExecutionV1,\n",
+                "        RuntimeProcessIngressAcknowledgementJobV2,\n",
+                "    >;"
+            )));
+        } else if path != Path::new("src/database.rs")
             && path != Path::new("src/gateway.rs")
             && path != Path::new("src/gateway_owner_startup.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
             && path != Path::new("src/health.rs")
             && path != Path::new("src/discord.rs")
+            && path != Path::new("src/ingress_acknowledgement_supervisor.rs")
             && path != Path::new("src/maintenance_ingress_gate.rs")
             && path != Path::new("src/process/closed.rs")
             && path != Path::new("src/process/connected.rs")
@@ -1160,6 +1181,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             let allowed_pending_drain_finalizer_v3 = matches!(
                 identifier,
                 "RuntimeOwnedStartupRecoveryExecutionOutcomeV3"
+                    | "RuntimeProcessMutationFinalizerV3"
+                    | "RuntimeProcessStartupMutationFinalizerV3"
                     | "RuntimePendingDrainMutationDatabaseV3"
                     | "RuntimePendingDrainFinalizerDispatchFailureV3"
                     | "RuntimePendingDrainFinalizerJobV3"
@@ -1184,7 +1207,10 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     || path == Path::new("src/process/startup_loop_tests.rs")
             );
             let allowed_observation_process = path == Path::new("src/process/observation.rs")
-                && identifier == "automation_runtime_worker";
+                && matches!(
+                    identifier,
+                    "automation_runtime_controller" | "automation_runtime_worker"
+                );
             let allowed_observation_process_tests = path
                 == Path::new("src/process/observation_tests.rs")
                 && identifier == "automation_runtime_worker";
@@ -1199,6 +1225,12 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             let allowed_maintenance_ingress_gate = path
                 == Path::new("src/maintenance_ingress_gate.rs")
                 && identifier == "automation_runtime_worker";
+            let allowed_ingress_acknowledgement_supervisor = path
+                == Path::new("src/ingress_acknowledgement_supervisor.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime_controller" | "automation_runtime_worker"
+                );
             let allowed_pending_drain_succession = path
                 == Path::new("src/process/pending_drain_finalizer.rs")
                 || matches!(
@@ -1247,6 +1279,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_recovery_identity
                         || allowed_mutation_finalizer
                         || allowed_maintenance_ingress_gate
+                        || allowed_ingress_acknowledgement_supervisor
                         || !matches!(
                             identifier,
                             "automation_runtime"
@@ -1259,6 +1292,26 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             );
         }
     }
+    let process_observation = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/process/observation.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    assert_eq!(
+        process_observation
+            .matches("automation_runtime_controller")
+            .count(),
+        6
+    );
+    assert!(process_observation.contains(concat!(
+        "use automation_runtime_controller::{\n",
+        "    RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimeObserveWriterFenceV1,\n",
+        "    RuntimeWriterFenceObservationV1,\n",
+        "};"
+    )));
+    assert!(process_observation.contains(
+        "writer_fence_generation: automation_runtime_controller::RuntimeWriterFenceGenerationV1,"
+    ));
     for required in [
         "shared_gateway_control_channel_with_policy_and_invalidator_v3",
         "GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect",
@@ -1539,6 +1592,7 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         "RuntimeMaintenanceIngressGateDrainHandleV2",
         "RuntimeMaintenanceIngressGateObserverV2",
         "RuntimeMaintenanceIngressGateShutdownHandleV2",
+        "shutdown_sealed: bool",
         "terminal_error: Option<RuntimeMaintenanceIngressGateErrorV2>",
         "checked_add(1)",
         ".filter(|value| *value <= i64::MAX as u64)",
@@ -1551,7 +1605,8 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         "state.snapshot.active_permit_count -= 1;",
         "pub(crate) fn try_acquire_v2(",
         "pub(crate) async fn wait_closed_until_v2(",
-        "pub(crate) fn close_v2(&self)",
+        "pub(crate) fn seal_shutdown_v2(&self)",
+        "RuntimeMaintenanceIngressGateErrorV2::ShutdownSealed",
     ] {
         assert!(production.contains(required), "{required}");
     }
@@ -1602,15 +1657,279 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
     ] {
         assert!(!contains_identifier(production, forbidden), "{forbidden}");
     }
+    let process = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/process.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let process_observation = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/process/observation.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let process_supervisor = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/process_supervisor.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let process_startup = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/process_startup.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let acknowledgement_supervisor = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/ingress_acknowledgement_supervisor.rs"))
+        .map(|(_, source)| source_before_test_module(source))
+        .unwrap();
+    assert_eq!(
+        process
+            .matches("RuntimeMaintenanceIngressGateControllerV2")
+            .count(),
+        4
+    );
+    assert!(
+        process.contains("maintenance_ingress: Option<RuntimeMaintenanceIngressGateControllerV2>,")
+    );
+    assert!(process.contains("self.maintenance_ingress.take()"));
+    assert_eq!(
+        process
+            .matches("RuntimeMaintenanceIngressGateControllerV2::new_v2()")
+            .count(),
+        1
+    );
+    let shutdown_trip = braced_declaration(process_supervisor, "pub(crate) fn trip(&self, cause:");
+    let process_shutdown = shutdown_trip.find("self.trigger.trip(cause)").unwrap();
+    let shutdown_deadline = shutdown_trip.find("trip.observation().deadline()").unwrap();
+    let health_seal = shutdown_trip.find("self.health.seal_readiness()").unwrap();
+    let ingress_seal = shutdown_trip
+        .find("self.maintenance_ingress.seal_shutdown_v2()")
+        .unwrap();
+    let acknowledgement_seal = shutdown_trip
+        .find("self.ingress_acknowledgement.seal_until_v2(deadline)")
+        .unwrap();
+    let finalizer_seal = shutdown_trip.find("self.finalizer.seal_intake()").unwrap();
+    let gateway_shutdown = shutdown_trip.find("self.gateway.enter_shutdown()").unwrap();
+    assert!(
+        process_shutdown < shutdown_deadline
+            && shutdown_deadline < health_seal
+            && health_seal < ingress_seal
+            && ingress_seal < acknowledgement_seal
+            && acknowledgement_seal < finalizer_seal
+            && finalizer_seal < gateway_shutdown
+    );
+    assert_eq!(process_supervisor.matches(".seal_shutdown_v2()").count(), 1);
+    for required in [
+        "const RUNTIME_INGRESS_ACKNOWLEDGEMENT_DATA_CAPACITY: usize = 1;",
+        "const RUNTIME_INGRESS_ACKNOWLEDGEMENT_CONTROL_CAPACITY: usize = 1;",
+        "RuntimeIngressAcknowledgementSupervisorV2",
+        "RuntimeIngressAcknowledgementShutdownHandleV2",
+        "RuntimeIngressAcknowledgementTerminalObserverV2",
+        "RuntimeIngressAcknowledgementAuthorityV2",
+        "RuntimeWorkerIngressAcknowledgementJobV2",
+        "RuntimeIngressOpenAcknowledgementSingleFlightV2",
+        "let (data, data_receiver) = mpsc::channel(RUNTIME_INGRESS_ACKNOWLEDGEMENT_DATA_CAPACITY);",
+        "mpsc::channel(RUNTIME_INGRESS_ACKNOWLEDGEMENT_CONTROL_CAPACITY)",
+        "self.shared.seal_shutdown(deadline)",
+        "state.phase = RuntimeIngressAcknowledgementSupervisorPhaseV2::ShutdownSealed;",
+        "tokio::select! {\n            biased;\n            command = control.recv()",
+        "command = data.recv()",
+        "RuntimeIngressAcknowledgementFailureV2::SecondUncertainty",
+    ] {
+        assert!(
+            acknowledgement_supervisor.contains(required),
+            "ingress acknowledgement supervisor: {required}"
+        );
+    }
+    assert_eq!(
+        acknowledgement_supervisor
+            .matches("port.publish_ingress_open_acknowledgement(attempt)")
+            .count(),
+        1
+    );
+    assert_eq!(
+        acknowledgement_supervisor
+            .matches("RuntimeIngressOpenAcknowledgementSingleFlightV2")
+            .count(),
+        2
+    );
+    let actor = braced_declaration(
+        acknowledgement_supervisor,
+        "async fn run_ingress_acknowledgement_actor_v2<",
+    );
+    let control = actor.find("command = control.recv()").unwrap();
+    let data = actor.find("command = data.recv()").unwrap();
+    assert!(control < data);
+    for forbidden in [
+        "interaction",
+        "route",
+        "consumer",
+        "sqlx",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+    ] {
+        assert!(
+            !contains_identifier(acknowledgement_supervisor, forbidden),
+            "ingress acknowledgement supervisor: {forbidden}"
+        );
+    }
+    let empty_open = braced_declaration(process_observation, "impl RuntimeEmptyOpenProcessV2");
+    for forbidden in [
+        "RuntimeMaintenanceIngressGatePermitV2",
+        "try_acquire_v2",
+        "interaction",
+        "route",
+        "consumer",
+    ] {
+        assert!(
+            !contains_identifier(empty_open, forbidden),
+            "RuntimeEmptyOpenProcessV2: {forbidden}"
+        );
+    }
+    let enter_empty_open = braced_declaration(
+        process_observation,
+        "pub(crate) async fn enter_empty_open_v2(",
+    );
+    let gate_open = enter_empty_open.find("controller.begin_open_v2()").unwrap();
+    let gate_commit = enter_empty_open.find("opening.commit_open_v2()").unwrap();
+    let predecessor_authorization = enter_empty_open
+        .find(".authorize_ingress_acknowledgement_predecessor_observation_v2()")
+        .unwrap();
+    let predecessor_observation = enter_empty_open
+        .find(".observe_ingress_open_acknowledgement_predecessor(&predecessor_authorization)")
+        .unwrap();
+    let predecessor_accept = enter_empty_open
+        .find("predecessor_authorization.accept(predecessor_observation)")
+        .unwrap();
+    let acknowledgement_authorization = enter_empty_open
+        .find(".into_ingress_acknowledgement_authority_v2(")
+        .unwrap();
+    let acknowledgement_lane = enter_empty_open
+        .find("execute_ingress_acknowledgement_v2(")
+        .unwrap();
+    let owner_reobservation = enter_empty_open
+        .find(".observe_current_owner_v2()")
+        .unwrap();
+    let open_transition = enter_empty_open
+        .find(".into_empty_open_v2(observation)")
+        .unwrap();
+    let readiness_publish = enter_empty_open
+        .find("readiness.publish_ready_v2()")
+        .unwrap();
+    assert!(
+        gate_open < gate_commit
+            && gate_commit < predecessor_authorization
+            && predecessor_authorization < predecessor_observation
+            && predecessor_observation < predecessor_accept
+            && predecessor_accept < acknowledgement_authorization
+            && acknowledgement_authorization < acknowledgement_lane
+            && acknowledgement_lane < owner_reobservation
+            && owner_reobservation < open_transition
+            && open_transition < readiness_publish
+    );
+    assert!(enter_empty_open.contains(
+        "RuntimeIngressOpenAcknowledgementLeaseDurationV2::from_duration(\n            INGRESS_ACKNOWLEDGEMENT_LEASE_V2,"
+    ));
+    let acknowledgement_lane = braced_declaration(
+        process_observation,
+        "async fn execute_ingress_acknowledgement_v2(",
+    );
+    let submit = acknowledgement_lane
+        .find("supervisor.try_submit(job, deadline)")
+        .unwrap();
+    let detach_waiter = acknowledgement_lane.find("waiter.cancel_v2()").unwrap();
+    let completion = acknowledgement_lane
+        .find("supervisor.recv_completion().await")
+        .unwrap();
+    assert!(submit < detach_waiter && detach_waiter < completion);
+    for required in [
+        "RuntimeIngressAcknowledgementExecutionResultV2::Accepted(outcome)",
+        "RuntimeIngressAcknowledgementExecutionResultV2::CompletionRejected",
+        "RuntimeIngressAcknowledgementExecutionResultV2::FailedClosed",
+        "rejection.into_job().into_authority()",
+        "job.into_authority()",
+    ] {
+        assert!(acknowledgement_lane.contains(required), "{required}");
+    }
+    let refresh = braced_declaration(
+        empty_open,
+        "async fn refresh_acknowledgement_with_owner_v2(",
+    );
+    assert!(refresh.contains("refresh.into_ingress_acknowledgement_authority_v2()"));
+    assert_eq!(
+        refresh
+            .matches("execute_ingress_acknowledgement_v2(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        enter_empty_open
+            .matches("execute_ingress_acknowledgement_v2(")
+            .count(),
+        1
+    );
+    assert!(enter_empty_open.contains(
+        "lifecycle.into_ingress_acknowledgement_authority_v2(\n            open_generation,"
+    ));
+    assert!(refresh.contains("maintenance_gate_generation: gate.generation()"));
+    for forbidden in [
+        "async fn publish_ingress_acknowledgement_v2",
+        ".begin_attempt()",
+        ".publish_ingress_open_acknowledgement(attempt)",
+    ] {
+        assert!(
+            !process_observation.contains(forbidden),
+            "process-owned acknowledgement lane: {forbidden}"
+        );
+    }
+    let empty_open_shutdown = braced_declaration(
+        process_observation,
+        "async fn shutdown_empty_open_process_v2(",
+    );
+    let readiness_remove = empty_open_shutdown
+        .find("readiness.remove_readiness_v2()")
+        .unwrap();
+    let gate_drop = empty_open_shutdown
+        .find("drop(maintenance_ingress)")
+        .unwrap();
+    let root_shutdown = empty_open_shutdown.find(".begin_shutdown_v1(").unwrap();
+    assert!(readiness_remove < gate_drop && gate_drop < root_shutdown);
+    let startup = braced_declaration(
+        process_startup,
+        "async fn stage_runtime_process_from_environment_v1(",
+    );
+    let startup_open = startup.find(".enter_empty_open_v2()").unwrap();
+    let startup_run = startup.find(".run_until_shutdown_v2()").unwrap();
+    let startup_done = startup
+        .find("Ok(RuntimeProcessStagingOutcomeV1 { _private: () })")
+        .unwrap();
+    assert!(startup_open < startup_run && startup_run < startup_done);
+    assert!(!startup.contains("empty_open\n        .shutdown()"));
+    for forbidden in [
+        "RuntimeMaintenanceIngressGatePermitV2",
+        "try_acquire_v2",
+        "interaction",
+        "route",
+        "consumer",
+    ] {
+        assert!(
+            !contains_identifier(startup, forbidden),
+            "EmptyOpen staging: {forbidden}"
+        );
+    }
     for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
         if path == Path::new("src/maintenance_ingress_gate.rs") {
             continue;
         }
-        assert!(
-            !contains_identifier(source, "RuntimeMaintenanceIngressGateControllerV2"),
-            "{}",
-            path.display()
-        );
+        if path != Path::new("src/process.rs") {
+            assert!(
+                !contains_identifier(source, "RuntimeMaintenanceIngressGateControllerV2"),
+                "{}",
+                path.display()
+            );
+        }
         assert!(
             !contains_identifier(source, "RuntimeMaintenanceIngressGatePermitV2"),
             "{}",
@@ -2363,13 +2682,28 @@ fn committed_closed_recovery_process_is_linear_retained_and_non_serving() {
     let fixed_point = startup_stage
         .find(".into_startup_recovery_fixed_point_v2()")
         .unwrap();
-    let shutdown = startup_stage[fixed_point..]
-        .find(".shutdown()")
-        .map(|offset| fixed_point + offset)
+    let paused_production = startup_stage
+        .find(".into_paused_production_handoff_v2()")
         .unwrap();
+    let process_bound = startup_stage
+        .find(".into_process_bound_handoff_v2()")
+        .unwrap();
+    let recovery_resume = startup_stage.find(".into_recovery_resume_v2()").unwrap();
+    let admission = startup_stage.find(".resume_recovery_v2()").unwrap();
+    let empty_open = startup_stage.find(".enter_empty_open_v2()").unwrap();
+    let run = startup_stage.find(".run_until_shutdown_v2()").unwrap();
     assert!(
-        pending < committed && committed < ready && ready < fixed_point && fixed_point < shutdown
+        pending < committed
+            && committed < ready
+            && ready < fixed_point
+            && fixed_point < paused_production
+            && paused_production < process_bound
+            && process_bound < recovery_resume
+            && recovery_resume < admission
+            && admission < empty_open
+            && empty_open < run
     );
+    assert!(!startup_stage.contains("empty_open\n        .shutdown()"));
     assert!(!library.contains("RuntimeClosedRecoveryProcessV2"));
     assert!(!library.contains("RuntimeClosedRecoverySessionV2"));
     assert!(!library.contains("RuntimeGatewayOwnerClosedRecoverySupervisorV2"));
@@ -2765,7 +3099,7 @@ fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
         .find("sleep_until(TokioInstant::from_std(commit_cutoff))")
         .unwrap();
     let commit = owner_commit
-        .find("prepared_owner.commit_closed_recovery_in_place_v2(&self.permit)")
+        .find("prepared_owner.commit_closed_recovery_in_place_v2(self.permit_v2())")
         .unwrap();
     assert!(
         preflight < section_drop
@@ -2779,7 +3113,7 @@ fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
     assert!(!owner_commit.contains(".await"));
     assert_eq!(
         production
-            .matches("prepared_owner.commit_closed_recovery_in_place_v2(&self.permit)")
+            .matches("prepared_owner.commit_closed_recovery_in_place_v2(self.permit_v2())")
             .count(),
         1
     );
@@ -2793,7 +3127,7 @@ fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
         .unwrap();
     let readiness_preflight_drop = readiness.find("drop(section)").unwrap();
     let readiness_transition = readiness
-        .find("coordinator.refresh_recovery_readiness(")
+        .find(".refresh_recovery_readiness(permit, readiness)")
         .unwrap();
     let readiness_postflight = readiness
         .rfind(".committed_pending_section_v2(committed_owner)")
@@ -2820,11 +3154,17 @@ fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
         pending,
         "pub(crate) fn validate_empty_registry_projection_v2(",
     );
-    let evidence_match = exact_registry
-        .find("self.binding.permit.registry_evidence().empty_observation() != observation")
-        .unwrap();
+    let permit = exact_registry.find(".permit_v2()").unwrap();
+    let evidence = exact_registry.find(".registry_evidence()").unwrap();
+    let empty = exact_registry.find(".empty_observation()").unwrap();
+    let evidence_match = exact_registry.find("!= observation").unwrap();
     let final_revalidation = exact_registry.find("self.require_current_v2()").unwrap();
-    assert!(evidence_match < final_revalidation);
+    assert!(
+        permit < evidence
+            && evidence < empty
+            && empty < evidence_match
+            && evidence_match < final_revalidation
+    );
     let pending_current = braced_declaration(pending, "fn require_current_v2(&self)");
     assert_no_watch_reborrow(pending_current, "pending section validation");
     assert_eq!(
@@ -2835,7 +3175,7 @@ fn gateway_section_snapshot_guards_never_reborrow_a_live_watch_reference() {
     );
     assert_eq!(
         pending_current
-            .matches(".validate_recovery_permit(&self.binding.permit)")
+            .matches(".validate_recovery_permit(self.binding.permit_v2())")
             .count(),
         2
     );
@@ -3193,8 +3533,61 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     ] {
         assert!(!contains_identifier(production, forbidden), "{forbidden}");
     }
-    assert!(!production.contains(".resume"));
+    let recovery_resume = braced_declaration(
+        production,
+        "pub(crate) async fn into_admission_acknowledging_v2(",
+    );
+    assert!(recovery_resume.contains("worker.resume_recovery(&port)"));
+    assert_eq!(
+        production.matches("worker.resume_recovery(&port)").count(),
+        1
+    );
+    assert!(!production.contains(".resume_admission"));
+    assert!(!production.contains(".resume_reserved_admission"));
+    assert!(!production.contains(".resume("));
     assert!(!production.contains("resume("));
+    let process_observation = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/process/observation.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let process_resume = braced_declaration(
+        process_observation,
+        "pub(crate) async fn resume_recovery_v2(",
+    );
+    let closed_gate = process_resume
+        .find("maintenance_gate_is_closed_v2(pre_gate)")
+        .unwrap();
+    let pause = process_resume
+        .find(".observe_exact_pause_reservation_v2()")
+        .unwrap();
+    let discord_resume = process_resume
+        .find(".resume_reserved_admission_in_place_v2(")
+        .unwrap();
+    let exact_evidence = process_resume
+        .find("evidence.coordinator_generation_v2() != coordinator_generation")
+        .unwrap();
+    let ready = process_resume
+        .find(".observe_exact_resumed_ready_attestation_v2()")
+        .unwrap();
+    let gate_reobservation = process_resume.find("post_gate != pre_gate").unwrap();
+    let worker_resume = process_resume
+        .find("lifecycle.into_admission_acknowledging_v2(observation)")
+        .unwrap();
+    assert!(
+        closed_gate < pause
+            && pause < discord_resume
+            && discord_resume < exact_evidence
+            && exact_evidence < ready
+            && ready < gate_reobservation
+            && gate_reobservation < worker_resume
+    );
+    for forbidden in ["begin_open_v2", "commit_open_v2", "try_acquire_v2"] {
+        assert!(
+            !contains_identifier(process_resume, forbidden),
+            "recovery resume: {forbidden}"
+        );
+    }
     for name in [
         "RuntimeClosedRecoveryPendingPhaseV2",
         "RuntimeClosedRecoverySessionV2",
@@ -3215,6 +3608,17 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
                 "{name}: {forbidden}"
             );
         }
+    }
+    let resume_database = braced_declaration(
+        process_observation,
+        "async fn collect_recovery_resume_database_evidence_v2(",
+    );
+    for method in [
+        "verify_readiness_refresh_until_v2",
+        "into_exact_capability_receipts",
+    ] {
+        assert_eq!(process_observation.matches(method).count(), 1, "{method}");
+        assert_eq!(resume_database.matches(method).count(), 1, "{method}");
     }
     for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
         for method in [
@@ -3265,7 +3669,8 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
             if contains_identifier(source, method) {
                 assert!(
                     path == Path::new("src/closed_recovery.rs")
-                        || path == Path::new("src/database.rs"),
+                        || path == Path::new("src/database.rs")
+                        || path == Path::new("src/process/observation.rs"),
                     "{}: {method}",
                     path.display()
                 );
@@ -3653,7 +4058,7 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
         .map(|(production, _)| production)
         .unwrap();
     let closed = include_str!("../src/closed_recovery.rs");
-    let gateway = include_str!("../src/gateway.rs");
+    let gateway = source_before_test_module(include_str!("../src/gateway.rs"));
     let finalizer = include_str!("../src/process/pending_drain_finalizer.rs");
 
     for required in [
@@ -3821,15 +4226,36 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
     ] {
         assert!(closed.contains(required), "{required}");
     }
-    for required in [
+    let gateway_begin = braced_declaration(
+        gateway,
         "pub(crate) fn begin_startup_recovery_execution_v2(",
-        "coordinator.begin_startup_recovery_execution(&mut self.permit, continuation)",
+    );
+    let begin_preflight = gateway_begin
+        .find("self.committed_pending_section_v2(committed_owner)")
+        .unwrap();
+    let begin_transition = gateway_begin
+        .find(".begin_startup_recovery_execution(permit, continuation)")
+        .unwrap();
+    let begin_postflight = gateway_begin
+        .rfind("self.committed_pending_section_v2(committed_owner)")
+        .unwrap();
+    assert!(begin_preflight < begin_transition && begin_transition < begin_postflight);
+    let gateway_complete = braced_declaration(
+        gateway,
         "pub(crate) fn complete_startup_recovery_execution_v2(",
-        "coordinator.complete_startup_recovery_execution(&mut self.permit, completed)",
-        "invalidate_capability_not_ready_v2",
-    ] {
-        assert!(gateway.contains(required), "{required}");
-    }
+    );
+    let complete_preflight = gateway_complete
+        .find("self.committed_pending_section_v2(committed_owner)")
+        .unwrap();
+    let complete_transition = gateway_complete
+        .find(".complete_startup_recovery_execution(permit, completed)")
+        .unwrap();
+    let complete_postflight = gateway_complete
+        .rfind("self.committed_pending_section_v2(committed_owner)")
+        .unwrap();
+    assert!(complete_preflight < complete_transition && complete_transition < complete_postflight);
+    assert!(gateway_complete.contains("owner_invalidated.store(true, Ordering::Release)"));
+    assert!(gateway.contains("invalidate_capability_not_ready_v2"));
     for forbidden in [
         "resume_admission",
         "open_admission",
@@ -3861,7 +4287,7 @@ fn startup_recovery_observation_is_private_linear_deadline_bound_and_non_authori
     let gateway = sources
         .iter()
         .find(|(path, _)| path == Path::new("src/gateway.rs"))
-        .map(|(_, source)| source.as_str())
+        .map(|(_, source)| source_before_test_module(source))
         .unwrap();
 
     for required in [
@@ -4012,7 +4438,7 @@ fn startup_recovery_observation_is_private_linear_deadline_bound_and_non_authori
         .find("self.committed_pending_section_v2(committed_owner)")
         .unwrap();
     let begin_transition = begin_gateway
-        .find("coordinator.begin_startup_recovery_observation(&mut self.permit, iteration)")
+        .find(".begin_startup_recovery_observation(permit, iteration)")
         .unwrap();
     let begin_postflight = begin_gateway
         .rfind("self.committed_pending_section_v2(committed_owner)")
@@ -4022,9 +4448,8 @@ fn startup_recovery_observation_is_private_linear_deadline_bound_and_non_authori
         gateway,
         "pub(crate) fn into_startup_recovery_observation_successor_v2(",
     );
-    assert!(complete_gateway
-        .contains(".complete_startup_recovery_observation(&mut self.permit, completed)"));
-    assert!(complete_gateway.contains("self.owner_invalidated.store(true, Ordering::Release)"));
+    assert!(complete_gateway.contains(".complete_startup_recovery_observation(permit, completed)"));
+    assert!(complete_gateway.contains("owner_invalidated.store(true, Ordering::Release)"));
     let fixed_gateway = braced_declaration(
         gateway,
         "pub(crate) fn validate_startup_recovery_fixed_point_v2(",
@@ -4033,7 +4458,7 @@ fn startup_recovery_observation_is_private_linear_deadline_bound_and_non_authori
         .find("self.committed_pending_section_v2(committed_owner)")
         .unwrap();
     let fixed_transition = fixed_gateway
-        .find("coordinator.validate_startup_recovery_fixed_point(&self.permit, proof)")
+        .find(".validate_startup_recovery_fixed_point(self.permit_v2(), proof)")
         .unwrap();
     let fixed_postflight = fixed_gateway
         .rfind("self.committed_pending_section_v2(committed_owner)")
@@ -4787,10 +5212,14 @@ fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_en
     let startup_recovery = staging
         .find(".into_startup_recovery_fixed_point_v2()")
         .unwrap();
-    let shutdown = staging[startup_recovery..]
-        .find(".shutdown()")
-        .map(|offset| startup_recovery + offset)
+    let paused_production = staging
+        .find(".into_paused_production_handoff_v2()")
         .unwrap();
+    let process_bound = staging.find(".into_process_bound_handoff_v2()").unwrap();
+    let recovery_resume = staging.find(".into_recovery_resume_v2()").unwrap();
+    let admission = staging.find(".resume_recovery_v2()").unwrap();
+    let empty_open = staging.find(".enter_empty_open_v2()").unwrap();
+    let run = staging.find(".run_until_shutdown_v2()").unwrap();
     let outcome = staging.find("Ok(RuntimeProcessStagingOutcomeV1").unwrap();
     assert!(
         config < secrets
@@ -4804,9 +5233,14 @@ fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_en
             && recovery_pending < closed_recovery
             && closed_recovery < recovery_iteration_ready
             && recovery_iteration_ready < startup_recovery
-            && startup_recovery < shutdown
-            && owner < shutdown
-            && shutdown < outcome
+            && startup_recovery < paused_production
+            && paused_production < process_bound
+            && process_bound < recovery_resume
+            && recovery_resume < admission
+            && admission < empty_open
+            && empty_open < run
+            && owner < run
+            && run < outcome
     );
     assert_eq!(
         staging
@@ -4827,10 +5261,16 @@ fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_en
         ".into_closed_recovery_v2()",
         ".into_recovery_iteration_ready_v2()",
         ".into_startup_recovery_fixed_point_v2()",
-        ".shutdown()",
+        ".into_paused_production_handoff_v2()",
+        ".into_process_bound_handoff_v2()",
+        ".into_recovery_resume_v2()",
+        ".resume_recovery_v2()",
+        ".enter_empty_open_v2()",
+        ".run_until_shutdown_v2()",
     ] {
         assert_eq!(staging.matches(operation).count(), 1, "{operation}");
     }
+    assert!(!staging.contains("empty_open\n        .shutdown()"));
     assert_eq!(
         entry.matches("run_runtime_startup_sync_stage_v1(").count(),
         1

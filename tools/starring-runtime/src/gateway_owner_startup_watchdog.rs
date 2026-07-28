@@ -1061,8 +1061,8 @@ impl RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
         };
         let inner = self.take_inner();
         Ok(RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
-            inner: Some(inner),
-            handoff_observation: handoff.observation,
+            inner: Some(Box::new(inner)),
+            handoff_observation: Box::new(handoff.observation),
             handoff_cutoff: handoff.cutoff,
         })
     }
@@ -1177,8 +1177,8 @@ pub(crate) enum RuntimeGatewayOwnerStrictSuccessorErrorV2 {
 }
 
 pub(crate) struct RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
-    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
-    handoff_observation: RuntimeGatewayOwnerCurrentObservationV1,
+    inner: Option<Box<RuntimeGatewayOwnerSupervisorHandleV1>>,
+    handoff_observation: Box<RuntimeGatewayOwnerCurrentObservationV1>,
     handoff_cutoff: Instant,
 }
 
@@ -1225,7 +1225,7 @@ impl RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
             NonZeroU64::new(self.inner().process_generation.load(Ordering::Acquire))
                 .expect("process-owned gateway owner generation");
         Ok(RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
-            inner: Some(self.take_inner()),
+            inner: Some(Box::new(self.take_inner())),
             activation_observation: observation,
             process_generation,
             production_start_observation: None,
@@ -1264,22 +1264,23 @@ impl RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
 
     fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
         self.inner
-            .as_ref()
+            .as_deref()
             .expect("admission-frozen gateway owner supervisor")
     }
 
     fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
-        self.inner
+        *self
+            .inner
             .take()
             .expect("admission-frozen gateway owner supervisor")
     }
 }
 
 pub(crate) struct RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
-    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
-    activation_observation: RuntimeGatewayOwnerCurrentObservationV1,
+    inner: Option<Box<RuntimeGatewayOwnerSupervisorHandleV1>>,
+    activation_observation: Box<RuntimeGatewayOwnerCurrentObservationV1>,
     process_generation: NonZeroU64,
-    production_start_observation: Option<RuntimeGatewayOwnerCurrentObservationV1>,
+    production_start_observation: Option<Box<RuntimeGatewayOwnerCurrentObservationV1>>,
 }
 
 impl RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
@@ -1329,7 +1330,7 @@ impl RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
             self.inner().invalidation.invalidate();
             return Err(RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProtocolViolation);
         }
-        self.production_start_observation = Some(observation.clone());
+        self.production_start_observation = Some(Box::new(observation.clone()));
         Ok(observation)
     }
 
@@ -1347,7 +1348,7 @@ impl RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
         }
         let process_generation = self.process_generation;
         Ok(RuntimeGatewayOwnerProductionSupervisorV2 {
-            inner: Some(self.take_inner()),
+            inner: Some(Box::new(self.take_inner())),
             process_generation,
             start_observation,
         })
@@ -1385,21 +1386,22 @@ impl RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
 
     fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
         self.inner
-            .as_ref()
+            .as_deref()
             .expect("process-frozen gateway owner supervisor")
     }
 
     fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
-        self.inner
+        *self
+            .inner
             .take()
             .expect("process-frozen gateway owner supervisor")
     }
 }
 
 pub(crate) struct RuntimeGatewayOwnerProductionSupervisorV2 {
-    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
+    inner: Option<Box<RuntimeGatewayOwnerSupervisorHandleV1>>,
     process_generation: NonZeroU64,
-    start_observation: RuntimeGatewayOwnerCurrentObservationV1,
+    start_observation: Box<RuntimeGatewayOwnerCurrentObservationV1>,
 }
 
 impl RuntimeGatewayOwnerProductionSupervisorV2 {
@@ -1407,6 +1409,7 @@ impl RuntimeGatewayOwnerProductionSupervisorV2 {
         self.process_generation
     }
 
+    #[cfg(test)]
     pub(crate) fn start_observation_v2(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
         &self.start_observation
     }
@@ -1506,12 +1509,13 @@ impl RuntimeGatewayOwnerProductionSupervisorV2 {
 
     fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
         self.inner
-            .as_ref()
+            .as_deref()
             .expect("production gateway owner supervisor")
     }
 
     fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
-        self.inner
+        *self
+            .inner
             .take()
             .expect("production gateway owner supervisor")
     }
@@ -1883,18 +1887,19 @@ where
     let production_generation = Arc::new(AtomicU64::new(0));
     let actor_production_generation = production_generation.clone();
     let task = runtime.spawn(async move {
-        let exit = run_gateway_owner_startup_watchdog_v1(
-            port,
-            watchdog,
-            config,
-            receivers,
-            guard,
-            actor_startup_cleanup_cap,
-            actor_process_generation,
-            actor_production_generation,
-            current_observation_sender,
-        )
-        .await;
+        let exit =
+            run_gateway_owner_startup_watchdog_v1(RuntimeGatewayOwnerStartupWatchdogActorV1 {
+                port,
+                watchdog,
+                config,
+                receivers,
+                guard,
+                startup_cleanup_cap: actor_startup_cleanup_cap,
+                process_generation: actor_process_generation,
+                production_generation: actor_production_generation,
+                current_observation_sender,
+            })
+            .await;
         let _result = terminal_sender.send(Some(exit));
     });
     Ok(RuntimeGatewayOwnerStartupWatchdogHandleV1 {
@@ -1936,21 +1941,36 @@ struct RuntimeGatewayOwnerStartupWatchdogReceiversV1 {
     closed_recovery_commands: mpsc::Receiver<RuntimeGatewayOwnerClosedRecoveryCommandV2>,
 }
 
-async fn run_gateway_owner_startup_watchdog_v1<P>(
+struct RuntimeGatewayOwnerStartupWatchdogActorV1<P> {
     port: P,
     watchdog: RuntimeGatewayOwnerWatchdogV1,
     config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
     receivers: RuntimeGatewayOwnerStartupWatchdogReceiversV1,
-    mut guard: RuntimeGatewayOwnerStartupWatchdogGuardV1,
+    guard: RuntimeGatewayOwnerStartupWatchdogGuardV1,
     startup_cleanup_cap: RuntimeGatewayOwnerStartupCleanupCapV1,
     process_generation: Arc<AtomicU64>,
     production_generation: Arc<AtomicU64>,
     current_observation_sender: watch::Sender<RuntimeGatewayOwnerCurrentObservationV1>,
+}
+
+async fn run_gateway_owner_startup_watchdog_v1<P>(
+    actor: RuntimeGatewayOwnerStartupWatchdogActorV1<P>,
 ) -> RuntimeGatewayOwnerStartupWatchdogExitV1
 where
     P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync + 'static,
     P::Error: Send + 'static,
 {
+    let RuntimeGatewayOwnerStartupWatchdogActorV1 {
+        port,
+        watchdog,
+        config,
+        receivers,
+        mut guard,
+        startup_cleanup_cap,
+        process_generation,
+        production_generation,
+        current_observation_sender,
+    } = actor;
     let RuntimeGatewayOwnerStartupWatchdogReceiversV1 {
         mut shutdown_commands,
         mut supervisor_commands,

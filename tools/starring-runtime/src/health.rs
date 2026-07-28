@@ -55,13 +55,19 @@ pub(crate) struct RuntimeHealthReadinessHandleV1 {
 }
 
 impl RuntimeHealthReadinessHandleV1 {
-    pub(crate) fn remove_readiness(&self) {
+    pub(crate) fn seal_readiness(&self) {
+        self.state.readiness_sealed.store(true, Ordering::Release);
         self.state.ready.store(false, Ordering::Release);
     }
 
     #[cfg(test)]
     fn is_ready(&self) -> bool {
         self.state.ready.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn is_sealed(&self) -> bool {
+        self.state.readiness_sealed.load(Ordering::Acquire)
     }
 }
 
@@ -74,7 +80,36 @@ impl Debug for RuntimeHealthReadinessHandleV1 {
 struct RuntimeHealthStateV1 {
     live: AtomicBool,
     ready: AtomicBool,
+    readiness_sealed: AtomicBool,
     stopped: watch::Sender<bool>,
+}
+
+pub(crate) struct RuntimeHealthReadinessPublisherV2 {
+    state: Arc<RuntimeHealthStateV1>,
+}
+
+impl RuntimeHealthReadinessPublisherV2 {
+    pub(crate) fn publish_ready_v2(&self) -> bool {
+        if self.state.readiness_sealed.load(Ordering::Acquire) {
+            return false;
+        }
+        self.state.ready.store(true, Ordering::Release);
+        if self.state.readiness_sealed.load(Ordering::Acquire) {
+            self.state.ready.store(false, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn remove_readiness_v2(&self) {
+        self.state.ready.store(false, Ordering::Release);
+    }
+}
+
+impl Debug for RuntimeHealthReadinessPublisherV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeHealthReadinessPublisherV2(<redacted>)")
+    }
 }
 
 pub(crate) struct RuntimeHealthTerminalObserverV1 {
@@ -104,6 +139,7 @@ pub(crate) struct RuntimeHealthSupervisorV1 {
     state: Arc<RuntimeHealthStateV1>,
     stop: mpsc::Sender<()>,
     task: Option<JoinHandle<bool>>,
+    readiness_publisher_available: bool,
     #[cfg(test)]
     bound_addr: SocketAddr,
 }
@@ -127,6 +163,7 @@ impl RuntimeHealthSupervisorV1 {
         let state = Arc::new(RuntimeHealthStateV1 {
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
+            readiness_sealed: AtomicBool::new(false),
             stopped,
         });
         let (stop, stop_receiver) = mpsc::channel(1);
@@ -140,6 +177,7 @@ impl RuntimeHealthSupervisorV1 {
             state,
             stop,
             task: Some(task),
+            readiness_publisher_available: true,
             #[cfg(test)]
             bound_addr,
         })
@@ -149,6 +187,18 @@ impl RuntimeHealthSupervisorV1 {
         RuntimeHealthReadinessHandleV1 {
             state: self.state.clone(),
         }
+    }
+
+    pub(crate) fn take_readiness_publisher_v2(
+        &mut self,
+    ) -> Option<RuntimeHealthReadinessPublisherV2> {
+        if !self.readiness_publisher_available {
+            return None;
+        }
+        self.readiness_publisher_available = false;
+        Some(RuntimeHealthReadinessPublisherV2 {
+            state: self.state.clone(),
+        })
     }
 
     pub(crate) fn terminal_observer(&self) -> RuntimeHealthTerminalObserverV1 {
@@ -171,7 +221,7 @@ impl RuntimeHealthSupervisorV1 {
         mut self,
         deadline: Instant,
     ) -> Result<(), RuntimeHealthShutdownErrorV1> {
-        self.readiness_handle().remove_readiness();
+        self.readiness_handle().seal_readiness();
         if Instant::now() >= deadline {
             self.abort_and_join().await;
             return Err(RuntimeHealthShutdownErrorV1::DeadlineElapsed);
@@ -201,7 +251,7 @@ impl RuntimeHealthSupervisorV1 {
 
 impl Drop for RuntimeHealthSupervisorV1 {
     fn drop(&mut self) {
-        self.state.ready.store(false, Ordering::Release);
+        self.readiness_handle().seal_readiness();
         self.state.live.store(false, Ordering::Release);
         self.state.stopped.send_replace(true);
         if let Some(task) = self.task.take() {
@@ -222,6 +272,7 @@ struct RuntimeHealthActorGuardV1 {
 
 impl Drop for RuntimeHealthActorGuardV1 {
     fn drop(&mut self) {
+        self.state.readiness_sealed.store(true, Ordering::Release);
         self.state.ready.store(false, Ordering::Release);
         self.state.live.store(false, Ordering::Release);
         self.state.stopped.send_replace(true);
@@ -340,13 +391,14 @@ mod tests {
 
     #[tokio::test]
     async fn listener_is_live_unready_redacted_and_stops_cleanly() {
-        let supervisor = RuntimeHealthSupervisorV1::start(SocketAddr::V4(SocketAddrV4::new(
+        let mut supervisor = RuntimeHealthSupervisorV1::start(SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::LOCALHOST,
             0,
         )))
         .await
         .unwrap();
         let addr = supervisor.bound_addr();
+        let publisher = supervisor.take_readiness_publisher_v2().unwrap();
 
         assert!(supervisor.is_live());
         assert!(!supervisor.readiness_handle().is_ready());
@@ -365,6 +417,19 @@ mod tests {
             format!("{:?}", supervisor.readiness_handle()),
             "RuntimeHealthReadinessHandleV1(<redacted>)"
         );
+        assert_eq!(
+            format!("{publisher:?}"),
+            "RuntimeHealthReadinessPublisherV2(<redacted>)"
+        );
+        assert!(publisher.publish_ready_v2());
+        assert!(request(addr, "/health/ready")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        publisher.remove_readiness_v2();
+        assert!(request(addr, "/health/ready")
+            .await
+            .starts_with("HTTP/1.1 503"));
+        assert!(supervisor.take_readiness_publisher_v2().is_none());
 
         supervisor
             .shutdown_until(Instant::now() + Duration::from_secs(1))
@@ -408,6 +473,7 @@ mod tests {
         let state = RuntimeHealthStateV1 {
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
+            readiness_sealed: AtomicBool::new(false),
             stopped,
         };
 
@@ -424,5 +490,64 @@ mod tests {
             runtime_health_response_v1(b"GET /health/live HTTP/1.1\r\n", &state)
                 .starts_with(b"HTTP/1.1 404")
         );
+    }
+
+    #[test]
+    fn shutdown_seal_prevents_every_later_publish() {
+        let (stopped, _) = watch::channel(false);
+        let state = Arc::new(RuntimeHealthStateV1 {
+            live: AtomicBool::new(true),
+            ready: AtomicBool::new(false),
+            readiness_sealed: AtomicBool::new(false),
+            stopped,
+        });
+        let publisher = RuntimeHealthReadinessPublisherV2 {
+            state: state.clone(),
+        };
+        let invalidator = RuntimeHealthReadinessHandleV1 {
+            state: state.clone(),
+        };
+
+        assert!(publisher.publish_ready_v2());
+        publisher.remove_readiness_v2();
+        assert!(publisher.publish_ready_v2());
+        invalidator.seal_readiness();
+
+        assert!(invalidator.is_sealed());
+        assert!(!invalidator.is_ready());
+        assert!(!publisher.publish_ready_v2());
+        assert!(!invalidator.is_ready());
+    }
+
+    #[test]
+    fn concurrent_publish_and_shutdown_seal_finish_not_ready() {
+        for _ in 0..512 {
+            let (stopped, _) = watch::channel(false);
+            let state = Arc::new(RuntimeHealthStateV1 {
+                live: AtomicBool::new(true),
+                ready: AtomicBool::new(false),
+                readiness_sealed: AtomicBool::new(false),
+                stopped,
+            });
+            let publisher = RuntimeHealthReadinessPublisherV2 {
+                state: state.clone(),
+            };
+            let invalidator = RuntimeHealthReadinessHandleV1 {
+                state: state.clone(),
+            };
+            let start = Arc::new(std::sync::Barrier::new(2));
+            let publish_start = start.clone();
+            let publish = std::thread::spawn(move || {
+                publish_start.wait();
+                publisher.publish_ready_v2()
+            });
+
+            start.wait();
+            invalidator.seal_readiness();
+            let _ = publish.join().unwrap();
+
+            assert!(invalidator.is_sealed());
+            assert!(!invalidator.is_ready());
+        }
     }
 }

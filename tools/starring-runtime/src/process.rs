@@ -8,6 +8,14 @@ use automation_runtime_worker::RuntimeMutationFinalizerGenerationV1;
 use crate::build_revision::CompiledRuntimeBuildRevisionV1;
 use crate::controller_identity::generate_runtime_controller_id_v1;
 use crate::database::compose_runtime_database_dependencies_v1;
+use crate::health::RuntimeHealthReadinessPublisherV2;
+use crate::ingress_acknowledgement_supervisor::{
+    RuntimeIngressAcknowledgementSupervisorConfigV2, RuntimeIngressAcknowledgementSupervisorExitV2,
+    RuntimeIngressAcknowledgementSupervisorV2, RuntimeWorkerIngressAcknowledgementJobV2,
+};
+use crate::maintenance_ingress_gate::{
+    RuntimeMaintenanceIngressGateControllerV2, RuntimeMaintenanceIngressGateObserverV2,
+};
 use crate::process_identity::generate_runtime_process_instance_id_v1;
 use crate::process_supervisor::{
     RuntimeProcessRootSupervisorStartErrorV1, RuntimeProcessRootSupervisorV1,
@@ -184,6 +192,7 @@ pub enum RuntimeProcessFoundationShutdownFailureV1 {
     SignalSupervisor,
     Database(RuntimeDatabasePoolShutdownErrorV1),
     HealthListener,
+    IngressAcknowledgement,
 }
 
 impl RuntimeProcessFoundationShutdownFailureV1 {
@@ -196,6 +205,9 @@ impl RuntimeProcessFoundationShutdownFailureV1 {
                 "runtime_process_foundation_database_shutdown_timed_out"
             }
             Self::HealthListener => "runtime_process_health_listener_shutdown",
+            Self::IngressAcknowledgement => {
+                "runtime_process_ingress_acknowledgement_supervisor_shutdown"
+            }
         }
     }
 }
@@ -275,6 +287,29 @@ impl RuntimeProcessFoundationShutdownFailuresV1 {
     }
 }
 
+type RuntimeProcessStartupMutationFinalizerV3 =
+    pending_drain_finalizer::RuntimePendingDrainFinalizerSupervisorV3<
+        execution::RuntimeProductionPendingDrainFinalizerEnvironmentV3,
+    >;
+
+type RuntimeProcessMutationFinalizerV3 =
+    crate::mutation_finalizer::RuntimeMutationFinalizerProcessSupervisorV1<
+        pending_drain_finalizer::RuntimePendingDrainFinalizerPortV3<
+            execution::RuntimeProductionPendingDrainFinalizerEnvironmentV3,
+        >,
+    >;
+
+pub(super) type RuntimeProcessIngressAcknowledgementJobV2 =
+    RuntimeWorkerIngressAcknowledgementJobV2<
+        crate::closed_recovery::RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2,
+    >;
+
+pub(super) type RuntimeProcessIngressAcknowledgementSupervisorV2 =
+    RuntimeIngressAcknowledgementSupervisorV2<
+        automation_runtime_execution_postgres::PostgresRuntimeExecutionV1,
+        RuntimeProcessIngressAcknowledgementJobV2,
+    >;
+
 pub(crate) struct RuntimeProcessFoundationV1 {
     gateway: RuntimeGatewayBootstrapV1,
     registry: RuntimeRegistryBootstrapV1,
@@ -285,13 +320,21 @@ pub(crate) struct RuntimeProcessFoundationV1 {
     build_revision: RuntimeBuildRevisionV1,
     process_instance_id: ProcessInstanceId,
     controller_id: ControllerId,
-    mutation_finalizer: Option<
-        pending_drain_finalizer::RuntimePendingDrainFinalizerSupervisorV3<
-            execution::RuntimeProductionPendingDrainFinalizerEnvironmentV3,
-        >,
-    >,
+    mutation_finalizer: Option<RuntimeProcessStartupMutationFinalizerV3>,
+    process_mutation_finalizer: Option<RuntimeProcessMutationFinalizerV3>,
+    maintenance_ingress: Option<RuntimeMaintenanceIngressGateControllerV2>,
+    maintenance_ingress_observer: RuntimeMaintenanceIngressGateObserverV2,
+    readiness_publisher: Option<RuntimeHealthReadinessPublisherV2>,
+    ingress_acknowledgement: Option<RuntimeProcessIngressAcknowledgementSupervisorV2>,
+    cleanup_mode: RuntimeProcessFoundationCleanupModeV1,
     root_supervisor: RuntimeProcessRootSupervisorV1,
     shutdown_failures: RuntimeProcessFoundationShutdownFailuresV1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeProcessFoundationCleanupModeV1 {
+    StartupBound,
+    ProcessBound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -300,6 +343,14 @@ pub(super) enum RuntimeProcessFinalizerHandoffFailureV2 {
     Unavailable,
     Terminal(RuntimeSupervisorExitV1),
     NotSettled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RuntimeProcessFinalizerActivationFailureV2 {
+    Unavailable,
+    Reserve(crate::mutation_finalizer::RuntimeMutationFinalizerProcessActivationReserveErrorV1),
+    Activate(crate::mutation_finalizer::RuntimeMutationFinalizerProcessActivationErrorV1),
+    NotReady(crate::mutation_finalizer::RuntimeMutationFinalizerProcessIntakeHealthV1),
 }
 
 impl RuntimeProcessFoundationV1 {
@@ -324,9 +375,44 @@ impl RuntimeProcessFoundationV1 {
         &self,
         observation: crate::RuntimeShutdownObservationV1,
     ) -> std::time::Instant {
-        observation
-            .deadline()
-            .min(self.startup_budget.cleanup_deadline())
+        match self.cleanup_mode {
+            RuntimeProcessFoundationCleanupModeV1::StartupBound => observation
+                .deadline()
+                .min(self.startup_budget.cleanup_deadline()),
+            RuntimeProcessFoundationCleanupModeV1::ProcessBound => observation.deadline(),
+        }
+    }
+
+    pub(super) fn enter_process_cleanup_mode_v2(&mut self) -> bool {
+        if self.cleanup_mode != RuntimeProcessFoundationCleanupModeV1::StartupBound {
+            return false;
+        }
+        self.cleanup_mode = RuntimeProcessFoundationCleanupModeV1::ProcessBound;
+        true
+    }
+
+    pub(super) fn maintenance_ingress_controller_v2(
+        &mut self,
+    ) -> Option<RuntimeMaintenanceIngressGateControllerV2> {
+        self.maintenance_ingress.take()
+    }
+
+    pub(super) fn maintenance_ingress_observer_v2(
+        &self,
+    ) -> RuntimeMaintenanceIngressGateObserverV2 {
+        self.maintenance_ingress_observer.clone()
+    }
+
+    pub(super) fn take_readiness_publisher_v2(
+        &mut self,
+    ) -> Option<RuntimeHealthReadinessPublisherV2> {
+        self.readiness_publisher.take()
+    }
+
+    pub(super) fn take_ingress_acknowledgement_supervisor_v2(
+        &mut self,
+    ) -> Option<RuntimeProcessIngressAcknowledgementSupervisorV2> {
+        self.ingress_acknowledgement.take()
     }
 
     pub(super) async fn seal_startup_finalizer_for_handoff_v2(
@@ -383,6 +469,52 @@ impl RuntimeProcessFoundationV1 {
         Ok(())
     }
 
+    pub(super) async fn activate_process_finalizer_until_v2(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<RuntimeMutationFinalizerGenerationV1, RuntimeProcessFinalizerActivationFailureV2>
+    {
+        let supervisor = self
+            .mutation_finalizer
+            .take()
+            .ok_or(RuntimeProcessFinalizerActivationFailureV2::Unavailable)?;
+        let activation = match supervisor.reserve_process_activation() {
+            Ok(activation) => activation,
+            Err(error) => {
+                self.mutation_finalizer = Some(supervisor);
+                return Err(RuntimeProcessFinalizerActivationFailureV2::Reserve(error));
+            }
+        };
+        let generation = activation.generation();
+        match supervisor
+            .activate_process_until(activation, deadline)
+            .await
+        {
+            Ok(process) => {
+                let health = process.process_intake_health();
+                if !health.is_ready() {
+                    self.process_mutation_finalizer = Some(process);
+                    return Err(RuntimeProcessFinalizerActivationFailureV2::NotReady(health));
+                }
+                self.process_mutation_finalizer = Some(process);
+                Ok(generation)
+            }
+            Err(failure) => {
+                let error = failure.error();
+                self.mutation_finalizer = Some(failure.into_shutdown_supervisor());
+                Err(RuntimeProcessFinalizerActivationFailureV2::Activate(error))
+            }
+        }
+    }
+
+    pub(super) fn process_finalizer_health_v2(
+        &self,
+    ) -> Option<crate::mutation_finalizer::RuntimeMutationFinalizerProcessIntakeHealthV1> {
+        self.process_mutation_finalizer
+            .as_ref()
+            .map(|process| process.process_intake_health())
+    }
+
     pub(super) async fn begin_shutdown_v1(
         &mut self,
         cause: RuntimeShutdownCauseV1,
@@ -398,6 +530,25 @@ impl RuntimeProcessFoundationV1 {
             }
             drop(finalizer_report);
         }
+        if let Some(mutation_finalizer) = self.process_mutation_finalizer.take() {
+            let finalizer_report = mutation_finalizer.shutdown_until(deadline).await;
+            if finalizer_report.exit() != RuntimeSupervisorExitV1::Commanded {
+                self.shutdown_failures.record(
+                    RuntimeProcessFoundationShutdownFailureV1::Finalizer(finalizer_report.exit()),
+                );
+            }
+            drop(finalizer_report);
+        }
+        if let Some(ingress_acknowledgement) = self.ingress_acknowledgement.take() {
+            let report = ingress_acknowledgement.shutdown_until(deadline).await;
+            if report.exit() != RuntimeIngressAcknowledgementSupervisorExitV2::Commanded
+                || report.completion().is_some()
+            {
+                self.shutdown_failures
+                    .record(RuntimeProcessFoundationShutdownFailureV1::IngressAcknowledgement);
+            }
+            drop(report);
+        }
         deadline
     }
 
@@ -412,6 +563,17 @@ impl RuntimeProcessFoundationV1 {
         if exit != RuntimeSupervisorExitV1::Commanded {
             self.shutdown_failures
                 .record(RuntimeProcessFoundationShutdownFailureV1::Finalizer(exit));
+        }
+    }
+
+    pub(super) fn record_ingress_acknowledgement_shutdown_v2(
+        &mut self,
+        exit: RuntimeIngressAcknowledgementSupervisorExitV2,
+        completion_present: bool,
+    ) {
+        if exit != RuntimeIngressAcknowledgementSupervisorExitV2::Commanded || completion_present {
+            self.shutdown_failures
+                .record(RuntimeProcessFoundationShutdownFailureV1::IngressAcknowledgement);
         }
     }
 
@@ -438,6 +600,12 @@ impl RuntimeProcessFoundationV1 {
             process_instance_id,
             controller_id,
             mutation_finalizer,
+            process_mutation_finalizer,
+            maintenance_ingress,
+            maintenance_ingress_observer,
+            readiness_publisher,
+            ingress_acknowledgement,
+            cleanup_mode,
             mut root_supervisor,
             mut shutdown_failures,
         } = self;
@@ -449,6 +617,27 @@ impl RuntimeProcessFoundationV1 {
                 ));
             }
             drop(finalizer_report);
+        }
+        if let Some(mutation_finalizer) = process_mutation_finalizer {
+            let finalizer_report = mutation_finalizer.shutdown_until(cleanup_deadline).await;
+            if finalizer_report.exit() != RuntimeSupervisorExitV1::Commanded {
+                shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::Finalizer(
+                    finalizer_report.exit(),
+                ));
+            }
+            drop(finalizer_report);
+        }
+        if let Some(ingress_acknowledgement) = ingress_acknowledgement {
+            let report = ingress_acknowledgement
+                .shutdown_until(cleanup_deadline)
+                .await;
+            if report.exit() != RuntimeIngressAcknowledgementSupervisorExitV2::Commanded
+                || report.completion().is_some()
+            {
+                shutdown_failures
+                    .record(RuntimeProcessFoundationShutdownFailureV1::IngressAcknowledgement);
+            }
+            drop(report);
         }
         let signal_exit = root_supervisor.join_signal_until(cleanup_deadline).await;
         if matches!(
@@ -472,6 +661,10 @@ impl RuntimeProcessFoundationV1 {
                 build_revision,
                 process_instance_id,
                 controller_id,
+                maintenance_ingress,
+                maintenance_ingress_observer,
+                readiness_publisher,
+                cleanup_mode,
             ),
             (),
         );
@@ -577,16 +770,30 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
                 };
             }
         };
+    let (maintenance_ingress, maintenance_ingress_observer, maintenance_ingress_shutdown) =
+        RuntimeMaintenanceIngressGateControllerV2::new_v2();
+    let ingress_acknowledgement = RuntimeProcessIngressAcknowledgementSupervisorV2::start(
+        databases.execution().clone(),
+        RuntimeIngressAcknowledgementSupervisorConfigV2::new(std::time::Duration::from_millis(25))
+            .expect("nonzero ingress acknowledgement retry delay"),
+    );
     let root_supervisor = match RuntimeProcessRootSupervisorV1::start(
         config.health_bind_addr(),
         mutation_finalizer.seal_handle(),
         mutation_finalizer.terminal_observer(),
         closed_components.gateway.shutdown_handle_v1(),
+        maintenance_ingress_shutdown,
+        ingress_acknowledgement.shutdown_handle_v2(),
+        ingress_acknowledgement.terminal_observer_v2(),
     )
     .await
     {
         Ok(supervisor) => supervisor,
         Err(composition) => {
+            let ingress_acknowledgement_report = ingress_acknowledgement
+                .shutdown_until(startup_budget.cleanup_deadline())
+                .await;
+            drop(ingress_acknowledgement_report);
             let finalizer_report = mutation_finalizer
                 .shutdown_until(startup_budget.cleanup_deadline())
                 .await;
@@ -607,6 +814,10 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
             };
         }
     };
+    let mut root_supervisor = root_supervisor;
+    let readiness_publisher = root_supervisor
+        .take_readiness_publisher_v2()
+        .expect("fresh runtime process root supervisor");
     Ok(RuntimeProcessFoundationV1 {
         gateway: closed_components.gateway,
         registry: closed_components.registry,
@@ -618,6 +829,12 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         process_instance_id,
         controller_id,
         mutation_finalizer: Some(mutation_finalizer),
+        process_mutation_finalizer: None,
+        maintenance_ingress: Some(maintenance_ingress),
+        maintenance_ingress_observer,
+        readiness_publisher: Some(readiness_publisher),
+        ingress_acknowledgement: Some(ingress_acknowledgement),
+        cleanup_mode: RuntimeProcessFoundationCleanupModeV1::StartupBound,
         root_supervisor,
         shutdown_failures: RuntimeProcessFoundationShutdownFailuresV1::new(),
     })

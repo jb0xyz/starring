@@ -222,9 +222,8 @@ fn validate_refresh(
     }
     let exact_current_owner = input.owner_receipt.owner_revision == previous_owner.owner_revision
         && input.owner_receipt.expires_at == previous_owner.expires_at;
-    let exact_successor_owner =
-        input.owner_receipt.owner_revision == successor_owner_revision
-            && input.owner_receipt.expires_at > previous_owner.expires_at;
+    let exact_successor_owner = input.owner_receipt.owner_revision == successor_owner_revision
+        && input.owner_receipt.expires_at > previous_owner.expires_at;
     if (!exact_current_owner && !exact_successor_owner)
         || input.owner_receipt.database_now <= previous_owner.database_now
         || input.owner_receipt.database_lease_duration().is_none()

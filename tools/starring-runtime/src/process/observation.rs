@@ -1,32 +1,58 @@
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::num::NonZeroU64;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use automation_runtime_worker::RuntimeStartupRecoveryObservationPortV2;
+use automation_runtime_controller::{
+    RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimeObserveWriterFenceV1,
+    RuntimeWriterFenceObservationV1,
+};
+use automation_runtime_worker::{
+    RuntimeEmptyOpenAcknowledgementRefreshInputV2, RuntimeIngressOpenAcknowledgementPortV2,
+    RuntimeOpenProductionObservationInputV2, RuntimeStartupRecoveryObservationPortV2,
+    RuntimeWriterFenceObservationPortV1,
+};
 pub(super) use automation_runtime_worker::{
     RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
 };
 
 use crate::closed_recovery::{
-    RuntimeClosedRecoveryAdmissionFrozenProcessV2, RuntimeClosedRecoveryFixedPointHandoffErrorV2,
-    RuntimeClosedRecoveryFixedPointV2, RuntimeClosedRecoverySessionV2,
-    RuntimeClosedRecoveryStartupIterationOutcomeV2,
+    RuntimeClosedRecoveryAdmissionAcknowledgingProcessV2,
+    RuntimeClosedRecoveryAdmissionFrozenProcessV2, RuntimeClosedRecoveryEmptyOpenProcessV2,
+    RuntimeClosedRecoveryFixedPointHandoffErrorV2, RuntimeClosedRecoveryFixedPointV2,
+    RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2,
+    RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2,
+    RuntimeClosedRecoveryIngressAcknowledgementRetainedStateV2,
+    RuntimeClosedRecoveryProcessFrozenProcessV2, RuntimeClosedRecoveryProductionHandoffErrorV2,
+    RuntimeClosedRecoveryProductionHandoffProcessV2, RuntimeClosedRecoveryResumeObservationV2,
+    RuntimeClosedRecoverySessionV2, RuntimeClosedRecoveryStartupIterationOutcomeV2,
     RuntimeClosedRecoveryStartupObservationAttemptErrorV2,
     RuntimeClosedRecoveryStartupObservationCleanupV2,
     RuntimeClosedRecoveryStartupObservationCompletionV2,
     RuntimeClosedRecoveryStartupObservationErrorV2,
+    RuntimeClosedRecoverySupervisedEmptyOpenProcessV2,
 };
 use crate::discord::{
     RuntimeDiscordGatewaySupervisorV1, RuntimeDiscordGatewayTerminalV1,
     RuntimeDiscordProcessHandoffFailureV2, RuntimeDiscordProcessHandoffV2,
-    RuntimeDiscordProcessSupervisorV2, RuntimeDiscordShutdownOnlySupervisorV2,
+    RuntimeDiscordProcessSupervisorV2, RuntimeDiscordRecoveryResumeAttemptV2,
+    RuntimeDiscordShutdownOnlySupervisorV2,
 };
 use crate::gateway::RuntimeGatewayRecoverySectionErrorV2;
+use crate::ingress_acknowledgement_supervisor::{
+    RuntimeIngressAcknowledgementExecutionResultV2, RuntimeIngressAcknowledgementFailureV2,
+    RuntimeIngressAcknowledgementRegistrationRejectionReasonV2,
+    RuntimeWorkerIngressAcknowledgementJobV2,
+};
+use crate::maintenance_ingress_gate::{
+    RuntimeMaintenanceIngressGateOpenAuthorityV2, RuntimeMaintenanceIngressGateSnapshotV2,
+    RuntimeMaintenanceIngressGateStageV2,
+};
 use crate::{
-    RuntimeClosedRecoveryProcessCleanupFailureV2, RuntimeGatewayReadyObservationErrorV1,
-    RuntimeMutationFinalizerHandoffStateV1, RuntimePausedConnectedProcessShutdownErrorV1,
-    RuntimeProcessGatewayOwnerCommitFailureV2, RuntimeRegistryRecoveryObservationErrorV1,
+    RuntimeClosedRecoveryProcessCleanupFailureV2, RuntimeGatewayOwnerStartupWatchdogExitV1,
+    RuntimeGatewayReadyObservationErrorV1, RuntimeMutationFinalizerHandoffStateV1,
+    RuntimePausedConnectedProcessShutdownErrorV1, RuntimeProcessGatewayOwnerCommitFailureV2,
+    RuntimeRegistryRecoveryObservationErrorV1,
 };
 
 use super::connected::{
@@ -35,7 +61,14 @@ use super::connected::{
     shutdown_paused_foundation_owner_v1, RuntimeProcessPausedConnectedTransitionFailureV1,
 };
 use super::readiness::RuntimeRecoveryIterationReadyProcessV2;
-use super::{RuntimeProcessFinalizerHandoffFailureV2, RuntimeProcessFoundationV1};
+use super::{
+    RuntimeProcessFinalizerActivationFailureV2, RuntimeProcessFinalizerHandoffFailureV2,
+    RuntimeProcessFoundationV1, RuntimeProcessIngressAcknowledgementSupervisorV2,
+};
+
+const INGRESS_ACKNOWLEDGEMENT_LEASE_V2: Duration = Duration::from_secs(10);
+const INGRESS_ACKNOWLEDGEMENT_REFRESH_ADVANCE_V2: Duration = Duration::from_secs(5);
+const INGRESS_ACKNOWLEDGEMENT_SAFETY_MARGIN_V2: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeProcessStartupRecoveryObservationFailureV2 {
@@ -131,6 +164,10 @@ pub enum RuntimeProcessProductionHandoffFailureV2 {
     FinalizerUnavailable,
     FinalizerTerminal,
     FinalizerNotSettled,
+    FinalizerActivation,
+    ProcessCleanupMode,
+    Database,
+    MaintenanceGate,
     FixedPoint,
     Owner,
     Gateway,
@@ -152,6 +189,10 @@ impl RuntimeProcessProductionHandoffFailureV2 {
             }
             Self::FinalizerTerminal => "runtime_process_production_handoff_finalizer_terminal",
             Self::FinalizerNotSettled => "runtime_process_production_handoff_finalizer_not_settled",
+            Self::FinalizerActivation => "runtime_process_production_handoff_finalizer_activation",
+            Self::ProcessCleanupMode => "runtime_process_production_handoff_process_cleanup_mode",
+            Self::Database => "runtime_process_production_handoff_database",
+            Self::MaintenanceGate => "runtime_process_production_handoff_maintenance_gate",
             Self::FixedPoint => "runtime_process_production_handoff_fixed_point",
             Self::Owner => "runtime_process_production_handoff_owner",
             Self::Gateway => "runtime_process_production_handoff_gateway",
@@ -231,6 +272,46 @@ pub(crate) struct RuntimePausedProductionHandoffProcessV2 {
     lifecycle: RuntimeClosedRecoveryAdmissionFrozenProcessV2,
     finalizer_handoff: RuntimeMutationFinalizerHandoffStateV1,
     process_generation: NonZeroU64,
+}
+
+pub(crate) struct RuntimeProcessBoundProductionHandoffProcessV2 {
+    discord: RuntimeDiscordProcessSupervisorV2,
+    foundation: RuntimeProcessFoundationV1,
+    lifecycle: RuntimeClosedRecoveryProcessFrozenProcessV2,
+    finalizer_generation: automation_runtime_worker::RuntimeMutationFinalizerGenerationV1,
+    process_generation: NonZeroU64,
+}
+
+pub(crate) struct RuntimeRecoveryResumeProcessV2 {
+    discord: RuntimeDiscordProcessSupervisorV2,
+    foundation: RuntimeProcessFoundationV1,
+    lifecycle: RuntimeClosedRecoveryProductionHandoffProcessV2,
+    process_generation: NonZeroU64,
+}
+
+pub(crate) struct RuntimeAdmissionAcknowledgingProcessV2 {
+    discord: RuntimeDiscordProcessSupervisorV2,
+    foundation: RuntimeProcessFoundationV1,
+    lifecycle: RuntimeClosedRecoveryAdmissionAcknowledgingProcessV2,
+    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    process_generation: NonZeroU64,
+}
+
+pub(crate) struct RuntimeEmptyOpenProcessV2 {
+    discord: RuntimeDiscordProcessSupervisorV2,
+    foundation: RuntimeProcessFoundationV1,
+    lifecycle: RuntimeClosedRecoverySupervisedEmptyOpenProcessV2,
+    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    readiness: crate::health::RuntimeHealthReadinessPublisherV2,
+    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    acknowledgement_schedule: RuntimeIngressAcknowledgementScheduleV2,
+    process_generation: NonZeroU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeIngressAcknowledgementScheduleV2 {
+    refresh_at: Instant,
+    safety_deadline: Instant,
 }
 
 enum RuntimeTransferredDiscordSupervisorV2 {
@@ -826,6 +907,1505 @@ impl RuntimePausedProductionHandoffProcessV2 {
         )
         .await
     }
+
+    pub(crate) async fn into_process_bound_handoff_v2(
+        mut self,
+    ) -> Result<RuntimeProcessBoundProductionHandoffProcessV2, RuntimeProcessProductionHandoffErrorV2>
+    {
+        if let Err(transition) = self.revalidate_paused_v2() {
+            let cleanup = self.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(transition, cleanup));
+        }
+        let activation_deadline = self.foundation.startup_budget.operation_cutoff();
+        let finalizer_generation = match self
+            .foundation
+            .activate_process_finalizer_until_v2(activation_deadline)
+            .await
+        {
+            Ok(generation) => generation,
+            Err(error) => {
+                let transition = map_finalizer_activation_failure_v2(error);
+                let cleanup = self.shutdown().await;
+                return Err(finish_production_handoff_transition_v2(transition, cleanup));
+            }
+        };
+        if !self.foundation.enter_process_cleanup_mode_v2() {
+            let cleanup = self.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(
+                RuntimeProcessProductionHandoffFailureV2::ProcessCleanupMode,
+                cleanup,
+            ));
+        }
+        if production_handoff_shutdown_failure_v2(&self.foundation.shutdown_observer_v1()).is_some()
+        {
+            let cleanup = self.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(
+                RuntimeProcessProductionHandoffFailureV2::ProcessShutdown,
+                cleanup,
+            ));
+        }
+        if let Err(error) = self
+            .lifecycle
+            .activate_process_owner_in_place_v2(self.process_generation)
+            .await
+        {
+            let transition = map_fixed_point_handoff_failure_v2(error);
+            let cleanup = self.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(transition, cleanup));
+        }
+        let Self {
+            discord,
+            foundation,
+            lifecycle,
+            finalizer_handoff,
+            process_generation,
+        } = self;
+        let _ = finalizer_handoff;
+        let lifecycle = match lifecycle.try_into_process_frozen_v2() {
+            Ok(lifecycle) => lifecycle,
+            Err(lifecycle) => {
+                let cleanup = shutdown_transferred_production_handoff_v2(
+                    foundation,
+                    RuntimeTransferredDiscordSupervisorV2::Process(discord),
+                    *lifecycle,
+                    process_generation,
+                )
+                .await;
+                return Err(finish_production_handoff_transition_v2(
+                    RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+                    cleanup,
+                ));
+            }
+        };
+        let process = RuntimeProcessBoundProductionHandoffProcessV2 {
+            discord,
+            foundation,
+            lifecycle,
+            finalizer_generation,
+            process_generation,
+        };
+        if let Err(transition) = process.revalidate_paused_v2() {
+            let cleanup = process.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(transition, cleanup));
+        }
+        Ok(process)
+    }
+}
+
+impl RuntimeProcessBoundProductionHandoffProcessV2 {
+    pub(crate) fn revalidate_paused_v2(
+        &self,
+    ) -> Result<(), RuntimeProcessProductionHandoffFailureV2> {
+        if self.discord.terminal_status_v2().is_some() || self.discord.is_finished_v2() {
+            return Err(RuntimeProcessProductionHandoffFailureV2::DiscordIndeterminate);
+        }
+        let finalizer_health = self
+            .foundation
+            .process_finalizer_health_v2()
+            .ok_or(RuntimeProcessProductionHandoffFailureV2::FinalizerUnavailable)?;
+        if !finalizer_health.is_ready() {
+            return Err(RuntimeProcessProductionHandoffFailureV2::FinalizerTerminal);
+        }
+        if self.lifecycle.process_generation_v2() != self.process_generation {
+            return Err(RuntimeProcessProductionHandoffFailureV2::Owner);
+        }
+        self.lifecycle
+            .revalidate_paused_v2()
+            .map_err(map_fixed_point_handoff_failure_v2)?;
+        production_handoff_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+            .map_or(Ok(()), Err)
+    }
+
+    pub(crate) async fn shutdown(self) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+        shutdown_process_bound_production_handoff_v2(
+            self.foundation,
+            self.discord,
+            self.lifecycle,
+            self.process_generation,
+        )
+        .await
+    }
+
+    pub(crate) async fn into_recovery_resume_v2(
+        self,
+    ) -> Result<RuntimeRecoveryResumeProcessV2, RuntimeProcessProductionHandoffErrorV2> {
+        if let Err(transition) = self.revalidate_paused_v2() {
+            let cleanup = self.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(transition, cleanup));
+        }
+        let Self {
+            discord,
+            foundation,
+            lifecycle,
+            finalizer_generation,
+            process_generation,
+        } = self;
+        let lifecycle = match lifecycle
+            .into_production_handoff_v2(finalizer_generation)
+            .await
+        {
+            Ok(lifecycle) => lifecycle,
+            Err(failure) => {
+                let transition = map_worker_production_handoff_failure_v2(failure.error_v2());
+                let cleanup = shutdown_process_bound_production_handoff_v2(
+                    foundation,
+                    discord,
+                    failure.into_state_v2(),
+                    process_generation,
+                )
+                .await;
+                return Err(finish_production_handoff_transition_v2(transition, cleanup));
+            }
+        };
+        let process = RuntimeRecoveryResumeProcessV2 {
+            discord,
+            foundation,
+            lifecycle,
+            process_generation,
+        };
+        if let Err(transition) = process.revalidate_paused_v2() {
+            let cleanup = process.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(transition, cleanup));
+        }
+        Ok(process)
+    }
+}
+
+impl RuntimeRecoveryResumeProcessV2 {
+    pub(crate) fn revalidate_paused_v2(
+        &self,
+    ) -> Result<(), RuntimeProcessProductionHandoffFailureV2> {
+        if self.discord.terminal_status_v2().is_some() || self.discord.is_finished_v2() {
+            return Err(RuntimeProcessProductionHandoffFailureV2::DiscordIndeterminate);
+        }
+        if !self
+            .foundation
+            .process_finalizer_health_v2()
+            .is_some_and(|health| health.is_ready())
+        {
+            return Err(RuntimeProcessProductionHandoffFailureV2::FinalizerTerminal);
+        }
+        self.lifecycle
+            .revalidate_paused_v2()
+            .map_err(map_worker_production_handoff_failure_v2)?;
+        production_handoff_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+            .map_or(Ok(()), Err)
+    }
+
+    pub(crate) async fn shutdown(self) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+        shutdown_recovery_resume_process_v2(
+            self.foundation,
+            self.discord,
+            self.lifecycle,
+            self.process_generation,
+        )
+        .await
+    }
+
+    pub(crate) async fn resume_recovery_v2(
+        mut self,
+    ) -> Result<RuntimeAdmissionAcknowledgingProcessV2, RuntimeProcessProductionHandoffErrorV2>
+    {
+        if let Err(transition) = self.revalidate_paused_v2() {
+            let cleanup = self.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(transition, cleanup));
+        }
+        let pre_gate = self
+            .foundation
+            .maintenance_ingress_observer_v2()
+            .snapshot_v2();
+        if !maintenance_gate_is_closed_v2(pre_gate) {
+            let cleanup = self.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(
+                RuntimeProcessProductionHandoffFailureV2::MaintenanceGate,
+                cleanup,
+            ));
+        }
+        let pre_database =
+            match collect_recovery_resume_database_evidence_v2(&self.foundation).await {
+                Ok(evidence) => evidence,
+                Err(transition) => {
+                    let cleanup = self.shutdown().await;
+                    return Err(finish_production_handoff_transition_v2(transition, cleanup));
+                }
+            };
+        if production_handoff_shutdown_failure_v2(&self.foundation.shutdown_observer_v1()).is_some()
+        {
+            let cleanup = self.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(
+                RuntimeProcessProductionHandoffFailureV2::ProcessShutdown,
+                cleanup,
+            ));
+        }
+        let coordinator_generation = self.lifecycle.coordinator_generation_v2();
+        let pause = match self.lifecycle.observe_exact_pause_reservation_v2() {
+            Ok(pause) => pause,
+            Err(_) => {
+                let cleanup = self.shutdown().await;
+                return Err(finish_production_handoff_transition_v2(
+                    RuntimeProcessProductionHandoffFailureV2::Gateway,
+                    cleanup,
+                ));
+            }
+        };
+        let owner_receipt = self
+            .lifecycle
+            .recovery_resume_permit_v2()
+            .owner_receipt()
+            .clone();
+        let resume_deadline = Instant::now() + Duration::from_secs(2);
+        let evidence = match self
+            .discord
+            .resume_reserved_admission_in_place_v2(coordinator_generation, pause, resume_deadline)
+            .await
+        {
+            RuntimeDiscordRecoveryResumeAttemptV2::Applied(evidence) => evidence,
+            RuntimeDiscordRecoveryResumeAttemptV2::DefinitelyNotApplied(_) => {
+                let cleanup = self.shutdown().await;
+                return Err(finish_production_handoff_transition_v2(
+                    RuntimeProcessProductionHandoffFailureV2::DiscordNotApplied,
+                    cleanup,
+                ));
+            }
+            RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(_) => {
+                let cleanup = self.shutdown().await;
+                return Err(finish_production_handoff_transition_v2(
+                    RuntimeProcessProductionHandoffFailureV2::DiscordIndeterminate,
+                    cleanup,
+                ));
+            }
+        };
+        if evidence.coordinator_generation_v2() != coordinator_generation
+            || evidence.expected_v2() != pause
+        {
+            let cleanup = self.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(
+                RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+                cleanup,
+            ));
+        }
+        let gateway_ready = match self.lifecycle.observe_exact_resumed_ready_attestation_v2() {
+            Ok(ready) => ready,
+            Err(_) => {
+                let cleanup = self.shutdown().await;
+                return Err(finish_production_handoff_transition_v2(
+                    RuntimeProcessProductionHandoffFailureV2::Gateway,
+                    cleanup,
+                ));
+            }
+        };
+        let post_database =
+            match collect_recovery_resume_database_evidence_v2(&self.foundation).await {
+                Ok(evidence) => evidence,
+                Err(transition) => {
+                    let cleanup = self.shutdown().await;
+                    return Err(finish_production_handoff_transition_v2(transition, cleanup));
+                }
+            };
+        let post_gate = self
+            .foundation
+            .maintenance_ingress_observer_v2()
+            .snapshot_v2();
+        if post_gate != pre_gate
+            || !maintenance_gate_is_closed_v2(post_gate)
+            || post_database.writer_fence_generation != pre_database.writer_fence_generation
+            || !self
+                .foundation
+                .process_finalizer_health_v2()
+                .is_some_and(|health| health.is_ready())
+            || production_handoff_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+                .is_some()
+        {
+            let cleanup = self.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(
+                RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+                cleanup,
+            ));
+        }
+        let observation = RuntimeClosedRecoveryResumeObservationV2 {
+            owner_receipt,
+            readiness: post_database.readiness,
+            gateway_ready,
+            writer_fence_generation: post_database.writer_fence_generation,
+            maintenance_gate_generation: post_gate.generation(),
+        };
+        let Self {
+            discord,
+            mut foundation,
+            lifecycle,
+            process_generation,
+        } = self;
+        let lifecycle = match lifecycle.into_admission_acknowledging_v2(observation).await {
+            Ok(lifecycle) => lifecycle,
+            Err(failure) => {
+                let transition = map_worker_production_handoff_failure_v2(failure.error_v2());
+                let cleanup = shutdown_recovery_resume_process_v2(
+                    foundation,
+                    discord,
+                    failure.into_state_v2(),
+                    process_generation,
+                )
+                .await;
+                return Err(finish_production_handoff_transition_v2(transition, cleanup));
+            }
+        };
+        let Some(ingress_acknowledgement) = foundation.take_ingress_acknowledgement_supervisor_v2()
+        else {
+            let cleanup = shutdown_admission_acknowledging_process_without_lane_v2(
+                foundation,
+                discord,
+                lifecycle,
+                process_generation,
+            )
+            .await;
+            return Err(finish_production_handoff_transition_v2(
+                RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+                cleanup,
+            ));
+        };
+        let process = RuntimeAdmissionAcknowledgingProcessV2 {
+            discord,
+            foundation,
+            lifecycle,
+            ingress_acknowledgement,
+            process_generation,
+        };
+        if let Err(transition) = process.revalidate_v2() {
+            let cleanup = process.shutdown().await;
+            return Err(finish_production_handoff_transition_v2(transition, cleanup));
+        }
+        Ok(process)
+    }
+}
+
+struct RuntimeRecoveryResumeDatabaseEvidenceV2 {
+    readiness: automation_runtime_worker::RuntimeCapabilityReadinessSetV2,
+    writer_fence_generation: automation_runtime_controller::RuntimeWriterFenceGenerationV1,
+}
+
+async fn collect_recovery_resume_database_evidence_v2(
+    foundation: &RuntimeProcessFoundationV1,
+) -> Result<RuntimeRecoveryResumeDatabaseEvidenceV2, RuntimeProcessProductionHandoffFailureV2> {
+    let cutoff = Instant::now() + Duration::from_secs(5);
+    let readiness = foundation
+        .databases
+        .verify_readiness_refresh_until_v2(cutoff)
+        .await
+        .map_err(|_| RuntimeProcessProductionHandoffFailureV2::Database)?
+        .into_exact_capability_receipts();
+    let writer = foundation
+        .databases
+        .execution()
+        .observe_writer_fence(RuntimeObserveWriterFenceV1)
+        .await
+        .map_err(|_| RuntimeProcessProductionHandoffFailureV2::Database)?;
+    let RuntimeWriterFenceObservationV1::Open { generation, .. } = writer else {
+        return Err(RuntimeProcessProductionHandoffFailureV2::Database);
+    };
+    Ok(RuntimeRecoveryResumeDatabaseEvidenceV2 {
+        readiness,
+        writer_fence_generation: generation,
+    })
+}
+
+fn maintenance_gate_is_closed_v2(snapshot: RuntimeMaintenanceIngressGateSnapshotV2) -> bool {
+    snapshot.stage() == RuntimeMaintenanceIngressGateStageV2::Closed
+        && snapshot.active_permit_count() == 0
+        && !snapshot.shutdown_sealed()
+        && snapshot.terminal_error().is_none()
+}
+
+impl RuntimeAdmissionAcknowledgingProcessV2 {
+    pub(crate) fn revalidate_v2(&self) -> Result<(), RuntimeProcessProductionHandoffFailureV2> {
+        if self.discord.terminal_status_v2().is_some() || self.discord.is_finished_v2() {
+            return Err(RuntimeProcessProductionHandoffFailureV2::DiscordIndeterminate);
+        }
+        if self.lifecycle.process_generation_v2() != self.process_generation {
+            return Err(RuntimeProcessProductionHandoffFailureV2::Owner);
+        }
+        if !self
+            .foundation
+            .process_finalizer_health_v2()
+            .is_some_and(|health| health.is_ready())
+        {
+            return Err(RuntimeProcessProductionHandoffFailureV2::FinalizerTerminal);
+        }
+        self.lifecycle
+            .revalidate_v2()
+            .map_err(map_worker_production_handoff_failure_v2)?;
+        production_handoff_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+            .map_or(Ok(()), Err)
+    }
+
+    pub(crate) async fn shutdown(self) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+        shutdown_admission_acknowledging_process_v2(
+            self.foundation,
+            self.discord,
+            self.lifecycle,
+            self.ingress_acknowledgement,
+            self.process_generation,
+        )
+        .await
+    }
+
+    pub(crate) async fn enter_empty_open_v2(
+        mut self,
+    ) -> Result<RuntimeEmptyOpenProcessV2, RuntimeProcessProductionHandoffErrorV2> {
+        if let Err(transition) = self.revalidate_v2() {
+            return Err(self.cleanup_transition_v2(transition).await);
+        }
+        let Some(readiness) = self.foundation.take_readiness_publisher_v2() else {
+            return Err(self
+                .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation)
+                .await);
+        };
+        let Some(controller) = self.foundation.maintenance_ingress_controller_v2() else {
+            return Err(self
+                .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::MaintenanceGate)
+                .await);
+        };
+        let opening = match controller.begin_open_v2() {
+            Ok(opening) => opening,
+            Err(failure) => {
+                drop(failure.into_state());
+                return Err(self
+                    .cleanup_transition_v2(
+                        RuntimeProcessProductionHandoffFailureV2::MaintenanceGate,
+                    )
+                    .await);
+            }
+        };
+        let maintenance_ingress = match opening.commit_open_v2() {
+            Ok(open) => open,
+            Err(failure) => {
+                drop(failure.into_state());
+                return Err(self
+                    .cleanup_transition_v2(
+                        RuntimeProcessProductionHandoffFailureV2::MaintenanceGate,
+                    )
+                    .await);
+            }
+        };
+        let open_generation = maintenance_ingress.generation();
+        let predecessor_authorization = self
+            .lifecycle
+            .authorize_ingress_acknowledgement_predecessor_observation_v2();
+        let predecessor_observation = match self
+            .foundation
+            .databases
+            .execution()
+            .observe_ingress_open_acknowledgement_predecessor(&predecessor_authorization)
+            .await
+        {
+            Ok(observation) => observation,
+            Err(_) => {
+                drop(maintenance_ingress);
+                return Err(self
+                    .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Database)
+                    .await);
+            }
+        };
+        let predecessor = match predecessor_authorization.accept(predecessor_observation) {
+            Ok(predecessor) => predecessor,
+            Err(_) => {
+                drop(maintenance_ingress);
+                return Err(self
+                    .cleanup_transition_v2(
+                        RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+                    )
+                    .await);
+            }
+        };
+        let lease_for = RuntimeIngressOpenAcknowledgementLeaseDurationV2::from_duration(
+            INGRESS_ACKNOWLEDGEMENT_LEASE_V2,
+        )
+        .expect("bounded ingress acknowledgement lease");
+        let Self {
+            discord,
+            foundation,
+            lifecycle,
+            mut ingress_acknowledgement,
+            process_generation,
+        } = self;
+        let authority = match lifecycle.into_ingress_acknowledgement_authority_v2(
+            open_generation,
+            predecessor,
+            lease_for,
+        ) {
+            Ok(authority) => authority,
+            Err(failure) => {
+                let transition =
+                    map_ingress_acknowledgement_authorization_failure_v2(failure.error_v2());
+                let process = Self {
+                    discord,
+                    foundation,
+                    lifecycle: failure.into_state_v2(),
+                    ingress_acknowledgement,
+                    process_generation,
+                };
+                drop(maintenance_ingress);
+                return Err(process.cleanup_transition_v2(transition).await);
+            }
+        };
+        let acknowledgement = execute_ingress_acknowledgement_v2(
+            &mut ingress_acknowledgement,
+            authority,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+        let (lifecycle, accepted) = match acknowledgement {
+            Ok(RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2::Admission {
+                lifecycle,
+                accepted,
+            }) => (*lifecycle, *accepted),
+            Ok(RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2::EmptyOpenRefresh {
+                lifecycle,
+                ..
+            }) => {
+                let cleanup = shutdown_orphaned_empty_open_process_v2(
+                    foundation,
+                    discord,
+                    *lifecycle,
+                    ingress_acknowledgement,
+                    maintenance_ingress,
+                    readiness,
+                    process_generation,
+                )
+                .await;
+                return Err(finish_production_handoff_transition_v2(
+                    RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+                    cleanup,
+                ));
+            }
+            Err(RuntimeProcessIngressAcknowledgementExecutionFailureV2::Retained {
+                authority,
+                transition,
+            }) => {
+                let retained = (*authority).into_retained_state_v2();
+                let RuntimeClosedRecoveryIngressAcknowledgementRetainedStateV2::Admission(
+                    lifecycle,
+                ) = retained
+                else {
+                    let cleanup = shutdown_orphaned_ingress_acknowledgement_v2(
+                        foundation,
+                        discord,
+                        retained,
+                        ingress_acknowledgement,
+                        maintenance_ingress,
+                        readiness,
+                        process_generation,
+                    )
+                    .await;
+                    return Err(finish_production_handoff_transition_v2(transition, cleanup));
+                };
+                let process = Self {
+                    discord,
+                    foundation,
+                    lifecycle: *lifecycle,
+                    ingress_acknowledgement,
+                    process_generation,
+                };
+                drop(maintenance_ingress);
+                return Err(process.cleanup_transition_v2(transition).await);
+            }
+            Err(RuntimeProcessIngressAcknowledgementExecutionFailureV2::AuthorityLost(
+                transition,
+            )) => {
+                drop(maintenance_ingress);
+                let cleanup = shutdown_process_without_lifecycle_v2(
+                    foundation,
+                    discord,
+                    ingress_acknowledgement,
+                    process_generation,
+                )
+                .await;
+                return Err(finish_production_handoff_transition_v2(transition, cleanup));
+            }
+        };
+        self = Self {
+            discord,
+            foundation,
+            lifecycle,
+            ingress_acknowledgement,
+            process_generation,
+        };
+        let acknowledgement_database_now = accepted.receipt().observed_database_now();
+        let acknowledged_owner = accepted.request().owner_receipt().clone();
+        let mut current_owner = match self.lifecycle.observe_current_owner_v2().await {
+            Ok(owner) => owner,
+            Err(_) => {
+                drop(maintenance_ingress);
+                return Err(self
+                    .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Owner)
+                    .await);
+            }
+        };
+        if current_owner.lease_id != acknowledged_owner.lease_id
+            || current_owner.owner_revision != acknowledged_owner.owner_revision
+            || current_owner.expires_at != acknowledged_owner.expires_at
+            || acknowledgement_database_now < current_owner.database_now
+            || acknowledgement_database_now >= current_owner.expires_at
+        {
+            drop(maintenance_ingress);
+            return Err(self
+                .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Owner)
+                .await);
+        }
+        current_owner.database_now = acknowledgement_database_now;
+        let database = match collect_recovery_resume_database_evidence_v2(&self.foundation).await {
+            Ok(database) => database,
+            Err(transition) => {
+                drop(maintenance_ingress);
+                return Err(self.cleanup_transition_v2(transition).await);
+            }
+        };
+        let gateway_ready = match self.lifecycle.observe_exact_current_ready_attestation_v2() {
+            Ok(ready) => ready,
+            Err(_) => {
+                drop(maintenance_ingress);
+                return Err(self
+                    .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Gateway)
+                    .await);
+            }
+        };
+        let registry_empty = match self.lifecycle.observe_registry_empty_v2() {
+            Ok(empty) => empty,
+            Err(_) => {
+                drop(maintenance_ingress);
+                return Err(self
+                    .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Registry)
+                    .await);
+            }
+        };
+        let gate = self
+            .foundation
+            .maintenance_ingress_observer_v2()
+            .snapshot_v2();
+        let finalizer_accepting = self
+            .foundation
+            .process_finalizer_health_v2()
+            .is_some_and(|health| health.is_ready());
+        if !maintenance_gate_is_open_v2(gate, open_generation)
+            || !finalizer_accepting
+            || self.discord.terminal_status_v2().is_some()
+            || self.discord.is_finished_v2()
+            || production_handoff_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+                .is_some()
+        {
+            drop(maintenance_ingress);
+            return Err(self
+                .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation)
+                .await);
+        }
+        let final_acknowledgement = match exact_reobserve_ingress_acknowledgement_v2(
+            self.foundation.databases.execution(),
+            self.lifecycle
+                .authorize_ingress_acknowledgement_predecessor_observation_v2(),
+            accepted.receipt(),
+        )
+        .await
+        {
+            Ok(database_now) => database_now,
+            Err(transition) => {
+                drop(maintenance_ingress);
+                return Err(self.cleanup_transition_v2(transition).await);
+            }
+        };
+        let final_acknowledgement_database_now = final_acknowledgement.observed_database_now();
+        if final_acknowledgement_database_now < current_owner.database_now
+            || final_acknowledgement_database_now >= current_owner.expires_at
+        {
+            drop(maintenance_ingress);
+            return Err(self
+                .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Owner)
+                .await);
+        }
+        current_owner.database_now = final_acknowledgement_database_now;
+        let acknowledged_owner_revision = current_owner.owner_revision;
+        let acknowledgement_schedule =
+            match ingress_acknowledgement_schedule_v2(&final_acknowledgement) {
+                Some(schedule) => schedule,
+                None => {
+                    drop(maintenance_ingress);
+                    return Err(self
+                        .cleanup_transition_v2(
+                            RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+                        )
+                        .await);
+                }
+            };
+        let finalizer_generation = self.lifecycle.finalizer_generation_v2();
+        let observation = RuntimeOpenProductionObservationInputV2 {
+            coordinator_generation: self.lifecycle.coordinator_generation_v2(),
+            writer_fence_generation: database.writer_fence_generation,
+            writer_fence_open: true,
+            maintenance_gate_generation: gate.generation(),
+            maintenance_gate_open: true,
+            owner_receipt: current_owner,
+            readiness: database.readiness,
+            gateway_ready,
+            registry_empty,
+            finalizer_generation,
+            finalizer_accepting,
+            supervisors_running: true,
+            observed_database_now: final_acknowledgement_database_now,
+            ingress_acknowledgement:
+                automation_runtime_worker::RuntimeIngressOpenAcknowledgementObservationV2::from_accepted(
+                    accepted,
+                ),
+        };
+        let mut lifecycle_slot = Some(self.lifecycle);
+        let lifecycle_transition = maintenance_ingress.linearize_open_transition_v2(|| {
+            lifecycle_slot
+                .take()
+                .expect("admission acknowledgement lifecycle")
+                .into_empty_open_v2(observation)
+        });
+        let lifecycle = match lifecycle_transition {
+            Ok(Ok(lifecycle)) => lifecycle,
+            Ok(Err(failure)) => {
+                let transition = map_worker_production_handoff_failure_v2(failure.error_v2());
+                let process = Self {
+                    discord: self.discord,
+                    foundation: self.foundation,
+                    lifecycle: failure.into_state_v2(),
+                    ingress_acknowledgement: self.ingress_acknowledgement,
+                    process_generation: self.process_generation,
+                };
+                drop(maintenance_ingress);
+                return Err(process.cleanup_transition_v2(transition).await);
+            }
+            Err(_) => {
+                let process = Self {
+                    discord: self.discord,
+                    foundation: self.foundation,
+                    lifecycle: lifecycle_slot
+                        .take()
+                        .expect("rejected admission acknowledgement lifecycle"),
+                    ingress_acknowledgement: self.ingress_acknowledgement,
+                    process_generation: self.process_generation,
+                };
+                drop(maintenance_ingress);
+                return Err(process
+                    .cleanup_transition_v2(
+                        RuntimeProcessProductionHandoffFailureV2::ProcessShutdown,
+                    )
+                    .await);
+            }
+        };
+        let lifecycle = match lifecycle.start_production_owner_v2().await {
+            Ok(lifecycle) => lifecycle,
+            Err(failure) => {
+                let transition = match failure.error_v2() {
+                    crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerProcessRenewalStartErrorV2::OwnerReceiptMismatch => RuntimeProcessProductionHandoffFailureV2::Owner,
+                    crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProcessGenerationMismatch
+                    | crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProtocolViolation
+                    | crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerProcessRenewalStartErrorV2::SupervisorUnavailable => RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+                };
+                let cleanup = shutdown_frozen_empty_open_process_v2(
+                    self.foundation,
+                    self.discord,
+                    failure.into_state_v2(),
+                    maintenance_ingress,
+                    readiness,
+                    self.ingress_acknowledgement,
+                    self.process_generation,
+                )
+                .await;
+                return Err(finish_production_handoff_transition_v2(transition, cleanup));
+            }
+        };
+        let successor = match lifecycle
+            .wait_for_owner_successor_v2(
+                acknowledged_owner_revision,
+                acknowledgement_schedule.safety_deadline,
+            )
+            .await
+        {
+            Ok(successor) => successor,
+            Err(_) => {
+                let process = RuntimeEmptyOpenProcessV2 {
+                    discord: self.discord,
+                    foundation: self.foundation,
+                    lifecycle,
+                    maintenance_ingress,
+                    readiness,
+                    ingress_acknowledgement: self.ingress_acknowledgement,
+                    acknowledgement_schedule,
+                    process_generation: self.process_generation,
+                };
+                return Err(process
+                    .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Owner)
+                    .await);
+            }
+        };
+        let process = RuntimeEmptyOpenProcessV2 {
+            discord: self.discord,
+            foundation: self.foundation,
+            lifecycle,
+            maintenance_ingress,
+            readiness,
+            ingress_acknowledgement: self.ingress_acknowledgement,
+            acknowledgement_schedule,
+            process_generation: self.process_generation,
+        };
+        let process = process
+            .refresh_acknowledgement_with_owner_v2(successor.receipt().clone())
+            .await?;
+        if !process.readiness.publish_ready_v2() {
+            return Err(process
+                .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::ProcessShutdown)
+                .await);
+        }
+        Ok(process)
+    }
+
+    async fn cleanup_transition_v2(
+        self,
+        transition: RuntimeProcessProductionHandoffFailureV2,
+    ) -> RuntimeProcessProductionHandoffErrorV2 {
+        let cleanup = self.shutdown().await;
+        finish_production_handoff_transition_v2(transition, cleanup)
+    }
+}
+
+enum RuntimeProcessIngressAcknowledgementExecutionFailureV2 {
+    Retained {
+        authority: Box<RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2>,
+        transition: RuntimeProcessProductionHandoffFailureV2,
+    },
+    AuthorityLost(RuntimeProcessProductionHandoffFailureV2),
+}
+
+async fn execute_ingress_acknowledgement_v2(
+    supervisor: &mut RuntimeProcessIngressAcknowledgementSupervisorV2,
+    authority: RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2,
+    deadline: Instant,
+) -> Result<
+    RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2,
+    RuntimeProcessIngressAcknowledgementExecutionFailureV2,
+> {
+    let job = RuntimeWorkerIngressAcknowledgementJobV2::new(authority);
+    let waiter = match supervisor.try_submit(job, deadline) {
+        Ok(waiter) => waiter,
+        Err(rejection) => {
+            let transition =
+                map_ingress_acknowledgement_registration_rejection_v2(rejection.reason());
+            return Err(
+                RuntimeProcessIngressAcknowledgementExecutionFailureV2::Retained {
+                    authority: Box::new(rejection.into_job().into_authority()),
+                    transition,
+                },
+            );
+        }
+    };
+    waiter.cancel_v2();
+    let Some(completion) = supervisor.recv_completion().await else {
+        return Err(
+            RuntimeProcessIngressAcknowledgementExecutionFailureV2::AuthorityLost(
+                RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+            ),
+        );
+    };
+    match completion.into_result() {
+        RuntimeIngressAcknowledgementExecutionResultV2::Accepted(outcome) => Ok(outcome),
+        RuntimeIngressAcknowledgementExecutionResultV2::CompletionRejected { job, error } => {
+            let transition = match error {
+                crate::closed_recovery::RuntimeClosedRecoveryIngressAcknowledgementCompletionErrorV2::EmptyOpenRefresh(
+                    lifecycle,
+                ) => map_production_lifecycle_failure_v2(lifecycle),
+            };
+            Err(
+                RuntimeProcessIngressAcknowledgementExecutionFailureV2::Retained {
+                    authority: Box::new(job.into_authority()),
+                    transition,
+                },
+            )
+        }
+        RuntimeIngressAcknowledgementExecutionResultV2::FailedClosed { job, failure } => Err(
+            RuntimeProcessIngressAcknowledgementExecutionFailureV2::Retained {
+                authority: Box::new(job.into_authority()),
+                transition: map_ingress_acknowledgement_failure_v2(failure),
+            },
+        ),
+    }
+}
+
+fn map_ingress_acknowledgement_registration_rejection_v2(
+    rejection: RuntimeIngressAcknowledgementRegistrationRejectionReasonV2,
+) -> RuntimeProcessProductionHandoffFailureV2 {
+    match rejection {
+        RuntimeIngressAcknowledgementRegistrationRejectionReasonV2::DeadlineElapsed => {
+            RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed
+        }
+        RuntimeIngressAcknowledgementRegistrationRejectionReasonV2::IntakeSealed
+        | RuntimeIngressAcknowledgementRegistrationRejectionReasonV2::SupervisorTerminal(_) => {
+            RuntimeProcessProductionHandoffFailureV2::ProcessShutdown
+        }
+        RuntimeIngressAcknowledgementRegistrationRejectionReasonV2::Busy
+        | RuntimeIngressAcknowledgementRegistrationRejectionReasonV2::SequenceExhausted => {
+            RuntimeProcessProductionHandoffFailureV2::ProtocolViolation
+        }
+    }
+}
+
+fn map_ingress_acknowledgement_failure_v2(
+    failure: RuntimeIngressAcknowledgementFailureV2,
+) -> RuntimeProcessProductionHandoffFailureV2 {
+    match failure {
+        RuntimeIngressAcknowledgementFailureV2::OperationDeadlineElapsed => {
+            RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed
+        }
+        RuntimeIngressAcknowledgementFailureV2::Shutdown => {
+            RuntimeProcessProductionHandoffFailureV2::ProcessShutdown
+        }
+        RuntimeIngressAcknowledgementFailureV2::ObservationAuthorityLost
+        | RuntimeIngressAcknowledgementFailureV2::Stale
+        | RuntimeIngressAcknowledgementFailureV2::Divergent => {
+            RuntimeProcessProductionHandoffFailureV2::Database
+        }
+        RuntimeIngressAcknowledgementFailureV2::AttemptUnavailable
+        | RuntimeIngressAcknowledgementFailureV2::ObservationProtocolViolation
+        | RuntimeIngressAcknowledgementFailureV2::ReplayBudgetExhausted
+        | RuntimeIngressAcknowledgementFailureV2::SecondUncertainty
+        | RuntimeIngressAcknowledgementFailureV2::ResolutionProtocolViolation => {
+            RuntimeProcessProductionHandoffFailureV2::ProtocolViolation
+        }
+    }
+}
+
+fn map_ingress_acknowledgement_authorization_failure_v2(
+    error: automation_runtime_worker::RuntimeIngressOpenAcknowledgementAuthorizationErrorV2,
+) -> RuntimeProcessProductionHandoffFailureV2 {
+    match error {
+        automation_runtime_worker::RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::OpenGateMismatch
+        | automation_runtime_worker::RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::PreviousAcknowledgementMismatch
+        | automation_runtime_worker::RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::PredecessorObservationMismatch
+        | automation_runtime_worker::RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::InvalidRequest => {
+            RuntimeProcessProductionHandoffFailureV2::ProtocolViolation
+        }
+    }
+}
+
+fn map_production_lifecycle_failure_v2(
+    error: automation_runtime_worker::RuntimeProductionLifecycleErrorV2,
+) -> RuntimeProcessProductionHandoffFailureV2 {
+    use automation_runtime_worker::RuntimeProductionLifecycleErrorV2;
+
+    match error {
+        RuntimeProductionLifecycleErrorV2::StaleConnectionEpoch
+        | RuntimeProductionLifecycleErrorV2::StaleAdmissionRevision
+        | RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch
+        | RuntimeProductionLifecycleErrorV2::ExplicitResumeMissing
+        | RuntimeProductionLifecycleErrorV2::StaleGeneration => {
+            RuntimeProcessProductionHandoffFailureV2::Gateway
+        }
+        RuntimeProductionLifecycleErrorV2::RegistryMismatch => {
+            RuntimeProcessProductionHandoffFailureV2::Registry
+        }
+        RuntimeProductionLifecycleErrorV2::OwnerMismatch => {
+            RuntimeProcessProductionHandoffFailureV2::Owner
+        }
+        RuntimeProductionLifecycleErrorV2::ReadinessMismatch
+        | RuntimeProductionLifecycleErrorV2::WriterFenceMismatch
+        | RuntimeProductionLifecycleErrorV2::IngressAcknowledgementNotCurrent => {
+            RuntimeProcessProductionHandoffFailureV2::Database
+        }
+        RuntimeProductionLifecycleErrorV2::FinalizerGenerationMismatch => {
+            RuntimeProcessProductionHandoffFailureV2::FinalizerTerminal
+        }
+        RuntimeProductionLifecycleErrorV2::FixedPoint(_)
+        | RuntimeProductionLifecycleErrorV2::HandoffEvidenceMismatch
+        | RuntimeProductionLifecycleErrorV2::StartupIntakeNotSealed
+        | RuntimeProductionLifecycleErrorV2::StartupJobsUnsettled
+        | RuntimeProductionLifecycleErrorV2::SupervisorsNotReady
+        | RuntimeProductionLifecycleErrorV2::ResumePermitMismatch
+        | RuntimeProductionLifecycleErrorV2::MaintenanceGateMismatch
+        | RuntimeProductionLifecycleErrorV2::IngressAcknowledgementMismatch
+        | RuntimeProductionLifecycleErrorV2::SequenceOutOfRange
+        | RuntimeProductionLifecycleErrorV2::GenerationOverflow => {
+            RuntimeProcessProductionHandoffFailureV2::ProtocolViolation
+        }
+    }
+}
+
+async fn exact_reobserve_ingress_acknowledgement_v2<P>(
+    port: &P,
+    authorization:
+        automation_runtime_worker::RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
+    expected: &automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2,
+) -> Result<
+    automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2,
+    RuntimeProcessProductionHandoffFailureV2,
+>
+where
+    P: RuntimeIngressOpenAcknowledgementPortV2,
+{
+    let observation = port
+        .observe_ingress_open_acknowledgement_predecessor(&authorization)
+        .await
+        .map_err(|_| RuntimeProcessProductionHandoffFailureV2::Database)?;
+    let predecessor = authorization
+        .accept(observation)
+        .map_err(|_| RuntimeProcessProductionHandoffFailureV2::ProtocolViolation)?;
+    let current = predecessor
+        .present_receipt()
+        .ok_or(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation)?;
+    if current.source_acknowledgement_revision() != expected.source_acknowledgement_revision()
+        || current.request_digest() != expected.request_digest()
+        || current.acknowledgement() != expected.acknowledgement()
+        || current.observed_database_now() < expected.observed_database_now()
+        || current.observed_database_now() >= current.acknowledgement().expires_at()
+    {
+        return Err(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation);
+    }
+    Ok(current.clone())
+}
+
+fn ingress_acknowledgement_schedule_v2(
+    receipt: &automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2,
+) -> Option<RuntimeIngressAcknowledgementScheduleV2> {
+    let remaining = receipt
+        .acknowledgement()
+        .expires_at()
+        .signed_duration_since(receipt.observed_database_now())
+        .to_std()
+        .ok()?;
+    let safety_remaining = remaining.checked_sub(INGRESS_ACKNOWLEDGEMENT_SAFETY_MARGIN_V2)?;
+    if safety_remaining.is_zero() {
+        return None;
+    }
+    let now = Instant::now();
+    let safety_deadline = now.checked_add(safety_remaining)?;
+    let refresh_remaining = remaining
+        .checked_sub(INGRESS_ACKNOWLEDGEMENT_REFRESH_ADVANCE_V2)
+        .unwrap_or(Duration::ZERO)
+        .min(safety_remaining);
+    let refresh_at = now.checked_add(refresh_remaining)?;
+    Some(RuntimeIngressAcknowledgementScheduleV2 {
+        refresh_at,
+        safety_deadline,
+    })
+}
+
+fn maintenance_gate_is_open_v2(
+    snapshot: RuntimeMaintenanceIngressGateSnapshotV2,
+    expected_generation: automation_runtime_worker::RuntimeMaintenanceGateGenerationV2,
+) -> bool {
+    snapshot.generation() == expected_generation
+        && snapshot.stage() == RuntimeMaintenanceIngressGateStageV2::Open
+        && snapshot.active_permit_count() == 0
+        && !snapshot.shutdown_sealed()
+        && snapshot.terminal_error().is_none()
+}
+
+impl RuntimeEmptyOpenProcessV2 {
+    pub(crate) fn revalidate_v2(&self) -> Result<(), RuntimeProcessProductionHandoffFailureV2> {
+        if self.discord.terminal_status_v2().is_some() || self.discord.is_finished_v2() {
+            return Err(RuntimeProcessProductionHandoffFailureV2::DiscordIndeterminate);
+        }
+        if self.lifecycle.process_generation_v2() != self.process_generation {
+            return Err(RuntimeProcessProductionHandoffFailureV2::Owner);
+        }
+        if !self
+            .foundation
+            .process_finalizer_health_v2()
+            .is_some_and(|health| health.is_ready())
+        {
+            return Err(RuntimeProcessProductionHandoffFailureV2::FinalizerTerminal);
+        }
+        let gate = self
+            .foundation
+            .maintenance_ingress_observer_v2()
+            .snapshot_v2();
+        if !maintenance_gate_is_open_v2(gate, self.maintenance_ingress.generation()) {
+            return Err(RuntimeProcessProductionHandoffFailureV2::MaintenanceGate);
+        }
+        self.lifecycle
+            .revalidate_v2()
+            .map_err(map_worker_production_handoff_failure_v2)?;
+        production_handoff_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+            .map_or(Ok(()), Err)
+    }
+
+    async fn refresh_acknowledgement_with_owner_v2(
+        self,
+        owner_receipt: automation_runtime_controller::RuntimeGatewayOwnerLeaseReceiptV1,
+    ) -> Result<Self, RuntimeProcessProductionHandoffErrorV2> {
+        if Instant::now() >= self.acknowledgement_schedule.safety_deadline {
+            return Err(self
+                .cleanup_transition_v2(
+                    RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed,
+                )
+                .await);
+        }
+        if let Err(transition) = self.revalidate_v2() {
+            return Err(self.cleanup_transition_v2(transition).await);
+        }
+        let database = match collect_recovery_resume_database_evidence_v2(&self.foundation).await {
+            Ok(database) => database,
+            Err(transition) => return Err(self.cleanup_transition_v2(transition).await),
+        };
+        let gateway_ready = match self.lifecycle.observe_exact_current_ready_attestation_v2() {
+            Ok(ready) => ready,
+            Err(_) => {
+                return Err(self
+                    .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Gateway)
+                    .await);
+            }
+        };
+        let registry_empty = match self.lifecycle.observe_registry_empty_v2() {
+            Ok(empty) => empty,
+            Err(_) => {
+                return Err(self
+                    .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Registry)
+                    .await);
+            }
+        };
+        let gate = self
+            .foundation
+            .maintenance_ingress_observer_v2()
+            .snapshot_v2();
+        let finalizer_accepting = self
+            .foundation
+            .process_finalizer_health_v2()
+            .is_some_and(|health| health.is_ready());
+        let supervisors_running = finalizer_accepting
+            && self.lifecycle.owner_terminal_status_v2().is_none()
+            && self.discord.terminal_status_v2().is_none()
+            && !self.discord.is_finished_v2()
+            && production_handoff_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+                .is_none();
+        if !maintenance_gate_is_open_v2(gate, self.maintenance_ingress.generation())
+            || !supervisors_running
+        {
+            return Err(self
+                .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation)
+                .await);
+        }
+        let predecessor_authorization = self
+            .lifecycle
+            .authorize_ingress_acknowledgement_predecessor_observation_v2();
+        let final_authorization = self
+            .lifecycle
+            .authorize_ingress_acknowledgement_predecessor_observation_v2();
+        let predecessor_observation = match self
+            .foundation
+            .databases
+            .execution()
+            .observe_ingress_open_acknowledgement_predecessor(&predecessor_authorization)
+            .await
+        {
+            Ok(observation) => observation,
+            Err(_) => {
+                return Err(self
+                    .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Database)
+                    .await);
+            }
+        };
+        let predecessor = match predecessor_authorization.accept(predecessor_observation) {
+            Ok(predecessor) => predecessor,
+            Err(_) => {
+                return Err(self
+                    .cleanup_transition_v2(
+                        RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+                    )
+                    .await);
+            }
+        };
+        let lease_for = RuntimeIngressOpenAcknowledgementLeaseDurationV2::from_duration(
+            INGRESS_ACKNOWLEDGEMENT_LEASE_V2,
+        )
+        .expect("bounded ingress acknowledgement lease");
+        let input = RuntimeEmptyOpenAcknowledgementRefreshInputV2 {
+            owner_receipt,
+            readiness: database.readiness,
+            gateway_ready,
+            writer_fence_generation: database.writer_fence_generation,
+            writer_fence_open: true,
+            maintenance_gate_generation: gate.generation(),
+            maintenance_gate_open: true,
+            registry_empty,
+            finalizer_generation: self.lifecycle.finalizer_generation_v2(),
+            finalizer_accepting,
+            supervisors_running,
+            predecessor,
+            lease_for,
+        };
+        let Self {
+            discord,
+            foundation,
+            lifecycle,
+            maintenance_ingress,
+            readiness,
+            mut ingress_acknowledgement,
+            acknowledgement_schedule,
+            process_generation,
+        } = self;
+        let refresh = match lifecycle.authorize_acknowledgement_refresh_v2(input) {
+            Ok(refresh) => refresh,
+            Err(failure) => {
+                let transition = map_production_lifecycle_failure_v2(failure.error_v2());
+                let process = Self {
+                    discord,
+                    foundation,
+                    lifecycle: failure.into_state_v2(),
+                    maintenance_ingress,
+                    readiness,
+                    ingress_acknowledgement,
+                    acknowledgement_schedule,
+                    process_generation,
+                };
+                return Err(process.cleanup_transition_v2(transition).await);
+            }
+        };
+        let authority = refresh.into_ingress_acknowledgement_authority_v2();
+        let acknowledgement = execute_ingress_acknowledgement_v2(
+            &mut ingress_acknowledgement,
+            authority,
+            acknowledgement_schedule.safety_deadline,
+        )
+        .await;
+        let (lifecycle, accepted_receipt) = match acknowledgement {
+            Ok(RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2::EmptyOpenRefresh {
+                lifecycle,
+                accepted_receipt,
+            }) => (*lifecycle, *accepted_receipt),
+            Ok(RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2::Admission {
+                lifecycle,
+                ..
+            }) => {
+                let cleanup = shutdown_orphaned_admission_process_v2(
+                    foundation,
+                    discord,
+                    *lifecycle,
+                    ingress_acknowledgement,
+                    maintenance_ingress,
+                    readiness,
+                    process_generation,
+                )
+                .await;
+                return Err(finish_production_handoff_transition_v2(
+                    RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+                    cleanup,
+                ));
+            }
+            Err(RuntimeProcessIngressAcknowledgementExecutionFailureV2::Retained {
+                authority,
+                transition,
+            }) => {
+                let retained = (*authority).into_retained_state_v2();
+                let RuntimeClosedRecoveryIngressAcknowledgementRetainedStateV2::EmptyOpenRefresh(
+                    refresh,
+                ) = retained
+                else {
+                    let cleanup = shutdown_orphaned_ingress_acknowledgement_v2(
+                        foundation,
+                        discord,
+                        retained,
+                        ingress_acknowledgement,
+                        maintenance_ingress,
+                        readiness,
+                        process_generation,
+                    )
+                    .await;
+                    return Err(finish_production_handoff_transition_v2(transition, cleanup));
+                };
+                let cleanup = shutdown_refreshing_empty_open_process_v2(
+                    foundation,
+                    discord,
+                    *refresh,
+                    ingress_acknowledgement,
+                    maintenance_ingress,
+                    readiness,
+                    process_generation,
+                )
+                .await;
+                return Err(finish_production_handoff_transition_v2(transition, cleanup));
+            }
+            Err(RuntimeProcessIngressAcknowledgementExecutionFailureV2::AuthorityLost(
+                transition,
+            )) => {
+                let cleanup = shutdown_process_without_lifecycle_v2(
+                    foundation,
+                    discord,
+                    ingress_acknowledgement,
+                    process_generation,
+                )
+                .await;
+                return Err(finish_production_handoff_transition_v2(transition, cleanup));
+            }
+        };
+        let final_observation = exact_reobserve_ingress_acknowledgement_v2(
+            foundation.databases.execution(),
+            final_authorization,
+            &accepted_receipt,
+        )
+        .await;
+        let schedule = final_observation
+            .as_ref()
+            .ok()
+            .and_then(ingress_acknowledgement_schedule_v2);
+        let process = Self {
+            discord,
+            foundation,
+            lifecycle,
+            maintenance_ingress,
+            readiness,
+            ingress_acknowledgement,
+            acknowledgement_schedule: schedule.unwrap_or(acknowledgement_schedule),
+            process_generation,
+        };
+        match (final_observation, schedule) {
+            (Ok(_), Some(_)) => {
+                if let Err(transition) = process.revalidate_v2() {
+                    Err(process.cleanup_transition_v2(transition).await)
+                } else {
+                    Ok(process)
+                }
+            }
+            (Err(transition), _) => Err(process.cleanup_transition_v2(transition).await),
+            (Ok(_), None) => Err(process
+                .cleanup_transition_v2(
+                    RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed,
+                )
+                .await),
+        }
+    }
+
+    pub(crate) async fn run_until_shutdown_v2(
+        mut self,
+    ) -> Result<(), RuntimeProcessProductionHandoffErrorV2> {
+        let trigger = self.foundation.shutdown_trigger_v1();
+        let mut shutdown_for_monitor = self.foundation.shutdown_observer_v1();
+        let mut discord_terminal = self.discord.observation_v2();
+        let owner_terminal = self.lifecycle.owner_terminal_observation_v2();
+        let monitor = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                _ = shutdown_for_monitor.wait() => {}
+                _ = discord_terminal.wait_terminal() => {
+                    trigger.trip(crate::RuntimeShutdownCauseV1::DiscordTerminal);
+                }
+                _ = owner_terminal => {
+                    trigger.trip(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
+                }
+            }
+        });
+        let mut shutdown = self.foundation.shutdown_observer_v1();
+        let observation = loop {
+            if let Some(observation) = shutdown.observed() {
+                break observation;
+            }
+            if Instant::now() >= self.acknowledgement_schedule.safety_deadline {
+                break self
+                    .foundation
+                    .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
+            }
+            let refresh_at = self.acknowledgement_schedule.refresh_at;
+            let selected = tokio::select! {
+                biased;
+                observation = shutdown.wait() => Some(observation),
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(refresh_at)) => None,
+            };
+            if let Some(observation) = selected {
+                break observation;
+            }
+            let owner = match self.lifecycle.observe_current_owner_v2().await {
+                Ok(owner) => owner,
+                Err(_) => {
+                    self.foundation
+                        .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
+                    stop_empty_open_monitor_v2(monitor).await;
+                    return Err(self
+                        .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Owner)
+                        .await);
+                }
+            };
+            match self
+                .refresh_acknowledgement_with_owner_v2(owner.receipt().clone())
+                .await
+            {
+                Ok(process) => self = process,
+                Err(error) => {
+                    stop_empty_open_monitor_v2(monitor).await;
+                    return Err(error);
+                }
+            }
+        };
+        stop_empty_open_monitor_v2(monitor).await;
+        let cleanup = self.shutdown().await;
+        match observation.cause() {
+            crate::RuntimeShutdownCauseV1::Interrupt
+            | crate::RuntimeShutdownCauseV1::Terminate
+            | crate::RuntimeShutdownCauseV1::Explicit => cleanup.map_err(|cleanup| {
+                finish_production_handoff_transition_v2(
+                    RuntimeProcessProductionHandoffFailureV2::ProcessShutdown,
+                    Err(cleanup),
+                )
+            }),
+            cause => Err(finish_production_handoff_transition_v2(
+                map_empty_open_shutdown_cause_v2(cause),
+                cleanup,
+            )),
+        }
+    }
+
+    pub(crate) async fn shutdown(self) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+        let _revalidation = self.revalidate_v2();
+        shutdown_empty_open_process_v2(
+            self.foundation,
+            self.discord,
+            self.lifecycle,
+            self.ingress_acknowledgement,
+            self.maintenance_ingress,
+            self.readiness,
+            self.process_generation,
+        )
+        .await
+    }
+
+    async fn cleanup_transition_v2(
+        self,
+        transition: RuntimeProcessProductionHandoffFailureV2,
+    ) -> RuntimeProcessProductionHandoffErrorV2 {
+        let cleanup = self.shutdown().await;
+        finish_production_handoff_transition_v2(transition, cleanup)
+    }
+}
+
+async fn stop_empty_open_monitor_v2(monitor: tokio::task::JoinHandle<()>) {
+    monitor.abort();
+    let _result = monitor.await;
+}
+
+fn map_empty_open_shutdown_cause_v2(
+    cause: crate::RuntimeShutdownCauseV1,
+) -> RuntimeProcessProductionHandoffFailureV2 {
+    match cause {
+        crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal => {
+            RuntimeProcessProductionHandoffFailureV2::Owner
+        }
+        crate::RuntimeShutdownCauseV1::DiscordTerminal => {
+            RuntimeProcessProductionHandoffFailureV2::DiscordIndeterminate
+        }
+        crate::RuntimeShutdownCauseV1::FinalizerTerminal => {
+            RuntimeProcessProductionHandoffFailureV2::FinalizerTerminal
+        }
+        crate::RuntimeShutdownCauseV1::ReadinessLost => {
+            RuntimeProcessProductionHandoffFailureV2::Database
+        }
+        crate::RuntimeShutdownCauseV1::HealthTerminal
+        | crate::RuntimeShutdownCauseV1::IngressAcknowledgementTerminal
+        | crate::RuntimeShutdownCauseV1::SupervisorFailure => {
+            RuntimeProcessProductionHandoffFailureV2::ProtocolViolation
+        }
+        crate::RuntimeShutdownCauseV1::Interrupt
+        | crate::RuntimeShutdownCauseV1::Terminate
+        | crate::RuntimeShutdownCauseV1::Explicit => {
+            RuntimeProcessProductionHandoffFailureV2::ProcessShutdown
+        }
+    }
 }
 
 fn production_handoff_shutdown_failure_v2(
@@ -893,6 +2473,346 @@ async fn shutdown_transferred_production_handoff_v2(
     finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
 }
 
+async fn shutdown_process_bound_production_handoff_v2(
+    mut foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordProcessSupervisorV2,
+    lifecycle: RuntimeClosedRecoveryProcessFrozenProcessV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    let cleanup_deadline = foundation
+        .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
+        .await;
+    foundation.observe_shutdown_registry_v1();
+    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_shutdown = discord
+        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
+        .await
+        .map_err(map_discord_shutdown_failure_v1);
+    let owner = lifecycle
+        .abort_and_shutdown_until_v2(cleanup_deadline)
+        .await;
+    let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
+    let owner_shutdown =
+        super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
+    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+}
+
+async fn shutdown_recovery_resume_process_v2(
+    foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordProcessSupervisorV2,
+    lifecycle: RuntimeClosedRecoveryProductionHandoffProcessV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    shutdown_recovery_resume_transferred_v2(
+        foundation,
+        RuntimeTransferredDiscordSupervisorV2::Process(discord),
+        lifecycle,
+        process_generation,
+    )
+    .await
+}
+
+async fn shutdown_recovery_resume_transferred_v2(
+    mut foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeTransferredDiscordSupervisorV2,
+    lifecycle: RuntimeClosedRecoveryProductionHandoffProcessV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    let cleanup_deadline = foundation
+        .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
+        .await;
+    foundation.observe_shutdown_registry_v1();
+    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_shutdown = discord
+        .shutdown_until_v2(discord_drain, process_generation, cleanup_deadline)
+        .await
+        .map_err(map_discord_shutdown_failure_v1);
+    let owner = lifecycle
+        .abort_and_shutdown_until_v2(cleanup_deadline)
+        .await;
+    let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
+    let owner_shutdown =
+        super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
+    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+}
+
+async fn shutdown_admission_acknowledging_process_v2(
+    mut foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordProcessSupervisorV2,
+    lifecycle: RuntimeClosedRecoveryAdmissionAcknowledgingProcessV2,
+    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    let cleanup_deadline = foundation
+        .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
+        .await;
+    shutdown_ingress_acknowledgement_supervisor_v2(
+        &mut foundation,
+        ingress_acknowledgement,
+        cleanup_deadline,
+    )
+    .await;
+    foundation.observe_shutdown_registry_v1();
+    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_shutdown = discord
+        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
+        .await
+        .map_err(map_discord_shutdown_failure_v1);
+    let owner = lifecycle
+        .abort_and_shutdown_until_v2(cleanup_deadline)
+        .await;
+    let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
+    let owner_shutdown =
+        super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
+    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+}
+
+async fn shutdown_admission_acknowledging_process_without_lane_v2(
+    mut foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordProcessSupervisorV2,
+    lifecycle: RuntimeClosedRecoveryAdmissionAcknowledgingProcessV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    let cleanup_deadline = foundation
+        .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
+        .await;
+    foundation.observe_shutdown_registry_v1();
+    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_shutdown = discord
+        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
+        .await
+        .map_err(map_discord_shutdown_failure_v1);
+    let owner = lifecycle
+        .abort_and_shutdown_until_v2(cleanup_deadline)
+        .await;
+    let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
+    let owner_shutdown =
+        super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
+    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+}
+
+async fn shutdown_ingress_acknowledgement_supervisor_v2(
+    foundation: &mut RuntimeProcessFoundationV1,
+    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    cleanup_deadline: Instant,
+) {
+    let report = ingress_acknowledgement
+        .shutdown_until(cleanup_deadline)
+        .await;
+    foundation
+        .record_ingress_acknowledgement_shutdown_v2(report.exit(), report.completion().is_some());
+    drop(report);
+}
+
+async fn shutdown_orphaned_empty_open_process_v2(
+    foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordProcessSupervisorV2,
+    lifecycle: RuntimeClosedRecoverySupervisedEmptyOpenProcessV2,
+    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    readiness: crate::health::RuntimeHealthReadinessPublisherV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    shutdown_empty_open_process_v2(
+        foundation,
+        discord,
+        lifecycle,
+        ingress_acknowledgement,
+        maintenance_ingress,
+        readiness,
+        process_generation,
+    )
+    .await
+}
+
+async fn shutdown_orphaned_admission_process_v2(
+    foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordProcessSupervisorV2,
+    lifecycle: RuntimeClosedRecoveryAdmissionAcknowledgingProcessV2,
+    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    readiness: crate::health::RuntimeHealthReadinessPublisherV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    readiness.remove_readiness_v2();
+    drop(maintenance_ingress);
+    shutdown_admission_acknowledging_process_v2(
+        foundation,
+        discord,
+        lifecycle,
+        ingress_acknowledgement,
+        process_generation,
+    )
+    .await
+}
+
+async fn shutdown_orphaned_ingress_acknowledgement_v2(
+    foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordProcessSupervisorV2,
+    retained: RuntimeClosedRecoveryIngressAcknowledgementRetainedStateV2,
+    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    readiness: crate::health::RuntimeHealthReadinessPublisherV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    match retained {
+        RuntimeClosedRecoveryIngressAcknowledgementRetainedStateV2::Admission(lifecycle) => {
+            shutdown_orphaned_admission_process_v2(
+                foundation,
+                discord,
+                *lifecycle,
+                ingress_acknowledgement,
+                maintenance_ingress,
+                readiness,
+                process_generation,
+            )
+            .await
+        }
+        RuntimeClosedRecoveryIngressAcknowledgementRetainedStateV2::EmptyOpenRefresh(lifecycle) => {
+            shutdown_refreshing_empty_open_process_v2(
+                foundation,
+                discord,
+                *lifecycle,
+                ingress_acknowledgement,
+                maintenance_ingress,
+                readiness,
+                process_generation,
+            )
+            .await
+        }
+    }
+}
+
+async fn shutdown_process_without_lifecycle_v2(
+    mut foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordProcessSupervisorV2,
+    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    let cleanup_deadline = foundation
+        .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
+        .await;
+    shutdown_ingress_acknowledgement_supervisor_v2(
+        &mut foundation,
+        ingress_acknowledgement,
+        cleanup_deadline,
+    )
+    .await;
+    foundation.observe_shutdown_registry_v1();
+    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_shutdown = discord
+        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
+        .await
+        .map_err(map_discord_shutdown_failure_v1);
+    let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
+    let owner_shutdown = super::owner::finish_runtime_owner_held_process_shutdown_v1(
+        Ok(RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped),
+        foundation,
+    );
+    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+}
+
+async fn shutdown_frozen_empty_open_process_v2(
+    mut foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordProcessSupervisorV2,
+    lifecycle: RuntimeClosedRecoveryEmptyOpenProcessV2,
+    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    readiness: crate::health::RuntimeHealthReadinessPublisherV2,
+    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    readiness.remove_readiness_v2();
+    drop(maintenance_ingress);
+    let cleanup_deadline = foundation
+        .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
+        .await;
+    shutdown_ingress_acknowledgement_supervisor_v2(
+        &mut foundation,
+        ingress_acknowledgement,
+        cleanup_deadline,
+    )
+    .await;
+    foundation.observe_shutdown_registry_v1();
+    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_shutdown = discord
+        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
+        .await
+        .map_err(map_discord_shutdown_failure_v1);
+    let owner = lifecycle
+        .abort_and_shutdown_until_v2(cleanup_deadline)
+        .await;
+    let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
+    let owner_shutdown =
+        super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
+    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+}
+
+async fn shutdown_empty_open_process_v2(
+    mut foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordProcessSupervisorV2,
+    lifecycle: RuntimeClosedRecoverySupervisedEmptyOpenProcessV2,
+    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    readiness: crate::health::RuntimeHealthReadinessPublisherV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    readiness.remove_readiness_v2();
+    drop(maintenance_ingress);
+    let cleanup_deadline = foundation
+        .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
+        .await;
+    shutdown_ingress_acknowledgement_supervisor_v2(
+        &mut foundation,
+        ingress_acknowledgement,
+        cleanup_deadline,
+    )
+    .await;
+    foundation.observe_shutdown_registry_v1();
+    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_shutdown = discord
+        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
+        .await
+        .map_err(map_discord_shutdown_failure_v1);
+    let owner = lifecycle.shutdown_until_v2(cleanup_deadline).await;
+    let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
+    let owner_shutdown =
+        super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
+    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+}
+
+async fn shutdown_refreshing_empty_open_process_v2(
+    mut foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordProcessSupervisorV2,
+    lifecycle: crate::closed_recovery::RuntimeClosedRecoveryEmptyOpenAcknowledgementRefreshV2,
+    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    readiness: crate::health::RuntimeHealthReadinessPublisherV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    readiness.remove_readiness_v2();
+    drop(maintenance_ingress);
+    let cleanup_deadline = foundation
+        .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
+        .await;
+    shutdown_ingress_acknowledgement_supervisor_v2(
+        &mut foundation,
+        ingress_acknowledgement,
+        cleanup_deadline,
+    )
+    .await;
+    foundation.observe_shutdown_registry_v1();
+    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_shutdown = discord
+        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
+        .await
+        .map_err(map_discord_shutdown_failure_v1);
+    let owner = lifecycle.shutdown_until_v2(cleanup_deadline).await;
+    let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
+    let owner_shutdown =
+        super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
+    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+}
+
 fn finish_production_handoff_transition_v2(
     transition: RuntimeProcessProductionHandoffFailureV2,
     cleanup: Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2>,
@@ -925,6 +2845,40 @@ fn map_finalizer_handoff_failure_v2(
     }
 }
 
+fn map_finalizer_activation_failure_v2(
+    error: RuntimeProcessFinalizerActivationFailureV2,
+) -> RuntimeProcessProductionHandoffFailureV2 {
+    match error {
+        RuntimeProcessFinalizerActivationFailureV2::Unavailable => {
+            RuntimeProcessProductionHandoffFailureV2::FinalizerUnavailable
+        }
+        RuntimeProcessFinalizerActivationFailureV2::Reserve(_)
+        | RuntimeProcessFinalizerActivationFailureV2::Activate(_)
+        | RuntimeProcessFinalizerActivationFailureV2::NotReady(_) => {
+            RuntimeProcessProductionHandoffFailureV2::FinalizerActivation
+        }
+    }
+}
+
+fn map_worker_production_handoff_failure_v2(
+    error: RuntimeClosedRecoveryProductionHandoffErrorV2,
+) -> RuntimeProcessProductionHandoffFailureV2 {
+    match error {
+        RuntimeClosedRecoveryProductionHandoffErrorV2::Owner => {
+            RuntimeProcessProductionHandoffFailureV2::Owner
+        }
+        RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway => {
+            RuntimeProcessProductionHandoffFailureV2::Gateway
+        }
+        RuntimeClosedRecoveryProductionHandoffErrorV2::Registry => {
+            RuntimeProcessProductionHandoffFailureV2::Registry
+        }
+        RuntimeClosedRecoveryProductionHandoffErrorV2::Worker(_) => {
+            RuntimeProcessProductionHandoffFailureV2::FixedPoint
+        }
+    }
+}
+
 fn map_fixed_point_handoff_failure_v2(
     error: RuntimeClosedRecoveryFixedPointHandoffErrorV2,
 ) -> RuntimeProcessProductionHandoffFailureV2 {
@@ -943,6 +2897,9 @@ fn map_fixed_point_handoff_failure_v2(
             RuntimeProcessProductionHandoffFailureV2::Registry
         }
         RuntimeClosedRecoveryFixedPointHandoffErrorV2::Owner(_) => {
+            RuntimeProcessProductionHandoffFailureV2::Owner
+        }
+        RuntimeClosedRecoveryFixedPointHandoffErrorV2::OwnerProcess(_) => {
             RuntimeProcessProductionHandoffFailureV2::Owner
         }
         RuntimeClosedRecoveryFixedPointHandoffErrorV2::ProtocolViolation => {
@@ -977,6 +2934,24 @@ impl Debug for RuntimeStartupRecoveryContinueProcessV2 {
 impl Debug for RuntimeStartupRecoveryFixedPointProcessV2 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeStartupRecoveryFixedPointProcessV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeProcessBoundProductionHandoffProcessV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeProcessBoundProductionHandoffProcessV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRecoveryResumeProcessV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRecoveryResumeProcessV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeAdmissionAcknowledgingProcessV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeAdmissionAcknowledgingProcessV2(<redacted>)")
     }
 }
 

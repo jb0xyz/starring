@@ -5,9 +5,11 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use automation_runtime::{
-    GatewayCommandAckV3, GatewayDisconnectKindV3, GatewayReadyKindV3,
+    GatewayAdmissionSnapshotV3, GatewayCommandAckV3, GatewayConnectionStateV3,
+    GatewayDisconnectKindV3, GatewayReadyKindV3, GatewayReadyLeaseV3,
     GatewayRuntimeCommandOutcomeV3, SharedGatewayRuntimeControlV3,
 };
+use automation_runtime_worker::RuntimeGatewayCoordinatorGenerationV2;
 use paused_discord_gateway::error::ReceiveMessageErrorType;
 use paused_discord_gateway::{
     CloseFrame, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt,
@@ -206,6 +208,8 @@ pub(crate) struct RuntimeDiscordGatewaySupervisorV1 {
     process_handoff_state: RuntimeDiscordProcessHandoffStateV2,
     drain: Option<oneshot::Sender<RuntimeDiscordDrainCommandV2>>,
     recovery_resume: mpsc::Sender<RuntimeDiscordRecoveryResumeCommandV2>,
+    discord_reservation: watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
+    recovery_resume_observation: watch::Receiver<Option<RuntimeDiscordRecoveryResumeEvidenceV2>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,6 +223,9 @@ enum RuntimeDiscordProcessHandoffStateV2 {
 
 pub(crate) struct RuntimeDiscordProcessSupervisorV2 {
     inner: RuntimeDiscordGatewaySupervisorV1,
+    recovery_resume_state: RuntimeDiscordRecoveryResumeStateV2,
+    recovery_resume_acknowledgement:
+        Option<oneshot::Receiver<RuntimeDiscordRecoveryResumeActorOutcomeV2>>,
 }
 
 pub(crate) struct RuntimeDiscordShutdownOnlySupervisorV2 {
@@ -269,13 +276,157 @@ struct RuntimeDiscordDrainCommandV2 {
 }
 
 struct RuntimeDiscordRecoveryResumeCommandV2 {
+    coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
     expected: RuntimeDiscordPauseReservationIdentityV2,
-    response: oneshot::Sender<bool>,
+    respond: bool,
+    response: oneshot::Sender<RuntimeDiscordRecoveryResumeActorOutcomeV2>,
 }
 
 pub(crate) struct RuntimeDiscordReservedResumeRequestV2 {
+    pub(crate) coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
     pub(crate) expected: RuntimeDiscordPauseReservationIdentityV2,
-    pub(crate) response: oneshot::Sender<bool>,
+    pub(crate) observation: watch::Sender<Option<RuntimeDiscordRecoveryResumeEvidenceV2>>,
+    pub(crate) response: oneshot::Sender<RuntimeDiscordRecoveryResumeControlOutcomeV2>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeDiscordRecoveryResumeFailureV2 {
+    CommandUnavailable,
+    ActorRejected,
+    AcknowledgementLost,
+    ActorTerminal,
+    DeadlineElapsed,
+}
+
+#[cfg(test)]
+pub(crate) enum RuntimeDiscordRecoveryResumeOwnershipV2 {
+    Process(RuntimeDiscordProcessSupervisorV2),
+    ShutdownOnly(RuntimeDiscordShutdownOnlySupervisorV2),
+}
+
+#[cfg(test)]
+pub(crate) enum RuntimeDiscordRecoveryResumeV2 {
+    Applied {
+        supervisor: RuntimeDiscordProcessSupervisorV2,
+        evidence: RuntimeDiscordRecoveryResumeEvidenceV2,
+    },
+    DefinitelyNotApplied {
+        ownership: RuntimeDiscordRecoveryResumeOwnershipV2,
+        failure: RuntimeDiscordRecoveryResumeFailureV2,
+    },
+    Indeterminate {
+        supervisor: RuntimeDiscordShutdownOnlySupervisorV2,
+        failure: RuntimeDiscordRecoveryResumeFailureV2,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeDiscordRecoveryResumeAttemptV2 {
+    Applied(RuntimeDiscordRecoveryResumeEvidenceV2),
+    DefinitelyNotApplied(RuntimeDiscordRecoveryResumeFailureV2),
+    Indeterminate(RuntimeDiscordRecoveryResumeFailureV2),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeDiscordRecoveryResumeStateV2 {
+    Idle,
+    InFlight {
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+        expected: RuntimeDiscordPauseReservationIdentityV2,
+    },
+    Applied(RuntimeDiscordRecoveryResumeEvidenceV2),
+    DefinitelyNotApplied(RuntimeDiscordRecoveryResumeFailureV2),
+    Indeterminate(RuntimeDiscordRecoveryResumeFailureV2),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeDiscordRecoveryResumeActorOutcomeV2 {
+    Applied(RuntimeDiscordRecoveryResumeEvidenceV2),
+    DefinitelyNotApplied,
+    Indeterminate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeDiscordRecoveryResumeControlOutcomeV2 {
+    Applied(RuntimeDiscordRecoveryResumeEvidenceV2),
+    DefinitelyNotApplied,
+    Indeterminate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeDiscordRecoveryResumeEvidenceV2 {
+    coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+    expected: RuntimeDiscordPauseReservationIdentityV2,
+    admission: GatewayAdmissionSnapshotV3,
+    ready: GatewayReadyLeaseV3,
+}
+
+impl RuntimeDiscordRecoveryResumeEvidenceV2 {
+    pub(crate) fn from_exact_snapshot_v2(
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+        expected: RuntimeDiscordPauseReservationIdentityV2,
+        admission: GatewayAdmissionSnapshotV3,
+        ready: GatewayReadyLeaseV3,
+    ) -> Option<Self> {
+        let GatewayConnectionStateV3::Connected { epoch, kind } = admission.connection() else {
+            return None;
+        };
+        if epoch != expected.epoch()
+            || kind != ready.kind()
+            || admission.admission_revision() != ready.admission_revision()
+            || admission.admission_revision() != expected.admission_revision()
+            || admission.connected_event_sequence() != Some(ready.connected_event_sequence())
+            || admission.resume_sequence() != Some(ready.resume_sequence())
+            || admission.transition_sequence() != ready.resume_sequence()
+            || admission.transition_sequence() <= expected.transition_sequence()
+            || ready.epoch() != expected.epoch()
+            || !ready.was_explicitly_resumed()
+        {
+            return None;
+        }
+        Some(Self {
+            coordinator_generation,
+            expected,
+            admission,
+            ready,
+        })
+    }
+
+    pub(crate) fn coordinator_generation_v2(self) -> RuntimeGatewayCoordinatorGenerationV2 {
+        self.coordinator_generation
+    }
+
+    pub(crate) fn expected_v2(self) -> RuntimeDiscordPauseReservationIdentityV2 {
+        self.expected
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_v2(self) -> GatewayAdmissionSnapshotV3 {
+        self.admission
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready_v2(self) -> GatewayReadyLeaseV3 {
+        self.ready
+    }
+
+    fn matches_current_v2(
+        self,
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+        expected: RuntimeDiscordPauseReservationIdentityV2,
+        current: RuntimeDiscordAdmissionReservationSnapshotV2,
+    ) -> bool {
+        self.coordinator_generation == coordinator_generation
+            && self.expected == expected
+            && current.reservation().is_none()
+            && current.admission() == self.admission
+            && Self::from_exact_snapshot_v2(
+                coordinator_generation,
+                expected,
+                self.admission,
+                self.ready,
+            ) == Some(self)
+    }
 }
 
 #[derive(Clone)]
@@ -336,6 +487,50 @@ async fn wait_for_runtime_discord_acknowledgement_v2(
         }
         _ = sleep_until(TokioInstant::from_std(deadline)) => {
             RuntimeDiscordActorAcknowledgementV2::DeadlineElapsed
+        },
+    }
+}
+
+async fn wait_for_runtime_discord_recovery_resume_v2(
+    acknowledgement: &mut oneshot::Receiver<RuntimeDiscordRecoveryResumeActorOutcomeV2>,
+    terminal: &mut watch::Receiver<Option<RuntimeDiscordGatewayTerminalV1>>,
+    deadline: Instant,
+) -> Result<RuntimeDiscordRecoveryResumeActorOutcomeV2, RuntimeDiscordActorAcknowledgementV2> {
+    if terminal.borrow().is_some() {
+        return Err(RuntimeDiscordActorAcknowledgementV2::Terminal);
+    }
+    if Instant::now() >= deadline {
+        return Err(RuntimeDiscordActorAcknowledgementV2::DeadlineElapsed);
+    }
+    tokio::select! {
+        biased;
+        changed = terminal.changed() => {
+            let _changed = changed;
+            match acknowledgement.try_recv() {
+                Ok(outcome) => Ok(outcome),
+                Err(oneshot::error::TryRecvError::Empty)
+                | Err(oneshot::error::TryRecvError::Closed) => {
+                    Err(RuntimeDiscordActorAcknowledgementV2::Terminal)
+                }
+            }
+        }
+        _ = sleep_until(TokioInstant::from_std(deadline)) => {
+            match acknowledgement.try_recv() {
+                Ok(outcome) => Ok(outcome),
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    Err(RuntimeDiscordActorAcknowledgementV2::DeadlineElapsed)
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    Err(RuntimeDiscordActorAcknowledgementV2::Lost)
+                }
+            }
+        }
+        acknowledgement = &mut *acknowledgement => match acknowledgement {
+            Ok(outcome) => Ok(outcome),
+            Err(_) if terminal.borrow().is_some() => {
+                Err(RuntimeDiscordActorAcknowledgementV2::Terminal)
+            }
+            Err(_) => Err(RuntimeDiscordActorAcknowledgementV2::Lost),
         },
     }
 }
@@ -627,6 +822,8 @@ impl RuntimeDiscordGatewaySupervisorV1 {
             RuntimeDiscordProcessHandoffStateV2::Process => {
                 RuntimeDiscordProcessHandoffV2::Process(RuntimeDiscordProcessSupervisorV2 {
                     inner: self,
+                    recovery_resume_state: RuntimeDiscordRecoveryResumeStateV2::Idle,
+                    recovery_resume_acknowledgement: None,
                 })
             }
             RuntimeDiscordProcessHandoffStateV2::NotApplied(failure) => {
@@ -724,40 +921,312 @@ impl RuntimeDiscordProcessSupervisorV2 {
         self.inner.is_finished()
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn observation_v2(&self) -> RuntimeDiscordGatewayObservationV1 {
+        self.inner.observation_v1()
+    }
+
+    #[cfg(test)]
     pub(crate) async fn resume_reserved_admission_v2(
         self,
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
         expected: RuntimeDiscordPauseReservationIdentityV2,
         deadline: Instant,
-    ) -> Result<Self, RuntimeDiscordShutdownOnlySupervisorV2> {
-        let this = self;
-        if Instant::now() >= deadline {
-            return Err(RuntimeDiscordShutdownOnlySupervisorV2 { inner: this.inner });
-        }
-        let (response, acknowledgement) = oneshot::channel();
-        if timeout_at(
-            TokioInstant::from_std(deadline),
-            this.inner
-                .recovery_resume
-                .send(RuntimeDiscordRecoveryResumeCommandV2 { expected, response }),
+    ) -> RuntimeDiscordRecoveryResumeV2 {
+        self.resume_reserved_admission_with_response_v2(
+            coordinator_generation,
+            expected,
+            deadline,
+            true,
         )
         .await
-        .is_err()
-        {
-            return Err(RuntimeDiscordShutdownOnlySupervisorV2 { inner: this.inner });
-        }
-        let mut terminal = this.inner.terminal.clone();
-        match wait_for_runtime_discord_acknowledgement_v2(acknowledgement, &mut terminal, deadline)
-            .await
-        {
-            RuntimeDiscordActorAcknowledgementV2::Accepted => Ok(this),
-            RuntimeDiscordActorAcknowledgementV2::Rejected
-            | RuntimeDiscordActorAcknowledgementV2::Lost
-            | RuntimeDiscordActorAcknowledgementV2::Terminal
-            | RuntimeDiscordActorAcknowledgementV2::DeadlineElapsed => {
-                Err(RuntimeDiscordShutdownOnlySupervisorV2 { inner: this.inner })
+    }
+
+    #[cfg(test)]
+    async fn resume_reserved_admission_losing_acknowledgement_for_test_v2(
+        self,
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+        expected: RuntimeDiscordPauseReservationIdentityV2,
+        deadline: Instant,
+    ) -> RuntimeDiscordRecoveryResumeV2 {
+        self.resume_reserved_admission_with_response_v2(
+            coordinator_generation,
+            expected,
+            deadline,
+            false,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn resume_reserved_admission_with_response_v2(
+        self,
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+        expected: RuntimeDiscordPauseReservationIdentityV2,
+        deadline: Instant,
+        respond: bool,
+    ) -> RuntimeDiscordRecoveryResumeV2 {
+        let mut this = self;
+        let attempt = this
+            .resume_reserved_admission_in_place_with_response_v2(
+                coordinator_generation,
+                expected,
+                deadline,
+                respond,
+            )
+            .await;
+        match attempt {
+            RuntimeDiscordRecoveryResumeAttemptV2::Applied(evidence) => {
+                RuntimeDiscordRecoveryResumeV2::Applied {
+                    supervisor: this,
+                    evidence,
+                }
+            }
+            RuntimeDiscordRecoveryResumeAttemptV2::DefinitelyNotApplied(failure)
+                if this.recovery_resume_state == RuntimeDiscordRecoveryResumeStateV2::Idle =>
+            {
+                RuntimeDiscordRecoveryResumeV2::DefinitelyNotApplied {
+                    ownership: RuntimeDiscordRecoveryResumeOwnershipV2::Process(this),
+                    failure,
+                }
+            }
+            RuntimeDiscordRecoveryResumeAttemptV2::DefinitelyNotApplied(failure) => {
+                RuntimeDiscordRecoveryResumeV2::DefinitelyNotApplied {
+                    ownership: RuntimeDiscordRecoveryResumeOwnershipV2::ShutdownOnly(
+                        RuntimeDiscordShutdownOnlySupervisorV2 { inner: this.inner },
+                    ),
+                    failure,
+                }
+            }
+            RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(failure) => {
+                RuntimeDiscordRecoveryResumeV2::Indeterminate {
+                    supervisor: RuntimeDiscordShutdownOnlySupervisorV2 { inner: this.inner },
+                    failure,
+                }
             }
         }
+    }
+
+    pub(crate) async fn resume_reserved_admission_in_place_v2(
+        &mut self,
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+        expected: RuntimeDiscordPauseReservationIdentityV2,
+        deadline: Instant,
+    ) -> RuntimeDiscordRecoveryResumeAttemptV2 {
+        self.resume_reserved_admission_in_place_with_response_v2(
+            coordinator_generation,
+            expected,
+            deadline,
+            true,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn resume_reserved_admission_in_place_losing_acknowledgement_for_test_v2(
+        &mut self,
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+        expected: RuntimeDiscordPauseReservationIdentityV2,
+        deadline: Instant,
+    ) -> RuntimeDiscordRecoveryResumeAttemptV2 {
+        self.resume_reserved_admission_in_place_with_response_v2(
+            coordinator_generation,
+            expected,
+            deadline,
+            false,
+        )
+        .await
+    }
+
+    async fn resume_reserved_admission_in_place_with_response_v2(
+        &mut self,
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+        expected: RuntimeDiscordPauseReservationIdentityV2,
+        deadline: Instant,
+        respond: bool,
+    ) -> RuntimeDiscordRecoveryResumeAttemptV2 {
+        match self.recovery_resume_state {
+            RuntimeDiscordRecoveryResumeStateV2::Applied(evidence) => {
+                if evidence.coordinator_generation_v2() == coordinator_generation
+                    && evidence.expected_v2() == expected
+                    && self.exact_recovery_resume_evidence_v2(coordinator_generation, expected)
+                        == Some(evidence)
+                {
+                    return RuntimeDiscordRecoveryResumeAttemptV2::Applied(evidence);
+                }
+                let current = *self.inner.discord_reservation.borrow();
+                if evidence.coordinator_generation_v2() == coordinator_generation
+                    && evidence.expected_v2().epoch() != expected.epoch()
+                    && current.reservation() == Some(expected)
+                    && current.admission().connection().current_epoch() == Some(expected.epoch())
+                {
+                    self.recovery_resume_state = RuntimeDiscordRecoveryResumeStateV2::Idle;
+                    self.recovery_resume_acknowledgement = None;
+                } else {
+                    let failure = RuntimeDiscordRecoveryResumeFailureV2::AcknowledgementLost;
+                    self.recovery_resume_state =
+                        RuntimeDiscordRecoveryResumeStateV2::Indeterminate(failure);
+                    return RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(failure);
+                }
+            }
+            RuntimeDiscordRecoveryResumeStateV2::DefinitelyNotApplied(failure) => {
+                return RuntimeDiscordRecoveryResumeAttemptV2::DefinitelyNotApplied(failure);
+            }
+            RuntimeDiscordRecoveryResumeStateV2::Indeterminate(failure) => {
+                return RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(failure);
+            }
+            RuntimeDiscordRecoveryResumeStateV2::InFlight {
+                coordinator_generation: current_generation,
+                expected: current_expected,
+            } if current_generation != coordinator_generation || current_expected != expected => {
+                let failure = RuntimeDiscordRecoveryResumeFailureV2::ActorRejected;
+                self.recovery_resume_state =
+                    RuntimeDiscordRecoveryResumeStateV2::Indeterminate(failure);
+                self.recovery_resume_acknowledgement = None;
+                return RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(failure);
+            }
+            RuntimeDiscordRecoveryResumeStateV2::Idle
+            | RuntimeDiscordRecoveryResumeStateV2::InFlight { .. } => {}
+        }
+        if self.recovery_resume_state == RuntimeDiscordRecoveryResumeStateV2::Idle {
+            if Instant::now() >= deadline {
+                return RuntimeDiscordRecoveryResumeAttemptV2::DefinitelyNotApplied(
+                    RuntimeDiscordRecoveryResumeFailureV2::DeadlineElapsed,
+                );
+            }
+            let (response, acknowledgement) = oneshot::channel();
+            let sent = timeout_at(
+                TokioInstant::from_std(deadline),
+                self.inner
+                    .recovery_resume
+                    .send(RuntimeDiscordRecoveryResumeCommandV2 {
+                        coordinator_generation,
+                        expected,
+                        respond,
+                        response,
+                    }),
+            )
+            .await;
+            match sent {
+                Ok(Ok(())) => {
+                    self.recovery_resume_state = RuntimeDiscordRecoveryResumeStateV2::InFlight {
+                        coordinator_generation,
+                        expected,
+                    };
+                    self.recovery_resume_acknowledgement = Some(acknowledgement);
+                }
+                Err(_) => {
+                    return RuntimeDiscordRecoveryResumeAttemptV2::DefinitelyNotApplied(
+                        RuntimeDiscordRecoveryResumeFailureV2::DeadlineElapsed,
+                    );
+                }
+                Ok(Err(_)) => {
+                    let failure = RuntimeDiscordRecoveryResumeFailureV2::CommandUnavailable;
+                    self.recovery_resume_state =
+                        RuntimeDiscordRecoveryResumeStateV2::DefinitelyNotApplied(failure);
+                    return RuntimeDiscordRecoveryResumeAttemptV2::DefinitelyNotApplied(failure);
+                }
+            }
+        }
+        if let Some(evidence) =
+            self.exact_recovery_resume_evidence_v2(coordinator_generation, expected)
+        {
+            self.recovery_resume_state = RuntimeDiscordRecoveryResumeStateV2::Applied(evidence);
+            self.recovery_resume_acknowledgement = None;
+            return RuntimeDiscordRecoveryResumeAttemptV2::Applied(evidence);
+        }
+        let Some(acknowledgement) = self.recovery_resume_acknowledgement.as_mut() else {
+            let failure = RuntimeDiscordRecoveryResumeFailureV2::AcknowledgementLost;
+            self.recovery_resume_state =
+                RuntimeDiscordRecoveryResumeStateV2::Indeterminate(failure);
+            return RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(failure);
+        };
+        let mut terminal = self.inner.terminal.clone();
+        let acknowledgement =
+            wait_for_runtime_discord_recovery_resume_v2(acknowledgement, &mut terminal, deadline)
+                .await;
+        self.recovery_resume_acknowledgement = None;
+        let exact = self.exact_recovery_resume_evidence_v2(coordinator_generation, expected);
+        let attempt = match acknowledgement {
+            Ok(RuntimeDiscordRecoveryResumeActorOutcomeV2::Applied(acknowledged))
+                if exact == Some(acknowledged) =>
+            {
+                RuntimeDiscordRecoveryResumeAttemptV2::Applied(acknowledged)
+            }
+            Err(
+                RuntimeDiscordActorAcknowledgementV2::Lost
+                | RuntimeDiscordActorAcknowledgementV2::DeadlineElapsed,
+            ) if exact.is_some() => RuntimeDiscordRecoveryResumeAttemptV2::Applied(
+                exact.expect("exact Discord recovery resume evidence"),
+            ),
+            Ok(RuntimeDiscordRecoveryResumeActorOutcomeV2::DefinitelyNotApplied) => {
+                RuntimeDiscordRecoveryResumeAttemptV2::DefinitelyNotApplied(
+                    RuntimeDiscordRecoveryResumeFailureV2::ActorRejected,
+                )
+            }
+            Ok(
+                RuntimeDiscordRecoveryResumeActorOutcomeV2::Applied(_)
+                | RuntimeDiscordRecoveryResumeActorOutcomeV2::Indeterminate,
+            ) => RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(
+                RuntimeDiscordRecoveryResumeFailureV2::AcknowledgementLost,
+            ),
+            Err(RuntimeDiscordActorAcknowledgementV2::Terminal) => {
+                RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(
+                    RuntimeDiscordRecoveryResumeFailureV2::ActorTerminal,
+                )
+            }
+            Err(RuntimeDiscordActorAcknowledgementV2::DeadlineElapsed) => {
+                RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(
+                    RuntimeDiscordRecoveryResumeFailureV2::DeadlineElapsed,
+                )
+            }
+            Err(RuntimeDiscordActorAcknowledgementV2::Lost) => {
+                RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(
+                    RuntimeDiscordRecoveryResumeFailureV2::AcknowledgementLost,
+                )
+            }
+            Err(
+                RuntimeDiscordActorAcknowledgementV2::Accepted
+                | RuntimeDiscordActorAcknowledgementV2::Rejected,
+            ) => unreachable!(),
+        };
+        self.recovery_resume_state = match attempt {
+            RuntimeDiscordRecoveryResumeAttemptV2::Applied(evidence) => {
+                RuntimeDiscordRecoveryResumeStateV2::Applied(evidence)
+            }
+            RuntimeDiscordRecoveryResumeAttemptV2::DefinitelyNotApplied(failure) => {
+                RuntimeDiscordRecoveryResumeStateV2::DefinitelyNotApplied(failure)
+            }
+            RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(failure) => {
+                RuntimeDiscordRecoveryResumeStateV2::Indeterminate(failure)
+            }
+        };
+        attempt
+    }
+
+    fn exact_recovery_resume_evidence_v2(
+        &self,
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+        expected: RuntimeDiscordPauseReservationIdentityV2,
+    ) -> Option<RuntimeDiscordRecoveryResumeEvidenceV2> {
+        if self.terminal_status_v2().is_some() || self.is_finished_v2() {
+            return None;
+        }
+        let first_evidence = *self.inner.recovery_resume_observation.borrow();
+        let first_reservation = *self.inner.discord_reservation.borrow();
+        let evidence = first_evidence?;
+        if !evidence.matches_current_v2(coordinator_generation, expected, first_reservation) {
+            return None;
+        }
+        let second_evidence = *self.inner.recovery_resume_observation.borrow();
+        let second_reservation = *self.inner.discord_reservation.borrow();
+        if first_evidence != second_evidence
+            || first_reservation != second_reservation
+            || self.terminal_status_v2().is_some()
+            || self.is_finished_v2()
+        {
+            return None;
+        }
+        Some(evidence)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -847,6 +1316,8 @@ where
     let (process_handoff, process_handoff_receiver) = oneshot::channel();
     let (drain, drain_receiver) = oneshot::channel();
     let (recovery_resume, recovery_resume_receiver) = mpsc::channel(1);
+    let (recovery_resume_observation_sender, recovery_resume_observation) = watch::channel(None);
+    let supervisor_discord_reservation = discord_reservation.clone();
     let publisher = RuntimeDiscordGatewayTerminalPublisherV1::new(terminal_sender);
     let actor_task = runtime.spawn(async move {
         let mut publisher = publisher;
@@ -861,6 +1332,7 @@ where
                 process_handoff: process_handoff_receiver,
                 drain: drain_receiver,
                 recovery_resume: recovery_resume_receiver,
+                recovery_resume_observation: recovery_resume_observation_sender,
                 reserved_resume,
             })
             .await
@@ -895,6 +1367,8 @@ where
         process_handoff_state: RuntimeDiscordProcessHandoffStateV2::NotStarted,
         drain: Some(drain),
         recovery_resume,
+        discord_reservation: supervisor_discord_reservation,
+        recovery_resume_observation,
     }
 }
 
@@ -940,6 +1414,7 @@ struct RuntimeDiscordGatewayActorV2<D> {
     process_handoff: oneshot::Receiver<RuntimeDiscordProcessHandoffCommandV2>,
     drain: oneshot::Receiver<RuntimeDiscordDrainCommandV2>,
     recovery_resume: mpsc::Receiver<RuntimeDiscordRecoveryResumeCommandV2>,
+    recovery_resume_observation: watch::Sender<Option<RuntimeDiscordRecoveryResumeEvidenceV2>>,
     reserved_resume: mpsc::Sender<RuntimeDiscordReservedResumeRequestV2>,
 }
 
@@ -959,6 +1434,7 @@ where
         mut process_handoff,
         mut drain,
         mut recovery_resume,
+        recovery_resume_observation,
         reserved_resume,
     } = actor;
     let RuntimeDiscordActorModeV2::StartupPaused { operation_cutoff } = mode else {
@@ -974,6 +1450,7 @@ where
         .await;
     }
     let mut _suppressed_handoff_response = None;
+    let mut _suppressed_recovery_resume_response = None;
     loop {
         let lifecycle_sequence = *lifecycle_drained.borrow();
         tokio::select! {
@@ -1050,16 +1527,24 @@ where
                     .await;
                 };
                 let resumed = resume_reserved_runtime_discord_admission_v2(
-                    &mut control,
-                    &mut lifecycle_drained,
-                    &mut discord_reservation,
+                    RuntimeDiscordRecoveryResumeActorContextV2 {
+                        control: &mut control,
+                        lifecycle_drained: &mut lifecycle_drained,
+                        discord_reservation: &mut discord_reservation,
+                        recovery_resume_observation: &recovery_resume_observation,
+                        reserved_resume: &reserved_resume,
+                    },
+                    recovery.coordinator_generation,
                     recovery.expected,
-                    &reserved_resume,
                     runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
                 )
                 .await;
-                let _response = recovery.response.send(resumed);
-                if !resumed {
+                if recovery.respond {
+                    let _response = recovery.response.send(resumed);
+                } else {
+                    _suppressed_recovery_resume_response = Some(recovery.response);
+                }
+                if !matches!(resumed, RuntimeDiscordRecoveryResumeActorOutcomeV2::Applied(_)) {
                     return finish_runtime_discord_gateway_if_connected_v1(
                         &mut driver,
                         &mut control,
@@ -1271,36 +1756,75 @@ fn runtime_discord_cleanup_deadline_v2(
     }
 }
 
+struct RuntimeDiscordRecoveryResumeActorContextV2<'a> {
+    control: &'a mut SharedGatewayRuntimeControlV3,
+    lifecycle_drained: &'a mut watch::Receiver<u64>,
+    discord_reservation: &'a mut watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
+    recovery_resume_observation: &'a watch::Sender<Option<RuntimeDiscordRecoveryResumeEvidenceV2>>,
+    reserved_resume: &'a mpsc::Sender<RuntimeDiscordReservedResumeRequestV2>,
+}
+
 async fn resume_reserved_runtime_discord_admission_v2(
-    control: &mut SharedGatewayRuntimeControlV3,
-    lifecycle_drained: &mut watch::Receiver<u64>,
-    discord_reservation: &mut watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
+    context: RuntimeDiscordRecoveryResumeActorContextV2<'_>,
+    coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
     expected: RuntimeDiscordPauseReservationIdentityV2,
-    reserved_resume: &mpsc::Sender<RuntimeDiscordReservedResumeRequestV2>,
     deadline: Instant,
-) -> bool {
+) -> RuntimeDiscordRecoveryResumeActorOutcomeV2 {
+    let RuntimeDiscordRecoveryResumeActorContextV2 {
+        control,
+        lifecycle_drained,
+        discord_reservation,
+        recovery_resume_observation,
+        reserved_resume,
+    } = context;
     let current = *discord_reservation.borrow();
     if current.reservation() != Some(expected)
         || current.admission().connection().current_epoch() != Some(expected.epoch())
     {
-        return false;
+        return RuntimeDiscordRecoveryResumeActorOutcomeV2::DefinitelyNotApplied;
     }
+    recovery_resume_observation.send_replace(None);
     let lifecycle_sequence = *lifecycle_drained.borrow();
     let (response, mut acknowledgement) = oneshot::channel();
-    if Instant::now() >= deadline
-        || timeout_at(
-            TokioInstant::from_std(deadline),
-            reserved_resume.send(RuntimeDiscordReservedResumeRequestV2 { expected, response }),
-        )
-        .await
-        .is_err()
+    if Instant::now() >= deadline {
+        return RuntimeDiscordRecoveryResumeActorOutcomeV2::DefinitelyNotApplied;
+    }
+    match timeout_at(
+        TokioInstant::from_std(deadline),
+        reserved_resume.send(RuntimeDiscordReservedResumeRequestV2 {
+            coordinator_generation,
+            expected,
+            observation: recovery_resume_observation.clone(),
+            response,
+        }),
+    )
+    .await
     {
-        return false;
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return RuntimeDiscordRecoveryResumeActorOutcomeV2::DefinitelyNotApplied,
+        Err(_) => return RuntimeDiscordRecoveryResumeActorOutcomeV2::DefinitelyNotApplied,
     }
     let outcome = tokio::select! {
         biased;
         acknowledgement = &mut acknowledgement => {
-            return acknowledgement.unwrap_or(false);
+            return match acknowledgement {
+                Ok(RuntimeDiscordRecoveryResumeControlOutcomeV2::Applied(evidence))
+                    if exact_runtime_discord_resume_evidence_v2(
+                        discord_reservation,
+                        recovery_resume_observation,
+                        coordinator_generation,
+                        expected,
+                    ) == Some(evidence) =>
+                {
+                    RuntimeDiscordRecoveryResumeActorOutcomeV2::Applied(evidence)
+                }
+                Ok(RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied) => {
+                    RuntimeDiscordRecoveryResumeActorOutcomeV2::DefinitelyNotApplied
+                }
+                Ok(RuntimeDiscordRecoveryResumeControlOutcomeV2::Applied(_))
+                | Ok(RuntimeDiscordRecoveryResumeControlOutcomeV2::Indeterminate)
+                | Err(_) => RuntimeDiscordRecoveryResumeActorOutcomeV2::Indeterminate,
+            };
         }
         outcome = control.process_next_command() => outcome,
     };
@@ -1309,20 +1833,72 @@ async fn resume_reserved_runtime_discord_admission_v2(
         GatewayRuntimeCommandOutcomeV3::Applied(GatewayCommandAckV3::AdmissionResumed { epoch })
             if epoch == expected.epoch()
     ) {
-        return false;
+        return match outcome {
+            GatewayRuntimeCommandOutcomeV3::Rejected(_) => {
+                RuntimeDiscordRecoveryResumeActorOutcomeV2::DefinitelyNotApplied
+            }
+            GatewayRuntimeCommandOutcomeV3::Applied(_)
+            | GatewayRuntimeCommandOutcomeV3::ControlOrphaned => {
+                RuntimeDiscordRecoveryResumeActorOutcomeV2::Indeterminate
+            }
+        };
     }
     if !wait_for_lifecycle_drain_v1(lifecycle_drained, lifecycle_sequence, deadline).await {
-        return false;
+        return RuntimeDiscordRecoveryResumeActorOutcomeV2::Indeterminate;
     }
-    if Instant::now() >= deadline
-        || timeout_at(TokioInstant::from_std(deadline), &mut acknowledgement).await != Ok(Ok(true))
-    {
-        return false;
+    let acknowledged = if Instant::now() >= deadline {
+        None
+    } else {
+        timeout_at(TokioInstant::from_std(deadline), &mut acknowledgement)
+            .await
+            .ok()
+            .and_then(Result::ok)
+    };
+    let exact = exact_runtime_discord_resume_evidence_v2(
+        discord_reservation,
+        recovery_resume_observation,
+        coordinator_generation,
+        expected,
+    );
+    match (acknowledged, exact) {
+        (
+            Some(RuntimeDiscordRecoveryResumeControlOutcomeV2::Applied(acknowledged)),
+            Some(exact),
+        ) if acknowledged == exact => RuntimeDiscordRecoveryResumeActorOutcomeV2::Applied(exact),
+        (Some(RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied), None) => {
+            RuntimeDiscordRecoveryResumeActorOutcomeV2::DefinitelyNotApplied
+        }
+        (None, Some(exact)) => RuntimeDiscordRecoveryResumeActorOutcomeV2::Applied(exact),
+        (
+            Some(
+                RuntimeDiscordRecoveryResumeControlOutcomeV2::Applied(_)
+                | RuntimeDiscordRecoveryResumeControlOutcomeV2::Indeterminate,
+            ),
+            _,
+        )
+        | (Some(RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied), Some(_))
+        | (None, None) => RuntimeDiscordRecoveryResumeActorOutcomeV2::Indeterminate,
     }
-    let current = *discord_reservation.borrow();
-    current.reservation().is_none()
-        && current.admission().connection().current_epoch() == Some(expected.epoch())
-        && current.admission().connection().admits_interactions()
+}
+
+fn exact_runtime_discord_resume_evidence_v2(
+    discord_reservation: &watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
+    recovery_resume_observation: &watch::Sender<Option<RuntimeDiscordRecoveryResumeEvidenceV2>>,
+    coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+    expected: RuntimeDiscordPauseReservationIdentityV2,
+) -> Option<RuntimeDiscordRecoveryResumeEvidenceV2> {
+    let first_reservation = *discord_reservation.borrow();
+    let first_evidence = *recovery_resume_observation.borrow();
+    let evidence = first_evidence?;
+    if !evidence.matches_current_v2(coordinator_generation, expected, first_reservation) {
+        return None;
+    }
+    let second_reservation = *discord_reservation.borrow();
+    let second_evidence = *recovery_resume_observation.borrow();
+    if first_reservation != second_reservation || first_evidence != second_evidence {
+        return None;
+    }
+    Some(evidence)
 }
 
 async fn finish_runtime_discord_gateway_if_connected_v1<D>(
@@ -1446,6 +2022,7 @@ mod tests {
     };
     use automation_runtime_controller::RuntimeGatewayReadyKindV2;
     use automation_runtime_convergence::ProcessInstanceId;
+    use automation_runtime_worker::RuntimeGatewayCoordinatorGenerationV2;
     use tokio::sync::{mpsc, oneshot, watch};
 
     use crate::gateway::{
@@ -1458,7 +2035,8 @@ mod tests {
         RuntimeDiscordGatewayCloseOutcomeV1, RuntimeDiscordGatewayDriverV1,
         RuntimeDiscordGatewayExitV1, RuntimeDiscordGatewayShutdownErrorV1,
         RuntimeDiscordGatewaySignalV1, RuntimeDiscordProcessHandoffFailureV2,
-        RuntimeDiscordProcessHandoffV2,
+        RuntimeDiscordProcessHandoffV2, RuntimeDiscordRecoveryResumeOwnershipV2,
+        RuntimeDiscordRecoveryResumeV2,
     };
 
     struct TestDiscordGatewayDriverV1 {
@@ -1637,6 +2215,31 @@ mod tests {
             } => {
                 drop(supervisor);
                 panic!("Discord process handoff was indeterminate: {failure:?}")
+            }
+        }
+    }
+
+    fn expect_applied_resume(
+        outcome: RuntimeDiscordRecoveryResumeV2,
+    ) -> (
+        super::RuntimeDiscordProcessSupervisorV2,
+        super::RuntimeDiscordRecoveryResumeEvidenceV2,
+    ) {
+        match outcome {
+            RuntimeDiscordRecoveryResumeV2::Applied {
+                supervisor,
+                evidence,
+            } => (supervisor, evidence),
+            RuntimeDiscordRecoveryResumeV2::DefinitelyNotApplied { ownership, failure } => {
+                drop(ownership);
+                panic!("Discord recovery resume was not applied: {failure:?}")
+            }
+            RuntimeDiscordRecoveryResumeV2::Indeterminate {
+                supervisor,
+                failure,
+            } => {
+                drop(supervisor);
+                panic!("Discord recovery resume was indeterminate: {failure:?}")
             }
         }
     }
@@ -1990,13 +2593,25 @@ mod tests {
         .await;
         assert_eq!(observation.terminal_status(), None);
         assert!(!observation.is_finished());
-        let process = process
-            .resume_reserved_admission_v2(
-                first_reservation,
-                Instant::now() + Duration::from_secs(1),
-            )
-            .await
-            .expect("first reserved resume");
+        let (process, first_evidence) = expect_applied_resume(
+            process
+                .resume_reserved_admission_v2(
+                    RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                    first_reservation,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await,
+        );
+        assert_eq!(
+            first_evidence.coordinator_generation_v2(),
+            RuntimeGatewayCoordinatorGenerationV2::FIRST
+        );
+        assert_eq!(first_evidence.expected_v2(), first_reservation);
+        assert_eq!(
+            first_evidence.admission_v2().connection().current_epoch(),
+            Some(first_reservation.epoch())
+        );
+        assert_eq!(first_evidence.ready_v2().epoch(), first_reservation.epoch());
         assert!(gateway.observe_current_ready_attestation().is_ok());
 
         signals
@@ -2010,15 +2625,275 @@ mod tests {
             .discord_pause_reservation_for_test_v2()
             .expect("second Discord pause reservation");
         assert_ne!(first_reservation, second_reservation);
-        let process = process
-            .resume_reserved_admission_v2(
-                second_reservation,
+        let (process, second_evidence) = expect_applied_resume(
+            process
+                .resume_reserved_admission_v2(
+                    RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                    second_reservation,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await,
+        );
+        assert_eq!(second_evidence.expected_v2(), second_reservation);
+        assert!(gateway.observe_current_ready_attestation().is_ok());
+
+        let terminal = process
+            .shutdown_until(
+                gateway.begin_discord_drain_v1(),
+                NonZeroU64::MIN,
                 Instant::now() + Duration::from_secs(1),
             )
             .await
-            .expect("second reserved resume");
-        assert!(gateway.observe_current_ready_attestation().is_ok());
+            .unwrap();
+        assert_eq!(terminal.exit(), RuntimeDiscordGatewayExitV1::Commanded);
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
 
+    #[tokio::test]
+    async fn lost_recovery_resume_ack_exact_observes_without_competing_resend() {
+        let mut gateway = gateway_with_lifecycle_capacity(1);
+        let (signals, driver, _polls, closes, drops) = driver();
+        let supervisor = gateway
+            .start_discord_gateway_with_driver_v1(
+                driver,
+                Instant::now() + Duration::from_secs(2),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        signals.send(RuntimeDiscordGatewaySignalV1::Ready).unwrap();
+        let _ready = wait_for_epoch(&gateway, 1).await;
+        let reservation = gateway
+            .discord_pause_reservation_for_test_v2()
+            .expect("Discord pause reservation");
+        let process =
+            expect_process_handoff(supervisor.handoff_to_process_v2(NonZeroU64::MIN).await);
+        let (process, evidence) = expect_applied_resume(
+            process
+                .resume_reserved_admission_losing_acknowledgement_for_test_v2(
+                    RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                    reservation,
+                    Instant::now() + Duration::from_millis(100),
+                )
+                .await,
+        );
+        assert_eq!(evidence.expected_v2(), reservation);
+        assert!(gateway.observe_current_ready_attestation().is_ok());
+        assert_eq!(
+            gateway
+                .observe_current_ready_attestation()
+                .unwrap()
+                .admission_revision
+                .get(),
+            evidence.ready_v2().admission_revision().get()
+        );
+        let terminal = process
+            .shutdown_until(
+                gateway.begin_discord_drain_v1(),
+                NonZeroU64::MIN,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.exit(), RuntimeDiscordGatewayExitV1::Commanded);
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn deadline_before_resume_enqueue_is_definitely_not_applied() {
+        let mut gateway = gateway_with_lifecycle_capacity(1);
+        let (signals, driver, _polls, closes, drops) = driver();
+        let supervisor = gateway
+            .start_discord_gateway_with_driver_v1(
+                driver,
+                Instant::now() + Duration::from_secs(2),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        signals.send(RuntimeDiscordGatewaySignalV1::Ready).unwrap();
+        let _ready = wait_for_epoch(&gateway, 1).await;
+        let reservation = gateway
+            .discord_pause_reservation_for_test_v2()
+            .expect("Discord pause reservation");
+        let process =
+            expect_process_handoff(supervisor.handoff_to_process_v2(NonZeroU64::MIN).await);
+        let process = match process
+            .resume_reserved_admission_v2(
+                RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                reservation,
+                Instant::now(),
+            )
+            .await
+        {
+            RuntimeDiscordRecoveryResumeV2::DefinitelyNotApplied {
+                ownership: RuntimeDiscordRecoveryResumeOwnershipV2::Process(supervisor),
+                failure: super::RuntimeDiscordRecoveryResumeFailureV2::DeadlineElapsed,
+            } => supervisor,
+            outcome => {
+                drop(outcome);
+                panic!("expired pre-enqueue resume was not definitely unapplied")
+            }
+        };
+        assert!(matches!(
+            gateway.observe_current_ready_attestation(),
+            Err(RuntimeGatewayReadyObservationErrorV1::AdmissionPaused)
+        ));
+        assert_eq!(
+            gateway.discord_pause_reservation_for_test_v2(),
+            Some(reservation)
+        );
+        let (process, _) = expect_applied_resume(
+            process
+                .resume_reserved_admission_v2(
+                    RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                    reservation,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await,
+        );
+        let terminal = process
+            .shutdown_until(
+                gateway.begin_discord_drain_v1(),
+                NonZeroU64::MIN,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.exit(), RuntimeDiscordGatewayExitV1::Commanded);
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_invalidates_lost_ack_evidence_without_resend() {
+        let mut gateway = gateway_with_lifecycle_capacity(1);
+        let (signals, driver, _polls, closes, drops) = driver();
+        let supervisor = gateway
+            .start_discord_gateway_with_driver_v1(
+                driver,
+                Instant::now() + Duration::from_secs(2),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        signals.send(RuntimeDiscordGatewaySignalV1::Ready).unwrap();
+        let _ready = wait_for_epoch(&gateway, 1).await;
+        let reservation = gateway
+            .discord_pause_reservation_for_test_v2()
+            .expect("Discord pause reservation");
+        let process =
+            expect_process_handoff(supervisor.handoff_to_process_v2(NonZeroU64::MIN).await);
+        let resume = tokio::spawn(
+            process.resume_reserved_admission_losing_acknowledgement_for_test_v2(
+                RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                reservation,
+                Instant::now() + Duration::from_millis(250),
+            ),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if gateway.observe_current_ready_attestation().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        signals
+            .send(RuntimeDiscordGatewaySignalV1::ReceiveError)
+            .unwrap();
+        signals
+            .send(RuntimeDiscordGatewaySignalV1::Resumed)
+            .unwrap();
+        let _resumed = wait_for_epoch(&gateway, 2).await;
+        let shutdown_only = match resume.await.unwrap() {
+            RuntimeDiscordRecoveryResumeV2::Indeterminate {
+                supervisor,
+                failure: super::RuntimeDiscordRecoveryResumeFailureV2::DeadlineElapsed,
+            } => supervisor,
+            outcome => {
+                drop(outcome);
+                panic!("reconnected lost-ack resume was not indeterminate")
+            }
+        };
+        assert!(matches!(
+            gateway.observe_current_ready_attestation(),
+            Err(RuntimeGatewayReadyObservationErrorV1::AdmissionPaused)
+        ));
+        let terminal = shutdown_only
+            .shutdown_until(
+                gateway.begin_discord_drain_v1(),
+                NonZeroU64::MIN,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.exit(), RuntimeDiscordGatewayExitV1::Commanded);
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn canceled_in_place_resume_retains_same_actor_without_resend() {
+        let mut gateway = gateway_with_lifecycle_capacity(1);
+        let (signals, driver, _polls, closes, drops) = driver();
+        let supervisor = gateway
+            .start_discord_gateway_with_driver_v1(
+                driver,
+                Instant::now() + Duration::from_secs(2),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        let observation = supervisor.observation_v1();
+        signals.send(RuntimeDiscordGatewaySignalV1::Ready).unwrap();
+        let _ready = wait_for_epoch(&gateway, 1).await;
+        let reservation = gateway
+            .discord_pause_reservation_for_test_v2()
+            .expect("Discord pause reservation");
+        let mut process =
+            expect_process_handoff(supervisor.handoff_to_process_v2(NonZeroU64::MIN).await);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut resume = Box::pin(
+            process.resume_reserved_admission_in_place_losing_acknowledgement_for_test_v2(
+                RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                reservation,
+                deadline,
+            ),
+        );
+        tokio::select! {
+            biased;
+            _ = &mut resume => panic!("suppressed resume acknowledgement completed early"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        drop(resume);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if gateway.observe_current_ready_attestation().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let attempt = process
+            .resume_reserved_admission_in_place_v2(
+                RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                reservation,
+                deadline,
+            )
+            .await;
+        assert!(matches!(
+            attempt,
+            super::RuntimeDiscordRecoveryResumeAttemptV2::Applied(evidence)
+                if evidence.expected_v2() == reservation
+        ));
+        assert!(!observation.is_finished());
         let terminal = process
             .shutdown_until(
                 gateway.begin_discord_drain_v1(),
@@ -2059,10 +2934,23 @@ mod tests {
             .unwrap();
         let _resumed = wait_for_epoch(&gateway, 2).await;
 
-        let shutdown_only = process
-            .resume_reserved_admission_v2(stale, Instant::now() + Duration::from_secs(1))
+        let shutdown_only = match process
+            .resume_reserved_admission_v2(
+                RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                stale,
+                Instant::now() + Duration::from_secs(1),
+            )
             .await
-            .expect_err("stale reserved resume must fail closed");
+        {
+            RuntimeDiscordRecoveryResumeV2::DefinitelyNotApplied {
+                ownership: RuntimeDiscordRecoveryResumeOwnershipV2::ShutdownOnly(supervisor),
+                ..
+            } => supervisor,
+            outcome => {
+                drop(outcome);
+                panic!("stale reserved resume did not fail closed")
+            }
+        };
         assert!(matches!(
             shutdown_only
                 .shutdown_until(
