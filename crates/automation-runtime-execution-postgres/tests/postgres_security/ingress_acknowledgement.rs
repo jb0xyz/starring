@@ -203,6 +203,23 @@ async fn ingress_acknowledgement_scenario(database: &mut IsolatedDatabase) {
     ));
     let capped_owner =
         acquire_ingress_owner(&adapter, "ingress-process-2", Duration::from_secs(2)).await;
+    let source_free_restart = ingress_acknowledgement_request(
+        None,
+        capped_owner.clone(),
+        2,
+        5,
+        11,
+        Duration::from_secs(1),
+    );
+    let predecessor_observation =
+        publish_ingress_acknowledgement(&database.executor_pool, &source_free_restart)
+            .await
+            .unwrap();
+    assert_eq!(predecessor_observation.outcome_name, "not_current");
+    assert_eq!(
+        predecessor_observation.acknowledgement_revision,
+        Some(2)
+    );
     let capped = ingress_acknowledgement_request(
         NonZeroU64::new(2),
         capped_owner.clone(),

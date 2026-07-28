@@ -4,14 +4,16 @@ mod row;
 use std::future::Future;
 
 use automation_runtime_controller::{
-    RuntimeObservedIngressOpenAcknowledgementV2, RuntimePublishIngressOpenAcknowledgementOutcomeV2,
-    RuntimePublishIngressOpenAcknowledgementV2,
+    RuntimeObserveIngressOpenAcknowledgementV2, RuntimeObservedIngressOpenAcknowledgementV2,
+    RuntimePublishIngressOpenAcknowledgementOutcomeV2, RuntimePublishIngressOpenAcknowledgementV2,
 };
 use automation_runtime_worker::{
     RuntimeAuthorizedIngressOpenAcknowledgementV2,
-    RuntimeIngressOpenAcknowledgementMutationErrorV2,
+    RuntimeIngressOpenAcknowledgementAttemptCompletionV2,
+    RuntimeIngressOpenAcknowledgementAttemptV2, RuntimeIngressOpenAcknowledgementMutationErrorV2,
     RuntimeIngressOpenAcknowledgementObservationErrorClassV2,
     RuntimeIngressOpenAcknowledgementPortV2,
+    RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -35,10 +37,9 @@ const MAX_CANONICAL_REQUEST_BYTES_WITH_SOURCE: usize = 586;
 impl PostgresRuntimeExecutionV1 {
     async fn observe_ingress_open_acknowledgement_v2(
         &self,
-        authorization: &RuntimeAuthorizedIngressOpenAcknowledgementV2,
+        request: &RuntimeObserveIngressOpenAcknowledgementV2,
     ) -> Result<RuntimeObservedIngressOpenAcknowledgementV2, RuntimeExecutionPersistenceErrorV1>
     {
-        let request = authorization.observation_request();
         validate_gateway_shard(&request.gateway_shard_id)?;
         let deadline = tokio::time::Instant::now() + self.timeouts.statement_timeout();
         let connection = tokio::time::timeout_at(deadline, self.pool.acquire())
@@ -153,24 +154,31 @@ impl RuntimeIngressOpenAcknowledgementPortV2 for PostgresRuntimeExecutionV1 {
         }
     }
 
-    fn publish_ingress_open_acknowledgement(
+    fn observe_ingress_open_acknowledgement_predecessor(
         &self,
-        authorization: &RuntimeAuthorizedIngressOpenAcknowledgementV2,
-    ) -> impl Future<
-        Output = Result<
-            RuntimePublishIngressOpenAcknowledgementOutcomeV2,
-            RuntimeIngressOpenAcknowledgementMutationErrorV2<Self::Error>,
-        >,
-    > + Send {
-        self.publish_ingress_open_acknowledgement_v2(authorization)
-    }
-
-    fn observe_ingress_open_acknowledgement(
-        &self,
-        authorization: &RuntimeAuthorizedIngressOpenAcknowledgementV2,
+        authorization: &RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
     ) -> impl Future<Output = Result<RuntimeObservedIngressOpenAcknowledgementV2, Self::Error>> + Send
     {
-        self.observe_ingress_open_acknowledgement_v2(authorization)
+        self.observe_ingress_open_acknowledgement_v2(authorization.request())
+    }
+
+    async fn publish_ingress_open_acknowledgement<'a>(
+        &'a self,
+        attempt: RuntimeIngressOpenAcknowledgementAttemptV2<'a>,
+    ) -> RuntimeIngressOpenAcknowledgementAttemptCompletionV2<'a, Self::Error> {
+        let result = self
+            .publish_ingress_open_acknowledgement_v2(attempt.authorization())
+            .await;
+        RuntimeIngressOpenAcknowledgementAttemptCompletionV2::new(attempt, result)
+    }
+
+    fn observe_ingress_open_acknowledgement<'a>(
+        &'a self,
+        attempt: &'a RuntimeIngressOpenAcknowledgementAttemptV2<'_>,
+    ) -> impl Future<Output = Result<RuntimeObservedIngressOpenAcknowledgementV2, Self::Error>> + Send
+    {
+        let request = attempt.authorization().observation_request();
+        async move { self.observe_ingress_open_acknowledgement_v2(&request).await }
     }
 }
 

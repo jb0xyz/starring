@@ -63,6 +63,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/product_drain.rs"),
             PathBuf::from("src/production_lifecycle/admission.rs"),
             PathBuf::from("src/production_lifecycle/handoff.rs"),
+            PathBuf::from("src/production_lifecycle/refresh.rs"),
             PathBuf::from("src/production_lifecycle/shutdown.rs"),
             PathBuf::from("src/production_lifecycle/tests.rs"),
             PathBuf::from("src/production_lifecycle.rs"),
@@ -1827,14 +1828,16 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
     let model = include_str!("../src/production_lifecycle.rs");
     let handoff = include_str!("../src/production_lifecycle/handoff.rs");
     let admission = include_str!("../src/production_lifecycle/admission.rs");
+    let refresh = include_str!("../src/production_lifecycle/refresh.rs");
     let shutdown = include_str!("../src/production_lifecycle/shutdown.rs");
-    let source = format!("{model}\n{handoff}\n{admission}\n{shutdown}");
+    let source = format!("{model}\n{handoff}\n{admission}\n{refresh}\n{shutdown}");
     let root = include_str!("../src/lib.rs");
     let closed = include_str!("../src/gateway_lifecycle.rs");
 
     assert!(model.lines().count() < 400);
     assert!(handoff.lines().count() < 500);
     assert!(admission.lines().count() < 700);
+    assert!(refresh.lines().count() < 400);
     assert!(shutdown.lines().count() < 650);
 
     for authority in [
@@ -1952,6 +1955,7 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
 fn ingress_acknowledgement_authority_is_linear_replayable_and_controller_composed() {
     let source = include_str!("../src/ingress_acknowledgement.rs");
     let admission = include_str!("../src/production_lifecycle/admission.rs");
+    let refresh = include_str!("../src/production_lifecycle/refresh.rs");
     let lifecycle = include_str!("../src/production_lifecycle.rs");
     let root = include_str!("../src/lib.rs");
 
@@ -1973,7 +1977,7 @@ fn ingress_acknowledgement_authority_is_linear_replayable_and_controller_compose
         source
             .matches("authorization: &RuntimeAuthorizedIngressOpenAcknowledgementV2,")
             .count(),
-        4
+        3
     );
     let accepted = source
         .split("pub struct RuntimeAcceptedIngressOpenAcknowledgementV2 {")
@@ -1989,13 +1993,18 @@ fn ingress_acknowledgement_authority_is_linear_replayable_and_controller_compose
     );
     for required in [
         "pub trait RuntimeIngressOpenAcknowledgementPortV2",
-        "fn publish_ingress_open_acknowledgement(",
-        "fn observe_ingress_open_acknowledgement(",
+        "fn publish_ingress_open_acknowledgement<'a>(",
+        "fn observe_ingress_open_acknowledgement<'a>(",
+        "fn observe_ingress_open_acknowledgement_predecessor(",
         "DefinitelyNotApplied",
         "OutcomeUnknown",
         "RuntimeIngressOpenAcknowledgementObservationErrorClassV2",
         "RuntimeIngressOpenAcknowledgementResolutionV2",
         "ReplaySameRequest",
+        "ReplayBudgetExhausted",
+        "RuntimeIngressOpenAcknowledgementSingleFlightV2",
+        "RuntimeIngressOpenAcknowledgementAttemptV2",
+        "RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2",
         "Divergent",
         "ProtocolViolation",
         "RuntimeIngressOpenAcknowledgementMutationErrorV2::DefinitelyNotApplied(<redacted>)",
@@ -2017,6 +2026,12 @@ fn ingress_acknowledgement_authority_is_linear_replayable_and_controller_compose
         assert!(!source.contains(forbidden), "{forbidden}");
     }
     assert!(admission.contains("pub fn authorize_ingress_open_acknowledgement("));
+    assert!(admission
+        .contains("pub fn authorize_ingress_open_acknowledgement_predecessor_observation("));
+    assert!(
+        refresh.contains("pub fn authorize_ingress_open_acknowledgement_refresh(\n        self,")
+    );
+    assert!(refresh.contains("RuntimeEmptyOpenAcknowledgementRefreshV2"));
     assert!(admission.contains(
         "RuntimeIngressOpenAcknowledgementV2 as RuntimeDurableIngressOpenAcknowledgementV2"
     ));
@@ -2042,6 +2057,9 @@ fn ingress_acknowledgement_authority_is_linear_replayable_and_controller_compose
         "RuntimeIngressOpenAcknowledgementPortV2",
         "RuntimeIngressOpenAcknowledgementMutationErrorV2",
         "RuntimeIngressOpenAcknowledgementResolutionV2",
+        "RuntimeIngressOpenAcknowledgementSingleFlightV2",
+        "RuntimeIngressOpenAcknowledgementPredecessorV2",
+        "RuntimeEmptyOpenAcknowledgementRefreshV2",
     ] {
         assert!(contains_identifier(root, exported), "{exported}");
     }

@@ -52,11 +52,16 @@ pub use ingress_acknowledgement::{
     classify_ingress_open_acknowledgement_outcome_v2,
     classify_unknown_ingress_open_acknowledgement_v2, RuntimeAcceptedIngressOpenAcknowledgementV2,
     RuntimeAuthorizedIngressOpenAcknowledgementV2,
+    RuntimeIngressOpenAcknowledgementAttemptCompletionV2,
+    RuntimeIngressOpenAcknowledgementAttemptErrorV2, RuntimeIngressOpenAcknowledgementAttemptV2,
     RuntimeIngressOpenAcknowledgementAuthorizationErrorV2,
     RuntimeIngressOpenAcknowledgementMutationErrorV2,
     RuntimeIngressOpenAcknowledgementObservationErrorClassV2,
-    RuntimeIngressOpenAcknowledgementPortV2, RuntimeIngressOpenAcknowledgementProtocolViolationV2,
-    RuntimeIngressOpenAcknowledgementResolutionV2,
+    RuntimeIngressOpenAcknowledgementPortV2,
+    RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
+    RuntimeIngressOpenAcknowledgementPredecessorV2,
+    RuntimeIngressOpenAcknowledgementProtocolViolationV2,
+    RuntimeIngressOpenAcknowledgementResolutionV2, RuntimeIngressOpenAcknowledgementSingleFlightV2,
 };
 pub use paused_gateway::{
     RuntimePausedGatewayObservationErrorV2, RuntimePausedGatewayObservationV2,
@@ -67,7 +72,11 @@ pub use product_drain::{
     RuntimeProductDrainUnknownRecoveryPortV2,
 };
 pub use production_lifecycle::{
-    RuntimeAdmissionAcknowledgingProcessV2, RuntimeEmptyOpenEpochV2, RuntimeEmptyOpenProcessV2,
+    RuntimeAdmissionAcknowledgingProcessV2,
+    RuntimeEmptyOpenAcknowledgementRefreshAuthorizationFailureV2,
+    RuntimeEmptyOpenAcknowledgementRefreshCompletionFailureV2,
+    RuntimeEmptyOpenAcknowledgementRefreshInputV2, RuntimeEmptyOpenAcknowledgementRefreshV2,
+    RuntimeEmptyOpenEpochV2, RuntimeEmptyOpenProcessV2,
     RuntimeIngressOpenAcknowledgementObservationV2, RuntimeMaintenanceGateGenerationV2,
     RuntimeMutationFinalizerGenerationV1, RuntimeOpenProductionObservationInputV2,
     RuntimeOpenProductionObservationPortV2, RuntimeOpenProductionObservationV2,

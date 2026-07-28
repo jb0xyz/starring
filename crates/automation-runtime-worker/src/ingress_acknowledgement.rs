@@ -2,9 +2,10 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 
 use automation_runtime_controller::{
-    RuntimeIngressOpenAcknowledgementReceiptV2, RuntimeIngressOpenAcknowledgementV2,
-    RuntimeObserveIngressOpenAcknowledgementV2, RuntimeObservedIngressOpenAcknowledgementV2,
-    RuntimePublishIngressOpenAcknowledgementOutcomeV2, RuntimePublishIngressOpenAcknowledgementV2,
+    GatewayShardIdV1, RuntimeIngressOpenAcknowledgementReceiptV2,
+    RuntimeIngressOpenAcknowledgementV2, RuntimeObserveIngressOpenAcknowledgementV2,
+    RuntimeObservedIngressOpenAcknowledgementV2, RuntimePublishIngressOpenAcknowledgementOutcomeV2,
+    RuntimePublishIngressOpenAcknowledgementV2,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -13,17 +14,120 @@ pub enum RuntimeIngressOpenAcknowledgementAuthorizationErrorV2 {
     OpenGateMismatch,
     #[error("runtime ingress acknowledgement predecessor does not match")]
     PreviousAcknowledgementMismatch,
+    #[error("runtime ingress acknowledgement predecessor observation does not match")]
+    PredecessorObservationMismatch,
     #[error("runtime ingress acknowledgement request is invalid")]
     InvalidRequest,
 }
 
+pub struct RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2 {
+    request: RuntimeObserveIngressOpenAcknowledgementV2,
+}
+
+impl RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2 {
+    pub(crate) fn for_shard(gateway_shard_id: GatewayShardIdV1) -> Self {
+        Self {
+            request: RuntimeObserveIngressOpenAcknowledgementV2 { gateway_shard_id },
+        }
+    }
+
+    pub fn request(&self) -> &RuntimeObserveIngressOpenAcknowledgementV2 {
+        &self.request
+    }
+
+    pub fn accept(
+        self,
+        observation: RuntimeObservedIngressOpenAcknowledgementV2,
+    ) -> Result<
+        RuntimeIngressOpenAcknowledgementPredecessorV2,
+        RuntimeIngressOpenAcknowledgementAuthorizationErrorV2,
+    > {
+        if observation.gateway_shard_id() != &self.request.gateway_shard_id {
+            return Err(
+                RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::PredecessorObservationMismatch,
+            );
+        }
+        Ok(RuntimeIngressOpenAcknowledgementPredecessorV2 { observation })
+    }
+}
+
+impl Debug for RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2(<redacted>)",
+        )
+    }
+}
+
+pub struct RuntimeIngressOpenAcknowledgementPredecessorV2 {
+    observation: RuntimeObservedIngressOpenAcknowledgementV2,
+}
+
+impl RuntimeIngressOpenAcknowledgementPredecessorV2 {
+    pub fn gateway_shard_id(&self) -> &GatewayShardIdV1 {
+        self.observation.gateway_shard_id()
+    }
+
+    pub fn observed_database_now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.observation.observed_database_now()
+    }
+
+    pub fn source_acknowledgement_revision(&self) -> Option<std::num::NonZeroU64> {
+        match &self.observation {
+            RuntimeObservedIngressOpenAcknowledgementV2::Missing { .. } => None,
+            RuntimeObservedIngressOpenAcknowledgementV2::Present(receipt) => {
+                Some(receipt.acknowledgement().acknowledgement_revision())
+            }
+        }
+    }
+
+    pub fn present_receipt(&self) -> Option<&RuntimeIngressOpenAcknowledgementReceiptV2> {
+        match &self.observation {
+            RuntimeObservedIngressOpenAcknowledgementV2::Missing { .. } => None,
+            RuntimeObservedIngressOpenAcknowledgementV2::Present(receipt) => Some(receipt),
+        }
+    }
+
+    fn is_missing(&self) -> bool {
+        matches!(
+            self.observation,
+            RuntimeObservedIngressOpenAcknowledgementV2::Missing { .. }
+        )
+    }
+
+    fn matches_present_identity(
+        &self,
+        receipt: &RuntimeIngressOpenAcknowledgementReceiptV2,
+    ) -> bool {
+        self.present_receipt().is_some_and(|predecessor| {
+            predecessor.source_acknowledgement_revision()
+                == receipt.source_acknowledgement_revision()
+                && predecessor.request_digest() == receipt.request_digest()
+                && predecessor.acknowledgement() == receipt.acknowledgement()
+        })
+    }
+}
+
+impl Debug for RuntimeIngressOpenAcknowledgementPredecessorV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeIngressOpenAcknowledgementPredecessorV2(<redacted>)")
+    }
+}
+
 pub struct RuntimeAuthorizedIngressOpenAcknowledgementV2 {
     request: RuntimePublishIngressOpenAcknowledgementV2,
+    predecessor: RuntimeIngressOpenAcknowledgementPredecessorV2,
 }
 
 impl RuntimeAuthorizedIngressOpenAcknowledgementV2 {
-    pub(crate) fn from_request(request: RuntimePublishIngressOpenAcknowledgementV2) -> Self {
-        Self { request }
+    pub(crate) fn from_request(
+        request: RuntimePublishIngressOpenAcknowledgementV2,
+        predecessor: RuntimeIngressOpenAcknowledgementPredecessorV2,
+    ) -> Self {
+        Self {
+            request,
+            predecessor,
+        }
     }
 
     pub fn request(&self) -> &RuntimePublishIngressOpenAcknowledgementV2 {
@@ -38,6 +142,193 @@ impl RuntimeAuthorizedIngressOpenAcknowledgementV2 {
 impl Debug for RuntimeAuthorizedIngressOpenAcknowledgementV2 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeAuthorizedIngressOpenAcknowledgementV2(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeIngressOpenAcknowledgementSingleFlightStateV2 {
+    FirstReady,
+    FirstInFlight,
+    ReplayReady,
+    ReplayInFlight,
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeIngressOpenAcknowledgementAttemptErrorV2 {
+    #[error("runtime ingress acknowledgement operation already has an attempt in flight")]
+    InFlight,
+    #[error("runtime ingress acknowledgement operation is terminal")]
+    Terminal,
+}
+
+pub struct RuntimeIngressOpenAcknowledgementSingleFlightV2 {
+    authorization: RuntimeAuthorizedIngressOpenAcknowledgementV2,
+    state: RuntimeIngressOpenAcknowledgementSingleFlightStateV2,
+}
+
+impl RuntimeIngressOpenAcknowledgementSingleFlightV2 {
+    pub(crate) fn new(authorization: RuntimeAuthorizedIngressOpenAcknowledgementV2) -> Self {
+        Self {
+            authorization,
+            state: RuntimeIngressOpenAcknowledgementSingleFlightStateV2::FirstReady,
+        }
+    }
+
+    pub fn request(&self) -> &RuntimePublishIngressOpenAcknowledgementV2 {
+        self.authorization.request()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn authorization(&self) -> &RuntimeAuthorizedIngressOpenAcknowledgementV2 {
+        &self.authorization
+    }
+
+    pub fn begin_attempt(
+        &mut self,
+    ) -> Result<
+        RuntimeIngressOpenAcknowledgementAttemptV2<'_>,
+        RuntimeIngressOpenAcknowledgementAttemptErrorV2,
+    > {
+        let replay = match self.state {
+            RuntimeIngressOpenAcknowledgementSingleFlightStateV2::FirstReady => {
+                self.state = RuntimeIngressOpenAcknowledgementSingleFlightStateV2::FirstInFlight;
+                false
+            }
+            RuntimeIngressOpenAcknowledgementSingleFlightStateV2::ReplayReady => {
+                self.state = RuntimeIngressOpenAcknowledgementSingleFlightStateV2::ReplayInFlight;
+                true
+            }
+            RuntimeIngressOpenAcknowledgementSingleFlightStateV2::FirstInFlight
+            | RuntimeIngressOpenAcknowledgementSingleFlightStateV2::ReplayInFlight => {
+                return Err(RuntimeIngressOpenAcknowledgementAttemptErrorV2::InFlight);
+            }
+            RuntimeIngressOpenAcknowledgementSingleFlightStateV2::Terminal => {
+                return Err(RuntimeIngressOpenAcknowledgementAttemptErrorV2::Terminal);
+            }
+        };
+        Ok(RuntimeIngressOpenAcknowledgementAttemptV2 {
+            operation: self,
+            replay,
+        })
+    }
+}
+
+impl Debug for RuntimeIngressOpenAcknowledgementSingleFlightV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeIngressOpenAcknowledgementSingleFlightV2(<redacted>)")
+    }
+}
+
+pub struct RuntimeIngressOpenAcknowledgementAttemptV2<'a> {
+    operation: &'a mut RuntimeIngressOpenAcknowledgementSingleFlightV2,
+    replay: bool,
+}
+
+impl RuntimeIngressOpenAcknowledgementAttemptV2<'_> {
+    pub fn authorization(&self) -> &RuntimeAuthorizedIngressOpenAcknowledgementV2 {
+        &self.operation.authorization
+    }
+
+    pub fn request(&self) -> &RuntimePublishIngressOpenAcknowledgementV2 {
+        self.operation.authorization.request()
+    }
+
+    pub fn is_replay(&self) -> bool {
+        self.replay
+    }
+
+    pub fn resolve_outcome(
+        self,
+        outcome: RuntimePublishIngressOpenAcknowledgementOutcomeV2,
+    ) -> RuntimeIngressOpenAcknowledgementResolutionV2 {
+        let resolution = classify_ingress_open_acknowledgement_outcome_v2(
+            &self.operation.authorization,
+            outcome,
+        );
+        self.finish(resolution)
+    }
+
+    pub fn resolve_unknown(
+        self,
+        observation: RuntimeObservedIngressOpenAcknowledgementV2,
+    ) -> RuntimeIngressOpenAcknowledgementResolutionV2 {
+        let resolution = classify_unknown_ingress_open_acknowledgement_v2(
+            &self.operation.authorization,
+            observation,
+        );
+        self.finish(resolution)
+    }
+
+    pub fn resolve_definitely_not_applied(self) -> RuntimeIngressOpenAcknowledgementResolutionV2 {
+        self.finish(RuntimeIngressOpenAcknowledgementResolutionV2::ReplaySameRequest)
+    }
+
+    fn finish(
+        self,
+        resolution: RuntimeIngressOpenAcknowledgementResolutionV2,
+    ) -> RuntimeIngressOpenAcknowledgementResolutionV2 {
+        if matches!(
+            resolution,
+            RuntimeIngressOpenAcknowledgementResolutionV2::ReplaySameRequest
+        ) {
+            if self.replay {
+                self.operation.state =
+                    RuntimeIngressOpenAcknowledgementSingleFlightStateV2::Terminal;
+                RuntimeIngressOpenAcknowledgementResolutionV2::ReplayBudgetExhausted
+            } else {
+                self.operation.state =
+                    RuntimeIngressOpenAcknowledgementSingleFlightStateV2::ReplayReady;
+                resolution
+            }
+        } else {
+            self.operation.state = RuntimeIngressOpenAcknowledgementSingleFlightStateV2::Terminal;
+            resolution
+        }
+    }
+}
+
+impl Debug for RuntimeIngressOpenAcknowledgementAttemptV2<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeIngressOpenAcknowledgementAttemptV2(<redacted>)")
+    }
+}
+
+pub struct RuntimeIngressOpenAcknowledgementAttemptCompletionV2<'a, E> {
+    attempt: RuntimeIngressOpenAcknowledgementAttemptV2<'a>,
+    result: Result<
+        RuntimePublishIngressOpenAcknowledgementOutcomeV2,
+        RuntimeIngressOpenAcknowledgementMutationErrorV2<E>,
+    >,
+}
+
+impl<'a, E> RuntimeIngressOpenAcknowledgementAttemptCompletionV2<'a, E> {
+    pub fn new(
+        attempt: RuntimeIngressOpenAcknowledgementAttemptV2<'a>,
+        result: Result<
+            RuntimePublishIngressOpenAcknowledgementOutcomeV2,
+            RuntimeIngressOpenAcknowledgementMutationErrorV2<E>,
+        >,
+    ) -> Self {
+        Self { attempt, result }
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        RuntimeIngressOpenAcknowledgementAttemptV2<'a>,
+        Result<
+            RuntimePublishIngressOpenAcknowledgementOutcomeV2,
+            RuntimeIngressOpenAcknowledgementMutationErrorV2<E>,
+        >,
+    ) {
+        (self.attempt, self.result)
+    }
+}
+
+impl<E> Debug for RuntimeIngressOpenAcknowledgementAttemptCompletionV2<'_, E> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeIngressOpenAcknowledgementAttemptCompletionV2(<redacted>)")
     }
 }
 
@@ -85,19 +376,19 @@ pub trait RuntimeIngressOpenAcknowledgementPortV2 {
         error: &Self::Error,
     ) -> RuntimeIngressOpenAcknowledgementObservationErrorClassV2;
 
-    fn publish_ingress_open_acknowledgement(
+    fn observe_ingress_open_acknowledgement_predecessor(
         &self,
-        authorization: &RuntimeAuthorizedIngressOpenAcknowledgementV2,
-    ) -> impl Future<
-        Output = Result<
-            RuntimePublishIngressOpenAcknowledgementOutcomeV2,
-            RuntimeIngressOpenAcknowledgementMutationErrorV2<Self::Error>,
-        >,
-    > + Send;
+        authorization: &RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
+    ) -> impl Future<Output = Result<RuntimeObservedIngressOpenAcknowledgementV2, Self::Error>> + Send;
 
-    fn observe_ingress_open_acknowledgement(
-        &self,
-        authorization: &RuntimeAuthorizedIngressOpenAcknowledgementV2,
+    fn publish_ingress_open_acknowledgement<'a>(
+        &'a self,
+        attempt: RuntimeIngressOpenAcknowledgementAttemptV2<'a>,
+    ) -> impl Future<Output = RuntimeIngressOpenAcknowledgementAttemptCompletionV2<'a, Self::Error>> + Send;
+
+    fn observe_ingress_open_acknowledgement<'a>(
+        &'a self,
+        attempt: &'a RuntimeIngressOpenAcknowledgementAttemptV2<'_>,
     ) -> impl Future<Output = Result<RuntimeObservedIngressOpenAcknowledgementV2, Self::Error>> + Send;
 }
 
@@ -147,6 +438,7 @@ pub enum RuntimeIngressOpenAcknowledgementResolutionV2 {
     ReplayedExact(RuntimeAcceptedIngressOpenAcknowledgementV2),
     AdoptExact(RuntimeAcceptedIngressOpenAcknowledgementV2),
     ReplaySameRequest,
+    ReplayBudgetExhausted,
     Stale,
     Divergent,
     ProtocolViolation(RuntimeIngressOpenAcknowledgementProtocolViolationV2),
@@ -159,6 +451,7 @@ impl RuntimeIngressOpenAcknowledgementResolutionV2 {
             | Self::ReplayedExact(accepted)
             | Self::AdoptExact(accepted) => Some(accepted),
             Self::ReplaySameRequest
+            | Self::ReplayBudgetExhausted
             | Self::Stale
             | Self::Divergent
             | Self::ProtocolViolation(_) => None,
@@ -173,6 +466,7 @@ impl Debug for RuntimeIngressOpenAcknowledgementResolutionV2 {
             Self::ReplayedExact(_) => "ReplayedExact",
             Self::AdoptExact(_) => "AdoptExact",
             Self::ReplaySameRequest => "ReplaySameRequest",
+            Self::ReplayBudgetExhausted => "ReplayBudgetExhausted",
             Self::Stale => "Stale",
             Self::Divergent => "Divergent",
             Self::ProtocolViolation(_) => "ProtocolViolation",
@@ -227,22 +521,25 @@ pub fn classify_unknown_ingress_open_acknowledgement_v2(
     }
     match observation {
         RuntimeObservedIngressOpenAcknowledgementV2::Missing { .. } => {
-            if request.source_acknowledgement_revision().is_none() {
+            if request.source_acknowledgement_revision().is_none()
+                && authorization.predecessor.is_missing()
+            {
                 RuntimeIngressOpenAcknowledgementResolutionV2::ReplaySameRequest
             } else {
                 RuntimeIngressOpenAcknowledgementResolutionV2::Stale
             }
         }
         RuntimeObservedIngressOpenAcknowledgementV2::Present(receipt) => {
-            classify_present_after_unknown(request, *receipt)
+            classify_present_after_unknown(authorization, *receipt)
         }
     }
 }
 
 fn classify_present_after_unknown(
-    request: &RuntimePublishIngressOpenAcknowledgementV2,
+    authorization: &RuntimeAuthorizedIngressOpenAcknowledgementV2,
     receipt: RuntimeIngressOpenAcknowledgementReceiptV2,
 ) -> RuntimeIngressOpenAcknowledgementResolutionV2 {
+    let request = authorization.request();
     if receipt.observed_database_now() >= receipt.acknowledgement().expires_at() {
         return RuntimeIngressOpenAcknowledgementResolutionV2::Stale;
     }
@@ -273,7 +570,7 @@ fn classify_present_after_unknown(
         .source_acknowledgement_revision()
         .is_some_and(|source| source == observed_revision)
     {
-        return if same_operation_scope(request, receipt.acknowledgement()) {
+        return if authorization.predecessor.matches_present_identity(&receipt) {
             RuntimeIngressOpenAcknowledgementResolutionV2::ReplaySameRequest
         } else {
             RuntimeIngressOpenAcknowledgementResolutionV2::Stale

@@ -17,7 +17,10 @@ use crate::{
     RuntimeAcceptedIngressOpenAcknowledgementV2, RuntimeAuthorizedIngressOpenAcknowledgementV2,
     RuntimeCapabilityReadinessSetV2, RuntimeClosedRecoveryAuthorityRevisionV2,
     RuntimeIngressOpenAcknowledgementAuthorizationErrorV2,
-    RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryEmptyObservationV2,
+    RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
+    RuntimeIngressOpenAcknowledgementPredecessorV2,
+    RuntimeIngressOpenAcknowledgementSingleFlightV2, RuntimeRegistryGlobalObservationSequenceV2,
+    RuntimeRegistryRecoveryEmptyObservationV2,
 };
 
 pub struct RuntimeRecoveryResumeObservationInputV2 {
@@ -106,13 +109,26 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
         self.resume.input.finalizer_generation
     }
 
+    pub fn authorize_ingress_open_acknowledgement_predecessor_observation(
+        &self,
+    ) -> RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2 {
+        RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2::for_shard(
+            self.resume
+                .input
+                .owner_receipt
+                .lease_id
+                .gateway_shard_id
+                .clone(),
+        )
+    }
+
     pub fn authorize_ingress_open_acknowledgement(
         &self,
         open_maintenance_gate_generation: RuntimeMaintenanceGateGenerationV2,
-        previous_acknowledgement: Option<&RuntimeDurableIngressOpenAcknowledgementV2>,
+        predecessor: RuntimeIngressOpenAcknowledgementPredecessorV2,
         lease_for: RuntimeIngressOpenAcknowledgementLeaseDurationV2,
     ) -> Result<
-        RuntimeAuthorizedIngressOpenAcknowledgementV2,
+        RuntimeIngressOpenAcknowledgementSingleFlightV2,
         RuntimeIngressOpenAcknowledgementAuthorizationErrorV2,
     > {
         let expected_gate_generation = self
@@ -127,21 +143,16 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
         if open_maintenance_gate_generation.get() != expected_gate_generation.get() {
             return Err(RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::OpenGateMismatch);
         }
-        if previous_acknowledgement.is_some_and(|acknowledgement| {
-            !acknowledgement_matches_admission(
-                self,
-                open_maintenance_gate_generation,
-                acknowledgement,
-            )
-        }) {
+        if predecessor.gateway_shard_id()
+            != &self.resume.input.owner_receipt.lease_id.gateway_shard_id
+        {
             return Err(
                 RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::PreviousAcknowledgementMismatch,
             );
         }
         let request = RuntimePublishIngressOpenAcknowledgementV2::new(
             RuntimePublishIngressOpenAcknowledgementInputV2 {
-                source_acknowledgement_revision: previous_acknowledgement
-                    .map(RuntimeDurableIngressOpenAcknowledgementV2::acknowledgement_revision),
+                source_acknowledgement_revision: predecessor.source_acknowledgement_revision(),
                 fence_generation: self.resume.input.writer_fence_generation,
                 maintenance_gate_generation: expected_gate_generation,
                 owner_receipt: self.resume.input.owner_receipt.clone(),
@@ -150,8 +161,8 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
             },
         )
         .map_err(|_| RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::InvalidRequest)?;
-        Ok(RuntimeAuthorizedIngressOpenAcknowledgementV2::from_request(
-            request,
+        Ok(RuntimeIngressOpenAcknowledgementSingleFlightV2::new(
+            RuntimeAuthorizedIngressOpenAcknowledgementV2::from_request(request, predecessor),
         ))
     }
 }
@@ -277,7 +288,14 @@ impl RuntimeIngressOpenAcknowledgementObservationV2 {
         self.accepted.acknowledgement()
     }
 
-    fn accepted_request(&self) -> &RuntimePublishIngressOpenAcknowledgementV2 {
+    #[cfg(test)]
+    pub(crate) fn accepted_receipt(
+        &self,
+    ) -> &automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2 {
+        self.accepted.receipt()
+    }
+
+    pub(super) fn accepted_request(&self) -> &RuntimePublishIngressOpenAcknowledgementV2 {
         self.accepted.request()
     }
 
@@ -429,13 +447,13 @@ pub trait RuntimeOpenProductionObservationPortV2 {
 }
 
 pub struct RuntimeEmptyOpenEpochV2 {
-    coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
-    gateway_owner: RuntimeGatewayOwnerLeaseReceiptV1,
-    readiness: RuntimeCapabilityReadinessSetV2,
-    gateway_ready: RuntimeGatewayReadyAttestationV2,
-    ingress_acknowledgement: RuntimeIngressOpenAcknowledgementObservationV2,
-    registry_empty: RuntimeRegistryRecoveryEmptyObservationV2,
-    finalizer_generation: RuntimeMutationFinalizerGenerationV1,
+    pub(super) coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+    pub(super) gateway_owner: RuntimeGatewayOwnerLeaseReceiptV1,
+    pub(super) readiness: RuntimeCapabilityReadinessSetV2,
+    pub(super) gateway_ready: RuntimeGatewayReadyAttestationV2,
+    pub(super) ingress_acknowledgement: RuntimeIngressOpenAcknowledgementObservationV2,
+    pub(super) registry_empty: RuntimeRegistryRecoveryEmptyObservationV2,
+    pub(super) finalizer_generation: RuntimeMutationFinalizerGenerationV1,
 }
 
 impl RuntimeEmptyOpenEpochV2 {
@@ -445,6 +463,10 @@ impl RuntimeEmptyOpenEpochV2 {
 
     pub fn process_instance_id(&self) -> &ProcessInstanceId {
         &self.gateway_owner.lease_id.process_instance_id
+    }
+
+    pub fn gateway_owner(&self) -> &RuntimeGatewayOwnerLeaseReceiptV1 {
+        &self.gateway_owner
     }
 
     pub fn gateway_ready(&self) -> &RuntimeGatewayReadyAttestationV2 {
@@ -476,7 +498,7 @@ impl Debug for RuntimeEmptyOpenEpochV2 {
 
 pub struct RuntimeEmptyOpenProcessV2 {
     pub(super) _admission: RuntimeAdmissionAcknowledgingProcessV2,
-    epoch: RuntimeEmptyOpenEpochV2,
+    pub(super) epoch: RuntimeEmptyOpenEpochV2,
 }
 
 impl RuntimeEmptyOpenProcessV2 {
@@ -641,24 +663,4 @@ fn validate_open(
         return Err(RuntimeProductionLifecycleErrorV2::IngressAcknowledgementNotCurrent);
     }
     Ok(())
-}
-
-fn acknowledgement_matches_admission(
-    state: &RuntimeAdmissionAcknowledgingProcessV2,
-    open_gate_generation: RuntimeMaintenanceGateGenerationV2,
-    acknowledgement: &RuntimeDurableIngressOpenAcknowledgementV2,
-) -> bool {
-    let owner = &state.resume.input.owner_receipt;
-    let ready = &state.resume.input.gateway_ready;
-    acknowledgement.fence_generation() == state.resume.input.writer_fence_generation
-        && acknowledgement.maintenance_gate_generation().get() == open_gate_generation.get()
-        && acknowledgement.gateway_owner_lease_id() == &owner.lease_id
-        && acknowledgement.observed_owner_revision() == owner.owner_revision
-        && acknowledgement.process_instance_id() == &ready.process_instance_id
-        && acknowledgement.connection_epoch() == ready.connection_epoch
-        && acknowledgement.admission_revision() == ready.admission_revision
-        && acknowledgement.connected_event_sequence() == ready.connected_event_sequence
-        && acknowledgement.resume_sequence() == ready.resume_sequence
-        && acknowledgement.expires_at() > owner.database_now
-        && acknowledgement.expires_at() <= owner.expires_at
 }
