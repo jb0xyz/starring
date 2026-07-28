@@ -241,15 +241,17 @@ The selector returns a bounded retry for a previous claim that is otherwise
 valid but not expired. It does not seal the local registry for that outcome.
 
 The succession mutation runs in one serializable read-write transaction with
-the established order:
+the established order shared by the existing Product first-apply and
+pending-drain mutation paths:
 
 1. global writer-fence advisory lock;
 2. gateway-owner advisory lock and current owner row;
-3. serving slot and slot writer fence;
-4. drain intent and Product root;
-5. deployment;
-6. certification state;
-7. exact action journal identity.
+3. serving-slot advisory lock, slot writer fence, and serving lease;
+4. deployment;
+5. Product root;
+6. drain-intent advisory lock and drain intent;
+7. certification state;
+8. exact action journal identity.
 
 Before mutation it revalidates:
 
