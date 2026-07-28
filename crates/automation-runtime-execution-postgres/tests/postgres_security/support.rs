@@ -84,7 +84,7 @@ const EXECUTOR_FUNCTIONS: [&str; 26] = [
     "public.starring_runtime_startup_recovery_pending_drain_succession_v3(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,text,bigint,bigint,text,bigint,bigint,bigint,bigint,text,bigint,bigint,bigint,text,bigint,text,text,boolean,bigint,bigint,bytea,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,boolean)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "a3674e7c69f24ce212ddf0598d23f448a47f0b6e7766dee20a78399d5b6477e7";
+    "059ee21b16b325a4da71dda5d63f75c8aeac4d0e2d9b18cbb3f628d15ea8967d";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";

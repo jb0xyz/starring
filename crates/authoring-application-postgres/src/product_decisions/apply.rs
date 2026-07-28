@@ -23,6 +23,11 @@ use automation_state::InteractionRuleSet;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
+use super::apply_consume::{
+    call_consume_runtime_drain, prepare_runtime_drain_consumption,
+    validate_runtime_drain_consumption_result, RuntimeDrainConsumptionCallV2,
+    ValidatedRuntimeDrainConsumptionV2,
+};
 use super::apply_projection::prepare_product_apply_v1;
 use super::apply_sql::{
     begin_runtime_drain, finalize_apply, load_apply_target_artifact, lock_apply,
@@ -144,7 +149,7 @@ impl PostgresProductDecisions {
                     return Err(classify_precommit_failure(error));
                 }
             };
-            let disposition =
+            let mut disposition =
                 match validate_runtime_drain_observation(request, digests, None, &observed) {
                     Ok(disposition) => disposition,
                     Err(error) => {
@@ -152,7 +157,7 @@ impl PostgresProductDecisions {
                         return Err(error);
                     }
                 };
-            if disposition == RuntimeDrainStartDispositionV2::Absent {
+            if matches!(disposition, RuntimeDrainStartDispositionV2::Absent) {
                 let candidates = match RuntimeDrainCandidateIdsV2::generate() {
                     Ok(candidates) => candidates,
                     Err(error) => {
@@ -176,25 +181,55 @@ impl PostgresProductDecisions {
                         return Err(classify_precommit_failure(error));
                     }
                 };
-                if started.outcome != "inserted"
-                    || !matches!(
-                        validate_runtime_drain_observation(
-                            request,
-                            digests,
-                            Some(&candidates),
-                            &started,
-                        ),
-                        Ok(RuntimeDrainStartDispositionV2::Present)
+                disposition = match validate_runtime_drain_observation(
+                    request,
+                    digests,
+                    Some(&candidates),
+                    &started,
+                ) {
+                    Ok(RuntimeDrainStartDispositionV2::Pending)
+                        if started.outcome == "inserted" =>
+                    {
+                        RuntimeDrainStartDispositionV2::Pending
+                    }
+                    _ => {
+                        let _ = transaction.rollback().await;
+                        return Err(ApplyAttemptFailure::Control(invalid_apply_result()));
+                    }
+                };
+            }
+            match disposition {
+                RuntimeDrainStartDispositionV2::Pending => {
+                    commit_apply(transaction).await?;
+                    return Err(ApplyAttemptFailure::Control(
+                        ProductControlPortError::RuntimeDrainRequired,
+                    ));
+                }
+                RuntimeDrainStartDispositionV2::Acknowledged(source) => {
+                    let receipt = match consume_acknowledged_runtime_drain(
+                        &mut transaction,
+                        request,
+                        digests,
+                        expected_revision,
+                        authority_revision,
+                        &source,
                     )
-                {
+                    .await
+                    {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            return Err(error);
+                        }
+                    };
+                    commit_apply(transaction).await?;
+                    return Ok(receipt);
+                }
+                RuntimeDrainStartDispositionV2::Absent => {
                     let _ = transaction.rollback().await;
                     return Err(ApplyAttemptFailure::Control(invalid_apply_result()));
                 }
             }
-            commit_apply(transaction).await?;
-            return Err(ApplyAttemptFailure::Control(
-                ProductControlPortError::RuntimeDrainRequired,
-            ));
         }
         if locked.outcome != "ready" {
             let error = map_lock_failure(&locked);
@@ -237,6 +272,60 @@ impl PostgresProductDecisions {
     }
 }
 
+async fn consume_acknowledged_runtime_drain(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &AuthorizedApplyProductV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    digests: &ApplyDigests,
+    expected_revision: i64,
+    authority_revision: i64,
+    source: &ValidatedRuntimeDrainConsumptionV2,
+) -> Result<ProductMutationReceiptV1, ApplyAttemptFailure> {
+    let call = RuntimeDrainConsumptionCallV2::new(
+        request,
+        digests,
+        expected_revision,
+        authority_revision,
+        source,
+    );
+    let prepared_row = call_consume_runtime_drain(transaction, "prepare", &call, None)
+        .await
+        .map_err(classify_precommit_failure)?;
+    if prepared_row.outcome_name == "cancelled" {
+        return Err(ApplyAttemptFailure::Control(
+            ProductControlPortError::LifecycleCancelled(
+                source.selector().map_err(ApplyAttemptFailure::Control)?,
+            ),
+        ));
+    }
+    if prepared_row.outcome_name != "drain_pending" {
+        return Err(ApplyAttemptFailure::Control(map_consume_outcome(
+            &prepared_row.outcome_name,
+        )));
+    }
+    let prepared = prepare_runtime_drain_consumption(request, digests, source, &prepared_row)
+        .map_err(ApplyAttemptFailure::Control)?;
+    let committed = call_consume_runtime_drain(transaction, "commit", &call, Some(&prepared))
+        .await
+        .map_err(classify_precommit_failure)?;
+    let result = validate_runtime_drain_consumption_result(digests, source, &prepared, &committed)
+        .map_err(ApplyAttemptFailure::Control)?;
+    let revision = ProductRevisionV1::new(result.product_revision)
+        .map_err(|_| ApplyAttemptFailure::Control(invalid_apply_result()))?;
+    let exact = exact_deployment(
+        request,
+        &result.deployment_id,
+        &result.desired_target_digest,
+    )?;
+    Ok(mutation_receipt(
+        request,
+        revision,
+        ProductDecisionPhaseV1::Applied {
+            exact_deployment: exact,
+        },
+        result.exact_replay,
+    ))
+}
+
 fn validate_runtime_drain_lock(locked: &ApplyLockRow) -> Result<(), ApplyAttemptFailure> {
     if map_lock_failure(locked) == ProductControlPortError::RuntimeDrainRequired {
         Ok(())
@@ -245,10 +334,26 @@ fn validate_runtime_drain_lock(locked: &ApplyLockRow) -> Result<(), ApplyAttempt
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+fn map_consume_outcome(outcome: &str) -> ProductControlPortError {
+    match outcome {
+        "scope_mismatch" => ProductControlPortError::ScopeMismatch,
+        "revision_conflict" | "terminal_conflict" => ProductControlPortError::RevisionConflict,
+        "idempotency_conflict" => ProductControlPortError::IdempotencyConflict,
+        "authorization_stale" => ProductControlPortError::InvalidState,
+        "writer_fenced" => {
+            ProductControlPortError::Backend("product apply is temporarily unavailable".to_string())
+        }
+        "indeterminate" => ProductControlPortError::Indeterminate(
+            "runtime drain consumption outcome is unavailable".to_string(),
+        ),
+        _ => invalid_apply_result(),
+    }
+}
+
 enum RuntimeDrainStartDispositionV2 {
     Absent,
-    Present,
+    Pending,
+    Acknowledged(Box<ValidatedRuntimeDrainConsumptionV2>),
 }
 
 struct ValidatedRuntimeDrainScopeV2 {
@@ -277,8 +382,7 @@ fn validate_runtime_drain_observation(
             Ok(RuntimeDrainStartDispositionV2::Absent)
         }
         "inserted" | "replayed" => {
-            validate_present_runtime_drain(request, digests, candidates, started)?;
-            Ok(RuntimeDrainStartDispositionV2::Present)
+            validate_present_runtime_drain(request, digests, candidates, started)
         }
         _ if runtime_drain_start_projection_is_empty(started) => Err(ApplyAttemptFailure::Control(
             map_runtime_drain_start_outcome(&started.outcome),
@@ -395,7 +499,7 @@ fn validate_present_runtime_drain(
     digests: &ApplyDigests,
     candidates: Option<&RuntimeDrainCandidateIdsV2>,
     started: &ApplyBeginRuntimeDrainRow,
-) -> Result<(), ApplyAttemptFailure> {
+) -> Result<RuntimeDrainStartDispositionV2, ApplyAttemptFailure> {
     let scope = validate_runtime_drain_scope(request, digests, started)?;
     let product_scope = scope.lookup.product_operation_scope();
     let drain_scope = scope.lookup.drain_intent_scope();
@@ -511,6 +615,16 @@ fn validate_present_runtime_drain(
         "replayed" => pending_marked_at <= scope.observed_at,
         _ => false,
     };
+    let acknowledgement_time_is_valid = state_kind
+        != RuntimeDrainIntentCanonicalStateKindV2::RouteAbsentAcknowledged
+        || canonical_state
+            .intent()
+            .state()
+            .acknowledgement()
+            .is_some_and(|acknowledgement| {
+                acknowledgement.acknowledged_at() >= pending_marked_at
+                    && acknowledgement.acknowledged_at() <= scope.observed_at
+            });
     let inserted_identity_is_valid = started.outcome != "inserted"
         || candidates.is_some_and(|candidates| {
             product_operation_id.as_str() == candidates.product_operation_id
@@ -530,6 +644,7 @@ fn validate_present_runtime_drain(
             != Some(product_scope.scope().deployment_id.as_str())
         || started.pending_expected_revision != Some(scope.expected_revision)
         || !time_progress_is_valid
+        || !acknowledgement_time_is_valid
         || !inserted_identity_is_valid
         || !intent_progress_is_valid
         || !epoch_progress_is_valid
@@ -537,7 +652,27 @@ fn validate_present_runtime_drain(
     {
         return Err(ApplyAttemptFailure::Control(invalid_apply_result()));
     }
-    Ok(())
+    match state_kind {
+        RuntimeDrainIntentCanonicalStateKindV2::PendingUnclaimed
+        | RuntimeDrainIntentCanonicalStateKindV2::PendingClaimed
+        | RuntimeDrainIntentCanonicalStateKindV2::PendingRefenced => {
+            Ok(RuntimeDrainStartDispositionV2::Pending)
+        }
+        RuntimeDrainIntentCanonicalStateKindV2::RouteAbsentAcknowledged => {
+            let source = ValidatedRuntimeDrainConsumptionV2::new(
+                persisted,
+                canonical_state,
+                canonical_state_digest.to_string(),
+                scope.locked_snapshot,
+            )
+            .map_err(|_| invalid_runtime_drain_attempt())?;
+            Ok(RuntimeDrainStartDispositionV2::Acknowledged(Box::new(
+                source,
+            )))
+        }
+        RuntimeDrainIntentCanonicalStateKindV2::Consumed
+        | RuntimeDrainIntentCanonicalStateKindV2::Cancelled => Err(invalid_runtime_drain_attempt()),
+    }
 }
 
 fn invalid_runtime_drain_attempt() -> ApplyAttemptFailure {

@@ -119,7 +119,10 @@ async fn insert_slot_race_installation_rows(
     .bind(&fixture.installation_id)
     .bind(&fixture.tenant_id)
     .bind(digest(&format!("race-binding:{}", fixture.installation_id)))
-    .bind(digest(&format!("race-authority:{}", fixture.installation_id)))
+    .bind(digest(&format!(
+        "race-authority:{}",
+        fixture.installation_id
+    )))
     .bind(&fixture.principal_id)
     .bind(digest(&format!("race-request:{}", fixture.installation_id)))
     .execute(&mut **transaction)
@@ -746,13 +749,8 @@ async fn product_apply_waits_at_writer_fence_before_product_row_locks() {
                 .await?;
             let _ = started_sender.send(process_id);
             let call = Call::valid(&apply_fixture);
-            let locked = lock_apply(
-                &mut transaction,
-                &apply_fixture,
-                &apply_operation,
-                &call,
-            )
-            .await?;
+            let locked =
+                lock_apply(&mut transaction, &apply_fixture, &apply_operation, &call).await?;
             transaction.rollback().await?;
             Ok::<_, sqlx::Error>(locked.outcome)
         });
@@ -919,9 +917,7 @@ async fn product_apply_writer_fence_closed_and_missing_are_stable_failures() {
     outcome.unwrap();
 }
 
-async fn product_apply_writer_fence_catalog_state(
-    pool: &PgPool,
-) -> (String, bool, i64, i64, i64) {
+async fn product_apply_writer_fence_catalog_state(pool: &PgPool) -> (String, bool, i64, i64, i64) {
     sqlx::query_as(
         "SELECT \
           pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(\
@@ -1363,5 +1359,227 @@ async fn migration_requires_explicit_apply_authority_intersection() {
             .await
             .unwrap();
     }
+    outcome.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn product_apply_consume_preparation_reservation_is_private_and_one_shot() {
+    let database = isolated_database("consume_reserve").await;
+    MIGRATOR.run(&database.pool).await.unwrap();
+    let role = format!("starring_consume_reserve_{}", suffix());
+    sqlx::query(&format!("CREATE ROLE {role} NOLOGIN NOINHERIT"))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let owner = sqlx::query_scalar::<_, String>("SELECT current_user")
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    let quoted_owner = sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_ident($1)")
+        .bind(&owner)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!("GRANT {role} TO {quoted_owner}"))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let outcome = async {
+        sqlx::query(&format!(
+            "REVOKE TEMPORARY ON DATABASE {} FROM PUBLIC",
+            database.name
+        ))
+        .execute(&database.pool)
+        .await?;
+        let has_temporary_privilege = sqlx::query_scalar::<_, bool>(
+            "SELECT pg_catalog.has_database_privilege($1, current_database(), 'TEMPORARY')",
+        )
+        .bind(&role)
+        .fetch_one(&database.pool)
+        .await?;
+        assert!(!has_temporary_privilege);
+
+        let token = format!("v2:{}", "1".repeat(64));
+        let binding_digest = "2".repeat(64);
+        let projection_digest = "3".repeat(64);
+        let terminal_time =
+            sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+                .fetch_one(&database.pool)
+                .await?;
+        let mut transaction = database.pool.begin().await?;
+        let prepared = sqlx::query_scalar::<_, bool>(
+            "SELECT starring_runtime_private_v2.\
+             starring_product_apply_consume_preparation_reservation_v2(\
+              'prepare', $1, $2, $3, $4)",
+        )
+        .bind(&token)
+        .bind(&binding_digest)
+        .bind(&projection_digest)
+        .bind(terminal_time)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert!(prepared);
+        sqlx::query(&format!("SET LOCAL ROLE {role}"))
+            .execute(&mut *transaction)
+            .await?;
+        for statement in [
+            "SELECT * FROM pg_temp.starring_product_apply_consume_preparation_reservations_v2",
+            "INSERT INTO pg_temp.starring_product_apply_consume_preparation_reservations_v2 \
+             (preparation_token, backend_pid, transaction_id, binding_digest, \
+              locked_projection_digest, terminal_database_time) \
+             VALUES ('v2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+              pg_catalog.pg_backend_pid(), pg_catalog.txid_current(), \
+              'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', \
+              'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', \
+              pg_catalog.clock_timestamp())",
+            "UPDATE pg_temp.starring_product_apply_consume_preparation_reservations_v2 \
+             SET binding_digest = \
+              'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'",
+            "DELETE FROM pg_temp.starring_product_apply_consume_preparation_reservations_v2",
+            "TRUNCATE TABLE pg_temp.starring_product_apply_consume_preparation_reservations_v2",
+            "DROP TABLE pg_temp.starring_product_apply_consume_preparation_reservations_v2",
+            "SELECT starring_runtime_private_v2.\
+             starring_product_apply_consume_preparation_reservation_v2(\
+              'commit', \
+              'v2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', \
+              'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', \
+              'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc', \
+              pg_catalog.clock_timestamp())",
+        ] {
+            sqlx::query("SAVEPOINT reservation_attack")
+                .execute(&mut *transaction)
+                .await?;
+            let error = sqlx::raw_sql(statement)
+                .execute(&mut *transaction)
+                .await
+                .expect_err("scoped role must not access the reservation");
+            let sqlx::Error::Database(database_error) = error else {
+                panic!("expected database permission error");
+            };
+            assert_eq!(database_error.code().as_deref(), Some("42501"));
+            sqlx::query("ROLLBACK TO SAVEPOINT reservation_attack")
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("RELEASE SAVEPOINT reservation_attack")
+                .execute(&mut *transaction)
+                .await?;
+        }
+        sqlx::query("RESET ROLE").execute(&mut *transaction).await?;
+        let consumed = sqlx::query_scalar::<_, bool>(
+            "SELECT starring_runtime_private_v2.\
+             starring_product_apply_consume_preparation_reservation_v2(\
+              'commit', $1, $2, $3, $4)",
+        )
+        .bind(&token)
+        .bind(&binding_digest)
+        .bind(&projection_digest)
+        .bind(terminal_time)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert!(consumed);
+        let consumed_again = sqlx::query_scalar::<_, bool>(
+            "SELECT starring_runtime_private_v2.\
+             starring_product_apply_consume_preparation_reservation_v2(\
+              'commit', $1, $2, $3, $4)",
+        )
+        .bind(&token)
+        .bind(&binding_digest)
+        .bind(&projection_digest)
+        .bind(terminal_time)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert!(!consumed_again);
+        transaction.commit().await?;
+
+        let mut transaction = database.pool.begin().await?;
+        let commit_without_prepare = sqlx::query_scalar::<_, bool>(
+            "SELECT starring_runtime_private_v2.\
+             starring_product_apply_consume_preparation_reservation_v2(\
+              'commit', $1, $2, $3, $4)",
+        )
+        .bind(&token)
+        .bind(&binding_digest)
+        .bind(&projection_digest)
+        .bind(terminal_time)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert!(!commit_without_prepare);
+        transaction.commit().await?;
+
+        let mut transaction = database.pool.begin().await?;
+        let prepared = sqlx::query_scalar::<_, bool>(
+            "SELECT starring_runtime_private_v2.\
+             starring_product_apply_consume_preparation_reservation_v2(\
+              'prepare', $1, $2, $3, $4)",
+        )
+        .bind(&token)
+        .bind(&binding_digest)
+        .bind(&projection_digest)
+        .bind(terminal_time)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert!(prepared);
+        transaction.commit().await?;
+        let mut transaction = database.pool.begin().await?;
+        let leaked_across_commit = sqlx::query_scalar::<_, bool>(
+            "SELECT starring_runtime_private_v2.\
+             starring_product_apply_consume_preparation_reservation_v2(\
+              'commit', $1, $2, $3, $4)",
+        )
+        .bind(&token)
+        .bind(&binding_digest)
+        .bind(&projection_digest)
+        .bind(terminal_time)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert!(!leaked_across_commit);
+        transaction.commit().await?;
+
+        let mut transaction = database.pool.begin().await?;
+        let prepared = sqlx::query_scalar::<_, bool>(
+            "SELECT starring_runtime_private_v2.\
+             starring_product_apply_consume_preparation_reservation_v2(\
+              'prepare', $1, $2, $3, $4)",
+        )
+        .bind(&token)
+        .bind(&binding_digest)
+        .bind(&projection_digest)
+        .bind(terminal_time)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert!(prepared);
+        transaction.rollback().await?;
+        let mut transaction = database.pool.begin().await?;
+        let leaked_across_rollback = sqlx::query_scalar::<_, bool>(
+            "SELECT starring_runtime_private_v2.\
+             starring_product_apply_consume_preparation_reservation_v2(\
+              'commit', $1, $2, $3, $4)",
+        )
+        .bind(&token)
+        .bind(&binding_digest)
+        .bind(&projection_digest)
+        .bind(terminal_time)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert!(!leaked_across_rollback);
+        transaction.commit().await?;
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    database.pool.close().await;
+    let mut administrator = database.administrator;
+    sqlx::query(&format!("DROP DATABASE {} WITH (FORCE)", database.name))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
+    sqlx::query(&format!("REVOKE {role} FROM {quoted_owner}"))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(&mut administrator)
+        .await
+        .unwrap();
     outcome.unwrap();
 }

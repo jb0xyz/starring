@@ -1,4 +1,5 @@
 mod apply;
+mod apply_consume;
 mod apply_contract;
 mod apply_projection;
 mod apply_readiness;

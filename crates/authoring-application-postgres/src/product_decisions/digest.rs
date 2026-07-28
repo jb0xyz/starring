@@ -22,6 +22,8 @@ const APPLY_RECEIPT_ID_DOMAIN: &[u8] = b"starring.product.apply.receipt.v1";
 const APPLY_AUDIT_EVENT_ID_DOMAIN: &[u8] = b"starring.product.apply.audit.v1";
 const APPLY_ATTEMPT_ID_DOMAIN: &[u8] = b"starring.product.apply.attempt.v1";
 const APPLY_DEPLOYMENT_ID_DOMAIN: &[u8] = b"starring.product.apply.deployment.v1";
+const APPLY_DRAIN_CONSUME_TERMINAL_ACTION_ID_DOMAIN: &[u8] =
+    b"starring.product.apply.runtime-drain-consume-terminal-action.v1";
 const REJECTION_IDEMPOTENCY_DOMAIN: &[u8] = b"starring.product.rejection.idempotency.v1";
 const REJECTION_SEMANTIC_REQUEST_DOMAIN: &[u8] = b"starring.product.rejection.request.v1";
 const REJECTION_RECEIPT_ID_DOMAIN: &[u8] = b"starring.product.rejection.receipt.v1";
@@ -52,6 +54,7 @@ pub(crate) struct ApplyDigests {
     pub audit_event_id: String,
     pub apply_attempt_id: String,
     pub deployment_id: String,
+    pub drain_consume_terminal_action_id: String,
     pub session_subject: Vec<u8>,
 }
 
@@ -198,6 +201,11 @@ pub(crate) fn apply_digests(
         APPLY_DEPLOYMENT_ID_DOMAIN,
         &identity_fields,
     );
+    let drain_consume_terminal_action_id = keyed_digest(
+        keyring.active(),
+        APPLY_DRAIN_CONSUME_TERMINAL_ACTION_ID_DOMAIN,
+        &identity_fields,
+    );
     let session_subject = product_action_session_subject_digest_v1(
         SESSION_SUBJECT_DOMAIN,
         scope.tenant_id().as_str().as_bytes(),
@@ -215,6 +223,7 @@ pub(crate) fn apply_digests(
         audit_event_id,
         apply_attempt_id,
         deployment_id,
+        drain_consume_terminal_action_id,
         session_subject,
     }
 }

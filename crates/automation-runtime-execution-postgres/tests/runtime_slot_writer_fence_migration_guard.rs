@@ -25,15 +25,15 @@ starring_runtime_slot_writer_fence_installation_insert_v2()";
 const MIGRATION_EXACT_TARGET_READINESS_DIGEST: &str =
     "e4bae4b38acc529accd4401af853eb7e96d2a34ad8fb1224b9965166ff40c229";
 const CURRENT_EXACT_TARGET_READINESS_DIGEST: &str =
-    "5eba72a786aebaa8afdc226d661b45132afc5aa053fab7be6a3b9737fdab0e8c";
+    "35903afa3bb9bebe712559a80a503823f4eeedf0d15ebd3d24ce3dbf706b5c14";
 const MIGRATION_SERVING_READINESS_DIGEST: &str =
     "1c0c79c6fbf528f28fb56e91a54b78cd1fe17c70d2bc3e8d7e3dc515d8a7f8f7";
 const CURRENT_SERVING_READINESS_DIGEST: &str =
-    "80e9f1da2a7b48610e95e2540db4c77a3daed2d53b3a2ec18de37c0767ac5380";
+    "8263d7ebddcd4f4c45b5b129ee061e85f92d596847d28448e0bb29dec6c8588d";
 const MIGRATION_READINESS_DIGEST: &str =
     "48a10f783603fe02879f2a1cddbecbb39541ac0ca154c77f7b1e0eef8d9f6834";
 const CURRENT_READINESS_DIGEST: &str =
-    "a3674e7c69f24ce212ddf0598d23f448a47f0b6e7766dee20a78399d5b6477e7";
+    "059ee21b16b325a4da71dda5d63f75c8aeac4d0e2d9b18cbb3f628d15ea8967d";
 
 fn function_section(marker: &str) -> &'static str {
     MIGRATION

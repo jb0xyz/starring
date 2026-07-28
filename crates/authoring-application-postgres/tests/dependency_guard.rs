@@ -81,6 +81,7 @@ fn adapter_uses_only_opaque_discord_identity_and_avoids_transport_or_foreign_dec
 fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     let approval = include_str!("../src/product_decisions/approve.rs");
     let apply = include_str!("../src/product_decisions/apply.rs");
+    let apply_consume = include_str!("../src/product_decisions/apply_consume.rs");
     let apply_contract = include_str!("../src/product_decisions/apply_contract.rs");
     let apply_readiness = include_str!("../src/product_decisions/apply_readiness.rs");
     let apply_sql = include_str!("../src/product_decisions/apply_sql.rs");
@@ -147,6 +148,10 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
             !apply_contract.contains(relation),
             "raw product Apply relation in contract: {relation}"
         );
+        assert!(
+            !apply_consume.contains(relation),
+            "raw product Apply relation in consume adapter: {relation}"
+        );
     }
     for required in [
         "public.starring_product_apply_executor_database_identity_v1()",
@@ -155,6 +160,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "public.starring_product_apply_finalize_v1(text,text,text,bigint",
         "public.starring_product_apply_keyring_coverage_v1(text[],text[])",
         "public.starring_product_apply_begin_runtime_drain_v2(text,text,text,bigint",
+        "public.starring_product_apply_consume_runtime_drain_v2(text,text,text,text,bigint",
         "FROM public.starring_product_apply_target_artifact_v1($1, $2, $3, $4, $5, $6, $7)",
         "LIMIT 2",
     ] {
@@ -164,8 +170,8 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         );
     }
     for required in [
-        "FUNCTIONS: [ScopedFunctionContractV1<'static>; 6]",
-        "RELATIONS: [ScopedRelationContractV1<'static>; 22]",
+        "FUNCTIONS: [ScopedFunctionContractV1<'static>; 7]",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 25]",
         "ScopedFunctionContractV1::set_named(",
         "ScopedFunctionContractV1::set_plpgsql_named(",
         "verify_apply_executor_readiness",
@@ -179,7 +185,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "starring_product_apply_lock_core_unfenced_v1",
         "pg_catalog.count(*) = 12",
         "private_routine_contract",
-        "pg_catalog.count(*) = 8",
+        "pg_catalog.count(*) = 13",
         "starring_runtime_private_v2",
         "starring_runtime_slot_writer_fence_lock_v2",
         "starring_runtime_slot_writer_fence_begin_unsafe_v2",
@@ -199,6 +205,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "lock_probe_row_is_exact(row, \"invalid_input\")",
         "lock_probe_row_is_exact(row, \"runtime_writer_fenced\")",
         "BEGIN_RUNTIME_DRAIN_PROBE_QUERY",
+        "CONSUME_RUNTIME_DRAIN_PROBE_QUERY",
         "outcome: \"lock_required\"",
     ] {
         assert!(
@@ -220,10 +227,18 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(apply.contains("\"runtime_drain_required\""));
     assert!(apply.contains("begin_runtime_drain("));
     assert!(apply.contains("validate_runtime_drain_observation("));
+    assert!(apply.contains("consume_acknowledged_runtime_drain("));
+    assert!(apply.contains("call_consume_runtime_drain("));
     assert!(apply.contains("commit_apply(transaction).await?"));
     assert!(apply.contains("ProductControlPortError::RuntimeDrainRequired"));
     assert!(apply.contains("product apply is temporarily unavailable"));
     assert!(apply.contains("runtime writer fence is unavailable"));
+    assert!(apply_consume.contains("requested_phase => $1"));
+    assert!(apply_consume.contains("expected_preparation_token => $40"));
+    assert!(apply_consume.contains("prepare_product_drain_source_supersession_v1"));
+    assert!(apply_consume.contains("RuntimeDrainIntentReceiptV2::consumed"));
+    assert!(apply_consume.contains("RuntimeUnixMicrosecondsV2::from_datetime"));
+    assert!(!apply_consume.contains("unwrap_or(0)"));
     assert!(readiness.contains("fetch_all(&mut *probe)"));
     assert!(database_capability.contains("function_row.prosecdef"));
     assert!(database_capability.contains("function_row.proleakproof"));
@@ -654,8 +669,12 @@ fn product_rejection_adapter_is_separate_payload_bound_and_fail_closed() {
     ] {
         assert!(digest_production.contains(domain));
     }
+    let rejection_digest_production = digest_production
+        .split("fn rejection_digests_from_material(")
+        .nth(1)
+        .unwrap();
     assert_eq!(
-        digest_production
+        rejection_digest_production
             .matches("material.reason.as_bytes()")
             .count(),
         1

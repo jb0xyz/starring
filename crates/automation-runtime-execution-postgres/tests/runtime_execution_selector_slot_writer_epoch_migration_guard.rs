@@ -223,7 +223,7 @@ fn migration_pins_predecessor_result_and_manifest_readiness_cascade() {
         assert!(postflight.contains(digest), "{digest}");
     }
     assert!(MIGRATION.contains("e9af146803f79bf195250ac230a9c39d7eef4f29349ac08a9d1c3914187fd3f2"));
-    let readiness = "a3674e7c69f24ce212ddf0598d23f448a47f0b6e7766dee20a78399d5b6477e7";
+    let readiness = "059ee21b16b325a4da71dda5d63f75c8aeac4d0e2d9b18cbb3f628d15ea8967d";
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
         assert!(source.contains(readiness));
     }

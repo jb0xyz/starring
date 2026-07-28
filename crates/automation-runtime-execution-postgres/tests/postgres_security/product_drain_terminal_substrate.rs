@@ -1,4 +1,4 @@
-const TERMINAL_RESULT_DEPLOYMENT_ID: &str = "11223344556677889900aabbccddeeff";
+const TERMINAL_RESULT_DEPLOYMENT_ID: &str = "result.Deployment:v2-01";
 
 #[derive(Clone, Debug, sqlx::FromRow)]
 struct ProductDrainTerminalSourceRow {
@@ -240,7 +240,23 @@ async fn insert_product_drain_terminal_action(
     } else {
         None
     };
-    let source_result_snapshot_digest = "d".repeat(64);
+    let Json(mut source_result_snapshot) = sqlx::query_scalar::<_, Json<Value>>(
+        "SELECT snapshot FROM public.runtime_deployments \
+         WHERE deployment_id = $1",
+    )
+    .bind(&source.deployment_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .unwrap();
+    let source_result_deployment_revision = source.expected_revision + 1;
+    source_result_snapshot["revision"] = json!(source_result_deployment_revision);
+    let source_result_snapshot_bytes = serde_json::to_vec(&source_result_snapshot).unwrap();
+    let source_result_snapshot_digest =
+        sqlx::query_scalar::<_, String>("SELECT pg_catalog.encode(pg_catalog.sha256($1), 'hex')")
+            .bind(&source_result_snapshot_bytes)
+            .fetch_one(&mut **transaction)
+            .await
+            .unwrap();
     let result_deployment_id = if terminal_kind == "consumed" {
         Some(TERMINAL_RESULT_DEPLOYMENT_ID)
     } else {
@@ -251,15 +267,84 @@ async fn insert_product_drain_terminal_action(
     } else {
         None
     };
-    let result_deployment_snapshot_digest = if terminal_kind == "consumed" {
-        Some("e".repeat(64))
+    let result_deployment_snapshot_bytes = if terminal_kind == "consumed" {
+        let mut result_snapshot = source_result_snapshot.clone();
+        result_snapshot["identity"]["deployment_id"] = json!(TERMINAL_RESULT_DEPLOYMENT_ID);
+        result_snapshot["revision"] = json!(1);
+        Some(serde_json::to_vec(&result_snapshot).unwrap())
     } else {
         None
     };
+    let result_deployment_snapshot_digest =
+        if let Some(snapshot_bytes) = result_deployment_snapshot_bytes.as_ref() {
+            Some(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT pg_catalog.encode(pg_catalog.sha256($1), 'hex')",
+                )
+                .bind(snapshot_bytes)
+                .fetch_one(&mut **transaction)
+                .await
+                .unwrap(),
+            )
+        } else {
+            None
+        };
     let product_receipt_id = "f".repeat(64);
     let product_audit_event_id = "1".repeat(64);
     let authority_observation_digest = "2".repeat(64);
-    let source_result_deployment_revision = source.expected_revision + 1;
+    let action = "runtime_drain.terminal";
+    let endpoint_domain = "runtime_drain_terminal_test";
+    let request_digest = product_action_semantic_request_digest.clone();
+    sqlx::query(
+        "INSERT INTO public.product_action_receipts (\
+            receipt_id, tenant_id, installation_id, principal_id, endpoint_domain, \
+            idempotency_key_digest, request_digest, target_resource_type, \
+            target_resource_id, resulting_revision, resulting_state, result_code, \
+            http_disposition_class, completed_at\
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,'runtime_drain',$8,$9,$10,'ok',2,$11)",
+    )
+    .bind(&product_receipt_id)
+    .bind(&source.tenant_id)
+    .bind(&source.installation_id)
+    .bind(PRINCIPAL)
+    .bind(endpoint_domain)
+    .bind(&product_action_idempotency_digest)
+    .bind(&request_digest)
+    .bind(&source.drain_intent_id)
+    .bind(result.intent_revision)
+    .bind(terminal_kind)
+    .bind(terminal_time)
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.product_audit_events (\
+            event_id, tenant_id, installation_id, principal_id, \
+            session_subject_digest, action, target_resource_type, \
+            target_resource_id, request_id, receipt_id, \
+            authority_observation_digest, effective_permission_bits, \
+            authority_observed_at, installation_authority_revision, \
+            resulting_state, result_code, occurred_at\
+         ) VALUES (\
+            $1,$2,$3,$4,pg_catalog.decode(pg_catalog.repeat('0',64),'hex'),\
+            $5,'runtime_drain',$6,$7,$8,$9,0,$10,$11,$12,'ok',$10\
+         )",
+    )
+    .bind(&product_audit_event_id)
+    .bind(&source.tenant_id)
+    .bind(&source.installation_id)
+    .bind(PRINCIPAL)
+    .bind(action)
+    .bind(&source.drain_intent_id)
+    .bind(format!("runtime.drain.terminal.{terminal_kind}"))
+    .bind(&product_receipt_id)
+    .bind(&authority_observation_digest)
+    .bind(terminal_time)
+    .bind(source.installation_authority_revision)
+    .bind(terminal_kind)
+    .execute(&mut **transaction)
+    .await
+    .unwrap();
     let projection = sqlx::query_scalar::<_, Vec<u8>>(
         "SELECT starring_runtime_private_v2.\
          starring_runtime_product_drain_terminal_projection_v2(\
@@ -312,15 +397,17 @@ async fn insert_product_drain_terminal_action(
             source_intent_revision, source_canonical_state_digest, \
             result_intent_revision, result_canonical_state_digest, \
             source_deployment_revision, source_result_deployment_revision, \
-            source_result_deployment_snapshot_digest, result_deployment_id, \
+            source_result_deployment_snapshot_digest, \
+            source_result_deployment_snapshot_bytes, result_deployment_id, \
             result_deployment_revision, result_deployment_snapshot_digest, \
+            result_deployment_snapshot_bytes, \
             source_slot_writer_epoch, successor_slot_writer_epoch, \
             terminal_database_time, product_receipt_id, product_audit_event_id, \
             authority_observation_digest, installation_authority_revision, \
             terminal_projection_bytes, terminal_projection_digest\
          ) VALUES (\
             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,\
-            $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28\
+            $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30\
          )",
     )
     .bind(&terminal_action_id)
@@ -339,9 +426,11 @@ async fn insert_product_drain_terminal_action(
     .bind(source.expected_revision)
     .bind(source_result_deployment_revision)
     .bind(&source_result_snapshot_digest)
+    .bind(&source_result_snapshot_bytes)
     .bind(result_deployment_id)
     .bind(result_deployment_revision)
     .bind(result_deployment_snapshot_digest.as_deref())
+    .bind(result_deployment_snapshot_bytes.as_deref())
     .bind(source.source_epoch)
     .bind(successor_epoch)
     .bind(terminal_time)
@@ -483,10 +572,7 @@ fn acknowledged_microseconds(source_state_bytes: &[u8]) -> i64 {
         .unwrap()
 }
 
-fn replace_acknowledged_microseconds(
-    source_state_bytes: &[u8],
-    replacement: i64,
-) -> Vec<u8> {
+fn replace_acknowledged_microseconds(source_state_bytes: &[u8], replacement: i64) -> Vec<u8> {
     let original = acknowledged_microseconds(source_state_bytes);
     let original_fragment = format!("\"acknowledged_at_unix_microseconds\":{original}");
     let replacement_fragment = format!("\"acknowledged_at_unix_microseconds\":{replacement}");
@@ -566,13 +652,12 @@ async fn assert_product_drain_terminal_clock_and_revision_guards(
         &source.source_state_bytes,
         terminal_time.timestamp_micros() + 1,
     );
-    let forged_source_state_digest = sqlx::query_scalar::<_, String>(
-        "SELECT pg_catalog.encode(pg_catalog.sha256($1), 'hex')",
-    )
-    .bind(&forged_source_state_bytes)
-    .fetch_one(&mut *independent_release)
-    .await
-    .unwrap();
+    let forged_source_state_digest =
+        sqlx::query_scalar::<_, String>("SELECT pg_catalog.encode(pg_catalog.sha256($1), 'hex')")
+            .bind(&forged_source_state_bytes)
+            .fetch_one(&mut *independent_release)
+            .await
+            .unwrap();
     let error = call_product_drain_terminal_release(
         &mut *independent_release,
         source,
@@ -607,6 +692,10 @@ async fn assert_product_drain_terminal_table_shape_guards(
             "pg_catalog.jsonb_build_object(\
                 'terminal_action_id', pg_catalog.repeat('8', 64), \
                 'result_deployment_revision', 2\
+             )",
+            "pg_catalog.jsonb_build_object(\
+                'terminal_action_id', pg_catalog.repeat('9', 64), \
+                'result_deployment_id', 'invalid deployment'\
              )",
         ]
     } else {
@@ -752,7 +841,20 @@ async fn exercise_product_drain_terminal_kind(
     .fetch_one(&database.owner_pool)
     .await
     .unwrap();
-    assert_eq!(public_terminal_capability_count, 0);
+    assert_eq!(public_terminal_capability_count, 1);
+    let runtime_executor_can_consume = sqlx::query_scalar::<_, bool>(
+        "SELECT pg_catalog.has_function_privilege(\
+             CURRENT_USER, function_row.oid, 'EXECUTE'\
+         ) \
+         FROM pg_catalog.pg_proc AS function_row \
+         WHERE function_row.pronamespace = pg_catalog.to_regnamespace('public') \
+             AND function_row.proname = \
+                 'starring_product_apply_consume_runtime_drain_v2'",
+    )
+    .fetch_one(&database.executor_pool)
+    .await
+    .unwrap();
+    assert!(!runtime_executor_can_consume);
 }
 
 #[tokio::test]
