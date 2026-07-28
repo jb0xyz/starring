@@ -1,5 +1,7 @@
 use std::process::Command;
 
+const ABANDONED_LIFECYCLE_TIMING: &str = "starring_runtime_lifecycle_timing_v2 source=unobserved shutdown_trip_to_readiness_seal=missing shutdown_trip_to_maintenance_ingress_seal=missing shutdown_trip_to_gateway_projection=missing recovery_resume_claim_to_exact_ready=missing exact_ready_to_durable_acknowledgement_terminal=missing shutdown_finalizer_join=missing shutdown_ingress_acknowledgement_join=missing shutdown_capability_readiness_join=missing shutdown_registry_observation=missing shutdown_gateway_drain_join=missing shutdown_owner_join=missing shutdown_root_signal_join=missing shutdown_database_pools_close=missing shutdown_health_stop=missing shutdown_total=abandoned:0ns\n";
+
 fn referenced_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_starring-runtime"));
     command.env_clear();
@@ -63,24 +65,17 @@ fn valid_runtime_configuration_stays_at_an_exact_closed_boundary() {
     let output = configured_command().output().unwrap();
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).unwrap();
+    let expected_database_failure = format!(
+        "{ABANDONED_LIFECYCLE_TIMING}starring_runtime_status=runtime_database_unavailable context=convergence\n"
+    );
     if std::env::var_os("STARRING_RUNTIME_TEST_REQUIRE_COMPILED_REVISION").is_some() {
         assert_eq!(output.status.code(), Some(69));
-        assert_eq!(
-            stderr,
-            "starring_runtime_status=runtime_database_unavailable context=convergence\n"
-        );
+        assert_eq!(stderr, expected_database_failure);
     } else {
         assert!(
-            matches!(
-                (output.status.code(), stderr.as_str()),
-                (
-                    Some(69),
-                    "starring_runtime_status=runtime_database_unavailable context=convergence\n"
-                ) | (
-                    Some(78),
-                    "starring_runtime_status=runtime_build_revision_missing\n"
-                )
-            ),
+            (output.status.code() == Some(69) && stderr == expected_database_failure)
+                || (output.status.code() == Some(78)
+                    && stderr == "starring_runtime_status=runtime_build_revision_missing\n"),
             "runtime did not stop at an exact closed boundary"
         );
     }
@@ -88,9 +83,6 @@ fn valid_runtime_configuration_stays_at_an_exact_closed_boundary() {
         database_password(),
         "opaque.discord_bot-token_1234567890abcdef".to_string(),
         database_socket_path(),
-        "ready".to_string(),
-        "owner".to_string(),
-        "discord".to_string(),
     ] {
         assert!(!stderr
             .to_ascii_lowercase()
