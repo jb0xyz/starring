@@ -51,6 +51,7 @@ use crate::gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerPreparedClosedRecoveryV2, RuntimeGatewayOwnerStartupWatchdogStartContextV1,
 };
 use crate::registry::RuntimeLockedRegistryEmptyEvidenceV2;
+use crate::shutdown::RuntimeShutdownObserverV1;
 use crate::{
     GatewayResourceConfigV1, RuntimeDiscordBotTokenV1, RuntimeGatewayOwnerStartupWatchdogConfigV1,
     RuntimeGatewayOwnerStartupWatchdogHandleV1, RuntimeGatewayOwnerStartupWatchdogStartErrorV1,
@@ -185,6 +186,28 @@ pub struct RuntimeGatewayBootstrapV1 {
     owner_invalidator: Option<RuntimeGatewayOwnerInvalidationBridgeV2>,
     owner_invalidated: Arc<AtomicBool>,
     owner_discord_attachment: Arc<Mutex<Option<RuntimeGatewayOwnerDiscordAttachmentV1>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeGatewayShutdownHandleV1 {
+    closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
+}
+
+impl RuntimeGatewayShutdownHandleV1 {
+    pub(crate) fn enter_shutdown(&self) -> RuntimeGatewayClosedSnapshotV2 {
+        let mut lifecycle = self
+            .closed_lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shutdown_closed_lifecycle(&mut lifecycle);
+        lifecycle.snapshot()
+    }
+}
+
+impl Debug for RuntimeGatewayShutdownHandleV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeGatewayShutdownHandleV1(<redacted>)")
+    }
 }
 
 pub(crate) struct RuntimeGatewayAdmissionChangeWatchV1 {
@@ -342,6 +365,12 @@ impl GatewaySynchronousInvalidatorV3 for RuntimeGatewayInvalidationBridgeV2 {
 }
 
 impl RuntimeGatewayBootstrapV1 {
+    pub(crate) fn shutdown_handle_v1(&self) -> RuntimeGatewayShutdownHandleV1 {
+        RuntimeGatewayShutdownHandleV1 {
+            closed_lifecycle: self.adapter.closed_lifecycle.clone(),
+        }
+    }
+
     pub(crate) fn admission_change_watch_v1(&self) -> RuntimeGatewayAdmissionChangeWatchV1 {
         RuntimeGatewayAdmissionChangeWatchV1 {
             inner: self.adapter.admission_snapshot.clone(),
@@ -353,12 +382,17 @@ impl RuntimeGatewayBootstrapV1 {
         token: &RuntimeDiscordBotTokenV1,
         operation_cutoff: Instant,
         shutdown_deadline: Instant,
+        shutdown: &mut RuntimeShutdownObserverV1,
     ) -> Result<RuntimeDiscordGatewaySupervisorV1, RuntimeDiscordGatewayStartErrorV1> {
         let driver =
             prepare_twilight_runtime_discord_gateway_driver_v1(token.expose_secret().to_owned());
         let prepared = self
-            .prepare_discord_gateway_start_v1(operation_cutoff)
+            .prepare_discord_gateway_start_v1(operation_cutoff, Some(shutdown))
             .await?;
+        if shutdown.observed().is_some() {
+            let _stopped = prepared.stopped_sender.send(true);
+            return Err(RuntimeDiscordGatewayStartErrorV1::OperationDeadlineElapsed);
+        }
         let mut supervisor = start_runtime_discord_gateway_v1(
             driver,
             RuntimeDiscordGatewayActorStartV1 {
@@ -373,6 +407,9 @@ impl RuntimeGatewayBootstrapV1 {
             },
         );
         self.attach_discord_supervisor_v1(&supervisor)?;
+        if shutdown.observed().is_some() {
+            return Err(RuntimeDiscordGatewayStartErrorV1::OperationDeadlineElapsed);
+        }
         if self.owner_invalidated.load(Ordering::Acquire) {
             return Err(RuntimeDiscordGatewayStartErrorV1::OwnerInvalidated);
         }
@@ -414,7 +451,7 @@ impl RuntimeGatewayBootstrapV1 {
         F: FnOnce(&Self),
     {
         let prepared = self
-            .prepare_discord_gateway_start_v1(operation_cutoff)
+            .prepare_discord_gateway_start_v1(operation_cutoff, None)
             .await?;
         let mut supervisor = start_runtime_discord_gateway_v1(
             driver,
@@ -536,7 +573,15 @@ impl RuntimeGatewayBootstrapV1 {
     async fn prepare_discord_gateway_start_v1(
         &mut self,
         operation_cutoff: Instant,
+        mut shutdown: Option<&mut RuntimeShutdownObserverV1>,
     ) -> Result<RuntimePreparedDiscordGatewayStartV1, RuntimeDiscordGatewayStartErrorV1> {
+        if shutdown
+            .as_deref()
+            .and_then(RuntimeShutdownObserverV1::observed)
+            .is_some()
+        {
+            return Err(RuntimeDiscordGatewayStartErrorV1::OperationDeadlineElapsed);
+        }
         if self.owner_invalidated.load(Ordering::Acquire) {
             return Err(RuntimeDiscordGatewayStartErrorV1::OwnerInvalidated);
         }
@@ -548,20 +593,47 @@ impl RuntimeGatewayBootstrapV1 {
             let _stopped = stopped_sender.send(true);
             return Err(RuntimeDiscordGatewayStartErrorV1::OwnerInvalidated);
         }
+        if shutdown
+            .as_deref()
+            .and_then(RuntimeShutdownObserverV1::observed)
+            .is_some()
+        {
+            let _stopped = stopped_sender.send(true);
+            return Err(RuntimeDiscordGatewayStartErrorV1::OperationDeadlineElapsed);
+        }
         if Instant::now() >= operation_cutoff {
             let _stopped = stopped_sender.send(true);
             return Err(RuntimeDiscordGatewayStartErrorV1::OperationDeadlineElapsed);
         }
-        let initial_lifecycle = match self.adapter.control.as_mut() {
-            Some(control) if Instant::now() < operation_cutoff => timeout_at(
-                TokioInstant::from_std(operation_cutoff),
-                control.next_lifecycle(),
-            )
-            .await
-            .ok()
-            .flatten(),
-            Some(_) | None => None,
-        };
+        let (initial_lifecycle, shutdown_observed) =
+            match (self.adapter.control.as_mut(), shutdown.as_deref_mut()) {
+                (Some(control), Some(shutdown)) if Instant::now() < operation_cutoff => {
+                    tokio::select! {
+                        biased;
+                        _observation = shutdown.wait() => (None, true),
+                        result = timeout_at(
+                            TokioInstant::from_std(operation_cutoff),
+                            control.next_lifecycle(),
+                        ) => (result.ok().flatten(), false),
+                    }
+                }
+                (Some(control), None) if Instant::now() < operation_cutoff => (
+                    timeout_at(
+                        TokioInstant::from_std(operation_cutoff),
+                        control.next_lifecycle(),
+                    )
+                    .await
+                    .ok()
+                    .flatten(),
+                    false,
+                ),
+                (Some(_), Some(shutdown)) => (None, shutdown.observed().is_some()),
+                (Some(_), None) | (None, _) => (None, false),
+            };
+        if shutdown_observed {
+            let _stopped = stopped_sender.send(true);
+            return Err(RuntimeDiscordGatewayStartErrorV1::OperationDeadlineElapsed);
+        }
         if initial_lifecycle != Some(GatewayLifecycleEventV3::Starting) {
             let _stopped = stopped_sender.send(true);
             return Err(if Instant::now() >= operation_cutoff {
@@ -569,6 +641,14 @@ impl RuntimeGatewayBootstrapV1 {
             } else {
                 RuntimeDiscordGatewayStartErrorV1::RuntimeUnavailable
             });
+        }
+        if shutdown
+            .as_deref()
+            .and_then(RuntimeShutdownObserverV1::observed)
+            .is_some()
+        {
+            let _stopped = stopped_sender.send(true);
+            return Err(RuntimeDiscordGatewayStartErrorV1::OperationDeadlineElapsed);
         }
         if self.owner_invalidated.load(Ordering::Acquire) {
             let _stopped = stopped_sender.send(true);

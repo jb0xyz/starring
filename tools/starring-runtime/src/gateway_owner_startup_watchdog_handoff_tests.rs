@@ -2219,7 +2219,7 @@ async fn root_finalizer_keeps_seal_on_second_uncertainty_and_returns_session_to_
     else {
         panic!("terminal mutation failure")
     };
-    let (session, environment, failure) = failed.into_parts();
+    let (session, environment, failure) = (*failed).into_parts();
     assert_eq!(
         failure,
         crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(

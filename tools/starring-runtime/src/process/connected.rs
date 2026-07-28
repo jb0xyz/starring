@@ -1,4 +1,6 @@
 use std::fmt::{Debug, Formatter};
+use std::future::Future;
+use std::time::Instant;
 
 use automation_runtime_worker::RuntimePausedGatewayObservationV2;
 use tokio::time::{sleep_until, Instant as TokioInstant};
@@ -8,6 +10,7 @@ use crate::discord::{
     RuntimeDiscordGatewayStartErrorV1, RuntimeDiscordGatewaySupervisorV1,
 };
 use crate::gateway::RuntimeGatewayReadyObservationErrorV1;
+use crate::RuntimeShutdownCauseV1;
 
 use super::owner::RuntimeOwnerHeldProcessV1;
 
@@ -21,6 +24,7 @@ pub enum RuntimeProcessPausedConnectedTransitionFailureV1 {
     GatewayOwnerTerminated,
     GatewayObservationClosed,
     GatewayObservation(RuntimeGatewayReadyObservationErrorV1),
+    ProcessShutdown(RuntimeShutdownCauseV1),
 }
 
 impl RuntimeProcessPausedConnectedTransitionFailureV1 {
@@ -46,6 +50,7 @@ impl RuntimeProcessPausedConnectedTransitionFailureV1 {
                 "runtime_process_paused_connected_gateway_observation_closed"
             }
             Self::GatewayObservation(error) => error.code(),
+            Self::ProcessShutdown(cause) => cause.code(),
         }
     }
 }
@@ -170,6 +175,7 @@ impl RuntimeOwnerHeldProcessV1 {
         }
         let operation_cutoff = self.foundation.startup_budget.operation_cutoff();
         let discord_cleanup_deadline = self.foundation.startup_budget.discord_cleanup_deadline();
+        let mut shutdown = self.foundation.shutdown_observer_v1();
         let discord = self
             .foundation
             .gateway
@@ -177,24 +183,36 @@ impl RuntimeOwnerHeldProcessV1 {
                 self.foundation.secrets.discord_bot_token(),
                 operation_cutoff,
                 discord_cleanup_deadline,
+                &mut shutdown,
             )
             .await;
         let discord = match discord {
             Ok(discord) => discord,
             Err(error) => {
-                let transition = match error {
-                    RuntimeDiscordGatewayStartErrorV1::RuntimeUnavailable => {
-                        RuntimeProcessPausedConnectedTransitionFailureV1::DiscordRuntimeUnavailable
+                let transition = match shutdown.observed() {
+                    Some(observation) => {
+                        RuntimeProcessPausedConnectedTransitionFailureV1::ProcessShutdown(
+                            observation.cause(),
+                        )
                     }
-                    RuntimeDiscordGatewayStartErrorV1::RuntimeHalfUnavailable => {
-                        RuntimeProcessPausedConnectedTransitionFailureV1::DiscordAlreadyStarted
-                    }
-                    RuntimeDiscordGatewayStartErrorV1::OwnerInvalidated => {
-                        RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated
-                    }
-                    RuntimeDiscordGatewayStartErrorV1::OperationDeadlineElapsed => {
-                        RuntimeProcessPausedConnectedTransitionFailureV1::OperationDeadlineElapsed
-                    }
+                    None => match error {
+                        RuntimeDiscordGatewayStartErrorV1::RuntimeUnavailable => {
+                            RuntimeProcessPausedConnectedTransitionFailureV1::
+                                DiscordRuntimeUnavailable
+                        }
+                        RuntimeDiscordGatewayStartErrorV1::RuntimeHalfUnavailable => {
+                            RuntimeProcessPausedConnectedTransitionFailureV1::DiscordAlreadyStarted
+                        }
+                        RuntimeDiscordGatewayStartErrorV1::OwnerInvalidated => {
+                            self.foundation
+                                .trip_shutdown_v1(RuntimeShutdownCauseV1::GatewayOwnerTerminal);
+                            RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated
+                        }
+                        RuntimeDiscordGatewayStartErrorV1::OperationDeadlineElapsed => {
+                            RuntimeProcessPausedConnectedTransitionFailureV1::
+                                OperationDeadlineElapsed
+                        }
+                    },
                 };
                 return Err(RuntimeDiscordStartingProcessFailureV1 {
                     owner_held: Box::new(self),
@@ -234,6 +252,7 @@ impl RuntimeDiscordStartingProcessV1 {
             .foundation
             .gateway
             .admission_change_watch_v1();
+        let mut shutdown = self.owner_held.foundation.shutdown_observer_v1();
         loop {
             self.require_live_paused_connection_v1()?;
             match self
@@ -257,6 +276,9 @@ impl RuntimeDiscordStartingProcessV1 {
                         Ok(_) => continue,
                         Err(error) if retryable_gateway_observation_v1(error) => continue,
                         Err(error) => {
+                            self.owner_held
+                                .foundation
+                                .trip_shutdown_v1(gateway_observation_shutdown_cause_v1(error));
                             return Err(
                                 RuntimeProcessPausedConnectedTransitionFailureV1::GatewayObservation(
                                     error,
@@ -267,6 +289,9 @@ impl RuntimeDiscordStartingProcessV1 {
                 }
                 Err(error) if retryable_gateway_observation_v1(error) => {}
                 Err(error) => {
+                    self.owner_held
+                        .foundation
+                        .trip_shutdown_v1(gateway_observation_shutdown_cause_v1(error));
                     return Err(
                         RuntimeProcessPausedConnectedTransitionFailureV1::GatewayObservation(error),
                     );
@@ -274,21 +299,37 @@ impl RuntimeDiscordStartingProcessV1 {
             }
             tokio::select! {
                 biased;
+                observation = shutdown.wait() => {
+                    return Err(
+                        RuntimeProcessPausedConnectedTransitionFailureV1::ProcessShutdown(
+                            observation.cause(),
+                        ),
+                    );
+                }
                 _ = sleep_until(TokioInstant::from_std(operation_cutoff)) => {
                     return Err(
                         RuntimeProcessPausedConnectedTransitionFailureV1::OperationDeadlineElapsed,
                     );
                 }
                 _owner = self.owner_held.owner.wait_terminal() => {
+                    self.owner_held
+                        .foundation
+                        .trip_shutdown_v1(RuntimeShutdownCauseV1::GatewayOwnerTerminal);
                     return Err(
                         RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated,
                     );
                 }
                 discord = self.discord.wait_terminal() => {
+                    self.owner_held
+                        .foundation
+                        .trip_shutdown_v1(RuntimeShutdownCauseV1::DiscordTerminal);
                     return Err(map_discord_transition_exit_v1(discord.exit()));
                 }
                 changed = changes.changed() => {
                     if !changed {
+                        self.owner_held
+                            .foundation
+                            .trip_shutdown_v1(RuntimeShutdownCauseV1::ReadinessLost);
                         return Err(
                             RuntimeProcessPausedConnectedTransitionFailureV1::GatewayObservationClosed,
                         );
@@ -315,6 +356,12 @@ impl RuntimeDiscordStartingProcessV1 {
             .gateway
             .observe_paused_connected_gateway_v2();
         if current.as_ref() != Ok(&paused_gateway) {
+            self.owner_held
+                .foundation
+                .trip_shutdown_v1(match current.as_ref() {
+                    Err(error) => gateway_observation_shutdown_cause_v1(*error),
+                    Ok(_) => RuntimeShutdownCauseV1::ReadinessLost,
+                });
             let transition = match current {
                 Ok(_) => RuntimeProcessPausedConnectedTransitionFailureV1::GatewayObservation(
                     RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot,
@@ -360,6 +407,13 @@ impl RuntimeDiscordStartingProcessV1 {
     fn require_live_paused_connection_v1(
         &self,
     ) -> Result<(), RuntimeProcessPausedConnectedTransitionFailureV1> {
+        if let Some(observation) = self.owner_held.foundation.shutdown_observer_v1().observed() {
+            return Err(
+                RuntimeProcessPausedConnectedTransitionFailureV1::ProcessShutdown(
+                    observation.cause(),
+                ),
+            );
+        }
         if !self
             .owner_held
             .foundation
@@ -369,9 +423,15 @@ impl RuntimeDiscordStartingProcessV1 {
             return Err(RuntimeProcessPausedConnectedTransitionFailureV1::OperationDeadlineElapsed);
         }
         if self.owner_held.owner.terminal_status().is_some() {
+            self.owner_held
+                .foundation
+                .trip_shutdown_v1(RuntimeShutdownCauseV1::GatewayOwnerTerminal);
             return Err(RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated);
         }
         if let Some(transition) = discord_transition_failure_v1(&self.discord) {
+            self.owner_held
+                .foundation
+                .trip_shutdown_v1(RuntimeShutdownCauseV1::DiscordTerminal);
             return Err(transition);
         }
         Ok(())
@@ -390,6 +450,13 @@ impl RuntimePausedConnectedProcessV1 {
     pub(super) fn require_current_paused_connection_v1(
         &self,
     ) -> Result<(), RuntimeProcessPausedConnectedTransitionFailureV1> {
+        if let Some(observation) = self.owner_held.foundation.shutdown_observer_v1().observed() {
+            return Err(
+                RuntimeProcessPausedConnectedTransitionFailureV1::ProcessShutdown(
+                    observation.cause(),
+                ),
+            );
+        }
         if !self
             .owner_held
             .foundation
@@ -399,9 +466,15 @@ impl RuntimePausedConnectedProcessV1 {
             return Err(RuntimeProcessPausedConnectedTransitionFailureV1::OperationDeadlineElapsed);
         }
         if self.owner_held.owner.terminal_status().is_some() {
+            self.owner_held
+                .foundation
+                .trip_shutdown_v1(RuntimeShutdownCauseV1::GatewayOwnerTerminal);
             return Err(RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated);
         }
         if let Some(transition) = discord_transition_failure_v1(&self.discord) {
+            self.owner_held
+                .foundation
+                .trip_shutdown_v1(RuntimeShutdownCauseV1::DiscordTerminal);
             return Err(transition);
         }
         match self
@@ -412,6 +485,9 @@ impl RuntimePausedConnectedProcessV1 {
         {
             Ok(current) if current == self.paused_gateway => {}
             Ok(_) => {
+                self.owner_held
+                    .foundation
+                    .trip_shutdown_v1(RuntimeShutdownCauseV1::ReadinessLost);
                 return Err(
                     RuntimeProcessPausedConnectedTransitionFailureV1::GatewayObservation(
                         RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot,
@@ -419,15 +495,24 @@ impl RuntimePausedConnectedProcessV1 {
                 );
             }
             Err(error) => {
+                self.owner_held
+                    .foundation
+                    .trip_shutdown_v1(gateway_observation_shutdown_cause_v1(error));
                 return Err(
                     RuntimeProcessPausedConnectedTransitionFailureV1::GatewayObservation(error),
                 );
             }
         }
         if self.owner_held.owner.terminal_status().is_some() {
+            self.owner_held
+                .foundation
+                .trip_shutdown_v1(RuntimeShutdownCauseV1::GatewayOwnerTerminal);
             return Err(RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated);
         }
         if let Some(transition) = discord_transition_failure_v1(&self.discord) {
+            self.owner_held
+                .foundation
+                .trip_shutdown_v1(RuntimeShutdownCauseV1::DiscordTerminal);
             return Err(transition);
         }
         Ok(())
@@ -466,6 +551,17 @@ fn retryable_gateway_observation_v1(error: RuntimeGatewayReadyObservationErrorV1
     )
 }
 
+pub(super) fn gateway_observation_shutdown_cause_v1(
+    error: RuntimeGatewayReadyObservationErrorV1,
+) -> RuntimeShutdownCauseV1 {
+    match error {
+        RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain => {
+            RuntimeShutdownCauseV1::GatewayOwnerTerminal
+        }
+        _ => RuntimeShutdownCauseV1::ReadinessLost,
+    }
+}
+
 pub(super) fn discord_transition_failure_v1(
     discord: &RuntimeDiscordGatewaySupervisorV1,
 ) -> Option<RuntimeProcessPausedConnectedTransitionFailureV1> {
@@ -502,18 +598,109 @@ pub(super) async fn shutdown_paused_discord_owner_v1(
     owner_held: RuntimeOwnerHeldProcessV1,
     discord: RuntimeDiscordGatewaySupervisorV1,
 ) -> Result<(), RuntimePausedConnectedProcessShutdownErrorV1> {
-    let discord_cleanup_deadline = owner_held
-        .foundation
+    let RuntimeOwnerHeldProcessV1 { foundation, owner } = owner_held;
+    shutdown_paused_foundation_owner_v1(foundation, discord, move |deadline| {
+        owner.shutdown_until(deadline)
+    })
+    .await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimePausedShutdownEventV1 {
+    ReadinessAndGatewayClosed,
+    FinalizerJoined,
+    RegistryProved,
+    DiscordJoined,
+    OwnerReleased,
+    PoolsClosed,
+    SecretsErased,
+    HealthStopped,
+}
+
+struct RuntimePausedShutdownOrderV1 {
+    next: u8,
+}
+
+impl RuntimePausedShutdownOrderV1 {
+    const fn new() -> Self {
+        Self { next: 0 }
+    }
+
+    fn record(&mut self, event: RuntimePausedShutdownEventV1) -> RuntimePausedShutdownEventV1 {
+        assert_eq!(self.next, event as u8);
+        self.next = self.next.saturating_add(1);
+        event
+    }
+
+    fn complete(self) {
+        assert_eq!(self.next, 8);
+    }
+}
+
+pub(super) async fn shutdown_paused_foundation_discord_v1(
+    mut foundation: super::RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordGatewaySupervisorV1,
+) {
+    let cleanup_deadline = foundation
+        .begin_shutdown_v1(RuntimeShutdownCauseV1::Explicit)
+        .await;
+    let discord_cleanup_deadline = foundation
         .startup_budget
-        .discord_cleanup_deadline();
+        .discord_cleanup_deadline()
+        .min(cleanup_deadline);
+    foundation.observe_shutdown_registry_v1();
+    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let _discord_shutdown = discord
+        .shutdown_until(discord_drain, discord_cleanup_deadline)
+        .await;
+    let _foundation_shutdown = foundation.finish_shutdown_v1(cleanup_deadline).await;
+}
+
+pub(super) async fn shutdown_paused_foundation_owner_v1<ShutdownOwner, OwnerShutdown>(
+    mut foundation: super::RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordGatewaySupervisorV1,
+    shutdown_owner: ShutdownOwner,
+) -> Result<(), RuntimePausedConnectedProcessShutdownErrorV1>
+where
+    ShutdownOwner: FnOnce(Instant) -> OwnerShutdown,
+    OwnerShutdown: Future<
+        Output = Result<
+            crate::RuntimeGatewayOwnerStartupWatchdogExitV1,
+            crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+        >,
+    >,
+{
+    let mut order = RuntimePausedShutdownOrderV1::new();
+    let cleanup_deadline = foundation
+        .begin_shutdown_v1(RuntimeShutdownCauseV1::Explicit)
+        .await;
+    let _ = order.record(RuntimePausedShutdownEventV1::ReadinessAndGatewayClosed);
+    let _ = order.record(RuntimePausedShutdownEventV1::FinalizerJoined);
+    let discord_cleanup_deadline = foundation
+        .startup_budget
+        .discord_cleanup_deadline()
+        .min(cleanup_deadline);
+    let owner_cleanup_deadline = foundation
+        .startup_budget
+        .owner_cleanup_deadline()
+        .min(cleanup_deadline);
+    foundation.observe_shutdown_registry_v1();
+    let _ = order.record(RuntimePausedShutdownEventV1::RegistryProved);
+    let discord_drain = foundation.gateway.begin_discord_drain_v1();
     let discord_shutdown = discord
-        .shutdown_until(
-            owner_held.foundation.gateway.begin_discord_drain_v1(),
-            discord_cleanup_deadline,
-        )
+        .shutdown_until(discord_drain, discord_cleanup_deadline)
         .await
         .map_err(map_discord_shutdown_failure_v1);
-    let owner_shutdown = owner_held.shutdown().await;
+    let _ = order.record(RuntimePausedShutdownEventV1::DiscordJoined);
+    let owner = shutdown_owner(owner_cleanup_deadline).await;
+    let _ = order.record(RuntimePausedShutdownEventV1::OwnerReleased);
+    let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
+    let _ = order.record(RuntimePausedShutdownEventV1::PoolsClosed);
+    let _ = order.record(RuntimePausedShutdownEventV1::SecretsErased);
+    let _ = order.record(RuntimePausedShutdownEventV1::HealthStopped);
+    order.complete();
+    let owner_shutdown =
+        super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
     finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown)
 }
 
@@ -670,5 +857,35 @@ mod tests {
         ] {
             assert!(!retryable_gateway_observation_v1(terminal));
         }
+    }
+
+    #[test]
+    fn paused_shutdown_event_trace_is_complete_and_strictly_ordered() {
+        let mut order = RuntimePausedShutdownOrderV1::new();
+        let trace = [
+            RuntimePausedShutdownEventV1::ReadinessAndGatewayClosed,
+            RuntimePausedShutdownEventV1::FinalizerJoined,
+            RuntimePausedShutdownEventV1::RegistryProved,
+            RuntimePausedShutdownEventV1::DiscordJoined,
+            RuntimePausedShutdownEventV1::OwnerReleased,
+            RuntimePausedShutdownEventV1::PoolsClosed,
+            RuntimePausedShutdownEventV1::SecretsErased,
+            RuntimePausedShutdownEventV1::HealthStopped,
+        ]
+        .map(|event| order.record(event));
+        order.complete();
+        assert_eq!(
+            trace,
+            [
+                RuntimePausedShutdownEventV1::ReadinessAndGatewayClosed,
+                RuntimePausedShutdownEventV1::FinalizerJoined,
+                RuntimePausedShutdownEventV1::RegistryProved,
+                RuntimePausedShutdownEventV1::DiscordJoined,
+                RuntimePausedShutdownEventV1::OwnerReleased,
+                RuntimePausedShutdownEventV1::PoolsClosed,
+                RuntimePausedShutdownEventV1::SecretsErased,
+                RuntimePausedShutdownEventV1::HealthStopped,
+            ]
+        );
     }
 }

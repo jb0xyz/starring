@@ -7,11 +7,13 @@ mod discord;
 mod gateway;
 mod gateway_owner_startup;
 mod gateway_owner_startup_watchdog;
+mod health;
 mod identity_encoding;
 mod mutation_finalizer;
 mod process;
 mod process_identity;
 mod process_startup;
+mod process_supervisor;
 mod recovery_identity;
 mod registry;
 mod secret;
@@ -64,7 +66,8 @@ pub use process::{
     RuntimeGatewayOwnerShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,
     RuntimeProcessClosedRecoveryBeginFailureV2, RuntimeProcessClosedRecoveryCommitFailureV2,
     RuntimeProcessClosedRecoveryTransitionErrorV2, RuntimeProcessClosedRecoveryTransitionFailureV2,
-    RuntimeProcessFoundationCompositionErrorV1, RuntimeProcessGatewayOwnerCommitFailureV2,
+    RuntimeProcessFoundationCompositionErrorV1, RuntimeProcessFoundationShutdownErrorV1,
+    RuntimeProcessFoundationShutdownFailureV1, RuntimeProcessGatewayOwnerCommitFailureV2,
     RuntimeProcessGatewayOwnerPrepareFailureV2, RuntimeProcessGatewayOwnerTransitionErrorV1,
     RuntimeProcessRecoveryPendingTransitionErrorV2,
     RuntimeProcessRecoveryPendingTransitionFailureV2, RuntimeProcessRecoveryReadinessFailureV2,

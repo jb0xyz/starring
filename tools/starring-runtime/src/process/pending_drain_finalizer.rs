@@ -15,8 +15,9 @@ use super::execution::RuntimeStartupRecoveryExecutionAwaitFailureV2;
 use super::startup_loop::RuntimeProcessStartupRecoveryLoopFailureV2;
 use crate::closed_recovery::RuntimeClosedRecoverySessionV2;
 use crate::{
-    RuntimeMutationFinalizerCompletionResultV1, RuntimeMutationFinalizerConfigV1,
-    RuntimeMutationFinalizerJobIdV1, RuntimeMutationFinalizerJobV1, RuntimeMutationFinalizerPortV1,
+    RuntimeMutationFinalizerCompletionResultV1, RuntimeMutationFinalizerCompletionV1,
+    RuntimeMutationFinalizerConfigV1, RuntimeMutationFinalizerJobIdV1,
+    RuntimeMutationFinalizerJobV1, RuntimeMutationFinalizerPortV1,
     RuntimeMutationFinalizerRegistrationRejectionReasonV1, RuntimeMutationFinalizerSupervisorV1,
     RuntimeSupervisorExitV1,
 };
@@ -225,12 +226,12 @@ pub(crate) type RuntimePendingDrainFinalizerSupervisorV3<E> =
 
 pub(crate) enum RuntimePendingDrainFinalizerDispatchFailureV3<E> {
     Rejected {
-        job: RuntimePendingDrainFinalizerJobV3<E>,
+        job: Box<RuntimePendingDrainFinalizerJobV3<E>>,
         reason: RuntimeMutationFinalizerRegistrationRejectionReasonV1,
     },
-    Failed(RuntimePendingDrainFinalizerFailedV3<E>),
+    Failed(Box<RuntimePendingDrainFinalizerFailedV3<E>>),
     Undispatched {
-        job: RuntimePendingDrainFinalizerJobV3<E>,
+        job: Box<RuntimePendingDrainFinalizerJobV3<E>>,
         exit: RuntimeSupervisorExitV1,
     },
     DispatchedTerminal(RuntimeSupervisorExitV1),
@@ -247,9 +248,59 @@ impl<E> Debug for RuntimePendingDrainFinalizerDispatchFailureV3<E> {
     }
 }
 
-pub(crate) async fn register_and_complete_pending_drain_job_v3<E>(
-    supervisor: &mut RuntimePendingDrainFinalizerSupervisorV3<E>,
+pub(crate) struct RuntimePendingDrainRegisteredJobV3 {
+    job_id: RuntimeMutationFinalizerJobIdV1,
+}
+
+impl RuntimePendingDrainRegisteredJobV3 {
+    pub(crate) const fn job_id(&self) -> RuntimeMutationFinalizerJobIdV1 {
+        self.job_id
+    }
+}
+
+impl Debug for RuntimePendingDrainRegisteredJobV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimePendingDrainRegisteredJobV3(<redacted>)")
+    }
+}
+
+type RuntimePendingDrainFinalizerCompletionV3<E> = RuntimeMutationFinalizerCompletionV1<
+    RuntimePendingDrainFinalizerJobV3<E>,
+    RuntimePendingDrainFinalizerSettledV3<E>,
+    RuntimePendingDrainFinalizerFailedV3<E>,
+>;
+
+pub(crate) fn register_pending_drain_job_v3<E>(
+    supervisor: &RuntimePendingDrainFinalizerSupervisorV3<E>,
     job: RuntimePendingDrainFinalizerJobV3<E>,
+) -> Result<RuntimePendingDrainRegisteredJobV3, RuntimePendingDrainFinalizerDispatchFailureV3<E>>
+where
+    E: RuntimePendingDrainMutationEnvironmentV3,
+{
+    match supervisor
+        .intake()
+        .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(job))
+    {
+        Ok(waiter) => {
+            let job_id = waiter.job_id();
+            drop(waiter);
+            Ok(RuntimePendingDrainRegisteredJobV3 { job_id })
+        }
+        Err(rejected) => {
+            let reason = rejected.reason();
+            let job = rejected.into_job().into_startup_pending_drain();
+            Err(RuntimePendingDrainFinalizerDispatchFailureV3::Rejected {
+                job: Box::new(job),
+                reason,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn complete_registered_pending_drain_job_v3<E>(
+    supervisor: &mut RuntimePendingDrainFinalizerSupervisorV3<E>,
+    registered: RuntimePendingDrainRegisteredJobV3,
 ) -> Result<
     RuntimePendingDrainFinalizerSettledV3<E>,
     RuntimePendingDrainFinalizerDispatchFailureV3<E>,
@@ -257,22 +308,20 @@ pub(crate) async fn register_and_complete_pending_drain_job_v3<E>(
 where
     E: RuntimePendingDrainMutationEnvironmentV3,
 {
-    let waiter = match supervisor
-        .intake()
-        .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(job))
-    {
-        Ok(waiter) => waiter,
-        Err(rejected) => {
-            let reason = rejected.reason();
-            let job = rejected.into_job().into_startup_pending_drain();
-            return Err(RuntimePendingDrainFinalizerDispatchFailureV3::Rejected { job, reason });
-        }
-    };
-    let expected = waiter.job_id();
-    drop(waiter);
     let Some(completion) = supervisor.next_completion().await else {
         return Err(RuntimePendingDrainFinalizerDispatchFailureV3::CompletionChannelClosed);
     };
+    complete_pending_drain_job_v3(registered, completion)
+}
+
+pub(crate) fn complete_pending_drain_job_v3<E>(
+    registered: RuntimePendingDrainRegisteredJobV3,
+    completion: RuntimePendingDrainFinalizerCompletionV3<E>,
+) -> Result<
+    RuntimePendingDrainFinalizerSettledV3<E>,
+    RuntimePendingDrainFinalizerDispatchFailureV3<E>,
+> {
+    let expected = registered.job_id();
     let actual = completion.job_id();
     if actual != expected {
         return Err(
@@ -285,11 +334,11 @@ where
     match completion.into_result() {
         RuntimeMutationFinalizerCompletionResultV1::Settled(settled) => Ok(settled),
         RuntimeMutationFinalizerCompletionResultV1::Failed(failed) => Err(
-            RuntimePendingDrainFinalizerDispatchFailureV3::Failed(failed),
+            RuntimePendingDrainFinalizerDispatchFailureV3::Failed(Box::new(failed)),
         ),
         RuntimeMutationFinalizerCompletionResultV1::Undispatched { job, exit } => Err(
             RuntimePendingDrainFinalizerDispatchFailureV3::Undispatched {
-                job: job.into_startup_pending_drain(),
+                job: Box::new(job.into_startup_pending_drain()),
                 exit,
             },
         ),
@@ -297,6 +346,21 @@ where
             Err(RuntimePendingDrainFinalizerDispatchFailureV3::DispatchedTerminal(exit))
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn register_and_complete_pending_drain_job_v3<E>(
+    supervisor: &mut RuntimePendingDrainFinalizerSupervisorV3<E>,
+    job: RuntimePendingDrainFinalizerJobV3<E>,
+) -> Result<
+    RuntimePendingDrainFinalizerSettledV3<E>,
+    RuntimePendingDrainFinalizerDispatchFailureV3<E>,
+>
+where
+    E: RuntimePendingDrainMutationEnvironmentV3,
+{
+    let registered = register_pending_drain_job_v3(supervisor, job)?;
+    complete_registered_pending_drain_job_v3(supervisor, registered).await
 }
 
 async fn execute_pending_drain_finalizer_job_v3<E>(

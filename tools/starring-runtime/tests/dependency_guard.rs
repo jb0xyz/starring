@@ -511,6 +511,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/gateway_owner_startup.rs",
             "src/gateway_owner_startup_watchdog.rs",
             "src/gateway_owner_startup_watchdog_handoff_tests.rs",
+            "src/health.rs",
             "src/identity_encoding.rs",
             "src/lib.rs",
             "src/main.rs",
@@ -529,6 +530,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/process.rs",
             "src/process_identity.rs",
             "src/process_startup.rs",
+            "src/process_supervisor.rs",
             "src/recovery_identity.rs",
             "src/registry.rs",
             "src/registry_succession_tests.rs",
@@ -560,6 +562,15 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
     assert_eq!(
         twilight_gateway["features"],
         serde_json::json!(["rustls-platform-verifier"])
+    );
+    let tokio = package_dependencies
+        .iter()
+        .find(|dependency| dependency["name"] == "tokio")
+        .unwrap();
+    assert_eq!(tokio["uses_default_features"], false);
+    assert_eq!(
+        tokio["features"],
+        serde_json::json!(["io-util", "macros", "net", "rt", "signal", "sync", "time"])
     );
     let mut dependencies = package_dependencies
         .into_iter()
@@ -648,6 +659,9 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             if path == Path::new("src/discord.rs") && forbidden == "twilight_gateway" {
                 continue;
             }
+            if path == Path::new("src/health.rs") && forbidden == "TcpListener" {
+                continue;
+            }
             assert!(
                 !contains_identifier(&source, forbidden),
                 "{}: {forbidden}",
@@ -676,18 +690,21 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/gateway_owner_startup.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
+            && path != Path::new("src/health.rs")
             && path != Path::new("src/discord.rs")
             && path != Path::new("src/process/closed.rs")
             && path != Path::new("src/process/connected.rs")
             && path != Path::new("src/process/execution.rs")
             && path != Path::new("src/process/observation.rs")
             && path != Path::new("src/process/observation_tests.rs")
+            && path != Path::new("src/process/owner.rs")
             && path != Path::new("src/process/pending_drain_finalizer.rs")
             && path != Path::new("src/process/readiness.rs")
             && path != Path::new("src/process/recovery.rs")
             && path != Path::new("src/process/startup_loop.rs")
             && path != Path::new("src/process/startup_loop_tests.rs")
             && path != Path::new("src/process_startup.rs")
+            && path != Path::new("src/process_supervisor.rs")
             && path != Path::new("src/mutation_finalizer.rs")
             && path != Path::new("src/shutdown.rs")
             && path != Path::new("src/startup_recovery_observation.rs")
@@ -730,7 +747,13 @@ fn mutation_finalizer_is_bounded_linear_supervised_and_handoff_compatible() {
         "RuntimeMutationFinalizerWaiterV1(<redacted>)",
         "RuntimeMutationFinalizerSupervisorV1(<redacted>)",
         "RuntimeMutationFinalizerCompletionV1(<redacted>)",
-        "RuntimeMutationFinalizerInFlightTaskV1",
+        "RuntimeMutationFinalizerInFlightAbortV1",
+        "RuntimeMutationFinalizerInFlightAbortGuardV1",
+        "RuntimeMutationFinalizerInFlightStoppedGuardV1",
+        "wait_stopped().await",
+        "abort_with(RuntimeSupervisorExitV1::DeadlineElapsed)",
+        "supervisor_id: NonZeroU64",
+        "NEXT_RUNTIME_MUTATION_FINALIZER_SUPERVISOR_ID",
         "task.abort()",
         "actor.abort()",
         "RuntimeSupervisorExitV1::Panicked",
@@ -1067,7 +1090,9 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     | "RuntimePendingDrainFinalizerDispatchFailureV3"
                     | "RuntimePendingDrainFinalizerJobV3"
                     | "RuntimePendingDrainFinalizerPortV3"
+                    | "RuntimePendingDrainFinalizerSettledV3"
                     | "RuntimePendingDrainFinalizerSupervisorV3"
+                    | "RuntimePendingDrainRegisteredJobV3"
                     | "RuntimePendingDrainMutationEnvironmentV3"
                     | "RuntimePendingDrainMutationOutputV3"
                     | "RuntimePendingDrainMutationStageV3"
@@ -1496,7 +1521,9 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "run_runtime_discord_control_v1(",
         "control.next_lifecycle()",
         "prepare_twilight_runtime_discord_gateway_driver_v1(",
-        "prepare_discord_gateway_start_v1(operation_cutoff)",
+        "prepare_discord_gateway_start_v1(operation_cutoff, Some(shutdown))",
+        "shutdown: &mut RuntimeShutdownObserverV1,",
+        "_observation = shutdown.wait()",
         "supervisor.release_start_v1()",
         "owner_discord_attachment:",
         "abort_handle.abort()",
@@ -1526,8 +1553,11 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "RuntimeDiscordStartingProcessV1(<redacted>)",
         "RuntimePausedConnectedProcessV1(<redacted>)",
         "shutdown_paused_discord_owner_v1",
+        "shutdown_paused_foundation_owner_v1",
+        ".begin_shutdown_v1(RuntimeShutdownCauseV1::Explicit)",
+        "foundation.observe_shutdown_registry_v1()",
         ".begin_discord_drain_v1()",
-        "let owner_shutdown = owner_held.shutdown().await;",
+        "foundation.finish_shutdown_v1(cleanup_deadline).await",
     ] {
         assert!(connected.contains(required), "{required}");
     }
@@ -1551,19 +1581,37 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         let declaration = braced_declaration(connected, marker);
         assert!(declaration.find("discord:").unwrap() < declaration.find("owner_held:").unwrap());
     }
-    let connected_shutdown =
-        braced_declaration(connected, "async fn shutdown_paused_discord_owner_v1(");
+    let connected_shutdown = braced_declaration(
+        connected,
+        "pub(super) async fn shutdown_paused_foundation_owner_v1<",
+    );
+    let begin = connected_shutdown.find(".begin_shutdown_v1(").unwrap();
+    let registry = connected_shutdown
+        .find("foundation.observe_shutdown_registry_v1()")
+        .unwrap();
+    let discord_drain = connected_shutdown
+        .find(".begin_discord_drain_v1()")
+        .unwrap();
     let discord_shutdown = connected_shutdown.find(".shutdown_until(").unwrap();
     let owner_shutdown = connected_shutdown
-        .find("let owner_shutdown = owner_held.shutdown().await;")
+        .find("shutdown_owner(owner_cleanup_deadline).await")
         .unwrap();
-    assert!(discord_shutdown < owner_shutdown);
+    let foundation_shutdown = connected_shutdown
+        .find("foundation.finish_shutdown_v1(cleanup_deadline).await")
+        .unwrap();
+    assert!(
+        begin < registry
+            && registry < discord_drain
+            && discord_drain < discord_shutdown
+            && discord_shutdown < owner_shutdown
+            && owner_shutdown < foundation_shutdown
+    );
     let start = braced_declaration(gateway, "pub(crate) async fn start_discord_gateway_v1(");
     let driver = start
         .find("prepare_twilight_runtime_discord_gateway_driver_v1(")
         .unwrap();
     let prepare = start
-        .find("prepare_discord_gateway_start_v1(operation_cutoff)")
+        .find("prepare_discord_gateway_start_v1(operation_cutoff, Some(shutdown))")
         .unwrap();
     let spawn = start.find("start_runtime_discord_gateway_v1(").unwrap();
     let attach = start.find("attach_discord_supervisor_v1").unwrap();
@@ -1645,8 +1693,7 @@ fn recovery_pending_process_is_fresh_closed_linear_and_bounded() {
         ".revalidate_v2()",
         "shutdown_prepared_recovery_v2(",
         "shutdown_pending_recovery_v2(",
-        "finish_runtime_owner_held_process_shutdown_v1(",
-        "finish_paused_connected_shutdown_v1(",
+        "shutdown_paused_foundation_owner_v1(",
         "RuntimeProcessRecoveryPendingTransitionErrorV2(<redacted>)",
         "RuntimeRecoveryPendingProcessShutdownErrorV2(<redacted>)",
     ] {
@@ -1705,13 +1752,15 @@ fn recovery_pending_process_is_fresh_closed_linear_and_bounded() {
         "async fn shutdown_pending_recovery_v2(",
     ] {
         let shutdown = braced_declaration(recovery, shutdown_name);
-        let discord = shutdown.find(".shutdown_until(").unwrap();
-        let owner = shutdown[discord..]
-            .find("shutdown_until_v2(")
-            .map(|offset| discord + offset)
-            .unwrap();
-        let database = shutdown.find("foundation.shutdown().await").unwrap();
-        assert!(discord < owner && owner < database, "{shutdown_name}");
+        assert!(
+            shutdown.contains("shutdown_paused_foundation_owner_v1("),
+            "{shutdown_name}"
+        );
+        assert!(
+            shutdown.contains(".abort_and_shutdown_until_v2(deadline)"),
+            "{shutdown_name}"
+        );
+        assert!(!shutdown.contains("foundation.shutdown().await"));
     }
     let state_attributes = declaration_attribute_block(recovery, "RuntimeRecoveryPendingProcessV2");
     for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
@@ -1936,25 +1985,30 @@ fn committed_closed_recovery_process_is_linear_retained_and_non_serving() {
     let race_helper = braced_declaration(process, "async fn await_closed_recovery_commit_v2<");
     let cutoff_branch = race_helper.find("Instant::now() >= commit_cutoff").unwrap();
     let biased = race_helper.find("biased;").unwrap();
+    let shutdown = race_helper.find("observation = &mut shutdown").unwrap();
     let deadline = race_helper.find("sleep_until(").unwrap();
     let discord = race_helper
         .find("transition = &mut discord_terminal")
         .unwrap();
     let commit_result = race_helper.find("result = &mut commit").unwrap();
-    assert!(cutoff_branch < biased && biased < deadline && deadline < discord);
+    assert!(
+        cutoff_branch < biased && biased < shutdown && shutdown < deadline && deadline < discord
+    );
     assert!(discord < commit_result);
     for shutdown_name in [
         "async fn shutdown_pending_commit_v2(",
         "async fn shutdown_committed_recovery_v2(",
     ] {
         let shutdown = braced_declaration(process, shutdown_name);
-        let discord = shutdown.find(".shutdown_until(").unwrap();
-        let owner = shutdown[discord..]
-            .find(".abort_and_shutdown_until_v2(")
-            .map(|offset| discord + offset)
-            .unwrap();
-        let database = shutdown.find("foundation.shutdown().await").unwrap();
-        assert!(discord < owner && owner < database, "{shutdown_name}");
+        assert!(
+            shutdown.contains("shutdown_paused_foundation_owner_v1("),
+            "{shutdown_name}"
+        );
+        assert!(
+            shutdown.contains(".abort_and_shutdown_until_v2(deadline)"),
+            "{shutdown_name}"
+        );
+        assert!(!shutdown.contains("foundation.shutdown().await"));
     }
     let state_attributes = declaration_attribute_block(process, "RuntimeClosedRecoveryProcessV2");
     for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
@@ -2287,6 +2341,7 @@ fn recovery_readiness_process_is_single_use_cancellation_safe_and_non_authorizin
     let race = braced_declaration(process, "async fn await_recovery_readiness_refresh_v2<");
     let elapsed = race.find("Instant::now() >= readiness_cutoff").unwrap();
     let biased = race.find("biased;").unwrap();
+    let shutdown = race.find("observation = &mut shutdown").unwrap();
     let deadline = race.find("sleep_until(").unwrap();
     let discord = race.find("transition = &mut discord_terminal").unwrap();
     let owner = race.find("() = &mut owner_terminal").unwrap();
@@ -2294,6 +2349,8 @@ fn recovery_readiness_process_is_single_use_cancellation_safe_and_non_authorizin
     assert!(
         elapsed < biased
             && biased < deadline
+            && biased < shutdown
+            && shutdown < deadline
             && deadline < discord
             && discord < owner
             && owner < refresh
@@ -2301,21 +2358,9 @@ fn recovery_readiness_process_is_single_use_cancellation_safe_and_non_authorizin
     assert_eq!(race.matches("tokio::select!").count(), 1);
 
     let cleanup = braced_declaration(process, "async fn shutdown_ready_recovery_v2(");
-    let discord_drain = cleanup
-        .find("foundation.gateway.begin_discord_drain_v1()")
-        .unwrap();
-    let discord_deadline = cleanup
-        .find("foundation.startup_budget.discord_cleanup_deadline()")
-        .unwrap();
-    let owner_deadline = cleanup
-        .find("foundation.startup_budget.owner_cleanup_deadline()")
-        .unwrap();
-    let database = cleanup.find("foundation.shutdown().await").unwrap();
-    assert!(
-        discord_drain < discord_deadline
-            && discord_deadline < owner_deadline
-            && owner_deadline < database
-    );
+    assert!(cleanup.contains("shutdown_paused_foundation_owner_v1("));
+    assert!(cleanup.contains(".abort_and_shutdown_until_v2(deadline)"));
+    assert!(!cleanup.contains("foundation.shutdown().await"));
     let ready_impl = braced_declaration(closed, "impl RuntimeClosedRecoveryReadyIterationV2");
     let ready_abort = braced_declaration(
         ready_impl,
@@ -3100,10 +3145,9 @@ fn startup_recovery_observation_process_is_single_use_interruptible_and_fail_clo
         "cleanup_after_startup_recovery_observation_failure_v2(",
         "current_typed_observation_outcome_transition_v2(",
         "shutdown_startup_observation_process_v2(",
-        "sequence_startup_observation_cleanup_v2(",
+        "sequence_startup_observation_cleanup_v2<",
         "finish_observation_transition_v2(",
-        "finish_runtime_owner_held_process_shutdown_v1,",
-        "finish_paused_connected_shutdown_v1,",
+        "shutdown_paused_foundation_owner_v1,",
         "#[path = \"observation_tests.rs\"]",
     ] {
         assert!(process.contains(required), "{required}");
@@ -3482,16 +3526,25 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
             .count(),
         4
     );
-    let registration = braced_declaration(
+    let registration =
+        braced_declaration(finalizer, "pub(crate) fn register_pending_drain_job_v3<");
+    let register = registration.find(".try_register(").unwrap();
+    let waiter_drop = registration.find("drop(waiter)").unwrap();
+    assert!(register < waiter_drop);
+    let completion_helper = braced_declaration(
+        finalizer,
+        "pub(crate) async fn complete_registered_pending_drain_job_v3<",
+    );
+    assert!(completion_helper.contains("supervisor.next_completion().await"));
+    let combined = braced_declaration(
         finalizer,
         "pub(crate) async fn register_and_complete_pending_drain_job_v3<",
     );
-    let register = registration.find(".try_register(").unwrap();
-    let waiter_drop = registration.find("drop(waiter)").unwrap();
-    let completion = registration
-        .find("supervisor.next_completion().await")
+    let register = combined.find("register_pending_drain_job_v3(").unwrap();
+    let completion = combined
+        .find("complete_registered_pending_drain_job_v3(")
         .unwrap();
-    assert!(register < waiter_drop && waiter_drop < completion);
+    assert!(register < completion);
     let stage_execution = braced_declaration(
         finalizer,
         "async fn execute_pending_drain_mutation_stage_v3<",
@@ -4837,6 +4890,7 @@ fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
         "acquire_runtime_gateway_owner_startup_v1(",
         "self.startup_budget.operation_cutoff()",
         "self.startup_budget.owner_cleanup_deadline()",
+        "&mut shutdown,",
         "RuntimeOwnerHeldProcessV1(<redacted>)",
         "RuntimeProcessGatewayOwnerTransitionErrorV1(<redacted>)",
         "RuntimeOwnerHeldProcessShutdownErrorV1(<redacted>)",
@@ -4849,8 +4903,16 @@ fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
             .count(),
         1
     );
-    assert_eq!(owner.matches("owner_cleanup_deadline()").count(), 3);
+    assert_eq!(owner.matches("owner_cleanup_deadline()").count(), 2);
+    assert!(!owner.contains("root_bounded_startup_window_v1"));
     assert!(!owner.contains("startup_budget.cleanup_deadline()"));
+    for required in [
+        "shutdown: &mut RuntimeShutdownObserverV1,",
+        "observation = shutdown.wait()",
+        "cleanup_deadline.min(shutdown_deadline)",
+    ] {
+        assert!(acquisition.contains(required), "{required}");
+    }
     let owner_attributes = declaration_attribute_block(owner, "RuntimeOwnerHeldProcessV1");
     for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
         assert!(
@@ -4867,11 +4929,15 @@ fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
         owner,
         "pub(crate) async fn shutdown(self) -> Result<(), RuntimeOwnerHeldProcessShutdownErrorV1>",
     );
+    let finalizer = shutdown.find(".begin_shutdown_v1(").unwrap();
+    let registry = shutdown
+        .find("foundation.observe_shutdown_registry_v1()")
+        .unwrap();
     let owner_release = shutdown
         .find("owner.shutdown_until(owner_cleanup_deadline)")
         .unwrap();
-    let database_close = shutdown.find("foundation.shutdown().await").unwrap();
-    assert!(owner_release < database_close);
+    let foundation_finish = shutdown.find("foundation.finish_shutdown_v1(").unwrap();
+    assert!(finalizer < registry && registry < owner_release && owner_release < foundation_finish);
     assert!(!owner.contains("pub struct RuntimeOwnerHeldProcessV1"));
     assert!(!library.contains("RuntimeOwnerHeldProcessV1"));
 
@@ -5024,7 +5090,12 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         "cleanup_after_operation_deadline_v1",
         "RuntimeProcessFoundationCompositionErrorV1::OperationDeadlineElapsed",
         "RuntimeProcessFoundationCompositionErrorV1::CleanupAfterOperationDeadline",
-        "pub(crate) async fn shutdown(self)",
+        "pub(crate) async fn shutdown(",
+        "pub(super) async fn begin_shutdown_v1(",
+        "pub(super) async fn finish_shutdown_v1(",
+        "RuntimeProcessRootSupervisorV1",
+        "mutation_finalizer:",
+        "shutdown_health_until(cleanup_deadline)",
         "shutdown.close_until(cleanup_deadline).await",
         "finish_runtime_process_foundation_shutdown_v1(",
         "let Self {",
@@ -5095,9 +5166,23 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
     }
     assert!(!composer.contains("drop(secrets)"));
     assert!(!composer.contains("drop(config)"));
-    let shutdown = braced_declaration(production, "pub(crate) async fn shutdown(self)");
-    let cleanup_deadline = shutdown
-        .find("let cleanup_deadline = startup_budget.cleanup_deadline()")
+    let shutdown = braced_declaration(production, "pub(crate) async fn shutdown(");
+    let begin = shutdown
+        .find(".begin_shutdown_v1(RuntimeShutdownCauseV1::Explicit)")
+        .unwrap();
+    let registry = shutdown
+        .find("self.observe_shutdown_registry_v1()")
+        .unwrap();
+    let finish = shutdown
+        .find("self.finish_shutdown_v1(cleanup_deadline)")
+        .unwrap();
+    assert!(begin < registry && registry < finish);
+    let shutdown = braced_declaration(production, "pub(super) async fn finish_shutdown_v1(");
+    let finalizer = shutdown
+        .find("mutation_finalizer.shutdown_until(cleanup_deadline)")
+        .unwrap();
+    let signal = shutdown
+        .find("root_supervisor.join_signal_until(cleanup_deadline)")
         .unwrap();
     let shutdown_handle = shutdown
         .find("let shutdown = databases.shutdown()")
@@ -5112,20 +5197,24 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
     let finish = shutdown
         .find("finish_runtime_process_foundation_shutdown_v1(")
         .unwrap();
+    let health = shutdown
+        .find(".shutdown_health_until(cleanup_deadline)")
+        .unwrap();
     assert!(
-        cleanup_deadline < shutdown_handle
+        finalizer < signal
+            && signal < shutdown_handle
             && shutdown_handle < closed_components
             && closed_components < close
             && close < release_handle
             && release_handle < finish
+            && finish < health
     );
-    assert!(shutdown.contains("let cleanup_deadline = startup_budget.cleanup_deadline()"));
     assert!(shutdown.contains("shutdown.close_until(cleanup_deadline).await"));
     assert!(!shutdown.contains("shutdown.close().await"));
     assert!(!composer.contains("shutdown.close().await"));
     let finish_shutdown = braced_declaration(
         production,
-        "fn finish_runtime_process_foundation_shutdown_v1<S, R>(",
+        "fn finish_runtime_process_foundation_shutdown_v1<S, R, T>(",
     );
     let drop_secrets = finish_shutdown.find("drop(secrets)").unwrap();
     let drop_retained = finish_shutdown.find("drop(retained)").unwrap();

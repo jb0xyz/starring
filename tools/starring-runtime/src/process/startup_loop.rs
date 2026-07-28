@@ -630,17 +630,26 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
         let deadline_failure =
             classify_bounded_startup_retry_deadline_v2(operation_cutoff, owner_safety_deadline);
         let owner_terminal = self.session.owner_terminal_observation_v2();
-        let discord_terminal =
-            async { map_discord_transition_exit_v1(self.discord.wait_terminal().await.exit()) };
+        let discord_terminal = async {
+            let transition =
+                map_discord_transition_exit_v1(self.discord.wait_terminal().await.exit());
+            self.foundation
+                .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::DiscordTerminal);
+            transition
+        };
         let owner_terminal = async {
             let _exit = owner_terminal.await;
+            self.foundation
+                .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
         };
+        let mut shutdown = self.foundation.shutdown_observer_v1();
         await_bounded_startup_retry_v2(
             deadline_failure,
             sleep_until(TokioInstant::from_std(wait_cutoff)),
             discord_terminal,
             owner_terminal,
             sleep_until(TokioInstant::from_std(retry_at)),
+            async move { shutdown.wait().await },
         )
         .await?;
         if let Some(transition) = current_bounded_startup_retry_transition_v2(self) {
@@ -680,12 +689,24 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
 fn current_bounded_startup_retry_transition_v2(
     process: &RuntimeStartupRecoveryContinueProcessV2,
 ) -> Option<RuntimeProcessStartupRecoveryLoopFailureV2> {
+    let discord = discord_transition_failure_v1(&process.discord);
+    let owner_terminal = process.session.owner_terminal_status_v2().is_some();
+    if discord.is_some() {
+        process
+            .foundation
+            .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::DiscordTerminal);
+    }
+    if owner_terminal {
+        process
+            .foundation
+            .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
+    }
     classify_current_bounded_startup_retry_transition_v2(
         Instant::now(),
         process.foundation.startup_budget.operation_cutoff(),
         process.session.owner_safety_deadline_v2(),
-        discord_transition_failure_v1(&process.discord),
-        process.session.owner_terminal_status_v2().is_some(),
+        discord,
+        owner_terminal,
     )
 }
 
@@ -725,25 +746,35 @@ fn classify_bounded_startup_retry_deadline_v2(
     }
 }
 
-async fn await_bounded_startup_retry_v2<Deadline, DiscordTerminal, OwnerTerminal, Retry>(
+async fn await_bounded_startup_retry_v2<Deadline, DiscordTerminal, OwnerTerminal, Retry, Shutdown>(
     deadline_failure: RuntimeProcessStartupRecoveryLoopFailureV2,
     deadline: Deadline,
     discord_terminal: DiscordTerminal,
     owner_terminal: OwnerTerminal,
     retry: Retry,
+    shutdown: Shutdown,
 ) -> Result<(), RuntimeProcessStartupRecoveryLoopFailureV2>
 where
     Deadline: Future<Output = ()>,
     DiscordTerminal: Future<Output = RuntimeProcessPausedConnectedTransitionFailureV1>,
     OwnerTerminal: Future<Output = ()>,
     Retry: Future<Output = ()>,
+    Shutdown: Future<Output = crate::RuntimeShutdownObservationV1>,
 {
     tokio::pin!(deadline);
     tokio::pin!(discord_terminal);
     tokio::pin!(owner_terminal);
     tokio::pin!(retry);
+    tokio::pin!(shutdown);
     tokio::select! {
         biased;
+        observation = &mut shutdown => {
+            Err(RuntimeProcessStartupRecoveryLoopFailureV2::PausedConnection(
+                RuntimeProcessPausedConnectedTransitionFailureV1::ProcessShutdown(
+                    observation.cause(),
+                ),
+            ))
+        }
         () = &mut deadline => Err(deadline_failure),
         transition = &mut discord_terminal => {
             Err(RuntimeProcessStartupRecoveryLoopFailureV2::PausedConnection(transition))

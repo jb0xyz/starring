@@ -24,9 +24,10 @@ use super::connected::{
 };
 use super::observation::RuntimeStartupRecoveryContinueProcessV2;
 use super::pending_drain_finalizer::{
-    register_and_complete_pending_drain_job_v3, RuntimePendingDrainFinalizerDispatchFailureV3,
-    RuntimePendingDrainFinalizerJobV3, RuntimePendingDrainMutationEnvironmentV3,
-    RuntimePendingDrainMutationOutputV3, RuntimePendingDrainMutationStageV3,
+    complete_pending_drain_job_v3, register_pending_drain_job_v3,
+    RuntimePendingDrainFinalizerDispatchFailureV3, RuntimePendingDrainFinalizerJobV3,
+    RuntimePendingDrainMutationEnvironmentV3, RuntimePendingDrainMutationOutputV3,
+    RuntimePendingDrainMutationStageV3,
 };
 use super::startup_loop::RuntimeProcessStartupRecoveryLoopFailureV2;
 use super::RuntimeProcessFoundationV1;
@@ -160,6 +161,8 @@ pub(super) struct RuntimeProductionPendingDrainFinalizerEnvironmentV3 {
     discord: RuntimeDiscordGatewayObservationV1,
     database: crate::database::RuntimePendingDrainMutationDatabaseV3,
     operation_cutoff: Instant,
+    shutdown: crate::process_supervisor::RuntimeProcessShutdownTriggerV1,
+    shutdown_observer: crate::shutdown::RuntimeShutdownObserverV1,
 }
 
 impl RuntimeProductionPendingDrainFinalizerEnvironmentV3 {
@@ -171,6 +174,8 @@ impl RuntimeProductionPendingDrainFinalizerEnvironmentV3 {
             discord: discord.observation_v1(),
             database: foundation.databases.pending_drain_mutation_v3(),
             operation_cutoff: foundation.startup_budget.operation_cutoff(),
+            shutdown: foundation.shutdown_trigger_v1(),
+            shutdown_observer: foundation.shutdown_observer_v1(),
         }
     }
 }
@@ -234,11 +239,19 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
             owner_safety_deadline,
         );
         let owner_terminal = self.session.owner_terminal_observation_v2();
-        let discord_terminal =
-            async { map_discord_transition_exit_v1(self.discord.wait_terminal().await.exit()) };
+        let discord_terminal = async {
+            let transition =
+                map_discord_transition_exit_v1(self.discord.wait_terminal().await.exit());
+            self.foundation
+                .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::DiscordTerminal);
+            transition
+        };
         let owner_terminal = async {
             let _exit = owner_terminal.await;
+            self.foundation
+                .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
         };
+        let mut shutdown = self.foundation.shutdown_observer_v1();
         let database = self
             .foundation
             .databases
@@ -250,6 +263,7 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
             discord_terminal,
             owner_terminal,
             database,
+            async move { shutdown.wait().await },
         )
         .await
         {
@@ -714,15 +728,86 @@ async fn execute_owned_pending_drain_stage_v3(
 > {
     let environment = RuntimeProductionPendingDrainFinalizerEnvironmentV3::new(discord, foundation);
     let job = RuntimePendingDrainFinalizerJobV3::new(session, environment, stage);
-    match register_and_complete_pending_drain_job_v3(&mut foundation.mutation_finalizer, job).await
-    {
+    let registered = match foundation.mutation_finalizer.as_ref() {
+        Some(supervisor) => match register_pending_drain_job_v3(supervisor, job) {
+            Ok(registered) => registered,
+            Err(failure) => return resolve_pending_drain_finalizer_dispatch_v3(Err(failure)),
+        },
+        None => {
+            let (session, environment, _) = job.into_parts();
+            drop(environment);
+            return Err(RuntimePendingDrainOwnedStageFailureV3::Retained {
+                session: Box::new(session),
+                failure:
+                    RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainRecoveryUnavailable,
+            });
+        }
+    };
+    let mut shutdown = foundation.root_supervisor.observer();
+    let completion = {
+        let supervisor = foundation
+            .mutation_finalizer
+            .as_mut()
+            .expect("registered pending drain finalizer");
+        tokio::select! {
+            biased;
+            completion = supervisor.next_completion() => Ok(completion),
+            observation = shutdown.wait() => Err(observation),
+        }
+    };
+    let dispatch = match completion {
+        Ok(Some(completion)) => complete_pending_drain_job_v3(registered, completion),
+        Ok(None) => Err(RuntimePendingDrainFinalizerDispatchFailureV3::CompletionChannelClosed),
+        Err(observation) => {
+            let shutdown_deadline = foundation.effective_shutdown_deadline_v1(observation);
+            let supervisor = foundation
+                .mutation_finalizer
+                .take()
+                .expect("registered pending drain finalizer");
+            let report = supervisor.shutdown_until(shutdown_deadline).await;
+            foundation.record_finalizer_shutdown_exit_v1(report.exit());
+            let mut completions = report.into_completions();
+            if completions.len() != 1 {
+                return Err(RuntimePendingDrainOwnedStageFailureV3::Lost);
+            }
+            complete_pending_drain_job_v3(registered, completions.remove(0))
+        }
+    };
+    resolve_pending_drain_finalizer_dispatch_v3(dispatch)
+}
+
+fn resolve_pending_drain_finalizer_dispatch_v3(
+    dispatch: Result<
+        super::pending_drain_finalizer::RuntimePendingDrainFinalizerSettledV3<
+            RuntimeProductionPendingDrainFinalizerEnvironmentV3,
+        >,
+        RuntimePendingDrainFinalizerDispatchFailureV3<
+            RuntimeProductionPendingDrainFinalizerEnvironmentV3,
+        >,
+    >,
+) -> Result<
+    (
+        RuntimeClosedRecoverySessionV2,
+        RuntimePendingDrainMutationOutputV3,
+    ),
+    RuntimePendingDrainOwnedStageFailureV3,
+> {
+    match dispatch {
         Ok(settled) => {
             let (session, environment, output) = settled.into_parts();
             drop(environment);
             Ok((session, output))
         }
         Err(RuntimePendingDrainFinalizerDispatchFailureV3::Rejected { job, reason }) => {
-            let (session, environment, _) = job.into_parts();
+            let (session, environment, _) = (*job).into_parts();
+            if matches!(
+                reason,
+                crate::RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(_)
+            ) {
+                environment
+                    .shutdown
+                    .trip(crate::RuntimeShutdownCauseV1::FinalizerTerminal);
+            }
             drop(environment);
             Err(RuntimePendingDrainOwnedStageFailureV3::Retained {
                 session: Box::new(session),
@@ -730,7 +815,7 @@ async fn execute_owned_pending_drain_stage_v3(
             })
         }
         Err(RuntimePendingDrainFinalizerDispatchFailureV3::Failed(failed)) => {
-            let (session, environment, failure) = failed.into_parts();
+            let (session, environment, failure) = (*failed).into_parts();
             drop(environment);
             Err(RuntimePendingDrainOwnedStageFailureV3::Retained {
                 session: Box::new(session),
@@ -738,7 +823,10 @@ async fn execute_owned_pending_drain_stage_v3(
             })
         }
         Err(RuntimePendingDrainFinalizerDispatchFailureV3::Undispatched { job, exit }) => {
-            let (session, environment, _) = job.into_parts();
+            let (session, environment, _) = (*job).into_parts();
+            environment
+                .shutdown
+                .trip(crate::RuntimeShutdownCauseV1::FinalizerTerminal);
             drop(environment);
             Err(RuntimePendingDrainOwnedStageFailureV3::Retained {
                 session: Box::new(session),
@@ -816,8 +904,8 @@ async fn pending_drain_owned_terminal_v3(
     discord: RuntimeDiscordGatewaySupervisorV1,
     foundation: RuntimeProcessFoundationV1,
 ) -> RuntimeOwnedStartupRecoveryExecutionOutcomeV3 {
-    drop(discord);
-    let _cleanup = foundation.shutdown().await;
+    foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::FinalizerTerminal);
+    super::connected::shutdown_paused_foundation_discord_v1(foundation, discord).await;
     RuntimeOwnedStartupRecoveryExecutionOutcomeV3::Terminal(
         super::startup_loop::RuntimeProcessStartupRecoveryLoopErrorV2::Transition(
             RuntimeProcessStartupRecoveryLoopFailureV2::ProtocolViolation,
@@ -1194,19 +1282,30 @@ impl RuntimePendingDrainMutationEnvironmentV3
         &self,
         session: &RuntimeClosedRecoverySessionV2,
     ) -> Option<RuntimeProcessStartupRecoveryLoopFailureV2> {
+        let discord = self
+            .discord
+            .terminal_status()
+            .map(|terminal| map_discord_transition_exit_v1(terminal.exit()))
+            .or_else(|| {
+                self.discord
+                    .is_finished()
+                    .then_some(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated)
+            });
+        let owner_terminal = session.owner_terminal_status_v2().is_some();
+        if discord.is_some() {
+            self.shutdown
+                .trip(crate::RuntimeShutdownCauseV1::DiscordTerminal);
+        }
+        if owner_terminal {
+            self.shutdown
+                .trip(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
+        }
         classify_current_pending_drain_finalizer_transition_v3(
             Instant::now(),
             self.operation_cutoff,
             session.owner_safety_deadline_v2(),
-            self.discord
-                .terminal_status()
-                .map(|terminal| map_discord_transition_exit_v1(terminal.exit()))
-                .or_else(|| {
-                    self.discord.is_finished().then_some(
-                        RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated,
-                    )
-                }),
-            session.owner_terminal_status_v2().is_some(),
+            discord,
+            owner_terminal,
         )
     }
 
@@ -1347,17 +1446,28 @@ where
         owner_safety_deadline,
     );
     let owner_terminal = session.owner_terminal_observation_v2();
-    let discord_terminal =
-        async { map_discord_transition_exit_v1(environment.discord.wait_terminal().await.exit()) };
+    let discord_terminal = async {
+        let transition =
+            map_discord_transition_exit_v1(environment.discord.wait_terminal().await.exit());
+        environment
+            .shutdown
+            .trip(crate::RuntimeShutdownCauseV1::DiscordTerminal);
+        transition
+    };
     let owner_terminal = async {
         let _exit = owner_terminal.await;
+        environment
+            .shutdown
+            .trip(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
     };
+    let mut shutdown = environment.shutdown_observer.clone();
     await_startup_recovery_execution_v2(
         deadline_failure,
         sleep_until(TokioInstant::from_std(execution_cutoff)),
         discord_terminal,
         owner_terminal,
         execution,
+        async move { shutdown.wait().await },
     )
     .await
 }
@@ -1397,17 +1507,23 @@ where
     let deadline_failure =
         classify_startup_recovery_execution_deadline_v2(operation_cutoff, owner_safety_deadline);
     let owner_terminal = session.owner_terminal_observation_v2();
-    let discord_terminal =
-        async { map_discord_transition_exit_v1(discord.wait_terminal().await.exit()) };
+    let discord_terminal = async {
+        let transition = map_discord_transition_exit_v1(discord.wait_terminal().await.exit());
+        foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::DiscordTerminal);
+        transition
+    };
     let owner_terminal = async {
         let _exit = owner_terminal.await;
+        foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
     };
+    let mut shutdown = foundation.shutdown_observer_v1();
     await_startup_recovery_execution_v2(
         deadline_failure,
         sleep_until(TokioInstant::from_std(execution_cutoff)),
         discord_terminal,
         owner_terminal,
         execution,
+        async move { shutdown.wait().await },
     )
     .await
 }
@@ -1506,12 +1622,20 @@ fn current_startup_recovery_execution_transition_from_parts_v2(
     discord: &RuntimeDiscordGatewaySupervisorV1,
     session: &RuntimeClosedRecoverySessionV2,
 ) -> Option<RuntimeProcessStartupRecoveryLoopFailureV2> {
+    let discord = discord_transition_failure_v1(discord);
+    let owner_terminal = session.owner_terminal_status_v2().is_some();
+    if discord.is_some() {
+        foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::DiscordTerminal);
+    }
+    if owner_terminal {
+        foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
+    }
     classify_current_startup_recovery_execution_transition_v2(
         Instant::now(),
         foundation.startup_budget.operation_cutoff(),
         session.owner_safety_deadline_v2(),
-        discord_transition_failure_v1(discord),
-        session.owner_terminal_status_v2().is_some(),
+        discord,
+        owner_terminal,
     )
 }
 
@@ -1556,6 +1680,7 @@ async fn await_startup_recovery_execution_v2<
     DiscordTerminal,
     OwnerTerminal,
     Execution,
+    Shutdown,
     Completed,
     E,
 >(
@@ -1564,19 +1689,31 @@ async fn await_startup_recovery_execution_v2<
     discord_terminal: DiscordTerminal,
     owner_terminal: OwnerTerminal,
     execution: Execution,
+    shutdown: Shutdown,
 ) -> Result<Completed, RuntimeStartupRecoveryExecutionAwaitFailureV2<E>>
 where
     Deadline: Future<Output = ()>,
     DiscordTerminal: Future<Output = RuntimeProcessPausedConnectedTransitionFailureV1>,
     OwnerTerminal: Future<Output = ()>,
     Execution: Future<Output = Result<Completed, E>>,
+    Shutdown: Future<Output = crate::RuntimeShutdownObservationV1>,
 {
     tokio::pin!(deadline);
     tokio::pin!(discord_terminal);
     tokio::pin!(owner_terminal);
     tokio::pin!(execution);
+    tokio::pin!(shutdown);
     tokio::select! {
         biased;
+        observation = &mut shutdown => {
+            Err(RuntimeStartupRecoveryExecutionAwaitFailureV2::Transition(
+                RuntimeProcessStartupRecoveryLoopFailureV2::PausedConnection(
+                    RuntimeProcessPausedConnectedTransitionFailureV1::ProcessShutdown(
+                        observation.cause(),
+                    ),
+                ),
+            ))
+        }
         () = &mut deadline => {
             Err(RuntimeStartupRecoveryExecutionAwaitFailureV2::Transition(deadline_failure))
         }
@@ -1638,6 +1775,7 @@ mod tests {
             ready(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated),
             ready(()),
             ready(Ok::<_, ()>(())),
+            pending(),
         )
         .await;
         assert!(matches!(
@@ -1653,6 +1791,7 @@ mod tests {
             ready(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated),
             ready(()),
             ready(Ok::<_, ()>(())),
+            pending(),
         )
         .await;
         assert!(matches!(
@@ -1670,6 +1809,7 @@ mod tests {
             pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
             ready(()),
             ready(Ok::<_, ()>(())),
+            pending(),
         )
         .await;
         assert!(matches!(
@@ -1687,6 +1827,7 @@ mod tests {
             pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
             pending::<()>(),
             ready(Ok::<_, ()>(())),
+            pending(),
         )
         .await;
         assert!(matches!(database_ready, Ok(())));
@@ -1697,6 +1838,7 @@ mod tests {
             pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
             pending::<()>(),
             ready(Err::<(), _>("database")),
+            pending(),
         )
         .await;
         assert!(matches!(
@@ -1721,6 +1863,7 @@ mod tests {
             pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
             pending::<()>(),
             execution,
+            pending(),
         )
         .await;
 

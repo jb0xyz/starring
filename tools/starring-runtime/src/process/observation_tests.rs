@@ -131,6 +131,7 @@ impl RuntimeStartupRecoveryObservationProcessStepV2<()> for FakeObservationProce
                     let interrupt = await_startup_recovery_observation_interrupt_v2(
                         discord_terminal,
                         owner_terminal,
+                        pending(),
                     );
                     let pending_observation = async move {
                         active.fetch_add(1, Ordering::AcqRel);
@@ -149,6 +150,11 @@ impl RuntimeStartupRecoveryObservationProcessStepV2<()> for FakeObservationProce
                                 RuntimeStartupRecoveryObservationInterruptV2::Owner => {
                                     RuntimeProcessStartupRecoveryObservationFailureV2::PausedConnection(
                                         RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated,
+                                    )
+                                }
+                                RuntimeStartupRecoveryObservationInterruptV2::Shutdown(cause) => {
+                                    RuntimeProcessStartupRecoveryObservationFailureV2::PausedConnection(
+                                        RuntimeProcessPausedConnectedTransitionFailureV1::ProcessShutdown(cause),
                                     )
                                 }
                             })
@@ -569,6 +575,7 @@ async fn interrupt_race_prioritizes_discord_when_both_signals_are_ready() {
     let interrupt = await_startup_recovery_observation_interrupt_v2(
         ready(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated),
         ready(()),
+        pending(),
     )
     .await;
 
@@ -585,6 +592,7 @@ async fn interrupt_race_observes_owner_termination_while_discord_is_live() {
     let interrupt = await_startup_recovery_observation_interrupt_v2(
         pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
         ready(()),
+        pending(),
     )
     .await;
 

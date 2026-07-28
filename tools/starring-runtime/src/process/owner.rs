@@ -2,12 +2,12 @@ use std::fmt::{Debug, Formatter};
 
 use crate::gateway_owner_startup::{
     acquire_runtime_gateway_owner_startup_v1, RuntimeAcquiredGatewayOwnerV1,
-    RuntimeGatewayOwnerStartupAcquisitionErrorV1,
+    RuntimeGatewayOwnerStartupAcquisitionErrorV1, RuntimeGatewayOwnerStartupBoundsV1,
 };
 use crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1;
 use crate::{RuntimeDatabasePoolShutdownErrorV1, RuntimeGatewayOwnerStartupWatchdogExitV1};
 
-use super::RuntimeProcessFoundationV1;
+use super::{RuntimeProcessFoundationShutdownErrorV1, RuntimeProcessFoundationV1};
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeProcessGatewayOwnerTransitionErrorV1 {
@@ -18,6 +18,23 @@ pub enum RuntimeProcessGatewayOwnerTransitionErrorV1 {
         transition: RuntimeGatewayOwnerStartupAcquisitionErrorV1,
         cleanup: RuntimeDatabasePoolShutdownErrorV1,
     },
+    #[error("runtime process gateway owner transition foundation cleanup failed")]
+    CleanupAfterGatewayOwnerFoundation {
+        transition: RuntimeGatewayOwnerStartupAcquisitionErrorV1,
+        cleanup: RuntimeProcessFoundationShutdownErrorV1,
+    },
+    #[error("runtime process shutdown interrupted gateway owner transition")]
+    ProcessShutdown(crate::RuntimeShutdownCauseV1),
+    #[error("runtime process shutdown interrupted gateway owner transition and cleanup failed")]
+    CleanupAfterProcessShutdown {
+        cause: crate::RuntimeShutdownCauseV1,
+        cleanup: RuntimeOwnerHeldProcessShutdownErrorV1,
+    },
+    #[error("runtime process shutdown interrupted gateway owner transition and foundation cleanup failed")]
+    CleanupAfterProcessShutdownFoundation {
+        cause: crate::RuntimeShutdownCauseV1,
+        cleanup: RuntimeProcessFoundationShutdownErrorV1,
+    },
 }
 
 impl RuntimeProcessGatewayOwnerTransitionErrorV1 {
@@ -27,13 +44,27 @@ impl RuntimeProcessGatewayOwnerTransitionErrorV1 {
             Self::CleanupAfterGatewayOwner { .. } => {
                 "runtime_process_gateway_owner_transition_cleanup"
             }
+            Self::CleanupAfterGatewayOwnerFoundation { .. } => {
+                "runtime_process_gateway_owner_transition_foundation_cleanup"
+            }
+            Self::ProcessShutdown(cause) => cause.code(),
+            Self::CleanupAfterProcessShutdown { .. } => {
+                "runtime_process_gateway_owner_transition_shutdown_cleanup"
+            }
+            Self::CleanupAfterProcessShutdownFoundation { .. } => {
+                "runtime_process_gateway_owner_transition_shutdown_foundation_cleanup"
+            }
         }
     }
 
     pub const fn context(self) -> Option<&'static str> {
         match self {
             Self::GatewayOwner(error) => error.context(),
-            Self::CleanupAfterGatewayOwner { .. } => None,
+            Self::CleanupAfterGatewayOwner { .. }
+            | Self::CleanupAfterGatewayOwnerFoundation { .. }
+            | Self::ProcessShutdown(_)
+            | Self::CleanupAfterProcessShutdown { .. }
+            | Self::CleanupAfterProcessShutdownFoundation { .. } => None,
         }
     }
 }
@@ -65,10 +96,17 @@ pub enum RuntimeOwnerHeldProcessShutdownErrorV1 {
     GatewayOwner(RuntimeGatewayOwnerShutdownFailureV1),
     #[error("runtime owner-held process database shutdown failed")]
     Database(RuntimeDatabasePoolShutdownErrorV1),
+    #[error("runtime owner-held process foundation shutdown failed")]
+    Foundation(RuntimeProcessFoundationShutdownErrorV1),
     #[error("runtime owner-held process gateway owner and database shutdown failed")]
     GatewayOwnerAndDatabase {
         owner: RuntimeGatewayOwnerShutdownFailureV1,
         database: RuntimeDatabasePoolShutdownErrorV1,
+    },
+    #[error("runtime owner-held process gateway owner and foundation shutdown failed")]
+    GatewayOwnerAndFoundation {
+        owner: RuntimeGatewayOwnerShutdownFailureV1,
+        foundation: RuntimeProcessFoundationShutdownErrorV1,
     },
 }
 
@@ -79,8 +117,12 @@ impl RuntimeOwnerHeldProcessShutdownErrorV1 {
             Self::Database(RuntimeDatabasePoolShutdownErrorV1::TimedOut) => {
                 "runtime_owner_held_process_database_shutdown_timed_out"
             }
+            Self::Foundation(error) => error.code(),
             Self::GatewayOwnerAndDatabase { .. } => {
                 "runtime_owner_held_process_gateway_owner_and_database_shutdown"
+            }
+            Self::GatewayOwnerAndFoundation { .. } => {
+                "runtime_owner_held_process_gateway_owner_and_foundation_shutdown"
             }
         }
     }
@@ -103,11 +145,21 @@ pub(crate) struct RuntimeOwnerHeldProcessV1 {
 
 impl RuntimeOwnerHeldProcessV1 {
     pub(crate) async fn shutdown(self) -> Result<(), RuntimeOwnerHeldProcessShutdownErrorV1> {
-        let Self { foundation, owner } = self;
-        let owner_cleanup_deadline = foundation.startup_budget.owner_cleanup_deadline();
+        let Self {
+            mut foundation,
+            owner,
+        } = self;
+        let cleanup_deadline = foundation
+            .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
+            .await;
+        foundation.observe_shutdown_registry_v1();
+        let owner_cleanup_deadline = foundation
+            .startup_budget
+            .owner_cleanup_deadline()
+            .min(cleanup_deadline);
         let owner = owner.shutdown_until(owner_cleanup_deadline).await;
-        let database = foundation.shutdown().await;
-        finish_runtime_owner_held_process_shutdown_v1(owner, database)
+        let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
+        finish_runtime_owner_held_process_shutdown_v1(owner, foundation)
     }
 }
 
@@ -129,16 +181,62 @@ impl RuntimeProcessFoundationV1 {
             .await);
         }
         let port = self.databases.execution().clone();
+        let mut shutdown = self.shutdown_observer_v1();
+        let operation_cutoff = self.startup_budget.operation_cutoff();
+        let owner_cleanup_deadline = self.startup_budget.owner_cleanup_deadline();
         let transition = acquire_runtime_gateway_owner_startup_v1(
             &mut self.gateway,
             port,
             &self.process_instance_id,
             &self.build_revision,
             self.config.gateway_owner(),
-            self.startup_budget.operation_cutoff(),
-            self.startup_budget.owner_cleanup_deadline(),
+            RuntimeGatewayOwnerStartupBoundsV1 {
+                operation_cutoff,
+                cleanup_deadline: owner_cleanup_deadline,
+                shutdown: &mut shutdown,
+            },
         )
         .await;
+        let shutdown_observation = shutdown.observed();
+        if let Some(observation) = shutdown_observation {
+            return match transition {
+                Ok(owner) => {
+                    let cleanup = RuntimeOwnerHeldProcessV1 {
+                        foundation: self,
+                        owner,
+                    }
+                    .shutdown()
+                    .await;
+                    match cleanup {
+                        Ok(()) => Err(RuntimeProcessGatewayOwnerTransitionErrorV1::ProcessShutdown(
+                            observation.cause(),
+                        )),
+                        Err(cleanup) => {
+                            Err(RuntimeProcessGatewayOwnerTransitionErrorV1::
+                                CleanupAfterProcessShutdown {
+                                    cause: observation.cause(),
+                                    cleanup,
+                                })
+                        }
+                    }
+                }
+                Err(_) => {
+                    let cleanup = self.shutdown().await;
+                    match cleanup {
+                        Ok(()) => Err(RuntimeProcessGatewayOwnerTransitionErrorV1::ProcessShutdown(
+                            observation.cause(),
+                        )),
+                        Err(cleanup) => Err(
+                            RuntimeProcessGatewayOwnerTransitionErrorV1::
+                                CleanupAfterProcessShutdownFoundation {
+                                    cause: observation.cause(),
+                                    cleanup,
+                                },
+                        ),
+                    }
+                }
+            };
+        }
         let owner = match transition {
             Ok(owner) => owner,
             Err(error) => {
@@ -146,9 +244,7 @@ impl RuntimeProcessFoundationV1 {
             }
         };
         if !self.startup_budget.operation_is_open() {
-            let owner_cleanup = owner
-                .shutdown_until(self.startup_budget.owner_cleanup_deadline())
-                .await;
+            let owner_cleanup = owner.shutdown_until(owner_cleanup_deadline).await;
             let error = match owner_cleanup {
                 Ok(RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed)
                 | Ok(RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation)
@@ -173,9 +269,19 @@ async fn cleanup_runtime_gateway_owner_transition_failure_v1(
 ) -> RuntimeProcessGatewayOwnerTransitionErrorV1 {
     match foundation.shutdown().await {
         Ok(()) => RuntimeProcessGatewayOwnerTransitionErrorV1::GatewayOwner(transition),
-        Err(cleanup) => RuntimeProcessGatewayOwnerTransitionErrorV1::CleanupAfterGatewayOwner {
-            transition,
-            cleanup,
+        Err(cleanup) => match cleanup.database_only() {
+            Some(cleanup) => {
+                RuntimeProcessGatewayOwnerTransitionErrorV1::CleanupAfterGatewayOwner {
+                    transition,
+                    cleanup,
+                }
+            }
+            None => {
+                RuntimeProcessGatewayOwnerTransitionErrorV1::CleanupAfterGatewayOwnerFoundation {
+                    transition,
+                    cleanup,
+                }
+            }
         },
     }
 }
@@ -185,7 +291,7 @@ pub(super) fn finish_runtime_owner_held_process_shutdown_v1(
         RuntimeGatewayOwnerStartupWatchdogExitV1,
         RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
     >,
-    database: Result<(), RuntimeDatabasePoolShutdownErrorV1>,
+    foundation: Result<(), RuntimeProcessFoundationShutdownErrorV1>,
 ) -> Result<(), RuntimeOwnerHeldProcessShutdownErrorV1> {
     let owner = match owner {
         Ok(RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown) => None,
@@ -194,13 +300,21 @@ pub(super) fn finish_runtime_owner_held_process_shutdown_v1(
             Some(RuntimeGatewayOwnerShutdownFailureV1::DeadlineElapsed)
         }
     };
-    match (owner, database) {
+    let foundation = foundation.map_err(|error| match error.database_only() {
+        Some(database) => RuntimeOwnerHeldProcessShutdownErrorV1::Database(database),
+        None => RuntimeOwnerHeldProcessShutdownErrorV1::Foundation(error),
+    });
+    match (owner, foundation) {
         (None, Ok(())) => Ok(()),
         (Some(owner), Ok(())) => Err(RuntimeOwnerHeldProcessShutdownErrorV1::GatewayOwner(owner)),
-        (None, Err(database)) => Err(RuntimeOwnerHeldProcessShutdownErrorV1::Database(database)),
-        (Some(owner), Err(database)) => {
+        (None, Err(foundation)) => Err(foundation),
+        (Some(owner), Err(RuntimeOwnerHeldProcessShutdownErrorV1::Database(database))) => {
             Err(RuntimeOwnerHeldProcessShutdownErrorV1::GatewayOwnerAndDatabase { owner, database })
         }
+        (Some(owner), Err(RuntimeOwnerHeldProcessShutdownErrorV1::Foundation(foundation))) => Err(
+            RuntimeOwnerHeldProcessShutdownErrorV1::GatewayOwnerAndFoundation { owner, foundation },
+        ),
+        (Some(owner), Err(_)) => Err(RuntimeOwnerHeldProcessShutdownErrorV1::GatewayOwner(owner)),
     }
 }
 
@@ -231,7 +345,11 @@ mod tests {
         assert_eq!(
             finish_runtime_owner_held_process_shutdown_v1(
                 Err(RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1::DeadlineElapsed),
-                Err(RuntimeDatabasePoolShutdownErrorV1::TimedOut),
+                Err(RuntimeProcessFoundationShutdownErrorV1::single(
+                    super::super::RuntimeProcessFoundationShutdownFailureV1::Database(
+                        RuntimeDatabasePoolShutdownErrorV1::TimedOut,
+                    ),
+                )),
             ),
             Err(
                 RuntimeOwnerHeldProcessShutdownErrorV1::GatewayOwnerAndDatabase {

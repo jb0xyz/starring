@@ -1,5 +1,5 @@
 use std::fmt::{Debug, Formatter};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroU8};
 
 use automation_runtime_controller::RuntimeBuildRevisionV1;
 use automation_runtime_convergence::{ControllerId, ProcessInstanceId};
@@ -9,6 +9,9 @@ use crate::build_revision::CompiledRuntimeBuildRevisionV1;
 use crate::controller_identity::generate_runtime_controller_id_v1;
 use crate::database::compose_runtime_database_dependencies_v1;
 use crate::process_identity::generate_runtime_process_instance_id_v1;
+use crate::process_supervisor::{
+    RuntimeProcessRootSupervisorStartErrorV1, RuntimeProcessRootSupervisorV1,
+};
 use crate::startup::RuntimeStartupBudgetV1;
 use crate::{
     compose_runtime_gateway_bootstrap_v1, compose_runtime_registry_bootstrap_v1,
@@ -18,6 +21,7 @@ use crate::{
     RuntimeGatewayBootstrapErrorV1, RuntimeGatewayBootstrapV1,
     RuntimeMutationFinalizerStartErrorV1, RuntimeProcessInstanceIdGenerationErrorV1,
     RuntimeRegistryBootstrapErrorV1, RuntimeRegistryBootstrapV1,
+    RuntimeRegistryRecoveryObservationErrorV1, RuntimeShutdownCauseV1, RuntimeSupervisorExitV1,
 };
 
 mod closed;
@@ -85,6 +89,10 @@ pub enum RuntimeProcessFoundationCompositionErrorV1 {
     Gateway(RuntimeGatewayBootstrapErrorV1),
     #[error("runtime process foundation mutation finalizer composition failed")]
     MutationFinalizer(RuntimeMutationFinalizerStartErrorV1),
+    #[error("runtime process foundation shutdown signal composition failed")]
+    ShutdownSignal,
+    #[error("runtime process foundation health listener composition failed")]
+    HealthListener,
     #[error("runtime process foundation registry failure cleanup failed")]
     CleanupAfterRegistry {
         composition: RuntimeRegistryBootstrapErrorV1,
@@ -98,6 +106,10 @@ pub enum RuntimeProcessFoundationCompositionErrorV1 {
     #[error("runtime process foundation mutation finalizer failure cleanup failed")]
     CleanupAfterMutationFinalizer {
         composition: RuntimeMutationFinalizerStartErrorV1,
+        cleanup: RuntimeDatabasePoolShutdownErrorV1,
+    },
+    #[error("runtime process foundation root supervisor failure cleanup failed")]
+    CleanupAfterRootSupervisor {
         cleanup: RuntimeDatabasePoolShutdownErrorV1,
     },
     #[error("runtime process foundation startup operation deadline elapsed")]
@@ -117,12 +129,17 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
             Self::Registry(error) => error.code(),
             Self::Gateway(error) => error.code(),
             Self::MutationFinalizer(_) => "runtime_process_foundation_mutation_finalizer",
+            Self::ShutdownSignal => "runtime_process_foundation_shutdown_signal",
+            Self::HealthListener => "runtime_process_foundation_health_listener",
             Self::CleanupAfterRegistry { .. } => {
                 "runtime_process_foundation_cleanup_after_registry"
             }
             Self::CleanupAfterGateway { .. } => "runtime_process_foundation_cleanup_after_gateway",
             Self::CleanupAfterMutationFinalizer { .. } => {
                 "runtime_process_foundation_cleanup_after_mutation_finalizer"
+            }
+            Self::CleanupAfterRootSupervisor { .. } => {
+                "runtime_process_foundation_cleanup_after_root_supervisor"
             }
             Self::OperationDeadlineElapsed => {
                 "runtime_process_foundation_operation_deadline_elapsed"
@@ -141,9 +158,12 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
             Self::Registry(_)
             | Self::Gateway(_)
             | Self::MutationFinalizer(_)
+            | Self::ShutdownSignal
+            | Self::HealthListener
             | Self::CleanupAfterRegistry { .. }
             | Self::CleanupAfterGateway { .. }
             | Self::CleanupAfterMutationFinalizer { .. }
+            | Self::CleanupAfterRootSupervisor { .. }
             | Self::OperationDeadlineElapsed
             | Self::CleanupAfterOperationDeadline { .. } => None,
         }
@@ -153,6 +173,104 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
 impl Debug for RuntimeProcessFoundationCompositionErrorV1 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeProcessFoundationCompositionErrorV1(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeProcessFoundationShutdownFailureV1 {
+    Finalizer(RuntimeSupervisorExitV1),
+    Registry(RuntimeRegistryRecoveryObservationErrorV1),
+    SignalSupervisor,
+    Database(RuntimeDatabasePoolShutdownErrorV1),
+    HealthListener,
+}
+
+impl RuntimeProcessFoundationShutdownFailureV1 {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Finalizer(exit) => exit.code(),
+            Self::Registry(error) => error.code(),
+            Self::SignalSupervisor => "runtime_process_signal_supervisor_shutdown",
+            Self::Database(RuntimeDatabasePoolShutdownErrorV1::TimedOut) => {
+                "runtime_process_foundation_database_shutdown_timed_out"
+            }
+            Self::HealthListener => "runtime_process_health_listener_shutdown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("runtime process foundation shutdown failed")]
+pub struct RuntimeProcessFoundationShutdownErrorV1 {
+    primary: RuntimeProcessFoundationShutdownFailureV1,
+    failure_count: NonZeroU8,
+}
+
+impl RuntimeProcessFoundationShutdownErrorV1 {
+    #[cfg(test)]
+    pub(crate) const fn single(primary: RuntimeProcessFoundationShutdownFailureV1) -> Self {
+        Self {
+            primary,
+            failure_count: NonZeroU8::MIN,
+        }
+    }
+
+    pub const fn code(self) -> &'static str {
+        if self.failure_count.get() == 1 {
+            self.primary.code()
+        } else {
+            "runtime_process_foundation_multiple_shutdown_failures"
+        }
+    }
+
+    pub const fn primary(self) -> RuntimeProcessFoundationShutdownFailureV1 {
+        self.primary
+    }
+
+    pub const fn failure_count(self) -> NonZeroU8 {
+        self.failure_count
+    }
+
+    pub const fn database_only(self) -> Option<RuntimeDatabasePoolShutdownErrorV1> {
+        match (self.failure_count.get(), self.primary) {
+            (1, RuntimeProcessFoundationShutdownFailureV1::Database(error)) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl Debug for RuntimeProcessFoundationShutdownErrorV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeProcessFoundationShutdownErrorV1(<redacted>)")
+    }
+}
+
+struct RuntimeProcessFoundationShutdownFailuresV1 {
+    primary: Option<RuntimeProcessFoundationShutdownFailureV1>,
+    failure_count: u8,
+}
+
+impl RuntimeProcessFoundationShutdownFailuresV1 {
+    const fn new() -> Self {
+        Self {
+            primary: None,
+            failure_count: 0,
+        }
+    }
+
+    fn record(&mut self, failure: RuntimeProcessFoundationShutdownFailureV1) {
+        self.primary.get_or_insert(failure);
+        self.failure_count = self.failure_count.saturating_add(1);
+    }
+
+    fn finish(self) -> Result<(), RuntimeProcessFoundationShutdownErrorV1> {
+        match self.primary {
+            Some(primary) => Err(RuntimeProcessFoundationShutdownErrorV1 {
+                primary,
+                failure_count: NonZeroU8::new(self.failure_count).unwrap_or(NonZeroU8::MIN),
+            }),
+            None => Ok(()),
+        }
     }
 }
 
@@ -166,13 +284,86 @@ pub(crate) struct RuntimeProcessFoundationV1 {
     build_revision: RuntimeBuildRevisionV1,
     process_instance_id: ProcessInstanceId,
     controller_id: ControllerId,
-    mutation_finalizer: pending_drain_finalizer::RuntimePendingDrainFinalizerSupervisorV3<
-        execution::RuntimeProductionPendingDrainFinalizerEnvironmentV3,
+    mutation_finalizer: Option<
+        pending_drain_finalizer::RuntimePendingDrainFinalizerSupervisorV3<
+            execution::RuntimeProductionPendingDrainFinalizerEnvironmentV3,
+        >,
     >,
+    root_supervisor: RuntimeProcessRootSupervisorV1,
+    shutdown_failures: RuntimeProcessFoundationShutdownFailuresV1,
 }
 
 impl RuntimeProcessFoundationV1 {
-    pub(crate) async fn shutdown(self) -> Result<(), RuntimeDatabasePoolShutdownErrorV1> {
+    pub(super) fn shutdown_observer_v1(&self) -> crate::shutdown::RuntimeShutdownObserverV1 {
+        self.root_supervisor.observer()
+    }
+
+    pub(super) fn shutdown_trigger_v1(
+        &self,
+    ) -> crate::process_supervisor::RuntimeProcessShutdownTriggerV1 {
+        self.root_supervisor.shutdown_trigger()
+    }
+
+    pub(super) fn trip_shutdown_v1(
+        &self,
+        cause: RuntimeShutdownCauseV1,
+    ) -> crate::RuntimeShutdownObservationV1 {
+        self.root_supervisor.trip(cause).observation()
+    }
+
+    pub(super) fn effective_shutdown_deadline_v1(
+        &self,
+        observation: crate::RuntimeShutdownObservationV1,
+    ) -> std::time::Instant {
+        observation
+            .deadline()
+            .min(self.startup_budget.cleanup_deadline())
+    }
+
+    pub(super) async fn begin_shutdown_v1(
+        &mut self,
+        cause: RuntimeShutdownCauseV1,
+    ) -> std::time::Instant {
+        let observation = self.trip_shutdown_v1(cause);
+        let deadline = self.effective_shutdown_deadline_v1(observation);
+        if let Some(mutation_finalizer) = self.mutation_finalizer.take() {
+            let finalizer_report = mutation_finalizer.shutdown_until(deadline).await;
+            if finalizer_report.exit() != RuntimeSupervisorExitV1::Commanded {
+                self.shutdown_failures.record(
+                    RuntimeProcessFoundationShutdownFailureV1::Finalizer(finalizer_report.exit()),
+                );
+            }
+            drop(finalizer_report);
+        }
+        deadline
+    }
+
+    pub(super) fn observe_shutdown_registry_v1(&mut self) {
+        if let Err(error) = self.registry.observe_recovery_empty_projection_v2() {
+            self.shutdown_failures
+                .record(RuntimeProcessFoundationShutdownFailureV1::Registry(error));
+        }
+    }
+
+    pub(super) fn record_finalizer_shutdown_exit_v1(&mut self, exit: RuntimeSupervisorExitV1) {
+        if exit != RuntimeSupervisorExitV1::Commanded {
+            self.shutdown_failures
+                .record(RuntimeProcessFoundationShutdownFailureV1::Finalizer(exit));
+        }
+    }
+
+    pub(crate) async fn shutdown(mut self) -> Result<(), RuntimeProcessFoundationShutdownErrorV1> {
+        let cleanup_deadline = self
+            .begin_shutdown_v1(RuntimeShutdownCauseV1::Explicit)
+            .await;
+        self.observe_shutdown_registry_v1();
+        self.finish_shutdown_v1(cleanup_deadline).await
+    }
+
+    pub(super) async fn finish_shutdown_v1(
+        self,
+        cleanup_deadline: std::time::Instant,
+    ) -> Result<(), RuntimeProcessFoundationShutdownErrorV1> {
         let Self {
             gateway,
             registry,
@@ -184,13 +375,31 @@ impl RuntimeProcessFoundationV1 {
             process_instance_id,
             controller_id,
             mutation_finalizer,
+            mut root_supervisor,
+            mut shutdown_failures,
         } = self;
-        let cleanup_deadline = startup_budget.cleanup_deadline();
-        let finalizer_report = mutation_finalizer.join().await;
-        drop(finalizer_report);
+        if let Some(mutation_finalizer) = mutation_finalizer {
+            let finalizer_report = mutation_finalizer.shutdown_until(cleanup_deadline).await;
+            if finalizer_report.exit() != RuntimeSupervisorExitV1::Commanded {
+                shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::Finalizer(
+                    finalizer_report.exit(),
+                ));
+            }
+            drop(finalizer_report);
+        }
+        let signal_exit = root_supervisor.join_signal_until(cleanup_deadline).await;
+        if matches!(
+            signal_exit,
+            crate::process_supervisor::RuntimeProcessSignalTaskExitV1::StreamClosed
+                | crate::process_supervisor::RuntimeProcessSignalTaskExitV1::Panicked
+        ) {
+            shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::SignalSupervisor);
+        }
         let shutdown = databases.shutdown();
         drop((gateway, registry, databases));
-        let result = shutdown.close_until(cleanup_deadline).await;
+        if let Err(error) = shutdown.close_until(cleanup_deadline).await {
+            shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::Database(error));
+        }
         drop(shutdown);
         finish_runtime_process_foundation_shutdown_v1(
             secrets,
@@ -201,16 +410,20 @@ impl RuntimeProcessFoundationV1 {
                 process_instance_id,
                 controller_id,
             ),
-            result,
-        )
+            (),
+        );
+        if root_supervisor
+            .shutdown_health_until(cleanup_deadline)
+            .await
+            .is_err()
+        {
+            shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::HealthListener);
+        }
+        shutdown_failures.finish()
     }
 }
 
-fn finish_runtime_process_foundation_shutdown_v1<S, R>(
-    secrets: S,
-    retained: R,
-    result: Result<(), RuntimeDatabasePoolShutdownErrorV1>,
-) -> Result<(), RuntimeDatabasePoolShutdownErrorV1> {
+fn finish_runtime_process_foundation_shutdown_v1<S, R, T>(secrets: S, retained: R, result: T) -> T {
     drop(secrets);
     drop(retained);
     result
@@ -301,6 +514,36 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
                 };
             }
         };
+    let root_supervisor = match RuntimeProcessRootSupervisorV1::start(
+        config.health_bind_addr(),
+        mutation_finalizer.seal_handle(),
+        mutation_finalizer.terminal_observer(),
+        closed_components.gateway.shutdown_handle_v1(),
+    )
+    .await
+    {
+        Ok(supervisor) => supervisor,
+        Err(composition) => {
+            let finalizer_report = mutation_finalizer
+                .shutdown_until(startup_budget.cleanup_deadline())
+                .await;
+            drop(finalizer_report);
+            drop(closed_components);
+            let shutdown = databases.shutdown();
+            drop(databases);
+            let cleanup = shutdown
+                .close_until(startup_budget.cleanup_deadline())
+                .await;
+            return match cleanup {
+                Ok(()) => Err(map_root_supervisor_composition_error_v1(composition)),
+                Err(cleanup) => Err(
+                    RuntimeProcessFoundationCompositionErrorV1::CleanupAfterRootSupervisor {
+                        cleanup,
+                    },
+                ),
+            };
+        }
+    };
     Ok(RuntimeProcessFoundationV1 {
         gateway: closed_components.gateway,
         registry: closed_components.registry,
@@ -311,8 +554,23 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         build_revision,
         process_instance_id,
         controller_id,
-        mutation_finalizer,
+        mutation_finalizer: Some(mutation_finalizer),
+        root_supervisor,
+        shutdown_failures: RuntimeProcessFoundationShutdownFailuresV1::new(),
     })
+}
+
+fn map_root_supervisor_composition_error_v1(
+    error: RuntimeProcessRootSupervisorStartErrorV1,
+) -> RuntimeProcessFoundationCompositionErrorV1 {
+    match error {
+        RuntimeProcessRootSupervisorStartErrorV1::Signal(_) => {
+            RuntimeProcessFoundationCompositionErrorV1::ShutdownSignal
+        }
+        RuntimeProcessRootSupervisorStartErrorV1::Health(_) => {
+            RuntimeProcessFoundationCompositionErrorV1::HealthListener
+        }
+    }
 }
 
 async fn cleanup_after_operation_deadline_v1(

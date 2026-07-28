@@ -511,6 +511,7 @@ async fn foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_prior
         ready(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated),
         ready(()),
         ready(()),
+        pending(),
     )
     .await;
     assert_eq!(all_ready, Err(deadline));
@@ -521,6 +522,7 @@ async fn foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_prior
         ready(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated),
         ready(()),
         ready(()),
+        pending(),
     )
     .await;
     assert_eq!(
@@ -538,6 +540,7 @@ async fn foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_prior
         pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
         ready(()),
         ready(()),
+        pending(),
     )
     .await;
     assert_eq!(
@@ -555,6 +558,7 @@ async fn foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_prior
         pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
         pending::<()>(),
         ready(()),
+        pending(),
     )
     .await;
     assert_eq!(retry_ready, Ok(()));
@@ -574,6 +578,7 @@ async fn dropping_a_polled_foreign_fresh_wait_drops_only_the_wait_future() {
         pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
         pending::<()>(),
         retry,
+        pending(),
     ));
 
     std::future::poll_fn(|context| {

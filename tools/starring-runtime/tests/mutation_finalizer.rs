@@ -2,7 +2,7 @@ use std::future::Future;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use automation_runtime_worker::RuntimeMutationFinalizerGenerationV1;
 use starring_runtime::{
@@ -30,6 +30,16 @@ struct TestPort {
     release: Arc<Notify>,
 }
 
+struct TestInFlightGuard {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for TestInFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl RuntimeMutationFinalizerPortV1 for TestPort {
     type Job = TestJob;
     type Output = u64;
@@ -48,6 +58,9 @@ impl RuntimeMutationFinalizerPortV1 for TestPort {
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
             let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            let _in_flight = TestInFlightGuard {
+                in_flight: in_flight.clone(),
+            };
             maximum_in_flight.fetch_max(current, Ordering::SeqCst);
             let result = match job.into_startup_pending_drain() {
                 TestJob::Complete(value) => Ok(value),
@@ -62,7 +75,6 @@ impl RuntimeMutationFinalizerPortV1 for TestPort {
                     panic!("injected finalizer panic")
                 }
             };
-            in_flight.fetch_sub(1, Ordering::SeqCst);
             completed.fetch_add(1, Ordering::SeqCst);
             result
         }
@@ -71,6 +83,7 @@ impl RuntimeMutationFinalizerPortV1 for TestPort {
 
 struct Fixture {
     calls: Arc<AtomicUsize>,
+    in_flight: Arc<AtomicUsize>,
     maximum_in_flight: Arc<AtomicUsize>,
     completed: Arc<AtomicUsize>,
     entered: Arc<Notify>,
@@ -81,6 +94,7 @@ impl Fixture {
     fn new() -> Self {
         Self {
             calls: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
             maximum_in_flight: Arc::new(AtomicUsize::new(0)),
             completed: Arc::new(AtomicUsize::new(0)),
             entered: Arc::new(Notify::new()),
@@ -91,7 +105,7 @@ impl Fixture {
     fn port(&self) -> TestPort {
         TestPort {
             calls: self.calls.clone(),
-            in_flight: Arc::new(AtomicUsize::new(0)),
+            in_flight: self.in_flight.clone(),
             maximum_in_flight: self.maximum_in_flight.clone(),
             completed: self.completed.clone(),
             entered: self.entered.clone(),
@@ -261,6 +275,47 @@ async fn actor_executes_at_most_one_registered_job_at_a_time() {
 }
 
 #[tokio::test]
+async fn job_identity_is_bound_to_its_supervisor_instance() {
+    let first_fixture = Fixture::new();
+    let second_fixture = Fixture::new();
+    let first = supervisor(1, &first_fixture);
+    let second = supervisor(1, &second_fixture);
+    let first_waiter = first
+        .intake()
+        .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(
+            TestJob::Complete(1),
+        ))
+        .unwrap();
+    let second_waiter = second
+        .intake()
+        .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(
+            TestJob::Complete(2),
+        ))
+        .unwrap();
+    assert_eq!(first_waiter.job_id().generation(), generation());
+    assert_eq!(second_waiter.job_id().generation(), generation());
+    assert_eq!(first_waiter.job_id().sequence(), NonZeroU64::MIN);
+    assert_eq!(second_waiter.job_id().sequence(), NonZeroU64::MIN);
+    assert_ne!(first_waiter.job_id(), second_waiter.job_id());
+    assert_eq!(
+        first_waiter.wait().await.status(),
+        RuntimeMutationFinalizerWaitStatusV1::Settled
+    );
+    assert_eq!(
+        second_waiter.wait().await.status(),
+        RuntimeMutationFinalizerWaitStatusV1::Settled
+    );
+    assert_eq!(
+        first.join().await.exit(),
+        RuntimeSupervisorExitV1::Commanded
+    );
+    assert_eq!(
+        second.join().await.exit(),
+        RuntimeSupervisorExitV1::Commanded
+    );
+}
+
+#[tokio::test]
 async fn panic_is_terminal_and_returns_queued_authority_undispatched() {
     let fixture = Fixture::new();
     let supervisor = supervisor(2, &fixture);
@@ -373,4 +428,84 @@ async fn sealed_settled_actor_exposes_exact_production_handoff_fields() {
     let report = supervisor.join().await;
     assert_eq!(report.exit(), RuntimeSupervisorExitV1::Commanded);
     assert!(!report.snapshot().handoff_state().startup_jobs_settled());
+}
+
+#[tokio::test]
+async fn absolute_shutdown_deadline_aborts_and_joins_a_hung_registered_job() {
+    let fixture = Fixture::new();
+    let supervisor = supervisor(1, &fixture);
+    let waiter = supervisor
+        .intake()
+        .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(
+            TestJob::Block(61),
+        ))
+        .unwrap();
+    fixture.entered.notified().await;
+
+    let report = supervisor
+        .shutdown_until(Instant::now() + Duration::from_millis(75))
+        .await;
+
+    assert_eq!(report.exit(), RuntimeSupervisorExitV1::DeadlineElapsed);
+    assert_eq!(
+        waiter.wait().await.status(),
+        RuntimeMutationFinalizerWaitStatusV1::FailedClosed(
+            RuntimeSupervisorExitV1::DeadlineElapsed
+        )
+    );
+    assert_eq!(report.snapshot().terminal(), Some(report.exit()));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.in_flight.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.completed.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn expired_shutdown_deadline_never_detaches_the_registered_port_future() {
+    let fixture = Fixture::new();
+    let supervisor = supervisor(1, &fixture);
+    let waiter = supervisor
+        .intake()
+        .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(
+            TestJob::Block(63),
+        ))
+        .unwrap();
+    fixture.entered.notified().await;
+
+    let report = supervisor.shutdown_until(Instant::now()).await;
+
+    assert_eq!(report.exit(), RuntimeSupervisorExitV1::DeadlineElapsed);
+    assert_eq!(
+        waiter.wait().await.status(),
+        RuntimeMutationFinalizerWaitStatusV1::FailedClosed(
+            RuntimeSupervisorExitV1::DeadlineElapsed
+        )
+    );
+    assert_eq!(fixture.in_flight.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.completed.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn bounded_shutdown_preserves_a_completion_that_settles_before_deadline() {
+    let fixture = Fixture::new();
+    let supervisor = supervisor(1, &fixture);
+    let waiter = supervisor
+        .intake()
+        .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(
+            TestJob::Block(67),
+        ))
+        .unwrap();
+    fixture.entered.notified().await;
+    fixture.release.notify_waiters();
+
+    let report = supervisor
+        .shutdown_until(Instant::now() + Duration::from_secs(1))
+        .await;
+
+    assert_eq!(
+        waiter.wait().await.status(),
+        RuntimeMutationFinalizerWaitStatusV1::Settled
+    );
+    assert_eq!(report.exit(), RuntimeSupervisorExitV1::Commanded);
+    assert_eq!(report.completions().len(), 1);
+    assert_eq!(report.snapshot().settled_jobs(), 1);
 }

@@ -8,12 +8,20 @@ use tokio::sync::watch;
 
 const RUNTIME_SHUTDOWN_WINDOW: Duration = Duration::from_secs(30);
 
+pub(crate) fn runtime_shutdown_deadline_v1(received_at: Instant) -> Instant {
+    received_at
+        .checked_add(RUNTIME_SHUTDOWN_WINDOW)
+        .unwrap_or(received_at)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeShutdownCauseV1 {
     Interrupt,
     Terminate,
     Explicit,
     SupervisorFailure,
+    FinalizerTerminal,
+    HealthTerminal,
     GatewayOwnerTerminal,
     DiscordTerminal,
     ReadinessLost,
@@ -26,6 +34,8 @@ impl RuntimeShutdownCauseV1 {
             Self::Terminate => "terminate",
             Self::Explicit => "explicit",
             Self::SupervisorFailure => "supervisor_failure",
+            Self::FinalizerTerminal => "finalizer_terminal",
+            Self::HealthTerminal => "health_terminal",
             Self::GatewayOwnerTerminal => "gateway_owner_terminal",
             Self::DiscordTerminal => "discord_terminal",
             Self::ReadinessLost => "readiness_lost",
@@ -116,9 +126,7 @@ impl RuntimeShutdownTriggerV1 {
         cause: RuntimeShutdownCauseV1,
         received_at: Instant,
     ) -> RuntimeShutdownTripV1 {
-        let deadline = received_at
-            .checked_add(RUNTIME_SHUTDOWN_WINDOW)
-            .unwrap_or(received_at);
+        let deadline = runtime_shutdown_deadline_v1(received_at);
         let deadline = self
             .state
             .deadline_ceiling
@@ -156,6 +164,28 @@ pub struct RuntimeShutdownSignalLatchV1 {
     receiver: watch::Receiver<Option<RuntimeShutdownObservationV1>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct RuntimeShutdownObserverV1 {
+    state: Arc<RuntimeShutdownLatchStateV1>,
+    receiver: watch::Receiver<Option<RuntimeShutdownObservationV1>>,
+}
+
+impl RuntimeShutdownObserverV1 {
+    pub(crate) fn observed(&self) -> Option<RuntimeShutdownObservationV1> {
+        self.state.observation.get().copied()
+    }
+
+    pub(crate) async fn wait(&mut self) -> RuntimeShutdownObservationV1 {
+        wait_for_runtime_shutdown_v1(&self.state, &mut self.receiver).await
+    }
+}
+
+impl Debug for RuntimeShutdownObserverV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeShutdownObserverV1(<redacted>)")
+    }
+}
+
 impl RuntimeShutdownSignalLatchV1 {
     pub fn create() -> Self {
         Self::create_with_deadline_ceiling(None)
@@ -181,21 +211,35 @@ impl RuntimeShutdownSignalLatchV1 {
         }
     }
 
+    pub(crate) fn observer(&self) -> RuntimeShutdownObserverV1 {
+        RuntimeShutdownObserverV1 {
+            state: self.state.clone(),
+            receiver: self.receiver.clone(),
+        }
+    }
+
     pub fn observed(&self) -> Option<RuntimeShutdownObservationV1> {
         self.state.observation.get().copied()
     }
 
     pub async fn wait(&mut self) -> RuntimeShutdownObservationV1 {
-        loop {
-            if let Some(observation) = *self.receiver.borrow_and_update() {
+        wait_for_runtime_shutdown_v1(&self.state, &mut self.receiver).await
+    }
+}
+
+async fn wait_for_runtime_shutdown_v1(
+    state: &RuntimeShutdownLatchStateV1,
+    receiver: &mut watch::Receiver<Option<RuntimeShutdownObservationV1>>,
+) -> RuntimeShutdownObservationV1 {
+    loop {
+        if let Some(observation) = *receiver.borrow_and_update() {
+            return observation;
+        }
+        if receiver.changed().await.is_err() {
+            if let Some(observation) = state.observation.get().copied() {
                 return observation;
             }
-            if self.receiver.changed().await.is_err() {
-                if let Some(observation) = self.state.observation.get().copied() {
-                    return observation;
-                }
-                std::future::pending::<()>().await;
-            }
+            std::future::pending::<()>().await;
         }
     }
 }
@@ -246,6 +290,13 @@ impl RuntimeOsShutdownSignalsV1 {
         &mut self,
         trigger: &RuntimeShutdownTriggerV1,
     ) -> Result<RuntimeShutdownTripV1, RuntimeShutdownSignalErrorV1> {
+        let cause = self.wait_cause().await?;
+        Ok(trigger.trip(cause))
+    }
+
+    pub(crate) async fn wait_cause(
+        &mut self,
+    ) -> Result<RuntimeShutdownCauseV1, RuntimeShutdownSignalErrorV1> {
         loop {
             match (&mut self.interrupt, &mut self.terminate) {
                 (Some(interrupt), Some(terminate)) => {
@@ -253,13 +304,13 @@ impl RuntimeOsShutdownSignalsV1 {
                         biased;
                         received = terminate.recv() => {
                             if received.is_some() {
-                                return Ok(trigger.trip(RuntimeShutdownCauseV1::Terminate));
+                                return Ok(RuntimeShutdownCauseV1::Terminate);
                             }
                             self.terminate = None;
                         }
                         received = interrupt.recv() => {
                             if received.is_some() {
-                                return Ok(trigger.trip(RuntimeShutdownCauseV1::Interrupt));
+                                return Ok(RuntimeShutdownCauseV1::Interrupt);
                             }
                             self.interrupt = None;
                         }
@@ -267,13 +318,13 @@ impl RuntimeOsShutdownSignalsV1 {
                 }
                 (Some(interrupt), None) => {
                     if interrupt.recv().await.is_some() {
-                        return Ok(trigger.trip(RuntimeShutdownCauseV1::Interrupt));
+                        return Ok(RuntimeShutdownCauseV1::Interrupt);
                     }
                     self.interrupt = None;
                 }
                 (None, Some(terminate)) => {
                     if terminate.recv().await.is_some() {
-                        return Ok(trigger.trip(RuntimeShutdownCauseV1::Terminate));
+                        return Ok(RuntimeShutdownCauseV1::Terminate);
                     }
                     self.terminate = None;
                 }
@@ -389,17 +440,19 @@ mod tests {
     async fn every_subscriber_observes_the_same_latched_event() {
         let mut first_latch = RuntimeShutdownSignalLatchV1::create();
         let trigger = first_latch.trigger();
-        let mut second_latch = RuntimeShutdownSignalLatchV1 {
-            state: first_latch.state.clone(),
-            receiver: first_latch.receiver.clone(),
-        };
+        let mut observer = first_latch.observer();
         let first_wait = first_latch.wait();
-        let second_wait = second_latch.wait();
+        let second_wait = observer.wait();
         let trip = trigger.trip(RuntimeShutdownCauseV1::Explicit);
         let (first, second) = tokio::join!(first_wait, second_wait);
 
         assert_eq!(first, trip.observation());
         assert_eq!(second, trip.observation());
+        assert_eq!(observer.observed(), Some(trip.observation()));
+        assert_eq!(
+            format!("{observer:?}"),
+            "RuntimeShutdownObserverV1(<redacted>)"
+        );
     }
 
     #[test]
