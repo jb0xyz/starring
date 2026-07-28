@@ -39,6 +39,7 @@ fn adapter_sources_contain_no_comments() {
         include_str!("../src/model.rs"),
         include_str!("../src/persistence.rs"),
         include_str!("../src/prepare.rs"),
+        include_str!("../src/product_drain.rs"),
         include_str!("../src/projection.rs"),
         include_str!("../src/row.rs"),
         include_str!("../src/store/attempt.rs"),
@@ -50,6 +51,7 @@ fn adapter_sources_contain_no_comments() {
         include_str!("../src/store/previous_serving/row.rs"),
         include_str!("../src/store/serving.rs"),
         include_str!("../src/store/status.rs"),
+        include_str!("product_drain_prepare.rs"),
     ];
     for source in sources {
         for line in source.lines() {
@@ -115,7 +117,7 @@ fn broad_owner_store_does_not_implement_the_serving_lease_port() {
 #[test]
 fn persistence_encoding_and_failure_messages_are_shared_with_the_controller() {
     let manifest = include_str!("../Cargo.toml");
-    assert!(!manifest.contains("sha2"));
+    assert!(manifest.contains("sha2 = \"0.10\""));
     let library = include_str!("../src/lib.rs");
     assert!(!library.contains("mod digest;"));
     let model = include_str!("../src/model.rs");
@@ -128,12 +130,40 @@ fn persistence_encoding_and_failure_messages_are_shared_with_the_controller() {
     ] {
         assert!(persistence.contains(shared));
     }
+    assert!(!persistence.contains("Sha256"));
+    let prepare = include_str!("../src/prepare.rs");
+    assert!(prepare.contains("Sha256::digest(&snapshot_bytes)"));
     for source in [
         include_str!("../src/controller.rs"),
         include_str!("../src/store/deployment.rs"),
     ] {
         assert!(source.contains("runtime_failure_message_v1"));
         assert!(!source.contains("fn stable_failure_message"));
+    }
+}
+
+#[test]
+fn product_drain_snapshot_preparation_is_pure_and_exact() {
+    let source = include_str!("../src/product_drain.rs");
+    for required in [
+        "ProductDrainSourceSupersessionPermitV1",
+        "from_adapter_validated_durable_route_absence_acknowledgement",
+        "supersede_product_drain_source",
+        "prepare_runtime_deployment_snapshot_v1",
+        "TransitionOutcomeV1::Applied",
+    ] {
+        assert!(source.contains(required), "missing boundary: {required}");
+    }
+    for forbidden in [
+        "sqlx",
+        "PgPool",
+        "PostgresRuntimeConvergence",
+        "query(",
+        "reqwest",
+        "tokio",
+        "std::net",
+    ] {
+        assert!(!source.contains(forbidden), "impure boundary: {forbidden}");
     }
 }
 

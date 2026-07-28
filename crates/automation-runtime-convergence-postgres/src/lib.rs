@@ -7,6 +7,7 @@ mod hydration;
 mod model;
 mod persistence;
 mod prepare;
+mod product_drain;
 mod projection;
 mod row;
 mod store;
@@ -38,6 +39,9 @@ pub use model::{
     SubmitDeploymentMutationV1, SubmitLiveAttestationV1,
 };
 pub use prepare::{prepare_requested_deployment_v1, PreparedRequestedDeploymentV1};
+pub use product_drain::{
+    prepare_product_drain_source_supersession_v1, PreparedProductDrainSourceSupersessionV1,
+};
 pub use store::PostgresRuntimeConvergence;
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
