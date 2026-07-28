@@ -154,7 +154,10 @@ pub(super) fn status_authority_lifetime(capability: CapabilityV1) -> Option<chro
     match capability {
         CapabilityV1::Read => Some(MAX_READ_AUTHORITY_LIFETIME),
         CapabilityV1::Apply => Some(MAX_APPLY_AUTHORITY_LIFETIME),
-        CapabilityV1::Promote | CapabilityV1::Approve | CapabilityV1::Reject => None,
+        CapabilityV1::Promote
+        | CapabilityV1::Approve
+        | CapabilityV1::Reject
+        | CapabilityV1::CancelLifecycle => None,
     }
 }
 
@@ -181,5 +184,9 @@ mod tests {
         assert_eq!(status_authority_lifetime(CapabilityV1::Promote), None);
         assert_eq!(status_authority_lifetime(CapabilityV1::Approve), None);
         assert_eq!(status_authority_lifetime(CapabilityV1::Reject), None);
+        assert_eq!(
+            status_authority_lifetime(CapabilityV1::CancelLifecycle),
+            None
+        );
     }
 }

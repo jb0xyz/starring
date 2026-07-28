@@ -183,7 +183,8 @@ fn authority_evidence_lifetime_is_bounded(
         CapabilityV1::Promote
         | CapabilityV1::Approve
         | CapabilityV1::Reject
-        | CapabilityV1::Apply => MAX_WRITE_AUTHORITY_LIFETIME,
+        | CapabilityV1::Apply
+        | CapabilityV1::CancelLifecycle => MAX_WRITE_AUTHORITY_LIFETIME,
     };
     expires_at > observed_at
         && observed_at
@@ -459,6 +460,7 @@ mod tests {
             CapabilityV1::Approve,
             CapabilityV1::Reject,
             CapabilityV1::Apply,
+            CapabilityV1::CancelLifecycle,
         ] {
             assert!(authority_evidence_lifetime_is_bounded(
                 capability,
