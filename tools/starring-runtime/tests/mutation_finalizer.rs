@@ -509,3 +509,57 @@ async fn bounded_shutdown_preserves_a_completion_that_settles_before_deadline() 
     assert_eq!(report.completions().len(), 1);
     assert_eq!(report.snapshot().settled_jobs(), 1);
 }
+
+#[tokio::test]
+async fn startup_seal_during_a_running_job_is_observed_after_exact_settlement() {
+    let fixture = Fixture::new();
+    let mut supervisor = supervisor(1, &fixture);
+    let waiter = supervisor
+        .intake()
+        .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(
+            TestJob::Block(71),
+        ))
+        .unwrap();
+    fixture.entered.notified().await;
+
+    assert!(matches!(
+        supervisor.seal_intake(),
+        RuntimeMutationFinalizerSealOutcomeV1::First(_)
+    ));
+    assert!(supervisor.snapshot().startup_intake_sealed());
+    assert!(!supervisor.snapshot().startup_jobs_settled());
+    fixture.release.notify_waiters();
+
+    assert_eq!(
+        waiter.wait().await.status(),
+        RuntimeMutationFinalizerWaitStatusV1::Settled
+    );
+    assert!(supervisor.wait_startup_jobs_settled().await);
+    assert!(supervisor.snapshot().startup_jobs_settled());
+    assert_eq!(
+        supervisor.join().await.exit(),
+        RuntimeSupervisorExitV1::Commanded
+    );
+}
+
+#[test]
+fn process_intake_reservation_has_no_job_or_clone_surface() {
+    let source = include_str!("../src/mutation_finalizer.rs");
+    assert!(source.contains("RuntimeMutationFinalizerProcessIntakeReservationV1"));
+    assert!(source.contains("RuntimeMutationFinalizerProcessIntakeHealthV1"));
+    assert!(source.contains("process_intake_health"));
+    assert!(!source.contains("Clone for RuntimeMutationFinalizerProcessIntakeReservationV1"));
+    assert!(!source.contains("Copy for RuntimeMutationFinalizerProcessIntakeReservationV1"));
+    assert!(!source.contains("Serialize for RuntimeMutationFinalizerProcessIntakeReservationV1"));
+    assert!(!source.contains("ProcessPendingDrain"));
+    let reservation = source
+        .split("pub(crate) struct RuntimeMutationFinalizerProcessIntakeReservationV1")
+        .nth(1)
+        .unwrap()
+        .split("impl Debug for RuntimeMutationFinalizerProcessIntakeReservationV1")
+        .next()
+        .unwrap();
+    assert!(!reservation.contains("try_register"));
+    assert!(!reservation.contains("derive(Clone"));
+    assert!(!reservation.contains("derive(Copy"));
+}

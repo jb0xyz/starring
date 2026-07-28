@@ -15,6 +15,8 @@ const RUNTIME_MUTATION_FINALIZER_MAX_CAPACITY: usize = 1_024;
 const RUNTIME_MUTATION_FINALIZER_ACTOR_ABORT_RESERVE: Duration = Duration::from_millis(25);
 const RUNTIME_MUTATION_FINALIZER_IN_FLIGHT_ABORT_RESERVE: Duration = Duration::from_millis(50);
 static NEXT_RUNTIME_MUTATION_FINALIZER_SUPERVISOR_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg_attr(not(test), allow(dead_code))]
+static NEXT_RUNTIME_MUTATION_FINALIZER_ACTIVATION_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeMutationFinalizerConfigErrorV1 {
@@ -271,8 +273,21 @@ impl RuntimeMutationFinalizerHandoffStateV1 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RuntimeMutationFinalizerPhaseV1 {
+    StartupAccepting,
+    StartupSealing,
+    StartupSettled,
+    ProcessActivationReserved,
+    ProcessAccepting,
+    ShutdownSealed,
+    Terminal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeMutationFinalizerSnapshotV1 {
     generation: RuntimeMutationFinalizerGenerationV1,
+    phase: RuntimeMutationFinalizerPhaseV1,
     intake_open: bool,
     queued_jobs: usize,
     in_flight_jobs: usize,
@@ -280,13 +295,21 @@ pub struct RuntimeMutationFinalizerSnapshotV1 {
     settled_jobs: u64,
     failed_jobs: u64,
     failed_closed_jobs: u64,
+    next_job_sequence: Option<NonZeroU64>,
+    startup_intake_sealed: bool,
     startup_jobs_settled: bool,
+    shutdown_sealed: bool,
     terminal: Option<RuntimeSupervisorExitV1>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl RuntimeMutationFinalizerSnapshotV1 {
     pub const fn generation(self) -> RuntimeMutationFinalizerGenerationV1 {
         self.generation
+    }
+
+    pub(crate) const fn phase(self) -> RuntimeMutationFinalizerPhaseV1 {
+        self.phase
     }
 
     pub const fn intake_open(self) -> bool {
@@ -317,8 +340,34 @@ impl RuntimeMutationFinalizerSnapshotV1 {
         self.failed_closed_jobs
     }
 
+    pub(crate) const fn next_job_sequence(self) -> Option<NonZeroU64> {
+        self.next_job_sequence
+    }
+
+    pub const fn startup_intake_sealed(self) -> bool {
+        self.startup_intake_sealed
+    }
+
     pub const fn startup_jobs_settled(self) -> bool {
         self.startup_jobs_settled
+    }
+
+    pub(crate) const fn process_activation_reserved(self) -> bool {
+        matches!(
+            self.phase,
+            RuntimeMutationFinalizerPhaseV1::ProcessActivationReserved
+        )
+    }
+
+    pub(crate) const fn process_accepting(self) -> bool {
+        matches!(
+            self.phase,
+            RuntimeMutationFinalizerPhaseV1::ProcessAccepting
+        )
+    }
+
+    pub(crate) const fn shutdown_sealed(self) -> bool {
+        self.shutdown_sealed
     }
 
     pub const fn terminal(self) -> Option<RuntimeSupervisorExitV1> {
@@ -328,8 +377,8 @@ impl RuntimeMutationFinalizerSnapshotV1 {
     pub fn handoff_state(self) -> RuntimeMutationFinalizerHandoffStateV1 {
         RuntimeMutationFinalizerHandoffStateV1 {
             finalizer_generation: self.generation,
-            startup_intake_sealed: !self.intake_open,
-            startup_jobs_settled: !self.intake_open
+            startup_intake_sealed: self.startup_intake_sealed,
+            startup_jobs_settled: self.startup_intake_sealed
                 && self.startup_jobs_settled
                 && self.terminal.is_none(),
         }
@@ -356,7 +405,7 @@ impl RuntimeMutationFinalizerSealOutcomeV1 {
 struct RuntimeMutationFinalizerStateV1 {
     supervisor_id: NonZeroU64,
     generation: RuntimeMutationFinalizerGenerationV1,
-    accepting: bool,
+    phase: RuntimeMutationFinalizerPhaseV1,
     next_sequence: Option<NonZeroU64>,
     queued_jobs: usize,
     in_flight_jobs: usize,
@@ -364,7 +413,10 @@ struct RuntimeMutationFinalizerStateV1 {
     settled_jobs: u64,
     failed_jobs: u64,
     failed_closed_jobs: u64,
+    activation_nonce: Option<NonZeroU64>,
+    startup_intake_sealed: bool,
     startup_jobs_settled: bool,
+    shutdown_sealed: bool,
     terminal: Option<RuntimeSupervisorExitV1>,
 }
 
@@ -462,16 +514,16 @@ impl RuntimeMutationFinalizerSharedV1 {
 
     fn closed_registration_reason(&self) -> RuntimeMutationFinalizerRegistrationRejectionReasonV1 {
         let state = self.lock();
-        match (state.terminal, state.accepting) {
+        match (state.terminal, state.phase) {
             (Some(exit), _) => {
                 RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit)
             }
-            (None, false) => RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed,
-            (None, true) => {
+            (None, RuntimeMutationFinalizerPhaseV1::StartupAccepting) => {
                 RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(
                     RuntimeSupervisorExitV1::ProtocolViolation,
                 )
             }
+            (None, _) => RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed,
         }
     }
 
@@ -482,19 +534,38 @@ impl RuntimeMutationFinalizerSharedV1 {
     fn publish_terminal(&self, exit: RuntimeSupervisorExitV1) -> RuntimeSupervisorExitV1 {
         let published = {
             let mut state = self.lock();
-            state.accepting = false;
-            *state.terminal.get_or_insert(exit)
+            let published = *state.terminal.get_or_insert(exit);
+            state.startup_intake_sealed = true;
+            state.shutdown_sealed = true;
+            if !matches!(state.phase, RuntimeMutationFinalizerPhaseV1::Terminal) {
+                state.phase = RuntimeMutationFinalizerPhaseV1::ShutdownSealed;
+                state.phase = RuntimeMutationFinalizerPhaseV1::Terminal;
+            }
+            published
         };
         self.terminal_publisher.send_replace(Some(published));
         published
     }
 
-    fn publish_startup_settled(&self) {
-        {
+    fn publish_startup_settled_if_ready(&self) -> bool {
+        let settled = {
             let mut state = self.lock();
-            state.startup_jobs_settled = true;
+            if matches!(state.phase, RuntimeMutationFinalizerPhaseV1::StartupSealing)
+                && state.queued_jobs == 0
+                && state.in_flight_jobs == 0
+                && state.terminal.is_none()
+            {
+                state.phase = RuntimeMutationFinalizerPhaseV1::StartupSettled;
+                state.startup_jobs_settled = true;
+                true
+            } else {
+                false
+            }
+        };
+        if settled {
+            self.startup_settlement_publisher.send_replace(true);
         }
-        self.startup_settlement_publisher.send_replace(true);
+        settled
     }
 }
 
@@ -505,8 +576,16 @@ struct RuntimeMutationFinalizerEnvelopeV1<J> {
     slot: OwnedSemaphorePermit,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 enum RuntimeMutationFinalizerControlV1 {
-    Seal,
+    StartupSeal,
+    ShutdownSeal,
+    ActivateProcess {
+        supervisor_id: NonZeroU64,
+        generation: RuntimeMutationFinalizerGenerationV1,
+        nonce: NonZeroU64,
+        acknowledgement: oneshot::Sender<Result<(), RuntimeSupervisorExitV1>>,
+    },
     Shutdown,
     ShutdownUntil(Instant),
     ProtocolViolation,
@@ -518,9 +597,14 @@ pub(crate) struct RuntimeMutationFinalizerSealHandleV1 {
     controls: mpsc::Sender<RuntimeMutationFinalizerControlV1>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl RuntimeMutationFinalizerSealHandleV1 {
     pub(crate) fn seal_intake(&self) -> RuntimeMutationFinalizerSealOutcomeV1 {
-        seal_runtime_mutation_finalizer_intake_v1(&self.shared, &self.controls)
+        seal_runtime_mutation_finalizer_shutdown_v1(&self.shared, &self.controls)
+    }
+
+    pub(crate) fn snapshot(&self) -> RuntimeMutationFinalizerSnapshotV1 {
+        self.shared.snapshot()
     }
 }
 
@@ -592,6 +676,24 @@ where
         RuntimeMutationFinalizerWaiterV1,
         RuntimeMutationFinalizerRegistrationRejectedV1<RuntimeMutationFinalizerJobV1<P::Job>>,
     > {
+        {
+            let state = self.shared.lock();
+            if let Some(exit) = state.terminal {
+                return Err(registration_rejected_v1(
+                    job,
+                    RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit),
+                ));
+            }
+            if !matches!(
+                state.phase,
+                RuntimeMutationFinalizerPhaseV1::StartupAccepting
+            ) {
+                return Err(registration_rejected_v1(
+                    job,
+                    RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed,
+                ));
+            }
+        }
         let slot = match self.slots.clone().try_acquire_owned() {
             Ok(slot) => slot,
             Err(TryAcquireError::NoPermits) => {
@@ -630,14 +732,20 @@ where
                 RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit),
             ));
         }
-        if !state.accepting {
+        if !matches!(
+            state.phase,
+            RuntimeMutationFinalizerPhaseV1::StartupAccepting
+        ) {
             return Err(registration_rejected_v1(
                 job,
                 RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed,
             ));
         }
         let Some(sequence) = state.next_sequence else {
-            state.accepting = false;
+            state.startup_intake_sealed = true;
+            state.shutdown_sealed = true;
+            state.phase = RuntimeMutationFinalizerPhaseV1::ShutdownSealed;
+            state.phase = RuntimeMutationFinalizerPhaseV1::Terminal;
             state.terminal = Some(RuntimeSupervisorExitV1::ProtocolViolation);
             drop(state);
             self.shared
@@ -707,6 +815,156 @@ pub enum RuntimeMutationFinalizerStartErrorV1 {
     SupervisorIdentityExhausted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RuntimeMutationFinalizerProcessActivationReserveErrorV1 {
+    #[error("runtime mutation finalizer startup jobs are not settled")]
+    StartupNotSettled,
+    #[error("runtime mutation finalizer process activation is already reserved")]
+    AlreadyReserved,
+    #[error("runtime mutation finalizer process is already accepting")]
+    AlreadyActive,
+    #[error("runtime mutation finalizer shutdown is sealed")]
+    ShutdownSealed,
+    #[error("runtime mutation finalizer is terminal")]
+    Terminal,
+    #[error("runtime mutation finalizer process activation identity exhausted")]
+    IdentityExhausted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RuntimeMutationFinalizerProcessActivationErrorV1 {
+    #[error("runtime mutation finalizer process activation authority does not match")]
+    AuthorityMismatch,
+    #[error("runtime mutation finalizer process activation deadline elapsed")]
+    DeadlineElapsed,
+    #[error("runtime mutation finalizer process activation acknowledgement was lost")]
+    AcknowledgementLost,
+    #[error("runtime mutation finalizer process activation lost to shutdown")]
+    ShutdownWon,
+    #[error("runtime mutation finalizer process activation violated its protocol")]
+    ProtocolViolation,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeMutationFinalizerProcessActivationV1 {
+    supervisor_id: NonZeroU64,
+    generation: RuntimeMutationFinalizerGenerationV1,
+    nonce: NonZeroU64,
+    shared: Arc<RuntimeMutationFinalizerSharedV1>,
+    controls: mpsc::Sender<RuntimeMutationFinalizerControlV1>,
+    armed: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeMutationFinalizerProcessActivationV1 {
+    pub(crate) const fn generation(&self) -> RuntimeMutationFinalizerGenerationV1 {
+        self.generation
+    }
+
+    pub(crate) const fn nonce(&self) -> NonZeroU64 {
+        self.nonce
+    }
+}
+
+impl Debug for RuntimeMutationFinalizerProcessActivationV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeMutationFinalizerProcessActivationV1(<redacted>)")
+    }
+}
+
+impl Drop for RuntimeMutationFinalizerProcessActivationV1 {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared
+                .publish_terminal(RuntimeSupervisorExitV1::ProtocolViolation);
+            let _ = self
+                .controls
+                .try_send(RuntimeMutationFinalizerControlV1::ProtocolViolation);
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct RuntimeMutationFinalizerProcessActivationCancellationGuardV1 {
+    shared: Arc<RuntimeMutationFinalizerSharedV1>,
+    controls: mpsc::Sender<RuntimeMutationFinalizerControlV1>,
+    armed: bool,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeMutationFinalizerProcessActivationCancellationGuardV1 {
+    fn new(
+        shared: Arc<RuntimeMutationFinalizerSharedV1>,
+        controls: mpsc::Sender<RuntimeMutationFinalizerControlV1>,
+    ) -> Self {
+        Self {
+            shared,
+            controls,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RuntimeMutationFinalizerProcessActivationCancellationGuardV1 {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared
+                .publish_terminal(RuntimeSupervisorExitV1::Aborted);
+            let _ = self
+                .controls
+                .try_send(RuntimeMutationFinalizerControlV1::ProtocolViolation);
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeMutationFinalizerProcessIntakeReservationV1 {
+    supervisor_id: NonZeroU64,
+    generation: RuntimeMutationFinalizerGenerationV1,
+    nonce: NonZeroU64,
+}
+
+impl Debug for RuntimeMutationFinalizerProcessIntakeReservationV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeMutationFinalizerProcessIntakeReservationV1(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RuntimeMutationFinalizerProcessIntakeHealthV1 {
+    Ready,
+    ShutdownSealed,
+    Terminal(RuntimeSupervisorExitV1),
+    ActorStopped,
+    AuthorityMismatch,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeMutationFinalizerProcessIntakeHealthV1 {
+    pub(crate) const fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Ready => "runtime_mutation_finalizer_process_intake_ready",
+            Self::ShutdownSealed => "runtime_mutation_finalizer_process_intake_shutdown_sealed",
+            Self::Terminal(_) => "runtime_mutation_finalizer_process_intake_terminal",
+            Self::ActorStopped => "runtime_mutation_finalizer_process_intake_actor_stopped",
+            Self::AuthorityMismatch => {
+                "runtime_mutation_finalizer_process_intake_authority_mismatch"
+            }
+        }
+    }
+}
+
 pub struct RuntimeMutationFinalizerSupervisorV1<P>
 where
     P: RuntimeMutationFinalizerPortV1,
@@ -748,7 +1006,7 @@ where
             state: Mutex::new(RuntimeMutationFinalizerStateV1 {
                 supervisor_id,
                 generation,
-                accepting: true,
+                phase: RuntimeMutationFinalizerPhaseV1::StartupAccepting,
                 next_sequence: Some(NonZeroU64::MIN),
                 queued_jobs: 0,
                 in_flight_jobs: 0,
@@ -756,7 +1014,10 @@ where
                 settled_jobs: 0,
                 failed_jobs: 0,
                 failed_closed_jobs: 0,
+                activation_nonce: None,
+                startup_intake_sealed: false,
                 startup_jobs_settled: false,
+                shutdown_sealed: false,
                 terminal: None,
             }),
             terminal_publisher,
@@ -812,7 +1073,246 @@ where
     }
 
     pub fn seal_intake(&self) -> RuntimeMutationFinalizerSealOutcomeV1 {
-        seal_runtime_mutation_finalizer_intake_v1(&self.intake.shared, &self.controls)
+        seal_runtime_mutation_finalizer_startup_v1(&self.intake.shared, &self.controls)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn reserve_process_activation(
+        &self,
+    ) -> Result<
+        RuntimeMutationFinalizerProcessActivationV1,
+        RuntimeMutationFinalizerProcessActivationReserveErrorV1,
+    > {
+        let nonce = NEXT_RUNTIME_MUTATION_FINALIZER_ACTIVATION_NONCE
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .ok()
+            .and_then(NonZeroU64::new)
+            .ok_or(RuntimeMutationFinalizerProcessActivationReserveErrorV1::IdentityExhausted)?;
+        let (supervisor_id, generation) = {
+            let mut state = self.intake.shared.lock();
+            match state.phase {
+                RuntimeMutationFinalizerPhaseV1::StartupSettled => {}
+                RuntimeMutationFinalizerPhaseV1::ProcessActivationReserved => {
+                    return Err(
+                        RuntimeMutationFinalizerProcessActivationReserveErrorV1::AlreadyReserved,
+                    );
+                }
+                RuntimeMutationFinalizerPhaseV1::ProcessAccepting => {
+                    return Err(
+                        RuntimeMutationFinalizerProcessActivationReserveErrorV1::AlreadyActive,
+                    );
+                }
+                RuntimeMutationFinalizerPhaseV1::ShutdownSealed => {
+                    return Err(
+                        RuntimeMutationFinalizerProcessActivationReserveErrorV1::ShutdownSealed,
+                    );
+                }
+                RuntimeMutationFinalizerPhaseV1::Terminal => {
+                    return Err(RuntimeMutationFinalizerProcessActivationReserveErrorV1::Terminal);
+                }
+                RuntimeMutationFinalizerPhaseV1::StartupAccepting
+                | RuntimeMutationFinalizerPhaseV1::StartupSealing => {
+                    return Err(
+                        RuntimeMutationFinalizerProcessActivationReserveErrorV1::StartupNotSettled,
+                    );
+                }
+            }
+            state.phase = RuntimeMutationFinalizerPhaseV1::ProcessActivationReserved;
+            state.activation_nonce = Some(nonce);
+            (state.supervisor_id, state.generation)
+        };
+        Ok(RuntimeMutationFinalizerProcessActivationV1 {
+            supervisor_id,
+            generation,
+            nonce,
+            shared: self.intake.shared.clone(),
+            controls: self.controls.clone(),
+            armed: true,
+        })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn activate_process_until(
+        self,
+        mut activation: RuntimeMutationFinalizerProcessActivationV1,
+        deadline: Instant,
+    ) -> Result<
+        RuntimeMutationFinalizerProcessSupervisorV1<P>,
+        RuntimeMutationFinalizerProcessActivationFailureV1<P>,
+    > {
+        let shared_matches = Arc::ptr_eq(&self.intake.shared, &activation.shared);
+        let (shutdown_won, reserved) = {
+            let state = self.intake.shared.lock();
+            let identity_matches = shared_matches
+                && state.supervisor_id == activation.supervisor_id
+                && state.generation == activation.generation
+                && state.activation_nonce == Some(activation.nonce);
+            (
+                identity_matches
+                    && (state.shutdown_sealed
+                        || state.terminal.is_some()
+                        || matches!(
+                            state.phase,
+                            RuntimeMutationFinalizerPhaseV1::ShutdownSealed
+                                | RuntimeMutationFinalizerPhaseV1::Terminal
+                        )),
+                identity_matches
+                    && matches!(
+                        state.phase,
+                        RuntimeMutationFinalizerPhaseV1::ProcessActivationReserved
+                    )
+                    && state.terminal.is_none(),
+            )
+        };
+        if shutdown_won {
+            activation.armed = false;
+            return Err(RuntimeMutationFinalizerProcessActivationFailureV1 {
+                error: RuntimeMutationFinalizerProcessActivationErrorV1::ShutdownWon,
+                supervisor: self,
+            });
+        }
+        if !reserved {
+            self.intake
+                .shared
+                .publish_terminal(RuntimeSupervisorExitV1::ProtocolViolation);
+            return Err(RuntimeMutationFinalizerProcessActivationFailureV1 {
+                error: RuntimeMutationFinalizerProcessActivationErrorV1::AuthorityMismatch,
+                supervisor: self,
+            });
+        }
+        activation.armed = false;
+        let mut cancellation = RuntimeMutationFinalizerProcessActivationCancellationGuardV1::new(
+            self.intake.shared.clone(),
+            self.controls.clone(),
+        );
+        if Instant::now() >= deadline {
+            self.intake
+                .shared
+                .publish_terminal(RuntimeSupervisorExitV1::DeadlineElapsed);
+            cancellation.disarm();
+            return Err(RuntimeMutationFinalizerProcessActivationFailureV1 {
+                error: RuntimeMutationFinalizerProcessActivationErrorV1::DeadlineElapsed,
+                supervisor: self,
+            });
+        }
+        let (acknowledgement, observed) = oneshot::channel();
+        let command = RuntimeMutationFinalizerControlV1::ActivateProcess {
+            supervisor_id: activation.supervisor_id,
+            generation: activation.generation,
+            nonce: activation.nonce,
+            acknowledgement,
+        };
+        match timeout_at(
+            TokioInstant::from_std(deadline),
+            self.controls.send(command),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.intake
+                    .shared
+                    .publish_terminal(RuntimeSupervisorExitV1::Aborted);
+                cancellation.disarm();
+                return Err(RuntimeMutationFinalizerProcessActivationFailureV1 {
+                    error: RuntimeMutationFinalizerProcessActivationErrorV1::AcknowledgementLost,
+                    supervisor: self,
+                });
+            }
+            Err(_) => {
+                self.intake
+                    .shared
+                    .publish_terminal(RuntimeSupervisorExitV1::DeadlineElapsed);
+                cancellation.disarm();
+                return Err(RuntimeMutationFinalizerProcessActivationFailureV1 {
+                    error: RuntimeMutationFinalizerProcessActivationErrorV1::DeadlineElapsed,
+                    supervisor: self,
+                });
+            }
+        }
+        let acknowledgement = match timeout_at(TokioInstant::from_std(deadline), observed).await {
+            Ok(Ok(acknowledgement)) => acknowledgement,
+            Ok(Err(_)) => {
+                self.intake
+                    .shared
+                    .publish_terminal(RuntimeSupervisorExitV1::Aborted);
+                cancellation.disarm();
+                return Err(RuntimeMutationFinalizerProcessActivationFailureV1 {
+                    error: RuntimeMutationFinalizerProcessActivationErrorV1::AcknowledgementLost,
+                    supervisor: self,
+                });
+            }
+            Err(_) => {
+                self.intake
+                    .shared
+                    .publish_terminal(RuntimeSupervisorExitV1::DeadlineElapsed);
+                cancellation.disarm();
+                return Err(RuntimeMutationFinalizerProcessActivationFailureV1 {
+                    error: RuntimeMutationFinalizerProcessActivationErrorV1::DeadlineElapsed,
+                    supervisor: self,
+                });
+            }
+        };
+        if let Err(exit) = acknowledgement {
+            cancellation.disarm();
+            return Err(RuntimeMutationFinalizerProcessActivationFailureV1 {
+                error: match exit {
+                    RuntimeSupervisorExitV1::Commanded
+                    | RuntimeSupervisorExitV1::DeadlineElapsed => {
+                        RuntimeMutationFinalizerProcessActivationErrorV1::ShutdownWon
+                    }
+                    RuntimeSupervisorExitV1::ProtocolViolation => {
+                        RuntimeMutationFinalizerProcessActivationErrorV1::ProtocolViolation
+                    }
+                    RuntimeSupervisorExitV1::DependencyTerminal
+                    | RuntimeSupervisorExitV1::Panicked
+                    | RuntimeSupervisorExitV1::Aborted => {
+                        RuntimeMutationFinalizerProcessActivationErrorV1::AcknowledgementLost
+                    }
+                },
+                supervisor: self,
+            });
+        }
+        let activated = {
+            let state = self.intake.shared.lock();
+            state.supervisor_id == activation.supervisor_id
+                && state.generation == activation.generation
+                && state.activation_nonce == Some(activation.nonce)
+                && matches!(
+                    state.phase,
+                    RuntimeMutationFinalizerPhaseV1::ProcessAccepting
+                )
+                && state.terminal.is_none()
+                && !state.shutdown_sealed
+        };
+        if !activated {
+            let shutdown_won = self.intake.shared.snapshot().shutdown_sealed();
+            if !shutdown_won {
+                self.intake
+                    .shared
+                    .publish_terminal(RuntimeSupervisorExitV1::ProtocolViolation);
+            }
+            cancellation.disarm();
+            return Err(RuntimeMutationFinalizerProcessActivationFailureV1 {
+                error: if shutdown_won {
+                    RuntimeMutationFinalizerProcessActivationErrorV1::ShutdownWon
+                } else {
+                    RuntimeMutationFinalizerProcessActivationErrorV1::ProtocolViolation
+                },
+                supervisor: self,
+            });
+        }
+        cancellation.disarm();
+        Ok(RuntimeMutationFinalizerProcessSupervisorV1 {
+            supervisor: self,
+            process_intake: RuntimeMutationFinalizerProcessIntakeReservationV1 {
+                supervisor_id: activation.supervisor_id,
+                generation: activation.generation,
+                nonce: activation.nonce,
+            },
+        })
     }
 
     pub async fn next_completion(&mut self) -> Option<RuntimeMutationFinalizerPortCompletionV1<P>> {
@@ -870,7 +1370,7 @@ where
     pub async fn join(
         mut self,
     ) -> RuntimeMutationFinalizerJoinReportV1<P::Job, P::Output, P::Error> {
-        self.seal_intake();
+        seal_runtime_mutation_finalizer_shutdown_v1(&self.intake.shared, &self.controls);
         let _ = self
             .controls
             .send(RuntimeMutationFinalizerControlV1::Shutdown)
@@ -899,7 +1399,7 @@ where
         mut self,
         deadline: Instant,
     ) -> RuntimeMutationFinalizerJoinReportV1<P::Job, P::Output, P::Error> {
-        self.seal_intake();
+        seal_runtime_mutation_finalizer_shutdown_v1(&self.intake.shared, &self.controls);
         if Instant::now() >= deadline {
             return self.abort_and_finish_until(deadline).await;
         }
@@ -995,15 +1495,139 @@ where
     }
 }
 
-fn seal_runtime_mutation_finalizer_intake_v1(
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeMutationFinalizerProcessActivationFailureV1<P>
+where
+    P: RuntimeMutationFinalizerPortV1,
+{
+    error: RuntimeMutationFinalizerProcessActivationErrorV1,
+    supervisor: RuntimeMutationFinalizerSupervisorV1<P>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<P> RuntimeMutationFinalizerProcessActivationFailureV1<P>
+where
+    P: RuntimeMutationFinalizerPortV1,
+{
+    pub(crate) const fn error(&self) -> RuntimeMutationFinalizerProcessActivationErrorV1 {
+        self.error
+    }
+
+    pub(crate) fn into_shutdown_supervisor(self) -> RuntimeMutationFinalizerSupervisorV1<P> {
+        self.supervisor
+    }
+}
+
+impl<P> Debug for RuntimeMutationFinalizerProcessActivationFailureV1<P>
+where
+    P: RuntimeMutationFinalizerPortV1,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeMutationFinalizerProcessActivationFailureV1(<redacted>)")
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeMutationFinalizerProcessSupervisorV1<P>
+where
+    P: RuntimeMutationFinalizerPortV1,
+{
+    supervisor: RuntimeMutationFinalizerSupervisorV1<P>,
+    process_intake: RuntimeMutationFinalizerProcessIntakeReservationV1,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<P> RuntimeMutationFinalizerProcessSupervisorV1<P>
+where
+    P: RuntimeMutationFinalizerPortV1,
+{
+    pub(crate) fn snapshot(&self) -> RuntimeMutationFinalizerSnapshotV1 {
+        self.supervisor.snapshot()
+    }
+
+    pub(crate) fn seal_handle(&self) -> RuntimeMutationFinalizerSealHandleV1 {
+        self.supervisor.seal_handle()
+    }
+
+    pub(crate) fn terminal_observation(&self) -> Option<RuntimeSupervisorExitV1> {
+        self.supervisor.terminal_observation()
+    }
+
+    pub(crate) fn process_intake_health(&self) -> RuntimeMutationFinalizerProcessIntakeHealthV1 {
+        let state = self.supervisor.intake.shared.lock();
+        if let Some(exit) = state.terminal {
+            return RuntimeMutationFinalizerProcessIntakeHealthV1::Terminal(exit);
+        }
+        if state.shutdown_sealed
+            || matches!(state.phase, RuntimeMutationFinalizerPhaseV1::ShutdownSealed)
+        {
+            return RuntimeMutationFinalizerProcessIntakeHealthV1::ShutdownSealed;
+        }
+        let actor_running = self
+            .supervisor
+            .actor
+            .as_ref()
+            .is_some_and(|actor| !actor.is_finished());
+        if !actor_running {
+            return RuntimeMutationFinalizerProcessIntakeHealthV1::ActorStopped;
+        }
+        if state.supervisor_id != self.process_intake.supervisor_id
+            || state.generation != self.process_intake.generation
+            || state.activation_nonce != Some(self.process_intake.nonce)
+            || !matches!(
+                state.phase,
+                RuntimeMutationFinalizerPhaseV1::ProcessAccepting
+            )
+        {
+            return RuntimeMutationFinalizerProcessIntakeHealthV1::AuthorityMismatch;
+        }
+        RuntimeMutationFinalizerProcessIntakeHealthV1::Ready
+    }
+
+    pub(crate) async fn next_completion(
+        &mut self,
+    ) -> Option<RuntimeMutationFinalizerPortCompletionV1<P>> {
+        self.supervisor.next_completion().await
+    }
+
+    pub(crate) async fn join(
+        self,
+    ) -> RuntimeMutationFinalizerJoinReportV1<P::Job, P::Output, P::Error> {
+        self.supervisor.join().await
+    }
+
+    pub(crate) async fn shutdown_until(
+        self,
+        deadline: Instant,
+    ) -> RuntimeMutationFinalizerJoinReportV1<P::Job, P::Output, P::Error> {
+        self.supervisor.shutdown_until(deadline).await
+    }
+}
+
+impl<P> Debug for RuntimeMutationFinalizerProcessSupervisorV1<P>
+where
+    P: RuntimeMutationFinalizerPortV1,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeMutationFinalizerProcessSupervisorV1(<redacted>)")
+    }
+}
+
+fn seal_runtime_mutation_finalizer_startup_v1(
     shared: &RuntimeMutationFinalizerSharedV1,
     controls: &mpsc::Sender<RuntimeMutationFinalizerControlV1>,
 ) -> RuntimeMutationFinalizerSealOutcomeV1 {
     let outcome = {
         let mut state = shared.lock();
         let terminal = state.terminal.is_some();
-        let was_open = state.accepting;
-        state.accepting = false;
+        let was_open = matches!(
+            state.phase,
+            RuntimeMutationFinalizerPhaseV1::StartupAccepting
+        );
+        if was_open {
+            state.phase = RuntimeMutationFinalizerPhaseV1::StartupSealing;
+            state.startup_intake_sealed = true;
+        }
         let snapshot = snapshot_from_state_v1(&state);
         if terminal {
             RuntimeMutationFinalizerSealOutcomeV1::Terminal(snapshot)
@@ -1014,7 +1638,36 @@ fn seal_runtime_mutation_finalizer_intake_v1(
         }
     };
     if matches!(outcome, RuntimeMutationFinalizerSealOutcomeV1::First(_)) {
-        let _ = controls.try_send(RuntimeMutationFinalizerControlV1::Seal);
+        let _ = controls.try_send(RuntimeMutationFinalizerControlV1::StartupSeal);
+    }
+    shared.publish_startup_settled_if_ready();
+    outcome
+}
+
+fn seal_runtime_mutation_finalizer_shutdown_v1(
+    shared: &RuntimeMutationFinalizerSharedV1,
+    controls: &mpsc::Sender<RuntimeMutationFinalizerControlV1>,
+) -> RuntimeMutationFinalizerSealOutcomeV1 {
+    let outcome = {
+        let mut state = shared.lock();
+        let terminal = state.terminal.is_some();
+        let was_open = !state.shutdown_sealed;
+        state.startup_intake_sealed = true;
+        state.shutdown_sealed = true;
+        if !terminal {
+            state.phase = RuntimeMutationFinalizerPhaseV1::ShutdownSealed;
+        }
+        let snapshot = snapshot_from_state_v1(&state);
+        if terminal {
+            RuntimeMutationFinalizerSealOutcomeV1::Terminal(snapshot)
+        } else if was_open {
+            RuntimeMutationFinalizerSealOutcomeV1::First(snapshot)
+        } else {
+            RuntimeMutationFinalizerSealOutcomeV1::AlreadySealed(snapshot)
+        }
+    };
+    if matches!(outcome, RuntimeMutationFinalizerSealOutcomeV1::First(_)) {
+        let _ = controls.try_send(RuntimeMutationFinalizerControlV1::ShutdownSeal);
     }
     outcome
 }
@@ -1097,74 +1750,134 @@ async fn run_runtime_mutation_finalizer_actor_v1<P>(
 where
     P: RuntimeMutationFinalizerPortV1,
 {
-    let mut sealed = false;
     let mut shutdown = false;
     loop {
-        let envelope = if sealed {
-            jobs.recv().await
+        shared.publish_startup_settled_if_ready();
+        let snapshot = shared.snapshot();
+        if let Some(exit) = snapshot.terminal() {
+            jobs.close();
+            fail_queued_jobs_v1(&shared, &mut jobs, &completions, exit).await;
+            return exit;
+        }
+        if snapshot.shutdown_sealed() {
+            let exit = shared.publish_terminal(RuntimeSupervisorExitV1::Commanded);
+            jobs.close();
+            fail_queued_jobs_v1(&shared, &mut jobs, &completions, exit).await;
+            return exit;
+        }
+        let control_only = matches!(
+            snapshot.phase(),
+            RuntimeMutationFinalizerPhaseV1::StartupSettled
+                | RuntimeMutationFinalizerPhaseV1::ProcessActivationReserved
+                | RuntimeMutationFinalizerPhaseV1::ProcessAccepting
+        );
+        let event = if control_only {
+            RuntimeMutationFinalizerActorEventV1::Control(controls.recv().await)
         } else {
             tokio::select! {
                 biased;
                 control = controls.recv() => {
-                    match control {
-                        Some(RuntimeMutationFinalizerControlV1::Seal) => {
-                            sealed = true;
-                            jobs.close();
-                            continue;
-                        }
-                        Some(RuntimeMutationFinalizerControlV1::Shutdown) => {
-                            jobs.close();
-                            let exit =
-                                shared.publish_terminal(RuntimeSupervisorExitV1::Commanded);
-                            fail_queued_jobs_v1(&shared, &mut jobs, &completions, exit).await;
-                            return exit;
-                        }
-                        Some(RuntimeMutationFinalizerControlV1::ShutdownUntil(_)) => {
-                            jobs.close();
-                            let exit =
-                                shared.publish_terminal(RuntimeSupervisorExitV1::Commanded);
-                            fail_queued_jobs_v1(&shared, &mut jobs, &completions, exit).await;
-                            return exit;
-                        }
-                        Some(RuntimeMutationFinalizerControlV1::ProtocolViolation) | None => {
-                            let exit = shared.publish_terminal(
-                                RuntimeSupervisorExitV1::ProtocolViolation,
-                            );
-                            jobs.close();
-                            fail_queued_jobs_v1(
-                                &shared,
-                                &mut jobs,
-                                &completions,
-                                exit,
-                            ).await;
-                            return exit;
-                        }
-                    }
+                    RuntimeMutationFinalizerActorEventV1::Control(control)
                 }
-                job = jobs.recv() => job,
+                job = jobs.recv() => RuntimeMutationFinalizerActorEventV1::Job(job),
             }
         };
-        let Some(envelope) = envelope else {
-            if !sealed {
-                return shared.publish_terminal(RuntimeSupervisorExitV1::ProtocolViolation);
-            }
-            shared.publish_startup_settled();
-            if shutdown {
-                return shared.publish_terminal(RuntimeSupervisorExitV1::Commanded);
-            }
-            match controls.recv().await {
-                Some(RuntimeMutationFinalizerControlV1::Seal) => continue,
+        let envelope = match event {
+            RuntimeMutationFinalizerActorEventV1::Control(control) => match control {
+                Some(RuntimeMutationFinalizerControlV1::StartupSeal)
+                | Some(RuntimeMutationFinalizerControlV1::ShutdownSeal) => {
+                    continue;
+                }
                 Some(RuntimeMutationFinalizerControlV1::Shutdown) => {
-                    return shared.publish_terminal(RuntimeSupervisorExitV1::Commanded);
+                    let exit = shared.publish_terminal(RuntimeSupervisorExitV1::Commanded);
+                    jobs.close();
+                    fail_queued_jobs_v1(&shared, &mut jobs, &completions, exit).await;
+                    return exit;
                 }
                 Some(RuntimeMutationFinalizerControlV1::ShutdownUntil(_)) => {
-                    return shared.publish_terminal(RuntimeSupervisorExitV1::Commanded);
+                    let exit = shared.publish_terminal(RuntimeSupervisorExitV1::Commanded);
+                    jobs.close();
+                    fail_queued_jobs_v1(&shared, &mut jobs, &completions, exit).await;
+                    return exit;
+                }
+                Some(RuntimeMutationFinalizerControlV1::ActivateProcess {
+                    supervisor_id,
+                    generation,
+                    nonce,
+                    acknowledgement,
+                }) => {
+                    let activation = {
+                        let mut state = shared.lock();
+                        if state.shutdown_sealed {
+                            Err(RuntimeSupervisorExitV1::Commanded)
+                        } else if state.supervisor_id == supervisor_id
+                            && state.generation == generation
+                            && state.activation_nonce == Some(nonce)
+                            && matches!(
+                                state.phase,
+                                RuntimeMutationFinalizerPhaseV1::ProcessActivationReserved
+                            )
+                            && state.startup_intake_sealed
+                            && state.startup_jobs_settled
+                            && state.queued_jobs == 0
+                            && state.in_flight_jobs == 0
+                            && state.terminal.is_none()
+                        {
+                            state.phase = RuntimeMutationFinalizerPhaseV1::ProcessAccepting;
+                            Ok(())
+                        } else {
+                            Err(RuntimeSupervisorExitV1::ProtocolViolation)
+                        }
+                    };
+                    let protocol_violation =
+                        matches!(activation, Err(RuntimeSupervisorExitV1::ProtocolViolation));
+                    if acknowledgement.send(activation).is_err() {
+                        let exit = shared.publish_terminal(RuntimeSupervisorExitV1::Aborted);
+                        jobs.close();
+                        fail_queued_jobs_v1(&shared, &mut jobs, &completions, exit).await;
+                        return exit;
+                    }
+                    if protocol_violation {
+                        let exit =
+                            shared.publish_terminal(RuntimeSupervisorExitV1::ProtocolViolation);
+                        jobs.close();
+                        fail_queued_jobs_v1(&shared, &mut jobs, &completions, exit).await;
+                        return exit;
+                    }
+                    continue;
                 }
                 Some(RuntimeMutationFinalizerControlV1::ProtocolViolation) | None => {
-                    return shared.publish_terminal(RuntimeSupervisorExitV1::ProtocolViolation);
+                    let exit = shared.publish_terminal(RuntimeSupervisorExitV1::ProtocolViolation);
+                    jobs.close();
+                    fail_queued_jobs_v1(&shared, &mut jobs, &completions, exit).await;
+                    return exit;
                 }
+            },
+            RuntimeMutationFinalizerActorEventV1::Job(Some(envelope)) => envelope,
+            RuntimeMutationFinalizerActorEventV1::Job(None) => {
+                let exit = shared.publish_terminal(RuntimeSupervisorExitV1::ProtocolViolation);
+                jobs.close();
+                fail_queued_jobs_v1(&shared, &mut jobs, &completions, exit).await;
+                return exit;
             }
         };
+        let may_dispatch = matches!(
+            shared.snapshot().phase(),
+            RuntimeMutationFinalizerPhaseV1::StartupAccepting
+                | RuntimeMutationFinalizerPhaseV1::StartupSealing
+        );
+        if !may_dispatch {
+            let exit = if shared.snapshot().shutdown_sealed() {
+                RuntimeSupervisorExitV1::Commanded
+            } else {
+                RuntimeSupervisorExitV1::ProtocolViolation
+            };
+            let exit = shared.publish_terminal(exit);
+            jobs.close();
+            fail_registered_job_v1(&shared, &completions, envelope, exit).await;
+            fail_queued_jobs_v1(&shared, &mut jobs, &completions, exit).await;
+            return exit;
+        }
         let exit = execute_registered_job_v1(
             &port,
             &shared,
@@ -1188,6 +1901,11 @@ where
             return exit;
         }
     }
+}
+
+enum RuntimeMutationFinalizerActorEventV1<J> {
+    Control(Option<RuntimeMutationFinalizerControlV1>),
+    Job(Option<RuntimeMutationFinalizerEnvelopeV1<J>>),
 }
 
 async fn execute_registered_job_v1<P>(
@@ -1237,7 +1955,21 @@ where
             result = &mut task => break result,
             control = controls.recv() => {
                 match control {
-                    Some(RuntimeMutationFinalizerControlV1::Seal) => {}
+                    Some(RuntimeMutationFinalizerControlV1::StartupSeal) => {}
+                    Some(RuntimeMutationFinalizerControlV1::ShutdownSeal) => {
+                        *shutdown = true;
+                    }
+                    Some(RuntimeMutationFinalizerControlV1::ActivateProcess {
+                        acknowledgement,
+                        ..
+                    }) => {
+                        let _ = acknowledgement.send(Err(
+                            RuntimeSupervisorExitV1::ProtocolViolation,
+                        ));
+                        task.abort();
+                        forced_exit = Some(RuntimeSupervisorExitV1::ProtocolViolation);
+                        break task.await;
+                    }
                     Some(RuntimeMutationFinalizerControlV1::Shutdown) => {
                         *shutdown = true;
                     }
@@ -1344,6 +2076,46 @@ impl Drop for RuntimeMutationFinalizerInFlightStoppedGuardV1 {
     }
 }
 
+async fn fail_registered_job_v1<J, O, E>(
+    shared: &RuntimeMutationFinalizerSharedV1,
+    completions: &mpsc::Sender<RuntimeMutationFinalizerCompletionV1<J, O, E>>,
+    envelope: RuntimeMutationFinalizerEnvelopeV1<J>,
+    exit: RuntimeSupervisorExitV1,
+) where
+    J: Send + 'static,
+    O: Send + 'static,
+    E: Send + 'static,
+{
+    let RuntimeMutationFinalizerEnvelopeV1 {
+        job_id,
+        job,
+        waiter,
+        slot,
+    } = envelope;
+    if completions
+        .send(RuntimeMutationFinalizerCompletionV1 {
+            job_id,
+            result: RuntimeMutationFinalizerCompletionResultV1::Undispatched { job, exit },
+            slot,
+        })
+        .await
+        .is_err()
+    {
+        shared.publish_terminal(RuntimeSupervisorExitV1::Aborted);
+        let _ = waiter.send(RuntimeMutationFinalizerWaitStatusV1::FailedClosed(
+            RuntimeSupervisorExitV1::Aborted,
+        ));
+        return;
+    }
+    {
+        let mut state = shared.lock();
+        state.queued_jobs = state.queued_jobs.saturating_sub(1);
+        state.unsettled_jobs = state.unsettled_jobs.saturating_sub(1);
+        state.failed_closed_jobs = state.failed_closed_jobs.saturating_add(1);
+    }
+    let _ = waiter.send(RuntimeMutationFinalizerWaitStatusV1::FailedClosed(exit));
+}
+
 async fn fail_queued_jobs_v1<J, O, E>(
     shared: &RuntimeMutationFinalizerSharedV1,
     jobs: &mut mpsc::Receiver<RuntimeMutationFinalizerEnvelopeV1<J>>,
@@ -1355,34 +2127,7 @@ async fn fail_queued_jobs_v1<J, O, E>(
     E: Send + 'static,
 {
     while let Some(envelope) = jobs.recv().await {
-        let RuntimeMutationFinalizerEnvelopeV1 {
-            job_id,
-            job,
-            waiter,
-            slot,
-        } = envelope;
-        if completions
-            .send(RuntimeMutationFinalizerCompletionV1 {
-                job_id,
-                result: RuntimeMutationFinalizerCompletionResultV1::Undispatched { job, exit },
-                slot,
-            })
-            .await
-            .is_err()
-        {
-            shared.publish_terminal(RuntimeSupervisorExitV1::Aborted);
-            let _ = waiter.send(RuntimeMutationFinalizerWaitStatusV1::FailedClosed(
-                RuntimeSupervisorExitV1::Aborted,
-            ));
-            return;
-        }
-        {
-            let mut state = shared.lock();
-            state.queued_jobs = state.queued_jobs.saturating_sub(1);
-            state.unsettled_jobs = state.unsettled_jobs.saturating_sub(1);
-            state.failed_closed_jobs = state.failed_closed_jobs.saturating_add(1);
-        }
-        let _ = waiter.send(RuntimeMutationFinalizerWaitStatusV1::FailedClosed(exit));
+        fail_registered_job_v1(shared, completions, envelope, exit).await;
     }
 }
 
@@ -1391,14 +2136,299 @@ fn snapshot_from_state_v1(
 ) -> RuntimeMutationFinalizerSnapshotV1 {
     RuntimeMutationFinalizerSnapshotV1 {
         generation: state.generation,
-        intake_open: state.accepting,
+        phase: state.phase,
+        intake_open: matches!(
+            state.phase,
+            RuntimeMutationFinalizerPhaseV1::StartupAccepting
+                | RuntimeMutationFinalizerPhaseV1::ProcessAccepting
+        ),
         queued_jobs: state.queued_jobs,
         in_flight_jobs: state.in_flight_jobs,
         unsettled_jobs: state.unsettled_jobs,
         settled_jobs: state.settled_jobs,
         failed_jobs: state.failed_jobs,
         failed_closed_jobs: state.failed_closed_jobs,
+        next_job_sequence: state.next_sequence,
+        startup_intake_sealed: state.startup_intake_sealed,
         startup_jobs_settled: state.startup_jobs_settled,
+        shutdown_sealed: state.shutdown_sealed,
         terminal: state.terminal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopPort;
+
+    impl RuntimeMutationFinalizerPortV1 for NoopPort {
+        type Job = ();
+        type Output = ();
+        type Error = ();
+
+        async fn execute(
+            &self,
+            _job: RuntimeMutationFinalizerJobV1<Self::Job>,
+        ) -> Result<Self::Output, Self::Error> {
+            Ok(())
+        }
+    }
+
+    fn generation_v1() -> RuntimeMutationFinalizerGenerationV1 {
+        RuntimeMutationFinalizerGenerationV1::new(NonZeroU64::new(19).unwrap()).unwrap()
+    }
+
+    fn supervisor_v1() -> RuntimeMutationFinalizerSupervisorV1<NoopPort> {
+        RuntimeMutationFinalizerSupervisorV1::start(
+            RuntimeMutationFinalizerConfigV1::new(1).unwrap(),
+            generation_v1(),
+            NoopPort,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actor_side_acknowledgement_loss_is_terminal_without_reservation() {
+        let mut supervisor = supervisor_v1();
+        supervisor.seal_intake();
+        assert!(supervisor.wait_startup_jobs_settled().await);
+        let mut activation = supervisor.reserve_process_activation().unwrap();
+        let permit = supervisor.controls.reserve().await.unwrap();
+        let (acknowledgement, observation) = oneshot::channel();
+        drop(observation);
+        let command = RuntimeMutationFinalizerControlV1::ActivateProcess {
+            supervisor_id: activation.supervisor_id,
+            generation: activation.generation,
+            nonce: activation.nonce,
+            acknowledgement,
+        };
+        activation.armed = false;
+        drop(activation);
+
+        permit.send(command);
+        assert_eq!(
+            supervisor.wait_terminal().await,
+            RuntimeSupervisorExitV1::Aborted
+        );
+
+        let snapshot = supervisor.snapshot();
+        assert_eq!(snapshot.terminal(), Some(RuntimeSupervisorExitV1::Aborted));
+        assert!(!snapshot.process_accepting());
+        assert!(!snapshot.intake_open());
+        assert_eq!(
+            supervisor.join().await.exit(),
+            RuntimeSupervisorExitV1::Aborted
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_queued_after_activation_command_wins_before_actor_ack() {
+        let mut supervisor = supervisor_v1();
+        supervisor.seal_intake();
+        assert!(supervisor.wait_startup_jobs_settled().await);
+        let mut activation = supervisor.reserve_process_activation().unwrap();
+        let permit = supervisor.controls.reserve().await.unwrap();
+        let (acknowledgement, observation) = oneshot::channel();
+        let command = RuntimeMutationFinalizerControlV1::ActivateProcess {
+            supervisor_id: activation.supervisor_id,
+            generation: activation.generation,
+            nonce: activation.nonce,
+            acknowledgement,
+        };
+        activation.armed = false;
+        drop(activation);
+
+        permit.send(command);
+        supervisor.seal_handle().seal_intake();
+        assert_eq!(
+            observation.await.unwrap(),
+            Err(RuntimeSupervisorExitV1::Commanded)
+        );
+        tokio::task::yield_now().await;
+
+        let snapshot = supervisor.snapshot();
+        assert!(snapshot.shutdown_sealed());
+        assert_eq!(
+            snapshot.terminal(),
+            Some(RuntimeSupervisorExitV1::Commanded)
+        );
+        assert!(!snapshot.process_accepting());
+        assert!(!snapshot.intake_open());
+        assert_eq!(
+            supervisor.join().await.exit(),
+            RuntimeSupervisorExitV1::Commanded
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_intake_health_detects_a_finished_tracked_actor() {
+        let mut supervisor = supervisor_v1();
+        let startup_intake = supervisor.intake().clone();
+        let waiter = startup_intake
+            .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(()))
+            .unwrap();
+        assert_eq!(
+            waiter.wait().await.status(),
+            RuntimeMutationFinalizerWaitStatusV1::Settled
+        );
+        drop(supervisor.next_completion().await.unwrap());
+        supervisor.seal_intake();
+        assert!(supervisor.wait_startup_jobs_settled().await);
+        let before = supervisor.snapshot();
+        let activation = supervisor.reserve_process_activation().unwrap();
+        assert_eq!(activation.generation(), generation_v1());
+        assert!(activation.nonce().get() > 0);
+        assert!(supervisor.snapshot().process_activation_reserved());
+        let process = supervisor
+            .activate_process_until(activation, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let after = process.snapshot();
+        assert_eq!(after.generation(), before.generation());
+        assert_eq!(after.next_job_sequence(), before.next_job_sequence());
+        assert!(after.startup_intake_sealed());
+        assert!(after.startup_jobs_settled());
+        assert!(after.process_accepting());
+        assert!(after.intake_open());
+        assert!(process.process_intake_health().is_ready());
+        assert_eq!(
+            process.process_intake_health().code(),
+            "runtime_mutation_finalizer_process_intake_ready"
+        );
+        let rejected = startup_intake
+            .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(()))
+            .unwrap_err();
+        assert_eq!(
+            rejected.reason(),
+            RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed
+        );
+        rejected.into_job().into_startup_pending_drain();
+
+        process.supervisor.actor.as_ref().unwrap().abort();
+        loop {
+            if process
+                .supervisor
+                .actor
+                .as_ref()
+                .is_some_and(|actor| actor.is_finished())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            process.process_intake_health(),
+            RuntimeMutationFinalizerProcessIntakeHealthV1::ActorStopped
+        );
+        let report = process.join().await;
+        assert_eq!(report.exit(), RuntimeSupervisorExitV1::Aborted);
+        assert_eq!(
+            report.snapshot().next_job_sequence(),
+            before.next_job_sequence()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_after_actor_ack_cannot_strand_process_accepting() {
+        let mut supervisor = supervisor_v1();
+        supervisor.seal_intake();
+        assert!(supervisor.wait_startup_jobs_settled().await);
+        let capacity = supervisor.controls.reserve().await.unwrap();
+        drop(capacity);
+        let observation = supervisor.seal_handle();
+        let activation = supervisor.reserve_process_activation().unwrap();
+        let mut activation_future = Box::pin(
+            supervisor.activate_process_until(activation, Instant::now() + Duration::from_secs(1)),
+        );
+
+        std::future::poll_fn(|context| {
+            assert!(activation_future.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::task::yield_now().await;
+        assert!(observation.snapshot().process_accepting());
+        assert_eq!(observation.snapshot().terminal(), None);
+
+        drop(activation_future);
+
+        let snapshot = observation.snapshot();
+        assert_eq!(snapshot.terminal(), Some(RuntimeSupervisorExitV1::Aborted));
+        assert!(snapshot.shutdown_sealed());
+        assert!(!snapshot.process_accepting());
+        assert!(!snapshot.intake_open());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn activation_reservation_drop_and_shutdown_races_are_irreversible() {
+        let mut dropped = supervisor_v1();
+        dropped.seal_intake();
+        assert!(dropped.wait_startup_jobs_settled().await);
+        let activation = dropped.reserve_process_activation().unwrap();
+        assert!(dropped.reserve_process_activation().is_err());
+        drop(activation);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dropped.terminal_observation(),
+            Some(RuntimeSupervisorExitV1::ProtocolViolation)
+        );
+        assert!(dropped.snapshot().shutdown_sealed());
+        assert_eq!(
+            dropped.join().await.exit(),
+            RuntimeSupervisorExitV1::ProtocolViolation
+        );
+
+        let mut before = supervisor_v1();
+        before.seal_intake();
+        assert!(before.wait_startup_jobs_settled().await);
+        let shutdown = before.seal_handle();
+        let activation = before.reserve_process_activation().unwrap();
+        shutdown.seal_intake();
+        let failure = before
+            .activate_process_until(activation, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            failure.error(),
+            RuntimeMutationFinalizerProcessActivationErrorV1::ShutdownWon
+        );
+        let before = failure.into_shutdown_supervisor();
+        assert!(before.snapshot().shutdown_sealed());
+        assert_eq!(
+            before
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .exit(),
+            RuntimeSupervisorExitV1::Commanded
+        );
+
+        let mut after = supervisor_v1();
+        after.seal_intake();
+        assert!(after.wait_startup_jobs_settled().await);
+        let shutdown = after.seal_handle();
+        let activation = after.reserve_process_activation().unwrap();
+        let mut process = after
+            .activate_process_until(activation, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(process.process_intake_health().is_ready());
+        let process_shutdown = process.seal_handle();
+        shutdown.seal_intake();
+        process_shutdown.seal_intake();
+        assert!(!process.process_intake_health().is_ready());
+        assert_eq!(
+            process.terminal_observation(),
+            process.snapshot().terminal()
+        );
+        assert!(process.next_completion().await.is_none());
+        assert_eq!(
+            process
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .exit(),
+            RuntimeSupervisorExitV1::Commanded
+        );
     }
 }
