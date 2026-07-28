@@ -52,7 +52,7 @@ const PRODUCT_APPLY_WRITER_FENCE_SUPPORT_FUNCTION: &str =
     "public.starring_product_apply_lock_core_unfenced_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)";
 const PRODUCT_RUNTIME_CONVERGENCE_SUPPORT_FUNCTION: &str =
     "public.validate_runtime_convergence_attempt_projection()";
-const PRODUCT_APPLY_SLOT_WRITER_FENCE_SUPPORT_FUNCTIONS: [&str; 13] = [
+const PRODUCT_APPLY_SLOT_WRITER_FENCE_SUPPORT_FUNCTIONS: [&str; 14] = [
     "starring_runtime_private_v2.starring_runtime_slot_writer_fence_lock_v2(text,text)",
     "starring_runtime_private_v2.starring_runtime_slot_writer_fence_begin_unsafe_v2(text,text,bigint)",
     "starring_runtime_private_v2.starring_runtime_slot_writer_fence_mark_drain_v2(text,text,bigint,text,text,text,text,text,bigint)",
@@ -64,6 +64,7 @@ const PRODUCT_APPLY_SLOT_WRITER_FENCE_SUPPORT_FUNCTIONS: [&str; 13] = [
     "starring_runtime_private_v2.starring_runtime_product_drain_source_supersession_exact_v2(public.runtime_deployments,jsonb,public.runtime_drain_intents_v2,jsonb,timestamp with time zone)",
     "starring_runtime_private_v2.starring_runtime_product_drain_consume_root_exact_v2(public.runtime_product_operations_v2,public.runtime_drain_intents_v2,public.runtime_deployments,text,text,bigint,bytea,text,text)",
     "starring_runtime_private_v2.starring_runtime_product_drain_supersede_source_v2(text,text,bigint,bytea,text,bytea,text,timestamp with time zone)",
+    "starring_runtime_private_v2.starring_product_apply_consumed_terminal_replay_exact_v2(text,text,text,text,text[],text,text,text,bigint,public.product_action_receipts,public.product_audit_events)",
     "starring_runtime_private_v2.starring_product_apply_consume_lock_core_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text)",
     "starring_runtime_private_v2.starring_product_apply_commit_unfenced_core_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb,timestamp with time zone,boolean)",
 ];
