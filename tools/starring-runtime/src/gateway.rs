@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,7 @@ use crate::discord::{
     prepare_twilight_runtime_discord_gateway_driver_v1, start_runtime_discord_gateway_v1,
     RuntimeDiscordControlTaskV1, RuntimeDiscordGatewayActorStartV1,
     RuntimeDiscordGatewayStartErrorV1, RuntimeDiscordGatewaySupervisorV1,
+    RuntimeDiscordRecoveryResumeControlOutcomeV2, RuntimeDiscordRecoveryResumeEvidenceV2,
     RuntimeDiscordReservedResumeRequestV2,
 };
 use crate::discord_lifecycle::{
@@ -77,18 +78,6 @@ enum RuntimeGatewayCoordinatorInterruptV2 {
 }
 
 impl RuntimeGatewayCoordinatorInterruptV2 {
-    fn from_raw(value: u8) -> Self {
-        match value {
-            0 => Self::None,
-            1 => Self::TransportDisconnected,
-            2 => Self::ControlOrphaned,
-            3 => Self::OwnershipUncertain,
-            4 => Self::CapabilityNotReady,
-            5 => Self::ProtocolViolation,
-            _ => Self::Shutdown,
-        }
-    }
-
     fn invalidation_cause(self) -> Option<RuntimeGatewayInvalidationCauseV2> {
         match self {
             Self::None | Self::Shutdown => None,
@@ -105,20 +94,152 @@ impl RuntimeGatewayCoordinatorInterruptV2 {
 
 #[derive(Clone)]
 struct RuntimeGatewayCoordinatorInterruptHandleV2 {
-    state: Arc<AtomicU8>,
+    state: Arc<Mutex<RuntimeGatewayCoordinatorArbiterStateV2>>,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeGatewayCoordinatorArbiterStateV2 {
+    interrupt: RuntimeGatewayCoordinatorInterruptV2,
+    generation: RuntimeGatewayCoordinatorGenerationV2,
+    production_generation_active: bool,
+    resume_claim: Option<RuntimeGatewayCoordinatorGenerationV2>,
 }
 
 impl RuntimeGatewayCoordinatorInterruptHandleV2 {
     fn new() -> Self {
         Self {
-            state: Arc::new(AtomicU8::new(
-                RuntimeGatewayCoordinatorInterruptV2::None as u8,
-            )),
+            state: Arc::new(Mutex::new(RuntimeGatewayCoordinatorArbiterStateV2 {
+                interrupt: RuntimeGatewayCoordinatorInterruptV2::None,
+                generation: RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                production_generation_active: false,
+                resume_claim: None,
+            })),
         }
     }
 
     fn current(&self) -> RuntimeGatewayCoordinatorInterruptV2 {
-        RuntimeGatewayCoordinatorInterruptV2::from_raw(self.state.load(Ordering::Acquire))
+        self.lock_state_v2().interrupt
+    }
+
+    fn current_generation_v2(&self) -> RuntimeGatewayCoordinatorGenerationV2 {
+        self.lock_state_v2().generation
+    }
+
+    fn current_state_v2(
+        &self,
+    ) -> (
+        RuntimeGatewayCoordinatorInterruptV2,
+        RuntimeGatewayCoordinatorGenerationV2,
+    ) {
+        let state = self.lock_state_v2();
+        (state.interrupt, state.generation)
+    }
+
+    fn synchronize_generation_v2(&self, generation: RuntimeGatewayCoordinatorGenerationV2) {
+        let mut state = self.lock_state_v2();
+        if state.production_generation_active || state.resume_claim.is_some() {
+            if state.generation != generation {
+                state.interrupt = RuntimeGatewayCoordinatorInterruptV2::ProtocolViolation;
+            }
+            return;
+        }
+        if generation.get() < state.generation.get() {
+            state.interrupt = RuntimeGatewayCoordinatorInterruptV2::ProtocolViolation;
+            return;
+        }
+        state.generation = generation;
+    }
+
+    fn activate_production_generation_v2(
+        &self,
+        expected_generation: RuntimeGatewayCoordinatorGenerationV2,
+    ) -> bool {
+        let mut state = self.lock_state_v2();
+        if state.interrupt != RuntimeGatewayCoordinatorInterruptV2::None
+            || state.generation != expected_generation
+            || state.production_generation_active
+            || state.resume_claim.is_some()
+        {
+            return false;
+        }
+        state.production_generation_active = true;
+        true
+    }
+
+    fn deactivate_production_generation_v2(
+        &self,
+        expected_generation: RuntimeGatewayCoordinatorGenerationV2,
+    ) {
+        let mut state = self.lock_state_v2();
+        if state.generation == expected_generation {
+            state.production_generation_active = false;
+            state.resume_claim = None;
+        }
+    }
+
+    fn production_successor_generation_v2(
+        &self,
+        expected_generation: RuntimeGatewayCoordinatorGenerationV2,
+    ) -> Option<RuntimeGatewayCoordinatorGenerationV2> {
+        let state = self.lock_state_v2();
+        if state.interrupt != RuntimeGatewayCoordinatorInterruptV2::None
+            || state.generation != expected_generation
+            || !state.production_generation_active
+        {
+            return None;
+        }
+        runtime_gateway_successor_generation_v2(expected_generation)
+    }
+
+    fn claim_recovery_resume_v2(
+        &self,
+        expected_generation: RuntimeGatewayCoordinatorGenerationV2,
+    ) -> bool {
+        let mut state = self.lock_state_v2();
+        if state.generation != expected_generation || state.resume_claim.is_some() {
+            return false;
+        }
+        let accepted = if state.production_generation_active {
+            state.interrupt == RuntimeGatewayCoordinatorInterruptV2::None
+                && runtime_gateway_successor_generation_v2(expected_generation).is_some()
+        } else {
+            state.interrupt != RuntimeGatewayCoordinatorInterruptV2::Shutdown
+        };
+        if accepted {
+            state.resume_claim = Some(expected_generation);
+        }
+        accepted
+    }
+
+    fn complete_recovery_resume_v2(
+        &self,
+        expected_generation: RuntimeGatewayCoordinatorGenerationV2,
+    ) -> Option<RuntimeGatewayCoordinatorGenerationV2> {
+        let mut state = self.lock_state_v2();
+        if state.generation != expected_generation
+            || state.resume_claim != Some(expected_generation)
+        {
+            return None;
+        }
+        state.resume_claim = None;
+        if !state.production_generation_active {
+            return Some(expected_generation);
+        }
+        let successor = runtime_gateway_successor_generation_v2(expected_generation)?;
+        state.generation = successor;
+        Some(successor)
+    }
+
+    fn cancel_recovery_resume_claim_v2(
+        &self,
+        expected_generation: RuntimeGatewayCoordinatorGenerationV2,
+    ) {
+        let mut state = self.lock_state_v2();
+        if state.generation == expected_generation
+            && state.resume_claim == Some(expected_generation)
+        {
+            state.resume_claim = None;
+        }
     }
 
     fn trip_invalidation(&self, cause: RuntimeGatewayInvalidationCauseV2) {
@@ -139,19 +260,20 @@ impl RuntimeGatewayCoordinatorInterruptHandleV2 {
                 RuntimeGatewayCoordinatorInterruptV2::ProtocolViolation
             }
         };
-        let _ = self.state.compare_exchange(
-            RuntimeGatewayCoordinatorInterruptV2::None as u8,
-            interrupt as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let mut state = self.lock_state_v2();
+        if state.interrupt == RuntimeGatewayCoordinatorInterruptV2::None {
+            state.interrupt = interrupt;
+        }
     }
 
     fn trip_shutdown(&self) {
-        self.state.store(
-            RuntimeGatewayCoordinatorInterruptV2::Shutdown as u8,
-            Ordering::Release,
-        );
+        self.lock_state_v2().interrupt = RuntimeGatewayCoordinatorInterruptV2::Shutdown;
+    }
+
+    fn lock_state_v2(&self) -> std::sync::MutexGuard<'_, RuntimeGatewayCoordinatorArbiterStateV2> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -164,11 +286,11 @@ struct RuntimeGatewayCoordinatorSnapshotObserverV2 {
 impl RuntimeGatewayCoordinatorSnapshotObserverV2 {
     fn effective_snapshot(&self) -> RuntimeGatewayClosedSnapshotV2 {
         let mirror = self.snapshot.borrow();
-        let interrupt = self.interrupt.current();
+        let (interrupt, generation) = self.interrupt.current_state_v2();
         if interrupt == mirror.applied_interrupt {
             mirror.snapshot.clone()
         } else {
-            project_runtime_gateway_interrupt_v2(&mirror.snapshot, interrupt)
+            project_runtime_gateway_interrupt_v2(&mirror.snapshot, interrupt, generation)
         }
     }
 }
@@ -259,9 +381,12 @@ impl RuntimeGatewayCoordinatorOwnerV2 {
     }
 
     fn publish_snapshot(&self) {
+        let lifecycle_snapshot = self.lifecycle.snapshot();
+        self.interrupt
+            .synchronize_generation_v2(lifecycle_snapshot.generation());
         self.snapshot
             .send_replace(RuntimeGatewayCoordinatorMirrorV2 {
-                snapshot: self.lifecycle.snapshot(),
+                snapshot: lifecycle_snapshot,
                 applied_interrupt: self.applied_interrupt,
             });
     }
@@ -270,16 +395,12 @@ impl RuntimeGatewayCoordinatorOwnerV2 {
 fn project_runtime_gateway_interrupt_v2(
     snapshot: &RuntimeGatewayClosedSnapshotV2,
     interrupt: RuntimeGatewayCoordinatorInterruptV2,
+    current: RuntimeGatewayCoordinatorGenerationV2,
 ) -> RuntimeGatewayClosedSnapshotV2 {
     if matches!(snapshot, RuntimeGatewayClosedSnapshotV2::Shutdown { .. }) {
         return snapshot.clone();
     }
-    let current = snapshot.generation();
-    let successor = current
-        .get()
-        .checked_add(1)
-        .and_then(NonZeroU64::new)
-        .map(RuntimeGatewayCoordinatorGenerationV2::new);
+    let successor = runtime_gateway_successor_generation_v2(current);
     match (interrupt, successor) {
         (RuntimeGatewayCoordinatorInterruptV2::None, _) => snapshot.clone(),
         (RuntimeGatewayCoordinatorInterruptV2::Shutdown, Some(generation)) => {
@@ -298,6 +419,17 @@ fn project_runtime_gateway_interrupt_v2(
                 .unwrap_or(RuntimeGatewayEmergencyCauseV2::ProtocolViolation),
         },
     }
+}
+
+fn runtime_gateway_successor_generation_v2(
+    current: RuntimeGatewayCoordinatorGenerationV2,
+) -> Option<RuntimeGatewayCoordinatorGenerationV2> {
+    current
+        .get()
+        .checked_add(1)
+        .filter(|value| *value <= i64::MAX as u64)
+        .and_then(NonZeroU64::new)
+        .map(RuntimeGatewayCoordinatorGenerationV2::new)
 }
 
 pub(crate) fn runtime_gateway_shard_id_v1() -> GatewayShardIdV1 {
@@ -477,6 +609,7 @@ pub(crate) struct RuntimeRecoveryPendingGatewayBindingV2 {
     process_instance_id: ProcessInstanceId,
     observer: GatewayConnectionObserverV3,
     admission_snapshot: watch::Receiver<GatewayAdmissionSnapshotV3>,
+    discord_reservation: watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
     coordinator: Option<RuntimeGatewayCoordinatorOwnerV2>,
     owner_invalidated: Arc<AtomicBool>,
     permit: Option<RuntimeClosedDrainRecoveryPermitV2>,
@@ -521,9 +654,9 @@ pub(crate) enum RuntimeGatewayProductionInterruptV2 {
 
 pub(crate) struct RuntimeGatewayProductionCoordinatorV2 {
     process_instance_id: ProcessInstanceId,
-    coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
     observer: GatewayConnectionObserverV3,
     admission_snapshot: watch::Receiver<GatewayAdmissionSnapshotV3>,
+    discord_reservation: watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
     fixed_point_admission_snapshot: GatewayAdmissionSnapshotV3,
     interrupt: RuntimeGatewayCoordinatorInterruptHandleV2,
     applied_interrupt: RuntimeGatewayCoordinatorInterruptV2,
@@ -532,7 +665,17 @@ pub(crate) struct RuntimeGatewayProductionCoordinatorV2 {
 
 impl RuntimeGatewayProductionCoordinatorV2 {
     pub(crate) fn coordinator_generation_v2(&self) -> RuntimeGatewayCoordinatorGenerationV2 {
-        self.coordinator_generation
+        self.interrupt.current_generation_v2()
+    }
+
+    pub(crate) fn recovery_resume_successor_generation_v2(
+        &self,
+        expected_predecessor: RuntimeGatewayCoordinatorGenerationV2,
+    ) -> Result<RuntimeGatewayCoordinatorGenerationV2, RuntimeGatewayReadyObservationErrorV1> {
+        self.require_resume_observation_generation_v2(expected_predecessor)?;
+        self.interrupt
+            .production_successor_generation_v2(expected_predecessor)
+            .ok_or(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceOutOfRange)
     }
 
     pub(crate) fn current_interrupt_v2(&self) -> Option<RuntimeGatewayProductionInterruptV2> {
@@ -554,7 +697,132 @@ impl RuntimeGatewayProductionCoordinatorV2 {
 
     pub(crate) fn closed_snapshot_v2(&self) -> RuntimeGatewayClosedSnapshotV2 {
         let mirror = self.snapshot.borrow();
-        project_runtime_gateway_interrupt_v2(&mirror.snapshot, self.interrupt.current())
+        let (interrupt, generation) = self.interrupt.current_state_v2();
+        project_runtime_gateway_interrupt_v2(&mirror.snapshot, interrupt, generation)
+    }
+
+    pub(crate) fn observe_exact_pause_reservation_v2(
+        &self,
+        expected_generation: RuntimeGatewayCoordinatorGenerationV2,
+    ) -> Result<RuntimeDiscordPauseReservationIdentityV2, RuntimeGatewayReadyObservationErrorV1>
+    {
+        self.require_resume_observation_generation_v2(expected_generation)?;
+        let first_admission = self.observer.current_admission_snapshot();
+        let first_watch = *self.admission_snapshot.borrow();
+        let first_reservation = *self.discord_reservation.borrow();
+        if first_admission != first_watch || first_reservation.admission() != first_admission {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        let identity = first_reservation
+            .reservation()
+            .ok_or(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot)?;
+        if identity.epoch()
+            != first_admission
+                .connection()
+                .current_epoch()
+                .ok_or(RuntimeGatewayReadyObservationErrorV1::NotConnected)?
+            || identity.admission_revision() != first_admission.admission_revision()
+            || identity.transition_sequence() != first_admission.transition_sequence()
+        {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        let (_, epoch) = map_paused_connected_observation_v2(
+            &self.process_instance_id,
+            expected_generation,
+            first_admission,
+        )?;
+        require_healthy_paused_observer_v2(&self.observer, epoch)?;
+        self.require_resume_observation_generation_v2(expected_generation)?;
+        let second_admission = self.observer.current_admission_snapshot();
+        let second_watch = *self.admission_snapshot.borrow();
+        let second_reservation = *self.discord_reservation.borrow();
+        if first_admission != second_admission
+            || first_watch != second_watch
+            || first_reservation != second_reservation
+        {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        self.require_resume_observation_generation_v2(expected_generation)?;
+        Ok(identity)
+    }
+
+    pub(crate) fn observe_exact_current_ready_attestation_v2(
+        &self,
+        expected_generation: RuntimeGatewayCoordinatorGenerationV2,
+    ) -> Result<RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyObservationErrorV1> {
+        self.require_resume_observation_generation_v2(expected_generation)?;
+        let first_admission = self.observer.current_admission_snapshot();
+        let first_watch = *self.admission_snapshot.borrow();
+        let first_reservation = *self.discord_reservation.borrow();
+        if first_admission != first_watch
+            || first_reservation.admission() != first_admission
+            || first_reservation.reservation().is_some()
+        {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        let attestation =
+            observe_current_ready_attestation_v2(&self.process_instance_id, &self.observer)?;
+        self.require_resume_observation_generation_v2(expected_generation)?;
+        let second_admission = self.observer.current_admission_snapshot();
+        let second_watch = *self.admission_snapshot.borrow();
+        let second_reservation = *self.discord_reservation.borrow();
+        if first_admission != second_admission
+            || first_watch != second_watch
+            || first_reservation != second_reservation
+        {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        if attestation.connection_epoch.get()
+            != first_admission
+                .connection()
+                .current_epoch()
+                .ok_or(RuntimeGatewayReadyObservationErrorV1::NotConnected)?
+                .get()
+            || attestation.admission_revision.get() != first_admission.admission_revision().get()
+            || attestation.connected_event_sequence.get()
+                != first_admission
+                    .connected_event_sequence()
+                    .ok_or(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceSequenceZero)?
+                    .get()
+            || attestation.resume_sequence.get()
+                != first_admission
+                    .resume_sequence()
+                    .ok_or(
+                        RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceNotExplicitlyResumed,
+                    )?
+                    .get()
+        {
+            return Err(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceNotCurrent);
+        }
+        self.require_resume_observation_generation_v2(expected_generation)?;
+        Ok(attestation)
+    }
+
+    fn require_resume_observation_generation_v2(
+        &self,
+        expected_generation: RuntimeGatewayCoordinatorGenerationV2,
+    ) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+        if self.coordinator_generation_v2() != expected_generation {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        match (self.applied_interrupt, self.interrupt.current()) {
+            (
+                RuntimeGatewayCoordinatorInterruptV2::None,
+                RuntimeGatewayCoordinatorInterruptV2::None,
+            ) => {}
+            (_, RuntimeGatewayCoordinatorInterruptV2::Shutdown) => {
+                return Err(RuntimeGatewayReadyObservationErrorV1::Stopped);
+            }
+            _ => return Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain),
+        }
+        if matches!(
+            self.closed_snapshot_v2(),
+            RuntimeGatewayClosedSnapshotV2::Emergency { .. }
+                | RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
+        ) {
+            return Err(RuntimeGatewayReadyObservationErrorV1::Stopped);
+        }
+        Ok(())
     }
 
     pub(crate) fn observe_exact_admission_snapshot_v2(
@@ -566,7 +834,7 @@ impl RuntimeGatewayProductionCoordinatorV2 {
         }
         let (_, connection_epoch) = map_paused_connected_observation_v2(
             &self.process_instance_id,
-            self.coordinator_generation,
+            self.coordinator_generation_v2(),
             first,
         )?;
         require_healthy_paused_observer_v2(&self.observer, connection_epoch)?;
@@ -1034,6 +1302,7 @@ impl RuntimeGatewayBootstrapV1 {
                 reserved_resume_receiver,
                 lifecycle_drained_sender,
                 discord_reservation_publisher,
+                self.coordinator_snapshot.interrupt.clone(),
             )),
             reserved_resume,
         );
@@ -1356,6 +1625,7 @@ async fn run_runtime_discord_control_v1(
     mut reserved_resume: mpsc::Receiver<RuntimeDiscordReservedResumeRequestV2>,
     lifecycle_drained: watch::Sender<u64>,
     discord_reservation: watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>,
+    coordinator: RuntimeGatewayCoordinatorInterruptHandleV2,
 ) {
     let mut lifecycle_sequence = 1u64;
     let mut pause_token: Option<GatewayPauseTokenV3> = None;
@@ -1425,7 +1695,10 @@ async fn run_runtime_discord_control_v1(
                 let resumed = resume_reserved_discord_admission_v2(
                     &mut control,
                     &mut pause_token,
+                    request.coordinator_generation,
                     request.expected,
+                    &coordinator,
+                    &request.observation,
                     &lifecycle_drained,
                     &mut lifecycle_sequence,
                     &discord_reservation,
@@ -1493,29 +1766,51 @@ async fn run_runtime_discord_control_v1(
 async fn resume_reserved_discord_admission_v2(
     control: &mut SharedGatewayControlV3,
     pause_token: &mut Option<GatewayPauseTokenV3>,
+    coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
     expected: RuntimeDiscordPauseReservationIdentityV2,
+    coordinator: &RuntimeGatewayCoordinatorInterruptHandleV2,
+    observation: &watch::Sender<Option<RuntimeDiscordRecoveryResumeEvidenceV2>>,
     lifecycle_drained: &watch::Sender<u64>,
     lifecycle_sequence: &mut u64,
     discord_reservation: &watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>,
-) -> bool {
-    let Some(token) = pause_token.take() else {
-        return false;
+) -> RuntimeDiscordRecoveryResumeControlOutcomeV2 {
+    let Some(token) = pause_token.as_ref() else {
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied;
     };
     if RuntimeDiscordPauseReservationIdentityV2::from_token(
         &token,
         control.current_admission_snapshot(),
     ) != Some(expected)
     {
-        return false;
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied;
+    }
+    if !coordinator.claim_recovery_resume_v2(coordinator_generation) {
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied;
+    }
+    let Some(token) = pause_token.take() else {
+        coordinator.cancel_recovery_resume_claim_v2(coordinator_generation);
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied;
+    };
+    match timeout(
+        DISCORD_CONTROL_OPERATION_TIMEOUT,
+        control.resume_admission(&token),
+    )
+    .await
+    {
+        Ok(Ok(GatewayCommandAckV3::AdmissionResumed { epoch })) if epoch == expected.epoch() => {}
+        Ok(Err(_)) | Ok(Ok(_)) => {
+            coordinator.cancel_recovery_resume_claim_v2(coordinator_generation);
+            return RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied;
+        }
+        Err(_) => return RuntimeDiscordRecoveryResumeControlOutcomeV2::Indeterminate,
+    }
+    if coordinator
+        .complete_recovery_resume_v2(coordinator_generation)
+        .is_none()
+    {
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::Indeterminate;
     }
     if !matches!(
-        timeout(
-            DISCORD_CONTROL_OPERATION_TIMEOUT,
-            control.resume_admission(&token),
-        )
-        .await,
-        Ok(Ok(GatewayCommandAckV3::AdmissionResumed { epoch })) if epoch == expected.epoch()
-    ) || !matches!(
         timeout(
             DISCORD_CONTROL_OPERATION_TIMEOUT,
             control.next_lifecycle(),
@@ -1523,12 +1818,48 @@ async fn resume_reserved_discord_admission_v2(
         .await,
         Ok(Some(GatewayLifecycleEventV3::AdmissionResumed { epoch })) if epoch == expected.epoch()
     ) {
-        return false;
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::Indeterminate;
     }
-    discord_reservation.send_replace(RuntimeDiscordAdmissionReservationSnapshotV2::unreserved(
-        control.current_admission_snapshot(),
-    ));
-    publish_runtime_lifecycle_drain_v1(lifecycle_drained, lifecycle_sequence)
+    let first_admission = control.current_admission_snapshot();
+    let Ok(ready) = control.issue_ready_lease(expected.epoch()) else {
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::Indeterminate;
+    };
+    if !control.ready_lease_is_current(&ready) {
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::Indeterminate;
+    }
+    let second_admission = control.current_admission_snapshot();
+    if first_admission != second_admission || !control.ready_lease_is_current(&ready) {
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::Indeterminate;
+    }
+    let Some(evidence) = RuntimeDiscordRecoveryResumeEvidenceV2::from_exact_snapshot_v2(
+        coordinator_generation,
+        expected,
+        first_admission,
+        ready,
+    ) else {
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::Indeterminate;
+    };
+    let reservation = RuntimeDiscordAdmissionReservationSnapshotV2::unreserved(first_admission);
+    discord_reservation.send_replace(reservation);
+    if *discord_reservation.borrow() != reservation
+        || control.current_admission_snapshot() != first_admission
+        || !control.ready_lease_is_current(&ready)
+        || !publish_runtime_lifecycle_drain_v1(lifecycle_drained, lifecycle_sequence)
+        || *discord_reservation.borrow() != reservation
+        || control.current_admission_snapshot() != first_admission
+        || !control.ready_lease_is_current(&ready)
+    {
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::Indeterminate;
+    }
+    observation.send_replace(Some(evidence));
+    if *observation.borrow() != Some(evidence)
+        || *discord_reservation.borrow() != reservation
+        || control.current_admission_snapshot() != first_admission
+        || !control.ready_lease_is_current(&ready)
+    {
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::Indeterminate;
+    }
+    RuntimeDiscordRecoveryResumeControlOutcomeV2::Applied(evidence)
 }
 
 #[cfg(test)]
@@ -1677,6 +2008,7 @@ impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
             process_instance_id: self.gateway.process_instance_id.clone(),
             observer: self.gateway.connection_observer.clone(),
             admission_snapshot: self.gateway.admission_snapshot.clone(),
+            discord_reservation: self.gateway.discord_reservation.clone(),
             coordinator: Some(coordinator),
             owner_invalidated: self.owner_invalidated.clone(),
             permit: Some(permit),
@@ -2011,10 +2343,10 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
                 ),
             });
         }
-        let coordinator_generation = self.permit_v2().originating_emergency_generation();
+        let paused_gateway_generation = self.permit_v2().originating_emergency_generation();
         let (paused_gateway, connection_epoch) = match map_paused_connected_observation_v2(
             &self.process_instance_id,
-            coordinator_generation,
+            paused_gateway_generation,
             fixed_point_admission_snapshot,
         ) {
             Ok(observation) => observation,
@@ -2070,6 +2402,17 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
             .permit
             .take()
             .expect("runtime fixed-point recovery permit");
+        if coordinator.interrupt.current_generation_v2() != permit.coordinator_generation() {
+            self.permit = Some(permit);
+            self.coordinator = Some(coordinator);
+            return Err(RuntimeGatewayFixedPointAcceptanceFailureV2 {
+                binding: Box::new(self),
+                proof: Box::new(proof),
+                error: RuntimeGatewayFixedPointAcceptanceErrorV2::Gateway(
+                    RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+                ),
+            });
+        }
         if let Err(error) = coordinator
             .lifecycle()
             .validate_startup_recovery_fixed_point(&permit, &proof)
@@ -2084,6 +2427,21 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
                 ),
             });
         }
+        let production_generation = permit.coordinator_generation();
+        if !coordinator
+            .interrupt
+            .activate_production_generation_v2(production_generation)
+        {
+            self.permit = Some(permit);
+            self.coordinator = Some(coordinator);
+            return Err(RuntimeGatewayFixedPointAcceptanceFailureV2 {
+                binding: Box::new(self),
+                proof: Box::new(proof),
+                error: RuntimeGatewayFixedPointAcceptanceErrorV2::Gateway(
+                    RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+                ),
+            });
+        }
         let RuntimeGatewayCoordinatorOwnerV2 {
             lifecycle,
             interrupt,
@@ -2094,9 +2452,9 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
             Ok(state) => Ok((
                 RuntimeGatewayProductionCoordinatorV2 {
                     process_instance_id: self.process_instance_id.clone(),
-                    coordinator_generation,
                     observer: self.observer.clone(),
                     admission_snapshot: self.admission_snapshot.clone(),
+                    discord_reservation: self.discord_reservation.clone(),
                     fixed_point_admission_snapshot,
                     interrupt,
                     applied_interrupt,
@@ -2105,6 +2463,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
                 state,
             )),
             Err(failure) => {
+                interrupt.deactivate_production_generation_v2(production_generation);
                 let error = failure.error();
                 let (lifecycle, permit, proof) = failure.into_parts();
                 self.permit = Some(permit);
@@ -2301,6 +2660,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
             process_instance_id: self.process_instance_id.clone(),
             observer: self.observer.clone(),
             admission_snapshot: self.admission_snapshot.clone(),
+            discord_reservation: self.discord_reservation.clone(),
             coordinator: None,
             owner_invalidated: self.owner_invalidated.clone(),
             permit: Some(previous),
@@ -2598,49 +2958,59 @@ impl SharedGatewayControlAdapterV2 {
     fn observe_current_ready_attestation(
         &self,
     ) -> Result<RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyObservationErrorV1> {
-        let snapshot = self.connection_observer.current_admission_snapshot();
-        let epoch = match snapshot.connection() {
-            GatewayConnectionStateV3::Connected { epoch, .. } => epoch,
-            GatewayConnectionStateV3::Starting | GatewayConnectionStateV3::Disconnected { .. } => {
-                return Err(RuntimeGatewayReadyObservationErrorV1::NotConnected)
-            }
-            GatewayConnectionStateV3::Paused { .. } => {
-                return Err(RuntimeGatewayReadyObservationErrorV1::AdmissionPaused)
-            }
-            GatewayConnectionStateV3::Draining { .. } => {
-                return Err(RuntimeGatewayReadyObservationErrorV1::Draining)
-            }
-            GatewayConnectionStateV3::Stopped { .. } => {
-                return Err(RuntimeGatewayReadyObservationErrorV1::Stopped)
-            }
-        };
-        let lease = self
-            .connection_observer
-            .issue_ready_lease(epoch)
-            .map_err(map_transition_error)?;
-        if !self.connection_observer.ready_lease_is_current(&lease) {
-            return Err(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceNotCurrent);
-        }
-        if !lease.was_explicitly_resumed() {
-            return Err(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceNotExplicitlyResumed);
-        }
-        let connection_epoch = bounded_non_zero(lease.epoch().get())?;
-        let admission_revision = bounded_non_zero(lease.admission_revision().get())?;
-        let connected_event_sequence = bounded_sequence(lease.connected_event_sequence().get())?;
-        let resume_sequence = bounded_sequence(lease.resume_sequence().get())?;
-        let kind = match lease.kind() {
-            GatewayReadyKindV3::Ready => RuntimeGatewayReadyKindV2::Ready,
-            GatewayReadyKindV3::Resumed => RuntimeGatewayReadyKindV2::Resumed,
-        };
-        Ok(RuntimeGatewayReadyAttestationV2 {
-            process_instance_id: self.process_instance_id.clone(),
-            connection_epoch,
-            kind,
-            admission_revision,
-            connected_event_sequence,
-            resume_sequence,
-        })
+        observe_current_ready_attestation_v2(&self.process_instance_id, &self.connection_observer)
     }
+}
+
+fn observe_current_ready_attestation_v2(
+    process_instance_id: &ProcessInstanceId,
+    observer: &GatewayConnectionObserverV3,
+) -> Result<RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyObservationErrorV1> {
+    let first_snapshot = observer.current_admission_snapshot();
+    let epoch = match first_snapshot.connection() {
+        GatewayConnectionStateV3::Connected { epoch, .. } => epoch,
+        GatewayConnectionStateV3::Starting | GatewayConnectionStateV3::Disconnected { .. } => {
+            return Err(RuntimeGatewayReadyObservationErrorV1::NotConnected)
+        }
+        GatewayConnectionStateV3::Paused { .. } => {
+            return Err(RuntimeGatewayReadyObservationErrorV1::AdmissionPaused)
+        }
+        GatewayConnectionStateV3::Draining { .. } => {
+            return Err(RuntimeGatewayReadyObservationErrorV1::Draining)
+        }
+        GatewayConnectionStateV3::Stopped { .. } => {
+            return Err(RuntimeGatewayReadyObservationErrorV1::Stopped)
+        }
+    };
+    let lease = observer
+        .issue_ready_lease(epoch)
+        .map_err(map_transition_error)?;
+    if !observer.ready_lease_is_current(&lease) {
+        return Err(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceNotCurrent);
+    }
+    if !lease.was_explicitly_resumed() {
+        return Err(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceNotExplicitlyResumed);
+    }
+    let second_snapshot = observer.current_admission_snapshot();
+    if first_snapshot != second_snapshot || !observer.ready_lease_is_current(&lease) {
+        return Err(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceNotCurrent);
+    }
+    let connection_epoch = bounded_non_zero(lease.epoch().get())?;
+    let admission_revision = bounded_non_zero(lease.admission_revision().get())?;
+    let connected_event_sequence = bounded_sequence(lease.connected_event_sequence().get())?;
+    let resume_sequence = bounded_sequence(lease.resume_sequence().get())?;
+    let kind = match lease.kind() {
+        GatewayReadyKindV3::Ready => RuntimeGatewayReadyKindV2::Ready,
+        GatewayReadyKindV3::Resumed => RuntimeGatewayReadyKindV2::Resumed,
+    };
+    Ok(RuntimeGatewayReadyAttestationV2 {
+        process_instance_id: process_instance_id.clone(),
+        connection_epoch,
+        kind,
+        admission_revision,
+        connected_event_sequence,
+        resume_sequence,
+    })
 }
 
 fn map_paused_connected_observation_v2(
@@ -2796,12 +3166,13 @@ mod tests {
         shared_gateway_control_channel_with_policy_and_invalidator_v3, GatewayAdmissionPolicyV3,
         GatewayCommandAckV3, GatewayControlConfigV3, GatewayControlErrorV3,
         GatewayControlTransitionErrorV3, GatewayDisconnectKindV3, GatewayDrainCauseV3,
-        GatewayInvalidationSignalV3, GatewayPauseTokenV3, GatewayReadyKindV3,
-        GatewayRuntimeCommandOutcomeV3, GatewaySynchronousInvalidatorV3,
+        GatewayInvalidationSignalV3, GatewayLifecycleEventV3, GatewayPauseTokenV3,
+        GatewayReadyKindV3, GatewayRuntimeCommandOutcomeV3, GatewaySynchronousInvalidatorV3,
     };
     use automation_runtime_convergence::ProcessInstanceId;
     use automation_runtime_worker::{
-        RuntimeGatewayClosedSnapshotV2, RuntimeGatewayEmergencyCauseV2,
+        RuntimeClosedRecoveryAuthorityRevisionV2, RuntimeGatewayClosedSnapshotV2,
+        RuntimeGatewayCoordinatorGenerationV2, RuntimeGatewayEmergencyCauseV2,
     };
     use tokio::sync::watch;
 
@@ -2809,10 +3180,12 @@ mod tests {
     use crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerEmergencyInvalidatorV1;
 
     use super::{
-        compose_with_control_config, RuntimeGatewayBootstrapV1, RuntimeGatewayCoordinatorOwnerV2,
+        compose_with_control_config, resume_reserved_discord_admission_v2,
+        RuntimeGatewayBootstrapV1, RuntimeGatewayCoordinatorInterruptV2,
+        RuntimeGatewayCoordinatorMirrorV2, RuntimeGatewayCoordinatorOwnerV2,
         RuntimeGatewayInvalidationBridgeV2, RuntimeGatewayOwnerInvalidationBridgeV2,
-        RuntimeGatewayReadyObservationErrorV1, SharedGatewayControlAdapterV2,
-        SharedGatewayRuntimeHalfV3,
+        RuntimeGatewayProductionCoordinatorV2, RuntimeGatewayReadyObservationErrorV1,
+        SharedGatewayControlAdapterV2, SharedGatewayRuntimeHalfV3,
     };
 
     struct TestPauseTokenV1(GatewayPauseTokenV3);
@@ -2830,6 +3203,10 @@ mod tests {
             ProcessInstanceId::parse("runtime-process:1").unwrap(),
             GatewayControlConfigV3::default(),
         )
+    }
+
+    fn coordinator_generation(value: u64) -> RuntimeGatewayCoordinatorGenerationV2 {
+        RuntimeGatewayCoordinatorGenerationV2::new(NonZeroU64::new(value).unwrap())
     }
 
     fn bootstrap_with_panicking_invalidator() -> RuntimeGatewayBootstrapV1 {
@@ -2907,6 +3284,44 @@ mod tests {
         }
     }
 
+    async fn connect_and_pause_with_drained_lifecycle(
+        bootstrap: &mut RuntimeGatewayBootstrapV1,
+    ) -> TestPauseTokenV1 {
+        assert_eq!(
+            bootstrap
+                .adapter
+                .control
+                .as_mut()
+                .expect("gateway control half")
+                .next_lifecycle()
+                .await,
+            Some(GatewayLifecycleEventV3::Starting)
+        );
+        connect(bootstrap, GatewayReadyKindV3::Ready);
+        assert!(matches!(
+            bootstrap
+                .adapter
+                .control
+                .as_mut()
+                .expect("gateway control half")
+                .next_lifecycle()
+                .await,
+            Some(GatewayLifecycleEventV3::Connected { paused: true, .. })
+        ));
+        let token = pause(bootstrap).await;
+        assert!(matches!(
+            bootstrap
+                .adapter
+                .control
+                .as_mut()
+                .expect("gateway control half")
+                .next_lifecycle()
+                .await,
+            Some(GatewayLifecycleEventV3::Paused { .. })
+        ));
+        token
+    }
+
     async fn resume(
         bootstrap: &mut RuntimeGatewayBootstrapV1,
         token: &TestPauseTokenV1,
@@ -2949,6 +3364,221 @@ mod tests {
             ._inner
             .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_linearized_before_resume_claim_preserves_the_pause_token() {
+        let mut bootstrap = bootstrap();
+        let token = connect_and_pause_with_drained_lifecycle(&mut bootstrap).await;
+        let paused_admission = bootstrap
+            .adapter
+            .connection_observer
+            .current_admission_snapshot();
+        let expected =
+            crate::discord_lifecycle::RuntimeDiscordPauseReservationIdentityV2::from_token(
+                &token.0,
+                paused_admission,
+            )
+            .unwrap();
+        let mut pause_token = Some(token.0);
+        let generation = coordinator_generation(2);
+        let coordinator = bootstrap.coordinator_snapshot.interrupt.clone();
+        coordinator.synchronize_generation_v2(generation);
+        let shutdown = bootstrap.shutdown_handle_v1().enter_shutdown();
+        assert!(matches!(
+            shutdown,
+            RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
+        ));
+        let (observation, _) = watch::channel(None);
+        let (lifecycle_drained, _) = watch::channel(1);
+        let mut lifecycle_sequence = 1;
+        let reservation = RuntimeDiscordAdmissionReservationSnapshotV2::reserved(
+            paused_admission,
+            pause_token.as_ref().unwrap(),
+        )
+        .unwrap();
+        let (discord_reservation, _) = watch::channel(reservation);
+        let outcome = resume_reserved_discord_admission_v2(
+            bootstrap
+                .adapter
+                .control
+                .as_mut()
+                .expect("gateway control half"),
+            &mut pause_token,
+            generation,
+            expected,
+            &coordinator,
+            &observation,
+            &lifecycle_drained,
+            &mut lifecycle_sequence,
+            &discord_reservation,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            crate::discord::RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied
+        );
+        assert!(pause_token.is_some());
+        assert_eq!(
+            bootstrap
+                .adapter
+                .connection_observer
+                .current_admission_snapshot(),
+            paused_admission
+        );
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            bootstrap
+                ._runtime
+                .as_mut()
+                .expect("gateway runtime half")
+                ._inner
+                .process_next_command(),
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_resume_advances_one_exact_generation_before_ready_observation() {
+        let mut bootstrap = bootstrap();
+        let token = connect_and_pause_with_drained_lifecycle(&mut bootstrap).await;
+        let paused_admission = bootstrap
+            .adapter
+            .connection_observer
+            .current_admission_snapshot();
+        let expected =
+            crate::discord_lifecycle::RuntimeDiscordPauseReservationIdentityV2::from_token(
+                &token.0,
+                paused_admission,
+            )
+            .unwrap();
+        let mut pause_token = Some(token.0);
+        let predecessor = coordinator_generation(2);
+        let successor = coordinator_generation(3);
+        let coordinator = bootstrap.coordinator_snapshot.interrupt.clone();
+        coordinator.synchronize_generation_v2(predecessor);
+        assert!(coordinator.activate_production_generation_v2(predecessor));
+        let reservation = RuntimeDiscordAdmissionReservationSnapshotV2::reserved(
+            paused_admission,
+            pause_token.as_ref().unwrap(),
+        )
+        .unwrap();
+        let (discord_reservation, discord_reservation_observer) = watch::channel(reservation);
+        let (snapshot, _) = watch::channel(RuntimeGatewayCoordinatorMirrorV2 {
+            snapshot: RuntimeGatewayClosedSnapshotV2::RecoveryPending {
+                generation: predecessor,
+                recovery_id: automation_runtime_controller::RuntimeRecoveryIdV2::parse(
+                    "0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+                authority_revision: RuntimeClosedRecoveryAuthorityRevisionV2::FIRST,
+            },
+            applied_interrupt: RuntimeGatewayCoordinatorInterruptV2::None,
+        });
+        let production = RuntimeGatewayProductionCoordinatorV2 {
+            process_instance_id: ProcessInstanceId::parse("runtime-process:1").unwrap(),
+            observer: bootstrap.adapter.connection_observer.clone(),
+            admission_snapshot: bootstrap.adapter.admission_snapshot.clone(),
+            discord_reservation: discord_reservation_observer,
+            fixed_point_admission_snapshot: paused_admission,
+            interrupt: coordinator.clone(),
+            applied_interrupt: RuntimeGatewayCoordinatorInterruptV2::None,
+            snapshot,
+        };
+        assert_eq!(
+            production
+                .recovery_resume_successor_generation_v2(predecessor)
+                .unwrap(),
+            successor
+        );
+        let (observation, _) = watch::channel(None);
+        let (lifecycle_drained, _) = watch::channel(1);
+        let mut lifecycle_sequence = 1;
+        let (outcome, runtime_outcome) = tokio::join!(
+            resume_reserved_discord_admission_v2(
+                bootstrap
+                    .adapter
+                    .control
+                    .as_mut()
+                    .expect("gateway control half"),
+                &mut pause_token,
+                predecessor,
+                expected,
+                &coordinator,
+                &observation,
+                &lifecycle_drained,
+                &mut lifecycle_sequence,
+                &discord_reservation,
+            ),
+            bootstrap
+                ._runtime
+                .as_mut()
+                .expect("gateway runtime half")
+                ._inner
+                .process_next_command(),
+        );
+        let crate::discord::RuntimeDiscordRecoveryResumeControlOutcomeV2::Applied(evidence) =
+            outcome
+        else {
+            panic!("recovery resume must be applied")
+        };
+        assert_eq!(evidence.coordinator_generation_v2(), predecessor);
+        assert!(matches!(
+            runtime_outcome,
+            GatewayRuntimeCommandOutcomeV3::Applied(GatewayCommandAckV3::AdmissionResumed { .. })
+        ));
+        assert_eq!(coordinator.current_generation_v2(), successor);
+        assert!(pause_token.is_none());
+        assert_eq!(
+            production.observe_exact_current_ready_attestation_v2(predecessor),
+            Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot)
+        );
+        let ready = production
+            .observe_exact_current_ready_attestation_v2(successor)
+            .unwrap();
+        assert_eq!(ready.connection_epoch.get(), expected.epoch().get());
+        assert!(ready.was_explicitly_resumed());
+    }
+
+    #[test]
+    fn resume_claim_linearized_before_shutdown_can_complete_its_exact_successor() {
+        let (_, coordinator, _) = RuntimeGatewayCoordinatorOwnerV2::new();
+        let predecessor = coordinator_generation(2);
+        let successor = coordinator_generation(3);
+        coordinator.synchronize_generation_v2(predecessor);
+        assert!(coordinator.activate_production_generation_v2(predecessor));
+        assert!(coordinator.claim_recovery_resume_v2(predecessor));
+        coordinator.trip_shutdown();
+        assert_eq!(
+            coordinator.complete_recovery_resume_v2(predecessor),
+            Some(successor)
+        );
+        assert_eq!(coordinator.current_generation_v2(), successor);
+        assert_eq!(
+            coordinator.current(),
+            RuntimeGatewayCoordinatorInterruptV2::Shutdown
+        );
+    }
+
+    #[test]
+    fn late_snapshot_publication_never_regresses_a_resumed_successor() {
+        let (_, coordinator, _) = RuntimeGatewayCoordinatorOwnerV2::new();
+        let predecessor = coordinator_generation(2);
+        let successor = coordinator_generation(3);
+        coordinator.synchronize_generation_v2(predecessor);
+        assert!(coordinator.activate_production_generation_v2(predecessor));
+        assert!(coordinator.claim_recovery_resume_v2(predecessor));
+        assert_eq!(
+            coordinator.complete_recovery_resume_v2(predecessor),
+            Some(successor)
+        );
+        coordinator.synchronize_generation_v2(predecessor);
+        assert_eq!(coordinator.current_generation_v2(), successor);
+        assert_eq!(
+            coordinator.current(),
+            RuntimeGatewayCoordinatorInterruptV2::ProtocolViolation
+        );
     }
 
     #[test]
