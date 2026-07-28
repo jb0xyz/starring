@@ -1,4 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -93,6 +94,13 @@ impl RuntimeGatewayOwnerStartupCleanupCapV1 {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .map(TokioInstant::from_std)
             .map_or(candidate, |deadline| candidate.min(deadline))
+    }
+
+    fn clear(&self) {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
@@ -325,6 +333,7 @@ struct RuntimeGatewayOwnerSupervisorHandleV1 {
     terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
     invalidation: Arc<RuntimeGatewayOwnerInvalidationLatchV1>,
     gateway_lifetime: Arc<AtomicBool>,
+    process_generation: Arc<AtomicU64>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -413,6 +422,55 @@ impl RuntimeGatewayOwnerSupervisorHandleV1 {
             }
             Ok(Err(error)) => Err(error),
             Err(_) => Err(wait_for_admission_frozen_handoff_terminal_v2(terminal).await),
+        }
+    }
+
+    async fn activate_process_ownership_v2(
+        &self,
+        expected_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+        process_generation: NonZeroU64,
+    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerProcessActivationErrorV2>
+    {
+        let (response, acknowledgement) = oneshot::channel();
+        if self
+            .supervisor_commands
+            .send(
+                RuntimeGatewayOwnerSupervisorCommandV1::ActivateProcessOwnership {
+                    expected_receipt,
+                    process_generation,
+                    response,
+                },
+            )
+            .await
+            .is_err()
+        {
+            return Err(RuntimeGatewayOwnerProcessActivationErrorV2::SupervisorUnavailable);
+        }
+        self.accept_process_activation_acknowledgement_v2(process_generation, acknowledgement)
+            .await
+    }
+
+    async fn accept_process_activation_acknowledgement_v2(
+        &self,
+        process_generation: NonZeroU64,
+        acknowledgement: oneshot::Receiver<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerProcessActivationErrorV2,
+            >,
+        >,
+    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerProcessActivationErrorV2>
+    {
+        match acknowledgement.await {
+            Ok(result) => result,
+            Err(_)
+                if self.process_generation.load(Ordering::Acquire) == process_generation.get() =>
+            {
+                self.observe_current_gateway_owner_v1().await.map_err(|_| {
+                    RuntimeGatewayOwnerProcessActivationErrorV2::ObservationUnavailable
+                })
+            }
+            Err(_) => Err(RuntimeGatewayOwnerProcessActivationErrorV2::SupervisorUnavailable),
         }
     }
 
@@ -1020,6 +1078,20 @@ pub(crate) enum RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2 {
     SupervisorUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RuntimeGatewayOwnerProcessActivationErrorV2 {
+    #[error("runtime gateway owner process activation deadline elapsed")]
+    DeadlineElapsed,
+    #[error("runtime gateway owner process activation receipt mismatched")]
+    OwnerReceiptMismatch,
+    #[error("runtime gateway owner process activation observation is unavailable")]
+    ObservationUnavailable,
+    #[error("runtime gateway owner process activation violated its protocol")]
+    ProtocolViolation,
+    #[error("runtime gateway owner process activation supervisor is unavailable")]
+    SupervisorUnavailable,
+}
+
 pub(crate) struct RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
     inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
     handoff_observation: RuntimeGatewayOwnerCurrentObservationV1,
@@ -1037,6 +1109,42 @@ impl RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
 
     pub(crate) fn terminal_status_v2(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
         self.inner().terminal_status()
+    }
+
+    pub(crate) async fn activate_process_ownership_in_place_v2(
+        &mut self,
+        process_generation: NonZeroU64,
+    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerProcessActivationErrorV2>
+    {
+        let expected = self.handoff_observation.receipt().clone();
+        let observation = self
+            .inner()
+            .activate_process_ownership_v2(expected, process_generation)
+            .await?;
+        if observation.receipt() != self.handoff_observation.receipt()
+            || self.inner().process_generation.load(Ordering::Acquire) != process_generation.get()
+        {
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerProcessActivationErrorV2::ProtocolViolation);
+        }
+        Ok(observation)
+    }
+
+    pub(crate) fn try_into_process_frozen_v2(
+        mut self,
+    ) -> Result<RuntimeGatewayOwnerProcessFrozenSupervisorV2, Self> {
+        if self.inner().process_generation.load(Ordering::Acquire) == 0 {
+            return Err(self);
+        }
+        let observation = self.handoff_observation.clone();
+        let process_generation =
+            NonZeroU64::new(self.inner().process_generation.load(Ordering::Acquire))
+                .expect("process-owned gateway owner generation");
+        Ok(RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
+            inner: Some(self.take_inner()),
+            activation_observation: observation,
+            process_generation,
+        })
     }
 
     #[cfg(test)]
@@ -1082,6 +1190,63 @@ impl RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
     }
 }
 
+pub(crate) struct RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
+    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
+    activation_observation: RuntimeGatewayOwnerCurrentObservationV1,
+    process_generation: NonZeroU64,
+}
+
+impl RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
+    pub(crate) fn activation_observation_v2(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
+        &self.activation_observation
+    }
+
+    pub(crate) fn process_generation_v2(&self) -> NonZeroU64 {
+        self.process_generation
+    }
+
+    pub(crate) fn terminal_status_v2(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.inner().terminal_status()
+    }
+
+    pub(crate) async fn observe_current_v2(
+        &self,
+    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerCurrentObservationErrorV1>
+    {
+        self.inner().observe_current_gateway_owner_v1().await
+    }
+
+    pub(crate) async fn abort_and_shutdown_until_v2(
+        mut self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let inner = self.take_inner();
+        inner.invalidation.invalidate();
+        inner.shutdown_until(cleanup_deadline).await
+    }
+
+    fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .as_ref()
+            .expect("process-frozen gateway owner supervisor")
+    }
+
+    fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .take()
+            .expect("process-frozen gateway owner supervisor")
+    }
+}
+
+impl std::fmt::Debug for RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeGatewayOwnerProcessFrozenSupervisorV2(<redacted>)")
+    }
+}
+
 impl std::fmt::Debug for RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeGatewayOwnerAdmissionFrozenSupervisorV2(<redacted>)")
@@ -1094,6 +1259,7 @@ enum RuntimeGatewayOwnerSupervisorRoleV1 {
     PreparedClosedRecovery,
     ClosedRecovery,
     AdmissionFrozen,
+    ProcessFrozen,
 }
 
 struct RuntimeGatewayOwnerStartupShutdownCommandV1 {
@@ -1116,6 +1282,16 @@ enum RuntimeGatewayOwnerSupervisorCommandV1 {
             Result<
                 RuntimeGatewayOwnerCurrentObservationV1,
                 RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2,
+            >,
+        >,
+    },
+    ActivateProcessOwnership {
+        expected_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+        process_generation: NonZeroU64,
+        response: oneshot::Sender<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerProcessActivationErrorV2,
             >,
         >,
     },
@@ -1387,6 +1563,8 @@ where
     let startup_cleanup_cap =
         RuntimeGatewayOwnerStartupCleanupCapV1::new(initial_startup_cleanup_deadline);
     let actor_startup_cleanup_cap = startup_cleanup_cap.clone();
+    let process_generation = Arc::new(AtomicU64::new(0));
+    let actor_process_generation = process_generation.clone();
     let task = runtime.spawn(async move {
         let exit = run_gateway_owner_startup_watchdog_v1(
             port,
@@ -1395,6 +1573,7 @@ where
             receivers,
             guard,
             actor_startup_cleanup_cap,
+            actor_process_generation,
         )
         .await;
         let _result = terminal_sender.send(Some(exit));
@@ -1407,6 +1586,7 @@ where
             terminal,
             invalidation,
             gateway_lifetime,
+            process_generation,
             task: Some(task),
         }),
         prepared_closed_recovery_observation: None,
@@ -1442,6 +1622,7 @@ async fn run_gateway_owner_startup_watchdog_v1<P>(
     receivers: RuntimeGatewayOwnerStartupWatchdogReceiversV1,
     mut guard: RuntimeGatewayOwnerStartupWatchdogGuardV1,
     startup_cleanup_cap: RuntimeGatewayOwnerStartupCleanupCapV1,
+    process_generation: Arc<AtomicU64>,
 ) -> RuntimeGatewayOwnerStartupWatchdogExitV1
 where
     P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync + 'static,
@@ -1516,6 +1697,7 @@ where
             RuntimeGatewayOwnerSupervisorRoleV1::PreparedClosedRecovery
                 | RuntimeGatewayOwnerSupervisorRoleV1::ClosedRecovery
                 | RuntimeGatewayOwnerSupervisorRoleV1::AdmissionFrozen
+                | RuntimeGatewayOwnerSupervisorRoleV1::ProcessFrozen
         ) {
             let watchdog = current.take().expect("gateway owner watchdog state");
             let safety_deadline = if role == RuntimeGatewayOwnerSupervisorRoleV1::AdmissionFrozen {
@@ -1673,6 +1855,75 @@ where
                             }
                             continue 'supervisor;
                         }
+                        RuntimeGatewayOwnerSupervisorCommandV1::ActivateProcessOwnership {
+                            expected_receipt,
+                            process_generation: requested_process_generation,
+                            response,
+                        } if role == RuntimeGatewayOwnerSupervisorRoleV1::AdmissionFrozen => {
+                            if response.is_closed() {
+                                current = Some(watchdog);
+                                continue 'supervisor;
+                            }
+                            if Instant::now() >= safety_deadline {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerProcessActivationErrorV2::DeadlineElapsed,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
+                                    config.cleanup,
+                                );
+                            }
+                            if watchdog.schedule().receipt() != &expected_receipt {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerProcessActivationErrorV2::OwnerReceiptMismatch,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            let observation =
+                                RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&watchdog);
+                            if process_generation
+                                .compare_exchange(
+                                    0,
+                                    requested_process_generation.get(),
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_err()
+                            {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerProcessActivationErrorV2::ProtocolViolation,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            startup_cleanup_cap.clear();
+                            role = RuntimeGatewayOwnerSupervisorRoleV1::ProcessFrozen;
+                            admission_frozen_cutoff = None;
+                            current = Some(watchdog);
+                            let _result = response.send(Ok(observation));
+                            continue 'supervisor;
+                        }
+                        RuntimeGatewayOwnerSupervisorCommandV1::Observe { response }
+                            if role == RuntimeGatewayOwnerSupervisorRoleV1::ProcessFrozen =>
+                        {
+                            if response.is_closed() {
+                                current = Some(watchdog);
+                                continue 'supervisor;
+                            }
+                            let observation =
+                                RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&watchdog);
+                            current = Some(watchdog);
+                            let _result = response.send(Ok(observation));
+                            continue 'supervisor;
+                        }
                         command => {
                             reject_frozen_supervisor_command_v2(command);
                             guard.invalidate_now();
@@ -1825,6 +2076,19 @@ where
                             } => {
                                 let _result = response.send(Err(
                                     RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ProtocolViolation,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            RuntimeGatewayOwnerSupervisorCommandV1::ActivateProcessOwnership {
+                                response,
+                                ..
+                            } => {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerProcessActivationErrorV2::ProtocolViolation,
                                 ));
                                 guard.invalidate_now();
                                 break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
@@ -1991,6 +2255,11 @@ fn reject_frozen_supervisor_command_v2(command: RuntimeGatewayOwnerSupervisorCom
         RuntimeGatewayOwnerSupervisorCommandV1::EnterAdmissionFrozen { response, .. } => {
             let _result = response.send(Err(
                 RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ProtocolViolation,
+            ));
+        }
+        RuntimeGatewayOwnerSupervisorCommandV1::ActivateProcessOwnership { response, .. } => {
+            let _result = response.send(Err(
+                RuntimeGatewayOwnerProcessActivationErrorV2::ProtocolViolation,
             ));
         }
     }

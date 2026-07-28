@@ -5519,6 +5519,287 @@ async fn admission_frozen_cleanup_remains_bounded_by_the_original_startup_cap() 
     assert_eq!(port.renew_calls(), 0);
 }
 
+async fn process_activation_fixture(
+    lease_for: Duration,
+    renew_before: Duration,
+    safety_margin: Duration,
+    startup_cleanup_deadline: Option<Instant>,
+    handoff_cutoff: Instant,
+) -> (
+    RuntimeGatewayOwnerAdmissionFrozenSupervisorV2,
+    FakePortV1,
+    Arc<AtomicBool>,
+    RuntimeGatewayOwnerLeaseReceiptV1,
+) {
+    let (handle, port, invalidated) = fixture_with_startup_cleanup_deadline(
+        lease_for,
+        renew_before,
+        safety_margin,
+        [],
+        startup_cleanup_deadline,
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let mut closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+    let receipt = closed.observation().receipt().clone();
+    let authority =
+        crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::for_test_v2(
+            receipt.clone(),
+            handoff_cutoff,
+        );
+    closed
+        .enter_admission_frozen_in_place_v2(authority)
+        .await
+        .unwrap();
+    (
+        closed.try_into_admission_frozen_v2().unwrap(),
+        port,
+        invalidated,
+        receipt,
+    )
+}
+
+#[tokio::test]
+async fn exact_process_activation_preserves_the_frozen_receipt_and_generation() {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    let process_generation = NonZeroU64::new(7).unwrap();
+
+    let activated = frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let process = frozen.try_into_process_frozen_v2().unwrap();
+
+    assert_eq!(activated.receipt(), &receipt);
+    assert_eq!(process.activation_observation_v2().receipt(), &receipt);
+    assert_eq!(process.process_generation_v2(), process_generation);
+    assert_eq!(
+        process.observe_current_v2().await.unwrap().receipt(),
+        &receipt
+    );
+    assert_eq!(port.renew_calls(), 0);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        process
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn lost_process_activation_acknowledgement_exact_observes_the_applied_generation() {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    let process_generation = NonZeroU64::new(11).unwrap();
+    frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let (sender, acknowledgement) = oneshot::channel();
+    drop(sender);
+
+    let recovered = frozen
+        .inner()
+        .accept_process_activation_acknowledgement_v2(process_generation, acknowledgement)
+        .await
+        .unwrap();
+
+    assert_eq!(recovered.receipt(), &receipt);
+    assert_eq!(port.renew_calls(), 0);
+    assert!(!invalidated.load(Ordering::Acquire));
+    let process = frozen.try_into_process_frozen_v2().unwrap();
+    assert_eq!(
+        process
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+}
+
+#[tokio::test]
+async fn stale_process_activation_receipt_is_rejected_and_invalidates() {
+    let (frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    let mut stale = receipt;
+    stale.owner_revision = NonZeroU64::new(stale.owner_revision.get() + 1).unwrap();
+
+    assert_eq!(
+        frozen
+            .inner()
+            .activate_process_ownership_v2(stale, NonZeroU64::new(3).unwrap())
+            .await,
+        Err(RuntimeGatewayOwnerProcessActivationErrorV2::OwnerReceiptMismatch)
+    );
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn stale_process_generation_cannot_replace_an_activated_generation() {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(5).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        frozen
+            .inner()
+            .activate_process_ownership_v2(receipt, NonZeroU64::new(4).unwrap())
+            .await,
+        Err(RuntimeGatewayOwnerProcessActivationErrorV2::ProtocolViolation)
+    );
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn process_frozen_survives_the_expired_startup_handoff_cutoff() {
+    let cutoff = Instant::now() + Duration::from_millis(80);
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_millis(900),
+        Duration::from_millis(500),
+        Duration::from_millis(100),
+        None,
+        cutoff,
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(9).unwrap())
+        .await
+        .unwrap();
+    let process = frozen.try_into_process_frozen_v2().unwrap();
+
+    sleep(Duration::from_millis(140)).await;
+
+    assert!(Instant::now() >= cutoff);
+    assert_eq!(
+        process.observe_current_v2().await.unwrap().receipt(),
+        &receipt
+    );
+    assert_eq!(process.terminal_status_v2(), None);
+    assert_eq!(port.renew_calls(), 0);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        process
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+}
+
+#[tokio::test]
+async fn process_activation_clears_the_original_startup_cleanup_cap() {
+    let startup_cleanup_deadline = Instant::now() + Duration::from_millis(250);
+    let (mut frozen, port, invalidated, _) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        Some(startup_cleanup_deadline),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(13).unwrap())
+        .await
+        .unwrap();
+    let process = frozen.try_into_process_frozen_v2().unwrap();
+    let release_gate = Arc::new(Notify::new());
+    *port
+        .state
+        .release_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release_gate.clone());
+    let release = tokio::spawn(async move {
+        sleep(Duration::from_millis(350)).await;
+        release_gate.notify_one();
+    });
+
+    let exit = process
+        .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    release.await.unwrap();
+    assert_eq!(exit, RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown);
+    assert!(Instant::now() >= startup_cleanup_deadline);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn process_frozen_does_not_renew_at_the_production_renewal_boundary() {
+    let (mut frozen, port, invalidated, _) = process_activation_fixture(
+        Duration::from_millis(1_200),
+        Duration::from_millis(900),
+        Duration::from_millis(100),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(17).unwrap())
+        .await
+        .unwrap();
+    let process = frozen.try_into_process_frozen_v2().unwrap();
+
+    sleep(Duration::from_millis(450)).await;
+
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(process.terminal_status_v2(), None);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        process
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
 #[tokio::test]
 async fn closed_recovery_commit_rejects_mismatched_permit_and_invalidates() {
     let (handle, port, invalidated) = fixture(
