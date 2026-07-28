@@ -105,6 +105,25 @@ pub struct ApplyView {
     pub replayed: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LifecycleCancellationView {
+    pub installation_id: String,
+    pub promotion_id: String,
+    pub revision: u64,
+    pub state: ProductState,
+    pub drain_intent_id: String,
+    pub source_intent_revision: u64,
+    pub terminal_intent_revision: u64,
+    pub terminal_state_digest: String,
+    pub product_operation_id: String,
+    pub source_runtime_deployment_revision: u64,
+    pub resulting_runtime_deployment_revision: u64,
+    pub source_slot_writer_epoch: u64,
+    pub successor_slot_writer_epoch: u64,
+    pub cancelled_at: DateTime<Utc>,
+    pub replayed: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentState {

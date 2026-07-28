@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
 use product_control_http::{
     product_control_router, product_control_router_with_operational_v2,
+    product_control_router_with_operational_v2_and_lifecycle_v1,
     product_control_router_with_operational_v2_and_readiness_gate, ApplyCommand, ApplyView,
     ApprovalPreviewView, CsrfSecret, CurrentPrincipal, CurrentPrincipalView, DecisionCommand,
     DecisionView, DeploymentAttestationViewV2, DeploymentFailureViewV2,
@@ -16,8 +17,9 @@ use product_control_http::{
     DeploymentRetryStateV2, DeploymentRetryViewV2, DeploymentRuntimePhaseV2,
     DeploymentServingFreshnessStateV2, DeploymentServingFreshnessViewV2, DeploymentState,
     DeploymentView, DiscordAuthorizationRequest, FacadeError, FacadeErrorCode, HttpBoundaryConfig,
-    IdempotencyKey, OAuthCallbackCommand, OAuthCallbackResult, OAuthStartCommand, OAuthStartResult,
-    ProductApiReadinessGate, ProductControlFacade, ProductControlOperationalFacadeV2,
+    IdempotencyKey, LifecycleCancellationCommand, LifecycleCancellationView, OAuthCallbackCommand,
+    OAuthCallbackResult, OAuthStartCommand, OAuthStartResult, ProductApiReadinessGate,
+    ProductControlFacade, ProductControlLifecycleFacadeV1, ProductControlOperationalFacadeV2,
     ProductRequestId, ProductState, PromoteCommand, PromotionView, RejectCommand,
     RuntimeDeploymentOperationalViewV2, SafeApprovalSummary, SessionCredential,
 };
@@ -332,6 +334,36 @@ impl ProductControlOperationalFacadeV2 for FakeFacade {
     }
 }
 
+#[async_trait]
+impl ProductControlLifecycleFacadeV1 for FakeFacade {
+    async fn cancel_lifecycle(
+        &self,
+        credential: &SessionCredential,
+        csrf: &CsrfSecret,
+        command: LifecycleCancellationCommand,
+    ) -> Result<LifecycleCancellationView, FacadeError> {
+        self.verify_mutation_inputs(credential, csrf)?;
+        self.record_request_id("cancel_lifecycle", &command.decision.request_id);
+        Ok(LifecycleCancellationView {
+            installation_id: command.decision.installation_id,
+            promotion_id: command.decision.promotion_id,
+            revision: command.decision.expected_revision,
+            state: ProductState::Approved,
+            drain_intent_id: command.drain_intent_id,
+            source_intent_revision: command.acknowledged_intent_revision,
+            terminal_intent_revision: command.acknowledged_intent_revision + 1,
+            terminal_state_digest: "c".repeat(64),
+            product_operation_id: command.product_operation_id,
+            source_runtime_deployment_revision: command.expected_runtime_deployment_revision,
+            resulting_runtime_deployment_revision: command.expected_runtime_deployment_revision + 1,
+            source_slot_writer_epoch: 11,
+            successor_slot_writer_epoch: 12,
+            cancelled_at: timestamp("2026-07-28T00:00:00Z"),
+            replayed: false,
+        })
+    }
+}
+
 fn app(facade: Arc<FakeFacade>) -> axum::Router {
     app_with_concurrency(facade, 8)
 }
@@ -379,6 +411,20 @@ fn operational_app_with_gate(
         )
         .unwrap(),
         readiness_gate,
+    )
+}
+
+fn lifecycle_app(facade: Arc<FakeFacade>) -> axum::Router {
+    product_control_router_with_operational_v2_and_lifecycle_v1(
+        facade,
+        HttpBoundaryConfig::new(
+            ORIGIN,
+            1_024,
+            8,
+            Duration::from_secs(2),
+            ["/app".to_string()],
+        )
+        .unwrap(),
     )
 }
 
@@ -1654,6 +1700,77 @@ async fn product_decisions_require_revision_and_digest_cas() {
         .unwrap();
     let response = app(facade).oneshot(zero_revision).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn lifecycle_cancellation_is_exact_bounded_and_separately_routed() {
+    let facade = Arc::new(FakeFacade::default());
+    let uri = format!("/v1/installations/install-1/promotions/{PROMOTION}/lifecycle-cancellations");
+    let valid = request_builder_with_id("POST", &uri, "cancel-lifecycle-1")
+        .header("content-type", "application/json")
+        .header("origin", ORIGIN)
+        .header(
+            "cookie",
+            format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+        )
+        .header("x-csrf-token", CSRF)
+        .header("idempotency-key", "cancel-lifecycle-key")
+        .body(Body::from(format!(
+            "{{\"expected_payload_digest\":\"{DIGEST}\",\"expected_revision\":4,\
+             \"drain_intent_id\":\"{}\",\"acknowledged_intent_revision\":7,\
+             \"acknowledged_state_digest\":\"{}\",\"product_operation_id\":\"{}\",\
+             \"expected_runtime_deployment_revision\":9,\"reason\":\"operator cancelled\"}}",
+            "d".repeat(32),
+            "e".repeat(64),
+            "f".repeat(32),
+        )))
+        .unwrap();
+    let response = lifecycle_app(Arc::clone(&facade))
+        .oneshot(valid)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(view["state"], "approved");
+    assert_eq!(view["source_intent_revision"], 7);
+    assert_eq!(view["terminal_intent_revision"], 8);
+    assert_eq!(view["source_runtime_deployment_revision"], 9);
+    assert_eq!(view["resulting_runtime_deployment_revision"], 10);
+    assert_eq!(view["replayed"], false);
+    assert_eq!(
+        facade.mutation_request_ids.lock().unwrap().as_slice(),
+        &[(
+            "cancel_lifecycle".to_string(),
+            "cancel-lifecycle-1".to_string(),
+        )]
+    );
+
+    let invalid = request_builder("POST", &uri)
+        .header("content-type", "application/json")
+        .header("origin", ORIGIN)
+        .header(
+            "cookie",
+            format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+        )
+        .header("x-csrf-token", CSRF)
+        .header("idempotency-key", "cancel-lifecycle-invalid")
+        .body(Body::from(format!(
+            "{{\"expected_payload_digest\":\"{DIGEST}\",\"expected_revision\":4,\
+             \"drain_intent_id\":\"{}\",\"acknowledged_intent_revision\":7,\
+             \"acknowledged_state_digest\":\"{}\",\"product_operation_id\":\"{}\",\
+             \"expected_runtime_deployment_revision\":9,\"reason\":\"operator cancelled\"}}",
+            "d".repeat(32),
+            "e".repeat(64),
+            "d".repeat(32),
+        )))
+        .unwrap();
+    let response = lifecycle_app(Arc::clone(&facade))
+        .oneshot(invalid)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(facade.mutation_request_ids.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

@@ -4,8 +4,8 @@ use uuid::Uuid;
 
 use crate::{
     ApplyView, ApprovalPreviewView, CsrfSecret, CurrentPrincipal, DecisionView,
-    DeploymentOperationalViewV2, DeploymentView, FacadeError, OAuthCode, OAuthState, ProductState,
-    PromotionView, SessionCredential,
+    DeploymentOperationalViewV2, DeploymentView, FacadeError, LifecycleCancellationView, OAuthCode,
+    OAuthState, ProductState, PromotionView, SessionCredential,
 };
 
 const RESOURCE_ID_MAX_BYTES: usize = 128;
@@ -167,6 +167,27 @@ pub struct ApplyCommand {
     pub decision: DecisionCommand,
 }
 
+pub struct LifecycleCancellationCommand {
+    pub decision: DecisionCommand,
+    pub drain_intent_id: String,
+    pub acknowledged_intent_revision: u64,
+    pub acknowledged_state_digest: String,
+    pub product_operation_id: String,
+    pub expected_runtime_deployment_revision: u64,
+    pub reason: String,
+}
+
+impl Debug for LifecycleCancellationCommand {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LifecycleCancellationCommand")
+            .field("decision", &self.decision)
+            .field("runtime_drain", &"<opaque>")
+            .field("reason", &"<redacted>")
+            .finish()
+    }
+}
+
 impl PromoteCommand {
     pub(crate) fn validate(&self) -> bool {
         valid_resource_id(&self.installation_id)
@@ -188,6 +209,37 @@ impl RejectCommand {
     pub(crate) fn normalize(mut self) -> Option<Self> {
         self.reason = self.reason.trim().to_string();
         if self.decision.validate()
+            && !self.reason.is_empty()
+            && self.reason.len() <= REASON_MAX_BYTES
+            && self.reason.chars().count() <= REASON_MAX_SCALARS
+            && !self.reason.chars().any(char::is_control)
+        {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+impl LifecycleCancellationCommand {
+    pub(crate) fn normalize(mut self) -> Option<Self> {
+        self.reason = self.reason.trim().to_string();
+        let valid_runtime_id = |value: &str| {
+            value.len() == 32
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if self.decision.validate()
+            && self.decision.expected_revision <= i64::MAX as u64
+            && valid_runtime_id(&self.drain_intent_id)
+            && valid_runtime_id(&self.product_operation_id)
+            && self.drain_intent_id != self.product_operation_id
+            && self.acknowledged_intent_revision > 0
+            && self.acknowledged_intent_revision <= i64::MAX as u64
+            && valid_digest(&self.acknowledged_state_digest)
+            && self.expected_runtime_deployment_revision > 0
+            && self.expected_runtime_deployment_revision <= i64::MAX as u64
             && !self.reason.is_empty()
             && self.reason.len() <= REASON_MAX_BYTES
             && self.reason.chars().count() <= REASON_MAX_SCALARS
@@ -283,6 +335,16 @@ pub trait ProductControlOperationalFacadeV2: ProductControlFacade {
         installation_id: &str,
         promotion_id: &str,
     ) -> Result<DeploymentOperationalViewV2, FacadeError>;
+}
+
+#[async_trait::async_trait]
+pub trait ProductControlLifecycleFacadeV1: ProductControlFacade {
+    async fn cancel_lifecycle(
+        &self,
+        credential: &SessionCredential,
+        csrf: &CsrfSecret,
+        command: LifecycleCancellationCommand,
+    ) -> Result<LifecycleCancellationView, FacadeError>;
 }
 
 pub(crate) fn validate_scoped_path(installation_id: &str, promotion_id: &str) -> bool {
