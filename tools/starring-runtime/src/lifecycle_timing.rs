@@ -436,15 +436,14 @@ impl RuntimeLifecycleTimingObserverV2 {
             .state
             .terminal_emission_count
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+            .is_ok()
         {
-            return;
-        }
-        #[cfg(not(test))]
-        {
-            let snapshot = self.snapshot_v2();
-            let mut stderr = std::io::stderr().lock();
-            let _ = snapshot.write_v2(&mut stderr);
+            #[cfg(not(test))]
+            {
+                let snapshot = self.snapshot_v2();
+                let mut stderr = std::io::stderr().lock();
+                let _ = snapshot.write_v2(&mut stderr);
+            }
         }
     }
 
