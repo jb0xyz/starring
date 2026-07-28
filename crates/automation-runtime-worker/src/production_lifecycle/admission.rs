@@ -14,8 +14,8 @@ use chrono::{DateTime, Utc};
 
 use super::*;
 use crate::{
-    RuntimeAuthorizedIngressOpenAcknowledgementV2, RuntimeCapabilityReadinessSetV2,
-    RuntimeClosedRecoveryAuthorityRevisionV2,
+    RuntimeAcceptedIngressOpenAcknowledgementV2, RuntimeAuthorizedIngressOpenAcknowledgementV2,
+    RuntimeCapabilityReadinessSetV2, RuntimeClosedRecoveryAuthorityRevisionV2,
     RuntimeIngressOpenAcknowledgementAuthorizationErrorV2,
     RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryEmptyObservationV2,
 };
@@ -265,33 +265,41 @@ fn validate_resume(
 }
 
 pub struct RuntimeIngressOpenAcknowledgementObservationV2 {
-    acknowledgement: RuntimeDurableIngressOpenAcknowledgementV2,
+    accepted: RuntimeAcceptedIngressOpenAcknowledgementV2,
 }
 
 impl RuntimeIngressOpenAcknowledgementObservationV2 {
-    pub fn new(acknowledgement: RuntimeDurableIngressOpenAcknowledgementV2) -> Self {
-        Self { acknowledgement }
+    pub fn from_accepted(accepted: RuntimeAcceptedIngressOpenAcknowledgementV2) -> Self {
+        Self { accepted }
     }
 
     pub fn acknowledgement(&self) -> &RuntimeDurableIngressOpenAcknowledgementV2 {
-        &self.acknowledgement
+        self.accepted.acknowledgement()
+    }
+
+    fn accepted_request(&self) -> &RuntimePublishIngressOpenAcknowledgementV2 {
+        self.accepted.request()
     }
 
     pub fn acknowledgement_revision(&self) -> NonZeroU64 {
-        self.acknowledgement.acknowledgement_revision()
+        self.accepted.acknowledgement().acknowledgement_revision()
     }
 
     pub fn fence_generation(&self) -> RuntimeWriterFenceGenerationV1 {
-        self.acknowledgement.fence_generation()
+        self.accepted.acknowledgement().fence_generation()
     }
 
     pub fn maintenance_gate_generation(&self) -> RuntimeMaintenanceGateGenerationV2 {
-        RuntimeMaintenanceGateGenerationV2::new(self.acknowledgement.maintenance_gate_generation())
-            .expect("durable acknowledgement gate generation must be persistence-bounded")
+        RuntimeMaintenanceGateGenerationV2::new(
+            self.accepted
+                .acknowledgement()
+                .maintenance_gate_generation(),
+        )
+        .expect("durable acknowledgement gate generation must be persistence-bounded")
     }
 
     pub fn expires_at(&self) -> DateTime<Utc> {
-        self.acknowledgement.expires_at()
+        self.accepted.acknowledgement().expires_at()
     }
 }
 
@@ -540,6 +548,7 @@ fn validate_open(
     observation: &RuntimeOpenProductionObservationV2,
 ) -> Result<(), RuntimeProductionLifecycleErrorV2> {
     let observed = &observation.input;
+    let acknowledgement_request = observed.ingress_acknowledgement.accepted_request();
     let acknowledgement = observed.ingress_acknowledgement.acknowledgement();
     if observed.coordinator_generation != request.coordinator_generation {
         return Err(RuntimeProductionLifecycleErrorV2::StaleGeneration);
@@ -601,6 +610,14 @@ fn validate_open(
     }
     if !observed.supervisors_running {
         return Err(RuntimeProductionLifecycleErrorV2::SupervisorsNotReady);
+    }
+    if acknowledgement_request.fence_generation() != request.writer_fence_generation
+        || acknowledgement_request.maintenance_gate_generation().get()
+            != observed.maintenance_gate_generation.get()
+        || acknowledgement_request.owner_receipt() != &state.resume.input.owner_receipt
+        || acknowledgement_request.gateway_ready() != &request.gateway_ready
+    {
+        return Err(RuntimeProductionLifecycleErrorV2::IngressAcknowledgementMismatch);
     }
     if acknowledgement.fence_generation() != request.writer_fence_generation
         || acknowledgement.maintenance_gate_generation().get()

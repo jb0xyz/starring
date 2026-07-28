@@ -118,20 +118,21 @@ pub enum RuntimeIngressOpenAcknowledgementProtocolViolationV2 {
 }
 
 pub struct RuntimeAcceptedIngressOpenAcknowledgementV2 {
+    request: RuntimePublishIngressOpenAcknowledgementV2,
     receipt: RuntimeIngressOpenAcknowledgementReceiptV2,
 }
 
 impl RuntimeAcceptedIngressOpenAcknowledgementV2 {
+    pub fn request(&self) -> &RuntimePublishIngressOpenAcknowledgementV2 {
+        &self.request
+    }
+
     pub fn receipt(&self) -> &RuntimeIngressOpenAcknowledgementReceiptV2 {
         &self.receipt
     }
 
     pub fn acknowledgement(&self) -> &RuntimeIngressOpenAcknowledgementV2 {
         self.receipt.acknowledgement()
-    }
-
-    pub fn into_acknowledgement(self) -> RuntimeIngressOpenAcknowledgementV2 {
-        self.receipt.into_acknowledgement()
     }
 }
 
@@ -357,7 +358,10 @@ fn accept_exact_receipt(
     {
         return Err(RuntimeIngressOpenAcknowledgementProtocolViolationV2::ObservationClockMismatch);
     }
-    Ok(RuntimeAcceptedIngressOpenAcknowledgementV2 { receipt })
+    Ok(RuntimeAcceptedIngressOpenAcknowledgementV2 {
+        request: request.clone(),
+        receipt,
+    })
 }
 
 fn same_operation_scope(

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::num::NonZeroU64;
 
 use automation_runtime_controller::{
@@ -6,8 +7,9 @@ use automation_runtime_controller::{
     RuntimeIngressOpenAcknowledgementInputV2, RuntimeIngressOpenAcknowledgementLeaseDurationV2,
     RuntimeIngressOpenAcknowledgementReceiptInputV2, RuntimeIngressOpenAcknowledgementReceiptV2,
     RuntimeIngressOpenAcknowledgementV2, RuntimeObservedIngressOpenAcknowledgementV2,
-    RuntimePublishIngressOpenAcknowledgementOutcomeV2, RuntimeRecoveryIdV2,
-    RuntimeStartupRecoveryObservationReceiptV2, RuntimeStartupRecoveryStateV2,
+    RuntimePublishIngressOpenAcknowledgementInputV2,
+    RuntimePublishIngressOpenAcknowledgementOutcomeV2, RuntimePublishIngressOpenAcknowledgementV2,
+    RuntimeRecoveryIdV2, RuntimeStartupRecoveryObservationReceiptV2, RuntimeStartupRecoveryStateV2,
     RuntimeStartupServingStateV2, RuntimeWriterFenceGenerationV1,
 };
 use automation_runtime_convergence::ProcessInstanceId;
@@ -17,12 +19,13 @@ use super::*;
 use crate::{
     accept_runtime_registry_recovery_empty_observation_v2,
     classify_ingress_open_acknowledgement_outcome_v2,
-    classify_unknown_ingress_open_acknowledgement_v2, RuntimeAcceptedStartupRecoveryOutcomeV2,
-    RuntimeCapabilityReadinessKindV2, RuntimeCapabilityReadinessReceiptV2,
-    RuntimeCapabilityReadinessSetV2, RuntimeClosedDrainRecoveryPermitV2,
-    RuntimeClosedRecoveryInputV2, RuntimeClosedRecoveryRegistryEvidenceV2,
-    RuntimeGatewayClosedLifecycleV2, RuntimeGatewayInvalidationCauseV2,
-    RuntimeIngressOpenAcknowledgementAuthorizationErrorV2,
+    classify_unknown_ingress_open_acknowledgement_v2, RuntimeAcceptedIngressOpenAcknowledgementV2,
+    RuntimeAcceptedStartupRecoveryOutcomeV2, RuntimeCapabilityReadinessKindV2,
+    RuntimeCapabilityReadinessReceiptV2, RuntimeCapabilityReadinessSetV2,
+    RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryInputV2,
+    RuntimeClosedRecoveryRegistryEvidenceV2, RuntimeGatewayClosedLifecycleV2,
+    RuntimeGatewayInvalidationCauseV2, RuntimeIngressOpenAcknowledgementAuthorizationErrorV2,
+    RuntimeIngressOpenAcknowledgementProtocolViolationV2,
     RuntimeIngressOpenAcknowledgementResolutionV2, RuntimePausedGatewayObservationV2,
     RuntimePausedGatewaySequenceV2, RuntimeRegistryGlobalObservationSequenceV2,
     RuntimeRegistryRecoveryObservationInputV2, RuntimeStartupRecoveryFixedPointProofV2,
@@ -305,6 +308,7 @@ enum OpenDrift {
 
 struct OpenPort {
     drift: OpenDrift,
+    acknowledgement: RefCell<Option<RuntimeAcceptedIngressOpenAcknowledgementV2>>,
 }
 
 impl RuntimeOpenProductionObservationPortV2 for OpenPort {
@@ -321,11 +325,12 @@ impl RuntimeOpenProductionObservationPortV2 for OpenPort {
         if matches!(self.drift, OpenDrift::Reconnect) {
             ready.connection_epoch = non_zero(ready.connection_epoch.get() + 1);
         }
-        let expires_at = if matches!(self.drift, OpenDrift::ExpiredAcknowledgement) {
-            at(260)
+        let observed_database_second = if matches!(self.drift, OpenDrift::ExpiredAcknowledgement) {
+            256
         } else {
-            at(300)
+            252
         };
+        let observed_database_now = at(observed_database_second);
         let open_gate_generation = if matches!(self.drift, OpenDrift::GateNotAdvanced) {
             request.closed_maintenance_gate_generation()
         } else {
@@ -334,24 +339,13 @@ impl RuntimeOpenProductionObservationPortV2 for OpenPort {
             ))
             .unwrap()
         };
-        let acknowledgement = RuntimeIngressOpenAcknowledgementObservationV2::new(
-            RuntimeIngressOpenAcknowledgementV2::new(RuntimeIngressOpenAcknowledgementInputV2 {
-                fence_generation: request.writer_fence_generation(),
-                maintenance_gate_generation: non_zero(open_gate_generation.get()),
-                gateway_owner_lease_id: request.owner_lease_id().clone(),
-                observed_owner_revision: request.owner_revision(),
-                process_instance_id: request.gateway_ready().process_instance_id.clone(),
-                connection_epoch: request.gateway_ready().connection_epoch,
-                admission_revision: request.gateway_ready().admission_revision,
-                connected_event_sequence: request.gateway_ready().connected_event_sequence,
-                resume_sequence: request.gateway_ready().resume_sequence,
-                acknowledgement_revision: non_zero(2),
-                acknowledged_at: at(255),
-                expires_at,
-            })
-            .unwrap(),
+        let acknowledgement = RuntimeIngressOpenAcknowledgementObservationV2::from_accepted(
+            self.acknowledgement
+                .borrow_mut()
+                .take()
+                .expect("test open acknowledgement must be consumed exactly once"),
         );
-        let mut current_owner = owner(260);
+        let mut current_owner = owner(observed_database_second);
         current_owner.expires_at = request.owner_expires_at();
         Ok(RuntimeOpenProductionObservationV2::new(
             RuntimeOpenProductionObservationInputV2 {
@@ -367,7 +361,7 @@ impl RuntimeOpenProductionObservationPortV2 for OpenPort {
                 finalizer_generation: request.finalizer_generation(),
                 finalizer_accepting: true,
                 supervisors_running: !matches!(self.drift, OpenDrift::SupervisorStopped),
-                observed_database_now: at(260),
+                observed_database_now,
                 ingress_acknowledgement: acknowledgement,
             },
         ))
@@ -375,16 +369,23 @@ impl RuntimeOpenProductionObservationPortV2 for OpenPort {
 }
 
 fn open() -> RuntimeEmptyOpenProcessV2 {
-    admission()
-        .observe_open_production(&OpenPort {
-            drift: OpenDrift::None,
-        })
-        .unwrap()
+    let state = admission();
+    let port = open_port(&state, OpenDrift::None);
+    state.observe_open_production(&port).unwrap()
 }
 
 fn acknowledgement_for_authorization(
     authorization: &crate::RuntimeAuthorizedIngressOpenAcknowledgementV2,
     revision: u64,
+) -> RuntimeIngressOpenAcknowledgementV2 {
+    acknowledgement_for_authorization_at(authorization, revision, 251, 256)
+}
+
+fn acknowledgement_for_authorization_at(
+    authorization: &crate::RuntimeAuthorizedIngressOpenAcknowledgementV2,
+    revision: u64,
+    acknowledged_at: i64,
+    expires_at: i64,
 ) -> RuntimeIngressOpenAcknowledgementV2 {
     let request = authorization.request();
     RuntimeIngressOpenAcknowledgementV2::new(RuntimeIngressOpenAcknowledgementInputV2 {
@@ -398,8 +399,8 @@ fn acknowledgement_for_authorization(
         connected_event_sequence: request.gateway_ready().connected_event_sequence,
         resume_sequence: request.gateway_ready().resume_sequence,
         acknowledgement_revision: non_zero(revision),
-        acknowledged_at: at(251),
-        expires_at: at(256),
+        acknowledged_at: at(acknowledged_at),
+        expires_at: at(expires_at),
     })
     .unwrap()
 }
@@ -419,6 +420,42 @@ fn receipt_for_authorization(
         },
     )
     .unwrap()
+}
+
+fn accepted_for_authorization(
+    authorization: &crate::RuntimeAuthorizedIngressOpenAcknowledgementV2,
+    revision: u64,
+) -> RuntimeAcceptedIngressOpenAcknowledgementV2 {
+    let resolution = classify_ingress_open_acknowledgement_outcome_v2(
+        authorization,
+        RuntimePublishIngressOpenAcknowledgementOutcomeV2::Applied(receipt_for_authorization(
+            authorization,
+            revision,
+        )),
+    );
+    let RuntimeIngressOpenAcknowledgementResolutionV2::AppliedExact(accepted) = resolution else {
+        panic!("test acknowledgement must be accepted")
+    };
+    accepted
+}
+
+fn open_port(state: &RuntimeAdmissionAcknowledgingProcessV2, drift: OpenDrift) -> OpenPort {
+    let lease = RuntimeIngressOpenAcknowledgementLeaseDurationV2::from_milliseconds(5_000).unwrap();
+    let open_gate = RuntimeMaintenanceGateGenerationV2::new(non_zero(
+        state.closed_maintenance_gate_generation().get() + 1,
+    ))
+    .unwrap();
+    let initial = state
+        .authorize_ingress_open_acknowledgement(open_gate, None, lease)
+        .unwrap();
+    let predecessor = acknowledgement_for_authorization(&initial, 1);
+    let renewal = state
+        .authorize_ingress_open_acknowledgement(open_gate, Some(&predecessor), lease)
+        .unwrap();
+    OpenPort {
+        drift,
+        acknowledgement: RefCell::new(Some(accepted_for_authorization(&renewal, 2))),
+    }
 }
 
 #[test]
@@ -591,6 +628,87 @@ fn acknowledgement_outcome_accepts_exact_receipts_and_unknown_recovery_is_bounde
 }
 
 #[test]
+fn acknowledgement_classifier_blocks_raw_timing_bypasses_before_open_capability() {
+    let state = admission();
+    let lease = RuntimeIngressOpenAcknowledgementLeaseDurationV2::from_milliseconds(5_000).unwrap();
+    let open_gate = RuntimeMaintenanceGateGenerationV2::new(non_zero(12)).unwrap();
+    let authorization = state
+        .authorize_ingress_open_acknowledgement(open_gate, None, lease)
+        .unwrap();
+
+    for (acknowledged_at, expires_at, expected) in [
+        (
+            249,
+            254,
+            RuntimeIngressOpenAcknowledgementProtocolViolationV2::AcknowledgementBeforeOwnerObservation,
+        ),
+        (
+            251,
+            257,
+            RuntimeIngressOpenAcknowledgementProtocolViolationV2::AcknowledgementLeaseMismatch,
+        ),
+    ] {
+        let receipt = RuntimeIngressOpenAcknowledgementReceiptV2::new(
+            RuntimeIngressOpenAcknowledgementReceiptInputV2 {
+                source_acknowledgement_revision: None,
+                request_digest: authorization.request().request_digest(),
+                acknowledgement: acknowledgement_for_authorization_at(
+                    &authorization,
+                    1,
+                    acknowledged_at,
+                    expires_at,
+                ),
+                observed_database_now: at(252),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            classify_ingress_open_acknowledgement_outcome_v2(
+                &authorization,
+                RuntimePublishIngressOpenAcknowledgementOutcomeV2::Applied(receipt),
+            ),
+            RuntimeIngressOpenAcknowledgementResolutionV2::ProtocolViolation(error)
+                if error == expected
+        ));
+    }
+}
+
+#[test]
+fn open_rejects_an_accepted_acknowledgement_from_a_different_gateway_snapshot() {
+    let state = admission();
+    let mut gateway_ready = state.gateway_ready().clone();
+    gateway_ready.kind = RuntimeGatewayReadyKindV2::Resumed;
+    let authorization = crate::RuntimeAuthorizedIngressOpenAcknowledgementV2::from_request(
+        RuntimePublishIngressOpenAcknowledgementV2::new(
+            RuntimePublishIngressOpenAcknowledgementInputV2 {
+                source_acknowledgement_revision: None,
+                fence_generation: state.writer_fence_generation(),
+                maintenance_gate_generation: non_zero(
+                    state.closed_maintenance_gate_generation().get() + 1,
+                ),
+                owner_receipt: owner(250),
+                gateway_ready,
+                lease_for: RuntimeIngressOpenAcknowledgementLeaseDurationV2::from_milliseconds(
+                    5_000,
+                )
+                .unwrap(),
+            },
+        )
+        .unwrap(),
+    );
+    let port = OpenPort {
+        drift: OpenDrift::None,
+        acknowledgement: RefCell::new(Some(accepted_for_authorization(&authorization, 1))),
+    };
+
+    let failure = state.observe_open_production(&port).unwrap_err();
+    assert_eq!(
+        failure.contract_error(),
+        Some(RuntimeProductionLifecycleErrorV2::IngressAcknowledgementMismatch)
+    );
+}
+
+#[test]
 fn fixed_point_to_open_production_to_shutdown_is_linear_and_exact() {
     let fixed_point = fixed_point();
     assert_eq!(
@@ -624,11 +742,8 @@ fn fixed_point_to_open_production_to_shutdown_is_linear_and_exact() {
     assert_eq!(admission.coordinator_generation().get(), 3);
     assert!(admission.gateway_ready().was_explicitly_resumed());
 
-    let open = admission
-        .observe_open_production(&OpenPort {
-            drift: OpenDrift::None,
-        })
-        .unwrap();
+    let port = open_port(&admission, OpenDrift::None);
+    let open = admission.observe_open_production(&port).unwrap();
     assert_eq!(
         open.stage(),
         RuntimeProductionLifecycleStageV2::OpenProduction
@@ -777,11 +892,9 @@ fn stale_pause_token_and_reconnect_evidence_never_enter_admission() {
 
 #[test]
 fn open_requires_current_acknowledgement_supervision_and_same_connection() {
-    let failure = admission()
-        .observe_open_production(&OpenPort {
-            drift: OpenDrift::Reconnect,
-        })
-        .unwrap_err();
+    let state = admission();
+    let port = open_port(&state, OpenDrift::Reconnect);
+    let failure = state.observe_open_production(&port).unwrap_err();
     assert_eq!(
         failure.contract_error(),
         Some(RuntimeProductionLifecycleErrorV2::StaleConnectionEpoch)
@@ -791,41 +904,33 @@ fn open_requires_current_acknowledgement_supervision_and_same_connection() {
         RuntimeProductionLifecycleStageV2::AdmissionAcknowledging
     );
 
-    let failure = admission()
-        .observe_open_production(&OpenPort {
-            drift: OpenDrift::ExpiredAcknowledgement,
-        })
-        .unwrap_err();
+    let state = admission();
+    let port = open_port(&state, OpenDrift::ExpiredAcknowledgement);
+    let failure = state.observe_open_production(&port).unwrap_err();
     assert_eq!(
         failure.contract_error(),
         Some(RuntimeProductionLifecycleErrorV2::IngressAcknowledgementNotCurrent)
     );
 
-    let failure = admission()
-        .observe_open_production(&OpenPort {
-            drift: OpenDrift::GateNotAdvanced,
-        })
-        .unwrap_err();
+    let state = admission();
+    let port = open_port(&state, OpenDrift::GateNotAdvanced);
+    let failure = state.observe_open_production(&port).unwrap_err();
     assert_eq!(
         failure.contract_error(),
         Some(RuntimeProductionLifecycleErrorV2::MaintenanceGateMismatch)
     );
 
-    let failure = admission()
-        .observe_open_production(&OpenPort {
-            drift: OpenDrift::SupervisorStopped,
-        })
-        .unwrap_err();
+    let state = admission();
+    let port = open_port(&state, OpenDrift::SupervisorStopped);
+    let failure = state.observe_open_production(&port).unwrap_err();
     assert_eq!(
         failure.contract_error(),
         Some(RuntimeProductionLifecycleErrorV2::SupervisorsNotReady)
     );
 
-    let failure = admission()
-        .observe_open_production(&OpenPort {
-            drift: OpenDrift::Port,
-        })
-        .unwrap_err();
+    let state = admission();
+    let port = open_port(&state, OpenDrift::Port);
+    let failure = state.observe_open_production(&port).unwrap_err();
     assert_eq!(failure.port_error(), Some(&TestPortError::Unavailable));
 }
 

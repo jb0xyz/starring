@@ -1975,6 +1975,18 @@ fn ingress_acknowledgement_authority_is_linear_replayable_and_controller_compose
             .count(),
         4
     );
+    let accepted = source
+        .split("pub struct RuntimeAcceptedIngressOpenAcknowledgementV2 {")
+        .nth(1)
+        .unwrap()
+        .split("impl Debug for RuntimeAcceptedIngressOpenAcknowledgementV2")
+        .next()
+        .unwrap();
+    assert!(accepted.contains("request: RuntimePublishIngressOpenAcknowledgementV2,"));
+    assert!(accepted.contains("receipt: RuntimeIngressOpenAcknowledgementReceiptV2,"));
+    assert!(
+        accepted.contains("pub fn request(&self) -> &RuntimePublishIngressOpenAcknowledgementV2")
+    );
     for required in [
         "pub trait RuntimeIngressOpenAcknowledgementPortV2",
         "fn publish_ingress_open_acknowledgement(",
@@ -2008,7 +2020,20 @@ fn ingress_acknowledgement_authority_is_linear_replayable_and_controller_compose
     assert!(admission.contains(
         "RuntimeIngressOpenAcknowledgementV2 as RuntimeDurableIngressOpenAcknowledgementV2"
     ));
-    assert!(admission.contains("acknowledgement: RuntimeDurableIngressOpenAcknowledgementV2,"));
+    let open_observation = admission
+        .split("pub struct RuntimeIngressOpenAcknowledgementObservationV2 {")
+        .nth(1)
+        .unwrap()
+        .split("impl Debug for RuntimeIngressOpenAcknowledgementObservationV2")
+        .next()
+        .unwrap();
+    assert!(open_observation.contains("accepted: RuntimeAcceptedIngressOpenAcknowledgementV2,"));
+    assert!(open_observation.contains(
+        "pub fn from_accepted(accepted: RuntimeAcceptedIngressOpenAcknowledgementV2) -> Self"
+    ));
+    assert!(!open_observation.contains("RuntimeDurableIngressOpenAcknowledgementV2,"));
+    assert!(!open_observation.contains("pub fn new("));
+    assert!(!source.contains("pub fn into_acknowledgement("));
     assert!(!admission.contains("RuntimeIngressOpenAcknowledgementObservationInputV2"));
     assert!(!lifecycle.contains("RuntimeIngressOpenAcknowledgementObservationInputV2"));
     assert!(!root.contains("RuntimeIngressOpenAcknowledgementObservationInputV2"));
