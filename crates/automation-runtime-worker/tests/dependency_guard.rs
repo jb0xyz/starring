@@ -1351,6 +1351,8 @@ fn pending_drain_v3_succession_authority_is_linear_compact_and_outcome_bound() {
         "source_state_digest: RuntimePendingDrainStateDigestV2",
         "predecessor_claim: RuntimeDrainClaimV2",
         "predecessor_claim_terminal_digest: RuntimeStartupRecoveryExecutionTerminalDigestV2",
+        "product_mutation_request_sha256: [u8; 32]",
+        "drain_intent_request_sha256: [u8; 32]",
         "RuntimePendingDrainSelectionOutcomeV3::FreshPreviousOwner(candidate)",
         "RuntimePendingDrainSelectionOutcomeV3::ExpiredPreviousOwner(candidate)",
         "Duration::from_secs(1)",

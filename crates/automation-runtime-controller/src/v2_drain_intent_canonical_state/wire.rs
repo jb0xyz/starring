@@ -19,6 +19,9 @@ use super::{
 use crate::v2_canonical_value::{
     RuntimeDiscordSnowflakeV2, RuntimePersistenceU64V2, RuntimeUnixMicrosecondsV2,
 };
+use crate::v2_drain_claim::{
+    validate_drain_claim_for_key, validate_route_absent_acknowledgement_for_key,
+};
 use crate::{
     GatewayShardIdV1, RuntimeBuildRevisionV1, RuntimeCanonicalRouteMutationProvenanceV2,
     RuntimeCanonicalValueErrorV2, RuntimeCertificationIntentFingerprintV2,
@@ -263,6 +266,148 @@ pub(super) fn decode_state(
         return Err(RuntimeDrainIntentCanonicalStateErrorV2::NonCanonicalEncoding);
     }
     Ok(intent)
+}
+
+pub(super) struct RuntimeCompactSuccessionSuccessorV2 {
+    pub key: RuntimeDrainIntentKeyV2,
+    pub drain_intent_digest: RuntimeDrainIntentDigestV2,
+    pub intent_revision: NonZeroU64,
+    pub acknowledgement: RuntimeRouteAbsentAcknowledgementV2,
+}
+
+pub(super) fn encode_compact_pending_unclaimed_source_v2(
+    key: &RuntimeDrainIntentKeyV2,
+    drain_intent_digest: &RuntimeDrainIntentDigestV2,
+    intent_revision: NonZeroU64,
+) -> Result<Vec<u8>, RuntimeDrainIntentCanonicalStateErrorV2> {
+    encode_compact_state_root_v2(
+        key,
+        drain_intent_digest,
+        intent_revision,
+        DrainIntentStateWireV2::PendingUnclaimed {},
+    )
+}
+
+pub(super) fn encode_compact_pending_claimed_source_v2(
+    key: &RuntimeDrainIntentKeyV2,
+    drain_intent_digest: &RuntimeDrainIntentDigestV2,
+    intent_revision: NonZeroU64,
+    predecessor_claim: &RuntimeDrainClaimV2,
+) -> Result<Vec<u8>, RuntimeDrainIntentCanonicalStateErrorV2> {
+    validate_drain_claim_for_key(predecessor_claim, key)?;
+    if predecessor_claim.progress().kind() != RuntimeDrainClaimProgressKindV2::Claimed
+        || predecessor_claim
+            .progress()
+            .seal()
+            .expected_route()
+            .is_some()
+    {
+        return Err(correlation(
+            RuntimeDrainIntentCanonicalStateCorrelationV2::PendingProgress,
+        ));
+    }
+    encode_compact_state_root_v2(
+        key,
+        drain_intent_digest,
+        intent_revision,
+        DrainIntentStateWireV2::PendingClaimed {
+            claim: Box::new(encode_claim(predecessor_claim)?),
+        },
+    )
+}
+
+pub(super) fn decode_compact_succession_successor_v2(
+    encoded: &[u8],
+) -> Result<RuntimeCompactSuccessionSuccessorV2, RuntimeDrainIntentCanonicalStateErrorV2> {
+    ensure_size(encoded)?;
+    let wire = serde_json::from_slice::<DrainIntentStateRootWireV2>(encoded)
+        .map_err(|_| RuntimeDrainIntentCanonicalStateErrorV2::Decoding)?;
+    if wire.format_version != FORMAT_VERSION {
+        return Err(RuntimeDrainIntentCanonicalStateErrorV2::UnsupportedFormatVersion);
+    }
+    let intent_revision = non_zero(
+        wire.intent_revision,
+        RuntimeDrainIntentCanonicalStateFieldV2::IntentRevision,
+    )?;
+    let (key, drain_intent_digest) = decode_compact_root_binding_v2(wire.root)?;
+    let acknowledgement = match wire.state {
+        DrainIntentStateWireV2::RouteAbsentAcknowledged { acknowledgement } => {
+            decode_acknowledgement(&key, *acknowledgement)?
+        }
+        DrainIntentStateWireV2::PendingUnclaimed {}
+        | DrainIntentStateWireV2::PendingClaimed { .. }
+        | DrainIntentStateWireV2::PendingRefenced { .. }
+        | DrainIntentStateWireV2::Consumed { .. }
+        | DrainIntentStateWireV2::Cancelled { .. } => {
+            return Err(correlation(
+                RuntimeDrainIntentCanonicalStateCorrelationV2::PendingProgress,
+            ));
+        }
+    };
+    let canonical = encode_compact_route_absent_acknowledged_v2(
+        &key,
+        &drain_intent_digest,
+        intent_revision,
+        &acknowledgement,
+    )?;
+    if canonical != encoded {
+        return Err(RuntimeDrainIntentCanonicalStateErrorV2::NonCanonicalEncoding);
+    }
+    Ok(RuntimeCompactSuccessionSuccessorV2 {
+        key,
+        drain_intent_digest,
+        intent_revision,
+        acknowledgement,
+    })
+}
+
+fn encode_compact_route_absent_acknowledged_v2(
+    key: &RuntimeDrainIntentKeyV2,
+    drain_intent_digest: &RuntimeDrainIntentDigestV2,
+    intent_revision: NonZeroU64,
+    acknowledgement: &RuntimeRouteAbsentAcknowledgementV2,
+) -> Result<Vec<u8>, RuntimeDrainIntentCanonicalStateErrorV2> {
+    validate_route_absent_acknowledgement_for_key(acknowledgement, key)?;
+    encode_compact_state_root_v2(
+        key,
+        drain_intent_digest,
+        intent_revision,
+        DrainIntentStateWireV2::RouteAbsentAcknowledged {
+            acknowledgement: Box::new(encode_acknowledgement(acknowledgement)?),
+        },
+    )
+}
+
+fn encode_compact_state_root_v2(
+    key: &RuntimeDrainIntentKeyV2,
+    drain_intent_digest: &RuntimeDrainIntentDigestV2,
+    intent_revision: NonZeroU64,
+    state: DrainIntentStateWireV2,
+) -> Result<Vec<u8>, RuntimeDrainIntentCanonicalStateErrorV2> {
+    encode_root(&DrainIntentStateRootWireV2 {
+        format_version: FORMAT_VERSION,
+        root: DrainIntentRootBindingWireV2 {
+            key: encode_key(key)?,
+            drain_intent_digest: drain_intent_digest.as_str().to_owned(),
+        },
+        intent_revision: persistence_u64(
+            intent_revision.get(),
+            RuntimeDrainIntentCanonicalStateFieldV2::IntentRevision,
+        )?,
+        state,
+    })
+}
+
+fn decode_compact_root_binding_v2(
+    wire: DrainIntentRootBindingWireV2,
+) -> Result<
+    (RuntimeDrainIntentKeyV2, RuntimeDrainIntentDigestV2),
+    RuntimeDrainIntentCanonicalStateErrorV2,
+> {
+    let key = decode_key(wire.key)?;
+    let drain_intent_digest = RuntimeDrainIntentDigestV2::parse(wire.drain_intent_digest)
+        .map_err(|_| invalid(RuntimeDrainIntentCanonicalStateFieldV2::DrainIntentDigest))?;
+    Ok((key, drain_intent_digest))
 }
 
 fn encode_root_binding(

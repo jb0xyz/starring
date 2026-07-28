@@ -7,14 +7,17 @@ use std::num::NonZeroU64;
 
 use automation_runtime_convergence::{ControllerId, FencingToken};
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 
+use crate::v2_drain_intent_receipt::validate_succession_acknowledgement_v2;
 use crate::{
     RuntimeCanonicalRouteMutationProvenanceV2, RuntimeCanonicalValueErrorV2,
     RuntimeClosedRecoveryRouteWitnessV2, RuntimeDrainAcknowledgementSourceV2,
     RuntimeDrainCertificationResolutionV2, RuntimeDrainClaimErrorV2,
     RuntimeDrainClaimProgressKindV2, RuntimeDrainClaimProgressV2, RuntimeDrainClaimSealWitnessV2,
-    RuntimeDrainClaimV2, RuntimeDrainIntentReceiptErrorV2, RuntimeDrainIntentReceiptV2,
-    RuntimeDrainIntentStateErrorV2, RuntimeDrainIntentStateKindV2, RuntimeDrainIntentV2,
+    RuntimeDrainClaimV2, RuntimeDrainIntentDigestV2, RuntimeDrainIntentKeyV2,
+    RuntimeDrainIntentReceiptErrorV2, RuntimeDrainIntentReceiptV2, RuntimeDrainIntentStateErrorV2,
+    RuntimeDrainIntentStateKindV2, RuntimeDrainIntentV2,
     RuntimeDrainSuccessionAcknowledgementExpectationV2,
     RuntimeDrainSuccessionAcknowledgementSourceV2, RuntimePersistedProductDrainRootV2,
     RuntimeRouteAbsentAcknowledgementV2, RuntimeRouteMutationProvenanceV2,
@@ -225,6 +228,134 @@ pub struct RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementInputV2 {
     pub acknowledgement_observation_sequence: NonZeroU64,
     pub certification: RuntimeDrainCertificationResolutionV2,
     pub acknowledged_at: DateTime<Utc>,
+}
+
+pub struct RuntimeCompactPendingDrainSuccessionValidationInputV2<'a> {
+    pub source_intent_revision: NonZeroU64,
+    pub source_state_digest: [u8; 32],
+    pub predecessor_claim_source_digest: [u8; 32],
+    pub predecessor_claim: &'a RuntimeDrainClaimV2,
+    pub succession: &'a RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementInputV2,
+    pub successor_state_bytes: &'a [u8],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeValidatedCompactPendingDrainSuccessionV2 {
+    key: RuntimeDrainIntentKeyV2,
+    drain_intent_digest: RuntimeDrainIntentDigestV2,
+    successor_intent_revision: NonZeroU64,
+    successor_state_digest: [u8; 32],
+    certification: RuntimeDrainCertificationResolutionV2,
+}
+
+impl RuntimeValidatedCompactPendingDrainSuccessionV2 {
+    pub fn key(&self) -> &RuntimeDrainIntentKeyV2 {
+        &self.key
+    }
+
+    pub fn drain_intent_digest(&self) -> &RuntimeDrainIntentDigestV2 {
+        &self.drain_intent_digest
+    }
+
+    pub fn successor_intent_revision(&self) -> NonZeroU64 {
+        self.successor_intent_revision
+    }
+
+    pub fn successor_state_digest(&self) -> &[u8; 32] {
+        &self.successor_state_digest
+    }
+
+    pub fn certification(&self) -> &RuntimeDrainCertificationResolutionV2 {
+        &self.certification
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeCompactPendingDrainSuccessionValidationErrorV2 {
+    #[error(
+        "runtime compact pending-drain succession predecessor claim source revision is absent"
+    )]
+    PredecessorClaimSourceRevisionMissing,
+    #[error(
+        "runtime compact pending-drain succession predecessor claim source digest does not match"
+    )]
+    PredecessorClaimSourceDigestMismatch,
+    #[error("runtime compact pending-drain succession source state digest does not match")]
+    SourceStateDigestMismatch,
+    #[error("runtime compact pending-drain succession intent revision is not the exact successor")]
+    SuccessorIntentRevisionMismatch,
+    #[error(transparent)]
+    CanonicalState(#[from] RuntimeDrainIntentCanonicalStateErrorV2),
+    #[error(transparent)]
+    Succession(#[from] RuntimeDrainIntentReceiptErrorV2),
+}
+
+pub fn validate_compact_pending_drain_succession_v2(
+    input: RuntimeCompactPendingDrainSuccessionValidationInputV2<'_>,
+) -> Result<
+    RuntimeValidatedCompactPendingDrainSuccessionV2,
+    RuntimeCompactPendingDrainSuccessionValidationErrorV2,
+> {
+    let predecessor_claim_source_revision = input
+        .source_intent_revision
+        .get()
+        .checked_sub(1)
+        .and_then(NonZeroU64::new)
+        .ok_or(
+            RuntimeCompactPendingDrainSuccessionValidationErrorV2::PredecessorClaimSourceRevisionMissing,
+        )?;
+    let successor = wire::decode_compact_succession_successor_v2(input.successor_state_bytes)?;
+    let source_state_bytes = wire::encode_compact_pending_claimed_source_v2(
+        &successor.key,
+        &successor.drain_intent_digest,
+        input.source_intent_revision,
+        input.predecessor_claim,
+    )?;
+    let source_state_digest: [u8; 32] = Sha256::digest(&source_state_bytes).into();
+    if source_state_digest != input.source_state_digest {
+        return Err(
+            RuntimeCompactPendingDrainSuccessionValidationErrorV2::SourceStateDigestMismatch,
+        );
+    }
+    let predecessor_claim_source_bytes = wire::encode_compact_pending_unclaimed_source_v2(
+        &successor.key,
+        &successor.drain_intent_digest,
+        predecessor_claim_source_revision,
+    )?;
+    let predecessor_claim_source_digest: [u8; 32] =
+        Sha256::digest(&predecessor_claim_source_bytes).into();
+    if predecessor_claim_source_digest != input.predecessor_claim_source_digest {
+        return Err(
+            RuntimeCompactPendingDrainSuccessionValidationErrorV2::PredecessorClaimSourceDigestMismatch,
+        );
+    }
+    if input.source_intent_revision.get().checked_add(1) != Some(successor.intent_revision.get()) {
+        return Err(
+            RuntimeCompactPendingDrainSuccessionValidationErrorV2::SuccessorIntentRevisionMismatch,
+        );
+    }
+    let succession = input.succession;
+    validate_succession_acknowledgement_v2(
+        input.predecessor_claim,
+        &successor.acknowledgement,
+        &RuntimeDrainSuccessionAcknowledgementExpectationV2 {
+            database_now: succession.database_now,
+            recovery_witness: succession.recovery_witness.clone(),
+            controller_id: succession.controller_id.clone(),
+            seal_generation: succession.seal_generation,
+            seal_observation_sequence: succession.seal_observation_sequence,
+            acknowledgement_observation_sequence: succession.acknowledgement_observation_sequence,
+            certification: succession.certification.clone(),
+            acknowledged_at: succession.acknowledged_at,
+        },
+    )?;
+    Ok(RuntimeValidatedCompactPendingDrainSuccessionV2 {
+        key: successor.key,
+        drain_intent_digest: successor.drain_intent_digest,
+        successor_intent_revision: successor.intent_revision,
+        successor_state_digest: Sha256::digest(input.successor_state_bytes).into(),
+        certification: successor.acknowledgement.certification().clone(),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

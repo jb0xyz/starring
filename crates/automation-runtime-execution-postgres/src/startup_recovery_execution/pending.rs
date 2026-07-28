@@ -490,7 +490,7 @@ impl PostgresRuntimeExecutionV1 {
         Ok(receipt)
     }
 
-    fn pending_effective_cutoff_v2(
+    pub(super) fn pending_effective_cutoff_v2(
         &self,
         operation_cutoff: Instant,
     ) -> Result<Instant, RuntimeExecutionPersistenceErrorV1> {
@@ -503,7 +503,7 @@ impl PostgresRuntimeExecutionV1 {
         Ok(operation_cutoff.min(statement_cutoff))
     }
 
-    async fn acquire_pending_connection_v2(
+    pub(super) async fn acquire_pending_connection_v2(
         &self,
         deadline: tokio::time::Instant,
         effective_cutoff: Instant,
@@ -677,28 +677,28 @@ impl RuntimePendingDrainCommonBindingsV2 {
     }
 }
 
-struct RuntimePendingDrainSealBindingsV2 {
-    pre_slot_present: bool,
-    pre_slot_admission_generation: i64,
-    pre_slot_observation_sequence: i64,
-    seal_key: [u8; 16],
-    seal_generation: i64,
-    post_slot_admission_generation: i64,
-    post_slot_observation_sequence: i64,
-    post_global_observation_sequence: i64,
-    post_retained_slot_count: i64,
-    post_retained_empty_tombstone_count: i64,
-    post_staged_route_count: i64,
-    post_serving_route_count: i64,
-    post_draining_route_count: i64,
-    post_sealed_slot_count: i64,
-    post_active_interaction_count: i64,
-    post_failed_closed_slot_count: i64,
-    post_registry_failed_closed: bool,
+pub(super) struct RuntimePendingDrainSealBindingsV2 {
+    pub(super) pre_slot_present: bool,
+    pub(super) pre_slot_admission_generation: i64,
+    pub(super) pre_slot_observation_sequence: i64,
+    pub(super) seal_key: [u8; 16],
+    pub(super) seal_generation: i64,
+    pub(super) post_slot_admission_generation: i64,
+    pub(super) post_slot_observation_sequence: i64,
+    pub(super) post_global_observation_sequence: i64,
+    pub(super) post_retained_slot_count: i64,
+    pub(super) post_retained_empty_tombstone_count: i64,
+    pub(super) post_staged_route_count: i64,
+    pub(super) post_serving_route_count: i64,
+    pub(super) post_draining_route_count: i64,
+    pub(super) post_sealed_slot_count: i64,
+    pub(super) post_active_interaction_count: i64,
+    pub(super) post_failed_closed_slot_count: i64,
+    pub(super) post_registry_failed_closed: bool,
 }
 
 impl RuntimePendingDrainSealBindingsV2 {
-    fn from_witness(
+    pub(super) fn from_witness(
         witness: &RuntimePendingDrainRegistrySealWitnessV2,
     ) -> Result<Self, RuntimeExecutionPersistenceErrorV1> {
         let pre = witness.pre_slot_observation();
@@ -896,7 +896,7 @@ fn decode_pending_candidate_v2(
     .map_err(|_| invalid())
 }
 
-fn pending_owner_receipt_v2(
+pub(super) fn pending_owner_receipt_v2(
     request: &RuntimeStartupRecoveryExecutionRequestV2,
     database_now: DateTime<Utc>,
     owner_expires_at: DateTime<Utc>,
@@ -923,7 +923,7 @@ fn pending_owner_receipt_v2(
     })
 }
 
-fn pending_closed_recovery_evidence_v2(
+pub(super) fn pending_closed_recovery_evidence_v2(
     request: &RuntimeStartupRecoveryExecutionRequestV2,
 ) -> Result<RuntimeClosedRecoveryExpectedEvidenceV2, RuntimeExecutionPersistenceErrorV1> {
     let paused = request.paused_gateway();
@@ -999,7 +999,7 @@ fn duplicate_terminal_digest_v2(
         .expect("accepted pending terminal digest is nonzero")
 }
 
-fn positive_i64(value: u64) -> Result<i64, RuntimeExecutionPersistenceErrorV1> {
+pub(super) fn positive_i64(value: u64) -> Result<i64, RuntimeExecutionPersistenceErrorV1> {
     i64::try_from(value)
         .ok()
         .filter(|value| *value > 0)
@@ -1010,18 +1010,20 @@ fn nonnegative_i64(value: u64) -> Result<i64, RuntimeExecutionPersistenceErrorV1
     i64::try_from(value).map_err(|_| RuntimeExecutionPersistenceErrorV1::InvalidInput)
 }
 
-fn positive_non_zero(value: i64) -> Result<NonZeroU64, RuntimeExecutionPersistenceErrorV1> {
+pub(super) fn positive_non_zero(
+    value: i64,
+) -> Result<NonZeroU64, RuntimeExecutionPersistenceErrorV1> {
     u64::try_from(value)
         .ok()
         .and_then(NonZeroU64::new)
         .ok_or_else(invalid)
 }
 
-fn lowercase_hex(bytes: &[u8]) -> String {
+pub(super) fn lowercase_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn client_cutoff_error(mutation_dispatched: bool) -> RuntimeExecutionPersistenceErrorV1 {
+pub(super) fn client_cutoff_error(mutation_dispatched: bool) -> RuntimeExecutionPersistenceErrorV1 {
     if mutation_dispatched {
         RuntimeExecutionPersistenceErrorV1::Indeterminate
     } else {
@@ -1029,7 +1031,9 @@ fn client_cutoff_error(mutation_dispatched: bool) -> RuntimeExecutionPersistence
     }
 }
 
-fn map_pending_mutation_dispatch_error(error: sqlx::Error) -> RuntimeExecutionPersistenceErrorV1 {
+pub(super) fn map_pending_mutation_dispatch_error(
+    error: sqlx::Error,
+) -> RuntimeExecutionPersistenceErrorV1 {
     let mapped = map_query_error(error);
     if mapped == RuntimeExecutionPersistenceErrorV1::Unavailable {
         RuntimeExecutionPersistenceErrorV1::Indeterminate

@@ -306,30 +306,13 @@ impl RuntimeDrainIntentReceiptV2 {
             .acknowledgement()
             .ok_or(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)?;
         let expectation = source.expectation();
-        validate_succession_owner(predecessor, expectation)?;
         if !is_exact_successor(
             source.source().intent_revision().get(),
             persisted_intent.intent_revision().get(),
         ) {
             return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionIntentRevisionMismatch);
         }
-        validate_succession_claim(predecessor, acknowledgement.claim(), expectation)?;
-        let expected_provenance =
-            RuntimeRouteMutationProvenanceV2::ClosedRecovery(expectation.recovery_witness.clone());
-        if acknowledgement.expected_route().is_some()
-            || acknowledgement.provenance() != &expected_provenance
-            || acknowledgement.registry_observation_sequence()
-                != expectation.acknowledgement_observation_sequence
-            || acknowledgement.acknowledged_at() != expectation.acknowledged_at
-        {
-            return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionAcknowledgementMismatch);
-        }
-        if acknowledgement.certification() != &expectation.certification
-            || acknowledgement.certification().kind()
-                == RuntimeDrainCertificationResolutionKindV2::CommittedAndDisconnected
-        {
-            return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionCertificationMismatch);
-        }
+        validate_succession_acknowledgement_v2(predecessor, acknowledgement, expectation)?;
         Ok(Self::from_result(
             RuntimeDrainIntentMutationOutcomeV2::Acknowledged,
             persisted_intent,
@@ -501,6 +484,32 @@ fn validate_succession_claim(
         || seal.expected_route().is_some()
     {
         return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionSealMismatch);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_succession_acknowledgement_v2(
+    predecessor: &RuntimeDrainClaimV2,
+    acknowledgement: &crate::RuntimeRouteAbsentAcknowledgementV2,
+    expectation: &RuntimeDrainSuccessionAcknowledgementExpectationV2,
+) -> Result<(), RuntimeDrainIntentReceiptErrorV2> {
+    validate_succession_owner(predecessor, expectation)?;
+    validate_succession_claim(predecessor, acknowledgement.claim(), expectation)?;
+    let expected_provenance =
+        RuntimeRouteMutationProvenanceV2::ClosedRecovery(expectation.recovery_witness.clone());
+    if acknowledgement.expected_route().is_some()
+        || acknowledgement.provenance() != &expected_provenance
+        || acknowledgement.registry_observation_sequence()
+            != expectation.acknowledgement_observation_sequence
+        || acknowledgement.acknowledged_at() != expectation.acknowledged_at
+    {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionAcknowledgementMismatch);
+    }
+    if acknowledgement.certification() != &expectation.certification
+        || acknowledgement.certification().kind()
+            == RuntimeDrainCertificationResolutionKindV2::CommittedAndDisconnected
+    {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionCertificationMismatch);
     }
     Ok(())
 }

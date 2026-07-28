@@ -488,6 +488,7 @@ dependencies = [
  "automation-runtime-convergence",
  "automation-runtime-worker",
  "chrono",
+ "serde",
  "serde_json",
  "sha2",
  "sqlx",

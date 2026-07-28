@@ -416,6 +416,24 @@ async fn authorize_pending_drain_adapter_call(
     pool: &PgPool,
     owner: RuntimeGatewayOwnerLeaseReceiptV1,
 ) -> PendingDrainAdapterAuthorization {
+    let (lifecycle, permit, authorization) =
+        authorize_pending_drain_adapter_execution(adapter, pool, owner).await;
+    (
+        lifecycle,
+        permit,
+        authorization.into_pending_drain_selection().unwrap(),
+    )
+}
+
+async fn authorize_pending_drain_adapter_execution(
+    adapter: &PostgresRuntimeExecutionV1,
+    pool: &PgPool,
+    owner: RuntimeGatewayOwnerLeaseReceiptV1,
+) -> (
+    RuntimeGatewayClosedLifecycleV2,
+    RuntimeClosedDrainRecoveryPermitV2,
+    automation_runtime_worker::RuntimeAuthorizedStartupRecoveryExecutionV2,
+) {
     let (mut lifecycle, mut permit, observation_authorization) =
         authorize_startup_observation_port_call(adapter, owner);
     let request = observation_authorization.request().clone();
@@ -452,8 +470,6 @@ async fn authorize_pending_drain_adapter_call(
     );
     let authorization = lifecycle
         .begin_startup_recovery_execution(&mut permit, continuation)
-        .unwrap()
-        .into_pending_drain_selection()
         .unwrap();
     (lifecycle, permit, authorization)
 }

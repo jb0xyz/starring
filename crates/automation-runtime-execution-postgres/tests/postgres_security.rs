@@ -25,3 +25,4 @@ include!("postgres_security/startup_recovery_execution_adapter.rs");
 include!("postgres_security/startup_pending_drain_execution.rs");
 include!("postgres_security/startup_pending_drain_execution_adapter.rs");
 include!("postgres_security/startup_pending_drain_succession.rs");
+include!("postgres_security/startup_pending_drain_succession_adapter.rs");

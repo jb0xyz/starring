@@ -10,14 +10,18 @@ use automation_runtime_convergence::{
 use chrono::{DateTime, Utc};
 use discord_model::GuildId;
 use resource_resolution::ResourceBindingFingerprint;
+use sha2::{Digest, Sha256};
 
 use super::{
-    RuntimeCanonicalDrainIntentStateV2, RuntimeClosedRecoveryEmptyRegistryPendingDrainClaimInputV2,
+    validate_compact_pending_drain_succession_v2, RuntimeCanonicalDrainIntentStateV2,
+    RuntimeClosedRecoveryEmptyRegistryPendingDrainClaimInputV2,
     RuntimeClosedRecoveryEmptyRegistryPendingDrainClaimTransitionV2,
     RuntimeClosedRecoveryPendingDrainAcknowledgementInputV2,
     RuntimeClosedRecoveryPendingDrainAcknowledgementTransitionV2,
     RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementInputV2,
     RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementTransitionV2,
+    RuntimeCompactPendingDrainSuccessionValidationErrorV2,
+    RuntimeCompactPendingDrainSuccessionValidationInputV2,
     RuntimeDrainIntentCanonicalStateCorrelationV2, RuntimeDrainIntentCanonicalStateErrorV2,
     RuntimeDrainIntentCanonicalStateFieldV2, RuntimeDrainIntentCanonicalStateKindV2,
     RuntimePersistedRouteAbsenceCandidateDrainIntentV2,
@@ -444,6 +448,123 @@ fn build_succession(
         persisted_route_absent_claimed(operation, revision, claim),
         input,
     )
+}
+
+fn compact_source_digest(
+    operation: &RuntimeProductDrainOperationV2,
+    revision: NonZeroU64,
+    predecessor: RuntimeDrainClaimV2,
+) -> [u8; 32] {
+    let persisted_root = root(operation);
+    let intent =
+        RuntimeDrainIntentV2::pending_from_persisted(&persisted_root, revision, Some(predecessor))
+            .unwrap();
+    let canonical = RuntimeCanonicalDrainIntentStateV2::from_intent(intent).unwrap();
+    Sha256::digest(canonical.state_bytes()).into()
+}
+
+fn compact_predecessor_claim_source_digest(
+    operation: &RuntimeProductDrainOperationV2,
+    source_revision: NonZeroU64,
+) -> [u8; 32] {
+    let predecessor_revision =
+        NonZeroU64::new(source_revision.get().checked_sub(1).unwrap()).unwrap();
+    let intent =
+        RuntimeDrainIntentV2::pending_from_persisted(&root(operation), predecessor_revision, None)
+            .unwrap();
+    let canonical = RuntimeCanonicalDrainIntentStateV2::from_intent(intent).unwrap();
+    Sha256::digest(canonical.state_bytes()).into()
+}
+
+fn validate_compact_succession(
+    operation: &RuntimeProductDrainOperationV2,
+    source_revision: NonZeroU64,
+    source_digest: [u8; 32],
+    predecessor: &RuntimeDrainClaimV2,
+    succession: &RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementInputV2,
+    successor_bytes: &[u8],
+) -> Result<
+    super::RuntimeValidatedCompactPendingDrainSuccessionV2,
+    RuntimeCompactPendingDrainSuccessionValidationErrorV2,
+> {
+    validate_compact_pending_drain_succession_v2(
+        RuntimeCompactPendingDrainSuccessionValidationInputV2 {
+            source_intent_revision: source_revision,
+            source_state_digest: source_digest,
+            predecessor_claim_source_digest: compact_predecessor_claim_source_digest(
+                operation,
+                source_revision,
+            ),
+            predecessor_claim: predecessor,
+            succession,
+            successor_state_bytes: successor_bytes,
+        },
+    )
+}
+
+fn compact_successor_claim(
+    operation: &RuntimeProductDrainOperationV2,
+    succession: &RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementInputV2,
+    owner_revision: u64,
+    claim_revision: u64,
+    fence: u64,
+    seal_generation: u64,
+    seal_observation_sequence: u64,
+) -> RuntimeDrainClaimV2 {
+    let key = &operation.canonical().drain_preimage().key;
+    let witness = &succession.recovery_witness;
+    let seal = RuntimeDrainClaimSealWitnessV2::new(
+        key,
+        witness.process_instance_id.clone(),
+        non_zero(seal_generation),
+        None,
+        non_zero(seal_observation_sequence),
+    )
+    .unwrap();
+    RuntimeDrainClaimV2::new(
+        key,
+        witness.gateway_owner_lease_id.clone(),
+        non_zero(owner_revision),
+        witness.process_instance_id.clone(),
+        succession.controller_id.clone(),
+        FencingToken::new(fence).unwrap(),
+        witness.recovery_generation,
+        non_zero(claim_revision),
+        witness.owner_expires_at,
+        RuntimeDrainClaimProgressV2::claimed(seal),
+    )
+    .unwrap()
+}
+
+fn compact_successor_bytes(
+    operation: &RuntimeProductDrainOperationV2,
+    revision: NonZeroU64,
+    claim: RuntimeDrainClaimV2,
+    provenance: RuntimeRouteMutationProvenanceV2,
+    certification: RuntimeDrainCertificationResolutionV2,
+    acknowledged_at: DateTime<Utc>,
+) -> Vec<u8> {
+    let key = &operation.canonical().drain_preimage().key;
+    let acknowledgement = RuntimeRouteAbsentAcknowledgementV2::new(
+        key,
+        claim,
+        None,
+        provenance,
+        non_zero(1),
+        certification,
+        acknowledged_at,
+    )
+    .unwrap();
+    let intent = RuntimeDrainIntentV2::route_absent_acknowledged_from_persisted(
+        &root(operation),
+        revision,
+        acknowledgement,
+    )
+    .unwrap();
+    RuntimeCanonicalDrainIntentStateV2::from_intent(intent)
+        .unwrap()
+        .state_bytes()
+        .to_vec()
 }
 
 fn assert_roundtrip(
@@ -1241,6 +1362,365 @@ fn succession_rejects_each_persistence_successor_overflow() {
             field: RuntimeDrainIntentCanonicalStateFieldV2::ControllerFencingToken,
             reason: crate::RuntimeCanonicalValueErrorV2::PersistenceIntegerOutOfRange,
         })
+    );
+}
+
+#[test]
+fn compact_succession_validator_returns_exact_canonical_result() {
+    let operation = operation();
+    let predecessor = claim(&operation, false);
+    let succession = succession_input();
+    let source_revision = non_zero(7);
+    let source_digest = compact_source_digest(&operation, source_revision, predecessor.clone());
+    let transition = build_succession(
+        &operation,
+        source_revision,
+        predecessor.clone(),
+        succession.clone(),
+    )
+    .unwrap();
+    let successor_bytes = transition.result().state_bytes();
+    let validated = validate_compact_succession(
+        &operation,
+        source_revision,
+        source_digest,
+        &predecessor,
+        &succession,
+        successor_bytes,
+    )
+    .unwrap();
+
+    assert_eq!(validated.key(), &operation.canonical().drain_preimage().key);
+    assert_eq!(
+        validated.drain_intent_digest(),
+        operation.drain_intent_digest()
+    );
+    assert_eq!(validated.successor_intent_revision(), non_zero(8));
+    assert_eq!(
+        validated.successor_state_digest(),
+        &<[u8; 32]>::from(Sha256::digest(successor_bytes))
+    );
+    assert_eq!(
+        validated.certification(),
+        &RuntimeDrainCertificationResolutionV2::no_operation_reserved()
+    );
+}
+
+#[test]
+fn compact_succession_validator_rejects_source_chain_and_root_tampering() {
+    let operation = operation();
+    let predecessor = claim(&operation, false);
+    let succession = succession_input();
+    let source_revision = non_zero(7);
+    let source_digest = compact_source_digest(&operation, source_revision, predecessor.clone());
+    let transition = build_succession(
+        &operation,
+        source_revision,
+        predecessor.clone(),
+        succession.clone(),
+    )
+    .unwrap();
+    let successor_bytes = transition.result().state_bytes().to_vec();
+
+    let mut wrong_source_digest = source_digest;
+    wrong_source_digest[0] ^= 1;
+    assert_eq!(
+        validate_compact_succession(
+            &operation,
+            source_revision,
+            wrong_source_digest,
+            &predecessor,
+            &succession,
+            &successor_bytes,
+        ),
+        Err(RuntimeCompactPendingDrainSuccessionValidationErrorV2::SourceStateDigestMismatch)
+    );
+
+    let mut wrong_predecessor_source_digest =
+        compact_predecessor_claim_source_digest(&operation, source_revision);
+    wrong_predecessor_source_digest[0] ^= 1;
+    assert_eq!(
+        validate_compact_pending_drain_succession_v2(
+            RuntimeCompactPendingDrainSuccessionValidationInputV2 {
+                source_intent_revision: source_revision,
+                source_state_digest: source_digest,
+                predecessor_claim_source_digest: wrong_predecessor_source_digest,
+                predecessor_claim: &predecessor,
+                succession: &succession,
+                successor_state_bytes: &successor_bytes,
+            },
+        ),
+        Err(
+            RuntimeCompactPendingDrainSuccessionValidationErrorV2::PredecessorClaimSourceDigestMismatch
+        )
+    );
+
+    assert_eq!(
+        validate_compact_pending_drain_succession_v2(
+            RuntimeCompactPendingDrainSuccessionValidationInputV2 {
+                source_intent_revision: NonZeroU64::MIN,
+                source_state_digest: source_digest,
+                predecessor_claim_source_digest: [1; 32],
+                predecessor_claim: &predecessor,
+                succession: &succession,
+                successor_state_bytes: &successor_bytes,
+            },
+        ),
+        Err(
+            RuntimeCompactPendingDrainSuccessionValidationErrorV2::PredecessorClaimSourceRevisionMissing
+        )
+    );
+
+    let tampered_root = String::from_utf8(successor_bytes.clone())
+        .unwrap()
+        .replacen(
+            "ffeeddccbbaa99887766554433221100",
+            "00112233445566778899aabbccddeeff",
+            1,
+        )
+        .into_bytes();
+    assert!(validate_compact_succession(
+        &operation,
+        source_revision,
+        source_digest,
+        &predecessor,
+        &succession,
+        &tampered_root,
+    )
+    .is_err());
+
+    let tampered_mutation_kind = String::from_utf8(successor_bytes)
+        .unwrap()
+        .replacen(
+            "\"mutation_kind\":\"authority_change\"",
+            "\"mutation_kind\":\"teardown\"",
+            1,
+        )
+        .into_bytes();
+    assert!(validate_compact_succession(
+        &operation,
+        source_revision,
+        source_digest,
+        &predecessor,
+        &succession,
+        &tampered_mutation_kind,
+    )
+    .is_err());
+}
+
+#[test]
+fn compact_succession_validator_rejects_successor_encoding_and_revision_tampering() {
+    let operation = operation();
+    let predecessor = claim(&operation, false);
+    let succession = succession_input();
+    let source_revision = non_zero(7);
+    let source_digest = compact_source_digest(&operation, source_revision, predecessor.clone());
+    let transition = build_succession(
+        &operation,
+        source_revision,
+        predecessor.clone(),
+        succession.clone(),
+    )
+    .unwrap();
+    let successor_bytes = transition.result().state_bytes().to_vec();
+
+    let mut noncanonical = successor_bytes.clone();
+    noncanonical.push(b' ');
+    assert!(matches!(
+        validate_compact_succession(
+            &operation,
+            source_revision,
+            source_digest,
+            &predecessor,
+            &succession,
+            &noncanonical,
+        ),
+        Err(
+            RuntimeCompactPendingDrainSuccessionValidationErrorV2::CanonicalState(
+                RuntimeDrainIntentCanonicalStateErrorV2::NonCanonicalEncoding
+            )
+        )
+    ));
+
+    let wrong_revision = String::from_utf8(successor_bytes)
+        .unwrap()
+        .replacen("\"intent_revision\":8", "\"intent_revision\":9", 1)
+        .into_bytes();
+    assert_eq!(
+        validate_compact_succession(
+            &operation,
+            source_revision,
+            source_digest,
+            &predecessor,
+            &succession,
+            &wrong_revision,
+        ),
+        Err(RuntimeCompactPendingDrainSuccessionValidationErrorV2::SuccessorIntentRevisionMismatch)
+    );
+}
+
+#[test]
+fn compact_succession_validator_rejects_claim_fence_and_seal_tampering() {
+    let operation = operation();
+    let predecessor = claim(&operation, false);
+    let succession = succession_input();
+    let source_revision = non_zero(7);
+    let source_digest = compact_source_digest(&operation, source_revision, predecessor.clone());
+    let owner_revision = succession.recovery_witness.observed_owner_revision.get();
+    let provenance =
+        RuntimeRouteMutationProvenanceV2::ClosedRecovery(succession.recovery_witness.clone());
+
+    for (claim, expected) in [
+        (
+            compact_successor_claim(&operation, &succession, owner_revision, 20, 21, 48, 100),
+            RuntimeDrainIntentReceiptErrorV2::SuccessionClaimRevisionMismatch,
+        ),
+        (
+            compact_successor_claim(&operation, &succession, owner_revision, 19, 22, 48, 100),
+            RuntimeDrainIntentReceiptErrorV2::SuccessionFenceMismatch,
+        ),
+        (
+            compact_successor_claim(&operation, &succession, owner_revision, 19, 21, 49, 100),
+            RuntimeDrainIntentReceiptErrorV2::SuccessionSealMismatch,
+        ),
+        (
+            compact_successor_claim(&operation, &succession, owner_revision, 19, 21, 48, 101),
+            RuntimeDrainIntentReceiptErrorV2::SuccessionSealMismatch,
+        ),
+    ] {
+        let successor_bytes = compact_successor_bytes(
+            &operation,
+            non_zero(8),
+            claim,
+            provenance.clone(),
+            succession.certification.clone(),
+            succession.acknowledged_at,
+        );
+        assert_eq!(
+            validate_compact_succession(
+                &operation,
+                source_revision,
+                source_digest,
+                &predecessor,
+                &succession,
+                &successor_bytes,
+            ),
+            Err(RuntimeCompactPendingDrainSuccessionValidationErrorV2::Succession(expected))
+        );
+    }
+}
+
+#[test]
+fn compact_succession_validator_rejects_provenance_certification_and_time_tampering() {
+    let operation = operation();
+    let predecessor = claim(&operation, false);
+    let succession = succession_input();
+    let source_revision = non_zero(7);
+    let source_digest = compact_source_digest(&operation, source_revision, predecessor.clone());
+    let owner_revision = succession.recovery_witness.observed_owner_revision.get();
+    let successor_claim =
+        || compact_successor_claim(&operation, &succession, owner_revision, 19, 21, 48, 100);
+    let closed =
+        RuntimeRouteMutationProvenanceV2::ClosedRecovery(succession.recovery_witness.clone());
+
+    let wrong_provenance = compact_successor_bytes(
+        &operation,
+        non_zero(8),
+        successor_claim(),
+        ordinary_provenance(),
+        succession.certification.clone(),
+        succession.acknowledged_at,
+    );
+    assert_eq!(
+        validate_compact_succession(
+            &operation,
+            source_revision,
+            source_digest,
+            &predecessor,
+            &succession,
+            &wrong_provenance,
+        ),
+        Err(
+            RuntimeCompactPendingDrainSuccessionValidationErrorV2::Succession(
+                RuntimeDrainIntentReceiptErrorV2::SuccessionAcknowledgementMismatch
+            )
+        )
+    );
+
+    let wrong_certification = compact_successor_bytes(
+        &operation,
+        non_zero(8),
+        successor_claim(),
+        closed.clone(),
+        RuntimeDrainCertificationResolutionV2::no_attestation_for_reserved_operation(
+            RuntimeCertificationOperationIdV2::parse("444455556666777788889999aaaabbbb").unwrap(),
+            RuntimeCertificationIntentFingerprintV2::parse("f".repeat(64)).unwrap(),
+        ),
+        succession.acknowledged_at,
+    );
+    assert_eq!(
+        validate_compact_succession(
+            &operation,
+            source_revision,
+            source_digest,
+            &predecessor,
+            &succession,
+            &wrong_certification,
+        ),
+        Err(
+            RuntimeCompactPendingDrainSuccessionValidationErrorV2::Succession(
+                RuntimeDrainIntentReceiptErrorV2::SuccessionCertificationMismatch
+            )
+        )
+    );
+
+    let wrong_time = compact_successor_bytes(
+        &operation,
+        non_zero(8),
+        successor_claim(),
+        closed,
+        succession.certification.clone(),
+        at(132),
+    );
+    assert_eq!(
+        validate_compact_succession(
+            &operation,
+            source_revision,
+            source_digest,
+            &predecessor,
+            &succession,
+            &wrong_time,
+        ),
+        Err(
+            RuntimeCompactPendingDrainSuccessionValidationErrorV2::Succession(
+                RuntimeDrainIntentReceiptErrorV2::SuccessionAcknowledgementMismatch
+            )
+        )
+    );
+
+    let mut fresh = succession;
+    fresh.database_now = at(129);
+    let valid_transition = build_succession(
+        &operation,
+        source_revision,
+        predecessor.clone(),
+        succession_input(),
+    )
+    .unwrap();
+    assert_eq!(
+        validate_compact_succession(
+            &operation,
+            source_revision,
+            source_digest,
+            &predecessor,
+            &fresh,
+            valid_transition.result().state_bytes(),
+        ),
+        Err(
+            RuntimeCompactPendingDrainSuccessionValidationErrorV2::Succession(
+                RuntimeDrainIntentReceiptErrorV2::SuccessionPredecessorNotExpired
+            )
+        )
     );
 }
 

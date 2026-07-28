@@ -125,17 +125,20 @@ pub use v2_drain_claim::{
     RuntimeRouteAbsentAcknowledgementV2,
 };
 pub use v2_drain_intent_canonical_state::{
-    RuntimeCanonicalDrainIntentStateV2, RuntimeClosedRecoveryEmptyRegistryPendingDrainClaimInputV2,
+    validate_compact_pending_drain_succession_v2, RuntimeCanonicalDrainIntentStateV2,
+    RuntimeClosedRecoveryEmptyRegistryPendingDrainClaimInputV2,
     RuntimeClosedRecoveryEmptyRegistryPendingDrainClaimTransitionV2,
     RuntimeClosedRecoveryPendingDrainAcknowledgementInputV2,
     RuntimeClosedRecoveryPendingDrainAcknowledgementTransitionV2,
     RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementInputV2,
     RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementTransitionV2,
+    RuntimeCompactPendingDrainSuccessionValidationErrorV2,
+    RuntimeCompactPendingDrainSuccessionValidationInputV2,
     RuntimeDrainIntentCanonicalStateCorrelationV2, RuntimeDrainIntentCanonicalStateErrorV2,
     RuntimeDrainIntentCanonicalStateFieldV2, RuntimeDrainIntentCanonicalStateKindV2,
     RuntimePersistedRouteAbsenceCandidateDrainIntentV2,
     RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2,
-    RuntimePersistedUnclaimedPendingDrainIntentV2,
+    RuntimePersistedUnclaimedPendingDrainIntentV2, RuntimeValidatedCompactPendingDrainSuccessionV2,
 };
 pub use v2_drain_intent_receipt::{
     RuntimeDrainAcknowledgementSourceV2, RuntimeDrainIntentMutationOutcomeV2,

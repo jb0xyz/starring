@@ -33,6 +33,8 @@ pub struct RuntimePendingDrainPreviousOwnerClaimedCandidateInputV3 {
     pub source: RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2,
     pub source_state_digest: RuntimePendingDrainStateDigestV2,
     pub predecessor_claim_terminal_digest: RuntimeStartupRecoveryExecutionTerminalDigestV2,
+    pub product_mutation_request_sha256: [u8; 32],
+    pub drain_intent_request_sha256: [u8; 32],
 }
 
 impl Debug for RuntimePendingDrainPreviousOwnerClaimedCandidateInputV3 {
@@ -50,6 +52,8 @@ pub struct RuntimePendingDrainPreviousOwnerClaimedCandidateV3 {
     source_state_digest: RuntimePendingDrainStateDigestV2,
     predecessor_claim: RuntimeDrainClaimV2,
     predecessor_claim_terminal_digest: RuntimeStartupRecoveryExecutionTerminalDigestV2,
+    product_mutation_request_sha256: [u8; 32],
+    drain_intent_request_sha256: [u8; 32],
 }
 
 impl Clone for RuntimePendingDrainPreviousOwnerClaimedCandidateV3 {
@@ -66,6 +70,8 @@ impl Clone for RuntimePendingDrainPreviousOwnerClaimedCandidateV3 {
                     *self.predecessor_claim_terminal_digest.as_bytes(),
                 )
                 .expect("checked predecessor claim terminal digest is nonzero"),
+            product_mutation_request_sha256: self.product_mutation_request_sha256,
+            drain_intent_request_sha256: self.drain_intent_request_sha256,
         }
     }
 }
@@ -112,6 +118,8 @@ impl RuntimePendingDrainPreviousOwnerClaimedCandidateV3 {
             source_state_digest: input.source_state_digest,
             predecessor_claim,
             predecessor_claim_terminal_digest: input.predecessor_claim_terminal_digest,
+            product_mutation_request_sha256: input.product_mutation_request_sha256,
+            drain_intent_request_sha256: input.drain_intent_request_sha256,
         })
     }
 
@@ -143,6 +151,14 @@ impl RuntimePendingDrainPreviousOwnerClaimedCandidateV3 {
 
     pub fn predecessor_claim(&self) -> &RuntimeDrainClaimV2 {
         &self.predecessor_claim
+    }
+
+    pub fn product_mutation_request_sha256(&self) -> &[u8; 32] {
+        &self.product_mutation_request_sha256
+    }
+
+    pub fn drain_intent_request_sha256(&self) -> &[u8; 32] {
+        &self.drain_intent_request_sha256
     }
 
     pub fn claim_expires_at(&self) -> DateTime<Utc> {

@@ -293,6 +293,8 @@ fn candidate(
             source_state_digest: RuntimePendingDrainStateDigestV2::new([1; 32]).unwrap(),
             predecessor_claim_terminal_digest:
                 RuntimeStartupRecoveryExecutionTerminalDigestV2::new([2; 32]).unwrap(),
+            product_mutation_request_sha256: [3; 32],
+            drain_intent_request_sha256: [4; 32],
         },
     )
 }
@@ -410,6 +412,8 @@ fn previous_owner_candidate_has_exact_one_step_headroom_and_compact_evidence() {
         valid.predecessor_claim_terminal_digest().as_bytes(),
         &[2; 32]
     );
+    assert_eq!(valid.product_mutation_request_sha256(), &[3; 32]);
+    assert_eq!(valid.drain_intent_request_sha256(), &[4; 32]);
     assert_eq!(
         candidate(i64::MAX as u64, "process:old", "shard:0", 6, 8, 9, at(120)).unwrap_err(),
         RuntimePendingDrainCompoundErrorV2::IntentRevisionOverflow
