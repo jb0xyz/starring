@@ -950,10 +950,56 @@ fn empty_open_refresh_requires_exact_monotonic_evidence_and_updates_once() {
         non_zero(3)
     );
 
-    let owner_open = open();
-    let mut drift = refresh_input(&owner_open);
-    drift.owner_receipt.owner_revision = owner_open.epoch().gateway_owner().owner_revision;
-    let failure = owner_open
+    let current_owner_open = open();
+    let expected_owner_revision = current_owner_open
+        .epoch()
+        .gateway_owner()
+        .owner_revision;
+    let expected_owner_expiry = current_owner_open.epoch().gateway_owner().expires_at;
+    let mut current_owner_refresh = refresh_input(&current_owner_open);
+    current_owner_refresh.owner_receipt.owner_revision = expected_owner_revision;
+    current_owner_refresh.owner_receipt.expires_at = expected_owner_expiry;
+    let mut current_owner_refresh = current_owner_open
+        .authorize_ingress_open_acknowledgement_refresh(current_owner_refresh)
+        .unwrap();
+    let receipt =
+        receipt_for_authorization_at(current_owner_refresh.operation_mut(), 3, 254, 259, 255);
+    let attempt = current_owner_refresh.operation_mut().begin_attempt().unwrap();
+    let RuntimeIngressOpenAcknowledgementResolutionV2::AppliedExact(accepted) = attempt
+        .resolve_outcome(RuntimePublishIngressOpenAcknowledgementOutcomeV2::Applied(
+            receipt,
+        ))
+    else {
+        panic!("same-owner acknowledgement refresh must apply")
+    };
+    let current_owner_open = current_owner_refresh.complete(accepted).unwrap();
+    assert_eq!(
+        current_owner_open.epoch().gateway_owner().owner_revision,
+        expected_owner_revision
+    );
+    assert_eq!(
+        current_owner_open.epoch().gateway_owner().expires_at,
+        expected_owner_expiry
+    );
+
+    let skipped_owner_open = open();
+    let mut drift = refresh_input(&skipped_owner_open);
+    drift.owner_receipt.owner_revision =
+        non_zero(skipped_owner_open.epoch().gateway_owner().owner_revision.get() + 2);
+    let failure = skipped_owner_open
+        .authorize_ingress_open_acknowledgement_refresh(drift)
+        .unwrap_err();
+    assert_eq!(
+        failure.error(),
+        RuntimeProductionLifecycleErrorV2::OwnerMismatch
+    );
+
+    let stale_owner_open = open();
+    let mut drift = refresh_input(&stale_owner_open);
+    drift.owner_receipt.owner_revision = stale_owner_open.epoch().gateway_owner().owner_revision;
+    drift.owner_receipt.expires_at = stale_owner_open.epoch().gateway_owner().expires_at;
+    drift.owner_receipt.database_now = stale_owner_open.epoch().gateway_owner().database_now;
+    let failure = stale_owner_open
         .authorize_ingress_open_acknowledgement_refresh(drift)
         .unwrap_err();
     assert_eq!(

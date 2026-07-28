@@ -210,17 +210,23 @@ fn validate_refresh(
 ) -> Result<(), RuntimeProductionLifecycleErrorV2> {
     let epoch = &state.epoch;
     let previous_owner = &epoch.gateway_owner;
-    let expected_owner_revision = previous_owner
+    let successor_owner_revision = previous_owner
         .owner_revision
         .get()
         .checked_add(1)
         .filter(|value| *value <= i64::MAX as u64)
         .and_then(NonZeroU64::new)
         .ok_or(RuntimeProductionLifecycleErrorV2::GenerationOverflow)?;
-    if input.owner_receipt.lease_id != previous_owner.lease_id
-        || input.owner_receipt.owner_revision != expected_owner_revision
+    if input.owner_receipt.lease_id != previous_owner.lease_id {
+        return Err(RuntimeProductionLifecycleErrorV2::OwnerMismatch);
+    }
+    let exact_current_owner = input.owner_receipt.owner_revision == previous_owner.owner_revision
+        && input.owner_receipt.expires_at == previous_owner.expires_at;
+    let exact_successor_owner =
+        input.owner_receipt.owner_revision == successor_owner_revision
+            && input.owner_receipt.expires_at > previous_owner.expires_at;
+    if (!exact_current_owner && !exact_successor_owner)
         || input.owner_receipt.database_now <= previous_owner.database_now
-        || input.owner_receipt.expires_at <= previous_owner.expires_at
         || input.owner_receipt.database_lease_duration().is_none()
     {
         return Err(RuntimeProductionLifecycleErrorV2::OwnerMismatch);
