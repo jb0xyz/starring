@@ -30,8 +30,15 @@ use automation_runtime_serving_postgres::{
     RuntimeServingPersistenceErrorV1,
 };
 use automation_runtime_worker::{
-    RuntimeCapabilityReadinessKindV2, RuntimeCapabilityReadinessReceiptV2,
-    RuntimeCapabilityReadinessSetV2,
+    RuntimeAuthorizedPendingDrainAcknowledgementV2, RuntimeAuthorizedPendingDrainClaimV2,
+    RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3, RuntimeCapabilityReadinessKindV2,
+    RuntimeCapabilityReadinessReceiptV2, RuntimeCapabilityReadinessSetV2,
+    RuntimePendingDrainAcknowledgementExecutionPortV2, RuntimePendingDrainAcknowledgementReceiptV2,
+    RuntimePendingDrainClaimExecutionPortV2, RuntimePendingDrainClaimReceiptV2,
+    RuntimePendingDrainNoCandidateReceiptV2, RuntimePendingDrainNoCandidateRecorderPortV2,
+    RuntimePendingDrainSuccessionAcknowledgementExecutionPortV3,
+    RuntimePendingDrainSuccessionAcknowledgementReceiptV3,
+    RuntimeSelectedPendingDrainNoCandidateV2,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::ConnectOptions;
@@ -262,9 +269,72 @@ pub struct RuntimeDatabaseDependenciesV1 {
     shutdown: RuntimeDatabasePoolShutdownV1,
 }
 
+#[derive(Clone)]
+pub(crate) struct RuntimePendingDrainMutationDatabaseV3 {
+    execution: PostgresRuntimeExecutionV1,
+}
+
+impl RuntimePendingDrainMutationDatabaseV3 {
+    pub(crate) async fn record_no_candidate_v3(
+        &self,
+        selection: &RuntimeSelectedPendingDrainNoCandidateV2,
+        execution_cutoff: StdInstant,
+    ) -> Result<RuntimePendingDrainNoCandidateReceiptV2, RuntimeExecutionPersistenceErrorV1> {
+        self.execution
+            .record_pending_drain_no_candidate(selection, execution_cutoff)
+            .await
+    }
+
+    pub(crate) async fn execute_claim_v3(
+        &self,
+        authorization: &RuntimeAuthorizedPendingDrainClaimV2,
+        execution_cutoff: StdInstant,
+    ) -> Result<RuntimePendingDrainClaimReceiptV2, RuntimeExecutionPersistenceErrorV1> {
+        self.execution
+            .execute_pending_drain_claim(authorization, execution_cutoff)
+            .await
+    }
+
+    pub(crate) async fn execute_acknowledgement_v3(
+        &self,
+        authorization: &RuntimeAuthorizedPendingDrainAcknowledgementV2,
+        execution_cutoff: StdInstant,
+    ) -> Result<RuntimePendingDrainAcknowledgementReceiptV2, RuntimeExecutionPersistenceErrorV1>
+    {
+        self.execution
+            .execute_pending_drain_acknowledgement(authorization, execution_cutoff)
+            .await
+    }
+
+    pub(crate) async fn execute_succession_v3(
+        &self,
+        authorization: &RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3,
+        execution_cutoff: StdInstant,
+    ) -> Result<
+        RuntimePendingDrainSuccessionAcknowledgementReceiptV3,
+        RuntimeExecutionPersistenceErrorV1,
+    > {
+        self.execution
+            .execute_pending_drain_succession_acknowledgement(authorization, execution_cutoff)
+            .await
+    }
+}
+
+impl Debug for RuntimePendingDrainMutationDatabaseV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimePendingDrainMutationDatabaseV3(<redacted>)")
+    }
+}
+
 impl RuntimeDatabaseDependenciesV1 {
     pub fn execution(&self) -> &PostgresRuntimeExecutionV1 {
         &self.execution
+    }
+
+    pub(crate) fn pending_drain_mutation_v3(&self) -> RuntimePendingDrainMutationDatabaseV3 {
+        RuntimePendingDrainMutationDatabaseV3 {
+            execution: self.execution.clone(),
+        }
     }
 
     pub fn exact_target(&self) -> &PostgresRuntimeExactTargetReader {

@@ -448,9 +448,21 @@ fn database_readiness_retains_five_exact_receipts_without_serialization() {
     assert_eq!(
         imported,
         BTreeSet::from([
+            "RuntimeAuthorizedPendingDrainAcknowledgementV2",
+            "RuntimeAuthorizedPendingDrainClaimV2",
+            "RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3",
             "RuntimeCapabilityReadinessKindV2",
             "RuntimeCapabilityReadinessReceiptV2",
             "RuntimeCapabilityReadinessSetV2",
+            "RuntimePendingDrainAcknowledgementExecutionPortV2",
+            "RuntimePendingDrainAcknowledgementReceiptV2",
+            "RuntimePendingDrainClaimExecutionPortV2",
+            "RuntimePendingDrainClaimReceiptV2",
+            "RuntimePendingDrainNoCandidateReceiptV2",
+            "RuntimePendingDrainNoCandidateRecorderPortV2",
+            "RuntimePendingDrainSuccessionAcknowledgementExecutionPortV3",
+            "RuntimePendingDrainSuccessionAcknowledgementReceiptV3",
+            "RuntimeSelectedPendingDrainNoCandidateV2",
         ])
     );
     assert!(!database.contains("Serialize"));
@@ -509,6 +521,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/process/observation.rs",
             "src/process/observation_tests.rs",
             "src/process/owner.rs",
+            "src/process/pending_drain_finalizer.rs",
             "src/process/readiness.rs",
             "src/process/recovery.rs",
             "src/process/startup_loop.rs",
@@ -669,6 +682,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/process/execution.rs")
             && path != Path::new("src/process/observation.rs")
             && path != Path::new("src/process/observation_tests.rs")
+            && path != Path::new("src/process/pending_drain_finalizer.rs")
             && path != Path::new("src/process/readiness.rs")
             && path != Path::new("src/process/recovery.rs")
             && path != Path::new("src/process/startup_loop.rs")
@@ -970,7 +984,14 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 let allowed = matches!(
                     identifier,
                     "RuntimeAuthorizedPendingDrainSelectionV3"
+                        | "RuntimeAcceptedPendingDrainSelectionV3"
                         | "RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3"
+                        | "RuntimePendingDrainFinalizerDispatchFailureV3"
+                        | "RuntimePendingDrainFinalizerJobV3"
+                        | "RuntimePendingDrainFinalizerPortV3"
+                        | "RuntimePendingDrainMutationEnvironmentV3"
+                        | "RuntimePendingDrainMutationOutputV3"
+                        | "RuntimePendingDrainMutationStageV3"
                         | "RuntimePendingDrainPreviousOwnerClaimedCandidateV3"
                         | "RuntimePendingDrainSelectionOutcomeV3"
                         | "RuntimePendingDrainSelectionReceiptV3"
@@ -1036,6 +1057,33 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 && identifier == "automation_runtime_worker";
             let allowed_execution_process = path == Path::new("src/process/execution.rs")
                 && identifier == "automation_runtime_worker";
+            let allowed_pending_drain_finalizer_dependency = path
+                == Path::new("src/process/pending_drain_finalizer.rs")
+                && identifier == "automation_runtime_worker";
+            let allowed_pending_drain_finalizer_v3 = matches!(
+                identifier,
+                "RuntimeOwnedStartupRecoveryExecutionOutcomeV3"
+                    | "RuntimePendingDrainMutationDatabaseV3"
+                    | "RuntimePendingDrainFinalizerDispatchFailureV3"
+                    | "RuntimePendingDrainFinalizerJobV3"
+                    | "RuntimePendingDrainFinalizerPortV3"
+                    | "RuntimePendingDrainFinalizerSupervisorV3"
+                    | "RuntimePendingDrainMutationEnvironmentV3"
+                    | "RuntimePendingDrainMutationOutputV3"
+                    | "RuntimePendingDrainMutationStageV3"
+                    | "RuntimePendingDrainOwnedStageFailureV3"
+                    | "RuntimeProductionPendingDrainFinalizerEnvironmentV3"
+                    | "RuntimeStartupRecoveryOwnedStepFutureV3"
+                    | "RuntimeStartupRecoveryOwnedStepOutcomeV3"
+            ) && matches!(
+                path.as_path(),
+                path if path == Path::new("src/database.rs")
+                    || path == Path::new("src/process.rs")
+                    || path == Path::new("src/process/execution.rs")
+                    || path == Path::new("src/process/pending_drain_finalizer.rs")
+                    || path == Path::new("src/process/startup_loop.rs")
+                    || path == Path::new("src/process/startup_loop_tests.rs")
+            );
             let allowed_observation_process = path == Path::new("src/process/observation.rs")
                 && identifier == "automation_runtime_worker";
             let allowed_observation_process_tests = path
@@ -1049,30 +1097,37 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 && identifier == "automation_runtime_controller";
             let allowed_mutation_finalizer = path == Path::new("src/mutation_finalizer.rs")
                 && identifier == "automation_runtime_worker";
-            let allowed_pending_drain_succession = matches!(
-                (path, identifier),
-                (
-                    path,
-                    "RuntimeDurablyAcknowledgedPendingDrainSuccessionV3"
-                        | "RuntimePendingDrainPreviousOwnerClaimedCandidateV3"
-                        | "RuntimeRegistryPendingDrainSuccessionSealBindingV3"
-                ) if path == Path::new("src/registry.rs")
-                    || path == Path::new("src/closed_recovery.rs")
-            ) || matches!(
-                (path, identifier),
-                (
-                    path,
-                    "RuntimeAcceptedPendingDrainSelectionV3"
-                        | "RuntimeAuthorizedPendingDrainSelectionV3"
-                        | "RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3"
-                        | "RuntimePendingDrainSelectionPortV3"
-                        | "RuntimePendingDrainSelectionReceiptV3"
-                        | "RuntimePendingDrainSuccessionAcknowledgementExecutionPortV3"
-                        | "RuntimePendingDrainSuccessionAcknowledgementReceiptV3"
-                ) if path == Path::new("src/process/execution.rs")
-            );
+            let allowed_pending_drain_succession = path
+                == Path::new("src/process/pending_drain_finalizer.rs")
+                || matches!(
+                    (path, identifier),
+                    (
+                        path,
+                        "RuntimeDurablyAcknowledgedPendingDrainSuccessionV3"
+                            | "RuntimePendingDrainPreviousOwnerClaimedCandidateV3"
+                            | "RuntimeRegistryPendingDrainSuccessionSealBindingV3"
+                    ) if path == Path::new("src/registry.rs")
+                        || path == Path::new("src/closed_recovery.rs")
+                )
+                || matches!(
+                    (path, identifier),
+                    (
+                        path,
+                        "RuntimeAcceptedPendingDrainSelectionV3"
+                            | "RuntimeAuthorizedPendingDrainSelectionV3"
+                            | "RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3"
+                            | "RuntimePendingDrainSelectionPortV3"
+                            | "RuntimePendingDrainSelectionReceiptV3"
+                            | "RuntimePendingDrainSuccessionAcknowledgementExecutionPortV3"
+                            | "RuntimePendingDrainSuccessionAcknowledgementReceiptV3"
+                    ) if path == Path::new("src/database.rs")
+                        || path == Path::new("src/process/execution.rs")
+                        || path == Path::new("src/process/pending_drain_finalizer.rs")
+                );
             assert!(
-                (!identifier.ends_with("V3") || allowed_pending_drain_succession)
+                (!identifier.ends_with("V3")
+                    || allowed_pending_drain_succession
+                    || allowed_pending_drain_finalizer_v3)
                     && (allowed_readiness_worker
                         || allowed_registry_adapter
                         || allowed_closed_recovery
@@ -1082,6 +1137,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_paused_connected
                         || allowed_recovery_process
                         || allowed_execution_process
+                        || allowed_pending_drain_finalizer_dependency
                         || allowed_observation_process
                         || allowed_observation_process_tests
                         || allowed_process_identity
@@ -3331,6 +3387,7 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
         .unwrap();
     let closed = include_str!("../src/closed_recovery.rs");
     let gateway = include_str!("../src/gateway.rs");
+    let finalizer = include_str!("../src/process/pending_drain_finalizer.rs");
 
     for required in [
         "RuntimeStartupRecoveryExecutionPortV2",
@@ -3394,74 +3451,15 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
     assert!(begin < database && database < complete);
     let pending_execution = braced_declaration(
         execution,
-        "async fn try_execute_pending_drain_recovery_with_environment_v2<",
-    );
-    let pending_wrapper = braced_declaration(
-        execution,
-        "async fn execute_pending_drain_recovery_in_place_v2(",
-    );
-    let pending_environment = pending_wrapper
-        .find("RuntimeProductionPendingDrainRecoveryEnvironmentV2")
-        .unwrap();
-    let pending_driver = pending_wrapper
-        .find("execute_pending_drain_recovery_with_environment_v2(session, &mut environment)")
-        .unwrap();
-    assert!(pending_environment < pending_driver);
-    let generic_wrapper = braced_declaration(
-        execution,
-        "pub(crate) async fn execute_pending_drain_recovery_with_environment_v2<",
-    );
-    let pending_attempt = generic_wrapper
-        .find("try_execute_pending_drain_recovery_with_environment_v2(session, environment)")
-        .unwrap();
-    let pending_failure = generic_wrapper.find("if result.is_err()").unwrap();
-    let pending_invalidation = generic_wrapper
-        .find("session.invalidate_startup_recovery_execution_v2()")
-        .unwrap();
-    assert!(pending_attempt < pending_failure && pending_failure < pending_invalidation);
-    let production_environment =
-        braced_declaration(execution, "impl RuntimePendingDrainRecoveryEnvironmentV2");
-    assert_eq!(
-        production_environment
-            .matches("await_pending_drain_database_v2(")
-            .count(),
-        5
-    );
-    assert_eq!(
-        pending_execution
-            .matches("revalidate_pending_drain_stage_v2(environment, session)?")
-            .count(),
-        10
-    );
-    assert_eq!(
-        pending_execution
-            .matches("pending_drain_requires_exact_finalization_v2(&error)")
-            .count(),
-        4
+        "async fn execute_pending_drain_recovery_owned_v3(",
     );
     let pending_begin = pending_execution
         .find(".begin_startup_recovery_execution_v2(")
         .unwrap();
     let pending_select = pending_execution.find(".select_pending_drain_v3(").unwrap();
     let pending_accept = pending_execution.find(".accept_selection(").unwrap();
-    let pending_seal = pending_execution
-        .find(".seal_pending_drain_candidate_v2(")
-        .unwrap();
-    let pending_bind = pending_execution.find(".bind_registry_seal(").unwrap();
-    let pending_claim = pending_execution
-        .find(".execute_pending_drain_claim_v2(")
-        .unwrap();
-    let pending_acknowledgement = pending_execution
-        .find(".execute_pending_drain_acknowledgement_v2(")
-        .unwrap();
-    let durable_acknowledgement = pending_execution
-        .find(".complete(acknowledgement_receipt)")
-        .unwrap();
-    let pending_unseal = pending_execution
-        .find(".unseal_pending_drain_after_durable_ack_v2(&durable)")
-        .unwrap();
-    let pending_rollover = pending_execution
-        .find(".complete_registry_rollover(unseal)")
+    let pending_stage = pending_execution
+        .find("execute_owned_pending_drain_stage_v3(")
         .unwrap();
     let pending_gateway_completion = pending_execution
         .rfind(".complete_startup_recovery_execution_v2(completed)")
@@ -3469,20 +3467,8 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
     assert!(
         pending_begin < pending_select
             && pending_select < pending_accept
-            && pending_accept < pending_seal
-            && pending_seal < pending_bind
-            && pending_bind < pending_claim
-            && pending_claim < pending_acknowledgement
-            && pending_acknowledgement < durable_acknowledgement
-            && durable_acknowledgement < pending_unseal
-            && pending_unseal < pending_rollover
-            && pending_rollover < pending_gateway_completion
-    );
-    assert_eq!(
-        pending_execution
-            .matches(".unseal_pending_drain_after_durable_ack_v2(")
-            .count(),
-        1
+            && pending_accept < pending_stage
+            && pending_stage < pending_gateway_completion
     );
     assert_eq!(
         pending_execution
@@ -3492,73 +3478,44 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
     );
     assert_eq!(
         pending_execution
-            .matches(".record_pending_drain_no_candidate_v2(")
+            .matches("execute_owned_pending_drain_stage_v3(")
             .count(),
-        2
+        4
+    );
+    let registration = braced_declaration(
+        finalizer,
+        "pub(crate) async fn register_and_complete_pending_drain_job_v3<",
+    );
+    let register = registration.find(".try_register(").unwrap();
+    let waiter_drop = registration.find("drop(waiter)").unwrap();
+    let completion = registration
+        .find("supervisor.next_completion().await")
+        .unwrap();
+    assert!(register < waiter_drop && waiter_drop < completion);
+    let stage_execution = braced_declaration(
+        finalizer,
+        "async fn execute_pending_drain_mutation_stage_v3<",
     );
     assert_eq!(
-        pending_execution
-            .matches(".execute_pending_drain_claim_v2(")
+        stage_execution
+            .matches("pending_drain_requires_exact_finalization_v3(&error)")
             .count(),
-        2
+        4
     );
-    assert_eq!(
-        pending_execution
-            .matches(".execute_pending_drain_acknowledgement_v2(")
-            .count(),
-        2
-    );
-    assert_eq!(
-        pending_execution
-            .matches(".execute_pending_drain_succession_v3(")
-            .count(),
-        2
-    );
-    assert_eq!(
-        pending_execution
-            .matches(".unseal_pending_drain_after_durable_succession_v3(")
-            .count(),
-        1
-    );
-    let succession_seal = pending_execution
-        .find(".seal_pending_drain_succession_candidate_v3(")
-        .unwrap();
-    let succession_bind = pending_execution[succession_seal..]
-        .find(".bind_registry_seal(seal)")
-        .map(|offset| succession_seal + offset)
-        .unwrap();
-    let succession_execute = pending_execution[succession_bind..]
-        .find(".execute_pending_drain_succession_v3(")
-        .map(|offset| succession_bind + offset)
-        .unwrap();
-    let succession_durable = pending_execution[succession_execute..]
-        .find("let durable = succession")
-        .map(|offset| succession_execute + offset)
-        .unwrap();
-    let succession_revalidate = pending_execution[succession_durable..]
-        .find("revalidate_pending_drain_stage_v2(environment, session)?")
-        .map(|offset| succession_durable + offset)
-        .unwrap();
-    let succession_unseal = pending_execution[succession_revalidate..]
-        .find(".unseal_pending_drain_after_durable_succession_v3(&durable)")
-        .map(|offset| succession_revalidate + offset)
-        .unwrap();
-    let succession_rollover = pending_execution[succession_unseal..]
-        .find(".complete_registry_rollover(unseal)")
-        .map(|offset| succession_unseal + offset)
-        .unwrap();
-    assert!(
-        succession_seal < succession_bind
-            && succession_bind < succession_execute
-            && succession_execute < succession_durable
-            && succession_durable < succession_revalidate
-            && succession_revalidate < succession_unseal
-            && succession_unseal < succession_rollover
-            && succession_rollover < pending_gateway_completion
-    );
+    for required in [
+        ".record_no_candidate_v3(session, &selection)",
+        ".execute_claim_v3(session, &authorization)",
+        ".execute_acknowledgement_v3(session, &authorization)",
+        ".execute_succession_v3(session, &authorization)",
+        ".unseal_pending_drain_after_durable_ack_v2(&durable)",
+        ".unseal_pending_drain_after_durable_succession_v3(&durable)",
+        ".complete_registry_rollover(unseal)",
+    ] {
+        assert!(stage_execution.contains(required), "{required}");
+    }
     let pending_finalization = braced_declaration(
-        execution,
-        "fn pending_drain_requires_exact_finalization_v2(",
+        finalizer,
+        "fn pending_drain_requires_exact_finalization_v3(",
     );
     assert!(pending_finalization.contains("RuntimeExecutionPersistenceErrorV1::Indeterminate"));
     assert!(!pending_finalization.contains(".class()"));

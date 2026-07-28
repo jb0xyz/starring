@@ -1,7 +1,9 @@
 use std::fmt::{Debug, Formatter};
+use std::num::NonZeroU64;
 
 use automation_runtime_controller::RuntimeBuildRevisionV1;
 use automation_runtime_convergence::{ControllerId, ProcessInstanceId};
+use automation_runtime_worker::RuntimeMutationFinalizerGenerationV1;
 
 use crate::build_revision::CompiledRuntimeBuildRevisionV1;
 use crate::controller_identity::generate_runtime_controller_id_v1;
@@ -14,8 +16,8 @@ use crate::{
     RuntimeControllerIdGenerationErrorV1, RuntimeDatabaseCompositionErrorV1,
     RuntimeDatabaseDependenciesV1, RuntimeDatabasePoolShutdownErrorV1,
     RuntimeGatewayBootstrapErrorV1, RuntimeGatewayBootstrapV1,
-    RuntimeProcessInstanceIdGenerationErrorV1, RuntimeRegistryBootstrapErrorV1,
-    RuntimeRegistryBootstrapV1,
+    RuntimeMutationFinalizerStartErrorV1, RuntimeProcessInstanceIdGenerationErrorV1,
+    RuntimeRegistryBootstrapErrorV1, RuntimeRegistryBootstrapV1,
 };
 
 mod closed;
@@ -24,6 +26,7 @@ mod execution;
 #[cfg_attr(test, allow(dead_code))]
 mod observation;
 mod owner;
+mod pending_drain_finalizer;
 mod readiness;
 mod recovery;
 mod startup_loop;
@@ -46,6 +49,13 @@ pub(crate) use owner::RuntimeOwnerHeldProcessV1;
 pub use owner::{
     RuntimeGatewayOwnerShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,
     RuntimeProcessGatewayOwnerTransitionErrorV1,
+};
+#[cfg(test)]
+pub(crate) use pending_drain_finalizer::{
+    register_and_complete_pending_drain_job_v3, RuntimePendingDrainFinalizerDispatchFailureV3,
+    RuntimePendingDrainFinalizerJobV3, RuntimePendingDrainFinalizerPortV3,
+    RuntimePendingDrainMutationEnvironmentV3, RuntimePendingDrainMutationOutputV3,
+    RuntimePendingDrainMutationStageV3,
 };
 pub use readiness::{
     RuntimeProcessRecoveryReadinessFailureV2, RuntimeProcessRecoveryReadinessTransitionErrorV2,
@@ -73,6 +83,8 @@ pub enum RuntimeProcessFoundationCompositionErrorV1 {
     Registry(RuntimeRegistryBootstrapErrorV1),
     #[error("runtime process foundation gateway composition failed")]
     Gateway(RuntimeGatewayBootstrapErrorV1),
+    #[error("runtime process foundation mutation finalizer composition failed")]
+    MutationFinalizer(RuntimeMutationFinalizerStartErrorV1),
     #[error("runtime process foundation registry failure cleanup failed")]
     CleanupAfterRegistry {
         composition: RuntimeRegistryBootstrapErrorV1,
@@ -81,6 +93,11 @@ pub enum RuntimeProcessFoundationCompositionErrorV1 {
     #[error("runtime process foundation gateway failure cleanup failed")]
     CleanupAfterGateway {
         composition: RuntimeGatewayBootstrapErrorV1,
+        cleanup: RuntimeDatabasePoolShutdownErrorV1,
+    },
+    #[error("runtime process foundation mutation finalizer failure cleanup failed")]
+    CleanupAfterMutationFinalizer {
+        composition: RuntimeMutationFinalizerStartErrorV1,
         cleanup: RuntimeDatabasePoolShutdownErrorV1,
     },
     #[error("runtime process foundation startup operation deadline elapsed")]
@@ -99,10 +116,14 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
             Self::Database(error) => error.code(),
             Self::Registry(error) => error.code(),
             Self::Gateway(error) => error.code(),
+            Self::MutationFinalizer(_) => "runtime_process_foundation_mutation_finalizer",
             Self::CleanupAfterRegistry { .. } => {
                 "runtime_process_foundation_cleanup_after_registry"
             }
             Self::CleanupAfterGateway { .. } => "runtime_process_foundation_cleanup_after_gateway",
+            Self::CleanupAfterMutationFinalizer { .. } => {
+                "runtime_process_foundation_cleanup_after_mutation_finalizer"
+            }
             Self::OperationDeadlineElapsed => {
                 "runtime_process_foundation_operation_deadline_elapsed"
             }
@@ -119,8 +140,10 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
             Self::Database(error) => error.context(),
             Self::Registry(_)
             | Self::Gateway(_)
+            | Self::MutationFinalizer(_)
             | Self::CleanupAfterRegistry { .. }
             | Self::CleanupAfterGateway { .. }
+            | Self::CleanupAfterMutationFinalizer { .. }
             | Self::OperationDeadlineElapsed
             | Self::CleanupAfterOperationDeadline { .. } => None,
         }
@@ -143,6 +166,9 @@ pub(crate) struct RuntimeProcessFoundationV1 {
     build_revision: RuntimeBuildRevisionV1,
     process_instance_id: ProcessInstanceId,
     controller_id: ControllerId,
+    mutation_finalizer: pending_drain_finalizer::RuntimePendingDrainFinalizerSupervisorV3<
+        execution::RuntimeProductionPendingDrainFinalizerEnvironmentV3,
+    >,
 }
 
 impl RuntimeProcessFoundationV1 {
@@ -157,8 +183,11 @@ impl RuntimeProcessFoundationV1 {
             build_revision,
             process_instance_id,
             controller_id,
+            mutation_finalizer,
         } = self;
         let cleanup_deadline = startup_budget.cleanup_deadline();
+        let finalizer_report = mutation_finalizer.join().await;
+        drop(finalizer_report);
         let shutdown = databases.shutdown();
         drop((gateway, registry, databases));
         let result = shutdown.close_until(cleanup_deadline).await;
@@ -243,6 +272,35 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         drop(closed_components);
         return Err(cleanup_after_operation_deadline_v1(databases, &startup_budget).await);
     }
+    let finalizer_generation =
+        RuntimeMutationFinalizerGenerationV1::new(NonZeroU64::MIN).expect("finalizer generation");
+    let mutation_finalizer =
+        match pending_drain_finalizer::RuntimePendingDrainFinalizerSupervisorV3::start(
+            pending_drain_finalizer::production_finalizer_config_v3(),
+            finalizer_generation,
+            pending_drain_finalizer::RuntimePendingDrainFinalizerPortV3::new(),
+        ) {
+            Ok(finalizer) => finalizer,
+            Err(composition) => {
+                drop(closed_components);
+                let shutdown = databases.shutdown();
+                drop(databases);
+                return match shutdown
+                    .close_until(startup_budget.cleanup_deadline())
+                    .await
+                {
+                    Ok(()) => Err(
+                        RuntimeProcessFoundationCompositionErrorV1::MutationFinalizer(composition),
+                    ),
+                    Err(cleanup) => Err(
+                        RuntimeProcessFoundationCompositionErrorV1::CleanupAfterMutationFinalizer {
+                            composition,
+                            cleanup,
+                        },
+                    ),
+                };
+            }
+        };
     Ok(RuntimeProcessFoundationV1 {
         gateway: closed_components.gateway,
         registry: closed_components.registry,
@@ -253,6 +311,7 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         build_revision,
         process_instance_id,
         controller_id,
+        mutation_finalizer,
     })
 }
 

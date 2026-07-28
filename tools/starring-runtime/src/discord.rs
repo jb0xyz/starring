@@ -197,6 +197,43 @@ pub(crate) struct RuntimeDiscordGatewaySupervisorV1 {
     join_task: Option<JoinHandle<bool>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct RuntimeDiscordGatewayObservationV1 {
+    terminal: watch::Receiver<Option<RuntimeDiscordGatewayTerminalV1>>,
+    stopped: watch::Receiver<bool>,
+}
+
+impl RuntimeDiscordGatewayObservationV1 {
+    pub(crate) fn terminal_status(&self) -> Option<RuntimeDiscordGatewayTerminalV1> {
+        *self.terminal.borrow()
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        *self.stopped.borrow()
+    }
+
+    pub(crate) async fn wait_terminal(&mut self) -> RuntimeDiscordGatewayTerminalV1 {
+        loop {
+            if let Some(terminal) = *self.terminal.borrow_and_update() {
+                return terminal;
+            }
+            if self.terminal.changed().await.is_err() {
+                return RuntimeDiscordGatewayTerminalV1 {
+                    exit: RuntimeDiscordGatewayExitV1::RuntimeFailure,
+                    close: RuntimeDiscordGatewayCloseOutcomeV1::DeadlineElapsed,
+                    control_stopped: false,
+                };
+            }
+        }
+    }
+}
+
+impl Debug for RuntimeDiscordGatewayObservationV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeDiscordGatewayObservationV1(<redacted>)")
+    }
+}
+
 pub(crate) struct RuntimeDiscordGatewayActorStartV1 {
     pub(crate) control: SharedGatewayRuntimeControlV3,
     pub(crate) operation_cutoff: Instant,
@@ -231,6 +268,13 @@ impl Drop for RuntimeDiscordControlTaskV1 {
 }
 
 impl RuntimeDiscordGatewaySupervisorV1 {
+    pub(crate) fn observation_v1(&self) -> RuntimeDiscordGatewayObservationV1 {
+        RuntimeDiscordGatewayObservationV1 {
+            terminal: self.terminal.clone(),
+            stopped: self.stopped.clone(),
+        }
+    }
+
     pub(crate) fn terminal_status(&self) -> Option<RuntimeDiscordGatewayTerminalV1> {
         *self.terminal.borrow()
     }

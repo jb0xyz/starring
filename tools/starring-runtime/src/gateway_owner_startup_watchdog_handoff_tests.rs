@@ -1089,6 +1089,91 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
     }
 }
 
+impl crate::process::RuntimePendingDrainMutationEnvironmentV3
+    for FakePendingDrainRecoveryEnvironmentV2
+{
+    fn current_transition_v3(
+        &self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+    ) -> Option<crate::process::RuntimeProcessStartupRecoveryLoopFailureV2> {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::current_transition_v2(
+            self, session,
+        )
+    }
+
+    async fn record_no_candidate_v3(
+        &mut self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        selection: &RuntimeSelectedPendingDrainNoCandidateV2,
+    ) -> Result<
+        RuntimePendingDrainNoCandidateReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            PendingDrainPersistenceErrorV1,
+        >,
+    > {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::record_pending_drain_no_candidate_v2(
+            self,
+            session,
+            selection,
+        )
+        .await
+    }
+
+    async fn execute_claim_v3(
+        &mut self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        authorization: &RuntimeAuthorizedPendingDrainClaimV2,
+    ) -> Result<
+        RuntimePendingDrainClaimReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            PendingDrainPersistenceErrorV1,
+        >,
+    > {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::execute_pending_drain_claim_v2(
+            self,
+            session,
+            authorization,
+        )
+        .await
+    }
+
+    async fn execute_acknowledgement_v3(
+        &mut self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        authorization: &RuntimeAuthorizedPendingDrainAcknowledgementV2,
+    ) -> Result<
+        RuntimePendingDrainAcknowledgementReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            PendingDrainPersistenceErrorV1,
+        >,
+    > {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::execute_pending_drain_acknowledgement_v2(
+            self,
+            session,
+            authorization,
+        )
+        .await
+    }
+
+    async fn execute_succession_v3(
+        &mut self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        authorization: &RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3,
+    ) -> Result<
+        RuntimePendingDrainSuccessionAcknowledgementReceiptV3,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            PendingDrainPersistenceErrorV1,
+        >,
+    > {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::execute_pending_drain_succession_v3(
+            self,
+            session,
+            authorization,
+        )
+        .await
+    }
+}
+
 fn fixture(
     lease_for: Duration,
     renew_before: Duration,
@@ -1919,6 +2004,305 @@ async fn run_pending_drain_test_v2(
         successor,
         environment,
     }
+}
+
+fn pending_drain_finalizer_supervisor_v3() -> crate::RuntimeMutationFinalizerSupervisorV1<
+    crate::process::RuntimePendingDrainFinalizerPortV3<FakePendingDrainRecoveryEnvironmentV2>,
+> {
+    crate::RuntimeMutationFinalizerSupervisorV1::start(
+        crate::RuntimeMutationFinalizerConfigV1::new(1).unwrap(),
+        automation_runtime_worker::RuntimeMutationFinalizerGenerationV1::new(
+            NonZeroU64::new(9).unwrap(),
+        )
+        .unwrap(),
+        crate::process::RuntimePendingDrainFinalizerPortV3::new(),
+    )
+    .unwrap()
+}
+
+async fn select_pending_drain_for_finalizer_v3(
+    session: &mut crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+    environment: &mut FakePendingDrainRecoveryEnvironmentV2,
+) -> automation_runtime_worker::RuntimeAcceptedPendingDrainSelectionV3 {
+    let authorization = session
+        .begin_startup_recovery_execution_v2(RuntimeStartupRecoveryContinuationV2::Recover(
+            RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent,
+        ))
+        .unwrap()
+        .into_pending_drain_selection_v3()
+        .unwrap();
+    let receipt =
+        match crate::process::RuntimePendingDrainRecoveryEnvironmentV2::select_pending_drain_v3(
+            environment,
+            session,
+            &authorization,
+        )
+        .await
+        {
+            Ok(receipt) => receipt,
+            Err(_) => panic!("pending-drain selection"),
+        };
+    authorization.accept_selection(receipt).unwrap()
+}
+
+#[tokio::test]
+async fn root_finalizer_owns_each_pending_drain_mutation_and_exactly_finalizes_once() {
+    let (gateway, registry, mut session, port) =
+        initial_pending_drain_continue_fresh_registry_fixture_v2(
+            "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+        )
+        .await;
+    let mut environment = FakePendingDrainRecoveryEnvironmentV2::failing_sequence([(
+        PendingDrainTestStageV2::NoCandidate,
+        PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate),
+    )]);
+    let selected = select_pending_drain_for_finalizer_v3(&mut session, &mut environment).await;
+    let automation_runtime_worker::RuntimeAcceptedPendingDrainSelectionV3::NoCandidate(selected) =
+        selected
+    else {
+        panic!("no-candidate selection")
+    };
+    let job = crate::process::RuntimePendingDrainFinalizerJobV3::new(
+        session,
+        environment,
+        crate::process::RuntimePendingDrainMutationStageV3::NoCandidate(selected),
+    );
+    let mut supervisor = pending_drain_finalizer_supervisor_v3();
+    let settled = crate::process::register_and_complete_pending_drain_job_v3(&mut supervisor, job)
+        .await
+        .unwrap();
+    let (session, environment, output) = settled.into_parts();
+    assert!(matches!(
+        output,
+        crate::process::RuntimePendingDrainMutationOutputV3::Completed(_)
+    ));
+    assert_eq!(
+        environment.events,
+        [
+            PendingDrainTestStageV2::Selection,
+            PendingDrainTestStageV2::NoCandidate,
+            PendingDrainTestStageV2::NoCandidate,
+        ]
+    );
+    let fingerprints: Vec<_> = environment
+        .mutation_fingerprints
+        .iter()
+        .filter(|fingerprint| fingerprint.stage() == PendingDrainTestStageV2::NoCandidate)
+        .collect();
+    assert_eq!(fingerprints.len(), 2);
+    assert!(fingerprints[0] == fingerprints[1]);
+    assert!(registry.observe_recovery_empty_projection_v2().is_ok());
+    drop(session);
+    drop(gateway);
+    let report = supervisor.join().await;
+    assert_eq!(report.exit(), crate::RuntimeSupervisorExitV1::Commanded);
+    wait_for(|| port.release_calls() == 1).await;
+
+    let (gateway, registry, mut session, port) =
+        initial_pending_drain_continue_fresh_registry_fixture_v2(
+            "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2",
+        )
+        .await;
+    let mut environment = FakePendingDrainRecoveryEnvironmentV2::failing_sequence([
+        (
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate),
+        ),
+        (
+            PendingDrainTestStageV2::Acknowledgement,
+            PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate),
+        ),
+    ]);
+    let selected = select_pending_drain_for_finalizer_v3(&mut session, &mut environment).await;
+    let automation_runtime_worker::RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selected) =
+        selected
+    else {
+        panic!("unclaimed selection")
+    };
+    let seal = session
+        .seal_pending_drain_candidate_v2(selected.candidate())
+        .unwrap();
+    let claim = selected.bind_registry_seal(seal).unwrap();
+    let mut supervisor = pending_drain_finalizer_supervisor_v3();
+    let job = crate::process::RuntimePendingDrainFinalizerJobV3::new(
+        session,
+        environment,
+        crate::process::RuntimePendingDrainMutationStageV3::Claim(Box::new(claim)),
+    );
+    let settled = crate::process::register_and_complete_pending_drain_job_v3(&mut supervisor, job)
+        .await
+        .unwrap();
+    let (session, environment, output) = settled.into_parts();
+    let crate::process::RuntimePendingDrainMutationOutputV3::ClaimAccepted(acknowledgement) =
+        output
+    else {
+        panic!("claim acknowledgement")
+    };
+    let job = crate::process::RuntimePendingDrainFinalizerJobV3::new(
+        session,
+        environment,
+        crate::process::RuntimePendingDrainMutationStageV3::Acknowledgement(Box::new(
+            acknowledgement,
+        )),
+    );
+    let settled = crate::process::register_and_complete_pending_drain_job_v3(&mut supervisor, job)
+        .await
+        .unwrap();
+    let (session, environment, output) = settled.into_parts();
+    assert!(matches!(
+        output,
+        crate::process::RuntimePendingDrainMutationOutputV3::Completed(_)
+    ));
+    assert_eq!(
+        environment.events,
+        [
+            PendingDrainTestStageV2::Selection,
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestStageV2::Acknowledgement,
+            PendingDrainTestStageV2::Acknowledgement,
+        ]
+    );
+    for stage in [
+        PendingDrainTestStageV2::Claim,
+        PendingDrainTestStageV2::Acknowledgement,
+    ] {
+        let fingerprints: Vec<_> = environment
+            .mutation_fingerprints
+            .iter()
+            .filter(|fingerprint| fingerprint.stage() == stage)
+            .collect();
+        assert_eq!(fingerprints.len(), 2);
+        assert!(fingerprints[0] == fingerprints[1]);
+    }
+    assert!(registry.observe_recovery_empty_projection_v2().is_ok());
+    drop(session);
+    drop(gateway);
+    let report = supervisor.join().await;
+    assert_eq!(report.exit(), crate::RuntimeSupervisorExitV1::Commanded);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn root_finalizer_keeps_seal_on_second_uncertainty_and_returns_session_to_mailbox() {
+    let (gateway, registry, mut session, port) =
+        initial_pending_drain_continue_fresh_registry_fixture_v2(
+            "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
+        )
+        .await;
+    let indeterminate =
+        PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate);
+    let mut environment = FakePendingDrainRecoveryEnvironmentV2::failing_sequence([
+        (PendingDrainTestStageV2::Claim, indeterminate),
+        (PendingDrainTestStageV2::Claim, indeterminate),
+    ]);
+    let selected = select_pending_drain_for_finalizer_v3(&mut session, &mut environment).await;
+    let automation_runtime_worker::RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selected) =
+        selected
+    else {
+        panic!("unclaimed selection")
+    };
+    let seal = session
+        .seal_pending_drain_candidate_v2(selected.candidate())
+        .unwrap();
+    let claim = selected.bind_registry_seal(seal).unwrap();
+    let job = crate::process::RuntimePendingDrainFinalizerJobV3::new(
+        session,
+        environment,
+        crate::process::RuntimePendingDrainMutationStageV3::Claim(Box::new(claim)),
+    );
+    let mut supervisor = pending_drain_finalizer_supervisor_v3();
+    let failed = crate::process::register_and_complete_pending_drain_job_v3(&mut supervisor, job)
+        .await
+        .unwrap_err();
+    let crate::process::RuntimePendingDrainFinalizerDispatchFailureV3::Failed(failed) = failed
+    else {
+        panic!("terminal mutation failure")
+    };
+    let (session, environment, failure) = failed.into_parts();
+    assert_eq!(
+        failure,
+        crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(
+            PendingDrainPersistenceErrorV1::Indeterminate,
+        )
+    );
+    assert_eq!(
+        environment.events,
+        [
+            PendingDrainTestStageV2::Selection,
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestStageV2::Claim,
+        ]
+    );
+    assert_eq!(
+        registry.observe_recovery_empty_projection_v2(),
+        Err(crate::RuntimeRegistryRecoveryObservationErrorV1::NotEmpty)
+    );
+    session.invalidate_startup_recovery_execution_v2();
+    drop(session);
+    drop(gateway);
+    let report = supervisor.join().await;
+    assert_eq!(report.exit(), crate::RuntimeSupervisorExitV1::Commanded);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn root_finalizer_preserves_expired_owner_succession_identity() {
+    let (gateway, registry, mut session, port) =
+        initial_pending_drain_continue_fresh_registry_fixture_v2(
+            "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        )
+        .await;
+    let mut environment = FakePendingDrainRecoveryEnvironmentV2::failing_sequence([(
+        PendingDrainTestStageV2::Succession,
+        PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate),
+    )]);
+    let selected = select_pending_drain_for_finalizer_v3(&mut session, &mut environment).await;
+    let automation_runtime_worker::RuntimeAcceptedPendingDrainSelectionV3::ExpiredPreviousOwner(
+        selected,
+    ) = selected
+    else {
+        panic!("expired previous owner selection")
+    };
+    let seal = session
+        .seal_pending_drain_succession_candidate_v3(selected.candidate())
+        .unwrap();
+    let succession = selected.bind_registry_seal(seal).unwrap();
+    let job = crate::process::RuntimePendingDrainFinalizerJobV3::new(
+        session,
+        environment,
+        crate::process::RuntimePendingDrainMutationStageV3::Succession(Box::new(succession)),
+    );
+    let mut supervisor = pending_drain_finalizer_supervisor_v3();
+    let settled = crate::process::register_and_complete_pending_drain_job_v3(&mut supervisor, job)
+        .await
+        .unwrap();
+    let (session, environment, output) = settled.into_parts();
+    assert!(matches!(
+        output,
+        crate::process::RuntimePendingDrainMutationOutputV3::Completed(_)
+    ));
+    assert_eq!(
+        environment.events,
+        [
+            PendingDrainTestStageV2::Selection,
+            PendingDrainTestStageV2::Succession,
+            PendingDrainTestStageV2::Succession,
+        ]
+    );
+    let fingerprints: Vec<_> = environment
+        .mutation_fingerprints
+        .iter()
+        .filter(|fingerprint| fingerprint.stage() == PendingDrainTestStageV2::Succession)
+        .collect();
+    assert_eq!(fingerprints.len(), 2);
+    assert!(fingerprints[0] == fingerprints[1]);
+    assert!(registry.observe_recovery_empty_projection_v2().is_ok());
+    drop(session);
+    drop(gateway);
+    let report = supervisor.join().await;
+    assert_eq!(report.exit(), crate::RuntimeSupervisorExitV1::Commanded);
+    wait_for(|| port.release_calls() == 1).await;
 }
 
 #[tokio::test]

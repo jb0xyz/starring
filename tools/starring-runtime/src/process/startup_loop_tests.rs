@@ -244,6 +244,23 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for FakeContinueProcessV2 {
         }))
     }
 
+    fn execute_recovery_owned_v3(
+        self,
+        _class: RuntimeStartupRecoveryClassV2,
+    ) -> RuntimeStartupRecoveryOwnedStepFutureV3<
+        Self,
+        Self::RecoveryCompletion,
+        Self::RecoveryFailure,
+        Self::Error,
+    > {
+        push_fake_loop_event_v2(&self.state, "recovery");
+        Box::pin(ready(Ok(if self.recovery_failure {
+            RuntimeStartupRecoveryOwnedStepOutcomeV3::Failed(self, ())
+        } else {
+            RuntimeStartupRecoveryOwnedStepOutcomeV3::Completed(self, ())
+        })))
+    }
+
     async fn cleanup_after_recovery_failure_v2(
         self,
         _failure: Self::RecoveryFailure,
@@ -322,6 +339,28 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for FakeCancelableContinueProcessV
         Box::pin(async move {
             recovery.await;
             Ok(())
+        })
+    }
+
+    fn execute_recovery_owned_v3(
+        self,
+        _class: RuntimeStartupRecoveryClassV2,
+    ) -> RuntimeStartupRecoveryOwnedStepFutureV3<
+        Self,
+        Self::RecoveryCompletion,
+        Self::RecoveryFailure,
+        Self::Error,
+    > {
+        let recovery = TrackedPendingWaitV2 {
+            polled: self.polled.clone(),
+            dropped: self.dropped.clone(),
+        };
+        Box::pin(async move {
+            recovery.await;
+            Ok(RuntimeStartupRecoveryOwnedStepOutcomeV3::Completed(
+                self,
+                (),
+            ))
         })
     }
 
