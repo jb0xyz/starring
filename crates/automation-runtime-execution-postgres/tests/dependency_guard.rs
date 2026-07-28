@@ -240,6 +240,8 @@ fn startup_recovery_action_journal_remains_private_behind_owner_fenced_execution
         source.contains("public.starring_runtime_startup_recovery_record_pending_drain_none_v2")
     );
     assert!(source.contains("public.starring_runtime_startup_recovery_execute_pending_drain_v2"));
+    assert!(source.contains("public.starring_runtime_startup_recovery_select_pending_drain_v3"));
+    assert!(source.contains("public.starring_runtime_startup_recovery_pending_drain_succession_v3"));
     for forbidden in [
         "starring_runtime_private_v2",
         "starring_runtime_startup_recovery_action_record_v2",
@@ -261,7 +263,7 @@ fn startup_recovery_action_journal_remains_private_behind_owner_fenced_execution
             .unwrap()
             .matches("public.starring_runtime_")
             .count(),
-        22
+        24
     );
 }
 

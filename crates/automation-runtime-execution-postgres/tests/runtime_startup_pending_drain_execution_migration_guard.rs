@@ -21,6 +21,8 @@ const MANIFEST_DEFINITION_DIGEST: &str =
     "9de93ea5d565254c47533c7af43959aa873014bee385a2af775fafdcbf8118b9";
 const READINESS_DEFINITION_DIGEST: &str =
     "1c20dcc6c6e01b440d9a5813bad12b109d89a67c5d6815f9fd15551fa3c0f4e5";
+const LATEST_READINESS_DEFINITION_DIGEST: &str =
+    "d73ca3b8f02623884ccf1e77390395a1daeee1d5c3d12274f865740d0798fa06";
 
 fn dollar_block(tag: &str) -> &'static str {
     MIGRATION
@@ -187,7 +189,7 @@ fn canonical_state_ddl_trigger_and_manifest_are_pinned() {
     ] {
         assert!(MIGRATION.contains(required), "{required}");
     }
-    assert!(SECURITY_SUPPORT_SOURCE.contains(READINESS_DEFINITION_DIGEST));
+    assert!(SECURITY_SUPPORT_SOURCE.contains(LATEST_READINESS_DEFINITION_DIGEST));
     let strict_backfill = dollar_block("strict_backfill_exact");
     for required in [
         "FROM public.runtime_drain_intents_v2 AS drain",
