@@ -6,6 +6,7 @@ use std::num::NonZeroU64;
 use automation_runtime_convergence::{ControllerId, DeploymentRevision};
 use chrono::{DateTime, Utc};
 
+use crate::v2_canonical_value::RuntimePersistenceU64V2;
 use crate::{
     RuntimeClosedRecoveryRouteWitnessV2, RuntimeDrainCertificationResolutionKindV2,
     RuntimeDrainCertificationResolutionV2, RuntimeDrainClaimProgressKindV2, RuntimeDrainClaimV2,
@@ -84,6 +85,12 @@ pub enum RuntimeDrainIntentReceiptErrorV2 {
     TerminalIntentRevisionMismatch,
     #[error("runtime drain consumption resulting deployment revision does not match")]
     ConsumptionResultingRevisionMismatch,
+    #[error("runtime drain consumption resulting deployment revision is not persistable")]
+    ConsumptionResultingRevisionInvalid,
+    #[error("runtime drain terminal timestamp is not canonical")]
+    TerminalTimestampInvalid,
+    #[error("runtime drain cancellation timestamp does not match")]
+    CancellationTimestampMismatch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,11 +221,13 @@ impl RuntimeDrainConsumptionSourceV2 {
     pub fn from_acknowledged(
         source: RuntimeRouteAbsentDrainIntentSourceV2,
         expected_resulting_revision: DeploymentRevision,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, RuntimeDrainIntentReceiptErrorV2> {
+        RuntimePersistenceU64V2::from_u64(expected_resulting_revision.get())
+            .map_err(|_| RuntimeDrainIntentReceiptErrorV2::ConsumptionResultingRevisionInvalid)?;
+        Ok(Self {
             source,
             expected_resulting_revision,
-        }
+        })
     }
 
     pub fn source(&self) -> &RuntimeDrainIntentV2 {
@@ -233,15 +242,28 @@ impl RuntimeDrainConsumptionSourceV2 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeDrainCancellationSourceV2 {
     source: RuntimeRouteAbsentDrainIntentSourceV2,
+    cancelled_at: RuntimeUnixMicrosecondsV2,
 }
 
 impl RuntimeDrainCancellationSourceV2 {
-    pub fn from_acknowledged(source: RuntimeRouteAbsentDrainIntentSourceV2) -> Self {
-        Self { source }
+    pub fn from_acknowledged(
+        source: RuntimeRouteAbsentDrainIntentSourceV2,
+        cancelled_at: DateTime<Utc>,
+    ) -> Result<Self, RuntimeDrainIntentReceiptErrorV2> {
+        let cancelled_at = RuntimeUnixMicrosecondsV2::from_datetime(cancelled_at)
+            .map_err(|_| RuntimeDrainIntentReceiptErrorV2::TerminalTimestampInvalid)?;
+        Ok(Self {
+            source,
+            cancelled_at,
+        })
     }
 
     pub fn source(&self) -> &RuntimeDrainIntentV2 {
         self.source.source()
+    }
+
+    pub fn cancelled_at(&self) -> DateTime<Utc> {
+        self.cancelled_at.to_datetime()
     }
 }
 
@@ -378,6 +400,7 @@ impl RuntimeDrainIntentReceiptV2 {
         if persisted_intent.state().kind() != RuntimeDrainIntentStateKindV2::Consumed {
             return Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch);
         }
+        validate_terminal_timestamp(persisted_intent.state().consumed_at())?;
         if persisted_intent.state().resulting_revision()
             != Some(source.expected_resulting_revision())
         {
@@ -402,6 +425,10 @@ impl RuntimeDrainIntentReceiptV2 {
         }
         if persisted_intent.state().kind() != RuntimeDrainIntentStateKindV2::Cancelled {
             return Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch);
+        }
+        let cancelled_at = validate_terminal_timestamp(persisted_intent.state().cancelled_at())?;
+        if cancelled_at != source.cancelled_at {
+            return Err(RuntimeDrainIntentReceiptErrorV2::CancellationTimestampMismatch);
         }
         Ok(Self::from_result(
             RuntimeDrainIntentMutationOutcomeV2::Cancelled,
@@ -445,6 +472,17 @@ fn validate_immutable_roots(
     } else {
         Err(RuntimeDrainIntentReceiptErrorV2::ImmutableRootMismatch)
     }
+}
+
+fn validate_terminal_timestamp(
+    value: Option<DateTime<Utc>>,
+) -> Result<RuntimeUnixMicrosecondsV2, RuntimeDrainIntentReceiptErrorV2> {
+    value
+        .ok_or(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+        .and_then(|value| {
+            RuntimeUnixMicrosecondsV2::from_datetime(value)
+                .map_err(|_| RuntimeDrainIntentReceiptErrorV2::TerminalTimestampInvalid)
+        })
 }
 
 fn pending_claim(

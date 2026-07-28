@@ -541,6 +541,16 @@ fn source_classifiers_accept_only_their_exact_mutable_states() {
     let routed = pending(&operation, 2, Some(routed_claim));
     let refenced = pending(&operation, 3, Some(refenced_claim.clone()));
     let acknowledged = acknowledged(&operation, 4, refenced_claim);
+    let consumed = RuntimeDrainIntentV2::consumed_from_persisted(
+        &root(&operation),
+        non_zero(5),
+        DeploymentRevision::new(9).unwrap(),
+        at(700),
+    )
+    .unwrap();
+    let cancelled =
+        RuntimeDrainIntentV2::cancelled_from_persisted(&root(&operation), non_zero(5), at(700))
+            .unwrap();
 
     assert_eq!(
         RuntimeDrainRefenceSourceV2::from_claimed(unclaimed.clone()),
@@ -562,11 +572,11 @@ fn source_classifiers_accept_only_their_exact_mutable_states() {
     );
 
     assert_eq!(
-        RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(unclaimed),
+        RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(unclaimed.clone()),
         Err(RuntimeDrainIntentReceiptErrorV2::SourceStateMismatch)
     );
     assert_eq!(
-        RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(routed),
+        RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(routed.clone()),
         Err(RuntimeDrainIntentReceiptErrorV2::SourceStateMismatch)
     );
     assert_eq!(
@@ -582,10 +592,12 @@ fn source_classifiers_accept_only_their_exact_mutable_states() {
         &refenced
     );
 
-    assert_eq!(
-        RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(refenced),
-        Err(RuntimeDrainIntentReceiptErrorV2::SourceStateMismatch)
-    );
+    for rejected in [unclaimed, routed, absent, refenced, consumed, cancelled] {
+        assert_eq!(
+            RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(rejected),
+            Err(RuntimeDrainIntentReceiptErrorV2::SourceStateMismatch)
+        );
+    }
     assert_eq!(
         RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged.clone())
             .unwrap()
@@ -1051,6 +1063,11 @@ fn terminal_receipts_accept_only_exact_acknowledged_successors() {
     let consumption_source = RuntimeDrainConsumptionSourceV2::from_acknowledged(
         RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged.clone()).unwrap(),
         resulting_revision,
+    )
+    .unwrap();
+    assert_eq!(
+        consumption_source.expected_resulting_revision(),
+        resulting_revision
     );
     let consumed = RuntimeDrainIntentV2::consumed_from_persisted(
         &root(&operation),
@@ -1069,7 +1086,10 @@ fn terminal_receipts_accept_only_exact_acknowledged_successors() {
 
     let cancellation_source = RuntimeDrainCancellationSourceV2::from_acknowledged(
         RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged).unwrap(),
-    );
+        at(1_000),
+    )
+    .unwrap();
+    assert_eq!(cancellation_source.cancelled_at(), at(1_000));
     let cancelled =
         RuntimeDrainIntentV2::cancelled_from_persisted(&root(&operation), non_zero(21), at(1_000))
             .unwrap();
@@ -1091,10 +1111,13 @@ fn terminal_receipts_reject_root_revision_state_and_result_drift() {
         RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged_intent.clone())
             .unwrap(),
         resulting_revision,
-    );
+    )
+    .unwrap();
     let cancellation_source = RuntimeDrainCancellationSourceV2::from_acknowledged(
         RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged_intent).unwrap(),
-    );
+        at(1),
+    )
+    .unwrap();
 
     let foreign_operation = operation_for(FOREIGN_DRAIN_INTENT_ID);
     let foreign_consumed = RuntimeDrainIntentV2::consumed_from_persisted(
@@ -1108,18 +1131,40 @@ fn terminal_receipts_reject_root_revision_state_and_result_drift() {
         RuntimeDrainIntentReceiptV2::consumed(&consumption_source, foreign_consumed),
         Err(RuntimeDrainIntentReceiptErrorV2::ImmutableRootMismatch)
     );
-
-    let skipped = RuntimeDrainIntentV2::consumed_from_persisted(
-        &root(&operation),
-        non_zero(22),
-        resulting_revision,
+    let foreign_cancelled = RuntimeDrainIntentV2::cancelled_from_persisted(
+        &root(&foreign_operation),
+        non_zero(21),
         at(1),
     )
     .unwrap();
     assert_eq!(
-        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, skipped),
-        Err(RuntimeDrainIntentReceiptErrorV2::TerminalIntentRevisionMismatch)
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, foreign_cancelled),
+        Err(RuntimeDrainIntentReceiptErrorV2::ImmutableRootMismatch)
     );
+
+    for rejected_revision in [19, 20, 22] {
+        let consumed = RuntimeDrainIntentV2::consumed_from_persisted(
+            &root(&operation),
+            non_zero(rejected_revision),
+            resulting_revision,
+            at(1),
+        )
+        .unwrap();
+        assert_eq!(
+            RuntimeDrainIntentReceiptV2::consumed(&consumption_source, consumed),
+            Err(RuntimeDrainIntentReceiptErrorV2::TerminalIntentRevisionMismatch)
+        );
+        let cancelled = RuntimeDrainIntentV2::cancelled_from_persisted(
+            &root(&operation),
+            non_zero(rejected_revision),
+            at(1),
+        )
+        .unwrap();
+        assert_eq!(
+            RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, cancelled),
+            Err(RuntimeDrainIntentReceiptErrorV2::TerminalIntentRevisionMismatch)
+        );
+    }
 
     let wrong_revision = RuntimeDrainIntentV2::consumed_from_persisted(
         &root(&operation),
@@ -1138,6 +1183,15 @@ fn terminal_receipts_reject_root_revision_state_and_result_drift() {
         RuntimeDrainIntentReceiptV2::consumed(&consumption_source, acknowledged_successor),
         Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
     );
+    let pending_successor = pending(&operation, 21, None);
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, pending_successor.clone()),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, pending_successor),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
 
     let consumed = RuntimeDrainIntentV2::consumed_from_persisted(
         &root(&operation),
@@ -1151,12 +1205,62 @@ fn terminal_receipts_reject_root_revision_state_and_result_drift() {
         Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
     );
 
-    let skipped_cancel =
-        RuntimeDrainIntentV2::cancelled_from_persisted(&root(&operation), non_zero(22), at(1))
+    let cancelled =
+        RuntimeDrainIntentV2::cancelled_from_persisted(&root(&operation), non_zero(21), at(1))
             .unwrap();
     assert_eq!(
-        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, skipped_cancel),
-        Err(RuntimeDrainIntentReceiptErrorV2::TerminalIntentRevisionMismatch)
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, cancelled),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
+    let acknowledged_successor = acknowledged(&operation, 21, claimed(&operation, None, 13, 10, 8));
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, acknowledged_successor),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
+
+    let timestamp_drift =
+        RuntimeDrainIntentV2::cancelled_from_persisted(&root(&operation), non_zero(21), at(2))
+            .unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, timestamp_drift),
+        Err(RuntimeDrainIntentReceiptErrorV2::CancellationTimestampMismatch)
+    );
+}
+
+#[test]
+fn cancellation_source_binds_only_canonical_database_time() {
+    let operation = operation_for(DRAIN_INTENT_ID);
+    let acknowledged = acknowledged(&operation, 20, claimed(&operation, None, 13, 10, 8));
+    let source = RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged).unwrap();
+    let canonical =
+        RuntimeDrainCancellationSourceV2::from_acknowledged(source.clone(), at(-1)).unwrap();
+    assert_eq!(canonical.source(), source.source());
+    assert_eq!(canonical.cancelled_at(), at(-1));
+
+    let sub_microsecond = DateTime::from_timestamp(1, 1).unwrap();
+    assert_eq!(
+        RuntimeDrainCancellationSourceV2::from_acknowledged(source, sub_microsecond),
+        Err(RuntimeDrainIntentReceiptErrorV2::TerminalTimestampInvalid)
+    );
+}
+
+#[test]
+fn consumption_source_binds_only_persistable_resulting_revision() {
+    let operation = operation_for(DRAIN_INTENT_ID);
+    let acknowledged = acknowledged(&operation, 20, claimed(&operation, None, 13, 10, 8));
+    let source = RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged).unwrap();
+    let expected = DeploymentRevision::new(i64::MAX as u64).unwrap();
+    let canonical =
+        RuntimeDrainConsumptionSourceV2::from_acknowledged(source.clone(), expected).unwrap();
+    assert_eq!(canonical.source(), source.source());
+    assert_eq!(canonical.expected_resulting_revision(), expected);
+
+    assert_eq!(
+        RuntimeDrainConsumptionSourceV2::from_acknowledged(
+            source,
+            DeploymentRevision::new(i64::MAX as u64 + 1).unwrap(),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::ConsumptionResultingRevisionInvalid)
     );
 }
 

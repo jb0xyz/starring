@@ -1943,6 +1943,11 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "result_claim.claim_revision() <= source_claim.claim_revision()",
         "result_claim.progress().seal() != source_claim.progress().seal()",
         "acknowledgement.claim() != source_claim",
+        "RuntimePersistenceU64V2::from_u64(expected_resulting_revision.get())",
+        "RuntimeUnixMicrosecondsV2::from_datetime(cancelled_at)",
+        "persisted_intent.state().consumed_at()",
+        "persisted_intent.state().cancelled_at()",
+        "cancelled_at != source.cancelled_at",
         "source.gateway_owner_lease_id() == result.gateway_owner_lease_id()",
         "source.observed_owner_revision() == result.observed_owner_revision()",
         "source.process_instance_id() == result.process_instance_id()",
@@ -1973,6 +1978,8 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "succession_receipt_rejects_seal_provenance_acknowledgement_and_certification_drift",
         "terminal_receipts_accept_only_exact_acknowledged_successors",
         "terminal_receipts_reject_root_revision_state_and_result_drift",
+        "cancellation_source_binds_only_canonical_database_time",
+        "consumption_source_binds_only_persistable_resulting_revision",
         "receipt_surface_is_closed_data_without_claim_or_terminal_authority",
     ] {
         assert!(
