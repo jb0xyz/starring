@@ -879,7 +879,7 @@ fn map_worker_observation_error(
 
 #[cfg(test)]
 #[path = "registry_succession_tests.rs"]
-mod succession_tests;
+pub(crate) mod succession_tests;
 
 #[cfg(test)]
 mod tests {

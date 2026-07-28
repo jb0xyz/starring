@@ -254,7 +254,16 @@ fn persisted_root() -> RuntimePersistedProductDrainRootV2 {
     .unwrap()
 }
 
-fn candidate(source_revision: u64) -> RuntimePendingDrainPreviousOwnerClaimedCandidateV3 {
+pub(crate) fn candidate(
+    source_revision: u64,
+) -> RuntimePendingDrainPreviousOwnerClaimedCandidateV3 {
+    candidate_with_claim_expiry(source_revision, at(120))
+}
+
+pub(crate) fn candidate_with_claim_expiry(
+    source_revision: u64,
+    claim_expires_at: DateTime<Utc>,
+) -> RuntimePendingDrainPreviousOwnerClaimedCandidateV3 {
     let key = canonical_product().drain_preimage().key.clone();
     let root = persisted_root();
     let process = ProcessInstanceId::parse("process:old").unwrap();
@@ -275,7 +284,7 @@ fn candidate(source_revision: u64) -> RuntimePendingDrainPreviousOwnerClaimedCan
         FencingToken::new(9).unwrap(),
         non_zero(5),
         non_zero(8),
-        at(120),
+        claim_expires_at,
         RuntimeDrainClaimProgressV2::claimed(seal),
     )
     .unwrap();

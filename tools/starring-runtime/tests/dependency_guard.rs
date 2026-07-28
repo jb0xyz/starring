@@ -842,9 +842,30 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         if path == Path::new("src/registry_succession_tests.rs") {
             continue;
         }
+        if path == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs") {
+            for identifier in source
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .filter(|identifier| !identifier.is_empty())
+            {
+                let allowed = matches!(
+                    identifier,
+                    "RuntimeAuthorizedPendingDrainSelectionV3"
+                        | "RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3"
+                        | "RuntimePendingDrainPreviousOwnerClaimedCandidateV3"
+                        | "RuntimePendingDrainSelectionOutcomeV3"
+                        | "RuntimePendingDrainSelectionReceiptV3"
+                        | "RuntimePendingDrainSuccessionAcknowledgementReceiptV3"
+                );
+                assert!(
+                    !identifier.ends_with("V3") || allowed,
+                    "{}: {identifier}",
+                    path.display()
+                );
+            }
+            continue;
+        }
         if path == Path::new("src/gateway_owner_startup.rs")
             || path == Path::new("src/gateway_owner_startup_watchdog.rs")
-            || path == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
         {
             for identifier in source
                 .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
@@ -915,6 +936,18 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         | "RuntimeRegistryPendingDrainSuccessionSealBindingV3"
                 ) if path == Path::new("src/registry.rs")
                     || path == Path::new("src/closed_recovery.rs")
+            ) || matches!(
+                (path, identifier),
+                (
+                    path,
+                    "RuntimeAcceptedPendingDrainSelectionV3"
+                        | "RuntimeAuthorizedPendingDrainSelectionV3"
+                        | "RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3"
+                        | "RuntimePendingDrainSelectionPortV3"
+                        | "RuntimePendingDrainSelectionReceiptV3"
+                        | "RuntimePendingDrainSuccessionAcknowledgementExecutionPortV3"
+                        | "RuntimePendingDrainSuccessionAcknowledgementReceiptV3"
+                ) if path == Path::new("src/process/execution.rs")
             );
             assert!(
                 (!identifier.ends_with("V3") || allowed_pending_drain_succession)
@@ -3065,18 +3098,25 @@ fn startup_recovery_loop_is_bounded_reobserving_and_non_authorizing() {
         .unwrap();
     assert!(wait_signature.contains("&mut self"));
     assert!(!wait_signature.contains("\n        self,"));
-    let operation_cutoff = wait_method
+    assert!(wait_method.contains(".wait_for_bounded_startup_retry_in_place_v2("));
+    let bounded_wait = braced_declaration(
+        process,
+        "async fn wait_for_bounded_startup_retry_in_place_v2(",
+    );
+    let operation_cutoff = bounded_wait
         .find("self.foundation.startup_budget.operation_cutoff()")
         .unwrap();
-    let owner_cutoff = wait_method
+    let owner_cutoff = bounded_wait
         .find("self.session.owner_safety_deadline_v2()")
         .unwrap();
-    let minimum = wait_method
+    let minimum = bounded_wait
         .find("operation_cutoff.min(owner_safety_deadline)")
         .unwrap();
-    let wait_race = wait_method.find("await_foreign_fresh_retry_v2(").unwrap();
+    let wait_race = bounded_wait
+        .find("await_bounded_startup_retry_v2(")
+        .unwrap();
     assert!(operation_cutoff < minimum && owner_cutoff < minimum && minimum < wait_race);
-    let race = braced_declaration(process, "async fn await_foreign_fresh_retry_v2<");
+    let race = braced_declaration(process, "async fn await_bounded_startup_retry_v2<");
     let deadline = race.find("() = &mut deadline").unwrap();
     let discord = race.find("transition = &mut discord_terminal").unwrap();
     let owner = race.find("() = &mut owner_terminal").unwrap();
@@ -3262,24 +3302,24 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
         production_environment
             .matches("await_pending_drain_database_v2(")
             .count(),
-        4
+        5
     );
     assert_eq!(
         pending_execution
             .matches("revalidate_pending_drain_stage_v2(environment, session)?")
             .count(),
-        7
+        10
     );
     assert_eq!(
         pending_execution
             .matches("pending_drain_requires_exact_finalization_v2(&error)")
             .count(),
-        3
+        4
     );
     let pending_begin = pending_execution
         .find(".begin_startup_recovery_execution_v2(")
         .unwrap();
-    let pending_select = pending_execution.find(".select_pending_drain_v2(").unwrap();
+    let pending_select = pending_execution.find(".select_pending_drain_v3(").unwrap();
     let pending_accept = pending_execution.find(".accept_selection(").unwrap();
     let pending_seal = pending_execution
         .find(".seal_pending_drain_candidate_v2(")
@@ -3323,7 +3363,7 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
     );
     assert_eq!(
         pending_execution
-            .matches(".select_pending_drain_v2(")
+            .matches(".select_pending_drain_v3(")
             .count(),
         1
     );
@@ -3345,6 +3385,54 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
             .count(),
         2
     );
+    assert_eq!(
+        pending_execution
+            .matches(".execute_pending_drain_succession_v3(")
+            .count(),
+        2
+    );
+    assert_eq!(
+        pending_execution
+            .matches(".unseal_pending_drain_after_durable_succession_v3(")
+            .count(),
+        1
+    );
+    let succession_seal = pending_execution
+        .find(".seal_pending_drain_succession_candidate_v3(")
+        .unwrap();
+    let succession_bind = pending_execution[succession_seal..]
+        .find(".bind_registry_seal(seal)")
+        .map(|offset| succession_seal + offset)
+        .unwrap();
+    let succession_execute = pending_execution[succession_bind..]
+        .find(".execute_pending_drain_succession_v3(")
+        .map(|offset| succession_bind + offset)
+        .unwrap();
+    let succession_durable = pending_execution[succession_execute..]
+        .find("let durable = succession")
+        .map(|offset| succession_execute + offset)
+        .unwrap();
+    let succession_revalidate = pending_execution[succession_durable..]
+        .find("revalidate_pending_drain_stage_v2(environment, session)?")
+        .map(|offset| succession_durable + offset)
+        .unwrap();
+    let succession_unseal = pending_execution[succession_revalidate..]
+        .find(".unseal_pending_drain_after_durable_succession_v3(&durable)")
+        .map(|offset| succession_revalidate + offset)
+        .unwrap();
+    let succession_rollover = pending_execution[succession_unseal..]
+        .find(".complete_registry_rollover(unseal)")
+        .map(|offset| succession_unseal + offset)
+        .unwrap();
+    assert!(
+        succession_seal < succession_bind
+            && succession_bind < succession_execute
+            && succession_execute < succession_durable
+            && succession_durable < succession_revalidate
+            && succession_revalidate < succession_unseal
+            && succession_unseal < succession_rollover
+            && succession_rollover < pending_gateway_completion
+    );
     let pending_finalization = braced_declaration(
         execution,
         "fn pending_drain_requires_exact_finalization_v2(",
@@ -3359,6 +3447,13 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
         production_continue,
         "async fn into_next_ready_after_recovery_v2(",
     );
+    let bounded_retry = loop_recovery
+        .find(".wait_for_bounded_startup_retry_in_place_v2(")
+        .unwrap();
+    let refreshed_recovery = loop_recovery
+        .find(".into_recovery_iteration_ready_v2()")
+        .unwrap();
+    assert!(bounded_retry < refreshed_recovery);
     assert!(loop_recovery.contains("RuntimeClosedRecoveryProcessV2"));
     assert!(loop_recovery.contains(".into_recovery_iteration_ready_v2()"));
     assert!(startup_loop.contains("ready = process"));

@@ -466,7 +466,7 @@ async fn production_used_driver_cleans_each_failure_authority_exactly_once() {
 #[tokio::test]
 async fn foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_priority() {
     let deadline = RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed;
-    let all_ready = await_foreign_fresh_retry_v2(
+    let all_ready = await_bounded_startup_retry_v2(
         deadline,
         ready(()),
         ready(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated),
@@ -476,7 +476,7 @@ async fn foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_prior
     .await;
     assert_eq!(all_ready, Err(deadline));
 
-    let discord_ready = await_foreign_fresh_retry_v2(
+    let discord_ready = await_bounded_startup_retry_v2(
         deadline,
         pending::<()>(),
         ready(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated),
@@ -493,7 +493,7 @@ async fn foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_prior
         )
     );
 
-    let owner_ready = await_foreign_fresh_retry_v2(
+    let owner_ready = await_bounded_startup_retry_v2(
         deadline,
         pending::<()>(),
         pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
@@ -510,7 +510,7 @@ async fn foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_prior
         )
     );
 
-    let retry_ready = await_foreign_fresh_retry_v2(
+    let retry_ready = await_bounded_startup_retry_v2(
         deadline,
         pending::<()>(),
         pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
@@ -529,7 +529,7 @@ async fn dropping_a_polled_foreign_fresh_wait_drops_only_the_wait_future() {
         polled: polled.clone(),
         dropped: dropped.clone(),
     };
-    let mut wait = Box::pin(await_foreign_fresh_retry_v2(
+    let mut wait = Box::pin(await_bounded_startup_retry_v2(
         RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed,
         pending::<()>(),
         pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
@@ -651,7 +651,7 @@ fn all_recovery_classes_map_to_distinct_finite_fail_closed_failures() {
 fn foreign_fresh_deadline_classification_never_extends_owner_or_operation_lifetime() {
     let now = Instant::now();
     assert_eq!(
-        classify_foreign_fresh_wait_deadline_v2(
+        classify_bounded_startup_retry_deadline_v2(
             now + Duration::from_secs(2),
             now + Duration::from_secs(1),
         ),
@@ -660,7 +660,7 @@ fn foreign_fresh_deadline_classification_never_extends_owner_or_operation_lifeti
         )
     );
     assert_eq!(
-        classify_foreign_fresh_wait_deadline_v2(
+        classify_bounded_startup_retry_deadline_v2(
             now + Duration::from_secs(1),
             now + Duration::from_secs(2),
         ),
@@ -673,7 +673,7 @@ fn foreign_fresh_current_state_uses_cutoff_then_discord_then_owner_priority() {
     let now = Instant::now();
     let discord = Some(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated);
     assert_eq!(
-        classify_current_foreign_fresh_wait_transition_v2(
+        classify_current_bounded_startup_retry_transition_v2(
             now,
             now,
             now + Duration::from_secs(1),
@@ -683,7 +683,7 @@ fn foreign_fresh_current_state_uses_cutoff_then_discord_then_owner_priority() {
         Some(RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed)
     );
     assert_eq!(
-        classify_current_foreign_fresh_wait_transition_v2(
+        classify_current_bounded_startup_retry_transition_v2(
             now,
             now + Duration::from_secs(2),
             now + Duration::from_secs(1),
@@ -697,7 +697,7 @@ fn foreign_fresh_current_state_uses_cutoff_then_discord_then_owner_priority() {
         )
     );
     assert_eq!(
-        classify_current_foreign_fresh_wait_transition_v2(
+        classify_current_bounded_startup_retry_transition_v2(
             now,
             now + Duration::from_secs(2),
             now + Duration::from_secs(1),

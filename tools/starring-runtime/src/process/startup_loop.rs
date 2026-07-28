@@ -438,9 +438,23 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for RuntimeStartupRecoveryContinue
     }
 
     async fn into_next_ready_after_recovery_v2(
-        self,
-        _completion: Self::RecoveryCompletion,
+        mut self,
+        completion: Self::RecoveryCompletion,
     ) -> Result<Self::Ready, Self::Error> {
+        if let Some(retry_after) = completion.bounded_retry_after_v2() {
+            if let Err(failure) = self
+                .wait_for_bounded_startup_retry_in_place_v2(
+                    retry_after,
+                    RuntimeProcessStartupRecoveryLoopFailureV2::ProtocolViolation,
+                )
+                .await
+            {
+                return Err(finish_startup_recovery_loop_transition_v2(
+                    failure,
+                    self.shutdown().await,
+                ));
+            }
+        }
         let Self {
             discord,
             foundation,
@@ -506,31 +520,45 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
         if retry_after.is_zero() {
             return Err(RuntimeProcessStartupRecoveryLoopFailureV2::InvalidForeignFreshRetry);
         }
-        if let Some(transition) = current_foreign_fresh_wait_transition_v2(self) {
+        self.wait_for_bounded_startup_retry_in_place_v2(
+            retry_after,
+            RuntimeProcessStartupRecoveryLoopFailureV2::InvalidForeignFreshRetry,
+        )
+        .await?;
+        Ok(RuntimeForeignFreshWaitCompletionV2 { retry_after })
+    }
+
+    async fn wait_for_bounded_startup_retry_in_place_v2(
+        &mut self,
+        retry_after: Duration,
+        invalid_retry: RuntimeProcessStartupRecoveryLoopFailureV2,
+    ) -> Result<(), RuntimeProcessStartupRecoveryLoopFailureV2> {
+        if retry_after.is_zero() {
+            return Err(invalid_retry);
+        }
+        if let Some(transition) = current_bounded_startup_retry_transition_v2(self) {
             return Err(transition);
         }
         let now = Instant::now();
-        let retry_at = now
-            .checked_add(retry_after)
-            .ok_or(RuntimeProcessStartupRecoveryLoopFailureV2::InvalidForeignFreshRetry)?;
+        let retry_at = now.checked_add(retry_after).ok_or(invalid_retry)?;
         let operation_cutoff = self.foundation.startup_budget.operation_cutoff();
         let owner_safety_deadline = self.session.owner_safety_deadline_v2();
         let wait_cutoff = operation_cutoff.min(owner_safety_deadline);
         if now >= wait_cutoff {
-            return Err(classify_foreign_fresh_wait_deadline_v2(
+            return Err(classify_bounded_startup_retry_deadline_v2(
                 operation_cutoff,
                 owner_safety_deadline,
             ));
         }
         let deadline_failure =
-            classify_foreign_fresh_wait_deadline_v2(operation_cutoff, owner_safety_deadline);
+            classify_bounded_startup_retry_deadline_v2(operation_cutoff, owner_safety_deadline);
         let owner_terminal = self.session.owner_terminal_observation_v2();
         let discord_terminal =
             async { map_discord_transition_exit_v1(self.discord.wait_terminal().await.exit()) };
         let owner_terminal = async {
             let _exit = owner_terminal.await;
         };
-        await_foreign_fresh_retry_v2(
+        await_bounded_startup_retry_v2(
             deadline_failure,
             sleep_until(TokioInstant::from_std(wait_cutoff)),
             discord_terminal,
@@ -538,10 +566,10 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
             sleep_until(TokioInstant::from_std(retry_at)),
         )
         .await?;
-        if let Some(transition) = current_foreign_fresh_wait_transition_v2(self) {
+        if let Some(transition) = current_bounded_startup_retry_transition_v2(self) {
             return Err(transition);
         }
-        Ok(RuntimeForeignFreshWaitCompletionV2 { retry_after })
+        Ok(())
     }
 
     fn into_closed_recovery_after_foreign_fresh_v2(
@@ -572,10 +600,10 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
     }
 }
 
-fn current_foreign_fresh_wait_transition_v2(
+fn current_bounded_startup_retry_transition_v2(
     process: &RuntimeStartupRecoveryContinueProcessV2,
 ) -> Option<RuntimeProcessStartupRecoveryLoopFailureV2> {
-    classify_current_foreign_fresh_wait_transition_v2(
+    classify_current_bounded_startup_retry_transition_v2(
         Instant::now(),
         process.foundation.startup_budget.operation_cutoff(),
         process.session.owner_safety_deadline_v2(),
@@ -584,7 +612,7 @@ fn current_foreign_fresh_wait_transition_v2(
     )
 }
 
-fn classify_current_foreign_fresh_wait_transition_v2(
+fn classify_current_bounded_startup_retry_transition_v2(
     now: Instant,
     operation_cutoff: Instant,
     owner_safety_deadline: Instant,
@@ -592,7 +620,7 @@ fn classify_current_foreign_fresh_wait_transition_v2(
     owner_terminal: bool,
 ) -> Option<RuntimeProcessStartupRecoveryLoopFailureV2> {
     if now >= operation_cutoff.min(owner_safety_deadline) {
-        return Some(classify_foreign_fresh_wait_deadline_v2(
+        return Some(classify_bounded_startup_retry_deadline_v2(
             operation_cutoff,
             owner_safety_deadline,
         ));
@@ -607,7 +635,7 @@ fn classify_current_foreign_fresh_wait_transition_v2(
     )
 }
 
-fn classify_foreign_fresh_wait_deadline_v2(
+fn classify_bounded_startup_retry_deadline_v2(
     operation_cutoff: Instant,
     owner_safety_deadline: Instant,
 ) -> RuntimeProcessStartupRecoveryLoopFailureV2 {
@@ -620,7 +648,7 @@ fn classify_foreign_fresh_wait_deadline_v2(
     }
 }
 
-async fn await_foreign_fresh_retry_v2<Deadline, DiscordTerminal, OwnerTerminal, Retry>(
+async fn await_bounded_startup_retry_v2<Deadline, DiscordTerminal, OwnerTerminal, Retry>(
     deadline_failure: RuntimeProcessStartupRecoveryLoopFailureV2,
     deadline: Deadline,
     discord_terminal: DiscordTerminal,

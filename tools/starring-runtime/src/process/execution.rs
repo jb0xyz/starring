@@ -1,16 +1,20 @@
 use std::future::Future;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use automation_runtime_worker::{
-    RuntimeAcceptedPendingDrainSelectionV2, RuntimeAuthorizedPendingDrainAcknowledgementV2,
-    RuntimeAuthorizedPendingDrainClaimV2, RuntimeAuthorizedPendingDrainSelectionV2,
+    RuntimeAcceptedPendingDrainSelectionV3, RuntimeAuthorizedPendingDrainAcknowledgementV2,
+    RuntimeAuthorizedPendingDrainClaimV2, RuntimeAuthorizedPendingDrainSelectionV3,
+    RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3,
     RuntimePendingDrainAcknowledgementExecutionPortV2, RuntimePendingDrainAcknowledgementReceiptV2,
     RuntimePendingDrainClaimExecutionPortV2, RuntimePendingDrainClaimReceiptV2,
     RuntimePendingDrainCompoundErrorV2, RuntimePendingDrainNoCandidateReceiptV2,
-    RuntimePendingDrainNoCandidateRecorderPortV2, RuntimePendingDrainSelectionPortV2,
-    RuntimePendingDrainSelectionReceiptV2, RuntimeSelectedPendingDrainNoCandidateV2,
-    RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
-    RuntimeStartupRecoveryExecutionPortV2, RuntimeStartupRecoveryExecutionReceiptOutcomeV2,
+    RuntimePendingDrainNoCandidateRecorderPortV2, RuntimePendingDrainSelectionPortV3,
+    RuntimePendingDrainSelectionReceiptV3,
+    RuntimePendingDrainSuccessionAcknowledgementExecutionPortV3,
+    RuntimePendingDrainSuccessionAcknowledgementReceiptV3,
+    RuntimeSelectedPendingDrainNoCandidateV2, RuntimeStartupRecoveryClassV2,
+    RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryExecutionPortV2,
+    RuntimeStartupRecoveryExecutionReceiptOutcomeV2,
 };
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
@@ -24,7 +28,25 @@ use super::RuntimeProcessFoundationV1;
 use crate::closed_recovery::RuntimeClosedRecoverySessionV2;
 use crate::discord::RuntimeDiscordGatewaySupervisorV1;
 
-pub(crate) struct RuntimeStartupRecoveryExecutionCompletionV2;
+pub(crate) struct RuntimeStartupRecoveryExecutionCompletionV2 {
+    retry_after: Option<Duration>,
+}
+
+impl RuntimeStartupRecoveryExecutionCompletionV2 {
+    fn completed_v2() -> Self {
+        Self { retry_after: None }
+    }
+
+    fn retry_after_v2(retry_after: Duration) -> Self {
+        Self {
+            retry_after: Some(retry_after),
+        }
+    }
+
+    pub(super) fn bounded_retry_after_v2(&self) -> Option<Duration> {
+        self.retry_after
+    }
+}
 
 pub(crate) enum RuntimeStartupRecoveryExecutionAwaitFailureV2<E> {
     Transition(RuntimeProcessStartupRecoveryLoopFailureV2),
@@ -37,13 +59,13 @@ pub(crate) trait RuntimePendingDrainRecoveryEnvironmentV2 {
         session: &RuntimeClosedRecoverySessionV2,
     ) -> Option<RuntimeProcessStartupRecoveryLoopFailureV2>;
 
-    fn select_pending_drain_v2<'a>(
+    fn select_pending_drain_v3<'a>(
         &'a mut self,
         session: &'a RuntimeClosedRecoverySessionV2,
-        authorization: &'a RuntimeAuthorizedPendingDrainSelectionV2,
+        authorization: &'a RuntimeAuthorizedPendingDrainSelectionV3,
     ) -> impl Future<
         Output = Result<
-            RuntimePendingDrainSelectionReceiptV2,
+            RuntimePendingDrainSelectionReceiptV3,
             RuntimeStartupRecoveryExecutionAwaitFailureV2<
                 automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
             >,
@@ -86,6 +108,20 @@ pub(crate) trait RuntimePendingDrainRecoveryEnvironmentV2 {
     ) -> impl Future<
         Output = Result<
             RuntimePendingDrainAcknowledgementReceiptV2,
+            RuntimeStartupRecoveryExecutionAwaitFailureV2<
+                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+            >,
+        >,
+    > + Send
+           + 'a;
+
+    fn execute_pending_drain_succession_v3<'a>(
+        &'a mut self,
+        session: &'a RuntimeClosedRecoverySessionV2,
+        authorization: &'a RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3,
+    ) -> impl Future<
+        Output = Result<
+            RuntimePendingDrainSuccessionAcknowledgementReceiptV3,
             RuntimeStartupRecoveryExecutionAwaitFailureV2<
                 automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
             >,
@@ -211,7 +247,7 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
         match accepted.outcome() {
             RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed { .. }
             | RuntimeStartupRecoveryExecutionReceiptOutcomeV2::NoCandidate => {
-                Ok(RuntimeStartupRecoveryExecutionCompletionV2)
+                Ok(RuntimeStartupRecoveryExecutionCompletionV2::completed_v2())
             }
             RuntimeStartupRecoveryExecutionReceiptOutcomeV2::RetryAfter { .. } => {
                 self.session.invalidate_startup_recovery_execution_v2();
@@ -268,10 +304,10 @@ where
     let authorization = session
         .begin_startup_recovery_execution_v2(RuntimeStartupRecoveryContinuationV2::Recover(class))
         .map_err(|error| startup_recovery_execution_rejected_v2(class, error.into()))?
-        .into_pending_drain_selection()
+        .into_pending_drain_selection_v3()
         .map_err(pending_drain_compound_failure_v2)?;
     let selection_receipt = environment
-        .select_pending_drain_v2(session, &authorization)
+        .select_pending_drain_v3(session, &authorization)
         .await
         .map_err(|error| {
             map_pending_drain_database_await_failure_v2(environment, session, error)
@@ -281,7 +317,7 @@ where
         .accept_selection(selection_receipt)
         .map_err(pending_drain_compound_failure_v2)?;
     let completed = match selection {
-        RuntimeAcceptedPendingDrainSelectionV2::NoCandidate(selection) => {
+        RuntimeAcceptedPendingDrainSelectionV3::NoCandidate(selection) => {
             let receipt = match environment
                 .record_pending_drain_no_candidate_v2(session, &selection)
                 .await
@@ -302,7 +338,7 @@ where
                 .complete(receipt)
                 .map_err(pending_drain_compound_failure_v2)?
         }
-        RuntimeAcceptedPendingDrainSelectionV2::Candidate(selection) => {
+        RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selection) => {
             let seal = session
                 .seal_pending_drain_candidate_v2(selection.candidate())
                 .map_err(|error| startup_recovery_execution_rejected_v2(class, error.into()))?;
@@ -357,6 +393,46 @@ where
                 .complete_registry_rollover(unseal)
                 .map_err(pending_drain_compound_failure_v2)?
         }
+        RuntimeAcceptedPendingDrainSelectionV3::FreshPreviousOwner(selection) => {
+            selection.complete()
+        }
+        RuntimeAcceptedPendingDrainSelectionV3::ExpiredPreviousOwner(selection) => {
+            let seal = session
+                .seal_pending_drain_succession_candidate_v3(selection.candidate())
+                .map_err(|error| startup_recovery_execution_rejected_v2(class, error.into()))?;
+            if let Some(transition) = environment.current_transition_v2(session) {
+                return Err(transition);
+            }
+            let succession = selection
+                .bind_registry_seal(seal)
+                .map_err(pending_drain_compound_failure_v2)?;
+            let receipt = match environment
+                .execute_pending_drain_succession_v3(session, &succession)
+                .await
+            {
+                Err(error) if pending_drain_requires_exact_finalization_v2(&error) => {
+                    revalidate_pending_drain_stage_v2(environment, session)?;
+                    environment
+                        .execute_pending_drain_succession_v3(session, &succession)
+                        .await
+                }
+                result => result,
+            }
+            .map_err(|error| {
+                map_pending_drain_database_await_failure_v2(environment, session, error)
+            })?;
+            revalidate_pending_drain_stage_v2(environment, session)?;
+            let durable = succession
+                .complete(receipt)
+                .map_err(pending_drain_compound_failure_v2)?;
+            revalidate_pending_drain_stage_v2(environment, session)?;
+            let unseal = session
+                .unseal_pending_drain_after_durable_succession_v3(&durable)
+                .map_err(|error| startup_recovery_execution_rejected_v2(class, error.into()))?;
+            durable
+                .complete_registry_rollover(unseal)
+                .map_err(pending_drain_compound_failure_v2)?
+        }
     };
     if let Some(transition) = environment.current_transition_v2(session) {
         return Err(transition);
@@ -364,19 +440,21 @@ where
     let accepted = session
         .complete_startup_recovery_execution_v2(completed)
         .map_err(|error| startup_recovery_execution_rejected_v2(class, error.into()))?;
-    if accepted.class() != class
-        || !matches!(
-            accepted.outcome(),
-            RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed { .. }
-                | RuntimeStartupRecoveryExecutionReceiptOutcomeV2::NoCandidate
-        )
-    {
+    if accepted.class() != class {
         return Err(startup_recovery_execution_rejected_v2(
             class,
             crate::RuntimeProcessClosedRecoveryCommitFailureV2::GatewayProtocolViolation,
         ));
     }
-    Ok(RuntimeStartupRecoveryExecutionCompletionV2)
+    match accepted.outcome() {
+        RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed { .. }
+        | RuntimeStartupRecoveryExecutionReceiptOutcomeV2::NoCandidate => {
+            Ok(RuntimeStartupRecoveryExecutionCompletionV2::completed_v2())
+        }
+        RuntimeStartupRecoveryExecutionReceiptOutcomeV2::RetryAfter { retry_after } => Ok(
+            RuntimeStartupRecoveryExecutionCompletionV2::retry_after_v2(*retry_after),
+        ),
+    }
 }
 
 fn pending_drain_requires_exact_finalization_v2(
@@ -450,12 +528,12 @@ impl RuntimePendingDrainRecoveryEnvironmentV2
         )
     }
 
-    async fn select_pending_drain_v2(
+    async fn select_pending_drain_v3(
         &mut self,
         session: &RuntimeClosedRecoverySessionV2,
-        authorization: &RuntimeAuthorizedPendingDrainSelectionV2,
+        authorization: &RuntimeAuthorizedPendingDrainSelectionV3,
     ) -> Result<
-        RuntimePendingDrainSelectionReceiptV2,
+        RuntimePendingDrainSelectionReceiptV3,
         RuntimeStartupRecoveryExecutionAwaitFailureV2<
             automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
         >,
@@ -466,7 +544,7 @@ impl RuntimePendingDrainRecoveryEnvironmentV2
             self.foundation,
             self.discord,
             session,
-            database.select_pending_drain(authorization, execution_cutoff),
+            database.select_pending_drain_v3(authorization, execution_cutoff),
         )
         .await
     }
@@ -530,6 +608,28 @@ impl RuntimePendingDrainRecoveryEnvironmentV2
             self.discord,
             session,
             database.execute_pending_drain_acknowledgement(authorization, execution_cutoff),
+        )
+        .await
+    }
+
+    async fn execute_pending_drain_succession_v3(
+        &mut self,
+        session: &RuntimeClosedRecoverySessionV2,
+        authorization: &RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3,
+    ) -> Result<
+        RuntimePendingDrainSuccessionAcknowledgementReceiptV3,
+        RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+        >,
+    > {
+        let database = self.foundation.databases.execution().clone();
+        let execution_cutoff = pending_drain_execution_cutoff_v2(self.foundation, session);
+        await_pending_drain_database_v2(
+            self.foundation,
+            self.discord,
+            session,
+            database
+                .execute_pending_drain_succession_acknowledgement(authorization, execution_cutoff),
         )
         .await
     }
