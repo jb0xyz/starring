@@ -16,12 +16,17 @@ use crate::ingress_acknowledgement_supervisor::{
     RuntimeIngressAcknowledgementSupervisorConfigV2, RuntimeIngressAcknowledgementSupervisorExitV2,
     RuntimeIngressAcknowledgementSupervisorV2, RuntimeWorkerIngressAcknowledgementJobV2,
 };
+use crate::lifecycle_timing::{
+    RuntimeLifecycleTimingMetricV2, RuntimeLifecycleTimingOutcomeV2,
+    RuntimeLifecycleTimingRecorderV2, RuntimeLifecycleTimingTerminalReporterV2,
+};
 use crate::maintenance_ingress_gate::{
     RuntimeMaintenanceIngressGateControllerV2, RuntimeMaintenanceIngressGateObserverV2,
 };
 use crate::process_identity::generate_runtime_process_instance_id_v1;
 use crate::process_supervisor::{
-    RuntimeProcessRootSupervisorStartErrorV1, RuntimeProcessRootSupervisorV1,
+    RuntimeProcessRootSupervisorControlV2, RuntimeProcessRootSupervisorStartErrorV1,
+    RuntimeProcessRootSupervisorV1,
 };
 use crate::startup::RuntimeStartupBudgetV1;
 use crate::{
@@ -331,6 +336,8 @@ pub(crate) struct RuntimeProcessFoundationV1 {
     maintenance_ingress_observer: RuntimeMaintenanceIngressGateObserverV2,
     readiness_publisher: Option<RuntimeHealthReadinessPublisherV2>,
     ingress_acknowledgement: Option<RuntimeProcessIngressAcknowledgementSupervisorV2>,
+    lifecycle_timing: RuntimeLifecycleTimingRecorderV2,
+    lifecycle_timing_terminal: Option<RuntimeLifecycleTimingTerminalReporterV2>,
     cleanup_mode: RuntimeProcessFoundationCleanupModeV1,
     root_supervisor: RuntimeProcessRootSupervisorV1,
     shutdown_failures: RuntimeProcessFoundationShutdownFailuresV1,
@@ -361,6 +368,10 @@ pub(super) enum RuntimeProcessFinalizerActivationFailureV2 {
 impl RuntimeProcessFoundationV1 {
     pub(super) fn shutdown_observer_v1(&self) -> crate::shutdown::RuntimeShutdownObserverV1 {
         self.root_supervisor.observer()
+    }
+
+    pub(super) fn lifecycle_timing_v2(&self) -> RuntimeLifecycleTimingRecorderV2 {
+        self.lifecycle_timing.clone()
     }
 
     pub(super) fn shutdown_trigger_v1(
@@ -539,11 +550,26 @@ impl RuntimeProcessFoundationV1 {
     pub(super) async fn begin_shutdown_v1(
         &mut self,
         cause: RuntimeShutdownCauseV1,
-    ) -> std::time::Instant {
+    ) -> (std::time::Instant, RuntimeLifecycleTimingTerminalReporterV2) {
+        let terminal = self
+            .lifecycle_timing_terminal
+            .take()
+            .expect("runtime lifecycle terminal reporter");
         let observation = self.trip_shutdown_v1(cause);
         let deadline = self.effective_shutdown_deadline_v1(observation);
+        let finalizer_present =
+            self.mutation_finalizer.is_some() || self.process_mutation_finalizer.is_some();
+        let finalizer_timing = finalizer_present.then(|| {
+            self.lifecycle_timing
+                .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownFinalizerJoin)
+        });
+        let mut finalizer_outcome = RuntimeLifecycleTimingOutcomeV2::Completed;
         if let Some(mutation_finalizer) = self.mutation_finalizer.take() {
             let finalizer_report = mutation_finalizer.shutdown_until(deadline).await;
+            finalizer_outcome = merge_lifecycle_timing_outcome_v2(
+                finalizer_outcome,
+                finalizer_shutdown_timing_outcome_v2(finalizer_report.exit()),
+            );
             if finalizer_report.exit() != RuntimeSupervisorExitV1::Commanded {
                 self.shutdown_failures.record(
                     RuntimeProcessFoundationShutdownFailureV1::Finalizer(finalizer_report.exit()),
@@ -553,6 +579,10 @@ impl RuntimeProcessFoundationV1 {
         }
         if let Some(mutation_finalizer) = self.process_mutation_finalizer.take() {
             let finalizer_report = mutation_finalizer.shutdown_until(deadline).await;
+            finalizer_outcome = merge_lifecycle_timing_outcome_v2(
+                finalizer_outcome,
+                finalizer_shutdown_timing_outcome_v2(finalizer_report.exit()),
+            );
             if finalizer_report.exit() != RuntimeSupervisorExitV1::Commanded {
                 self.shutdown_failures.record(
                     RuntimeProcessFoundationShutdownFailureV1::Finalizer(finalizer_report.exit()),
@@ -560,8 +590,18 @@ impl RuntimeProcessFoundationV1 {
             }
             drop(finalizer_report);
         }
+        if let Some(timing) = finalizer_timing {
+            timing.finish_v2(finalizer_outcome);
+        }
         if let Some(ingress_acknowledgement) = self.ingress_acknowledgement.take() {
+            let timing = self
+                .lifecycle_timing
+                .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownIngressAcknowledgementJoin);
             let report = ingress_acknowledgement.shutdown_until(deadline).await;
+            let outcome = ingress_acknowledgement_shutdown_timing_outcome_v2(
+                report.exit(),
+                report.completion().is_some(),
+            );
             if report.exit() != RuntimeIngressAcknowledgementSupervisorExitV2::Commanded
                 || report.completion().is_some()
             {
@@ -569,7 +609,11 @@ impl RuntimeProcessFoundationV1 {
                     .record(RuntimeProcessFoundationShutdownFailureV1::IngressAcknowledgement);
             }
             drop(report);
+            timing.finish_v2(outcome);
         }
+        let capability_timing = self
+            .lifecycle_timing
+            .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownCapabilityReadinessJoin);
         let capability_readiness = self
             .root_supervisor
             .shutdown_capability_readiness_until_v2(deadline)
@@ -582,13 +626,23 @@ impl RuntimeProcessFoundationV1 {
             self.shutdown_failures
                 .record(RuntimeProcessFoundationShutdownFailureV1::CapabilityReadiness);
         }
-        deadline
+        capability_timing.finish_v2(capability_readiness_shutdown_timing_outcome_v2(
+            capability_readiness,
+        ));
+        (deadline, terminal)
     }
 
     pub(super) fn observe_shutdown_registry_v1(&mut self) {
-        if let Err(error) = self.registry.observe_recovery_empty_projection_v2() {
-            self.shutdown_failures
-                .record(RuntimeProcessFoundationShutdownFailureV1::Registry(error));
+        let timing = self
+            .lifecycle_timing
+            .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownRegistryObservation);
+        match self.registry.observe_recovery_empty_projection_v2() {
+            Ok(_) => timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::Completed),
+            Err(error) => {
+                self.shutdown_failures
+                    .record(RuntimeProcessFoundationShutdownFailureV1::Registry(error));
+                timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::FailedClosed);
+            }
         }
     }
 
@@ -611,11 +665,17 @@ impl RuntimeProcessFoundationV1 {
     }
 
     pub(crate) async fn shutdown(mut self) -> Result<(), RuntimeProcessFoundationShutdownErrorV1> {
-        let cleanup_deadline = self
+        let (cleanup_deadline, terminal) = self
             .begin_shutdown_v1(RuntimeShutdownCauseV1::Explicit)
             .await;
         self.observe_shutdown_registry_v1();
-        self.finish_shutdown_v1(cleanup_deadline).await
+        let result = self.finish_shutdown_v1(cleanup_deadline).await;
+        let outcome = if result.is_ok() {
+            RuntimeLifecycleTimingOutcomeV2::Completed
+        } else {
+            RuntimeLifecycleTimingOutcomeV2::FailedClosed
+        };
+        terminal.finish_result_v2(result, outcome)
     }
 
     pub(super) async fn finish_shutdown_v1(
@@ -638,12 +698,24 @@ impl RuntimeProcessFoundationV1 {
             maintenance_ingress_observer,
             readiness_publisher,
             ingress_acknowledgement,
+            lifecycle_timing,
+            lifecycle_timing_terminal,
             cleanup_mode,
             mut root_supervisor,
             mut shutdown_failures,
         } = self;
+        let finalizer_present =
+            mutation_finalizer.is_some() || process_mutation_finalizer.is_some();
+        let finalizer_timing = finalizer_present.then(|| {
+            lifecycle_timing.start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownFinalizerJoin)
+        });
+        let mut finalizer_outcome = RuntimeLifecycleTimingOutcomeV2::Completed;
         if let Some(mutation_finalizer) = mutation_finalizer {
             let finalizer_report = mutation_finalizer.shutdown_until(cleanup_deadline).await;
+            finalizer_outcome = merge_lifecycle_timing_outcome_v2(
+                finalizer_outcome,
+                finalizer_shutdown_timing_outcome_v2(finalizer_report.exit()),
+            );
             if finalizer_report.exit() != RuntimeSupervisorExitV1::Commanded {
                 shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::Finalizer(
                     finalizer_report.exit(),
@@ -653,6 +725,10 @@ impl RuntimeProcessFoundationV1 {
         }
         if let Some(mutation_finalizer) = process_mutation_finalizer {
             let finalizer_report = mutation_finalizer.shutdown_until(cleanup_deadline).await;
+            finalizer_outcome = merge_lifecycle_timing_outcome_v2(
+                finalizer_outcome,
+                finalizer_shutdown_timing_outcome_v2(finalizer_report.exit()),
+            );
             if finalizer_report.exit() != RuntimeSupervisorExitV1::Commanded {
                 shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::Finalizer(
                     finalizer_report.exit(),
@@ -660,10 +736,19 @@ impl RuntimeProcessFoundationV1 {
             }
             drop(finalizer_report);
         }
+        if let Some(timing) = finalizer_timing {
+            timing.finish_v2(finalizer_outcome);
+        }
         if let Some(ingress_acknowledgement) = ingress_acknowledgement {
+            let timing = lifecycle_timing
+                .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownIngressAcknowledgementJoin);
             let report = ingress_acknowledgement
                 .shutdown_until(cleanup_deadline)
                 .await;
+            let outcome = ingress_acknowledgement_shutdown_timing_outcome_v2(
+                report.exit(),
+                report.completion().is_some(),
+            );
             if report.exit() != RuntimeIngressAcknowledgementSupervisorExitV2::Commanded
                 || report.completion().is_some()
             {
@@ -671,7 +756,10 @@ impl RuntimeProcessFoundationV1 {
                     .record(RuntimeProcessFoundationShutdownFailureV1::IngressAcknowledgement);
             }
             drop(report);
+            timing.finish_v2(outcome);
         }
+        let capability_timing = lifecycle_timing
+            .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownCapabilityReadinessJoin);
         let capability_readiness = root_supervisor
             .shutdown_capability_readiness_until_v2(cleanup_deadline)
             .await;
@@ -683,6 +771,11 @@ impl RuntimeProcessFoundationV1 {
             shutdown_failures
                 .record(RuntimeProcessFoundationShutdownFailureV1::CapabilityReadiness);
         }
+        capability_timing.finish_v2(capability_readiness_shutdown_timing_outcome_v2(
+            capability_readiness,
+        ));
+        let signal_timing =
+            lifecycle_timing.start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownRootSignalJoin);
         let signal_exit = root_supervisor.join_signal_until(cleanup_deadline).await;
         if matches!(
             signal_exit,
@@ -691,10 +784,28 @@ impl RuntimeProcessFoundationV1 {
         ) {
             shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::SignalSupervisor);
         }
+        signal_timing.finish_v2(
+            if matches!(
+                signal_exit,
+                crate::process_supervisor::RuntimeProcessSignalTaskExitV1::StreamClosed
+                    | crate::process_supervisor::RuntimeProcessSignalTaskExitV1::Panicked
+            ) {
+                RuntimeLifecycleTimingOutcomeV2::FailedClosed
+            } else {
+                RuntimeLifecycleTimingOutcomeV2::Completed
+            },
+        );
+        let database_timing = lifecycle_timing
+            .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownDatabasePoolsClose);
         let shutdown = databases.shutdown();
         drop((gateway, registry, databases));
-        if let Err(error) = shutdown.close_until(cleanup_deadline).await {
-            shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::Database(error));
+        match shutdown.close_until(cleanup_deadline).await {
+            Ok(()) => database_timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::Completed),
+            Err(error) => {
+                shutdown_failures
+                    .record(RuntimeProcessFoundationShutdownFailureV1::Database(error));
+                database_timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed);
+            }
         }
         drop(shutdown);
         finish_runtime_process_foundation_shutdown_v1(
@@ -712,14 +823,108 @@ impl RuntimeProcessFoundationV1 {
             ),
             (),
         );
-        if root_supervisor
+        let health_timing =
+            lifecycle_timing.start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownHealthStop);
+        match root_supervisor
             .shutdown_health_until(cleanup_deadline)
             .await
-            .is_err()
         {
-            shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::HealthListener);
+            Ok(()) => health_timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::Completed),
+            Err(crate::health::RuntimeHealthShutdownErrorV1::DeadlineElapsed) => {
+                shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::HealthListener);
+                health_timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed);
+            }
+            Err(crate::health::RuntimeHealthShutdownErrorV1::TaskStopped) => {
+                shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::HealthListener);
+                health_timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::FailedClosed);
+            }
         }
-        shutdown_failures.finish()
+        for metric in [
+            RuntimeLifecycleTimingMetricV2::ShutdownFinalizerJoin,
+            RuntimeLifecycleTimingMetricV2::ShutdownIngressAcknowledgementJoin,
+            RuntimeLifecycleTimingMetricV2::ShutdownCapabilityReadinessJoin,
+            RuntimeLifecycleTimingMetricV2::ShutdownRegistryObservation,
+            RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+            RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin,
+        ] {
+            lifecycle_timing.record_skipped_v2(metric);
+        }
+        let result = shutdown_failures.finish();
+        drop(lifecycle_timing_terminal);
+        result
+    }
+}
+
+fn merge_lifecycle_timing_outcome_v2(
+    current: RuntimeLifecycleTimingOutcomeV2,
+    next: RuntimeLifecycleTimingOutcomeV2,
+) -> RuntimeLifecycleTimingOutcomeV2 {
+    match (current, next) {
+        (RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed, _)
+        | (_, RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed) => {
+            RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed
+        }
+        (RuntimeLifecycleTimingOutcomeV2::FailedClosed, _)
+        | (_, RuntimeLifecycleTimingOutcomeV2::FailedClosed) => {
+            RuntimeLifecycleTimingOutcomeV2::FailedClosed
+        }
+        (_, next) => next,
+    }
+}
+
+fn finalizer_shutdown_timing_outcome_v2(
+    exit: RuntimeSupervisorExitV1,
+) -> RuntimeLifecycleTimingOutcomeV2 {
+    match exit {
+        RuntimeSupervisorExitV1::Commanded => RuntimeLifecycleTimingOutcomeV2::Completed,
+        RuntimeSupervisorExitV1::DeadlineElapsed => {
+            RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed
+        }
+        RuntimeSupervisorExitV1::DependencyTerminal
+        | RuntimeSupervisorExitV1::ProtocolViolation
+        | RuntimeSupervisorExitV1::Panicked
+        | RuntimeSupervisorExitV1::Aborted => RuntimeLifecycleTimingOutcomeV2::FailedClosed,
+    }
+}
+
+fn ingress_acknowledgement_shutdown_timing_outcome_v2(
+    exit: RuntimeIngressAcknowledgementSupervisorExitV2,
+    completion_present: bool,
+) -> RuntimeLifecycleTimingOutcomeV2 {
+    if completion_present {
+        return RuntimeLifecycleTimingOutcomeV2::FailedClosed;
+    }
+    match exit {
+        RuntimeIngressAcknowledgementSupervisorExitV2::Commanded => {
+            RuntimeLifecycleTimingOutcomeV2::Completed
+        }
+        RuntimeIngressAcknowledgementSupervisorExitV2::DeadlineElapsed => {
+            RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed
+        }
+        RuntimeIngressAcknowledgementSupervisorExitV2::IntakeClosed
+        | RuntimeIngressAcknowledgementSupervisorExitV2::ProtocolViolation
+        | RuntimeIngressAcknowledgementSupervisorExitV2::Panicked
+        | RuntimeIngressAcknowledgementSupervisorExitV2::Aborted => {
+            RuntimeLifecycleTimingOutcomeV2::FailedClosed
+        }
+    }
+}
+
+fn capability_readiness_shutdown_timing_outcome_v2(
+    exit: RuntimeCapabilityReadinessSupervisorExitV2,
+) -> RuntimeLifecycleTimingOutcomeV2 {
+    match exit {
+        RuntimeCapabilityReadinessSupervisorExitV2::Commanded
+        | RuntimeCapabilityReadinessSupervisorExitV2::ReadinessLost => {
+            RuntimeLifecycleTimingOutcomeV2::Completed
+        }
+        RuntimeCapabilityReadinessSupervisorExitV2::DeadlineElapsed => {
+            RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed
+        }
+        RuntimeCapabilityReadinessSupervisorExitV2::ControlClosed
+        | RuntimeCapabilityReadinessSupervisorExitV2::Panicked => {
+            RuntimeLifecycleTimingOutcomeV2::FailedClosed
+        }
     }
 }
 
@@ -757,6 +962,12 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
     let controller_id =
         controller_id.map_err(RuntimeProcessFoundationCompositionErrorV1::ControllerId)?;
     let build_revision = build_revision.into_revision();
+    let (lifecycle_timing, lifecycle_timing_observer) =
+        RuntimeLifecycleTimingRecorderV2::create_v2();
+    let lifecycle_timing_terminal = RuntimeLifecycleTimingTerminalReporterV2::new_v2(
+        lifecycle_timing.clone(),
+        lifecycle_timing_observer,
+    );
     let databases = compose_runtime_database_dependencies_v1(&config, &secrets, &startup_budget)
         .await
         .map_err(RuntimeProcessFoundationCompositionErrorV1::Database)?;
@@ -781,6 +992,9 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
             return Err(error.into_public(cleanup));
         }
     };
+    closed_components
+        .gateway
+        .bind_lifecycle_timing_v2(lifecycle_timing.clone());
     if !startup_budget.operation_is_open() {
         drop(closed_components);
         return Err(cleanup_after_operation_deadline_v1(databases, &startup_budget).await);
@@ -826,9 +1040,12 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         mutation_finalizer.seal_handle(),
         mutation_finalizer.terminal_observer(),
         closed_components.gateway.shutdown_handle_v1(),
-        maintenance_ingress_shutdown,
-        ingress_acknowledgement.shutdown_handle_v2(),
-        ingress_acknowledgement.terminal_observer_v2(),
+        RuntimeProcessRootSupervisorControlV2::new_v2(
+            maintenance_ingress_shutdown,
+            ingress_acknowledgement.shutdown_handle_v2(),
+            ingress_acknowledgement.terminal_observer_v2(),
+            lifecycle_timing.clone(),
+        ),
     )
     .await
     {
@@ -878,6 +1095,8 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         maintenance_ingress_observer,
         readiness_publisher: Some(readiness_publisher),
         ingress_acknowledgement: Some(ingress_acknowledgement),
+        lifecycle_timing,
+        lifecycle_timing_terminal: Some(lifecycle_timing_terminal),
         cleanup_mode: RuntimeProcessFoundationCleanupModeV1::StartupBound,
         root_supervisor,
         shutdown_failures: RuntimeProcessFoundationShutdownFailuresV1::new(),

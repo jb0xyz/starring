@@ -902,3 +902,78 @@ fn cleanup_failure_preserves_transition_class_without_exposing_sources() {
     );
     assert!(std::error::Error::source(&cleanup).is_none());
 }
+
+#[test]
+fn observation_outer_shutdown_error_forces_failed_closed_terminal_total() {
+    let (recorder, observer) =
+        crate::lifecycle_timing::RuntimeLifecycleTimingRecorderV2::create_v2();
+    let terminal = crate::lifecycle_timing::RuntimeLifecycleTimingTerminalReporterV2::new_v2(
+        recorder,
+        observer.clone(),
+    );
+    let result = finish_observation_shutdown_timing_v2(
+        terminal,
+        Err::<(), _>(RuntimeClosedRecoveryProcessCleanupFailureV2::Discord(
+            RuntimeDiscordGatewayShutdownFailureV1::UnexpectedExit,
+        )),
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        observer
+            .snapshot_v2()
+            .sample_v2(RuntimeLifecycleTimingMetricV2::ShutdownTotal)
+            .unwrap()
+            .outcome(),
+        RuntimeLifecycleTimingOutcomeV2::FailedClosed
+    );
+    assert_eq!(observer.terminal_emission_count_v2(), 1);
+}
+
+#[tokio::test]
+async fn observation_phase_wrapper_preserves_discord_and_owner_deadlines() {
+    let (recorder, observer) =
+        crate::lifecycle_timing::RuntimeLifecycleTimingRecorderV2::create_v2();
+    let discord = ready(Err::<
+        (),
+        crate::discord::RuntimeDiscordGatewayShutdownErrorV1,
+    >(
+        crate::discord::RuntimeDiscordGatewayShutdownErrorV1::CloseDeadlineElapsed,
+    ));
+    let _ = time_shutdown_result_v2(
+        &recorder,
+        RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+        discord,
+        discord_shutdown_timing_outcome_v2,
+    )
+    .await;
+    let owner = ready(Err::<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        crate::gateway_owner_startup_watchdog::
+            RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    >(
+        crate::gateway_owner_startup_watchdog::
+            RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1::DeadlineElapsed,
+    ));
+    let _ = time_shutdown_result_v2(
+        &recorder,
+        RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin,
+        owner,
+        owner_shutdown_timing_outcome_v2,
+    )
+    .await;
+    let snapshot = observer.snapshot_v2();
+    assert_eq!(
+        snapshot
+            .sample_v2(RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin)
+            .unwrap()
+            .outcome(),
+        RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed
+    );
+    assert_eq!(
+        snapshot
+            .sample_v2(RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin)
+            .unwrap()
+            .outcome(),
+        RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed
+    );
+}

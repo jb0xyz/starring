@@ -586,6 +586,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/ingress_acknowledgement_safety.rs",
             "src/ingress_acknowledgement_supervisor.rs",
             "src/lib.rs",
+            "src/lifecycle_timing.rs",
             "src/main.rs",
             "src/maintenance_ingress_gate.rs",
             "src/mutation_finalizer.rs",

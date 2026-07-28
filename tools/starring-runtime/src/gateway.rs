@@ -54,6 +54,7 @@ use crate::gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerEmergencyInvalidatorV1,
     RuntimeGatewayOwnerPreparedClosedRecoveryV2, RuntimeGatewayOwnerStartupWatchdogStartContextV1,
 };
+use crate::lifecycle_timing::RuntimeLifecycleTimingRecorderV2;
 use crate::process_supervisor::RuntimeProcessInvalidationTriggerV1;
 use crate::registry::RuntimeLockedRegistryEmptyEvidenceV2;
 use crate::shutdown::RuntimeShutdownObserverV1;
@@ -105,6 +106,7 @@ struct RuntimeGatewayCoordinatorArbiterStateV2 {
     production_generation_active: bool,
     resume_claim: Option<RuntimeGatewayCoordinatorGenerationV2>,
     process_invalidation: Option<RuntimeGatewayNarrowInvalidationTriggerV2>,
+    lifecycle_timing: Option<RuntimeLifecycleTimingRecorderV2>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +155,7 @@ impl RuntimeGatewayCoordinatorInterruptHandleV2 {
             production_generation_active: false,
             resume_claim: None,
             process_invalidation: None,
+            lifecycle_timing: None,
         };
         let (observation, _) = watch::channel(state.observation_v2());
         Self {
@@ -223,6 +226,11 @@ impl RuntimeGatewayCoordinatorInterruptHandleV2 {
         self.mutate_state_v2(|state| {
             if state.generation == expected_generation {
                 state.production_generation_active = false;
+                if state.resume_claim.is_some() {
+                    if let Some(timing) = state.lifecycle_timing.as_ref() {
+                        timing.abandon_recovery_resume_claim_v2();
+                    }
+                }
                 state.resume_claim = None;
                 state.process_invalidation = None;
             }
@@ -259,6 +267,9 @@ impl RuntimeGatewayCoordinatorInterruptHandleV2 {
             };
             if accepted {
                 state.resume_claim = Some(expected_generation);
+                if let Some(timing) = state.lifecycle_timing.as_ref() {
+                    timing.record_recovery_resume_claim_v2();
+                }
             }
             accepted
         })
@@ -294,6 +305,9 @@ impl RuntimeGatewayCoordinatorInterruptHandleV2 {
                 && state.resume_claim == Some(expected_generation)
             {
                 state.resume_claim = None;
+                if let Some(timing) = state.lifecycle_timing.as_ref() {
+                    timing.abandon_recovery_resume_claim_v2();
+                }
             }
         });
     }
@@ -339,6 +353,11 @@ impl RuntimeGatewayCoordinatorInterruptHandleV2 {
             expected_generation,
             RuntimeGatewayNarrowInvalidationTriggerV2::Process(trigger),
         )
+    }
+
+    fn bind_lifecycle_timing_v2(&self, timing: RuntimeLifecycleTimingRecorderV2) {
+        let mut state = self.lock_state_v2();
+        state.lifecycle_timing = Some(timing);
     }
 
     #[cfg(test)]
@@ -706,6 +725,12 @@ impl RuntimeGatewayShutdownHandleV1 {
         self.interrupt.trip_shutdown();
         self.snapshot.effective_snapshot()
     }
+}
+
+pub(crate) fn runtime_gateway_shutdown_projection_confirmed_v2(
+    snapshot: &RuntimeGatewayClosedSnapshotV2,
+) -> bool {
+    matches!(snapshot, RuntimeGatewayClosedSnapshotV2::Shutdown { .. })
 }
 
 impl Debug for RuntimeGatewayShutdownHandleV1 {
@@ -1247,6 +1272,12 @@ impl GatewaySynchronousInvalidatorV3 for RuntimeGatewayInvalidationBridgeV2 {
 }
 
 impl RuntimeGatewayBootstrapV1 {
+    pub(crate) fn bind_lifecycle_timing_v2(&self, timing: RuntimeLifecycleTimingRecorderV2) {
+        self.coordinator_snapshot
+            .interrupt
+            .bind_lifecycle_timing_v2(timing);
+    }
+
     pub(crate) fn shutdown_handle_v1(&self) -> RuntimeGatewayShutdownHandleV1 {
         RuntimeGatewayShutdownHandleV1 {
             interrupt: self.coordinator_snapshot.interrupt.clone(),
@@ -4040,6 +4071,29 @@ mod tests {
             coordinator.current(),
             RuntimeGatewayCoordinatorInterruptV2::Shutdown
         );
+    }
+
+    #[test]
+    fn cancelled_resume_claim_is_reclaimable_without_stale_timing_state() {
+        let (_, coordinator, _) = RuntimeGatewayCoordinatorOwnerV2::new();
+        let (timing, observer) =
+            crate::lifecycle_timing::RuntimeLifecycleTimingRecorderV2::create_v2();
+        coordinator.bind_lifecycle_timing_v2(timing.clone());
+        let generation = coordinator_generation(2);
+        coordinator.synchronize_generation_v2(generation);
+        assert!(coordinator.activate_production_generation_v2(generation));
+        assert!(coordinator.claim_recovery_resume_v2(generation));
+        coordinator.cancel_recovery_resume_claim_v2(generation);
+        assert_eq!(coordinator.current_observation_v2().resume_claim, None);
+        assert!(coordinator.claim_recovery_resume_v2(generation));
+        timing.record_exact_ready_v2();
+        assert!(observer
+            .snapshot_v2()
+            .sample_v2(
+                crate::lifecycle_timing::RuntimeLifecycleTimingMetricV2::
+                    RecoveryResumeClaimToExactReady
+            )
+            .is_some());
     }
 
     #[test]

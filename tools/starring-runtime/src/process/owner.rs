@@ -5,8 +5,10 @@ use crate::gateway_owner_startup::{
     RuntimeGatewayOwnerStartupAcquisitionErrorV1, RuntimeGatewayOwnerStartupBoundsV1,
 };
 use crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1;
+use crate::lifecycle_timing::{RuntimeLifecycleTimingMetricV2, RuntimeLifecycleTimingOutcomeV2};
 use crate::{RuntimeDatabasePoolShutdownErrorV1, RuntimeGatewayOwnerStartupWatchdogExitV1};
 
+use super::connected::owner_shutdown_timing_outcome_v2;
 use super::{RuntimeProcessFoundationShutdownErrorV1, RuntimeProcessFoundationV1};
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -149,7 +151,7 @@ impl RuntimeOwnerHeldProcessV1 {
             mut foundation,
             owner,
         } = self;
-        let cleanup_deadline = foundation
+        let (cleanup_deadline, terminal) = foundation
             .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
             .await;
         foundation.observe_shutdown_registry_v1();
@@ -157,9 +159,19 @@ impl RuntimeOwnerHeldProcessV1 {
             .startup_budget
             .owner_cleanup_deadline()
             .min(cleanup_deadline);
+        let timing = foundation
+            .lifecycle_timing_v2()
+            .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin);
         let owner = owner.shutdown_until(owner_cleanup_deadline).await;
+        timing.finish_v2(owner_shutdown_timing_outcome_v2(&owner));
         let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
-        finish_runtime_owner_held_process_shutdown_v1(owner, foundation)
+        let result = finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
+        let outcome = if result.is_ok() {
+            RuntimeLifecycleTimingOutcomeV2::Completed
+        } else {
+            RuntimeLifecycleTimingOutcomeV2::FailedClosed
+        };
+        terminal.finish_result_v2(result, outcome)
     }
 }
 

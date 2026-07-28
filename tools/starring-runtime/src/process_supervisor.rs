@@ -11,7 +11,9 @@ use crate::capability_readiness_supervisor::{
     RuntimeCapabilityReadinessSupervisorV2,
 };
 use crate::database::RuntimeDatabaseReadinessProbeV2;
-use crate::gateway::RuntimeGatewayShutdownHandleV1;
+use crate::gateway::{
+    runtime_gateway_shutdown_projection_confirmed_v2, RuntimeGatewayShutdownHandleV1,
+};
 use crate::health::{
     RuntimeHealthReadinessHandleV1, RuntimeHealthReadinessPublisherV2,
     RuntimeHealthShutdownErrorV1, RuntimeHealthStartErrorV1, RuntimeHealthSupervisorV1,
@@ -19,6 +21,10 @@ use crate::health::{
 use crate::ingress_acknowledgement_supervisor::{
     RuntimeIngressAcknowledgementShutdownHandleV2, RuntimeIngressAcknowledgementSupervisorExitV2,
     RuntimeIngressAcknowledgementTerminalObserverV2,
+};
+use crate::lifecycle_timing::{
+    RuntimeLifecycleTimingMetricV2, RuntimeLifecycleTimingOutcomeV2,
+    RuntimeLifecycleTimingRecorderV2,
 };
 use crate::maintenance_ingress_gate::RuntimeMaintenanceIngressGateShutdownHandleV2;
 use crate::mutation_finalizer::{
@@ -50,6 +56,29 @@ pub(crate) enum RuntimeProcessSignalTaskExitV1 {
     CapabilityReadiness(RuntimeCapabilityReadinessSupervisorExitV2),
 }
 
+pub(crate) struct RuntimeProcessRootSupervisorControlV2 {
+    maintenance_ingress: RuntimeMaintenanceIngressGateShutdownHandleV2,
+    ingress_acknowledgement: RuntimeIngressAcknowledgementShutdownHandleV2,
+    ingress_acknowledgement_terminal: RuntimeIngressAcknowledgementTerminalObserverV2,
+    timing: RuntimeLifecycleTimingRecorderV2,
+}
+
+impl RuntimeProcessRootSupervisorControlV2 {
+    pub(crate) fn new_v2(
+        maintenance_ingress: RuntimeMaintenanceIngressGateShutdownHandleV2,
+        ingress_acknowledgement: RuntimeIngressAcknowledgementShutdownHandleV2,
+        ingress_acknowledgement_terminal: RuntimeIngressAcknowledgementTerminalObserverV2,
+        timing: RuntimeLifecycleTimingRecorderV2,
+    ) -> Self {
+        Self {
+            maintenance_ingress,
+            ingress_acknowledgement,
+            ingress_acknowledgement_terminal,
+            timing,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeProcessInvalidationTriggerV1 {
     trigger: RuntimeShutdownTriggerV1,
@@ -58,14 +87,31 @@ pub(crate) struct RuntimeProcessInvalidationTriggerV1 {
     ingress_acknowledgement: RuntimeIngressAcknowledgementShutdownHandleV2,
     capability_readiness: RuntimeCapabilityReadinessShutdownHandleV2,
     finalizer: RuntimeMutationFinalizerSealHandleV1,
+    timing: RuntimeLifecycleTimingRecorderV2,
 }
 
 impl RuntimeProcessInvalidationTriggerV1 {
     pub(crate) fn trip(&self, cause: RuntimeShutdownCauseV1) -> RuntimeShutdownTripV1 {
         let trip = self.trigger.trip(cause);
+        let observation = trip.observation();
         let deadline = trip.observation().deadline();
+        self.timing.observe_shutdown_v2(observation);
         self.health.seal_readiness();
-        self.maintenance_ingress.seal_shutdown_v2();
+        self.timing.record_shutdown_projection_v2(
+            RuntimeLifecycleTimingMetricV2::ShutdownTripToReadinessSeal,
+            observation,
+            RuntimeLifecycleTimingOutcomeV2::Completed,
+        );
+        let maintenance = self.maintenance_ingress.seal_shutdown_v2();
+        self.timing.record_shutdown_projection_v2(
+            RuntimeLifecycleTimingMetricV2::ShutdownTripToMaintenanceIngressSeal,
+            observation,
+            if maintenance.shutdown_sealed() {
+                RuntimeLifecycleTimingOutcomeV2::Completed
+            } else {
+                RuntimeLifecycleTimingOutcomeV2::FailedClosed
+            },
+        );
         self.ingress_acknowledgement.seal_until_v2(deadline);
         self.capability_readiness.seal_until_v2(deadline);
         self.finalizer.seal_intake();
@@ -88,7 +134,16 @@ pub(crate) struct RuntimeProcessShutdownTriggerV1 {
 impl RuntimeProcessShutdownTriggerV1 {
     pub(crate) fn trip(&self, cause: RuntimeShutdownCauseV1) -> RuntimeShutdownTripV1 {
         let trip = self.invalidation.trip(cause);
-        self.gateway.enter_shutdown();
+        let projection = self.gateway.enter_shutdown();
+        self.invalidation.timing.record_shutdown_projection_v2(
+            RuntimeLifecycleTimingMetricV2::ShutdownTripToGatewayProjection,
+            trip.observation(),
+            if runtime_gateway_shutdown_projection_confirmed_v2(&projection) {
+                RuntimeLifecycleTimingOutcomeV2::Completed
+            } else {
+                RuntimeLifecycleTimingOutcomeV2::FailedClosed
+            },
+        );
         trip
     }
 
@@ -118,10 +173,14 @@ impl RuntimeProcessRootSupervisorV1 {
         finalizer: RuntimeMutationFinalizerSealHandleV1,
         mut finalizer_terminal: RuntimeMutationFinalizerTerminalObserverV1,
         gateway: RuntimeGatewayShutdownHandleV1,
-        maintenance_ingress: RuntimeMaintenanceIngressGateShutdownHandleV2,
-        ingress_acknowledgement: RuntimeIngressAcknowledgementShutdownHandleV2,
-        mut ingress_acknowledgement_terminal: RuntimeIngressAcknowledgementTerminalObserverV2,
+        control: RuntimeProcessRootSupervisorControlV2,
     ) -> Result<Self, RuntimeProcessRootSupervisorStartErrorV1> {
+        let RuntimeProcessRootSupervisorControlV2 {
+            maintenance_ingress,
+            ingress_acknowledgement,
+            mut ingress_acknowledgement_terminal,
+            timing,
+        } = control;
         let mut signals = RuntimeOsShutdownSignalsV1::register()
             .map_err(RuntimeProcessRootSupervisorStartErrorV1::Signal)?;
         let mut health = RuntimeHealthSupervisorV1::start(health_bind_addr)
@@ -141,6 +200,7 @@ impl RuntimeProcessRootSupervisorV1 {
                 ingress_acknowledgement,
                 capability_readiness: capability_readiness.shutdown_handle_v2(),
                 finalizer,
+                timing,
             },
             gateway,
         };
@@ -305,6 +365,10 @@ mod tests {
         RuntimeIngressAcknowledgementSupervisorConfigV2,
         RuntimeIngressAcknowledgementSupervisorPhaseV2, RuntimeIngressAcknowledgementSupervisorV2,
     };
+    use crate::lifecycle_timing::{
+        RuntimeLifecycleShutdownSourceV2, RuntimeLifecycleTimingMetricV2,
+        RuntimeLifecycleTimingOutcomeV2, RuntimeLifecycleTimingRecorderV2,
+    };
     use crate::maintenance_ingress_gate::{
         RuntimeMaintenanceIngressGateControllerV2, RuntimeMaintenanceIngressGateStageV2,
     };
@@ -344,6 +408,151 @@ mod tests {
         ) -> Result<Self::Output, Self::Error> {
             Ok(())
         }
+    }
+
+    async fn direct_trip_projection_sample_v2() -> [Duration; 3] {
+        let process_instance_id =
+            ProcessInstanceId::parse("runtime-process:direct-trip-projection").unwrap();
+        let gateway = compose_runtime_gateway_bootstrap_v1(
+            process_instance_id,
+            GatewayResourceConfigV1::default(),
+        )
+        .unwrap();
+        let (maintenance, maintenance_observer, maintenance_shutdown) =
+            RuntimeMaintenanceIngressGateControllerV2::new_v2();
+        let maintenance = maintenance
+            .begin_open_v2()
+            .unwrap()
+            .commit_open_v2()
+            .unwrap();
+        let acknowledgement =
+            RuntimeIngressAcknowledgementSupervisorV2::<(), ComposedAcknowledgementJobV2>::start(
+                (),
+                RuntimeIngressAcknowledgementSupervisorConfigV2::new(Duration::from_millis(1))
+                    .unwrap(),
+            );
+        let finalizer = RuntimeMutationFinalizerSupervisorV1::start(
+            RuntimeMutationFinalizerConfigV1::new(1).unwrap(),
+            RuntimeMutationFinalizerGenerationV1::new(NonZeroU64::MIN).unwrap(),
+            ComposedFinalizerPortV1,
+        )
+        .unwrap();
+        let (timing, timing_observer) = RuntimeLifecycleTimingRecorderV2::create_v2();
+        let mut root = RuntimeProcessRootSupervisorV1::start(
+            "127.0.0.1:0".parse().unwrap(),
+            finalizer.seal_handle(),
+            finalizer.terminal_observer(),
+            gateway.shutdown_handle_v1(),
+            RuntimeProcessRootSupervisorControlV2::new_v2(
+                maintenance_shutdown,
+                acknowledgement.shutdown_handle_v2(),
+                acknowledgement.terminal_observer_v2(),
+                timing,
+            ),
+        )
+        .await
+        .unwrap();
+        let readiness = root.take_readiness_publisher_v2().unwrap();
+        let readiness_state = root.health.as_ref().unwrap().readiness_handle();
+        assert!(readiness.publish_ready_v2());
+        root.shutdown_trigger()
+            .trip(RuntimeShutdownCauseV1::Explicit);
+        assert!(readiness_state.is_sealed());
+        assert!(!readiness_state.is_ready());
+        assert!(maintenance_observer.snapshot_v2().shutdown_sealed());
+        assert!(matches!(
+            gateway.closed_snapshot(),
+            RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
+        ));
+        let snapshot = timing_observer.snapshot_v2();
+        assert_eq!(
+            snapshot.shutdown_source_v2(),
+            Some(RuntimeLifecycleShutdownSourceV2::Direct)
+        );
+        let durations = [
+            RuntimeLifecycleTimingMetricV2::ShutdownTripToReadinessSeal,
+            RuntimeLifecycleTimingMetricV2::ShutdownTripToMaintenanceIngressSeal,
+            RuntimeLifecycleTimingMetricV2::ShutdownTripToGatewayProjection,
+        ]
+        .map(|metric| {
+            let sample = snapshot.sample_v2(metric).unwrap();
+            assert_eq!(sample.outcome(), RuntimeLifecycleTimingOutcomeV2::Completed);
+            sample.elapsed()
+        });
+        drop(maintenance);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(
+            root.shutdown_capability_readiness_until_v2(deadline).await,
+            RuntimeCapabilityReadinessSupervisorExitV2::Commanded
+        );
+        let _signal_exit = root.join_signal_until(deadline).await;
+        root.shutdown_health_until(deadline).await.unwrap();
+        assert_eq!(
+            acknowledgement.shutdown_until(deadline).await.exit(),
+            RuntimeIngressAcknowledgementSupervisorExitV2::Commanded
+        );
+        assert_eq!(
+            finalizer.shutdown_until(deadline).await.exit(),
+            crate::RuntimeSupervisorExitV1::Commanded
+        );
+        durations
+    }
+
+    fn projection_percentiles_v2(mut values: Vec<Duration>) -> [Duration; 4] {
+        values.sort_unstable();
+        let nearest_rank = |percent: usize| {
+            let rank = (values.len() * percent).div_ceil(100);
+            values[rank.saturating_sub(1)]
+        };
+        [
+            nearest_rank(50),
+            nearest_rank(95),
+            nearest_rank(99),
+            *values.last().unwrap(),
+        ]
+    }
+
+    fn require_release_profile_v2() {
+        #[cfg(debug_assertions)]
+        panic!("release profile required");
+    }
+
+    #[tokio::test]
+    #[ignore = "diagnostic in-process gateway shutdown projection"]
+    async fn runtime_direct_trip_projection_release_diagnostic_v2() {
+        require_release_profile_v2();
+        for _ in 0..20 {
+            let _ = direct_trip_projection_sample_v2().await;
+        }
+        let mut readiness = Vec::with_capacity(200);
+        let mut maintenance = Vec::with_capacity(200);
+        let mut gateway = Vec::with_capacity(200);
+        for _ in 0..200 {
+            let [readiness_elapsed, maintenance_elapsed, gateway_elapsed] =
+                direct_trip_projection_sample_v2().await;
+            readiness.push(readiness_elapsed);
+            maintenance.push(maintenance_elapsed);
+            gateway.push(gateway_elapsed);
+        }
+        let readiness = projection_percentiles_v2(readiness);
+        let maintenance = projection_percentiles_v2(maintenance);
+        let gateway = projection_percentiles_v2(gateway);
+        for (name, values) in [
+            ("readiness_seal", readiness),
+            ("maintenance_ingress_seal", maintenance),
+            ("gateway_shutdown_projection", gateway),
+        ] {
+            println!(
+                "runtime_lifecycle_diagnostic_cohort scope=in_process_gateway_shutdown_projection load=idle unmeasured=os_signal_delivery,discord_hard_pause,capacity_50_percent,capacity_90_percent metric={name} warmup=20 samples=200 p50={}ns p95={}ns p99={}ns max={}ns",
+                values[0].as_nanos(),
+                values[1].as_nanos(),
+                values[2].as_nanos(),
+                values[3].as_nanos()
+            );
+        }
+        assert!(readiness[2] <= Duration::from_millis(50));
+        assert!(maintenance[2] <= Duration::from_millis(50));
+        assert!(gateway[2] <= Duration::from_millis(250));
     }
 
     #[test]
@@ -391,14 +600,18 @@ mod tests {
             ComposedFinalizerPortV1,
         )
         .unwrap();
+        let (timing, timing_observer) = RuntimeLifecycleTimingRecorderV2::create_v2();
         let mut root = RuntimeProcessRootSupervisorV1::start(
             "127.0.0.1:0".parse().unwrap(),
             finalizer.seal_handle(),
             finalizer.terminal_observer(),
             gateway.shutdown_handle_v1(),
-            maintenance_shutdown,
-            acknowledgement.shutdown_handle_v2(),
-            acknowledgement.terminal_observer_v2(),
+            RuntimeProcessRootSupervisorControlV2::new_v2(
+                maintenance_shutdown,
+                acknowledgement.shutdown_handle_v2(),
+                acknowledgement.terminal_observer_v2(),
+                timing,
+            ),
         )
         .await
         .unwrap();
@@ -444,6 +657,21 @@ mod tests {
             gateway.closed_snapshot(),
             RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
         ));
+        let timing = timing_observer.snapshot_v2();
+        assert_eq!(
+            timing.shutdown_source_v2(),
+            Some(RuntimeLifecycleShutdownSourceV2::Supervisor)
+        );
+        for metric in [
+            RuntimeLifecycleTimingMetricV2::ShutdownTripToReadinessSeal,
+            RuntimeLifecycleTimingMetricV2::ShutdownTripToMaintenanceIngressSeal,
+            RuntimeLifecycleTimingMetricV2::ShutdownTripToGatewayProjection,
+        ] {
+            assert_eq!(
+                timing.sample_v2(metric).unwrap().outcome(),
+                RuntimeLifecycleTimingOutcomeV2::Completed
+            );
+        }
 
         drop(maintenance);
         let deadline = Instant::now() + Duration::from_secs(2);

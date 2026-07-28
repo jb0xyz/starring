@@ -45,6 +45,10 @@ use crate::ingress_acknowledgement_supervisor::{
     RuntimeIngressAcknowledgementRegistrationRejectionReasonV2,
     RuntimeWorkerIngressAcknowledgementJobV2,
 };
+use crate::lifecycle_timing::{
+    RuntimeLifecycleTimingMetricV2, RuntimeLifecycleTimingOutcomeV2,
+    RuntimeLifecycleTimingRecorderV2, RuntimeLifecycleTimingTerminalReporterV2,
+};
 use crate::maintenance_ingress_gate::{
     RuntimeMaintenanceIngressGateOpenAuthorityV2, RuntimeMaintenanceIngressGateSnapshotV2,
     RuntimeMaintenanceIngressGateStageV2,
@@ -57,8 +61,9 @@ use crate::{
 };
 
 use super::connected::{
-    discord_transition_failure_v1, finish_paused_connected_shutdown_v1,
-    map_discord_shutdown_failure_v1, map_discord_transition_exit_v1,
+    discord_shutdown_timing_outcome_v2, discord_transition_failure_v1,
+    finish_paused_connected_shutdown_v1, map_discord_shutdown_failure_v1,
+    map_discord_transition_exit_v1, owner_shutdown_timing_outcome_v2,
     shutdown_paused_foundation_owner_v1, RuntimeProcessPausedConnectedTransitionFailureV1,
 };
 use super::readiness::RuntimeRecoveryIterationReadyProcessV2;
@@ -1210,6 +1215,9 @@ impl RuntimeRecoveryResumeProcessV2 {
                 ));
             }
         };
+        self.foundation
+            .lifecycle_timing_v2()
+            .record_exact_ready_v2();
         let post_database =
             match collect_recovery_resume_database_evidence_v2(&self.foundation).await {
                 Ok(evidence) => evidence,
@@ -1467,6 +1475,7 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
             &mut ingress_acknowledgement,
             authority,
             Instant::now() + Duration::from_secs(5),
+            foundation.lifecycle_timing_v2(),
         )
         .await;
         let (lifecycle, accepted) = match acknowledgement {
@@ -1831,6 +1840,7 @@ async fn execute_ingress_acknowledgement_v2(
     supervisor: &mut RuntimeProcessIngressAcknowledgementSupervisorV2,
     authority: RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2,
     deadline: Instant,
+    lifecycle_timing: crate::lifecycle_timing::RuntimeLifecycleTimingRecorderV2,
 ) -> Result<
     RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2,
     RuntimeProcessIngressAcknowledgementExecutionFailureV2,
@@ -1839,6 +1849,9 @@ async fn execute_ingress_acknowledgement_v2(
     let waiter = match supervisor.try_submit(job, deadline) {
         Ok(waiter) => waiter,
         Err(rejection) => {
+            lifecycle_timing.record_durable_acknowledgement_terminal_v2(
+                crate::lifecycle_timing::RuntimeLifecycleTimingOutcomeV2::Rejected,
+            );
             let transition =
                 map_ingress_acknowledgement_registration_rejection_v2(rejection.reason());
             return Err(
@@ -1851,6 +1864,9 @@ async fn execute_ingress_acknowledgement_v2(
     };
     waiter.cancel_v2();
     let Some(completion) = supervisor.recv_completion().await else {
+        lifecycle_timing.record_durable_acknowledgement_terminal_v2(
+            crate::lifecycle_timing::RuntimeLifecycleTimingOutcomeV2::FailedClosed,
+        );
         return Err(
             RuntimeProcessIngressAcknowledgementExecutionFailureV2::AuthorityLost(
                 RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
@@ -1858,8 +1874,16 @@ async fn execute_ingress_acknowledgement_v2(
         );
     };
     match completion.into_result() {
-        RuntimeIngressAcknowledgementExecutionResultV2::Accepted(outcome) => Ok(outcome),
+        RuntimeIngressAcknowledgementExecutionResultV2::Accepted(outcome) => {
+            lifecycle_timing.record_durable_acknowledgement_terminal_v2(
+                crate::lifecycle_timing::RuntimeLifecycleTimingOutcomeV2::Completed,
+            );
+            Ok(outcome)
+        }
         RuntimeIngressAcknowledgementExecutionResultV2::CompletionRejected { job, error } => {
+            lifecycle_timing.record_durable_acknowledgement_terminal_v2(
+                crate::lifecycle_timing::RuntimeLifecycleTimingOutcomeV2::Rejected,
+            );
             let transition = match error {
                 crate::closed_recovery::RuntimeClosedRecoveryIngressAcknowledgementCompletionErrorV2::EmptyOpenRefresh(
                     lifecycle,
@@ -1872,12 +1896,24 @@ async fn execute_ingress_acknowledgement_v2(
                 },
             )
         }
-        RuntimeIngressAcknowledgementExecutionResultV2::FailedClosed { job, failure } => Err(
-            RuntimeProcessIngressAcknowledgementExecutionFailureV2::Retained {
-                authority: Box::new(job.into_authority()),
-                transition: map_ingress_acknowledgement_failure_v2(failure),
-            },
-        ),
+        RuntimeIngressAcknowledgementExecutionResultV2::FailedClosed { job, failure } => {
+            lifecycle_timing.record_durable_acknowledgement_terminal_v2(
+                if matches!(
+                    failure,
+                    RuntimeIngressAcknowledgementFailureV2::OperationDeadlineElapsed
+                ) {
+                    crate::lifecycle_timing::RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed
+                } else {
+                    crate::lifecycle_timing::RuntimeLifecycleTimingOutcomeV2::FailedClosed
+                },
+            );
+            Err(
+                RuntimeProcessIngressAcknowledgementExecutionFailureV2::Retained {
+                    authority: Box::new(job.into_authority()),
+                    transition: map_ingress_acknowledgement_failure_v2(failure),
+                },
+            )
+        }
     }
 }
 
@@ -2231,6 +2267,7 @@ impl RuntimeEmptyOpenProcessV2 {
             &mut ingress_acknowledgement,
             authority,
             acknowledgement_schedule.safety_deadline,
+            foundation.lifecycle_timing_v2(),
         )
         .await;
         let (lifecycle, accepted_receipt) = match acknowledgement {
@@ -2575,6 +2612,34 @@ fn production_handoff_shutdown_failure_v2(
         .map(|_| RuntimeProcessProductionHandoffFailureV2::ProcessShutdown)
 }
 
+async fn time_shutdown_result_v2<T, E, F, Outcome>(
+    timing: &RuntimeLifecycleTimingRecorderV2,
+    metric: RuntimeLifecycleTimingMetricV2,
+    future: F,
+    outcome: Outcome,
+) -> Result<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+    Outcome: FnOnce(&Result<T, E>) -> RuntimeLifecycleTimingOutcomeV2,
+{
+    let span = timing.start_span_v2(metric);
+    let result = future.await;
+    span.finish_v2(outcome(&result));
+    result
+}
+
+fn finish_observation_shutdown_timing_v2<T, E>(
+    terminal: RuntimeLifecycleTimingTerminalReporterV2,
+    result: Result<T, E>,
+) -> Result<T, E> {
+    let outcome = if result.is_ok() {
+        RuntimeLifecycleTimingOutcomeV2::Completed
+    } else {
+        RuntimeLifecycleTimingOutcomeV2::FailedClosed
+    };
+    terminal.finish_result_v2(result, outcome)
+}
+
 impl RuntimeTransferredDiscordSupervisorV2 {
     async fn shutdown_until_v2<F>(
         self,
@@ -2606,7 +2671,7 @@ async fn shutdown_transferred_production_handoff_v2(
     lifecycle: RuntimeClosedRecoveryAdmissionFrozenProcessV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
-    let cleanup_deadline = foundation
+    let (cleanup_deadline, terminal) = foundation
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
     let discord_cleanup_deadline = foundation
@@ -2619,17 +2684,28 @@ async fn shutdown_transferred_production_handoff_v2(
         .min(cleanup_deadline);
     foundation.observe_shutdown_registry_v1();
     let discord_drain = foundation.gateway.begin_discord_drain_v1();
-    let discord_shutdown = discord
-        .shutdown_until_v2(discord_drain, process_generation, discord_cleanup_deadline)
-        .await
-        .map_err(map_discord_shutdown_failure_v1);
-    let owner = lifecycle
-        .abort_and_shutdown_until_v2(owner_cleanup_deadline)
-        .await;
+    let timing = foundation.lifecycle_timing_v2();
+    let discord_shutdown = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+        discord.shutdown_until_v2(discord_drain, process_generation, discord_cleanup_deadline),
+        discord_shutdown_timing_outcome_v2,
+    )
+    .await
+    .map_err(map_discord_shutdown_failure_v1);
+    let owner = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin,
+        lifecycle.abort_and_shutdown_until_v2(owner_cleanup_deadline),
+        owner_shutdown_timing_outcome_v2,
+    )
+    .await;
     let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
     let owner_shutdown =
         super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
-    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+    let result =
+        finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into);
+    finish_observation_shutdown_timing_v2(terminal, result)
 }
 
 async fn shutdown_process_bound_production_handoff_v2(
@@ -2638,22 +2714,33 @@ async fn shutdown_process_bound_production_handoff_v2(
     lifecycle: RuntimeClosedRecoveryProcessFrozenProcessV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
-    let cleanup_deadline = foundation
+    let (cleanup_deadline, terminal) = foundation
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
     foundation.observe_shutdown_registry_v1();
     let discord_drain = foundation.gateway.begin_discord_drain_v1();
-    let discord_shutdown = discord
-        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
-        .await
-        .map_err(map_discord_shutdown_failure_v1);
-    let owner = lifecycle
-        .abort_and_shutdown_until_v2(cleanup_deadline)
-        .await;
+    let timing = foundation.lifecycle_timing_v2();
+    let discord_shutdown = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+        discord.shutdown_until(discord_drain, process_generation, cleanup_deadline),
+        discord_shutdown_timing_outcome_v2,
+    )
+    .await
+    .map_err(map_discord_shutdown_failure_v1);
+    let owner = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin,
+        lifecycle.abort_and_shutdown_until_v2(cleanup_deadline),
+        owner_shutdown_timing_outcome_v2,
+    )
+    .await;
     let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
     let owner_shutdown =
         super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
-    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+    let result =
+        finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into);
+    finish_observation_shutdown_timing_v2(terminal, result)
 }
 
 async fn shutdown_recovery_resume_process_v2(
@@ -2677,22 +2764,33 @@ async fn shutdown_recovery_resume_transferred_v2(
     lifecycle: RuntimeClosedRecoveryProductionHandoffProcessV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
-    let cleanup_deadline = foundation
+    let (cleanup_deadline, terminal) = foundation
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
     foundation.observe_shutdown_registry_v1();
     let discord_drain = foundation.gateway.begin_discord_drain_v1();
-    let discord_shutdown = discord
-        .shutdown_until_v2(discord_drain, process_generation, cleanup_deadline)
-        .await
-        .map_err(map_discord_shutdown_failure_v1);
-    let owner = lifecycle
-        .abort_and_shutdown_until_v2(cleanup_deadline)
-        .await;
+    let timing = foundation.lifecycle_timing_v2();
+    let discord_shutdown = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+        discord.shutdown_until_v2(discord_drain, process_generation, cleanup_deadline),
+        discord_shutdown_timing_outcome_v2,
+    )
+    .await
+    .map_err(map_discord_shutdown_failure_v1);
+    let owner = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin,
+        lifecycle.abort_and_shutdown_until_v2(cleanup_deadline),
+        owner_shutdown_timing_outcome_v2,
+    )
+    .await;
     let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
     let owner_shutdown =
         super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
-    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+    let result =
+        finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into);
+    finish_observation_shutdown_timing_v2(terminal, result)
 }
 
 async fn shutdown_admission_acknowledging_process_v2(
@@ -2702,7 +2800,7 @@ async fn shutdown_admission_acknowledging_process_v2(
     ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
-    let cleanup_deadline = foundation
+    let (cleanup_deadline, terminal) = foundation
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
     shutdown_ingress_acknowledgement_supervisor_v2(
@@ -2713,17 +2811,28 @@ async fn shutdown_admission_acknowledging_process_v2(
     .await;
     foundation.observe_shutdown_registry_v1();
     let discord_drain = foundation.gateway.begin_discord_drain_v1();
-    let discord_shutdown = discord
-        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
-        .await
-        .map_err(map_discord_shutdown_failure_v1);
-    let owner = lifecycle
-        .abort_and_shutdown_until_v2(cleanup_deadline)
-        .await;
+    let timing = foundation.lifecycle_timing_v2();
+    let discord_shutdown = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+        discord.shutdown_until(discord_drain, process_generation, cleanup_deadline),
+        discord_shutdown_timing_outcome_v2,
+    )
+    .await
+    .map_err(map_discord_shutdown_failure_v1);
+    let owner = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin,
+        lifecycle.abort_and_shutdown_until_v2(cleanup_deadline),
+        owner_shutdown_timing_outcome_v2,
+    )
+    .await;
     let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
     let owner_shutdown =
         super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
-    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+    let result =
+        finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into);
+    finish_observation_shutdown_timing_v2(terminal, result)
 }
 
 async fn shutdown_admission_acknowledging_process_without_lane_v2(
@@ -2732,22 +2841,33 @@ async fn shutdown_admission_acknowledging_process_without_lane_v2(
     lifecycle: RuntimeClosedRecoveryAdmissionAcknowledgingProcessV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
-    let cleanup_deadline = foundation
+    let (cleanup_deadline, terminal) = foundation
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
     foundation.observe_shutdown_registry_v1();
     let discord_drain = foundation.gateway.begin_discord_drain_v1();
-    let discord_shutdown = discord
-        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
-        .await
-        .map_err(map_discord_shutdown_failure_v1);
-    let owner = lifecycle
-        .abort_and_shutdown_until_v2(cleanup_deadline)
-        .await;
+    let timing = foundation.lifecycle_timing_v2();
+    let discord_shutdown = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+        discord.shutdown_until(discord_drain, process_generation, cleanup_deadline),
+        discord_shutdown_timing_outcome_v2,
+    )
+    .await
+    .map_err(map_discord_shutdown_failure_v1);
+    let owner = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin,
+        lifecycle.abort_and_shutdown_until_v2(cleanup_deadline),
+        owner_shutdown_timing_outcome_v2,
+    )
+    .await;
     let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
     let owner_shutdown =
         super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
-    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+    let result =
+        finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into);
+    finish_observation_shutdown_timing_v2(terminal, result)
 }
 
 async fn shutdown_ingress_acknowledgement_supervisor_v2(
@@ -2755,12 +2875,28 @@ async fn shutdown_ingress_acknowledgement_supervisor_v2(
     ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
     cleanup_deadline: Instant,
 ) {
+    let timing = foundation
+        .lifecycle_timing_v2()
+        .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownIngressAcknowledgementJoin);
     let report = ingress_acknowledgement
         .shutdown_until(cleanup_deadline)
         .await;
+    let outcome = if report.completion().is_some() {
+        RuntimeLifecycleTimingOutcomeV2::FailedClosed
+    } else {
+        match report.exit() {
+            crate::ingress_acknowledgement_supervisor::RuntimeIngressAcknowledgementSupervisorExitV2::Commanded => RuntimeLifecycleTimingOutcomeV2::Completed,
+            crate::ingress_acknowledgement_supervisor::RuntimeIngressAcknowledgementSupervisorExitV2::DeadlineElapsed => RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed,
+            crate::ingress_acknowledgement_supervisor::RuntimeIngressAcknowledgementSupervisorExitV2::IntakeClosed
+            | crate::ingress_acknowledgement_supervisor::RuntimeIngressAcknowledgementSupervisorExitV2::ProtocolViolation
+            | crate::ingress_acknowledgement_supervisor::RuntimeIngressAcknowledgementSupervisorExitV2::Panicked
+            | crate::ingress_acknowledgement_supervisor::RuntimeIngressAcknowledgementSupervisorExitV2::Aborted => RuntimeLifecycleTimingOutcomeV2::FailedClosed,
+        }
+    };
     foundation
         .record_ingress_acknowledgement_shutdown_v2(report.exit(), report.completion().is_some());
     drop(report);
+    timing.finish_v2(outcome);
 }
 
 async fn shutdown_orphaned_empty_open_process_v2(
@@ -2853,7 +2989,7 @@ async fn shutdown_process_without_lifecycle_v2(
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
     let RuntimeIngressAcknowledgementCleanupV2 { supervisor, safety } = ingress_acknowledgement;
-    let cleanup_deadline = foundation
+    let (cleanup_deadline, terminal) = foundation
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
     if let Some(acknowledgement_safety) = safety {
@@ -2863,16 +2999,23 @@ async fn shutdown_process_without_lifecycle_v2(
         .await;
     foundation.observe_shutdown_registry_v1();
     let discord_drain = foundation.gateway.begin_discord_drain_v1();
-    let discord_shutdown = discord
-        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
-        .await
-        .map_err(map_discord_shutdown_failure_v1);
+    let timing = foundation.lifecycle_timing_v2();
+    let discord_shutdown = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+        discord.shutdown_until(discord_drain, process_generation, cleanup_deadline),
+        discord_shutdown_timing_outcome_v2,
+    )
+    .await
+    .map_err(map_discord_shutdown_failure_v1);
     let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
     let owner_shutdown = super::owner::finish_runtime_owner_held_process_shutdown_v1(
         Ok(RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped),
         foundation,
     );
-    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+    let result =
+        finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into);
+    finish_observation_shutdown_timing_v2(terminal, result)
 }
 
 async fn shutdown_frozen_empty_open_process_v2(
@@ -2886,7 +3029,7 @@ async fn shutdown_frozen_empty_open_process_v2(
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
     readiness.remove_readiness_v2();
     drop(maintenance_ingress);
-    let cleanup_deadline = foundation
+    let (cleanup_deadline, terminal) = foundation
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
     shutdown_ingress_acknowledgement_supervisor_v2(
@@ -2897,17 +3040,28 @@ async fn shutdown_frozen_empty_open_process_v2(
     .await;
     foundation.observe_shutdown_registry_v1();
     let discord_drain = foundation.gateway.begin_discord_drain_v1();
-    let discord_shutdown = discord
-        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
-        .await
-        .map_err(map_discord_shutdown_failure_v1);
-    let owner = lifecycle
-        .abort_and_shutdown_until_v2(cleanup_deadline)
-        .await;
+    let timing = foundation.lifecycle_timing_v2();
+    let discord_shutdown = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+        discord.shutdown_until(discord_drain, process_generation, cleanup_deadline),
+        discord_shutdown_timing_outcome_v2,
+    )
+    .await
+    .map_err(map_discord_shutdown_failure_v1);
+    let owner = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin,
+        lifecycle.abort_and_shutdown_until_v2(cleanup_deadline),
+        owner_shutdown_timing_outcome_v2,
+    )
+    .await;
     let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
     let owner_shutdown =
         super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
-    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+    let result =
+        finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into);
+    finish_observation_shutdown_timing_v2(terminal, result)
 }
 
 async fn shutdown_empty_open_process_v2(
@@ -2922,7 +3076,7 @@ async fn shutdown_empty_open_process_v2(
     let RuntimeIngressAcknowledgementCleanupV2 { supervisor, safety } = ingress_acknowledgement;
     readiness.remove_readiness_v2();
     drop(maintenance_ingress);
-    let cleanup_deadline = foundation
+    let (cleanup_deadline, terminal) = foundation
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
     if let Some(acknowledgement_safety) = safety {
@@ -2932,15 +3086,28 @@ async fn shutdown_empty_open_process_v2(
         .await;
     foundation.observe_shutdown_registry_v1();
     let discord_drain = foundation.gateway.begin_discord_drain_v1();
-    let discord_shutdown = discord
-        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
-        .await
-        .map_err(map_discord_shutdown_failure_v1);
-    let owner = lifecycle.shutdown_until_v2(cleanup_deadline).await;
+    let timing = foundation.lifecycle_timing_v2();
+    let discord_shutdown = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+        discord.shutdown_until(discord_drain, process_generation, cleanup_deadline),
+        discord_shutdown_timing_outcome_v2,
+    )
+    .await
+    .map_err(map_discord_shutdown_failure_v1);
+    let owner = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin,
+        lifecycle.shutdown_until_v2(cleanup_deadline),
+        owner_shutdown_timing_outcome_v2,
+    )
+    .await;
     let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
     let owner_shutdown =
         super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
-    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+    let result =
+        finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into);
+    finish_observation_shutdown_timing_v2(terminal, result)
 }
 
 async fn shutdown_refreshing_empty_open_process_v2(
@@ -2955,7 +3122,7 @@ async fn shutdown_refreshing_empty_open_process_v2(
     let RuntimeIngressAcknowledgementCleanupV2 { supervisor, safety } = ingress_acknowledgement;
     readiness.remove_readiness_v2();
     drop(maintenance_ingress);
-    let cleanup_deadline = foundation
+    let (cleanup_deadline, terminal) = foundation
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
     if let Some(acknowledgement_safety) = safety {
@@ -2965,15 +3132,28 @@ async fn shutdown_refreshing_empty_open_process_v2(
         .await;
     foundation.observe_shutdown_registry_v1();
     let discord_drain = foundation.gateway.begin_discord_drain_v1();
-    let discord_shutdown = discord
-        .shutdown_until(discord_drain, process_generation, cleanup_deadline)
-        .await
-        .map_err(map_discord_shutdown_failure_v1);
-    let owner = lifecycle.shutdown_until_v2(cleanup_deadline).await;
+    let timing = foundation.lifecycle_timing_v2();
+    let discord_shutdown = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+        discord.shutdown_until(discord_drain, process_generation, cleanup_deadline),
+        discord_shutdown_timing_outcome_v2,
+    )
+    .await
+    .map_err(map_discord_shutdown_failure_v1);
+    let owner = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin,
+        lifecycle.shutdown_until_v2(cleanup_deadline),
+        owner_shutdown_timing_outcome_v2,
+    )
+    .await;
     let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
     let owner_shutdown =
         super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
-    finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into)
+    let result =
+        finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into);
+    finish_observation_shutdown_timing_v2(terminal, result)
 }
 
 fn finish_production_handoff_transition_v2(
