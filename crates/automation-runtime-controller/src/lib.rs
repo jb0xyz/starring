@@ -141,7 +141,8 @@ pub use v2_drain_intent_canonical_state::{
     RuntimePersistedUnclaimedPendingDrainIntentV2, RuntimeValidatedCompactPendingDrainSuccessionV2,
 };
 pub use v2_drain_intent_receipt::{
-    RuntimeDrainAcknowledgementSourceV2, RuntimeDrainIntentMutationOutcomeV2,
+    RuntimeDrainAcknowledgementSourceV2, RuntimeDrainCancellationSourceV2,
+    RuntimeDrainConsumptionSourceV2, RuntimeDrainIntentMutationOutcomeV2,
     RuntimeDrainIntentReceiptErrorV2, RuntimeDrainIntentReceiptV2, RuntimeDrainRefenceSourceV2,
     RuntimeDrainSuccessionAcknowledgementExpectationV2,
     RuntimeDrainSuccessionAcknowledgementSourceV2, RuntimeRouteAbsentDrainIntentSourceV2,

@@ -12,7 +12,8 @@ use discord_model::GuildId;
 use resource_resolution::ResourceBindingFingerprint;
 
 use super::{
-    RuntimeDrainAcknowledgementSourceV2, RuntimeDrainIntentMutationOutcomeV2,
+    RuntimeDrainAcknowledgementSourceV2, RuntimeDrainCancellationSourceV2,
+    RuntimeDrainConsumptionSourceV2, RuntimeDrainIntentMutationOutcomeV2,
     RuntimeDrainIntentReceiptErrorV2, RuntimeDrainIntentReceiptV2, RuntimeDrainRefenceSourceV2,
     RuntimeDrainSuccessionAcknowledgementExpectationV2,
     RuntimeDrainSuccessionAcknowledgementSourceV2, RuntimeRouteAbsentDrainIntentSourceV2,
@@ -1043,6 +1044,123 @@ fn succession_receipt_rejects_seal_provenance_acknowledgement_and_certification_
 }
 
 #[test]
+fn terminal_receipts_accept_only_exact_acknowledged_successors() {
+    let operation = operation_for(DRAIN_INTENT_ID);
+    let acknowledged = acknowledged(&operation, 20, claimed(&operation, None, 13, 10, 8));
+    let resulting_revision = DeploymentRevision::new(9).unwrap();
+    let consumption_source = RuntimeDrainConsumptionSourceV2::from_acknowledged(
+        RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged.clone()).unwrap(),
+        resulting_revision,
+    );
+    let consumed = RuntimeDrainIntentV2::consumed_from_persisted(
+        &root(&operation),
+        non_zero(21),
+        resulting_revision,
+        at(-100),
+    )
+    .unwrap();
+    let consumed_receipt =
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, consumed.clone()).unwrap();
+    assert_eq!(
+        consumed_receipt.outcome(),
+        RuntimeDrainIntentMutationOutcomeV2::Consumed
+    );
+    assert_eq!(consumed_receipt.intent(), &consumed);
+
+    let cancellation_source = RuntimeDrainCancellationSourceV2::from_acknowledged(
+        RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged).unwrap(),
+    );
+    let cancelled =
+        RuntimeDrainIntentV2::cancelled_from_persisted(&root(&operation), non_zero(21), at(1_000))
+            .unwrap();
+    let cancelled_receipt =
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, cancelled.clone()).unwrap();
+    assert_eq!(
+        cancelled_receipt.outcome(),
+        RuntimeDrainIntentMutationOutcomeV2::Cancelled
+    );
+    assert_eq!(cancelled_receipt.intent(), &cancelled);
+}
+
+#[test]
+fn terminal_receipts_reject_root_revision_state_and_result_drift() {
+    let operation = operation_for(DRAIN_INTENT_ID);
+    let acknowledged_intent = acknowledged(&operation, 20, claimed(&operation, None, 13, 10, 8));
+    let resulting_revision = DeploymentRevision::new(9).unwrap();
+    let consumption_source = RuntimeDrainConsumptionSourceV2::from_acknowledged(
+        RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged_intent.clone())
+            .unwrap(),
+        resulting_revision,
+    );
+    let cancellation_source = RuntimeDrainCancellationSourceV2::from_acknowledged(
+        RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged_intent).unwrap(),
+    );
+
+    let foreign_operation = operation_for(FOREIGN_DRAIN_INTENT_ID);
+    let foreign_consumed = RuntimeDrainIntentV2::consumed_from_persisted(
+        &root(&foreign_operation),
+        non_zero(21),
+        resulting_revision,
+        at(1),
+    )
+    .unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, foreign_consumed),
+        Err(RuntimeDrainIntentReceiptErrorV2::ImmutableRootMismatch)
+    );
+
+    let skipped = RuntimeDrainIntentV2::consumed_from_persisted(
+        &root(&operation),
+        non_zero(22),
+        resulting_revision,
+        at(1),
+    )
+    .unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, skipped),
+        Err(RuntimeDrainIntentReceiptErrorV2::TerminalIntentRevisionMismatch)
+    );
+
+    let wrong_revision = RuntimeDrainIntentV2::consumed_from_persisted(
+        &root(&operation),
+        non_zero(21),
+        DeploymentRevision::new(10).unwrap(),
+        at(1),
+    )
+    .unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, wrong_revision),
+        Err(RuntimeDrainIntentReceiptErrorV2::ConsumptionResultingRevisionMismatch)
+    );
+
+    let acknowledged_successor = acknowledged(&operation, 21, claimed(&operation, None, 13, 10, 8));
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, acknowledged_successor),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
+
+    let consumed = RuntimeDrainIntentV2::consumed_from_persisted(
+        &root(&operation),
+        non_zero(21),
+        resulting_revision,
+        at(1),
+    )
+    .unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, consumed),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
+
+    let skipped_cancel =
+        RuntimeDrainIntentV2::cancelled_from_persisted(&root(&operation), non_zero(22), at(1))
+            .unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, skipped_cancel),
+        Err(RuntimeDrainIntentReceiptErrorV2::TerminalIntentRevisionMismatch)
+    );
+}
+
+#[test]
 fn receipt_surface_is_closed_data_without_claim_or_terminal_authority() {
     let source = include_str!("../v2_drain_intent_receipt.rs");
 
@@ -1067,8 +1185,6 @@ fn receipt_surface_is_closed_data_without_claim_or_terminal_authority() {
         "pub fn claimed(",
         "pub fn claim_initial(",
         "pub fn claim_successor(",
-        "pub fn consumed(",
-        "pub fn cancelled(",
         "pub outcome:",
         "pub intent:",
         "pub source:",
@@ -1082,6 +1198,8 @@ fn receipt_surface_is_closed_data_without_claim_or_terminal_authority() {
         "pub struct RuntimeDrainSuccessionAcknowledgementExpectationV2",
         "pub struct RuntimeDrainSuccessionAcknowledgementSourceV2",
         "pub struct RuntimeRouteAbsentDrainIntentSourceV2",
+        "pub struct RuntimeDrainConsumptionSourceV2",
+        "pub struct RuntimeDrainCancellationSourceV2",
         "pub struct RuntimeDrainIntentReceiptV2",
         "pub fn from_expired_route_absent_claimed(",
         "pub fn inserted(",
@@ -1090,6 +1208,8 @@ fn receipt_surface_is_closed_data_without_claim_or_terminal_authority() {
         "pub fn refenced(",
         "pub fn acknowledged(",
         "pub fn succession_acknowledged(",
+        "pub fn consumed(",
+        "pub fn cancelled(",
     ] {
         assert!(source.contains(declaration), "{declaration}");
     }

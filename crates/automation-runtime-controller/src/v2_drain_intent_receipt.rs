@@ -3,7 +3,7 @@ mod tests;
 
 use std::num::NonZeroU64;
 
-use automation_runtime_convergence::ControllerId;
+use automation_runtime_convergence::{ControllerId, DeploymentRevision};
 use chrono::{DateTime, Utc};
 
 use crate::{
@@ -80,6 +80,10 @@ pub enum RuntimeDrainIntentReceiptErrorV2 {
     SuccessionAcknowledgementMismatch,
     #[error("runtime drain succession certification is not eligible for direct acknowledgement")]
     SuccessionCertificationMismatch,
+    #[error("runtime drain terminal result is not the exact intent-revision successor")]
+    TerminalIntentRevisionMismatch,
+    #[error("runtime drain consumption resulting deployment revision does not match")]
+    ConsumptionResultingRevisionMismatch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,6 +205,47 @@ impl RuntimeRouteAbsentDrainIntentSourceV2 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeDrainConsumptionSourceV2 {
+    source: RuntimeRouteAbsentDrainIntentSourceV2,
+    expected_resulting_revision: DeploymentRevision,
+}
+
+impl RuntimeDrainConsumptionSourceV2 {
+    pub fn from_acknowledged(
+        source: RuntimeRouteAbsentDrainIntentSourceV2,
+        expected_resulting_revision: DeploymentRevision,
+    ) -> Self {
+        Self {
+            source,
+            expected_resulting_revision,
+        }
+    }
+
+    pub fn source(&self) -> &RuntimeDrainIntentV2 {
+        self.source.source()
+    }
+
+    pub fn expected_resulting_revision(&self) -> DeploymentRevision {
+        self.expected_resulting_revision
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeDrainCancellationSourceV2 {
+    source: RuntimeRouteAbsentDrainIntentSourceV2,
+}
+
+impl RuntimeDrainCancellationSourceV2 {
+    pub fn from_acknowledged(source: RuntimeRouteAbsentDrainIntentSourceV2) -> Self {
+        Self { source }
+    }
+
+    pub fn source(&self) -> &RuntimeDrainIntentV2 {
+        self.source.source()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeDrainIntentReceiptV2 {
     outcome: RuntimeDrainIntentMutationOutcomeV2,
     intent: RuntimeDrainIntentV2,
@@ -315,6 +360,51 @@ impl RuntimeDrainIntentReceiptV2 {
         validate_succession_acknowledgement_v2(predecessor, acknowledgement, expectation)?;
         Ok(Self::from_result(
             RuntimeDrainIntentMutationOutcomeV2::Acknowledged,
+            persisted_intent,
+        ))
+    }
+
+    pub fn consumed(
+        source: &RuntimeDrainConsumptionSourceV2,
+        persisted_intent: RuntimeDrainIntentV2,
+    ) -> Result<Self, RuntimeDrainIntentReceiptErrorV2> {
+        validate_immutable_roots(source.source(), &persisted_intent)?;
+        if !is_exact_successor(
+            source.source().intent_revision().get(),
+            persisted_intent.intent_revision().get(),
+        ) {
+            return Err(RuntimeDrainIntentReceiptErrorV2::TerminalIntentRevisionMismatch);
+        }
+        if persisted_intent.state().kind() != RuntimeDrainIntentStateKindV2::Consumed {
+            return Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch);
+        }
+        if persisted_intent.state().resulting_revision()
+            != Some(source.expected_resulting_revision())
+        {
+            return Err(RuntimeDrainIntentReceiptErrorV2::ConsumptionResultingRevisionMismatch);
+        }
+        Ok(Self::from_result(
+            RuntimeDrainIntentMutationOutcomeV2::Consumed,
+            persisted_intent,
+        ))
+    }
+
+    pub fn cancelled(
+        source: &RuntimeDrainCancellationSourceV2,
+        persisted_intent: RuntimeDrainIntentV2,
+    ) -> Result<Self, RuntimeDrainIntentReceiptErrorV2> {
+        validate_immutable_roots(source.source(), &persisted_intent)?;
+        if !is_exact_successor(
+            source.source().intent_revision().get(),
+            persisted_intent.intent_revision().get(),
+        ) {
+            return Err(RuntimeDrainIntentReceiptErrorV2::TerminalIntentRevisionMismatch);
+        }
+        if persisted_intent.state().kind() != RuntimeDrainIntentStateKindV2::Cancelled {
+            return Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch);
+        }
+        Ok(Self::from_result(
+            RuntimeDrainIntentMutationOutcomeV2::Cancelled,
             persisted_intent,
         ))
     }

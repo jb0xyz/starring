@@ -1730,8 +1730,6 @@ fn v2_drain_intent_state_is_closed_immutable_and_non_authorizing() {
         "pub state:",
         "pub fn new(",
         "pub fn pending(",
-        "pub fn consumed(",
-        "pub fn cancelled(",
         ".next()",
         "checked_add",
         "SystemTime",
@@ -1896,8 +1894,6 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "pub fn claimed(",
         "pub fn claim_initial(",
         "pub fn claim_successor(",
-        "pub fn consumed(",
-        "pub fn cancelled(",
         ".next()",
         "SystemTime",
         "Instant",
@@ -1919,6 +1915,8 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "pub struct RuntimeDrainSuccessionAcknowledgementExpectationV2",
         "pub struct RuntimeDrainSuccessionAcknowledgementSourceV2",
         "pub struct RuntimeRouteAbsentDrainIntentSourceV2",
+        "pub struct RuntimeDrainConsumptionSourceV2",
+        "pub struct RuntimeDrainCancellationSourceV2",
         "pub struct RuntimeDrainIntentReceiptV2",
         "pub fn from_claimed(",
         "pub fn from_route_absence_candidate(",
@@ -1930,6 +1928,8 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "pub fn refenced(",
         "pub fn acknowledged(",
         "pub fn succession_acknowledged(",
+        "pub fn consumed(",
+        "pub fn cancelled(",
     ] {
         assert!(source.contains(declaration), "missing {declaration}");
     }
@@ -1971,6 +1971,8 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "succession_receipt_rejects_root_state_and_intent_revision_drift",
         "succession_receipt_rejects_claim_revision_fence_and_identity_drift",
         "succession_receipt_rejects_seal_provenance_acknowledgement_and_certification_drift",
+        "terminal_receipts_accept_only_exact_acknowledged_successors",
+        "terminal_receipts_reject_root_revision_state_and_result_drift",
         "receipt_surface_is_closed_data_without_claim_or_terminal_authority",
     ] {
         assert!(
@@ -1989,6 +1991,8 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "RuntimeDrainSuccessionAcknowledgementExpectationV2",
         "RuntimeDrainSuccessionAcknowledgementSourceV2",
         "RuntimeRouteAbsentDrainIntentSourceV2",
+        "RuntimeDrainConsumptionSourceV2",
+        "RuntimeDrainCancellationSourceV2",
     ] {
         assert!(library.contains(exported), "missing export {exported}");
     }
