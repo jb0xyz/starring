@@ -72,6 +72,7 @@ pub use process::{
     RuntimeProcessFoundationCompositionErrorV1, RuntimeProcessFoundationShutdownErrorV1,
     RuntimeProcessFoundationShutdownFailureV1, RuntimeProcessGatewayOwnerCommitFailureV2,
     RuntimeProcessGatewayOwnerPrepareFailureV2, RuntimeProcessGatewayOwnerTransitionErrorV1,
+    RuntimeProcessProductionHandoffErrorV2, RuntimeProcessProductionHandoffFailureV2,
     RuntimeProcessRecoveryPendingTransitionErrorV2,
     RuntimeProcessRecoveryPendingTransitionFailureV2, RuntimeProcessRecoveryReadinessFailureV2,
     RuntimeProcessRecoveryReadinessTransitionErrorV2,

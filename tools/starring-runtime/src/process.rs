@@ -46,6 +46,7 @@ pub(crate) use execution::{
     RuntimeStartupRecoveryExecutionAwaitFailureV2,
 };
 pub use observation::{
+    RuntimeProcessProductionHandoffErrorV2, RuntimeProcessProductionHandoffFailureV2,
     RuntimeProcessStartupRecoveryObservationErrorV2,
     RuntimeProcessStartupRecoveryObservationFailureV2,
 };
@@ -293,6 +294,14 @@ pub(crate) struct RuntimeProcessFoundationV1 {
     shutdown_failures: RuntimeProcessFoundationShutdownFailuresV1,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RuntimeProcessFinalizerHandoffFailureV2 {
+    DeadlineElapsed,
+    Unavailable,
+    Terminal(RuntimeSupervisorExitV1),
+    NotSettled,
+}
+
 impl RuntimeProcessFoundationV1 {
     pub(super) fn shutdown_observer_v1(&self) -> crate::shutdown::RuntimeShutdownObserverV1 {
         self.root_supervisor.observer()
@@ -318,6 +327,60 @@ impl RuntimeProcessFoundationV1 {
         observation
             .deadline()
             .min(self.startup_budget.cleanup_deadline())
+    }
+
+    pub(super) async fn seal_startup_finalizer_for_handoff_v2(
+        &mut self,
+        cutoff: std::time::Instant,
+    ) -> Result<
+        crate::RuntimeMutationFinalizerHandoffStateV1,
+        RuntimeProcessFinalizerHandoffFailureV2,
+    > {
+        if std::time::Instant::now() >= cutoff {
+            return Err(RuntimeProcessFinalizerHandoffFailureV2::DeadlineElapsed);
+        }
+        let finalizer = self
+            .mutation_finalizer
+            .as_mut()
+            .ok_or(RuntimeProcessFinalizerHandoffFailureV2::Unavailable)?;
+        finalizer.seal_intake();
+        let settled = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(cutoff),
+            finalizer.wait_startup_jobs_settled(),
+        )
+        .await
+        .map_err(|_| RuntimeProcessFinalizerHandoffFailureV2::DeadlineElapsed)?;
+        let snapshot = finalizer.snapshot();
+        if let Some(exit) = snapshot.terminal() {
+            return Err(RuntimeProcessFinalizerHandoffFailureV2::Terminal(exit));
+        }
+        let handoff = snapshot.handoff_state();
+        if !settled || !handoff.startup_intake_sealed() || !handoff.startup_jobs_settled() {
+            return Err(RuntimeProcessFinalizerHandoffFailureV2::NotSettled);
+        }
+        Ok(handoff)
+    }
+
+    pub(super) fn revalidate_finalizer_handoff_v2(
+        &self,
+        expected: crate::RuntimeMutationFinalizerHandoffStateV1,
+    ) -> Result<(), RuntimeProcessFinalizerHandoffFailureV2> {
+        let finalizer = self
+            .mutation_finalizer
+            .as_ref()
+            .ok_or(RuntimeProcessFinalizerHandoffFailureV2::Unavailable)?;
+        let snapshot = finalizer.snapshot();
+        if let Some(exit) = snapshot.terminal() {
+            return Err(RuntimeProcessFinalizerHandoffFailureV2::Terminal(exit));
+        }
+        let observed = snapshot.handoff_state();
+        if observed != expected
+            || !observed.startup_intake_sealed()
+            || !observed.startup_jobs_settled()
+        {
+            return Err(RuntimeProcessFinalizerHandoffFailureV2::NotSettled);
+        }
+        Ok(())
     }
 
     pub(super) async fn begin_shutdown_v1(

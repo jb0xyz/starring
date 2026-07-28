@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use automation_runtime::{
@@ -63,6 +63,242 @@ use crate::{
 
 const SUPPORTED_GATEWAY_SHARD_ID: &str = "shard:0";
 const DISCORD_CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_millis(400);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum RuntimeGatewayCoordinatorInterruptV2 {
+    None = 0,
+    TransportDisconnected = 1,
+    ControlOrphaned = 2,
+    OwnershipUncertain = 3,
+    CapabilityNotReady = 4,
+    ProtocolViolation = 5,
+    Shutdown = u8::MAX,
+}
+
+impl RuntimeGatewayCoordinatorInterruptV2 {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            0 => Self::None,
+            1 => Self::TransportDisconnected,
+            2 => Self::ControlOrphaned,
+            3 => Self::OwnershipUncertain,
+            4 => Self::CapabilityNotReady,
+            5 => Self::ProtocolViolation,
+            _ => Self::Shutdown,
+        }
+    }
+
+    fn invalidation_cause(self) -> Option<RuntimeGatewayInvalidationCauseV2> {
+        match self {
+            Self::None | Self::Shutdown => None,
+            Self::TransportDisconnected => {
+                Some(RuntimeGatewayInvalidationCauseV2::TransportDisconnected)
+            }
+            Self::ControlOrphaned => Some(RuntimeGatewayInvalidationCauseV2::ControlOrphaned),
+            Self::OwnershipUncertain => Some(RuntimeGatewayInvalidationCauseV2::OwnershipUncertain),
+            Self::CapabilityNotReady => Some(RuntimeGatewayInvalidationCauseV2::CapabilityNotReady),
+            Self::ProtocolViolation => Some(RuntimeGatewayInvalidationCauseV2::ProtocolViolation),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeGatewayCoordinatorInterruptHandleV2 {
+    state: Arc<AtomicU8>,
+}
+
+impl RuntimeGatewayCoordinatorInterruptHandleV2 {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(
+                RuntimeGatewayCoordinatorInterruptV2::None as u8,
+            )),
+        }
+    }
+
+    fn current(&self) -> RuntimeGatewayCoordinatorInterruptV2 {
+        RuntimeGatewayCoordinatorInterruptV2::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    fn trip_invalidation(&self, cause: RuntimeGatewayInvalidationCauseV2) {
+        let interrupt = match cause {
+            RuntimeGatewayInvalidationCauseV2::TransportDisconnected => {
+                RuntimeGatewayCoordinatorInterruptV2::TransportDisconnected
+            }
+            RuntimeGatewayInvalidationCauseV2::ControlOrphaned => {
+                RuntimeGatewayCoordinatorInterruptV2::ControlOrphaned
+            }
+            RuntimeGatewayInvalidationCauseV2::OwnershipUncertain => {
+                RuntimeGatewayCoordinatorInterruptV2::OwnershipUncertain
+            }
+            RuntimeGatewayInvalidationCauseV2::CapabilityNotReady => {
+                RuntimeGatewayCoordinatorInterruptV2::CapabilityNotReady
+            }
+            RuntimeGatewayInvalidationCauseV2::ProtocolViolation => {
+                RuntimeGatewayCoordinatorInterruptV2::ProtocolViolation
+            }
+        };
+        let _ = self.state.compare_exchange(
+            RuntimeGatewayCoordinatorInterruptV2::None as u8,
+            interrupt as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn trip_shutdown(&self) {
+        self.state.store(
+            RuntimeGatewayCoordinatorInterruptV2::Shutdown as u8,
+            Ordering::Release,
+        );
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeGatewayCoordinatorSnapshotObserverV2 {
+    snapshot: watch::Receiver<RuntimeGatewayCoordinatorMirrorV2>,
+    interrupt: RuntimeGatewayCoordinatorInterruptHandleV2,
+}
+
+impl RuntimeGatewayCoordinatorSnapshotObserverV2 {
+    fn effective_snapshot(&self) -> RuntimeGatewayClosedSnapshotV2 {
+        let mirror = self.snapshot.borrow();
+        let interrupt = self.interrupt.current();
+        if interrupt == mirror.applied_interrupt {
+            mirror.snapshot.clone()
+        } else {
+            project_runtime_gateway_interrupt_v2(&mirror.snapshot, interrupt)
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeGatewayCoordinatorMirrorV2 {
+    snapshot: RuntimeGatewayClosedSnapshotV2,
+    applied_interrupt: RuntimeGatewayCoordinatorInterruptV2,
+}
+
+struct RuntimeGatewayCoordinatorOwnerV2 {
+    lifecycle: RuntimeGatewayClosedLifecycleV2,
+    interrupt: RuntimeGatewayCoordinatorInterruptHandleV2,
+    applied_interrupt: RuntimeGatewayCoordinatorInterruptV2,
+    snapshot: watch::Sender<RuntimeGatewayCoordinatorMirrorV2>,
+}
+
+impl RuntimeGatewayCoordinatorOwnerV2 {
+    fn new() -> (
+        Self,
+        RuntimeGatewayCoordinatorInterruptHandleV2,
+        RuntimeGatewayCoordinatorSnapshotObserverV2,
+    ) {
+        let lifecycle = RuntimeGatewayClosedLifecycleV2::starting();
+        let interrupt = RuntimeGatewayCoordinatorInterruptHandleV2::new();
+        let initial = RuntimeGatewayCoordinatorMirrorV2 {
+            snapshot: lifecycle.snapshot(),
+            applied_interrupt: RuntimeGatewayCoordinatorInterruptV2::None,
+        };
+        let (snapshot, observer) = watch::channel(initial);
+        (
+            Self {
+                lifecycle,
+                interrupt: interrupt.clone(),
+                applied_interrupt: RuntimeGatewayCoordinatorInterruptV2::None,
+                snapshot,
+            },
+            interrupt.clone(),
+            RuntimeGatewayCoordinatorSnapshotObserverV2 {
+                snapshot: observer,
+                interrupt,
+            },
+        )
+    }
+
+    fn lifecycle(&self) -> &RuntimeGatewayClosedLifecycleV2 {
+        &self.lifecycle
+    }
+
+    fn lifecycle_mut(
+        &mut self,
+    ) -> Result<&mut RuntimeGatewayClosedLifecycleV2, RuntimeGatewayReadyObservationErrorV1> {
+        self.reconcile_interrupt();
+        if self.applied_interrupt != RuntimeGatewayCoordinatorInterruptV2::None {
+            return Err(RuntimeGatewayReadyObservationErrorV1::Stopped);
+        }
+        Ok(&mut self.lifecycle)
+    }
+
+    fn require_uninterrupted(&self) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+        if self.interrupt.current() == RuntimeGatewayCoordinatorInterruptV2::None
+            && self.applied_interrupt == RuntimeGatewayCoordinatorInterruptV2::None
+        {
+            Ok(())
+        } else {
+            Err(RuntimeGatewayReadyObservationErrorV1::Stopped)
+        }
+    }
+
+    fn reconcile_interrupt(&mut self) {
+        let interrupt = self.interrupt.current();
+        if interrupt == self.applied_interrupt {
+            return;
+        }
+        match interrupt {
+            RuntimeGatewayCoordinatorInterruptV2::None => {}
+            RuntimeGatewayCoordinatorInterruptV2::Shutdown => {
+                shutdown_closed_lifecycle(&mut self.lifecycle);
+            }
+            interrupt => {
+                if let Some(cause) = interrupt.invalidation_cause() {
+                    invalidate_closed_lifecycle(&mut self.lifecycle, cause);
+                }
+            }
+        }
+        self.applied_interrupt = interrupt;
+        self.publish_snapshot();
+    }
+
+    fn publish_snapshot(&self) {
+        self.snapshot
+            .send_replace(RuntimeGatewayCoordinatorMirrorV2 {
+                snapshot: self.lifecycle.snapshot(),
+                applied_interrupt: self.applied_interrupt,
+            });
+    }
+}
+
+fn project_runtime_gateway_interrupt_v2(
+    snapshot: &RuntimeGatewayClosedSnapshotV2,
+    interrupt: RuntimeGatewayCoordinatorInterruptV2,
+) -> RuntimeGatewayClosedSnapshotV2 {
+    if matches!(snapshot, RuntimeGatewayClosedSnapshotV2::Shutdown { .. }) {
+        return snapshot.clone();
+    }
+    let current = snapshot.generation();
+    let successor = current
+        .get()
+        .checked_add(1)
+        .and_then(NonZeroU64::new)
+        .map(RuntimeGatewayCoordinatorGenerationV2::new);
+    match (interrupt, successor) {
+        (RuntimeGatewayCoordinatorInterruptV2::None, _) => snapshot.clone(),
+        (RuntimeGatewayCoordinatorInterruptV2::Shutdown, Some(generation)) => {
+            RuntimeGatewayClosedSnapshotV2::Shutdown { generation }
+        }
+        (RuntimeGatewayCoordinatorInterruptV2::Shutdown, None) | (_, None) => {
+            RuntimeGatewayClosedSnapshotV2::Shutdown {
+                generation: current,
+            }
+        }
+        (interrupt, Some(generation)) => RuntimeGatewayClosedSnapshotV2::Emergency {
+            generation,
+            cause: interrupt
+                .invalidation_cause()
+                .map(Into::into)
+                .unwrap_or(RuntimeGatewayEmergencyCauseV2::ProtocolViolation),
+        },
+    }
+}
 
 pub(crate) fn runtime_gateway_shard_id_v1() -> GatewayShardIdV1 {
     GatewayShardIdV1::parse(SUPPORTED_GATEWAY_SHARD_ID).expect("supported gateway shard identity")
@@ -161,7 +397,6 @@ struct SharedGatewayControlAdapterV2 {
     discord_reservation_publisher:
         Option<watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>>,
     discord_reservation: watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
-    closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
 }
 
 struct SharedGatewayRuntimeHalfV3 {
@@ -190,6 +425,8 @@ enum RuntimeDiscordControlCommandV1 {
 
 pub struct RuntimeGatewayBootstrapV1 {
     adapter: SharedGatewayControlAdapterV2,
+    coordinator: Option<RuntimeGatewayCoordinatorOwnerV2>,
+    coordinator_snapshot: RuntimeGatewayCoordinatorSnapshotObserverV2,
     _runtime: Option<SharedGatewayRuntimeHalfV3>,
     owner_invalidator: Option<RuntimeGatewayOwnerInvalidationBridgeV2>,
     owner_invalidated: Arc<AtomicBool>,
@@ -198,17 +435,14 @@ pub struct RuntimeGatewayBootstrapV1 {
 
 #[derive(Clone)]
 pub(crate) struct RuntimeGatewayShutdownHandleV1 {
-    closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
+    interrupt: RuntimeGatewayCoordinatorInterruptHandleV2,
+    snapshot: RuntimeGatewayCoordinatorSnapshotObserverV2,
 }
 
 impl RuntimeGatewayShutdownHandleV1 {
     pub(crate) fn enter_shutdown(&self) -> RuntimeGatewayClosedSnapshotV2 {
-        let mut lifecycle = self
-            .closed_lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        shutdown_closed_lifecycle(&mut lifecycle);
-        lifecycle.snapshot()
+        self.interrupt.trip_shutdown();
+        self.snapshot.effective_snapshot()
     }
 }
 
@@ -230,9 +464,9 @@ impl RuntimeGatewayAdmissionChangeWatchV1 {
 
 pub(crate) struct RuntimeEmergencyGatewaySectionV2<'a> {
     gateway: &'a SharedGatewayControlAdapterV2,
+    coordinator: &'a mut Option<RuntimeGatewayCoordinatorOwnerV2>,
     prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
     owner_invalidated: &'a Arc<AtomicBool>,
-    coordinator: MutexGuard<'a, RuntimeGatewayClosedLifecycleV2>,
     admission_snapshot: watch::Ref<'a, GatewayAdmissionSnapshotV3>,
     paused_gateway: RuntimePausedGatewayObservationV2,
     connection_epoch: GatewayConnectionEpochV3,
@@ -243,15 +477,14 @@ pub(crate) struct RuntimeRecoveryPendingGatewayBindingV2 {
     process_instance_id: ProcessInstanceId,
     observer: GatewayConnectionObserverV3,
     admission_snapshot: watch::Receiver<GatewayAdmissionSnapshotV3>,
-    closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
+    coordinator: Option<RuntimeGatewayCoordinatorOwnerV2>,
     owner_invalidated: Arc<AtomicBool>,
-    permit: RuntimeClosedDrainRecoveryPermitV2,
+    permit: Option<RuntimeClosedDrainRecoveryPermitV2>,
 }
 
 pub(crate) struct RuntimeRecoveryPendingGatewaySectionV2<'a> {
     binding: &'a RuntimeRecoveryPendingGatewayBindingV2,
     owner: RuntimeGatewayOwnerRecoveryEvidenceV2<'a>,
-    coordinator: MutexGuard<'a, RuntimeGatewayClosedLifecycleV2>,
     admission_snapshot: watch::Ref<'a, GatewayAdmissionSnapshotV3>,
 }
 
@@ -280,12 +513,124 @@ pub(crate) enum RuntimeGatewayRecoveryOwnerCommitErrorV2 {
     Owner(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeGatewayProductionInterruptV2 {
+    Invalidation(RuntimeGatewayInvalidationCauseV2),
+    Shutdown,
+}
+
+pub(crate) struct RuntimeGatewayProductionCoordinatorV2 {
+    process_instance_id: ProcessInstanceId,
+    coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+    observer: GatewayConnectionObserverV3,
+    admission_snapshot: watch::Receiver<GatewayAdmissionSnapshotV3>,
+    fixed_point_admission_snapshot: GatewayAdmissionSnapshotV3,
+    interrupt: RuntimeGatewayCoordinatorInterruptHandleV2,
+    applied_interrupt: RuntimeGatewayCoordinatorInterruptV2,
+    snapshot: watch::Sender<RuntimeGatewayCoordinatorMirrorV2>,
+}
+
+impl RuntimeGatewayProductionCoordinatorV2 {
+    pub(crate) fn coordinator_generation_v2(&self) -> RuntimeGatewayCoordinatorGenerationV2 {
+        self.coordinator_generation
+    }
+
+    pub(crate) fn current_interrupt_v2(&self) -> Option<RuntimeGatewayProductionInterruptV2> {
+        let interrupt = self.interrupt.current();
+        if interrupt == self.applied_interrupt
+            || interrupt == RuntimeGatewayCoordinatorInterruptV2::None
+        {
+            return None;
+        }
+        match interrupt {
+            RuntimeGatewayCoordinatorInterruptV2::Shutdown => {
+                Some(RuntimeGatewayProductionInterruptV2::Shutdown)
+            }
+            interrupt => interrupt
+                .invalidation_cause()
+                .map(RuntimeGatewayProductionInterruptV2::Invalidation),
+        }
+    }
+
+    pub(crate) fn closed_snapshot_v2(&self) -> RuntimeGatewayClosedSnapshotV2 {
+        let mirror = self.snapshot.borrow();
+        project_runtime_gateway_interrupt_v2(&mirror.snapshot, self.interrupt.current())
+    }
+
+    pub(crate) fn observe_exact_admission_snapshot_v2(
+        &self,
+    ) -> Result<GatewayAdmissionSnapshotV3, RuntimeGatewayReadyObservationErrorV1> {
+        let first = self.observer.current_admission_snapshot();
+        if *self.admission_snapshot.borrow() != first {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        let (_, connection_epoch) = map_paused_connected_observation_v2(
+            &self.process_instance_id,
+            self.coordinator_generation,
+            first,
+        )?;
+        require_healthy_paused_observer_v2(&self.observer, connection_epoch)?;
+        if self.observer.current_admission_snapshot() != first
+            || *self.admission_snapshot.borrow() != first
+        {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        Ok(first)
+    }
+
+    pub(crate) fn revalidate_fixed_point_admission_v2(
+        &self,
+    ) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
+        if self.observe_exact_admission_snapshot_v2()? == self.fixed_point_admission_snapshot {
+            Ok(())
+        } else {
+            Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot)
+        }
+    }
+}
+
+impl Debug for RuntimeGatewayProductionCoordinatorV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeGatewayProductionCoordinatorV2(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeGatewayFixedPointAcceptanceErrorV2 {
+    Gateway(RuntimeGatewayRecoverySectionErrorV2),
+    Worker(automation_runtime_worker::RuntimeProductionLifecycleErrorV2),
+}
+
+pub(crate) struct RuntimeGatewayFixedPointAcceptanceFailureV2 {
+    binding: Box<RuntimeRecoveryPendingGatewayBindingV2>,
+    proof: Box<RuntimeStartupRecoveryFixedPointProofV2>,
+    error: RuntimeGatewayFixedPointAcceptanceErrorV2,
+}
+
+impl RuntimeGatewayFixedPointAcceptanceFailureV2 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        RuntimeRecoveryPendingGatewayBindingV2,
+        RuntimeStartupRecoveryFixedPointProofV2,
+        RuntimeGatewayFixedPointAcceptanceErrorV2,
+    ) {
+        (*self.binding, *self.proof, self.error)
+    }
+}
+
+impl Debug for RuntimeGatewayFixedPointAcceptanceFailureV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeGatewayFixedPointAcceptanceFailureV2(<redacted>)")
+    }
+}
+
 struct RuntimeGatewayInvalidationBridgeV2 {
-    closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
+    interrupt: RuntimeGatewayCoordinatorInterruptHandleV2,
 }
 
 struct RuntimeGatewayOwnerInvalidationBridgeV2 {
-    closed_lifecycle: Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
+    interrupt: RuntimeGatewayCoordinatorInterruptHandleV2,
     invalidated: Arc<AtomicBool>,
     discord_attachment: Arc<Mutex<Option<RuntimeGatewayOwnerDiscordAttachmentV1>>>,
 }
@@ -306,7 +651,7 @@ impl GatewaySynchronousInvalidatorV3 for RuntimeGatewaySnapshotTestInvalidatorV3
 
 impl RuntimeGatewayOwnerEmergencyInvalidatorV1 for RuntimeGatewayOwnerInvalidationBridgeV2 {
     fn invalidate_gateway_ownership(&self) {
-        invalidate_gateway_owner_state(&self.closed_lifecycle, &self.invalidated);
+        invalidate_gateway_owner_state(&self.interrupt, &self.invalidated);
         let attachment = self
             .discord_attachment
             .lock()
@@ -332,42 +677,33 @@ impl RuntimeGatewayOwnerEmergencyInvalidatorV1 for RuntimeGatewayOwnerInvalidati
 
 impl GatewaySynchronousInvalidatorV3 for RuntimeGatewayInvalidationBridgeV2 {
     fn invalidate(&self, signal: GatewayInvalidationSignalV3) {
-        let mut lifecycle = self
-            .closed_lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match signal {
-            GatewayInvalidationSignalV3::AdmissionPaused => invalidate_closed_lifecycle(
-                &mut lifecycle,
-                RuntimeGatewayInvalidationCauseV2::CapabilityNotReady,
-            ),
-            GatewayInvalidationSignalV3::Disconnected(_) => invalidate_closed_lifecycle(
-                &mut lifecycle,
-                RuntimeGatewayInvalidationCauseV2::TransportDisconnected,
-            ),
+            GatewayInvalidationSignalV3::AdmissionPaused => self
+                .interrupt
+                .trip_invalidation(RuntimeGatewayInvalidationCauseV2::CapabilityNotReady),
+            GatewayInvalidationSignalV3::Disconnected(_) => self
+                .interrupt
+                .trip_invalidation(RuntimeGatewayInvalidationCauseV2::TransportDisconnected),
             GatewayInvalidationSignalV3::Draining(GatewayDrainCauseV3::Commanded)
-            | GatewayInvalidationSignalV3::Stopped(_) => shutdown_closed_lifecycle(&mut lifecycle),
+            | GatewayInvalidationSignalV3::Stopped(_) => self.interrupt.trip_shutdown(),
             GatewayInvalidationSignalV3::Draining(
                 GatewayDrainCauseV3::ControlOrphaned | GatewayDrainCauseV3::LifecycleClosed,
             )
-            | GatewayInvalidationSignalV3::ControlOrphaned => invalidate_closed_lifecycle(
-                &mut lifecycle,
-                RuntimeGatewayInvalidationCauseV2::ControlOrphaned,
-            ),
+            | GatewayInvalidationSignalV3::ControlOrphaned => self
+                .interrupt
+                .trip_invalidation(RuntimeGatewayInvalidationCauseV2::ControlOrphaned),
             GatewayInvalidationSignalV3::Draining(
                 GatewayDrainCauseV3::ConnectionEpochOverflow
                 | GatewayDrainCauseV3::AdmissionRevisionOverflow
                 | GatewayDrainCauseV3::AdmissionSequenceOverflow,
-            ) => invalidate_closed_lifecycle(
-                &mut lifecycle,
-                RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
-            ),
+            ) => self
+                .interrupt
+                .trip_invalidation(RuntimeGatewayInvalidationCauseV2::ProtocolViolation),
             GatewayInvalidationSignalV3::Draining(
                 GatewayDrainCauseV3::LifecycleOverflow | GatewayDrainCauseV3::RuntimeFailure,
-            ) => invalidate_closed_lifecycle(
-                &mut lifecycle,
-                RuntimeGatewayInvalidationCauseV2::CapabilityNotReady,
-            ),
+            ) => self
+                .interrupt
+                .trip_invalidation(RuntimeGatewayInvalidationCauseV2::CapabilityNotReady),
         }
     }
 }
@@ -375,7 +711,8 @@ impl GatewaySynchronousInvalidatorV3 for RuntimeGatewayInvalidationBridgeV2 {
 impl RuntimeGatewayBootstrapV1 {
     pub(crate) fn shutdown_handle_v1(&self) -> RuntimeGatewayShutdownHandleV1 {
         RuntimeGatewayShutdownHandleV1 {
-            closed_lifecycle: self.adapter.closed_lifecycle.clone(),
+            interrupt: self.coordinator_snapshot.interrupt.clone(),
+            snapshot: self.coordinator_snapshot.clone(),
         }
     }
 
@@ -713,11 +1050,7 @@ impl RuntimeGatewayBootstrapV1 {
     }
 
     pub fn closed_snapshot(&self) -> RuntimeGatewayClosedSnapshotV2 {
-        self.adapter
-            .closed_lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot()
+        self.coordinator_snapshot.effective_snapshot()
     }
 
     pub fn observe_current_ready_attestation(
@@ -786,12 +1119,13 @@ impl RuntimeGatewayBootstrapV1 {
     }
 
     pub(crate) fn initial_emergency_gateway_section_v2<'a>(
-        &'a self,
+        &'a mut self,
         prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
         expected_paused_gateway: &RuntimePausedGatewayObservationV2,
     ) -> Result<RuntimeEmergencyGatewaySectionV2<'a>, RuntimeGatewayReadyObservationErrorV1> {
         RuntimeEmergencyGatewaySectionV2::acquire(
             &self.adapter,
+            &mut self.coordinator,
             &self.owner_invalidated,
             prepared_owner,
             expected_paused_gateway,
@@ -867,7 +1201,10 @@ impl RuntimeGatewayBootstrapV1 {
     {
         let lease_id = accepted_receipt.receipt().lease_id.clone();
         let Some(invalidator) = self.owner_invalidator.take() else {
-            invalidate_gateway_owner_state(&self.adapter.closed_lifecycle, &self.owner_invalidated);
+            self.coordinator_snapshot
+                .interrupt
+                .trip_invalidation(RuntimeGatewayInvalidationCauseV2::OwnershipUncertain);
+            self.owner_invalidated.store(true, Ordering::Release);
             return Err(RuntimeGatewayOwnerStartupWatchdogStartFailureV1::new(
                 RuntimeGatewayOwnerStartupWatchdogStartErrorV1::AlreadyStarted,
                 port,
@@ -950,12 +1287,14 @@ impl RuntimeGatewayBootstrapV1 {
         let expected_paused_gateway = self.observe_paused_connected_gateway_v2()?;
         let Self {
             adapter,
+            coordinator,
             _runtime,
             owner_invalidated,
             ..
         } = self;
         let section = RuntimeEmergencyGatewaySectionV2::acquire(
             adapter,
+            coordinator,
             owner_invalidated,
             prepared_owner,
             &expected_paused_gateway,
@@ -1237,16 +1576,18 @@ fn publish_runtime_lifecycle_drain_v1(
 impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
     fn acquire(
         gateway: &'a SharedGatewayControlAdapterV2,
+        coordinator: &'a mut Option<RuntimeGatewayCoordinatorOwnerV2>,
         owner_invalidated: &'a Arc<AtomicBool>,
         prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
         expected_paused_gateway: &RuntimePausedGatewayObservationV2,
     ) -> Result<Self, RuntimeGatewayReadyObservationErrorV1> {
         require_prepared_owner_lifetime_v2(owner_invalidated, prepared_owner)?;
-        let coordinator = gateway
-            .closed_lifecycle
-            .lock()
-            .map_err(|_| RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)?;
-        if coordinator.snapshot()
+        let coordinator_owner = coordinator
+            .as_mut()
+            .ok_or(RuntimeGatewayReadyObservationErrorV1::Stopped)?;
+        coordinator_owner.reconcile_interrupt();
+        coordinator_owner.require_uninterrupted()?;
+        if coordinator_owner.lifecycle().snapshot()
             != (RuntimeGatewayClosedSnapshotV2::Emergency {
                 generation: RuntimeGatewayCoordinatorGenerationV2::FIRST,
                 cause: RuntimeGatewayEmergencyCauseV2::Starting,
@@ -1275,9 +1616,9 @@ impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
         require_prepared_owner_lifetime_v2(owner_invalidated, prepared_owner)?;
         let section = Self {
             gateway,
+            coordinator,
             prepared_owner,
             owner_invalidated,
-            coordinator,
             admission_snapshot,
             paused_gateway,
             connection_epoch,
@@ -1306,10 +1647,16 @@ impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
             self.paused_gateway.clone(),
             RuntimeClosedRecoveryRegistryEvidenceV2::Empty(registry.into_observation_v2()),
         );
-        let (_, permit) = self
+        let coordinator = self
             .coordinator
+            .as_mut()
+            .ok_or(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?;
+        let (_, permit) = coordinator
+            .lifecycle_mut()
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?
             .begin_recovery(RuntimeGatewayCoordinatorGenerationV2::FIRST, input)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        coordinator.publish_snapshot();
         self.pending_permit = Some(permit);
         self.require_pending_current_v2()
     }
@@ -1322,19 +1669,28 @@ impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
             .pending_permit
             .take()
             .ok_or(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?;
+        let coordinator = self
+            .coordinator
+            .take()
+            .ok_or(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?;
         Ok(RuntimeRecoveryPendingGatewayBindingV2 {
             process_instance_id: self.gateway.process_instance_id.clone(),
             observer: self.gateway.connection_observer.clone(),
             admission_snapshot: self.gateway.admission_snapshot.clone(),
-            closed_lifecycle: self.gateway.closed_lifecycle.clone(),
+            coordinator: Some(coordinator),
             owner_invalidated: self.owner_invalidated.clone(),
-            permit,
+            permit: Some(permit),
         })
     }
 
     fn require_current_v2(&self) -> Result<(), RuntimeGatewayReadyObservationErrorV1> {
         require_prepared_owner_lifetime_v2(self.owner_invalidated, self.prepared_owner)?;
-        if self.coordinator.snapshot()
+        let coordinator = self
+            .coordinator
+            .as_ref()
+            .ok_or(RuntimeGatewayReadyObservationErrorV1::Stopped)?;
+        coordinator.require_uninterrupted()?;
+        if coordinator.lifecycle().snapshot()
             != (RuntimeGatewayClosedSnapshotV2::Emergency {
                 generation: RuntimeGatewayCoordinatorGenerationV2::FIRST,
                 cause: RuntimeGatewayEmergencyCauseV2::Starting,
@@ -1358,7 +1714,15 @@ impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
             .pending_permit
             .as_ref()
             .ok_or(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?;
-        self.coordinator
+        let coordinator = self
+            .coordinator
+            .as_ref()
+            .ok_or(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?;
+        coordinator
+            .require_uninterrupted()
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        coordinator
+            .lifecycle()
             .validate_recovery_permit(permit)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         require_prepared_owner_lifetime_v2(self.owner_invalidated, self.prepared_owner)
@@ -1368,7 +1732,8 @@ impl<'a> RuntimeEmergencyGatewaySectionV2<'a> {
         {
             return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
         }
-        self.coordinator
+        coordinator
+            .lifecycle()
             .validate_recovery_permit(permit)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)
     }
@@ -1379,16 +1744,29 @@ impl Drop for RuntimeEmergencyGatewaySectionV2<'_> {
         let Some(permit) = self.pending_permit.as_ref() else {
             return;
         };
-        if self.coordinator.validate_recovery_permit(permit).is_ok() {
-            let _ = self.coordinator.invalidate(
+        let Some(coordinator) = self.coordinator.as_mut() else {
+            return;
+        };
+        coordinator.reconcile_interrupt();
+        if coordinator
+            .lifecycle()
+            .validate_recovery_permit(permit)
+            .is_ok()
+        {
+            let _ = coordinator.lifecycle.invalidate(
                 permit.coordinator_generation(),
                 RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
             );
+            coordinator.publish_snapshot();
         }
     }
 }
 
 impl RuntimeRecoveryPendingGatewayBindingV2 {
+    fn permit_v2(&self) -> &RuntimeClosedDrainRecoveryPermitV2 {
+        self.permit.as_ref().expect("runtime recovery permit")
+    }
+
     pub(crate) fn pending_section_v2<'a>(
         &'a self,
         prepared_owner: &'a RuntimeGatewayOwnerPreparedClosedRecoveryV2,
@@ -1427,7 +1805,7 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
             _ = sleep_until(TokioInstant::from_std(commit_cutoff)) => {
                 Err(RuntimeGatewayRecoveryOwnerCommitErrorV2::DeadlineElapsed)
             }
-            result = prepared_owner.commit_closed_recovery_in_place_v2(&self.permit) => {
+            result = prepared_owner.commit_closed_recovery_in_place_v2(self.permit_v2()) => {
                 result.map_err(RuntimeGatewayRecoveryOwnerCommitErrorV2::Owner)
             }
         }
@@ -1442,21 +1820,22 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
         let transition = {
-            let mut coordinator = self.closed_lifecycle.lock().map_err(|_| {
-                RuntimeGatewayRecoverySectionErrorV2::Gateway(
-                    RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
-                )
-            })?;
-            let transition = coordinator.refresh_recovery_readiness(&mut self.permit, readiness);
+            let owner_invalidated = self.owner_invalidated.clone();
+            let coordinator = current_runtime_gateway_coordinator_mut_v2(&mut self.coordinator)?;
+            let permit = self.permit.as_mut().expect("runtime recovery permit");
+            let transition = coordinator
+                .lifecycle
+                .refresh_recovery_readiness(permit, readiness);
             if transition.is_err()
                 && matches!(
-                    coordinator.snapshot(),
+                    coordinator.lifecycle.snapshot(),
                     RuntimeGatewayClosedSnapshotV2::Emergency { .. }
                         | RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
                 )
             {
-                self.owner_invalidated.store(true, Ordering::Release);
+                owner_invalidated.store(true, Ordering::Release);
             }
+            coordinator.publish_snapshot();
             transition
         };
         let iteration = transition.map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
@@ -1474,12 +1853,13 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
         let authorization = {
-            let mut coordinator = self.closed_lifecycle.lock().map_err(|_| {
-                RuntimeGatewayRecoverySectionErrorV2::Gateway(
-                    RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
-                )
-            })?;
-            coordinator.begin_startup_recovery_observation(&mut self.permit, iteration)
+            let coordinator = current_runtime_gateway_coordinator_mut_v2(&mut self.coordinator)?;
+            let permit = self.permit.as_mut().expect("runtime recovery permit");
+            let authorization = coordinator
+                .lifecycle
+                .begin_startup_recovery_observation(permit, iteration);
+            coordinator.publish_snapshot();
+            authorization
         }
         .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         let section = self.committed_pending_section_v2(committed_owner)?;
@@ -1496,22 +1876,22 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
         let transition = {
-            let mut coordinator = self.closed_lifecycle.lock().map_err(|_| {
-                RuntimeGatewayRecoverySectionErrorV2::Gateway(
-                    RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
-                )
-            })?;
-            let transition =
-                coordinator.complete_startup_recovery_observation(&mut self.permit, completed);
+            let owner_invalidated = self.owner_invalidated.clone();
+            let coordinator = current_runtime_gateway_coordinator_mut_v2(&mut self.coordinator)?;
+            let permit = self.permit.as_mut().expect("runtime recovery permit");
+            let transition = coordinator
+                .lifecycle
+                .complete_startup_recovery_observation(permit, completed);
             if transition.is_err()
                 && matches!(
-                    coordinator.snapshot(),
+                    coordinator.lifecycle.snapshot(),
                     RuntimeGatewayClosedSnapshotV2::Emergency { .. }
                         | RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
                 )
             {
-                self.owner_invalidated.store(true, Ordering::Release);
+                owner_invalidated.store(true, Ordering::Release);
             }
+            coordinator.publish_snapshot();
             transition
         }
         .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
@@ -1529,12 +1909,13 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
         let authorization = {
-            let mut coordinator = self.closed_lifecycle.lock().map_err(|_| {
-                RuntimeGatewayRecoverySectionErrorV2::Gateway(
-                    RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
-                )
-            })?;
-            coordinator.begin_startup_recovery_execution(&mut self.permit, continuation)
+            let coordinator = current_runtime_gateway_coordinator_mut_v2(&mut self.coordinator)?;
+            let permit = self.permit.as_mut().expect("runtime recovery permit");
+            let authorization = coordinator
+                .lifecycle
+                .begin_startup_recovery_execution(permit, continuation);
+            coordinator.publish_snapshot();
+            authorization
         }
         .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         let section = self.committed_pending_section_v2(committed_owner)?;
@@ -1553,22 +1934,22 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
         let transition = {
-            let mut coordinator = self.closed_lifecycle.lock().map_err(|_| {
-                RuntimeGatewayRecoverySectionErrorV2::Gateway(
-                    RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
-                )
-            })?;
-            let transition =
-                coordinator.complete_startup_recovery_execution(&mut self.permit, completed);
+            let owner_invalidated = self.owner_invalidated.clone();
+            let coordinator = current_runtime_gateway_coordinator_mut_v2(&mut self.coordinator)?;
+            let permit = self.permit.as_mut().expect("runtime recovery permit");
+            let transition = coordinator
+                .lifecycle
+                .complete_startup_recovery_execution(permit, completed);
             if transition.is_err()
                 && matches!(
-                    coordinator.snapshot(),
+                    coordinator.lifecycle.snapshot(),
                     RuntimeGatewayClosedSnapshotV2::Emergency { .. }
                         | RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
                 )
             {
-                self.owner_invalidated.store(true, Ordering::Release);
+                owner_invalidated.store(true, Ordering::Release);
             }
+            coordinator.publish_snapshot();
             transition
         }
         .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
@@ -1585,21 +1966,18 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
         let transition = {
-            let mut coordinator = self.closed_lifecycle.lock().map_err(|_| {
-                RuntimeGatewayRecoverySectionErrorV2::Gateway(
-                    RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
-                )
-            })?;
-            let transition = coordinator.validate_startup_recovery_fixed_point(&self.permit, proof);
+            let coordinator = self.coordinator_ref_v2()?;
+            let transition = coordinator
+                .lifecycle()
+                .validate_startup_recovery_fixed_point(self.permit_v2(), proof);
             if matches!(
                 transition,
                 Err(RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryFixedPointAuthority)
             ) {
                 self.owner_invalidated.store(true, Ordering::Release);
-                let _ = coordinator.invalidate(
-                    self.permit.coordinator_generation(),
-                    RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
-                );
+                coordinator
+                    .interrupt
+                    .trip_invalidation(RuntimeGatewayInvalidationCauseV2::ProtocolViolation);
             }
             transition
         };
@@ -1607,6 +1985,142 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         let section = self.committed_pending_section_v2(committed_owner)?;
         drop(section);
         Ok(())
+    }
+
+    pub(crate) fn into_worker_fixed_point_v2(
+        mut self,
+        proof: RuntimeStartupRecoveryFixedPointProofV2,
+    ) -> Result<
+        (
+            RuntimeGatewayProductionCoordinatorV2,
+            automation_runtime_worker::RuntimeStartupRecoveryFixedPointProcessV2,
+        ),
+        RuntimeGatewayFixedPointAcceptanceFailureV2,
+    > {
+        let fixed_point_admission_snapshot = self.observer.current_admission_snapshot();
+        if *self.admission_snapshot.borrow() != fixed_point_admission_snapshot
+            || self.observer.current_admission_snapshot() != fixed_point_admission_snapshot
+        {
+            return Err(RuntimeGatewayFixedPointAcceptanceFailureV2 {
+                binding: Box::new(self),
+                proof: Box::new(proof),
+                error: RuntimeGatewayFixedPointAcceptanceErrorV2::Gateway(
+                    RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                        RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot,
+                    ),
+                ),
+            });
+        }
+        let coordinator_generation = self.permit_v2().originating_emergency_generation();
+        let (paused_gateway, connection_epoch) = match map_paused_connected_observation_v2(
+            &self.process_instance_id,
+            coordinator_generation,
+            fixed_point_admission_snapshot,
+        ) {
+            Ok(observation) => observation,
+            Err(error) => {
+                return Err(RuntimeGatewayFixedPointAcceptanceFailureV2 {
+                    binding: Box::new(self),
+                    proof: Box::new(proof),
+                    error: RuntimeGatewayFixedPointAcceptanceErrorV2::Gateway(
+                        RuntimeGatewayRecoverySectionErrorV2::Gateway(error),
+                    ),
+                });
+            }
+        };
+        if paused_gateway != *self.permit_v2().paused_gateway()
+            || require_healthy_paused_observer_v2(&self.observer, connection_epoch).is_err()
+            || self.observer.current_admission_snapshot() != fixed_point_admission_snapshot
+            || *self.admission_snapshot.borrow() != fixed_point_admission_snapshot
+        {
+            return Err(RuntimeGatewayFixedPointAcceptanceFailureV2 {
+                binding: Box::new(self),
+                proof: Box::new(proof),
+                error: RuntimeGatewayFixedPointAcceptanceErrorV2::Gateway(
+                    RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                        RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot,
+                    ),
+                ),
+            });
+        }
+        let mut coordinator = match self.coordinator.take() {
+            Some(coordinator) => coordinator,
+            None => {
+                return Err(RuntimeGatewayFixedPointAcceptanceFailureV2 {
+                    binding: Box::new(self),
+                    proof: Box::new(proof),
+                    error: RuntimeGatewayFixedPointAcceptanceErrorV2::Gateway(
+                        RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation,
+                    ),
+                });
+            }
+        };
+        coordinator.reconcile_interrupt();
+        if let Err(error) = coordinator.require_uninterrupted() {
+            self.coordinator = Some(coordinator);
+            return Err(RuntimeGatewayFixedPointAcceptanceFailureV2 {
+                binding: Box::new(self),
+                proof: Box::new(proof),
+                error: RuntimeGatewayFixedPointAcceptanceErrorV2::Gateway(
+                    RuntimeGatewayRecoverySectionErrorV2::Gateway(error),
+                ),
+            });
+        }
+        let permit = self
+            .permit
+            .take()
+            .expect("runtime fixed-point recovery permit");
+        if let Err(error) = coordinator
+            .lifecycle()
+            .validate_startup_recovery_fixed_point(&permit, &proof)
+        {
+            self.permit = Some(permit);
+            self.coordinator = Some(coordinator);
+            return Err(RuntimeGatewayFixedPointAcceptanceFailureV2 {
+                binding: Box::new(self),
+                proof: Box::new(proof),
+                error: RuntimeGatewayFixedPointAcceptanceErrorV2::Gateway(
+                    RuntimeGatewayRecoverySectionErrorV2::Coordinator(error),
+                ),
+            });
+        }
+        let RuntimeGatewayCoordinatorOwnerV2 {
+            lifecycle,
+            interrupt,
+            applied_interrupt,
+            snapshot,
+        } = coordinator;
+        match lifecycle.into_production_fixed_point(permit, proof) {
+            Ok(state) => Ok((
+                RuntimeGatewayProductionCoordinatorV2 {
+                    process_instance_id: self.process_instance_id.clone(),
+                    coordinator_generation,
+                    observer: self.observer.clone(),
+                    admission_snapshot: self.admission_snapshot.clone(),
+                    fixed_point_admission_snapshot,
+                    interrupt,
+                    applied_interrupt,
+                    snapshot,
+                },
+                state,
+            )),
+            Err(failure) => {
+                let error = failure.error();
+                let (lifecycle, permit, proof) = failure.into_parts();
+                self.permit = Some(permit);
+                self.coordinator = Some(RuntimeGatewayCoordinatorOwnerV2 {
+                    lifecycle,
+                    interrupt,
+                    applied_interrupt,
+                    snapshot,
+                });
+                Err(RuntimeGatewayFixedPointAcceptanceFailureV2 {
+                    binding: Box::new(self),
+                    proof: Box::new(proof),
+                    error: RuntimeGatewayFixedPointAcceptanceErrorV2::Worker(error),
+                })
+            }
+        }
     }
 
     pub(crate) fn invalidate_capability_not_ready_v2(&self) {
@@ -1624,23 +2138,20 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
     {
         require_recovery_owner_lifetime_v2(&self.owner_invalidated, &owner)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
-        let coordinator = self.closed_lifecycle.lock().map_err(|_| {
-            RuntimeGatewayRecoverySectionErrorV2::Gateway(
-                RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
-            )
-        })?;
+        let coordinator = self.coordinator_ref_v2()?;
         coordinator
-            .validate_recovery_permit(&self.permit)
+            .lifecycle()
+            .validate_recovery_permit(self.permit_v2())
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         let snapshot = self.observer.current_admission_snapshot();
         let (paused_gateway, connection_epoch) = map_paused_connected_observation_v2(
             &self.process_instance_id,
-            self.permit.originating_emergency_generation(),
+            self.permit_v2().originating_emergency_generation(),
             snapshot,
         )
         .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
-        if owner.observation().receipt() != self.permit.owner_receipt()
-            || paused_gateway != *self.permit.paused_gateway()
+        if owner.observation().receipt() != self.permit_v2().owner_receipt()
+            || paused_gateway != *self.permit_v2().paused_gateway()
         {
             return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
         }
@@ -1652,7 +2163,8 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         require_recovery_owner_lifetime_v2(&self.owner_invalidated, &owner)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
         coordinator
-            .validate_recovery_permit(&self.permit)
+            .lifecycle()
+            .validate_recovery_permit(self.permit_v2())
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         let admission_snapshot = self.admission_snapshot.borrow();
         if *admission_snapshot != snapshot {
@@ -1661,53 +2173,84 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         require_recovery_owner_lifetime_v2(&self.owner_invalidated, &owner)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
         coordinator
-            .validate_recovery_permit(&self.permit)
+            .lifecycle()
+            .validate_recovery_permit(self.permit_v2())
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         Ok(RuntimeRecoveryPendingGatewaySectionV2 {
             binding: self,
             owner,
-            coordinator,
             admission_snapshot,
         })
     }
 
     fn invalidate_if_current_v2(&self, cause: RuntimeGatewayInvalidationCauseV2) {
-        let mut coordinator = match self.closed_lifecycle.lock() {
-            Ok(coordinator) => coordinator,
-            Err(poisoned) => {
-                self.owner_invalidated.store(true, Ordering::Release);
-                let mut coordinator = poisoned.into_inner();
-                shutdown_closed_lifecycle(&mut coordinator);
-                return;
-            }
-        };
-        if coordinator.validate_recovery_permit(&self.permit).is_ok() {
+        if self.coordinator.as_ref().is_some_and(|coordinator| {
+            coordinator
+                .lifecycle()
+                .validate_recovery_permit(self.permit_v2())
+                .is_ok()
+        }) {
             self.owner_invalidated.store(true, Ordering::Release);
-            let _ = coordinator.invalidate(self.permit.coordinator_generation(), cause);
+            if let Some(coordinator) = self.coordinator.as_ref() {
+                coordinator.interrupt.trip_invalidation(cause);
+            }
         }
     }
+
+    fn coordinator_ref_v2(
+        &self,
+    ) -> Result<&RuntimeGatewayCoordinatorOwnerV2, RuntimeGatewayRecoverySectionErrorV2> {
+        let coordinator = self
+            .coordinator
+            .as_ref()
+            .ok_or(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?;
+        coordinator
+            .require_uninterrupted()
+            .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+        Ok(coordinator)
+    }
+}
+
+fn current_runtime_gateway_coordinator_mut_v2(
+    coordinator: &mut Option<RuntimeGatewayCoordinatorOwnerV2>,
+) -> Result<&mut RuntimeGatewayCoordinatorOwnerV2, RuntimeGatewayRecoverySectionErrorV2> {
+    let coordinator = coordinator
+        .as_mut()
+        .ok_or(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?;
+    coordinator.reconcile_interrupt();
+    coordinator
+        .require_uninterrupted()
+        .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
+    Ok(coordinator)
 }
 
 #[cfg(test)]
 impl RuntimeRecoveryPendingGatewayBindingV2 {
     pub(crate) fn successor_for_stale_drop_test_v2(
-        &self,
-    ) -> Result<Self, RuntimeGatewayRecoverySectionErrorV2> {
+        &mut self,
+    ) -> Result<(), RuntimeGatewayRecoverySectionErrorV2> {
         let snapshot = self.observer.current_admission_snapshot();
-        let mut coordinator = self.closed_lifecycle.lock().map_err(|_| {
-            RuntimeGatewayRecoverySectionErrorV2::Gateway(
-                RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
-            )
-        })?;
+        let permit = self
+            .permit
+            .as_ref()
+            .ok_or(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?;
+        let permit_generation = permit.coordinator_generation();
+        let previous_registry = permit.registry_evidence().empty_observation();
+        let owner_receipt = permit.owner_receipt().clone();
+        let readiness = permit.readiness().clone();
+        let coordinator = current_runtime_gateway_coordinator_mut_v2(&mut self.coordinator)?;
         coordinator
-            .validate_recovery_permit(&self.permit)
+            .lifecycle()
+            .validate_recovery_permit(permit)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         let emergency = coordinator
+            .lifecycle
             .invalidate(
-                self.permit.coordinator_generation(),
+                permit_generation,
                 RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
             )
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
+        coordinator.publish_snapshot();
         let (paused_gateway, connection_epoch) = map_paused_connected_observation_v2(
             &self.process_instance_id,
             emergency.generation(),
@@ -1719,7 +2262,6 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         if self.observer.current_admission_snapshot() != snapshot {
             return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
         }
-        let previous_registry = self.permit.registry_evidence().empty_observation();
         let registry =
             automation_runtime_worker::accept_runtime_registry_recovery_empty_observation_v2(
                 previous_registry.process_instance_id().clone(),
@@ -1741,22 +2283,30 @@ impl RuntimeRecoveryPendingGatewayBindingV2 {
         let input = RuntimeClosedRecoveryInputV2::new(
             RuntimeRecoveryIdV2::parse("fedcba9876543210fedcba9876543210")
                 .map_err(|_| RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation)?,
-            self.permit.owner_receipt().clone(),
-            self.permit.readiness().clone(),
+            owner_receipt,
+            readiness,
             paused_gateway,
             RuntimeClosedRecoveryRegistryEvidenceV2::Empty(registry),
         );
         let (_, permit) = coordinator
+            .lifecycle
             .begin_recovery(emergency.generation(), input)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
-        Ok(Self {
+        coordinator.publish_snapshot();
+        let previous = self
+            .permit
+            .replace(permit)
+            .expect("runtime predecessor recovery permit");
+        let predecessor = Self {
             process_instance_id: self.process_instance_id.clone(),
             observer: self.observer.clone(),
             admission_snapshot: self.admission_snapshot.clone(),
-            closed_lifecycle: self.closed_lifecycle.clone(),
+            coordinator: None,
             owner_invalidated: self.owner_invalidated.clone(),
-            permit,
-        })
+            permit: Some(previous),
+        };
+        drop(predecessor);
+        Ok(())
     }
 }
 
@@ -1777,7 +2327,13 @@ impl RuntimeRecoveryPendingGatewaySectionV2<'_> {
         &self,
         observation: &RuntimeRegistryRecoveryEmptyObservationV2,
     ) -> Result<(), RuntimeGatewayRecoverySectionErrorV2> {
-        if self.binding.permit.registry_evidence().empty_observation() != observation {
+        if self
+            .binding
+            .permit_v2()
+            .registry_evidence()
+            .empty_observation()
+            != observation
+        {
             return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
         }
         self.require_current_v2()
@@ -1786,25 +2342,28 @@ impl RuntimeRecoveryPendingGatewaySectionV2<'_> {
     fn require_current_v2(&self) -> Result<(), RuntimeGatewayRecoverySectionErrorV2> {
         require_recovery_owner_lifetime_v2(&self.binding.owner_invalidated, &self.owner)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
-        self.coordinator
-            .validate_recovery_permit(&self.binding.permit)
+        let coordinator = self.binding.coordinator_ref_v2()?;
+        coordinator
+            .lifecycle()
+            .validate_recovery_permit(self.binding.permit_v2())
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)?;
         let snapshot = *self.admission_snapshot;
         let (paused_gateway, _) = map_paused_connected_observation_v2(
             &self.binding.process_instance_id,
-            self.binding.permit.originating_emergency_generation(),
+            self.binding.permit_v2().originating_emergency_generation(),
             snapshot,
         )
         .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
-        if self.owner.observation().receipt() != self.binding.permit.owner_receipt()
-            || paused_gateway != *self.binding.permit.paused_gateway()
+        if self.owner.observation().receipt() != self.binding.permit_v2().owner_receipt()
+            || paused_gateway != *self.binding.permit_v2().paused_gateway()
         {
             return Err(RuntimeGatewayRecoverySectionErrorV2::ProtocolViolation);
         }
         require_recovery_owner_lifetime_v2(&self.binding.owner_invalidated, &self.owner)
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Gateway)?;
-        self.coordinator
-            .validate_recovery_permit(&self.binding.permit)
+        coordinator
+            .lifecycle()
+            .validate_recovery_permit(self.binding.permit_v2())
             .map_err(RuntimeGatewayRecoverySectionErrorV2::Coordinator)
     }
 }
@@ -1870,7 +2429,7 @@ pub fn compose_runtime_gateway_bootstrap_v1(
 pub(crate) fn compose_runtime_gateway_section_test_bootstrap_v2(
     process_instance_id: ProcessInstanceId,
 ) -> RuntimeGatewayBootstrapV1 {
-    let closed_lifecycle = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
+    let (coordinator, interrupt, coordinator_snapshot) = RuntimeGatewayCoordinatorOwnerV2::new();
     let owner_invalidated = Arc::new(AtomicBool::new(false));
     let owner_discord_attachment = Arc::new(Mutex::new(None));
     let (control, runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
@@ -1892,11 +2451,12 @@ pub(crate) fn compose_runtime_gateway_section_test_bootstrap_v2(
             admission_snapshot,
             discord_reservation_publisher: Some(discord_reservation_publisher),
             discord_reservation,
-            closed_lifecycle: closed_lifecycle.clone(),
         },
+        coordinator: Some(coordinator),
+        coordinator_snapshot,
         _runtime: Some(SharedGatewayRuntimeHalfV3 { _inner: runtime }),
         owner_invalidator: Some(RuntimeGatewayOwnerInvalidationBridgeV2 {
-            closed_lifecycle,
+            interrupt,
             invalidated: owner_invalidated.clone(),
             discord_attachment: owner_discord_attachment.clone(),
         }),
@@ -1921,11 +2481,11 @@ fn compose_with_control_config(
     process_instance_id: ProcessInstanceId,
     config: GatewayControlConfigV3,
 ) -> RuntimeGatewayBootstrapV1 {
-    let closed_lifecycle = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
+    let (coordinator, interrupt, coordinator_snapshot) = RuntimeGatewayCoordinatorOwnerV2::new();
     let owner_invalidated = Arc::new(AtomicBool::new(false));
     let owner_discord_attachment = Arc::new(Mutex::new(None));
     let invalidation = RuntimeGatewayInvalidationBridgeV2 {
-        closed_lifecycle: closed_lifecycle.clone(),
+        interrupt: interrupt.clone(),
     };
     let (control, runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
         config,
@@ -1946,11 +2506,12 @@ fn compose_with_control_config(
             admission_snapshot,
             discord_reservation_publisher: Some(discord_reservation_publisher),
             discord_reservation,
-            closed_lifecycle: closed_lifecycle.clone(),
         },
+        coordinator: Some(coordinator),
+        coordinator_snapshot,
         _runtime: Some(SharedGatewayRuntimeHalfV3 { _inner: runtime }),
         owner_invalidator: Some(RuntimeGatewayOwnerInvalidationBridgeV2 {
-            closed_lifecycle,
+            interrupt,
             invalidated: owner_invalidated.clone(),
             discord_attachment: owner_discord_attachment.clone(),
         }),
@@ -1960,19 +2521,13 @@ fn compose_with_control_config(
 }
 
 fn invalidate_gateway_owner_state(
-    closed_lifecycle: &Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>,
+    interrupt: &RuntimeGatewayCoordinatorInterruptHandleV2,
     invalidated: &AtomicBool,
 ) {
     if invalidated.swap(true, Ordering::AcqRel) {
         return;
     }
-    let mut lifecycle = closed_lifecycle
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    invalidate_closed_lifecycle(
-        &mut lifecycle,
-        RuntimeGatewayInvalidationCauseV2::OwnershipUncertain,
-    );
+    interrupt.trip_invalidation(RuntimeGatewayInvalidationCauseV2::OwnershipUncertain);
 }
 
 fn invalidate_closed_lifecycle(
@@ -2246,8 +2801,7 @@ mod tests {
     };
     use automation_runtime_convergence::ProcessInstanceId;
     use automation_runtime_worker::{
-        RuntimeGatewayClosedLifecycleV2, RuntimeGatewayClosedSnapshotV2,
-        RuntimeGatewayEmergencyCauseV2,
+        RuntimeGatewayClosedSnapshotV2, RuntimeGatewayEmergencyCauseV2,
     };
     use tokio::sync::watch;
 
@@ -2255,9 +2809,10 @@ mod tests {
     use crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerEmergencyInvalidatorV1;
 
     use super::{
-        compose_with_control_config, RuntimeGatewayBootstrapV1, RuntimeGatewayInvalidationBridgeV2,
-        RuntimeGatewayOwnerInvalidationBridgeV2, RuntimeGatewayReadyObservationErrorV1,
-        SharedGatewayControlAdapterV2, SharedGatewayRuntimeHalfV3,
+        compose_with_control_config, RuntimeGatewayBootstrapV1, RuntimeGatewayCoordinatorOwnerV2,
+        RuntimeGatewayInvalidationBridgeV2, RuntimeGatewayOwnerInvalidationBridgeV2,
+        RuntimeGatewayReadyObservationErrorV1, SharedGatewayControlAdapterV2,
+        SharedGatewayRuntimeHalfV3,
     };
 
     struct TestPauseTokenV1(GatewayPauseTokenV3);
@@ -2278,7 +2833,8 @@ mod tests {
     }
 
     fn bootstrap_with_panicking_invalidator() -> RuntimeGatewayBootstrapV1 {
-        let closed_lifecycle = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
+        let (coordinator, interrupt, coordinator_snapshot) =
+            RuntimeGatewayCoordinatorOwnerV2::new();
         let owner_invalidated = Arc::new(AtomicBool::new(false));
         let owner_discord_attachment = Arc::new(Mutex::new(None));
         let (control, runtime) = shared_gateway_control_channel_with_policy_and_invalidator_v3(
@@ -2300,11 +2856,12 @@ mod tests {
                 admission_snapshot,
                 discord_reservation_publisher: Some(discord_reservation_publisher),
                 discord_reservation,
-                closed_lifecycle: closed_lifecycle.clone(),
             },
+            coordinator: Some(coordinator),
+            coordinator_snapshot,
             _runtime: Some(SharedGatewayRuntimeHalfV3 { _inner: runtime }),
             owner_invalidator: Some(RuntimeGatewayOwnerInvalidationBridgeV2 {
-                closed_lifecycle,
+                interrupt,
                 invalidated: owner_invalidated.clone(),
                 discord_attachment: owner_discord_attachment.clone(),
             }),
@@ -2396,11 +2953,7 @@ mod tests {
 
     #[test]
     fn invalidation_bridge_maps_every_signal_and_shutdown_is_terminal() {
-        let closed = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
-        let bridge = RuntimeGatewayInvalidationBridgeV2 {
-            closed_lifecycle: closed.clone(),
-        };
-        for (index, (signal, cause)) in [
+        for (signal, cause) in [
             (
                 GatewayInvalidationSignalV3::AdmissionPaused,
                 RuntimeGatewayEmergencyCauseV2::CapabilityNotReady,
@@ -2447,24 +3000,32 @@ mod tests {
             ),
         ]
         .into_iter()
-        .enumerate()
         {
+            let (mut coordinator, interrupt, snapshot) = RuntimeGatewayCoordinatorOwnerV2::new();
+            let bridge = RuntimeGatewayInvalidationBridgeV2 { interrupt };
             bridge.invalidate(signal);
+            coordinator.reconcile_interrupt();
             assert_eq!(
-                closed.lock().unwrap().snapshot(),
+                snapshot.effective_snapshot(),
                 RuntimeGatewayClosedSnapshotV2::Emergency {
                     generation:
                         automation_runtime_worker::RuntimeGatewayCoordinatorGenerationV2::new(
-                            NonZeroU64::new(index as u64 + 2).unwrap(),
+                            NonZeroU64::new(2).unwrap(),
                         ),
                     cause,
                 }
             );
         }
+        let (mut coordinator, interrupt, snapshot) = RuntimeGatewayCoordinatorOwnerV2::new();
+        let bridge = RuntimeGatewayInvalidationBridgeV2 {
+            interrupt: interrupt.clone(),
+        };
+        bridge.invalidate(GatewayInvalidationSignalV3::AdmissionPaused);
         bridge.invalidate(GatewayInvalidationSignalV3::Draining(
             GatewayDrainCauseV3::Commanded,
         ));
-        let shutdown = closed.lock().unwrap().snapshot();
+        coordinator.reconcile_interrupt();
+        let shutdown = snapshot.effective_snapshot();
         assert!(matches!(
             shutdown,
             RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
@@ -2472,17 +3033,16 @@ mod tests {
         bridge.invalidate(GatewayInvalidationSignalV3::Stopped(
             GatewayDrainCauseV3::RuntimeFailure,
         ));
-        assert_eq!(closed.lock().unwrap().snapshot(), shutdown);
+        coordinator.reconcile_interrupt();
+        assert_eq!(snapshot.effective_snapshot(), shutdown);
 
-        let stopped = Arc::new(Mutex::new(RuntimeGatewayClosedLifecycleV2::starting()));
-        RuntimeGatewayInvalidationBridgeV2 {
-            closed_lifecycle: stopped.clone(),
-        }
-        .invalidate(GatewayInvalidationSignalV3::Stopped(
-            GatewayDrainCauseV3::RuntimeFailure,
-        ));
+        let (mut stopped, interrupt, snapshot) = RuntimeGatewayCoordinatorOwnerV2::new();
+        RuntimeGatewayInvalidationBridgeV2 { interrupt }.invalidate(
+            GatewayInvalidationSignalV3::Stopped(GatewayDrainCauseV3::RuntimeFailure),
+        );
+        stopped.reconcile_interrupt();
         assert!(matches!(
-            stopped.lock().unwrap().snapshot(),
+            snapshot.effective_snapshot(),
             RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
         ));
     }
@@ -2696,13 +3256,13 @@ mod tests {
     async fn dropping_control_owner_forces_the_runtime_half_closed() {
         let RuntimeGatewayBootstrapV1 {
             adapter,
+            coordinator_snapshot,
             mut _runtime,
             ..
         } = bootstrap();
-        let closed = adapter.closed_lifecycle.clone();
         drop(adapter);
         assert!(matches!(
-            closed.lock().unwrap().snapshot(),
+            coordinator_snapshot.effective_snapshot(),
             RuntimeGatewayClosedSnapshotV2::Emergency {
                 cause: RuntimeGatewayEmergencyCauseV2::ControlOrphaned,
                 ..
@@ -2719,7 +3279,7 @@ mod tests {
         ));
         drop(_runtime);
         assert!(matches!(
-            closed.lock().unwrap().snapshot(),
+            coordinator_snapshot.effective_snapshot(),
             RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
         ));
     }

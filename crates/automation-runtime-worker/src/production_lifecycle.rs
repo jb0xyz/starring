@@ -206,8 +206,12 @@ impl RuntimeStartupRecoveryFixedPointProcessV2 {
         self.authority.proof.acknowledged_product_handoff_count()
     }
 
-    pub(super) fn owner_receipt(&self) -> &RuntimeGatewayOwnerLeaseReceiptV1 {
-        self.authority.permit.owner_receipt()
+    pub fn owner_receipt(&self) -> &RuntimeGatewayOwnerLeaseReceiptV1 {
+        self.authority.proof.owner_receipt()
+    }
+
+    pub fn minimum_database_now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.authority.proof.owner_receipt().database_now
     }
 
     pub(super) fn writer_fence_is_bounded(

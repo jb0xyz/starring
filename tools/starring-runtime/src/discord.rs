@@ -203,8 +203,18 @@ pub(crate) struct RuntimeDiscordGatewaySupervisorV1 {
     join_task: Option<JoinHandle<bool>>,
     startup_operation_cutoff: Instant,
     process_handoff: Option<oneshot::Sender<RuntimeDiscordProcessHandoffCommandV2>>,
+    process_handoff_state: RuntimeDiscordProcessHandoffStateV2,
     drain: Option<oneshot::Sender<RuntimeDiscordDrainCommandV2>>,
     recovery_resume: mpsc::Sender<RuntimeDiscordRecoveryResumeCommandV2>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeDiscordProcessHandoffStateV2 {
+    NotStarted,
+    InFlight,
+    Process,
+    NotApplied(RuntimeDiscordProcessHandoffFailureV2),
+    Indeterminate(RuntimeDiscordProcessHandoffFailureV2),
 }
 
 pub(crate) struct RuntimeDiscordProcessSupervisorV2 {
@@ -533,11 +543,32 @@ impl RuntimeDiscordGatewaySupervisorV1 {
         process_generation: NonZeroU64,
         respond: bool,
     ) -> RuntimeDiscordProcessHandoffV2 {
+        self.handoff_to_process_in_place_with_response_v2(process_generation, respond)
+            .await;
+        self.into_process_handoff_v2()
+    }
+
+    pub(crate) async fn handoff_to_process_in_place_v2(&mut self, process_generation: NonZeroU64) {
+        self.handoff_to_process_in_place_with_response_v2(process_generation, true)
+            .await;
+    }
+
+    async fn handoff_to_process_in_place_with_response_v2(
+        &mut self,
+        process_generation: NonZeroU64,
+        respond: bool,
+    ) {
+        if self.process_handoff_state != RuntimeDiscordProcessHandoffStateV2::NotStarted {
+            self.process_handoff_state = RuntimeDiscordProcessHandoffStateV2::Indeterminate(
+                RuntimeDiscordProcessHandoffFailureV2::ActorRejected,
+            );
+            return;
+        }
         let Some(process_handoff) = self.process_handoff.take() else {
-            return RuntimeDiscordProcessHandoffV2::NotApplied {
-                supervisor: self,
-                failure: RuntimeDiscordProcessHandoffFailureV2::CommandUnavailable,
-            };
+            self.process_handoff_state = RuntimeDiscordProcessHandoffStateV2::NotApplied(
+                RuntimeDiscordProcessHandoffFailureV2::CommandUnavailable,
+            );
+            return;
         };
         let (response, acknowledgement) = oneshot::channel();
         if process_handoff
@@ -548,11 +579,12 @@ impl RuntimeDiscordGatewaySupervisorV1 {
             })
             .is_err()
         {
-            return RuntimeDiscordProcessHandoffV2::NotApplied {
-                supervisor: self,
-                failure: RuntimeDiscordProcessHandoffFailureV2::CommandUnavailable,
-            };
+            self.process_handoff_state = RuntimeDiscordProcessHandoffStateV2::NotApplied(
+                RuntimeDiscordProcessHandoffFailureV2::CommandUnavailable,
+            );
+            return;
         }
+        self.process_handoff_state = RuntimeDiscordProcessHandoffStateV2::InFlight;
         let mut terminal = self.terminal.clone();
         let acknowledgement = wait_for_runtime_discord_acknowledgement_v2(
             acknowledgement,
@@ -560,17 +592,14 @@ impl RuntimeDiscordGatewaySupervisorV1 {
             self.startup_operation_cutoff,
         )
         .await;
-        match acknowledgement {
+        self.process_handoff_state = match acknowledgement {
             RuntimeDiscordActorAcknowledgementV2::Accepted => {
-                RuntimeDiscordProcessHandoffV2::Process(RuntimeDiscordProcessSupervisorV2 {
-                    inner: self,
-                })
+                RuntimeDiscordProcessHandoffStateV2::Process
             }
             RuntimeDiscordActorAcknowledgementV2::Rejected => {
-                RuntimeDiscordProcessHandoffV2::NotApplied {
-                    supervisor: self,
-                    failure: RuntimeDiscordProcessHandoffFailureV2::ActorRejected,
-                }
+                RuntimeDiscordProcessHandoffStateV2::NotApplied(
+                    RuntimeDiscordProcessHandoffFailureV2::ActorRejected,
+                )
             }
             RuntimeDiscordActorAcknowledgementV2::Lost
             | RuntimeDiscordActorAcknowledgementV2::Terminal
@@ -588,6 +617,37 @@ impl RuntimeDiscordGatewaySupervisorV1 {
                     RuntimeDiscordActorAcknowledgementV2::Accepted
                     | RuntimeDiscordActorAcknowledgementV2::Rejected => unreachable!(),
                 };
+                RuntimeDiscordProcessHandoffStateV2::Indeterminate(failure)
+            }
+        };
+    }
+
+    pub(crate) fn into_process_handoff_v2(self) -> RuntimeDiscordProcessHandoffV2 {
+        match self.process_handoff_state {
+            RuntimeDiscordProcessHandoffStateV2::Process => {
+                RuntimeDiscordProcessHandoffV2::Process(RuntimeDiscordProcessSupervisorV2 {
+                    inner: self,
+                })
+            }
+            RuntimeDiscordProcessHandoffStateV2::NotApplied(failure) => {
+                RuntimeDiscordProcessHandoffV2::NotApplied {
+                    supervisor: self,
+                    failure,
+                }
+            }
+            RuntimeDiscordProcessHandoffStateV2::NotStarted => {
+                RuntimeDiscordProcessHandoffV2::NotApplied {
+                    supervisor: self,
+                    failure: RuntimeDiscordProcessHandoffFailureV2::CommandUnavailable,
+                }
+            }
+            RuntimeDiscordProcessHandoffStateV2::InFlight => {
+                RuntimeDiscordProcessHandoffV2::Indeterminate {
+                    supervisor: RuntimeDiscordShutdownOnlySupervisorV2 { inner: self },
+                    failure: RuntimeDiscordProcessHandoffFailureV2::AcknowledgementLost,
+                }
+            }
+            RuntimeDiscordProcessHandoffStateV2::Indeterminate(failure) => {
                 RuntimeDiscordProcessHandoffV2::Indeterminate {
                     supervisor: RuntimeDiscordShutdownOnlySupervisorV2 { inner: self },
                     failure,
@@ -656,6 +716,14 @@ impl RuntimeDiscordGatewaySupervisorV1 {
 }
 
 impl RuntimeDiscordProcessSupervisorV2 {
+    pub(crate) fn terminal_status_v2(&self) -> Option<RuntimeDiscordGatewayTerminalV1> {
+        self.inner.terminal_status()
+    }
+
+    pub(crate) fn is_finished_v2(&self) -> bool {
+        self.inner.is_finished()
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn resume_reserved_admission_v2(
         self,
@@ -824,6 +892,7 @@ where
         join_task: Some(join_task),
         startup_operation_cutoff: operation_cutoff,
         process_handoff: Some(process_handoff),
+        process_handoff_state: RuntimeDiscordProcessHandoffStateV2::NotStarted,
         drain: Some(drain),
         recovery_resume,
     }
@@ -1835,6 +1904,50 @@ mod tests {
             }
         };
         assert!(Instant::now() >= operation_cutoff);
+        let terminal = shutdown_only
+            .shutdown_until(
+                gateway.begin_discord_drain_v1(),
+                NonZeroU64::MIN,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.exit(), RuntimeDiscordGatewayExitV1::Commanded);
+        assert_eq!(closes.load(Ordering::Acquire), 0);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn canceled_in_place_handoff_retains_shutdown_only_join_authority() {
+        let mut gateway = gateway_with_lifecycle_capacity(1);
+        let (_signals, driver, _polls, closes, drops) = driver();
+        let mut supervisor = gateway
+            .start_discord_gateway_with_driver_v1(
+                driver,
+                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        let mut handoff = Box::pin(
+            supervisor.handoff_to_process_in_place_with_response_v2(NonZeroU64::MIN, false),
+        );
+        tokio::select! {
+            biased;
+            () = &mut handoff => panic!("in-place handoff unexpectedly completed"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        drop(handoff);
+        let shutdown_only = match supervisor.into_process_handoff_v2() {
+            RuntimeDiscordProcessHandoffV2::Indeterminate {
+                supervisor,
+                failure: RuntimeDiscordProcessHandoffFailureV2::AcknowledgementLost,
+            } => supervisor,
+            outcome => {
+                drop(outcome);
+                panic!("canceled Discord handoff returned retryable ownership")
+            }
+        };
         let terminal = shutdown_only
             .shutdown_until(
                 gateway.begin_discord_drain_v1(),

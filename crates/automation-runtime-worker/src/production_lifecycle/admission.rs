@@ -231,8 +231,8 @@ fn validate_resume(
     {
         return Err(RuntimeProductionLifecycleErrorV2::ExplicitResumeMissing);
     }
-    if !same_owner(state.fixed_point.owner_receipt(), &observed.owner_receipt)
-        || observed.owner_receipt.database_now < state.fixed_point.owner_receipt().database_now
+    if !same_owner(permit.owner_receipt(), &observed.owner_receipt)
+        || observed.owner_receipt.database_now < permit.owner_receipt().database_now
         || observed.owner_receipt.database_lease_duration().is_none()
     {
         return Err(RuntimeProductionLifecycleErrorV2::OwnerMismatch);

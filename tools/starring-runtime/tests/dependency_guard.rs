@@ -28,6 +28,74 @@ fn collect_source_files(root: &Path, directory: &Path, files: &mut Vec<(PathBuf,
     }
 }
 
+#[test]
+fn paused_production_handoff_is_linear_shutdown_biased_and_non_serving() {
+    let observation = include_str!("../src/process/observation.rs");
+    let gateway = source_before_test_module(include_str!("../src/gateway.rs"));
+    let discord = source_before_test_module(include_str!("../src/discord.rs"));
+    let closed_recovery = include_str!("../src/closed_recovery.rs");
+    let handoff = braced_declaration(
+        observation,
+        "pub(crate) async fn into_paused_production_handoff_v2(",
+    );
+
+    let finalizer = handoff
+        .find("seal_startup_finalizer_for_handoff_v2(handoff_cutoff)")
+        .unwrap();
+    let worker = handoff.find("into_worker_fixed_point_v2()").unwrap();
+    let owner = handoff
+        .find("enter_admission_frozen_in_place_v2()")
+        .unwrap();
+    let frozen = handoff.find("try_into_admission_frozen_v2()").unwrap();
+    let discord_ack = handoff
+        .find("handoff_to_process_in_place_v2(process_generation)")
+        .unwrap();
+    let discord_state = handoff.find("into_process_handoff_v2()").unwrap();
+    let revalidate = handoff.find("revalidate_paused_v2()").unwrap();
+    assert!(
+        finalizer < worker
+            && worker < owner
+            && owner < frozen
+            && frozen < discord_ack
+            && discord_ack < discord_state
+            && discord_state < revalidate
+    );
+    assert_eq!(
+        handoff
+            .matches("await_production_handoff_stage_v2(")
+            .count(),
+        3
+    );
+    assert_eq!(handoff.matches("&mut shutdown").count(), 3);
+    for forbidden in [
+        "resume_reserved_runtime_discord_admission_v2",
+        "publish_ready",
+        "ready_to_serve",
+        "execute_admitted_interaction",
+        "activate",
+        "deploy",
+    ] {
+        assert!(!contains_identifier(handoff, forbidden), "{forbidden}");
+    }
+
+    let final_revalidation = braced_declaration(observation, "pub(crate) fn revalidate_paused_v2(");
+    let owner = final_revalidation.find(".revalidate_paused_v2()").unwrap();
+    let root_shutdown = final_revalidation
+        .find("production_handoff_shutdown_failure_v2(")
+        .unwrap();
+    assert!(owner < root_shutdown);
+    let shutdown_check =
+        braced_declaration(observation, "fn production_handoff_shutdown_failure_v2(");
+    assert!(shutdown_check.contains("RuntimeProcessProductionHandoffFailureV2::ProcessShutdown"));
+
+    assert!(!gateway.contains("Arc<Mutex<RuntimeGatewayClosedLifecycleV2>>"));
+    assert!(!gateway.contains("Arc::try_unwrap"));
+    assert!(discord.contains("RuntimeDiscordProcessHandoffStateV2::InFlight"));
+    assert!(discord.contains("RuntimeDiscordProcessHandoffV2::Indeterminate"));
+    assert!(closed_recovery.contains("operation_cutoff"));
+    assert!(closed_recovery.contains("RuntimeClosedRecoveryAdmissionFrozenProcessV2"));
+}
+
 fn source_files() -> Vec<(PathBuf, String)> {
     let package_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
@@ -1296,14 +1364,10 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     assert!(!owner_supervisor.contains("impl Clone for RuntimeGatewayOwnerStartupWatchdogHandleV1"));
     assert!(owner_supervisor.contains("impl Drop for RuntimeGatewayOwnerSupervisorHandleV1"));
     assert!(!owner_supervisor.contains("impl Drop for RuntimeGatewayOwnerStartupWatchdogHandleV1"));
-    assert!(owner_supervisor.contains("pub(crate) async fn into_production_v1("));
-    assert!(
-        owner_supervisor.contains("pub(crate) struct RuntimeGatewayOwnerProductionHandoffProofV1")
-    );
-    assert!(
-        owner_supervisor.contains("pub(crate) struct RuntimeGatewayOwnerProductionSupervisorV1")
-    );
-    assert!(owner_supervisor.contains("RuntimeGatewayOwnerSupervisorCommandV1::Promote"));
+    assert!(!owner_supervisor.contains("pub(crate) async fn into_production_v1("));
+    assert!(!owner_supervisor.contains("RuntimeGatewayOwnerProductionHandoffProofV1"));
+    assert!(!owner_supervisor.contains("RuntimeGatewayOwnerProductionSupervisorV1"));
+    assert!(!owner_supervisor.contains("RuntimeGatewayOwnerSupervisorCommandV1::Promote"));
     assert!(!owner_supervisor.contains("RuntimeGatewayOwnerSupervisorCommandV1::Prepare"));
     assert!(!owner_supervisor.contains("RuntimeGatewayOwnerSupervisorCommandV1::Commit"));
     for required in [
@@ -1318,6 +1382,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "RuntimeGatewayOwnerClosedRecoveryCommandV2::Commit",
         "RuntimeGatewayOwnerSupervisorRoleV1::PreparedClosedRecovery",
         "RuntimeGatewayOwnerSupervisorRoleV1::ClosedRecovery",
+        "RuntimeGatewayOwnerSupervisorRoleV1::AdmissionFrozen",
+        "RuntimeGatewayOwnerSupervisorCommandV1::EnterAdmissionFrozen",
         "permit.owner_receipt() != self.observation.receipt()",
         "watchdog.schedule().receipt() != &expected_receipt",
         "RuntimeGatewayOwnerPreparedClosedRecoveryV2(<redacted>)",
@@ -1348,23 +1414,6 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     )));
     assert!(!owner_supervisor.contains("prepare_closed_recovery_observation_v2"));
     assert!(owner_supervisor.contains(concat!(
-        "pub(crate) struct RuntimeGatewayOwnerProductionHandoffProofV1 {\n",
-        "    _private: (),\n",
-        "}"
-    )));
-    assert!(owner_supervisor.contains(concat!(
-        "pub(crate) struct RuntimeGatewayOwnerProductionSupervisorV1 {\n",
-        "    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,\n",
-        "    handoff_observation: RuntimeGatewayOwnerCurrentObservationV1,\n",
-        "}"
-    )));
-    assert_eq!(
-        owner_supervisor
-            .matches("RuntimeGatewayOwnerProductionHandoffProofV1 {")
-            .count(),
-        1
-    );
-    assert!(owner_supervisor.contains(concat!(
         "#[cfg(test)]\n",
         "#[path = \"gateway_owner_startup_watchdog_handoff_tests.rs\"]\n",
         "mod handoff_tests;"
@@ -1372,10 +1421,9 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     for name in [
         "RuntimeGatewayOwnerSupervisorHandleV1",
         "RuntimeGatewayOwnerStartupWatchdogHandleV1",
-        "RuntimeGatewayOwnerProductionHandoffProofV1",
-        "RuntimeGatewayOwnerProductionSupervisorV1",
         "RuntimeGatewayOwnerPreparedClosedRecoveryV2",
         "RuntimeGatewayOwnerClosedRecoverySupervisorV2",
+        "RuntimeGatewayOwnerAdmissionFrozenSupervisorV2",
     ] {
         let attributes = declaration_attribute_block(owner_supervisor, name);
         for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
@@ -5136,9 +5184,7 @@ fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
         "struct RuntimeGatewayOwnerStartupCleanupCapV1",
         "initial_startup_cleanup_deadline: Option<Instant>,",
         "RuntimeGatewayOwnerStartupCleanupCapV1::new(initial_startup_cleanup_deadline)",
-        "startup_cleanup_cap: RuntimeGatewayOwnerStartupCleanupCapV1,",
         "startup_cleanup_cap.limit(stop.cleanup_deadline)",
-        "self.inner().clear_startup_cleanup_deadline();",
     ] {
         assert!(watchdog.contains(required), "{required}");
     }
@@ -5150,18 +5196,8 @@ fn gateway_owner_staging_is_exact_bounded_opaque_and_non_serving() {
             .count(),
         3
     );
-    let production_handoff =
-        braced_declaration(watchdog, "pub(crate) async fn into_production_v1(");
-    let projection = production_handoff
-        .find("self.inner().promote_to_production_v1().await?")
-        .unwrap();
-    let clear = production_handoff
-        .find("self.inner().clear_startup_cleanup_deadline()")
-        .unwrap();
-    let transfer = production_handoff
-        .find("let inner = self.take_inner()")
-        .unwrap();
-    assert!(projection < clear && clear < transfer);
+    assert!(!watchdog.contains("promote_to_production_v1"));
+    assert!(!watchdog.contains("clear_startup_cleanup_deadline"));
     let watchdog_start = braced_declaration(
         watchdog,
         "pub(crate) fn start_runtime_gateway_owner_startup_watchdog_v1",

@@ -284,7 +284,7 @@ impl RuntimePausedConnectedProcessV1 {
             paused_gateway,
         } = self;
         let RuntimeOwnerHeldProcessV1 {
-            foundation,
+            mut foundation,
             mut owner,
         } = owner_held;
         let operation_cutoff = foundation.startup_budget.operation_cutoff();
@@ -368,7 +368,7 @@ impl RuntimePausedConnectedProcessV1 {
             return Err(finish_transition_v2(transition, cleanup));
         }
         let pending = begin_initial_empty_recovery_retained_v2(
-            &foundation.gateway,
+            &mut foundation.gateway,
             &foundation.registry,
             prepared,
             recovery_id,

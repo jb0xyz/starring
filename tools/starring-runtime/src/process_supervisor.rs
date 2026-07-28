@@ -161,7 +161,7 @@ impl RuntimeProcessRootSupervisorV1 {
     }
 }
 
-fn create_runtime_process_shutdown_latch_v1() -> RuntimeShutdownSignalLatchV1 {
+pub(crate) fn create_runtime_process_shutdown_latch_v1() -> RuntimeShutdownSignalLatchV1 {
     RuntimeShutdownSignalLatchV1::create()
 }
 

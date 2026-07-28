@@ -214,6 +214,13 @@ impl RuntimeRegistryEmptyRecoveryBindingV2 {
         project_empty_observation_v2(&self.process_instance_id, observation)
     }
 
+    pub(crate) fn revalidate_production_empty_projection_v2(
+        &self,
+    ) -> Result<RuntimeRegistryRecoveryEmptyObservationV2, RuntimeRegistryRecoveryObservationErrorV1>
+    {
+        self.revalidate_empty_projection_unordered_v2()
+    }
+
     pub(crate) fn into_pending_drain_seal_binding_v2(
         self,
         candidate: &RuntimePendingDrainCandidateV2,

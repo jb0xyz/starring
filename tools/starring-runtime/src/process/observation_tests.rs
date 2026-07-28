@@ -602,6 +602,84 @@ async fn interrupt_race_observes_owner_termination_while_discord_is_live() {
     ));
 }
 
+#[tokio::test]
+async fn production_handoff_shutdown_wins_at_every_long_wait_boundary() {
+    for _boundary in 0..3 {
+        let stage_polls = Arc::new(AtomicUsize::new(0));
+        let stage_polls_for_future = stage_polls.clone();
+        let latch = crate::process_supervisor::create_runtime_process_shutdown_latch_v1();
+        let trigger = latch.trigger();
+        let mut shutdown = latch.observer();
+        trigger.trip(crate::RuntimeShutdownCauseV1::Explicit);
+        let output = await_production_handoff_stage_v2(
+            async move {
+                stage_polls_for_future.fetch_add(1, Ordering::AcqRel);
+                ready::<()>(()).await
+            },
+            &mut shutdown,
+        )
+        .await;
+        assert_eq!(output, None);
+        assert_eq!(stage_polls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            trigger.observed().unwrap().cause(),
+            crate::RuntimeShutdownCauseV1::Explicit
+        );
+    }
+}
+
+#[tokio::test]
+async fn production_handoff_shutdown_cancels_a_started_stage_without_losing_its_owner() {
+    for _boundary in 0..3 {
+        let active = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let stage_active = active.clone();
+        let stage_dropped = dropped.clone();
+        let latch = crate::process_supervisor::create_runtime_process_shutdown_latch_v1();
+        let trigger = latch.trigger();
+        let mut shutdown = latch.observer();
+        let mut handoff = Box::pin(await_production_handoff_stage_v2(
+            async move {
+                stage_active.fetch_add(1, Ordering::AcqRel);
+                let _guard = FakePendingObservationGuardV2 {
+                    active: stage_active,
+                    dropped: stage_dropped,
+                };
+                pending::<()>().await
+            },
+            &mut shutdown,
+        ));
+        std::future::poll_fn(|context| {
+            assert!(Future::poll(handoff.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        assert!(trigger
+            .trip(crate::RuntimeShutdownCauseV1::Explicit)
+            .first());
+        assert_eq!(handoff.await, None);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+    }
+}
+
+#[test]
+fn production_handoff_final_revalidation_rejects_latched_root_shutdown() {
+    let latch = crate::process_supervisor::create_runtime_process_shutdown_latch_v1();
+    let shutdown = latch.observer();
+    assert_eq!(production_handoff_shutdown_failure_v2(&shutdown), None);
+
+    latch
+        .trigger()
+        .trip(crate::RuntimeShutdownCauseV1::Explicit);
+
+    assert_eq!(
+        production_handoff_shutdown_failure_v2(&shutdown),
+        Some(RuntimeProcessProductionHandoffFailureV2::ProcessShutdown)
+    );
+}
+
 #[test]
 fn observation_failures_map_to_finite_public_classes() {
     let operation_cutoff = Instant::now() + Duration::from_secs(2);

@@ -2,7 +2,7 @@ use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::time::Instant;
 
-use automation_runtime_controller::RuntimeRecoveryIdV2;
+use automation_runtime_controller::{RuntimeGatewayOwnerLeaseReceiptV1, RuntimeRecoveryIdV2};
 use automation_runtime_worker::{
     RuntimeAcceptedStartupRecoveryExecutionOutcomeV2, RuntimeAuthorizedStartupRecoveryExecutionV2,
     RuntimeCompletedStartupRecoveryExecutionV2, RuntimeDurablyAcknowledgedPendingDrainSuccessionV3,
@@ -20,13 +20,16 @@ use crate::database::{
     RuntimeDatabaseReadinessRefreshV2, RuntimeDatabaseReadinessV1,
 };
 use crate::gateway::{
-    RuntimeGatewayBootstrapV1, RuntimeGatewayRecoveryOwnerCommitErrorV2,
-    RuntimeGatewayRecoverySectionErrorV2, RuntimeRecoveryPendingGatewayBindingV2,
+    RuntimeGatewayBootstrapV1, RuntimeGatewayFixedPointAcceptanceErrorV2,
+    RuntimeGatewayProductionCoordinatorV2, RuntimeGatewayProductionInterruptV2,
+    RuntimeGatewayRecoveryOwnerCommitErrorV2, RuntimeGatewayRecoverySectionErrorV2,
+    RuntimeRecoveryPendingGatewayBindingV2,
 };
 use crate::gateway_owner_startup_watchdog::{
-    RuntimeGatewayOwnerClosedRecoveryCommitErrorV2, RuntimeGatewayOwnerClosedRecoverySupervisorV2,
-    RuntimeGatewayOwnerPreparedClosedRecoveryV2, RuntimeGatewayOwnerStartupWatchdogExitV1,
-    RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2,
+    RuntimeGatewayOwnerAdmissionFrozenSupervisorV2, RuntimeGatewayOwnerClosedRecoveryCommitErrorV2,
+    RuntimeGatewayOwnerClosedRecoverySupervisorV2, RuntimeGatewayOwnerPreparedClosedRecoveryV2,
+    RuntimeGatewayOwnerStartupWatchdogExitV1, RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
 };
 use crate::registry::{
     RuntimeRegistryBootstrapV1, RuntimeRegistryEmptyRecoveryBindingV2,
@@ -84,6 +87,68 @@ impl Debug for RuntimeClosedRecoveryTransitionAuthorityV2 {
     }
 }
 
+pub(crate) struct RuntimeGatewayOwnerAdmissionFrozenAuthorityV2 {
+    baseline_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+    cutoff: Instant,
+}
+
+impl RuntimeGatewayOwnerAdmissionFrozenAuthorityV2 {
+    fn from_worker_fixed_point_v2(
+        fixed_point: &automation_runtime_worker::RuntimeStartupRecoveryFixedPointProcessV2,
+        cutoff: Instant,
+    ) -> Option<Self> {
+        let baseline_receipt = fixed_point.owner_receipt().clone();
+        let minimum_database_now = fixed_point.minimum_database_now();
+        if Instant::now() >= cutoff
+            || baseline_receipt.database_now < minimum_database_now
+            || baseline_receipt.database_lease_duration().is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            baseline_receipt,
+            cutoff,
+        })
+    }
+
+    pub(crate) fn cutoff_v2(&self) -> Instant {
+        self.cutoff
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_v2(
+        baseline_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+        cutoff: Instant,
+    ) -> Self {
+        Self {
+            baseline_receipt,
+            cutoff,
+        }
+    }
+
+    pub(crate) fn accepts_current_v2(&self, current: &RuntimeGatewayOwnerLeaseReceiptV1) -> bool {
+        current.lease_id == self.baseline_receipt.lease_id
+            && current.owner_revision == self.baseline_receipt.owner_revision
+            && current.expires_at == self.baseline_receipt.expires_at
+            && current.database_now <= self.baseline_receipt.database_now
+            && current.database_lease_duration().is_some()
+    }
+
+    pub(crate) fn accepts_observed_v2(&self, observed: &RuntimeGatewayOwnerLeaseReceiptV1) -> bool {
+        observed.lease_id == self.baseline_receipt.lease_id
+            && observed.owner_revision == self.baseline_receipt.owner_revision
+            && observed.expires_at == self.baseline_receipt.expires_at
+            && observed.database_now >= self.baseline_receipt.database_now
+            && observed.database_lease_duration().is_some()
+    }
+}
+
+impl Debug for RuntimeGatewayOwnerAdmissionFrozenAuthorityV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeGatewayOwnerAdmissionFrozenAuthorityV2(<redacted>)")
+    }
+}
+
 pub(crate) struct RuntimeClosedRecoveryPendingPhaseV2 {
     owner: RuntimeGatewayOwnerPreparedClosedRecoveryV2,
     gateway: RuntimeRecoveryPendingGatewayBindingV2,
@@ -132,6 +197,48 @@ pub(crate) struct RuntimeClosedRecoveryFixedPointV2 {
     registry: RuntimeRegistryEmptyRecoveryBindingV2,
     operation_cutoff: Instant,
     proof: RuntimeStartupRecoveryFixedPointProofV2,
+}
+
+pub(crate) struct RuntimeClosedRecoveryWorkerFixedPointV2 {
+    owner: RuntimeGatewayOwnerClosedRecoverySupervisorV2,
+    gateway: RuntimeGatewayProductionCoordinatorV2,
+    registry: RuntimeRegistryEmptyRecoveryBindingV2,
+    operation_cutoff: Instant,
+    worker: automation_runtime_worker::RuntimeStartupRecoveryFixedPointProcessV2,
+}
+
+pub(crate) struct RuntimeClosedRecoveryAdmissionFrozenProcessV2 {
+    owner: RuntimeGatewayOwnerAdmissionFrozenSupervisorV2,
+    gateway: RuntimeGatewayProductionCoordinatorV2,
+    registry: RuntimeRegistryEmptyRecoveryBindingV2,
+    operation_cutoff: Instant,
+    worker: automation_runtime_worker::RuntimeStartupRecoveryFixedPointProcessV2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeClosedRecoveryFixedPointHandoffErrorV2 {
+    DeadlineElapsed,
+    Recovery(RuntimeClosedRecoveryCommitErrorV2),
+    Gateway(RuntimeGatewayFixedPointAcceptanceErrorV2),
+    GatewayObservation(crate::RuntimeGatewayReadyObservationErrorV1),
+    Registry(RuntimeRegistryRecoveryObservationErrorV1),
+    Owner(RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2),
+    ProtocolViolation,
+}
+
+pub(crate) struct RuntimeClosedRecoveryFixedPointAcceptanceFailureV2 {
+    fixed_point: Box<RuntimeClosedRecoveryFixedPointV2>,
+    error: RuntimeClosedRecoveryFixedPointHandoffErrorV2,
+}
+
+pub(crate) struct RuntimeClosedRecoveryAdmissionFrozenFailureV2 {
+    cleanup: RuntimeClosedRecoveryAdmissionFrozenCleanupV2,
+    error: RuntimeClosedRecoveryFixedPointHandoffErrorV2,
+}
+
+enum RuntimeClosedRecoveryAdmissionFrozenCleanupV2 {
+    Worker(Box<RuntimeClosedRecoveryWorkerFixedPointV2>),
+    Frozen(Box<RuntimeClosedRecoveryAdmissionFrozenProcessV2>),
 }
 
 pub(crate) enum RuntimeClosedRecoveryStartupIterationOutcomeV2 {
@@ -690,6 +797,18 @@ impl RuntimeClosedRecoveryFixedPointV2 {
         self.owner.observation().safety_deadline()
     }
 
+    pub(crate) fn handoff_cutoff_v2(&self) -> Instant {
+        self.operation_cutoff
+            .min(self.owner.observation().safety_deadline())
+    }
+
+    pub(crate) fn revalidate_for_handoff_v2(
+        &self,
+    ) -> Result<(), RuntimeClosedRecoveryFixedPointHandoffErrorV2> {
+        self.revalidate_v2()
+            .map_err(RuntimeClosedRecoveryFixedPointHandoffErrorV2::Recovery)
+    }
+
     #[cfg_attr(test, allow(dead_code))]
     pub(crate) async fn abort_and_shutdown_until_v2(
         self,
@@ -712,6 +831,240 @@ impl RuntimeClosedRecoveryFixedPointV2 {
     #[cfg(test)]
     pub(crate) fn acknowledged_product_handoff_count_v2(&self) -> u32 {
         self.proof.acknowledged_product_handoff_count()
+    }
+
+    pub(crate) fn into_worker_fixed_point_v2(
+        self,
+    ) -> Result<
+        RuntimeClosedRecoveryWorkerFixedPointV2,
+        RuntimeClosedRecoveryFixedPointAcceptanceFailureV2,
+    > {
+        if let Err(error) = self.revalidate_v2() {
+            return Err(RuntimeClosedRecoveryFixedPointAcceptanceFailureV2 {
+                fixed_point: Box::new(self),
+                error: RuntimeClosedRecoveryFixedPointHandoffErrorV2::Recovery(error),
+            });
+        }
+        let Self {
+            owner,
+            gateway,
+            registry,
+            operation_cutoff,
+            proof,
+        } = self;
+        match gateway.into_worker_fixed_point_v2(proof) {
+            Ok((gateway, worker)) => Ok(RuntimeClosedRecoveryWorkerFixedPointV2 {
+                owner,
+                gateway,
+                registry,
+                operation_cutoff,
+                worker,
+            }),
+            Err(failure) => {
+                let (gateway, proof, error) = failure.into_parts();
+                Err(RuntimeClosedRecoveryFixedPointAcceptanceFailureV2 {
+                    fixed_point: Box::new(Self {
+                        owner,
+                        gateway,
+                        registry,
+                        operation_cutoff,
+                        proof,
+                    }),
+                    error: RuntimeClosedRecoveryFixedPointHandoffErrorV2::Gateway(error),
+                })
+            }
+        }
+    }
+}
+
+impl RuntimeClosedRecoveryWorkerFixedPointV2 {
+    pub(crate) async fn enter_admission_frozen_in_place_v2(
+        &mut self,
+    ) -> Result<(), RuntimeClosedRecoveryFixedPointHandoffErrorV2> {
+        let cutoff = self
+            .operation_cutoff
+            .min(self.owner.observation().safety_deadline());
+        let Some(authority) =
+            RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::from_worker_fixed_point_v2(
+                &self.worker,
+                cutoff,
+            )
+        else {
+            return Err(RuntimeClosedRecoveryFixedPointHandoffErrorV2::DeadlineElapsed);
+        };
+        if let Some(interrupt) = self.gateway.current_interrupt_v2() {
+            return Err(match interrupt {
+                RuntimeGatewayProductionInterruptV2::Invalidation(_) => {
+                    RuntimeClosedRecoveryFixedPointHandoffErrorV2::ProtocolViolation
+                }
+                RuntimeGatewayProductionInterruptV2::Shutdown => {
+                    RuntimeClosedRecoveryFixedPointHandoffErrorV2::GatewayObservation(
+                        crate::RuntimeGatewayReadyObservationErrorV1::Stopped,
+                    )
+                }
+            });
+        }
+        if let Err(error) = self.gateway.revalidate_fixed_point_admission_v2() {
+            return Err(RuntimeClosedRecoveryFixedPointHandoffErrorV2::GatewayObservation(error));
+        }
+        if let Err(error) = self.registry.revalidate_production_empty_projection_v2() {
+            return Err(RuntimeClosedRecoveryFixedPointHandoffErrorV2::Registry(
+                error,
+            ));
+        }
+        if let Err(error) = self
+            .owner
+            .enter_admission_frozen_in_place_v2(authority)
+            .await
+        {
+            return Err(RuntimeClosedRecoveryFixedPointHandoffErrorV2::Owner(error));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn try_into_admission_frozen_v2(
+        self,
+    ) -> Result<
+        RuntimeClosedRecoveryAdmissionFrozenProcessV2,
+        RuntimeClosedRecoveryAdmissionFrozenFailureV2,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            operation_cutoff,
+            worker,
+        } = self;
+        let owner = match owner.try_into_admission_frozen_v2() {
+            Ok(owner) => owner,
+            Err(owner) => {
+                return Err(RuntimeClosedRecoveryAdmissionFrozenFailureV2 {
+                    cleanup: RuntimeClosedRecoveryAdmissionFrozenCleanupV2::Worker(Box::new(
+                        Self {
+                            owner: *owner,
+                            gateway,
+                            registry,
+                            operation_cutoff,
+                            worker,
+                        },
+                    )),
+                    error: RuntimeClosedRecoveryFixedPointHandoffErrorV2::ProtocolViolation,
+                });
+            }
+        };
+        let frozen = RuntimeClosedRecoveryAdmissionFrozenProcessV2 {
+            owner,
+            gateway,
+            registry,
+            operation_cutoff,
+            worker,
+        };
+        if let Err(error) = frozen.revalidate_paused_v2() {
+            return Err(RuntimeClosedRecoveryAdmissionFrozenFailureV2 {
+                cleanup: RuntimeClosedRecoveryAdmissionFrozenCleanupV2::Frozen(Box::new(frozen)),
+                error,
+            });
+        }
+        Ok(frozen)
+    }
+
+    pub(crate) async fn abort_and_shutdown_until_v2(
+        self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            operation_cutoff,
+            worker,
+        } = self;
+        drop((gateway, registry, operation_cutoff, worker));
+        owner.abort_and_shutdown_until_v2(cleanup_deadline).await
+    }
+}
+
+impl RuntimeClosedRecoveryAdmissionFrozenProcessV2 {
+    pub(crate) fn revalidate_paused_v2(
+        &self,
+    ) -> Result<(), RuntimeClosedRecoveryFixedPointHandoffErrorV2> {
+        if self.owner.terminal_status_v2().is_some()
+            || self.operation_cutoff <= Instant::now()
+            || self.owner.handoff_cutoff_v2() <= Instant::now()
+            || self.owner.handoff_observation_v2().safety_deadline() <= Instant::now()
+            || self.gateway.current_interrupt_v2().is_some()
+            || self.worker.coordinator_generation() != self.gateway.coordinator_generation_v2()
+            || matches!(
+                self.gateway.closed_snapshot_v2(),
+                automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency { .. }
+                    | automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
+            )
+        {
+            return Err(RuntimeClosedRecoveryFixedPointHandoffErrorV2::ProtocolViolation);
+        }
+        self.gateway
+            .revalidate_fixed_point_admission_v2()
+            .map_err(RuntimeClosedRecoveryFixedPointHandoffErrorV2::GatewayObservation)?;
+        self.registry
+            .revalidate_production_empty_projection_v2()
+            .map_err(RuntimeClosedRecoveryFixedPointHandoffErrorV2::Registry)?;
+        Ok(())
+    }
+
+    pub(crate) async fn abort_and_shutdown_until_v2(
+        self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            operation_cutoff,
+            worker,
+        } = self;
+        drop((gateway, registry, operation_cutoff, worker));
+        owner.abort_and_shutdown_until_v2(cleanup_deadline).await
+    }
+}
+
+impl RuntimeClosedRecoveryFixedPointAcceptanceFailureV2 {
+    pub(crate) fn error_v2(&self) -> RuntimeClosedRecoveryFixedPointHandoffErrorV2 {
+        self.error
+    }
+
+    pub(crate) fn into_fixed_point_v2(self) -> RuntimeClosedRecoveryFixedPointV2 {
+        *self.fixed_point
+    }
+}
+
+impl RuntimeClosedRecoveryAdmissionFrozenFailureV2 {
+    pub(crate) fn error_v2(&self) -> RuntimeClosedRecoveryFixedPointHandoffErrorV2 {
+        self.error
+    }
+
+    pub(crate) async fn abort_and_shutdown_until_v2(
+        self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        match self.cleanup {
+            RuntimeClosedRecoveryAdmissionFrozenCleanupV2::Worker(fixed_point) => {
+                fixed_point
+                    .abort_and_shutdown_until_v2(cleanup_deadline)
+                    .await
+            }
+            RuntimeClosedRecoveryAdmissionFrozenCleanupV2::Frozen(frozen) => {
+                frozen.abort_and_shutdown_until_v2(cleanup_deadline).await
+            }
+        }
     }
 }
 
@@ -854,7 +1207,7 @@ fn map_commit_refresh_error_v2(
 
 #[cfg(test)]
 pub(crate) fn begin_initial_empty_recovery_v2(
-    gateway: &RuntimeGatewayBootstrapV1,
+    gateway: &mut RuntimeGatewayBootstrapV1,
     registry: &RuntimeRegistryBootstrapV1,
     owner: RuntimeGatewayOwnerPreparedClosedRecoveryV2,
     recovery_id: RuntimeRecoveryIdV2,
@@ -875,7 +1228,7 @@ pub(crate) fn begin_initial_empty_recovery_v2(
 }
 
 pub(crate) fn begin_initial_empty_recovery_retained_v2(
-    gateway: &RuntimeGatewayBootstrapV1,
+    gateway: &mut RuntimeGatewayBootstrapV1,
     registry: &RuntimeRegistryBootstrapV1,
     owner: RuntimeGatewayOwnerPreparedClosedRecoveryV2,
     recovery_id: RuntimeRecoveryIdV2,
@@ -929,7 +1282,7 @@ pub(crate) fn begin_initial_empty_recovery_retained_v2(
 }
 
 fn bind_initial_empty_recovery_v2(
-    gateway: &RuntimeGatewayBootstrapV1,
+    gateway: &mut RuntimeGatewayBootstrapV1,
     registry: &RuntimeRegistryBootstrapV1,
     owner: &RuntimeGatewayOwnerPreparedClosedRecoveryV2,
     recovery_id: RuntimeRecoveryIdV2,
@@ -997,12 +1350,9 @@ impl RuntimeClosedRecoveryPendingPhaseV2 {
     pub(crate) fn stale_predecessor_drop_preserves_successor_v2(
         &mut self,
     ) -> Result<(), RuntimeClosedRecoveryBeginErrorV2> {
-        let successor = self
-            .gateway
+        self.gateway
             .successor_for_stale_drop_test_v2()
             .map_err(RuntimeClosedRecoveryBeginErrorV2::Gateway)?;
-        let predecessor = std::mem::replace(&mut self.gateway, successor);
-        drop(predecessor);
         self.revalidate_v2()
     }
 }

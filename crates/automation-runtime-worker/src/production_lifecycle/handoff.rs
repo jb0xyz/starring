@@ -2,11 +2,10 @@ use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
 
 use automation_runtime_controller::{
-    RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayOwnerLeaseIdV1, RuntimeGatewayReadyKindV2,
-    RuntimeRecoveryIdV2,
+    RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayOwnerLeaseIdV1,
+    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyKindV2, RuntimeRecoveryIdV2,
 };
 use automation_runtime_convergence::ProcessInstanceId;
-use chrono::{DateTime, Utc};
 
 use super::*;
 use crate::{RuntimeClosedRecoveryAuthorityRevisionV2, RuntimeRegistryGlobalObservationSequenceV2};
@@ -15,9 +14,7 @@ pub struct RuntimeProductionHandoffRequestV2 {
     coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
     recovery_id: RuntimeRecoveryIdV2,
     recovery_authority_revision: RuntimeClosedRecoveryAuthorityRevisionV2,
-    owner_lease_id: RuntimeGatewayOwnerLeaseIdV1,
-    owner_revision: NonZeroU64,
-    owner_expires_at: DateTime<Utc>,
+    owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
     process_instance_id: ProcessInstanceId,
     connection_epoch: NonZeroU64,
     ready_kind: RuntimeGatewayReadyKindV2,
@@ -31,14 +28,12 @@ impl RuntimeProductionHandoffRequestV2 {
     fn from_fixed_point(state: &RuntimeStartupRecoveryFixedPointProcessV2) -> Self {
         let permit = &state.authority.permit;
         let paused = permit.paused_gateway();
-        let owner = permit.owner_receipt();
+        let owner = state.owner_receipt();
         Self {
             coordinator_generation: permit.coordinator_generation(),
             recovery_id: permit.recovery_id().clone(),
             recovery_authority_revision: permit.authority_revision(),
-            owner_lease_id: owner.lease_id.clone(),
-            owner_revision: owner.owner_revision,
-            owner_expires_at: owner.expires_at,
+            owner_receipt: owner.clone(),
             process_instance_id: paused.process_instance_id().clone(),
             connection_epoch: paused.connection_epoch(),
             ready_kind: paused.kind(),
@@ -65,15 +60,15 @@ impl RuntimeProductionHandoffRequestV2 {
     }
 
     pub fn owner_lease_id(&self) -> &RuntimeGatewayOwnerLeaseIdV1 {
-        &self.owner_lease_id
+        &self.owner_receipt.lease_id
     }
 
     pub fn owner_revision(&self) -> NonZeroU64 {
-        self.owner_revision
+        self.owner_receipt.owner_revision
     }
 
-    pub fn owner_expires_at(&self) -> DateTime<Utc> {
-        self.owner_expires_at
+    pub fn owner_receipt(&self) -> &RuntimeGatewayOwnerLeaseReceiptV1 {
+        &self.owner_receipt
     }
 
     pub fn process_instance_id(&self) -> &ProcessInstanceId {
@@ -115,9 +110,7 @@ pub struct RuntimeProductionHandoffObservationInputV2 {
     pub coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
     pub recovery_id: RuntimeRecoveryIdV2,
     pub recovery_authority_revision: RuntimeClosedRecoveryAuthorityRevisionV2,
-    pub owner_lease_id: RuntimeGatewayOwnerLeaseIdV1,
-    pub owner_revision: NonZeroU64,
-    pub owner_expires_at: DateTime<Utc>,
+    pub owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
     pub process_instance_id: ProcessInstanceId,
     pub connection_epoch: NonZeroU64,
     pub paused_admission_revision: NonZeroU64,
@@ -169,9 +162,7 @@ pub struct RuntimeRecoveryResumePermitV2 {
     coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
     recovery_id: RuntimeRecoveryIdV2,
     recovery_authority_revision: RuntimeClosedRecoveryAuthorityRevisionV2,
-    owner_lease_id: RuntimeGatewayOwnerLeaseIdV1,
-    owner_revision: NonZeroU64,
-    owner_expires_at: DateTime<Utc>,
+    owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
     process_instance_id: ProcessInstanceId,
     connection_epoch: NonZeroU64,
     ready_kind: RuntimeGatewayReadyKindV2,
@@ -191,9 +182,7 @@ impl RuntimeRecoveryResumePermitV2 {
             coordinator_generation: request.coordinator_generation,
             recovery_id: request.recovery_id.clone(),
             recovery_authority_revision: request.recovery_authority_revision,
-            owner_lease_id: request.owner_lease_id.clone(),
-            owner_revision: request.owner_revision,
-            owner_expires_at: request.owner_expires_at,
+            owner_receipt: observation.input.owner_receipt.clone(),
             process_instance_id: request.process_instance_id.clone(),
             connection_epoch: request.connection_epoch,
             ready_kind: request.ready_kind,
@@ -218,15 +207,15 @@ impl RuntimeRecoveryResumePermitV2 {
     }
 
     pub fn owner_lease_id(&self) -> &RuntimeGatewayOwnerLeaseIdV1 {
-        &self.owner_lease_id
+        &self.owner_receipt.lease_id
     }
 
     pub fn owner_revision(&self) -> NonZeroU64 {
-        self.owner_revision
+        self.owner_receipt.owner_revision
     }
 
-    pub fn owner_expires_at(&self) -> DateTime<Utc> {
-        self.owner_expires_at
+    pub fn owner_receipt(&self) -> &RuntimeGatewayOwnerLeaseReceiptV1 {
+        &self.owner_receipt
     }
 
     pub fn process_instance_id(&self) -> &ProcessInstanceId {
@@ -348,9 +337,6 @@ fn validate_handoff(
     if observed.coordinator_generation != request.coordinator_generation
         || observed.recovery_id != request.recovery_id
         || observed.recovery_authority_revision != request.recovery_authority_revision
-        || observed.owner_lease_id != request.owner_lease_id
-        || observed.owner_revision != request.owner_revision
-        || observed.owner_expires_at != request.owner_expires_at
         || observed.process_instance_id != request.process_instance_id
         || observed.connection_epoch != request.connection_epoch
         || observed.paused_admission_revision != request.paused_admission_revision
@@ -359,6 +345,12 @@ fn validate_handoff(
         || observed.registry_observation_sequence != request.registry_observation_sequence
     {
         return Err(RuntimeProductionLifecycleErrorV2::HandoffEvidenceMismatch);
+    }
+    if !same_owner(&request.owner_receipt, &observed.owner_receipt)
+        || observed.owner_receipt.database_now < request.owner_receipt.database_now
+        || observed.owner_receipt.database_lease_duration().is_none()
+    {
+        return Err(RuntimeProductionLifecycleErrorV2::OwnerMismatch);
     }
     if !observed.startup_intake_sealed {
         return Err(RuntimeProductionLifecycleErrorV2::StartupIntakeNotSealed);

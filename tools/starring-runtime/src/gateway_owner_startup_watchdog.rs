@@ -20,6 +20,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep_until, timeout_at, Instant as TokioInstant};
 
+use crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2;
 use crate::GatewayOwnerTimingConfigV1;
 
 const SHUTDOWN_COMMAND_CAPACITY: usize = 1;
@@ -84,13 +85,6 @@ impl RuntimeGatewayOwnerStartupCleanupCapV1 {
         Self {
             deadline: Arc::new(Mutex::new(deadline)),
         }
-    }
-
-    fn clear(&self) {
-        *self
-            .deadline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     fn limit(&self, candidate: TokioInstant) -> TokioInstant {
@@ -332,7 +326,6 @@ struct RuntimeGatewayOwnerSupervisorHandleV1 {
     invalidation: Arc<RuntimeGatewayOwnerInvalidationLatchV1>,
     gateway_lifetime: Arc<AtomicBool>,
     task: Option<tokio::task::JoinHandle<()>>,
-    startup_cleanup_cap: RuntimeGatewayOwnerStartupCleanupCapV1,
 }
 
 impl Drop for RuntimeGatewayOwnerSupervisorHandleV1 {
@@ -342,10 +335,6 @@ impl Drop for RuntimeGatewayOwnerSupervisorHandleV1 {
 }
 
 impl RuntimeGatewayOwnerSupervisorHandleV1 {
-    fn clear_startup_cleanup_deadline(&self) {
-        self.startup_cleanup_cap.clear();
-    }
-
     fn is_bound_to_gateway_lifetime_v2(&self, expected: &Arc<AtomicBool>) -> bool {
         Arc::ptr_eq(&self.gateway_lifetime, expected)
     }
@@ -385,31 +374,45 @@ impl RuntimeGatewayOwnerSupervisorHandleV1 {
         }
     }
 
-    async fn promote_to_production_v1(
+    async fn enter_admission_frozen_v2(
         &self,
-    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerProductionHandoffErrorV1>
-    {
+        authority: RuntimeGatewayOwnerAdmissionFrozenAuthorityV2,
+    ) -> Result<
+        RuntimeGatewayOwnerCurrentObservationV1,
+        RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2,
+    > {
+        if Instant::now() >= authority.cutoff_v2() {
+            self.invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::DeadlineElapsed);
+        }
+        let cutoff = authority.cutoff_v2();
         let (response, acknowledgement) = oneshot::channel();
         let terminal = self.terminal.clone();
         if self
             .supervisor_commands
-            .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote { response })
+            .send(
+                RuntimeGatewayOwnerSupervisorCommandV1::EnterAdmissionFrozen {
+                    authority,
+                    response,
+                },
+            )
             .await
             .is_err()
         {
-            return Err(wait_for_handoff_terminal_v1(terminal).await);
+            return Err(wait_for_admission_frozen_handoff_terminal_v2(terminal).await);
         }
         match acknowledgement.await {
-            Ok(observation) => {
-                match accept_production_handoff_observation_v1(observation, Instant::now()) {
-                    Ok(observation) => Ok(observation),
-                    Err(error) => {
-                        self.invalidation.invalidate();
-                        Err(error)
-                    }
-                }
+            Ok(Ok(observation))
+                if Instant::now() < cutoff && observation.safety_deadline() > Instant::now() =>
+            {
+                Ok(observation)
             }
-            Err(_) => Err(wait_for_handoff_terminal_v1(terminal).await),
+            Ok(Ok(_)) => {
+                self.invalidation.invalidate();
+                Err(RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::DeadlineElapsed)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(wait_for_admission_frozen_handoff_terminal_v2(terminal).await),
         }
     }
 
@@ -581,17 +584,6 @@ impl RuntimeGatewayOwnerSupervisorHandleV1 {
     }
 }
 
-fn accept_production_handoff_observation_v1(
-    observation: RuntimeGatewayOwnerCurrentObservationV1,
-    observed_at: Instant,
-) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerProductionHandoffErrorV1> {
-    if observation.safety_deadline() > observed_at {
-        Ok(observation)
-    } else {
-        Err(RuntimeGatewayOwnerProductionHandoffErrorV1::SafetyElapsed)
-    }
-}
-
 fn accept_closed_recovery_prepare_observation_v2(
     observation: RuntimeGatewayOwnerCurrentObservationV1,
     observed_at: Instant,
@@ -653,29 +645,6 @@ impl RuntimeGatewayOwnerStartupWatchdogHandleV1 {
         RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
     > {
         self.take_inner().shutdown_until(cleanup_deadline).await
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "production composition follows closed recovery handoff"
-        )
-    )]
-    pub(crate) async fn into_production_v1(
-        mut self,
-        _proof: RuntimeGatewayOwnerProductionHandoffProofV1,
-    ) -> Result<
-        RuntimeGatewayOwnerProductionSupervisorV1,
-        RuntimeGatewayOwnerProductionHandoffErrorV1,
-    > {
-        let handoff_observation = self.inner().promote_to_production_v1().await?;
-        self.inner().clear_startup_cleanup_deadline();
-        let inner = self.take_inner();
-        Ok(RuntimeGatewayOwnerProductionSupervisorV1 {
-            inner: Some(inner),
-            handoff_observation,
-        })
     }
 
     #[cfg(test)]
@@ -859,6 +828,7 @@ impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
         Ok(RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
             inner: Some(inner),
             observation: acknowledged,
+            admission_frozen_handoff: None,
         })
     }
 
@@ -901,6 +871,12 @@ impl RuntimeGatewayOwnerPreparedClosedRecoveryV2 {
 pub(crate) struct RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
     inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
     observation: RuntimeGatewayOwnerCurrentObservationV1,
+    admission_frozen_handoff: Option<RuntimeGatewayOwnerAdmissionFrozenHandoffV2>,
+}
+
+struct RuntimeGatewayOwnerAdmissionFrozenHandoffV2 {
+    observation: RuntimeGatewayOwnerCurrentObservationV1,
+    cutoff: Instant,
 }
 
 impl std::fmt::Debug for RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
@@ -919,6 +895,7 @@ impl RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
         self.inner().terminal_status()
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn terminal_observation_v2(
         &self,
     ) -> impl std::future::Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static
@@ -940,10 +917,43 @@ impl RuntimeGatewayOwnerClosedRecoverySupervisorV2 {
         self.inner().is_bound_to_gateway_lifetime_v2(expected)
     }
 
+    pub(crate) async fn enter_admission_frozen_in_place_v2(
+        &mut self,
+        authority: RuntimeGatewayOwnerAdmissionFrozenAuthorityV2,
+    ) -> Result<(), RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2> {
+        if self.admission_frozen_handoff.is_some() {
+            self.admission_frozen_handoff = None;
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ProtocolViolation);
+        }
+        let cutoff = authority.cutoff_v2();
+        let observation = self.inner().enter_admission_frozen_v2(authority).await?;
+        self.admission_frozen_handoff = Some(RuntimeGatewayOwnerAdmissionFrozenHandoffV2 {
+            observation,
+            cutoff,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn try_into_admission_frozen_v2(
+        mut self,
+    ) -> Result<RuntimeGatewayOwnerAdmissionFrozenSupervisorV2, Box<Self>> {
+        let Some(handoff) = self.admission_frozen_handoff.take() else {
+            return Err(Box::new(self));
+        };
+        let inner = self.take_inner();
+        Ok(RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
+            inner: Some(inner),
+            handoff_observation: handoff.observation,
+            handoff_cutoff: handoff.cutoff,
+        })
+    }
+
     pub(crate) async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
         self.take_inner().shutdown().await
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) async fn abort_and_shutdown_until_v2(
         mut self,
         cleanup_deadline: Instant,
@@ -996,74 +1006,85 @@ pub(crate) enum RuntimeGatewayOwnerClosedRecoveryCommitErrorV2 {
     SupervisorUnavailable,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "production composition follows closed recovery handoff"
-    )
-)]
-pub(crate) struct RuntimeGatewayOwnerProductionHandoffProofV1 {
-    _private: (),
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2 {
+    #[error("runtime gateway owner admission-frozen handoff deadline elapsed")]
+    DeadlineElapsed,
+    #[error("runtime gateway owner admission-frozen handoff found ownership loss")]
+    OwnershipLost,
+    #[error("runtime gateway owner admission-frozen handoff observation is unavailable")]
+    ObservationUnavailable,
+    #[error("runtime gateway owner admission-frozen handoff violated its protocol")]
+    ProtocolViolation,
+    #[error("runtime gateway owner admission-frozen handoff supervisor is unavailable")]
+    SupervisorUnavailable,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "production composition follows closed recovery handoff"
-    )
-)]
-pub(crate) struct RuntimeGatewayOwnerProductionSupervisorV1 {
+pub(crate) struct RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
     inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
     handoff_observation: RuntimeGatewayOwnerCurrentObservationV1,
+    handoff_cutoff: Instant,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "production composition follows closed recovery handoff"
-    )
-)]
-impl RuntimeGatewayOwnerProductionSupervisorV1 {
-    pub(crate) fn handoff_observation(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
+impl RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
+    pub(crate) fn handoff_observation_v2(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
         &self.handoff_observation
     }
 
-    pub(crate) fn terminal_status(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+    pub(crate) fn handoff_cutoff_v2(&self) -> Instant {
+        self.handoff_cutoff
+    }
+
+    pub(crate) fn terminal_status_v2(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
         self.inner().terminal_status()
     }
 
-    pub(crate) async fn wait_terminal(&mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
-        self.inner_mut().wait_terminal().await
-    }
-
-    pub(crate) async fn observe_current_gateway_owner_v1(
+    #[cfg(test)]
+    pub(crate) fn terminal_observation_v2(
         &self,
-    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerCurrentObservationErrorV1>
+    ) -> impl std::future::Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static
     {
-        self.inner().observe_current_gateway_owner_v1().await
+        let mut terminal = self.inner().terminal.clone();
+        async move {
+            loop {
+                if let Some(exit) = *terminal.borrow() {
+                    return exit;
+                }
+                if terminal.changed().await.is_err() {
+                    return RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped;
+                }
+            }
+        }
     }
 
-    pub(crate) async fn shutdown(mut self) -> RuntimeGatewayOwnerStartupWatchdogExitV1 {
-        self.take_inner().shutdown().await
+    pub(crate) async fn abort_and_shutdown_until_v2(
+        mut self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let inner = self.take_inner();
+        inner.invalidation.invalidate();
+        inner.shutdown_until(cleanup_deadline).await
     }
 
     fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
         self.inner
             .as_ref()
-            .expect("gateway owner supervisor handle")
-    }
-
-    fn inner_mut(&mut self) -> &mut RuntimeGatewayOwnerSupervisorHandleV1 {
-        self.inner
-            .as_mut()
-            .expect("gateway owner supervisor handle")
+            .expect("admission-frozen gateway owner supervisor")
     }
 
     fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
-        self.inner.take().expect("gateway owner supervisor handle")
+        self.inner
+            .take()
+            .expect("admission-frozen gateway owner supervisor")
+    }
+}
+
+impl std::fmt::Debug for RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeGatewayOwnerAdmissionFrozenSupervisorV2(<redacted>)")
     }
 }
 
@@ -1072,19 +1093,7 @@ enum RuntimeGatewayOwnerSupervisorRoleV1 {
     Startup,
     PreparedClosedRecovery,
     ClosedRecovery,
-    Production,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum RuntimeGatewayOwnerProductionHandoffErrorV1 {
-    #[error("runtime gateway owner production handoff safety deadline elapsed")]
-    SafetyElapsed,
-    #[error("runtime gateway owner production handoff found ownership loss")]
-    OwnershipLost,
-    #[error("runtime gateway owner production handoff violated its protocol")]
-    ProtocolViolation,
-    #[error("runtime gateway owner production handoff supervisor is unavailable")]
-    SupervisorUnavailable,
+    AdmissionFrozen,
 }
 
 struct RuntimeGatewayOwnerStartupShutdownCommandV1 {
@@ -1101,8 +1110,14 @@ enum RuntimeGatewayOwnerSupervisorCommandV1 {
             >,
         >,
     },
-    Promote {
-        response: oneshot::Sender<RuntimeGatewayOwnerCurrentObservationV1>,
+    EnterAdmissionFrozen {
+        authority: RuntimeGatewayOwnerAdmissionFrozenAuthorityV2,
+        response: oneshot::Sender<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2,
+            >,
+        >,
     },
 }
 
@@ -1148,15 +1163,15 @@ async fn wait_for_observation_terminal_v1(
     }
 }
 
-async fn wait_for_handoff_terminal_v1(
+async fn wait_for_admission_frozen_handoff_terminal_v2(
     mut terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
-) -> RuntimeGatewayOwnerProductionHandoffErrorV1 {
+) -> RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2 {
     loop {
         if let Some(exit) = *terminal.borrow() {
-            return map_terminal_handoff_error_v1(exit);
+            return map_terminal_admission_frozen_handoff_error_v2(exit);
         }
         if terminal.changed().await.is_err() {
-            return RuntimeGatewayOwnerProductionHandoffErrorV1::SupervisorUnavailable;
+            return RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::SupervisorUnavailable;
         }
     }
 }
@@ -1231,24 +1246,24 @@ fn map_terminal_observation_error_v1(
     }
 }
 
-fn map_terminal_handoff_error_v1(
+fn map_terminal_admission_frozen_handoff_error_v2(
     exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
-) -> RuntimeGatewayOwnerProductionHandoffErrorV1 {
+) -> RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2 {
     match exit {
         RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed => {
-            RuntimeGatewayOwnerProductionHandoffErrorV1::SafetyElapsed
+            RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::DeadlineElapsed
         }
         RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost => {
-            RuntimeGatewayOwnerProductionHandoffErrorV1::OwnershipLost
+            RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::OwnershipLost
         }
         RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation => {
-            RuntimeGatewayOwnerProductionHandoffErrorV1::ProtocolViolation
+            RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ProtocolViolation
         }
         RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
         | RuntimeGatewayOwnerStartupWatchdogExitV1::RenewalUnknown
         | RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
         | RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped => {
-            RuntimeGatewayOwnerProductionHandoffErrorV1::SupervisorUnavailable
+            RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::SupervisorUnavailable
         }
     }
 }
@@ -1393,7 +1408,6 @@ where
             invalidation,
             gateway_lifetime,
             task: Some(task),
-            startup_cleanup_cap,
         }),
         prepared_closed_recovery_observation: None,
     })
@@ -1441,6 +1455,7 @@ where
     let lease_id = watchdog.schedule().receipt().lease_id.clone();
     let mut current = Some(watchdog);
     let mut role = RuntimeGatewayOwnerSupervisorRoleV1::Startup;
+    let mut admission_frozen_cutoff = None;
     let mut pending_supervisor_command = None;
     let mut pending_closed_recovery_command = None;
     let mut shutdown_acknowledgement = None;
@@ -1500,9 +1515,28 @@ where
             role,
             RuntimeGatewayOwnerSupervisorRoleV1::PreparedClosedRecovery
                 | RuntimeGatewayOwnerSupervisorRoleV1::ClosedRecovery
+                | RuntimeGatewayOwnerSupervisorRoleV1::AdmissionFrozen
         ) {
             let watchdog = current.take().expect("gateway owner watchdog state");
-            let safety_deadline = watchdog.schedule().safety_deadline();
+            let safety_deadline = if role == RuntimeGatewayOwnerSupervisorRoleV1::AdmissionFrozen {
+                let Some(cutoff) = admission_frozen_cutoff else {
+                    guard.invalidate_now();
+                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                        config.cleanup,
+                    );
+                };
+                watchdog.schedule().safety_deadline().min(cutoff)
+            } else {
+                watchdog.schedule().safety_deadline()
+            };
+            if Instant::now() >= safety_deadline {
+                guard.invalidate_now();
+                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
+                    config.cleanup,
+                );
+            }
             tokio::select! {
                 biased;
                 command = shutdown_commands.recv() => {
@@ -1597,12 +1631,57 @@ where
                             config.cleanup,
                         );
                     };
-                    reject_frozen_supervisor_command_v2(command);
-                    guard.invalidate_now();
-                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
-                        config.cleanup,
-                    );
+                    match command {
+                        RuntimeGatewayOwnerSupervisorCommandV1::EnterAdmissionFrozen {
+                            authority,
+                            response,
+                        } if role == RuntimeGatewayOwnerSupervisorRoleV1::ClosedRecovery => {
+                            match enter_admission_frozen_owner_v2(
+                                &port,
+                                watchdog,
+                                authority,
+                                response,
+                                RuntimeGatewayOwnerAdmissionFrozenActorContextV2 {
+                                    shutdown_commands: &mut shutdown_commands,
+                                    shutdown_acknowledgement: &mut shutdown_acknowledgement,
+                                    guard: &mut guard,
+                                    cleanup: config.cleanup,
+                                },
+                            )
+                            .await
+                            {
+                                RuntimeGatewayOwnerAdmissionFrozenStepV2::Frozen {
+                                    successor,
+                                    observation,
+                                    cutoff,
+                                    response,
+                                } => {
+                                    role = RuntimeGatewayOwnerSupervisorRoleV1::AdmissionFrozen;
+                                    admission_frozen_cutoff = Some(cutoff);
+                                    current = Some(*successor);
+                                    if response.send(Ok(observation)).is_err() {
+                                        guard.invalidate_now();
+                                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                            RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                                            config.cleanup,
+                                        );
+                                    }
+                                }
+                                RuntimeGatewayOwnerAdmissionFrozenStepV2::Stop(stop) => {
+                                    break 'supervisor stop;
+                                }
+                            }
+                            continue 'supervisor;
+                        }
+                        command => {
+                            reject_frozen_supervisor_command_v2(command);
+                            guard.invalidate_now();
+                            break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                config.cleanup,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1740,67 +1819,18 @@ where
                                     }
                                 }
                             }
-                            RuntimeGatewayOwnerSupervisorCommandV1::Promote { response } => {
-                                match shutdown_commands.try_recv() {
-                                    Ok(command) => {
-                                        break 'supervisor receive_shutdown(
-                                            Some(command),
-                                            &mut shutdown_acknowledgement,
-                                            config.cleanup,
-                                        );
-                                    }
-                                    Err(TryRecvError::Disconnected) => {
-                                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                                            RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                                            config.cleanup,
-                                        );
-                                    }
-                                    Err(TryRecvError::Empty) => {}
-                                }
-                                if response.is_closed() {
-                                    guard.invalidate_now();
-                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                                        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                                        config.cleanup,
-                                    );
-                                }
-                                if role != RuntimeGatewayOwnerSupervisorRoleV1::Startup {
-                                    guard.invalidate_now();
-                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
-                                        config.cleanup,
-                                    );
-                                }
-                                match watchdog.action_at(Instant::now()) {
-                                    RuntimeGatewayOwnerWatchdogActionV1::WaitUntil(_) => {}
-                                    RuntimeGatewayOwnerWatchdogActionV1::RenewNow => {
-                                        current = Some(watchdog);
-                                        pending_supervisor_command = Some(
-                                            RuntimeGatewayOwnerSupervisorCommandV1::Promote {
-                                                response,
-                                            },
-                                        );
-                                        continue 'supervisor;
-                                    }
-                                    RuntimeGatewayOwnerWatchdogActionV1::InvalidateNow => {
-                                        guard.invalidate_now();
-                                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                                            RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
-                                            config.cleanup,
-                                        );
-                                    }
-                                }
-                                let projection =
-                                    RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&watchdog);
-                                if response.send(projection).is_err() {
-                                    guard.invalidate_now();
-                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                                        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
-                                        config.cleanup,
-                                    );
-                                }
-                                role = RuntimeGatewayOwnerSupervisorRoleV1::Production;
-                                current = Some(watchdog);
+                            RuntimeGatewayOwnerSupervisorCommandV1::EnterAdmissionFrozen {
+                                response,
+                                ..
+                            } => {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ProtocolViolation,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
                             }
                         }
                     }
@@ -1958,8 +1988,10 @@ fn reject_frozen_supervisor_command_v2(command: RuntimeGatewayOwnerSupervisorCom
                 RuntimeGatewayOwnerCurrentObservationErrorV1::ProtocolViolation,
             ));
         }
-        RuntimeGatewayOwnerSupervisorCommandV1::Promote { response } => {
-            drop(response);
+        RuntimeGatewayOwnerSupervisorCommandV1::EnterAdmissionFrozen { response, .. } => {
+            let _result = response.send(Err(
+                RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ProtocolViolation,
+            ));
         }
     }
 }
@@ -1975,6 +2007,240 @@ fn reject_frozen_closed_recovery_command_v2(command: RuntimeGatewayOwnerClosedRe
             let _result = response.send(Err(
                 RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::ProtocolViolation,
             ));
+        }
+    }
+}
+
+enum RuntimeGatewayOwnerAdmissionFrozenStepV2 {
+    Frozen {
+        successor: Box<RuntimeGatewayOwnerWatchdogV1>,
+        observation: RuntimeGatewayOwnerCurrentObservationV1,
+        cutoff: Instant,
+        response: oneshot::Sender<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2,
+            >,
+        >,
+    },
+    Stop(RuntimeGatewayOwnerStartupWatchdogStopV1),
+}
+
+struct RuntimeGatewayOwnerAdmissionFrozenActorContextV2<'a> {
+    shutdown_commands: &'a mut mpsc::Receiver<RuntimeGatewayOwnerStartupShutdownCommandV1>,
+    shutdown_acknowledgement:
+        &'a mut Option<oneshot::Sender<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
+    guard: &'a mut RuntimeGatewayOwnerStartupWatchdogGuardV1,
+    cleanup: RuntimeGatewayOwnerCleanupBoundV1,
+}
+
+async fn enter_admission_frozen_owner_v2<P>(
+    port: &P,
+    watchdog: RuntimeGatewayOwnerWatchdogV1,
+    authority: RuntimeGatewayOwnerAdmissionFrozenAuthorityV2,
+    mut response: oneshot::Sender<
+        Result<
+            RuntimeGatewayOwnerCurrentObservationV1,
+            RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2,
+        >,
+    >,
+    context: RuntimeGatewayOwnerAdmissionFrozenActorContextV2<'_>,
+) -> RuntimeGatewayOwnerAdmissionFrozenStepV2
+where
+    P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync,
+    P::Error: Send,
+{
+    let RuntimeGatewayOwnerAdmissionFrozenActorContextV2 {
+        shutdown_commands,
+        shutdown_acknowledgement,
+        guard,
+        cleanup,
+    } = context;
+    let now = Instant::now();
+    if now >= authority.cutoff_v2() || !authority.accepts_current_v2(watchdog.schedule().receipt())
+    {
+        return stop_after_admission_frozen_error_v2(
+            response,
+            if now >= authority.cutoff_v2() {
+                RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::DeadlineElapsed
+            } else {
+                RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ProtocolViolation
+            },
+            if now >= authority.cutoff_v2() {
+                RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed
+            } else {
+                RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+            },
+            guard,
+            cleanup,
+        );
+    }
+    let inflight = match watchdog.begin_current_observation(now) {
+        Ok(inflight) => inflight,
+        Err(error) => {
+            return stop_after_admission_frozen_error_v2(
+                response,
+                map_admission_frozen_watchdog_error_v2(error),
+                map_watchdog_error(error),
+                guard,
+                cleanup,
+            );
+        }
+    };
+    let observation_deadline = inflight
+        .previous_schedule()
+        .safety_deadline()
+        .min(authority.cutoff_v2());
+    let request = inflight.request().clone();
+    let observation = port.observe_gateway_owner(request);
+    tokio::pin!(observation);
+    let result = tokio::select! {
+        biased;
+        shutdown = shutdown_commands.recv() => {
+            guard.invalidate_now();
+            let stop = receive_shutdown(
+                shutdown,
+                shutdown_acknowledgement,
+                cleanup,
+            );
+            let _result = response.send(Err(
+                RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::SupervisorUnavailable,
+            ));
+            return RuntimeGatewayOwnerAdmissionFrozenStepV2::Stop(stop);
+        }
+        _ = response.closed() => {
+            guard.invalidate_now();
+            return RuntimeGatewayOwnerAdmissionFrozenStepV2::Stop(
+                RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                    cleanup,
+                ),
+            );
+        }
+        _ = sleep_until(TokioInstant::from_std(observation_deadline)) => {
+            return stop_after_admission_frozen_error_v2(
+                response,
+                RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::DeadlineElapsed,
+                RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
+                guard,
+                cleanup,
+            );
+        }
+        result = &mut observation => result,
+    };
+    let response_observed_at = Instant::now();
+    if response_observed_at >= authority.cutoff_v2() {
+        return stop_after_admission_frozen_error_v2(
+            response,
+            RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::DeadlineElapsed,
+            RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
+            guard,
+            cleanup,
+        );
+    }
+    match result {
+        Ok(observation) => match inflight.complete(observation, response_observed_at) {
+            Ok(RuntimeGatewayOwnerObservationCompletionV1::Current(successor)) => {
+                let observation =
+                    RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&successor);
+                if !authority.accepts_observed_v2(observation.receipt()) {
+                    return stop_after_admission_frozen_error_v2(
+                        response,
+                        RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ProtocolViolation,
+                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                        guard,
+                        cleanup,
+                    );
+                }
+                RuntimeGatewayOwnerAdmissionFrozenStepV2::Frozen {
+                    successor,
+                    observation,
+                    cutoff: authority.cutoff_v2(),
+                    response,
+                }
+            }
+            Ok(RuntimeGatewayOwnerObservationCompletionV1::OwnershipLost(_)) => {
+                stop_after_admission_frozen_error_v2(
+                    response,
+                    RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::OwnershipLost,
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
+                    guard,
+                    cleanup,
+                )
+            }
+            Err(error) => stop_after_admission_frozen_error_v2(
+                response,
+                map_admission_frozen_watchdog_error_v2(error),
+                map_watchdog_error(error),
+                guard,
+                cleanup,
+            ),
+        },
+        Err(error) => match P::classify_observation_error(&error) {
+            RuntimeGatewayOwnerObservationErrorClassV1::Retryable => {
+                stop_after_admission_frozen_error_v2(
+                    response,
+                    RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ObservationUnavailable,
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown,
+                    guard,
+                    cleanup,
+                )
+            }
+            RuntimeGatewayOwnerObservationErrorClassV1::OwnershipLost => {
+                stop_after_admission_frozen_error_v2(
+                    response,
+                    RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::OwnershipLost,
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
+                    guard,
+                    cleanup,
+                )
+            }
+            RuntimeGatewayOwnerObservationErrorClassV1::ProtocolViolation => {
+                stop_after_admission_frozen_error_v2(
+                    response,
+                    RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ProtocolViolation,
+                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                    guard,
+                    cleanup,
+                )
+            }
+        },
+    }
+}
+
+fn stop_after_admission_frozen_error_v2(
+    response: oneshot::Sender<
+        Result<
+            RuntimeGatewayOwnerCurrentObservationV1,
+            RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2,
+        >,
+    >,
+    response_error: RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2,
+    exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
+    guard: &mut RuntimeGatewayOwnerStartupWatchdogGuardV1,
+    cleanup: RuntimeGatewayOwnerCleanupBoundV1,
+) -> RuntimeGatewayOwnerAdmissionFrozenStepV2 {
+    guard.invalidate_now();
+    let _result = response.send(Err(response_error));
+    RuntimeGatewayOwnerAdmissionFrozenStepV2::Stop(RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+        exit, cleanup,
+    ))
+}
+
+fn map_admission_frozen_watchdog_error_v2(
+    error: RuntimeGatewayOwnerWatchdogErrorV1,
+) -> RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2 {
+    match error {
+        RuntimeGatewayOwnerWatchdogErrorV1::SafetyElapsed
+        | RuntimeGatewayOwnerWatchdogErrorV1::Schedule(
+            RuntimeGatewayOwnerRenewalScheduleErrorV1::SafetyElapsed,
+        ) => RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::DeadlineElapsed,
+        RuntimeGatewayOwnerWatchdogErrorV1::ClockReversed
+        | RuntimeGatewayOwnerWatchdogErrorV1::RequestedLeaseTooShort
+        | RuntimeGatewayOwnerWatchdogErrorV1::RevisionExhausted
+        | RuntimeGatewayOwnerWatchdogErrorV1::ProtocolViolation { .. }
+        | RuntimeGatewayOwnerWatchdogErrorV1::Schedule(_) => {
+            RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ProtocolViolation
         }
     }
 }

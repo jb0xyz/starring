@@ -3,7 +3,6 @@ use std::future::{ready, Future};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use automation_runtime_controller::{
@@ -68,7 +67,6 @@ enum FakeObservationStepV1 {
 #[derive(Clone)]
 enum FakeRenewStepV1 {
     Renewed,
-    OwnershipLost,
     BlockedDefinitelyNotApplied(Arc<Notify>),
     Blocked(Arc<Notify>),
 }
@@ -132,18 +130,6 @@ impl FakePortV1 {
         self.state.maximum_active_operations.load(Ordering::Acquire)
     }
 
-    fn active_operations(&self) -> usize {
-        self.state.active_operations.load(Ordering::Acquire)
-    }
-
-    fn block_release(&self, gate: Arc<Notify>) {
-        *self
-            .state
-            .release_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
-    }
-
     fn block_next_observation(&self, gate: Arc<Notify>) {
         *self
             .state
@@ -183,20 +169,6 @@ enum StartupObservationFixtureOutcomeV2 {
 struct PendingStartupObservationGuardV2 {
     active: Arc<AtomicUsize>,
     dropped: Arc<AtomicUsize>,
-}
-
-struct WakeCounterV1 {
-    wakes: AtomicUsize,
-}
-
-impl Wake for WakeCounterV1 {
-    fn wake(self: Arc<Self>) {
-        self.wakes.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.wakes.fetch_add(1, Ordering::AcqRel);
-    }
 }
 
 impl FakeOperationGuardV1 {
@@ -354,14 +326,6 @@ impl RuntimeGatewayOwnerLeasePortV1 for FakePortV1 {
                 .unwrap_or(FakeRenewStepV1::Renewed);
             match step {
                 FakeRenewStepV1::Renewed => Ok(renewed_outcome(&state, request)),
-                FakeRenewStepV1::OwnershipLost => {
-                    Ok(RuntimeRenewGatewayOwnerLeaseOutcomeV1::NotCurrent(
-                        RuntimeGatewayOwnerLeaseObservationV1::Unowned {
-                            gateway_shard_id: request.lease_id.gateway_shard_id,
-                            database_now: at_millis(1_000_001),
-                        },
-                    ))
-                }
                 FakeRenewStepV1::BlockedDefinitelyNotApplied(gate) => {
                     gate.notified().await;
                     Err(RuntimeGatewayOwnerMutationErrorV1::DefinitelyNotApplied {
@@ -1229,10 +1193,6 @@ fn fixture_with_startup_cleanup_deadline(
     (handle, port, invalidated)
 }
 
-fn handoff_proof() -> RuntimeGatewayOwnerProductionHandoffProofV1 {
-    RuntimeGatewayOwnerProductionHandoffProofV1 { _private: () }
-}
-
 async fn wait_for(mut condition: impl FnMut() -> bool) {
     timeout(Duration::from_secs(2), async {
         while !condition() {
@@ -1355,7 +1315,7 @@ async fn initial_pending_recovery_fixture_until_with_registry_and_owner_v2(
     let readiness = crate::database::runtime_database_readiness_for_test_v1();
     let paused_gateway = gateway.observe_paused_connected_gateway_v2().unwrap();
     let pending = crate::closed_recovery::begin_initial_empty_recovery_v2(
-        &gateway,
+        &mut gateway,
         &registry,
         owner,
         RuntimeRecoveryIdV2::parse(recovery_id).unwrap(),
@@ -3593,8 +3553,8 @@ async fn disconnect_during_startup_observation_prevents_authority_advance() {
     assert_eq!(
         error,
         crate::closed_recovery::RuntimeClosedRecoveryStartupObservationErrorV2::Gateway(
-            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
-                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                crate::RuntimeGatewayReadyObservationErrorV1::Stopped,
             ),
         )
     );
@@ -3602,8 +3562,8 @@ async fn disconnect_during_startup_observation_prevents_authority_advance() {
         gateway.closed_snapshot(),
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
             generation,
-            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
-        } if generation.get() == 4
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::TransportDisconnected,
+        } if generation.get() == 3
     ));
     wait_for(|| port.release_calls() == 1).await;
 }
@@ -3632,8 +3592,8 @@ async fn disconnect_after_startup_observation_refuses_the_successor_session() {
     assert_eq!(
         error,
         crate::closed_recovery::RuntimeClosedRecoveryStartupObservationErrorV2::Gateway(
-            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
-                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                crate::RuntimeGatewayReadyObservationErrorV1::Stopped,
             ),
         )
     );
@@ -3641,8 +3601,8 @@ async fn disconnect_after_startup_observation_refuses_the_successor_session() {
         gateway.closed_snapshot(),
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
             generation,
-            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
-        } if generation.get() == 4
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::TransportDisconnected,
+        } if generation.get() == 3
     ));
     wait_for(|| port.release_calls() == 1).await;
 }
@@ -3699,7 +3659,7 @@ async fn prepared_owner_is_bound_to_one_gateway_and_snapshot_guard_blocks_public
     .unwrap();
     let readiness = crate::database::runtime_database_readiness_for_test_v1();
     let mut pending = crate::closed_recovery::begin_initial_empty_recovery_v2(
-        &owner_gateway,
+        &mut owner_gateway,
         &registry,
         prepared,
         RuntimeRecoveryIdV2::parse("0123456789abcdef0123456789abcdef").unwrap(),
@@ -3807,7 +3767,7 @@ async fn initial_recovery_rejects_a_replaced_paused_connection_epoch() {
     .unwrap();
     let readiness = crate::database::runtime_database_readiness_for_test_v1();
     let failure = match crate::closed_recovery::begin_initial_empty_recovery_retained_v2(
-        &gateway,
+        &mut gateway,
         &registry,
         prepared,
         RuntimeRecoveryIdV2::parse("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd").unwrap(),
@@ -3881,7 +3841,7 @@ async fn retained_recovery_begin_deadline_returns_owner_for_bounded_cleanup() {
     .unwrap();
     let readiness = crate::database::runtime_database_readiness_for_test_v1();
     let failure = match crate::closed_recovery::begin_initial_empty_recovery_retained_v2(
-        &gateway,
+        &mut gateway,
         &registry,
         prepared,
         RuntimeRecoveryIdV2::parse("abababababababababababababababab").unwrap(),
@@ -4406,8 +4366,8 @@ async fn post_commit_disconnect_refuses_the_compound_session() {
     assert_eq!(
         error,
         crate::closed_recovery::RuntimeClosedRecoveryCommitErrorV2::Gateway(
-            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
-                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                crate::RuntimeGatewayReadyObservationErrorV1::Stopped,
             ),
         )
     );
@@ -4415,8 +4375,8 @@ async fn post_commit_disconnect_refuses_the_compound_session() {
         gateway.closed_snapshot(),
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
             generation,
-            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
-        } if generation.get() == 4
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::TransportDisconnected,
+        } if generation.get() == 3
     ));
     wait_for(|| port.release_calls() == 1).await;
     assert_eq!(port.renew_calls(), 0);
@@ -4781,8 +4741,8 @@ async fn disconnect_during_readiness_wait_prevents_authority_advance() {
     assert_eq!(
         error,
         crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway(
-            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
-                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                crate::RuntimeGatewayReadyObservationErrorV1::Stopped,
             ),
         )
     );
@@ -4790,8 +4750,8 @@ async fn disconnect_during_readiness_wait_prevents_authority_advance() {
         gateway.closed_snapshot(),
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
             generation,
-            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
-        } if generation.get() == 4
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::TransportDisconnected,
+        } if generation.get() == 3
     ));
     wait_for(|| port.release_calls() == 1).await;
 }
@@ -4845,8 +4805,8 @@ async fn disconnect_after_readiness_advance_refuses_the_successor_session() {
     assert_eq!(
         error,
         crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway(
-            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
-                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                crate::RuntimeGatewayReadyObservationErrorV1::Stopped,
             ),
         )
     );
@@ -4854,33 +4814,10 @@ async fn disconnect_after_readiness_advance_refuses_the_successor_session() {
         gateway.closed_snapshot(),
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
             generation,
-            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
-        } if generation.get() == 4
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::TransportDisconnected,
+        } if generation.get() == 3
     ));
     wait_for(|| port.release_calls() == 1).await;
-}
-
-#[test]
-fn handoff_observation_requires_strict_positive_monotonic_safety() {
-    let observed_at = Instant::now();
-    for safety_deadline in [
-        observed_at.checked_sub(Duration::from_nanos(1)).unwrap(),
-        observed_at,
-    ] {
-        let observation = RuntimeGatewayOwnerCurrentObservationV1 {
-            receipt: receipt(Duration::from_secs(5)),
-            safety_deadline,
-        };
-        assert_eq!(
-            accept_production_handoff_observation_v1(observation, observed_at),
-            Err(RuntimeGatewayOwnerProductionHandoffErrorV1::SafetyElapsed)
-        );
-    }
-    let observation = RuntimeGatewayOwnerCurrentObservationV1 {
-        receipt: receipt(Duration::from_secs(5)),
-        safety_deadline: observed_at.checked_add(Duration::from_nanos(1)).unwrap(),
-    };
-    assert!(accept_production_handoff_observation_v1(observation, observed_at).is_ok());
 }
 
 #[test]
@@ -4926,301 +4863,6 @@ fn closed_recovery_commit_ack_classifies_elapsed_before_protocol_mismatch() {
         ),
         Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::SafetyElapsed)
     );
-}
-
-#[tokio::test]
-async fn production_handoff_keeps_one_actor_and_contiguous_owner_revision() {
-    let (handle, port, invalidated) = fixture(
-        Duration::from_millis(700),
-        Duration::from_millis(500),
-        Duration::from_millis(100),
-        [],
-    );
-
-    let production = handle.into_production_v1(handoff_proof()).await.unwrap();
-
-    assert_eq!(
-        production.handoff_observation().receipt().owner_revision,
-        NonZeroU64::new(3).unwrap()
-    );
-    assert_eq!(port.acquire_calls(), 0);
-    assert_eq!(port.observe_calls(), 0);
-    assert_eq!(port.release_calls(), 0);
-    assert_eq!(production.terminal_status(), None);
-    wait_for(|| port.renew_calls() == 1).await;
-    let observation = production.observe_current_gateway_owner_v1().await.unwrap();
-    assert_eq!(
-        observation.receipt().owner_revision,
-        NonZeroU64::new(4).unwrap()
-    );
-    assert_eq!(port.maximum_active_operations(), 1);
-    assert!(!invalidated.load(Ordering::Acquire));
-    assert_eq!(
-        production.shutdown().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
-    );
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn canceled_after_promotion_ack_retains_the_startup_cleanup_cap() {
-    let cleanup_deadline = Instant::now() + Duration::from_millis(300);
-    let (handle, port, _invalidated) = fixture_with_startup_cleanup_deadline(
-        Duration::from_secs(1),
-        Duration::from_millis(400),
-        Duration::from_millis(100),
-        [],
-        Some(cleanup_deadline),
-    );
-    port.block_release(Arc::new(Notify::new()));
-    let mut handoff = Box::pin(handle.into_production_v1(handoff_proof()));
-    let wake_counter = Arc::new(WakeCounterV1 {
-        wakes: AtomicUsize::new(0),
-    });
-    let waker = Waker::from(wake_counter.clone());
-    let mut context = Context::from_waker(&waker);
-
-    assert!(matches!(handoff.as_mut().poll(&mut context), Poll::Pending));
-    wait_for(|| wake_counter.wakes.load(Ordering::Acquire) != 0).await;
-
-    drop(handoff);
-
-    wait_for(|| port.release_calls() == 1).await;
-    wait_for(|| port.active_operations() == 0).await;
-    assert!(Instant::now() <= cleanup_deadline + Duration::from_millis(100));
-}
-
-#[tokio::test]
-async fn completed_production_handoff_clears_the_startup_cleanup_cap() {
-    let (handle, port, _invalidated) = fixture_with_startup_cleanup_deadline(
-        Duration::from_secs(1),
-        Duration::from_millis(400),
-        Duration::from_millis(100),
-        [],
-        Some(Instant::now() + Duration::from_millis(300)),
-    );
-    let production = handle.into_production_v1(handoff_proof()).await.unwrap();
-
-    sleep(Duration::from_millis(350)).await;
-
-    assert_eq!(
-        production.shutdown().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
-    );
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn handoff_queued_behind_renewal_receives_the_exact_successor() {
-    let gate = Arc::new(Notify::new());
-    let (handle, port, invalidated) = fixture(
-        Duration::from_millis(800),
-        Duration::from_millis(600),
-        Duration::from_millis(100),
-        [FakeRenewStepV1::Blocked(gate.clone())],
-    );
-    wait_for(|| port.renew_calls() == 1).await;
-    let mut handoff = Box::pin(handle.into_production_v1(handoff_proof()));
-
-    tokio::select! {
-        _ = &mut handoff => panic!("handoff completed before renewal"),
-        _ = sleep(Duration::from_millis(20)) => {}
-    }
-    gate.notify_one();
-    let production = handoff.await.unwrap();
-
-    assert_eq!(
-        production.handoff_observation().receipt().owner_revision,
-        NonZeroU64::new(4).unwrap()
-    );
-    assert_eq!(port.acquire_calls(), 0);
-    assert_eq!(port.observe_calls(), 0);
-    assert_eq!(port.release_calls(), 0);
-    assert_eq!(port.maximum_active_operations(), 1);
-    assert!(!invalidated.load(Ordering::Acquire));
-    assert_eq!(
-        production.shutdown().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
-    );
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn canceled_handoff_invalidates_synchronously_and_releases_once() {
-    let gate = Arc::new(Notify::new());
-    let (handle, port, invalidated) = fixture(
-        Duration::from_millis(800),
-        Duration::from_millis(600),
-        Duration::from_millis(100),
-        [FakeRenewStepV1::Blocked(gate.clone())],
-    );
-    wait_for(|| port.renew_calls() == 1).await;
-    let mut handoff = Box::pin(handle.into_production_v1(handoff_proof()));
-    tokio::select! {
-        _ = &mut handoff => panic!("blocked handoff completed"),
-        _ = sleep(Duration::from_millis(20)) => {}
-    }
-
-    drop(handoff);
-
-    assert!(invalidated.load(Ordering::Acquire));
-    gate.notify_one();
-    wait_for(|| port.release_calls() == 1).await;
-    assert_eq!(port.acquire_calls(), 0);
-    assert_eq!(port.maximum_active_operations(), 1);
-}
-
-#[tokio::test]
-async fn lost_handoff_acknowledgement_invalidates_and_stops_the_actor() {
-    let (mut handle, port, invalidated) = fixture(
-        Duration::from_secs(5),
-        Duration::from_secs(2),
-        Duration::from_millis(500),
-        [],
-    );
-    let (response, acknowledgement) = oneshot::channel();
-    drop(acknowledgement);
-    handle
-        .inner()
-        .supervisor_commands
-        .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote { response })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        handle.wait_terminal().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
-    );
-    assert!(invalidated.load(Ordering::Acquire));
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn dropping_startup_after_actor_ack_invalidates_the_promoted_actor() {
-    let (handle, port, invalidated) = fixture(
-        Duration::from_secs(5),
-        Duration::from_secs(2),
-        Duration::from_millis(500),
-        [],
-    );
-    let (response, acknowledgement) = oneshot::channel();
-    handle
-        .inner()
-        .supervisor_commands
-        .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote { response })
-        .await
-        .unwrap();
-    assert_eq!(
-        acknowledgement.await.unwrap().receipt().owner_revision,
-        NonZeroU64::new(3).unwrap()
-    );
-    assert!(!invalidated.load(Ordering::Acquire));
-
-    drop(handle);
-
-    assert!(invalidated.load(Ordering::Acquire));
-    wait_for(|| port.release_calls() == 1).await;
-}
-
-#[tokio::test]
-async fn duplicate_private_handoff_is_a_terminal_protocol_violation() {
-    let (mut handle, port, invalidated) = fixture(
-        Duration::from_secs(5),
-        Duration::from_secs(2),
-        Duration::from_millis(500),
-        [],
-    );
-    let commands = handle.inner().supervisor_commands.clone();
-    let (first_response, first_acknowledgement) = oneshot::channel();
-    commands
-        .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote {
-            response: first_response,
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        first_acknowledgement
-            .await
-            .unwrap()
-            .receipt()
-            .owner_revision,
-        NonZeroU64::new(3).unwrap()
-    );
-    let (second_response, second_acknowledgement) = oneshot::channel();
-    commands
-        .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote {
-            response: second_response,
-        })
-        .await
-        .unwrap();
-
-    assert!(second_acknowledgement.await.is_err());
-    assert_eq!(
-        handle.wait_terminal().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
-    );
-    assert!(invalidated.load(Ordering::Acquire));
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn dropping_production_invalidates_synchronously_and_releases_once() {
-    let (handle, port, invalidated) = fixture(
-        Duration::from_secs(5),
-        Duration::from_secs(2),
-        Duration::from_millis(500),
-        [],
-    );
-    let production = handle.into_production_v1(handoff_proof()).await.unwrap();
-
-    drop(production);
-
-    assert!(invalidated.load(Ordering::Acquire));
-    wait_for(|| port.release_calls() == 1).await;
-}
-
-#[tokio::test]
-async fn shutdown_queued_with_handoff_wins_before_production_transition() {
-    let gate = Arc::new(Notify::new());
-    let (mut handle, port, invalidated) = fixture(
-        Duration::from_millis(800),
-        Duration::from_millis(600),
-        Duration::from_millis(100),
-        [FakeRenewStepV1::Blocked(gate.clone())],
-    );
-    wait_for(|| port.renew_calls() == 1).await;
-    let (promotion_response, promotion_acknowledgement) = oneshot::channel();
-    handle
-        .inner()
-        .supervisor_commands
-        .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote {
-            response: promotion_response,
-        })
-        .await
-        .unwrap();
-    let (shutdown_response, shutdown_acknowledgement) = oneshot::channel();
-    handle
-        .inner()
-        .shutdown_commands
-        .send(RuntimeGatewayOwnerStartupShutdownCommandV1 {
-            response: shutdown_response,
-            cleanup_deadline: None,
-        })
-        .await
-        .unwrap();
-    gate.notify_one();
-
-    assert_eq!(
-        shutdown_acknowledgement.await.unwrap(),
-        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
-    );
-    assert!(promotion_acknowledgement.await.is_err());
-    assert_eq!(
-        handle.wait_terminal().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
-    );
-    assert!(invalidated.load(Ordering::Acquire));
-    assert_eq!(port.release_calls(), 1);
 }
 
 #[tokio::test]
@@ -5684,6 +5326,200 @@ async fn closed_recovery_commit_rechecks_exact_permit_receipt_and_stays_frozen()
 }
 
 #[tokio::test]
+async fn committed_closed_recovery_freezes_the_exact_owner_without_renewal() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_millis(700),
+        Duration::from_millis(500),
+        Duration::from_millis(100),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let mut closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+    let committed = closed.observation().receipt().clone();
+    let authority =
+        crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::for_test_v2(
+            committed.clone(),
+            Instant::now() + Duration::from_millis(300),
+        );
+
+    closed
+        .enter_admission_frozen_in_place_v2(authority)
+        .await
+        .unwrap();
+    let frozen = closed.try_into_admission_frozen_v2().unwrap();
+
+    assert_eq!(frozen.handoff_observation_v2().receipt(), &committed);
+    assert_eq!(port.observe_calls(), 2);
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(port.acquire_calls(), 0);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        frozen
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn admission_frozen_rejects_a_strict_owner_revision_successor() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_millis(700),
+        Duration::from_millis(500),
+        Duration::from_millis(100),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let mut closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+    let committed = closed.observation().receipt().clone();
+    {
+        let mut receipt = port
+            .state
+            .receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        receipt.owner_revision =
+            NonZeroU64::new(receipt.owner_revision.get().saturating_add(1)).unwrap();
+        receipt.expires_at += TimeDelta::milliseconds(100);
+    }
+    let authority =
+        crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::for_test_v2(
+            committed,
+            Instant::now() + Duration::from_millis(300),
+        );
+
+    assert_eq!(
+        closed.enter_admission_frozen_in_place_v2(authority).await,
+        Err(RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ProtocolViolation)
+    );
+    assert_eq!(
+        closed.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert_eq!(port.renew_calls(), 0);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn admission_frozen_keeps_the_startup_cutoff_and_cancellation_fails_closed() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_secs(2),
+        Duration::from_millis(900),
+        Duration::from_millis(100),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let mut closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+    let committed = closed.observation().receipt().clone();
+    let gate = Arc::new(Notify::new());
+    port.block_next_observation(gate.clone());
+    let authority =
+        crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::for_test_v2(
+            committed,
+            Instant::now() + Duration::from_millis(400),
+        );
+    let mut handoff = Box::pin(closed.enter_admission_frozen_in_place_v2(authority));
+    tokio::select! {
+        biased;
+        result = &mut handoff => panic!("unexpected admission-frozen result: {result:?}"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+    wait_for(|| port.observe_calls() == 2).await;
+    drop(handoff);
+    gate.notify_waiters();
+
+    assert_eq!(
+        closed.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.renew_calls(), 0);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+
+    let (handle, port, invalidated) = fixture(
+        Duration::from_secs(2),
+        Duration::from_millis(900),
+        Duration::from_millis(100),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let mut closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+    let committed = closed.observation().receipt().clone();
+    let cutoff = Instant::now() + Duration::from_millis(80);
+    let authority =
+        crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::for_test_v2(
+            committed, cutoff,
+        );
+    closed
+        .enter_admission_frozen_in_place_v2(authority)
+        .await
+        .unwrap();
+    let frozen = closed.try_into_admission_frozen_v2().unwrap();
+    assert_eq!(frozen.handoff_cutoff_v2(), cutoff);
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed
+    );
+    assert_eq!(port.renew_calls(), 0);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn admission_frozen_cleanup_remains_bounded_by_the_original_startup_cap() {
+    let startup_cleanup_deadline = Instant::now() + Duration::from_millis(250);
+    let (handle, port, invalidated) = fixture_with_startup_cleanup_deadline(
+        Duration::from_secs(2),
+        Duration::from_millis(900),
+        Duration::from_millis(100),
+        [],
+        Some(startup_cleanup_deadline),
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let mut closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+    let authority =
+        crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::for_test_v2(
+            closed.observation().receipt().clone(),
+            Instant::now() + Duration::from_secs(1),
+        );
+    closed
+        .enter_admission_frozen_in_place_v2(authority)
+        .await
+        .unwrap();
+    let frozen = closed.try_into_admission_frozen_v2().unwrap();
+    *port
+        .state
+        .release_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(Notify::new()));
+
+    let exit = timeout(
+        Duration::from_millis(700),
+        frozen.abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(2)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        exit,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
+    );
+    assert!(Instant::now() >= startup_cleanup_deadline);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
 async fn closed_recovery_commit_rejects_mismatched_permit_and_invalidates() {
     let (handle, port, invalidated) = fixture(
         Duration::from_secs(5),
@@ -5804,51 +5640,5 @@ async fn committed_closed_recovery_never_renews_and_expires_fail_closed() {
 
     assert_eq!(port.renew_calls(), 0);
     drop(closed);
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn safety_deadline_wins_over_handoff_queued_behind_renewal() {
-    let gate = Arc::new(Notify::new());
-    let (mut handle, port, invalidated) = fixture(
-        Duration::from_millis(400),
-        Duration::from_millis(300),
-        Duration::from_millis(100),
-        [FakeRenewStepV1::Blocked(gate.clone())],
-    );
-    wait_for(|| port.renew_calls() == 1).await;
-    let (response, acknowledgement) = oneshot::channel();
-    handle
-        .inner()
-        .supervisor_commands
-        .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote { response })
-        .await
-        .unwrap();
-    wait_for(|| invalidated.load(Ordering::Acquire)).await;
-    gate.notify_one();
-
-    assert!(acknowledgement.await.is_err());
-    assert_eq!(
-        handle.wait_terminal().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed
-    );
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn production_wait_reports_ownership_loss_from_the_same_actor() {
-    let (handle, port, invalidated) = fixture(
-        Duration::from_millis(700),
-        Duration::from_millis(500),
-        Duration::from_millis(100),
-        [FakeRenewStepV1::OwnershipLost],
-    );
-    let mut production = handle.into_production_v1(handoff_proof()).await.unwrap();
-
-    assert_eq!(
-        production.wait_terminal().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost
-    );
-    assert!(invalidated.load(Ordering::Acquire));
     assert_eq!(port.release_calls(), 1);
 }

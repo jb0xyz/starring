@@ -174,6 +174,29 @@ struct HandoffPort {
     settled: bool,
 }
 
+fn handoff_observation(
+    request: &RuntimeProductionHandoffRequestV2,
+    owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+    settled: bool,
+) -> RuntimeProductionHandoffObservationV2 {
+    RuntimeProductionHandoffObservationV2::new(RuntimeProductionHandoffObservationInputV2 {
+        coordinator_generation: request.coordinator_generation(),
+        recovery_id: request.recovery_id().clone(),
+        recovery_authority_revision: request.recovery_authority_revision(),
+        owner_receipt,
+        process_instance_id: request.process_instance_id().clone(),
+        connection_epoch: request.connection_epoch(),
+        paused_admission_revision: request.paused_admission_revision(),
+        connected_event_sequence: request.connected_event_sequence(),
+        pause_sequence: request.pause_sequence(),
+        registry_observation_sequence: request.registry_observation_sequence(),
+        finalizer_generation: RuntimeMutationFinalizerGenerationV1::new(non_zero(9)).unwrap(),
+        startup_intake_sealed: true,
+        startup_jobs_settled: settled,
+        supervisors_started: true,
+    })
+}
+
 impl RuntimeProductionHandoffObservationPortV2 for HandoffPort {
     type Error = TestPortError;
 
@@ -184,27 +207,32 @@ impl RuntimeProductionHandoffObservationPortV2 for HandoffPort {
         if self.fail {
             return Err(TestPortError::Unavailable);
         }
-        Ok(RuntimeProductionHandoffObservationV2::new(
-            RuntimeProductionHandoffObservationInputV2 {
-                coordinator_generation: request.coordinator_generation(),
-                recovery_id: request.recovery_id().clone(),
-                recovery_authority_revision: request.recovery_authority_revision(),
-                owner_lease_id: request.owner_lease_id().clone(),
-                owner_revision: request.owner_revision(),
-                owner_expires_at: request.owner_expires_at(),
-                process_instance_id: request.process_instance_id().clone(),
-                connection_epoch: request.connection_epoch(),
-                paused_admission_revision: request.paused_admission_revision(),
-                connected_event_sequence: request.connected_event_sequence(),
-                pause_sequence: request.pause_sequence(),
-                registry_observation_sequence: request.registry_observation_sequence(),
-                finalizer_generation: RuntimeMutationFinalizerGenerationV1::new(non_zero(9))
-                    .unwrap(),
-                startup_intake_sealed: true,
-                startup_jobs_settled: self.settled,
-                supervisors_started: true,
-            },
+        Ok(handoff_observation(
+            request,
+            request.owner_receipt().clone(),
+            self.settled,
         ))
+    }
+}
+
+struct RenewedOwnerHandoffPort {
+    revision: u64,
+    database_now: i64,
+    expires_at: i64,
+}
+
+impl RuntimeProductionHandoffObservationPortV2 for RenewedOwnerHandoffPort {
+    type Error = TestPortError;
+
+    fn observe_production_handoff(
+        &self,
+        request: &RuntimeProductionHandoffRequestV2,
+    ) -> Result<RuntimeProductionHandoffObservationV2, Self::Error> {
+        let mut receipt = request.owner_receipt().clone();
+        receipt.owner_revision = non_zero(self.revision);
+        receipt.database_now = at(self.database_now);
+        receipt.expires_at = at(self.expires_at);
+        Ok(handoff_observation(request, receipt, true))
     }
 }
 
@@ -225,6 +253,12 @@ enum ResumeDrift {
     ConnectionEpoch,
     NotExplicitlyResumed,
     WriterFenceClosed,
+    OwnerRenewed,
+    OwnerRevisionRegressed,
+    OwnerClockRegressed,
+    OwnerSameRevisionExpiryChanged,
+    OwnerRenewalExpiryRegressed,
+    OwnerLeaseChanged,
 }
 
 struct ResumePort {
@@ -256,6 +290,31 @@ impl RuntimeRecoveryResumePortV2 for ResumePort {
         } else {
             sequence(6)
         };
+        let mut current_owner = owner(250);
+        match self.drift {
+            ResumeDrift::OwnerRenewed => {
+                current_owner.owner_revision = non_zero(9);
+                current_owner.expires_at = at(1_100);
+            }
+            ResumeDrift::OwnerRevisionRegressed => {
+                current_owner.owner_revision = non_zero(7);
+            }
+            ResumeDrift::OwnerClockRegressed => {
+                current_owner.database_now = at(209);
+            }
+            ResumeDrift::OwnerSameRevisionExpiryChanged => {
+                current_owner.expires_at = at(1_100);
+            }
+            ResumeDrift::OwnerRenewalExpiryRegressed => {
+                current_owner.owner_revision = non_zero(9);
+                current_owner.expires_at = at(900);
+            }
+            ResumeDrift::OwnerLeaseChanged => {
+                current_owner.lease_id.gateway_shard_id =
+                    GatewayShardIdV1::parse("shard:1").unwrap();
+            }
+            _ => {}
+        }
         Ok(RuntimeRecoveryResumeObservationV2::new(
             RuntimeRecoveryResumeObservationInputV2 {
                 coordinator_generation: permit.coordinator_generation(),
@@ -266,7 +325,7 @@ impl RuntimeRecoveryResumePortV2 for ResumePort {
                 paused_admission_revision,
                 connected_event_sequence: permit.connected_event_sequence(),
                 pause_sequence: permit.pause_sequence(),
-                owner_receipt: owner(250),
+                owner_receipt: current_owner,
                 readiness: readiness(200),
                 registry_observation_sequence: permit.registry_observation_sequence(),
                 finalizer_generation: permit.finalizer_generation(),
@@ -834,6 +893,64 @@ fn fixed_point_and_port_failures_return_all_unconsumed_authority() {
 }
 
 #[test]
+fn production_handoff_requires_exact_owner_identity_with_a_monotonic_database_clock() {
+    let handoff = fixed_point()
+        .begin_production_handoff(&RenewedOwnerHandoffPort {
+            revision: 8,
+            database_now: 211,
+            expires_at: 1_000,
+        })
+        .unwrap();
+    let current = handoff.recovery_resume_permit().owner_receipt();
+    assert_eq!(current.owner_revision, non_zero(8));
+    assert_eq!(current.database_now, at(211));
+    assert_eq!(current.expires_at, at(1_000));
+
+    for port in [
+        RenewedOwnerHandoffPort {
+            revision: 7,
+            database_now: 211,
+            expires_at: 1_100,
+        },
+        RenewedOwnerHandoffPort {
+            revision: 8,
+            database_now: 209,
+            expires_at: 1_000,
+        },
+        RenewedOwnerHandoffPort {
+            revision: 8,
+            database_now: 211,
+            expires_at: 1_100,
+        },
+        RenewedOwnerHandoffPort {
+            revision: 9,
+            database_now: 211,
+            expires_at: 1_100,
+        },
+        RenewedOwnerHandoffPort {
+            revision: 9,
+            database_now: 211,
+            expires_at: 900,
+        },
+        RenewedOwnerHandoffPort {
+            revision: 9,
+            database_now: 1_100,
+            expires_at: 1_100,
+        },
+    ] {
+        let failure = fixed_point().begin_production_handoff(&port).unwrap_err();
+        assert_eq!(
+            failure.contract_error(),
+            Some(RuntimeProductionLifecycleErrorV2::OwnerMismatch)
+        );
+        assert_eq!(
+            failure.into_state().stage(),
+            RuntimeProductionLifecycleStageV2::FixedPoint
+        );
+    }
+}
+
+#[test]
 fn stale_pause_token_and_reconnect_evidence_never_enter_admission() {
     let failure = handoff()
         .resume_recovery(&ResumePort {
@@ -888,6 +1005,40 @@ fn stale_pause_token_and_reconnect_evidence_never_enter_admission() {
         failure.contract_error(),
         Some(RuntimeProductionLifecycleErrorV2::WriterFenceMismatch)
     );
+}
+
+#[test]
+fn recovery_resume_rejects_every_owner_identity_drift_after_freeze() {
+    let admission = handoff()
+        .resume_recovery(&ResumePort {
+            drift: ResumeDrift::None,
+        })
+        .unwrap();
+    assert_eq!(
+        admission.stage(),
+        RuntimeProductionLifecycleStageV2::AdmissionAcknowledging
+    );
+
+    for drift in [
+        ResumeDrift::OwnerRenewed,
+        ResumeDrift::OwnerRevisionRegressed,
+        ResumeDrift::OwnerClockRegressed,
+        ResumeDrift::OwnerSameRevisionExpiryChanged,
+        ResumeDrift::OwnerRenewalExpiryRegressed,
+        ResumeDrift::OwnerLeaseChanged,
+    ] {
+        let failure = handoff()
+            .resume_recovery(&ResumePort { drift })
+            .unwrap_err();
+        assert_eq!(
+            failure.contract_error(),
+            Some(RuntimeProductionLifecycleErrorV2::OwnerMismatch)
+        );
+        assert_eq!(
+            failure.into_state().stage(),
+            RuntimeProductionLifecycleStageV2::ProductionHandoff
+        );
+    }
 }
 
 #[test]
