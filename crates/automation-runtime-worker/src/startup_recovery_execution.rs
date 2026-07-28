@@ -248,6 +248,13 @@ impl RuntimeAuthorizedStartupRecoveryExecutionV2 {
         crate::startup_pending_drain::authorize_pending_drain_selection_v3(self)
     }
 
+    pub fn into_pending_drain_selection_v4(
+        self,
+    ) -> Result<crate::RuntimeAuthorizedPendingDrainSelectionV4, crate::RuntimePendingDrainV4Error>
+    {
+        crate::startup_pending_drain::authorize_pending_drain_selection_v4(self)
+    }
+
     pub(crate) fn complete_pending_drain(
         self,
         receipt: RuntimeStartupRecoveryExecutionReceiptV2,
@@ -260,6 +267,13 @@ impl RuntimeAuthorizedStartupRecoveryExecutionV2 {
             pending_drain_proof: Some(proof),
             pending_registry_successor: registry_successor,
         }
+    }
+}
+
+impl RuntimeStartupRecoveryExecutionCorrelationV2 {
+    pub(crate) fn replace_authority_revision_for_v4(&mut self, authority_revision: NonZeroU64) {
+        self.selection_authority_revision = self.authority_revision;
+        self.authority_revision = authority_revision;
     }
 }
 

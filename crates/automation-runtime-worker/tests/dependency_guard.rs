@@ -64,6 +64,12 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/registry_recovery.rs"),
             PathBuf::from("src/startup_pending_drain/v3/tests.rs"),
             PathBuf::from("src/startup_pending_drain/v3.rs"),
+            PathBuf::from("src/startup_pending_drain/v4/mutation.rs"),
+            PathBuf::from("src/startup_pending_drain/v4/orchestration.rs"),
+            PathBuf::from("src/startup_pending_drain/v4/selection.rs"),
+            PathBuf::from("src/startup_pending_drain/v4/terminal.rs"),
+            PathBuf::from("src/startup_pending_drain/v4/tests.rs"),
+            PathBuf::from("src/startup_pending_drain/v4.rs"),
             PathBuf::from("src/startup_pending_drain.rs"),
             PathBuf::from("src/startup_recovery.rs"),
             PathBuf::from("src/startup_recovery_execution.rs"),
@@ -1425,6 +1431,195 @@ fn pending_drain_v3_succession_authority_is_linear_compact_and_outcome_bound() {
     assert!(parent.contains("Self::Deferred(proof)"));
     assert!(parent.contains("Self::Succession(proof)"));
     assert!(execution.contains("|| !proof.matches_outcome(&receipt.outcome)"));
+}
+
+#[test]
+fn pending_drain_v4_authority_is_linear_and_ports_require_checked_receipts() {
+    let model = include_str!("../src/startup_pending_drain/v4.rs");
+    let mutation = include_str!("../src/startup_pending_drain/v4/mutation.rs");
+    let orchestration = include_str!("../src/startup_pending_drain/v4/orchestration.rs");
+    let selection = include_str!("../src/startup_pending_drain/v4/selection.rs");
+    let terminal = include_str!("../src/startup_pending_drain/v4/terminal.rs");
+    let source = format!("{model}\n{selection}\n{mutation}\n{terminal}\n{orchestration}");
+    assert!(model.lines().count() < 900);
+    for required in [
+        "RuntimePendingDrainCandidateEvidenceInputV4",
+        "RuntimePendingDrainSelectionClassV4",
+        "RuntimeAuthorizedPendingDrainSelectionV4",
+    ] {
+        assert!(selection.contains(required), "{required}");
+    }
+    for forbidden in [
+        "RuntimePendingDrainMutationReceiptV4",
+        "RuntimePendingDrainTerminalIdentityV4",
+        "RuntimePendingDrainRegistryTransitionPortV4",
+    ] {
+        assert!(!selection.contains(forbidden), "{forbidden}");
+    }
+    for required in [
+        "RuntimePendingDrainActionIdentityV4",
+        "RuntimeRoutedSealedWitnessV4",
+        "RuntimeDurableRoutedClaimReceiptV4",
+        "RuntimeDurableRefenceReceiptV4",
+    ] {
+        assert!(mutation.contains(required), "{required}");
+    }
+    for required in [
+        "RuntimePendingDrainTerminalIdentityV4",
+        "RuntimePendingDrainUnknownResultV4",
+        "RuntimePendingDrainFinalizerRegistrationV4",
+    ] {
+        assert!(terminal.contains(required), "{required}");
+    }
+    for required in [
+        "RuntimePendingDrainRegistryTransitionPortV4",
+        "RuntimeRoutedDrainClaimExecutionPortV4",
+        "RuntimePreviousProcessDrainTeardownExecutionPortV4",
+    ] {
+        assert!(orchestration.contains(required), "{required}");
+    }
+    for authority in [
+        "RuntimeAuthorizedPendingDrainSelectionV4",
+        "RuntimeSelectedUnclaimedPendingDrainV4",
+        "RuntimeSelectedCurrentRouteAbsentClaimedV4",
+        "RuntimeSelectedCurrentRoutedClaimedV4",
+        "RuntimeSelectedCurrentRefencedV4",
+        "RuntimeReconstructedDurablyRefencedV4",
+        "RuntimeAuthorizedRoutedDrainClaimV4",
+        "RuntimeAuthorizedDrainRefenceProgressV4",
+        "RuntimeAuthorizedSameProcessDrainAcknowledgementV4",
+        "RuntimeAuthorizedPreviousProcessDrainTeardownV4",
+        "RuntimeDurableRoutedClaimReceiptV4",
+        "RuntimeDurableRefenceReceiptV4",
+        "RuntimeDurableSameProcessDrainAcknowledgementV4",
+        "RuntimeDurablePreviousProcessDrainTeardownV4",
+        "RuntimeRoutedDrainRollbackPermitV4",
+        "RuntimeRoutedSealedClaimV4",
+        "RuntimeDurableRoutedClaimBoundaryV4",
+        "RuntimeRoutedDrainRollbackAuthorizationV4",
+        "RuntimeRoutedClaimedContinuationV4",
+        "RuntimePendingDrainLaneJoinedV4",
+        "RuntimePendingDrainServingResolvedV4",
+        "RuntimeAuthorizedRegistryRefenceV4",
+        "RuntimeLocalRefenceProgressV4",
+        "RuntimeDurableRefenceBoundaryV4",
+        "RuntimeDurablyRefencedBoundaryV4",
+        "RuntimeRouteAbsentAcknowledgementV4",
+        "RuntimeDurableSameProcessAcknowledgementBoundaryV4",
+        "RuntimePreviousProcessTeardownV4",
+        "RuntimeDurablePreviousProcessTeardownBoundaryV4",
+    ] {
+        let marker = format!("pub struct {authority}");
+        let start = source.find(&marker).unwrap();
+        let attributes = source[..start].rsplit_once("\n\n").unwrap().1;
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!attributes.contains(forbidden), "{authority}: {forbidden}");
+            assert!(!implements_trait(&source, authority, forbidden));
+        }
+        let declaration = &source[start + marker.len()..];
+        let fields = declaration
+            .split_once('{')
+            .and_then(|(_, value)| value.split("\n}\n\n").next())
+            .unwrap();
+        assert!(!fields.contains("pub "), "{authority}");
+        assert!(source.contains(&format!("{authority}(<redacted>)")));
+    }
+
+    let registry = orchestration
+        .split("pub trait RuntimePendingDrainRegistryTransitionPortV4 {")
+        .nth(1)
+        .and_then(|value| value.split("\n}\n\n").next())
+        .unwrap();
+    for required in [
+        "RuntimeRoutedSealPortObservationV4",
+        "RuntimeRoutedClaimedSealPortObservationV4",
+        "RuntimeLocalRefencePortObservationV4",
+        "RuntimeDurableRefencePortObservationV4",
+        "RuntimeRouteAbsentPortObservationV4",
+        "RuntimeEmptySuccessionPortObservationV4",
+        "RuntimeAuthorizedRegistryRefenceEvidenceV4",
+        "RuntimeSelectedExpiredPreviousOwnerV4",
+        "RuntimeDurableRoutedClaimReceiptV4",
+        "RuntimeDurableRefenceReceiptV4",
+        "RuntimeDurableSameProcessDrainAcknowledgementV4",
+        "RuntimeDurablePreviousProcessDrainTeardownV4",
+    ] {
+        assert!(registry.contains(required), "{required}");
+    }
+    for forbidden in [
+        "RuntimePendingDrainEvidenceDigestV4",
+        "[u8; 32]",
+        "RuntimeDrainIntentIdV2",
+        "ProcessInstanceId",
+    ] {
+        assert!(!registry.contains(forbidden), "{forbidden}");
+    }
+
+    let rollback = orchestration
+        .split("pub trait RuntimeRoutedDrainRollbackPortV4 {")
+        .nth(1)
+        .and_then(|value| value.split("\n}\n\n").next())
+        .unwrap();
+    assert!(rollback.contains("source: Self::RoutedSealed"));
+    assert!(rollback.contains("permit: RuntimeRoutedDrainRollbackPermitV4"));
+    for forbidden in [
+        "RuntimePendingDrainEvidenceDigestV4",
+        "[u8; 32]",
+        "RuntimeDrainIntentIdV2",
+        "ProcessInstanceId",
+    ] {
+        assert!(!rollback.contains(forbidden), "{forbidden}");
+    }
+
+    for (port_name, authorization) in [
+        (
+            "RuntimeRoutedDrainClaimExecutionPortV4",
+            "RuntimeRoutedSealedClaimV4",
+        ),
+        (
+            "RuntimeDrainRefenceProgressExecutionPortV4",
+            "RuntimeLocalRefenceProgressV4",
+        ),
+        (
+            "RuntimeSameProcessDrainAcknowledgementExecutionPortV4",
+            "RuntimeRouteAbsentAcknowledgementV4",
+        ),
+        (
+            "RuntimePreviousProcessDrainTeardownExecutionPortV4",
+            "RuntimePreviousProcessTeardownV4",
+        ),
+    ] {
+        let port = orchestration
+            .split(&format!("pub trait {port_name} {{"))
+            .nth(1)
+            .and_then(|value| value.split("\n}\n\n").next())
+            .unwrap();
+        assert!(port.contains("RuntimeRegisteredPendingDrainFinalizerV4<"));
+        assert!(port.contains(authorization));
+        assert!(port.contains("operation_cutoff: Instant"));
+    }
+
+    let root = include_str!("../src/lib.rs");
+    for forbidden in [
+        "RuntimeRoutedSealedWitnessInputV4",
+        "RuntimeRoutedClaimedSealedWitnessInputV4",
+        "RuntimeLocallyRefencedSealedWitnessInputV4",
+        "RuntimeDurablyRefencedSealedWitnessInputV4",
+        "RuntimeRouteAbsentSealedWitnessInputV4",
+        "RuntimeEmptySuccessionSealedWitnessInputV4",
+        "RuntimePendingDrainMutationReceiptInputV4",
+        "RuntimePendingDrainMutationReceiptV4",
+        "RuntimeAuthorizedRoutedDrainClaimV4",
+        "RuntimeAuthorizedDrainRefenceProgressV4",
+        "RuntimeAuthorizedSameProcessDrainAcknowledgementV4",
+        "RuntimeAuthorizedPreviousProcessDrainTeardownV4",
+        "RuntimeRoutedDrainClaimReceiptV4",
+        "RuntimeDrainRefenceProgressReceiptV4",
+        "RuntimeSameProcessDrainAcknowledgementReceiptV4",
+        "RuntimePreviousProcessDrainTeardownReceiptV4",
+    ] {
+        assert!(!contains_identifier(root, forbidden), "{forbidden}");
+    }
 }
 
 #[test]

@@ -19,6 +19,7 @@ use crate::{
 };
 
 mod v3;
+pub(crate) mod v4;
 
 pub(crate) use v3::authorize_pending_drain_selection_v3;
 pub use v3::{
@@ -33,6 +34,7 @@ pub use v3::{
     RuntimePendingDrainSuccessionAcknowledgementReceiptV3, RuntimePendingDrainSuccessionProofV3,
     RuntimeSelectedPendingDrainSuccessionV3,
 };
+pub(crate) use v4::authorize_pending_drain_selection_v4;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct RuntimePendingDrainStateDigestV2([u8; 32]);
