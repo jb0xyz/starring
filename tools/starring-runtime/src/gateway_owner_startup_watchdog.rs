@@ -331,9 +331,11 @@ struct RuntimeGatewayOwnerSupervisorHandleV1 {
     supervisor_commands: mpsc::Sender<RuntimeGatewayOwnerSupervisorCommandV1>,
     closed_recovery_commands: mpsc::Sender<RuntimeGatewayOwnerClosedRecoveryCommandV2>,
     terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
+    current_observation: watch::Receiver<RuntimeGatewayOwnerCurrentObservationV1>,
     invalidation: Arc<RuntimeGatewayOwnerInvalidationLatchV1>,
     gateway_lifetime: Arc<AtomicBool>,
     process_generation: Arc<AtomicU64>,
+    production_generation: Arc<AtomicU64>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -361,6 +363,12 @@ impl RuntimeGatewayOwnerSupervisorHandleV1 {
                 return RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped;
             }
         }
+    }
+
+    fn current_observation_watch_v2(
+        &self,
+    ) -> watch::Receiver<RuntimeGatewayOwnerCurrentObservationV1> {
+        self.current_observation.clone()
     }
 
     async fn observe_current_gateway_owner_v1(
@@ -471,6 +479,58 @@ impl RuntimeGatewayOwnerSupervisorHandleV1 {
                 })
             }
             Err(_) => Err(RuntimeGatewayOwnerProcessActivationErrorV2::SupervisorUnavailable),
+        }
+    }
+
+    async fn start_process_renewal_v2(
+        &self,
+        expected_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+        process_generation: NonZeroU64,
+    ) -> Result<
+        RuntimeGatewayOwnerCurrentObservationV1,
+        RuntimeGatewayOwnerProcessRenewalStartErrorV2,
+    > {
+        let (response, acknowledgement) = oneshot::channel();
+        if self
+            .supervisor_commands
+            .send(
+                RuntimeGatewayOwnerSupervisorCommandV1::StartProcessRenewal {
+                    expected_receipt,
+                    process_generation,
+                    response,
+                },
+            )
+            .await
+            .is_err()
+        {
+            return Err(RuntimeGatewayOwnerProcessRenewalStartErrorV2::SupervisorUnavailable);
+        }
+        self.accept_process_renewal_acknowledgement_v2(process_generation, acknowledgement)
+            .await
+    }
+
+    async fn accept_process_renewal_acknowledgement_v2(
+        &self,
+        process_generation: NonZeroU64,
+        acknowledgement: oneshot::Receiver<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerProcessRenewalStartErrorV2,
+            >,
+        >,
+    ) -> Result<
+        RuntimeGatewayOwnerCurrentObservationV1,
+        RuntimeGatewayOwnerProcessRenewalStartErrorV2,
+    > {
+        match acknowledgement.await {
+            Ok(result) => result,
+            Err(_)
+                if self.production_generation.load(Ordering::Acquire)
+                    == process_generation.get() =>
+            {
+                Ok(self.current_observation.borrow().clone())
+            }
+            Err(_) => Err(RuntimeGatewayOwnerProcessRenewalStartErrorV2::SupervisorUnavailable),
         }
     }
 
@@ -1092,6 +1152,30 @@ pub(crate) enum RuntimeGatewayOwnerProcessActivationErrorV2 {
     SupervisorUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RuntimeGatewayOwnerProcessRenewalStartErrorV2 {
+    #[error("runtime gateway owner process renewal start receipt mismatched")]
+    OwnerReceiptMismatch,
+    #[error("runtime gateway owner process renewal start generation mismatched")]
+    ProcessGenerationMismatch,
+    #[error("runtime gateway owner process renewal start violated its protocol")]
+    ProtocolViolation,
+    #[error("runtime gateway owner process renewal start supervisor is unavailable")]
+    SupervisorUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RuntimeGatewayOwnerStrictSuccessorErrorV2 {
+    #[error("runtime gateway owner strict successor deadline elapsed")]
+    DeadlineElapsed,
+    #[error("runtime gateway owner strict successor found ownership loss")]
+    OwnershipLost,
+    #[error("runtime gateway owner strict successor violated its protocol")]
+    ProtocolViolation,
+    #[error("runtime gateway owner strict successor supervisor is unavailable")]
+    SupervisorUnavailable,
+}
+
 pub(crate) struct RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
     inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
     handoff_observation: RuntimeGatewayOwnerCurrentObservationV1,
@@ -1144,6 +1228,7 @@ impl RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
             inner: Some(self.take_inner()),
             activation_observation: observation,
             process_generation,
+            production_start_observation: None,
         })
     }
 
@@ -1194,6 +1279,7 @@ pub(crate) struct RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
     inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
     activation_observation: RuntimeGatewayOwnerCurrentObservationV1,
     process_generation: NonZeroU64,
+    production_start_observation: Option<RuntimeGatewayOwnerCurrentObservationV1>,
 }
 
 impl RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
@@ -1216,6 +1302,57 @@ impl RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
         self.inner().observe_current_gateway_owner_v1().await
     }
 
+    pub(crate) async fn start_production_renewal_in_place_v2(
+        &mut self,
+    ) -> Result<
+        RuntimeGatewayOwnerCurrentObservationV1,
+        RuntimeGatewayOwnerProcessRenewalStartErrorV2,
+    > {
+        if self.production_start_observation.is_some() {
+            self.production_start_observation = None;
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProtocolViolation);
+        }
+        let observation = self
+            .inner()
+            .start_process_renewal_v2(
+                self.activation_observation.receipt().clone(),
+                self.process_generation,
+            )
+            .await?;
+        if observation.receipt().lease_id != self.activation_observation.receipt().lease_id
+            || observation.receipt().owner_revision
+                < self.activation_observation.receipt().owner_revision
+            || self.inner().production_generation.load(Ordering::Acquire)
+                != self.process_generation.get()
+        {
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProtocolViolation);
+        }
+        self.production_start_observation = Some(observation.clone());
+        Ok(observation)
+    }
+
+    pub(crate) fn try_into_production_v2(
+        mut self,
+    ) -> Result<RuntimeGatewayOwnerProductionSupervisorV2, Self> {
+        let Some(start_observation) = self.production_start_observation.take() else {
+            return Err(self);
+        };
+        if self.inner().production_generation.load(Ordering::Acquire)
+            != self.process_generation.get()
+        {
+            self.inner().invalidation.invalidate();
+            return Err(self);
+        }
+        let process_generation = self.process_generation;
+        Ok(RuntimeGatewayOwnerProductionSupervisorV2 {
+            inner: Some(self.take_inner()),
+            process_generation,
+            start_observation,
+        })
+    }
+
     pub(crate) async fn abort_and_shutdown_until_v2(
         mut self,
         cleanup_deadline: Instant,
@@ -1228,6 +1365,24 @@ impl RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
         inner.shutdown_until(cleanup_deadline).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn terminal_observation_v2(
+        &self,
+    ) -> impl std::future::Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static
+    {
+        let mut terminal = self.inner().terminal.clone();
+        async move {
+            loop {
+                if let Some(exit) = *terminal.borrow() {
+                    return exit;
+                }
+                if terminal.changed().await.is_err() {
+                    return RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped;
+                }
+            }
+        }
+    }
+
     fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
         self.inner
             .as_ref()
@@ -1238,6 +1393,133 @@ impl RuntimeGatewayOwnerProcessFrozenSupervisorV2 {
         self.inner
             .take()
             .expect("process-frozen gateway owner supervisor")
+    }
+}
+
+pub(crate) struct RuntimeGatewayOwnerProductionSupervisorV2 {
+    inner: Option<RuntimeGatewayOwnerSupervisorHandleV1>,
+    process_generation: NonZeroU64,
+    start_observation: RuntimeGatewayOwnerCurrentObservationV1,
+}
+
+impl RuntimeGatewayOwnerProductionSupervisorV2 {
+    pub(crate) fn process_generation_v2(&self) -> NonZeroU64 {
+        self.process_generation
+    }
+
+    pub(crate) fn start_observation_v2(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
+        &self.start_observation
+    }
+
+    pub(crate) fn terminal_status_v2(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.inner().terminal_status()
+    }
+
+    pub(crate) fn terminal_observation_v2(
+        &self,
+    ) -> impl std::future::Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static
+    {
+        let mut terminal = self.inner().terminal.clone();
+        async move {
+            loop {
+                if let Some(exit) = *terminal.borrow() {
+                    return exit;
+                }
+                if terminal.changed().await.is_err() {
+                    return RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped;
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn observe_current_v2(
+        &self,
+    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerCurrentObservationErrorV1>
+    {
+        self.inner().observe_current_gateway_owner_v1().await
+    }
+
+    pub(crate) async fn wait_for_strict_successor_v2(
+        &self,
+        previous_revision: NonZeroU64,
+        deadline: Instant,
+    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerStrictSuccessorErrorV2>
+    {
+        let mut current = self.inner().current_observation_watch_v2();
+        let mut terminal = self.inner().terminal.clone();
+        let expected_lease_id = &self.start_observation.receipt().lease_id;
+        loop {
+            let observation = current.borrow().clone();
+            if &observation.receipt().lease_id != expected_lease_id {
+                self.inner().invalidation.invalidate();
+                return Err(RuntimeGatewayOwnerStrictSuccessorErrorV2::OwnershipLost);
+            }
+            if observation.receipt().owner_revision > previous_revision {
+                return Ok(observation);
+            }
+            if observation.receipt().owner_revision < previous_revision {
+                self.inner().invalidation.invalidate();
+                return Err(RuntimeGatewayOwnerStrictSuccessorErrorV2::ProtocolViolation);
+            }
+            if let Some(exit) = *terminal.borrow() {
+                return Err(map_terminal_strict_successor_error_v2(exit));
+            }
+            if Instant::now() >= deadline {
+                self.inner().invalidation.invalidate();
+                return Err(RuntimeGatewayOwnerStrictSuccessorErrorV2::DeadlineElapsed);
+            }
+            tokio::select! {
+                biased;
+                _ = sleep_until(TokioInstant::from_std(deadline)) => {
+                    self.inner().invalidation.invalidate();
+                    return Err(RuntimeGatewayOwnerStrictSuccessorErrorV2::DeadlineElapsed);
+                }
+                changed = terminal.changed() => {
+                    if changed.is_err() {
+                        self.inner().invalidation.invalidate();
+                        return Err(
+                            RuntimeGatewayOwnerStrictSuccessorErrorV2::SupervisorUnavailable,
+                        );
+                    }
+                }
+                changed = current.changed() => {
+                    if changed.is_err() {
+                        self.inner().invalidation.invalidate();
+                        return Err(
+                            RuntimeGatewayOwnerStrictSuccessorErrorV2::SupervisorUnavailable,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn shutdown_until_v2(
+        mut self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        self.take_inner().shutdown_until(cleanup_deadline).await
+    }
+
+    fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .as_ref()
+            .expect("production gateway owner supervisor")
+    }
+
+    fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .take()
+            .expect("production gateway owner supervisor")
+    }
+}
+
+impl std::fmt::Debug for RuntimeGatewayOwnerProductionSupervisorV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeGatewayOwnerProductionSupervisorV2(<redacted>)")
     }
 }
 
@@ -1260,6 +1542,7 @@ enum RuntimeGatewayOwnerSupervisorRoleV1 {
     ClosedRecovery,
     AdmissionFrozen,
     ProcessFrozen,
+    Production,
 }
 
 struct RuntimeGatewayOwnerStartupShutdownCommandV1 {
@@ -1292,6 +1575,16 @@ enum RuntimeGatewayOwnerSupervisorCommandV1 {
             Result<
                 RuntimeGatewayOwnerCurrentObservationV1,
                 RuntimeGatewayOwnerProcessActivationErrorV2,
+            >,
+        >,
+    },
+    StartProcessRenewal {
+        expected_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+        process_generation: NonZeroU64,
+        response: oneshot::Sender<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerProcessRenewalStartErrorV2,
             >,
         >,
     },
@@ -1444,6 +1737,26 @@ fn map_terminal_admission_frozen_handoff_error_v2(
     }
 }
 
+fn map_terminal_strict_successor_error_v2(
+    exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
+) -> RuntimeGatewayOwnerStrictSuccessorErrorV2 {
+    match exit {
+        RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost => {
+            RuntimeGatewayOwnerStrictSuccessorErrorV2::OwnershipLost
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation => {
+            RuntimeGatewayOwnerStrictSuccessorErrorV2::ProtocolViolation
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::RenewalUnknown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped => {
+            RuntimeGatewayOwnerStrictSuccessorErrorV2::SupervisorUnavailable
+        }
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn map_terminal_closed_recovery_prepare_error_v2(
     exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
@@ -1559,12 +1872,16 @@ where
         closed_recovery_commands: closed_recovery_receiver,
     };
     let (terminal_sender, terminal) = watch::channel(None);
+    let initial_observation = RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&watchdog);
+    let (current_observation_sender, current_observation) = watch::channel(initial_observation);
     let guard = RuntimeGatewayOwnerStartupWatchdogGuardV1::new(invalidation.clone());
     let startup_cleanup_cap =
         RuntimeGatewayOwnerStartupCleanupCapV1::new(initial_startup_cleanup_deadline);
     let actor_startup_cleanup_cap = startup_cleanup_cap.clone();
     let process_generation = Arc::new(AtomicU64::new(0));
     let actor_process_generation = process_generation.clone();
+    let production_generation = Arc::new(AtomicU64::new(0));
+    let actor_production_generation = production_generation.clone();
     let task = runtime.spawn(async move {
         let exit = run_gateway_owner_startup_watchdog_v1(
             port,
@@ -1574,6 +1891,8 @@ where
             guard,
             actor_startup_cleanup_cap,
             actor_process_generation,
+            actor_production_generation,
+            current_observation_sender,
         )
         .await;
         let _result = terminal_sender.send(Some(exit));
@@ -1584,9 +1903,11 @@ where
             supervisor_commands,
             closed_recovery_commands,
             terminal,
+            current_observation,
             invalidation,
             gateway_lifetime,
             process_generation,
+            production_generation,
             task: Some(task),
         }),
         prepared_closed_recovery_observation: None,
@@ -1623,6 +1944,8 @@ async fn run_gateway_owner_startup_watchdog_v1<P>(
     mut guard: RuntimeGatewayOwnerStartupWatchdogGuardV1,
     startup_cleanup_cap: RuntimeGatewayOwnerStartupCleanupCapV1,
     process_generation: Arc<AtomicU64>,
+    production_generation: Arc<AtomicU64>,
+    current_observation_sender: watch::Sender<RuntimeGatewayOwnerCurrentObservationV1>,
 ) -> RuntimeGatewayOwnerStartupWatchdogExitV1
 where
     P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync + 'static,
@@ -1640,6 +1963,7 @@ where
     let mut pending_supervisor_command = None;
     let mut pending_closed_recovery_command = None;
     let mut shutdown_acknowledgement = None;
+    let mut force_production_renewal = false;
     let stop = 'supervisor: loop {
         match shutdown_commands.try_recv() {
             Ok(command) => {
@@ -1924,6 +2248,64 @@ where
                             let _result = response.send(Ok(observation));
                             continue 'supervisor;
                         }
+                        RuntimeGatewayOwnerSupervisorCommandV1::StartProcessRenewal {
+                            expected_receipt,
+                            process_generation: requested_process_generation,
+                            response,
+                        } if role == RuntimeGatewayOwnerSupervisorRoleV1::ProcessFrozen => {
+                            if response.is_closed() {
+                                current = Some(watchdog);
+                                continue 'supervisor;
+                            }
+                            if watchdog.schedule().receipt() != &expected_receipt {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerProcessRenewalStartErrorV2::OwnerReceiptMismatch,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            if process_generation.load(Ordering::Acquire)
+                                != requested_process_generation.get()
+                            {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProcessGenerationMismatch,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            let observation =
+                                RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&watchdog);
+                            if production_generation
+                                .compare_exchange(
+                                    0,
+                                    requested_process_generation.get(),
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_err()
+                            {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProtocolViolation,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            role = RuntimeGatewayOwnerSupervisorRoleV1::Production;
+                            force_production_renewal = true;
+                            let _result = current_observation_sender.send(observation.clone());
+                            current = Some(watchdog);
+                            let _result = response.send(Ok(observation));
+                            continue 'supervisor;
+                        }
                         command => {
                             reject_frozen_supervisor_command_v2(command);
                             guard.invalidate_now();
@@ -2001,7 +2383,13 @@ where
             );
         }
         let watchdog = current.take().expect("gateway owner watchdog state");
-        match watchdog.action_at(Instant::now()) {
+        let action = if force_production_renewal && pending_supervisor_command.is_none() {
+            force_production_renewal = false;
+            RuntimeGatewayOwnerWatchdogActionV1::RenewNow
+        } else {
+            watchdog.action_at(Instant::now())
+        };
+        match action {
             RuntimeGatewayOwnerWatchdogActionV1::WaitUntil(renew_at) => {
                 tokio::select! {
                     biased;
@@ -2096,6 +2484,19 @@ where
                                     config.cleanup,
                                 );
                             }
+                            RuntimeGatewayOwnerSupervisorCommandV1::StartProcessRenewal {
+                                response,
+                                ..
+                            } => {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProtocolViolation,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
                         }
                     }
                 }
@@ -2146,6 +2547,9 @@ where
                 match result {
                     Ok(outcome) => match inflight.complete(outcome, response_observed_at) {
                         Ok(RuntimeGatewayOwnerRenewalCompletionV1::Renewed(successor)) => {
+                            let observation =
+                                RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&successor);
+                            let _result = current_observation_sender.send(observation);
                             current = Some(successor);
                         }
                         Ok(RuntimeGatewayOwnerRenewalCompletionV1::OwnershipLost(_)) => {
@@ -2175,6 +2579,9 @@ where
                             .checked_add(config.retry_delay)
                             .map(|candidate| candidate.min(restored.schedule().safety_deadline()))
                             .unwrap_or(restored.schedule().safety_deadline());
+                        if role == RuntimeGatewayOwnerSupervisorRoleV1::Production {
+                            force_production_renewal = true;
+                        }
                         tokio::select! {
                             biased;
                             command = shutdown_commands.recv() => {
@@ -2260,6 +2667,11 @@ fn reject_frozen_supervisor_command_v2(command: RuntimeGatewayOwnerSupervisorCom
         RuntimeGatewayOwnerSupervisorCommandV1::ActivateProcessOwnership { response, .. } => {
             let _result = response.send(Err(
                 RuntimeGatewayOwnerProcessActivationErrorV2::ProtocolViolation,
+            ));
+        }
+        RuntimeGatewayOwnerSupervisorCommandV1::StartProcessRenewal { response, .. } => {
+            let _result = response.send(Err(
+                RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProtocolViolation,
             ));
         }
     }
