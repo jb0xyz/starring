@@ -300,6 +300,7 @@ pub(crate) struct RuntimeAdmissionAcknowledgingProcessV2 {
     foundation: RuntimeProcessFoundationV1,
     lifecycle: RuntimeClosedRecoveryAdmissionAcknowledgingProcessV2,
     ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    acknowledgement_safety: Option<RuntimeIngressAcknowledgementSafetyMonitorV2>,
     process_generation: NonZeroU64,
 }
 
@@ -1292,6 +1293,7 @@ impl RuntimeRecoveryResumeProcessV2 {
             foundation,
             lifecycle,
             ingress_acknowledgement,
+            acknowledgement_safety: None,
             process_generation,
         };
         if let Err(transition) = process.revalidate_v2() {
@@ -1366,7 +1368,10 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
             self.foundation,
             self.discord,
             self.lifecycle,
-            self.ingress_acknowledgement,
+            RuntimeIngressAcknowledgementCleanupV2::new_v2(
+                self.ingress_acknowledgement,
+                self.acknowledgement_safety,
+            ),
             self.process_generation,
         )
         .await
@@ -1449,6 +1454,7 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
             foundation,
             lifecycle,
             mut ingress_acknowledgement,
+            acknowledgement_safety,
             process_generation,
         } = self;
         let authority = match lifecycle.into_ingress_acknowledgement_authority_v2(
@@ -1465,16 +1471,18 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                     foundation,
                     lifecycle: failure.into_state_v2(),
                     ingress_acknowledgement,
+                    acknowledgement_safety,
                     process_generation,
                 };
                 drop(maintenance_ingress);
                 return Err(process.cleanup_transition_v2(transition).await);
             }
         };
+        let initial_acknowledgement_observation_started_at = Instant::now();
         let acknowledgement = execute_ingress_acknowledgement_v2(
             &mut ingress_acknowledgement,
             authority,
-            Instant::now() + Duration::from_secs(5),
+            initial_acknowledgement_observation_started_at + Duration::from_secs(5),
             foundation.lifecycle_timing_v2(),
         )
         .await;
@@ -1491,7 +1499,10 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                     foundation,
                     discord,
                     *lifecycle,
-                    RuntimeIngressAcknowledgementCleanupV2::new_v2(ingress_acknowledgement, None),
+                    RuntimeIngressAcknowledgementCleanupV2::new_v2(
+                        ingress_acknowledgement,
+                        acknowledgement_safety,
+                    ),
                     maintenance_ingress,
                     readiness,
                     process_generation,
@@ -1517,7 +1528,7 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                         retained,
                         RuntimeIngressAcknowledgementCleanupV2::new_v2(
                             ingress_acknowledgement,
-                            None,
+                            acknowledgement_safety,
                         ),
                         maintenance_ingress,
                         readiness,
@@ -1531,6 +1542,7 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                     foundation,
                     lifecycle: *lifecycle,
                     ingress_acknowledgement,
+                    acknowledgement_safety,
                     process_generation,
                 };
                 drop(maintenance_ingress);
@@ -1543,18 +1555,48 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                 let cleanup = shutdown_process_without_lifecycle_v2(
                     foundation,
                     discord,
-                    RuntimeIngressAcknowledgementCleanupV2::new_v2(ingress_acknowledgement, None),
+                    RuntimeIngressAcknowledgementCleanupV2::new_v2(
+                        ingress_acknowledgement,
+                        acknowledgement_safety,
+                    ),
                     process_generation,
                 )
                 .await;
                 return Err(finish_production_handoff_transition_v2(transition, cleanup));
             }
         };
+        let acknowledgement_schedule = match ingress_acknowledgement_schedule_v2(
+            accepted.receipt(),
+            initial_acknowledgement_observation_started_at,
+        ) {
+            Some(schedule) => schedule,
+            None => {
+                let process = Self {
+                    discord,
+                    foundation,
+                    lifecycle,
+                    ingress_acknowledgement,
+                    acknowledgement_safety,
+                    process_generation,
+                };
+                drop(maintenance_ingress);
+                return Err(process
+                    .cleanup_transition_v2(
+                        RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+                    )
+                    .await);
+            }
+        };
+        let acknowledgement_safety = Some(RuntimeIngressAcknowledgementSafetyMonitorV2::start_v2(
+            acknowledgement_schedule.safety_deadline,
+            foundation.invalidation_trigger_v1(),
+        ));
         self = Self {
             discord,
             foundation,
             lifecycle,
             ingress_acknowledgement,
+            acknowledgement_safety,
             process_generation,
         };
         let acknowledgement_database_now = accepted.receipt().observed_database_now();
@@ -1625,7 +1667,6 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                 .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation)
                 .await);
         }
-        let final_acknowledgement_observation_started_at = Instant::now();
         let final_acknowledgement = match exact_reobserve_ingress_acknowledgement_v2(
             self.foundation.databases.execution(),
             self.lifecycle
@@ -1651,20 +1692,6 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
         }
         current_owner.database_now = final_acknowledgement_database_now;
         let acknowledged_owner_revision = current_owner.owner_revision;
-        let acknowledgement_schedule = match ingress_acknowledgement_schedule_v2(
-            &final_acknowledgement,
-            final_acknowledgement_observation_started_at,
-        ) {
-            Some(schedule) => schedule,
-            None => {
-                drop(maintenance_ingress);
-                return Err(self
-                    .cleanup_transition_v2(
-                        RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
-                    )
-                    .await);
-            }
-        };
         let finalizer_generation = self.lifecycle.finalizer_generation_v2();
         let observation = RuntimeOpenProductionObservationInputV2 {
             coordinator_generation: self.lifecycle.coordinator_generation_v2(),
@@ -1701,6 +1728,7 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                     foundation: self.foundation,
                     lifecycle: failure.into_state_v2(),
                     ingress_acknowledgement: self.ingress_acknowledgement,
+                    acknowledgement_safety: self.acknowledgement_safety,
                     process_generation: self.process_generation,
                 };
                 drop(maintenance_ingress);
@@ -1714,6 +1742,7 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                         .take()
                         .expect("rejected admission acknowledgement lifecycle"),
                     ingress_acknowledgement: self.ingress_acknowledgement,
+                    acknowledgement_safety: self.acknowledgement_safety,
                     process_generation: self.process_generation,
                 };
                 drop(maintenance_ingress);
@@ -1724,6 +1753,10 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                     .await);
             }
         };
+        let acknowledgement_safety = self
+            .acknowledgement_safety
+            .take()
+            .expect("accepted admission acknowledgement safety");
         let lifecycle = match lifecycle.start_production_owner_v2().await {
             Ok(lifecycle) => lifecycle,
             Err(failure) => {
@@ -1739,17 +1772,16 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                     failure.into_state_v2(),
                     maintenance_ingress,
                     readiness,
-                    self.ingress_acknowledgement,
+                    RuntimeIngressAcknowledgementCleanupV2::new_v2(
+                        self.ingress_acknowledgement,
+                        Some(acknowledgement_safety),
+                    ),
                     self.process_generation,
                 )
                 .await;
                 return Err(finish_production_handoff_transition_v2(transition, cleanup));
             }
         };
-        let acknowledgement_safety = RuntimeIngressAcknowledgementSafetyMonitorV2::start_v2(
-            acknowledgement_schedule.safety_deadline,
-            self.foundation.invalidation_trigger_v1(),
-        );
         let successor = match lifecycle
             .wait_for_owner_successor_v2(
                 acknowledged_owner_revision,
@@ -2797,18 +2829,18 @@ async fn shutdown_admission_acknowledging_process_v2(
     mut foundation: RuntimeProcessFoundationV1,
     discord: RuntimeDiscordProcessSupervisorV2,
     lifecycle: RuntimeClosedRecoveryAdmissionAcknowledgingProcessV2,
-    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    ingress_acknowledgement: RuntimeIngressAcknowledgementCleanupV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    let RuntimeIngressAcknowledgementCleanupV2 { supervisor, safety } = ingress_acknowledgement;
     let (cleanup_deadline, terminal) = foundation
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
-    shutdown_ingress_acknowledgement_supervisor_v2(
-        &mut foundation,
-        ingress_acknowledgement,
-        cleanup_deadline,
-    )
-    .await;
+    if let Some(acknowledgement_safety) = safety {
+        acknowledgement_safety.stop_v2().await;
+    }
+    shutdown_ingress_acknowledgement_supervisor_v2(&mut foundation, supervisor, cleanup_deadline)
+        .await;
     foundation.observe_shutdown_registry_v1();
     let discord_drain = foundation.gateway.begin_discord_drain_v1();
     let timing = foundation.lifecycle_timing_v2();
@@ -2929,17 +2961,13 @@ async fn shutdown_orphaned_admission_process_v2(
     readiness: crate::health::RuntimeHealthReadinessPublisherV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
-    let RuntimeIngressAcknowledgementCleanupV2 { supervisor, safety } = ingress_acknowledgement;
     readiness.remove_readiness_v2();
     drop(maintenance_ingress);
-    if let Some(acknowledgement_safety) = safety {
-        acknowledgement_safety.stop_v2().await;
-    }
     shutdown_admission_acknowledging_process_v2(
         foundation,
         discord,
         lifecycle,
-        supervisor,
+        ingress_acknowledgement,
         process_generation,
     )
     .await
@@ -3024,20 +3052,20 @@ async fn shutdown_frozen_empty_open_process_v2(
     lifecycle: RuntimeClosedRecoveryEmptyOpenProcessV2,
     maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
     readiness: crate::health::RuntimeHealthReadinessPublisherV2,
-    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    ingress_acknowledgement: RuntimeIngressAcknowledgementCleanupV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    let RuntimeIngressAcknowledgementCleanupV2 { supervisor, safety } = ingress_acknowledgement;
     readiness.remove_readiness_v2();
     drop(maintenance_ingress);
     let (cleanup_deadline, terminal) = foundation
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
-    shutdown_ingress_acknowledgement_supervisor_v2(
-        &mut foundation,
-        ingress_acknowledgement,
-        cleanup_deadline,
-    )
-    .await;
+    if let Some(acknowledgement_safety) = safety {
+        acknowledgement_safety.stop_v2().await;
+    }
+    shutdown_ingress_acknowledgement_supervisor_v2(&mut foundation, supervisor, cleanup_deadline)
+        .await;
     foundation.observe_shutdown_registry_v1();
     let discord_drain = foundation.gateway.begin_discord_drain_v1();
     let timing = foundation.lifecycle_timing_v2();

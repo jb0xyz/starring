@@ -1845,17 +1845,28 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
     let acknowledgement_authorization = enter_empty_open
         .find(".into_ingress_acknowledgement_authority_v2(")
         .unwrap();
+    let initial_acknowledgement_anchor = enter_empty_open
+        .find("let initial_acknowledgement_observation_started_at = Instant::now()")
+        .unwrap();
     let acknowledgement_lane = enter_empty_open
         .find("execute_ingress_acknowledgement_v2(")
+        .unwrap();
+    let initial_acknowledgement_schedule = enter_empty_open
+        .find(
+            "ingress_acknowledgement_schedule_v2(\n            accepted.receipt(),\n            initial_acknowledgement_observation_started_at,",
+        )
+        .unwrap();
+    let acknowledgement_safety_arm = enter_empty_open
+        .find("RuntimeIngressAcknowledgementSafetyMonitorV2::start_v2(")
         .unwrap();
     let owner_reobservation = enter_empty_open
         .find(".observe_current_owner_v2()")
         .unwrap();
+    let final_acknowledgement_reobservation = enter_empty_open
+        .find("exact_reobserve_ingress_acknowledgement_v2(")
+        .unwrap();
     let open_transition = enter_empty_open
         .find(".into_empty_open_v2(observation)")
-        .unwrap();
-    let acknowledgement_safety_arm = enter_empty_open
-        .find("RuntimeIngressAcknowledgementSafetyMonitorV2::start_v2(")
         .unwrap();
     let owner_successor_wait = enter_empty_open
         .find(".wait_for_owner_successor_v2(")
@@ -1879,10 +1890,13 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
             && predecessor_authorization < predecessor_observation
             && predecessor_observation < predecessor_accept
             && predecessor_accept < acknowledgement_authorization
-            && acknowledgement_authorization < acknowledgement_lane
-            && acknowledgement_lane < owner_reobservation
-            && owner_reobservation < open_transition
-            && open_transition < acknowledgement_safety_arm
+            && acknowledgement_authorization < initial_acknowledgement_anchor
+            && initial_acknowledgement_anchor < acknowledgement_lane
+            && acknowledgement_lane < initial_acknowledgement_schedule
+            && initial_acknowledgement_schedule < acknowledgement_safety_arm
+            && acknowledgement_safety_arm < owner_reobservation
+            && owner_reobservation < final_acknowledgement_reobservation
+            && final_acknowledgement_reobservation < open_transition
             && acknowledgement_safety_arm < owner_successor_wait
             && owner_successor_wait < acknowledgement_refresh
             && acknowledgement_refresh < capability_activation
@@ -1890,6 +1904,28 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
             && gateway_invalidation_arm < final_revalidation
             && final_revalidation < readiness_publish
     );
+    assert_eq!(
+        enter_empty_open
+            .matches("RuntimeIngressAcknowledgementSafetyMonitorV2::start_v2(")
+            .count(),
+        1
+    );
+    assert!(!enter_empty_open.contains(".rearm_v2("));
+    assert!(!enter_empty_open
+        .contains("ingress_acknowledgement_schedule_v2(\n            &final_acknowledgement,"));
+    assert!(process_observation
+        .contains("acknowledgement_safety: Option<RuntimeIngressAcknowledgementSafetyMonitorV2>,"));
+    let admission_shutdown = braced_declaration(
+        process_observation,
+        "async fn shutdown_admission_acknowledging_process_v2(",
+    );
+    let admission_monitor_stop = admission_shutdown
+        .find("acknowledgement_safety.stop_v2().await")
+        .unwrap();
+    let admission_lane_shutdown = admission_shutdown
+        .find("shutdown_ingress_acknowledgement_supervisor_v2(")
+        .unwrap();
+    assert!(admission_monitor_stop < admission_lane_shutdown);
     assert!(enter_empty_open.contains(
         "RuntimeIngressOpenAcknowledgementLeaseDurationV2::from_duration(\n            INGRESS_ACKNOWLEDGEMENT_LEASE_V2,"
     ));

@@ -315,6 +315,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::future::pending;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -362,6 +363,23 @@ mod tests {
         );
         wait_for_count_v2(&invalidation, 1).await;
         drop(monitor);
+        assert_eq!(invalidation.count_v2(), 1);
+    }
+
+    #[tokio::test]
+    async fn initial_acknowledgement_deadline_trips_while_post_acknowledgement_work_is_blocked() {
+        let invalidation = FakeInvalidationV2::new();
+        let monitor = RuntimeIngressAcknowledgementSafetyMonitorV2::start_v2(
+            Instant::now() + Duration::from_millis(10),
+            invalidation.clone(),
+        );
+        let blocked = pending::<()>();
+        tokio::pin!(blocked);
+        tokio::select! {
+            () = &mut blocked => panic!("post acknowledgement work completed"),
+            () = wait_for_count_v2(&invalidation, 1) => {}
+        }
+        monitor.stop_v2().await;
         assert_eq!(invalidation.count_v2(), 1);
     }
 
@@ -415,6 +433,20 @@ mod tests {
             invalidation.clone(),
         );
         drop(monitor);
+        assert_eq!(invalidation.count_v2(), 1);
+        tokio::task::yield_now().await;
+        assert_eq!(invalidation.count_v2(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_acknowledgement_cancellation_before_transfer_fails_closed_synchronously() {
+        let invalidation = FakeInvalidationV2::new();
+        let accepted_acknowledgement_safety =
+            Some(RuntimeIngressAcknowledgementSafetyMonitorV2::start_v2(
+                Instant::now() + Duration::from_secs(10),
+                invalidation.clone(),
+            ));
+        drop(accepted_acknowledgement_safety);
         assert_eq!(invalidation.count_v2(), 1);
         tokio::task::yield_now().await;
         assert_eq!(invalidation.count_v2(), 1);
