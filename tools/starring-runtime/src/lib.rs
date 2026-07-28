@@ -8,6 +8,7 @@ mod gateway;
 mod gateway_owner_startup;
 mod gateway_owner_startup_watchdog;
 mod identity_encoding;
+mod mutation_finalizer;
 mod process;
 mod process_identity;
 mod process_startup;
@@ -39,6 +40,19 @@ pub use gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerStartupWatchdogConfigV1, RuntimeGatewayOwnerStartupWatchdogExitV1,
     RuntimeGatewayOwnerStartupWatchdogHandleV1, RuntimeGatewayOwnerStartupWatchdogStartErrorV1,
     RuntimeGatewayOwnerStartupWatchdogStartFailureV1,
+};
+pub use mutation_finalizer::{
+    RuntimeMutationFinalizerCompletionResultV1, RuntimeMutationFinalizerCompletionV1,
+    RuntimeMutationFinalizerConfigErrorV1, RuntimeMutationFinalizerConfigV1,
+    RuntimeMutationFinalizerHandoffStateV1, RuntimeMutationFinalizerIntakeV1,
+    RuntimeMutationFinalizerJobIdV1, RuntimeMutationFinalizerJobV1,
+    RuntimeMutationFinalizerJoinReportV1, RuntimeMutationFinalizerPortV1,
+    RuntimeMutationFinalizerRegistrationRejectedV1,
+    RuntimeMutationFinalizerRegistrationRejectionReasonV1, RuntimeMutationFinalizerSealOutcomeV1,
+    RuntimeMutationFinalizerSnapshotV1, RuntimeMutationFinalizerStartErrorV1,
+    RuntimeMutationFinalizerSupervisorV1, RuntimeMutationFinalizerWaitOutcomeV1,
+    RuntimeMutationFinalizerWaitStatusV1, RuntimeMutationFinalizerWaiterV1,
+    RuntimeSupervisorExitV1,
 };
 pub use process::connected::{
     RuntimeDiscordGatewayShutdownFailureV1, RuntimePausedConnectedProcessShutdownErrorV1,

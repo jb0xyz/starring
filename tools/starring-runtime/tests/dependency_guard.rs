@@ -502,6 +502,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/identity_encoding.rs",
             "src/lib.rs",
             "src/main.rs",
+            "src/mutation_finalizer.rs",
             "src/process/closed.rs",
             "src/process/connected.rs",
             "src/process/execution.rs",
@@ -524,6 +525,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/startup_recovery_observation.rs",
             "tests/dependency_guard.rs",
             "tests/gateway_owner_startup_watchdog.rs",
+            "tests/mutation_finalizer.rs",
             "tests/process_contract.rs"
         ]
     );
@@ -672,6 +674,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/process/startup_loop.rs")
             && path != Path::new("src/process/startup_loop_tests.rs")
             && path != Path::new("src/process_startup.rs")
+            && path != Path::new("src/mutation_finalizer.rs")
             && path != Path::new("src/shutdown.rs")
             && path != Path::new("src/startup_recovery_observation.rs")
         {
@@ -689,6 +692,67 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
         }
         if path != Path::new("src/build_revision.rs") {
             assert!(!source.contains("option_env!"), "{}", path.display());
+        }
+    }
+}
+
+#[test]
+fn mutation_finalizer_is_bounded_linear_supervised_and_handoff_compatible() {
+    let source = include_str!("../src/mutation_finalizer.rs");
+    for required in [
+        "const RUNTIME_MUTATION_FINALIZER_MAX_CAPACITY: usize = 1_024;",
+        "RuntimeMutationFinalizerJobV1<J>",
+        "StartupPendingDrain(J)",
+        "RuntimeMutationFinalizerGenerationV1",
+        "RuntimeMutationFinalizerHandoffStateV1",
+        "startup_intake_sealed",
+        "startup_jobs_settled",
+        "mpsc::channel(capacity)",
+        "mpsc::channel(1)",
+        "Semaphore::new(capacity)",
+        "try_acquire_owned()",
+        "self.jobs.try_reserve()",
+        "RuntimeMutationFinalizerRegistrationRejectedV1",
+        "RuntimeMutationFinalizerWaiterV1(<redacted>)",
+        "RuntimeMutationFinalizerSupervisorV1(<redacted>)",
+        "RuntimeMutationFinalizerCompletionV1(<redacted>)",
+        "RuntimeMutationFinalizerInFlightTaskV1",
+        "task.abort()",
+        "actor.abort()",
+        "RuntimeSupervisorExitV1::Panicked",
+        "RuntimeSupervisorExitV1::Aborted",
+    ] {
+        assert!(source.contains(required), "{required}");
+    }
+    for forbidden in [
+        "unbounded_channel",
+        "spawn_blocking",
+        "dyn Fn",
+        "BoxFuture",
+        "sqlx",
+        "PgPool",
+        "twilight",
+        "RuntimePublicAdmissionPermit",
+        "GatewayCommand",
+    ] {
+        assert!(!contains_identifier(source, forbidden), "{forbidden}");
+    }
+    for type_name in [
+        "RuntimeMutationFinalizerSupervisorV1",
+        "RuntimeMutationFinalizerWaiterV1",
+        "RuntimeMutationFinalizerCompletionV1",
+        "RuntimeMutationFinalizerJobV1",
+    ] {
+        let attributes = declaration_attribute_block(source, type_name);
+        for forbidden in ["Clone", "Copy", "Serialize", "Deserialize", "Default"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{type_name}: {forbidden}"
+            );
+            assert!(
+                !source.contains(&format!("{forbidden} for {type_name}")),
+                "{type_name}: {forbidden}"
+            );
         }
     }
 }
@@ -983,6 +1047,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 && identifier == "automation_runtime_convergence";
             let allowed_recovery_identity = path == Path::new("src/recovery_identity.rs")
                 && identifier == "automation_runtime_controller";
+            let allowed_mutation_finalizer = path == Path::new("src/mutation_finalizer.rs")
+                && identifier == "automation_runtime_worker";
             let allowed_pending_drain_succession = matches!(
                 (path, identifier),
                 (
@@ -1021,6 +1087,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_process_identity
                         || allowed_controller_identity
                         || allowed_recovery_identity
+                        || allowed_mutation_finalizer
                         || !matches!(
                             identifier,
                             "automation_runtime"
