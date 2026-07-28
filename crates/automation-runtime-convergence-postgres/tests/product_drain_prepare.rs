@@ -10,7 +10,8 @@ use automation_runtime_convergence::{
     RuntimeProcessIdentityV1, SupersedingDeploymentV1, TenantId,
 };
 use automation_runtime_convergence_postgres::{
-    prepare_product_drain_source_supersession_v1, RuntimeConvergenceStoreError,
+    prepare_product_drain_source_cancellation_v1, prepare_product_drain_source_supersession_v1,
+    RuntimeConvergenceStoreError,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use discord_model::GuildId;
@@ -442,6 +443,276 @@ fn database_revision_and_projection_overflow_are_rejected() {
     successor.runtime_generation = RuntimeGeneration::new(u64::MAX).unwrap();
     assert!(matches!(
         prepare(source, successor, "correlated Product apply"),
+        Err(RuntimeConvergenceStoreError::InvalidInput(
+            "runtime deployment projection"
+        ))
+    ));
+}
+
+fn prepare_cancellation(
+    source: RuntimeDeploymentSnapshotV1,
+    acknowledged_at: DateTime<Utc>,
+    cancelled_at: DateTime<Utc>,
+) -> Result<
+    automation_runtime_convergence_postgres::PreparedProductDrainSourceCancellationV1,
+    RuntimeConvergenceStoreError,
+> {
+    let expected_revision = source.revision;
+    prepare_product_drain_source_cancellation_v1(
+        source,
+        expected_revision,
+        acknowledged_at,
+        cancelled_at,
+    )
+}
+
+#[test]
+fn awaiting_source_prepares_exact_revision_only_cancellation_projection() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_awaiting();
+    let source = fixture.deployment.snapshot();
+    let prepared = prepare_cancellation(source.clone(), at(60), at(61)).unwrap();
+    let mut expected = source.clone();
+    expected.revision = expected.revision.next().unwrap();
+    assert_eq!(prepared.snapshot(), &expected);
+    assert_eq!(prepared.source_revision(), source.revision);
+    assert_eq!(prepared.resulting_revision(), expected.revision);
+    assert_eq!(prepared.acknowledged_at(), at(60));
+    assert_eq!(prepared.cancelled_at(), at(61));
+    assert_eq!(
+        prepared.snapshot_bytes(),
+        serde_json::to_vec(prepared.snapshot()).unwrap()
+    );
+    assert_eq!(
+        prepared.snapshot_json(),
+        &serde_json::from_slice::<Value>(prepared.snapshot_bytes()).unwrap()
+    );
+    assert_eq!(
+        prepared.snapshot_digest(),
+        raw_sha256_hex(prepared.snapshot_bytes())
+    );
+    assert_eq!(
+        RuntimeDeployment::restore(serde_json::from_slice(prepared.snapshot_bytes()).unwrap())
+            .unwrap()
+            .snapshot(),
+        prepared.snapshot().clone()
+    );
+    assert_eq!(
+        format!("{prepared:?}"),
+        "PreparedProductDrainSourceCancellationV1(<opaque>)"
+    );
+}
+
+#[test]
+fn live_cancellation_projection_preserves_exact_serving_state() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_live();
+    let source = fixture.deployment.snapshot();
+    let prepared = prepare_cancellation(source.clone(), at(60), at(61)).unwrap();
+    let mut expected = source;
+    expected.revision = expected.revision.next().unwrap();
+    assert_eq!(prepared.snapshot(), &expected);
+    assert_eq!(prepared.snapshot().phase, RuntimeDeploymentPhaseV1::Live);
+    assert_eq!(
+        prepared.snapshot().controller_lease,
+        expected.controller_lease
+    );
+    assert_eq!(
+        prepared.snapshot().panel_certificate,
+        expected.panel_certificate
+    );
+    assert_eq!(prepared.snapshot().gateway_ready, expected.gateway_ready);
+    assert_eq!(prepared.snapshot().live, expected.live);
+    assert_eq!(
+        prepared.snapshot().last_live_recovery,
+        expected.last_live_recovery
+    );
+}
+
+#[test]
+fn cancellation_snapshot_digest_is_stable_and_terminal_time_stays_exact() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_awaiting();
+    let source = fixture.deployment.snapshot();
+    let first = prepare_cancellation(source.clone(), at(60), at(61)).unwrap();
+    let later = prepare_cancellation(source.clone(), at(60), at(62)).unwrap();
+    let mut changed_source = source;
+    changed_source.controller_lease.as_mut().unwrap().expires_at = at(3_601);
+    RuntimeDeployment::restore(changed_source.clone()).unwrap();
+    let changed = prepare_cancellation(changed_source, at(60), at(61)).unwrap();
+    assert_eq!(
+        first.snapshot_digest(),
+        "5bd5ab0618a1d4649cd8de8ed3c624be1fbac886ce425849df6f0d9a473483bb"
+    );
+    assert_eq!(first.snapshot_bytes(), later.snapshot_bytes());
+    assert_eq!(first.snapshot_digest(), later.snapshot_digest());
+    assert_ne!(first, later);
+    assert_eq!(later.cancelled_at(), at(62));
+    assert_ne!(first.snapshot_bytes(), changed.snapshot_bytes());
+    assert_ne!(first.snapshot_digest(), changed.snapshot_digest());
+}
+
+#[test]
+fn cancellation_rejects_malformed_drifted_and_replayed_sources() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_awaiting();
+    let source = fixture.deployment.snapshot();
+    let mut malformed = source.clone();
+    malformed.phase = RuntimeDeploymentPhaseV1::Live;
+    malformed.live = None;
+    assert!(matches!(
+        prepare_cancellation(malformed, at(60), at(61)),
+        Err(RuntimeConvergenceStoreError::Domain(
+            RuntimeDeploymentError::InvalidSnapshot
+        ))
+    ));
+    assert!(matches!(
+        prepare_product_drain_source_cancellation_v1(
+            source.clone(),
+            DeploymentRevision::FIRST,
+            at(60),
+            at(61),
+        ),
+        Err(RuntimeConvergenceStoreError::Domain(
+            RuntimeDeploymentError::RevisionConflict { .. }
+        ))
+    ));
+    assert!(matches!(
+        prepare_product_drain_source_cancellation_v1(
+            source.clone(),
+            source.revision,
+            at(39),
+            at(61),
+        ),
+        Err(RuntimeConvergenceStoreError::Domain(
+            RuntimeDeploymentError::AttestationTimeRegression
+        ))
+    ));
+    assert!(matches!(
+        prepare_product_drain_source_cancellation_v1(
+            source.clone(),
+            source.revision,
+            at(60),
+            at(59),
+        ),
+        Err(RuntimeConvergenceStoreError::Domain(
+            RuntimeDeploymentError::AttestationTimeRegression
+        ))
+    ));
+    let prepared = prepare_cancellation(source.clone(), at(60), at(61)).unwrap();
+    assert!(matches!(
+        prepare_product_drain_source_cancellation_v1(
+            prepared.snapshot().clone(),
+            source.revision,
+            at(60),
+            at(61),
+        ),
+        Err(RuntimeConvergenceStoreError::Domain(
+            RuntimeDeploymentError::RevisionConflict { .. }
+        ))
+    ));
+}
+
+#[test]
+fn cancellation_database_timestamps_must_be_canonical_microseconds() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_awaiting();
+    let source = fixture.deployment.snapshot();
+    let submicrosecond = DateTime::from_timestamp(1_800_000_060, 1).unwrap();
+    assert!(matches!(
+        prepare_product_drain_source_cancellation_v1(
+            source.clone(),
+            source.revision,
+            submicrosecond,
+            at(61),
+        ),
+        Err(RuntimeConvergenceStoreError::InvalidInput(
+            "Product drain acknowledgement database timestamp"
+        ))
+    ));
+    assert!(matches!(
+        prepare_product_drain_source_cancellation_v1(
+            source.clone(),
+            source.revision,
+            at(60),
+            DateTime::from_timestamp(1_800_000_061, 1).unwrap(),
+        ),
+        Err(RuntimeConvergenceStoreError::InvalidInput(
+            "Product drain cancellation database timestamp"
+        ))
+    ));
+    assert!(matches!(
+        prepare_product_drain_source_cancellation_v1(
+            source.clone(),
+            source.revision,
+            DateTime::<Utc>::MAX_UTC,
+            at(61),
+        ),
+        Err(RuntimeConvergenceStoreError::InvalidInput(
+            "Product drain acknowledgement database timestamp"
+        ))
+    ));
+    assert!(matches!(
+        prepare_product_drain_source_cancellation_v1(
+            source.clone(),
+            source.revision,
+            at(60),
+            DateTime::<Utc>::MAX_UTC,
+        ),
+        Err(RuntimeConvergenceStoreError::InvalidInput(
+            "Product drain cancellation database timestamp"
+        ))
+    ));
+}
+
+#[test]
+fn cancellation_database_revision_bounds_are_enforced() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_awaiting();
+    let mut source = fixture.deployment.snapshot();
+    source.revision = DeploymentRevision::new(i64::MAX as u64).unwrap();
+    RuntimeDeployment::restore(source.clone()).unwrap();
+    assert!(matches!(
+        prepare_cancellation(source, at(60), at(61)),
+        Err(RuntimeConvergenceStoreError::InvalidInput(
+            "runtime deployment projection"
+        ))
+    ));
+    let mut source = fixture.deployment.snapshot();
+    source.revision = DeploymentRevision::new(u64::MAX).unwrap();
+    RuntimeDeployment::restore(source.clone()).unwrap();
+    assert!(matches!(
+        prepare_cancellation(source, at(60), at(61)),
+        Err(RuntimeConvergenceStoreError::InvalidInput(
+            "runtime deployment revision"
+        ))
+    ));
+    let mut source = fixture.deployment.snapshot();
+    let oversized_generation = RuntimeGeneration::new(i64::MAX as u64 + 1).unwrap();
+    source.runtime_generation = oversized_generation;
+    source.preflight.as_mut().unwrap().runtime_generation = oversized_generation;
+    source.drain.as_mut().unwrap().target_runtime_generation = oversized_generation;
+    source.activation.as_mut().unwrap().runtime_generation = oversized_generation;
+    source
+        .panel_certificate
+        .as_mut()
+        .unwrap()
+        .runtime_generation = oversized_generation;
+    RuntimeDeployment::restore(source.clone()).unwrap();
+    assert!(matches!(
+        prepare_cancellation(source, at(60), at(61)),
+        Err(RuntimeConvergenceStoreError::InvalidInput(
+            "runtime deployment projection"
+        ))
+    ));
+    let mut source = fixture.deployment.snapshot();
+    source.target.binding_revision = BindingRevision::new(i64::MAX as u64 + 1).unwrap();
+    source.preflight.as_mut().unwrap().target = source.target.clone();
+    source.activation.as_mut().unwrap().target = source.target.clone();
+    source.panel_certificate.as_mut().unwrap().target = source.target.clone();
+    RuntimeDeployment::restore(source.clone()).unwrap();
+    assert!(matches!(
+        prepare_cancellation(source, at(60), at(61)),
         Err(RuntimeConvergenceStoreError::InvalidInput(
             "runtime deployment projection"
         ))

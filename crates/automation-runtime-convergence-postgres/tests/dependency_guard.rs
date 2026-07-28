@@ -147,8 +147,16 @@ fn product_drain_snapshot_preparation_is_pure_and_exact() {
     let source = include_str!("../src/product_drain.rs");
     for required in [
         "ProductDrainSourceSupersessionPermitV1",
+        "ProductDrainSourceCancellationPermitV1",
+        "PreparedProductDrainSourceCancellationV1",
         "from_adapter_validated_durable_route_absence_acknowledgement",
         "supersede_product_drain_source",
+        "cancel_product_drain_source",
+        "prepare_product_drain_source_cancellation_v1",
+        "source_revision",
+        "acknowledged_at",
+        "cancelled_at",
+        "snapshot != expected_snapshot",
         "prepare_runtime_deployment_snapshot_v1",
         "TransitionOutcomeV1::Applied",
     ] {
@@ -162,6 +170,7 @@ fn product_drain_snapshot_preparation_is_pure_and_exact() {
         "reqwest",
         "tokio",
         "std::net",
+        "TransitionOutcomeV1::Replayed",
     ] {
         assert!(!source.contains(forbidden), "impure boundary: {forbidden}");
     }

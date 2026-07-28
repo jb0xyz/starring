@@ -40,7 +40,8 @@ pub use model::{
 };
 pub use prepare::{prepare_requested_deployment_v1, PreparedRequestedDeploymentV1};
 pub use product_drain::{
-    prepare_product_drain_source_supersession_v1, PreparedProductDrainSourceSupersessionV1,
+    prepare_product_drain_source_cancellation_v1, prepare_product_drain_source_supersession_v1,
+    PreparedProductDrainSourceCancellationV1, PreparedProductDrainSourceSupersessionV1,
 };
 pub use store::PostgresRuntimeConvergence;
 

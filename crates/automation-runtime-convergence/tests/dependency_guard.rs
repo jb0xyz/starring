@@ -81,12 +81,14 @@ fn source_files_contain_no_comments() {
 }
 
 #[test]
-fn product_drain_supersession_requires_an_adapter_validated_opaque_proof() {
+fn product_drain_transitions_require_adapter_validated_opaque_proofs() {
     let source = include_str!("../src/machine/product_drain.rs");
     for required in [
         "pub struct ProductDrainSourceSupersessionPermitV1",
+        "pub struct ProductDrainSourceCancellationPermitV1",
         "from_adapter_validated_durable_route_absence_acknowledgement",
         "pub fn supersede_product_drain_source",
+        "pub fn cancel_product_drain_source",
     ] {
         assert!(source.contains(required), "missing boundary: {required}");
     }
@@ -96,6 +98,7 @@ fn product_drain_supersession_requires_an_adapter_validated_opaque_proof() {
         "Serialize",
         "Deserialize",
         "impl Clone for ProductDrainSourceSupersessionPermitV1",
+        "impl Clone for ProductDrainSourceCancellationPermitV1",
         "automation_runtime_controller",
         "RuntimePersistedRouteAbsent",
     ] {
@@ -104,4 +107,9 @@ fn product_drain_supersession_requires_an_adapter_validated_opaque_proof() {
             "forbidden proof surface: {forbidden}"
         );
     }
+    let cancellation = source
+        .split("pub fn cancel_product_drain_source")
+        .nth(1)
+        .unwrap();
+    assert!(!cancellation.contains("replayed"));
 }

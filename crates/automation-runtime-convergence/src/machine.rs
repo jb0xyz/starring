@@ -5,7 +5,9 @@ use chrono::{DateTime, Utc};
 mod product_drain;
 mod validation;
 
-pub use product_drain::ProductDrainSourceSupersessionPermitV1;
+pub use product_drain::{
+    ProductDrainSourceCancellationPermitV1, ProductDrainSourceSupersessionPermitV1,
+};
 
 use crate::{
     ActivationAttestationV1, CommandGuardV1, ControllerLeaseV1, DeploymentId, DeploymentRevision,

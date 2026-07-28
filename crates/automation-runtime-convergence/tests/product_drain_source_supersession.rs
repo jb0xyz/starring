@@ -6,12 +6,12 @@ use automation_runtime_convergence::{
     CommandGuardV1, ControllerId, DeploymentId, DeploymentRevision, DrainAttestationV1,
     FencingToken, GatewayReadyAttestationV1, GatewayReadyKindV1, InstallationId, LeaseRequestV1,
     LiveLossKindV1, PanelCertificateId, PanelCertificateV1, PanelReportDigestV1,
-    PreflightAttestationV1, ProcessInstanceId, ProductDrainSourceSupersessionPermitV1, PromotionId,
-    RuntimeDeployment, RuntimeDeploymentError, RuntimeDeploymentIdentityV1,
-    RuntimeDeploymentPhaseKindV1, RuntimeDeploymentPhaseV1, RuntimeDeploymentSnapshotV1,
-    RuntimeDeploymentTargetV1, RuntimeFailureId, RuntimeFailureKindV1, RuntimeFailureV1,
-    RuntimeGeneration, RuntimeProcessIdentityV1, SupersedingDeploymentV1, TenantId,
-    TransitionOutcomeV1,
+    PreflightAttestationV1, ProcessInstanceId, ProductDrainSourceCancellationPermitV1,
+    ProductDrainSourceSupersessionPermitV1, PromotionId, RuntimeDeployment, RuntimeDeploymentError,
+    RuntimeDeploymentIdentityV1, RuntimeDeploymentPhaseKindV1, RuntimeDeploymentPhaseV1,
+    RuntimeDeploymentSnapshotV1, RuntimeDeploymentTargetV1, RuntimeFailureId, RuntimeFailureKindV1,
+    RuntimeFailureV1, RuntimeGeneration, RuntimeProcessIdentityV1, SupersedingDeploymentV1,
+    TenantId, TransitionOutcomeV1,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use discord_model::GuildId;
@@ -603,5 +603,223 @@ fn proof_debug_output_is_opaque() {
     assert_eq!(
         format!("{:?}", permit(&fixture.deployment, at(60))),
         "ProductDrainSourceSupersessionPermitV1(<opaque>)"
+    );
+}
+
+fn cancellation_permit(
+    deployment: &RuntimeDeployment,
+    acknowledged_at: DateTime<Utc>,
+) -> ProductDrainSourceCancellationPermitV1 {
+    ProductDrainSourceCancellationPermitV1::from_adapter_validated_durable_route_absence_acknowledgement(
+        deployment,
+        deployment.revision(),
+        acknowledged_at,
+    )
+    .unwrap()
+}
+
+fn assert_only_revision_changed(
+    before: &RuntimeDeploymentSnapshotV1,
+    after: &RuntimeDeploymentSnapshotV1,
+) {
+    let mut expected = before.clone();
+    expected.revision = expected.revision.next().unwrap();
+    assert_eq!(after, &expected);
+}
+
+#[test]
+fn awaiting_gateway_ready_product_drain_cancellation_only_advances_revision() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_awaiting_with_failure_history();
+    let before = fixture.deployment.snapshot();
+    assert_eq!(
+        fixture
+            .deployment
+            .cancel_product_drain_source(cancellation_permit(&fixture.deployment, at(60)), at(61))
+            .unwrap(),
+        TransitionOutcomeV1::Applied {
+            revision: before.revision.next().unwrap()
+        }
+    );
+    let after = fixture.deployment.snapshot();
+    assert_only_revision_changed(&before, &after);
+    assert_eq!(after.phase, RuntimeDeploymentPhaseV1::AwaitingGatewayReady);
+    assert_eq!(
+        RuntimeDeployment::restore(after).unwrap(),
+        fixture.deployment
+    );
+}
+
+#[test]
+fn live_product_drain_cancellation_preserves_all_serving_evidence_and_lease() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_live_with_failure_history();
+    let before = fixture.deployment.snapshot();
+    fixture
+        .deployment
+        .cancel_product_drain_source(cancellation_permit(&fixture.deployment, at(60)), at(61))
+        .unwrap();
+    let after = fixture.deployment.snapshot();
+    assert_only_revision_changed(&before, &after);
+    assert_eq!(after.phase, RuntimeDeploymentPhaseV1::Live);
+    assert_eq!(after.controller_lease, before.controller_lease);
+    assert_eq!(after.panel_certificate, before.panel_certificate);
+    assert_eq!(after.gateway_ready, before.gateway_ready);
+    assert_eq!(after.live, before.live);
+    assert_eq!(after.last_live_recovery, before.last_live_recovery);
+}
+
+#[test]
+fn product_drain_cancellation_replay_is_rejected_without_terminal_journal_evidence() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_live_with_failure_history();
+    let first = cancellation_permit(&fixture.deployment, at(60));
+    let same_time_replay = cancellation_permit(&fixture.deployment, at(60));
+    let changed_time_replay = cancellation_permit(&fixture.deployment, at(60));
+    fixture
+        .deployment
+        .cancel_product_drain_source(first, at(61))
+        .unwrap();
+    let snapshot = fixture.deployment.snapshot();
+    assert_eq!(
+        fixture
+            .deployment
+            .cancel_product_drain_source(same_time_replay, at(61))
+            .unwrap_err(),
+        RuntimeDeploymentError::ProductDrainCancellationSourceMismatch
+    );
+    assert_eq!(fixture.deployment.snapshot(), snapshot);
+    assert_eq!(
+        fixture
+            .deployment
+            .cancel_product_drain_source(changed_time_replay, at(62))
+            .unwrap_err(),
+        RuntimeDeploymentError::ProductDrainCancellationSourceMismatch
+    );
+    assert_eq!(fixture.deployment.snapshot(), snapshot);
+}
+
+#[test]
+fn product_drain_cancellation_permit_requires_exact_eligible_source() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        ProductDrainSourceCancellationPermitV1::from_adapter_validated_durable_route_absence_acknowledgement(
+            &fixture.deployment,
+            fixture.deployment.revision(),
+            at(60),
+        )
+        .unwrap_err(),
+        RuntimeDeploymentError::InvalidTransition {
+            current: RuntimeDeploymentPhaseKindV1::Requested,
+            operation: "prove_product_drain_route_absence_cancellation",
+        }
+    );
+    let mut awaiting = Fixture::new();
+    awaiting.advance_to_awaiting_with_failure_history();
+    assert!(matches!(
+        ProductDrainSourceCancellationPermitV1::from_adapter_validated_durable_route_absence_acknowledgement(
+            &awaiting.deployment,
+            DeploymentRevision::FIRST,
+            at(60),
+        ),
+        Err(RuntimeDeploymentError::RevisionConflict { .. })
+    ));
+    assert_eq!(
+        ProductDrainSourceCancellationPermitV1::from_adapter_validated_durable_route_absence_acknowledgement(
+            &awaiting.deployment,
+            awaiting.deployment.revision(),
+            at(39),
+        )
+        .unwrap_err(),
+        RuntimeDeploymentError::AttestationTimeRegression
+    );
+    assert!(
+        ProductDrainSourceCancellationPermitV1::from_adapter_validated_durable_route_absence_acknowledgement(
+            &awaiting.deployment,
+            awaiting.deployment.revision(),
+            at(40),
+        )
+        .is_ok()
+    );
+    awaiting
+        .deployment
+        .certify_live(&awaiting.guard(50), awaiting.ready(), at(51))
+        .unwrap();
+    assert_eq!(
+        ProductDrainSourceCancellationPermitV1::from_adapter_validated_durable_route_absence_acknowledgement(
+            &awaiting.deployment,
+            awaiting.deployment.revision(),
+            at(50),
+        )
+        .unwrap_err(),
+        RuntimeDeploymentError::AttestationTimeRegression
+    );
+    assert!(
+        ProductDrainSourceCancellationPermitV1::from_adapter_validated_durable_route_absence_acknowledgement(
+            &awaiting.deployment,
+            awaiting.deployment.revision(),
+            at(51),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn product_drain_cancellation_rejects_source_drift_without_mutation() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_awaiting_with_failure_history();
+    let permit = cancellation_permit(&fixture.deployment, at(60));
+    fixture
+        .deployment
+        .certify_live(&fixture.guard(50), fixture.ready(), at(51))
+        .unwrap();
+    let before = fixture.deployment.snapshot();
+    assert_eq!(
+        fixture
+            .deployment
+            .cancel_product_drain_source(permit, at(61))
+            .unwrap_err(),
+        RuntimeDeploymentError::ProductDrainCancellationSourceMismatch
+    );
+    assert_eq!(fixture.deployment.snapshot(), before);
+}
+
+#[test]
+fn product_drain_cancellation_rejects_clock_and_revision_overflow_without_mutation() {
+    let mut early = Fixture::new();
+    early.advance_to_awaiting_with_failure_history();
+    let before = early.deployment.snapshot();
+    assert_eq!(
+        early
+            .deployment
+            .cancel_product_drain_source(cancellation_permit(&early.deployment, at(60)), at(59))
+            .unwrap_err(),
+        RuntimeDeploymentError::AttestationTimeRegression
+    );
+    assert_eq!(early.deployment.snapshot(), before);
+
+    let mut overflow = Fixture::new();
+    overflow.advance_to_awaiting_with_failure_history();
+    let mut snapshot = overflow.deployment.snapshot();
+    snapshot.revision = DeploymentRevision::new(u64::MAX).unwrap();
+    overflow.deployment = RuntimeDeployment::restore(snapshot).unwrap();
+    let before = overflow.deployment.snapshot();
+    assert_eq!(
+        overflow
+            .deployment
+            .cancel_product_drain_source(cancellation_permit(&overflow.deployment, at(60)), at(61),)
+            .unwrap_err(),
+        RuntimeDeploymentError::RevisionOverflow
+    );
+    assert_eq!(overflow.deployment.snapshot(), before);
+}
+
+#[test]
+fn product_drain_cancellation_permit_debug_output_is_opaque() {
+    let mut fixture = Fixture::new();
+    fixture.advance_to_awaiting_with_failure_history();
+    assert_eq!(
+        format!("{:?}", cancellation_permit(&fixture.deployment, at(60))),
+        "ProductDrainSourceCancellationPermitV1(<opaque>)"
     );
 }
