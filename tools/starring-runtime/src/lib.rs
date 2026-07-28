@@ -1,4 +1,5 @@
 mod build_revision;
+mod capability_readiness_supervisor;
 mod closed_recovery;
 mod config;
 mod controller_identity;
@@ -10,6 +11,7 @@ mod gateway_owner_startup;
 mod gateway_owner_startup_watchdog;
 mod health;
 mod identity_encoding;
+mod ingress_acknowledgement_safety;
 mod ingress_acknowledgement_supervisor;
 #[cfg_attr(not(test), allow(dead_code))]
 mod maintenance_ingress_gate;

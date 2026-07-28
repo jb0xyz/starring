@@ -270,6 +270,41 @@ pub struct RuntimeDatabaseDependenciesV1 {
 }
 
 #[derive(Clone)]
+pub(crate) struct RuntimeDatabaseReadinessProbeV2 {
+    execution: PostgresRuntimeExecutionV1,
+    exact_target: PostgresRuntimeExactTargetReader,
+    panel: PostgresRuntimePanelV1,
+    serving: PostgresRuntimeServingLeaseV1,
+    interaction: PostgresRuntimeInteractionV1,
+}
+
+impl RuntimeDatabaseReadinessProbeV2 {
+    pub(crate) async fn verify_v2(
+        &self,
+    ) -> Result<RuntimeDatabaseReadinessV1, RuntimeDatabaseCompositionErrorV1> {
+        let readiness = async {
+            let (execution, exact_target, panel, serving, interaction) = tokio::join!(
+                self.execution.verify_database_v1(),
+                self.exact_target.verify_database_v1(),
+                self.panel.verify_database_v1(),
+                self.serving.verify_database_v1(),
+                self.interaction.verify_database_v1(),
+            );
+            verified_readiness_from_results(execution, exact_target, panel, serving, interaction)
+        };
+        timeout(PERIODIC_READINESS_TIMEOUT, readiness)
+            .await
+            .map_err(|_| RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut)?
+    }
+}
+
+impl Debug for RuntimeDatabaseReadinessProbeV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeDatabaseReadinessProbeV2(<redacted>)")
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct RuntimePendingDrainMutationDatabaseV3 {
     execution: PostgresRuntimeExecutionV1,
 }
@@ -361,22 +396,20 @@ impl RuntimeDatabaseDependenciesV1 {
         self.shutdown.clone()
     }
 
+    pub(crate) fn readiness_probe_v2(&self) -> RuntimeDatabaseReadinessProbeV2 {
+        RuntimeDatabaseReadinessProbeV2 {
+            execution: self.execution.clone(),
+            exact_target: self.exact_target.clone(),
+            panel: self.panel.clone(),
+            serving: self.serving.clone(),
+            interaction: self.interaction.clone(),
+        }
+    }
+
     pub async fn verify_readiness_v1(
         &self,
     ) -> Result<RuntimeDatabaseReadinessV1, RuntimeDatabaseCompositionErrorV1> {
-        let readiness = async {
-            let (execution, exact_target, panel, serving, interaction) = tokio::join!(
-                self.execution.verify_database_v1(),
-                self.exact_target.verify_database_v1(),
-                self.panel.verify_database_v1(),
-                self.serving.verify_database_v1(),
-                self.interaction.verify_database_v1(),
-            );
-            verified_readiness_from_results(execution, exact_target, panel, serving, interaction)
-        };
-        timeout(PERIODIC_READINESS_TIMEOUT, readiness)
-            .await
-            .map_err(|_| RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut)?
+        self.readiness_probe_v2().verify_v2().await
     }
 
     #[cfg_attr(test, allow(dead_code))]

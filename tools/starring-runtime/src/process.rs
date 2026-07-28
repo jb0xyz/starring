@@ -6,6 +6,9 @@ use automation_runtime_convergence::{ControllerId, ProcessInstanceId};
 use automation_runtime_worker::RuntimeMutationFinalizerGenerationV1;
 
 use crate::build_revision::CompiledRuntimeBuildRevisionV1;
+use crate::capability_readiness_supervisor::{
+    RuntimeCapabilityReadinessActivationErrorV2, RuntimeCapabilityReadinessSupervisorExitV2,
+};
 use crate::controller_identity::generate_runtime_controller_id_v1;
 use crate::database::compose_runtime_database_dependencies_v1;
 use crate::health::RuntimeHealthReadinessPublisherV2;
@@ -193,6 +196,7 @@ pub enum RuntimeProcessFoundationShutdownFailureV1 {
     Database(RuntimeDatabasePoolShutdownErrorV1),
     HealthListener,
     IngressAcknowledgement,
+    CapabilityReadiness,
 }
 
 impl RuntimeProcessFoundationShutdownFailureV1 {
@@ -208,6 +212,7 @@ impl RuntimeProcessFoundationShutdownFailureV1 {
             Self::IngressAcknowledgement => {
                 "runtime_process_ingress_acknowledgement_supervisor_shutdown"
             }
+            Self::CapabilityReadiness => "runtime_process_capability_readiness_supervisor_shutdown",
         }
     }
 }
@@ -364,6 +369,12 @@ impl RuntimeProcessFoundationV1 {
         self.root_supervisor.shutdown_trigger()
     }
 
+    pub(super) fn invalidation_trigger_v1(
+        &self,
+    ) -> crate::process_supervisor::RuntimeProcessInvalidationTriggerV1 {
+        self.root_supervisor.invalidation_trigger()
+    }
+
     pub(super) fn trip_shutdown_v1(
         &self,
         cause: RuntimeShutdownCauseV1,
@@ -413,6 +424,16 @@ impl RuntimeProcessFoundationV1 {
         &mut self,
     ) -> Option<RuntimeProcessIngressAcknowledgementSupervisorV2> {
         self.ingress_acknowledgement.take()
+    }
+
+    pub(super) async fn activate_capability_readiness_supervisor_v2(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<(), RuntimeCapabilityReadinessActivationErrorV2> {
+        let probe = self.databases.readiness_probe_v2();
+        self.root_supervisor
+            .activate_capability_readiness_until_v2(probe, deadline)
+            .await
     }
 
     pub(super) async fn seal_startup_finalizer_for_handoff_v2(
@@ -549,6 +570,18 @@ impl RuntimeProcessFoundationV1 {
             }
             drop(report);
         }
+        let capability_readiness = self
+            .root_supervisor
+            .shutdown_capability_readiness_until_v2(deadline)
+            .await;
+        if !matches!(
+            capability_readiness,
+            RuntimeCapabilityReadinessSupervisorExitV2::Commanded
+                | RuntimeCapabilityReadinessSupervisorExitV2::ReadinessLost
+        ) {
+            self.shutdown_failures
+                .record(RuntimeProcessFoundationShutdownFailureV1::CapabilityReadiness);
+        }
         deadline
     }
 
@@ -638,6 +671,17 @@ impl RuntimeProcessFoundationV1 {
                     .record(RuntimeProcessFoundationShutdownFailureV1::IngressAcknowledgement);
             }
             drop(report);
+        }
+        let capability_readiness = root_supervisor
+            .shutdown_capability_readiness_until_v2(cleanup_deadline)
+            .await;
+        if !matches!(
+            capability_readiness,
+            RuntimeCapabilityReadinessSupervisorExitV2::Commanded
+                | RuntimeCapabilityReadinessSupervisorExitV2::ReadinessLost
+        ) {
+            shutdown_failures
+                .record(RuntimeProcessFoundationShutdownFailureV1::CapabilityReadiness);
         }
         let signal_exit = root_supervisor.join_signal_until(cleanup_deadline).await;
         if matches!(

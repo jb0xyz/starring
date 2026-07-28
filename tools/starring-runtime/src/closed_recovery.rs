@@ -38,8 +38,8 @@ use crate::discord_lifecycle::RuntimeDiscordPauseReservationIdentityV2;
 use crate::gateway::{
     RuntimeGatewayBootstrapV1, RuntimeGatewayFixedPointAcceptanceErrorV2,
     RuntimeGatewayProductionCoordinatorV2, RuntimeGatewayProductionInterruptV2,
-    RuntimeGatewayRecoveryOwnerCommitErrorV2, RuntimeGatewayRecoverySectionErrorV2,
-    RuntimeRecoveryPendingGatewayBindingV2,
+    RuntimeGatewayReadyInvalidationObserverV2, RuntimeGatewayRecoveryOwnerCommitErrorV2,
+    RuntimeGatewayRecoverySectionErrorV2, RuntimeRecoveryPendingGatewayBindingV2,
 };
 use crate::gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2,
@@ -1923,6 +1923,24 @@ impl RuntimeClosedRecoverySupervisedEmptyOpenProcessV2 {
     {
         self.gateway
             .observe_exact_current_ready_attestation_v2(self.worker.coordinator_generation())
+    }
+
+    pub(crate) fn arm_gateway_invalidation_trigger_v2(
+        &self,
+        trigger: crate::process_supervisor::RuntimeProcessInvalidationTriggerV1,
+    ) -> bool {
+        self.gateway
+            .arm_process_invalidation_v2(self.worker.coordinator_generation(), trigger)
+    }
+
+    pub(crate) fn bind_gateway_ready_invalidation_observer_v2(
+        &self,
+        expected_ready: &RuntimeGatewayReadyAttestationV2,
+    ) -> RuntimeGatewayReadyInvalidationObserverV2 {
+        self.gateway.bind_current_ready_invalidation_observer_v2(
+            self.worker.coordinator_generation(),
+            expected_ready,
+        )
     }
 
     pub(crate) fn observe_registry_empty_v2(

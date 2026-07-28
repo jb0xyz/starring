@@ -61,12 +61,12 @@ impl RuntimeHealthReadinessHandleV1 {
     }
 
     #[cfg(test)]
-    fn is_ready(&self) -> bool {
+    pub(crate) fn is_ready(&self) -> bool {
         self.state.ready.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
-    fn is_sealed(&self) -> bool {
+    pub(crate) fn is_sealed(&self) -> bool {
         self.state.readiness_sealed.load(Ordering::Acquire)
     }
 }

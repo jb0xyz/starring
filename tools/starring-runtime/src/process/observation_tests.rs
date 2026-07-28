@@ -12,6 +12,80 @@ use crate::{
     RuntimeOwnerHeldProcessShutdownErrorV1,
 };
 
+#[test]
+fn ingress_acknowledgement_schedule_is_fail_closed_at_expiry_and_safety_equality() {
+    let now = Instant::now();
+    assert_eq!(
+        ingress_acknowledgement_schedule_from_remaining_v2(Duration::ZERO, now, now),
+        None
+    );
+    assert_eq!(
+        ingress_acknowledgement_schedule_from_remaining_v2(
+            INGRESS_ACKNOWLEDGEMENT_SAFETY_MARGIN_V2,
+            now,
+            now,
+        ),
+        None
+    );
+
+    let remaining = INGRESS_ACKNOWLEDGEMENT_SAFETY_MARGIN_V2 + Duration::from_nanos(1);
+    let schedule = ingress_acknowledgement_schedule_from_remaining_v2(remaining, now, now).unwrap();
+    assert_eq!(schedule.refresh_at, now);
+    assert_eq!(schedule.safety_deadline, now + Duration::from_nanos(1));
+}
+
+#[test]
+fn ingress_acknowledgement_schedule_refreshes_before_its_safety_deadline() {
+    let now = Instant::now();
+    let schedule = ingress_acknowledgement_schedule_from_remaining_v2(
+        INGRESS_ACKNOWLEDGEMENT_LEASE_V2,
+        now,
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        schedule.refresh_at,
+        now + INGRESS_ACKNOWLEDGEMENT_LEASE_V2
+            .checked_sub(INGRESS_ACKNOWLEDGEMENT_REFRESH_ADVANCE_V2)
+            .unwrap()
+    );
+    assert_eq!(
+        schedule.safety_deadline,
+        now + INGRESS_ACKNOWLEDGEMENT_LEASE_V2
+            .checked_sub(INGRESS_ACKNOWLEDGEMENT_SAFETY_MARGIN_V2)
+            .unwrap()
+    );
+    assert!(schedule.refresh_at < schedule.safety_deadline);
+}
+
+#[test]
+fn ingress_acknowledgement_schedule_keeps_the_pre_observation_monotonic_anchor() {
+    let observation_started_at = Instant::now();
+    let observed_at = observation_started_at + Duration::from_secs(7);
+    let schedule = ingress_acknowledgement_schedule_from_remaining_v2(
+        INGRESS_ACKNOWLEDGEMENT_LEASE_V2,
+        observation_started_at,
+        observed_at,
+    )
+    .unwrap();
+    assert_eq!(
+        schedule.refresh_at,
+        observation_started_at + Duration::from_secs(5)
+    );
+    assert_eq!(
+        schedule.safety_deadline,
+        observation_started_at + Duration::from_secs(8)
+    );
+    assert_eq!(
+        ingress_acknowledgement_schedule_from_remaining_v2(
+            INGRESS_ACKNOWLEDGEMENT_LEASE_V2,
+            observation_started_at,
+            schedule.safety_deadline,
+        ),
+        None
+    );
+}
+
 const FAKE_PROCESS_CLEANUP_EVENTS_V2: [&str; 8] = [
     "discord_start",
     "discord_done",

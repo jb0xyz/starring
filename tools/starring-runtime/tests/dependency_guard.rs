@@ -570,6 +570,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             .collect::<Vec<_>>(),
         [
             "src/build_revision.rs",
+            "src/capability_readiness_supervisor.rs",
             "src/closed_recovery.rs",
             "src/config.rs",
             "src/controller_identity.rs",
@@ -582,6 +583,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/gateway_owner_startup_watchdog_handoff_tests.rs",
             "src/health.rs",
             "src/identity_encoding.rs",
+            "src/ingress_acknowledgement_safety.rs",
             "src/ingress_acknowledgement_supervisor.rs",
             "src/lib.rs",
             "src/main.rs",
@@ -775,13 +777,15 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
                 "        RuntimeProcessIngressAcknowledgementJobV2,\n",
                 "    >;"
             )));
-        } else if path != Path::new("src/database.rs")
+        } else if path != Path::new("src/capability_readiness_supervisor.rs")
+            && path != Path::new("src/database.rs")
             && path != Path::new("src/gateway.rs")
             && path != Path::new("src/gateway_owner_startup.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog.rs")
             && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
             && path != Path::new("src/health.rs")
             && path != Path::new("src/discord.rs")
+            && path != Path::new("src/ingress_acknowledgement_safety.rs")
             && path != Path::new("src/ingress_acknowledgement_supervisor.rs")
             && path != Path::new("src/maintenance_ingress_gate.rs")
             && path != Path::new("src/process/closed.rs")
@@ -1091,6 +1095,11 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         {
             continue;
         }
+        let source = if path == Path::new("src/process_supervisor.rs") {
+            source_before_test_module(source)
+        } else {
+            source
+        };
         if path == Path::new("src/registry_succession_tests.rs") {
             continue;
         }
@@ -1682,6 +1691,16 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         .find(|(path, _)| path == Path::new("src/ingress_acknowledgement_supervisor.rs"))
         .map(|(_, source)| source_before_test_module(source))
         .unwrap();
+    let capability_readiness_supervisor = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/capability_readiness_supervisor.rs"))
+        .map(|(_, source)| source_before_test_module(source))
+        .unwrap();
+    let acknowledgement_safety = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/ingress_acknowledgement_safety.rs"))
+        .map(|(_, source)| source_before_test_module(source))
+        .unwrap();
     assert_eq!(
         process
             .matches("RuntimeMaintenanceIngressGateControllerV2")
@@ -1698,26 +1717,45 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
             .count(),
         1
     );
-    let shutdown_trip = braced_declaration(process_supervisor, "pub(crate) fn trip(&self, cause:");
-    let process_shutdown = shutdown_trip.find("self.trigger.trip(cause)").unwrap();
-    let shutdown_deadline = shutdown_trip.find("trip.observation().deadline()").unwrap();
-    let health_seal = shutdown_trip.find("self.health.seal_readiness()").unwrap();
-    let ingress_seal = shutdown_trip
+    let invalidation_impl = braced_declaration(
+        process_supervisor,
+        "impl RuntimeProcessInvalidationTriggerV1",
+    );
+    let invalidation_trip =
+        braced_declaration(invalidation_impl, "pub(crate) fn trip(&self, cause:");
+    let process_shutdown = invalidation_trip.find("self.trigger.trip(cause)").unwrap();
+    let shutdown_deadline = invalidation_trip
+        .find("trip.observation().deadline()")
+        .unwrap();
+    let health_seal = invalidation_trip
+        .find("self.health.seal_readiness()")
+        .unwrap();
+    let ingress_seal = invalidation_trip
         .find("self.maintenance_ingress.seal_shutdown_v2()")
         .unwrap();
-    let acknowledgement_seal = shutdown_trip
+    let acknowledgement_seal = invalidation_trip
         .find("self.ingress_acknowledgement.seal_until_v2(deadline)")
         .unwrap();
-    let finalizer_seal = shutdown_trip.find("self.finalizer.seal_intake()").unwrap();
-    let gateway_shutdown = shutdown_trip.find("self.gateway.enter_shutdown()").unwrap();
+    let capability_seal = invalidation_trip
+        .find("self.capability_readiness.seal_until_v2(deadline)")
+        .unwrap();
+    let finalizer_seal = invalidation_trip
+        .find("self.finalizer.seal_intake()")
+        .unwrap();
     assert!(
         process_shutdown < shutdown_deadline
             && shutdown_deadline < health_seal
             && health_seal < ingress_seal
             && ingress_seal < acknowledgement_seal
-            && acknowledgement_seal < finalizer_seal
-            && finalizer_seal < gateway_shutdown
+            && acknowledgement_seal < capability_seal
+            && capability_seal < finalizer_seal
     );
+    let shutdown_impl =
+        braced_declaration(process_supervisor, "impl RuntimeProcessShutdownTriggerV1");
+    let shutdown_trip = braced_declaration(shutdown_impl, "pub(crate) fn trip(&self, cause:");
+    let invalidation = shutdown_trip.find("self.invalidation.trip(cause)").unwrap();
+    let gateway_shutdown = shutdown_trip.find("self.gateway.enter_shutdown()").unwrap();
+    assert!(invalidation < gateway_shutdown);
     assert_eq!(process_supervisor.matches(".seal_shutdown_v2()").count(), 1);
     for required in [
         "const RUNTIME_INGRESS_ACKNOWLEDGEMENT_DATA_CAPACITY: usize = 1;",
@@ -1815,6 +1853,22 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
     let open_transition = enter_empty_open
         .find(".into_empty_open_v2(observation)")
         .unwrap();
+    let acknowledgement_safety_arm = enter_empty_open
+        .find("RuntimeIngressAcknowledgementSafetyMonitorV2::start_v2(")
+        .unwrap();
+    let owner_successor_wait = enter_empty_open
+        .find(".wait_for_owner_successor_v2(")
+        .unwrap();
+    let acknowledgement_refresh = enter_empty_open
+        .find(".refresh_acknowledgement_with_owner_v2(")
+        .unwrap();
+    let capability_activation = enter_empty_open
+        .find(".activate_capability_readiness_supervisor_v2(")
+        .unwrap();
+    let gateway_invalidation_arm = enter_empty_open
+        .find(".arm_gateway_invalidation_trigger_v2(")
+        .unwrap();
+    let final_revalidation = enter_empty_open.rfind(".revalidate_v2()").unwrap();
     let readiness_publish = enter_empty_open
         .find("readiness.publish_ready_v2()")
         .unwrap();
@@ -1827,7 +1881,13 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
             && acknowledgement_authorization < acknowledgement_lane
             && acknowledgement_lane < owner_reobservation
             && owner_reobservation < open_transition
-            && open_transition < readiness_publish
+            && open_transition < acknowledgement_safety_arm
+            && acknowledgement_safety_arm < owner_successor_wait
+            && owner_successor_wait < acknowledgement_refresh
+            && acknowledgement_refresh < capability_activation
+            && capability_activation < gateway_invalidation_arm
+            && gateway_invalidation_arm < final_revalidation
+            && final_revalidation < readiness_publish
     );
     assert!(enter_empty_open.contains(
         "RuntimeIngressOpenAcknowledgementLeaseDurationV2::from_duration(\n            INGRESS_ACKNOWLEDGEMENT_LEASE_V2,"
@@ -1864,6 +1924,23 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
             .count(),
         1
     );
+    let final_observation_anchor = refresh
+        .find("let final_observation_started_at = Instant::now()")
+        .unwrap();
+    let final_observation = refresh
+        .find("exact_reobserve_ingress_acknowledgement_v2(")
+        .unwrap();
+    let schedule = refresh
+        .find("ingress_acknowledgement_schedule_v2(receipt, final_observation_started_at)")
+        .unwrap();
+    let safety_rearm = refresh.find(".rearm_v2(schedule.safety_deadline)").unwrap();
+    let refresh_revalidation = refresh.rfind(".revalidate_v2()").unwrap();
+    assert!(
+        final_observation_anchor < final_observation
+            && final_observation < schedule
+            && schedule < safety_rearm
+            && safety_rearm < refresh_revalidation
+    );
     assert_eq!(
         enter_empty_open
             .matches("execute_ingress_acknowledgement_v2(")
@@ -1874,6 +1951,71 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         "lifecycle.into_ingress_acknowledgement_authority_v2(\n            open_generation,"
     ));
     assert!(refresh.contains("maintenance_gate_generation: gate.generation()"));
+    for required in [
+        "const CAPABILITY_READINESS_CONTROL_CAPACITY_V2: usize = 1;",
+        "const CAPABILITY_READINESS_CADENCE_V2: Duration = Duration::from_secs(1);",
+        "const CAPABILITY_READINESS_VERIFY_TIMEOUT_V2: Duration = Duration::from_secs(5);",
+        "mpsc::channel(CAPABILITY_READINESS_CONTROL_CAPACITY_V2)",
+        "tokio::select! {\n        biased;\n        changed = shutdown.changed()",
+        "invalidation.invalidate_readiness_v2();",
+    ] {
+        assert!(
+            capability_readiness_supervisor.contains(required),
+            "capability readiness supervisor: {required}"
+        );
+    }
+    assert_eq!(
+        capability_readiness_supervisor
+            .matches("invalidation.invalidate_readiness_v2();")
+            .count(),
+        3
+    );
+    for forbidden in [
+        "interaction",
+        "route",
+        "consumer",
+        "sqlx",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+    ] {
+        assert!(
+            !contains_identifier(capability_readiness_supervisor, forbidden),
+            "capability readiness supervisor: {forbidden}"
+        );
+    }
+    for required in [
+        "RuntimeIngressAcknowledgementSafetyMonitorV2",
+        "RuntimeIngressAcknowledgementSafetyStageV2::Armed",
+        "RuntimeIngressAcknowledgementSafetyStageV2::Expired",
+        "deadline <= current.deadline",
+        "current.generation.checked_add(1)",
+        "tokio::select! {\n                biased;",
+        "task.abort();",
+        "let _joined = task.await;",
+        "invalidate_ingress_acknowledgement_v2();",
+    ] {
+        assert!(
+            acknowledgement_safety.contains(required),
+            "acknowledgement safety: {required}"
+        );
+    }
+    for forbidden in [
+        "interaction",
+        "route",
+        "consumer",
+        "sqlx",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+    ] {
+        assert!(
+            !contains_identifier(acknowledgement_safety, forbidden),
+            "acknowledgement safety: {forbidden}"
+        );
+    }
     for forbidden in [
         "async fn publish_ingress_acknowledgement_v2",
         ".begin_attempt()",
@@ -1923,6 +2065,11 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         if path == Path::new("src/maintenance_ingress_gate.rs") {
             continue;
         }
+        let source = if path == Path::new("src/process_supervisor.rs") {
+            source_before_test_module(source)
+        } else {
+            source
+        };
         if path != Path::new("src/process.rs") {
             assert!(
                 !contains_identifier(source, "RuntimeMaintenanceIngressGateControllerV2"),
@@ -5390,8 +5537,9 @@ fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_en
 fn executable_delegates_once_without_raw_startup_or_runtime_authority() {
     let main = source_before_test_module(include_str!("../src/main.rs"));
     let entry = braced_declaration(main, "fn main() -> ExitCode");
-    assert!(main.contains("StartupRecoveryFixedPointAndClosed"));
-    assert!(main.contains("runtime_staging_startup_recovery_fixed_point_and_closed"));
+    assert!(main.contains("CleanShutdown"));
+    assert!(main.contains("runtime_process_clean_shutdown"));
+    assert!(main.contains("Self::CleanShutdown => ExitCode::SUCCESS"));
     assert!(main.contains("Self::Failed(error) if error.cleanup_class()"));
     assert_eq!(
         entry
