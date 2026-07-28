@@ -129,15 +129,19 @@ pub use v2_drain_intent_canonical_state::{
     RuntimeClosedRecoveryEmptyRegistryPendingDrainClaimTransitionV2,
     RuntimeClosedRecoveryPendingDrainAcknowledgementInputV2,
     RuntimeClosedRecoveryPendingDrainAcknowledgementTransitionV2,
+    RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementInputV2,
+    RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementTransitionV2,
     RuntimeDrainIntentCanonicalStateCorrelationV2, RuntimeDrainIntentCanonicalStateErrorV2,
     RuntimeDrainIntentCanonicalStateFieldV2, RuntimeDrainIntentCanonicalStateKindV2,
     RuntimePersistedRouteAbsenceCandidateDrainIntentV2,
+    RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2,
     RuntimePersistedUnclaimedPendingDrainIntentV2,
 };
 pub use v2_drain_intent_receipt::{
     RuntimeDrainAcknowledgementSourceV2, RuntimeDrainIntentMutationOutcomeV2,
     RuntimeDrainIntentReceiptErrorV2, RuntimeDrainIntentReceiptV2, RuntimeDrainRefenceSourceV2,
-    RuntimeRouteAbsentDrainIntentSourceV2,
+    RuntimeDrainSuccessionAcknowledgementExpectationV2,
+    RuntimeDrainSuccessionAcknowledgementSourceV2, RuntimeRouteAbsentDrainIntentSourceV2,
 };
 pub use v2_drain_intent_state::{
     RuntimeDrainIntentStateErrorV2, RuntimeDrainIntentStateFieldV2, RuntimeDrainIntentStateKindV2,

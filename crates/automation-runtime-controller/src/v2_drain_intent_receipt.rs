@@ -1,9 +1,16 @@
 #[cfg(test)]
 mod tests;
 
+use std::num::NonZeroU64;
+
+use automation_runtime_convergence::ControllerId;
+use chrono::{DateTime, Utc};
+
 use crate::{
-    RuntimeDrainClaimProgressKindV2, RuntimeDrainClaimV2, RuntimeDrainIntentStateKindV2,
-    RuntimeDrainIntentV2, RuntimeProductDrainOperationV2,
+    RuntimeClosedRecoveryRouteWitnessV2, RuntimeDrainCertificationResolutionKindV2,
+    RuntimeDrainCertificationResolutionV2, RuntimeDrainClaimProgressKindV2, RuntimeDrainClaimV2,
+    RuntimeDrainIntentStateKindV2, RuntimeDrainIntentV2, RuntimeProductDrainOperationV2,
+    RuntimeRouteMutationProvenanceV2, RuntimeUnixMicrosecondsV2,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +48,38 @@ pub enum RuntimeDrainIntentReceiptErrorV2 {
     ClaimProgressMismatch,
     #[error("runtime route-absence acknowledgement does not contain the exact source claim")]
     AcknowledgementMismatch,
+    #[error("runtime drain succession predecessor is not expired at database time")]
+    SuccessionPredecessorNotExpired,
+    #[error("runtime drain succession database time is not canonical")]
+    SuccessionDatabaseTimeInvalid,
+    #[error("runtime drain succession process is not distinct from its predecessor")]
+    SuccessionProcessNotDistinct,
+    #[error("runtime drain succession owner identity is internally inconsistent")]
+    SuccessionOwnerMismatch,
+    #[error("runtime drain succession recovery generation is not the exact emergency successor")]
+    SuccessionRecoveryGenerationMismatch,
+    #[error("runtime drain succession pause does not follow its connected event")]
+    SuccessionPauseSequenceMismatch,
+    #[error("runtime drain succession gateway shard changed")]
+    SuccessionShardMismatch,
+    #[error("runtime drain succession owner lease epoch is not strictly newer")]
+    SuccessionOwnerEpochNotNewer,
+    #[error("runtime drain succession owner lease is not current at database time")]
+    SuccessionOwnerExpired,
+    #[error("runtime drain succession result is not the exact intent-revision successor")]
+    SuccessionIntentRevisionMismatch,
+    #[error("runtime drain succession result has the wrong claim identity")]
+    SuccessionClaimMismatch,
+    #[error("runtime drain succession claim revision is not the exact successor")]
+    SuccessionClaimRevisionMismatch,
+    #[error("runtime drain succession controller fence is not the exact successor")]
+    SuccessionFenceMismatch,
+    #[error("runtime drain succession seal does not match current recovery evidence")]
+    SuccessionSealMismatch,
+    #[error("runtime drain succession acknowledgement does not match current recovery evidence")]
+    SuccessionAcknowledgementMismatch,
+    #[error("runtime drain succession certification is not eligible for direct acknowledgement")]
+    SuccessionCertificationMismatch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +127,54 @@ impl RuntimeDrainAcknowledgementSourceV2 {
 
     pub fn source(&self) -> &RuntimeDrainIntentV2 {
         &self.source
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeDrainSuccessionAcknowledgementExpectationV2 {
+    pub database_now: DateTime<Utc>,
+    pub recovery_witness: RuntimeClosedRecoveryRouteWitnessV2,
+    pub controller_id: ControllerId,
+    pub seal_generation: NonZeroU64,
+    pub seal_observation_sequence: NonZeroU64,
+    pub acknowledgement_observation_sequence: NonZeroU64,
+    pub certification: RuntimeDrainCertificationResolutionV2,
+    pub acknowledged_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeDrainSuccessionAcknowledgementSourceV2 {
+    source: RuntimeDrainIntentV2,
+    expectation: RuntimeDrainSuccessionAcknowledgementExpectationV2,
+}
+
+impl RuntimeDrainSuccessionAcknowledgementSourceV2 {
+    pub fn from_expired_route_absent_claimed(
+        source: RuntimeDrainIntentV2,
+        expectation: RuntimeDrainSuccessionAcknowledgementExpectationV2,
+    ) -> Result<Self, RuntimeDrainIntentReceiptErrorV2> {
+        let predecessor = pending_claimed(&source)?;
+        if predecessor.progress().seal().expected_route().is_some() {
+            return Err(RuntimeDrainIntentReceiptErrorV2::SourceStateMismatch);
+        }
+        validate_succession_owner(predecessor, &expectation)?;
+        if expectation.certification.kind()
+            == RuntimeDrainCertificationResolutionKindV2::CommittedAndDisconnected
+        {
+            return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionCertificationMismatch);
+        }
+        Ok(Self {
+            source,
+            expectation,
+        })
+    }
+
+    pub fn source(&self) -> &RuntimeDrainIntentV2 {
+        &self.source
+    }
+
+    pub fn expectation(&self) -> &RuntimeDrainSuccessionAcknowledgementExpectationV2 {
+        &self.expectation
     }
 }
 
@@ -208,6 +295,47 @@ impl RuntimeDrainIntentReceiptV2 {
         ))
     }
 
+    pub fn succession_acknowledged(
+        source: &RuntimeDrainSuccessionAcknowledgementSourceV2,
+        persisted_intent: RuntimeDrainIntentV2,
+    ) -> Result<Self, RuntimeDrainIntentReceiptErrorV2> {
+        validate_immutable_roots(source.source(), &persisted_intent)?;
+        let predecessor = pending_claimed(source.source())?;
+        let acknowledgement = persisted_intent
+            .state()
+            .acknowledgement()
+            .ok_or(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)?;
+        let expectation = source.expectation();
+        validate_succession_owner(predecessor, expectation)?;
+        if !is_exact_successor(
+            source.source().intent_revision().get(),
+            persisted_intent.intent_revision().get(),
+        ) {
+            return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionIntentRevisionMismatch);
+        }
+        validate_succession_claim(predecessor, acknowledgement.claim(), expectation)?;
+        let expected_provenance =
+            RuntimeRouteMutationProvenanceV2::ClosedRecovery(expectation.recovery_witness.clone());
+        if acknowledgement.expected_route().is_some()
+            || acknowledgement.provenance() != &expected_provenance
+            || acknowledgement.registry_observation_sequence()
+                != expectation.acknowledgement_observation_sequence
+            || acknowledgement.acknowledged_at() != expectation.acknowledged_at
+        {
+            return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionAcknowledgementMismatch);
+        }
+        if acknowledgement.certification() != &expectation.certification
+            || acknowledgement.certification().kind()
+                == RuntimeDrainCertificationResolutionKindV2::CommittedAndDisconnected
+        {
+            return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionCertificationMismatch);
+        }
+        Ok(Self::from_result(
+            RuntimeDrainIntentMutationOutcomeV2::Acknowledged,
+            persisted_intent,
+        ))
+    }
+
     pub fn outcome(&self) -> RuntimeDrainIntentMutationOutcomeV2 {
         self.outcome
     }
@@ -292,4 +420,91 @@ fn claim_identity_matches(source: &RuntimeDrainClaimV2, result: &RuntimeDrainCla
         && source.controller_fencing_token() == result.controller_fencing_token()
         && source.claim_epoch() == result.claim_epoch()
         && source.expires_at() == result.expires_at()
+}
+
+fn validate_succession_owner(
+    predecessor: &RuntimeDrainClaimV2,
+    expectation: &RuntimeDrainSuccessionAcknowledgementExpectationV2,
+) -> Result<(), RuntimeDrainIntentReceiptErrorV2> {
+    let witness = &expectation.recovery_witness;
+    if RuntimeUnixMicrosecondsV2::from_datetime(expectation.database_now).is_err() {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionDatabaseTimeInvalid);
+    }
+    if expectation.database_now < predecessor.expires_at() {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionPredecessorNotExpired);
+    }
+    if witness.gateway_owner_lease_id.process_instance_id != witness.process_instance_id {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionOwnerMismatch);
+    }
+    if witness
+        .originating_emergency_generation
+        .get()
+        .checked_add(1)
+        != Some(witness.recovery_generation.get())
+    {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionRecoveryGenerationMismatch);
+    }
+    if witness.pause_sequence.get() <= witness.connected_event_sequence.get() {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionPauseSequenceMismatch);
+    }
+    if predecessor.process_instance_id() == &witness.process_instance_id {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionProcessNotDistinct);
+    }
+    if predecessor.gateway_owner_lease_id().gateway_shard_id
+        != witness.gateway_owner_lease_id.gateway_shard_id
+    {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionShardMismatch);
+    }
+    if witness.gateway_owner_lease_id.lease_epoch
+        <= predecessor.gateway_owner_lease_id().lease_epoch
+    {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionOwnerEpochNotNewer);
+    }
+    if expectation.database_now >= witness.owner_expires_at {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionOwnerExpired);
+    }
+    Ok(())
+}
+
+fn validate_succession_claim(
+    predecessor: &RuntimeDrainClaimV2,
+    successor: &RuntimeDrainClaimV2,
+    expectation: &RuntimeDrainSuccessionAcknowledgementExpectationV2,
+) -> Result<(), RuntimeDrainIntentReceiptErrorV2> {
+    let witness = &expectation.recovery_witness;
+    if successor.progress().kind() != RuntimeDrainClaimProgressKindV2::Claimed
+        || successor.gateway_owner_lease_id() != &witness.gateway_owner_lease_id
+        || successor.observed_owner_revision() != witness.observed_owner_revision
+        || successor.process_instance_id() != &witness.process_instance_id
+        || successor.controller_id() != &expectation.controller_id
+        || successor.claim_epoch() != witness.recovery_generation
+        || successor.expires_at() != witness.owner_expires_at
+    {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionClaimMismatch);
+    }
+    if !is_exact_successor(
+        predecessor.claim_revision().get(),
+        successor.claim_revision().get(),
+    ) {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionClaimRevisionMismatch);
+    }
+    if !is_exact_successor(
+        predecessor.controller_fencing_token().get(),
+        successor.controller_fencing_token().get(),
+    ) {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionFenceMismatch);
+    }
+    let seal = successor.progress().seal();
+    if seal.process_instance_id() != &witness.process_instance_id
+        || seal.seal_generation() != expectation.seal_generation
+        || seal.registry_observation_sequence() != expectation.seal_observation_sequence
+        || seal.expected_route().is_some()
+    {
+        return Err(RuntimeDrainIntentReceiptErrorV2::SuccessionSealMismatch);
+    }
+    Ok(())
+}
+
+fn is_exact_successor(current: u64, successor: u64) -> bool {
+    current.checked_add(1) == Some(successor)
 }

@@ -15,8 +15,9 @@ use crate::{
     RuntimeDrainClaimProgressKindV2, RuntimeDrainClaimProgressV2, RuntimeDrainClaimSealWitnessV2,
     RuntimeDrainClaimV2, RuntimeDrainIntentReceiptErrorV2, RuntimeDrainIntentReceiptV2,
     RuntimeDrainIntentStateErrorV2, RuntimeDrainIntentStateKindV2, RuntimeDrainIntentV2,
-    RuntimePersistedProductDrainRootV2, RuntimeRouteAbsentAcknowledgementV2,
-    RuntimeRouteMutationProvenanceV2,
+    RuntimeDrainSuccessionAcknowledgementExpectationV2,
+    RuntimeDrainSuccessionAcknowledgementSourceV2, RuntimePersistedProductDrainRootV2,
+    RuntimeRouteAbsentAcknowledgementV2, RuntimeRouteMutationProvenanceV2,
 };
 
 const DRAIN_INTENT_STATE_MAX_OCTETS: usize = 1_048_576;
@@ -215,6 +216,18 @@ pub struct RuntimeClosedRecoveryPendingDrainAcknowledgementInputV2 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementInputV2 {
+    pub database_now: DateTime<Utc>,
+    pub recovery_witness: RuntimeClosedRecoveryRouteWitnessV2,
+    pub controller_id: ControllerId,
+    pub seal_generation: NonZeroU64,
+    pub seal_observation_sequence: NonZeroU64,
+    pub acknowledgement_observation_sequence: NonZeroU64,
+    pub certification: RuntimeDrainCertificationResolutionV2,
+    pub acknowledged_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimePersistedUnclaimedPendingDrainIntentV2 {
     canonical: RuntimeCanonicalDrainIntentStateV2,
 }
@@ -351,6 +364,46 @@ impl RuntimePersistedRouteAbsenceCandidateDrainIntentV2 {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2 {
+    canonical: RuntimeCanonicalDrainIntentStateV2,
+}
+
+impl RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2 {
+    pub fn from_persisted(
+        root: &RuntimePersistedProductDrainRootV2,
+        intent_revision: NonZeroU64,
+        persisted_state: &str,
+        state_bytes: &[u8],
+    ) -> Result<Self, RuntimeDrainIntentCanonicalStateErrorV2> {
+        let canonical = RuntimeCanonicalDrainIntentStateV2::from_persisted(
+            root,
+            intent_revision,
+            persisted_state,
+            state_bytes,
+        )?;
+        let candidate = canonical.state_kind()?
+            == RuntimeDrainIntentCanonicalStateKindV2::PendingClaimed
+            && canonical
+                .intent()
+                .state()
+                .pending_claim()
+                .is_some_and(|claim| claim.progress().seal().expected_route().is_none());
+        if !candidate {
+            return Err(
+                RuntimeDrainIntentCanonicalStateErrorV2::CorrelationMismatch {
+                    field: RuntimeDrainIntentCanonicalStateCorrelationV2::PendingProgress,
+                },
+            );
+        }
+        Ok(Self { canonical })
+    }
+
+    pub fn canonical(&self) -> &RuntimeCanonicalDrainIntentStateV2 {
+        &self.canonical
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeClosedRecoveryPendingDrainAcknowledgementTransitionV2 {
     source: RuntimePersistedRouteAbsenceCandidateDrainIntentV2,
     result: RuntimeCanonicalDrainIntentStateV2,
@@ -414,6 +467,101 @@ impl RuntimeClosedRecoveryPendingDrainAcknowledgementTransitionV2 {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementTransitionV2 {
+    source: RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2,
+    result: RuntimeCanonicalDrainIntentStateV2,
+}
+
+impl RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementTransitionV2 {
+    pub fn build(
+        source: RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2,
+        input: RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementInputV2,
+    ) -> Result<Self, RuntimeDrainIntentCanonicalStateErrorV2> {
+        let source_intent = source.canonical().intent();
+        let predecessor = source_intent.state().pending_claim().ok_or(
+            RuntimeDrainIntentCanonicalStateErrorV2::CorrelationMismatch {
+                field: RuntimeDrainIntentCanonicalStateCorrelationV2::PendingProgress,
+            },
+        )?;
+        let expectation = RuntimeDrainSuccessionAcknowledgementExpectationV2 {
+            database_now: input.database_now,
+            recovery_witness: input.recovery_witness.clone(),
+            controller_id: input.controller_id.clone(),
+            seal_generation: input.seal_generation,
+            seal_observation_sequence: input.seal_observation_sequence,
+            acknowledgement_observation_sequence: input.acknowledgement_observation_sequence,
+            certification: input.certification.clone(),
+            acknowledged_at: input.acknowledged_at,
+        };
+        let receipt_source =
+            RuntimeDrainSuccessionAcknowledgementSourceV2::from_expired_route_absent_claimed(
+                source_intent.clone(),
+                expectation,
+            )?;
+        let provenance =
+            RuntimeRouteMutationProvenanceV2::ClosedRecovery(input.recovery_witness.clone());
+        RuntimeCanonicalRouteMutationProvenanceV2::new(provenance.clone()).map_err(|_| {
+            RuntimeDrainIntentCanonicalStateErrorV2::InvalidField {
+                field: RuntimeDrainIntentCanonicalStateFieldV2::Provenance,
+            }
+        })?;
+        let successor_claim_revision = next_persistence_revision(
+            predecessor.claim_revision(),
+            RuntimeDrainIntentCanonicalStateFieldV2::ClaimRevision,
+        )?;
+        let successor_fence = next_controller_fence(predecessor.controller_fencing_token())?;
+        let seal = RuntimeDrainClaimSealWitnessV2::new(
+            source_intent.key(),
+            input.recovery_witness.process_instance_id.clone(),
+            input.seal_generation,
+            None,
+            input.seal_observation_sequence,
+        )?;
+        let claim = RuntimeDrainClaimV2::new(
+            source_intent.key(),
+            input.recovery_witness.gateway_owner_lease_id.clone(),
+            input.recovery_witness.observed_owner_revision,
+            input.recovery_witness.process_instance_id,
+            input.controller_id,
+            successor_fence,
+            input.recovery_witness.recovery_generation,
+            successor_claim_revision,
+            input.recovery_witness.owner_expires_at,
+            RuntimeDrainClaimProgressV2::claimed(seal),
+        )?;
+        let acknowledgement = RuntimeRouteAbsentAcknowledgementV2::new(
+            source_intent.key(),
+            claim,
+            None,
+            provenance,
+            input.acknowledgement_observation_sequence,
+            input.certification,
+            input.acknowledged_at,
+        )?;
+        let root = persisted_root_from_intent(source_intent)?;
+        let result_revision = next_intent_revision(source_intent.intent_revision())?;
+        let result = RuntimeDrainIntentV2::route_absent_acknowledged_from_persisted(
+            &root,
+            result_revision,
+            acknowledgement,
+        )?;
+        RuntimeDrainIntentReceiptV2::succession_acknowledged(&receipt_source, result.clone())?;
+        Ok(Self {
+            source,
+            result: RuntimeCanonicalDrainIntentStateV2::from_intent(result)?,
+        })
+    }
+
+    pub fn source(&self) -> &RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2 {
+        &self.source
+    }
+
+    pub fn result(&self) -> &RuntimeCanonicalDrainIntentStateV2 {
+        &self.result
+    }
+}
+
 fn next_intent_revision(
     current: NonZeroU64,
 ) -> Result<NonZeroU64, RuntimeDrainIntentCanonicalStateErrorV2> {
@@ -428,6 +576,41 @@ fn next_intent_revision(
     if next.get() > i64::MAX as u64 {
         return Err(RuntimeDrainIntentCanonicalStateErrorV2::CanonicalValue {
             field: RuntimeDrainIntentCanonicalStateFieldV2::IntentRevision,
+            reason: RuntimeCanonicalValueErrorV2::PersistenceIntegerOutOfRange,
+        });
+    }
+    Ok(next)
+}
+
+fn next_persistence_revision(
+    current: NonZeroU64,
+    field: RuntimeDrainIntentCanonicalStateFieldV2,
+) -> Result<NonZeroU64, RuntimeDrainIntentCanonicalStateErrorV2> {
+    let next = current
+        .get()
+        .checked_add(1)
+        .and_then(NonZeroU64::new)
+        .filter(|value| value.get() <= i64::MAX as u64)
+        .ok_or(RuntimeDrainIntentCanonicalStateErrorV2::CanonicalValue {
+            field,
+            reason: RuntimeCanonicalValueErrorV2::PersistenceIntegerOutOfRange,
+        })?;
+    Ok(next)
+}
+
+fn next_controller_fence(
+    current: FencingToken,
+) -> Result<FencingToken, RuntimeDrainIntentCanonicalStateErrorV2> {
+    let next =
+        current.next().map_err(
+            |_| RuntimeDrainIntentCanonicalStateErrorV2::CanonicalValue {
+                field: RuntimeDrainIntentCanonicalStateFieldV2::ControllerFencingToken,
+                reason: RuntimeCanonicalValueErrorV2::PersistenceIntegerOutOfRange,
+            },
+        )?;
+    if next.get() > i64::MAX as u64 {
+        return Err(RuntimeDrainIntentCanonicalStateErrorV2::CanonicalValue {
+            field: RuntimeDrainIntentCanonicalStateFieldV2::ControllerFencingToken,
             reason: RuntimeCanonicalValueErrorV2::PersistenceIntegerOutOfRange,
         });
     }
