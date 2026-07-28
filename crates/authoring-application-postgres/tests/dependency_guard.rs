@@ -686,7 +686,67 @@ fn product_rejection_adapter_is_separate_payload_bound_and_fail_closed() {
 }
 
 #[test]
-fn product_control_facade_composes_exact_ports_and_four_role_readiness() {
+fn lifecycle_cancellation_adapter_is_typed_bounded_and_relation_blind() {
+    let cancellation = include_str!("../src/product_decisions/lifecycle_cancel.rs");
+    let digest = include_str!("../src/product_decisions/digest.rs");
+    let module = include_str!("../src/product_decisions/mod.rs");
+    let library = include_str!("../src/lib.rs");
+    for required in [
+        "pub struct PostgresProductLifecycleCancellations",
+        "cancellation_executor: PgPool",
+        "ProductLifecycleCancellationPort<FreshDiscordAuthorityEvidenceV1>",
+        "CapabilityV1::CancelLifecycle",
+        "public.starring_product_cancel_runtime_drain_v2(",
+        "MAX_TRANSACTION_ATTEMPTS: usize = 2",
+        "configure_apply_transaction(&mut transaction, &self.config)",
+        "is_safe_transaction_retry(&error)",
+        "RuntimePersistedProductDrainRootV2::from_persisted(",
+        "RuntimeCanonicalDrainIntentStateV2::from_persisted(",
+        "RuntimeDrainIntentReceiptV2::cancelled(",
+        "prepare_product_drain_source_cancellation_v1(",
+        "Json<Box<RawValue>>",
+        "value.0.get().as_bytes()",
+        "failure_is_closed",
+    ] {
+        assert!(
+            cancellation.contains(required),
+            "missing lifecycle cancellation guard: {required}"
+        );
+    }
+    for forbidden in [
+        "INSERT INTO ",
+        "UPDATE ",
+        "DELETE FROM ",
+        "runtime_deployments",
+        "runtime_drain_intents_v2",
+        "runtime_product_operations_v2",
+        "runtime_product_drain_terminal_actions_v2",
+        "tokio::time::sleep",
+        ".bind(request.command().idempotency_key.as_str())",
+    ] {
+        assert!(
+            !cancellation.contains(forbidden),
+            "forbidden lifecycle cancellation adapter edge: {forbidden}"
+        );
+    }
+    for domain in [
+        "starring.product.lifecycle-cancellation.idempotency.v1",
+        "starring.product.lifecycle-cancellation.request.v1",
+        "starring.product.lifecycle-cancellation.receipt.v1",
+        "starring.product.lifecycle-cancellation.audit.v1",
+        "starring.product.lifecycle-cancellation.terminal-action.v1",
+        "starring.product.lifecycle-cancellation.reason.v1",
+        "starring.product.lifecycle-cancellation.session-subject.v1",
+        "starring.product.lifecycle-cancellation.digest-key-fingerprint.v1",
+    ] {
+        assert!(digest.contains(domain));
+    }
+    assert!(module.contains("pub use lifecycle_cancel::PostgresProductLifecycleCancellations"));
+    assert!(library.contains("PostgresProductLifecycleCancellations"));
+}
+
+#[test]
+fn product_control_facade_composes_exact_ports_and_five_role_readiness() {
     let facade = include_str!("../src/product_decisions/facade.rs");
     let module = include_str!("../src/product_decisions/mod.rs");
     let library = include_str!("../src/lib.rs");
@@ -694,20 +754,25 @@ fn product_control_facade_composes_exact_ports_and_four_role_readiness() {
         "pub struct PostgresProductControl",
         "decisions: PostgresProductDecisions",
         "rejections: PostgresProductRejections",
+        "cancellations: PostgresProductLifecycleCancellations",
         "decision_pools: ProductDecisionDatabasePoolsV1",
         "rejection_executor: PgPool",
+        "cancellation_executor: PgPool",
         "PostgresProductDecisionsConfig::production(keyring)?",
         "PostgresProductDecisions::with_config(decision_pools, config.clone())",
-        "PostgresProductRejections::with_config(rejection_executor, config)",
+        "PostgresProductRejections::with_config(",
+        "PostgresProductLifecycleCancellations::with_config(",
         "ProductDecisionQueryPort<FreshDiscordAuthorityEvidenceV1>",
         "ProductDecisionObservationPort<FreshDiscordAuthorityEvidenceV1>",
         "ProductApprovalPort<FreshDiscordAuthorityEvidenceV1>",
         "ProductRejectionPort<FreshDiscordAuthorityEvidenceV1>",
         "ProductApplyPort<FreshDiscordAuthorityEvidenceV1>",
+        "ProductLifecycleCancellationPort<FreshDiscordAuthorityEvidenceV1>",
         "self.decisions.check_decision_reader_readiness().await?",
         "self.decisions.check_approval_executor_readiness().await?",
         ".check_product_rejection_readiness()",
         "self.decisions.check_apply_executor_readiness().await?",
+        ".check_product_lifecycle_cancellation_readiness()",
         "verify_same_database_distinct_roles(&topologies)",
     ] {
         assert!(
@@ -719,10 +784,17 @@ fn product_control_facade_composes_exact_ports_and_four_role_readiness() {
     assert_eq!(facade.matches("async fn approve_payload_bound").count(), 1);
     assert_eq!(facade.matches("async fn reject_payload_bound").count(), 1);
     assert_eq!(facade.matches("async fn apply_idempotent").count(), 1);
+    assert_eq!(
+        facade
+            .matches("async fn cancel_lifecycle_idempotent")
+            .count(),
+        1
+    );
     for forbidden in [
         "from_parts",
         "pub fn decisions(",
         "pub fn rejections(",
+        "pub fn cancellations(",
         "impl ProductDecisionPort<",
     ] {
         assert!(
@@ -1503,6 +1575,10 @@ fn source_files_contain_no_comments() {
         (
             "src/product_decisions/digest.rs",
             include_str!("../src/product_decisions/digest.rs"),
+        ),
+        (
+            "src/product_decisions/lifecycle_cancel.rs",
+            include_str!("../src/product_decisions/lifecycle_cancel.rs"),
         ),
         (
             "src/product_decisions/mod.rs",

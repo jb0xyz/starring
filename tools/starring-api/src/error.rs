@@ -44,6 +44,8 @@ pub fn map_product_control_error(error: ProductControlPortError) -> FacadeError 
         ProductControlPortError::PayloadMismatch => FacadeErrorCode::StalePayload,
         ProductControlPortError::InvalidState
         | ProductControlPortError::RuntimeDrainRequired
+        | ProductControlPortError::RuntimeDrainPending(_)
+        | ProductControlPortError::LifecycleCancelled(_)
         | ProductControlPortError::DuplicateDecision
         | ProductControlPortError::Expired => FacadeErrorCode::InvalidState,
         ProductControlPortError::SelfApprovalForbidden => FacadeErrorCode::Forbidden,

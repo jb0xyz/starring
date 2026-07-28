@@ -4,8 +4,8 @@ use std::task::Poll;
 use std::time::Duration;
 
 use product_control_http::{
-    product_control_router_with_operational_v2_and_readiness_gate, ProductApiReadinessGate,
-    ProductControlFacade,
+    product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate,
+    ProductApiReadinessGate, ProductControlFacade,
 };
 use starring_api::{
     compose_production_service_v1, resolve_production_secrets_v1,
@@ -98,7 +98,7 @@ async fn serve(
 ) -> ExitStatusV1 {
     let (facade, http_boundary, bind_addr, database_shutdown) = service.into_parts();
     let readiness_gate = ProductApiReadinessGate::initially_unready();
-    let router = product_control_router_with_operational_v2_and_readiness_gate(
+    let router = product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate(
         facade.clone(),
         http_boundary,
         readiness_gate.clone(),
@@ -346,6 +346,7 @@ fn database_role_code(role: DatabaseRoleV1) -> &'static str {
         DatabaseRoleV1::ApprovalExecutor => "approval_executor",
         DatabaseRoleV1::RejectionExecutor => "rejection_executor",
         DatabaseRoleV1::ApplyExecutor => "apply_executor",
+        DatabaseRoleV1::CancellationExecutor => "cancellation_executor",
         DatabaseRoleV1::DeploymentStatusReader => "deployment_status_reader",
         DatabaseRoleV1::OperationalDeploymentStatusReader => "operational_deployment_status_reader",
     }

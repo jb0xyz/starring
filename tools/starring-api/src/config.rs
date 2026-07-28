@@ -57,12 +57,13 @@ pub enum DatabaseRoleV1 {
     ApprovalExecutor,
     RejectionExecutor,
     ApplyExecutor,
+    CancellationExecutor,
     DeploymentStatusReader,
     OperationalDeploymentStatusReader,
 }
 
 impl DatabaseRoleV1 {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::OAuthFlowWriter,
         Self::SessionIssuer,
         Self::SessionApi,
@@ -74,6 +75,7 @@ impl DatabaseRoleV1 {
         Self::ApprovalExecutor,
         Self::RejectionExecutor,
         Self::ApplyExecutor,
+        Self::CancellationExecutor,
         Self::DeploymentStatusReader,
         Self::OperationalDeploymentStatusReader,
     ];
@@ -99,6 +101,9 @@ impl DatabaseRoleV1 {
             Self::ApprovalExecutor => "STARRING_API_APPROVAL_EXECUTOR_DATABASE_SECRET_REFERENCE",
             Self::RejectionExecutor => "STARRING_API_REJECTION_EXECUTOR_DATABASE_SECRET_REFERENCE",
             Self::ApplyExecutor => "STARRING_API_APPLY_EXECUTOR_DATABASE_SECRET_REFERENCE",
+            Self::CancellationExecutor => {
+                "STARRING_API_CANCELLATION_EXECUTOR_DATABASE_SECRET_REFERENCE"
+            }
             Self::DeploymentStatusReader => {
                 "STARRING_API_DEPLOYMENT_STATUS_DATABASE_SECRET_REFERENCE"
             }
@@ -327,7 +332,7 @@ impl Debug for DiscordPublicConfigV1 {
 
 #[derive(Clone)]
 pub(crate) struct ProductionSecretReferencesV1 {
-    database: [SecretReferenceV1; 13],
+    database: [SecretReferenceV1; 14],
     discord_oauth_client_secret: SecretReferenceV1,
     discord_bot_token: SecretReferenceV1,
     product_action_keyring: SecretReferenceV1,
@@ -583,7 +588,7 @@ fn parse_secret_references(
     if duplicate {
         return Err(ProductionConfigErrorV1::DuplicateSecretReference);
     }
-    let database: [SecretReferenceV1; 13] = database
+    let database: [SecretReferenceV1; 14] = database
         .try_into()
         .map_err(|_| ProductionConfigErrorV1::DuplicateSecretReference)?;
     let discord_oauth_client_secret = parse_secret_reference(
@@ -842,11 +847,11 @@ mod tests {
         );
         assert_eq!(config.default_return_path(), "/app");
         assert_eq!(config.return_paths(), ["/", "/app", "/settings"]);
-        assert_eq!(config.pool_config().total_connection_ceiling(), 26);
+        assert_eq!(config.pool_config().total_connection_ceiling(), 28);
         assert_eq!(config.discord().application_id().get(), 1234);
         assert_eq!(config.discord().bot_user_id().get(), 5678);
         assert!(config.discord().api_origin().ends_with("discord.com"));
-        assert_eq!(DatabaseRoleV1::ALL.len(), 13);
+        assert_eq!(DatabaseRoleV1::ALL.len(), 14);
     }
 
     #[test]
@@ -914,7 +919,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pool.max_connections(), 4);
-        assert_eq!(pool.total_connection_ceiling(), 52);
+        assert_eq!(pool.total_connection_ceiling(), 56);
         assert_eq!(
             PoolConfigV1::new(
                 5,
@@ -940,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn all_thirteen_database_references_are_required_and_unique() {
+    fn all_fourteen_database_references_are_required_and_unique() {
         let mut missing = valid_source();
         let missing_role = DatabaseRoleV1::ApprovalExecutor;
         missing

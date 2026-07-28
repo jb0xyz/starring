@@ -64,6 +64,8 @@
         <string>keychain:starring-api.staging:database.rejection-executor</string>
         <key>STARRING_API_APPLY_EXECUTOR_DATABASE_SECRET_REFERENCE</key>
         <string>keychain:starring-api.staging:database.apply-executor</string>
+        <key>STARRING_API_CANCELLATION_EXECUTOR_DATABASE_SECRET_REFERENCE</key>
+        <string>keychain:starring-api.staging:database.cancellation-executor</string>
         <key>STARRING_API_DEPLOYMENT_STATUS_DATABASE_SECRET_REFERENCE</key>
         <string>keychain:starring-api.staging:database.deployment-status-reader</string>
         <key>STARRING_API_OPERATIONAL_STATUS_DATABASE_SECRET_REFERENCE</key>

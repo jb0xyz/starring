@@ -370,7 +370,7 @@ WITH common_owner AS (
         ('public.authoring_promotions', 'authoring_promotions_stage_valid', 'c'::"char", FALSE,
             'CHECK ((stage = ANY (ARRAY[''prepared''::text, ''published''::text, ''activation_pending''::text, ''expired''::text])))'),
         ('public.product_action_receipts', 'product_action_receipts_approval_key_identity_required', 'c'::"char", FALSE,
-            'CHECK (((endpoint_domain <> ALL (ARRAY[''product_approve_v1''::text, ''product_apply_v1''::text, ''product_promote_v1''::text, ''product_reject_v1''::text])) OR ((idempotency_digest_key_id IS NOT NULL) AND (idempotency_digest_key_fingerprint IS NOT NULL))))'),
+            'CHECK (((endpoint_domain <> ALL (ARRAY[''product_approve_v1''::text, ''product_apply_v1''::text, ''product_promote_v1''::text, ''product_reject_v1''::text, ''product_cancel_lifecycle_v1''::text])) OR ((idempotency_digest_key_id IS NOT NULL) AND (idempotency_digest_key_fingerprint IS NOT NULL))))'),
         ('public.activation_request_approvals', 'activation_request_approvals_pkey', 'p'::"char", TRUE,
             'PRIMARY KEY (request_id, approver_id)'),
         ('public.activation_request_approvals', 'activation_request_approvals_request_id_fkey', 'f'::"char", TRUE,

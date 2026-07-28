@@ -849,7 +849,7 @@ pub enum ProductionSecretResolutionErrorV1 {
 }
 
 pub struct ResolvedProductionSecretsV1 {
-    database_urls: [DatabaseUrlSecretV1; 13],
+    database_urls: [DatabaseUrlSecretV1; 14],
     discord_bot_token: DiscordBotTokenV1,
     discord_oauth_client_secret: DiscordOAuthClientSecretV1,
     product_action_keyring: ProductActionDigestKeyringV1,
@@ -863,7 +863,7 @@ pub fn resolve_production_secrets_v1(
 }
 
 pub(crate) type ResolvedProductionSecretPartsV1 = (
-    [DatabaseUrlSecretV1; 13],
+    [DatabaseUrlSecretV1; 14],
     DiscordBotTokenV1,
     DiscordOAuthClientSecretV1,
     ProductActionDigestKeyringV1,
