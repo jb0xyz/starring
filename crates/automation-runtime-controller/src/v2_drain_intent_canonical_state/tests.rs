@@ -24,9 +24,15 @@ use super::{
     RuntimeCompactPendingDrainSuccessionValidationInputV2,
     RuntimeDrainIntentCanonicalStateCorrelationV2, RuntimeDrainIntentCanonicalStateErrorV2,
     RuntimeDrainIntentCanonicalStateFieldV2, RuntimeDrainIntentCanonicalStateKindV2,
+    RuntimePersistedRefencedPendingDrainIntentV2,
     RuntimePersistedRouteAbsenceCandidateDrainIntentV2,
     RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2,
-    RuntimePersistedUnclaimedPendingDrainIntentV2,
+    RuntimePersistedRoutedClaimedPendingDrainIntentV2,
+    RuntimePersistedUnclaimedPendingDrainIntentV2, RuntimeRoutedPendingDrainClaimInputV2,
+    RuntimeRoutedPendingDrainClaimTransitionV2, RuntimeRoutedPendingDrainRefenceInputV2,
+    RuntimeRoutedPendingDrainRefenceTransitionV2,
+    RuntimeSameProcessRefencedDrainAcknowledgementInputV2,
+    RuntimeSameProcessRefencedDrainAcknowledgementTransitionV2,
 };
 use crate::{
     GatewayShardIdV1, RuntimeBarrierIdV1, RuntimeBarrierPauseWitnessV2, RuntimeBuildRevisionV1,
@@ -40,7 +46,7 @@ use crate::{
     RuntimeProductDrainOperationV2, RuntimeProductMutationKindV2, RuntimeProductMutationPreimageV2,
     RuntimeProductOperationIdV2, RuntimeProductSemanticRequestDigestV2, RuntimeRecoveryIdV2,
     RuntimeRouteAbsentAcknowledgementV2, RuntimeRouteMutationProvenanceV2,
-    RuntimeServingIdentityV2, RuntimeServingSlotV2,
+    RuntimeServingIdentityV2, RuntimeServingSlotV2, RuntimeShutdownRouteWitnessV2,
 };
 
 fn non_zero(value: u64) -> NonZeroU64 {
@@ -215,12 +221,21 @@ fn claim(operation: &RuntimeProductDrainOperationV2, refenced: bool) -> RuntimeD
 }
 
 fn routed_claimed(operation: &RuntimeProductDrainOperationV2) -> RuntimeDrainClaimV2 {
+    routed_claim_with_numbers(operation, 19, 20, 18)
+}
+
+fn routed_claim_with_numbers(
+    operation: &RuntimeProductDrainOperationV2,
+    route_fence: u64,
+    claim_fence: u64,
+    claim_revision: u64,
+) -> RuntimeDrainClaimV2 {
     let key = &operation.canonical().drain_preimage().key;
     let seal = RuntimeDrainClaimSealWitnessV2::new(
         key,
         process_id(),
         non_zero(14),
-        Some(route(19)),
+        Some(route(route_fence)),
         non_zero(15),
     )
     .unwrap();
@@ -230,11 +245,52 @@ fn routed_claimed(operation: &RuntimeProductDrainOperationV2) -> RuntimeDrainCla
         non_zero(16),
         process_id(),
         ControllerId::parse("controller:1").unwrap(),
-        FencingToken::new(20).unwrap(),
+        FencingToken::new(claim_fence).unwrap(),
         non_zero(17),
-        non_zero(18),
+        non_zero(claim_revision),
         at(130),
         RuntimeDrainClaimProgressV2::claimed(seal),
+    )
+    .unwrap()
+}
+
+fn refenced_claim_with_numbers(
+    operation: &RuntimeProductDrainOperationV2,
+    route_fence: u64,
+    removal_fence: u64,
+    claim_revision: u64,
+    provenance: RuntimeRouteMutationProvenanceV2,
+) -> RuntimeDrainClaimV2 {
+    let key = &operation.canonical().drain_preimage().key;
+    let old_route = route(route_fence);
+    let seal = RuntimeDrainClaimSealWitnessV2::new(
+        key,
+        process_id(),
+        non_zero(14),
+        Some(old_route.clone()),
+        non_zero(15),
+    )
+    .unwrap();
+    let progress = RuntimeDrainClaimProgressV2::refenced(
+        seal,
+        provenance,
+        old_route,
+        route(removal_fence),
+        non_zero(21),
+        at(110),
+    )
+    .unwrap();
+    RuntimeDrainClaimV2::new(
+        key,
+        owner(),
+        non_zero(16),
+        process_id(),
+        ControllerId::parse("controller:1").unwrap(),
+        FencingToken::new(removal_fence).unwrap(),
+        non_zero(17),
+        non_zero(claim_revision),
+        at(500),
+        progress,
     )
     .unwrap()
 }
@@ -349,6 +405,57 @@ fn closed_recovery_witness() -> RuntimeClosedRecoveryRouteWitnessV2 {
     }
 }
 
+fn shutdown_witness() -> RuntimeShutdownRouteWitnessV2 {
+    RuntimeShutdownRouteWitnessV2 {
+        shutdown_generation: non_zero(38),
+        gateway_owner_lease_id: owner(),
+        observed_owner_revision: non_zero(16),
+        owner_expires_at: at(500),
+        process_instance_id: process_id(),
+        connection_epoch: non_zero(33),
+        paused_admission_revision: non_zero(34),
+        connected_event_sequence: RuntimeGatewayAdmissionSequenceV2::new(non_zero(35)),
+        pause_sequence: RuntimeGatewayAdmissionSequenceV2::new(non_zero(36)),
+    }
+}
+
+fn routed_claim_input() -> RuntimeRoutedPendingDrainClaimInputV2 {
+    RuntimeRoutedPendingDrainClaimInputV2 {
+        gateway_owner_lease_id: owner(),
+        observed_owner_revision: non_zero(16),
+        controller_id: ControllerId::parse("controller:1").unwrap(),
+        claim_epoch: non_zero(17),
+        claim_expires_at: at(500),
+        seal_generation: non_zero(14),
+        seal_observation_sequence: non_zero(15),
+        expected_route: route(19),
+    }
+}
+
+fn routed_refence_input(
+    provenance: RuntimeRouteMutationProvenanceV2,
+) -> RuntimeRoutedPendingDrainRefenceInputV2 {
+    RuntimeRoutedPendingDrainRefenceInputV2 {
+        provenance,
+        old_route: route(19),
+        removal_target: route(20),
+        registry_observation_sequence: non_zero(21),
+        refenced_at: at(110),
+    }
+}
+
+fn same_process_acknowledgement_input(
+    provenance: RuntimeRouteMutationProvenanceV2,
+) -> RuntimeSameProcessRefencedDrainAcknowledgementInputV2 {
+    RuntimeSameProcessRefencedDrainAcknowledgementInputV2 {
+        removed_route: route(20),
+        provenance,
+        registry_observation_sequence: non_zero(22),
+        certification: RuntimeDrainCertificationResolutionV2::no_operation_reserved(),
+        acknowledged_at: at(120),
+    }
+}
+
 fn succession_recovery_witness() -> RuntimeClosedRecoveryRouteWitnessV2 {
     RuntimeClosedRecoveryRouteWitnessV2 {
         recovery_id: RuntimeRecoveryIdV2::parse("3333444455556666777788889999aaaa").unwrap(),
@@ -412,6 +519,32 @@ fn persisted_unclaimed(
         revision,
         "pending",
         canonical.state_bytes(),
+    )
+    .unwrap()
+}
+
+fn persisted_routed_claimed(
+    operation: &RuntimeProductDrainOperationV2,
+    transition: &RuntimeRoutedPendingDrainClaimTransitionV2,
+) -> RuntimePersistedRoutedClaimedPendingDrainIntentV2 {
+    RuntimePersistedRoutedClaimedPendingDrainIntentV2::from_persisted(
+        &root(operation),
+        transition.result().intent().intent_revision(),
+        "pending",
+        transition.result().state_bytes(),
+    )
+    .unwrap()
+}
+
+fn persisted_refenced(
+    operation: &RuntimeProductDrainOperationV2,
+    transition: &RuntimeRoutedPendingDrainRefenceTransitionV2,
+) -> RuntimePersistedRefencedPendingDrainIntentV2 {
+    RuntimePersistedRefencedPendingDrainIntentV2::from_persisted(
+        &root(operation),
+        transition.result().intent().intent_revision(),
+        "pending",
+        transition.result().state_bytes(),
     )
     .unwrap()
 }
@@ -811,6 +944,387 @@ fn payload_limit_matches_the_one_mebibyte_execution_frame_cap() {
             &oversized,
         ),
         Err(RuntimeDrainIntentCanonicalStateErrorV2::PayloadTooLarge)
+    );
+}
+
+#[test]
+fn routed_claim_refence_and_acknowledgement_are_exact_canonical_successors() {
+    let operation = operation();
+    let persisted_root = root(&operation);
+    let claim_transition = RuntimeRoutedPendingDrainClaimTransitionV2::build(
+        persisted_unclaimed(&persisted_root, non_zero(1)),
+        routed_claim_input(),
+    )
+    .unwrap();
+    let claimed = claim_transition
+        .result()
+        .intent()
+        .state()
+        .pending_claim()
+        .unwrap();
+
+    assert_eq!(
+        claim_transition.result().intent().intent_revision(),
+        non_zero(2)
+    );
+    assert_eq!(claimed.claim_revision(), NonZeroU64::MIN);
+    assert_eq!(
+        claimed.controller_fencing_token(),
+        FencingToken::new(20).unwrap()
+    );
+    assert_eq!(claimed.progress().seal().expected_route(), Some(&route(19)));
+
+    let refence_transition = RuntimeRoutedPendingDrainRefenceTransitionV2::build(
+        persisted_routed_claimed(&operation, &claim_transition),
+        routed_refence_input(RuntimeRouteMutationProvenanceV2::ClosedRecovery(
+            closed_recovery_witness(),
+        )),
+    )
+    .unwrap();
+    let refenced = refence_transition
+        .result()
+        .intent()
+        .state()
+        .pending_claim()
+        .unwrap();
+
+    assert_eq!(
+        refence_transition.result().intent().intent_revision(),
+        non_zero(3)
+    );
+    assert_eq!(refenced.claim_revision(), non_zero(2));
+    assert_eq!(
+        refenced.controller_fencing_token(),
+        claimed.controller_fencing_token()
+    );
+    assert_eq!(refenced.progress().seal(), claimed.progress().seal());
+    assert_eq!(refenced.progress().old_route(), Some(&route(19)));
+    assert_eq!(refenced.progress().removal_target(), Some(&route(20)));
+
+    let acknowledgement_transition =
+        RuntimeSameProcessRefencedDrainAcknowledgementTransitionV2::build(
+            persisted_refenced(&operation, &refence_transition),
+            same_process_acknowledgement_input(RuntimeRouteMutationProvenanceV2::ClosedRecovery(
+                closed_recovery_witness(),
+            )),
+        )
+        .unwrap();
+    let acknowledgement = acknowledgement_transition
+        .result()
+        .intent()
+        .state()
+        .acknowledgement()
+        .unwrap();
+
+    assert_eq!(
+        acknowledgement_transition
+            .result()
+            .intent()
+            .intent_revision(),
+        non_zero(4)
+    );
+    assert_eq!(acknowledgement.claim(), refenced);
+    assert_eq!(acknowledgement.expected_route(), Some(&route(20)));
+    assert_eq!(
+        (
+            format!(
+                "{:x}",
+                Sha256::digest(claim_transition.result().state_bytes())
+            ),
+            format!(
+                "{:x}",
+                Sha256::digest(refence_transition.result().state_bytes())
+            ),
+            format!(
+                "{:x}",
+                Sha256::digest(acknowledgement_transition.result().state_bytes())
+            ),
+        ),
+        (
+            "9d462f6113830ef927aba5fcdbf7bcaf4e0e896e8e3984f4af5672ef95ff7cb2".to_string(),
+            "92887e9c75386bac771c4a531858be70249484efeb28e0401645ccaadba6a884".to_string(),
+            "22146efe9ef92dd51a80a7005617dd8fabaf516a510b3aca4e708db02f7681c2".to_string(),
+        )
+    );
+
+    for canonical in [
+        claim_transition.result(),
+        refence_transition.result(),
+        acknowledgement_transition.result(),
+    ] {
+        let restored = RuntimeCanonicalDrainIntentStateV2::from_persisted(
+            &persisted_root,
+            canonical.intent().intent_revision(),
+            canonical.persisted_state().unwrap(),
+            canonical.state_bytes(),
+        )
+        .unwrap();
+        assert_eq!(&restored, canonical);
+    }
+}
+
+#[test]
+fn routed_and_refenced_classifiers_require_exact_initial_lineage() {
+    let operation = operation();
+    let persisted_root = root(&operation);
+    let classify_routed = |claim| {
+        let intent =
+            RuntimeDrainIntentV2::pending_from_persisted(&persisted_root, non_zero(2), Some(claim))
+                .unwrap();
+        let canonical = RuntimeCanonicalDrainIntentStateV2::from_intent(intent).unwrap();
+        RuntimePersistedRoutedClaimedPendingDrainIntentV2::from_persisted(
+            &persisted_root,
+            non_zero(2),
+            "pending",
+            canonical.state_bytes(),
+        )
+    };
+    let classify_refenced = |claim| {
+        let intent =
+            RuntimeDrainIntentV2::pending_from_persisted(&persisted_root, non_zero(3), Some(claim))
+                .unwrap();
+        let canonical = RuntimeCanonicalDrainIntentStateV2::from_intent(intent).unwrap();
+        RuntimePersistedRefencedPendingDrainIntentV2::from_persisted(
+            &persisted_root,
+            non_zero(3),
+            "pending",
+            canonical.state_bytes(),
+        )
+    };
+
+    assert!(classify_routed(routed_claim_with_numbers(&operation, 19, 20, 1)).is_ok());
+    assert!(classify_routed(routed_claim_with_numbers(&operation, 19, 20, 2)).is_err());
+    assert!(classify_routed(routed_claim_with_numbers(&operation, 19, 21, 1)).is_err());
+    assert!(classify_refenced(refenced_claim_with_numbers(
+        &operation,
+        19,
+        20,
+        2,
+        RuntimeRouteMutationProvenanceV2::ClosedRecovery(closed_recovery_witness()),
+    ))
+    .is_ok());
+    assert!(classify_refenced(refenced_claim_with_numbers(
+        &operation,
+        19,
+        20,
+        3,
+        RuntimeRouteMutationProvenanceV2::ClosedRecovery(closed_recovery_witness()),
+    ))
+    .is_err());
+    assert!(classify_refenced(refenced_claim_with_numbers(
+        &operation,
+        19,
+        21,
+        2,
+        RuntimeRouteMutationProvenanceV2::ClosedRecovery(closed_recovery_witness()),
+    ))
+    .is_err());
+    assert!(classify_refenced(refenced_claim_with_numbers(
+        &operation,
+        19,
+        20,
+        2,
+        ordinary_provenance(),
+    ))
+    .is_err());
+}
+
+#[test]
+fn same_process_transitions_reject_route_owner_provenance_and_observation_drift() {
+    let operation = operation();
+    let persisted_root = root(&operation);
+    let unclaimed = || persisted_unclaimed(&persisted_root, non_zero(1));
+
+    let mut foreign_owner = routed_claim_input();
+    foreign_owner.gateway_owner_lease_id.process_instance_id = successor_process_id();
+    assert!(RuntimeRoutedPendingDrainClaimTransitionV2::build(unclaimed(), foreign_owner).is_err());
+
+    let mut exhausted_route = routed_claim_input();
+    exhausted_route.expected_route.controller_fencing_token =
+        FencingToken::new(i64::MAX as u64).unwrap();
+    assert!(
+        RuntimeRoutedPendingDrainClaimTransitionV2::build(unclaimed(), exhausted_route).is_err()
+    );
+
+    let exhausted_intent = persisted_unclaimed(&persisted_root, non_zero(i64::MAX as u64));
+    assert!(RuntimeRoutedPendingDrainClaimTransitionV2::build(
+        exhausted_intent,
+        routed_claim_input(),
+    )
+    .is_err());
+
+    let claim_transition =
+        RuntimeRoutedPendingDrainClaimTransitionV2::build(unclaimed(), routed_claim_input())
+            .unwrap();
+    let routed_source = || persisted_routed_claimed(&operation, &claim_transition);
+    let routed_claim = claim_transition
+        .result()
+        .intent()
+        .state()
+        .pending_claim()
+        .unwrap()
+        .clone();
+    let exhausted_routed_intent = RuntimeDrainIntentV2::pending_from_persisted(
+        &persisted_root,
+        non_zero(i64::MAX as u64),
+        Some(routed_claim),
+    )
+    .unwrap();
+    let exhausted_routed =
+        RuntimeCanonicalDrainIntentStateV2::from_intent(exhausted_routed_intent).unwrap();
+    let exhausted_routed_source =
+        RuntimePersistedRoutedClaimedPendingDrainIntentV2::from_persisted(
+            &persisted_root,
+            non_zero(i64::MAX as u64),
+            "pending",
+            exhausted_routed.state_bytes(),
+        )
+        .unwrap();
+    assert!(RuntimeRoutedPendingDrainRefenceTransitionV2::build(
+        exhausted_routed_source,
+        routed_refence_input(RuntimeRouteMutationProvenanceV2::ClosedRecovery(
+            closed_recovery_witness(),
+        )),
+    )
+    .is_err());
+
+    let mut wrong_old_route = routed_refence_input(
+        RuntimeRouteMutationProvenanceV2::ClosedRecovery(closed_recovery_witness()),
+    );
+    wrong_old_route.old_route = route(18);
+    assert!(
+        RuntimeRoutedPendingDrainRefenceTransitionV2::build(routed_source(), wrong_old_route,)
+            .is_err()
+    );
+
+    let mut skipped_fence = routed_refence_input(RuntimeRouteMutationProvenanceV2::ClosedRecovery(
+        closed_recovery_witness(),
+    ));
+    skipped_fence.removal_target = route(21);
+    assert!(
+        RuntimeRoutedPendingDrainRefenceTransitionV2::build(routed_source(), skipped_fence)
+            .is_err()
+    );
+
+    let mut wrong_incarnation = routed_refence_input(
+        RuntimeRouteMutationProvenanceV2::ClosedRecovery(closed_recovery_witness()),
+    );
+    wrong_incarnation.removal_target.route_incarnation = non_zero(9);
+    assert!(RuntimeRoutedPendingDrainRefenceTransitionV2::build(
+        routed_source(),
+        wrong_incarnation,
+    )
+    .is_err());
+
+    let mut stale_observation = routed_refence_input(
+        RuntimeRouteMutationProvenanceV2::ClosedRecovery(closed_recovery_witness()),
+    );
+    stale_observation.registry_observation_sequence = non_zero(15);
+    assert!(RuntimeRoutedPendingDrainRefenceTransitionV2::build(
+        routed_source(),
+        stale_observation,
+    )
+    .is_err());
+
+    assert!(RuntimeRoutedPendingDrainRefenceTransitionV2::build(
+        routed_source(),
+        routed_refence_input(ordinary_provenance()),
+    )
+    .is_err());
+
+    let mut owner_drift = closed_recovery_witness();
+    owner_drift.observed_owner_revision = non_zero(99);
+    assert!(RuntimeRoutedPendingDrainRefenceTransitionV2::build(
+        routed_source(),
+        routed_refence_input(RuntimeRouteMutationProvenanceV2::ClosedRecovery(
+            owner_drift
+        )),
+    )
+    .is_err());
+
+    let shutdown_refence = RuntimeRoutedPendingDrainRefenceTransitionV2::build(
+        routed_source(),
+        routed_refence_input(RuntimeRouteMutationProvenanceV2::Shutdown(
+            shutdown_witness(),
+        )),
+    )
+    .unwrap();
+    let refenced_source = || persisted_refenced(&operation, &shutdown_refence);
+
+    let mut wrong_removed_route = same_process_acknowledgement_input(
+        RuntimeRouteMutationProvenanceV2::Shutdown(shutdown_witness()),
+    );
+    wrong_removed_route.removed_route = route(19);
+    assert!(
+        RuntimeSameProcessRefencedDrainAcknowledgementTransitionV2::build(
+            refenced_source(),
+            wrong_removed_route,
+        )
+        .is_err()
+    );
+
+    let mut stale_absence = same_process_acknowledgement_input(
+        RuntimeRouteMutationProvenanceV2::Shutdown(shutdown_witness()),
+    );
+    stale_absence.registry_observation_sequence = non_zero(21);
+    assert!(
+        RuntimeSameProcessRefencedDrainAcknowledgementTransitionV2::build(
+            refenced_source(),
+            stale_absence,
+        )
+        .is_err()
+    );
+
+    assert!(
+        RuntimeSameProcessRefencedDrainAcknowledgementTransitionV2::build(
+            refenced_source(),
+            same_process_acknowledgement_input(ordinary_provenance()),
+        )
+        .is_err()
+    );
+
+    let mut acknowledgement_owner_drift = shutdown_witness();
+    acknowledgement_owner_drift.observed_owner_revision = non_zero(99);
+    assert!(
+        RuntimeSameProcessRefencedDrainAcknowledgementTransitionV2::build(
+            refenced_source(),
+            same_process_acknowledgement_input(RuntimeRouteMutationProvenanceV2::Shutdown(
+                acknowledgement_owner_drift,
+            )),
+        )
+        .is_err()
+    );
+
+    let refenced_claim = shutdown_refence
+        .result()
+        .intent()
+        .state()
+        .pending_claim()
+        .unwrap()
+        .clone();
+    let exhausted_refenced_intent = RuntimeDrainIntentV2::pending_from_persisted(
+        &persisted_root,
+        non_zero(i64::MAX as u64),
+        Some(refenced_claim),
+    )
+    .unwrap();
+    let exhausted_refenced =
+        RuntimeCanonicalDrainIntentStateV2::from_intent(exhausted_refenced_intent).unwrap();
+    let exhausted_refenced_source = RuntimePersistedRefencedPendingDrainIntentV2::from_persisted(
+        &persisted_root,
+        non_zero(i64::MAX as u64),
+        "pending",
+        exhausted_refenced.state_bytes(),
+    )
+    .unwrap();
+    assert!(
+        RuntimeSameProcessRefencedDrainAcknowledgementTransitionV2::build(
+            exhausted_refenced_source,
+            same_process_acknowledgement_input(RuntimeRouteMutationProvenanceV2::Shutdown(
+                shutdown_witness(),
+            )),
+        )
+        .is_err()
     );
 }
 

@@ -37,13 +37,13 @@ pub enum RuntimeDrainIntentReceiptErrorV2 {
     ResultStateMismatch,
     #[error("runtime drain-intent transition changed its immutable roots")]
     ImmutableRootMismatch,
-    #[error("runtime drain-intent revision is not strictly newer")]
+    #[error("runtime drain-intent revision is not the exact successor")]
     IntentRevisionNotNewer,
     #[error("runtime drain-claim replay changed its persisted aggregate")]
     ClaimReplayMismatch,
     #[error("runtime drain-claim transition changed its immutable identity")]
     ClaimIdentityMismatch,
-    #[error("runtime drain-claim revision is not strictly newer")]
+    #[error("runtime drain-claim revision is not the exact successor")]
     ClaimRevisionNotNewer,
     #[error("runtime drain-claim transition changed its sealed progress basis")]
     ClaimProgressMismatch,
@@ -138,6 +138,15 @@ impl RuntimeDrainAcknowledgementSourceV2 {
 
     pub fn source(&self) -> &RuntimeDrainIntentV2 {
         &self.source
+    }
+
+    pub fn from_refenced(
+        source: RuntimeDrainIntentV2,
+    ) -> Result<Self, RuntimeDrainIntentReceiptErrorV2> {
+        if pending_claim(&source)?.progress().kind() != RuntimeDrainClaimProgressKindV2::Refenced {
+            return Err(RuntimeDrainIntentReceiptErrorV2::SourceStateMismatch);
+        }
+        Ok(Self { source })
     }
 }
 
@@ -322,13 +331,19 @@ impl RuntimeDrainIntentReceiptV2 {
         validate_immutable_roots(source.source(), &persisted_intent)?;
         let source_claim = pending_claimed(source.source())?;
         let result_claim = pending_refenced(&persisted_intent)?;
-        if persisted_intent.intent_revision() <= source.source().intent_revision() {
+        if !is_exact_successor(
+            source.source().intent_revision().get(),
+            persisted_intent.intent_revision().get(),
+        ) {
             return Err(RuntimeDrainIntentReceiptErrorV2::IntentRevisionNotNewer);
         }
         if !claim_identity_matches(source_claim, result_claim) {
             return Err(RuntimeDrainIntentReceiptErrorV2::ClaimIdentityMismatch);
         }
-        if result_claim.claim_revision() <= source_claim.claim_revision() {
+        if !is_exact_successor(
+            source_claim.claim_revision().get(),
+            result_claim.claim_revision().get(),
+        ) {
             return Err(RuntimeDrainIntentReceiptErrorV2::ClaimRevisionNotNewer);
         }
         if result_claim.progress().seal() != source_claim.progress().seal() {
@@ -350,7 +365,10 @@ impl RuntimeDrainIntentReceiptV2 {
             .state()
             .acknowledgement()
             .ok_or(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)?;
-        if persisted_intent.intent_revision() <= source.source().intent_revision() {
+        if !is_exact_successor(
+            source.source().intent_revision().get(),
+            persisted_intent.intent_revision().get(),
+        ) {
             return Err(RuntimeDrainIntentReceiptErrorV2::IntentRevisionNotNewer);
         }
         if acknowledgement.claim() != source_claim {

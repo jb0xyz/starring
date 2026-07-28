@@ -1812,6 +1812,14 @@ fn v2_drain_intent_canonical_state_is_strict_pure_and_closed() {
     for declaration in [
         "pub struct RuntimeCanonicalDrainIntentStateV2",
         "pub struct RuntimePersistedUnclaimedPendingDrainIntentV2",
+        "pub struct RuntimePersistedRoutedClaimedPendingDrainIntentV2",
+        "pub struct RuntimePersistedRefencedPendingDrainIntentV2",
+        "pub struct RuntimeRoutedPendingDrainClaimInputV2",
+        "pub struct RuntimeRoutedPendingDrainClaimTransitionV2",
+        "pub struct RuntimeRoutedPendingDrainRefenceInputV2",
+        "pub struct RuntimeRoutedPendingDrainRefenceTransitionV2",
+        "pub struct RuntimeSameProcessRefencedDrainAcknowledgementInputV2",
+        "pub struct RuntimeSameProcessRefencedDrainAcknowledgementTransitionV2",
         "pub struct RuntimePersistedRouteAbsenceCandidateDrainIntentV2",
         "pub struct RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2",
         "pub struct RuntimeClosedRecoveryEmptyRegistryPendingDrainClaimTransitionV2",
@@ -1827,6 +1835,14 @@ fn v2_drain_intent_canonical_state_is_strict_pure_and_closed() {
         "RuntimeCanonicalDrainIntentStateV2::from_persisted(",
         "RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(",
         "RuntimeDrainIntentReceiptV2::acknowledged(",
+        "RuntimeDrainAcknowledgementSourceV2::from_refenced(",
+        "RuntimeDrainIntentReceiptV2::refenced(",
+        "NonZeroU64::MIN",
+        "next_controller_fence(input.expected_route.controller_fencing_token)",
+        "is_exact_initial_routed_claim",
+        "is_exact_initial_refenced_claim",
+        "is_exact_fence_successor",
+        "validate_same_process_provenance",
         "RuntimeDrainSuccessionAcknowledgementSourceV2::from_expired_route_absent_claimed(",
         "RuntimeDrainIntentReceiptV2::succession_acknowledged(",
         "RuntimeDrainClaimProgressKindV2::Claimed => None",
@@ -1850,6 +1866,9 @@ fn v2_drain_intent_canonical_state_is_strict_pure_and_closed() {
         "decoder_rejects_unknown_noncanonical_and_mismatched_root_state",
         "pending_subtype_and_nested_provenance_corruption_fail_closed",
         "payload_limit_matches_the_one_mebibyte_execution_frame_cap",
+        "routed_claim_refence_and_acknowledgement_are_exact_canonical_successors",
+        "routed_and_refenced_classifiers_require_exact_initial_lineage",
+        "same_process_transitions_reject_route_owner_provenance_and_observation_drift",
         "unclaimed_closed_recovery_requires_two_persisted_cas_transitions",
         "persisted_refenced_candidate_acknowledges_the_exact_removal_target",
         "routed_claimed_state_is_not_a_route_absence_candidate",
@@ -1864,6 +1883,20 @@ fn v2_drain_intent_canonical_state_is_strict_pure_and_closed() {
             tests.contains(&format!("fn {test_name}(")),
             "missing V2 drain-intent canonical-state test: {test_name}"
         );
+    }
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimePersistedRoutedClaimedPendingDrainIntentV2",
+        "RuntimePersistedRefencedPendingDrainIntentV2",
+        "RuntimeRoutedPendingDrainClaimInputV2",
+        "RuntimeRoutedPendingDrainClaimTransitionV2",
+        "RuntimeRoutedPendingDrainRefenceInputV2",
+        "RuntimeRoutedPendingDrainRefenceTransitionV2",
+        "RuntimeSameProcessRefencedDrainAcknowledgementInputV2",
+        "RuntimeSameProcessRefencedDrainAcknowledgementTransitionV2",
+    ] {
+        assert!(library.contains(exported), "missing export {exported}");
     }
 }
 
@@ -1920,6 +1953,7 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "pub struct RuntimeDrainIntentReceiptV2",
         "pub fn from_claimed(",
         "pub fn from_route_absence_candidate(",
+        "pub fn from_refenced(",
         "pub fn from_expired_route_absent_claimed(",
         "pub fn from_acknowledged(",
         "pub fn inserted(",
@@ -1939,8 +1973,10 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "persisted_intent.state().pending_claim().is_some()",
         "persisted_intent != source",
         "source.canonical() == result.canonical()",
-        "persisted_intent.intent_revision() <= source.source().intent_revision()",
-        "result_claim.claim_revision() <= source_claim.claim_revision()",
+        "source.source().intent_revision().get(),",
+        "persisted_intent.intent_revision().get(),",
+        "source_claim.claim_revision().get(),",
+        "result_claim.claim_revision().get(),",
         "result_claim.progress().seal() != source_claim.progress().seal()",
         "acknowledgement.claim() != source_claim",
         "RuntimePersistenceU64V2::from_u64(expected_resulting_revision.get())",
@@ -1967,7 +2003,7 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "inserted_and_replayed_receipts_bind_the_exact_operation_roots",
         "source_classifiers_accept_only_their_exact_mutable_states",
         "claim_replay_requires_an_exact_unchanged_claimed_aggregate",
-        "refence_receipt_allows_only_progress_and_strictly_newer_database_revisions",
+        "refence_receipt_allows_only_progress_and_exact_database_revision_successors",
         "refence_receipt_rejects_root_state_revision_identity_and_seal_drift",
         "acknowledgement_receipt_accepts_initial_absence_and_durable_refence",
         "acknowledgement_receipt_rejects_root_revision_state_and_claim_drift",

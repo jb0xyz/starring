@@ -591,6 +591,16 @@ fn source_classifiers_accept_only_their_exact_mutable_states() {
             .source(),
         &refenced
     );
+    assert_eq!(
+        RuntimeDrainAcknowledgementSourceV2::from_refenced(absent.clone()),
+        Err(RuntimeDrainIntentReceiptErrorV2::SourceStateMismatch)
+    );
+    assert_eq!(
+        RuntimeDrainAcknowledgementSourceV2::from_refenced(refenced.clone())
+            .unwrap()
+            .source(),
+        &refenced
+    );
 
     for rejected in [unclaimed, routed, absent, refenced, consumed, cancelled] {
         assert_eq!(
@@ -632,14 +642,13 @@ fn claim_replay_requires_an_exact_unchanged_claimed_aggregate() {
 }
 
 #[test]
-fn refence_receipt_allows_only_progress_and_strictly_newer_database_revisions() {
+fn refence_receipt_allows_only_progress_and_exact_database_revision_successors() {
     let operation = operation_for(DRAIN_INTENT_ID);
     let source_claim = claimed(&operation, Some(route(10, 5)), 13, 10, 8);
     let source_intent = pending(&operation, 20, Some(source_claim.clone()));
     let source = RuntimeDrainRefenceSourceV2::from_claimed(source_intent).unwrap();
-    let maximum = i64::MAX as u64;
-    let result_claim = refenced_from(&operation, &source_claim, maximum, 10);
-    let result = pending(&operation, maximum, Some(result_claim.clone()));
+    let result_claim = refenced_from(&operation, &source_claim, 14, 10);
+    let result = pending(&operation, 21, Some(result_claim.clone()));
 
     let receipt = RuntimeDrainIntentReceiptV2::refenced(&source, result.clone()).unwrap();
     assert_eq!(
@@ -695,10 +704,28 @@ fn refence_receipt_rejects_root_state_revision_identity_and_seal_drift() {
     assert_eq!(
         RuntimeDrainIntentReceiptV2::refenced(
             &source,
+            pending(&operation, 22, Some(valid_refenced.clone())),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::IntentRevisionNotNewer)
+    );
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::refenced(
+            &source,
             pending(
                 &operation,
                 21,
                 Some(refenced_from(&operation, &source_claim, 13, 10)),
+            ),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::ClaimRevisionNotNewer)
+    );
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::refenced(
+            &source,
+            pending(
+                &operation,
+                21,
+                Some(refenced_from(&operation, &source_claim, 15, 10)),
             ),
         ),
         Err(RuntimeDrainIntentReceiptErrorV2::ClaimRevisionNotNewer)
@@ -767,7 +794,7 @@ fn acknowledgement_receipt_accepts_initial_absence_and_durable_refence() {
     let absent_source =
         RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(absent_source_intent)
             .unwrap();
-    let absent_result = acknowledged(&operation, 31, absent_claim);
+    let absent_result = acknowledged(&operation, 21, absent_claim);
     let absent_receipt =
         RuntimeDrainIntentReceiptV2::acknowledged(&absent_source, absent_result.clone()).unwrap();
     assert_eq!(
@@ -782,7 +809,7 @@ fn acknowledgement_receipt_accepts_initial_absence_and_durable_refence() {
     let refenced_source =
         RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(refenced_source_intent)
             .unwrap();
-    let refenced_result = acknowledged(&operation, 90, refenced_claim);
+    let refenced_result = acknowledged(&operation, 51, refenced_claim);
     assert!(RuntimeDrainIntentReceiptV2::acknowledged(&refenced_source, refenced_result).is_ok());
 }
 
@@ -803,6 +830,13 @@ fn acknowledgement_receipt_rejects_root_revision_state_and_claim_drift() {
         RuntimeDrainIntentReceiptV2::acknowledged(
             &source,
             acknowledged(&operation, 20, source_claim.clone()),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::IntentRevisionNotNewer)
+    );
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::acknowledged(
+            &source,
+            acknowledged(&operation, 22, source_claim.clone()),
         ),
         Err(RuntimeDrainIntentReceiptErrorV2::IntentRevisionNotNewer)
     );
@@ -1305,6 +1339,7 @@ fn receipt_surface_is_closed_data_without_claim_or_terminal_authority() {
         "pub struct RuntimeDrainConsumptionSourceV2",
         "pub struct RuntimeDrainCancellationSourceV2",
         "pub struct RuntimeDrainIntentReceiptV2",
+        "pub fn from_refenced(",
         "pub fn from_expired_route_absent_claimed(",
         "pub fn inserted(",
         "pub fn replayed(",
