@@ -256,6 +256,10 @@ Before mutation it revalidates:
 - current owner and database clock;
 - exact selected source revision and digest;
 - canonical predecessor state;
+- deterministic predecessor recovery and claim action identity decoded from
+  the predecessor controller identity;
+- immutable predecessor action journal owner, process, epoch, revision, claim
+  stage, successor digest, successor bytes, and terminal digest;
 - predecessor expiry and owner epoch ordering;
 - deployment fence and controller history;
 - absent serving route and controller lease;
@@ -269,7 +273,7 @@ terminal projection.
 
 The action journal terminal projection binds:
 
-- complete predecessor canonical bytes and digest;
+- predecessor canonical digest and exact predecessor claim terminal digest;
 - predecessor claim identity;
 - complete successor canonical bytes and digest;
 - current owner and closed-recovery evidence;
@@ -277,6 +281,13 @@ The action journal terminal projection binds:
 - source and successor deployment fences;
 - certification resolution;
 - mutation database time.
+
+The projection does not duplicate the complete predecessor canonical bytes.
+Drain canonical state permits a larger payload than the bounded action
+journal. The mutation instead revalidates the locked predecessor bytes against
+their digest and verifies that the immutable predecessor action journal
+committed the same successor digest. This keeps the audit chain exact without
+making a valid large predecessor impossible to recover.
 
 An exact replay returns the original projection. Any changed recovery,
 authority revision, owner, source, target, seal, fence, certification, or
