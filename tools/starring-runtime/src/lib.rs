@@ -10,6 +10,8 @@ mod gateway_owner_startup;
 mod gateway_owner_startup_watchdog;
 mod health;
 mod identity_encoding;
+#[cfg_attr(not(test), allow(dead_code))]
+mod maintenance_ingress_gate;
 mod mutation_finalizer;
 mod process;
 mod process_identity;

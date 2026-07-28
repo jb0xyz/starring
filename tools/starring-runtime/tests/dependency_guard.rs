@@ -516,6 +516,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/identity_encoding.rs",
             "src/lib.rs",
             "src/main.rs",
+            "src/maintenance_ingress_gate.rs",
             "src/mutation_finalizer.rs",
             "src/process/closed.rs",
             "src/process/connected.rs",
@@ -693,6 +694,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
             && path != Path::new("src/health.rs")
             && path != Path::new("src/discord.rs")
+            && path != Path::new("src/maintenance_ingress_gate.rs")
             && path != Path::new("src/process/closed.rs")
             && path != Path::new("src/process/connected.rs")
             && path != Path::new("src/process/execution.rs")
@@ -1126,6 +1128,9 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 && identifier == "automation_runtime_controller";
             let allowed_mutation_finalizer = path == Path::new("src/mutation_finalizer.rs")
                 && identifier == "automation_runtime_worker";
+            let allowed_maintenance_ingress_gate = path
+                == Path::new("src/maintenance_ingress_gate.rs")
+                && identifier == "automation_runtime_worker";
             let allowed_pending_drain_succession = path
                 == Path::new("src/process/pending_drain_finalizer.rs")
                 || matches!(
@@ -1173,6 +1178,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_controller_identity
                         || allowed_recovery_identity
                         || allowed_mutation_finalizer
+                        || allowed_maintenance_ingress_gate
                         || !matches!(
                             identifier,
                             "automation_runtime"
@@ -1452,6 +1458,121 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "start_gateway_owner_production",
     ] {
         assert!(!owner_supervisor.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
+    let sources = source_files();
+    let gate = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/maintenance_ingress_gate.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    let production = source_before_test_module(gate);
+    let library = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/lib.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    assert!(library.contains(concat!(
+        "#[cfg_attr(not(test), allow(dead_code))]\n",
+        "mod maintenance_ingress_gate;"
+    )));
+    assert!(!library.contains("pub mod maintenance_ingress_gate"));
+    assert!(!library.contains("RuntimeMaintenanceIngressGate"));
+    for required in [
+        "RuntimeMaintenanceIngressGateStageV2",
+        "RuntimeMaintenanceIngressGateSnapshotV2",
+        "RuntimeMaintenanceIngressGateControllerV2",
+        "RuntimeMaintenanceIngressGateOpeningAuthorityV2",
+        "RuntimeMaintenanceIngressGateOpenAuthorityV2",
+        "RuntimeMaintenanceIngressGatePermitV2",
+        "RuntimeMaintenanceIngressGateDrainHandleV2",
+        "RuntimeMaintenanceIngressGateObserverV2",
+        "RuntimeMaintenanceIngressGateShutdownHandleV2",
+        "terminal_error: Option<RuntimeMaintenanceIngressGateErrorV2>",
+        "checked_add(1)",
+        ".filter(|value| *value <= i64::MAX as u64)",
+        ".filter(|count| *count <= i64::MAX as u64)",
+        "fail_closed_state_v2(&mut state, error)",
+        "shared.state.clear_poison()",
+        "RuntimeMaintenanceIngressGateErrorV2::Poisoned",
+        "RuntimeMaintenanceIngressGateStageV2::Opening",
+        "RuntimeMaintenanceIngressGateStageV2::Closing",
+        "state.snapshot.active_permit_count -= 1;",
+        "pub(crate) fn try_acquire_v2(",
+        "pub(crate) async fn wait_closed_until_v2(",
+        "pub(crate) fn close_v2(&self)",
+    ] {
+        assert!(production.contains(required), "{required}");
+    }
+    for name in [
+        "RuntimeMaintenanceIngressGateControllerV2",
+        "RuntimeMaintenanceIngressGateOpeningAuthorityV2",
+        "RuntimeMaintenanceIngressGateOpenAuthorityV2",
+        "RuntimeMaintenanceIngressGatePermitV2",
+        "RuntimeMaintenanceIngressGateDrainHandleV2",
+    ] {
+        let attributes = declaration_attribute_block(production, name);
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(production, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
+    }
+    for name in [
+        "RuntimeMaintenanceIngressGateObserverV2",
+        "RuntimeMaintenanceIngressGateShutdownHandleV2",
+    ] {
+        let attributes = declaration_attribute_block(production, name);
+        assert!(contains_identifier(attributes, "Clone"), "{name}");
+        for forbidden in ["Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(production, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
+    }
+    for forbidden in [
+        "RuntimePublicAdmission",
+        "RuntimeInteraction",
+        "interaction",
+        "route",
+        "sqlx",
+        "twilight",
+        "unsafe",
+    ] {
+        assert!(!contains_identifier(production, forbidden), "{forbidden}");
+    }
+    for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
+        if path == Path::new("src/maintenance_ingress_gate.rs") {
+            continue;
+        }
+        assert!(
+            !contains_identifier(source, "RuntimeMaintenanceIngressGateControllerV2"),
+            "{}",
+            path.display()
+        );
+        assert!(
+            !contains_identifier(source, "RuntimeMaintenanceIngressGatePermitV2"),
+            "{}",
+            path.display()
+        );
+        assert!(
+            !contains_identifier(source, "try_acquire_v2"),
+            "{}",
+            path.display()
+        );
     }
 }
 
