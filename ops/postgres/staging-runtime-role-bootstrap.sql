@@ -49,17 +49,17 @@ SELECT 1 / 0;
 SELECT 1 / 0;
 \endif
 
-BEGIN;
-
-SET LOCAL lock_timeout = '5s';
-SET LOCAL statement_timeout = '60s';
-SET LOCAL idle_in_transaction_session_timeout = '60s';
-SET LOCAL search_path = pg_catalog;
-SET LOCAL starring.runtime_enable = :'runtime_enable';
-SET LOCAL starring.expected_staging_database = :'expected_database';
-SET LOCAL starring.expected_staging_system_identifier = :'expected_system_identifier';
-SET LOCAL starring.runtime_dedicated_cluster_acknowledgement =
+SET lock_timeout = '5s';
+SET statement_timeout = '60s';
+SET idle_in_transaction_session_timeout = '60s';
+SET search_path = pg_catalog;
+SET starring.runtime_enable = :'runtime_enable';
+SET starring.expected_staging_database = :'expected_database';
+SET starring.expected_staging_system_identifier = :'expected_system_identifier';
+SET starring.runtime_dedicated_cluster_acknowledgement =
     :'runtime_dedicated_cluster_acknowledgement';
+
+BEGIN;
 
 CREATE TEMP TABLE starring_runtime_capability_roles (
     capability TEXT PRIMARY KEY,
@@ -71,7 +71,7 @@ CREATE TEMP TABLE starring_runtime_capability_roles (
         'serving',
         'interaction'
     ))
-) ON COMMIT DROP;
+) ON COMMIT PRESERVE ROWS;
 
 INSERT INTO pg_temp.starring_runtime_capability_roles (
     capability,
@@ -90,7 +90,7 @@ CREATE TEMP TABLE starring_runtime_capability_functions (
     PRIMARY KEY (capability, function_identity),
     FOREIGN KEY (capability)
         REFERENCES pg_temp.starring_runtime_capability_roles (capability)
-) ON COMMIT DROP;
+) ON COMMIT PRESERVE ROWS;
 
 INSERT INTO pg_temp.starring_runtime_capability_functions (
     capability,
@@ -146,6 +146,17 @@ VALUES
     ('interaction', 'public.starring_runtime_interaction_route_read_v1(text,text)'),
     ('interaction', 'public.starring_runtime_interaction_pinned_read_v1(text,text)'),
     ('interaction', 'public.starring_runtime_interaction_instance_register_v1(text,text,text,bigint,text,text,jsonb)');
+
+SELECT pg_catalog.pg_advisory_lock(
+    pg_catalog.hashtextextended(
+        pg_catalog.format(
+            'starring-runtime-role-bootstrap-v2:%s:%s',
+            :'expected_database',
+            :'expected_system_identifier'
+        ),
+        0
+    )
+);
 
 DO $guard$
 DECLARE
@@ -225,14 +236,8 @@ BEGIN
     IF (
         SELECT pg_catalog.count(*)
         FROM pg_temp.starring_runtime_capability_functions
-    ) <> 49
-        OR EXISTS (
-            SELECT 1
-            FROM pg_temp.starring_runtime_capability_functions AS expected
-            WHERE pg_catalog.to_regprocedure(expected.function_identity) IS NULL
-        )
-    THEN
-        RAISE EXCEPTION 'runtime capability function manifest is unavailable'
+    ) <> 49 THEN
+        RAISE EXCEPTION 'runtime capability function manifest is invalid'
             USING ERRCODE = '55000';
     END IF;
 
@@ -264,35 +269,112 @@ BEGIN
                 USING ERRCODE = '55000';
         END IF;
 
-        IF role_oid IS NOT NULL
-            AND (
-                EXISTS (
-                    SELECT 1
-                    FROM pg_catalog.pg_stat_activity AS activity
-                    WHERE activity.usesysid = role_oid
-                        AND activity.pid <> pg_catalog.pg_backend_pid()
-                )
-                OR EXISTS (
-                    SELECT 1
-                    FROM pg_catalog.pg_prepared_xacts AS prepared
-                    WHERE prepared.owner = role_entry.role_name
-                )
-            )
-        THEN
-            RAISE EXCEPTION 'runtime capability role has an active session or prepared transaction'
-                USING ERRCODE = '55000';
-        END IF;
     END LOOP;
 END;
 $guard$;
 
-DO $configure$
+COMMIT;
+
+BEGIN;
+
+DO $seal$
 DECLARE
     enable_roles BOOLEAN;
     role_entry RECORD;
+BEGIN
+    enable_roles := pg_catalog.current_setting('starring.runtime_enable') = 'on';
+
+    FOR role_entry IN
+        SELECT role_name
+        FROM pg_temp.starring_runtime_capability_roles
+        ORDER BY capability
+    LOOP
+        IF NOT enable_roles THEN
+            IF pg_catalog.to_regrole(role_entry.role_name::TEXT) IS NULL THEN
+                EXECUTE pg_catalog.format(
+                    'CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 VALID UNTIL ''infinity'' PASSWORD NULL',
+                    role_entry.role_name
+                );
+            ELSE
+                EXECUTE pg_catalog.format(
+                    'ALTER ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 VALID UNTIL ''infinity'' PASSWORD NULL',
+                    role_entry.role_name
+                );
+            END IF;
+        ELSIF NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_authid AS role
+            WHERE role.rolname = role_entry.role_name
+                AND NOT role.rolsuper
+                AND NOT role.rolcreatedb
+                AND NOT role.rolcreaterole
+                AND NOT role.rolinherit
+                AND NOT role.rolreplication
+                AND NOT role.rolbypassrls
+                AND NOT role.rolcanlogin
+                AND role.rolconnlimit = 4
+                AND role.rolvaliduntil
+                    IS NOT DISTINCT FROM 'infinity'::TIMESTAMPTZ
+                AND role.rolpassword LIKE 'SCRAM-SHA-256$%'
+        ) THEN
+            RAISE EXCEPTION 'runtime capability role password preflight failed'
+                USING ERRCODE = '55000';
+        END IF;
+    END LOOP;
+END;
+$seal$;
+
+COMMIT;
+
+BEGIN;
+
+DO $isolation_guard$
+DECLARE
+    role_entry RECORD;
+    role_oid OID;
+BEGIN
+    FOR role_entry IN
+        SELECT role_name
+        FROM pg_temp.starring_runtime_capability_roles
+        ORDER BY capability
+    LOOP
+        role_oid := pg_catalog.to_regrole(role_entry.role_name::TEXT);
+
+        IF role_oid IS NULL
+            OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_stat_activity AS activity
+                WHERE activity.usesysid = role_oid
+                    AND activity.pid <> pg_catalog.pg_backend_pid()
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_prepared_xacts AS prepared
+                WHERE prepared.owner = role_entry.role_name
+            )
+        THEN
+            RAISE EXCEPTION 'runtime capability role is not isolated'
+                USING ERRCODE = '55000';
+        END IF;
+    END LOOP;
+END;
+$isolation_guard$;
+
+DO $quarantine_cleanup$
+DECLARE
+    enable_roles BOOLEAN;
+    role_entry RECORD;
+    owner_entry RECORD;
+    default_acl_entry RECORD;
     database_entry RECORD;
     schema_entry RECORD;
+    relation_entry RECORD;
     function_entry RECORD;
+    type_entry RECORD;
+    language_entry RECORD;
+    foreign_data_wrapper_entry RECORD;
+    foreign_server_entry RECORD;
+    tablespace_entry RECORD;
     large_object_entry RECORD;
     parameter_entry RECORD;
 BEGIN
@@ -312,103 +394,545 @@ BEGIN
             );
         END LOOP;
 
+        FOR owner_entry IN
+            SELECT role.rolname
+            FROM pg_catalog.pg_roles AS role
+            WHERE role.rolname <> 'pg_database_owner'
+                AND pg_catalog.has_schema_privilege(
+                    role.oid,
+                    'public',
+                    'CREATE'
+                )
+            ORDER BY role.rolname
+        LOOP
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE ALL PRIVILEGES ON TABLES FROM PUBLIC CASCADE',
+                owner_entry.rolname
+            );
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE ALL PRIVILEGES ON SEQUENCES FROM PUBLIC CASCADE',
+                owner_entry.rolname
+            );
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE ALL PRIVILEGES ON ROUTINES FROM PUBLIC CASCADE',
+                owner_entry.rolname
+            );
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE ALL PRIVILEGES ON TYPES FROM PUBLIC CASCADE',
+                owner_entry.rolname
+            );
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE ALL PRIVILEGES ON SCHEMAS FROM PUBLIC CASCADE',
+                owner_entry.rolname
+            );
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE ALL PRIVILEGES ON TABLES FROM PUBLIC CASCADE',
+                owner_entry.rolname
+            );
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE ALL PRIVILEGES ON SEQUENCES FROM PUBLIC CASCADE',
+                owner_entry.rolname
+            );
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE ALL PRIVILEGES ON ROUTINES FROM PUBLIC CASCADE',
+                owner_entry.rolname
+            );
+            EXECUTE pg_catalog.format(
+                'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE ALL PRIVILEGES ON TYPES FROM PUBLIC CASCADE',
+                owner_entry.rolname
+            );
+        END LOOP;
+
+        FOR default_acl_entry IN
+            SELECT DISTINCT
+                owner_role.rolname AS owner_name,
+                namespace.nspname AS schema_name,
+                CASE default_acl.defaclobjtype
+                    WHEN 'r' THEN 'TABLES'
+                    WHEN 'S' THEN 'SEQUENCES'
+                    WHEN 'f' THEN 'ROUTINES'
+                    WHEN 'T' THEN 'TYPES'
+                    WHEN 'n' THEN 'SCHEMAS'
+                END AS object_family,
+                pg_catalog.format('%I', grantee_role.rolname)
+                    AS grantee_identity
+            FROM pg_catalog.pg_default_acl AS default_acl
+            INNER JOIN pg_catalog.pg_roles AS owner_role
+                ON owner_role.oid = default_acl.defaclrole
+            LEFT JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = default_acl.defaclnamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                default_acl.defaclacl
+            ) AS privilege
+            INNER JOIN pg_catalog.pg_roles AS grantee_role
+                ON grantee_role.oid = privilege.grantee
+            WHERE default_acl.defaclobjtype IN ('r', 'S', 'f', 'T', 'n')
+                AND privilege.grantee <> default_acl.defaclrole
+                AND privilege.grantee IN (
+                    SELECT pg_catalog.to_regrole(
+                        expected.role_name::TEXT
+                    )
+                    FROM pg_temp.starring_runtime_capability_roles AS expected
+                )
+            ORDER BY owner_name, schema_name, object_family, grantee_identity
+        LOOP
+            IF default_acl_entry.schema_name IS NULL THEN
+                EXECUTE pg_catalog.format(
+                    'ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE ALL PRIVILEGES ON %s FROM %s CASCADE',
+                    default_acl_entry.owner_name,
+                    default_acl_entry.object_family,
+                    default_acl_entry.grantee_identity
+                );
+            ELSE
+                EXECUTE pg_catalog.format(
+                    'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA %I REVOKE ALL PRIVILEGES ON %s FROM %s CASCADE',
+                    default_acl_entry.owner_name,
+                    default_acl_entry.schema_name,
+                    default_acl_entry.object_family,
+                    default_acl_entry.grantee_identity
+                );
+            END IF;
+        END LOOP;
+
         FOR role_entry IN
             SELECT capability, role_name
             FROM pg_temp.starring_runtime_capability_roles
             ORDER BY capability
         LOOP
-            IF pg_catalog.to_regrole(role_entry.role_name::TEXT) IS NULL THEN
-                EXECUTE pg_catalog.format(
-                    'CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 VALID UNTIL ''infinity'' PASSWORD NULL',
-                    role_entry.role_name
-                );
-            ELSE
-                EXECUTE pg_catalog.format(
-                    'ALTER ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4 VALID UNTIL ''infinity'' PASSWORD NULL',
-                    role_entry.role_name
-                );
-            END IF;
-
             EXECUTE pg_catalog.format(
                 'ALTER ROLE %I RESET ALL',
                 role_entry.role_name
             );
 
             FOR database_entry IN
-                SELECT datname
-                FROM pg_catalog.pg_database
-                ORDER BY datname
+                SELECT database_row.datname
+                FROM pg_catalog.pg_db_role_setting AS setting
+                INNER JOIN pg_catalog.pg_database AS database_row
+                    ON database_row.oid = setting.setdatabase
+                WHERE setting.setrole
+                    = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                ORDER BY database_row.datname
             LOOP
                 EXECUTE pg_catalog.format(
                     'ALTER ROLE %I IN DATABASE %I RESET ALL',
                     role_entry.role_name,
                     database_entry.datname
                 );
+            END LOOP;
+
+            FOR database_entry IN
+                SELECT DISTINCT
+                    database_row.datname,
+                    grantor_role.rolname AS grantor_name
+                FROM pg_catalog.pg_database AS database_row
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    database_row.datacl
+                ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
+                WHERE privilege.grantee
+                    = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                ORDER BY database_row.datname, grantor_name
+            LOOP
+                EXECUTE pg_catalog.format(
+                    'SET LOCAL ROLE %I',
+                    database_entry.grantor_name
+                );
                 EXECUTE pg_catalog.format(
                     'REVOKE ALL PRIVILEGES ON DATABASE %I FROM %I CASCADE',
                     database_entry.datname,
                     role_entry.role_name
                 );
+                EXECUTE 'RESET ROLE';
             END LOOP;
 
             FOR schema_entry IN
-                SELECT namespace.nspname
+                SELECT DISTINCT
+                    namespace.nspname,
+                    grantor_role.rolname AS grantor_name
                 FROM pg_catalog.pg_namespace AS namespace
-                WHERE namespace.nspname <> 'information_schema'
-                    AND pg_catalog.left(namespace.nspname, 3) <> 'pg_'
-                ORDER BY namespace.nspname
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    namespace.nspacl
+                ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
+                WHERE privilege.grantee
+                    = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                ORDER BY namespace.nspname, grantor_name
             LOOP
                 EXECUTE pg_catalog.format(
-                    'REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA %I FROM %I CASCADE',
-                    schema_entry.nspname,
-                    role_entry.role_name
-                );
-                EXECUTE pg_catalog.format(
-                    'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM %I CASCADE',
-                    schema_entry.nspname,
-                    role_entry.role_name
-                );
-                EXECUTE pg_catalog.format(
-                    'REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA %I FROM %I CASCADE',
-                    schema_entry.nspname,
-                    role_entry.role_name
+                    'SET LOCAL ROLE %I',
+                    schema_entry.grantor_name
                 );
                 EXECUTE pg_catalog.format(
                     'REVOKE ALL PRIVILEGES ON SCHEMA %I FROM %I CASCADE',
                     schema_entry.nspname,
                     role_entry.role_name
                 );
+                EXECUTE 'RESET ROLE';
+            END LOOP;
+
+            FOR relation_entry IN
+                SELECT DISTINCT
+                    namespace.nspname,
+                    relation.relname,
+                    grantor_role.rolname AS grantor_name
+                FROM pg_catalog.pg_class AS relation
+                INNER JOIN pg_catalog.pg_namespace AS namespace
+                    ON namespace.oid = relation.relnamespace
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    relation.relacl
+                ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
+                WHERE relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+                    AND privilege.grantee
+                        = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                ORDER BY
+                    namespace.nspname,
+                    relation.relname,
+                    grantor_name
+            LOOP
+                EXECUTE pg_catalog.format(
+                    'SET LOCAL ROLE %I',
+                    relation_entry.grantor_name
+                );
+                EXECUTE pg_catalog.format(
+                    'REVOKE ALL PRIVILEGES ON TABLE %I.%I FROM %I CASCADE',
+                    relation_entry.nspname,
+                    relation_entry.relname,
+                    role_entry.role_name
+                );
+                EXECUTE 'RESET ROLE';
+            END LOOP;
+
+            FOR relation_entry IN
+                SELECT DISTINCT
+                    namespace.nspname,
+                    relation.relname,
+                    grantor_role.rolname AS grantor_name
+                FROM pg_catalog.pg_class AS relation
+                INNER JOIN pg_catalog.pg_namespace AS namespace
+                    ON namespace.oid = relation.relnamespace
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    relation.relacl
+                ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
+                WHERE relation.relkind = 'S'
+                    AND privilege.grantee
+                        = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                ORDER BY
+                    namespace.nspname,
+                    relation.relname,
+                    grantor_name
+            LOOP
+                EXECUTE pg_catalog.format(
+                    'SET LOCAL ROLE %I',
+                    relation_entry.grantor_name
+                );
+                EXECUTE pg_catalog.format(
+                    'REVOKE ALL PRIVILEGES ON SEQUENCE %I.%I FROM %I CASCADE',
+                    relation_entry.nspname,
+                    relation_entry.relname,
+                    role_entry.role_name
+                );
+                EXECUTE 'RESET ROLE';
+            END LOOP;
+
+            FOR function_entry IN
+                SELECT DISTINCT
+                    function_row.oid::REGPROCEDURE::TEXT
+                        AS function_identity,
+                    grantor_role.rolname AS grantor_name
+                FROM pg_catalog.pg_proc AS function_row
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    function_row.proacl
+                ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
+                WHERE privilege.grantee
+                    = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                ORDER BY function_identity, grantor_name
+            LOOP
+                EXECUTE pg_catalog.format(
+                    'SET LOCAL ROLE %I',
+                    function_entry.grantor_name
+                );
+                EXECUTE pg_catalog.format(
+                    'REVOKE ALL PRIVILEGES ON ROUTINE %s FROM %I CASCADE',
+                    function_entry.function_identity,
+                    role_entry.role_name
+                );
+                EXECUTE 'RESET ROLE';
+            END LOOP;
+
+            FOR relation_entry IN
+                SELECT
+                    namespace.nspname,
+                    relation.relname,
+                    pg_catalog.string_agg(
+                        pg_catalog.format('%I', attribute.attname),
+                        ', '
+                        ORDER BY attribute.attnum
+                    ) AS column_list,
+                    grantor_role.rolname AS grantor_name
+                FROM pg_catalog.pg_class AS relation
+                INNER JOIN pg_catalog.pg_namespace AS namespace
+                    ON namespace.oid = relation.relnamespace
+                INNER JOIN pg_catalog.pg_attribute AS attribute
+                    ON attribute.attrelid = relation.oid
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    attribute.attacl
+                ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
+                WHERE relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+                    AND attribute.attnum > 0
+                    AND NOT attribute.attisdropped
+                    AND privilege.grantee
+                        = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                GROUP BY
+                    namespace.nspname,
+                    relation.relname,
+                    grantor_role.rolname
+                ORDER BY
+                    namespace.nspname,
+                    relation.relname,
+                    grantor_name
+            LOOP
+                EXECUTE pg_catalog.format(
+                    'SET LOCAL ROLE %I',
+                    relation_entry.grantor_name
+                );
+                EXECUTE pg_catalog.format(
+                    'REVOKE ALL PRIVILEGES (%s) ON TABLE %I.%I FROM %I CASCADE',
+                    relation_entry.column_list,
+                    relation_entry.nspname,
+                    relation_entry.relname,
+                    role_entry.role_name
+                );
+                EXECUTE 'RESET ROLE';
+            END LOOP;
+
+            FOR type_entry IN
+                SELECT DISTINCT
+                    namespace.nspname,
+                    type_row.typname,
+                    grantor_role.rolname AS grantor_name
+                FROM pg_catalog.pg_type AS type_row
+                INNER JOIN pg_catalog.pg_namespace AS namespace
+                    ON namespace.oid = type_row.typnamespace
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    type_row.typacl
+                ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
+                WHERE privilege.grantee
+                    = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                ORDER BY
+                    namespace.nspname,
+                    type_row.typname,
+                    grantor_name
+            LOOP
+                EXECUTE pg_catalog.format(
+                    'SET LOCAL ROLE %I',
+                    type_entry.grantor_name
+                );
+                EXECUTE pg_catalog.format(
+                    'REVOKE ALL PRIVILEGES ON TYPE %I.%I FROM %I CASCADE',
+                    type_entry.nspname,
+                    type_entry.typname,
+                    role_entry.role_name
+                );
+                EXECUTE 'RESET ROLE';
+            END LOOP;
+
+            FOR language_entry IN
+                SELECT DISTINCT
+                    language.lanname,
+                    grantor_role.rolname AS grantor_name
+                FROM pg_catalog.pg_language AS language
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    language.lanacl
+                ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
+                WHERE language.lanpltrusted
+                    AND privilege.grantee
+                        = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                ORDER BY language.lanname, grantor_name
+            LOOP
+                EXECUTE pg_catalog.format(
+                    'SET LOCAL ROLE %I',
+                    language_entry.grantor_name
+                );
+                EXECUTE pg_catalog.format(
+                    'REVOKE ALL PRIVILEGES ON LANGUAGE %I FROM %I CASCADE',
+                    language_entry.lanname,
+                    role_entry.role_name
+                );
+                EXECUTE 'RESET ROLE';
+            END LOOP;
+
+            FOR foreign_data_wrapper_entry IN
+                SELECT DISTINCT
+                    wrapper.fdwname,
+                    grantor_role.rolname AS grantor_name
+                FROM pg_catalog.pg_foreign_data_wrapper AS wrapper
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    wrapper.fdwacl
+                ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
+                WHERE privilege.grantee
+                    = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                ORDER BY wrapper.fdwname, grantor_name
+            LOOP
+                EXECUTE pg_catalog.format(
+                    'SET LOCAL ROLE %I',
+                    foreign_data_wrapper_entry.grantor_name
+                );
+                EXECUTE pg_catalog.format(
+                    'REVOKE ALL PRIVILEGES ON FOREIGN DATA WRAPPER %I FROM %I CASCADE',
+                    foreign_data_wrapper_entry.fdwname,
+                    role_entry.role_name
+                );
+                EXECUTE 'RESET ROLE';
+            END LOOP;
+
+            FOR foreign_server_entry IN
+                SELECT DISTINCT
+                    server.srvname,
+                    grantor_role.rolname AS grantor_name
+                FROM pg_catalog.pg_foreign_server AS server
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    server.srvacl
+                ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
+                WHERE privilege.grantee
+                    = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                ORDER BY server.srvname, grantor_name
+            LOOP
+                EXECUTE pg_catalog.format(
+                    'SET LOCAL ROLE %I',
+                    foreign_server_entry.grantor_name
+                );
+                EXECUTE pg_catalog.format(
+                    'REVOKE ALL PRIVILEGES ON FOREIGN SERVER %I FROM %I CASCADE',
+                    foreign_server_entry.srvname,
+                    role_entry.role_name
+                );
+                EXECUTE 'RESET ROLE';
+            END LOOP;
+
+            FOR tablespace_entry IN
+                SELECT DISTINCT
+                    tablespace.spcname,
+                    grantor_role.rolname AS grantor_name
+                FROM pg_catalog.pg_tablespace AS tablespace
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    tablespace.spcacl
+                ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
+                WHERE privilege.grantee
+                    = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                ORDER BY tablespace.spcname, grantor_name
+            LOOP
+                EXECUTE pg_catalog.format(
+                    'SET LOCAL ROLE %I',
+                    tablespace_entry.grantor_name
+                );
+                EXECUTE pg_catalog.format(
+                    'REVOKE ALL PRIVILEGES ON TABLESPACE %I FROM %I CASCADE',
+                    tablespace_entry.spcname,
+                    role_entry.role_name
+                );
+                EXECUTE 'RESET ROLE';
             END LOOP;
 
             FOR large_object_entry IN
-                SELECT oid
-                FROM pg_catalog.pg_largeobject_metadata
-                ORDER BY oid
+                SELECT DISTINCT
+                    large_object.oid,
+                    grantor_role.rolname AS grantor_name
+                FROM pg_catalog.pg_largeobject_metadata AS large_object
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    large_object.lomacl
+                ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
+                WHERE privilege.grantee
+                    = pg_catalog.to_regrole(role_entry.role_name::TEXT)
+                ORDER BY large_object.oid, grantor_name
             LOOP
+                EXECUTE pg_catalog.format(
+                    'SET LOCAL ROLE %I',
+                    large_object_entry.grantor_name
+                );
                 EXECUTE pg_catalog.format(
                     'REVOKE ALL PRIVILEGES ON LARGE OBJECT %s FROM %I CASCADE',
                     large_object_entry.oid,
                     role_entry.role_name
                 );
+                EXECUTE 'RESET ROLE';
             END LOOP;
 
             FOR parameter_entry IN
-                SELECT parameter_acl.parname
+                SELECT DISTINCT
+                    parameter_acl.parname,
+                    grantor_role.rolname AS grantor_name
                 FROM pg_catalog.pg_parameter_acl AS parameter_acl
                 CROSS JOIN LATERAL pg_catalog.aclexplode(
                     parameter_acl.paracl
                 ) AS privilege
+                INNER JOIN pg_catalog.pg_roles AS grantor_role
+                    ON grantor_role.oid = privilege.grantor
                 WHERE privilege.grantee
                     = pg_catalog.to_regrole(role_entry.role_name::TEXT)
-                ORDER BY parameter_acl.parname
+                ORDER BY parameter_acl.parname, grantor_name
             LOOP
                 EXECUTE pg_catalog.format(
-                    'REVOKE ALL PRIVILEGES ON PARAMETER %I FROM %I',
+                    'SET LOCAL ROLE %I',
+                    parameter_entry.grantor_name
+                );
+                EXECUTE pg_catalog.format(
+                    'REVOKE ALL PRIVILEGES ON PARAMETER %I FROM %I CASCADE',
                     parameter_entry.parname,
                     role_entry.role_name
                 );
+                EXECUTE 'RESET ROLE';
             END LOOP;
+        END LOOP;
+    END IF;
+END;
+$quarantine_cleanup$;
 
+DO $function_guard$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_temp.starring_runtime_capability_functions AS expected
+        WHERE pg_catalog.to_regprocedure(expected.function_identity) IS NULL
+    ) THEN
+        RAISE EXCEPTION 'runtime capability function manifest is unavailable'
+            USING ERRCODE = '55000';
+    END IF;
+END;
+$function_guard$;
+
+DO $configure$
+DECLARE
+    role_entry RECORD;
+    function_entry RECORD;
+BEGIN
+    IF pg_catalog.current_setting('starring.runtime_enable') = 'off' THEN
+        FOR role_entry IN
+            SELECT capability, role_name
+            FROM pg_temp.starring_runtime_capability_roles
+            ORDER BY capability
+        LOOP
             EXECUTE pg_catalog.format(
                 'GRANT CONNECT ON DATABASE %I TO %I',
                 pg_catalog.current_database(),
@@ -432,36 +956,6 @@ BEGIN
                 );
             END LOOP;
         END LOOP;
-    ELSE
-        FOR role_entry IN
-            SELECT role_name
-            FROM pg_temp.starring_runtime_capability_roles
-            ORDER BY capability
-        LOOP
-            IF NOT EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_authid AS role
-                WHERE role.rolname = role_entry.role_name
-                    AND NOT role.rolsuper
-                    AND NOT role.rolcreatedb
-                    AND NOT role.rolcreaterole
-                    AND NOT role.rolinherit
-                    AND NOT role.rolreplication
-                    AND NOT role.rolbypassrls
-                    AND role.rolconnlimit = 4
-                    AND role.rolvaliduntil
-                        IS NOT DISTINCT FROM 'infinity'::TIMESTAMPTZ
-                    AND role.rolpassword LIKE 'SCRAM-SHA-256$%'
-            ) THEN
-                RAISE EXCEPTION 'runtime capability role password preflight failed'
-                    USING ERRCODE = '55000';
-            END IF;
-
-            EXECUTE pg_catalog.format(
-                'ALTER ROLE %I LOGIN',
-                role_entry.role_name
-            );
-        END LOOP;
     END IF;
 END;
 $configure$;
@@ -482,6 +976,82 @@ BEGIN
     FROM pg_catalog.pg_database AS database_row
     WHERE database_row.datname = pg_catalog.current_database();
 
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_roles AS owner_role
+        WHERE owner_role.rolname <> 'pg_database_owner'
+            AND pg_catalog.has_schema_privilege(
+                owner_role.oid,
+                'public',
+                'CREATE'
+            )
+            AND (
+                NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_default_acl AS default_acl
+                    WHERE default_acl.defaclrole = owner_role.oid
+                        AND default_acl.defaclnamespace = 0
+                        AND default_acl.defaclobjtype = 'f'
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.aclexplode(
+                                default_acl.defaclacl
+                            ) AS privilege
+                            WHERE privilege.grantee = 0
+                        )
+                )
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_default_acl AS default_acl
+                    WHERE default_acl.defaclrole = owner_role.oid
+                        AND default_acl.defaclnamespace = 0
+                        AND default_acl.defaclobjtype = 'T'
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.aclexplode(
+                                default_acl.defaclacl
+                            ) AS privilege
+                            WHERE privilege.grantee = 0
+                        )
+                )
+            )
+    ) OR EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_default_acl AS default_acl
+        INNER JOIN pg_catalog.pg_roles AS owner_role
+            ON owner_role.oid = default_acl.defaclrole
+        LEFT JOIN pg_catalog.pg_namespace AS namespace
+            ON namespace.oid = default_acl.defaclnamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(
+            default_acl.defaclacl
+        ) AS privilege
+        WHERE (
+                privilege.grantee = 0
+                AND owner_role.rolname <> 'pg_database_owner'
+                AND pg_catalog.has_schema_privilege(
+                    owner_role.oid,
+                    'public',
+                    'CREATE'
+                )
+                AND (
+                    default_acl.defaclnamespace = 0
+                    OR namespace.nspname = 'public'
+                )
+            )
+            OR (
+                privilege.grantee <> default_acl.defaclrole
+                AND privilege.grantee IN (
+                    SELECT pg_catalog.to_regrole(
+                        expected.role_name::TEXT
+                    )
+                    FROM pg_temp.starring_runtime_capability_roles AS expected
+                )
+            )
+    ) THEN
+        RAISE EXCEPTION 'runtime default privileges are invalid'
+            USING ERRCODE = '55000';
+    END IF;
+
     FOR role_entry IN
         SELECT capability, role_name
         FROM pg_temp.starring_runtime_capability_roles
@@ -494,7 +1064,7 @@ BEGIN
                 SELECT 1
                 FROM pg_catalog.pg_authid AS role
                 WHERE role.oid = role_oid
-                    AND role.rolcanlogin IS NOT DISTINCT FROM enable_roles
+                    AND NOT role.rolcanlogin
                     AND NOT role.rolsuper
                     AND NOT role.rolcreatedb
                     AND NOT role.rolcreaterole
@@ -512,6 +1082,98 @@ BEGIN
                         OR (
                             NOT enable_roles
                             AND role.rolpassword IS NULL
+                        )
+                    )
+            )
+            OR (
+                SELECT pg_catalog.count(*)
+                FROM pg_catalog.pg_database AS database_row
+                CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                    database_row.datacl,
+                    pg_catalog.acldefault('d', database_row.datdba)
+                )) AS privilege
+                WHERE database_row.oid = database_oid
+                    AND privilege.grantee = role_oid
+                    AND privilege.privilege_type = 'CONNECT'
+                    AND NOT privilege.is_grantable
+            ) <> 1
+            OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_database AS database_row
+                CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                    database_row.datacl,
+                    pg_catalog.acldefault('d', database_row.datdba)
+                )) AS privilege
+                WHERE database_row.oid = database_oid
+                    AND privilege.grantee = role_oid
+                    AND (
+                        privilege.privilege_type <> 'CONNECT'
+                        OR privilege.is_grantable
+                    )
+            )
+            OR (
+                SELECT pg_catalog.count(*)
+                FROM pg_catalog.pg_namespace AS namespace
+                CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                    namespace.nspacl,
+                    pg_catalog.acldefault('n', namespace.nspowner)
+                )) AS privilege
+                WHERE namespace.nspname = 'public'
+                    AND privilege.grantee = role_oid
+                    AND privilege.privilege_type = 'USAGE'
+                    AND NOT privilege.is_grantable
+            ) <> 1
+            OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_namespace AS namespace
+                CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                    namespace.nspacl,
+                    pg_catalog.acldefault('n', namespace.nspowner)
+                )) AS privilege
+                WHERE namespace.nspname = 'public'
+                    AND privilege.grantee = role_oid
+                    AND (
+                        privilege.privilege_type <> 'USAGE'
+                        OR privilege.is_grantable
+                    )
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM pg_temp.starring_runtime_capability_functions AS expected
+                WHERE expected.capability = role_entry.capability
+                    AND (
+                        (
+                            SELECT pg_catalog.count(*)
+                            FROM pg_catalog.pg_proc AS function_row
+                            CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                                function_row.proacl,
+                                pg_catalog.acldefault(
+                                    'f',
+                                    function_row.proowner
+                                )
+                            )) AS privilege
+                            WHERE function_row.oid
+                                = pg_catalog.to_regprocedure(
+                                    expected.function_identity
+                                )
+                                AND privilege.grantee = role_oid
+                                AND privilege.privilege_type = 'EXECUTE'
+                        ) <> 1
+                        OR EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_proc AS function_row
+                            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                                function_row.proacl
+                            ) AS privilege
+                            WHERE function_row.oid
+                                = pg_catalog.to_regprocedure(
+                                    expected.function_identity
+                                )
+                                AND privilege.grantee = role_oid
+                                AND (
+                                    privilege.privilege_type <> 'EXECUTE'
+                                    OR privilege.is_grantable
+                                )
                         )
                     )
             )
@@ -573,6 +1235,15 @@ BEGIN
                         )
                     )
             )
+            OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_database AS database_row
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    database_row.datacl
+                ) AS privilege
+                WHERE database_row.oid <> database_oid
+                    AND privilege.grantee = role_oid
+            )
         THEN
             RAISE EXCEPTION 'runtime capability database privileges are invalid'
                 USING ERRCODE = '55000';
@@ -606,6 +1277,15 @@ BEGIN
                             'CREATE'
                         )
                     )
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_namespace AS namespace
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    namespace.nspacl
+                ) AS privilege
+                WHERE namespace.nspname <> 'public'
+                    AND privilege.grantee = role_oid
             )
         THEN
             RAISE EXCEPTION 'runtime capability schema privileges are invalid'
@@ -646,6 +1326,23 @@ BEGIN
                     ),
                     'USAGE,SELECT,UPDATE'
                 )
+        ) OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_class AS relation
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                relation.relacl
+            ) AS privilege
+            WHERE relation.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+                AND privilege.grantee = role_oid
+        ) OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_attribute AS attribute
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                attribute.attacl
+            ) AS privilege
+            WHERE attribute.attnum > 0
+                AND NOT attribute.attisdropped
+                AND privilege.grantee = role_oid
         ) THEN
             RAISE EXCEPTION 'runtime capability relation privileges are invalid'
                 USING ERRCODE = '55000';
@@ -682,8 +1379,103 @@ BEGIN
                         'EXECUTE'
                     )
             )
+            OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_proc AS function_row
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    function_row.proacl
+                ) AS privilege
+                WHERE privilege.grantee = role_oid
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM pg_temp.starring_runtime_capability_functions
+                            AS expected
+                        WHERE expected.capability = role_entry.capability
+                            AND pg_catalog.to_regprocedure(
+                                expected.function_identity
+                            ) = function_row.oid
+                    )
+            )
         THEN
             RAISE EXCEPTION 'runtime capability function privileges are invalid'
+                USING ERRCODE = '55000';
+        END IF;
+
+        IF EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_type AS type_row
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                type_row.typacl
+            ) AS privilege
+            WHERE privilege.grantee = role_oid
+        ) OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_type AS type_row
+            INNER JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = type_row.typnamespace
+            LEFT JOIN pg_catalog.pg_class AS type_relation
+                ON type_relation.oid = type_row.typrelid
+            WHERE namespace.nspname <> 'information_schema'
+                AND pg_catalog.left(namespace.nspname, 3) <> 'pg_'
+                AND type_row.typisdefined
+                AND type_row.typtype <> 'p'
+                AND type_row.typelem = 0
+                AND (
+                    type_row.typrelid = 0
+                    OR type_relation.relkind = 'c'
+                )
+                AND pg_catalog.has_type_privilege(
+                    role_oid,
+                    type_row.oid,
+                    'USAGE'
+                )
+        ) OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_language AS language
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                language.lanacl
+            ) AS privilege
+            WHERE privilege.grantee = role_oid
+        ) OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_language AS language
+            WHERE language.lanname NOT IN (
+                    'internal',
+                    'c',
+                    'sql',
+                    'plpgsql'
+                )
+                AND pg_catalog.has_language_privilege(
+                    role_oid,
+                    language.oid,
+                    'USAGE'
+                )
+        ) OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_foreign_data_wrapper AS wrapper
+            WHERE pg_catalog.has_foreign_data_wrapper_privilege(
+                role_oid,
+                wrapper.oid,
+                'USAGE'
+            )
+        ) OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_foreign_server AS server
+            WHERE pg_catalog.has_server_privilege(
+                role_oid,
+                server.oid,
+                'USAGE'
+            )
+        ) OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_tablespace AS tablespace
+            WHERE pg_catalog.has_tablespace_privilege(
+                role_oid,
+                tablespace.oid,
+                'CREATE'
+            )
+        ) THEN
+            RAISE EXCEPTION 'runtime capability extended object privileges are invalid'
                 USING ERRCODE = '55000';
         END IF;
 
@@ -725,4 +1517,102 @@ BEGIN
 END;
 $postflight$;
 
+DO $isolation_postflight$
+DECLARE
+    role_entry RECORD;
+    role_oid OID;
+BEGIN
+    FOR role_entry IN
+        SELECT role_name
+        FROM pg_temp.starring_runtime_capability_roles
+        ORDER BY capability
+    LOOP
+        role_oid := pg_catalog.to_regrole(role_entry.role_name::TEXT);
+
+        IF role_oid IS NULL
+            OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_stat_activity AS activity
+                WHERE activity.usesysid = role_oid
+                    AND activity.pid <> pg_catalog.pg_backend_pid()
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_prepared_xacts AS prepared
+                WHERE prepared.owner = role_entry.role_name
+            )
+        THEN
+            RAISE EXCEPTION 'runtime capability role lost isolation'
+                USING ERRCODE = '55000';
+        END IF;
+    END LOOP;
+END;
+$isolation_postflight$;
+
+DO $activate$
+DECLARE
+    role_entry RECORD;
+BEGIN
+    IF pg_catalog.current_setting('starring.runtime_enable') = 'on' THEN
+        FOR role_entry IN
+            SELECT role_name
+            FROM pg_temp.starring_runtime_capability_roles
+            ORDER BY capability
+        LOOP
+            EXECUTE pg_catalog.format(
+                'ALTER ROLE %I LOGIN',
+                role_entry.role_name
+            );
+        END LOOP;
+    END IF;
+END;
+$activate$;
+
+DO $activation_postflight$
+DECLARE
+    enable_roles BOOLEAN;
+    role_entry RECORD;
+BEGIN
+    enable_roles := pg_catalog.current_setting('starring.runtime_enable') = 'on';
+
+    FOR role_entry IN
+        SELECT role_name
+        FROM pg_temp.starring_runtime_capability_roles
+        ORDER BY capability
+    LOOP
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_roles AS role
+            WHERE role.rolname = role_entry.role_name
+                AND role.rolcanlogin IS NOT DISTINCT FROM enable_roles
+        ) THEN
+            RAISE EXCEPTION 'runtime capability role activation is invalid'
+                USING ERRCODE = '55000';
+        END IF;
+    END LOOP;
+END;
+$activation_postflight$;
+
 COMMIT;
+
+DO $unlock$
+BEGIN
+    IF NOT pg_catalog.pg_advisory_unlock(
+        pg_catalog.hashtextextended(
+            pg_catalog.format(
+                'starring-runtime-role-bootstrap-v2:%s:%s',
+                pg_catalog.current_setting(
+                    'starring.expected_staging_database'
+                ),
+                pg_catalog.current_setting(
+                    'starring.expected_staging_system_identifier'
+                )
+            ),
+            0
+        )
+    ) THEN
+        RAISE EXCEPTION 'runtime role bootstrap serialization lock is unavailable'
+            USING ERRCODE = '55000';
+    END IF;
+END;
+$unlock$;

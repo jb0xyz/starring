@@ -72,7 +72,7 @@ Every `zsh` block below is a fail-fast subshell. Run a block as one unit and
 continue only when its exit status is zero. Secrets are entered only at an
 interactive password prompt.
 
-## Preconditions and target validation
+## Local preconditions and independent inventory
 
 ```zsh
 (
@@ -92,6 +92,7 @@ interactive password prompt.
   test "$(git rev-parse --is-inside-work-tree)" = true
   test -x /opt/homebrew/opt/postgresql@16/bin/psql
   test -x /usr/bin/security
+  test -x /usr/bin/perl
   plutil -lint ops/macos/local.starring.runtime.staging.plist
   AVAILABLE_KIB="$(df -Pk /Users/jungbogeon | awk 'NR == 2 { print $4 }')"
   test "$AVAILABLE_KIB" -ge 31457280
@@ -107,6 +108,41 @@ cluster-wide so the five runtime roles cannot connect to another database
 through inherited `PUBLIC` access. A staging-looking database name is not
 proof that its cluster is dedicated. The independently reviewed system
 identifier and exact cluster-wide ACL acknowledgement are both mandatory.
+
+## Authenticate and prove the exact target before any migration
+
+This read-only proof is the first database connection in the procedure. It
+uses an explicit TCP host, port, database, and independently inventoried
+administrator. The observed database name, PostgreSQL system identifier,
+current user, session user, and superuser status must match one exact expected
+record. Do not apply a migration, run the role bootstrap, or change a
+credential if this proof fails. Never replace the inventory value with an
+identifier learned from this connection.
+
+```zsh
+(
+  set -euo pipefail
+  STAGING_DATABASE=starring_runtime_staging
+  STAGING_DATABASE_HOST=127.0.0.1
+  STAGING_DATABASE_PORT=5432
+  : "${STARRING_STAGING_CLUSTER_ADMIN:?load the reviewed cluster administrator}"
+  : "${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER:?load the reviewed system identifier}"
+  unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
+  unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
+  EXPECTED_TARGET="${STAGING_DATABASE}|${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER}|${STARRING_STAGING_CLUSTER_ADMIN}|${STARRING_STAGING_CLUSTER_ADMIN}|true"
+  OBSERVED_TARGET="$(
+    PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
+      --no-psqlrc --set ON_ERROR_STOP=1 --password --quiet \
+      --host "$STAGING_DATABASE_HOST" --port "$STAGING_DATABASE_PORT" \
+      --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+      --dbname "$STAGING_DATABASE" --tuples-only --no-align \
+      --command "BEGIN READ ONLY" \
+      --command "SELECT pg_catalog.concat_ws('|', pg_catalog.current_database(), control.system_identifier::TEXT, current_user, session_user, administrator.rolsuper::TEXT) FROM pg_catalog.pg_control_system() AS control CROSS JOIN pg_catalog.pg_roles AS administrator WHERE administrator.rolname = current_user" \
+      --command "COMMIT"
+  )"
+  test "$OBSERVED_TARGET" = "$EXPECTED_TARGET"
+)
+```
 
 ## Stop the existing service before database work
 
@@ -183,11 +219,27 @@ fails the block.
 
 ## Bootstrap the five database roles
 
-Run the script in quarantine mode. It verifies the independently supplied
-database, system identifier, and dedicated-cluster acknowledgement before any
-cluster-wide change. It also proves that the LaunchAgent is unloaded and SQL
-then proves that the target roles have no active session or prepared
-transaction.
+Run the script in quarantine mode. A session advisory lock serializes valid
+invocations for this database and cluster identity. After read-only target and
+role validation, a minimal mutation transaction only creates or alters the
+five roles, strips privileged attributes, clears their passwords, and commits
+them as `NOLOGIN`. That seal commits before any ACL tuple is touched. A later
+transaction proves that every role has exactly zero sessions and prepared
+transactions, resets settings, removes every direct target-role ACL and grant
+option across user and system objects, establishes the exact capability
+grants, verifies the result, and repeats the isolation proof immediately
+before commit. A lock timeout, unsafe `PUBLIC` ACL, invalid default privilege,
+or later configuration failure rolls back that transaction while the minimal
+`NOLOGIN` seal remains committed.
+
+The default-privilege mutation is deliberately narrow. Direct grants to the
+five runtime roles are removed from every current-database default ACL.
+`PUBLIC` table, sequence, routine, type, and schema defaults are suppressed
+only for owners that can currently create in the runtime-accessible `public`
+schema. Existing built-in `PUBLIC` type, language, catalog, and routine
+baselines remain unchanged. Unexpected effective `PUBLIC` access outside the
+separately acknowledged database and `public`-schema boundary fails closed
+instead of being rewritten.
 
 ```zsh
 (
@@ -218,12 +270,17 @@ transaction.
 ```
 
 Bootstrap mode is deliberately fail-closed: it leaves the five roles
-`NOLOGIN` with no password. Generate a separate password for every role in a
-password manager. Each password must contain 24–512 characters from only
-`A-Z`, `a-z`, `0-9`, `_`, `-`, `.`, and `~`; 32 or more random characters is
-the operational minimum. Use the client-side `\password` command so plaintext
-is not placed in SQL, server statement logs, process arguments, or shell
-history:
+`NOLOGIN` with no password. A connection that raced the quarantine commit
+or an ACL lock held by another identity causes the later transaction to fail
+before any exact grant is installed. Stop the session or release the lock,
+rerun quarantine mode, and do not set passwords until the whole block
+succeeds.
+
+Generate a separate password for every role in a password manager. Each
+password must contain 24–512 characters from only `A-Z`, `a-z`, `0-9`, `_`,
+`-`, `.`, and `~`; 32 or more random characters is the operational minimum.
+Use the client-side `\password` command so plaintext is not placed in SQL,
+server statement logs, process arguments, or shell history:
 
 ```zsh
 (
@@ -249,9 +306,148 @@ history:
 \q
 ```
 
+## Install the fail-closed PostgreSQL HBA boundary
+
+Database ACLs cannot protect a database created after this bootstrap because a
+future PostgreSQL database can begin with `PUBLIC CONNECT` and `TEMPORARY`.
+Before enabling the roles, use separately reviewed configuration management to
+prepend the following block as the first four effective rules in the
+`pg_hba.conf` reported by `SHOW hba_file`. Do not append it after a broader
+matching rule and do not weaken `scram-sha-256`.
+
+```text
+hostnossl starring_runtime_staging starring_runtime_execution,starring_runtime_exact_target,starring_runtime_panel,starring_runtime_serving,starring_runtime_interaction 127.0.0.1/32 scram-sha-256
+host all starring_runtime_execution,starring_runtime_exact_target,starring_runtime_panel,starring_runtime_serving,starring_runtime_interaction 0.0.0.0/0 reject
+host all starring_runtime_execution,starring_runtime_exact_target,starring_runtime_panel,starring_runtime_serving,starring_runtime_interaction ::0/0 reject
+local all starring_runtime_execution,starring_runtime_exact_target,starring_runtime_panel,starring_runtime_serving,starring_runtime_interaction reject
+```
+
+The first rule permits only the exact five roles, exact staging database,
+unencrypted loopback transport required by the runtime URL contract, and SCRAM
+authentication. The next three rules reject every other IPv4, IPv6, and Unix
+socket database connection for those roles before any pre-existing general
+rule can match.
+
+Print the authoritative path without editing it through this runbook:
+
+```zsh
+(
+  set -euo pipefail
+  : "${STARRING_STAGING_CLUSTER_ADMIN:?load the reviewed cluster administrator}"
+  unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
+  unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
+  HBA_FILE="$(
+    PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
+      --no-psqlrc --set ON_ERROR_STOP=1 --password \
+      --host 127.0.0.1 --port 5432 \
+      --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+      --dbname starring_runtime_staging --tuples-only --no-align \
+      --command 'SHOW hba_file'
+  )"
+  test -n "$HBA_FILE"
+  print -r -- "$HBA_FILE"
+)
+```
+
+After the reviewed edit, require the parsed rules to have no errors and the
+managed block to be exactly effective rules 1–4. Reload it, wait one second,
+and repeat the parsed proof through the same authenticated administrator
+connection:
+
+```zsh
+(
+  set -euo pipefail
+  : "${STARRING_STAGING_CLUSTER_ADMIN:?load the reviewed cluster administrator}"
+  unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
+  unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
+  HBA_PROOF_QUERY="
+    WITH expected AS (
+      SELECT ARRAY[
+        'starring_runtime_execution',
+        'starring_runtime_exact_target',
+        'starring_runtime_panel',
+        'starring_runtime_serving',
+        'starring_runtime_interaction'
+      ]::TEXT[] AS users
+    ),
+    managed AS (
+      SELECT rule.*
+      FROM pg_catalog.pg_hba_file_rules AS rule
+      CROSS JOIN expected
+      WHERE rule.user_name = expected.users
+    )
+    SELECT pg_catalog.concat_ws(
+      '|',
+      (
+        SELECT pg_catalog.count(*)
+        FROM pg_catalog.pg_hba_file_rules
+        WHERE error IS NOT NULL
+      ),
+      pg_catalog.count(*),
+      pg_catalog.count(*) FILTER (
+        WHERE rule_number = 1
+          AND type = 'hostnossl'
+          AND database = ARRAY['starring_runtime_staging']::TEXT[]
+          AND address = '127.0.0.1'
+          AND netmask = '255.255.255.255'
+          AND auth_method = 'scram-sha-256'
+      ),
+      pg_catalog.count(*) FILTER (
+        WHERE rule_number = 2
+          AND type = 'host'
+          AND database = ARRAY['all']::TEXT[]
+          AND address = '0.0.0.0'
+          AND netmask = '0.0.0.0'
+          AND auth_method = 'reject'
+      ),
+      pg_catalog.count(*) FILTER (
+        WHERE rule_number = 3
+          AND type = 'host'
+          AND database = ARRAY['all']::TEXT[]
+          AND address = '::'
+          AND netmask = '::'
+          AND auth_method = 'reject'
+      ),
+      pg_catalog.count(*) FILTER (
+        WHERE rule_number = 4
+          AND type = 'local'
+          AND database = ARRAY['all']::TEXT[]
+          AND address IS NULL
+          AND netmask IS NULL
+          AND auth_method = 'reject'
+      )
+    )
+    FROM managed
+  "
+  HBA_VALIDATION="$(
+    PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
+      --no-psqlrc --set ON_ERROR_STOP=1 --password \
+      --host 127.0.0.1 --port 5432 \
+      --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+      --dbname starring_runtime_staging --tuples-only --no-align \
+      --command "$HBA_PROOF_QUERY" \
+      --command "SELECT CASE WHEN pg_catalog.pg_reload_conf() THEN 'reloaded' ELSE 'reload_failed' END" \
+      --command 'SELECT pg_catalog.pg_sleep(1)' \
+      --command "$HBA_PROOF_QUERY" \
+      | sed '/^$/d'
+  )"
+  test "$(
+    print -r -- "$HBA_VALIDATION" \
+      | grep -Fxc '0|4|1|1|1|1'
+  )" = 2
+  test "$(
+    print -r -- "$HBA_VALIDATION" \
+      | grep -Fxc 'reloaded'
+  )" = 1
+)
+```
+
 Run the same script in enable mode. It requires five SCRAM-SHA-256 verifiers,
-revalidates the exact ACL boundary, and only then changes the roles to
-`LOGIN`.
+requires each role to be committed `NOLOGIN`, verifies zero sessions and
+prepared transactions plus the exact ACL boundary, repeats the isolation proof,
+and only then changes all five roles to `LOGIN` in one final transaction. Any
+failure rolls that activation transaction back to the committed `NOLOGIN`
+state.
 
 ```zsh
 (
@@ -276,18 +472,28 @@ revalidates the exact ACL boundary, and only then changes the roles to
 )
 ```
 
-Any bootstrap rerun intentionally returns all five roles to `NOLOGIN`, clears
-their passwords, and requires a fresh password-and-enable cycle. Stop and
-unload the LaunchAgent first. This is credential rotation, not a harmless
-read-only check.
+Any quarantine-mode rerun intentionally returns all five roles to `NOLOGIN`,
+clears their passwords, and requires a fresh password-and-enable cycle. Enable
+mode refuses roles that are already `LOGIN`; it is an activation edge, not an
+idempotent health check. Stop and unload the LaunchAgent first. This is
+credential rotation, not a harmless read-only check.
+
+From the moment enable mode succeeds until every authentication, HBA,
+cross-database, capability-readiness, future-database, and service-readiness
+proof in this runbook succeeds, any nonzero block exit or unexpected output is
+an activation failure. Keep or make the LaunchAgent unloaded and immediately
+rerun the earlier quarantine-mode bootstrap block before inspecting logs,
+editing HBA, retrying a probe, or cleaning up a probe database. That mandatory
+reseal commits all five roles as `NOLOGIN` with null passwords even when later
+ACL work fails. Do not leave the roles `LOGIN` under an unproven boundary.
 
 ## Prove authentication and database isolation
 
-The SCRAM verifier alone does not prove that `pg_hba.conf` requires a
-password. For each role, the first probe uses a deliberately invalid password
-that cannot satisfy this runbook's password alphabet, the second prompts for
-the correct password and invokes that role's readiness function on the target,
-and the third prompts again and must be denied on database `postgres`.
+The SCRAM verifier alone does not prove that the active HBA requires a
+password. For each role, the first target probe uses a deliberately invalid
+password and must reach the SCRAM rule, the second prompts for the correct
+password and invokes that role's readiness function, and the third prompts
+again and must be rejected by HBA on `postgres`.
 
 ```zsh
 (
@@ -309,38 +515,42 @@ and the third prompts again and must be denied on database `postgres`.
   )
   unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
   unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
-  CROSS_DATABASE_ERROR="$(mktemp)"
-  trap 'rm -f -- "$CROSS_DATABASE_ERROR"' EXIT
+  TARGET_ERROR="$(mktemp)"
+  POSTGRES_ERROR="$(mktemp)"
+  trap 'rm -f -- "$TARGET_ERROR" "$POSTGRES_ERROR"' EXIT
   for INDEX in {1..5}; do
     ROLE="${ROLES[$INDEX]}"
     READINESS_FUNCTION="${READINESS_FUNCTIONS[$INDEX]}"
-    if PGSSLMODE=disable PGPASSWORD='invalid password probe' \
+    : >"$TARGET_ERROR"
+    if LC_ALL=C PGSSLMODE=disable PGPASSWORD='invalid password probe' \
       /opt/homebrew/opt/postgresql@16/bin/psql \
         --no-psqlrc --set ON_ERROR_STOP=1 \
         --host 127.0.0.1 --port 5432 --username "$ROLE" \
         --dbname "$STAGING_DATABASE" \
-        --command 'SELECT 1' >/dev/null 2>&1
+        --command 'SELECT 1' >/dev/null 2>"$TARGET_ERROR"
     then
       print -u2 -r -- "wrong-password probe unexpectedly succeeded for $ROLE"
       exit 1
     fi
+    grep -F "password authentication failed for user \"$ROLE\"" \
+      "$TARGET_ERROR" >/dev/null
     PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
       --no-psqlrc --set ON_ERROR_STOP=1 --password \
       --host 127.0.0.1 --port 5432 --username "$ROLE" \
       --dbname "$STAGING_DATABASE" \
       --command "SELECT * FROM ${READINESS_FUNCTION}()" >/dev/null
-    : >"$CROSS_DATABASE_ERROR"
+    : >"$POSTGRES_ERROR"
     if LC_ALL=C PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
       --no-psqlrc --set ON_ERROR_STOP=1 --password \
       --host 127.0.0.1 --port 5432 --username "$ROLE" \
       --dbname postgres --command 'SELECT 1' \
-      >/dev/null 2>"$CROSS_DATABASE_ERROR"
+      >/dev/null 2>"$POSTGRES_ERROR"
     then
-      print -u2 -r -- "cross-database probe unexpectedly succeeded for $ROLE"
+      print -u2 -r -- "postgres HBA probe unexpectedly succeeded for $ROLE"
       exit 1
     fi
-    grep -F 'permission denied for database "postgres"' \
-      "$CROSS_DATABASE_ERROR" >/dev/null
+    grep -F 'pg_hba.conf rejects connection' "$POSTGRES_ERROR" >/dev/null
+    grep -F 'database "postgres"' "$POSTGRES_ERROR" >/dev/null
   done
 )
 ```
@@ -348,6 +558,128 @@ and the third prompts again and must be denied on database `postgres`.
 The correct passwords are read only by `psql` from the terminal. They are
 never command arguments, shell-history text, exported variables, or command
 output.
+
+Now create one temporary database after bootstrap and deliberately give
+`PUBLIC` the future-database privileges against which the HBA boundary must
+protect. The fixed name must not already exist:
+
+```zsh
+(
+  set -euo pipefail
+  PROBE_DATABASE=starring_runtime_hba_probe
+  : "${STARRING_STAGING_CLUSTER_ADMIN:?load the reviewed cluster administrator}"
+  unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
+  unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
+  PROBE_EXISTS="$(
+    PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
+      --no-psqlrc --set ON_ERROR_STOP=1 --password \
+      --host 127.0.0.1 --port 5432 \
+      --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+      --dbname starring_runtime_staging --tuples-only --no-align \
+      --command "SELECT pg_catalog.count(*) FROM pg_catalog.pg_database WHERE datname = '$PROBE_DATABASE'"
+  )"
+  test "$PROBE_EXISTS" = 0
+  PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
+    --no-psqlrc --set ON_ERROR_STOP=1 --password \
+    --host 127.0.0.1 --port 5432 \
+    --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+    --dbname postgres \
+    --command 'CREATE DATABASE starring_runtime_hba_probe' \
+    --command 'GRANT CONNECT, TEMPORARY ON DATABASE starring_runtime_hba_probe TO PUBLIC'
+  PUBLIC_PROOF="$(
+    PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
+      --no-psqlrc --set ON_ERROR_STOP=1 --password \
+      --host 127.0.0.1 --port 5432 \
+      --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+      --dbname starring_runtime_staging --tuples-only --no-align \
+      --command "
+        SELECT pg_catalog.concat_ws(
+          '|',
+          pg_catalog.count(*) FILTER (
+            WHERE pg_catalog.has_database_privilege(
+              rolname,
+              '$PROBE_DATABASE',
+              'CONNECT'
+            )
+          ),
+          pg_catalog.count(*) FILTER (
+            WHERE pg_catalog.has_database_privilege(
+              rolname,
+              '$PROBE_DATABASE',
+              'TEMPORARY'
+            )
+          )
+        )
+        FROM pg_catalog.pg_roles
+        WHERE rolname IN (
+          'starring_runtime_execution',
+          'starring_runtime_exact_target',
+          'starring_runtime_panel',
+          'starring_runtime_serving',
+          'starring_runtime_interaction'
+        )
+      "
+  )"
+  test "$PUBLIC_PROOF" = '5|5'
+)
+```
+
+The probe database intentionally makes capability readiness report drift while
+it exists. Keep the runtime unloaded. With each correct role password, prove
+that the earlier all-database reject rule still denies the database despite
+the effective `PUBLIC` privileges:
+
+```zsh
+(
+  set -euo pipefail
+  PROBE_DATABASE=starring_runtime_hba_probe
+  ROLES=(
+    starring_runtime_execution
+    starring_runtime_exact_target
+    starring_runtime_panel
+    starring_runtime_serving
+    starring_runtime_interaction
+  )
+  unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
+  unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
+  PROBE_ERROR="$(mktemp)"
+  trap 'rm -f -- "$PROBE_ERROR"' EXIT
+  for ROLE in "${ROLES[@]}"; do
+    : >"$PROBE_ERROR"
+    if LC_ALL=C PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
+      --no-psqlrc --set ON_ERROR_STOP=1 --password \
+      --host 127.0.0.1 --port 5432 --username "$ROLE" \
+      --dbname "$PROBE_DATABASE" --command 'SELECT 1' \
+      >/dev/null 2>"$PROBE_ERROR"
+    then
+      print -u2 -r -- "future-database HBA probe unexpectedly succeeded for $ROLE"
+      exit 1
+    fi
+    grep -F 'pg_hba.conf rejects connection' "$PROBE_ERROR" >/dev/null
+    grep -F "database \"$PROBE_DATABASE\"" "$PROBE_ERROR" >/dev/null
+  done
+)
+```
+
+Drop the temporary database after a successful probe. If any probe fails,
+first perform the mandatory quarantine-mode reseal above. Only after all five
+roles are `NOLOGIN` with null passwords may the operator record the failing
+role and block exit status, investigate, and run this cleanup block:
+
+```zsh
+(
+  set -euo pipefail
+  : "${STARRING_STAGING_CLUSTER_ADMIN:?load the reviewed cluster administrator}"
+  unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
+  unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
+  PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
+    --no-psqlrc --set ON_ERROR_STOP=1 --password \
+    --host 127.0.0.1 --port 5432 \
+    --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+    --dbname postgres \
+    --command 'DROP DATABASE starring_runtime_hba_probe'
+)
+```
 
 ## Store indirect secrets in Keychain
 
@@ -546,16 +878,38 @@ Discord, joins supervisors, closes database pools, and stops health within the
     print -r -- "$SERVICE_STATE" \
       | awk '/^[[:space:]]*pid = / { print $3; exit }'
   )"
+  RUNS="$(
+    print -r -- "$SERVICE_STATE" \
+      | awk '/^[[:space:]]*runs = / { print $3; exit }'
+  )"
   print -r -- "$PID" | grep -Eq '^[0-9]+$'
+  print -r -- "$RUNS" | grep -Eq '^[0-9]+$'
   LOG_INODE="$(stat -f '%i' "$LOG_PATH")"
   LOG_OFFSET="$(stat -f '%z' "$LOG_PATH")"
+  SHUTDOWN_STARTED="$(
+    /usr/bin/perl \
+      -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+      -e 'printf "%.9f\n", clock_gettime(CLOCK_MONOTONIC)'
+  )"
   launchctl kill SIGTERM "$SERVICE"
-  for ATTEMPT in {1..35}; do
-    if ! kill -0 "$PID" 2>/dev/null; then
-      break
-    fi
-    sleep 1
-  done
+  SHUTDOWN_ELAPSED_MILLISECONDS="$(
+    /usr/bin/perl \
+      -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC,sleep \
+      -e '
+        my ($pid, $started) = @ARGV;
+        while (kill 0, $pid) {
+          my $elapsed = clock_gettime(CLOCK_MONOTONIC) - $started;
+          exit 124 if $elapsed > 30;
+          sleep 0.1;
+        }
+        my $elapsed = clock_gettime(CLOCK_MONOTONIC) - $started;
+        exit 124 if $elapsed > 30;
+        printf "%.0f\n", $elapsed * 1000;
+      ' \
+      "$PID" "$SHUTDOWN_STARTED"
+  )"
+  print -r -- "$SHUTDOWN_ELAPSED_MILLISECONDS" | grep -Eq '^[0-9]+$'
+  test "$SHUTDOWN_ELAPSED_MILLISECONDS" -le 30000
   ! kill -0 "$PID" 2>/dev/null
   test "$(stat -f '%i' "$LOG_PATH")" = "$LOG_INODE"
   LOG_SEGMENT="$(tail -c "+$((LOG_OFFSET + 1))" "$LOG_PATH")"
@@ -568,13 +922,73 @@ Discord, joins supervisors, closes database pools, and stops health within the
     | grep -Fx 'starring_runtime_status=runtime_process_clean_shutdown' \
     >/dev/null
   SERVICE_STATE="$(launchctl print "$SERVICE")"
+  STOPPED_RUNS="$(
+    print -r -- "$SERVICE_STATE" \
+      | awk '/^[[:space:]]*runs = / { print $3; exit }'
+  )"
+  LAST_EXIT_CODE="$(
+    print -r -- "$SERVICE_STATE" \
+      | awk '/^[[:space:]]*last exit code = / { print $5; exit }'
+  )"
+  test "$STOPPED_RUNS" = "$RUNS"
+  test "$LAST_EXIT_CODE" = 0
+  ! print -r -- "$SERVICE_STATE" \
+    | grep -Eq '^[[:space:]]*pid = '
+  THROTTLE_STARTED="$(
+    /usr/bin/perl \
+      -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+      -e 'printf "%.9f\n", clock_gettime(CLOCK_MONOTONIC)'
+  )"
+  while /usr/bin/perl \
+    -MTime::HiRes=clock_gettime,CLOCK_MONOTONIC \
+    -e 'exit(clock_gettime(CLOCK_MONOTONIC) - $ARGV[0] < 31 ? 0 : 1)' \
+    "$THROTTLE_STARTED"
+  do
+    SERVICE_STATE="$(launchctl print "$SERVICE")"
+    STOPPED_RUNS="$(
+      print -r -- "$SERVICE_STATE" \
+        | awk '/^[[:space:]]*runs = / { print $3; exit }'
+    )"
+    LAST_EXIT_CODE="$(
+      print -r -- "$SERVICE_STATE" \
+        | awk '/^[[:space:]]*last exit code = / { print $5; exit }'
+    )"
+    test "$STOPPED_RUNS" = "$RUNS"
+    test "$LAST_EXIT_CODE" = 0
+    ! print -r -- "$SERVICE_STATE" \
+      | grep -Eq '^[[:space:]]*pid = '
+    sleep 1
+  done
+  SERVICE_STATE="$(launchctl print "$SERVICE")"
+  STOPPED_RUNS="$(
+    print -r -- "$SERVICE_STATE" \
+      | awk '/^[[:space:]]*runs = / { print $3; exit }'
+  )"
+  LAST_EXIT_CODE="$(
+    print -r -- "$SERVICE_STATE" \
+      | awk '/^[[:space:]]*last exit code = / { print $5; exit }'
+  )"
+  test "$STOPPED_RUNS" = "$RUNS"
+  test "$LAST_EXIT_CODE" = 0
   ! print -r -- "$SERVICE_STATE" \
     | grep -Eq '^[[:space:]]*pid = '
   NEW_PID="$(launchctl kickstart -p "$SERVICE")"
   print -r -- "$NEW_PID" | grep -Eq '^[0-9]+$'
   test "$NEW_PID" != "$PID"
+  EXPECTED_RUNS="$(( RUNS + 1 ))"
   READY=0
   for ATTEMPT in {1..50}; do
+    SERVICE_STATE="$(launchctl print "$SERVICE")"
+    CURRENT_PID="$(
+      print -r -- "$SERVICE_STATE" \
+        | awk '/^[[:space:]]*pid = / { print $3; exit }'
+    )"
+    CURRENT_RUNS="$(
+      print -r -- "$SERVICE_STATE" \
+        | awk '/^[[:space:]]*runs = / { print $3; exit }'
+    )"
+    test "$CURRENT_PID" = "$NEW_PID"
+    test "$CURRENT_RUNS" = "$EXPECTED_RUNS"
     if curl --fail --silent --show-error --max-time 1 \
       http://127.0.0.1:19091/health/ready >/dev/null 2>&1
     then
@@ -584,15 +998,29 @@ Discord, joins supervisors, closes database pools, and stops health within the
     sleep 1
   done
   test "$READY" = 1
+  SERVICE_STATE="$(launchctl print "$SERVICE")"
+  test "$(
+    print -r -- "$SERVICE_STATE" \
+      | awk '/^[[:space:]]*pid = / { print $3; exit }'
+  )" = "$NEW_PID"
+  test "$(
+    print -r -- "$SERVICE_STATE" \
+      | awk '/^[[:space:]]*runs = / { print $3; exit }'
+  )" = "$EXPECTED_RUNS"
 )
 ```
 
 The check reads only bytes appended after signaling the captured PID, requires
-exactly one clean-shutdown status in that segment, proves launchd did not
-restart a failed exit, and starts a distinct PID without `-k`. Treat a deadline
-error, an orphaned process, repeated restart, owner loss,
-capability-readiness loss, ACK loss, or persistent `not_ready` as a failed
-cutover.
+exactly one clean-shutdown status in that segment, requires the same launchd
+generation to report exit code zero, and enforces the process deadline with a
+monotonic timer. The plist's 35-second `ExitTimeOut` is only an outer launchd
+kill bound and does not extend the 30-second acceptance limit. The check also
+observes the complete 30-second throttle window with no PID or run-count
+change. The manual start then requires the PID returned by `kickstart -p` to
+remain the same process through readiness and increments the run count exactly
+once. Treat a deadline error, an orphaned process, restart, PID succession,
+nonzero exit, owner loss, capability-readiness loss, ACK loss, or persistent
+`not_ready` as a failed cutover.
 
 ## Routine operation
 
