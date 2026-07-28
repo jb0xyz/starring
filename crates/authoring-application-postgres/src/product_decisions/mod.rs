@@ -16,6 +16,7 @@ mod reject;
 mod rejection_contract;
 mod rejection_readiness;
 mod row;
+mod runtime_identity;
 mod store;
 
 pub use crate::product_action_digest::{

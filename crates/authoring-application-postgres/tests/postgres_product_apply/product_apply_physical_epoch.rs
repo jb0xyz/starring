@@ -3,6 +3,137 @@ const PRODUCT_DRAIN_FIRST_APPLY_FOR_EPOCH_TEST: &str = "SELECT outcome_name FROM
         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20\
     )";
 
+const PRODUCT_APPLY_BEGIN_RUNTIME_DRAIN_FOR_EPOCH_TEST: &str = "SELECT \
+    outcome, product_operation_id, drain_intent_id, writer_epoch_before, \
+    writer_epoch_after, pending_drain_intent_id, pending_product_operation_id, \
+    pending_tenant_id, pending_installation_id, pending_deployment_id, \
+    pending_expected_revision \
+    FROM public.starring_product_apply_begin_runtime_drain_v2(\
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,\
+        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32\
+    )";
+
+#[derive(Debug, sqlx::FromRow)]
+struct ProductApplyBeginRuntimeDrainRow {
+    outcome: String,
+    product_operation_id: Option<String>,
+    drain_intent_id: Option<String>,
+    writer_epoch_before: Option<i64>,
+    writer_epoch_after: Option<i64>,
+    pending_drain_intent_id: Option<String>,
+    pending_product_operation_id: Option<String>,
+    pending_tenant_id: Option<String>,
+    pending_installation_id: Option<String>,
+    pending_deployment_id: Option<String>,
+    pending_expected_revision: Option<i64>,
+}
+
+struct ExpectedProductApplyRuntimeDrain<'a> {
+    outcome: &'a str,
+    operation_id: &'a str,
+    intent_id: &'a str,
+    epoch_before: i64,
+    epoch_after: i64,
+    fixture: &'a Fixture,
+    deployment_id: &'a str,
+}
+
+impl ProductApplyBeginRuntimeDrainRow {
+    fn assert_absent(&self, expected_epoch: i64) {
+        assert_eq!(self.outcome, "absent");
+        assert!(self.product_operation_id.is_none());
+        assert!(self.drain_intent_id.is_none());
+        assert_eq!(self.writer_epoch_before, Some(expected_epoch));
+        assert_eq!(self.writer_epoch_after, Some(expected_epoch));
+        assert!(self.pending_drain_intent_id.is_none());
+        assert!(self.pending_product_operation_id.is_none());
+        assert!(self.pending_tenant_id.is_none());
+        assert!(self.pending_installation_id.is_none());
+        assert!(self.pending_deployment_id.is_none());
+        assert!(self.pending_expected_revision.is_none());
+    }
+
+    fn assert_present(&self, expected: ExpectedProductApplyRuntimeDrain<'_>) {
+        assert_eq!(self.outcome, expected.outcome);
+        assert_eq!(
+            self.product_operation_id.as_deref(),
+            Some(expected.operation_id)
+        );
+        assert_eq!(self.drain_intent_id.as_deref(), Some(expected.intent_id));
+        assert_eq!(self.writer_epoch_before, Some(expected.epoch_before));
+        assert_eq!(self.writer_epoch_after, Some(expected.epoch_after));
+        assert_eq!(
+            self.pending_drain_intent_id.as_deref(),
+            Some(expected.intent_id)
+        );
+        assert_eq!(
+            self.pending_product_operation_id.as_deref(),
+            Some(expected.operation_id)
+        );
+        assert_eq!(
+            self.pending_tenant_id.as_deref(),
+            Some(expected.fixture.tenant_id.as_str())
+        );
+        assert_eq!(
+            self.pending_installation_id.as_deref(),
+            Some(expected.fixture.installation_id.as_str())
+        );
+        assert_eq!(
+            self.pending_deployment_id.as_deref(),
+            Some(expected.deployment_id)
+        );
+        assert_eq!(self.pending_expected_revision, Some(2));
+    }
+}
+
+async fn begin_product_apply_runtime_drain_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    fixture: &Fixture,
+    operation: &Operation,
+    call: &Call,
+    proposed_operation_id: &str,
+    proposed_intent_id: &str,
+) -> Result<ProductApplyBeginRuntimeDrainRow, sqlx::Error> {
+    let context = ApplyLockContext::single(fixture, operation);
+    sqlx::query_as::<_, ProductApplyBeginRuntimeDrainRow>(
+        PRODUCT_APPLY_BEGIN_RUNTIME_DRAIN_FOR_EPOCH_TEST,
+    )
+    .bind(&fixture.tenant_id)
+    .bind(&fixture.installation_id)
+    .bind(&fixture.promotion_id)
+    .bind(call.expected_revision)
+    .bind(&context.expected_payload_digest)
+    .bind(&fixture.actor.principal_id)
+    .bind(&call.session_digest)
+    .bind(&fixture.actor.session_subject)
+    .bind(&fixture.actor.user_id)
+    .bind(&fixture.application_id)
+    .bind(&fixture.guild_id)
+    .bind(&call.capability)
+    .bind(context.expected_authority_revision)
+    .bind(&context.expected_authority_digest)
+    .bind(&fixture.observation_digest)
+    .bind(call.observed_at)
+    .bind(call.expires_at)
+    .bind(&call.effective_permissions)
+    .bind(call.guild_owner)
+    .bind(&operation.request_id)
+    .bind(&context.active_idempotency_digest)
+    .bind(&context.idempotency_candidates)
+    .bind(&context.candidate_key_ids)
+    .bind(&context.candidate_key_fingerprints)
+    .bind(&context.active_key_id)
+    .bind(&operation.semantic_digest)
+    .bind(&operation.receipt_id)
+    .bind(&operation.audit_event_id)
+    .bind(&operation.apply_attempt_id)
+    .bind(&operation.deployment_id)
+    .bind(proposed_operation_id)
+    .bind(proposed_intent_id)
+    .fetch_one(&mut **transaction)
+    .await
+}
+
 async fn product_slot_writer_epoch(pool: &PgPool, fixture: &Fixture) -> i64 {
     sqlx::query_scalar(
         "SELECT writer_epoch FROM public.runtime_slot_writer_fences_v2 \
@@ -156,7 +287,10 @@ async fn terminalize_product_apply_pending_deployment(
     transaction.commit().await.unwrap();
 }
 
-async fn product_pending_drain_state(pool: &PgPool, fixture: &Fixture) -> (i64, String, i64, i64) {
+async fn product_pending_drain_state(
+    pool: &PgPool,
+    fixture: &Fixture,
+) -> (i64, Option<String>, i64, i64) {
     sqlx::query_as(
         "SELECT fence.writer_epoch, fence.pending_drain_intent_id, \
           (SELECT pg_catalog.count(*) FROM public.runtime_product_operations_v2 \
@@ -173,6 +307,143 @@ async fn product_pending_drain_state(pool: &PgPool, fixture: &Fixture) -> (i64, 
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires STARRING_TEST_DATABASE_URL"]
+async fn product_apply_runtime_drain_observes_rolls_back_inserts_and_adopts_exactly() {
+    let database = isolated_database("apply_drain_public").await;
+    let outcome = async {
+        MIGRATOR.run(&database.pool).await?;
+        let fixture = seed_fixture(&database.pool).await;
+        let applied_operation = Operation::new("public-drain-seed");
+        complete_apply(&database.pool, &fixture, &applied_operation).await;
+
+        let mut transition = database.pool.begin().await?;
+        set_existing_runtime_phase(
+            &mut transition,
+            &fixture,
+            &applied_operation.deployment_id,
+            "awaiting_gateway_ready",
+        )
+        .await?;
+        reopen_applied_activation(&mut transition, &fixture).await?;
+        transition.commit().await?;
+
+        let fresh_operation = Operation::new("public-drain-fresh");
+        let mut call = Call::valid(&fixture);
+        call.expected_revision = 4;
+        assert_eq!(product_slot_writer_epoch(&database.pool, &fixture).await, 2);
+
+        let mut observation = begin_serializable(&database.pool).await;
+        let absent = begin_product_apply_runtime_drain_in(
+            &mut observation,
+            &fixture,
+            &fresh_operation,
+            &call,
+            "",
+            "",
+        )
+        .await?;
+        absent.assert_absent(2);
+        observation.commit().await?;
+        assert_eq!(
+            product_pending_drain_state(&database.pool, &fixture).await,
+            (2, None, 0, 0)
+        );
+
+        let rolled_back_operation_id = &digest("public-drain-rolled-back-operation")[..32];
+        let rolled_back_intent_id = &digest("public-drain-rolled-back-intent")[..32];
+        let mut rolled_back = begin_serializable(&database.pool).await;
+        let inserted = begin_product_apply_runtime_drain_in(
+            &mut rolled_back,
+            &fixture,
+            &fresh_operation,
+            &call,
+            rolled_back_operation_id,
+            rolled_back_intent_id,
+        )
+        .await?;
+        inserted.assert_present(ExpectedProductApplyRuntimeDrain {
+            outcome: "inserted",
+            operation_id: rolled_back_operation_id,
+            intent_id: rolled_back_intent_id,
+            epoch_before: 2,
+            epoch_after: 3,
+            fixture: &fixture,
+            deployment_id: &applied_operation.deployment_id,
+        });
+        rolled_back.rollback().await?;
+        assert_eq!(
+            product_pending_drain_state(&database.pool, &fixture).await,
+            (2, None, 0, 0)
+        );
+
+        let operation_id = &digest("public-drain-committed-operation")[..32];
+        let intent_id = &digest("public-drain-committed-intent")[..32];
+        let mut creation = begin_serializable(&database.pool).await;
+        let absent_after_rollback = begin_product_apply_runtime_drain_in(
+            &mut creation,
+            &fixture,
+            &fresh_operation,
+            &call,
+            "",
+            "",
+        )
+        .await?;
+        absent_after_rollback.assert_absent(2);
+        let inserted = begin_product_apply_runtime_drain_in(
+            &mut creation,
+            &fixture,
+            &fresh_operation,
+            &call,
+            operation_id,
+            intent_id,
+        )
+        .await?;
+        inserted.assert_present(ExpectedProductApplyRuntimeDrain {
+            outcome: "inserted",
+            operation_id,
+            intent_id,
+            epoch_before: 2,
+            epoch_after: 3,
+            fixture: &fixture,
+            deployment_id: &applied_operation.deployment_id,
+        });
+        creation.commit().await?;
+
+        let persisted = product_pending_drain_state(&database.pool, &fixture).await;
+        assert_eq!(persisted, (3, Some(intent_id.to_string()), 1, 1));
+
+        let mut replay = begin_serializable(&database.pool).await;
+        let adopted = begin_product_apply_runtime_drain_in(
+            &mut replay,
+            &fixture,
+            &fresh_operation,
+            &call,
+            "",
+            "",
+        )
+        .await?;
+        adopted.assert_present(ExpectedProductApplyRuntimeDrain {
+            outcome: "replayed",
+            operation_id,
+            intent_id,
+            epoch_before: 3,
+            epoch_after: 3,
+            fixture: &fixture,
+            deployment_id: &applied_operation.deployment_id,
+        });
+        replay.commit().await?;
+        assert_eq!(
+            product_pending_drain_state(&database.pool, &fixture).await,
+            persisted
+        );
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    drop_isolated_database(database).await;
+    outcome.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -430,7 +701,7 @@ async fn drain_first_apply_wins_slot_epoch_race_and_product_apply_retries_closed
         assert!(is_serialization_failure(&stale_error));
 
         let pending_state = product_pending_drain_state(&database.pool, &fixture).await;
-        assert_eq!(pending_state, (3, expected_intent_id, 1, 1));
+        assert_eq!(pending_state, (3, Some(expected_intent_id), 1, 1));
 
         terminalize_product_apply_pending_deployment(
             &database.pool,

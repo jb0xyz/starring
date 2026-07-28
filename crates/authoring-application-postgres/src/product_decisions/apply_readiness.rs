@@ -8,6 +8,7 @@ use crate::runtime_convergence_readiness::RUNTIME_ATTEMPT_SCHEMA_CONTRACT_QUERY;
 use crate::ProductDecisionReadinessErrorV1;
 
 use super::apply_contract::{
+    BEGIN_RUNTIME_DRAIN_ARGUMENTS, BEGIN_RUNTIME_DRAIN_FUNCTION, BEGIN_RUNTIME_DRAIN_RESULT,
     DATABASE_IDENTITY_FUNCTION, FINALIZE_ARGUMENTS, FINALIZE_FUNCTION, FINALIZE_RESULT,
     KEYRING_COVERAGE_ARGUMENTS, KEYRING_COVERAGE_FUNCTION, KEYRING_COVERAGE_RESULT, LOCK_ARGUMENTS,
     LOCK_FUNCTION, LOCK_RESULT, TARGET_ARTIFACT_ARGUMENTS, TARGET_ARTIFACT_FUNCTION,
@@ -17,7 +18,7 @@ use super::digest::keyring_coverage_identity;
 use super::readiness::{map_readiness, readiness_database, verify_approval_support_contract};
 use super::store::PostgresProductDecisions;
 
-const FUNCTIONS: [ScopedFunctionContractV1<'static>; 5] = [
+const FUNCTIONS: [ScopedFunctionContractV1<'static>; 6] = [
     ScopedFunctionContractV1::scalar(DATABASE_IDENTITY_FUNCTION, "text"),
     ScopedFunctionContractV1::set_plpgsql_named(LOCK_FUNCTION, LOCK_RESULT, 1.0, LOCK_ARGUMENTS),
     ScopedFunctionContractV1::set_named(
@@ -38,8 +39,14 @@ const FUNCTIONS: [ScopedFunctionContractV1<'static>; 5] = [
         1.0,
         KEYRING_COVERAGE_ARGUMENTS,
     ),
+    ScopedFunctionContractV1::set_plpgsql_named(
+        BEGIN_RUNTIME_DRAIN_FUNCTION,
+        BEGIN_RUNTIME_DRAIN_RESULT,
+        1.0,
+        BEGIN_RUNTIME_DRAIN_ARGUMENTS,
+    ),
 ];
-const RELATIONS: [ScopedRelationContractV1<'static>; 21] = [
+const RELATIONS: [ScopedRelationContractV1<'static>; 22] = [
     ScopedRelationContractV1::ordinary_without_rls("public.product_control_plane_identity"),
     ScopedRelationContractV1::ordinary_without_rls("public.activation_requests"),
     ScopedRelationContractV1::ordinary_without_rls("public.activation_request_approvals"),
@@ -60,6 +67,7 @@ const RELATIONS: [ScopedRelationContractV1<'static>; 21] = [
     ScopedRelationContractV1::ordinary_without_rls("public.automation_ruleset_activations"),
     ScopedRelationContractV1::ordinary_without_rls("public.automation_ruleset_versions"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_deployments"),
+    ScopedRelationContractV1::ordinary_without_rls("public.runtime_product_operations_v2"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_drain_intents_v2"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_slot_writer_fences_v2"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_writer_fence"),
@@ -95,6 +103,33 @@ const FINALIZE_PROBE_QUERY: &str = "SELECT outcome, resulting_revision, resultin
     ARRAY[pg_catalog.repeat('5', 64)], 'probe_key', pg_catalog.repeat('6', 64), \
     'probe_receipt', 'probe_audit', 'probe_attempt', 'probe_deployment', \
     '{}'::JSONB, pg_catalog.repeat('7', 64), 'null'::JSONB, '{}'::JSONB, '[]'::JSONB)";
+const BEGIN_RUNTIME_DRAIN_PROBE_QUERY: &str = "SELECT outcome, \
+    locked_snapshot IS NULL AND observed_at IS NULL \
+    AND product_tenant_id IS NULL AND product_installation_id IS NULL \
+    AND product_deployment_id IS NULL AND product_expected_revision IS NULL \
+    AND product_operation_id IS NULL AND product_expected_target IS NULL \
+    AND product_mutation_request_bytes IS NULL AND product_mutation_digest IS NULL \
+    AND drain_tenant_id IS NULL AND drain_installation_id IS NULL \
+    AND drain_deployment_id IS NULL AND drain_slot_guild_id IS NULL \
+    AND drain_slot_ruleset_key IS NULL AND drain_expected_revision IS NULL \
+    AND drain_intent_id IS NULL AND drain_intent_request_bytes IS NULL \
+    AND drain_intent_digest IS NULL AND intent_revision IS NULL AND intent_state IS NULL \
+    AND canonical_state_bytes IS NULL AND canonical_state_digest IS NULL \
+    AND writer_epoch_before IS NULL AND writer_epoch_after IS NULL \
+    AND pending_drain_intent_id IS NULL AND pending_product_operation_id IS NULL \
+    AND pending_tenant_id IS NULL AND pending_installation_id IS NULL \
+    AND pending_deployment_id IS NULL AND pending_expected_revision IS NULL \
+    AND pending_marked_at IS NULL AS payload_empty \
+    FROM public.starring_product_apply_begin_runtime_drain_v2( \
+    'probe_tenant', 'probe_installation', pg_catalog.repeat('0', 64), 1, \
+    pg_catalog.repeat('1', 64), 'probe_principal', $1, $2, '1', '1', '1', \
+    'invalid', 1, pg_catalog.repeat('2', 64), pg_catalog.repeat('3', 64), \
+    TIMESTAMPTZ '2000-01-01T00:00:00Z', TIMESTAMPTZ '2000-01-01T00:00:01Z', \
+    '8', TRUE, 'probe_request', pg_catalog.repeat('4', 64), \
+    ARRAY[pg_catalog.repeat('4', 64)], ARRAY['probe_key'], \
+    ARRAY[pg_catalog.repeat('5', 64)], 'probe_key', pg_catalog.repeat('6', 64), \
+    'probe_receipt', 'probe_audit', 'probe_attempt', 'probe_deployment', \
+    '', '')";
 const APPLY_SUPPORT_CONTRACT_QUERY: &str = r#"
 WITH common_owner AS (
     SELECT relation.relowner AS owner_oid
@@ -264,37 +299,68 @@ WITH common_owner AS (
 ), expected_private_routines(
     function_name,
     identity_arguments,
+    language_name,
+    volatility,
+    parallel_safety,
     returns_set,
     rows_estimate,
-    result_name
+    result_name,
+    configuration
 ) AS (
     VALUES
         ('starring_runtime_slot_writer_fence_lock_v2',
             'requested_slot_guild_id text, requested_slot_ruleset_key text',
-            TRUE, 1::REAL,
-            'TABLE(writer_epoch bigint, pending_drain_intent_id text, pending_product_operation_id text, pending_tenant_id text, pending_installation_id text, pending_deployment_id text, pending_expected_revision bigint, pending_marked_at timestamp with time zone, observed_at timestamp with time zone)'),
+            'plpgsql', 'v'::"char", 'u'::"char", TRUE, 1::REAL,
+            'TABLE(writer_epoch bigint, pending_drain_intent_id text, pending_product_operation_id text, pending_tenant_id text, pending_installation_id text, pending_deployment_id text, pending_expected_revision bigint, pending_marked_at timestamp with time zone, observed_at timestamp with time zone)',
+            ARRAY['search_path=pg_catalog']::TEXT[]),
         ('starring_runtime_slot_writer_fence_begin_unsafe_v2',
             'requested_slot_guild_id text, requested_slot_ruleset_key text, requested_expected_epoch bigint',
-            FALSE, 0::REAL, 'bigint')
+            'plpgsql', 'v'::"char", 'u'::"char", FALSE, 0::REAL, 'bigint',
+            ARRAY['search_path=pg_catalog']::TEXT[]),
+        ('starring_runtime_slot_writer_fence_mark_drain_v2',
+            'requested_slot_guild_id text, requested_slot_ruleset_key text, requested_expected_epoch bigint, requested_drain_intent_id text, requested_product_operation_id text, requested_tenant_id text, requested_installation_id text, requested_deployment_id text, requested_expected_revision bigint',
+            'plpgsql', 'v'::"char", 'u'::"char", FALSE, 0::REAL, 'bigint',
+            ARRAY['search_path=pg_catalog']::TEXT[]),
+        ('starring_runtime_product_drain_first_apply_core_v2',
+            'requested_operation_id text, requested_intent_id text, requested_tenant_id text, requested_installation_id text, requested_deployment_id text, requested_expected_revision bigint, requested_slot_guild_id text, requested_slot_ruleset_key text, requested_target_guild_id text, requested_target_ruleset_key text, requested_target_version bigint, requested_target_content_hash text, requested_target_binding_revision bigint, requested_target_binding_fingerprint text, requested_mutation_kind text, requested_product_semantic_request_digest text, requested_product_mutation_request_bytes bytea, requested_product_mutation_digest text, requested_drain_intent_request_bytes bytea, requested_drain_intent_digest text',
+            'plpgsql', 'v'::"char", 'u'::"char", TRUE, 1::REAL,
+            'TABLE(outcome_name text, locked_snapshot jsonb, observed_at timestamp with time zone, product_tenant_id text, product_installation_id text, product_deployment_id text, product_expected_revision bigint, product_operation_id text, product_expected_target jsonb, product_mutation_request_bytes bytea, product_mutation_digest text, drain_tenant_id text, drain_installation_id text, drain_deployment_id text, drain_slot_guild_id text, drain_slot_ruleset_key text, drain_expected_revision bigint, drain_intent_id text, drain_intent_request_bytes bytea, drain_intent_digest text, intent_revision bigint, intent_state text)',
+            ARRAY['search_path=pg_catalog, starring_runtime_private_v2']::TEXT[]),
+        ('starring_runtime_product_mutation_bytes_v2',
+            'requested_operation_id text, requested_tenant_id text, requested_installation_id text, requested_deployment_id text, requested_expected_revision bigint, requested_slot_guild_id text, requested_slot_ruleset_key text, requested_target_guild_id text, requested_target_ruleset_key text, requested_target_version bigint, requested_target_content_hash text, requested_target_binding_revision bigint, requested_target_binding_fingerprint text, requested_mutation_kind text, requested_product_semantic_request_digest text',
+            'plpgsql', 'i'::"char", 's'::"char", FALSE, 0::REAL, 'bytea',
+            ARRAY['search_path=pg_catalog']::TEXT[]),
+        ('starring_runtime_product_mutation_digest_v2',
+            'canonical_payload bytea',
+            'plpgsql', 'i'::"char", 's'::"char", FALSE, 0::REAL, 'text',
+            ARRAY['search_path=pg_catalog']::TEXT[]),
+        ('starring_runtime_drain_intent_bytes_v2',
+            'requested_intent_id text, requested_operation_id text, requested_tenant_id text, requested_installation_id text, requested_deployment_id text, requested_expected_revision bigint, requested_slot_guild_id text, requested_slot_ruleset_key text, requested_target_guild_id text, requested_target_ruleset_key text, requested_target_version bigint, requested_target_content_hash text, requested_target_binding_revision bigint, requested_target_binding_fingerprint text, requested_mutation_kind text, requested_product_semantic_request_digest text',
+            'plpgsql', 'i'::"char", 's'::"char", FALSE, 0::REAL, 'bytea',
+            ARRAY['search_path=pg_catalog']::TEXT[]),
+        ('starring_runtime_drain_intent_digest_v2',
+            'canonical_payload bytea',
+            'plpgsql', 'i'::"char", 's'::"char", FALSE, 0::REAL, 'text',
+            ARRAY['search_path=pg_catalog']::TEXT[])
 ), private_routine_contract AS (
-    SELECT pg_catalog.count(*) = 2
+    SELECT pg_catalog.count(*) = 8
         AND pg_catalog.bool_and(COALESCE(
             namespace.oid IS NOT NULL
             AND namespace.nspowner = common_owner.owner_oid
             AND function_row.oid IS NOT NULL
             AND function_row.proowner = common_owner.owner_oid
             AND function_row.prokind = 'f'
-            AND function_row.provolatile = 'v'
+            AND function_row.provolatile = expected.volatility
             AND function_row.proisstrict
-            AND function_row.proparallel = 'u'
+            AND function_row.proparallel = expected.parallel_safety
             AND NOT function_row.prosecdef
             AND NOT function_row.proleakproof
             AND function_row.pronargdefaults = 0
             AND function_row.provariadic = 0
             AND function_row.proretset = expected.returns_set
             AND function_row.prorows = expected.rows_estimate
-            AND function_row.proconfig = ARRAY['search_path=pg_catalog']::TEXT[]
-            AND language_row.lanname = 'plpgsql'
+            AND function_row.proconfig = expected.configuration
+            AND language_row.lanname = expected.language_name
             AND pg_catalog.pg_get_function_identity_arguments(function_row.oid)
                 = expected.identity_arguments
             AND pg_catalog.pg_get_function_result(function_row.oid)
@@ -346,6 +412,12 @@ struct ApplyFinalizeProbeRow {
     guild_id: Option<String>,
     deployment_id: Option<String>,
     desired_target_digest: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+struct ApplyBeginRuntimeDrainProbeRow {
+    outcome: String,
+    payload_empty: bool,
 }
 
 impl PostgresProductDecisions {
@@ -495,6 +567,21 @@ async fn run_apply_probes(
     {
         return Err(ProductDecisionReadinessErrorV1::ContractMismatch);
     }
+    let begin_rows =
+        sqlx::query_as::<_, ApplyBeginRuntimeDrainProbeRow>(BEGIN_RUNTIME_DRAIN_PROBE_QUERY)
+            .bind(PROBE_SESSION_DIGEST.as_slice())
+            .bind(PROBE_SUBJECT_DIGEST.as_slice())
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(readiness_database)?;
+    if begin_rows
+        != [ApplyBeginRuntimeDrainProbeRow {
+            outcome: "invalid_input".to_string(),
+            payload_empty: true,
+        }]
+    {
+        return Err(ProductDecisionReadinessErrorV1::ContractMismatch);
+    }
     Ok(())
 }
 
@@ -517,8 +604,8 @@ mod tests {
 
     #[test]
     fn apply_manifest_is_exact_and_nonempty() {
-        assert_eq!(FUNCTIONS.len(), 5);
-        assert_eq!(RELATIONS.len(), 21);
+        assert_eq!(FUNCTIONS.len(), 6);
+        assert_eq!(RELATIONS.len(), 22);
         assert_eq!(PROBE_SESSION_DIGEST.len(), 32);
         assert_eq!(PROBE_SUBJECT_DIGEST.len(), 32);
     }

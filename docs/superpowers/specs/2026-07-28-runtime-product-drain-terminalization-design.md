@@ -39,6 +39,37 @@ exist. It consumes only an already persisted, byte-exact
 `RouteAbsentAcknowledged` source. A source that is still `Pending`, routed,
 refenced, ambiguous, or corrupt remains frozen.
 
+## Required Product Apply composition
+
+The repository already contains the private first-apply drain core, canonical
+builders, physical slot fence, and strict runtime recovery path. Before this
+design was audited against the production Rust adapter, that private core was
+not called by `ProductApplyPort::apply_idempotent`: a
+`runtime_drain_required` outcome was rolled back. Terminalization therefore
+depends on completing this missing production composition first.
+
+An exact Product Apply that encounters an eligible `Live` or
+`AwaitingGatewayReady` lane head must:
+
+1. remain inside the authenticated serializable Apply transaction;
+2. select the exact current deployment and physical slot fence;
+3. obtain fresh 128-bit CSPRNG Product-operation and drain-intent candidates
+   at the Product mutation boundary;
+4. call the existing checked first-apply core;
+5. atomically persist the Product operation, pending drain intent, and slot
+   epoch freeze;
+6. commit before returning the typed `RuntimeDrainRequired` result.
+
+An exact retry observes the complete natural scope before creation and adopts
+the persisted CSPRNG identities and canonical root. A first insert must use
+the fresh candidates from that Product call. Commit uncertainty is resolved
+by scope-only observation, never by minting or deriving a competing identity.
+A changed semantic request, lane head, deployment revision, or canonical root
+is not a replay. These ownership and recovery rules are the
+`RuntimeProductOperationIdV2` and `RuntimeDrainIntentIdV2` rules in the
+canonical V2 persistence addendum of the production runtime worker
+composition design.
+
 ## Meaning of cancellation
 
 Cancellation in this design cancels the pending Product lifecycle mutation. It
@@ -72,7 +103,6 @@ revision.
 
 This slice does not:
 
-- create an initial Product drain intent;
 - claim, refence, drain, remove, or acknowledge a route;
 - implement route-present or `PendingRefenced` recovery;
 - reconstruct process-local route-absence evidence;
@@ -946,18 +976,21 @@ Under PostgreSQL 16 with real scoped roles:
 
 ## Implementation order
 
-1. Pure controller source types and exact consumed/cancelled receipts.
-2. Application drain selector, structured pending result, cancellation
+1. Compose the existing private first-apply core into authenticated Product
+   Apply so the pending intent and physical freeze commit before the pending
+   result is returned.
+2. Pure controller source types and exact consumed/cancelled receipts.
+3. Application drain selector, structured pending result, cancellation
    command, capability, port, and fake-port tests.
-3. Discord `CancelLifecycle` authority evidence and distinct digest domain.
-4. Additive PostgreSQL terminal journal, canonical validators, state
+4. Discord `CancelLifecycle` authority evidence and distinct digest domain.
+5. Additive PostgreSQL terminal journal, canonical validators, state
    constraint, trigger gates, and slot release helper.
-5. Atomic consume capability and Product apply adapter integration.
-6. Atomic cancellation capability, distinct executor, adapter, and audit
+6. Atomic consume capability and Product apply adapter integration.
+7. Atomic cancellation capability, distinct executor, adapter, and audit
    integration.
-7. Runtime observation and selector support for terminal history.
-8. PostgreSQL concurrency, crash, ACL, readiness, and migration-guard tests.
-9. Full repository gates and disposable-database end-to-end verification.
+8. Runtime observation and selector support for terminal history.
+9. PostgreSQL concurrency, crash, ACL, readiness, and migration-guard tests.
+10. Full repository gates and disposable-database end-to-end verification.
 
 Each item is a separate functional commit. Consume and cancellation may be
 reviewed separately, but neither is production-complete until the shared slot
@@ -970,18 +1003,20 @@ a real PostgreSQL 16 database:
 
 1. a persisted route-absent acknowledgement remains frozen across process
    restarts;
-2. an exact Product apply retry consumes it and applies the Product mutation
+2. an initial exact Product Apply durably creates the pending intent and
+   advances the physical slot epoch before returning drain-required;
+3. an exact Product apply retry consumes it and applies the Product mutation
    in one commit;
-3. an explicitly authorized cancellation instead preserves the target and
+4. an explicitly authorized cancellation instead preserves the target and
    phase while advancing deployment revision;
-4. either terminal action advances the slot writer epoch and clears the fence
+5. either terminal action advances the slot writer epoch and clears the fence
    in that same commit;
-5. stale writers from both pre-freeze and frozen epochs are rejected;
-6. a lost commit response returns the exact original terminal receipt on
+6. stale writers from both pre-freeze and frozen epochs are rejected;
+7. a lost commit response returns the exact original terminal receipt on
    replay;
-7. an old replay cannot affect a newer Product operation or newer drain;
-8. runtime and all unrelated application roles cannot terminalize;
-9. every crash and concurrency boundary preserves either the complete frozen
+8. an old replay cannot affect a newer Product operation or newer drain;
+9. runtime and all unrelated application roles cannot terminalize;
+10. every crash and concurrency boundary preserves either the complete frozen
    source or the complete terminal successor;
-10. all repository, security, readiness, migration, and formatting gates are
+11. all repository, security, readiness, migration, and formatting gates are
     green.

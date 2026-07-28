@@ -24,12 +24,13 @@ const REJECTION_FUNCTIONS: [&str; 3] = [
     "public.starring_product_rejection_keyring_coverage_v1(text[],text[])",
     "public.starring_product_reject_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text)",
 ];
-const APPLY_FUNCTIONS: [&str; 5] = [
+const APPLY_FUNCTIONS: [&str; 6] = [
     "public.starring_product_apply_executor_database_identity_v1()",
     "public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
     "public.starring_product_apply_target_artifact_v1(text,text,text,text,bytea,text,text)",
     "public.starring_product_apply_finalize_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb)",
     "public.starring_product_apply_keyring_coverage_v1(text[],text[])",
+    "public.starring_product_apply_begin_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text)",
 ];
 
 static SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);

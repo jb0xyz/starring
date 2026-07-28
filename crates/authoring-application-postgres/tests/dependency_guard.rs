@@ -154,6 +154,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "public.starring_product_apply_target_artifact_v1(text,text,text,text,bytea,text,text)",
         "public.starring_product_apply_finalize_v1(text,text,text,bigint",
         "public.starring_product_apply_keyring_coverage_v1(text[],text[])",
+        "public.starring_product_apply_begin_runtime_drain_v2(text,text,text,bigint",
         "FROM public.starring_product_apply_target_artifact_v1($1, $2, $3, $4, $5, $6, $7)",
         "LIMIT 2",
     ] {
@@ -163,8 +164,8 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         );
     }
     for required in [
-        "FUNCTIONS: [ScopedFunctionContractV1<'static>; 5]",
-        "RELATIONS: [ScopedRelationContractV1<'static>; 21]",
+        "FUNCTIONS: [ScopedFunctionContractV1<'static>; 6]",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 22]",
         "ScopedFunctionContractV1::set_named(",
         "ScopedFunctionContractV1::set_plpgsql_named(",
         "verify_apply_executor_readiness",
@@ -178,10 +179,16 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "starring_product_apply_lock_core_unfenced_v1",
         "pg_catalog.count(*) = 12",
         "private_routine_contract",
-        "pg_catalog.count(*) = 2",
+        "pg_catalog.count(*) = 8",
         "starring_runtime_private_v2",
         "starring_runtime_slot_writer_fence_lock_v2",
         "starring_runtime_slot_writer_fence_begin_unsafe_v2",
+        "starring_runtime_slot_writer_fence_mark_drain_v2",
+        "starring_runtime_product_drain_first_apply_core_v2",
+        "starring_runtime_product_mutation_bytes_v2",
+        "starring_runtime_product_mutation_digest_v2",
+        "starring_runtime_drain_intent_bytes_v2",
+        "starring_runtime_drain_intent_digest_v2",
         "runtime_drain_intents_v2",
         "runtime_slot_writer_fences_v2",
         "runtime_serving_leases",
@@ -191,6 +198,7 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "idempotency_keyring_incomplete",
         "lock_probe_row_is_exact(row, \"invalid_input\")",
         "lock_probe_row_is_exact(row, \"runtime_writer_fenced\")",
+        "BEGIN_RUNTIME_DRAIN_PROBE_QUERY",
         "outcome: \"lock_required\"",
     ] {
         assert!(
@@ -210,6 +218,9 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(apply.contains("\"runtime_writer_fenced\""));
     assert!(apply.contains("\"runtime_writer_fence_invalid\""));
     assert!(apply.contains("\"runtime_drain_required\""));
+    assert!(apply.contains("begin_runtime_drain("));
+    assert!(apply.contains("validate_runtime_drain_observation("));
+    assert!(apply.contains("commit_apply(transaction).await?"));
     assert!(apply.contains("ProductControlPortError::RuntimeDrainRequired"));
     assert!(apply.contains("product apply is temporarily unavailable"));
     assert!(apply.contains("runtime writer fence is unavailable"));
