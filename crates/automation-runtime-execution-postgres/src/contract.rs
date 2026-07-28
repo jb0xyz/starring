@@ -12,7 +12,7 @@ pub(crate) const FOUNDATIONAL_CAPABILITY_IDENTITIES_V1: [&str; 2] = [
     "public.starring_runtime_execution_database_identity_v1()",
 ];
 
-pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 24] = [
+pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 26] = [
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
     "public.starring_runtime_execution_renew_v1(text,text,text,bigint,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_execution_mutate_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,jsonb)",
@@ -24,6 +24,8 @@ pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 24] = [
     "public.starring_runtime_gateway_owner_acquire_v1(text,text,text,bigint)",
     "public.starring_runtime_gateway_owner_renew_v1(text,text,bigint,text,bigint,bigint)",
     "public.starring_runtime_gateway_owner_release_v1(text,text,bigint,text)",
+    "public.starring_runtime_ingress_open_acknowledgement_observe_v2(text)",
+    "public.starring_runtime_ingress_open_acknowledgement_publish_v2(text,bigint,bytea,bytea,bigint,bigint,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,bigint,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_writer_fence_observe_v1()",
     "public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)",
     "public.starring_runtime_certification_reserve_intent_v2(bigint,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,text,text,bigint,bigint,text,text,text,bigint,bytea,text)",
@@ -40,13 +42,13 @@ pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 24] = [
 ];
 
 pub(crate) const RUNTIME_EXECUTION_READINESS_DEFINITION_DIGEST_V1: Option<&str> =
-    Some("059ee21b16b325a4da71dda5d63f75c8aeac4d0e2d9b18cbb3f628d15ea8967d");
+    Some("572d7ffd19d6f2edb5ec84ea6b7bfebd178c7da0568bce61af2f7907cfe72647");
 
 pub(crate) fn capability_manifest_is_well_formed_v1() -> bool {
     let capabilities = FOUNDATIONAL_CAPABILITY_IDENTITIES_V1
         .iter()
         .chain(OPERATION_CAPABILITY_IDENTITIES_V1.iter());
-    if capabilities.clone().count() != 26 {
+    if capabilities.clone().count() != 28 {
         return false;
     }
     for (index, capability) in capabilities.clone().enumerate() {

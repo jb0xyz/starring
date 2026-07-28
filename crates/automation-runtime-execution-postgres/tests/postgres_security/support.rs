@@ -13,11 +13,13 @@ use automation_runtime_controller::{
     RuntimeAcquireGatewayOwnerLeaseV1, RuntimeBuildRevisionV1, RuntimeClaimNextExecutionV1,
     RuntimeConvergenceMutationV1, RuntimeConvergenceSessionStateV1, RuntimeConvergenceSessionV1,
     RuntimeExecutionGuardV1, RuntimeExecutionReceiptV1, RuntimeGatewayOwnerLeaseDurationV1,
-    RuntimeGatewayOwnerLeaseObservationV1, RuntimeLiveAttestationRecordV1,
+    RuntimeGatewayOwnerLeaseObservationV1, RuntimeGatewayReadyAttestationV2,
+    RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimeLiveAttestationRecordV1,
     RuntimeMutationReceiptV1, RuntimeObserveGatewayOwnerLeaseV1, RuntimeObserveWriterFenceV1,
+    RuntimePublishIngressOpenAcknowledgementInputV2, RuntimePublishIngressOpenAcknowledgementV2,
     RuntimeReleaseGatewayOwnerLeaseOutcomeV1, RuntimeReleaseGatewayOwnerLeaseV1,
     RuntimeRenewGatewayOwnerLeaseOutcomeV1, RuntimeRenewGatewayOwnerLeaseV1,
-    RuntimeWriterFenceObservationV1,
+    RuntimeWriterFenceGenerationV1, RuntimeWriterFenceObservationV1,
 };
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ControllerId, DrainAttestationV1,
@@ -55,7 +57,7 @@ const SERVING_FUNCTIONS: [&str; 4] = [
     "public.starring_runtime_serving_heartbeat_v1(text,text,text,text,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_serving_disconnect_v1(text,text,text,text,text,bigint,bigint,bigint)",
 ];
-const EXECUTOR_FUNCTIONS: [&str; 26] = [
+const EXECUTOR_FUNCTIONS: [&str; 28] = [
     "public.starring_runtime_execution_database_readiness_v1()",
     "public.starring_runtime_execution_database_identity_v1()",
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
@@ -69,6 +71,8 @@ const EXECUTOR_FUNCTIONS: [&str; 26] = [
     "public.starring_runtime_gateway_owner_acquire_v1(text,text,text,bigint)",
     "public.starring_runtime_gateway_owner_renew_v1(text,text,bigint,text,bigint,bigint)",
     "public.starring_runtime_gateway_owner_release_v1(text,text,bigint,text)",
+    "public.starring_runtime_ingress_open_acknowledgement_observe_v2(text)",
+    "public.starring_runtime_ingress_open_acknowledgement_publish_v2(text,bigint,bytea,bytea,bigint,bigint,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,bigint,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_writer_fence_observe_v1()",
     "public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)",
     "public.starring_runtime_certification_reserve_intent_v2(bigint,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,text,text,bigint,bigint,text,text,text,bigint,bytea,text)",
@@ -84,7 +88,7 @@ const EXECUTOR_FUNCTIONS: [&str; 26] = [
     "public.starring_runtime_startup_recovery_pending_drain_succession_v3(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,text,bigint,bigint,text,bigint,bigint,bigint,bigint,text,bigint,bigint,bigint,text,bigint,text,text,boolean,bigint,bigint,bytea,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,boolean)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "059ee21b16b325a4da71dda5d63f75c8aeac4d0e2d9b18cbb3f628d15ea8967d";
+    "572d7ffd19d6f2edb5ec84ea6b7bfebd178c7da0568bce61af2f7907cfe72647";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";

@@ -8,6 +8,7 @@ include!("postgres_security/startup_suspended_local_execution.rs");
 include!("postgres_security/certification_terminal_ledger.rs");
 include!("postgres_security/adapter.rs");
 include!("postgres_security/gateway_owner.rs");
+include!("postgres_security/ingress_acknowledgement.rs");
 include!("postgres_security/writer_fence.rs");
 include!("postgres_security/product_drain.rs");
 include!("postgres_security/product_drain_first_apply.rs");

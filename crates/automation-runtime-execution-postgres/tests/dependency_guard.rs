@@ -94,6 +94,8 @@ fn adapter_contract_is_function_only_and_manifest_is_isolated() {
         "starring_runtime_gateway_owner_acquire_v1",
         "starring_runtime_gateway_owner_renew_v1",
         "starring_runtime_gateway_owner_release_v1",
+        "starring_runtime_ingress_open_acknowledgement_observe_v2",
+        "starring_runtime_ingress_open_acknowledgement_publish_v2",
         "starring_runtime_writer_fence_observe_v1",
         "starring_runtime_product_drain_observe_v2",
     ] {
@@ -207,6 +209,7 @@ fn adapter_exposes_only_approved_runtime_ports() {
         "impl RuntimeExecutionConvergencePort",
         "impl RuntimePreviousServingObservationPort",
         "impl RuntimeGatewayOwnerLeasePortV1",
+        "impl RuntimeIngressOpenAcknowledgementPortV2",
         "impl RuntimeWriterFenceObservationPortV1",
         "impl RuntimeProductDrainObservationPortV2",
         "impl RuntimeCertificationReservationPortV2",
@@ -263,7 +266,7 @@ fn startup_recovery_action_journal_remains_private_behind_owner_fenced_execution
             .unwrap()
             .matches("public.starring_runtime_")
             .count(),
-        24
+        26
     );
 }
 
@@ -473,6 +476,44 @@ fn gateway_owner_operations_use_only_scoped_functions_and_verified_transactions(
         "DELETE ",
     ] {
         assert!(!gateway_owner.contains(forbidden));
+    }
+}
+
+#[test]
+fn ingress_open_acknowledgement_uses_only_scoped_functions_and_verified_transactions() {
+    let acknowledgement = include_str!("../src/ingress_acknowledgement/mod.rs");
+    let query = include_str!("../src/ingress_acknowledgement/query.rs");
+    let row = include_str!("../src/ingress_acknowledgement/row.rs");
+    let acknowledgement_production = acknowledgement.split("#[cfg(test)]").next().unwrap();
+    let query_production = query.split("#[cfg(test)]").next().unwrap();
+    for capability in [
+        "starring_runtime_ingress_open_acknowledgement_observe_v2",
+        "starring_runtime_ingress_open_acknowledgement_publish_v2",
+    ] {
+        assert!(query.contains(capability));
+    }
+    for required in [
+        "begin_execution_serializable_observation_transaction",
+        "begin_execution_mutation_transaction",
+        "verify_runtime_execution_binding_v1",
+        "ExecutionConnectionGuardV1",
+        "RuntimeIngressOpenAcknowledgementOperationRowV2",
+        "RuntimeIngressOpenAcknowledgementPortV2",
+        "DefinitelyNotApplied",
+        "OutcomeUnknown",
+    ] {
+        assert!(acknowledgement.contains(required) || row.contains(required));
+    }
+    for source in [acknowledgement_production, query_production] {
+        for forbidden in [
+            "runtime_ingress_open_acknowledgements_v2",
+            "INSERT ",
+            "UPDATE ",
+            "DELETE ",
+            "TRUNCATE ",
+        ] {
+            assert!(!source.contains(forbidden), "raw ingress edge: {forbidden}");
+        }
     }
 }
 
