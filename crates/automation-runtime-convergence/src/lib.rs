@@ -20,7 +20,7 @@ pub use id::{
 pub use identity::{
     RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1, RuntimeProcessIdentityV1,
 };
-pub use machine::{RuntimeDeployment, TransitionOutcomeV1};
+pub use machine::{ProductDrainSourceSupersessionPermitV1, RuntimeDeployment, TransitionOutcomeV1};
 pub use state::{
     CommandGuardV1, ControllerLeaseV1, LeaseRequestV1, RecoverBlockedRequestV1,
     RecoverLiveRequestV1, RuntimeDeploymentPhaseKindV1, RuntimeDeploymentPhaseV1,

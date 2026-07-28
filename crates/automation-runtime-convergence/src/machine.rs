@@ -2,7 +2,10 @@ use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
 
+mod product_drain;
 mod validation;
+
+pub use product_drain::ProductDrainSourceSupersessionPermitV1;
 
 use crate::{
     ActivationAttestationV1, CommandGuardV1, ControllerLeaseV1, DeploymentId, DeploymentRevision,
@@ -637,22 +640,7 @@ impl RuntimeDeployment {
         if self.phase.is_terminal() {
             return Err(self.invalid_transition("supersede"));
         }
-        Self::validate_reason(&reason)?;
-        if by.runtime_generation <= self.runtime_generation {
-            return Err(RuntimeDeploymentError::RuntimeGenerationNotMonotonic);
-        }
-        if by.identity.deployment_id == self.identity.deployment_id {
-            return Err(RuntimeDeploymentError::SupersedingDeploymentIdentityConflict);
-        }
-        if !by.identity.same_product_scope(&self.identity) {
-            return Err(RuntimeDeploymentError::SupersedingDeploymentScopeMismatch);
-        }
-        if !by.target.same_slot(&self.target) {
-            return Err(RuntimeDeploymentError::PreviousRuntimeSlotMismatch);
-        }
-        if superseded_at < self.requested_at {
-            return Err(RuntimeDeploymentError::AttestationTimeRegression);
-        }
+        self.validate_supersession(&by, &reason, superseded_at)?;
         self.phase = RuntimeDeploymentPhaseV1::Superseded {
             by,
             reason,
