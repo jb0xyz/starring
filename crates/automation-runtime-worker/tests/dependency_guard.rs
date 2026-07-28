@@ -60,6 +60,11 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/lib.rs"),
             PathBuf::from("src/paused_gateway.rs"),
             PathBuf::from("src/product_drain.rs"),
+            PathBuf::from("src/production_lifecycle/admission.rs"),
+            PathBuf::from("src/production_lifecycle/handoff.rs"),
+            PathBuf::from("src/production_lifecycle/shutdown.rs"),
+            PathBuf::from("src/production_lifecycle/tests.rs"),
+            PathBuf::from("src/production_lifecycle.rs"),
             PathBuf::from("src/recovery.rs"),
             PathBuf::from("src/registry_recovery.rs"),
             PathBuf::from("src/startup_pending_drain/v3/tests.rs"),
@@ -1814,4 +1819,130 @@ fn worker_gateway_owner_watchdog_state_is_nonclone_and_monotonic() {
         "}"
     )));
     assert!(!owner_source.contains("impl Clone for RuntimeAcceptedGatewayOwnerReceiptV1"));
+}
+
+#[test]
+fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
+    let model = include_str!("../src/production_lifecycle.rs");
+    let handoff = include_str!("../src/production_lifecycle/handoff.rs");
+    let admission = include_str!("../src/production_lifecycle/admission.rs");
+    let shutdown = include_str!("../src/production_lifecycle/shutdown.rs");
+    let source = format!("{model}\n{handoff}\n{admission}\n{shutdown}");
+    let root = include_str!("../src/lib.rs");
+    let closed = include_str!("../src/gateway_lifecycle.rs");
+
+    assert!(model.lines().count() < 400);
+    assert!(handoff.lines().count() < 500);
+    assert!(admission.lines().count() < 700);
+    assert!(shutdown.lines().count() < 650);
+
+    for authority in [
+        "RuntimeStartupRecoveryFixedPointProcessV2",
+        "RuntimeProductionFixedPointAcceptanceFailureV2",
+        "RuntimeProductionTransitionFailureV2",
+        "RuntimeProductionHandoffProcessV2",
+        "RuntimeRecoveryResumePermitV2",
+        "RuntimeAdmissionAcknowledgingProcessV2",
+        "RuntimeEmptyOpenEpochV2",
+        "RuntimeEmptyOpenProcessV2",
+        "RuntimeProductionEmergencyProcessV2",
+        "RuntimeShuttingDownProcessV2",
+    ] {
+        let marker = format!("pub struct {authority}");
+        let start = source.find(&marker).unwrap();
+        let attributes = source[..start].rsplit("\n\n").next().unwrap();
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !attributes.contains(forbidden),
+                "{authority} derives {forbidden}"
+            );
+            assert!(
+                !source.contains(&format!("{forbidden} for {authority}")),
+                "{authority} implements {forbidden}"
+            );
+        }
+        let fields = source[start..]
+            .split_once('{')
+            .unwrap()
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0;
+        assert!(
+            fields.lines().all(|line| !line.starts_with("    pub ")),
+            "{authority} exposes authority fields"
+        );
+    }
+
+    for transition in [
+        "pub fn begin_production_handoff<P>(\n        self,",
+        "pub fn resume_recovery<P>(\n        self,",
+        "pub fn observe_open_production<P>(\n        self,",
+        "pub fn invalidate_production(\n        self,",
+        "pub fn begin_shutdown(\n        self,",
+    ] {
+        assert!(source.contains(transition), "{transition}");
+    }
+
+    for port in [
+        "RuntimeProductionHandoffObservationPortV2",
+        "RuntimeRecoveryResumePortV2",
+        "RuntimeOpenProductionObservationPortV2",
+    ] {
+        let body = source
+            .split(&format!("pub trait {port} {{"))
+            .nth(1)
+            .and_then(|value| value.split("\n}\n").next())
+            .unwrap();
+        assert_eq!(body.matches("\n    fn ").count(), 1, "{port}");
+        assert!(!body.contains("RuntimeGatewayClosedLifecycleV2"), "{port}");
+        assert!(
+            !body.contains("RuntimeClosedDrainRecoveryPermitV2"),
+            "{port}"
+        );
+    }
+
+    for required in [
+        "into_production_fixed_point",
+        "RuntimeStartupRecoveryFixedPointProofV2",
+        "RuntimeProductionLifecycleStageV2::AdmissionAcknowledging",
+        "RuntimeProductionLifecycleStageV2::OpenProduction",
+        "RuntimeProductionLifecycleStageV2::Shutdown",
+        "RuntimeIngressOpenAcknowledgementObservationV2",
+        "RuntimeProductionInvalidationOutcomeV2",
+        "RuntimeShutdownCauseV2::GenerationOverflow",
+    ] {
+        assert!(source.contains(required), "{required}");
+    }
+
+    for forbidden in [
+        "RuntimePublicAdmissionPermit",
+        "AdmittedInteraction",
+        "execute_interaction",
+        "interaction_consumer",
+        "GatewayPauseToken",
+        "SharedGatewayControl",
+        "sqlx",
+        "twilight",
+        "tokio",
+        "serde",
+        "async fn",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+    }
+
+    for exported in [
+        "RuntimeStartupRecoveryFixedPointProcessV2",
+        "RuntimeProductionHandoffProcessV2",
+        "RuntimeRecoveryResumePermitV2",
+        "RuntimeAdmissionAcknowledgingProcessV2",
+        "RuntimeEmptyOpenProcessV2",
+        "RuntimeProductionEmergencyProcessV2",
+        "RuntimeShuttingDownProcessV2",
+    ] {
+        assert!(contains_identifier(root, exported), "{exported}");
+    }
+    assert!(!contains_identifier(root, "RuntimePublicAdmissionPermitV2"));
+    assert!(!closed.contains("AdmissionAcknowledging"));
+    assert!(!closed.contains("OpenProduction"));
 }

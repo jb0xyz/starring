@@ -6,6 +6,7 @@ mod gateway_owner;
 mod gateway_owner_watchdog;
 mod paused_gateway;
 mod product_drain;
+mod production_lifecycle;
 mod recovery;
 mod registry_recovery;
 mod startup_pending_drain;
@@ -53,6 +54,22 @@ pub use paused_gateway::{
 pub use product_drain::{
     RuntimeProductDrainObservationPortV2, RuntimeProductDrainRecoveryOutcomeV2,
     RuntimeProductDrainUnknownRecoveryPortV2,
+};
+pub use production_lifecycle::{
+    RuntimeAdmissionAcknowledgingProcessV2, RuntimeEmptyOpenEpochV2, RuntimeEmptyOpenProcessV2,
+    RuntimeIngressOpenAcknowledgementObservationInputV2,
+    RuntimeIngressOpenAcknowledgementObservationV2, RuntimeMaintenanceGateGenerationV2,
+    RuntimeMutationFinalizerGenerationV1, RuntimeOpenProductionObservationInputV2,
+    RuntimeOpenProductionObservationPortV2, RuntimeOpenProductionObservationV2,
+    RuntimeOpenProductionRequestV2, RuntimeProductionEmergencyProcessV2,
+    RuntimeProductionFixedPointAcceptanceFailureV2, RuntimeProductionHandoffObservationInputV2,
+    RuntimeProductionHandoffObservationPortV2, RuntimeProductionHandoffObservationV2,
+    RuntimeProductionHandoffProcessV2, RuntimeProductionHandoffRequestV2,
+    RuntimeProductionInvalidationOutcomeV2, RuntimeProductionLifecycleErrorV2,
+    RuntimeProductionLifecycleStageV2, RuntimeProductionTransitionFailureV2,
+    RuntimeRecoveryResumeObservationInputV2, RuntimeRecoveryResumeObservationV2,
+    RuntimeRecoveryResumePermitV2, RuntimeRecoveryResumePortV2, RuntimeShutdownCauseV2,
+    RuntimeShuttingDownProcessV2, RuntimeStartupRecoveryFixedPointProcessV2,
 };
 pub use recovery::RuntimeRecoveryPendingV2;
 pub use registry_recovery::{
