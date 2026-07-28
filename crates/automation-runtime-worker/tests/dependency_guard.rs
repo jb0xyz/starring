@@ -57,6 +57,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/gateway_lifecycle_tests.rs"),
             PathBuf::from("src/gateway_owner.rs"),
             PathBuf::from("src/gateway_owner_watchdog.rs"),
+            PathBuf::from("src/ingress_acknowledgement.rs"),
             PathBuf::from("src/lib.rs"),
             PathBuf::from("src/paused_gateway.rs"),
             PathBuf::from("src/product_drain.rs"),
@@ -1945,4 +1946,78 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
     assert!(!contains_identifier(root, "RuntimePublicAdmissionPermitV2"));
     assert!(!closed.contains("AdmissionAcknowledging"));
     assert!(!closed.contains("OpenProduction"));
+}
+
+#[test]
+fn ingress_acknowledgement_authority_is_linear_replayable_and_controller_composed() {
+    let source = include_str!("../src/ingress_acknowledgement.rs");
+    let admission = include_str!("../src/production_lifecycle/admission.rs");
+    let lifecycle = include_str!("../src/production_lifecycle.rs");
+    let root = include_str!("../src/lib.rs");
+
+    let authority = source
+        .split("pub struct RuntimeAuthorizedIngressOpenAcknowledgementV2 {")
+        .next()
+        .unwrap()
+        .rsplit_once("\n\n")
+        .unwrap()
+        .1;
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(!authority.contains(forbidden), "{forbidden}");
+        assert!(!source.contains(&format!(
+            "impl {forbidden} for RuntimeAuthorizedIngressOpenAcknowledgementV2"
+        )));
+    }
+    assert!(source.contains("authorization: &RuntimeAuthorizedIngressOpenAcknowledgementV2,"));
+    assert_eq!(
+        source
+            .matches("authorization: &RuntimeAuthorizedIngressOpenAcknowledgementV2,")
+            .count(),
+        4
+    );
+    for required in [
+        "pub trait RuntimeIngressOpenAcknowledgementPortV2",
+        "fn publish_ingress_open_acknowledgement(",
+        "fn observe_ingress_open_acknowledgement(",
+        "DefinitelyNotApplied",
+        "OutcomeUnknown",
+        "RuntimeIngressOpenAcknowledgementObservationErrorClassV2",
+        "RuntimeIngressOpenAcknowledgementResolutionV2",
+        "ReplaySameRequest",
+        "Divergent",
+        "ProtocolViolation",
+        "RuntimeIngressOpenAcknowledgementMutationErrorV2::DefinitelyNotApplied(<redacted>)",
+        "RuntimeAuthorizedIngressOpenAcknowledgementV2(<redacted>)",
+    ] {
+        assert!(source.contains(required), "{required}");
+    }
+    for forbidden in [
+        "sqlx",
+        "rusqlite",
+        "twilight",
+        "tokio",
+        "Serialize",
+        "Deserialize",
+        "async fn",
+        "Utc::now",
+        "SystemTime",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+    }
+    assert!(admission.contains("pub fn authorize_ingress_open_acknowledgement("));
+    assert!(admission.contains(
+        "RuntimeIngressOpenAcknowledgementV2 as RuntimeDurableIngressOpenAcknowledgementV2"
+    ));
+    assert!(admission.contains("acknowledgement: RuntimeDurableIngressOpenAcknowledgementV2,"));
+    assert!(!admission.contains("RuntimeIngressOpenAcknowledgementObservationInputV2"));
+    assert!(!lifecycle.contains("RuntimeIngressOpenAcknowledgementObservationInputV2"));
+    assert!(!root.contains("RuntimeIngressOpenAcknowledgementObservationInputV2"));
+    for exported in [
+        "RuntimeAuthorizedIngressOpenAcknowledgementV2",
+        "RuntimeIngressOpenAcknowledgementPortV2",
+        "RuntimeIngressOpenAcknowledgementMutationErrorV2",
+        "RuntimeIngressOpenAcknowledgementResolutionV2",
+    ] {
+        assert!(contains_identifier(root, exported), "{exported}");
+    }
 }

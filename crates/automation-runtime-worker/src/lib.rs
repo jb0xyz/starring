@@ -4,6 +4,7 @@ mod closed_recovery;
 mod gateway_lifecycle;
 mod gateway_owner;
 mod gateway_owner_watchdog;
+mod ingress_acknowledgement;
 mod paused_gateway;
 mod product_drain;
 mod production_lifecycle;
@@ -47,6 +48,16 @@ pub use gateway_owner_watchdog::{
     RuntimeGatewayOwnerUnknownRenewalV1, RuntimeGatewayOwnerWatchdogActionV1,
     RuntimeGatewayOwnerWatchdogErrorV1, RuntimeGatewayOwnerWatchdogV1,
 };
+pub use ingress_acknowledgement::{
+    classify_ingress_open_acknowledgement_outcome_v2,
+    classify_unknown_ingress_open_acknowledgement_v2, RuntimeAcceptedIngressOpenAcknowledgementV2,
+    RuntimeAuthorizedIngressOpenAcknowledgementV2,
+    RuntimeIngressOpenAcknowledgementAuthorizationErrorV2,
+    RuntimeIngressOpenAcknowledgementMutationErrorV2,
+    RuntimeIngressOpenAcknowledgementObservationErrorClassV2,
+    RuntimeIngressOpenAcknowledgementPortV2, RuntimeIngressOpenAcknowledgementProtocolViolationV2,
+    RuntimeIngressOpenAcknowledgementResolutionV2,
+};
 pub use paused_gateway::{
     RuntimePausedGatewayObservationErrorV2, RuntimePausedGatewayObservationV2,
     RuntimePausedGatewaySequenceV2,
@@ -57,7 +68,6 @@ pub use product_drain::{
 };
 pub use production_lifecycle::{
     RuntimeAdmissionAcknowledgingProcessV2, RuntimeEmptyOpenEpochV2, RuntimeEmptyOpenProcessV2,
-    RuntimeIngressOpenAcknowledgementObservationInputV2,
     RuntimeIngressOpenAcknowledgementObservationV2, RuntimeMaintenanceGateGenerationV2,
     RuntimeMutationFinalizerGenerationV1, RuntimeOpenProductionObservationInputV2,
     RuntimeOpenProductionObservationPortV2, RuntimeOpenProductionObservationV2,

@@ -3,15 +3,20 @@ use std::num::NonZeroU64;
 
 use automation_runtime_controller::{
     RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayOwnerLeaseIdV1,
-    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2, RuntimeRecoveryIdV2,
-    RuntimeWriterFenceGenerationV1,
+    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2,
+    RuntimeIngressOpenAcknowledgementLeaseDurationV2,
+    RuntimeIngressOpenAcknowledgementV2 as RuntimeDurableIngressOpenAcknowledgementV2,
+    RuntimePublishIngressOpenAcknowledgementInputV2, RuntimePublishIngressOpenAcknowledgementV2,
+    RuntimeRecoveryIdV2, RuntimeWriterFenceGenerationV1,
 };
 use automation_runtime_convergence::ProcessInstanceId;
 use chrono::{DateTime, Utc};
 
 use super::*;
 use crate::{
-    RuntimeCapabilityReadinessSetV2, RuntimeClosedRecoveryAuthorityRevisionV2,
+    RuntimeAuthorizedIngressOpenAcknowledgementV2, RuntimeCapabilityReadinessSetV2,
+    RuntimeClosedRecoveryAuthorityRevisionV2,
+    RuntimeIngressOpenAcknowledgementAuthorizationErrorV2,
     RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryEmptyObservationV2,
 };
 
@@ -99,6 +104,55 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
 
     pub fn finalizer_generation(&self) -> RuntimeMutationFinalizerGenerationV1 {
         self.resume.input.finalizer_generation
+    }
+
+    pub fn authorize_ingress_open_acknowledgement(
+        &self,
+        open_maintenance_gate_generation: RuntimeMaintenanceGateGenerationV2,
+        previous_acknowledgement: Option<&RuntimeDurableIngressOpenAcknowledgementV2>,
+        lease_for: RuntimeIngressOpenAcknowledgementLeaseDurationV2,
+    ) -> Result<
+        RuntimeAuthorizedIngressOpenAcknowledgementV2,
+        RuntimeIngressOpenAcknowledgementAuthorizationErrorV2,
+    > {
+        let expected_gate_generation = self
+            .resume
+            .input
+            .maintenance_gate_generation
+            .get()
+            .checked_add(1)
+            .filter(|value| *value <= i64::MAX as u64)
+            .and_then(NonZeroU64::new)
+            .ok_or(RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::OpenGateMismatch)?;
+        if open_maintenance_gate_generation.get() != expected_gate_generation.get() {
+            return Err(RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::OpenGateMismatch);
+        }
+        if previous_acknowledgement.is_some_and(|acknowledgement| {
+            !acknowledgement_matches_admission(
+                self,
+                open_maintenance_gate_generation,
+                acknowledgement,
+            )
+        }) {
+            return Err(
+                RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::PreviousAcknowledgementMismatch,
+            );
+        }
+        let request = RuntimePublishIngressOpenAcknowledgementV2::new(
+            RuntimePublishIngressOpenAcknowledgementInputV2 {
+                source_acknowledgement_revision: previous_acknowledgement
+                    .map(RuntimeDurableIngressOpenAcknowledgementV2::acknowledgement_revision),
+                fence_generation: self.resume.input.writer_fence_generation,
+                maintenance_gate_generation: expected_gate_generation,
+                owner_receipt: self.resume.input.owner_receipt.clone(),
+                gateway_ready: self.resume.input.gateway_ready.clone(),
+                lease_for,
+            },
+        )
+        .map_err(|_| RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::InvalidRequest)?;
+        Ok(RuntimeAuthorizedIngressOpenAcknowledgementV2::from_request(
+            request,
+        ))
     }
 }
 
@@ -210,50 +264,34 @@ fn validate_resume(
     Ok(())
 }
 
-pub struct RuntimeIngressOpenAcknowledgementObservationInputV2 {
-    pub fence_generation: RuntimeWriterFenceGenerationV1,
-    pub maintenance_gate_generation: RuntimeMaintenanceGateGenerationV2,
-    pub gateway_owner_lease_id: RuntimeGatewayOwnerLeaseIdV1,
-    pub observed_owner_revision: NonZeroU64,
-    pub process_instance_id: ProcessInstanceId,
-    pub connection_epoch: NonZeroU64,
-    pub admission_revision: NonZeroU64,
-    pub connected_event_sequence: RuntimeGatewayAdmissionSequenceV2,
-    pub resume_sequence: RuntimeGatewayAdmissionSequenceV2,
-    pub acknowledgement_revision: NonZeroU64,
-    pub acknowledged_at: DateTime<Utc>,
-    pub expires_at: DateTime<Utc>,
-}
-
-impl Debug for RuntimeIngressOpenAcknowledgementObservationInputV2 {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("RuntimeIngressOpenAcknowledgementObservationInputV2(<redacted>)")
-    }
-}
-
 pub struct RuntimeIngressOpenAcknowledgementObservationV2 {
-    input: RuntimeIngressOpenAcknowledgementObservationInputV2,
+    acknowledgement: RuntimeDurableIngressOpenAcknowledgementV2,
 }
 
 impl RuntimeIngressOpenAcknowledgementObservationV2 {
-    pub fn new(input: RuntimeIngressOpenAcknowledgementObservationInputV2) -> Self {
-        Self { input }
+    pub fn new(acknowledgement: RuntimeDurableIngressOpenAcknowledgementV2) -> Self {
+        Self { acknowledgement }
+    }
+
+    pub fn acknowledgement(&self) -> &RuntimeDurableIngressOpenAcknowledgementV2 {
+        &self.acknowledgement
     }
 
     pub fn acknowledgement_revision(&self) -> NonZeroU64 {
-        self.input.acknowledgement_revision
+        self.acknowledgement.acknowledgement_revision()
     }
 
     pub fn fence_generation(&self) -> RuntimeWriterFenceGenerationV1 {
-        self.input.fence_generation
+        self.acknowledgement.fence_generation()
     }
 
     pub fn maintenance_gate_generation(&self) -> RuntimeMaintenanceGateGenerationV2 {
-        self.input.maintenance_gate_generation
+        RuntimeMaintenanceGateGenerationV2::new(self.acknowledgement.maintenance_gate_generation())
+            .expect("durable acknowledgement gate generation must be persistence-bounded")
     }
 
     pub fn expires_at(&self) -> DateTime<Utc> {
-        self.input.expires_at
+        self.acknowledgement.expires_at()
     }
 }
 
@@ -502,7 +540,7 @@ fn validate_open(
     observation: &RuntimeOpenProductionObservationV2,
 ) -> Result<(), RuntimeProductionLifecycleErrorV2> {
     let observed = &observation.input;
-    let acknowledgement = &observed.ingress_acknowledgement.input;
+    let acknowledgement = observed.ingress_acknowledgement.acknowledgement();
     if observed.coordinator_generation != request.coordinator_generation {
         return Err(RuntimeProductionLifecycleErrorV2::StaleGeneration);
     }
@@ -564,25 +602,46 @@ fn validate_open(
     if !observed.supervisors_running {
         return Err(RuntimeProductionLifecycleErrorV2::SupervisorsNotReady);
     }
-    if acknowledgement.fence_generation != request.writer_fence_generation
-        || acknowledgement.maintenance_gate_generation != observed.maintenance_gate_generation
-        || acknowledgement.gateway_owner_lease_id != request.owner_lease_id
-        || acknowledgement.observed_owner_revision != request.owner_revision
-        || acknowledgement.process_instance_id != request.gateway_ready.process_instance_id
-        || acknowledgement.connection_epoch != request.gateway_ready.connection_epoch
-        || acknowledgement.admission_revision != request.gateway_ready.admission_revision
-        || acknowledgement.connected_event_sequence
+    if acknowledgement.fence_generation() != request.writer_fence_generation
+        || acknowledgement.maintenance_gate_generation().get()
+            != observed.maintenance_gate_generation.get()
+        || acknowledgement.gateway_owner_lease_id() != &request.owner_lease_id
+        || acknowledgement.observed_owner_revision() != request.owner_revision
+        || acknowledgement.process_instance_id() != &request.gateway_ready.process_instance_id
+        || acknowledgement.connection_epoch() != request.gateway_ready.connection_epoch
+        || acknowledgement.admission_revision() != request.gateway_ready.admission_revision
+        || acknowledgement.connected_event_sequence()
             != request.gateway_ready.connected_event_sequence
-        || acknowledgement.resume_sequence != request.gateway_ready.resume_sequence
+        || acknowledgement.resume_sequence() != request.gateway_ready.resume_sequence
     {
         return Err(RuntimeProductionLifecycleErrorV2::IngressAcknowledgementMismatch);
     }
-    bounded_generation(acknowledgement.acknowledgement_revision)?;
-    if acknowledgement.acknowledged_at > observed.observed_database_now
-        || observed.observed_database_now >= acknowledgement.expires_at
-        || acknowledgement.expires_at > observed.owner_receipt.expires_at
+    bounded_generation(acknowledgement.acknowledgement_revision())?;
+    if acknowledgement.acknowledged_at() > observed.observed_database_now
+        || observed.observed_database_now >= acknowledgement.expires_at()
+        || acknowledgement.expires_at() > observed.owner_receipt.expires_at
     {
         return Err(RuntimeProductionLifecycleErrorV2::IngressAcknowledgementNotCurrent);
     }
     Ok(())
+}
+
+fn acknowledgement_matches_admission(
+    state: &RuntimeAdmissionAcknowledgingProcessV2,
+    open_gate_generation: RuntimeMaintenanceGateGenerationV2,
+    acknowledgement: &RuntimeDurableIngressOpenAcknowledgementV2,
+) -> bool {
+    let owner = &state.resume.input.owner_receipt;
+    let ready = &state.resume.input.gateway_ready;
+    acknowledgement.fence_generation() == state.resume.input.writer_fence_generation
+        && acknowledgement.maintenance_gate_generation().get() == open_gate_generation.get()
+        && acknowledgement.gateway_owner_lease_id() == &owner.lease_id
+        && acknowledgement.observed_owner_revision() == owner.owner_revision
+        && acknowledgement.process_instance_id() == &ready.process_instance_id
+        && acknowledgement.connection_epoch() == ready.connection_epoch
+        && acknowledgement.admission_revision() == ready.admission_revision
+        && acknowledgement.connected_event_sequence() == ready.connected_event_sequence
+        && acknowledgement.resume_sequence() == ready.resume_sequence
+        && acknowledgement.expires_at() > owner.database_now
+        && acknowledgement.expires_at() <= owner.expires_at
 }

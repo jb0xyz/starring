@@ -139,6 +139,58 @@ fn v2_evidence_stays_domain_only_and_runtime_independent() {
 }
 
 #[test]
+fn ingress_open_acknowledgement_contract_is_canonical_pure_and_non_authorizing() {
+    let source = include_str!("../src/v2_ingress_acknowledgement.rs");
+    let root = include_str!("../src/lib.rs");
+
+    for required in [
+        "RuntimeIngressOpenAcknowledgementLeaseDurationV2",
+        "MIN_INGRESS_OPEN_ACKNOWLEDGEMENT_LEASE_MILLISECONDS: u64 = 1_000",
+        "MAX_INGRESS_OPEN_ACKNOWLEDGEMENT_LEASE_MILLISECONDS: u64 = 10_000",
+        "RuntimeIngressOpenAcknowledgementRequestDigestV2",
+        "RuntimePublishIngressOpenAcknowledgementV2",
+        "RuntimeIngressOpenAcknowledgementV2",
+        "RuntimeIngressOpenAcknowledgementReceiptV2",
+        "RuntimeObservedIngressOpenAcknowledgementV2",
+        "source_acknowledgement_revision",
+        "canonical_request_bytes",
+        "Sha256::digest",
+        "RuntimeGatewayReadyKindV2::Ready => 1",
+        "RuntimeGatewayReadyKindV2::Resumed => 2",
+    ] {
+        assert!(source.contains(required), "{required}");
+    }
+    for forbidden in [
+        "sqlx",
+        "rusqlite",
+        "tokio",
+        "twilight",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "Future",
+        "PortV2",
+        "Authority",
+        "Permit",
+        "Utc::now",
+        "SystemTime",
+        "async fn",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+    }
+    for exported in [
+        "RuntimeIngressOpenAcknowledgementLeaseDurationV2",
+        "RuntimeIngressOpenAcknowledgementRequestDigestV2",
+        "RuntimePublishIngressOpenAcknowledgementV2",
+        "RuntimeIngressOpenAcknowledgementV2",
+        "RuntimeIngressOpenAcknowledgementReceiptV2",
+        "RuntimeObservedIngressOpenAcknowledgementV2",
+    ] {
+        assert!(root.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn v2_route_mutation_provenance_is_exact_inert_evidence() {
     let source = include_str!("../src/v2_route_provenance.rs");
     for forbidden in [
@@ -3622,6 +3674,10 @@ fn source_files_contain_no_comments() {
         ("src/v2_evidence.rs", include_str!("../src/v2_evidence.rs")),
         ("src/v2_gateway.rs", include_str!("../src/v2_gateway.rs")),
         ("src/v2_identity.rs", include_str!("../src/v2_identity.rs")),
+        (
+            "src/v2_ingress_acknowledgement.rs",
+            include_str!("../src/v2_ingress_acknowledgement.rs"),
+        ),
         ("src/v2_product.rs", include_str!("../src/v2_product.rs")),
         (
             "src/v2_product_drain_canonical.rs",

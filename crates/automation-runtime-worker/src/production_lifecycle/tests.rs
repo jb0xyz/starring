@@ -3,7 +3,11 @@ use std::num::NonZeroU64;
 use automation_runtime_controller::{
     GatewayShardIdV1, RuntimeBuildRevisionV1, RuntimeGatewayAdmissionSequenceV2,
     RuntimeGatewayOwnerLeaseIdV1, RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyKindV2,
-    RuntimeRecoveryIdV2, RuntimeStartupRecoveryObservationReceiptV2, RuntimeStartupRecoveryStateV2,
+    RuntimeIngressOpenAcknowledgementInputV2, RuntimeIngressOpenAcknowledgementLeaseDurationV2,
+    RuntimeIngressOpenAcknowledgementReceiptInputV2, RuntimeIngressOpenAcknowledgementReceiptV2,
+    RuntimeIngressOpenAcknowledgementV2, RuntimeObservedIngressOpenAcknowledgementV2,
+    RuntimePublishIngressOpenAcknowledgementOutcomeV2, RuntimeRecoveryIdV2,
+    RuntimeStartupRecoveryObservationReceiptV2, RuntimeStartupRecoveryStateV2,
     RuntimeStartupServingStateV2, RuntimeWriterFenceGenerationV1,
 };
 use automation_runtime_convergence::ProcessInstanceId;
@@ -11,14 +15,17 @@ use chrono::{DateTime, Utc};
 
 use super::*;
 use crate::{
-    accept_runtime_registry_recovery_empty_observation_v2, RuntimeAcceptedStartupRecoveryOutcomeV2,
+    accept_runtime_registry_recovery_empty_observation_v2,
+    classify_ingress_open_acknowledgement_outcome_v2,
+    classify_unknown_ingress_open_acknowledgement_v2, RuntimeAcceptedStartupRecoveryOutcomeV2,
     RuntimeCapabilityReadinessKindV2, RuntimeCapabilityReadinessReceiptV2,
     RuntimeCapabilityReadinessSetV2, RuntimeClosedDrainRecoveryPermitV2,
     RuntimeClosedRecoveryInputV2, RuntimeClosedRecoveryRegistryEvidenceV2,
     RuntimeGatewayClosedLifecycleV2, RuntimeGatewayInvalidationCauseV2,
-    RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
-    RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryObservationInputV2,
-    RuntimeStartupRecoveryFixedPointProofV2,
+    RuntimeIngressOpenAcknowledgementAuthorizationErrorV2,
+    RuntimeIngressOpenAcknowledgementResolutionV2, RuntimePausedGatewayObservationV2,
+    RuntimePausedGatewaySequenceV2, RuntimeRegistryGlobalObservationSequenceV2,
+    RuntimeRegistryRecoveryObservationInputV2, RuntimeStartupRecoveryFixedPointProofV2,
 };
 
 fn non_zero(value: u64) -> NonZeroU64 {
@@ -328,9 +335,9 @@ impl RuntimeOpenProductionObservationPortV2 for OpenPort {
             .unwrap()
         };
         let acknowledgement = RuntimeIngressOpenAcknowledgementObservationV2::new(
-            RuntimeIngressOpenAcknowledgementObservationInputV2 {
+            RuntimeIngressOpenAcknowledgementV2::new(RuntimeIngressOpenAcknowledgementInputV2 {
                 fence_generation: request.writer_fence_generation(),
-                maintenance_gate_generation: open_gate_generation,
+                maintenance_gate_generation: non_zero(open_gate_generation.get()),
                 gateway_owner_lease_id: request.owner_lease_id().clone(),
                 observed_owner_revision: request.owner_revision(),
                 process_instance_id: request.gateway_ready().process_instance_id.clone(),
@@ -341,7 +348,8 @@ impl RuntimeOpenProductionObservationPortV2 for OpenPort {
                 acknowledgement_revision: non_zero(2),
                 acknowledged_at: at(255),
                 expires_at,
-            },
+            })
+            .unwrap(),
         );
         let mut current_owner = owner(260);
         current_owner.expires_at = request.owner_expires_at();
@@ -372,6 +380,214 @@ fn open() -> RuntimeEmptyOpenProcessV2 {
             drift: OpenDrift::None,
         })
         .unwrap()
+}
+
+fn acknowledgement_for_authorization(
+    authorization: &crate::RuntimeAuthorizedIngressOpenAcknowledgementV2,
+    revision: u64,
+) -> RuntimeIngressOpenAcknowledgementV2 {
+    let request = authorization.request();
+    RuntimeIngressOpenAcknowledgementV2::new(RuntimeIngressOpenAcknowledgementInputV2 {
+        fence_generation: request.fence_generation(),
+        maintenance_gate_generation: request.maintenance_gate_generation(),
+        gateway_owner_lease_id: request.owner_receipt().lease_id.clone(),
+        observed_owner_revision: request.owner_receipt().owner_revision,
+        process_instance_id: request.gateway_ready().process_instance_id.clone(),
+        connection_epoch: request.gateway_ready().connection_epoch,
+        admission_revision: request.gateway_ready().admission_revision,
+        connected_event_sequence: request.gateway_ready().connected_event_sequence,
+        resume_sequence: request.gateway_ready().resume_sequence,
+        acknowledgement_revision: non_zero(revision),
+        acknowledged_at: at(251),
+        expires_at: at(256),
+    })
+    .unwrap()
+}
+
+fn receipt_for_authorization(
+    authorization: &crate::RuntimeAuthorizedIngressOpenAcknowledgementV2,
+    revision: u64,
+) -> RuntimeIngressOpenAcknowledgementReceiptV2 {
+    RuntimeIngressOpenAcknowledgementReceiptV2::new(
+        RuntimeIngressOpenAcknowledgementReceiptInputV2 {
+            source_acknowledgement_revision: authorization
+                .request()
+                .source_acknowledgement_revision(),
+            request_digest: authorization.request().request_digest(),
+            acknowledgement: acknowledgement_for_authorization(authorization, revision),
+            observed_database_now: at(252),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn admission_acknowledgement_authority_requires_the_exact_open_gate_and_predecessor() {
+    let state = admission();
+    let lease = RuntimeIngressOpenAcknowledgementLeaseDurationV2::from_milliseconds(5_000).unwrap();
+    let wrong_gate = RuntimeMaintenanceGateGenerationV2::new(non_zero(11)).unwrap();
+    assert!(matches!(
+        state.authorize_ingress_open_acknowledgement(wrong_gate, None, lease),
+        Err(RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::OpenGateMismatch)
+    ));
+
+    let open_gate = RuntimeMaintenanceGateGenerationV2::new(non_zero(12)).unwrap();
+    let initial = state
+        .authorize_ingress_open_acknowledgement(open_gate, None, lease)
+        .unwrap();
+    let predecessor = acknowledgement_for_authorization(&initial, 1);
+    let renewal = state
+        .authorize_ingress_open_acknowledgement(open_gate, Some(&predecessor), lease)
+        .unwrap();
+
+    assert_eq!(
+        renewal.request().source_acknowledgement_revision(),
+        Some(non_zero(1))
+    );
+    assert_eq!(
+        format!("{renewal:?}"),
+        "RuntimeAuthorizedIngressOpenAcknowledgementV2(<redacted>)"
+    );
+
+    let mut mismatched_input = RuntimeIngressOpenAcknowledgementInputV2 {
+        fence_generation: renewal.request().fence_generation(),
+        maintenance_gate_generation: renewal.request().maintenance_gate_generation(),
+        gateway_owner_lease_id: renewal.request().owner_receipt().lease_id.clone(),
+        observed_owner_revision: renewal.request().owner_receipt().owner_revision,
+        process_instance_id: renewal
+            .request()
+            .gateway_ready()
+            .process_instance_id
+            .clone(),
+        connection_epoch: renewal.request().gateway_ready().connection_epoch,
+        admission_revision: renewal.request().gateway_ready().admission_revision,
+        connected_event_sequence: renewal.request().gateway_ready().connected_event_sequence,
+        resume_sequence: renewal.request().gateway_ready().resume_sequence,
+        acknowledgement_revision: non_zero(1),
+        acknowledged_at: at(251),
+        expires_at: at(256),
+    };
+    mismatched_input.admission_revision = non_zero(
+        mismatched_input
+            .admission_revision
+            .get()
+            .checked_add(1)
+            .unwrap(),
+    );
+    let mismatched = RuntimeIngressOpenAcknowledgementV2::new(mismatched_input).unwrap();
+    assert!(matches!(
+        state.authorize_ingress_open_acknowledgement(open_gate, Some(&mismatched), lease),
+        Err(RuntimeIngressOpenAcknowledgementAuthorizationErrorV2::PreviousAcknowledgementMismatch)
+    ));
+}
+
+#[test]
+fn acknowledgement_outcome_accepts_exact_receipts_and_unknown_recovery_is_bounded() {
+    let state = admission();
+    let lease = RuntimeIngressOpenAcknowledgementLeaseDurationV2::from_milliseconds(5_000).unwrap();
+    let open_gate = RuntimeMaintenanceGateGenerationV2::new(non_zero(12)).unwrap();
+    let initial = state
+        .authorize_ingress_open_acknowledgement(open_gate, None, lease)
+        .unwrap();
+    let receipt = receipt_for_authorization(&initial, 1);
+
+    assert!(matches!(
+        classify_ingress_open_acknowledgement_outcome_v2(
+            &initial,
+            RuntimePublishIngressOpenAcknowledgementOutcomeV2::Applied(receipt.clone()),
+        ),
+        RuntimeIngressOpenAcknowledgementResolutionV2::AppliedExact(_)
+    ));
+    assert!(matches!(
+        classify_unknown_ingress_open_acknowledgement_v2(
+            &initial,
+            RuntimeObservedIngressOpenAcknowledgementV2::present(receipt),
+        ),
+        RuntimeIngressOpenAcknowledgementResolutionV2::AdoptExact(_)
+    ));
+    assert!(matches!(
+        classify_unknown_ingress_open_acknowledgement_v2(
+            &initial,
+            RuntimeObservedIngressOpenAcknowledgementV2::missing(
+                initial
+                    .request()
+                    .owner_receipt()
+                    .lease_id
+                    .gateway_shard_id
+                    .clone(),
+                at(252),
+            )
+            .unwrap(),
+        ),
+        RuntimeIngressOpenAcknowledgementResolutionV2::ReplaySameRequest
+    ));
+
+    let predecessor = acknowledgement_for_authorization(&initial, 1);
+    let renewal = state
+        .authorize_ingress_open_acknowledgement(open_gate, Some(&predecessor), lease)
+        .unwrap();
+    assert!(matches!(
+        classify_unknown_ingress_open_acknowledgement_v2(
+            &renewal,
+            RuntimeObservedIngressOpenAcknowledgementV2::present(receipt_for_authorization(
+                &initial, 1,
+            )),
+        ),
+        RuntimeIngressOpenAcknowledgementResolutionV2::ReplaySameRequest
+    ));
+    assert!(matches!(
+        classify_unknown_ingress_open_acknowledgement_v2(
+            &renewal,
+            RuntimeObservedIngressOpenAcknowledgementV2::missing(
+                renewal
+                    .request()
+                    .owner_receipt()
+                    .lease_id
+                    .gateway_shard_id
+                    .clone(),
+                at(252),
+            )
+            .unwrap(),
+        ),
+        RuntimeIngressOpenAcknowledgementResolutionV2::Stale
+    ));
+
+    let divergent = RuntimeIngressOpenAcknowledgementReceiptV2::new(
+        RuntimeIngressOpenAcknowledgementReceiptInputV2 {
+            source_acknowledgement_revision: Some(non_zero(1)),
+            request_digest:
+                automation_runtime_controller::RuntimeIngressOpenAcknowledgementRequestDigestV2::from_bytes(
+                    [9; 32],
+                ),
+            acknowledgement: acknowledgement_for_authorization(&renewal, 2),
+            observed_database_now: at(252),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        classify_unknown_ingress_open_acknowledgement_v2(
+            &renewal,
+            RuntimeObservedIngressOpenAcknowledgementV2::present(divergent),
+        ),
+        RuntimeIngressOpenAcknowledgementResolutionV2::Divergent
+    ));
+
+    let expired = RuntimeIngressOpenAcknowledgementReceiptV2::new(
+        RuntimeIngressOpenAcknowledgementReceiptInputV2 {
+            source_acknowledgement_revision: None,
+            request_digest: initial.request().request_digest(),
+            acknowledgement: acknowledgement_for_authorization(&initial, 1),
+            observed_database_now: at(256),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        classify_unknown_ingress_open_acknowledgement_v2(
+            &initial,
+            RuntimeObservedIngressOpenAcknowledgementV2::present(expired),
+        ),
+        RuntimeIngressOpenAcknowledgementResolutionV2::Stale
+    ));
 }
 
 #[test]

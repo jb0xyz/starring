@@ -29,6 +29,7 @@ mod v2_drain_intent_state;
 mod v2_evidence;
 mod v2_gateway;
 mod v2_identity;
+mod v2_ingress_acknowledgement;
 mod v2_product;
 mod v2_product_drain_adoption;
 mod v2_product_drain_canonical;
@@ -176,6 +177,15 @@ pub use v2_identity::{
     RuntimeBarrierIdV1, RuntimeCertificationOperationIdV2, RuntimeCutoverCoordinatorIdV1,
     RuntimeDrainIntentIdV2, RuntimeGatewayAdmissionSequenceV2, RuntimeProductOperationIdV2,
     RuntimeRecoveryIdV2, RuntimeSuspensionIdV2,
+};
+pub use v2_ingress_acknowledgement::{
+    RuntimeIngressOpenAcknowledgementErrorV2, RuntimeIngressOpenAcknowledgementInputV2,
+    RuntimeIngressOpenAcknowledgementLeaseDurationV2,
+    RuntimeIngressOpenAcknowledgementReceiptInputV2, RuntimeIngressOpenAcknowledgementReceiptV2,
+    RuntimeIngressOpenAcknowledgementRequestDigestV2, RuntimeIngressOpenAcknowledgementV2,
+    RuntimeObserveIngressOpenAcknowledgementV2, RuntimeObservedIngressOpenAcknowledgementV2,
+    RuntimePublishIngressOpenAcknowledgementInputV2,
+    RuntimePublishIngressOpenAcknowledgementOutcomeV2, RuntimePublishIngressOpenAcknowledgementV2,
 };
 pub use v2_product::{RuntimeProductMutationKindV2, RuntimeProductMutationPreimageV2};
 pub use v2_product_drain_adoption::{

@@ -18,7 +18,6 @@ mod shutdown;
 
 pub use admission::{
     RuntimeAdmissionAcknowledgingProcessV2, RuntimeEmptyOpenEpochV2, RuntimeEmptyOpenProcessV2,
-    RuntimeIngressOpenAcknowledgementObservationInputV2,
     RuntimeIngressOpenAcknowledgementObservationV2, RuntimeOpenProductionObservationInputV2,
     RuntimeOpenProductionObservationPortV2, RuntimeOpenProductionObservationV2,
     RuntimeOpenProductionRequestV2, RuntimeRecoveryResumeObservationInputV2,
