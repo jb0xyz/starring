@@ -173,13 +173,15 @@ pub(super) async fn erase_product_finalization(pool: &PgPool, case: &PreparedCas
          ALTER TABLE public.product_action_receipts DISABLE TRIGGER ALL; \
          ALTER TABLE public.product_action_receipt_idempotency_aliases DISABLE TRIGGER ALL; \
          ALTER TABLE public.product_audit_events DISABLE TRIGGER ALL; \
-         ALTER TABLE public.product_action_receipt_audit_evidence DISABLE TRIGGER ALL",
+         ALTER TABLE public.product_action_receipt_audit_evidence DISABLE TRIGGER ALL; \
+         ALTER TABLE public.runtime_product_drain_terminal_actions_v2 DISABLE TRIGGER ALL",
     )
     .execute(&mut *transaction)
     .await
     .unwrap();
     sqlx::raw_sql(
-        "TRUNCATE public.product_action_receipt_audit_evidence, \
+        "TRUNCATE public.runtime_product_drain_terminal_actions_v2, \
+         public.product_action_receipt_audit_evidence, \
          public.product_audit_events, \
          public.product_action_receipt_idempotency_aliases, \
          public.product_action_receipts",
@@ -210,7 +212,8 @@ pub(super) async fn erase_product_finalization(pool: &PgPool, case: &PreparedCas
         .unwrap();
     }
     sqlx::raw_sql(
-        "ALTER TABLE public.product_action_receipt_audit_evidence ENABLE TRIGGER ALL; \
+        "ALTER TABLE public.runtime_product_drain_terminal_actions_v2 ENABLE TRIGGER ALL; \
+         ALTER TABLE public.product_action_receipt_audit_evidence ENABLE TRIGGER ALL; \
          ALTER TABLE public.product_audit_events ENABLE TRIGGER ALL; \
          ALTER TABLE public.product_action_receipt_idempotency_aliases ENABLE TRIGGER ALL; \
          ALTER TABLE public.product_action_receipts ENABLE TRIGGER ALL; \
