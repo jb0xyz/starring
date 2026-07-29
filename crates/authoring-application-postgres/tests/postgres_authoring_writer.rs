@@ -2,6 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use authoring_application_postgres::MIGRATOR;
 use futures::future;
+use resource_resolution::{resource_binding_fingerprint_v2, ResourceBindingMap};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
@@ -10,6 +11,8 @@ use sqlx::Connection;
 
 #[path = "postgres_authoring_writer/migration_security.rs"]
 mod migration_security;
+#[path = "postgres_authoring_writer/read_security.rs"]
+mod read_security;
 
 const COMMIT_QUERY: &str = "SELECT * FROM public.starring_authoring_session_writer_commit_v1(\
      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,\
@@ -51,6 +54,7 @@ struct CommitInput {
     semantic_digest: String,
     writer_key_id: String,
     writer_key_fingerprint: String,
+    snapshot_schema_version: i64,
     ciphertext: Vec<u8>,
     nonce: Vec<u8>,
     encryption_key_id: String,
@@ -225,7 +229,8 @@ async fn seed_scope(pool: &PgPool, suffix: &str) -> Scope {
         principal_id: format!("principal-{suffix}"),
         session_id: format!("session-{suffix}"),
         bindings: json!({"role_bindings": {}, "channel_bindings": {}}),
-        binding_fingerprint: digest(format!("bindings:{suffix}")),
+        binding_fingerprint: resource_binding_fingerprint_v2(&ResourceBindingMap::default())
+            .into_string(),
         authority_revision: 1,
         authority_digest: digest(format!("authority:{suffix}:1")),
     };
@@ -292,6 +297,7 @@ fn commit_input(seed: &str, projection: &[u8]) -> CommitInput {
         semantic_digest: digest(format!("semantic:{seed}")),
         writer_key_id: "writer-v1".to_string(),
         writer_key_fingerprint: digest("writer-v1-fingerprint"),
+        snapshot_schema_version: 1,
         ciphertext: vec![seed.as_bytes()[0]; 48],
         nonce: vec![seed.as_bytes()[0]; 24],
         encryption_key_id: "snapshot-v1".to_string(),
@@ -377,7 +383,7 @@ async fn execute_commit_with_candidates(
         .bind(&input.semantic_digest)
         .bind(&input.writer_key_id)
         .bind(&input.writer_key_fingerprint)
-        .bind(1_i64)
+        .bind(input.snapshot_schema_version)
         .bind(&input.ciphertext)
         .bind(&input.nonce)
         .bind(&input.encryption_key_id)
