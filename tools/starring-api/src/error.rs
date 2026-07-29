@@ -1,9 +1,10 @@
 use authoring_application::{
-    AuthenticationBackendFailureV1, AuthenticationError, AuthoringApplicationError,
-    AuthorizedPromotionBackendFailureV1, AuthorizedPromotionSubmissionErrorV1,
-    DeploymentStatusPortError, FreshGuildAuthorityError, OwnedSessionLoadError,
-    ProductApplicationError, ProductCandidateErrorCodeV1, ProductControlPortError,
-    PromotionAuthorityError,
+    AuthenticationBackendFailureV1, AuthenticationError, AuthoringAdmissionError,
+    AuthoringApplicationError, AuthoringConversationError, AuthoringSessionLoadError,
+    AuthoringSessionObservationErrorV1, AuthorizedPromotionBackendFailureV1,
+    AuthorizedPromotionSubmissionErrorV1, DeploymentStatusPortError, FreshGuildAuthorityError,
+    OwnedSessionLoadError, ProductApplicationError, ProductCandidateErrorCodeV1,
+    ProductControlPortError, PromotionAuthorityError,
 };
 use authoring_application_discord::DiscordOAuthError;
 use authoring_application_postgres::{
@@ -79,6 +80,53 @@ pub fn map_authoring_application_error(error: AuthoringApplicationError) -> Faca
         AuthoringApplicationError::AuthorizedPromotion(error) => {
             map_authorized_promotion_error(error)
         }
+    }
+}
+
+pub fn map_authoring_conversation_error(error: AuthoringConversationError) -> FacadeError {
+    match error {
+        AuthoringConversationError::Authentication(error) => map_authentication_error(error),
+        AuthoringConversationError::Authority(error) => map_fresh_authority_error(error),
+        AuthoringConversationError::Admission(error) => facade(match error {
+            AuthoringAdmissionError::Saturated => FacadeErrorCode::AuthoringSaturated,
+            AuthoringAdmissionError::Unavailable => FacadeErrorCode::DependencyUnavailable,
+        }),
+        AuthoringConversationError::Store(error) => facade(match error {
+            AuthoringSessionLoadError::Timeout => FacadeErrorCode::DependencyTimeout,
+            AuthoringSessionLoadError::Unavailable | AuthoringSessionLoadError::Retryable => {
+                FacadeErrorCode::DependencyUnavailable
+            }
+            AuthoringSessionLoadError::InvalidState => FacadeErrorCode::Internal,
+        }),
+        AuthoringConversationError::Observation(error) => facade(match error {
+            AuthoringSessionObservationErrorV1::NotFound
+            | AuthoringSessionObservationErrorV1::InvalidState => FacadeErrorCode::NotFound,
+            AuthoringSessionObservationErrorV1::Timeout => FacadeErrorCode::DependencyTimeout,
+            AuthoringSessionObservationErrorV1::Retryable
+            | AuthoringSessionObservationErrorV1::Unavailable => {
+                FacadeErrorCode::DependencyUnavailable
+            }
+        }),
+        AuthoringConversationError::IdempotencyConflict => {
+            facade(FacadeErrorCode::IdempotencyConflict)
+        }
+        AuthoringConversationError::GenerationConflict { .. } => {
+            facade(FacadeErrorCode::StaleGeneration)
+        }
+        AuthoringConversationError::AuthorityDrift | AuthoringConversationError::BindingDrift => {
+            facade(FacadeErrorCode::InvalidState)
+        }
+        AuthoringConversationError::TurnHalted { .. } => {
+            facade(FacadeErrorCode::DependencyUnavailable)
+        }
+        AuthoringConversationError::CancelledBeforeCommit => {
+            facade(FacadeErrorCode::DependencyTimeout)
+        }
+        AuthoringConversationError::Projection(_)
+        | AuthoringConversationError::ExpectedGeneration(_)
+        | AuthoringConversationError::InvalidSession
+        | AuthoringConversationError::InvalidModelCallCount
+        | AuthoringConversationError::InvalidCommit => facade(FacadeErrorCode::Internal),
     }
 }
 
@@ -463,6 +511,78 @@ mod tests {
                 )),
             )),
             FacadeErrorCode::DependencyUnavailable
+        );
+    }
+
+    #[test]
+    fn conversation_errors_preserve_capacity_conflicts_and_timeouts() {
+        let saturated = map_authoring_conversation_error(AuthoringConversationError::Admission(
+            AuthoringAdmissionError::Saturated,
+        ));
+        assert_eq!(code(saturated), FacadeErrorCode::AuthoringSaturated);
+        assert!(saturated.retryable());
+        assert_eq!(
+            code(map_authoring_conversation_error(
+                AuthoringConversationError::IdempotencyConflict,
+            )),
+            FacadeErrorCode::IdempotencyConflict
+        );
+        assert_eq!(
+            code(map_authoring_conversation_error(
+                AuthoringConversationError::GenerationConflict {
+                    current_generation: None,
+                },
+            )),
+            FacadeErrorCode::StaleGeneration
+        );
+        assert_eq!(
+            code(map_authoring_conversation_error(
+                AuthoringConversationError::Store(AuthoringSessionLoadError::Timeout),
+            )),
+            FacadeErrorCode::DependencyTimeout
+        );
+        assert_eq!(
+            code(map_authoring_conversation_error(
+                AuthoringConversationError::CancelledBeforeCommit,
+            )),
+            FacadeErrorCode::DependencyTimeout
+        );
+        assert_eq!(
+            code(map_authoring_conversation_error(
+                AuthoringConversationError::TurnHalted {
+                    code: "sensitive-upstream-detail".to_string(),
+                },
+            )),
+            FacadeErrorCode::DependencyUnavailable
+        );
+    }
+
+    #[test]
+    fn conversation_observation_failures_do_not_reveal_session_existence() {
+        for error in [
+            AuthoringSessionObservationErrorV1::NotFound,
+            AuthoringSessionObservationErrorV1::InvalidState,
+        ] {
+            assert_eq!(
+                code(map_authoring_conversation_error(
+                    AuthoringConversationError::Observation(error),
+                )),
+                FacadeErrorCode::NotFound
+            );
+        }
+        assert_eq!(
+            code(map_authoring_conversation_error(
+                AuthoringConversationError::Observation(
+                    AuthoringSessionObservationErrorV1::Timeout,
+                ),
+            )),
+            FacadeErrorCode::DependencyTimeout
+        );
+        assert_eq!(
+            code(map_authoring_conversation_error(
+                AuthoringConversationError::Authority(FreshGuildAuthorityError::Forbidden),
+            )),
+            FacadeErrorCode::NotFound
         );
     }
 

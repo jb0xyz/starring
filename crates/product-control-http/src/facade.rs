@@ -3,9 +3,10 @@ use std::fmt::{Debug, Formatter};
 use uuid::Uuid;
 
 use crate::{
-    ApplyView, ApprovalPreviewView, CsrfSecret, CurrentPrincipal, DecisionView,
-    DeploymentOperationalViewV2, DeploymentView, FacadeError, LifecycleCancellationView, OAuthCode,
-    OAuthState, ProductState, PromotionView, SessionCredential,
+    ApplyView, ApprovalPreviewView, AuthoringSessionViewV1, AuthoringTurnViewV1, CsrfSecret,
+    CurrentPrincipal, DecisionView, DeploymentOperationalViewV2, DeploymentView, FacadeError,
+    LifecycleCancellationView, OAuthCode, OAuthState, ProductState, PromotionView,
+    SessionCredential,
 };
 
 const RESOURCE_ID_MAX_BYTES: usize = 128;
@@ -120,6 +121,30 @@ impl Debug for PromoteCommand {
             .field("session_id", &self.session_id)
             .field("expected_generation", &self.expected_generation)
             .field("idempotency_key", &"<redacted>")
+            .finish()
+    }
+}
+
+pub struct AuthoringTurnCommandV1 {
+    pub request_id: ProductRequestId,
+    pub installation_id: String,
+    pub session_id: String,
+    pub expected_generation: authoring_application::AuthoringExpectedGenerationV1,
+    pub idempotency_key: crate::IdempotencyKey,
+    pub message: authoring_application::AuthoringHumanMessageV1,
+    pub commit_boundary: authoring_application::AuthoringCommitBoundaryV1,
+}
+
+impl Debug for AuthoringTurnCommandV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthoringTurnCommandV1")
+            .field("request_id", &self.request_id)
+            .field("installation_id", &self.installation_id)
+            .field("session_id", &self.session_id)
+            .field("expected_generation", &self.expected_generation)
+            .field("idempotency_key", &"<redacted>")
+            .field("message", &"<redacted>")
             .finish()
     }
 }
@@ -331,6 +356,23 @@ pub trait ProductControlFacade: Send + Sync + 'static {
     ) -> Result<DeploymentView, FacadeError>;
 
     async fn readiness(&self) -> Result<(), FacadeError>;
+}
+
+#[async_trait::async_trait]
+pub trait ProductControlAuthoringFacadeV1: ProductControlFacade {
+    async fn authoring_turn(
+        &self,
+        credential: &SessionCredential,
+        csrf: &CsrfSecret,
+        command: AuthoringTurnCommandV1,
+    ) -> Result<AuthoringTurnViewV1, FacadeError>;
+
+    async fn authoring_session(
+        &self,
+        credential: &SessionCredential,
+        installation_id: &str,
+        session_id: &str,
+    ) -> Result<AuthoringSessionViewV1, FacadeError>;
 }
 
 #[async_trait::async_trait]

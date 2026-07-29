@@ -2,6 +2,7 @@ use std::num::NonZeroU32;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use authoring_application::{
+    AuthoringMutationDispositionV1, AuthoringSessionObservationV1, AuthoringTurnOutcomeV1,
     DeploymentConvergencePhaseV2, DeploymentOperationalObservationV2,
     DeploymentOperatorActionV2 as ApplicationOperatorActionV2, DeploymentRetryObservationV2,
     DeploymentServingFreshnessV2, DeploymentStatusObservationV1, DeploymentStatusProjectionV1,
@@ -15,17 +16,85 @@ use authoring_application_discord::DiscordApplicationIdV1;
 use authoring_application_postgres::{
     CurrentProductPrincipalV1, IssuedProductSessionV1, OAuthFlowIssueV1,
 };
+use authoring_promotion::AuthoringSessionId;
 use chrono::{DateTime, Utc};
 use product_control_http::{
-    ApplyView, ApprovalPreviewView, CsrfSecret, CurrentPrincipal, DecisionView,
-    DeploymentAttestationViewV2, DeploymentFailureViewV2, DeploymentOperationalStateV2,
-    DeploymentOperationalViewV2, DeploymentOperatorActionV2, DeploymentRetryStateV2,
-    DeploymentRetryViewV2, DeploymentRuntimePhaseV2, DeploymentServingFreshnessStateV2,
-    DeploymentServingFreshnessViewV2, DeploymentState, DeploymentView, DiscordAuthorizationRequest,
-    FacadeError, FacadeErrorCode, LifecycleCancellationView, OAuthCallbackResult, OAuthStartResult,
-    OAuthState, ProductState, PromotionView, RuntimeDeploymentOperationalViewV2,
-    SafeApprovalSummary, SessionCredential,
+    ApplyView, ApprovalPreviewView, AuthoringSessionViewV1, AuthoringTurnDispositionV1,
+    AuthoringTurnViewV1, CsrfSecret, CurrentPrincipal, DecisionView, DeploymentAttestationViewV2,
+    DeploymentFailureViewV2, DeploymentOperationalStateV2, DeploymentOperationalViewV2,
+    DeploymentOperatorActionV2, DeploymentRetryStateV2, DeploymentRetryViewV2,
+    DeploymentRuntimePhaseV2, DeploymentServingFreshnessStateV2, DeploymentServingFreshnessViewV2,
+    DeploymentState, DeploymentView, DiscordAuthorizationRequest, FacadeError, FacadeErrorCode,
+    LifecycleCancellationView, OAuthCallbackResult, OAuthStartResult, OAuthState, ProductState,
+    PromotionView, RuntimeDeploymentOperationalViewV2, SafeApprovalSummary, SessionCredential,
 };
+
+pub fn project_authoring_turn(
+    expected_session_id: &AuthoringSessionId,
+    outcome: &AuthoringTurnOutcomeV1,
+) -> Result<AuthoringTurnViewV1, FacadeError> {
+    outcome.projection().validate().map_err(|_| internal())?;
+    match outcome {
+        AuthoringTurnOutcomeV1::Committed(receipt) => {
+            if receipt.session_id() != expected_session_id
+                || matches!(
+                    receipt.projection().state(),
+                    authoring_application::SafeAuthoringTurnStateV1::Unsupported
+                        | authoring_application::SafeAuthoringTurnStateV1::Rejected
+                )
+            {
+                return Err(internal());
+            }
+            Ok(AuthoringTurnViewV1 {
+                session_id: receipt.session_id().as_str().to_string(),
+                generation: Some(receipt.generation().get()),
+                disposition: Some(match receipt.disposition() {
+                    AuthoringMutationDispositionV1::Created => AuthoringTurnDispositionV1::Created,
+                    AuthoringMutationDispositionV1::ExactReplay => {
+                        AuthoringTurnDispositionV1::ExactReplay
+                    }
+                }),
+                projection: receipt.projection().clone(),
+            })
+        }
+        AuthoringTurnOutcomeV1::NotCommitted(projection) => {
+            if !matches!(
+                projection.state(),
+                authoring_application::SafeAuthoringTurnStateV1::Unsupported
+                    | authoring_application::SafeAuthoringTurnStateV1::Rejected
+            ) {
+                return Err(internal());
+            }
+            Ok(AuthoringTurnViewV1 {
+                session_id: expected_session_id.as_str().to_string(),
+                generation: None,
+                disposition: None,
+                projection: projection.clone(),
+            })
+        }
+    }
+}
+
+pub fn project_authoring_session(
+    observation: &AuthoringSessionObservationV1,
+) -> Result<AuthoringSessionViewV1, FacadeError> {
+    observation
+        .projection()
+        .validate()
+        .map_err(|_| internal())?;
+    if matches!(
+        observation.projection().state(),
+        authoring_application::SafeAuthoringTurnStateV1::Unsupported
+            | authoring_application::SafeAuthoringTurnStateV1::Rejected
+    ) {
+        return Err(internal());
+    }
+    Ok(AuthoringSessionViewV1 {
+        session_id: observation.session_id().as_str().to_string(),
+        observed_generation: observation.generation().get(),
+        projection: observation.projection().clone(),
+    })
+}
 
 pub fn project_oauth_start(
     issue: &OAuthFlowIssueV1,
@@ -660,8 +729,11 @@ mod tests {
         ProductLifecycleCancellationDeploymentProjectionV1,
         ProductLifecycleCancellationDrainProjectionV1,
         ProductLifecycleCancellationSlotProjectionV1, ProductRevisionV1,
+        SafeAuthoringTurnProjectionV1,
     };
-    use authoring_promotion::{AutomationInstallationId, PromotionId, TenantId};
+    use authoring_promotion::{
+        AuthoringSessionId, AutomationInstallationId, PromotionId, SessionGeneration, TenantId,
+    };
     use discord_model::GuildId;
 
     use super::*;
@@ -682,6 +754,13 @@ mod tests {
             digest('b'),
         )
         .unwrap()
+    }
+
+    fn safe_authoring_projection(state: &str) -> SafeAuthoringTurnProjectionV1 {
+        let bytes = format!(
+            "{{\"schema_version\":1,\"state\":\"{state}\",\"assistant_message\":\"Safe response\",\"capabilities\":[],\"draft\":{{\"panels\":0,\"modals\":0,\"rules\":0,\"actions\":0,\"unresolved_references\":[]}},\"preview\":null}}"
+        );
+        SafeAuthoringTurnProjectionV1::from_canonical_json(bytes.as_bytes()).unwrap()
     }
 
     fn decision(phase: ProductDecisionPhaseV1) -> ProductDecisionProjectionV1 {
@@ -713,6 +792,62 @@ mod tests {
 
         assert_eq!(
             project_oauth_callback_parts(&first, &first, "/", 60)
+                .unwrap_err()
+                .error_code(),
+            FacadeErrorCode::Internal
+        );
+    }
+
+    #[test]
+    fn authoring_projection_exposes_only_the_canonical_safe_projection() {
+        let session_id = AuthoringSessionId::parse("session-1").unwrap();
+        let outcome = AuthoringTurnOutcomeV1::NotCommitted(safe_authoring_projection("rejected"));
+        let view = project_authoring_turn(&session_id, &outcome).unwrap();
+        assert_eq!(view.session_id, "session-1");
+        assert_eq!(view.generation, None);
+        assert_eq!(view.disposition, None);
+        assert_eq!(
+            view.projection.state(),
+            authoring_application::SafeAuthoringTurnStateV1::Rejected
+        );
+
+        let observation = AuthoringSessionObservationV1::from_storage(
+            session_id,
+            SessionGeneration::new(7).unwrap(),
+            safe_authoring_projection("discussion"),
+            None,
+        )
+        .unwrap();
+        let view = project_authoring_session(&observation).unwrap();
+        assert_eq!(view.session_id, "session-1");
+        assert_eq!(view.observed_generation, 7);
+        assert_eq!(
+            view.projection.state(),
+            authoring_application::SafeAuthoringTurnStateV1::Discussion
+        );
+    }
+
+    #[test]
+    fn authoring_projection_rejects_non_durable_read_and_commit_shapes() {
+        let session_id = AuthoringSessionId::parse("session-1").unwrap();
+        let invalid_turn =
+            AuthoringTurnOutcomeV1::NotCommitted(safe_authoring_projection("discussion"));
+        assert_eq!(
+            project_authoring_turn(&session_id, &invalid_turn)
+                .unwrap_err()
+                .error_code(),
+            FacadeErrorCode::Internal
+        );
+
+        let invalid_read = AuthoringSessionObservationV1::from_storage(
+            session_id,
+            SessionGeneration::new(1).unwrap(),
+            safe_authoring_projection("unsupported"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            project_authoring_session(&invalid_read)
                 .unwrap_err()
                 .error_code(),
             FacadeErrorCode::Internal

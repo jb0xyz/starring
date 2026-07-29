@@ -2,11 +2,11 @@ use std::fmt::{Debug, Formatter};
 
 use async_trait::async_trait;
 use authoring_application::{
-    AuthoringApplication, AuthorizedDeploymentStatusV1, DeploymentOperationalObservationV2,
-    DeploymentOperationalStatusPortV2, DeploymentStatusObservationPort,
-    DeploymentStatusObservationV1, DeploymentStatusPort, DeploymentStatusPortError,
-    DeploymentStatusProjectionV1, ProductControlApplication, ProductStatusQueryV1,
-    PromotionSelectorV1,
+    AuthoringApplication, AuthoringConversationConfigV1, AuthorizedDeploymentStatusV1,
+    ConversationApplication, DeploymentOperationalObservationV2, DeploymentOperationalStatusPortV2,
+    DeploymentStatusObservationPort, DeploymentStatusObservationV1, DeploymentStatusPort,
+    DeploymentStatusPortError, DeploymentStatusProjectionV1, ProductControlApplication,
+    ProductStatusQueryV1, PromotionSelectorV1,
 };
 use authoring_application_discord::{
     DiscordAuthorityConfigV1, DiscordGuildAuthorityAdapter, DiscordOAuthClient,
@@ -22,28 +22,34 @@ use authoring_application_postgres::{
     ProductApiReadinessErrorV1, XChaCha20Poly1305SnapshotEnvelopeCipherV1,
 };
 use product_control_http::{
-    ApplyCommand, ApplyView, ApprovalPreviewView, CsrfSecret, CurrentPrincipal, DecisionCommand,
-    DecisionView, DeploymentOperationalViewV2, DeploymentView, FacadeError, FacadeErrorCode,
+    ApplyCommand, ApplyView, ApprovalPreviewView, AuthoringSessionViewV1, AuthoringTurnCommandV1,
+    AuthoringTurnViewV1, CsrfSecret, CurrentPrincipal, DecisionCommand, DecisionView,
+    DeploymentOperationalViewV2, DeploymentView, FacadeError, FacadeErrorCode,
     LifecycleCancellationCommand, LifecycleCancellationView, OAuthCallbackCommand,
-    OAuthCallbackResult, OAuthStartCommand, OAuthStartResult, ProductControlFacade,
-    ProductControlLifecycleFacadeV1, ProductControlOperationalFacadeV2, PromoteCommand,
-    PromotionView, RejectCommand, SessionCredential,
+    OAuthCallbackResult, OAuthStartCommand, OAuthStartResult, ProductControlAuthoringFacadeV1,
+    ProductControlFacade, ProductControlLifecycleFacadeV1, ProductControlOperationalFacadeV2,
+    PromoteCommand, PromotionView, RejectCommand, SessionCredential,
 };
 
+use crate::composition::ProductionAuthoringLlmClientV1;
 use crate::input::parse_installation;
 use crate::{
     map_apply_command, map_approve_command, map_authoring_application_error,
+    map_authoring_conversation_error, map_authoring_session_query, map_authoring_turn_command,
     map_discord_authorization_code, map_discord_oauth_error, map_discord_oauth_state,
     map_lifecycle_cancellation_command, map_oauth_flow_error, map_product_application_error,
     map_product_identity_error, map_product_target, map_promote_command, map_reject_command,
-    project_apply, project_approval_preview, project_current_principal, project_decision_mutation,
-    project_deployment, project_deployment_operational_v2, project_lifecycle_cancellation,
-    project_oauth_callback, project_oauth_start, project_product_status, project_promotion,
+    project_apply, project_approval_preview, project_authoring_session, project_authoring_turn,
+    project_current_principal, project_decision_mutation, project_deployment,
+    project_deployment_operational_v2, project_lifecycle_cancellation, project_oauth_callback,
+    project_oauth_start, project_product_status, project_promotion, AuthoringAdmissionV1,
 };
 
 type ProductionIdentityStore = PostgresProductIdentityStore<OperatingSystemSecretGenerator>;
 type ProductionSnapshots =
     PostgresAuthorizedPromotionSnapshots<XChaCha20Poly1305SnapshotEnvelopeCipherV1>;
+type ProductionConversationStore =
+    PostgresAuthoringConversationStoreV1<XChaCha20Poly1305SnapshotEnvelopeCipherV1>;
 type ProductionAuthority = DiscordGuildAuthorityAdapter<
     PostgresInstallationAuthoritySource,
     TwilightDiscordGuildAuthorityClient,
@@ -150,6 +156,35 @@ impl Debug for ProductionPersistenceDependenciesV1 {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ProductionAuthoringDependenciesV1 {
+    store: ProductionConversationStore,
+    worker: ProductionAuthoringLlmClientV1,
+    admission: AuthoringAdmissionV1,
+    config: AuthoringConversationConfigV1,
+}
+
+impl ProductionAuthoringDependenciesV1 {
+    pub(crate) fn new(
+        store: ProductionConversationStore,
+        worker: ProductionAuthoringLlmClientV1,
+        admission: AuthoringAdmissionV1,
+    ) -> Self {
+        Self {
+            store,
+            worker,
+            admission,
+            config: AuthoringConversationConfigV1::default(),
+        }
+    }
+}
+
+impl Debug for ProductionAuthoringDependenciesV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProductionAuthoringDependenciesV1(<redacted>)")
+    }
+}
+
 pub struct ProductionProductControlFacadeV1 {
     identity: ProductionIdentityStore,
     authentication: PostgresAuthentication,
@@ -162,6 +197,7 @@ pub struct ProductionProductControlFacadeV1 {
     promotions: PostgresProductPromotions,
     control: PostgresProductControl,
     deployments: ProductionDeploymentStatusesV1,
+    authoring: Option<ProductionAuthoringDependenciesV1>,
 }
 
 impl ProductionProductControlFacadeV1 {
@@ -192,7 +228,20 @@ impl ProductionProductControlFacadeV1 {
                 status: persistence.deployment_statuses,
                 operational: persistence.operational_deployment_statuses,
             },
+            authoring: None,
         }
+    }
+
+    pub(crate) fn with_authoring(
+        mut self,
+        authoring: Option<ProductionAuthoringDependenciesV1>,
+    ) -> Self {
+        self.authoring = authoring;
+        self
+    }
+
+    pub(crate) fn authoring_available(&self) -> bool {
+        self.authoring.is_some()
     }
 
     fn authoring_application(
@@ -226,6 +275,27 @@ impl ProductionProductControlFacadeV1 {
             &self.authority,
             &self.control,
             &self.deployments,
+        )
+    }
+
+    fn conversation_application<'a>(
+        &'a self,
+        authoring: &'a ProductionAuthoringDependenciesV1,
+    ) -> ConversationApplication<
+        'a,
+        PostgresAuthentication,
+        ProductionAuthority,
+        ProductionConversationStore,
+        AuthoringAdmissionV1,
+        ProductionAuthoringLlmClientV1,
+    > {
+        ConversationApplication::new(
+            &self.authentication,
+            &self.authority,
+            &authoring.store,
+            &authoring.admission,
+            &authoring.worker,
+            authoring.config.clone(),
         )
     }
 
@@ -546,6 +616,55 @@ impl ProductControlFacade for ProductionProductControlFacadeV1 {
 }
 
 #[async_trait]
+impl ProductControlAuthoringFacadeV1 for ProductionProductControlFacadeV1 {
+    async fn authoring_turn(
+        &self,
+        credential: &SessionCredential,
+        csrf: &CsrfSecret,
+        command: AuthoringTurnCommandV1,
+    ) -> Result<AuthoringTurnViewV1, FacadeError> {
+        let authoring = self
+            .authoring
+            .as_ref()
+            .ok_or_else(|| FacadeError::new(FacadeErrorCode::DependencyUnavailable))?;
+        let (_request_id, installation, command) =
+            map_authoring_turn_command(command)?.into_parts();
+        let session_id = command.session_id().clone();
+        let outcome = self
+            .conversation_application(authoring)
+            .start_or_advance_turn(
+                credential.expose_secret(),
+                csrf.expose_secret(),
+                &installation,
+                command,
+            )
+            .await
+            .map_err(map_authoring_conversation_error)?;
+        project_authoring_turn(&session_id, &outcome)
+    }
+
+    async fn authoring_session(
+        &self,
+        credential: &SessionCredential,
+        installation_id: &str,
+        session_id: &str,
+    ) -> Result<AuthoringSessionViewV1, FacadeError> {
+        let authoring = self
+            .authoring
+            .as_ref()
+            .ok_or_else(|| FacadeError::new(FacadeErrorCode::DependencyUnavailable))?;
+        let (installation, query) =
+            map_authoring_session_query(installation_id, session_id)?.into_parts();
+        let observation = self
+            .conversation_application(authoring)
+            .read_session(credential.expose_secret(), &installation, query)
+            .await
+            .map_err(map_authoring_conversation_error)?;
+        project_authoring_session(&observation)
+    }
+}
+
+#[async_trait]
 impl ProductControlOperationalFacadeV2 for ProductionProductControlFacadeV1 {
     async fn deployment_operational_v2(
         &self,
@@ -617,11 +736,13 @@ mod tests {
 
     fn assert_operational_facade<T: ProductControlOperationalFacadeV2>() {}
     fn assert_lifecycle_facade<T: ProductControlLifecycleFacadeV1>() {}
+    fn assert_authoring_facade<T: ProductControlAuthoringFacadeV1>() {}
 
     #[test]
     fn production_facade_closes_the_complete_http_contract() {
         assert_operational_facade::<ProductionProductControlFacadeV1>();
         assert_lifecycle_facade::<ProductionProductControlFacadeV1>();
+        assert_authoring_facade::<ProductionProductControlFacadeV1>();
     }
 
     #[test]

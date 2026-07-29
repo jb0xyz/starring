@@ -67,6 +67,7 @@ where
         installation: &InstallationSelectorV1,
         command: StartOrAdvanceAuthoringTurnV1,
     ) -> Result<AuthoringTurnOutcomeV1, AuthoringConversationError> {
+        ensure_request_active(&command)?;
         let (initial_actor, initial_authorized) = self
             .authenticate_author(credential, csrf, installation)
             .await?;
@@ -76,6 +77,7 @@ where
             &command,
         );
         let _keyed_permit = self.admission.acquire_keyed(&local_key).await?;
+        ensure_request_active(&command)?;
         let (keyed_actor, keyed_authorized) = self
             .authenticate_author(credential, csrf, installation)
             .await?;
@@ -94,7 +96,9 @@ where
         if let Some(receipt) = self.check_before_model(&access).await? {
             return Ok(receipt);
         }
+        ensure_request_active(&command)?;
         let model_permit = self.admission.acquire_model_capacity().await?;
+        ensure_request_active(&command)?;
         let (model_actor, model_authorized) = self
             .authenticate_author(credential, csrf, installation)
             .await?;
@@ -113,6 +117,7 @@ where
         if let Some(receipt) = self.check_before_model(&access).await? {
             return Ok(receipt);
         }
+        ensure_request_active(&command)?;
         let loaded = self.store.load_exact_generation(&access).await?;
         validate_loaded_generation(command.expected_generation().get(), &loaded)?;
         let (snapshot, bindings) = loaded.into_snapshot_and_bindings();
@@ -135,6 +140,7 @@ where
         let model_calls_before = session.observability().model_calls;
         let outcome = session.run_burst(command.human_message().as_str()).await;
         drop(model_permit);
+        ensure_request_active(&command)?;
         if let BurstOutcome::Halted(report) = &outcome {
             return Err(AuthoringConversationError::TurnHalted {
                 code: report.code.clone(),
@@ -203,6 +209,9 @@ where
             projected.projection,
             projected.preview_ready_artifact,
         );
+        if !command.commit_boundary().enter_commit_phase() {
+            return Err(AuthoringConversationError::CancelledBeforeCommit);
+        }
         let outcome = self.store.commit_authorized_generation(commit).await?;
         self.finish_commit(&command, &request_identity, candidate, outcome)
             .map(AuthoringTurnOutcomeV1::Committed)
@@ -326,6 +335,16 @@ where
             stored.into_projection(),
         )
         .map_err(AuthoringConversationError::from)
+    }
+}
+
+fn ensure_request_active(
+    command: &StartOrAdvanceAuthoringTurnV1,
+) -> Result<(), AuthoringConversationError> {
+    if command.commit_boundary().cancelled_before_commit() {
+        Err(AuthoringConversationError::CancelledBeforeCommit)
+    } else {
+        Ok(())
     }
 }
 
@@ -563,6 +582,8 @@ pub enum AuthoringConversationError {
     InvalidModelCallCount,
     #[error("authoring turn halted before producing a durable state")]
     TurnHalted { code: String },
+    #[error("authoring request was cancelled before commit")]
+    CancelledBeforeCommit,
     #[error("authoring commit result is invalid")]
     InvalidCommit,
 }

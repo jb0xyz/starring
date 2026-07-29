@@ -26,8 +26,8 @@ pub(crate) use candidate::{
     candidate_ruleset_hash, draft_state_hash, replay_intent_candidate_preparation,
 };
 pub use candidate::{
-    prepare_intent_candidate, CommittedIntentCandidateV1, IntentExecutionReportV1,
-    PreparedIntentCandidateV1,
+    prepare_intent_candidate, verify_preview_ruleset_v1, CommittedIntentCandidateV1,
+    IntentExecutionReportV1, PreparedIntentCandidateV1, PreviewRulesetVerificationErrorV1,
 };
 pub use capability::{
     assess_intent_capabilities_v2, intent_capability_manifest_digest_v2,

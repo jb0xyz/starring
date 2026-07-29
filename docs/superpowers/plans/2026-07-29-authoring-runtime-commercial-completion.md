@@ -302,7 +302,7 @@ removing security, restart, failure, or release gates.
 - [x] A2. Add the pure conversation application
 - [x] A3. Add authenticated snapshot encryption and writer persistence
 - [x] A4. Provision the writer capability
-- [ ] A5. Expose authenticated authoring HTTP routes
+- [x] A5. Expose authenticated authoring HTTP routes
 - [ ] A6. Pass the authoring milestone gate
 - [ ] B1. Extend the existing production lifecycle for route serving
 - [ ] B2. Compose the convergence lane and exact hydration

@@ -46,6 +46,12 @@ impl AuthoringAdmissionConfigV1 {
     pub fn model_capacity(self) -> usize {
         self.model_capacity
     }
+
+    pub fn production_with_model_capacity(
+        model_capacity: usize,
+    ) -> Result<Self, AuthoringAdmissionConfigErrorV1> {
+        Self::new(DEFAULT_MAX_KEYED_ENTRIES, model_capacity)
+    }
 }
 
 impl Default for AuthoringAdmissionConfigV1 {
@@ -189,5 +195,19 @@ mod tests {
         let admission = AuthoringAdmissionV1::new(AuthoringAdmissionConfigV1::new(1, 1).unwrap());
         drop(admission.acquire_keyed(&key("request-1")).await.unwrap());
         assert!(admission.acquire_keyed(&key("request-2")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn production_model_capacity_matches_the_worker_preflight_contract() {
+        let admission = AuthoringAdmissionV1::new(
+            AuthoringAdmissionConfigV1::production_with_model_capacity(2).unwrap(),
+        );
+        let first = admission.acquire_model_capacity().await.unwrap();
+        let second = admission.acquire_model_capacity().await.unwrap();
+        assert_eq!(
+            admission.acquire_model_capacity().await.unwrap_err(),
+            AuthoringAdmissionError::Saturated
+        );
+        drop((first, second));
     }
 }

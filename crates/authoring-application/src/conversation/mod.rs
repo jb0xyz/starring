@@ -4,10 +4,10 @@ mod projection;
 mod service;
 
 pub use command::{
-    AuthoringConversationConfigError, AuthoringConversationConfigV1,
+    AuthoringCommitBoundaryV1, AuthoringConversationConfigError, AuthoringConversationConfigV1,
     AuthoringExpectedGenerationError, AuthoringExpectedGenerationV1, AuthoringHumanMessageError,
     AuthoringHumanMessageV1, LocalAuthoringRequestKeyV1, ReadAuthoringSessionV1,
-    StartOrAdvanceAuthoringTurnV1,
+    StartOrAdvanceAuthoringTurnV1, AUTHORING_MAX_MODEL_CALLS_V1,
 };
 pub use ports::{
     AuthoringAdmissionError, AuthoringCommitOutcomeV1, AuthoringConversationStorePort,

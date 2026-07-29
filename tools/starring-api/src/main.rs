@@ -4,7 +4,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use product_control_http::{
-    product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate,
+    product_control_router_with_operational_v2_and_lifecycle_v1_and_authoring_v1_and_readiness_gate,
     ProductApiReadinessGate, ProductControlFacade,
 };
 use starring_api::{
@@ -96,13 +96,16 @@ async fn serve(
     service: ComposedProductionServiceV1,
     mut shutdown: ShutdownSignalsV1,
 ) -> ExitStatusV1 {
+    let authoring_http_boundary = service.authoring_http_boundary_config();
     let (facade, http_boundary, bind_addr, database_shutdown) = service.into_parts();
     let readiness_gate = ProductApiReadinessGate::initially_unready();
-    let router = product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate(
-        facade.clone(),
-        http_boundary,
-        readiness_gate.clone(),
-    );
+    let router =
+        product_control_router_with_operational_v2_and_lifecycle_v1_and_authoring_v1_and_readiness_gate(
+            facade.clone(),
+            http_boundary,
+            authoring_http_boundary,
+            readiness_gate.clone(),
+        );
     let startup_facade = facade.clone();
     let startup_probe = async move { startup_facade.readiness().await.is_ok() };
     let runtime_facade = facade.clone();

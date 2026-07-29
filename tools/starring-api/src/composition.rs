@@ -16,8 +16,10 @@ use authoring_application_postgres::{
     ProductDecisionDatabasePoolsV1, ProductIdentityDatabasePoolsV1,
     XChaCha20Poly1305SnapshotEnvelopeCipherV1,
 };
-use design_harness_codex_worker_client::CodexWorkerClient;
-use product_control_http::{HttpBoundaryConfig, ProductControlFacade};
+use design_harness_codex_worker_client::{CodexWorkerClient, CODEX_WORKER_REQUEST_TIMEOUT_V1};
+use product_control_http::{
+    AuthoringHttpBoundaryConfigV1, HttpBoundaryConfig, ProductControlFacade,
+};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::ConnectOptions;
 use tokio::time::timeout;
@@ -26,20 +28,23 @@ use twilight_http::Client as TwilightHttpClient;
 use crate::config::{
     DatabaseRoleV1, PoolConfigV1, ProductionAuthoringConfigV1, ProductionConfigV1,
 };
+use crate::facade::ProductionAuthoringDependenciesV1;
 use crate::secret::{
     DatabaseEndpointV1, DatabaseSslModeV1, DatabaseUrlSecretV1, ResolvedAuthoringSecretsV1,
     ResolvedProductionSecretsV1,
 };
 use crate::{
-    AuthoringAdmissionV1, ProductionAuthorityDependenciesV1, ProductionFacadeConfigurationErrorV1,
-    ProductionIdentityDependenciesV1, ProductionPersistenceDependenciesV1,
-    ProductionProductControlFacadeV1,
+    AuthoringAdmissionConfigV1, AuthoringAdmissionV1, ProductionAuthorityDependenciesV1,
+    ProductionFacadeConfigurationErrorV1, ProductionIdentityDependenciesV1,
+    ProductionPersistenceDependenciesV1, ProductionProductControlFacadeV1,
 };
 
 const APPLICATION_NAME: &str = "starring-api";
 const STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(45);
 const AUTHORING_STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const DATABASE_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(crate) type ProductionAuthoringLlmClientV1 = CodexWorkerClient;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProductionReadinessPhaseV1 {
@@ -85,9 +90,9 @@ impl Debug for ProductionDatabasePoolShutdownErrorV1 {
 pub struct ComposedProductionServiceV1 {
     facade: Arc<ProductionProductControlFacadeV1>,
     http_boundary: HttpBoundaryConfig,
+    authoring_http_boundary: AuthoringHttpBoundaryConfigV1,
     loopback_bind_addr: SocketAddr,
     database_shutdown: ProductionDatabasePoolShutdownV1,
-    authoring_dependencies: Option<ProductionAuthoringDependenciesV1>,
 }
 
 impl ComposedProductionServiceV1 {
@@ -103,8 +108,12 @@ impl ComposedProductionServiceV1 {
         self.loopback_bind_addr
     }
 
+    pub fn authoring_http_boundary_config(&self) -> AuthoringHttpBoundaryConfigV1 {
+        self.authoring_http_boundary
+    }
+
     pub fn authoring_dependencies_available(&self) -> bool {
-        self.authoring_dependencies.is_some()
+        self.facade.authoring_available()
     }
 
     pub fn into_parts(
@@ -131,25 +140,10 @@ impl Debug for ComposedProductionServiceV1 {
             .field("loopback_bind_addr", &self.loopback_bind_addr)
             .field(
                 "authoring_dependencies_available",
-                &self.authoring_dependencies.is_some(),
+                &self.facade.authoring_available(),
             )
             .field("dependencies", &"<redacted>")
             .finish()
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ProductionAuthoringDependenciesV1 {
-    pub(crate) store:
-        PostgresAuthoringConversationStoreV1<XChaCha20Poly1305SnapshotEnvelopeCipherV1>,
-    pub(crate) worker: CodexWorkerClient,
-    pub(crate) admission: AuthoringAdmissionV1,
-}
-
-impl Debug for ProductionAuthoringDependenciesV1 {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        let _dependencies = (&self.store, &self.worker, &self.admission);
-        formatter.write_str("ProductionAuthoringDependenciesV1(<redacted>)")
     }
 }
 
@@ -190,6 +184,9 @@ pub async fn compose_production_service_v1(
     }
     let return_paths = config.return_paths().to_vec();
     let http_boundary = config.http_boundary();
+    let authoring_http_boundary =
+        AuthoringHttpBoundaryConfigV1::production(CODEX_WORKER_REQUEST_TIMEOUT_V1)
+            .map_err(|_| ProductionCompositionErrorV1::HttpBoundaryConfiguration)?;
     let identity_config = PostgresProductIdentityConfig::production(
         config.oauth_redirect_uri(),
         return_paths.iter().cloned(),
@@ -249,7 +246,7 @@ pub async fn compose_production_service_v1(
         },
     );
     let facade = match facade {
-        Ok(facade) => Arc::new(facade),
+        Ok(facade) => facade,
         Err(error) => {
             let _shutdown_result = database_pools.close().await;
             return Err(error);
@@ -258,7 +255,7 @@ pub async fn compose_production_service_v1(
     let (facade_readiness, authoring) = tokio::join!(
         timeout(STARTUP_READINESS_TIMEOUT, facade.readiness()),
         compose_optional_authoring_dependencies_v1(
-            facade.as_ref(),
+            &facade,
             authoring_config,
             authoring_secrets,
             pool_config,
@@ -289,12 +286,13 @@ pub async fn compose_production_service_v1(
         Some(authoring) => (Some(authoring.dependencies), Some(authoring.pool)),
         None => (None, None),
     };
+    let facade = Arc::new(facade.with_authoring(authoring_dependencies));
     Ok(ComposedProductionServiceV1 {
         facade,
         http_boundary,
+        authoring_http_boundary,
         loopback_bind_addr,
         database_shutdown: database_pools.into_shutdown(authoring_pool),
-        authoring_dependencies,
     })
 }
 
@@ -313,10 +311,9 @@ async fn compose_optional_authoring_dependencies_v1(
 ) -> Option<ComposedOptionalAuthoringV1> {
     let (config, secrets) = config.zip(secrets)?;
     let (database_url, worker_token) = secrets.into_parts();
-    let mut worker_token = worker_token.into_zeroizing();
-    let worker = CodexWorkerClient::new(
+    let worker = CodexWorkerClient::new_zeroizing(
         config.worker_url().to_string(),
-        std::mem::take(&mut *worker_token),
+        worker_token.into_zeroizing(),
     )
     .ok()?;
     let pool = connect_pool_v1(database_url, pool_config).await.ok()?;
@@ -330,19 +327,32 @@ async fn compose_optional_authoring_dependencies_v1(
             AUTHORING_STARTUP_READINESS_TIMEOUT,
             facade.verify_authoring_readiness(&store)
         ),
-        timeout(AUTHORING_STARTUP_READINESS_TIMEOUT, worker.preflight()),
+        timeout(
+            AUTHORING_STARTUP_READINESS_TIMEOUT,
+            worker.preflight_contract()
+        ),
     );
-    if !matches!(authoring_readiness, Ok(Ok(()))) || !matches!(worker_readiness, Ok(Ok(()))) {
+    if !matches!(authoring_readiness, Ok(Ok(()))) {
         let _shutdown_result =
             await_pool_shutdown_with_timeout(pool.close(), DATABASE_POOL_SHUTDOWN_TIMEOUT).await;
         return None;
     }
+    let worker_contract = match worker_readiness {
+        Ok(Ok(contract)) => contract,
+        Ok(Err(_)) | Err(_) => {
+            let _shutdown_result =
+                await_pool_shutdown_with_timeout(pool.close(), DATABASE_POOL_SHUTDOWN_TIMEOUT)
+                    .await;
+            return None;
+        }
+    };
+    let admission = AuthoringAdmissionConfigV1::production_with_model_capacity(
+        worker_contract.concurrency_limit(),
+    )
+    .ok()
+    .map(AuthoringAdmissionV1::new)?;
     Some(ComposedOptionalAuthoringV1 {
-        dependencies: ProductionAuthoringDependenciesV1 {
-            store,
-            worker,
-            admission: AuthoringAdmissionV1::production(),
-        },
+        dependencies: ProductionAuthoringDependenciesV1::new(store, worker, admission),
         pool,
     })
 }

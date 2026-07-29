@@ -5,18 +5,20 @@ use std::time::{Duration, SystemTime};
 
 use authoring_application::{
     AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationClaimsV1,
-    AuthenticationError, AuthenticationPort, AuthoringCommitOutcomeV1,
+    AuthenticationError, AuthenticationPort, AuthoringCommitBoundaryV1, AuthoringCommitOutcomeV1,
     AuthoringConversationConfigError, AuthoringConversationConfigV1, AuthoringConversationError,
     AuthoringExpectedGenerationError, AuthoringExpectedGenerationV1, AuthoringHumanMessageError,
     AuthoringHumanMessageV1, AuthoringMutationDispositionV1, AuthoringSessionCommitPort,
     AuthoringSessionLoadError, AuthoringSessionLoadPort, AuthoringSessionLoadV1,
+    AuthoringSessionObservationErrorV1, AuthoringSessionObservationV1, AuthoringSessionReadPort,
     AuthoringStoredGenerationV1, AuthoringStoredRequestIdentityV1, AuthoringTurnAdmissionPort,
     AuthoringTurnCheckV1, AuthoringTurnOutcomeV1, AuthoringTurnReceiptV1,
-    AuthorizedAuthoringCommitV1, AuthorizedInstallationScopeV1, AuthorizedInstallationV1,
-    CapabilityV1, ConversationApplication, FreshGuildAuthorityError, FreshGuildAuthorityEvidence,
-    FreshGuildAuthorityPort, InstallationSelectorV1, LocalAuthoringRequestKeyV1,
-    MutationAuthenticationPort, ProductIdempotencyKeyV1, SafeAuthoringProjectionError,
-    SafeAuthoringTurnProjectionV1, SafeAuthoringTurnStateV1, StartOrAdvanceAuthoringTurnV1,
+    AuthorizedAuthoringCommitV1, AuthorizedConversationReadAccessV1, AuthorizedInstallationScopeV1,
+    AuthorizedInstallationV1, CapabilityV1, ConversationApplication, FreshGuildAuthorityError,
+    FreshGuildAuthorityEvidence, FreshGuildAuthorityPort, InstallationSelectorV1,
+    LocalAuthoringRequestKeyV1, MutationAuthenticationPort, ProductIdempotencyKeyV1,
+    ReadAuthoringSessionV1, SafeAuthoringProjectionError, SafeAuthoringTurnProjectionV1,
+    SafeAuthoringTurnStateV1, StartOrAdvanceAuthoringTurnV1,
 };
 use authoring_promotion::{
     AuthoringSessionId, AutomationInstallationId, PrincipalId, SessionGeneration, TenantId,
@@ -73,6 +75,66 @@ impl LlmClient for ScriptedClient {
             .unwrap()
             .pop_front()
             .expect("scripted model response")
+    }
+}
+
+#[derive(Clone)]
+struct BlockingClient {
+    response: Arc<Mutex<Option<Result<LlmResponse, LlmError>>>>,
+    started: Arc<(Mutex<bool>, Condvar)>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+    calls: Arc<Mutex<usize>>,
+}
+
+impl BlockingClient {
+    fn new(response: Result<LlmResponse, LlmError>) -> Self {
+        Self {
+            response: Arc::new(Mutex::new(Some(response))),
+            started: Arc::new((Mutex::new(false), Condvar::new())),
+            release: Arc::new((Mutex::new(false), Condvar::new())),
+            calls: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn wait_until_started(&self) {
+        let (started, changed) = &*self.started;
+        let mut started = started.lock().unwrap();
+        while !*started {
+            started = changed.wait(started).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        let (release, changed) = &*self.release;
+        *release.lock().unwrap() = true;
+        changed.notify_all();
+    }
+
+    fn calls(&self) -> usize {
+        *self.calls.lock().unwrap()
+    }
+}
+
+impl LlmClient for BlockingClient {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, LlmError> {
+        *self.calls.lock().unwrap() += 1;
+        let (started, started_changed) = &*self.started;
+        *started.lock().unwrap() = true;
+        started_changed.notify_all();
+        let (release, release_changed) = &*self.release;
+        let mut released = release.lock().unwrap();
+        while !*released {
+            released = release_changed.wait(released).unwrap();
+        }
+        self.response
+            .lock()
+            .unwrap()
+            .take()
+            .expect("configured blocking model response")
     }
 }
 
@@ -382,6 +444,321 @@ impl FreshGuildAuthorityPort for Authority {
     }
 }
 
+struct ReadAuthentication {
+    outcome: Result<AuthenticationClaimsV1, AuthenticationError>,
+    authentication_calls: Mutex<Vec<String>>,
+    mutation_calls: Mutex<usize>,
+}
+
+impl ReadAuthentication {
+    fn valid(principal_id: &str) -> Self {
+        Self {
+            outcome: Ok(AuthenticationClaimsV1::from_authentication(
+                PrincipalId::parse(principal_id).unwrap(),
+                AuthenticatedSessionFingerprintV1::from_sha256_digest([9; 32]),
+            )),
+            authentication_calls: Mutex::new(Vec::new()),
+            mutation_calls: Mutex::new(0),
+        }
+    }
+
+    fn failed(error: AuthenticationError) -> Self {
+        Self {
+            outcome: Err(error),
+            authentication_calls: Mutex::new(Vec::new()),
+            mutation_calls: Mutex::new(0),
+        }
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.authentication_calls.lock().unwrap().len(),
+            *self.mutation_calls.lock().unwrap(),
+        )
+    }
+
+    fn credentials(&self) -> Vec<String> {
+        self.authentication_calls.lock().unwrap().clone()
+    }
+}
+
+impl AuthenticationPort for ReadAuthentication {
+    type Credential = str;
+
+    async fn authenticate(
+        &self,
+        credential: &Self::Credential,
+    ) -> Result<AuthenticationClaimsV1, AuthenticationError> {
+        self.authentication_calls
+            .lock()
+            .unwrap()
+            .push(credential.to_string());
+        self.outcome.clone()
+    }
+}
+
+impl MutationAuthenticationPort for ReadAuthentication {
+    type CsrfProof = str;
+
+    async fn authenticate_mutation(
+        &self,
+        _credential: &Self::Credential,
+        _csrf: &Self::CsrfProof,
+    ) -> Result<AuthenticationClaimsV1, AuthenticationError> {
+        *self.mutation_calls.lock().unwrap() += 1;
+        Err(AuthenticationError::InvalidCsrf)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReadEvidence {
+    tenant_id: TenantId,
+    installation_id: AutomationInstallationId,
+    guild_id: GuildId,
+    acting_user_id: UserId,
+    capability: CapabilityV1,
+    revision: NonZeroU64,
+    authority_digest: String,
+}
+
+impl ReadEvidence {
+    fn valid() -> Self {
+        Self {
+            tenant_id: TenantId::parse("tenant-1").unwrap(),
+            installation_id: AutomationInstallationId::parse("installation-1").unwrap(),
+            guild_id: GuildId(10),
+            acting_user_id: UserId(20),
+            capability: CapabilityV1::Read,
+            revision: NonZeroU64::new(11).unwrap(),
+            authority_digest: "d".repeat(64),
+        }
+    }
+}
+
+impl FreshGuildAuthorityEvidence for ReadEvidence {
+    fn tenant_id(&self) -> &TenantId {
+        &self.tenant_id
+    }
+
+    fn installation_id(&self) -> &AutomationInstallationId {
+        &self.installation_id
+    }
+
+    fn discord_application_id(&self) -> NonZeroU64 {
+        NonZeroU64::new(30).unwrap()
+    }
+
+    fn guild_id(&self) -> GuildId {
+        self.guild_id
+    }
+
+    fn acting_user_id(&self) -> UserId {
+        self.acting_user_id
+    }
+
+    fn capability(&self) -> CapabilityV1 {
+        self.capability
+    }
+
+    fn guild_owner(&self) -> bool {
+        true
+    }
+
+    fn effective_permissions_bits(&self) -> u64 {
+        0
+    }
+
+    fn installation_authority_revision(&self) -> NonZeroU64 {
+        self.revision
+    }
+
+    fn installation_authority_digest(&self) -> &str {
+        &self.authority_digest
+    }
+
+    fn observation_digest(&self) -> &str {
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    }
+
+    fn observed_at(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(200)
+    }
+
+    fn expires_at(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(205)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReadAuthorityCall {
+    principal_id: String,
+    installation_id: String,
+    capability: CapabilityV1,
+}
+
+struct ReadAuthority {
+    outcome: Result<AuthorizedInstallationV1<ReadEvidence>, FreshGuildAuthorityError>,
+    calls: Mutex<Vec<ReadAuthorityCall>>,
+}
+
+impl ReadAuthority {
+    fn valid() -> Self {
+        Self::with_scope_and_evidence(
+            AuthorizedInstallationScopeV1::from_fresh_authority(
+                TenantId::parse("tenant-1").unwrap(),
+                AutomationInstallationId::parse("installation-1").unwrap(),
+                GuildId(10),
+                UserId(20),
+            ),
+            ReadEvidence::valid(),
+        )
+    }
+
+    fn with_scope_and_evidence(
+        scope: AuthorizedInstallationScopeV1,
+        evidence: ReadEvidence,
+    ) -> Self {
+        Self {
+            outcome: Ok(AuthorizedInstallationV1::from_fresh_authority(
+                scope, evidence,
+            )),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> Vec<ReadAuthorityCall> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl FreshGuildAuthorityPort for ReadAuthority {
+    type Evidence = ReadEvidence;
+
+    async fn authorize_installation(
+        &self,
+        actor: &AuthenticatedActorV1,
+        installation: &InstallationSelectorV1,
+        capability: CapabilityV1,
+    ) -> Result<AuthorizedInstallationV1<Self::Evidence>, FreshGuildAuthorityError> {
+        self.calls.lock().unwrap().push(ReadAuthorityCall {
+            principal_id: actor.principal_id().as_str().to_string(),
+            installation_id: installation.installation_id().as_str().to_string(),
+            capability,
+        });
+        self.outcome.clone()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReadAccessRecord {
+    principal_id: String,
+    tenant_id: String,
+    installation_id: String,
+    guild_id: GuildId,
+    acting_user_id: UserId,
+    evidence: ReadEvidence,
+    session_id: String,
+}
+
+#[derive(Default)]
+struct ReadStoreCounts {
+    reads: usize,
+    checks: usize,
+    loads: usize,
+    commits: usize,
+}
+
+struct ReadStore {
+    outcome:
+        Mutex<Option<Result<AuthoringSessionObservationV1, AuthoringSessionObservationErrorV1>>>,
+    accesses: Mutex<Vec<ReadAccessRecord>>,
+    counts: Mutex<ReadStoreCounts>,
+}
+
+impl ReadStore {
+    fn successful(session_id: &str, generation: u64) -> Self {
+        Self {
+            outcome: Mutex::new(Some(Ok(AuthoringSessionObservationV1::from_storage(
+                AuthoringSessionId::parse(session_id).unwrap(),
+                SessionGeneration::new(generation).unwrap(),
+                replay_projection(),
+                None,
+            )
+            .unwrap()))),
+            accesses: Mutex::new(Vec::new()),
+            counts: Mutex::new(ReadStoreCounts::default()),
+        }
+    }
+
+    fn failed(error: AuthoringSessionObservationErrorV1) -> Self {
+        Self {
+            outcome: Mutex::new(Some(Err(error))),
+            accesses: Mutex::new(Vec::new()),
+            counts: Mutex::new(ReadStoreCounts::default()),
+        }
+    }
+
+    fn accesses(&self) -> Vec<ReadAccessRecord> {
+        self.accesses.lock().unwrap().clone()
+    }
+
+    fn counts(&self) -> (usize, usize, usize, usize) {
+        let counts = self.counts.lock().unwrap();
+        (counts.reads, counts.checks, counts.loads, counts.commits)
+    }
+}
+
+impl AuthoringSessionReadPort<ReadEvidence> for ReadStore {
+    async fn read_authorized_session(
+        &self,
+        access: &AuthorizedConversationReadAccessV1<'_, ReadEvidence>,
+    ) -> Result<AuthoringSessionObservationV1, AuthoringSessionObservationErrorV1> {
+        self.counts.lock().unwrap().reads += 1;
+        self.accesses.lock().unwrap().push(ReadAccessRecord {
+            principal_id: access.actor().principal_id().as_str().to_string(),
+            tenant_id: access.scope().tenant_id().as_str().to_string(),
+            installation_id: access.scope().installation_id().as_str().to_string(),
+            guild_id: access.scope().guild_id(),
+            acting_user_id: access.scope().acting_user_id(),
+            evidence: access.evidence().clone(),
+            session_id: access.query().session_id().as_str().to_string(),
+        });
+        self.outcome
+            .lock()
+            .unwrap()
+            .take()
+            .expect("configured authoring observation")
+    }
+}
+
+impl AuthoringSessionLoadPort<ReadEvidence> for ReadStore {
+    async fn check_replay_or_head(
+        &self,
+        _access: &authoring_application::AuthorizedConversationAccessV1<'_, ReadEvidence>,
+    ) -> Result<AuthoringTurnCheckV1, AuthoringSessionLoadError> {
+        self.counts.lock().unwrap().checks += 1;
+        Err(AuthoringSessionLoadError::Unavailable)
+    }
+
+    async fn load_exact_generation(
+        &self,
+        _access: &authoring_application::AuthorizedConversationAccessV1<'_, ReadEvidence>,
+    ) -> Result<AuthoringSessionLoadV1, AuthoringSessionLoadError> {
+        self.counts.lock().unwrap().loads += 1;
+        Err(AuthoringSessionLoadError::Unavailable)
+    }
+}
+
+impl AuthoringSessionCommitPort<ReadEvidence> for ReadStore {
+    async fn commit_authorized_generation(
+        &self,
+        _request: AuthorizedAuthoringCommitV1<'_, ReadEvidence>,
+    ) -> Result<AuthoringCommitOutcomeV1, AuthoringSessionLoadError> {
+        self.counts.lock().unwrap().commits += 1;
+        Err(AuthoringSessionLoadError::Unavailable)
+    }
+}
+
 #[derive(Clone)]
 struct StoredRecord {
     session_id: String,
@@ -426,6 +803,8 @@ struct Store {
     bindings: ResourceBindingMap,
     forced_check: Mutex<Option<AuthoringTurnCheckV1>>,
     forced_commit: Mutex<Option<AuthoringCommitOutcomeV1>>,
+    probe_commit_boundary: bool,
+    commit_boundary_cancellation_results: Mutex<Vec<bool>>,
 }
 
 impl Store {
@@ -435,6 +814,8 @@ impl Store {
             bindings: bindings(),
             forced_check: Mutex::new(None),
             forced_commit: Mutex::new(None),
+            probe_commit_boundary: false,
+            commit_boundary_cancellation_results: Mutex::new(Vec::new()),
         }
     }
 
@@ -444,6 +825,8 @@ impl Store {
             bindings: bindings(),
             forced_check: Mutex::new(Some(check)),
             forced_commit: Mutex::new(None),
+            probe_commit_boundary: false,
+            commit_boundary_cancellation_results: Mutex::new(Vec::new()),
         }
     }
 
@@ -453,6 +836,19 @@ impl Store {
             bindings: bindings(),
             forced_check: Mutex::new(None),
             forced_commit: Mutex::new(Some(commit)),
+            probe_commit_boundary: false,
+            commit_boundary_cancellation_results: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_commit_boundary_probe() -> Self {
+        Self {
+            state: Mutex::new(StoreState::default()),
+            bindings: bindings(),
+            forced_check: Mutex::new(None),
+            forced_commit: Mutex::new(None),
+            probe_commit_boundary: true,
+            commit_boundary_cancellation_results: Mutex::new(Vec::new()),
         }
     }
 
@@ -467,6 +863,13 @@ impl Store {
 
     fn last_record(&self) -> Option<StoredRecord> {
         self.state.lock().unwrap().records.last().cloned()
+    }
+
+    fn commit_boundary_cancellation_results(&self) -> Vec<bool> {
+        self.commit_boundary_cancellation_results
+            .lock()
+            .unwrap()
+            .clone()
     }
 }
 
@@ -536,6 +939,12 @@ impl AuthoringSessionCommitPort<Evidence> for Store {
         request: AuthorizedAuthoringCommitV1<'_, Evidence>,
     ) -> Result<AuthoringCommitOutcomeV1, AuthoringSessionLoadError> {
         let command = request.access().command();
+        if self.probe_commit_boundary {
+            self.commit_boundary_cancellation_results
+                .lock()
+                .unwrap()
+                .push(command.commit_boundary().cancel_before_commit());
+        }
         let mut state = self.state.lock().unwrap();
         state.commits += 1;
         if let Some(commit) = self.forced_commit.lock().unwrap().clone() {
@@ -790,6 +1199,21 @@ fn command(
     )
 }
 
+fn command_with_commit_boundary(
+    expected_generation: u64,
+    idempotency_key: &str,
+    message: &str,
+    commit_boundary: AuthoringCommitBoundaryV1,
+) -> StartOrAdvanceAuthoringTurnV1 {
+    StartOrAdvanceAuthoringTurnV1::new_with_commit_boundary(
+        AuthoringSessionId::parse("session-1").unwrap(),
+        AuthoringExpectedGenerationV1::new(expected_generation).unwrap(),
+        ProductIdempotencyKeyV1::parse(idempotency_key).unwrap(),
+        AuthoringHumanMessageV1::parse(message).unwrap(),
+        commit_boundary,
+    )
+}
+
 fn committed(outcome: AuthoringTurnOutcomeV1) -> AuthoringTurnReceiptV1 {
     outcome.into_committed().unwrap()
 }
@@ -799,6 +1223,260 @@ fn replay_projection() -> SafeAuthoringTurnProjectionV1 {
         br#"{"schema_version":1,"state":"discussion","assistant_message":"Previously completed","capabilities":[],"draft":{"panels":0,"modals":0,"rules":0,"actions":0,"unresolved_references":[]},"preview":null}"#,
     )
     .unwrap()
+}
+
+fn read_query(session_id: &str) -> ReadAuthoringSessionV1 {
+    ReadAuthoringSessionV1::new(AuthoringSessionId::parse(session_id).unwrap())
+}
+
+#[test]
+fn read_session_authenticates_and_forwards_exact_fresh_read_scope() {
+    block_on(async {
+        let authentication = ReadAuthentication::valid("principal-1");
+        let authority = ReadAuthority::valid();
+        let store = ReadStore::successful("session-1", 4);
+        let admission = Admission::new();
+        let client = ScriptedClient::new(Vec::new());
+        let application = ConversationApplication::new(
+            &authentication,
+            &authority,
+            &store,
+            &admission,
+            &client,
+            AuthoringConversationConfigV1::default(),
+        );
+
+        let observation = application
+            .read_session("read-credential", &installation(), read_query("session-1"))
+            .await
+            .unwrap();
+
+        assert_eq!(observation.session_id().as_str(), "session-1");
+        assert_eq!(observation.generation().get(), 4);
+        assert_eq!(observation.projection(), &replay_projection());
+        assert_eq!(authentication.counts(), (1, 0));
+        assert_eq!(
+            authentication.credentials(),
+            vec!["read-credential".to_string()]
+        );
+        assert_eq!(
+            authority.calls(),
+            vec![ReadAuthorityCall {
+                principal_id: "principal-1".to_string(),
+                installation_id: "installation-1".to_string(),
+                capability: CapabilityV1::Read,
+            }]
+        );
+        assert_eq!(
+            store.accesses(),
+            vec![ReadAccessRecord {
+                principal_id: "principal-1".to_string(),
+                tenant_id: "tenant-1".to_string(),
+                installation_id: "installation-1".to_string(),
+                guild_id: GuildId(10),
+                acting_user_id: UserId(20),
+                evidence: ReadEvidence::valid(),
+                session_id: "session-1".to_string(),
+            }]
+        );
+        assert_eq!(store.counts(), (1, 0, 0, 0));
+        assert_eq!(admission.counts(), (0, 0));
+        assert_eq!(client.calls(), 0);
+    });
+}
+
+#[test]
+fn read_session_maps_non_owner_and_cross_scope_reads_to_not_found() {
+    block_on(async {
+        for (principal_id, session_id) in [
+            ("principal-without-session", "session-1"),
+            ("principal-1", "session-from-another-scope"),
+        ] {
+            let authentication = ReadAuthentication::valid(principal_id);
+            let authority = ReadAuthority::valid();
+            let store = ReadStore::failed(AuthoringSessionObservationErrorV1::NotFound);
+            let admission = Admission::new();
+            let client = ScriptedClient::new(Vec::new());
+            let application = ConversationApplication::new(
+                &authentication,
+                &authority,
+                &store,
+                &admission,
+                &client,
+                AuthoringConversationConfigV1::default(),
+            );
+
+            let error = application
+                .read_session("credential", &installation(), read_query(session_id))
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                error,
+                AuthoringConversationError::Observation(
+                    AuthoringSessionObservationErrorV1::NotFound
+                )
+            );
+            assert_eq!(authentication.counts(), (1, 0));
+            assert_eq!(authority.calls().len(), 1);
+            assert_eq!(store.counts(), (1, 0, 0, 0));
+            assert_eq!(admission.counts(), (0, 0));
+            assert_eq!(client.calls(), 0);
+        }
+    });
+}
+
+#[test]
+fn read_session_rejects_expired_and_revoked_authentication_before_authority() {
+    block_on(async {
+        for authentication_error in [AuthenticationError::Expired, AuthenticationError::Revoked] {
+            let authentication = ReadAuthentication::failed(authentication_error.clone());
+            let authority = ReadAuthority::valid();
+            let store = ReadStore::failed(AuthoringSessionObservationErrorV1::NotFound);
+            let admission = Admission::new();
+            let client = ScriptedClient::new(Vec::new());
+            let application = ConversationApplication::new(
+                &authentication,
+                &authority,
+                &store,
+                &admission,
+                &client,
+                AuthoringConversationConfigV1::default(),
+            );
+
+            let error = application
+                .read_session("credential", &installation(), read_query("session-1"))
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                error,
+                AuthoringConversationError::Authentication(authentication_error)
+            );
+            assert_eq!(authentication.counts(), (1, 0));
+            assert!(authority.calls().is_empty());
+            assert_eq!(store.counts(), (0, 0, 0, 0));
+            assert_eq!(admission.counts(), (0, 0));
+            assert_eq!(client.calls(), 0);
+        }
+    });
+}
+
+#[test]
+fn read_session_rejects_scope_and_evidence_authority_mismatch() {
+    block_on(async {
+        let mismatched_scope = AuthorizedInstallationScopeV1::from_fresh_authority(
+            TenantId::parse("tenant-1").unwrap(),
+            AutomationInstallationId::parse("installation-2").unwrap(),
+            GuildId(10),
+            UserId(20),
+        );
+        let mut mismatched_scope_evidence = ReadEvidence::valid();
+        mismatched_scope_evidence.installation_id =
+            AutomationInstallationId::parse("installation-2").unwrap();
+        let authentication = ReadAuthentication::valid("principal-1");
+        let authority =
+            ReadAuthority::with_scope_and_evidence(mismatched_scope, mismatched_scope_evidence);
+        let store = ReadStore::failed(AuthoringSessionObservationErrorV1::NotFound);
+        let admission = Admission::new();
+        let client = ScriptedClient::new(Vec::new());
+        let application = ConversationApplication::new(
+            &authentication,
+            &authority,
+            &store,
+            &admission,
+            &client,
+            AuthoringConversationConfigV1::default(),
+        );
+
+        let error = application
+            .read_session("credential", &installation(), read_query("session-1"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            AuthoringConversationError::Authority(FreshGuildAuthorityError::ScopeMismatch)
+        );
+        assert_eq!(store.counts(), (0, 0, 0, 0));
+        assert_eq!(admission.counts(), (0, 0));
+        assert_eq!(client.calls(), 0);
+
+        let authentication = ReadAuthentication::valid("principal-1");
+        let mut mismatched_evidence = ReadEvidence::valid();
+        mismatched_evidence.capability = CapabilityV1::Author;
+        let authority = ReadAuthority::with_scope_and_evidence(
+            AuthorizedInstallationScopeV1::from_fresh_authority(
+                TenantId::parse("tenant-1").unwrap(),
+                AutomationInstallationId::parse("installation-1").unwrap(),
+                GuildId(10),
+                UserId(20),
+            ),
+            mismatched_evidence,
+        );
+        let store = ReadStore::failed(AuthoringSessionObservationErrorV1::NotFound);
+        let admission = Admission::new();
+        let client = ScriptedClient::new(Vec::new());
+        let application = ConversationApplication::new(
+            &authentication,
+            &authority,
+            &store,
+            &admission,
+            &client,
+            AuthoringConversationConfigV1::default(),
+        );
+
+        let error = application
+            .read_session("credential", &installation(), read_query("session-1"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, AuthoringConversationError::AuthorityDrift);
+        assert_eq!(store.counts(), (0, 0, 0, 0));
+        assert_eq!(admission.counts(), (0, 0));
+        assert_eq!(client.calls(), 0);
+    });
+}
+
+#[test]
+fn read_session_preserves_bounded_observation_failures_without_side_effects() {
+    block_on(async {
+        for observation_error in [
+            AuthoringSessionObservationErrorV1::Timeout,
+            AuthoringSessionObservationErrorV1::Retryable,
+            AuthoringSessionObservationErrorV1::Unavailable,
+            AuthoringSessionObservationErrorV1::InvalidState,
+        ] {
+            let authentication = ReadAuthentication::valid("principal-1");
+            let authority = ReadAuthority::valid();
+            let store = ReadStore::failed(observation_error);
+            let admission = Admission::new();
+            let client = ScriptedClient::new(Vec::new());
+            let application = ConversationApplication::new(
+                &authentication,
+                &authority,
+                &store,
+                &admission,
+                &client,
+                AuthoringConversationConfigV1::default(),
+            );
+
+            let error = application
+                .read_session("credential", &installation(), read_query("session-1"))
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                error,
+                AuthoringConversationError::Observation(observation_error)
+            );
+            assert_eq!(authentication.counts(), (1, 0));
+            assert_eq!(authority.calls().len(), 1);
+            assert_eq!(store.counts(), (1, 0, 0, 0));
+            assert_eq!(admission.counts(), (0, 0));
+            assert_eq!(client.calls(), 0);
+        }
+    });
 }
 
 #[test]
@@ -908,6 +1586,44 @@ fn safe_projection_accepts_only_its_canonical_bounded_shape() {
             SafeAuthoringProjectionError::NonDurableState
         );
     }
+}
+
+fn preview_ready_projection(
+    ruleset: &str,
+    candidate_ruleset_hash: &str,
+) -> SafeAuthoringTurnProjectionV1 {
+    let projection = format!(
+        r#"{{"schema_version":1,"state":"preview_ready","assistant_message":"Preview ready","capabilities":[],"draft":{{"panels":1,"modals":0,"rules":1,"actions":1,"unresolved_references":[]}},"preview":{{"revision":1,"draft":{{"panels":1,"modals":0,"rules":1,"actions":1,"unresolved_references":[]}},"ruleset":{ruleset},"receipt":{{"identity_revision":1,"intent_revision":1,"candidate_revision":1,"request_evidence_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request_evidence_entries":1,"compiler_input_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","semantic_intent_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","compiled_plan_hash":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","candidate_ruleset_hash":"{candidate_ruleset_hash}","candidate_draft_hash":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","compiled_operations":1}}}}}}"#
+    );
+    SafeAuthoringTurnProjectionV1::from_canonical_json(projection.as_bytes()).unwrap()
+}
+
+#[test]
+fn preview_integrity_binds_a_typed_structural_ruleset_to_its_receipt() {
+    let ruleset = r#"{"modals":[],"panels":[{"buttons":[{"label":"Welcome","route":{"static":{"key":"welcome"}}}],"channel":"welcome_channel","content":"Choose a welcome","key":"welcome_panel"}],"rules":[{"actions":[{"content":"Welcome!","type":"respond_ephemeral"}],"key":"welcome_rule","trigger":{"component":"welcome","type":"button_click"}}],"version":1}"#;
+    let valid = preview_ready_projection(
+        ruleset,
+        "f283047e6367d67067822a399200ffd2ea6c1a6940969e0ab9abd399cb43d537",
+    );
+    assert_eq!(valid.validate_preview_integrity(), Ok(()));
+
+    let malformed = preview_ready_projection(
+        r#"{"malformed":true}"#,
+        "f283047e6367d67067822a399200ffd2ea6c1a6940969e0ab9abd399cb43d537",
+    );
+    assert_eq!(
+        malformed.validate_preview_integrity(),
+        Err(SafeAuthoringProjectionError::InvalidPreview)
+    );
+
+    let mismatched = preview_ready_projection(
+        ruleset,
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    assert_eq!(
+        mismatched.validate_preview_integrity(),
+        Err(SafeAuthoringProjectionError::InvalidPreview)
+    );
 }
 
 #[test]
@@ -1040,6 +1756,94 @@ fn stale_generation_fails_before_model_capacity_and_load() {
 }
 
 #[test]
+fn cancellation_before_execution_prevents_authentication_admission_model_and_commit() {
+    block_on(async {
+        let store = Store::empty();
+        let authentication = Authentication::new();
+        let authority = Authority::stable();
+        let admission = Admission::new();
+        let client = ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]);
+        let application = ConversationApplication::new(
+            &authentication,
+            &authority,
+            &store,
+            &admission,
+            &client,
+            AuthoringConversationConfigV1::default(),
+        );
+        let commit_boundary = AuthoringCommitBoundaryV1::new();
+        assert!(commit_boundary.cancel_before_commit());
+        let request = command_with_commit_boundary(
+            0,
+            "cancelled-before-start-key",
+            "Create private study rooms",
+            commit_boundary.clone(),
+        );
+
+        let error = application
+            .start_or_advance_turn("credential", "csrf", &installation(), request)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, AuthoringConversationError::CancelledBeforeCommit);
+        assert!(!commit_boundary.commit_phase_started());
+        assert_eq!(client.calls(), 0);
+        assert_eq!(admission.counts(), (0, 0));
+        assert_eq!(store.counts(), (0, 0, 0));
+        assert_eq!(authentication.calls(), 0);
+        assert_eq!(authority.calls(), 0);
+    });
+}
+
+#[test]
+fn cancellation_during_model_prevents_commit() {
+    let store = Store::empty();
+    let authentication = Authentication::new();
+    let authority = Authority::stable();
+    let admission = Admission::new();
+    let client = BlockingClient::new(Ok(private_room(0, Some("community_hub"))));
+    let application = ConversationApplication::new(
+        &authentication,
+        &authority,
+        &store,
+        &admission,
+        &client,
+        AuthoringConversationConfigV1::default(),
+    );
+    let commit_boundary = AuthoringCommitBoundaryV1::new();
+    let request = command_with_commit_boundary(
+        0,
+        "cancelled-during-model-key",
+        "Create private study rooms",
+        commit_boundary.clone(),
+    );
+
+    let result = std::thread::scope(|scope| {
+        let execution = scope.spawn(|| {
+            block_on(application.start_or_advance_turn(
+                "credential",
+                "csrf",
+                &installation(),
+                request,
+            ))
+        });
+        client.wait_until_started();
+        assert!(commit_boundary.cancel_before_commit());
+        client.release();
+        execution.join().unwrap()
+    });
+
+    assert_eq!(
+        result.unwrap_err(),
+        AuthoringConversationError::CancelledBeforeCommit
+    );
+    assert!(!commit_boundary.commit_phase_started());
+    assert_eq!(client.calls(), 1);
+    assert_eq!(admission.counts(), (1, 1));
+    assert_eq!(store.counts(), (2, 1, 0));
+}
+
+#[test]
 fn preview_ready_turn_commits_generation_one() {
     block_on(async {
         let store = Store::empty();
@@ -1087,6 +1891,45 @@ fn preview_ready_turn_commits_generation_one() {
         assert_eq!(store.counts(), (2, 1, 1));
         assert_eq!(authentication.calls(), 4);
         assert_eq!(authority.calls(), 4);
+    });
+}
+
+#[test]
+fn commit_phase_wins_the_cancellation_race_before_store_commit() {
+    block_on(async {
+        let store = Store::with_commit_boundary_probe();
+        let authentication = Authentication::new();
+        let authority = Authority::stable();
+        let admission = Admission::new();
+        let client = ScriptedClient::new(vec![Ok(private_room(0, Some("community_hub")))]);
+        let application = ConversationApplication::new(
+            &authentication,
+            &authority,
+            &store,
+            &admission,
+            &client,
+            AuthoringConversationConfigV1::default(),
+        );
+        let commit_boundary = AuthoringCommitBoundaryV1::new();
+        let request = command_with_commit_boundary(
+            0,
+            "commit-wins-key",
+            "Create private study rooms",
+            commit_boundary.clone(),
+        );
+
+        let receipt = committed(
+            application
+                .start_or_advance_turn("credential", "csrf", &installation(), request)
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(receipt.generation().get(), 1);
+        assert!(commit_boundary.commit_phase_started());
+        assert!(!commit_boundary.cancel_before_commit());
+        assert_eq!(store.commit_boundary_cancellation_results(), vec![false]);
+        assert_eq!(store.counts(), (2, 1, 1));
     });
 }
 

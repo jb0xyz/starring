@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use design_harness::{LlmClient, LlmError, LlmResponse, Message, ToolCall, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RETAINED_MODEL_CALL_METRICS: usize = 4096;
@@ -17,6 +18,28 @@ pub const SERVING_AUTH_MODE: &str = "chatgpt";
 pub const SERVING_MODEL: &str = "gpt-5.6-luna";
 pub const SERVING_PROVIDER: &str = "codex_chatgpt";
 pub const SERVING_REASONING_EFFORT: &str = "medium";
+pub const CODEX_WORKER_REQUEST_TIMEOUT_V1: Duration = REQUEST_TIMEOUT;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodexWorkerPreflightV1 {
+    concurrency_limit: usize,
+    queue_capacity: usize,
+    request_timeout: Duration,
+}
+
+impl CodexWorkerPreflightV1 {
+    pub fn concurrency_limit(self) -> usize {
+        self.concurrency_limit
+    }
+
+    pub fn queue_capacity(self) -> usize {
+        self.queue_capacity
+    }
+
+    pub fn request_timeout(self) -> Duration {
+        self.request_timeout
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,7 +76,7 @@ pub struct CodexWorkerClient {
     http: reqwest::Client,
     completion_endpoint: String,
     health_endpoint: String,
-    token: String,
+    token: Arc<Zeroizing<String>>,
     call_sequence: Arc<AtomicU64>,
     metrics: Arc<Mutex<VecDeque<CodexWorkerCallMetric>>>,
 }
@@ -172,6 +195,10 @@ impl MetricObservation {
 
 impl CodexWorkerClient {
     pub fn new(base_url: String, token: String) -> Result<Self, LlmError> {
+        Self::new_zeroizing(base_url, Zeroizing::new(token))
+    }
+
+    pub fn new_zeroizing(base_url: String, token: Zeroizing<String>) -> Result<Self, LlmError> {
         if token.trim().is_empty() {
             return Err(LlmError::Client(
                 "codex worker token must not be empty".to_string(),
@@ -201,17 +228,21 @@ impl CodexWorkerClient {
             http,
             completion_endpoint: format!("{base_url}/v1/frontier-completions"),
             health_endpoint: format!("{base_url}/health"),
-            token,
+            token: Arc::new(token),
             call_sequence: Arc::new(AtomicU64::new(0)),
             metrics: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
     pub async fn preflight(&self) -> Result<(), LlmError> {
+        self.preflight_contract().await.map(drop)
+    }
+
+    pub async fn preflight_contract(&self) -> Result<CodexWorkerPreflightV1, LlmError> {
         let response = self
             .http
             .get(&self.health_endpoint)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .send()
             .await
             .map_err(|_| LlmError::Client("codex worker preflight failed".to_string()))?;
@@ -225,7 +256,12 @@ impl CodexWorkerClient {
             .json::<WorkerHealth>()
             .await
             .map_err(|_| LlmError::Client("codex worker health is invalid".to_string()))?;
-        validate_health(&health)
+        validate_health(&health)?;
+        Ok(CodexWorkerPreflightV1 {
+            concurrency_limit: health.concurrency_limit,
+            queue_capacity: health.queue_capacity,
+            request_timeout: Duration::from_millis(health.request_timeout_ms),
+        })
     }
 
     pub fn model_call_metrics(&self) -> Result<Vec<CodexWorkerCallMetric>, LlmError> {
@@ -299,7 +335,7 @@ impl LlmClient for CodexWorkerClient {
         let response = self
             .http
             .post(&self.completion_endpoint)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
             .send()

@@ -10,6 +10,12 @@ const MAX_BODY_LIMIT: usize = 1_048_576;
 const MAX_IN_FLIGHT: usize = 4_096;
 const OAUTH_START_BUDGET_CAPACITY: u32 = 10;
 const OAUTH_START_BUDGET_REFILL_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_AUTHORING_WORKER_CALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MAX_AUTHORING_COORDINATION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const MAX_AUTHORING_REQUEST_TIMEOUT: Duration = Duration::from_secs(32 * 60);
+const MAX_AUTHORING_RETRY_AFTER_SECONDS: u64 = 60;
+const DEFAULT_AUTHORING_MAX_IN_FLIGHT: usize = 64;
+const MAX_AUTHORING_MAX_IN_FLIGHT: usize = 256;
 
 #[derive(Clone, Copy)]
 pub(crate) struct OAuthStartBudgetConfig {
@@ -46,6 +52,87 @@ pub enum HttpBoundaryConfigError {
     InvalidRequestTimeout,
     #[error("OAuth return path allowlist is invalid")]
     InvalidReturnPaths,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AuthoringHttpBoundaryConfigErrorV1 {
+    #[error("authoring worker call timeout is invalid")]
+    InvalidWorkerCallTimeout,
+    #[error("authoring coordination timeout is invalid")]
+    InvalidCoordinationTimeout,
+    #[error("authoring request timeout cannot be represented")]
+    InvalidRequestTimeout,
+    #[error("authoring retry delay is invalid")]
+    InvalidRetryAfter,
+    #[error("authoring concurrency limit is invalid")]
+    InvalidConcurrencyLimit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthoringHttpBoundaryConfigV1 {
+    request_timeout: Duration,
+    retry_after_seconds: u64,
+    max_in_flight: usize,
+}
+
+impl AuthoringHttpBoundaryConfigV1 {
+    pub fn new(
+        worker_call_timeout: Duration,
+        coordination_timeout: Duration,
+        retry_after_seconds: u64,
+    ) -> Result<Self, AuthoringHttpBoundaryConfigErrorV1> {
+        if worker_call_timeout.is_zero() || worker_call_timeout > MAX_AUTHORING_WORKER_CALL_TIMEOUT
+        {
+            return Err(AuthoringHttpBoundaryConfigErrorV1::InvalidWorkerCallTimeout);
+        }
+        if coordination_timeout.is_zero()
+            || coordination_timeout > MAX_AUTHORING_COORDINATION_TIMEOUT
+        {
+            return Err(AuthoringHttpBoundaryConfigErrorV1::InvalidCoordinationTimeout);
+        }
+        let request_timeout = worker_call_timeout
+            .checked_mul(authoring_application::AUTHORING_MAX_MODEL_CALLS_V1)
+            .and_then(|timeout| timeout.checked_add(coordination_timeout))
+            .filter(|timeout| *timeout <= MAX_AUTHORING_REQUEST_TIMEOUT)
+            .ok_or(AuthoringHttpBoundaryConfigErrorV1::InvalidRequestTimeout)?;
+        if retry_after_seconds == 0 || retry_after_seconds > MAX_AUTHORING_RETRY_AFTER_SECONDS {
+            return Err(AuthoringHttpBoundaryConfigErrorV1::InvalidRetryAfter);
+        }
+        Ok(Self {
+            request_timeout,
+            retry_after_seconds,
+            max_in_flight: DEFAULT_AUTHORING_MAX_IN_FLIGHT,
+        })
+    }
+
+    pub fn production(
+        worker_call_timeout: Duration,
+    ) -> Result<Self, AuthoringHttpBoundaryConfigErrorV1> {
+        Self::new(worker_call_timeout, Duration::from_secs(30), 1)
+    }
+
+    pub fn request_timeout(self) -> Duration {
+        self.request_timeout
+    }
+
+    pub fn retry_after_seconds(self) -> u64 {
+        self.retry_after_seconds
+    }
+
+    pub fn with_max_in_flight(
+        mut self,
+        max_in_flight: usize,
+    ) -> Result<Self, AuthoringHttpBoundaryConfigErrorV1> {
+        if max_in_flight == 0 || max_in_flight > MAX_AUTHORING_MAX_IN_FLIGHT {
+            return Err(AuthoringHttpBoundaryConfigErrorV1::InvalidConcurrencyLimit);
+        }
+        self.max_in_flight = max_in_flight;
+        Ok(self)
+    }
+
+    pub fn max_in_flight(self) -> usize {
+        self.max_in_flight
+    }
 }
 
 #[derive(Clone)]

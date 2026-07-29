@@ -389,7 +389,7 @@ fn executable_is_pinned_to_the_lifecycle_gated_operational_router() {
     let sources = source_files();
     let main = source_named(&sources, "main.rs");
     for required in [
-        "product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate",
+        "product_control_router_with_operational_v2_and_lifecycle_v1_and_authoring_v1_and_readiness_gate",
         "ProductApiReadinessGate",
         "initially_unready",
         "serve_verified_loopback_with_runtime_readiness",
@@ -401,6 +401,7 @@ fn executable_is_pinned_to_the_lifecycle_gated_operational_router() {
         "product_control_router_with_readiness_gate",
         "product_control_router_with_operational_v2",
         "product_control_router_with_operational_v2_and_readiness_gate",
+        "product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate",
         "serve_verified_loopback",
     ] {
         assert!(

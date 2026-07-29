@@ -116,7 +116,7 @@ ai-gateway = "1"
 }
 
 #[test]
-fn conversation_command_accepts_only_client_owned_turn_inputs() {
+fn conversation_command_accepts_only_client_owned_inputs_and_server_commit_boundary() {
     let command_source = include_str!("../src/conversation/command.rs");
     let command = command_source
         .split("pub struct StartOrAdvanceAuthoringTurnV1")
@@ -133,6 +133,7 @@ fn conversation_command_accepts_only_client_owned_turn_inputs() {
     assert_eq!(
         fields,
         BTreeSet::from([
+            "commit_boundary",
             "expected_generation",
             "human_message",
             "idempotency_key",

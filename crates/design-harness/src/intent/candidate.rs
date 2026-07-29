@@ -1,9 +1,12 @@
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
+use automation_core::validate::validate_structural;
+use automation_state::InteractionRuleSet;
 use resource_resolution::ResourceBindingMap;
 use schemars::JsonSchema;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::draft::Draft;
 use crate::errors::StructuredError;
@@ -34,6 +37,40 @@ pub struct IntentExecutionReportV1 {
     pub validation_passed: bool,
     pub simulation_traces: u32,
     pub close_executed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewRulesetVerificationErrorV1 {
+    Malformed,
+    UnsupportedVersion,
+    NonCanonicalShape,
+    StructurallyInvalid,
+    SerializationFailed,
+    IdentityMismatch,
+}
+
+pub fn verify_preview_ruleset_v1(
+    ruleset: &Value,
+    expected_candidate_ruleset_hash: &str,
+) -> Result<(), PreviewRulesetVerificationErrorV1> {
+    let typed = serde_json::from_value::<InteractionRuleSet>(ruleset.clone())
+        .map_err(|_| PreviewRulesetVerificationErrorV1::Malformed)?;
+    if typed.version != 1 {
+        return Err(PreviewRulesetVerificationErrorV1::UnsupportedVersion);
+    }
+    let canonical = serde_json::to_value(&typed)
+        .map_err(|_| PreviewRulesetVerificationErrorV1::SerializationFailed)?;
+    if canonical != *ruleset {
+        return Err(PreviewRulesetVerificationErrorV1::NonCanonicalShape);
+    }
+    validate_structural(&typed)
+        .map_err(|_| PreviewRulesetVerificationErrorV1::StructurallyInvalid)?;
+    let actual = candidate_ruleset_identity_hash_v1(&typed)
+        .map_err(|_| PreviewRulesetVerificationErrorV1::SerializationFailed)?;
+    if actual != expected_candidate_ruleset_hash {
+        return Err(PreviewRulesetVerificationErrorV1::IdentityMismatch);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -195,9 +232,15 @@ fn verify_external_channel_keys(
 }
 
 pub(crate) fn candidate_ruleset_hash(candidate: &Draft) -> Result<String, StructuredError> {
+    candidate_ruleset_identity_hash_v1(&candidate.ruleset)
+}
+
+fn candidate_ruleset_identity_hash_v1(
+    ruleset: &InteractionRuleSet,
+) -> Result<String, StructuredError> {
     canonical_json_digest(
         CANDIDATE_RULESET_DIGEST_DOMAIN_V1,
-        &candidate.ruleset,
+        ruleset,
         IdentityErrorSpec::new(
             "INTENT_CANDIDATE_SERIALIZATION_FAILED",
             "intent.candidate.ruleset_hash",
@@ -352,6 +395,82 @@ mod tests {
                 draft_state_hash(&content_changed).unwrap()
             );
         });
+    }
+
+    #[test]
+    fn preview_ruleset_verifier_reuses_the_candidate_identity_contract() {
+        let ruleset = json!({
+            "version": 1,
+            "panels": [{
+                "key": "welcome_panel",
+                "channel": "welcome_channel",
+                "content": "Choose a welcome",
+                "buttons": [{
+                    "label": "Welcome",
+                    "route": {"static": {"key": "welcome"}}
+                }]
+            }],
+            "modals": [],
+            "rules": [{
+                "key": "welcome_rule",
+                "trigger": {"type": "button_click", "component": "welcome"},
+                "actions": [{"type": "respond_ephemeral", "content": "Welcome!"}]
+            }]
+        });
+
+        assert_eq!(
+            verify_preview_ruleset_v1(
+                &ruleset,
+                "f283047e6367d67067822a399200ffd2ea6c1a6940969e0ab9abd399cb43d537"
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            verify_preview_ruleset_v1(
+                &ruleset,
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            Err(PreviewRulesetVerificationErrorV1::IdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn preview_ruleset_verifier_rejects_untyped_noncanonical_and_structural_inputs() {
+        assert_eq!(
+            verify_preview_ruleset_v1(
+                &json!({
+                    "version": 1,
+                    "panels": [],
+                    "modals": [],
+                    "rules": [{"key": "broken"}]
+                }),
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            Err(PreviewRulesetVerificationErrorV1::Malformed)
+        );
+        assert_eq!(
+            verify_preview_ruleset_v1(
+                &json!({"version": 1}),
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            Err(PreviewRulesetVerificationErrorV1::NonCanonicalShape)
+        );
+        assert_eq!(
+            verify_preview_ruleset_v1(
+                &json!({
+                    "version": 1,
+                    "panels": [],
+                    "modals": [],
+                    "rules": [{
+                        "key": "orphan_rule",
+                        "trigger": {"type": "button_click", "component": "missing"},
+                        "actions": [{"type": "respond_ephemeral", "content": "Welcome!"}]
+                    }]
+                }),
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            Err(PreviewRulesetVerificationErrorV1::StructurallyInvalid)
+        );
     }
 
     fn bindings(hub: &str) -> ResourceBindingMap {

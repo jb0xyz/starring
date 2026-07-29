@@ -27,18 +27,19 @@ pub use control::{
     RejectionReasonV1,
 };
 pub use conversation::{
-    AuthoringAdmissionError, AuthoringCommitOutcomeV1, AuthoringConversationConfigError,
-    AuthoringConversationConfigV1, AuthoringConversationError, AuthoringConversationStorePort,
-    AuthoringExpectedGenerationError, AuthoringExpectedGenerationV1, AuthoringHumanMessageError,
-    AuthoringHumanMessageV1, AuthoringMutationDispositionV1, AuthoringSessionCommitPort,
-    AuthoringSessionLoadError, AuthoringSessionLoadPort, AuthoringSessionLoadV1,
-    AuthoringSessionObservationErrorV1, AuthoringSessionObservationV1, AuthoringSessionReadPort,
-    AuthoringStoredGenerationV1, AuthoringStoredRequestIdentityV1, AuthoringTurnAdmissionPort,
-    AuthoringTurnCheckV1, AuthoringTurnOutcomeV1, AuthoringTurnReceiptV1,
-    AuthorizedAuthoringCommitV1, AuthorizedConversationAccessV1,
-    AuthorizedConversationReadAccessV1, ConversationApplication, LocalAuthoringRequestKeyV1,
-    ReadAuthoringSessionV1, SafeAuthoringPreviewV1, SafeAuthoringProjectionError,
-    SafeAuthoringTurnProjectionV1, SafeAuthoringTurnStateV1, StartOrAdvanceAuthoringTurnV1,
+    AuthoringAdmissionError, AuthoringCommitBoundaryV1, AuthoringCommitOutcomeV1,
+    AuthoringConversationConfigError, AuthoringConversationConfigV1, AuthoringConversationError,
+    AuthoringConversationStorePort, AuthoringExpectedGenerationError,
+    AuthoringExpectedGenerationV1, AuthoringHumanMessageError, AuthoringHumanMessageV1,
+    AuthoringMutationDispositionV1, AuthoringSessionCommitPort, AuthoringSessionLoadError,
+    AuthoringSessionLoadPort, AuthoringSessionLoadV1, AuthoringSessionObservationErrorV1,
+    AuthoringSessionObservationV1, AuthoringSessionReadPort, AuthoringStoredGenerationV1,
+    AuthoringStoredRequestIdentityV1, AuthoringTurnAdmissionPort, AuthoringTurnCheckV1,
+    AuthoringTurnOutcomeV1, AuthoringTurnReceiptV1, AuthorizedAuthoringCommitV1,
+    AuthorizedConversationAccessV1, AuthorizedConversationReadAccessV1, ConversationApplication,
+    LocalAuthoringRequestKeyV1, ReadAuthoringSessionV1, SafeAuthoringPreviewV1,
+    SafeAuthoringProjectionError, SafeAuthoringTurnProjectionV1, SafeAuthoringTurnStateV1,
+    StartOrAdvanceAuthoringTurnV1, AUTHORING_MAX_MODEL_CALLS_V1,
 };
 pub use design_harness::PreviewReadyArtifactV1;
 pub use identity::{

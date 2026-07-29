@@ -1,4 +1,6 @@
 use std::fmt::{Debug, Formatter};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use authoring_promotion::{
     AuthoringSessionId, AutomationInstallationId, PrincipalId, SessionGeneration, TenantId,
@@ -14,6 +16,65 @@ const MAX_HUMAN_MESSAGE_SCALARS: usize = 2_000;
 const MIN_CONTEXT_CHARS: usize = 8_000;
 const MAX_CONTEXT_CHARS: usize = 64_000;
 const DEFAULT_CONTEXT_CHARS: usize = 44_000;
+pub const AUTHORING_MAX_MODEL_CALLS_V1: u32 = 2;
+const AUTHORING_COMMIT_OPEN: u8 = 0;
+const AUTHORING_COMMIT_STARTED: u8 = 1;
+const AUTHORING_COMMIT_CANCELLED: u8 = 2;
+
+#[derive(Clone)]
+pub struct AuthoringCommitBoundaryV1 {
+    state: Arc<AtomicU8>,
+}
+
+impl AuthoringCommitBoundaryV1 {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(AUTHORING_COMMIT_OPEN)),
+        }
+    }
+
+    pub fn cancel_before_commit(&self) -> bool {
+        self.state
+            .compare_exchange(
+                AUTHORING_COMMIT_OPEN,
+                AUTHORING_COMMIT_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn enter_commit_phase(&self) -> bool {
+        self.state
+            .compare_exchange(
+                AUTHORING_COMMIT_OPEN,
+                AUTHORING_COMMIT_STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn commit_phase_started(&self) -> bool {
+        self.state.load(Ordering::Acquire) == AUTHORING_COMMIT_STARTED
+    }
+
+    pub(crate) fn cancelled_before_commit(&self) -> bool {
+        self.state.load(Ordering::Acquire) == AUTHORING_COMMIT_CANCELLED
+    }
+}
+
+impl Default for AuthoringCommitBoundaryV1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Debug for AuthoringCommitBoundaryV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthoringCommitBoundaryV1(<redacted>)")
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AuthoringExpectedGenerationError {
@@ -101,12 +162,13 @@ impl Debug for AuthoringHumanMessageV1 {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct StartOrAdvanceAuthoringTurnV1 {
     session_id: AuthoringSessionId,
     expected_generation: AuthoringExpectedGenerationV1,
     idempotency_key: ProductIdempotencyKeyV1,
     human_message: AuthoringHumanMessageV1,
+    commit_boundary: AuthoringCommitBoundaryV1,
 }
 
 impl Debug for StartOrAdvanceAuthoringTurnV1 {
@@ -122,11 +184,28 @@ impl StartOrAdvanceAuthoringTurnV1 {
         idempotency_key: ProductIdempotencyKeyV1,
         human_message: AuthoringHumanMessageV1,
     ) -> Self {
+        Self::new_with_commit_boundary(
+            session_id,
+            expected_generation,
+            idempotency_key,
+            human_message,
+            AuthoringCommitBoundaryV1::new(),
+        )
+    }
+
+    pub fn new_with_commit_boundary(
+        session_id: AuthoringSessionId,
+        expected_generation: AuthoringExpectedGenerationV1,
+        idempotency_key: ProductIdempotencyKeyV1,
+        human_message: AuthoringHumanMessageV1,
+        commit_boundary: AuthoringCommitBoundaryV1,
+    ) -> Self {
         Self {
             session_id,
             expected_generation,
             idempotency_key,
             human_message,
+            commit_boundary,
         }
     }
 
@@ -145,7 +224,22 @@ impl StartOrAdvanceAuthoringTurnV1 {
     pub fn human_message(&self) -> &AuthoringHumanMessageV1 {
         &self.human_message
     }
+
+    pub fn commit_boundary(&self) -> &AuthoringCommitBoundaryV1 {
+        &self.commit_boundary
+    }
 }
+
+impl PartialEq for StartOrAdvanceAuthoringTurnV1 {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.expected_generation == other.expected_generation
+            && self.idempotency_key == other.idempotency_key
+            && self.human_message == other.human_message
+    }
+}
+
+impl Eq for StartOrAdvanceAuthoringTurnV1 {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadAuthoringSessionV1 {
@@ -189,7 +283,7 @@ impl AuthoringConversationConfigV1 {
 
     pub(crate) fn session_config(&self) -> SessionConfig {
         SessionConfig {
-            max_model_calls: 2,
+            max_model_calls: AUTHORING_MAX_MODEL_CALLS_V1 as usize,
             max_tool_calls: 2,
             max_gate_failures: 1,
             context_char_budget: self.context_char_budget,

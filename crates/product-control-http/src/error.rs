@@ -12,6 +12,7 @@ pub enum FacadeErrorCode {
     Superseded,
     InvalidServerCandidate,
     UpstreamInvalidResponse,
+    AuthoringSaturated,
     DependencyUnavailable,
     DependencyTimeout,
     Internal,
@@ -34,7 +35,9 @@ impl FacadeError {
     pub fn retryable(self) -> bool {
         matches!(
             self.code,
-            FacadeErrorCode::DependencyUnavailable | FacadeErrorCode::DependencyTimeout
+            FacadeErrorCode::AuthoringSaturated
+                | FacadeErrorCode::DependencyUnavailable
+                | FacadeErrorCode::DependencyTimeout
         )
     }
 
@@ -50,7 +53,9 @@ impl FacadeError {
             | FacadeErrorCode::Superseded => StatusCode::CONFLICT,
             FacadeErrorCode::InvalidServerCandidate => StatusCode::UNPROCESSABLE_ENTITY,
             FacadeErrorCode::UpstreamInvalidResponse => StatusCode::BAD_GATEWAY,
-            FacadeErrorCode::DependencyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            FacadeErrorCode::AuthoringSaturated | FacadeErrorCode::DependencyUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             FacadeErrorCode::DependencyTimeout => StatusCode::GATEWAY_TIMEOUT,
             FacadeErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -68,6 +73,7 @@ impl FacadeError {
             FacadeErrorCode::Superseded => "superseded",
             FacadeErrorCode::InvalidServerCandidate => "invalid_server_candidate",
             FacadeErrorCode::UpstreamInvalidResponse => "upstream_invalid_response",
+            FacadeErrorCode::AuthoringSaturated => "authoring_saturated",
             FacadeErrorCode::DependencyUnavailable => "dependency_unavailable",
             FacadeErrorCode::DependencyTimeout => "dependency_timeout",
             FacadeErrorCode::Internal => "internal_error",
@@ -94,6 +100,7 @@ impl FacadeError {
             FacadeErrorCode::UpstreamInvalidResponse => {
                 "An upstream service returned an invalid response."
             }
+            FacadeErrorCode::AuthoringSaturated => "Authoring capacity is busy. Retry shortly.",
             FacadeErrorCode::DependencyUnavailable => "A required dependency is unavailable.",
             FacadeErrorCode::DependencyTimeout => "A required dependency timed out.",
             FacadeErrorCode::Internal => "The request could not be completed.",

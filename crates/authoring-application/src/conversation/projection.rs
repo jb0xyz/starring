@@ -1,7 +1,9 @@
 use std::fmt::{Debug, Formatter};
 
 use authoring_promotion::{AuthoringSessionId, SessionGeneration};
-use design_harness::{DraftSummary, IntentRecipeReceiptV2, PreviewReadyArtifactV1};
+use design_harness::{
+    verify_preview_ruleset_v1, DraftSummary, IntentRecipeReceiptV2, PreviewReadyArtifactV1,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -166,6 +168,15 @@ impl SafeAuthoringTurnProjectionV1 {
             > MAX_SAFE_PROJECTION_BYTES
         {
             return Err(SafeAuthoringProjectionError::TooLarge);
+        }
+        Ok(())
+    }
+
+    pub fn validate_preview_integrity(&self) -> Result<(), SafeAuthoringProjectionError> {
+        self.validate()?;
+        if let Some(preview) = &self.preview {
+            verify_preview_ruleset_v1(&preview.ruleset, &preview.receipt.candidate_ruleset_hash)
+                .map_err(|_| SafeAuthoringProjectionError::InvalidPreview)?;
         }
         Ok(())
     }
