@@ -1,4 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+
+#[path = "support/staging_api_capabilities.rs"]
+mod staging_api_capabilities;
+
+use staging_api_capabilities::CAPABILITIES;
 
 const BOOTSTRAP: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -8,194 +13,6 @@ const ENABLE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../ops/postgres/staging-api-role-enable.sql"
 ));
-const API_READINESS_TEST: &str = include_str!("postgres_product_api_readiness.rs");
-
-const EXPECTED_CAPABILITIES: [(&str, &str); 46] = [
-    (
-        "starring_identity_oauth",
-        "public.starring_product_oauth_database_identity_v1()",
-    ),
-    (
-        "starring_identity_oauth",
-        "public.starring_product_oauth_flow_create_v1(bytea,bytea,text,text,double precision)",
-    ),
-    (
-        "starring_identity_oauth",
-        "public.starring_product_oauth_flow_consume_v1(bytea,bytea,text,text[])",
-    ),
-    (
-        "starring_identity_issuer",
-        "public.starring_product_session_issuer_database_identity_v1()",
-    ),
-    (
-        "starring_identity_issuer",
-        "public.starring_product_session_issue_v1(bytea,text,text,timestamp with time zone,text,text,bytea,bytea,double precision,double precision)",
-    ),
-    (
-        "starring_identity_session",
-        "public.starring_product_session_api_database_identity_v1()",
-    ),
-    (
-        "starring_identity_session",
-        "public.starring_product_session_read_v1(bytea)",
-    ),
-    (
-        "starring_identity_session",
-        "public.starring_product_session_mutation_read_v1(bytea)",
-    ),
-    (
-        "starring_identity_session",
-        "public.starring_product_session_touch_v1(bytea,timestamp with time zone,timestamp with time zone,timestamp with time zone,double precision)",
-    ),
-    (
-        "starring_identity_session",
-        "public.starring_product_session_logout_read_v1(bytea)",
-    ),
-    (
-        "starring_identity_session",
-        "public.starring_product_session_logout_commit_v1(bytea,bytea,timestamp with time zone)",
-    ),
-    (
-        "starring_identity_security",
-        "public.starring_product_security_revoker_database_identity_v1()",
-    ),
-    (
-        "starring_identity_security",
-        "public.starring_product_session_security_revoke_v1(bytea)",
-    ),
-    (
-        "starring_installation_authority_reader",
-        "public.starring_product_installation_authority_reader_database_identity_v1()",
-    ),
-    (
-        "starring_installation_authority_reader",
-        "public.starring_product_installation_authority_read_v1(text,text,bytea)",
-    ),
-    (
-        "starring_authorized_snapshot_reader",
-        "public.starring_product_authorized_snapshot_reader_database_identity_v1()",
-    ),
-    (
-        "starring_authorized_snapshot_reader",
-        "public.starring_product_authorized_snapshot_read_v1(text,text,bytea,text,text)",
-    ),
-    (
-        "starring_authorized_snapshot_reader",
-        "public.starring_product_authorized_snapshot_key_coverage_v1(text[])",
-    ),
-    (
-        "starring_promotion_executor",
-        "public.starring_product_promotion_executor_database_identity_v1()",
-    ),
-    (
-        "starring_promotion_executor",
-        "public.starring_product_promotion_replay_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,bigint,text,text[],text[],text[])",
-    ),
-    (
-        "starring_promotion_executor",
-        "public.starring_product_promotion_prepare_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bytea,text,bigint,bigint,text,text,text,text,jsonb,jsonb,text,text,text[],text[],text[],text,text,text,text)",
-    ),
-    (
-        "starring_promotion_executor",
-        "public.starring_product_promotion_publish_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bigint,text,text)",
-    ),
-    (
-        "starring_promotion_executor",
-        "public.starring_product_promotion_approval_environment_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bigint,text,text)",
-    ),
-    (
-        "starring_promotion_executor",
-        "public.starring_product_promotion_activation_link_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bigint,text,text,jsonb)",
-    ),
-    (
-        "starring_promotion_executor",
-        "public.starring_product_promotion_repair_link_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text,bytea,jsonb,text,text,text[],text[],text[],text,text,text,text)",
-    ),
-    (
-        "starring_promotion_executor",
-        "public.starring_product_promotion_keyring_coverage_v1(text[],text[])",
-    ),
-    (
-        "starring_decision_reader",
-        "public.starring_product_decision_reader_database_identity_v1()",
-    ),
-    (
-        "starring_decision_reader",
-        "public.starring_product_decision_read_v1(text,text,text,text,text,text,bytea)",
-    ),
-    (
-        "starring_decision_approval",
-        "public.starring_product_approval_executor_database_identity_v1()",
-    ),
-    (
-        "starring_decision_approval",
-        "public.starring_product_approve_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text)",
-    ),
-    (
-        "starring_decision_approval",
-        "public.starring_product_approval_keyring_coverage_v1(text[],text[])",
-    ),
-    (
-        "starring_decision_rejection",
-        "public.starring_product_rejection_executor_database_identity_v1()",
-    ),
-    (
-        "starring_decision_rejection",
-        "public.starring_product_rejection_keyring_coverage_v1(text[],text[])",
-    ),
-    (
-        "starring_decision_rejection",
-        "public.starring_product_reject_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text)",
-    ),
-    (
-        "starring_decision_apply",
-        "public.starring_product_apply_executor_database_identity_v1()",
-    ),
-    (
-        "starring_decision_apply",
-        "public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
-    ),
-    (
-        "starring_decision_apply",
-        "public.starring_product_apply_target_artifact_v1(text,text,text,text,bytea,text,text)",
-    ),
-    (
-        "starring_decision_apply",
-        "public.starring_product_apply_finalize_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb)",
-    ),
-    (
-        "starring_decision_apply",
-        "public.starring_product_apply_keyring_coverage_v1(text[],text[])",
-    ),
-    (
-        "starring_decision_cancellation",
-        "public.starring_product_lifecycle_cancellation_executor_database_identity_v1()",
-    ),
-    (
-        "starring_decision_cancellation",
-        "public.starring_product_lifecycle_cancellation_keyring_coverage_v1(text[],text[])",
-    ),
-    (
-        "starring_decision_cancellation",
-        "public.starring_product_cancel_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text,bigint,text,text,bigint)",
-    ),
-    (
-        "starring_deployment_status_reader",
-        "public.starring_product_deployment_status_reader_database_identity_v1()",
-    ),
-    (
-        "starring_deployment_status_reader",
-        "public.starring_product_deployment_status_read_v1(text,text,text,text,text,text,text,text,bytea)",
-    ),
-    (
-        "starring_operational_deployment_status_reader",
-        "public.starring_product_deployment_status_reader_database_identity_v2()",
-    ),
-    (
-        "starring_operational_deployment_status_reader",
-        "public.starring_product_deployment_status_read_v2(text,text,text,text,text,text,text,text,bytea)",
-    ),
-];
 
 fn values_section<'a>(source: &'a str, insertion: &str, next: &str) -> &'a str {
     let start = source.find(insertion).unwrap();
@@ -222,6 +39,77 @@ fn tuple_rows(section: &str) -> Vec<Vec<String>> {
             Some(row.split("', '").map(ToString::to_string).collect())
         })
         .collect()
+}
+
+fn expected_roles() -> BTreeSet<String> {
+    CAPABILITIES
+        .iter()
+        .map(|capability| capability.staging_role.to_string())
+        .collect()
+}
+
+fn expected_capabilities() -> BTreeSet<(String, String)> {
+    CAPABILITIES
+        .iter()
+        .flat_map(|capability| {
+            capability
+                .functions
+                .iter()
+                .map(|function| (capability.staging_role.to_string(), (*function).to_string()))
+        })
+        .collect()
+}
+
+fn manifest_roles(source: &str, next: &str) -> Vec<String> {
+    tuple_rows(values_section(
+        source,
+        "INSERT INTO pg_temp.starring_api_request_roles",
+        next,
+    ))
+    .into_iter()
+    .map(|fields| {
+        assert_eq!(fields.len(), 1);
+        fields.into_iter().next().unwrap()
+    })
+    .collect()
+}
+
+fn manifest_capabilities(source: &str, next: &str) -> Vec<(String, String)> {
+    tuple_rows(values_section(
+        source,
+        "INSERT INTO pg_temp.starring_api_capability_manifest",
+        next,
+    ))
+    .into_iter()
+    .map(|fields| {
+        assert_eq!(fields.len(), 2);
+        (fields[0].clone(), fields[1].clone())
+    })
+    .collect()
+}
+
+fn assert_exact_set<T>(label: &str, rows: Vec<T>, expected: &BTreeSet<T>) -> BTreeSet<T>
+where
+    T: Clone + Ord + std::fmt::Debug,
+{
+    let actual = rows.iter().cloned().collect::<BTreeSet<_>>();
+    assert_eq!(
+        rows.len(),
+        actual.len(),
+        "{label} contains duplicate entries"
+    );
+    let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
+    assert!(missing.is_empty(), "{label} is missing {missing:?}");
+    let extra = actual.difference(expected).cloned().collect::<Vec<_>>();
+    assert!(extra.is_empty(), "{label} contains extra entries {extra:?}");
+    actual
+}
+
+fn assert_cardinality_guard(source: &str, expected: usize) {
+    let guard = format!(
+        "OR (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_capability_manifest) <> {expected}"
+    );
+    assert_eq!(source.matches(&guard).count(), 1);
 }
 
 #[test]
@@ -271,7 +159,10 @@ fn staging_role_bootstrap_is_atomic_bounded_and_secret_free() {
         "pg_catalog.pg_shdepend",
         "pg_catalog.pg_terminate_backend(activity.pid, 5000)",
     ] {
-        assert!(BOOTSTRAP.contains(required), "missing bootstrap guard: {required}");
+        assert!(
+            BOOTSTRAP.contains(required),
+            "missing bootstrap guard: {required}"
+        );
     }
     let upper = BOOTSTRAP.to_ascii_uppercase();
     assert!(!upper.contains("CREATE ROLE STARRING_OWNER"));
@@ -308,94 +199,42 @@ fn staging_role_bootstrap_is_atomic_bounded_and_secret_free() {
 
 #[test]
 fn staging_role_bootstrap_matches_the_fourteen_readiness_allowlists() {
-    let role_section = values_section(
-        BOOTSTRAP,
-        "INSERT INTO pg_temp.starring_api_request_roles",
-        "CREATE TEMP TABLE starring_api_capability_manifest",
-    );
-    let mut roles = tuple_rows(role_section)
-        .into_iter()
-        .map(|fields| {
-            assert_eq!(fields.len(), 1);
-            fields.into_iter().next().unwrap()
-        })
-        .collect::<Vec<_>>();
-    roles.sort();
-    let expected_counts = EXPECTED_CAPABILITIES.iter().fold(
-        BTreeMap::<&str, usize>::new(),
-        |mut counts, (role, _)| {
-            *counts.entry(role).or_default() += 1;
-            counts
-        },
-    );
-    assert_eq!(roles.len(), 14);
-    assert_eq!(
-        roles,
-        expected_counts
-            .keys()
-            .copied()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-    );
-
-    let enable_role_section = values_section(
-        ENABLE,
-        "INSERT INTO pg_temp.starring_api_request_roles",
-        "CREATE TEMP TABLE starring_api_capability_manifest",
-    );
-    let mut enable_roles = tuple_rows(enable_role_section)
-        .into_iter()
-        .map(|fields| {
-            assert_eq!(fields.len(), 1);
-            fields.into_iter().next().unwrap()
-        })
-        .collect::<Vec<_>>();
-    enable_roles.sort();
-    assert_eq!(enable_roles, roles);
-
-    let capability_section = values_section(
-        BOOTSTRAP,
-        "INSERT INTO pg_temp.starring_api_capability_manifest",
-        "DO $roles$",
-    );
-    let actual = tuple_rows(capability_section)
-        .into_iter()
-        .map(|fields| {
-            assert_eq!(fields.len(), 2);
-            (fields[0].clone(), fields[1].clone())
-        })
-        .collect::<Vec<_>>();
-    let expected = EXPECTED_CAPABILITIES
+    let fixtures = CAPABILITIES
         .iter()
-        .map(|(role, function)| ((*role).to_string(), (*function).to_string()))
-        .collect::<Vec<_>>();
-    assert_eq!(actual, expected);
-    assert_eq!(actual.len(), 46);
+        .map(|capability| capability.fixture_label)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(fixtures.len(), 14);
 
-    let enable_capability_section = values_section(
-        ENABLE,
-        "INSERT INTO pg_temp.starring_api_capability_manifest",
-        "DO $preflight$",
+    let expected_roles = expected_roles();
+    assert_eq!(expected_roles.len(), 14);
+    let bootstrap_roles = assert_exact_set(
+        "bootstrap roles",
+        manifest_roles(
+            BOOTSTRAP,
+            "CREATE TEMP TABLE starring_api_capability_manifest",
+        ),
+        &expected_roles,
     );
-    let enable_actual = tuple_rows(enable_capability_section)
-        .into_iter()
-        .map(|fields| {
-            assert_eq!(fields.len(), 2);
-            (fields[0].clone(), fields[1].clone())
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(enable_actual, expected);
+    let enable_roles = assert_exact_set(
+        "enable roles",
+        manifest_roles(ENABLE, "CREATE TEMP TABLE starring_api_capability_manifest"),
+        &expected_roles,
+    );
+    assert_eq!(bootstrap_roles, enable_roles);
 
-    for (role, function) in EXPECTED_CAPABILITIES {
-        assert!(API_READINESS_TEST.contains(function));
-        assert_eq!(
-            actual
-                .iter()
-                .filter(|(actual_role, actual_function)| {
-                    actual_role == role && actual_function == function
-                })
-                .count(),
-            1
-        );
-    }
+    let expected_capabilities = expected_capabilities();
+    assert_eq!(expected_capabilities.len(), 48);
+    let bootstrap_capabilities = assert_exact_set(
+        "bootstrap capabilities",
+        manifest_capabilities(BOOTSTRAP, "DO $roles$"),
+        &expected_capabilities,
+    );
+    let enable_capabilities = assert_exact_set(
+        "enable capabilities",
+        manifest_capabilities(ENABLE, "DO $preflight$"),
+        &expected_capabilities,
+    );
+    assert_eq!(bootstrap_capabilities, enable_capabilities);
+    assert_cardinality_guard(BOOTSTRAP, expected_capabilities.len());
+    assert_cardinality_guard(ENABLE, expected_capabilities.len());
 }

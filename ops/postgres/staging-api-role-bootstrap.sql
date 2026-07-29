@@ -120,6 +120,8 @@ VALUES
     ('starring_decision_apply', 'public.starring_product_apply_target_artifact_v1(text,text,text,text,bytea,text,text)'),
     ('starring_decision_apply', 'public.starring_product_apply_finalize_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb)'),
     ('starring_decision_apply', 'public.starring_product_apply_keyring_coverage_v1(text[],text[])'),
+    ('starring_decision_apply', 'public.starring_product_apply_begin_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text)'),
+    ('starring_decision_apply', 'public.starring_product_apply_consume_runtime_drain_v2(text,text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,bigint,bytea,text,text,text,bigint,text,text,bytea,text,bytea,text,text,bytea)'),
     ('starring_decision_cancellation', 'public.starring_product_lifecycle_cancellation_executor_database_identity_v1()'),
     ('starring_decision_cancellation', 'public.starring_product_lifecycle_cancellation_keyring_coverage_v1(text[],text[])'),
     ('starring_decision_cancellation', 'public.starring_product_cancel_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text,bigint,text,text,bigint)'),
@@ -635,7 +637,7 @@ DECLARE
 BEGIN
     IF owner_oid IS NULL
         OR (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_request_roles) <> 14
-        OR (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_capability_manifest) <> 46
+        OR (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_capability_manifest) <> 48
     THEN
         RAISE EXCEPTION 'staging API capability manifest cardinality is invalid'
             USING ERRCODE = '55000';
