@@ -17,6 +17,11 @@ use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
 use sqlx::Connection;
 use zeroize::Zeroizing;
 
+#[path = "support/staging_api_capabilities.rs"]
+mod staging_api_capabilities;
+
+use staging_api_capabilities::{CAPABILITIES, OPERATIONAL_DEPLOYMENT_STATUS_FUNCTIONS};
+
 const OAUTH_FLOW_WRITER: usize = 0;
 const SESSION_ISSUER: usize = 1;
 const SESSION_API: usize = 2;
@@ -31,100 +36,6 @@ const APPLY_EXECUTOR: usize = 10;
 const CANCELLATION_EXECUTOR: usize = 11;
 const DEPLOYMENT_STATUS: usize = 12;
 const OPERATIONAL_DEPLOYMENT_STATUS: usize = 13;
-
-const OAUTH_FLOW_FUNCTIONS: &[&str] = &[
-    "public.starring_product_oauth_database_identity_v1()",
-    "public.starring_product_oauth_flow_create_v1(bytea,bytea,text,text,double precision)",
-    "public.starring_product_oauth_flow_consume_v1(bytea,bytea,text,text[])",
-];
-const SESSION_ISSUER_FUNCTIONS: &[&str] = &[
-    "public.starring_product_session_issuer_database_identity_v1()",
-    "public.starring_product_session_issue_v1(bytea,text,text,timestamp with time zone,text,text,bytea,bytea,double precision,double precision)",
-];
-const SESSION_API_FUNCTIONS: &[&str] = &[
-    "public.starring_product_session_api_database_identity_v1()",
-    "public.starring_product_session_read_v1(bytea)",
-    "public.starring_product_session_mutation_read_v1(bytea)",
-    "public.starring_product_session_touch_v1(bytea,timestamp with time zone,timestamp with time zone,timestamp with time zone,double precision)",
-    "public.starring_product_session_logout_read_v1(bytea)",
-    "public.starring_product_session_logout_commit_v1(bytea,bytea,timestamp with time zone)",
-];
-const SECURITY_REVOKER_FUNCTIONS: &[&str] = &[
-    "public.starring_product_security_revoker_database_identity_v1()",
-    "public.starring_product_session_security_revoke_v1(bytea)",
-];
-const INSTALLATION_AUTHORITY_FUNCTIONS: &[&str] = &[
-    "public.starring_product_installation_authority_reader_database_identity_v1()",
-    "public.starring_product_installation_authority_read_v1(text,text,bytea)",
-];
-const AUTHORIZED_SNAPSHOT_FUNCTIONS: &[&str] = &[
-    "public.starring_product_authorized_snapshot_reader_database_identity_v1()",
-    "public.starring_product_authorized_snapshot_read_v1(text,text,bytea,text,text)",
-    "public.starring_product_authorized_snapshot_key_coverage_v1(text[])",
-];
-const PROMOTION_FUNCTIONS: &[&str] = &[
-    "public.starring_product_promotion_executor_database_identity_v1()",
-    "public.starring_product_promotion_replay_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,bigint,text,text[],text[],text[])",
-    "public.starring_product_promotion_prepare_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bytea,text,bigint,bigint,text,text,text,text,jsonb,jsonb,text,text,text[],text[],text[],text,text,text,text)",
-    "public.starring_product_promotion_publish_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bigint,text,text)",
-    "public.starring_product_promotion_approval_environment_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bigint,text,text)",
-    "public.starring_product_promotion_activation_link_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,bigint,text,text,jsonb)",
-    "public.starring_product_promotion_repair_link_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text,bytea,jsonb,text,text,text[],text[],text[],text,text,text,text)",
-    "public.starring_product_promotion_keyring_coverage_v1(text[],text[])",
-];
-const DECISION_READER_FUNCTIONS: &[&str] = &[
-    "public.starring_product_decision_reader_database_identity_v1()",
-    "public.starring_product_decision_read_v1(text,text,text,text,text,text,bytea)",
-];
-const APPROVAL_EXECUTOR_FUNCTIONS: &[&str] = &[
-    "public.starring_product_approval_executor_database_identity_v1()",
-    "public.starring_product_approve_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text)",
-    "public.starring_product_approval_keyring_coverage_v1(text[],text[])",
-];
-const REJECTION_EXECUTOR_FUNCTIONS: &[&str] = &[
-    "public.starring_product_rejection_executor_database_identity_v1()",
-    "public.starring_product_rejection_keyring_coverage_v1(text[],text[])",
-    "public.starring_product_reject_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text)",
-];
-const APPLY_EXECUTOR_FUNCTIONS: &[&str] = &[
-    "public.starring_product_apply_executor_database_identity_v1()",
-    "public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
-    "public.starring_product_apply_target_artifact_v1(text,text,text,text,bytea,text,text)",
-    "public.starring_product_apply_finalize_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb)",
-    "public.starring_product_apply_keyring_coverage_v1(text[],text[])",
-    "public.starring_product_apply_begin_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text)",
-    "public.starring_product_apply_consume_runtime_drain_v2(text,text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,bigint,bytea,text,text,text,bigint,text,text,bytea,text,bytea,text,text,bytea)",
-];
-const CANCELLATION_EXECUTOR_FUNCTIONS: &[&str] = &[
-    "public.starring_product_lifecycle_cancellation_executor_database_identity_v1()",
-    "public.starring_product_lifecycle_cancellation_keyring_coverage_v1(text[],text[])",
-    "public.starring_product_cancel_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text,bigint,text,text,bigint)",
-];
-const DEPLOYMENT_STATUS_FUNCTIONS: &[&str] = &[
-    "public.starring_product_deployment_status_reader_database_identity_v1()",
-    "public.starring_product_deployment_status_read_v1(text,text,text,text,text,text,text,text,bytea)",
-];
-const OPERATIONAL_DEPLOYMENT_STATUS_FUNCTIONS: &[&str] = &[
-    "public.starring_product_deployment_status_reader_database_identity_v2()",
-    "public.starring_product_deployment_status_read_v2(text,text,text,text,text,text,text,text,bytea)",
-];
-
-const CAPABILITIES: [(&str, &[&str]); 14] = [
-    ("oauth", OAUTH_FLOW_FUNCTIONS),
-    ("issuer", SESSION_ISSUER_FUNCTIONS),
-    ("session", SESSION_API_FUNCTIONS),
-    ("revoker", SECURITY_REVOKER_FUNCTIONS),
-    ("authority", INSTALLATION_AUTHORITY_FUNCTIONS),
-    ("snapshot", AUTHORIZED_SNAPSHOT_FUNCTIONS),
-    ("promotion", PROMOTION_FUNCTIONS),
-    ("decision", DECISION_READER_FUNCTIONS),
-    ("approval", APPROVAL_EXECUTOR_FUNCTIONS),
-    ("rejection", REJECTION_EXECUTOR_FUNCTIONS),
-    ("apply", APPLY_EXECUTOR_FUNCTIONS),
-    ("cancellation", CANCELLATION_EXECUTOR_FUNCTIONS),
-    ("status", DEPLOYMENT_STATUS_FUNCTIONS),
-    ("operational", OPERATIONAL_DEPLOYMENT_STATUS_FUNCTIONS),
-];
 
 static SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -212,8 +123,9 @@ fn primary_roles() -> Vec<RoleCredentials> {
     let shared_suffix = suffix();
     CAPABILITIES
         .iter()
-        .map(|(label, _)| {
-            let name = format!("starring_api_{label}_{shared_suffix}");
+        .map(|capability| {
+            assert_safe_identifier(capability.staging_role);
+            let name = format!("starring_api_{}_{shared_suffix}", capability.fixture_label);
             assert_safe_identifier(&name);
             RoleCredentials {
                 name,
@@ -382,8 +294,8 @@ async fn provision_primary(
     normalize_public_ownership(database, owner).await;
     seal_database(database).await;
     grant_database_access(database, owner, roles.iter().map(|role| role.name.clone())).await;
-    for ((_, functions), role) in CAPABILITIES.iter().zip(roles) {
-        grant_functions(database, &role.name, functions).await;
+    for (capability, role) in CAPABILITIES.iter().zip(roles) {
+        grant_functions(database, &role.name, capability.functions).await;
     }
     let mut pools = Vec::with_capacity(roles.len());
     for role in roles {

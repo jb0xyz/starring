@@ -546,12 +546,14 @@ Stated as capabilities (durable across the phase numbering):
   approval executor is function-scoped behind a separate credential with exact
   topology, approval, keyring-coverage, trigger, relation, rollback-probe, and
   cross-pool readiness checks. Apply is independently function-scoped behind a
-  five-function credential covering topology, lock, bounded target-artifact
-  projection, finalization, and Apply-only keyring coverage. Its readiness gate
-  verifies 18 direct and transitive relations, the exact internal helper and
-  24-trigger graph, trusted schema and role topology, exact executable and
-  argument manifests, rollback-only probes, and full reader/approval/Apply
-  three-role composition. A restricted direct-login PostgreSQL test completes
+  seven-function credential covering topology, lock, bounded target-artifact
+  projection, finalization, Apply-only keyring coverage, runtime-drain begin,
+  and runtime-drain consumption. Its readiness gate verifies 25 direct and
+  transitive relations, the exact internal helper and 24-trigger graph, trusted
+  schema and role topology, exact executable and argument manifests,
+  rollback-only lock, artifact, finalizer, drain-begin, and drain-consumption
+  probes, and full reader/approval/Apply three-role composition. A restricted
+  direct-login PostgreSQL test completes
   a real Apply and exact replay while direct relation access, DML, DDL,
   temporary objects, unrelated capabilities, PUBLIC grants, metadata drift,
   RLS drift, trigger drift, and incomplete key coverage fail closed.
