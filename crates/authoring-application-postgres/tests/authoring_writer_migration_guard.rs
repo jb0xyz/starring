@@ -64,6 +64,11 @@ fn atomic_commit_prioritizes_replay_and_rechecks_authority() {
         "INSERT INTO public.authoring_sessions",
         "INSERT INTO public.authoring_session_generations",
         "UPDATE public.authoring_sessions",
+        "authoring_sessions_assert_head_insert",
+        "authoring_sessions_assert_head_update",
+        "authoring_generations_assert_head",
+        "IMMEDIATE;",
+        "DEFERRED;",
     ] {
         assert!(MIGRATION.contains(required), "missing {required}");
     }
@@ -74,6 +79,7 @@ fn atomic_commit_prioritizes_replay_and_rechecks_authority() {
         .find("outcome_code := 'generation_conflict'")
         .expect("generation conflict outcome");
     assert!(replay < generation_conflict);
+    assert!(!MIGRATION.contains("pg_catalog.greatest("));
     for forbidden in [
         "raw_model_response",
         "backend_error",

@@ -1165,7 +1165,7 @@ BEGIN
     IF expected_generation <> 0 THEN
         UPDATE public.authoring_sessions AS authoring_session
         SET current_generation = successor_generation,
-            updated_at = pg_catalog.greatest(
+            updated_at = GREATEST(
                 pg_catalog.clock_timestamp(),
                 authoring_session.updated_at + INTERVAL '1 microsecond'
             )
@@ -1180,6 +1180,17 @@ BEGIN
                 USING ERRCODE = '40001';
         END IF;
     END IF;
+
+    SET CONSTRAINTS
+        authoring_sessions_assert_head_insert,
+        authoring_sessions_assert_head_update,
+        authoring_generations_assert_head
+        IMMEDIATE;
+    SET CONSTRAINTS
+        authoring_sessions_assert_head_insert,
+        authoring_sessions_assert_head_update,
+        authoring_generations_assert_head
+        DEFERRED;
 
     outcome_code := 'committed';
     current_generation := successor_generation;

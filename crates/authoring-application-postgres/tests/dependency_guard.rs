@@ -1693,6 +1693,10 @@ fn source_files_contain_no_comments() {
             include_str!("authoring_writer_migration_guard.rs"),
         ),
         (
+            "tests/postgres_authoring_writer.rs",
+            include_str!("postgres_authoring_writer.rs"),
+        ),
+        (
             "tests/postgres_adapter.rs",
             include_str!("postgres_adapter.rs"),
         ),
