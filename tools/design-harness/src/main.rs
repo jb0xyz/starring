@@ -1,5 +1,4 @@
 mod client;
-mod codex_worker;
 mod config;
 mod eval;
 mod store;
@@ -18,13 +17,13 @@ use design_harness::{
     ResourceBindingMap, SessionConfig, SessionSnapshot, SessionSnapshotError, StructuredError,
     ToolCall, ToolDefinition, TurnIntent,
 };
+use design_harness_codex_worker_client::CodexWorkerClient;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::{GemmaClient, ModelCallMetric};
-use crate::codex_worker::CodexWorkerClient;
 use crate::config::{
     intent_bindings_from_env, CodexWorkerConfig, EdgeConfig, HarnessMode, PersistenceConfig,
     SERVING_MODEL,
@@ -47,6 +46,7 @@ impl IntentMetricsSource for GemmaClient {
 impl IntentMetricsSource for CodexWorkerClient {
     fn model_call_metrics(&self) -> Result<Vec<ModelCallMetric>, LlmError> {
         CodexWorkerClient::model_call_metrics(self)
+            .map(|metrics| metrics.into_iter().map(ModelCallMetric::from).collect())
     }
 }
 

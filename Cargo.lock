@@ -1011,6 +1011,7 @@ name = "design-harness-cli"
 version = "0.1.0"
 dependencies = [
  "design-harness",
+ "design-harness-codex-worker-client",
  "desired-state",
  "discord-model",
  "reqwest",
@@ -1019,6 +1020,17 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
+name = "design-harness-codex-worker-client"
+version = "0.1.0"
+dependencies = [
+ "design-harness",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

@@ -298,7 +298,7 @@ removing security, restart, failure, or release gates.
 
 ## Progress ledger
 
-- [ ] A1. Extract the reusable Codex worker client
+- [x] A1. Extract the reusable Codex worker client
 - [ ] A2. Add the pure conversation application
 - [ ] A3. Add authenticated snapshot encryption and writer persistence
 - [ ] A4. Provision the writer capability
