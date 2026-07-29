@@ -54,7 +54,7 @@ SELECT
         AND NOT administrator.rolbypassrls
         AND administrator.rolconnlimit = 2
         AND administrator.rolvaliduntil =
-            'infinity'::PG_CATALOG.TIMESTAMP WITH TIME ZONE,
+            'infinity'::PG_CATALOG.TIMESTAMPTZ,
     NOT EXISTS (
         SELECT 1
         FROM pg_catalog.pg_auth_members AS membership
@@ -1093,6 +1093,12 @@ mod tests {
         ] {
             assert!(exact_admin_target_connect_options(invalid.as_bytes(), "test").is_err());
         }
+    }
+
+    #[test]
+    fn cluster_preflight_uses_a_schema_qualified_atomic_type_name() {
+        assert!(CLUSTER_PREFLIGHT_SQL.contains("'infinity'::PG_CATALOG.TIMESTAMPTZ"));
+        assert!(!CLUSTER_PREFLIGHT_SQL.contains("PG_CATALOG.TIMESTAMP WITH TIME ZONE"));
     }
 
     #[test]
