@@ -1,7 +1,64 @@
 use super::*;
 
+struct ApplyAuthorityCheck {
+    events: Arc<Mutex<Vec<&'static str>>>,
+    capability: Mutex<Option<CapabilityV1>>,
+}
+
+impl FreshGuildAuthorityPort for ApplyAuthorityCheck {
+    type Evidence = Evidence;
+
+    async fn authorize_installation(
+        &self,
+        actor: &AuthenticatedActorV1,
+        installation: &InstallationSelectorV1,
+        capability: CapabilityV1,
+    ) -> Result<AuthorizedInstallationV1<Self::Evidence>, FreshGuildAuthorityError> {
+        self.events.lock().unwrap().push("authorize");
+        assert_eq!(actor.principal_id().as_str(), "principal-1");
+        assert_eq!(installation.installation_id().as_str(), "installation-2");
+        *self.capability.lock().unwrap() = Some(capability);
+        Ok(AuthorizedInstallationV1::from_fresh_authority(
+            AuthorizedInstallationScopeV1::from_fresh_authority(
+                TenantId::parse("tenant-1").unwrap(),
+                AutomationInstallationId::parse("installation-2").unwrap(),
+                GuildId(900),
+                UserId(200),
+            ),
+            Evidence("fresh-authority-evidence"),
+        ))
+    }
+}
+
 fn promotion_id() -> PromotionId {
     PromotionId::parse(&"a".repeat(64)).unwrap()
+}
+
+#[test]
+fn authority_check_authenticates_and_requires_fresh_apply_authority_only() {
+    block_on(async {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let authentication = Authentication {
+            events: events.clone(),
+            failure: None,
+        };
+        let authority = ApplyAuthorityCheck {
+            events: events.clone(),
+            capability: Mutex::new(None),
+        };
+        ProductControlApplication::new(&authentication, &authority, &(), &())
+            .check_apply_authority("opaque-session-token", &installation())
+            .await
+            .unwrap();
+        assert_eq!(
+            *authority.capability.lock().unwrap(),
+            Some(CapabilityV1::Apply)
+        );
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["authenticate", "authorize"]
+        );
+    });
 }
 
 fn approve_command() -> ApproveProductPromotionV1 {

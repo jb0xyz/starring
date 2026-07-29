@@ -20,6 +20,16 @@ where
     A: AuthenticationPort,
     G: FreshGuildAuthorityPort,
 {
+    pub async fn check_apply_authority(
+        &self,
+        credential: &A::Credential,
+        installation: &InstallationSelectorV1,
+    ) -> Result<(), ProductApplicationError> {
+        self.authenticate_and_authorize(credential, installation, CapabilityV1::Apply)
+            .await
+            .map(drop)
+    }
+
     pub async fn get_product_status(
         &self,
         credential: &A::Credential,

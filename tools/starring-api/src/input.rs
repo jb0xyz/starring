@@ -362,7 +362,7 @@ fn parse_request_id(
     ProductRequestIdV1::parse(value.as_str()).map_err(internal)
 }
 
-fn parse_installation(value: &str) -> Result<InstallationSelectorV1, FacadeError> {
+pub(crate) fn parse_installation(value: &str) -> Result<InstallationSelectorV1, FacadeError> {
     AutomationInstallationId::parse(value)
         .map(InstallationSelectorV1::new)
         .map_err(internal)
