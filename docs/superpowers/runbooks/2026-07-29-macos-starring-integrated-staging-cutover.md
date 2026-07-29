@@ -466,6 +466,7 @@ Keychain item.
   test ! -e "$STARRING_PGDATA"
   test ! -e "$STARRING_BOOTSTRAP_SOCKET_DIR"
   mkdir -m 700 "$STARRING_BOOTSTRAP_SOCKET_DIR"
+  chgrp "$(id -gn)" "$STARRING_BOOTSTRAP_SOCKET_DIR"
   test "$(stat -f '%Su:%Sg:%Lp' "$STARRING_BOOTSTRAP_SOCKET_DIR")" \
     = "$(id -un):$(id -gn):700"
   LC_ALL=C /opt/homebrew/opt/postgresql@16/bin/initdb \
