@@ -51,7 +51,6 @@ fn source_files_contain_no_comments() {
             assert!(
                 !trimmed.starts_with("//")
                     && !trimmed.starts_with("/*")
-                    && !trimmed.starts_with('*')
                     && !trimmed.ends_with("*/"),
                 "source comment at {path}:{}",
                 index + 1
@@ -61,20 +60,37 @@ fn source_files_contain_no_comments() {
 }
 
 #[test]
-fn cancellation_authority_has_a_distinct_length_framed_digest_domain() {
+fn mutation_authorities_have_distinct_length_framed_digest_domains() {
     let adapter = include_str!("../src/adapter.rs");
     let base = "starring.discord-authority.v1";
+    let author = "starring.discord-authority.author.v1";
     let apply = "starring.discord-authority.apply-runtime.v1";
     let cancellation = "starring.discord-authority.cancel-lifecycle-runtime.v1";
-    assert_ne!(base, apply);
-    assert_ne!(base, cancellation);
-    assert_ne!(apply, cancellation);
-    for domain in [base, apply, cancellation] {
+    let domains = [base, author, apply, cancellation];
+    for (index, left) in domains.iter().enumerate() {
+        for right in domains.iter().skip(index + 1) {
+            assert_ne!(left, right);
+        }
+    }
+    for domain in domains {
         assert_eq!(adapter.matches(domain).count(), 1);
     }
     assert!(adapter.contains("update_field(&mut hasher, digest_domain);"));
+    assert!(adapter.contains("CapabilityV1::Author => AUTHOR_AUTHORITY_DIGEST_DOMAIN_V1"));
     assert!(adapter.contains(
         "CapabilityV1::CancelLifecycle => CANCEL_LIFECYCLE_RUNTIME_AUTHORITY_DIGEST_DOMAIN_V1"
     ));
-    assert!(adapter.contains("CapabilityV1::Apply | CapabilityV1::CancelLifecycle"));
+    let compact = adapter.split_whitespace().collect::<String>();
+    assert!(compact.contains("CapabilityV1::Author=>b\"author\""));
+    assert!(compact.contains(
+        "CapabilityV1::Author|CapabilityV1::Promote|CapabilityV1::Approve|CapabilityV1::Reject|CapabilityV1::Apply|CapabilityV1::CancelLifecycle=>self.write_lifetime"
+    ));
+    assert!(compact.contains("ifwrite_lifetime.is_zero()||write_lifetime>Duration::from_secs(5)"));
+    assert!(compact.contains(
+        "Self::new(Duration::from_secs(5),Duration::from_secs(5),Duration::from_secs(30),)"
+    ));
+    assert!(
+        compact.contains("matches!(capability,CapabilityV1::Apply|CapabilityV1::CancelLifecycle)")
+    );
+    assert!(!compact.contains("matches!(capability,CapabilityV1::Author|CapabilityV1::Apply"));
 }

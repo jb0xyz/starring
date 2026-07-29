@@ -1,6 +1,7 @@
 mod application;
 mod authority;
 mod control;
+mod conversation;
 mod identity;
 mod lifecycle;
 mod promotion;
@@ -25,6 +26,19 @@ pub use control::{
     ProductStatusQueryV1, PromotionSelectorV1, RejectProductPromotionV1, RejectionReasonError,
     RejectionReasonV1,
 };
+pub use conversation::{
+    AuthoringAdmissionError, AuthoringCommitOutcomeV1, AuthoringConversationConfigError,
+    AuthoringConversationConfigV1, AuthoringConversationError, AuthoringConversationStorePort,
+    AuthoringExpectedGenerationError, AuthoringExpectedGenerationV1, AuthoringHumanMessageError,
+    AuthoringHumanMessageV1, AuthoringMutationDispositionV1, AuthoringSessionCommitPort,
+    AuthoringSessionLoadError, AuthoringSessionLoadPort, AuthoringSessionLoadV1,
+    AuthoringStoredGenerationV1, AuthoringStoredRequestIdentityV1, AuthoringTurnAdmissionPort,
+    AuthoringTurnCheckV1, AuthoringTurnOutcomeV1, AuthoringTurnReceiptV1,
+    AuthorizedAuthoringCommitV1, AuthorizedConversationAccessV1, ConversationApplication,
+    LocalAuthoringRequestKeyV1, SafeAuthoringPreviewV1, SafeAuthoringProjectionError,
+    SafeAuthoringTurnProjectionV1, SafeAuthoringTurnStateV1, StartOrAdvanceAuthoringTurnV1,
+};
+pub use design_harness::PreviewReadyArtifactV1;
 pub use identity::{
     AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationBackendFailureV1,
     AuthenticationClaimsV1, AuthenticationError, AuthenticationPort, MutationAuthenticationPort,

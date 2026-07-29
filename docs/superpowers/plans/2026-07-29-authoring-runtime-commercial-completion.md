@@ -299,7 +299,7 @@ removing security, restart, failure, or release gates.
 ## Progress ledger
 
 - [x] A1. Extract the reusable Codex worker client
-- [ ] A2. Add the pure conversation application
+- [x] A2. Add the pure conversation application
 - [ ] A3. Add authenticated snapshot encryption and writer persistence
 - [ ] A4. Provision the writer capability
 - [ ] A5. Expose authenticated authoring HTTP routes

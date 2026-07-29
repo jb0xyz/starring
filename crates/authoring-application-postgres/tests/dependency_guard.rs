@@ -1800,3 +1800,20 @@ fn source_files_contain_no_comments() {
         }
     }
 }
+
+#[test]
+fn author_capability_has_exhaustive_non_product_postgres_classification() {
+    let decisions = include_str!("../src/product_decisions/row.rs")
+        .split_whitespace()
+        .collect::<String>();
+    assert!(decisions.contains(
+        "CapabilityV1::Author|CapabilityV1::Promote|CapabilityV1::Approve|CapabilityV1::Reject|CapabilityV1::Apply|CapabilityV1::CancelLifecycle=>MAX_WRITE_AUTHORITY_LIFETIME"
+    ));
+
+    let deployment_status = include_str!("../src/deployment_status/row.rs")
+        .split_whitespace()
+        .collect::<String>();
+    assert!(deployment_status.contains(
+        "CapabilityV1::Author|CapabilityV1::Promote|CapabilityV1::Approve|CapabilityV1::Reject|CapabilityV1::CancelLifecycle=>None"
+    ));
+}

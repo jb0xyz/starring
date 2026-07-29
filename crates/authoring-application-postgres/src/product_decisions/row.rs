@@ -180,7 +180,8 @@ fn authority_evidence_lifetime_is_bounded(
 ) -> bool {
     let maximum = match capability {
         CapabilityV1::Read => MAX_READ_AUTHORITY_LIFETIME,
-        CapabilityV1::Promote
+        CapabilityV1::Author
+        | CapabilityV1::Promote
         | CapabilityV1::Approve
         | CapabilityV1::Reject
         | CapabilityV1::Apply

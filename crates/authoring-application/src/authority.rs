@@ -23,6 +23,7 @@ impl InstallationSelectorV1 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapabilityV1 {
+    Author,
     Promote,
     Read,
     Approve,
