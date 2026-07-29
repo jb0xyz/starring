@@ -89,3 +89,10 @@ fn atomic_commit_prioritizes_replay_and_rechecks_authority() {
         assert!(!MIGRATION.contains(forbidden), "forbidden {forbidden}");
     }
 }
+
+#[test]
+fn migration_restores_the_sqlx_ledger_search_path() {
+    assert!(MIGRATION
+        .trim_end()
+        .ends_with("SET LOCAL search_path = public, pg_catalog;"));
+}

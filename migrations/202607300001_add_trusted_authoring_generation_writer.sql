@@ -2183,3 +2183,5 @@ BEGIN
     END IF;
 END;
 $postflight$;
+
+SET LOCAL search_path = public, pg_catalog;
