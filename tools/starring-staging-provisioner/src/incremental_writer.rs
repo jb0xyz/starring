@@ -485,6 +485,15 @@ SELECT
             'starring_authoring_session_writer'
         )
     )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_default_acl AS defaults
+        CROSS JOIN LATERAL pg_catalog.aclexplode(defaults.defaclacl) AS privilege
+        WHERE privilege.grantee IN (
+            0,
+            pg_catalog.to_regrole('starring_authoring_session_writer')
+        )
+    )
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1011,6 +1020,26 @@ async fn rollback_authoring_writer(
 mod tests {
     use super::*;
 
+    const VERIFY_WRITER_DEFAULT_ACL_CONTRACT_SQL: &str = r#"
+SELECT
+    NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_default_acl AS defaults
+        WHERE defaults.defaclrole = pg_catalog.to_regrole(
+            'starring_authoring_session_writer'
+        )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_default_acl AS defaults
+        CROSS JOIN LATERAL pg_catalog.aclexplode(defaults.defaclacl) AS privilege
+        WHERE privilege.grantee IN (
+            0,
+            pg_catalog.to_regrole('starring_authoring_session_writer')
+        )
+    )
+"#;
+
     #[test]
     fn state_machine_accepts_only_fresh_or_complete_replay() {
         assert_eq!(
@@ -1077,6 +1106,22 @@ mod tests {
         assert!(VERIFY_WRITER_CONTRACT_SQL.contains(
             "WHEN relation.relkind = 'S'\n                THEN pg_catalog.has_sequence_privilege"
         ));
+    }
+
+    #[test]
+    fn writer_contract_rejects_owned_direct_and_public_default_acl_paths() {
+        assert!(VERIFY_WRITER_CONTRACT_SQL.contains(
+            "WHERE defaults.defaclrole = pg_catalog.to_regrole(\n            'starring_authoring_session_writer'\n        )"
+        ));
+        assert!(VERIFY_WRITER_CONTRACT_SQL.contains(
+            "CROSS JOIN LATERAL pg_catalog.aclexplode(defaults.defaclacl) AS privilege\n        WHERE privilege.grantee IN (\n            0,\n            pg_catalog.to_regrole('starring_authoring_session_writer')\n        )"
+        ));
+        assert_eq!(
+            VERIFY_WRITER_CONTRACT_SQL
+                .matches("FROM pg_catalog.pg_default_acl AS defaults")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1228,6 +1273,28 @@ mod tests {
                 .fetch_one(&mut target)
                 .await
                 .unwrap();
+            let exact: bool = sqlx::query_scalar(VERIFY_WRITER_DEFAULT_ACL_CONTRACT_SQL)
+                .fetch_one(&mut target)
+                .await
+                .unwrap();
+            assert!(exact);
+            for statement in [
+                "ALTER DEFAULT PRIVILEGES FOR ROLE starring_authoring_session_writer REVOKE ALL PRIVILEGES ON TABLES FROM starring_authoring_session_writer",
+                "ALTER DEFAULT PRIVILEGES FOR ROLE starring_owner IN SCHEMA public GRANT SELECT ON TABLES TO starring_authoring_session_writer",
+                "ALTER DEFAULT PRIVILEGES FOR ROLE starring_owner IN SCHEMA public GRANT USAGE ON SEQUENCES TO PUBLIC",
+            ] {
+                let mut transaction = target.begin().await.unwrap();
+                sqlx::query(statement)
+                    .execute(&mut *transaction)
+                    .await
+                    .unwrap();
+                let exact: bool = sqlx::query_scalar(VERIFY_WRITER_DEFAULT_ACL_CONTRACT_SQL)
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .unwrap();
+                assert!(!exact, "{statement}");
+                transaction.rollback().await.unwrap();
+            }
         } else {
             let verifier =
                 crate::crypto::scram_verifier(b"contract-parse", b"0123456789abcdef").unwrap();
