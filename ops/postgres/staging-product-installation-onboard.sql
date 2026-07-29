@@ -199,7 +199,8 @@ BEGIN
         OR created_by_discord_user_id !~ '^[1-9][0-9]{0,19}$'
         OR created_by_discord_user_id::PG_CATALOG.NUMERIC
             > 18446744073709551615
-        OR binding_fingerprint !~ '^[0-9a-f]{64}$'
+        OR binding_fingerprint IS DISTINCT FROM
+            'a44fd4f629a1183147a25a8afb93b026de7e3f92efe737637da222617df0c655'
         OR authority_payload_digest !~ '^[0-9a-f]{64}$'
         OR created_by_request_digest !~ '^[0-9a-f]{64}$'
         OR commit_onboarding NOT IN ('true', 'false')
