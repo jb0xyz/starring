@@ -68,6 +68,7 @@ async fn run() -> ExitStatusV1 {
             }
         }
     };
+    emit_authoring_composition_status(service.authoring_dependencies_available());
     if shutdown.received_now().await {
         return close_cancelled_service(service).await;
     }
@@ -382,6 +383,19 @@ fn emit_status(status: ExitStatusV1) {
     }
 }
 
+fn emit_authoring_composition_status(available: bool) {
+    let mut stderr = std::io::stderr().lock();
+    let _write_result = write_authoring_composition_status(&mut stderr, available);
+}
+
+fn write_authoring_composition_status(
+    mut destination: impl Write,
+    available: bool,
+) -> std::io::Result<()> {
+    let status = if available { "ready" } else { "unavailable" };
+    writeln!(destination, "starring_api_authoring_status={status}")
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -413,6 +427,22 @@ mod tests {
         assert!(!status.success());
         assert!(ExitStatusV1::CleanShutdown.success());
         assert!(ExitStatusV1::StartupCancelled.success());
+    }
+
+    #[test]
+    fn authoring_composition_status_is_closed_and_finite() {
+        let mut ready = Vec::new();
+        let mut unavailable = Vec::new();
+        write_authoring_composition_status(&mut ready, true).unwrap();
+        write_authoring_composition_status(&mut unavailable, false).unwrap();
+        assert_eq!(
+            String::from_utf8(ready).unwrap(),
+            "starring_api_authoring_status=ready\n"
+        );
+        assert_eq!(
+            String::from_utf8(unavailable).unwrap(),
+            "starring_api_authoring_status=unavailable\n"
+        );
     }
 
     #[test]
