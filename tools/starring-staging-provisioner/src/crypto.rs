@@ -42,6 +42,26 @@ pub struct DatabaseSecretV1 {
 }
 
 impl DatabaseSecretV1 {
+    pub(crate) fn generate(identity: DatabaseIdentityV1) -> Result<Self, ProvisionerErrorV1> {
+        let mut source = SystemRandomSourceV1;
+        Self::generate_with(identity, &mut source)
+    }
+
+    fn generate_with(
+        identity: DatabaseIdentityV1,
+        source: &mut impl RandomSourceV1,
+    ) -> Result<Self, ProvisionerErrorV1> {
+        let password = unique_password(source, std::iter::empty())?;
+        let verifier = random_scram_verifier(source, password.as_bytes())?;
+        let url = database_url(identity.role, password.as_str(), DATABASE_NAME);
+        Ok(Self {
+            identity,
+            password,
+            verifier,
+            url,
+        })
+    }
+
     pub fn identity(&self) -> DatabaseIdentityV1 {
         self.identity
     }
@@ -458,6 +478,31 @@ mod tests {
         assert_ne!(
             keyrings[0]["active"]["material"],
             keyrings[1]["active"]["material"]
+        );
+    }
+
+    #[test]
+    fn incremental_database_secret_generates_only_the_requested_identity() {
+        let mut random = DeterministicRandomV1 { state: 7 };
+        let secret = DatabaseSecretV1::generate_with(
+            crate::identity::AUTHORING_WRITER_IDENTITY,
+            &mut random,
+        )
+        .unwrap();
+        assert_eq!(
+            secret.identity(),
+            crate::identity::AUTHORING_WRITER_IDENTITY
+        );
+        assert_eq!(secret.password().len(), 43);
+        assert!(valid_scram_verifier(secret.verifier()));
+        assert_eq!(
+            std::str::from_utf8(secret.url()).unwrap(),
+            database_url(
+                crate::identity::AUTHORING_WRITER_IDENTITY.role,
+                secret.password(),
+                DATABASE_NAME
+            )
+            .as_str()
         );
     }
 

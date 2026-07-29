@@ -1833,6 +1833,81 @@ variable:
 The final HBA and these probes supersede every HBA installation or proof block
 in the component runbooks.
 
+### Existing nineteen-role staging cluster: incremental authoring writer
+
+This subsection applies only to the already provisioned staging cluster that
+has fourteen API roles, five runtime roles, the final TCP administrator
+credential, and no authoring-writer role or Keychain item. Do not rerun the
+one-shot provisioner and do not replay either full role bootstrap against that
+cluster.
+
+Keep the API stopped while applying the trusted authoring-writer migration.
+Install and reload the reviewed
+`ops/postgres/staging-integrated-pg_hba.conf` after confirming its API allow
+and reject rows include `starring_authoring_session_writer`. Build and install
+the provisioner from the same approved revision as the migration and HBA.
+Before the first invocation, prove only the new item is absent without reading
+any Keychain value:
+
+```zsh
+(
+  set -euo pipefail
+  set +x
+  cd /Users/jungbogeon/starring
+  cmp -s "$STARRING_PGDATA/pg_hba.conf" \
+    ops/postgres/staging-integrated-pg_hba.conf
+  ! /usr/bin/security find-generic-password \
+    -s starring-api.staging \
+    -a database.authoring-session-writer >/dev/null 2>&1
+)
+```
+
+Run the incremental mode twice. The first call must create exactly one
+credential and the second must prove exact replay:
+
+```zsh
+(
+  set -euo pipefail
+  set +x
+  env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$STARRING_PROVISIONER_BINARY" \
+    --provision-authoring-writer \
+    "$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    >"$STARRING_CUTOVER_EVIDENCE/authoring-writer-created.txt"
+  grep -Fx \
+    'provisioned authoring_writer=created database=starring_runtime_staging credential_items=1 capabilities=5 snapshot_reader=v2_only' \
+    "$STARRING_CUTOVER_EVIDENCE/authoring-writer-created.txt" >/dev/null
+  env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$STARRING_PROVISIONER_BINARY" \
+    --provision-authoring-writer \
+    "$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    >"$STARRING_CUTOVER_EVIDENCE/authoring-writer-replay.txt"
+  grep -Fx \
+    'provisioned authoring_writer=exact_replay database=starring_runtime_staging credential_items=1 capabilities=5 snapshot_reader=v2_only' \
+    "$STARRING_CUTOVER_EVIDENCE/authoring-writer-replay.txt" >/dev/null
+  /usr/bin/security find-generic-password \
+    -s starring-api.staging \
+    -a database.authoring-session-writer >/dev/null
+)
+```
+
+The incremental mode serializes concurrent attempts, reads only the existing
+administrator credential, and writes only the authoring-writer item. One
+serializable transaction creates the new role with its exact five functions
+and atomically replaces the existing snapshot reader's v1 execute with v2
+execute. It does not change any other role, credential, keyring, or ACL. Fresh
+state is exactly absent writer role, absent writer item, and v1-only snapshot
+reader access. Replay is exactly complete writer state and v2-only snapshot
+reader access. Mixed, missing, or excess access fails closed. A missing
+migration, old HBA, malformed replay, or asymmetric role and Keychain state
+stops with a stable error code. A pre-commit failure restores the Keychain
+item. A commit-indeterminate or failed compensating rollback preserves the
+generated item for reconciliation instead of destroying the only matching
+credential. A successful compensating rollback restores v1-only snapshot
+access before dropping the writer and removing its Keychain item.
+
 ## Gate 11: prove the exact Keychain inventory without reading values
 
 Gate 10 already created the twenty database URLs and two keyrings and left the

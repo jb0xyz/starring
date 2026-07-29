@@ -20,6 +20,11 @@ pub const ADMIN_KEYCHAIN_SERVICE: &str = "starring.postgres.staging";
 pub const ADMIN_KEYCHAIN_ACCOUNT: &str = "database.cluster-admin";
 pub const PRODUCT_ACTION_KEYRING_ACCOUNT: &str = "keyring.product-action";
 pub const SNAPSHOT_ENVELOPE_KEYRING_ACCOUNT: &str = "keyring.snapshot-envelope";
+pub const AUTHORING_WRITER_IDENTITY: DatabaseIdentityV1 = DatabaseIdentityV1 {
+    service: API_KEYCHAIN_SERVICE,
+    account: "database.authoring-session-writer",
+    role: "starring_authoring_session_writer",
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DatabaseIdentityV1 {
@@ -99,11 +104,7 @@ pub const APPLICATION_DATABASE_IDENTITIES: [DatabaseIdentityV1; 20] = [
         account: "database.operational-deployment-status-reader",
         role: "starring_operational_deployment_status_reader",
     },
-    DatabaseIdentityV1 {
-        service: API_KEYCHAIN_SERVICE,
-        account: "database.authoring-session-writer",
-        role: "starring_authoring_session_writer",
-    },
+    AUTHORING_WRITER_IDENTITY,
     DatabaseIdentityV1 {
         service: RUNTIME_KEYCHAIN_SERVICE,
         account: "database.execution",

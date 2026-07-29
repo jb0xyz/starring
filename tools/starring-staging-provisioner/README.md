@@ -48,6 +48,33 @@ and role identities, and the fifteen-line final HBA contract. Physical
 replication rejection remains a separate external negative probe because this
 tool does not claim to model a replication-protocol startup.
 
+An already provisioned nineteen-role staging cluster must not rerun the
+one-shot mode. After the trusted authoring-writer migration is applied and the
+reviewed final HBA containing `starring_authoring_session_writer` is installed
+and reloaded, keep the API stopped and provision only the new writer:
+
+```zsh
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+  "$HOME/.local/libexec/starring-staging-provisioner" \
+  --provision-authoring-writer \
+  "$STAGING_SYSTEM_IDENTIFIER" \
+  "starring-runtime-dedicated-staging-cluster-v2:$STAGING_SYSTEM_IDENTIFIER:starring_runtime_staging:cluster-wide-public-acl-reset:bidirectional-runtime-membership-revocation"
+```
+
+This mode reads the existing administrator URL from Keychain, validates the
+final cluster and HBA, requires the exact writer migration and five-function
+capability set, and creates only
+`starring_authoring_session_writer` plus
+`starring-api.staging/database.authoring-session-writer`. In the same
+serializable transaction it performs the one required existing capability
+cutover: `starring_authorized_snapshot_reader` loses v1 snapshot execute and
+gains v2 snapshot execute. No other existing role, credential, keyring, or ACL
+is changed. A second identical invocation returns
+`authoring_writer=exact_replay` without rotating anything. Legacy writer state,
+cutover snapshot state, asymmetric state, mixed v1/v2 access, and excess ACLs
+are classified explicitly and fail closed unless they form one exact fresh or
+replay state.
+
 This is a disposable staging same-login-boundary tool. It does not create a
 production secret-isolation boundary: every process running under the same
 macOS login remains inside the Keychain threat boundary.

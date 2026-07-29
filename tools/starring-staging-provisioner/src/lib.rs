@@ -1,6 +1,7 @@
 mod crypto;
 mod final_verify;
 mod identity;
+mod incremental_writer;
 mod keychain;
 mod keyring;
 mod postgres;
@@ -17,6 +18,10 @@ pub use identity::{
     ADMIN_DATABASE_NAME, ADMIN_KEYCHAIN_ACCOUNT, ADMIN_KEYCHAIN_SERVICE,
     APPLICATION_DATABASE_IDENTITIES, CLUSTER_ADMIN_ROLE, DATABASE_HOST, DATABASE_NAME,
     DATABASE_PORT, OWNER_ROLE, PEER_SOCKET_DIRECTORY,
+};
+pub use incremental_writer::{
+    provision_authoring_writer, IncrementalAuthoringWriterOutcomeV1,
+    IncrementalAuthoringWriterReportV1,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -71,6 +76,14 @@ pub enum ProvisionerErrorV1 {
     FinalConnectionContract,
     #[error("keyring_contract_failed")]
     KeyringContract,
+    #[error("incremental_authoring_writer_busy")]
+    IncrementalAuthoringWriterBusy,
+    #[error("incremental_authoring_writer_contract_failed")]
+    IncrementalAuthoringWriterContract,
+    #[error("incremental_authoring_writer_partial_state")]
+    IncrementalAuthoringWriterPartialState,
+    #[error("incremental_authoring_writer_rollback_failed")]
+    IncrementalAuthoringWriterRollback,
 }
 
 impl ProvisionerErrorV1 {
@@ -101,6 +114,16 @@ impl ProvisionerErrorV1 {
             Self::FinalRoleContract => "final_role_contract_failed",
             Self::FinalConnectionContract => "final_connection_contract_failed",
             Self::KeyringContract => "keyring_contract_failed",
+            Self::IncrementalAuthoringWriterBusy => "incremental_authoring_writer_busy",
+            Self::IncrementalAuthoringWriterContract => {
+                "incremental_authoring_writer_contract_failed"
+            }
+            Self::IncrementalAuthoringWriterPartialState => {
+                "incremental_authoring_writer_partial_state"
+            }
+            Self::IncrementalAuthoringWriterRollback => {
+                "incremental_authoring_writer_rollback_failed"
+            }
         }
     }
 }
@@ -220,6 +243,10 @@ mod tests {
             ProvisionerErrorV1::KeychainWrite,
             ProvisionerErrorV1::DatabaseMutation,
             ProvisionerErrorV1::DatabaseCommitIndeterminate,
+            ProvisionerErrorV1::IncrementalAuthoringWriterBusy,
+            ProvisionerErrorV1::IncrementalAuthoringWriterContract,
+            ProvisionerErrorV1::IncrementalAuthoringWriterPartialState,
+            ProvisionerErrorV1::IncrementalAuthoringWriterRollback,
         ] {
             assert_eq!(error.to_string(), error.code());
             assert!(!error.to_string().contains("postgresql://"));

@@ -77,7 +77,7 @@ pub async fn verify_final(
     })
 }
 
-async fn verify_admin_connection(
+pub(crate) async fn verify_admin_connection(
     connection: &mut PgConnection,
     system_identifier: &str,
 ) -> Result<(), ProvisionerErrorV1> {
@@ -103,7 +103,7 @@ async fn verify_admin_connection(
     Ok(())
 }
 
-async fn verify_application_connection(
+pub(crate) async fn verify_application_connection(
     connection: &mut PgConnection,
     role: &str,
 ) -> Result<(), ProvisionerErrorV1> {
@@ -125,7 +125,7 @@ async fn verify_application_connection(
     Ok(())
 }
 
-async fn verify_admin_target_connection(
+pub(crate) async fn verify_admin_target_connection(
     connection: &mut PgConnection,
 ) -> Result<(), ProvisionerErrorV1> {
     let exact: bool = sqlx::query_scalar(
@@ -344,7 +344,9 @@ fn expected_rule(
     }
 }
 
-async fn verify_final_hba(connection: &mut PgConnection) -> Result<(), ProvisionerErrorV1> {
+pub(crate) async fn verify_final_hba(
+    connection: &mut PgConnection,
+) -> Result<(), ProvisionerErrorV1> {
     let rows = sqlx::query(
         "SELECT line_number, type, database, user_name, address, netmask, auth_method, COALESCE(options, ARRAY[]::TEXT[]), error FROM pg_catalog.pg_hba_file_rules ORDER BY line_number",
     )

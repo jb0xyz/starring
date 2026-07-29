@@ -65,6 +65,7 @@ impl KeychainClientV1 {
             backups.push(KeychainBackupEntryV1 {
                 identity: item.identity,
                 previous: self.read_optional(item.identity)?,
+                created: None,
             });
         }
         for (written, item) in items.iter().enumerate() {
@@ -82,7 +83,26 @@ impl KeychainClientV1 {
         })
     }
 
-    fn read_optional(
+    pub(crate) fn begin_create(
+        &self,
+        item: SecretItemRefV1<'_>,
+    ) -> Result<KeychainUpdateV1, ProvisionerErrorV1> {
+        if self.read_optional(item.identity)?.is_some() {
+            return Err(ProvisionerErrorV1::IncrementalAuthoringWriterPartialState);
+        }
+        self.write_new_and_verify(item.identity, item.value)?;
+        Ok(KeychainUpdateV1 {
+            backups: vec![KeychainBackupEntryV1 {
+                identity: item.identity,
+                previous: None,
+                created: Some(Zeroizing::new(item.value.to_vec())),
+            }],
+            client: Self,
+            completed: false,
+        })
+    }
+
+    pub(crate) fn read_optional(
         &self,
         identity: KeychainIdentityV1,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, ProvisionerErrorV1> {
@@ -124,6 +144,23 @@ impl KeychainClientV1 {
         identity: KeychainIdentityV1,
         value: &[u8],
     ) -> Result<(), ProvisionerErrorV1> {
+        self.write_with_mode_and_verify(identity, value, true)
+    }
+
+    fn write_new_and_verify(
+        &self,
+        identity: KeychainIdentityV1,
+        value: &[u8],
+    ) -> Result<(), ProvisionerErrorV1> {
+        self.write_with_mode_and_verify(identity, value, false)
+    }
+
+    fn write_with_mode_and_verify(
+        &self,
+        identity: KeychainIdentityV1,
+        value: &[u8],
+        update: bool,
+    ) -> Result<(), ProvisionerErrorV1> {
         if value.is_empty()
             || value.len() > MAX_CAPTURE_BYTES
             || value.iter().any(|byte| byte.is_ascii_control())
@@ -143,7 +180,11 @@ impl KeychainClientV1 {
         let mut input = Zeroizing::new(Vec::with_capacity(
             48 + identity.service.len() + identity.account.len() + value.len() * 2,
         ));
-        input.extend_from_slice(b"add-generic-password -U -s ");
+        input.extend_from_slice(b"add-generic-password ");
+        if update {
+            input.extend_from_slice(b"-U ");
+        }
+        input.extend_from_slice(b"-s ");
         input.extend_from_slice(identity.service.as_bytes());
         input.extend_from_slice(b" -a ");
         input.extend_from_slice(identity.account.as_bytes());
@@ -167,7 +208,11 @@ impl KeychainClientV1 {
         if !status.success() {
             return Err(ProvisionerErrorV1::KeychainWrite);
         }
-        let readback = self.read_required(identity)?;
+        let readback = match self.read_required(identity) {
+            Ok(readback) => readback,
+            Err(_) if !update => return Err(ProvisionerErrorV1::KeychainWrite),
+            Err(error) => return Err(error),
+        };
         if readback.len() != value.len() || !bool::from(readback.as_slice().ct_eq(value)) {
             return Err(ProvisionerErrorV1::KeychainWrite);
         }
@@ -208,7 +253,7 @@ impl KeychainClientV1 {
         for backup in backups[..written].iter().rev() {
             let result = match &backup.previous {
                 Some(value) => self.write_and_verify(backup.identity, value),
-                None => self.delete(backup.identity),
+                None => self.delete_created(backup),
             };
             failed |= result.is_err();
         }
@@ -218,11 +263,28 @@ impl KeychainClientV1 {
             Ok(())
         }
     }
+
+    fn delete_created(&self, backup: &KeychainBackupEntryV1) -> Result<(), ProvisionerErrorV1> {
+        let Some(expected) = &backup.created else {
+            return self.delete(backup.identity);
+        };
+        match self.read_optional(backup.identity)? {
+            None => Ok(()),
+            Some(current)
+                if current.len() == expected.len()
+                    && bool::from(current.as_slice().ct_eq(expected.as_slice())) =>
+            {
+                self.delete(backup.identity)
+            }
+            Some(_) => Err(ProvisionerErrorV1::KeychainRollback),
+        }
+    }
 }
 
 struct KeychainBackupEntryV1 {
     identity: KeychainIdentityV1,
     previous: Option<Zeroizing<Vec<u8>>>,
+    created: Option<Zeroizing<Vec<u8>>>,
 }
 
 pub struct KeychainUpdateV1 {
@@ -349,5 +411,36 @@ mod tests {
         assert_eq!(readback.as_slice(), secret);
         client.delete(identity).unwrap();
         assert!(client.read_optional(identity).unwrap().is_none());
+        let update = client
+            .begin_create(SecretItemRefV1 {
+                identity,
+                value: secret,
+            })
+            .unwrap();
+        assert_eq!(
+            client
+                .begin_create(SecretItemRefV1 {
+                    identity,
+                    value: b"different",
+                })
+                .err(),
+            Some(ProvisionerErrorV1::IncrementalAuthoringWriterPartialState)
+        );
+        assert_eq!(client.read_required(identity).unwrap().as_slice(), secret);
+        update.rollback().unwrap();
+        assert!(client.read_optional(identity).unwrap().is_none());
+        let update = client
+            .begin_create(SecretItemRefV1 {
+                identity,
+                value: secret,
+            })
+            .unwrap();
+        client.write_and_verify(identity, b"different").unwrap();
+        assert_eq!(update.rollback(), Err(ProvisionerErrorV1::KeychainRollback));
+        assert_eq!(
+            client.read_required(identity).unwrap().as_slice(),
+            b"different"
+        );
+        client.delete(identity).unwrap();
     }
 }

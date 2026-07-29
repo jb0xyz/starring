@@ -1,8 +1,8 @@
 use std::process::ExitCode;
 
 use starring_staging_provisioner::{
-    postgres_environment_is_present, provision_staging, verify_final, ProvisionerErrorV1,
-    StagingAcknowledgementV1,
+    postgres_environment_is_present, provision_authoring_writer, provision_staging, verify_final,
+    ProvisionerErrorV1, StagingAcknowledgementV1,
 };
 
 #[tokio::main]
@@ -20,10 +20,13 @@ async fn main() -> ExitCode {
         eprintln!("{}", ProvisionerErrorV1::CommandLineArguments.code());
         return ExitCode::from(64);
     };
-    let (verify, system_identifier, acknowledgement) = match arguments.as_slice() {
-        [system_identifier, acknowledgement] => (false, *system_identifier, *acknowledgement),
+    let (mode, system_identifier, acknowledgement) = match arguments.as_slice() {
+        [system_identifier, acknowledgement] => ("provision", *system_identifier, *acknowledgement),
         [mode, system_identifier, acknowledgement] if *mode == "--verify-final" => {
-            (true, *system_identifier, *acknowledgement)
+            ("verify", *system_identifier, *acknowledgement)
+        }
+        [mode, system_identifier, acknowledgement] if *mode == "--provision-authoring-writer" => {
+            ("authoring-writer", *system_identifier, *acknowledgement)
         }
         _ => {
             eprintln!("{}", ProvisionerErrorV1::CommandLineArguments.code());
@@ -38,7 +41,7 @@ async fn main() -> ExitCode {
             return ExitCode::from(64);
         }
     };
-    if verify {
+    if mode == "verify" {
         match verify_final(acknowledgement).await {
             Ok(report) => {
                 println!(
@@ -47,6 +50,21 @@ async fn main() -> ExitCode {
                     report.application_database_credentials(),
                     report.keyrings(),
                     report.hba_rules()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{}", error.code());
+                ExitCode::from(1)
+            }
+        }
+    } else if mode == "authoring-writer" {
+        match provision_authoring_writer(acknowledgement).await {
+            Ok(report) => {
+                println!(
+                    "provisioned authoring_writer={} database={} credential_items=1 capabilities=5 snapshot_reader=v2_only",
+                    report.outcome().as_str(),
+                    report.database()
                 );
                 ExitCode::SUCCESS
             }
