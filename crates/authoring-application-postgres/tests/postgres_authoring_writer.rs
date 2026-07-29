@@ -8,6 +8,9 @@ use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions};
 use sqlx::types::Json;
 use sqlx::Connection;
 
+#[path = "postgres_authoring_writer/migration_security.rs"]
+mod migration_security;
+
 const COMMIT_QUERY: &str = "SELECT * FROM public.starring_authoring_session_writer_commit_v1(\
      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,\
      $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)";
@@ -317,6 +320,27 @@ async fn execute_commit(
     input: &CommitInput,
     persist: bool,
 ) -> CommitRow {
+    execute_commit_with_candidates(
+        pool,
+        role,
+        scope,
+        expected_generation,
+        input,
+        &[input],
+        persist,
+    )
+    .await
+}
+
+async fn execute_commit_with_candidates(
+    pool: &PgPool,
+    role: &str,
+    scope: &Scope,
+    expected_generation: i64,
+    input: &CommitInput,
+    candidates: &[&CommitInput],
+    persist: bool,
+) -> CommitRow {
     let mut transaction = pool.begin().await.unwrap();
     set_local_role(&mut transaction, role).await;
     let row = sqlx::query_as::<_, CommitRow>(COMMIT_QUERY)
@@ -325,10 +349,30 @@ async fn execute_commit(
         .bind(&scope.principal_id)
         .bind(&scope.session_id)
         .bind(expected_generation)
-        .bind(vec![input.request_digest.clone()])
-        .bind(vec![input.semantic_digest.clone()])
-        .bind(vec![input.writer_key_id.clone()])
-        .bind(vec![input.writer_key_fingerprint.clone()])
+        .bind(
+            candidates
+                .iter()
+                .map(|candidate| candidate.request_digest.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            candidates
+                .iter()
+                .map(|candidate| candidate.semantic_digest.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            candidates
+                .iter()
+                .map(|candidate| candidate.writer_key_id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            candidates
+                .iter()
+                .map(|candidate| candidate.writer_key_fingerprint.clone())
+                .collect::<Vec<_>>(),
+        )
         .bind(&input.request_digest)
         .bind(&input.semantic_digest)
         .bind(&input.writer_key_id)
@@ -372,6 +416,26 @@ async fn commit(
     execute_commit(pool, role, scope, expected_generation, input, true).await
 }
 
+async fn commit_with_candidates(
+    pool: &PgPool,
+    role: &str,
+    scope: &Scope,
+    expected_generation: i64,
+    input: &CommitInput,
+    candidates: &[&CommitInput],
+) -> CommitRow {
+    execute_commit_with_candidates(
+        pool,
+        role,
+        scope,
+        expected_generation,
+        input,
+        candidates,
+        true,
+    )
+    .await
+}
+
 async fn commit_then_rollback(
     pool: &PgPool,
     role: &str,
@@ -389,6 +453,16 @@ async fn check(
     expected_generation: i64,
     input: &CommitInput,
 ) -> CheckRow {
+    check_with_candidates(pool, role, scope, expected_generation, &[input]).await
+}
+
+async fn check_with_candidates(
+    pool: &PgPool,
+    role: &str,
+    scope: &Scope,
+    expected_generation: i64,
+    candidates: &[&CommitInput],
+) -> CheckRow {
     let mut transaction = pool.begin().await.unwrap();
     set_local_role(&mut transaction, role).await;
     let row = sqlx::query_as::<_, CheckRow>(CHECK_QUERY)
@@ -397,10 +471,30 @@ async fn check(
         .bind(&scope.principal_id)
         .bind(&scope.session_id)
         .bind(expected_generation)
-        .bind(vec![input.request_digest.clone()])
-        .bind(vec![input.semantic_digest.clone()])
-        .bind(vec![input.writer_key_id.clone()])
-        .bind(vec![input.writer_key_fingerprint.clone()])
+        .bind(
+            candidates
+                .iter()
+                .map(|candidate| candidate.request_digest.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            candidates
+                .iter()
+                .map(|candidate| candidate.semantic_digest.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            candidates
+                .iter()
+                .map(|candidate| candidate.writer_key_id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            candidates
+                .iter()
+                .map(|candidate| candidate.writer_key_fingerprint.clone())
+                .collect::<Vec<_>>(),
+        )
         .fetch_one(&mut *transaction)
         .await
         .unwrap();
@@ -633,6 +727,49 @@ async fn trusted_authoring_writer_is_atomic_replay_safe_and_relation_blind() {
     );
     assert_eq!(
         replay.safe_turn_projection_digest.as_deref(),
+        Some(generation_one.projection_digest.as_str())
+    );
+
+    let mut rotated_active = commit_input("rotated-active", projection_one);
+    rotated_active.writer_key_id = "writer-v2".to_string();
+    rotated_active.writer_key_fingerprint = digest("writer-v2-fingerprint");
+    let active_only = check(&pool, &role, &scope, 0, &rotated_active).await;
+    assert_eq!(active_only.outcome_code, "generation_conflict");
+    assert_eq!(active_only.current_generation, Some(1));
+    assert!(active_only.matched_generation.is_none());
+    assert!(active_only.safe_turn_projection.is_none());
+    assert!(active_only.safe_turn_projection_digest.is_none());
+    let rotated_candidates = [&rotated_active, &generation_one];
+    let retired_check = check_with_candidates(&pool, &role, &scope, 0, &rotated_candidates).await;
+    assert_eq!(retired_check.outcome_code, "exact_replay");
+    assert_eq!(retired_check.current_generation, Some(1));
+    assert_eq!(retired_check.matched_generation, Some(1));
+    assert_eq!(
+        retired_check.safe_turn_projection.as_deref(),
+        Some(projection_one.as_slice())
+    );
+    assert_eq!(
+        retired_check.safe_turn_projection_digest.as_deref(),
+        Some(generation_one.projection_digest.as_str())
+    );
+    let retired_commit = commit_with_candidates(
+        &pool,
+        &role,
+        &scope,
+        0,
+        &rotated_active,
+        &rotated_candidates,
+    )
+    .await;
+    assert_eq!(retired_commit.outcome_code, "exact_replay");
+    assert_eq!(retired_commit.current_generation, Some(1));
+    assert_eq!(retired_commit.committed_generation, Some(1));
+    assert_eq!(
+        retired_commit.safe_turn_projection.as_deref(),
+        Some(projection_one.as_slice())
+    );
+    assert_eq!(
+        retired_commit.safe_turn_projection_digest.as_deref(),
         Some(generation_one.projection_digest.as_str())
     );
 

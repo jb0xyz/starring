@@ -1069,3 +1069,175 @@ impl LlmClient for NoLlmClient {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAFE_PROJECTION: &[u8] = br#"{"schema_version":1,"state":"discussion","assistant_message":"Ready","capabilities":[],"draft":{"panels":0,"modals":0,"rules":0,"actions":0,"unresolved_references":[]},"preview":null}"#;
+
+    fn legacy_load_row() -> AuthoringWriterLoadRowV1 {
+        AuthoringWriterLoadRowV1 {
+            outcome_code: "loaded".to_string(),
+            head_generation: None,
+            snapshot_schema_version: None,
+            snapshot_ciphertext: None,
+            snapshot_nonce: None,
+            encryption_key_id: None,
+            encryption_suite: None,
+            encryption_suite_version: None,
+            authenticated_metadata_digest: None,
+            resource_bindings: None,
+            binding_fingerprint: None,
+            installation_authority_revision: Some(1),
+            authority_payload_digest: Some("authority-digest".to_string()),
+            writer_request_digest: Some("request-digest".to_string()),
+            writer_semantic_request_digest: None,
+            writer_digest_key_id: None,
+            writer_digest_key_fingerprint: None,
+            safe_turn_projection: None,
+            safe_turn_projection_digest: None,
+            stage: None,
+            candidate_revision: None,
+            candidate_hash: None,
+            harness_contract_revision: None,
+            current_authority_revision: None,
+            current_authority_payload_digest: None,
+            current_resource_bindings: None,
+            current_binding_fingerprint: None,
+        }
+    }
+
+    fn trusted_load_row() -> AuthoringWriterLoadRowV1 {
+        AuthoringWriterLoadRowV1 {
+            writer_semantic_request_digest: Some("semantic-digest".to_string()),
+            writer_digest_key_id: Some("digest-key-v1".to_string()),
+            writer_digest_key_fingerprint: Some("digest-key-fingerprint".to_string()),
+            safe_turn_projection: Some(SAFE_PROJECTION.to_vec()),
+            safe_turn_projection_digest: Some(safe_projection_digest_v1(SAFE_PROJECTION)),
+            ..legacy_load_row()
+        }
+    }
+
+    fn commit_row(
+        projection: Option<Vec<u8>>,
+        projection_digest: Option<String>,
+    ) -> AuthoringWriterCommitRowV1 {
+        AuthoringWriterCommitRowV1 {
+            outcome_code: "committed".to_string(),
+            current_generation: Some(1),
+            committed_generation: Some(1),
+            safe_turn_projection: projection,
+            safe_turn_projection_digest: projection_digest,
+        }
+    }
+
+    #[test]
+    fn trusted_metadata_accepts_legacy_or_complete_rows_only() {
+        assert!(matches!(trusted_metadata(&legacy_load_row()), Ok(None)));
+
+        let row = trusted_load_row();
+        let metadata = trusted_metadata(&row).unwrap().unwrap();
+        assert_eq!(metadata.authority_revision, 1);
+        assert_eq!(metadata.authority_digest, "authority-digest");
+        assert_eq!(metadata.writer_request_digest, "request-digest");
+        assert_eq!(metadata.semantic_digest, "semantic-digest");
+        assert_eq!(metadata.digest_key_id, "digest-key-v1");
+        assert_eq!(metadata.digest_key_fingerprint, "digest-key-fingerprint");
+        assert_eq!(
+            metadata.projection_digest,
+            safe_projection_digest_v1(SAFE_PROJECTION)
+        );
+    }
+
+    #[test]
+    fn trusted_metadata_rejects_every_partial_or_unbound_shape() {
+        for missing_field in 0_u8..8 {
+            let mut row = trusted_load_row();
+            match missing_field {
+                0 => row.writer_semantic_request_digest = None,
+                1 => row.writer_digest_key_id = None,
+                2 => row.writer_digest_key_fingerprint = None,
+                3 => row.safe_turn_projection = None,
+                4 => row.safe_turn_projection_digest = None,
+                5 => row.installation_authority_revision = None,
+                6 => row.authority_payload_digest = None,
+                7 => row.writer_request_digest = None,
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                trusted_metadata(&row),
+                Err(AuthoringSessionLoadError::InvalidState)
+            ));
+        }
+
+        let mut zero_revision = trusted_load_row();
+        zero_revision.installation_authority_revision = Some(0);
+        assert!(matches!(
+            trusted_metadata(&zero_revision),
+            Err(AuthoringSessionLoadError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn projection_digest_validation_rejects_missing_mismatched_and_noncanonical_data() {
+        let projection_digest = safe_projection_digest_v1(SAFE_PROJECTION);
+        assert_eq!(
+            validate_projection_digest(SAFE_PROJECTION, Some(&projection_digest)),
+            Ok(())
+        );
+        assert!(matches!(
+            validate_projection_digest(SAFE_PROJECTION, None),
+            Err(AuthoringSessionLoadError::InvalidState)
+        ));
+        assert!(matches!(
+            validate_projection_digest(SAFE_PROJECTION, Some("wrong-digest")),
+            Err(AuthoringSessionLoadError::InvalidState)
+        ));
+        let noncanonical = [b" ".as_slice(), SAFE_PROJECTION].concat();
+        let noncanonical_digest = safe_projection_digest_v1(&noncanonical);
+        assert!(matches!(
+            validate_projection_digest(&noncanonical, Some(&noncanonical_digest)),
+            Err(AuthoringSessionLoadError::InvalidState)
+        ));
+        let empty_digest = safe_projection_digest_v1(&[]);
+        assert!(matches!(
+            validate_projection_digest(&[], Some(&empty_digest)),
+            Err(AuthoringSessionLoadError::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn commit_projection_adapter_requires_exact_bytes_and_digest() {
+        let digest = safe_projection_digest_v1(SAFE_PROJECTION);
+        let exact = commit_row(Some(SAFE_PROJECTION.to_vec()), Some(digest.clone()));
+        assert_eq!(
+            validate_returned_projection(&exact, SAFE_PROJECTION, &digest),
+            Ok(())
+        );
+
+        let missing_projection = commit_row(None, Some(digest.clone()));
+        assert!(matches!(
+            validate_returned_projection(&missing_projection, SAFE_PROJECTION, &digest),
+            Err(AuthoringSessionLoadError::InvalidState)
+        ));
+        let changed_projection = commit_row(Some(br#"{}"#.to_vec()), Some(digest.clone()));
+        assert!(matches!(
+            validate_returned_projection(&changed_projection, SAFE_PROJECTION, &digest),
+            Err(AuthoringSessionLoadError::InvalidState)
+        ));
+        let missing_digest = commit_row(Some(SAFE_PROJECTION.to_vec()), None);
+        assert!(matches!(
+            validate_returned_projection(&missing_digest, SAFE_PROJECTION, &digest),
+            Err(AuthoringSessionLoadError::InvalidState)
+        ));
+        let changed_digest = commit_row(
+            Some(SAFE_PROJECTION.to_vec()),
+            Some("wrong-digest".to_string()),
+        );
+        assert!(matches!(
+            validate_returned_projection(&changed_digest, SAFE_PROJECTION, &digest),
+            Err(AuthoringSessionLoadError::InvalidState)
+        ));
+    }
+}
