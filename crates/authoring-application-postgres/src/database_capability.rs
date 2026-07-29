@@ -10,6 +10,7 @@ pub(crate) struct ScopedFunctionContractV1<'a> {
     identity: &'a str,
     result: &'a str,
     returns_set: bool,
+    strict: bool,
     rows: f32,
     language: ScopedFunctionLanguageV1,
     identity_arguments: Option<&'a str>,
@@ -37,6 +38,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
             identity,
             result,
             returns_set: true,
+            strict: true,
             rows,
             language: ScopedFunctionLanguageV1::Sql,
             identity_arguments: None,
@@ -54,6 +56,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
             identity,
             result,
             returns_set: true,
+            strict: true,
             rows,
             language: ScopedFunctionLanguageV1::Sql,
             identity_arguments: Some(identity_arguments),
@@ -66,6 +69,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
             identity,
             result,
             returns_set: false,
+            strict: true,
             rows: 0.0,
             language: ScopedFunctionLanguageV1::Sql,
             identity_arguments: None,
@@ -78,6 +82,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
             identity,
             result,
             returns_set: true,
+            strict: true,
             rows,
             language: ScopedFunctionLanguageV1::PlPgSql,
             identity_arguments: None,
@@ -95,6 +100,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
             identity,
             result,
             returns_set: true,
+            strict: true,
             rows,
             language: ScopedFunctionLanguageV1::PlPgSql,
             identity_arguments: Some(identity_arguments),
@@ -102,7 +108,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
         }
     }
 
-    pub(crate) const fn set_plpgsql_trusted_public(
+    pub(crate) const fn set_plpgsql_non_strict_trusted_public(
         identity: &'a str,
         result: &'a str,
         rows: f32,
@@ -111,6 +117,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
             identity,
             result,
             returns_set: true,
+            strict: false,
             rows,
             language: ScopedFunctionLanguageV1::PlPgSql,
             identity_arguments: None,
@@ -642,7 +649,7 @@ async fn load_function_capability(
            function_contract.oid IS NOT NULL \
             AND function_contract.prokind = 'f' \
             AND function_contract.prosecdef \
-            AND function_contract.proisstrict \
+            AND function_contract.proisstrict = $8 \
             AND function_contract.provolatile = 'v' \
             AND function_contract.proparallel = 'u' \
             AND function_contract.proretset = $3 \
@@ -701,6 +708,7 @@ async fn load_function_capability(
     .bind(contract.language.database_name())
     .bind(contract.identity_arguments)
     .bind(contract.search_path)
+    .bind(contract.strict)
     .fetch_one(&mut **transaction)
     .await
     .map_err(readiness_database)
@@ -921,8 +929,18 @@ mod tests {
     fn function_contracts_can_require_plpgsql() {
         let set = ScopedFunctionContractV1::set_plpgsql("public.read_v1(text)", "SETOF text", 1.0);
         assert!(set.returns_set);
+        assert!(set.strict);
         assert_eq!(set.language, ScopedFunctionLanguageV1::PlPgSql);
         assert_eq!(set.language.database_name(), "plpgsql");
+
+        let commit = ScopedFunctionContractV1::set_plpgsql_non_strict_trusted_public(
+            "public.commit_v1(text)",
+            "SETOF text",
+            1.0,
+        );
+        assert!(commit.returns_set);
+        assert!(!commit.strict);
+        assert_eq!(commit.search_path, "search_path=pg_catalog, public");
     }
 
     #[test]

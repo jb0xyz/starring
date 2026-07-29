@@ -29,7 +29,11 @@ const TOPOLOGY_QUERY: &str = "SELECT \
 const FUNCTIONS: [ScopedFunctionContractV1<'static>; 5] = [
     ScopedFunctionContractV1::scalar(DATABASE_IDENTITY_FUNCTION, "text"),
     ScopedFunctionContractV1::set_plpgsql(CHECK_FUNCTION, CHECK_RESULT, 1.0),
-    ScopedFunctionContractV1::set_plpgsql_trusted_public(COMMIT_FUNCTION, COMMIT_RESULT, 1.0),
+    ScopedFunctionContractV1::set_plpgsql_non_strict_trusted_public(
+        COMMIT_FUNCTION,
+        COMMIT_RESULT,
+        1.0,
+    ),
     ScopedFunctionContractV1::set_plpgsql(LOAD_FUNCTION, LOAD_RESULT, 1.0),
     ScopedFunctionContractV1::set_plpgsql(KEY_COVERAGE_FUNCTION, KEY_COVERAGE_RESULT, 1.0),
 ];
