@@ -13,6 +13,7 @@ automation-ruleset = { path = "../../crates/automation-ruleset" }
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio"] }
 base64 = "0.22"
 chrono = "0.4"
+design-harness-codex-worker-client = { path = "../../crates/design-harness-codex-worker-client" }
 hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", default-features = false, features = ["server-auto", "tokio", "service"] }
 product-control-http = { path = "../../crates/product-control-http" }

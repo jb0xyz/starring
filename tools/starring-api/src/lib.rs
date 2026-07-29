@@ -1,3 +1,4 @@
+mod authoring_admission;
 mod composition;
 mod config;
 mod error;
@@ -7,6 +8,9 @@ mod projection;
 mod secret;
 mod server;
 
+pub use authoring_admission::{
+    AuthoringAdmissionConfigErrorV1, AuthoringAdmissionConfigV1, AuthoringAdmissionV1,
+};
 pub use composition::{
     compose_production_service_v1, ComposedProductionServiceV1, ProductionCompositionErrorV1,
     ProductionDatabasePoolShutdownErrorV1, ProductionDatabasePoolShutdownV1,

@@ -28,7 +28,7 @@ pub struct DatabaseIdentityV1 {
     pub role: &'static str,
 }
 
-pub const APPLICATION_DATABASE_IDENTITIES: [DatabaseIdentityV1; 19] = [
+pub const APPLICATION_DATABASE_IDENTITIES: [DatabaseIdentityV1; 20] = [
     DatabaseIdentityV1 {
         service: API_KEYCHAIN_SERVICE,
         account: "database.oauth-flow-writer",
@@ -98,6 +98,11 @@ pub const APPLICATION_DATABASE_IDENTITIES: [DatabaseIdentityV1; 19] = [
         service: API_KEYCHAIN_SERVICE,
         account: "database.operational-deployment-status-reader",
         role: "starring_operational_deployment_status_reader",
+    },
+    DatabaseIdentityV1 {
+        service: API_KEYCHAIN_SERVICE,
+        account: "database.authoring-session-writer",
+        role: "starring_authoring_session_writer",
     },
     DatabaseIdentityV1 {
         service: RUNTIME_KEYCHAIN_SERVICE,
@@ -171,9 +176,9 @@ pub fn validate_identity_manifest() -> Result<(), ProvisionerErrorV1> {
         .iter()
         .map(|identity| (identity.service, identity.account))
         .collect::<BTreeSet<_>>();
-    if APPLICATION_DATABASE_IDENTITIES.len() != 19
-        || roles.len() != 19
-        || keychain.len() != 19
+    if APPLICATION_DATABASE_IDENTITIES.len() != 20
+        || roles.len() != 20
+        || keychain.len() != 20
         || roles.contains(CLUSTER_ADMIN_ROLE)
         || roles.contains(OWNER_ROLE)
     {
@@ -263,7 +268,7 @@ mod tests {
                 .iter()
                 .filter(|identity| identity.service == API_KEYCHAIN_SERVICE)
                 .count(),
-            14
+            15
         );
         assert_eq!(
             APPLICATION_DATABASE_IDENTITIES
@@ -281,7 +286,15 @@ mod tests {
             }
         );
         assert_eq!(
-            APPLICATION_DATABASE_IDENTITIES[18],
+            APPLICATION_DATABASE_IDENTITIES[14],
+            DatabaseIdentityV1 {
+                service: API_KEYCHAIN_SERVICE,
+                account: "database.authoring-session-writer",
+                role: "starring_authoring_session_writer",
+            }
+        );
+        assert_eq!(
+            APPLICATION_DATABASE_IDENTITIES[19],
             DatabaseIdentityV1 {
                 service: RUNTIME_KEYCHAIN_SERVICE,
                 account: "database.interaction",

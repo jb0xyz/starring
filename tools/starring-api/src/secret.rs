@@ -19,13 +19,14 @@ use serde::Deserialize;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::config::{DatabaseRoleV1, ProductionConfigV1};
+use crate::config::{DatabaseRoleV1, ProductionAuthoringConfigV1, ProductionConfigV1};
 
 const MAX_ENVIRONMENT_NAME_BYTES: usize = 128;
 const MAX_KEYCHAIN_COMPONENT_BYTES: usize = 128;
 const MAX_SECRET_BYTES: usize = 32 * 1024;
 const MAX_DATABASE_URL_BYTES: usize = 8 * 1024;
 const MAX_DISCORD_TOKEN_BYTES: usize = 8 * 1024;
+const MAX_AUTHORING_WORKER_TOKEN_BYTES: usize = 8 * 1024;
 const MAX_KEYRING_BYTES: usize = 16 * 1024;
 const MAX_KEYRING_KEYS: usize = 8;
 #[cfg(target_os = "macos")]
@@ -112,6 +113,10 @@ impl SecretReferenceV1 {
             SecretReferenceSourceV1::Environment(_) => SecretReferenceKindV1::Environment,
             SecretReferenceSourceV1::Keychain { .. } => SecretReferenceKindV1::Keychain,
         }
+    }
+
+    pub(crate) fn is_keychain(&self) -> bool {
+        matches!(self.source, SecretReferenceSourceV1::Keychain { .. })
     }
 }
 
@@ -488,6 +493,30 @@ impl Debug for DiscordBotTokenV1 {
     }
 }
 
+pub(crate) struct AuthoringWorkerTokenV1(Zeroizing<String>);
+
+impl AuthoringWorkerTokenV1 {
+    fn parse(secret: ResolvedSecretV1) -> Result<Self, SecretResolutionErrorV1> {
+        let value = secret.into_zeroizing();
+        if value.len() > MAX_AUTHORING_WORKER_TOKEN_BYTES
+            || value.bytes().any(|byte| byte.is_ascii_whitespace())
+        {
+            return Err(SecretResolutionErrorV1::InvalidSecret);
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn into_zeroizing(self) -> Zeroizing<String> {
+        self.0
+    }
+}
+
+impl Debug for AuthoringWorkerTokenV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthoringWorkerTokenV1(<redacted>)")
+    }
+}
+
 pub(crate) struct SecretResolverV1<E, K> {
     environment: E,
     keychain: K,
@@ -545,6 +574,13 @@ impl<E: EnvironmentSecretReaderV1, K: KeychainSecretReaderV1> SecretResolverV1<E
         reference: &SecretReferenceV1,
     ) -> Result<DiscordBotTokenV1, SecretResolutionErrorV1> {
         DiscordBotTokenV1::parse(self.resolve(reference)?)
+    }
+
+    pub(crate) fn resolve_authoring_worker_token(
+        &self,
+        reference: &SecretReferenceV1,
+    ) -> Result<AuthoringWorkerTokenV1, SecretResolutionErrorV1> {
+        AuthoringWorkerTokenV1::parse(self.resolve(reference)?)
     }
 }
 
@@ -854,6 +890,24 @@ pub struct ResolvedProductionSecretsV1 {
     discord_oauth_client_secret: DiscordOAuthClientSecretV1,
     product_action_keyring: ProductActionDigestKeyringV1,
     snapshot_envelope_keyring: SnapshotEnvelopeKeyringV1,
+    authoring: Option<ResolvedAuthoringSecretsV1>,
+}
+
+pub(crate) struct ResolvedAuthoringSecretsV1 {
+    database_url: DatabaseUrlSecretV1,
+    worker_token: AuthoringWorkerTokenV1,
+}
+
+impl ResolvedAuthoringSecretsV1 {
+    pub(crate) fn into_parts(self) -> (DatabaseUrlSecretV1, AuthoringWorkerTokenV1) {
+        (self.database_url, self.worker_token)
+    }
+}
+
+impl Debug for ResolvedAuthoringSecretsV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ResolvedAuthoringSecretsV1(<redacted>)")
+    }
 }
 
 pub fn resolve_production_secrets_v1(
@@ -868,6 +922,7 @@ pub(crate) type ResolvedProductionSecretPartsV1 = (
     DiscordOAuthClientSecretV1,
     ProductActionDigestKeyringV1,
     SnapshotEnvelopeKeyringV1,
+    Option<ResolvedAuthoringSecretsV1>,
 );
 
 impl ResolvedProductionSecretsV1 {
@@ -882,8 +937,8 @@ impl ResolvedProductionSecretsV1 {
         resolver: &SecretResolverV1<E, K>,
     ) -> Result<Self, ProductionSecretResolutionErrorV1> {
         let references = config.secret_references();
-        let mut database_urls = Vec::with_capacity(DatabaseRoleV1::ALL.len());
-        for role in DatabaseRoleV1::ALL {
+        let mut database_urls = Vec::with_capacity(DatabaseRoleV1::CORE.len());
+        for role in DatabaseRoleV1::CORE {
             let database_url = resolver
                 .resolve_database_url(references.database(role))
                 .map_err(|source| ProductionSecretResolutionErrorV1::Database { role, source })?;
@@ -919,12 +974,16 @@ impl ResolvedProductionSecretsV1 {
         if keyring_payloads_alias_material(&action_payload, &snapshot_payload) {
             return Err(ProductionSecretResolutionErrorV1::CrossPurposeKeyMaterialAlias);
         }
+        let authoring = config
+            .authoring()
+            .and_then(|authoring| resolve_authoring_secrets_v1(authoring, resolver).ok());
         Ok(Self {
             database_urls,
             discord_bot_token,
             discord_oauth_client_secret,
             product_action_keyring,
             snapshot_envelope_keyring,
+            authoring,
         })
     }
 
@@ -935,6 +994,7 @@ impl ResolvedProductionSecretsV1 {
             self.discord_oauth_client_secret,
             self.product_action_keyring,
             self.snapshot_envelope_keyring,
+            self.authoring,
         )
     }
 }
@@ -943,6 +1003,18 @@ impl Debug for ResolvedProductionSecretsV1 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ResolvedProductionSecretsV1(<redacted>)")
     }
+}
+
+fn resolve_authoring_secrets_v1<E: EnvironmentSecretReaderV1, K: KeychainSecretReaderV1>(
+    config: &ProductionAuthoringConfigV1,
+    resolver: &SecretResolverV1<E, K>,
+) -> Result<ResolvedAuthoringSecretsV1, SecretResolutionErrorV1> {
+    let database_url = resolver.resolve_database_url(config.database())?;
+    let worker_token = resolver.resolve_authoring_worker_token(config.worker_token())?;
+    Ok(ResolvedAuthoringSecretsV1 {
+        database_url,
+        worker_token,
+    })
 }
 
 fn map_discord_oauth_secret_error(
@@ -965,8 +1037,10 @@ fn keyring_payloads_alias_material(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
 
     use super::*;
+    use crate::config::NonSecretConfigurationSourceV1;
 
     #[derive(Default)]
     struct FakeEnvironmentV1 {
@@ -1014,6 +1088,121 @@ mod tests {
         keychain: FakeKeychainV1,
     ) -> SecretResolverV1<FakeEnvironmentV1, FakeKeychainV1> {
         SecretResolverV1::new(environment, keychain)
+    }
+
+    #[derive(Default)]
+    struct FakeProductionConfigurationSourceV1 {
+        values: BTreeMap<String, OsString>,
+    }
+
+    impl NonSecretConfigurationSourceV1 for FakeProductionConfigurationSourceV1 {
+        fn read(&self, name: &str) -> Option<OsString> {
+            self.values.get(name).cloned()
+        }
+    }
+
+    fn production_config_with_authoring() -> ProductionConfigV1 {
+        let mut source = FakeProductionConfigurationSourceV1::default();
+        for (name, value) in [
+            ("STARRING_API_BIND_PORT", "8080"),
+            ("STARRING_API_PUBLIC_ORIGIN", "https://starring.example"),
+            ("STARRING_API_OAUTH_RETURN_PATHS_JSON", r#"["/","/app"]"#),
+            ("STARRING_API_OAUTH_DEFAULT_RETURN_PATH", "/app"),
+            ("STARRING_API_DATABASE_MAX_CONNECTIONS", "2"),
+            ("STARRING_API_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS", "2000"),
+            ("STARRING_API_DATABASE_IDLE_TIMEOUT_SECONDS", "60"),
+            ("STARRING_API_DATABASE_MAX_LIFETIME_SECONDS", "600"),
+            ("STARRING_API_DISCORD_APPLICATION_ID", "1234"),
+            ("STARRING_API_DISCORD_BOT_USER_ID", "5678"),
+            ("STARRING_API_DISCORD_REQUEST_TIMEOUT_MILLISECONDS", "5000"),
+            (
+                "STARRING_API_DISCORD_WRITE_AUTHORITY_LIFETIME_MILLISECONDS",
+                "5000",
+            ),
+            (
+                "STARRING_API_DISCORD_READ_AUTHORITY_LIFETIME_MILLISECONDS",
+                "30000",
+            ),
+            (
+                "STARRING_API_DISCORD_OAUTH_CLIENT_SECRET_REFERENCE",
+                "env:CORE_OAUTH_SECRET",
+            ),
+            (
+                "STARRING_API_DISCORD_BOT_TOKEN_REFERENCE",
+                "env:CORE_BOT_TOKEN",
+            ),
+            (
+                "STARRING_API_PRODUCT_ACTION_KEYRING_SECRET_REFERENCE",
+                "env:CORE_ACTION_KEYRING",
+            ),
+            (
+                "STARRING_API_SNAPSHOT_ENVELOPE_KEYRING_SECRET_REFERENCE",
+                "env:CORE_SNAPSHOT_KEYRING",
+            ),
+            (
+                "STARRING_API_AUTHORING_SESSION_WRITER_DATABASE_SECRET_REFERENCE",
+                "keychain:starring-api.staging:database.authoring-session-writer",
+            ),
+            (
+                "STARRING_API_AUTHORING_WORKER_URL",
+                "http://127.0.0.1:18181",
+            ),
+            (
+                "STARRING_API_AUTHORING_WORKER_TOKEN_SECRET_REFERENCE",
+                "keychain:com.starring.llm-api-key:llm-api",
+            ),
+        ] {
+            source.values.insert(name.to_string(), value.into());
+        }
+        for (index, name) in [
+            "STARRING_API_OAUTH_FLOW_WRITER_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_SESSION_ISSUER_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_SESSION_API_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_SECURITY_REVOKER_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_INSTALLATION_AUTHORITY_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_AUTHORIZED_SNAPSHOT_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_PROMOTION_EXECUTOR_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_DECISION_READER_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_APPROVAL_EXECUTOR_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_REJECTION_EXECUTOR_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_APPLY_EXECUTOR_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_CANCELLATION_EXECUTOR_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_DEPLOYMENT_STATUS_DATABASE_SECRET_REFERENCE",
+            "STARRING_API_OPERATIONAL_STATUS_DATABASE_SECRET_REFERENCE",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            source.values.insert(
+                name.to_string(),
+                format!("env:CORE_DATABASE_{index}").into(),
+            );
+        }
+        ProductionConfigV1::from_source(&source).unwrap()
+    }
+
+    fn production_secret_environment() -> FakeEnvironmentV1 {
+        let mut environment = FakeEnvironmentV1::default();
+        for index in 0..DatabaseRoleV1::CORE.len() {
+            environment
+                .values
+                .insert(format!("CORE_DATABASE_{index}"), database_url());
+        }
+        environment
+            .values
+            .insert("CORE_OAUTH_SECRET".into(), "client-secret".into());
+        environment
+            .values
+            .insert("CORE_BOT_TOKEN".into(), "bot-token".into());
+        environment.values.insert(
+            "CORE_ACTION_KEYRING".into(),
+            keyring_json("action", &material(11), &[]),
+        );
+        environment.values.insert(
+            "CORE_SNAPSHOT_KEYRING".into(),
+            keyring_json("snapshot", &material(79), &[]),
+        );
+        environment
     }
 
     fn material(seed: u8) -> String {
@@ -1264,6 +1453,47 @@ mod tests {
         assert_eq!(
             DiscordBotTokenV1::parse(invalid_token).unwrap_err(),
             SecretResolutionErrorV1::InvalidSecret
+        );
+        let valid_worker_token =
+            ResolvedSecretV1::from_zeroizing(Zeroizing::new("worker-token".to_string())).unwrap();
+        let valid_worker_token = AuthoringWorkerTokenV1::parse(valid_worker_token).unwrap();
+        assert_eq!(
+            format!("{valid_worker_token:?}"),
+            "AuthoringWorkerTokenV1(<redacted>)"
+        );
+        let invalid_worker_token =
+            ResolvedSecretV1::from_zeroizing(Zeroizing::new("worker token".to_string())).unwrap();
+        assert_eq!(
+            AuthoringWorkerTokenV1::parse(invalid_worker_token).unwrap_err(),
+            SecretResolutionErrorV1::InvalidSecret
+        );
+    }
+
+    #[test]
+    fn optional_authoring_secret_failure_does_not_fail_core_resolution() {
+        let config = production_config_with_authoring();
+        let missing = resolver(production_secret_environment(), FakeKeychainV1::default());
+        let resolved = ResolvedProductionSecretsV1::resolve(&config, &missing).unwrap();
+        assert!(resolved.into_parts().5.is_none());
+
+        let mut keychain = FakeKeychainV1::default();
+        keychain.values.insert(
+            (
+                "starring-api.staging".into(),
+                "database.authoring-session-writer".into(),
+            ),
+            database_url().into_bytes(),
+        );
+        keychain.values.insert(
+            ("com.starring.llm-api-key".into(), "llm-api".into()),
+            b"worker-token".to_vec(),
+        );
+        let complete = resolver(production_secret_environment(), keychain);
+        let resolved = ResolvedProductionSecretsV1::resolve(&config, &complete).unwrap();
+        let authoring = resolved.into_parts().5.unwrap();
+        assert_eq!(
+            format!("{authoring:?}"),
+            "ResolvedAuthoringSecretsV1(<redacted>)"
         );
     }
 

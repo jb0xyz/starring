@@ -66,7 +66,8 @@ VALUES
     ('starring_decision_apply'),
     ('starring_decision_cancellation'),
     ('starring_deployment_status_reader'),
-    ('starring_operational_deployment_status_reader');
+    ('starring_operational_deployment_status_reader'),
+    ('starring_authoring_session_writer');
 
 CREATE TEMP TABLE starring_api_capability_manifest (
     role_name NAME NOT NULL,
@@ -97,7 +98,7 @@ VALUES
     ('starring_installation_authority_reader', 'public.starring_product_installation_authority_reader_database_identity_v1()'),
     ('starring_installation_authority_reader', 'public.starring_product_installation_authority_read_v1(text,text,bytea)'),
     ('starring_authorized_snapshot_reader', 'public.starring_product_authorized_snapshot_reader_database_identity_v1()'),
-    ('starring_authorized_snapshot_reader', 'public.starring_product_authorized_snapshot_read_v1(text,text,bytea,text,text)'),
+    ('starring_authorized_snapshot_reader', 'public.starring_product_authorized_snapshot_read_v2(text,text,bytea,text,text)'),
     ('starring_authorized_snapshot_reader', 'public.starring_product_authorized_snapshot_key_coverage_v1(text[])'),
     ('starring_promotion_executor', 'public.starring_product_promotion_executor_database_identity_v1()'),
     ('starring_promotion_executor', 'public.starring_product_promotion_replay_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,bigint,text,text[],text[],text[])'),
@@ -128,7 +129,12 @@ VALUES
     ('starring_deployment_status_reader', 'public.starring_product_deployment_status_reader_database_identity_v1()'),
     ('starring_deployment_status_reader', 'public.starring_product_deployment_status_read_v1(text,text,text,text,text,text,text,text,bytea)'),
     ('starring_operational_deployment_status_reader', 'public.starring_product_deployment_status_reader_database_identity_v2()'),
-    ('starring_operational_deployment_status_reader', 'public.starring_product_deployment_status_read_v2(text,text,text,text,text,text,text,text,bytea)');
+    ('starring_operational_deployment_status_reader', 'public.starring_product_deployment_status_read_v2(text,text,text,text,text,text,text,text,bytea)'),
+    ('starring_authoring_session_writer', 'public.starring_authoring_session_writer_database_identity_v1()'),
+    ('starring_authoring_session_writer', 'public.starring_authoring_session_writer_check_v1(text,text,text,text,bigint,text[],text[],text[],text[])'),
+    ('starring_authoring_session_writer', 'public.starring_authoring_session_writer_load_v1(text,text,text,text,bigint)'),
+    ('starring_authoring_session_writer', 'public.starring_authoring_session_writer_commit_v1(text,text,text,text,bigint,text[],text[],text[],text[],text,text,text,text,bigint,bytea,bytea,text,text,smallint,text,jsonb,text,bigint,text,jsonb,text,bigint,text,bytea,text,bigint)'),
+    ('starring_authoring_session_writer', 'public.starring_authoring_session_writer_key_coverage_v1(text[],text[],text[])');
 
 DO $preflight$
 DECLARE
@@ -141,8 +147,8 @@ BEGIN
     WHERE namespace.nspname <> 'information_schema'
         AND pg_catalog.left(namespace.nspname, 3) <> 'pg_';
 
-    IF (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_request_roles) <> 14
-        OR (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_capability_manifest) <> 48
+    IF (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_request_roles) <> 15
+        OR (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_capability_manifest) <> 53
         OR EXISTS (
             SELECT 1
             FROM pg_temp.starring_api_capability_manifest AS expected
@@ -204,7 +210,7 @@ BEGIN
         FROM pg_catalog.pg_authid AS role
         INNER JOIN pg_temp.starring_api_request_roles AS expected
             ON expected.role_name = role.rolname
-    ) <> 14 THEN
+    ) <> 15 THEN
         RAISE EXCEPTION 'staging request role enable attribute preflight failed'
             USING ERRCODE = '55000';
     END IF;
@@ -609,7 +615,7 @@ BEGIN
         FROM pg_catalog.pg_authid AS role
         INNER JOIN pg_temp.starring_api_request_roles AS expected
             ON expected.role_name = role.rolname
-    ) <> 14 THEN
+    ) <> 15 THEN
         RAISE EXCEPTION 'staging request role enable postflight failed'
             USING ERRCODE = '55000';
     END IF;

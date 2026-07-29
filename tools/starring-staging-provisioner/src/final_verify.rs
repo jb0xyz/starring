@@ -427,7 +427,7 @@ mod tests {
             .enumerate()
             .all(|(index, rule)| rule.line_number == index as i32 + 1));
         assert_eq!(rules[0].users.len(), 5);
-        assert_eq!(rules[4].users.len(), 14);
+        assert_eq!(rules[4].users.len(), 15);
         assert_eq!(rules[8].users, [CLUSTER_ADMIN_ROLE]);
         assert_eq!(rules[12].databases, ["replication"]);
         assert_eq!(rules[14].connection_type, "local");

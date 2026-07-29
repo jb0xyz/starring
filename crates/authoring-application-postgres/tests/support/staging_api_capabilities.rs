@@ -31,7 +31,7 @@ const INSTALLATION_AUTHORITY_FUNCTIONS: &[&str] = &[
 ];
 const AUTHORIZED_SNAPSHOT_FUNCTIONS: &[&str] = &[
     "public.starring_product_authorized_snapshot_reader_database_identity_v1()",
-    "public.starring_product_authorized_snapshot_read_v1(text,text,bytea,text,text)",
+    "public.starring_product_authorized_snapshot_read_v2(text,text,bytea,text,text)",
     "public.starring_product_authorized_snapshot_key_coverage_v1(text[])",
 ];
 const PROMOTION_FUNCTIONS: &[&str] = &[
@@ -80,8 +80,15 @@ pub const OPERATIONAL_DEPLOYMENT_STATUS_FUNCTIONS: &[&str] = &[
     "public.starring_product_deployment_status_reader_database_identity_v2()",
     "public.starring_product_deployment_status_read_v2(text,text,text,text,text,text,text,text,bytea)",
 ];
+const AUTHORING_SESSION_WRITER_FUNCTIONS: &[&str] = &[
+    "public.starring_authoring_session_writer_database_identity_v1()",
+    "public.starring_authoring_session_writer_check_v1(text,text,text,text,bigint,text[],text[],text[],text[])",
+    "public.starring_authoring_session_writer_load_v1(text,text,text,text,bigint)",
+    "public.starring_authoring_session_writer_commit_v1(text,text,text,text,bigint,text[],text[],text[],text[],text,text,text,text,bigint,bytea,bytea,text,text,smallint,text,jsonb,text,bigint,text,jsonb,text,bigint,text,bytea,text,bigint)",
+    "public.starring_authoring_session_writer_key_coverage_v1(text[],text[],text[])",
+];
 
-pub const CAPABILITIES: [StagingApiCapabilitySet; 14] = [
+pub const CAPABILITIES: [StagingApiCapabilitySet; 15] = [
     StagingApiCapabilitySet {
         fixture_label: "oauth",
         staging_role: "starring_identity_oauth",
@@ -151,5 +158,10 @@ pub const CAPABILITIES: [StagingApiCapabilitySet; 14] = [
         fixture_label: "operational",
         staging_role: "starring_operational_deployment_status_reader",
         functions: OPERATIONAL_DEPLOYMENT_STATUS_FUNCTIONS,
+    },
+    StagingApiCapabilitySet {
+        fixture_label: "authoring_writer",
+        staging_role: "starring_authoring_session_writer",
+        functions: AUTHORING_SESSION_WRITER_FUNCTIONS,
     },
 ];

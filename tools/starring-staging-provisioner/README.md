@@ -8,11 +8,11 @@ intentionally limited to the fixed `starring_runtime_staging` database,
 
 The provisioning mode verifies the independent system identifier and exact v2
 containment acknowledgement, the temporary peer HBA rule, an idle target, the
-passwordless `starring_owner`, and nineteen passwordless `NOLOGIN`
+passwordless `starring_owner`, and twenty passwordless `NOLOGIN`
 application roles. It requires the three existing Discord Keychain items to be
 readable and leaves them unchanged.
 
-It generates twenty distinct 32-byte passwords, two independent 32-byte API
+It generates twenty-one distinct 32-byte passwords, two independent 32-byte API
 keyrings, and independent PostgreSQL SCRAM-SHA-256 verifiers. Plaintext
 passwords are hex-encoded in memory and passed only to the interactive macOS
 `security` process over stdin, never through an argument or environment
@@ -40,7 +40,7 @@ env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   "starring-runtime-dedicated-staging-cluster-v2:$STAGING_SYSTEM_IDENTIFIER:starring_runtime_staging:cluster-wide-public-acl-reset:bidirectional-runtime-membership-revocation"
 ```
 
-The final verifier reads the fixed administrator and nineteen application
+The final verifier reads the fixed administrator and twenty application
 database URLs plus both API keyrings from Keychain without printing them. It
 requires strict version-1 keyring payloads with distinct active IDs and
 materials, direct non-TLS IPv4 loopback connections, exact database, schema,

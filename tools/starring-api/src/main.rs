@@ -349,6 +349,7 @@ fn database_role_code(role: DatabaseRoleV1) -> &'static str {
         DatabaseRoleV1::CancellationExecutor => "cancellation_executor",
         DatabaseRoleV1::DeploymentStatusReader => "deployment_status_reader",
         DatabaseRoleV1::OperationalDeploymentStatusReader => "operational_deployment_status_reader",
+        DatabaseRoleV1::AuthoringSessionWriter => "authoring_session_writer",
     }
 }
 

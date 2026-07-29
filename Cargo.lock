@@ -3263,6 +3263,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "design-harness-codex-worker-client",
  "discord-model",
  "hyper",
  "hyper-util",

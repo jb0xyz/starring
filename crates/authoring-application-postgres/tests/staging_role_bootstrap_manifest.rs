@@ -198,15 +198,15 @@ fn staging_role_bootstrap_is_atomic_bounded_and_secret_free() {
 }
 
 #[test]
-fn staging_role_bootstrap_matches_the_fourteen_readiness_allowlists() {
+fn staging_role_bootstrap_matches_the_fifteen_readiness_allowlists() {
     let fixtures = CAPABILITIES
         .iter()
         .map(|capability| capability.fixture_label)
         .collect::<BTreeSet<_>>();
-    assert_eq!(fixtures.len(), 14);
+    assert_eq!(fixtures.len(), 15);
 
     let expected_roles = expected_roles();
-    assert_eq!(expected_roles.len(), 14);
+    assert_eq!(expected_roles.len(), 15);
     let bootstrap_roles = assert_exact_set(
         "bootstrap roles",
         manifest_roles(
@@ -223,7 +223,7 @@ fn staging_role_bootstrap_matches_the_fourteen_readiness_allowlists() {
     assert_eq!(bootstrap_roles, enable_roles);
 
     let expected_capabilities = expected_capabilities();
-    assert_eq!(expected_capabilities.len(), 48);
+    assert_eq!(expected_capabilities.len(), 53);
     let bootstrap_capabilities = assert_exact_set(
         "bootstrap capabilities",
         manifest_capabilities(BOOTSTRAP, "DO $roles$"),

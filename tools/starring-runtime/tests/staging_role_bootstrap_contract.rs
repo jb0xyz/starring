@@ -25,7 +25,7 @@ const RUNBOOK: &str = include_str!(concat!(
     "/../../docs/superpowers/runbooks/2026-07-29-macos-starring-runtime-staging-operations.md"
 ));
 const RUNTIME_HBA_ROLES: &str = "starring_runtime_execution,starring_runtime_exact_target,starring_runtime_panel,starring_runtime_serving,starring_runtime_interaction";
-const API_HBA_ROLES: &str = "starring_identity_oauth,starring_identity_issuer,starring_identity_session,starring_identity_security,starring_installation_authority_reader,starring_authorized_snapshot_reader,starring_promotion_executor,starring_decision_reader,starring_decision_approval,starring_decision_rejection,starring_decision_apply,starring_decision_cancellation,starring_deployment_status_reader,starring_operational_deployment_status_reader";
+const API_HBA_ROLES: &str = "starring_identity_oauth,starring_identity_issuer,starring_identity_session,starring_identity_security,starring_installation_authority_reader,starring_authorized_snapshot_reader,starring_promotion_executor,starring_decision_reader,starring_decision_approval,starring_decision_rejection,starring_decision_apply,starring_decision_cancellation,starring_deployment_status_reader,starring_operational_deployment_status_reader,starring_authoring_session_writer";
 
 fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start = source.find(start).unwrap();
@@ -347,7 +347,7 @@ fn integrated_staging_hba_pins_the_exact_fail_closed_boundary() {
         "CREATE TEMP TABLE starring_api_capability_manifest",
     ));
     assert_eq!(api_roles, api_manifest_roles);
-    assert_eq!(api_roles.len(), 14);
+    assert_eq!(api_roles.len(), 15);
     assert!(runtime_roles.is_disjoint(&api_roles));
 
     let lower = INTEGRATED_HBA.to_ascii_lowercase();

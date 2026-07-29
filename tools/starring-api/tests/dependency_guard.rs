@@ -200,6 +200,7 @@ fn direct_dependencies_are_closed_to_reviewed_architecture_inputs() {
                     | "axum"
                     | "base64"
                     | "chrono"
+                    | "design-harness-codex-worker-client"
                     | "discord-model"
                     | "hyper"
                     | "hyper-util"
@@ -283,6 +284,7 @@ fn package_is_registered_once_and_source_modules_are_exactly_classified() {
                 | "config.rs"
                 | "composition.rs"
                 | "server.rs"
+                | "authoring_admission.rs"
                 | "main.rs"
         ));
     }
@@ -348,6 +350,19 @@ fn raw_operational_adapters_remain_confined_to_facade_and_composition() {
         if path != Path::new("composition.rs") && path != Path::new("facade.rs") {
             assert_identifier_prefixes_absent(path, source, &["Postgres", "Twilight"]);
             assert_identifiers_absent(path, source, &["DiscordOAuthClient"]);
+        }
+    }
+}
+
+#[test]
+fn codex_worker_client_remains_confined_to_composition() {
+    for (path, source) in source_files() {
+        if path != Path::new("composition.rs") {
+            assert_identifiers_absent(
+                &path,
+                &source,
+                &["design_harness_codex_worker_client", "CodexWorkerClient"],
+            );
         }
     }
 }

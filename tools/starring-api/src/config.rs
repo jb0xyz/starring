@@ -25,6 +25,7 @@ const MAX_MAX_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const MAX_DISCORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_WRITE_AUTHORITY_LIFETIME: Duration = Duration::from_secs(5);
 const MAX_READ_AUTHORITY_LIFETIME: Duration = Duration::from_secs(30);
+const RAW_AUTHORING_WORKER_TOKEN_ENVIRONMENT: &str = "STARRING_API_AUTHORING_WORKER_TOKEN";
 const FORBIDDEN_POSTGRES_ENVIRONMENT: [&str; 13] = [
     "PGAPPNAME",
     "PGDATABASE",
@@ -60,10 +61,11 @@ pub enum DatabaseRoleV1 {
     CancellationExecutor,
     DeploymentStatusReader,
     OperationalDeploymentStatusReader,
+    AuthoringSessionWriter,
 }
 
 impl DatabaseRoleV1 {
-    pub const ALL: [Self; 14] = [
+    pub const CORE: [Self; 14] = [
         Self::OAuthFlowWriter,
         Self::SessionIssuer,
         Self::SessionApi,
@@ -78,6 +80,23 @@ impl DatabaseRoleV1 {
         Self::CancellationExecutor,
         Self::DeploymentStatusReader,
         Self::OperationalDeploymentStatusReader,
+    ];
+    pub const ALL: [Self; 15] = [
+        Self::OAuthFlowWriter,
+        Self::SessionIssuer,
+        Self::SessionApi,
+        Self::SecurityRevoker,
+        Self::InstallationAuthorityReader,
+        Self::AuthorizedSnapshotReader,
+        Self::PromotionExecutor,
+        Self::DecisionReader,
+        Self::ApprovalExecutor,
+        Self::RejectionExecutor,
+        Self::ApplyExecutor,
+        Self::CancellationExecutor,
+        Self::DeploymentStatusReader,
+        Self::OperationalDeploymentStatusReader,
+        Self::AuthoringSessionWriter,
     ];
 
     pub const fn index(self) -> usize {
@@ -110,6 +129,9 @@ impl DatabaseRoleV1 {
             Self::OperationalDeploymentStatusReader => {
                 "STARRING_API_OPERATIONAL_STATUS_DATABASE_SECRET_REFERENCE"
             }
+            Self::AuthoringSessionWriter => {
+                "STARRING_API_AUTHORING_SESSION_WRITER_DATABASE_SECRET_REFERENCE"
+            }
         }
     }
 }
@@ -134,6 +156,8 @@ pub enum ProductionConfigurationFieldV1 {
     DiscordBotTokenReference,
     ProductActionKeyringReference,
     SnapshotEnvelopeKeyringReference,
+    AuthoringWorkerUrl,
+    AuthoringWorkerTokenReference,
 }
 
 impl ProductionConfigurationFieldV1 {
@@ -166,6 +190,10 @@ impl ProductionConfigurationFieldV1 {
             }
             Self::SnapshotEnvelopeKeyringReference => {
                 "STARRING_API_SNAPSHOT_ENVELOPE_KEYRING_SECRET_REFERENCE"
+            }
+            Self::AuthoringWorkerUrl => "STARRING_API_AUTHORING_WORKER_URL",
+            Self::AuthoringWorkerTokenReference => {
+                "STARRING_API_AUTHORING_WORKER_TOKEN_SECRET_REFERENCE"
             }
         }
     }
@@ -264,6 +292,11 @@ impl PoolConfigV1 {
     #[cfg(test)]
     pub(crate) fn total_connection_ceiling(self) -> u32 {
         self.max_connections.get() * DatabaseRoleV1::ALL.len() as u32
+    }
+
+    #[cfg(test)]
+    pub(crate) fn core_connection_ceiling(self) -> u32 {
+        self.max_connections.get() * DatabaseRoleV1::CORE.len() as u32
     }
 }
 
@@ -368,6 +401,33 @@ impl Debug for ProductionSecretReferencesV1 {
 }
 
 #[derive(Clone)]
+pub(crate) struct ProductionAuthoringConfigV1 {
+    database: SecretReferenceV1,
+    worker_url: String,
+    worker_token: SecretReferenceV1,
+}
+
+impl ProductionAuthoringConfigV1 {
+    pub(crate) fn database(&self) -> &SecretReferenceV1 {
+        &self.database
+    }
+
+    pub(crate) fn worker_url(&self) -> &str {
+        &self.worker_url
+    }
+
+    pub(crate) fn worker_token(&self) -> &SecretReferenceV1 {
+        &self.worker_token
+    }
+}
+
+impl Debug for ProductionAuthoringConfigV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProductionAuthoringConfigV1(<redacted>)")
+    }
+}
+
+#[derive(Clone)]
 pub struct ProductionConfigV1 {
     bind_addr: SocketAddr,
     public_origin: String,
@@ -379,6 +439,7 @@ pub struct ProductionConfigV1 {
     pool: PoolConfigV1,
     discord: DiscordPublicConfigV1,
     secret_references: ProductionSecretReferencesV1,
+    authoring: Option<ProductionAuthoringConfigV1>,
 }
 
 impl ProductionConfigV1 {
@@ -440,6 +501,7 @@ impl ProductionConfigV1 {
             timing,
         };
         let secret_references = parse_secret_references(source)?;
+        let authoring = parse_optional_authoring_config(source, &secret_references);
         Ok(Self {
             bind_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, bind_port)),
             public_origin,
@@ -451,6 +513,7 @@ impl ProductionConfigV1 {
             pool,
             discord,
             secret_references,
+            authoring,
         })
     }
 
@@ -495,6 +558,10 @@ impl ProductionConfigV1 {
     pub(crate) fn secret_references(&self) -> &ProductionSecretReferencesV1 {
         &self.secret_references
     }
+
+    pub(crate) fn authoring(&self) -> Option<&ProductionAuthoringConfigV1> {
+        self.authoring.as_ref()
+    }
 }
 
 impl Debug for ProductionConfigV1 {
@@ -509,6 +576,10 @@ impl Debug for ProductionConfigV1 {
             .field("pool", &self.pool)
             .field("discord", &self.discord)
             .field("secret_references", &"<redacted>")
+            .field(
+                "authoring",
+                &self.authoring.as_ref().map(|_| "<configured>"),
+            )
             .finish()
     }
 }
@@ -574,8 +645,8 @@ fn parse_discord_timing(
 fn parse_secret_references(
     source: &impl NonSecretConfigurationSourceV1,
 ) -> Result<ProductionSecretReferencesV1, ProductionConfigErrorV1> {
-    let mut database = Vec::with_capacity(DatabaseRoleV1::ALL.len());
-    for role in DatabaseRoleV1::ALL {
+    let mut database = Vec::with_capacity(DatabaseRoleV1::CORE.len());
+    for role in DatabaseRoleV1::CORE {
         let field = ProductionConfigurationFieldV1::DatabaseSecretReference(role);
         database.push(parse_secret_reference(source, field)?);
     }
@@ -635,6 +706,76 @@ fn parse_secret_references(
         product_action_keyring,
         snapshot_envelope_keyring,
     })
+}
+
+fn parse_optional_authoring_config(
+    source: &impl NonSecretConfigurationSourceV1,
+    core: &ProductionSecretReferencesV1,
+) -> Option<ProductionAuthoringConfigV1> {
+    if source
+        .read(RAW_AUTHORING_WORKER_TOKEN_ENVIRONMENT)
+        .is_some()
+    {
+        return None;
+    }
+    let database = read_optional(
+        source,
+        ProductionConfigurationFieldV1::DatabaseSecretReference(
+            DatabaseRoleV1::AuthoringSessionWriter,
+        ),
+    )
+    .and_then(|value| SecretReferenceV1::parse(&value).ok())?;
+    let worker_url = read_optional(source, ProductionConfigurationFieldV1::AuthoringWorkerUrl)?;
+    if !valid_authoring_worker_url(&worker_url) {
+        return None;
+    }
+    let worker_token = read_optional(
+        source,
+        ProductionConfigurationFieldV1::AuthoringWorkerTokenReference,
+    )
+    .and_then(|value| SecretReferenceV1::parse(&value).ok())?;
+    if !worker_token.is_keychain()
+        || database == worker_token
+        || core.database.iter().any(|reference| reference == &database)
+        || core
+            .database
+            .iter()
+            .any(|reference| reference == &worker_token)
+    {
+        return None;
+    }
+    let purpose_references = [
+        &core.discord_oauth_client_secret,
+        &core.discord_bot_token,
+        &core.product_action_keyring,
+        &core.snapshot_envelope_keyring,
+    ];
+    if purpose_references
+        .iter()
+        .any(|reference| *reference == &database || *reference == &worker_token)
+    {
+        return None;
+    }
+    Some(ProductionAuthoringConfigV1 {
+        database,
+        worker_url,
+        worker_token,
+    })
+}
+
+fn valid_authoring_worker_url(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    matches!(url.host(), Some(Host::Ipv4(host)) if host == Ipv4Addr::LOCALHOST)
+        && url.scheme() == "http"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_some_and(|port| port >= MIN_BIND_PORT)
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && value == url.origin().ascii_serialization()
 }
 
 fn parse_secret_reference(
@@ -749,6 +890,17 @@ fn read_required(
     Ok(value)
 }
 
+fn read_optional(
+    source: &impl NonSecretConfigurationSourceV1,
+    field: ProductionConfigurationFieldV1,
+) -> Option<String> {
+    let value = source.read(field.environment_name())?.into_string().ok()?;
+    (!value.is_empty()
+        && value.len() <= MAX_CONFIGURATION_VALUE_BYTES
+        && !value.chars().any(char::is_control))
+    .then_some(value)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -804,7 +956,7 @@ mod tests {
             ProductionConfigurationFieldV1::DiscordReadAuthorityLifetime,
             "30000",
         );
-        for role in DatabaseRoleV1::ALL {
+        for role in DatabaseRoleV1::CORE {
             source.insert(
                 ProductionConfigurationFieldV1::DatabaseSecretReference(role),
                 format!("env:STARRING_DATABASE_SECRET_{}", role.index()),
@@ -829,6 +981,25 @@ mod tests {
         source
     }
 
+    fn source_with_authoring() -> FakeConfigSourceV1 {
+        let mut source = valid_source();
+        source.insert(
+            ProductionConfigurationFieldV1::DatabaseSecretReference(
+                DatabaseRoleV1::AuthoringSessionWriter,
+            ),
+            "keychain:starring-api.staging:database.authoring-session-writer",
+        );
+        source.insert(
+            ProductionConfigurationFieldV1::AuthoringWorkerUrl,
+            "http://127.0.0.1:18181",
+        );
+        source.insert(
+            ProductionConfigurationFieldV1::AuthoringWorkerTokenReference,
+            "keychain:com.starring.llm-api-key:llm-api",
+        );
+        source
+    }
+
     #[test]
     fn production_config_is_loopback_only_and_canonical() {
         let config = ProductionConfigV1::from_source(&valid_source()).unwrap();
@@ -847,11 +1018,14 @@ mod tests {
         );
         assert_eq!(config.default_return_path(), "/app");
         assert_eq!(config.return_paths(), ["/", "/app", "/settings"]);
-        assert_eq!(config.pool_config().total_connection_ceiling(), 28);
+        assert_eq!(config.pool_config().core_connection_ceiling(), 28);
+        assert_eq!(config.pool_config().total_connection_ceiling(), 30);
         assert_eq!(config.discord().application_id().get(), 1234);
         assert_eq!(config.discord().bot_user_id().get(), 5678);
         assert!(config.discord().api_origin().ends_with("discord.com"));
-        assert_eq!(DatabaseRoleV1::ALL.len(), 14);
+        assert_eq!(DatabaseRoleV1::CORE.len(), 14);
+        assert_eq!(DatabaseRoleV1::ALL.len(), 15);
+        assert!(config.authoring().is_none());
     }
 
     #[test]
@@ -919,7 +1093,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pool.max_connections(), 4);
-        assert_eq!(pool.total_connection_ceiling(), 56);
+        assert_eq!(pool.core_connection_ceiling(), 56);
+        assert_eq!(pool.total_connection_ceiling(), 60);
         assert_eq!(
             PoolConfigV1::new(
                 5,
@@ -993,11 +1168,81 @@ mod tests {
     }
 
     #[test]
+    fn complete_authoring_configuration_is_separate_and_loopback_only() {
+        let config = ProductionConfigV1::from_source(&source_with_authoring()).unwrap();
+        let authoring = config.authoring().unwrap();
+        assert_eq!(authoring.worker_url(), "http://127.0.0.1:18181");
+        assert!(authoring.worker_token().is_keychain());
+        assert_eq!(
+            format!("{authoring:?}"),
+            "ProductionAuthoringConfigV1(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn incomplete_or_invalid_authoring_configuration_degrades_without_core_failure() {
+        let mut incomplete = source_with_authoring();
+        incomplete
+            .values
+            .remove(ProductionConfigurationFieldV1::AuthoringWorkerUrl.environment_name());
+        assert!(ProductionConfigV1::from_source(&incomplete)
+            .unwrap()
+            .authoring()
+            .is_none());
+
+        let mut remote = source_with_authoring();
+        remote.insert(
+            ProductionConfigurationFieldV1::AuthoringWorkerUrl,
+            "https://worker.example",
+        );
+        assert!(ProductionConfigV1::from_source(&remote)
+            .unwrap()
+            .authoring()
+            .is_none());
+
+        let mut raw_reference = source_with_authoring();
+        raw_reference.insert(
+            ProductionConfigurationFieldV1::AuthoringWorkerTokenReference,
+            "env:STARRING_CODEX_WORKER_TOKEN",
+        );
+        assert!(ProductionConfigV1::from_source(&raw_reference)
+            .unwrap()
+            .authoring()
+            .is_none());
+
+        let mut raw_value = source_with_authoring();
+        raw_value.values.insert(
+            RAW_AUTHORING_WORKER_TOKEN_ENVIRONMENT.to_string(),
+            "forbidden".into(),
+        );
+        assert!(ProductionConfigV1::from_source(&raw_value)
+            .unwrap()
+            .authoring()
+            .is_none());
+
+        let mut alias = source_with_authoring();
+        alias.insert(
+            ProductionConfigurationFieldV1::DatabaseSecretReference(
+                DatabaseRoleV1::AuthoringSessionWriter,
+            ),
+            "env:STARRING_DATABASE_SECRET_0",
+        );
+        assert!(ProductionConfigV1::from_source(&alias)
+            .unwrap()
+            .authoring()
+            .is_none());
+    }
+
+    #[test]
     fn configuration_debug_redacts_all_secret_reference_identifiers() {
         let config = ProductionConfigV1::from_source(&valid_source()).unwrap();
         let debug = format!("{config:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("STARRING_DATABASE_SECRET"));
         assert!(!debug.contains("starring.production"));
+        let configured = ProductionConfigV1::from_source(&source_with_authoring()).unwrap();
+        let configured_debug = format!("{configured:?}");
+        assert!(!configured_debug.contains("com.starring.llm-api-key"));
+        assert!(!configured_debug.contains("database.authoring-session-writer"));
     }
 }

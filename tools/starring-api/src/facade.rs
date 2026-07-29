@@ -14,11 +14,12 @@ use authoring_application_discord::{
     TwilightDiscordGuildAuthorityClient,
 };
 use authoring_application_postgres::{
-    OperatingSystemSecretGenerator, PostgresAuthentication, PostgresAuthorizedPromotionSnapshots,
-    PostgresInstallationAuthoritySource, PostgresProductApiReadiness, PostgresProductControl,
+    OperatingSystemSecretGenerator, PostgresAuthentication, PostgresAuthoringConversationStoreV1,
+    PostgresAuthorizedPromotionSnapshots, PostgresInstallationAuthoritySource,
+    PostgresProductApiReadiness, PostgresProductControl,
     PostgresProductDeploymentOperationalStatusesV2, PostgresProductDeploymentStatuses,
-    PostgresProductIdentityStore, PostgresProductPromotions, ProductApiReadinessErrorV1,
-    XChaCha20Poly1305SnapshotEnvelopeCipherV1,
+    PostgresProductIdentityStore, PostgresProductPromotions, ProductApiAuthoringReadinessErrorV1,
+    ProductApiReadinessErrorV1, XChaCha20Poly1305SnapshotEnvelopeCipherV1,
 };
 use product_control_http::{
     ApplyCommand, ApplyView, ApprovalPreviewView, CsrfSecret, CurrentPrincipal, DecisionCommand,
@@ -226,6 +227,23 @@ impl ProductionProductControlFacadeV1 {
             &self.control,
             &self.deployments,
         )
+    }
+
+    pub(crate) async fn verify_authoring_readiness(
+        &self,
+        writer: &PostgresAuthoringConversationStoreV1<XChaCha20Poly1305SnapshotEnvelopeCipherV1>,
+    ) -> Result<(), ProductApiAuthoringReadinessErrorV1> {
+        PostgresProductApiReadiness::new(
+            &self.identity,
+            &self.installation_authority,
+            &self.snapshots,
+            &self.promotions,
+            &self.control,
+            &self.deployments.status,
+            &self.deployments.operational,
+        )
+        .verify_authoring_readiness(writer)
+        .await
     }
 }
 

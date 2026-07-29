@@ -9,7 +9,7 @@ use thiserror::Error;
 pub const DATABASE_NAME: &str = "starring_runtime_staging";
 pub const OWNER_ROLE: &str = "starring_owner";
 pub const RELATION_COUNT: i64 = 171;
-pub const CAPABILITY_FUNCTION_COUNT: usize = 97;
+pub const CAPABILITY_FUNCTION_COUNT: usize = 102;
 pub const CLUSTER_ADMIN_ROLE: &str = "starring_cluster_admin";
 pub const PEER_MAP_NAME: &str = "starring_bootstrap";
 pub const PEER_SOCKET_DIRECTORY: &str = "/private/tmp/starring-bootstrap";
@@ -967,12 +967,12 @@ mod tests {
     #[test]
     fn manifest_is_exact_and_unique() {
         let identities = capability_function_identities().unwrap();
-        assert_eq!(identities.len(), 97);
+        assert_eq!(identities.len(), 102);
         assert_eq!(
             identities.iter().copied().collect::<BTreeSet<_>>().len(),
-            97
+            102
         );
-        assert_eq!(extract_manifest(API_ROLE_BOOTSTRAP).len(), 48);
+        assert_eq!(extract_manifest(API_ROLE_BOOTSTRAP).len(), 53);
         assert_eq!(extract_manifest(RUNTIME_ROLE_BOOTSTRAP).len(), 49);
     }
 
@@ -1019,7 +1019,7 @@ mod tests {
         assert_eq!(DATABASE_NAME, "starring_runtime_staging");
         assert_eq!(OWNER_ROLE, "starring_owner");
         assert_eq!(RELATION_COUNT, 171);
-        assert_eq!(CAPABILITY_FUNCTION_COUNT, 97);
+        assert_eq!(CAPABILITY_FUNCTION_COUNT, 102);
         assert_eq!(CLUSTER_ADMIN_ROLE, "starring_cluster_admin");
         assert_eq!(PEER_MAP_NAME, "starring_bootstrap");
         assert_eq!(PEER_SOCKET_DIRECTORY, "/private/tmp/starring-bootstrap");

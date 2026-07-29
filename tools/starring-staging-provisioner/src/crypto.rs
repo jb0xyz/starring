@@ -409,8 +409,8 @@ mod tests {
     fn generated_passwords_verifiers_and_keyrings_are_distinct_and_shaped() {
         let mut random = DeterministicRandomV1 { state: 1 };
         let secrets = GeneratedSecretsV1::generate_with(&mut random).unwrap();
-        assert_eq!(secrets.database().len(), 19);
-        assert_eq!(secrets.keychain_items().len(), 22);
+        assert_eq!(secrets.database().len(), 20);
+        assert_eq!(secrets.keychain_items().len(), 23);
         let mut passwords = secrets
             .database()
             .iter()
@@ -429,7 +429,7 @@ mod tests {
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
-            20
+            21
         );
         assert!(passwords.iter().all(|password| password.len() == 43));
         assert!(secrets
