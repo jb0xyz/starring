@@ -161,14 +161,19 @@ SELECT pg_catalog.pg_advisory_lock(
 DO $guard$
 DECLARE
     actual_system_identifier TEXT;
-    role_entry RECORD;
-    role_oid OID;
 BEGIN
     IF pg_catalog.current_setting('starring.runtime_enable', TRUE)
         NOT IN ('on', 'off')
     THEN
         RAISE EXCEPTION 'runtime role mode must be on or off'
             USING ERRCODE = '22023';
+    END IF;
+
+    IF pg_catalog.current_setting('server_version_num')::INTEGER
+        NOT BETWEEN 160000 AND 169999
+    THEN
+        RAISE EXCEPTION 'runtime staging PostgreSQL major version is unsupported'
+            USING ERRCODE = '55000';
     END IF;
 
     IF pg_catalog.current_database()
@@ -196,7 +201,7 @@ BEGIN
     IF pg_catalog.current_setting(
             'starring.runtime_dedicated_cluster_acknowledgement'
         ) IS DISTINCT FROM pg_catalog.format(
-            'starring-runtime-dedicated-staging-cluster-v1:%s:%s:cluster-wide-public-acl-reset',
+            'starring-runtime-dedicated-staging-cluster-v2:%s:%s:cluster-wide-public-acl-reset:bidirectional-runtime-membership-revocation',
             actual_system_identifier,
             pg_catalog.current_database()
         )
@@ -227,9 +232,16 @@ BEGIN
                 OR expected.role_name = current_user
                 OR expected.role_name
                     = pg_catalog.current_setting('session_authorization')
+                OR expected.role_name::TEXT <> CASE expected.capability
+                    WHEN 'execution' THEN 'starring_runtime_execution'
+                    WHEN 'exact_target' THEN 'starring_runtime_exact_target'
+                    WHEN 'panel' THEN 'starring_runtime_panel'
+                    WHEN 'serving' THEN 'starring_runtime_serving'
+                    WHEN 'interaction' THEN 'starring_runtime_interaction'
+                END
         )
     THEN
-        RAISE EXCEPTION 'runtime capability role identities are invalid'
+        RAISE EXCEPTION 'runtime capability role identities are not exact'
             USING ERRCODE = '22023';
     END IF;
 
@@ -240,36 +252,6 @@ BEGIN
         RAISE EXCEPTION 'runtime capability function manifest is invalid'
             USING ERRCODE = '55000';
     END IF;
-
-    FOR role_entry IN
-        SELECT role_name
-        FROM pg_temp.starring_runtime_capability_roles
-        ORDER BY capability
-    LOOP
-        role_oid := pg_catalog.to_regrole(role_entry.role_name::TEXT);
-        IF role_oid IS NOT NULL
-            AND (
-                EXISTS (
-                    SELECT 1
-                    FROM pg_catalog.pg_auth_members AS membership
-                    WHERE membership.member = role_oid
-                        OR membership.roleid = role_oid
-                )
-                OR EXISTS (
-                    SELECT 1
-                    FROM pg_catalog.pg_shdepend AS dependency
-                    WHERE dependency.refclassid
-                            = 'pg_catalog.pg_authid'::REGCLASS
-                        AND dependency.refobjid = role_oid
-                        AND dependency.deptype = 'o'
-                )
-            )
-        THEN
-            RAISE EXCEPTION 'runtime capability role has external ownership or membership'
-                USING ERRCODE = '55000';
-        END IF;
-
-    END LOOP;
 END;
 $guard$;
 
@@ -321,8 +303,56 @@ BEGIN
                 USING ERRCODE = '55000';
         END IF;
     END LOOP;
+
 END;
 $seal$;
+
+COMMIT;
+
+BEGIN;
+
+DO $membership_cleanup$
+DECLARE
+    membership_entry RECORD;
+BEGIN
+    FOR membership_entry IN
+        SELECT
+            granted_role.rolname AS granted_role_name,
+            member_role.rolname AS member_role_name,
+            grantor_role.rolname AS grantor_role_name
+        FROM pg_catalog.pg_auth_members AS membership
+        INNER JOIN pg_catalog.pg_roles AS granted_role
+            ON granted_role.oid = membership.roleid
+        INNER JOIN pg_catalog.pg_roles AS member_role
+            ON member_role.oid = membership.member
+        INNER JOIN pg_catalog.pg_roles AS grantor_role
+            ON grantor_role.oid = membership.grantor
+        WHERE membership.roleid IN (
+                SELECT pg_catalog.to_regrole(role_name::TEXT)
+                FROM pg_temp.starring_runtime_capability_roles
+            )
+            OR membership.member IN (
+                SELECT pg_catalog.to_regrole(role_name::TEXT)
+                FROM pg_temp.starring_runtime_capability_roles
+            )
+        ORDER BY
+            granted_role.rolname,
+            member_role.rolname,
+            grantor_role.rolname
+    LOOP
+        EXECUTE pg_catalog.format(
+            'SET LOCAL ROLE %I',
+            membership_entry.grantor_role_name
+        );
+        EXECUTE pg_catalog.format(
+            'REVOKE %I FROM %I CASCADE',
+            membership_entry.granted_role_name,
+            membership_entry.member_role_name
+        );
+        EXECUTE 'RESET ROLE';
+    END LOOP;
+END;
+$membership_cleanup$;
 
 COMMIT;
 
@@ -333,6 +363,27 @@ DECLARE
     role_entry RECORD;
     role_oid OID;
 BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_stat_activity AS activity
+        WHERE activity.pid <> pg_catalog.pg_backend_pid()
+            AND (
+                activity.backend_type = 'client backend'
+                OR activity.usesysid IN (
+                    SELECT pg_catalog.to_regrole(
+                        expected.role_name::TEXT
+                    )
+                    FROM pg_temp.starring_runtime_capability_roles AS expected
+                )
+            )
+    ) OR EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_prepared_xacts AS prepared
+    ) THEN
+        RAISE EXCEPTION 'runtime staging cluster is not quiescent'
+            USING ERRCODE = '55000';
+    END IF;
+
     FOR role_entry IN
         SELECT role_name
         FROM pg_temp.starring_runtime_capability_roles
@@ -340,22 +391,28 @@ BEGIN
     LOOP
         role_oid := pg_catalog.to_regrole(role_entry.role_name::TEXT);
 
-        IF role_oid IS NULL
-            OR EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_stat_activity AS activity
-                WHERE activity.usesysid = role_oid
-                    AND activity.pid <> pg_catalog.pg_backend_pid()
-            )
-            OR EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_prepared_xacts AS prepared
-                WHERE prepared.owner = role_entry.role_name
-            )
-        THEN
+        IF role_oid IS NULL THEN
             RAISE EXCEPTION 'runtime capability role is not isolated'
                 USING ERRCODE = '55000';
         END IF;
+
+        IF EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_auth_members AS membership
+            WHERE membership.member = role_oid
+                OR membership.roleid = role_oid
+        ) OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_shdepend AS dependency
+            WHERE dependency.refclassid
+                    = 'pg_catalog.pg_authid'::REGCLASS
+                AND dependency.refobjid = role_oid
+                AND dependency.deptype = 'o'
+        ) THEN
+            RAISE EXCEPTION 'runtime capability role has external ownership or membership'
+                USING ERRCODE = '55000';
+        END IF;
+
     END LOOP;
 END;
 $isolation_guard$;
@@ -398,6 +455,12 @@ BEGIN
             SELECT role.rolname
             FROM pg_catalog.pg_roles AS role
             WHERE role.rolname <> 'pg_database_owner'
+                AND role.oid NOT IN (
+                    SELECT pg_catalog.to_regrole(
+                        expected.role_name::TEXT
+                    )
+                    FROM pg_temp.starring_runtime_capability_roles AS expected
+                )
                 AND pg_catalog.has_schema_privilege(
                     role.oid,
                     'public',
@@ -905,6 +968,47 @@ BEGIN
                 EXECUTE 'RESET ROLE';
             END LOOP;
         END LOOP;
+
+        FOR function_entry IN
+            SELECT DISTINCT
+                function_row.oid::REGPROCEDURE::TEXT
+                    AS function_identity,
+                CASE
+                    WHEN privilege.grantee = 0 THEN 'PUBLIC'
+                    ELSE pg_catalog.format('%I', grantee_role.rolname)
+                END AS grantee_identity,
+                grantor_role.rolname AS grantor_name
+            FROM pg_temp.starring_runtime_capability_functions AS expected
+            INNER JOIN pg_temp.starring_runtime_capability_roles
+                AS expected_role
+                ON expected_role.capability = expected.capability
+            INNER JOIN pg_catalog.pg_proc AS function_row
+                ON function_row.oid = pg_catalog.to_regprocedure(
+                    expected.function_identity
+                )
+            CROSS JOIN LATERAL pg_catalog.aclexplode(
+                function_row.proacl
+            ) AS privilege
+            INNER JOIN pg_catalog.pg_roles AS grantor_role
+                ON grantor_role.oid = privilege.grantor
+            LEFT JOIN pg_catalog.pg_roles AS grantee_role
+                ON grantee_role.oid = privilege.grantee
+            WHERE privilege.grantee <> function_row.proowner
+                AND privilege.grantee
+                    <> pg_catalog.to_regrole(expected_role.role_name::TEXT)
+            ORDER BY function_identity, grantee_identity, grantor_name
+        LOOP
+            EXECUTE pg_catalog.format(
+                'SET LOCAL ROLE %I',
+                function_entry.grantor_name
+            );
+            EXECUTE pg_catalog.format(
+                'REVOKE ALL PRIVILEGES ON ROUTINE %s FROM %s CASCADE',
+                function_entry.function_identity,
+                function_entry.grantee_identity
+            );
+            EXECUTE 'RESET ROLE';
+        END LOOP;
     END IF;
 END;
 $quarantine_cleanup$;
@@ -944,11 +1048,29 @@ BEGIN
             );
 
             FOR function_entry IN
-                SELECT function_identity
+                SELECT
+                    expected.function_identity,
+                    owner_role.rolname AS owner_name
                 FROM pg_temp.starring_runtime_capability_functions
-                WHERE capability = role_entry.capability
-                ORDER BY function_identity
+                    AS expected
+                INNER JOIN pg_catalog.pg_proc AS function_row
+                    ON function_row.oid = pg_catalog.to_regprocedure(
+                        expected.function_identity
+                    )
+                INNER JOIN pg_catalog.pg_roles AS owner_role
+                    ON owner_role.oid = function_row.proowner
+                WHERE expected.capability = role_entry.capability
+                ORDER BY expected.function_identity
             LOOP
+                EXECUTE pg_catalog.format(
+                    'REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE',
+                    function_entry.function_identity
+                );
+                EXECUTE pg_catalog.format(
+                    'GRANT EXECUTE ON FUNCTION %s TO %I',
+                    function_entry.function_identity,
+                    function_entry.owner_name
+                );
                 EXECUTE pg_catalog.format(
                     'GRANT EXECUTE ON FUNCTION %s TO %I',
                     function_entry.function_identity,
@@ -975,6 +1097,325 @@ BEGIN
     INTO database_oid
     FROM pg_catalog.pg_database AS database_row
     WHERE database_row.datname = pg_catalog.current_database();
+
+    IF EXISTS (
+        WITH actual_public_privileges AS (
+            SELECT
+                'pg_catalog.pg_namespace'::REGCLASS::OID AS class_oid,
+                namespace.oid AS object_oid,
+                0::INTEGER AS object_subid,
+                namespace.nspowner AS owner_oid,
+                'n'::"char" AS object_type,
+                namespace.nspname AS namespace_name,
+                privilege.grantor,
+                privilege.privilege_type,
+                privilege.is_grantable
+            FROM pg_catalog.pg_namespace AS namespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                namespace.nspacl,
+                pg_catalog.acldefault('n', namespace.nspowner)
+            )) AS privilege
+            WHERE (
+                    namespace.nspname = 'information_schema'
+                    OR pg_catalog.left(namespace.nspname, 3) = 'pg_'
+                )
+                AND privilege.grantee = 0
+
+            UNION ALL
+
+            SELECT
+                'pg_catalog.pg_class'::REGCLASS::OID,
+                relation.oid,
+                0::INTEGER,
+                relation.relowner,
+                CASE
+                    WHEN relation.relkind = 'S' THEN 'S'::"char"
+                    ELSE 'r'::"char"
+                END,
+                namespace.nspname,
+                privilege.grantor,
+                privilege.privilege_type,
+                privilege.is_grantable
+            FROM pg_catalog.pg_class AS relation
+            INNER JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = relation.relnamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                relation.relacl,
+                pg_catalog.acldefault(
+                    CASE
+                        WHEN relation.relkind = 'S' THEN 'S'::"char"
+                        ELSE 'r'::"char"
+                    END,
+                    relation.relowner
+                )
+            )) AS privilege
+            WHERE (
+                    namespace.nspname = 'information_schema'
+                    OR pg_catalog.left(namespace.nspname, 3) = 'pg_'
+                )
+                AND relation.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+                AND privilege.grantee = 0
+
+            UNION ALL
+
+            SELECT
+                'pg_catalog.pg_class'::REGCLASS::OID,
+                relation.oid,
+                attribute.attnum::INTEGER,
+                relation.relowner,
+                'c'::"char",
+                namespace.nspname,
+                privilege.grantor,
+                privilege.privilege_type,
+                privilege.is_grantable
+            FROM pg_catalog.pg_attribute AS attribute
+            INNER JOIN pg_catalog.pg_class AS relation
+                ON relation.oid = attribute.attrelid
+            INNER JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = relation.relnamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                attribute.attacl,
+                pg_catalog.acldefault('c', relation.relowner)
+            )) AS privilege
+            WHERE (
+                    namespace.nspname = 'information_schema'
+                    OR pg_catalog.left(namespace.nspname, 3) = 'pg_'
+                )
+                AND attribute.attnum > 0
+                AND NOT attribute.attisdropped
+                AND privilege.grantee = 0
+
+            UNION ALL
+
+            SELECT
+                'pg_catalog.pg_proc'::REGCLASS::OID,
+                function_row.oid,
+                0::INTEGER,
+                function_row.proowner,
+                'f'::"char",
+                namespace.nspname,
+                privilege.grantor,
+                privilege.privilege_type,
+                privilege.is_grantable
+            FROM pg_catalog.pg_proc AS function_row
+            INNER JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = function_row.pronamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                function_row.proacl,
+                pg_catalog.acldefault('f', function_row.proowner)
+            )) AS privilege
+            WHERE (
+                    namespace.nspname = 'information_schema'
+                    OR pg_catalog.left(namespace.nspname, 3) = 'pg_'
+                )
+                AND privilege.grantee = 0
+
+            UNION ALL
+
+            SELECT
+                'pg_catalog.pg_type'::REGCLASS::OID,
+                type_row.oid,
+                0::INTEGER,
+                type_row.typowner,
+                'T'::"char",
+                namespace.nspname,
+                privilege.grantor,
+                privilege.privilege_type,
+                privilege.is_grantable
+            FROM pg_catalog.pg_type AS type_row
+            INNER JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = type_row.typnamespace
+            CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                type_row.typacl,
+                pg_catalog.acldefault('T', type_row.typowner)
+            )) AS privilege
+            WHERE (
+                    namespace.nspname = 'information_schema'
+                    OR pg_catalog.left(namespace.nspname, 3) = 'pg_'
+                )
+                AND privilege.grantee = 0
+
+            UNION ALL
+
+            SELECT
+                'pg_catalog.pg_language'::REGCLASS::OID,
+                language.oid,
+                0::INTEGER,
+                language.lanowner,
+                'l'::"char",
+                NULL::NAME,
+                privilege.grantor,
+                privilege.privilege_type,
+                privilege.is_grantable
+            FROM pg_catalog.pg_language AS language
+            CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+                language.lanacl,
+                pg_catalog.acldefault('l', language.lanowner)
+            )) AS privilege
+            WHERE privilege.grantee = 0
+        )
+        SELECT 1
+        FROM actual_public_privileges AS actual
+        WHERE NOT (
+            (
+                actual.namespace_name = 'information_schema'
+                AND actual.object_oid < 16384
+                AND actual.class_oid
+                    = 'pg_catalog.pg_namespace'::REGCLASS::OID
+                AND actual.object_subid = 0
+                AND actual.grantor = actual.owner_oid
+                AND actual.privilege_type = 'USAGE'
+                AND NOT actual.is_grantable
+            )
+            OR (
+                actual.namespace_name = 'information_schema'
+                AND actual.object_oid < 16384
+                AND actual.class_oid
+                    = 'pg_catalog.pg_class'::REGCLASS::OID
+                AND actual.object_subid = 0
+                AND actual.grantor = actual.owner_oid
+                AND actual.privilege_type = 'SELECT'
+                AND NOT actual.is_grantable
+                AND EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_class AS baseline_relation
+                    WHERE baseline_relation.oid = actual.object_oid
+                        AND baseline_relation.relname NOT IN (
+                            '_pg_foreign_data_wrappers',
+                            '_pg_foreign_servers',
+                            '_pg_foreign_table_columns',
+                            '_pg_foreign_tables',
+                            '_pg_user_mappings',
+                            'sql_parts',
+                            'transforms'
+                        )
+                )
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_init_privs AS initial
+                CROSS JOIN LATERAL pg_catalog.aclexplode(
+                    initial.initprivs
+                ) AS baseline
+                WHERE initial.classoid = actual.class_oid
+                    AND initial.objoid = actual.object_oid
+                    AND initial.objsubid = actual.object_subid
+                    AND baseline.grantee = 0
+                    AND baseline.grantor = actual.grantor
+                    AND baseline.privilege_type
+                        = actual.privilege_type
+                    AND baseline.is_grantable
+                        = actual.is_grantable
+            )
+            OR (
+                (
+                    actual.object_oid < 16384
+                    OR actual.namespace_name IN (
+                        SELECT namespace.nspname
+                        FROM pg_catalog.pg_namespace AS namespace
+                        WHERE namespace.oid
+                                = pg_catalog.pg_my_temp_schema()
+                            OR namespace.nspname = pg_catalog.replace(
+                                (
+                                    SELECT temp_namespace.nspname
+                                    FROM pg_catalog.pg_namespace
+                                        AS temp_namespace
+                                    WHERE temp_namespace.oid
+                                        = pg_catalog.pg_my_temp_schema()
+                                ),
+                                'pg_temp_',
+                                'pg_toast_temp_'
+                            )
+                    )
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.pg_init_privs AS initial
+                    WHERE initial.classoid = actual.class_oid
+                        AND initial.objoid = actual.object_oid
+                        AND initial.objsubid = actual.object_subid
+                )
+                AND EXISTS (
+                    SELECT 1
+                    FROM pg_catalog.aclexplode(
+                        pg_catalog.acldefault(
+                            actual.object_type,
+                            actual.owner_oid
+                        )
+                    ) AS baseline
+                    WHERE baseline.grantee = 0
+                        AND baseline.grantor = actual.grantor
+                        AND baseline.privilege_type
+                            = actual.privilege_type
+                        AND baseline.is_grantable
+                            = actual.is_grantable
+                )
+            )
+        )
+    ) THEN
+        RAISE EXCEPTION 'runtime system PUBLIC privileges are invalid'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_database AS database_row
+        CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+            database_row.datacl,
+            pg_catalog.acldefault('d', database_row.datdba)
+        )) AS privilege
+        WHERE privilege.grantee = 0
+    ) OR EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_namespace AS namespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+            namespace.nspacl,
+            pg_catalog.acldefault('n', namespace.nspowner)
+        )) AS privilege
+        WHERE namespace.nspname = 'public'
+            AND privilege.grantee = 0
+    ) THEN
+        RAISE EXCEPTION 'runtime public boundary privileges are invalid'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_temp.starring_runtime_capability_functions AS expected
+        INNER JOIN pg_temp.starring_runtime_capability_roles
+            AS expected_role
+            ON expected_role.capability = expected.capability
+        INNER JOIN pg_catalog.pg_proc AS function_row
+            ON function_row.oid = pg_catalog.to_regprocedure(
+                expected.function_identity
+            )
+        CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(
+            function_row.proacl,
+            pg_catalog.acldefault('f', function_row.proowner)
+        )) AS privilege
+        GROUP BY
+            function_row.oid,
+            function_row.proowner,
+            expected_role.role_name
+        HAVING pg_catalog.count(*) <> 2
+            OR pg_catalog.count(*) FILTER (
+                WHERE privilege.grantee = function_row.proowner
+                    AND privilege.grantor = function_row.proowner
+                    AND privilege.privilege_type = 'EXECUTE'
+                    AND NOT privilege.is_grantable
+            ) <> 1
+            OR pg_catalog.count(*) FILTER (
+                WHERE privilege.grantee = pg_catalog.to_regrole(
+                        expected_role.role_name::TEXT
+                    )
+                    AND privilege.grantor = function_row.proowner
+                    AND privilege.privilege_type = 'EXECUTE'
+                    AND NOT privilege.is_grantable
+            ) <> 1
+    ) THEN
+        RAISE EXCEPTION 'runtime capability function ACL topology is invalid'
+            USING ERRCODE = '55000';
+    END IF;
 
     IF EXISTS (
         SELECT 1
@@ -1522,6 +1963,27 @@ DECLARE
     role_entry RECORD;
     role_oid OID;
 BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_stat_activity AS activity
+        WHERE activity.pid <> pg_catalog.pg_backend_pid()
+            AND (
+                activity.backend_type = 'client backend'
+                OR activity.usesysid IN (
+                    SELECT pg_catalog.to_regrole(
+                        expected.role_name::TEXT
+                    )
+                    FROM pg_temp.starring_runtime_capability_roles AS expected
+                )
+            )
+    ) OR EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_prepared_xacts AS prepared
+    ) THEN
+        RAISE EXCEPTION 'runtime staging cluster lost quiescence'
+            USING ERRCODE = '55000';
+    END IF;
+
     FOR role_entry IN
         SELECT role_name
         FROM pg_temp.starring_runtime_capability_roles
@@ -1529,19 +1991,19 @@ BEGIN
     LOOP
         role_oid := pg_catalog.to_regrole(role_entry.role_name::TEXT);
 
-        IF role_oid IS NULL
-            OR EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_stat_activity AS activity
-                WHERE activity.usesysid = role_oid
-                    AND activity.pid <> pg_catalog.pg_backend_pid()
-            )
-            OR EXISTS (
-                SELECT 1
-                FROM pg_catalog.pg_prepared_xacts AS prepared
-                WHERE prepared.owner = role_entry.role_name
-            )
-        THEN
+        IF role_oid IS NULL OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_auth_members AS membership
+            WHERE membership.member = role_oid
+                OR membership.roleid = role_oid
+        ) OR EXISTS (
+            SELECT 1
+            FROM pg_catalog.pg_shdepend AS dependency
+            WHERE dependency.refclassid
+                    = 'pg_catalog.pg_authid'::REGCLASS
+                AND dependency.refobjid = role_oid
+                AND dependency.deptype = 'o'
+        ) THEN
             RAISE EXCEPTION 'runtime capability role lost isolation'
                 USING ERRCODE = '55000';
         END IF;

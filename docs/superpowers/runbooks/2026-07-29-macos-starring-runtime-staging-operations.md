@@ -65,7 +65,7 @@ this procedure. The acknowledgement must equal this exact value, with the
 reviewed identifier substituted:
 
 ```text
-starring-runtime-dedicated-staging-cluster-v1:SYSTEM_IDENTIFIER:starring_runtime_staging:cluster-wide-public-acl-reset
+starring-runtime-dedicated-staging-cluster-v2:SYSTEM_IDENTIFIER:starring_runtime_staging:cluster-wide-public-acl-reset:bidirectional-runtime-membership-revocation
 ```
 
 Every `zsh` block below is a fail-fast subshell. Run a block as one unit and
@@ -82,7 +82,7 @@ interactive password prompt.
   : "${STARRING_STAGING_CLUSTER_ADMIN:?load the reviewed cluster administrator}"
   : "${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER:?load the reviewed system identifier}"
   : "${STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT:?load the reviewed dedicated-cluster acknowledgement}"
-  EXPECTED_ACKNOWLEDGEMENT="starring-runtime-dedicated-staging-cluster-v1:${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER}:${STAGING_DATABASE}:cluster-wide-public-acl-reset"
+  EXPECTED_ACKNOWLEDGEMENT="starring-runtime-dedicated-staging-cluster-v2:${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER}:${STAGING_DATABASE}:cluster-wide-public-acl-reset:bidirectional-runtime-membership-revocation"
   test "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" = "$EXPECTED_ACKNOWLEDGEMENT"
   print -r -- "$STARRING_STAGING_CLUSTER_ADMIN" \
     | grep -Eq '^[a-z_][a-z0-9_]{0,62}$'
@@ -108,16 +108,21 @@ cluster-wide so the five runtime roles cannot connect to another database
 through inherited `PUBLIC` access. A staging-looking database name is not
 proof that its cluster is dedicated. The independently reviewed system
 identifier and exact cluster-wide ACL acknowledgement are both mandatory.
+The acknowledgement also approves removal of every inbound and outbound role
+membership involving a runtime capability role. Each removal uses the original
+grantor and `CASCADE`, so dependent role grants can also be removed. This
+bootstrap is restricted to PostgreSQL 16 because its system-object `PUBLIC`
+baseline is checked against PostgreSQL 16 catalog metadata.
 
 ## Authenticate and prove the exact target before any migration
 
 This read-only proof is the first database connection in the procedure. It
 uses an explicit TCP host, port, database, and independently inventoried
 administrator. The observed database name, PostgreSQL system identifier,
-current user, session user, and superuser status must match one exact expected
-record. Do not apply a migration, run the role bootstrap, or change a
-credential if this proof fails. Never replace the inventory value with an
-identifier learned from this connection.
+current user, session user, superuser status, and PostgreSQL major version must
+match one exact expected record. Do not apply a migration, run the role
+bootstrap, or change a credential if this proof fails. Never replace the
+inventory value with an identifier learned from this connection.
 
 ```zsh
 (
@@ -129,7 +134,7 @@ identifier learned from this connection.
   : "${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER:?load the reviewed system identifier}"
   unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
   unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
-  EXPECTED_TARGET="${STAGING_DATABASE}|${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER}|${STARRING_STAGING_CLUSTER_ADMIN}|${STARRING_STAGING_CLUSTER_ADMIN}|true"
+  EXPECTED_TARGET="${STAGING_DATABASE}|${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER}|${STARRING_STAGING_CLUSTER_ADMIN}|${STARRING_STAGING_CLUSTER_ADMIN}|true|16"
   OBSERVED_TARGET="$(
     PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
       --no-psqlrc --set ON_ERROR_STOP=1 --password --quiet \
@@ -137,43 +142,62 @@ identifier learned from this connection.
       --username "$STARRING_STAGING_CLUSTER_ADMIN" \
       --dbname "$STAGING_DATABASE" --tuples-only --no-align \
       --command "BEGIN READ ONLY" \
-      --command "SELECT pg_catalog.concat_ws('|', pg_catalog.current_database(), control.system_identifier::TEXT, current_user, session_user, administrator.rolsuper::TEXT) FROM pg_catalog.pg_control_system() AS control CROSS JOIN pg_catalog.pg_roles AS administrator WHERE administrator.rolname = current_user" \
+      --command "SELECT pg_catalog.concat_ws('|', pg_catalog.current_database(), control.system_identifier::TEXT, current_user, session_user, administrator.rolsuper::TEXT, (pg_catalog.current_setting('server_version_num')::INTEGER / 10000)::TEXT) FROM pg_catalog.pg_control_system() AS control CROSS JOIN pg_catalog.pg_roles AS administrator WHERE administrator.rolname = current_user" \
       --command "COMMIT"
   )"
   test "$OBSERVED_TARGET" = "$EXPECTED_TARGET"
 )
 ```
 
-## Stop the existing service before database work
+## Quiesce the dedicated cluster before database work
 
-Bootstrap, migration, and credential rotation require the runtime to be
-unloaded. The SQL guard independently refuses any active session or prepared
-transaction owned by one of the five roles.
+Bootstrap, migration, and credential rotation require both the runtime and API
+LaunchAgents to be unloaded. Stop every maintenance job, migration process,
+connection pool, and ad-hoc SQL client that can reach any database in this
+dedicated cluster. The SQL guard rejects every other cluster-wide client
+backend, every non-client backend authenticated as one of the five runtime
+roles, and every prepared transaction, regardless of database or session
+identity.
 
 ```zsh
 (
   set -euo pipefail
   DOMAIN="gui/$(id -u)"
-  SERVICE="$DOMAIN/local.starring.runtime.staging"
-  if SERVICE_STATE="$(launchctl print "$SERVICE" 2>/dev/null)"; then
-    PID="$(
-      print -r -- "$SERVICE_STATE" \
-        | awk '/^[[:space:]]*pid = / { print $3; exit }'
-    )"
-    launchctl bootout "$SERVICE"
-    if test -n "$PID"; then
-      for ATTEMPT in {1..35}; do
-        if ! kill -0 "$PID" 2>/dev/null; then
-          break
-        fi
-        sleep 1
-      done
-      ! kill -0 "$PID" 2>/dev/null
+  API_SERVICE="$DOMAIN/local.starring.api.staging"
+  API_WAS_LOADED=false
+  SERVICES=(
+    "$DOMAIN/local.starring.runtime.staging"
+    "$API_SERVICE"
+  )
+  for SERVICE in "${SERVICES[@]}"; do
+    if SERVICE_STATE="$(launchctl print "$SERVICE" 2>/dev/null)"; then
+      if test "$SERVICE" = "$API_SERVICE"; then
+        API_WAS_LOADED=true
+      fi
+      PID="$(
+        print -r -- "$SERVICE_STATE" \
+          | awk '/^[[:space:]]*pid = / { print $3; exit }'
+      )"
+      launchctl bootout "$SERVICE"
+      if test -n "$PID"; then
+        for ATTEMPT in {1..35}; do
+          if ! kill -0 "$PID" 2>/dev/null; then
+            break
+          fi
+          sleep 1
+        done
+        ! kill -0 "$PID" 2>/dev/null
+      fi
     fi
-  fi
-  ! launchctl print "$SERVICE" >/dev/null 2>&1
+    ! launchctl print "$SERVICE" >/dev/null 2>&1
+  done
+  print -r -- "api_was_loaded=$API_WAS_LOADED"
 )
 ```
+
+Preserve the printed `api_was_loaded` value in the change record. A previously
+loaded API must remain down during this procedure and must be restored by the
+conditional recovery section only after all runtime acceptance checks pass.
 
 ## Verify the exact SQLx migration ledger
 
@@ -220,26 +244,38 @@ fails the block.
 ## Bootstrap the five database roles
 
 Run the script in quarantine mode. A session advisory lock serializes valid
-invocations for this database and cluster identity. After read-only target and
-role validation, a minimal mutation transaction only creates or alters the
-five roles, strips privileged attributes, clears their passwords, and commits
-them as `NOLOGIN`. That seal commits before any ACL tuple is touched. A later
-transaction proves that every role has exactly zero sessions and prepared
-transactions, resets settings, removes every direct target-role ACL and grant
-option across user and system objects, establishes the exact capability
-grants, verifies the result, and repeats the isolation proof immediately
-before commit. A lock timeout, unsafe `PUBLIC` ACL, invalid default privilege,
-or later configuration failure rolls back that transaction while the minimal
-`NOLOGIN` seal remains committed.
+invocations for this database and cluster identity. The first transaction
+validates PostgreSQL 16, the exact target identity, administrator authority,
+the exact five fixed capability-role names, and the dedicated-cluster
+acknowledgement. Role-name overrides are forbidden. The second transaction
+only creates or alters those five roles, strips privileged attributes, clears
+their passwords, and commits them as `NOLOGIN`. The third transaction removes
+every inbound and outbound membership involving those roles under each
+original grantor with `CASCADE`, then commits. The fourth transaction rejects
+external ownership without changing it, proves cluster-wide zero client
+backends and zero prepared transactions, resets settings, removes every direct
+target-role ACL and grant option across user and system objects, establishes
+the exact capability grants, verifies the result, repeats the cluster isolation
+proof, and only then commits.
+
+If membership removal fails, the credential seal remains committed and the
+membership transaction rolls back. If ownership, cluster quiescence, ACL
+validation, or configuration later fails, both the credential seal and
+completed membership removals remain committed. Do not treat that state as a
+successful bootstrap: stop all clients, correct the reported drift, and
+complete quarantine mode before setting passwords.
 
 The default-privilege mutation is deliberately narrow. Direct grants to the
 five runtime roles are removed from every current-database default ACL.
 `PUBLIC` table, sequence, routine, type, and schema defaults are suppressed
 only for owners that can currently create in the runtime-accessible `public`
-schema. Existing built-in `PUBLIC` type, language, catalog, and routine
-baselines remain unchanged. Unexpected effective `PUBLIC` access outside the
-separately acknowledged database and `public`-schema boundary fails closed
-instead of being rewritten.
+schema. `PUBLIC` privileges are removed from every database and from schema
+`public`. PostgreSQL 16 built-in system-schema, relation, column, routine, type,
+and language baselines remain unchanged; added `PUBLIC` privileges are
+detected from `pg_init_privs` and fail closed instead of being rewritten. Every
+manifest capability function must have exactly two non-grantable `EXECUTE`
+entries: its owner and its one designated capability role. Quarantine mode
+removes `PUBLIC` and unrelated-role grants from those manifest functions.
 
 ```zsh
 (
@@ -254,6 +290,7 @@ instead of being rewritten.
   : "${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER:?load the reviewed system identifier}"
   : "${STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT:?load the reviewed dedicated-cluster acknowledgement}"
   ! launchctl print "$SERVICE" >/dev/null 2>&1
+  ! launchctl print "$DOMAIN/local.starring.api.staging" >/dev/null 2>&1
   unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
   unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
   PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
@@ -265,16 +302,21 @@ instead of being rewritten.
     --set expected_system_identifier="$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
     --set runtime_dedicated_cluster_acknowledgement="$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
     --dbname "$STAGING_DATABASE" \
+    --command "SELECT 1 / CASE WHEN NOT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE pid <> pg_catalog.pg_backend_pid() AND (backend_type = 'client backend' OR usesysid IN (pg_catalog.to_regrole('starring_runtime_execution'), pg_catalog.to_regrole('starring_runtime_exact_target'), pg_catalog.to_regrole('starring_runtime_panel'), pg_catalog.to_regrole('starring_runtime_serving'), pg_catalog.to_regrole('starring_runtime_interaction')))) AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_prepared_xacts) THEN 1 ELSE 0 END AS cluster_quiescence_proof" \
     --file ops/postgres/staging-runtime-role-bootstrap.sql
 )
 ```
 
-Bootstrap mode is deliberately fail-closed: it leaves the five roles
-`NOLOGIN` with no password. A connection that raced the quarantine commit
-or an ACL lock held by another identity causes the later transaction to fail
-before any exact grant is installed. Stop the session or release the lock,
-rerun quarantine mode, and do not set passwords until the whole block
-succeeds.
+Bootstrap mode is deliberately fail-closed. It commits the five roles as
+`NOLOGIN` with null passwords before attempting membership cleanup, then
+commits bidirectional membership removal before checking ownership, cluster
+quiescence, and ACLs. A client that raced the proof, a prepared transaction,
+an ACL lock, an owned object, or invalid `PUBLIC` state can therefore fail the
+last transaction after the seal and membership changes are durable. Stop every
+cluster client, release the lock or prepared transaction, separately review
+owned objects and system `PUBLIC` drift, and rerun quarantine mode. The
+bootstrap never drops or reassigns an owned object. Do not set passwords until
+the entire block succeeds.
 
 Generate a separate password for every role in a password manager. Each
 password must contain 24–512 characters from only `A-Z`, `a-z`, `0-9`, `_`,
@@ -443,11 +485,12 @@ connection:
 ```
 
 Run the same script in enable mode. It requires five SCRAM-SHA-256 verifiers,
-requires each role to be committed `NOLOGIN`, verifies zero sessions and
-prepared transactions plus the exact ACL boundary, repeats the isolation proof,
-and only then changes all five roles to `LOGIN` in one final transaction. Any
-failure rolls that activation transaction back to the committed `NOLOGIN`
-state.
+requires each role to be committed `NOLOGIN`, removes any newly introduced
+bidirectional membership, verifies zero client sessions and prepared
+transactions across the dedicated cluster plus the exact ACL boundary, repeats
+the isolation proof, and only then changes all five roles to `LOGIN` in one
+final transaction. Any failure rolls that activation transaction back to the
+committed `NOLOGIN` state.
 
 ```zsh
 (
@@ -457,6 +500,9 @@ state.
   : "${STARRING_STAGING_CLUSTER_ADMIN:?load the reviewed cluster administrator}"
   : "${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER:?load the reviewed system identifier}"
   : "${STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT:?load the reviewed dedicated-cluster acknowledgement}"
+  DOMAIN="gui/$(id -u)"
+  ! launchctl print "$DOMAIN/local.starring.runtime.staging" >/dev/null 2>&1
+  ! launchctl print "$DOMAIN/local.starring.api.staging" >/dev/null 2>&1
   unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
   unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
   PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
@@ -468,6 +514,7 @@ state.
     --set expected_system_identifier="$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
     --set runtime_dedicated_cluster_acknowledgement="$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
     --dbname "$STAGING_DATABASE" \
+    --command "SELECT 1 / CASE WHEN NOT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE pid <> pg_catalog.pg_backend_pid() AND (backend_type = 'client backend' OR usesysid IN (pg_catalog.to_regrole('starring_runtime_execution'), pg_catalog.to_regrole('starring_runtime_exact_target'), pg_catalog.to_regrole('starring_runtime_panel'), pg_catalog.to_regrole('starring_runtime_serving'), pg_catalog.to_regrole('starring_runtime_interaction')))) AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_prepared_xacts) THEN 1 ELSE 0 END AS cluster_quiescence_proof" \
     --file ops/postgres/staging-runtime-role-bootstrap.sql
 )
 ```
@@ -475,7 +522,7 @@ state.
 Any quarantine-mode rerun intentionally returns all five roles to `NOLOGIN`,
 clears their passwords, and requires a fresh password-and-enable cycle. Enable
 mode refuses roles that are already `LOGIN`; it is an activation edge, not an
-idempotent health check. Stop and unload the LaunchAgent first. This is
+idempotent health check. Stop and unload both staging LaunchAgents first. This is
 credential rotation, not a harmless read-only check.
 
 From the moment enable mode succeeds until every authentication, HBA,
@@ -1021,6 +1068,50 @@ remain the same process through readiness and increments the run count exactly
 once. Treat a deadline error, an orphaned process, restart, PID succession,
 nonzero exit, owner loss, capability-readiness loss, ACK loss, or persistent
 `not_ready` as a failed cutover.
+
+## Restore a previously loaded API
+
+Run this block only when the preserved entry evidence says
+`api_was_loaded=true`. It restores only the API service that this procedure
+stopped and requires both API health gates. If the installed API plist, binary,
+or its separate operating authority is unavailable, keep the API stopped and
+hand restoration to the owner of the
+`2026-07-19-production-control-plane-cutover.md` procedure. Do not silently
+finish with a previously loaded API down.
+
+```zsh
+(
+  set -euo pipefail
+  DOMAIN="gui/$(id -u)"
+  API_SERVICE="$DOMAIN/local.starring.api.staging"
+  API_PLIST="$HOME/Library/LaunchAgents/local.starring.api.staging.plist"
+  test -f "$API_PLIST"
+  test -x "$HOME/.local/libexec/starring-api"
+  plutil -lint "$API_PLIST"
+  ! launchctl print "$API_SERVICE" >/dev/null 2>&1
+  launchctl bootstrap "$DOMAIN" "$API_PLIST"
+  READY=0
+  for ATTEMPT in {1..60}; do
+    if curl --fail --silent --show-error --max-time 1 \
+      http://127.0.0.1:18080/health/live >/dev/null 2>&1 \
+      && curl --fail --silent --show-error --max-time 1 \
+        http://127.0.0.1:18080/health/ready >/dev/null 2>&1
+    then
+      READY=1
+      break
+    fi
+    sleep 1
+  done
+  test "$READY" = 1
+  launchctl print "$API_SERVICE"
+)
+```
+
+If API restoration fails, unload both staging LaunchAgents and immediately run
+the earlier quarantine-mode role bootstrap. Keep both services down until the
+API owner corrects the failure and the complete password, enable, runtime, and
+API readiness sequence is repeated. When `api_was_loaded=false`, do not run the
+restore block; record that the API intentionally remained stopped.
 
 ## Routine operation
 
