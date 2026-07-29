@@ -491,3 +491,71 @@ async fn trusted_writer_postflight_drift_aborts_the_whole_migration() {
     drop_migration_database(administrator, pool, &database_name).await;
     outcome.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires superuser STARRING_TEST_DATABASE_URL"]
+async fn trusted_writer_postflight_acl_drift_aborts_the_whole_migration() {
+    let database_name = format!("starring_writer_postflight_acl_test_{}", unique_suffix());
+    let (administrator, pool) = temporary_database(&database_name).await;
+    let outcome = async {
+        apply_pre_trusted_writer_migrations(&pool).await;
+        let superuser = sqlx::query_scalar::<_, bool>(
+            "SELECT role.rolsuper \
+             FROM pg_catalog.pg_roles AS role \
+             WHERE role.rolname = CURRENT_USER",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(superuser);
+        sqlx::raw_sql(
+            "CREATE TABLE public.authoring_writer_postflight_acl_probe (\
+                 revoke_count BIGINT NOT NULL, \
+                 injected BOOLEAN NOT NULL\
+             ); \
+             INSERT INTO public.authoring_writer_postflight_acl_probe VALUES (0, FALSE); \
+             CREATE FUNCTION public.inject_authoring_writer_postflight_acl_drift() \
+             RETURNS EVENT_TRIGGER \
+             LANGUAGE plpgsql \
+             SET search_path = pg_catalog, public \
+             AS $function$ \
+             DECLARE \
+                 observed_revoke_count BIGINT; \
+             BEGIN \
+                 UPDATE public.authoring_writer_postflight_acl_probe \
+                 SET revoke_count = revoke_count + 1 \
+                 RETURNING revoke_count INTO observed_revoke_count; \
+                 IF observed_revoke_count = 7 \
+                 THEN \
+                     UPDATE public.authoring_writer_postflight_acl_probe \
+                     SET injected = TRUE; \
+                     GRANT EXECUTE ON FUNCTION \
+                         public.starring_authoring_session_writer_database_identity_v1() \
+                     TO PUBLIC; \
+                 END IF; \
+             END; \
+             $function$; \
+             CREATE EVENT TRIGGER inject_authoring_writer_postflight_acl_drift \
+             ON ddl_command_end \
+             WHEN TAG IN ('REVOKE') \
+             EXECUTE FUNCTION public.inject_authoring_writer_postflight_acl_drift();",
+        )
+        .execute(&pool)
+        .await?;
+
+        let error = apply_trusted_writer_migration_expect_failure(&pool).await;
+        assert_operational_error(&error, "authoring writer function ACL is invalid");
+        assert_no_trusted_writer_residue(&pool).await;
+
+        let probe = sqlx::query_as::<_, (i64, bool)>(
+            "SELECT revoke_count, injected \
+             FROM public.authoring_writer_postflight_acl_probe",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(probe, (0, false));
+        Ok::<_, sqlx::Error>(())
+    }
+    .await;
+    drop_migration_database(administrator, pool, &database_name).await;
+    outcome.unwrap();
+}
