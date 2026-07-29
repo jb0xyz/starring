@@ -1316,6 +1316,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     );
     assert!(process_observation.contains(concat!(
         "use automation_runtime_controller::{\n",
+        "    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2,\n",
         "    RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimeObserveWriterFenceV1,\n",
         "    RuntimeWriterFenceObservationV1,\n",
         "};"
@@ -3731,6 +3732,14 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     assert!(!production.contains(".resume_reserved_admission"));
     assert!(!production.contains(".resume("));
     assert!(!production.contains("resume("));
+    let resumed_ready = braced_declaration(
+        production,
+        "pub(crate) fn observe_exact_resumed_ready_attestation_v2(",
+    );
+    assert!(
+        resumed_ready.contains(".observe_exact_recovery_resume_successor_ready_attestation_v2(")
+    );
+    assert!(!resumed_ready.contains(".recovery_resume_successor_generation_v2()"));
     let process_observation = sources
         .iter()
         .find(|(path, _)| path == Path::new("src/process/observation.rs"))
@@ -3743,29 +3752,70 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
     let closed_gate = process_resume
         .find("maintenance_gate_is_closed_v2(pre_gate)")
         .unwrap();
-    let pause = process_resume
-        .find(".observe_exact_pause_reservation_v2()")
+    let pre_database = process_resume
+        .find("collect_recovery_resume_database_evidence_v2(&self.foundation)")
         .unwrap();
-    let discord_resume = process_resume
-        .find(".resume_reserved_admission_in_place_v2(")
+    let gateway_stage_call = process_resume
+        .find("execute_recovery_resume_gateway_stage_v2(")
         .unwrap();
-    let exact_evidence = process_resume
-        .find("evidence.coordinator_generation_v2() != coordinator_generation")
-        .unwrap();
-    let ready = process_resume
-        .find(".observe_exact_resumed_ready_attestation_v2()")
+    let record_exact_ready = process_resume.find(".record_exact_ready_v2()").unwrap();
+    let post_database = process_resume
+        .rfind("collect_recovery_resume_database_evidence_v2(&self.foundation)")
         .unwrap();
     let gate_reobservation = process_resume.find("post_gate != pre_gate").unwrap();
     let worker_resume = process_resume
         .find("lifecycle.into_admission_acknowledging_v2(observation)")
         .unwrap();
+    assert_eq!(
+        process_resume
+            .matches("execute_recovery_resume_gateway_stage_v2(")
+            .count(),
+        1
+    );
     assert!(
-        closed_gate < pause
-            && pause < discord_resume
-            && discord_resume < exact_evidence
-            && exact_evidence < ready
-            && ready < gate_reobservation
+        closed_gate < pre_database
+            && pre_database < gateway_stage_call
+            && gateway_stage_call < record_exact_ready
+            && record_exact_ready < post_database
+            && post_database < gate_reobservation
             && gate_reobservation < worker_resume
+    );
+    assert!(!process_resume.contains(".resume_reserved_admission_in_place_v2("));
+    assert!(!process_resume.contains(".observe_exact_pause_reservation_v2()"));
+    let gateway_stage = braced_declaration(
+        process_observation,
+        "pub(crate) async fn execute_recovery_resume_gateway_stage_v2(",
+    );
+    let pause = gateway_stage
+        .find(".observe_exact_pause_reservation_v2()")
+        .unwrap();
+    let successor = gateway_stage
+        .find(".recovery_resume_successor_generation_v2()")
+        .unwrap();
+    let owner_receipt = gateway_stage.find(".recovery_resume_permit_v2()").unwrap();
+    let resume_deadline = gateway_stage
+        .find("let resume_deadline = Instant::now() + resume_for;")
+        .unwrap();
+    let discord_resume = gateway_stage
+        .find(".resume_reserved_admission_in_place_v2(")
+        .unwrap();
+    let exact_evidence = gateway_stage
+        .find("evidence.coordinator_generation_v2() != coordinator_generation")
+        .unwrap();
+    let successor_evidence = gateway_stage
+        .find("lifecycle.coordinator_generation_v2() != expected_gateway_successor")
+        .unwrap();
+    let ready = gateway_stage
+        .find(".observe_exact_resumed_ready_attestation_v2()")
+        .unwrap();
+    assert!(
+        pause < successor
+            && successor < owner_receipt
+            && owner_receipt < resume_deadline
+            && resume_deadline < discord_resume
+            && discord_resume < exact_evidence
+            && exact_evidence < successor_evidence
+            && successor_evidence < ready
     );
     for forbidden in ["begin_open_v2", "commit_open_v2", "try_acquire_v2"] {
         assert!(
@@ -3855,7 +3905,9 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
                 assert!(
                     path == Path::new("src/closed_recovery.rs")
                         || path == Path::new("src/database.rs")
-                        || path == Path::new("src/process/observation.rs"),
+                        || path == Path::new("src/process/observation.rs")
+                        || path
+                            == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs",),
                     "{}: {method}",
                     path.display()
                 );
