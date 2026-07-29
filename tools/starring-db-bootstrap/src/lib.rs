@@ -1,3 +1,5 @@
+mod keychain;
+
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
@@ -5,6 +7,11 @@ use automation_instance_postgres::MIGRATOR;
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
 use sqlx::{Connection, Row};
 use thiserror::Error;
+
+pub use keychain::{
+    read_admin_url_from_keychain, AdminKeychainErrorV1, ADMIN_KEYCHAIN_ACCOUNT,
+    ADMIN_KEYCHAIN_SERVICE,
+};
 
 pub const DATABASE_NAME: &str = "starring_runtime_staging";
 pub const OWNER_ROLE: &str = "starring_owner";
@@ -16,6 +23,8 @@ pub const PEER_SOCKET_DIRECTORY: &str = "/private/tmp/starring-bootstrap";
 pub const PEER_PORT: u16 = 5432;
 
 const ADMIN_DATABASE: &str = "postgres";
+const ADMIN_HOST: &str = "127.0.0.1";
+const ADMIN_PORT: u16 = 5432;
 const APPLICATION_NAME: &str = "starring-db-bootstrap";
 const API_ROLE_BOOTSTRAP: &str =
     include_str!("../../../ops/postgres/staging-api-role-bootstrap.sql");
@@ -553,6 +562,33 @@ pub fn parse_admin_connect_options(input: &str) -> Result<PgConnectOptions, Boot
     PgConnectOptions::from_str(input).map_err(|_| BootstrapErrorV1::InvalidAdminUrl)
 }
 
+pub fn parse_keychain_admin_connect_options(
+    input: &str,
+) -> Result<PgConnectOptions, BootstrapErrorV1> {
+    let prefix = format!("postgresql://{CLUSTER_ADMIN_ROLE}:");
+    let suffix = format!("@{ADMIN_HOST}:{ADMIN_PORT}/{ADMIN_DATABASE}?sslmode=disable");
+    let password = input
+        .strip_prefix(&prefix)
+        .and_then(|value| value.strip_suffix(&suffix))
+        .ok_or(BootstrapErrorV1::InvalidAdminUrl)?;
+    if password.len() != 43
+        || !password
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(BootstrapErrorV1::InvalidAdminUrl);
+    }
+    let options = parse_admin_connect_options(input)?;
+    if options.get_host() != ADMIN_HOST
+        || options.get_port() != ADMIN_PORT
+        || options.get_username() != CLUSTER_ADMIN_ROLE
+        || options.get_database() != Some(ADMIN_DATABASE)
+    {
+        return Err(BootstrapErrorV1::InvalidAdminUrl);
+    }
+    Ok(options)
+}
+
 pub fn peer_bootstrap_connect_options() -> PgConnectOptions {
     PgConnectOptions::new()
         .host(PEER_SOCKET_DIRECTORY)
@@ -1015,6 +1051,36 @@ mod tests {
     }
 
     #[test]
+    fn keychain_admin_url_parser_accepts_only_the_fixed_staging_shape() {
+        let password = "A".repeat(43);
+        let valid = format!(
+            "postgresql://{CLUSTER_ADMIN_ROLE}:{password}@{ADMIN_HOST}:{ADMIN_PORT}/{ADMIN_DATABASE}?sslmode=disable"
+        );
+        let options = parse_keychain_admin_connect_options(&valid).unwrap();
+        assert_eq!(options.get_host(), ADMIN_HOST);
+        assert_eq!(options.get_port(), ADMIN_PORT);
+        assert_eq!(options.get_username(), CLUSTER_ADMIN_ROLE);
+        assert_eq!(options.get_database(), Some(ADMIN_DATABASE));
+        let wrong_database = format!(
+            "postgresql://{CLUSTER_ADMIN_ROLE}:{password}@{ADMIN_HOST}:{ADMIN_PORT}/{DATABASE_NAME}?sslmode=disable"
+        );
+        for invalid in [
+            valid.replace(CLUSTER_ADMIN_ROLE, "other"),
+            valid.replace(ADMIN_HOST, "localhost"),
+            valid.replace(&ADMIN_PORT.to_string(), "5433"),
+            wrong_database,
+            valid.replace("sslmode=disable", "sslmode=require"),
+            valid.replace(&password, "short"),
+            valid.replace(&password, &format!("{}+", "A".repeat(42))),
+        ] {
+            assert!(matches!(
+                parse_keychain_admin_connect_options(&invalid),
+                Err(BootstrapErrorV1::InvalidAdminUrl)
+            ));
+        }
+    }
+
+    #[test]
     fn fixed_identities_are_not_configurable() {
         assert_eq!(DATABASE_NAME, "starring_runtime_staging");
         assert_eq!(OWNER_ROLE, "starring_owner");
@@ -1024,6 +1090,8 @@ mod tests {
         assert_eq!(PEER_MAP_NAME, "starring_bootstrap");
         assert_eq!(PEER_SOCKET_DIRECTORY, "/private/tmp/starring-bootstrap");
         assert_eq!(PEER_PORT, 5432);
+        assert_eq!(ADMIN_KEYCHAIN_SERVICE, "starring.postgres.staging");
+        assert_eq!(ADMIN_KEYCHAIN_ACCOUNT, "database.cluster-admin");
         let peer = peer_bootstrap_connect_options();
         assert_eq!(peer.get_host(), "/private/tmp/starring-bootstrap");
         assert_eq!(peer.get_port(), 5432);

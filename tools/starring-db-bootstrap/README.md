@@ -16,6 +16,25 @@ env -i PATH="$PATH" starring-db-bootstrap \
   "starring-runtime-dedicated-staging-cluster-v2:$STAGING_SYSTEM_IDENTIFIER:starring_runtime_staging:cluster-wide-public-acl-reset:bidirectional-runtime-membership-revocation"
 ```
 
+The authenticated staging rerun mode reads the URL from the fixed macOS
+Keychain generic-password item with service `starring.postgres.staging` and
+account `database.cluster-admin`:
+
+```zsh
+env -i PATH="$PATH" starring-db-bootstrap --keychain-admin \
+  "$STAGING_SYSTEM_IDENTIFIER" \
+  "starring-runtime-dedicated-staging-cluster-v2:$STAGING_SYSTEM_IDENTIFIER:starring_runtime_staging:cluster-wide-public-acl-reset:bidirectional-runtime-membership-revocation"
+```
+
+This mode accepts only the fixed loopback URL shape for
+`starring_cluster_admin`, port `5432`, database `postgres`, disabled TLS, and
+the reviewed 43-character password alphabet. It executes
+`/usr/bin/security` with a cleared environment, null standard input and
+standard error, bounded captured output, and a ten-second deadline. The
+credential is never placed in command arguments, environment variables, or
+diagnostic output. The captured Keychain buffer is zeroized after connection
+options are constructed.
+
 The fresh-cluster mode has no secret input:
 
 ```zsh
@@ -51,5 +70,5 @@ longer connect. The final HBA keeps only the reviewed loopback SCRAM path for
 `starring_cluster_admin` and rejects every local-socket path.
 
 Every mode rejects inherited `PG*` environment variables. The tool never
-creates a role password, reads Keychain, accepts a password through command
-arguments, or creates a permanent migrator or peer HBA rule.
+creates a role password, accepts a password through command arguments or
+environment variables, or creates a permanent migrator or peer HBA rule.
