@@ -190,6 +190,84 @@ starring_admin_pgpass() {
     | /usr/bin/sed -nE \
       's#^postgresql://starring_cluster_admin:([A-Za-z0-9_-]{43})@127\.0\.0\.1:5432/postgres\?sslmode=disable$#127.0.0.1:5432:*:starring_cluster_admin:\1#p'
 }
+starring_with_admin_pgpass() (
+  set +x
+  umask 077
+  ADMIN_PGPASS_DIR=
+  ADMIN_PGPASS_PATH=
+  COMMAND_STATUS=0
+  CLEANUP_STATUS=0
+  starring_cleanup_admin_pgpass() {
+    CLEANUP_RESULT=0
+    if test -n "${ADMIN_PGPASS_PATH:-}" \
+      && test -e "$ADMIN_PGPASS_PATH"
+    then
+      if test -f "$ADMIN_PGPASS_PATH" \
+        && ! test -L "$ADMIN_PGPASS_PATH"
+      then
+        /bin/dd if=/dev/zero of="$ADMIN_PGPASS_PATH" \
+          bs=4096 count=1 conv=notrunc >/dev/null 2>&1 \
+          || CLEANUP_RESULT=1
+      else
+        CLEANUP_RESULT=1
+      fi
+      /bin/rm -f "$ADMIN_PGPASS_PATH" >/dev/null 2>&1 \
+        || CLEANUP_RESULT=1
+    fi
+    if test -n "${ADMIN_PGPASS_DIR:-}"
+    then
+      /bin/rmdir "$ADMIN_PGPASS_DIR" >/dev/null 2>&1 \
+        || CLEANUP_RESULT=1
+    fi
+    return "$CLEANUP_RESULT"
+  }
+  trap \
+    'TRAP_STATUS=$?; trap - EXIT HUP INT TERM; starring_cleanup_admin_pgpass || CLEANUP_STATUS=$?; if test "$TRAP_STATUS" -eq 0 && test "$CLEANUP_STATUS" -ne 0; then exit "$CLEANUP_STATUS"; fi; exit "$TRAP_STATUS"' \
+    EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if ! ADMIN_PGPASS_DIR="$(
+    /usr/bin/mktemp -d /private/tmp/starring-admin-pgpass.XXXXXX
+  )"
+  then
+    return 1
+  fi
+  if ! test -d "$ADMIN_PGPASS_DIR" \
+    || ! test "$(
+      /usr/bin/stat -f '%u:%Lp' "$ADMIN_PGPASS_DIR"
+    )" = "$(/usr/bin/id -u):700" \
+    || ! /bin/ls -lde "$ADMIN_PGPASS_DIR" \
+      | /usr/bin/awk \
+        'NR == 1 { ok = ($1 == "drwx------" || $1 == "drwx------@") } NR > 1 { ok = 0 } END { exit(ok ? 0 : 1) }'
+  then
+    return 1
+  fi
+  ADMIN_PGPASS_PATH="$ADMIN_PGPASS_DIR/pgpass"
+  if ! starring_admin_pgpass >"$ADMIN_PGPASS_PATH"
+  then
+    COMMAND_STATUS=1
+  elif ! test -f "$ADMIN_PGPASS_PATH" \
+    || test -L "$ADMIN_PGPASS_PATH" \
+    || ! test "$(
+      /usr/bin/stat -f '%u:%Lp' "$ADMIN_PGPASS_PATH"
+    )" = "$(/usr/bin/id -u):600" \
+    || ! /bin/ls -le "$ADMIN_PGPASS_PATH" \
+      | /usr/bin/awk \
+        'NR == 1 { ok = ($1 == "-rw-------" || $1 == "-rw-------@") } NR > 1 { ok = 0 } END { exit(ok ? 0 : 1) }' \
+    || ! test "$(
+      /usr/bin/wc -l <"$ADMIN_PGPASS_PATH" | /usr/bin/tr -d ' '
+    )" = 1 \
+    || ! /usr/bin/grep -Eq \
+      '^127\.0\.0\.1:5432:\*:starring_cluster_admin:[A-Za-z0-9_-]{43}$' \
+      "$ADMIN_PGPASS_PATH"
+  then
+    COMMAND_STATUS=1
+  else
+    PGPASSFILE="$ADMIN_PGPASS_PATH" "$@" || COMMAND_STATUS=$?
+  fi
+  return "$COMMAND_STATUS"
+)
 ```
 
 `STARRING_CUTOVER_ID` must match
@@ -1255,16 +1333,20 @@ administrator on IPv4 loopback to `postgres` and the fixed database. It has no
 migrator path, no peer path, no IPv6 allow, no socket allow, and no physical
 replication allow.
 
-First disable Unix sockets for the next postmaster start while the peer path is
-still active. Then stage both replacement files in PGDATA, archive the active
-bootstrap files, atomically rename the final HBA into place, remove the
-now-unused ident mapping, and restart:
+First archive the active bootstrap files, remove any auto-configuration
+override, and stage a main configuration that disables Unix sockets for the
+next postmaster start while the peer path is still active. Then stage both
+replacement access files in PGDATA, stop and prove PostgreSQL down, atomically
+rename the final HBA into place, remove the now-unused ident mapping, install
+the staged main configuration, and restart:
 
 ```zsh
 (
   set -euo pipefail
   set +x
   cd /Users/jungbogeon/starring
+  unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
+  unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
   DOMAIN="gui/$(id -u)"
   ! launchctl print "$DOMAIN/local.starring.api.staging" >/dev/null 2>&1
   ! launchctl print "$DOMAIN/local.starring.runtime.staging" >/dev/null 2>&1
@@ -1274,28 +1356,58 @@ now-unused ident mapping, and restart:
   cmp -s "$STARRING_PGDATA/pg_ident.conf" \
     ops/postgres/staging-integrated-bootstrap-pg_ident.conf
   test "$(wc -l <ops/postgres/staging-integrated-pg_hba.conf | tr -d ' ')" = 15
+  cp -p "$STARRING_PGDATA/pg_hba.conf" \
+    "$STARRING_CUTOVER_EVIDENCE/active-bootstrap-pg_hba.conf"
+  cp -p "$STARRING_PGDATA/pg_ident.conf" \
+    "$STARRING_CUTOVER_EVIDENCE/active-bootstrap-pg_ident.conf"
+  cp -p "$STARRING_PGDATA/postgresql.conf" \
+    "$STARRING_CUTOVER_EVIDENCE/active-bootstrap-postgresql.conf"
+  cp -p "$STARRING_PGDATA/postgresql.auto.conf" \
+    "$STARRING_CUTOVER_EVIDENCE/active-bootstrap-postgresql.auto.conf"
   /opt/homebrew/opt/postgresql@16/bin/psql \
     --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
     --host "$STARRING_BOOTSTRAP_SOCKET_DIR" --port 5432 \
     --username "$STARRING_STAGING_CLUSTER_ADMIN" \
     --dbname postgres \
-    --command "ALTER SYSTEM SET unix_socket_directories = ''"
+    --command "ALTER SYSTEM RESET unix_socket_directories"
+  ! grep -Eq \
+    '^[[:space:]]*unix_socket_directories[[:space:]]*=' \
+    "$STARRING_PGDATA/postgresql.auto.conf"
+  cp -p "$STARRING_PGDATA/postgresql.auto.conf" \
+    "$STARRING_CUTOVER_EVIDENCE/post-reset-postgresql.auto.conf"
   FINAL_HBA_TEMP="$STARRING_PGDATA/.pg_hba.conf.final-${STARRING_CUTOVER_ID}"
   FINAL_IDENT_TEMP="$STARRING_PGDATA/.pg_ident.conf.final-${STARRING_CUTOVER_ID}"
+  FINAL_CONFIG_TEMP="$STARRING_PGDATA/.postgresql.conf.final-${STARRING_CUTOVER_ID}"
   test ! -e "$FINAL_HBA_TEMP"
   test ! -e "$FINAL_IDENT_TEMP"
-  cp -p "$STARRING_PGDATA/pg_hba.conf" \
-    "$STARRING_CUTOVER_EVIDENCE/active-bootstrap-pg_hba.conf"
-  cp -p "$STARRING_PGDATA/pg_ident.conf" \
-    "$STARRING_CUTOVER_EVIDENCE/active-bootstrap-pg_ident.conf"
+  test ! -e "$FINAL_CONFIG_TEMP"
   install -m 600 ops/postgres/staging-integrated-pg_hba.conf \
     "$FINAL_HBA_TEMP"
   install -m 600 /dev/null "$FINAL_IDENT_TEMP"
+  cp -p "$STARRING_PGDATA/postgresql.conf" "$FINAL_CONFIG_TEMP"
+  test "$(
+    grep -Ec \
+      "^[[:space:]]*unix_socket_directories[[:space:]]*=[[:space:]]*'/private/tmp/starring-bootstrap'([[:space:]]*#.*)?$" \
+      "$FINAL_CONFIG_TEMP"
+  )" = 1
+  /usr/bin/sed -E -i '' \
+    "s|^[[:space:]]*unix_socket_directories[[:space:]]*=[[:space:]]*'/private/tmp/starring-bootstrap'([[:space:]]*#.*)?\$|unix_socket_directories = '' # comma-separated list of directories|" \
+    "$FINAL_CONFIG_TEMP"
   cmp -s ops/postgres/staging-integrated-pg_hba.conf "$FINAL_HBA_TEMP"
   test ! -s "$FINAL_IDENT_TEMP"
-  mv "$FINAL_HBA_TEMP" "$STARRING_PGDATA/pg_hba.conf"
-  mv "$FINAL_IDENT_TEMP" "$STARRING_PGDATA/pg_ident.conf"
-  sync
+  test "$(
+    grep -Fxc \
+      "unix_socket_directories = '' # comma-separated list of directories" \
+      "$FINAL_CONFIG_TEMP"
+  )" = 1
+  ! grep -F '/private/tmp/starring-bootstrap' "$FINAL_CONFIG_TEMP" >/dev/null
+  STAGED_SOCKET_DIRECTORIES="$(
+    /opt/homebrew/opt/postgresql@16/bin/postgres \
+      -D "$STARRING_PGDATA" \
+      -C unix_socket_directories \
+      -c "config_file=$FINAL_CONFIG_TEMP"
+  )"
+  test -z "$STAGED_SOCKET_DIRECTORIES"
   brew services stop postgresql@16
   for ATTEMPT in {1..60}
   do
@@ -1306,6 +1418,15 @@ now-unused ident mapping, and restart:
     sleep 1
   done
   ! lsof -nP -iTCP:5432 -sTCP:LISTEN >/dev/null 2>&1
+  ! /opt/homebrew/opt/postgresql@16/bin/pg_ctl \
+    --pgdata "$STARRING_PGDATA" status >/dev/null 2>&1
+  test ! -e "$STARRING_PGDATA/postmaster.pid"
+  test ! -e "$STARRING_BOOTSTRAP_SOCKET_DIR/.s.PGSQL.5432"
+  test ! -e "$STARRING_BOOTSTRAP_SOCKET_DIR/.s.PGSQL.5432.lock"
+  mv "$FINAL_HBA_TEMP" "$STARRING_PGDATA/pg_hba.conf"
+  mv "$FINAL_IDENT_TEMP" "$STARRING_PGDATA/pg_ident.conf"
+  mv "$FINAL_CONFIG_TEMP" "$STARRING_PGDATA/postgresql.conf"
+  sync
   brew services start postgresql@16
   READY=0
   for ATTEMPT in {1..60}
@@ -1327,6 +1448,22 @@ now-unused ident mapping, and restart:
     "$STARRING_CUTOVER_EVIDENCE/final-postgresql-listeners.txt" >/dev/null
   test ! -e "$STARRING_BOOTSTRAP_SOCKET_DIR/.s.PGSQL.5432"
   test ! -e "$STARRING_BOOTSTRAP_SOCKET_DIR/.s.PGSQL.5432.lock"
+  FINAL_CONFIG_SOCKET_DIRECTORIES="$(
+    /opt/homebrew/opt/postgresql@16/bin/postgres \
+      -D "$STARRING_PGDATA" \
+      -C unix_socket_directories
+  )"
+  test -z "$FINAL_CONFIG_SOCKET_DIRECTORIES"
+  LIVE_SOCKET_DIRECTORIES="$(
+    starring_with_admin_pgpass /usr/bin/env \
+      PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
+      --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
+      --host 127.0.0.1 --port 5432 \
+      --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+      --dbname postgres --tuples-only --no-align \
+      --command "SELECT pg_catalog.current_setting('unix_socket_directories')"
+  )"
+  test -z "$LIVE_SOCKET_DIRECTORIES"
   cmp -s "$STARRING_PGDATA/pg_hba.conf" \
     ops/postgres/staging-integrated-pg_hba.conf
   test ! -s "$STARRING_PGDATA/pg_ident.conf"
@@ -1334,15 +1471,26 @@ now-unused ident mapping, and restart:
     "$STARRING_CUTOVER_EVIDENCE/final-pg_hba.conf"
   cp -p "$STARRING_PGDATA/pg_ident.conf" \
     "$STARRING_CUTOVER_EVIDENCE/final-pg_ident.conf"
-  shasum -a 256 "$STARRING_PGDATA/pg_hba.conf" \
-    >"$STARRING_CUTOVER_EVIDENCE/final-pg_hba.sha256"
+  cp -p "$STARRING_PGDATA/postgresql.conf" \
+    "$STARRING_CUTOVER_EVIDENCE/final-postgresql.conf"
+  cp -p "$STARRING_PGDATA/postgresql.auto.conf" \
+    "$STARRING_CUTOVER_EVIDENCE/final-postgresql.auto.conf"
+  shasum -a 256 \
+    "$STARRING_PGDATA/pg_hba.conf" \
+    "$STARRING_PGDATA/pg_ident.conf" \
+    "$STARRING_PGDATA/postgresql.conf" \
+    "$STARRING_PGDATA/postgresql.auto.conf" \
+    >"$STARRING_CUTOVER_EVIDENCE/final-postgresql-config.sha256"
 )
 ```
 
-Any failure after the first `mv` is fail-closed: keep both applications and
-the tunnel unloaded, stop PostgreSQL, and use the physical rollback. Never
-reinstall the peer files merely to continue forward. A reload is insufficient
-because removing `unix_socket_directories` is a postmaster-start setting.
+PostgreSQL is proven stopped before the first `mv`, so a rename or sync failure
+cannot leave the live peer boundary active with partially replaced files. Any
+failure after the first `mv` is fail-closed: keep both applications and the
+tunnel unloaded, stop PostgreSQL if a start was attempted, and use the physical
+rollback. Never reinstall the peer files merely to continue forward. A reload
+is insufficient because removing `unix_socket_directories` is a
+postmaster-start setting.
 
 Prove all fifteen parsed final rules in exact order and prove the ident mapping
 is empty. Administrator authentication uses only the ephemeral Keychain-backed
@@ -1544,7 +1692,7 @@ is empty. Administrator authentication uses only the ephemeral Keychain-backed
     CROSS JOIN expected
   "
   FINAL_HBA_PROOF="$(
-    PGPASSFILE=<(starring_admin_pgpass) \
+    starring_with_admin_pgpass /usr/bin/env \
       PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
       --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
       --host 127.0.0.1 --port 5432 \
@@ -1555,7 +1703,7 @@ is empty. Administrator authentication uses only the ephemeral Keychain-backed
   test "$FINAL_HBA_PROOF" \
     = '0|15|1|1|1|1|1|1|1|1|1|1|1|1|1|1|1'
   FINAL_IDENT_PROOF="$(
-    PGPASSFILE=<(starring_admin_pgpass) \
+    starring_with_admin_pgpass /usr/bin/env \
       PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
       --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
       --host 127.0.0.1 --port 5432 \
@@ -1584,7 +1732,7 @@ variable:
   for DATABASE in postgres starring_runtime_staging
   do
     OBSERVED="$(
-      PGPASSFILE=<(starring_admin_pgpass) \
+      starring_with_admin_pgpass /usr/bin/env \
         PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
         --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
         --host 127.0.0.1 --port 5432 \
@@ -1596,9 +1744,8 @@ variable:
       = "${DATABASE}|${STARRING_STAGING_CLUSTER_ADMIN}"
   done
   ERROR_PATH="$STARRING_CUTOVER_EVIDENCE/admin-wrong-database.txt"
-  if LC_ALL=C PGPASSFILE=<(starring_admin_pgpass) \
-    PGSSLMODE=disable \
-    /opt/homebrew/opt/postgresql@16/bin/psql \
+  if LC_ALL=C starring_with_admin_pgpass /usr/bin/env \
+    PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
       --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
       --host 127.0.0.1 --port 5432 \
       --username "$STARRING_STAGING_CLUSTER_ADMIN" \
@@ -1861,8 +2008,8 @@ quarantine through the administrator Keychain URL:
   done
   unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGPASSFILE
   unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
-  PGOPTIONS="-c starring.expected_staging_database=starring_runtime_staging -c starring.expected_staging_system_identifier=${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER}" \
-    PGPASSFILE=<(starring_admin_pgpass) \
+  starring_with_admin_pgpass /usr/bin/env \
+    PGOPTIONS="-c starring.expected_staging_database=starring_runtime_staging -c starring.expected_staging_system_identifier=${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER}" \
     PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
       --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
       --host 127.0.0.1 --port 5432 \
@@ -1870,7 +2017,7 @@ quarantine through the administrator Keychain URL:
       --dbname starring_runtime_staging \
       --file ops/postgres/staging-api-role-bootstrap.sql
   unset PGOPTIONS
-  PGPASSFILE=<(starring_admin_pgpass) \
+  starring_with_admin_pgpass /usr/bin/env \
     PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
     --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
     --host 127.0.0.1 --port 5432 \
@@ -1903,7 +2050,7 @@ ownership, and lack database and schema creation:
   unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
   unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
   ROLE_PROOF="$(
-    PGPASSFILE=<(starring_admin_pgpass) \
+    starring_with_admin_pgpass /usr/bin/env \
       PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
       --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
       --host 127.0.0.1 --port 5432 \
@@ -2062,7 +2209,7 @@ final integrated HBA must still deny all nineteen roles:
   PROBE_DATABASE=starring_integrated_hba_probe
   unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
   unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
-  PGPASSFILE=<(starring_admin_pgpass) \
+  starring_with_admin_pgpass /usr/bin/env \
     PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
     --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
     --host 127.0.0.1 --port 5432 \
@@ -2108,7 +2255,7 @@ final integrated HBA must still deny all nineteen roles:
     grep -F 'pg_hba.conf rejects connection' "$ERROR_PATH" >/dev/null
     grep -F "database \"$PROBE_DATABASE\"" "$ERROR_PATH" >/dev/null
   done
-  PGPASSFILE=<(starring_admin_pgpass) \
+  starring_with_admin_pgpass /usr/bin/env \
     PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
     --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
     --host 127.0.0.1 --port 5432 \
