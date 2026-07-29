@@ -482,6 +482,9 @@ DECLARE
     ruleset_key TEXT := pg_catalog.current_setting(
         'starring.onboarding_ruleset_key'
     );
+    onboarding_result TEXT := pg_catalog.current_setting(
+        'starring.onboarding_result'
+    );
 BEGIN
     IF (
         SELECT pg_catalog.count(*)
@@ -501,20 +504,52 @@ BEGIN
         WHERE authority.tenant_id = verify.tenant_id
             AND authority.installation_id = verify.installation_id
             AND authority.revision = 1
-    ) <> 1 OR (
-        SELECT pg_catalog.count(*)
-        FROM public.runtime_slot_writer_fences_v2 AS fence
-        WHERE fence.slot_guild_id = discord_guild_id
-            AND fence.slot_ruleset_key = ruleset_key
-            AND fence.writer_epoch = 1
-            AND fence.pending_drain_intent_id IS NULL
-            AND fence.pending_product_operation_id IS NULL
-            AND fence.pending_tenant_id IS NULL
-            AND fence.pending_installation_id IS NULL
-            AND fence.pending_deployment_id IS NULL
-            AND fence.pending_expected_revision IS NULL
-            AND fence.pending_marked_at IS NULL
-    ) <> 1 THEN
+    ) <> 1 OR onboarding_result NOT IN ('created', 'exact_replay') OR (
+        onboarding_result = 'created'
+        AND (
+            SELECT pg_catalog.count(*)
+            FROM public.runtime_slot_writer_fences_v2 AS fence
+            WHERE fence.slot_guild_id = discord_guild_id
+                AND fence.slot_ruleset_key = ruleset_key
+                AND fence.writer_epoch = 1
+                AND fence.pending_drain_intent_id IS NULL
+                AND fence.pending_product_operation_id IS NULL
+                AND fence.pending_tenant_id IS NULL
+                AND fence.pending_installation_id IS NULL
+                AND fence.pending_deployment_id IS NULL
+                AND fence.pending_expected_revision IS NULL
+                AND fence.pending_marked_at IS NULL
+        ) <> 1
+    ) OR (
+        onboarding_result = 'exact_replay'
+        AND (
+            SELECT pg_catalog.count(*)
+            FROM public.runtime_slot_writer_fences_v2 AS fence
+            WHERE fence.slot_guild_id = discord_guild_id
+                AND fence.slot_ruleset_key = ruleset_key
+                AND fence.writer_epoch BETWEEN 1 AND 9223372036854775807
+                AND pg_catalog.isfinite(fence.updated_at)
+                AND (
+                    (
+                        fence.pending_drain_intent_id IS NULL
+                        AND fence.pending_product_operation_id IS NULL
+                        AND fence.pending_tenant_id IS NULL
+                        AND fence.pending_installation_id IS NULL
+                        AND fence.pending_deployment_id IS NULL
+                        AND fence.pending_expected_revision IS NULL
+                        AND fence.pending_marked_at IS NULL
+                    ) OR (
+                        fence.pending_drain_intent_id IS NOT NULL
+                        AND fence.pending_product_operation_id IS NOT NULL
+                        AND fence.pending_tenant_id IS NOT NULL
+                        AND fence.pending_installation_id IS NOT NULL
+                        AND fence.pending_deployment_id IS NOT NULL
+                        AND fence.pending_expected_revision IS NOT NULL
+                        AND fence.pending_marked_at IS NOT NULL
+                    )
+                )
+        ) <> 1
+    ) THEN
         RAISE EXCEPTION 'staging installation onboarding verification failed'
             USING ERRCODE = '55000';
     END IF;
