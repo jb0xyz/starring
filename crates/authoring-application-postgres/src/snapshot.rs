@@ -5,7 +5,7 @@ use authoring_application::{
     AuthenticatedActorV1, AuthorizedInstallationScopeV1, AuthorizedPromotionSnapshotError,
     AuthorizedPromotionSnapshotPort, AuthorizedPromotionSnapshotV1, CapabilityV1,
     FreshGuildAuthorityEvidence, OwnedSessionLoadError, PromotionAuthorityError,
-    ResolvedPromotionAuthorityV1,
+    ResolvedPromotionAuthorityV1, SafeAuthoringTurnProjectionV1, SafeAuthoringTurnStateV1,
 };
 use authoring_promotion::{
     ApprovalPolicyV1, AuthoringSessionId, AutomationInstallationId, BindingRevision,
@@ -26,8 +26,9 @@ use subtle::ConstantTimeEq;
 
 use crate::bindings::decode_resource_bindings;
 use crate::envelope::{
-    build_snapshot_authenticated_data_v1, EncryptedSnapshotEnvelopeV1,
-    SnapshotAuthenticatedDataInputV1, SnapshotEnvelopeCipher,
+    build_snapshot_authenticated_data_v1, build_writer_snapshot_authenticated_data_v1,
+    EncryptedSnapshotEnvelopeV1, SnapshotAuthenticatedDataInputV1, SnapshotEnvelopeCipher,
+    WriterSnapshotAuthenticatedDataInputV1,
 };
 use crate::ProductDatabaseFailureV1;
 
@@ -172,6 +173,12 @@ struct AtomicSnapshotRow {
     candidate_revision: Option<i64>,
     candidate_hash: Option<String>,
     harness_contract_revision: i64,
+    writer_request_digest: String,
+    writer_semantic_request_digest: Option<String>,
+    writer_digest_key_id: Option<String>,
+    writer_digest_key_fingerprint: Option<String>,
+    safe_turn_projection: Option<Vec<u8>>,
+    safe_turn_projection_digest: Option<String>,
     authority_tenant_id: String,
     binding_revision: i64,
     authority_resource_bindings: Json<Value>,
@@ -195,7 +202,19 @@ struct CopiedAuthorizedSnapshot {
     envelope: EncryptedSnapshotEnvelopeV1,
     candidate_revision: u64,
     candidate_hash: String,
+    writer_metadata: Option<CopiedWriterMetadataV1>,
     authority: ResolvedPromotionAuthorityV1,
+}
+
+struct CopiedWriterMetadataV1 {
+    installation_authority_revision: u64,
+    installation_authority_digest: String,
+    writer_request_digest: String,
+    writer_semantic_request_digest: String,
+    writer_digest_key_id: String,
+    writer_digest_key_fingerprint: String,
+    safe_turn_projection: Vec<u8>,
+    safe_turn_projection_digest: String,
 }
 
 impl<C, E> AuthorizedPromotionSnapshotPort<E> for PostgresAuthorizedPromotionSnapshots<C>
@@ -257,7 +276,7 @@ async fn fetch_atomic_snapshot(
 ) -> Result<Option<AtomicSnapshotRow>, AuthorizedPromotionSnapshotError> {
     sqlx::query_as::<_, AtomicSnapshotRow>(
         "SELECT * \
-         FROM public.starring_product_authorized_snapshot_read_v1($1, $2, $3, $4, $5)",
+         FROM public.starring_product_authorized_snapshot_read_v2($1, $2, $3, $4, $5)",
     )
     .bind(session_id.as_str())
     .bind(actor.principal_id().as_str())
@@ -309,6 +328,7 @@ fn validate_and_copy_row<E: FreshGuildAuthorityEvidence>(
     }
     validate_scope(&row, scope)?;
     validate_evidence(&row, scope, evidence, config)?;
+    let writer_metadata = copy_writer_metadata(&row)?;
     if row.current_authority_revision != row.installation_authority_revision {
         return Err(PromotionAuthorityError::GenerationMismatch.into());
     }
@@ -394,6 +414,7 @@ fn validate_and_copy_row<E: FreshGuildAuthorityEvidence>(
         envelope,
         candidate_revision,
         candidate_hash,
+        writer_metadata,
         authority: ResolvedPromotionAuthorityV1 {
             guild_id,
             installation_id,
@@ -474,19 +495,33 @@ async fn materialize_snapshot<C: SnapshotEnvelopeCipher>(
     copied: &CopiedAuthorizedSnapshot,
     config: PostgresAuthorizedPromotionSnapshotsConfig,
 ) -> Result<PreviewReadyArtifactV1, AuthorizedPromotionSnapshotError> {
-    let authenticated_data =
-        build_snapshot_authenticated_data_v1(SnapshotAuthenticatedDataInputV1 {
-            tenant_id: &copied.tenant_id,
-            installation_id: &copied.installation_id,
-            session_id: &copied.session_id,
-            generation: copied.generation,
-            snapshot_schema_version: copied.snapshot_schema_version,
-            binding_fingerprint: &copied.binding_fingerprint,
-            encryption_key_id: copied.envelope.encryption_key_id(),
-            encryption_suite: copied.envelope.encryption_suite(),
-            encryption_suite_version: copied.envelope.encryption_suite_version(),
-        })
-        .map_err(|_| session_backend("persisted snapshot authenticated metadata is invalid"))?;
+    let snapshot_authenticated_data = SnapshotAuthenticatedDataInputV1 {
+        tenant_id: &copied.tenant_id,
+        installation_id: &copied.installation_id,
+        session_id: &copied.session_id,
+        generation: copied.generation,
+        snapshot_schema_version: copied.snapshot_schema_version,
+        binding_fingerprint: &copied.binding_fingerprint,
+        encryption_key_id: copied.envelope.encryption_key_id(),
+        encryption_suite: copied.envelope.encryption_suite(),
+        encryption_suite_version: copied.envelope.encryption_suite_version(),
+    };
+    let authenticated_data = match copied.writer_metadata.as_ref() {
+        Some(metadata) => {
+            build_writer_snapshot_authenticated_data_v1(WriterSnapshotAuthenticatedDataInputV1 {
+                snapshot: snapshot_authenticated_data,
+                installation_authority_revision: metadata.installation_authority_revision,
+                installation_authority_digest: &metadata.installation_authority_digest,
+                writer_request_digest: &metadata.writer_request_digest,
+                writer_semantic_request_digest: &metadata.writer_semantic_request_digest,
+                writer_digest_key_id: &metadata.writer_digest_key_id,
+                writer_digest_key_fingerprint: &metadata.writer_digest_key_fingerprint,
+                safe_turn_projection_digest: &metadata.safe_turn_projection_digest,
+            })
+        }
+        None => build_snapshot_authenticated_data_v1(snapshot_authenticated_data),
+    }
+    .map_err(|_| session_backend("persisted snapshot authenticated metadata is invalid"))?;
     if copied.authenticated_metadata_digest != authenticated_data.digest_hex() {
         return Err(session_backend("snapshot authenticated metadata digest mismatch").into());
     }
@@ -523,7 +558,135 @@ async fn materialize_snapshot<C: SnapshotEnvelopeCipher>(
     {
         return Err(session_backend("snapshot preview projection does not match artifact").into());
     }
+    if let Some(metadata) = copied.writer_metadata.as_ref() {
+        validate_safe_preview_projection(metadata, &artifact)?;
+    }
     Ok(artifact)
+}
+
+fn copy_writer_metadata(
+    row: &AtomicSnapshotRow,
+) -> Result<Option<CopiedWriterMetadataV1>, AuthorizedPromotionSnapshotError> {
+    let present = [
+        row.writer_semantic_request_digest.is_some(),
+        row.writer_digest_key_id.is_some(),
+        row.writer_digest_key_fingerprint.is_some(),
+        row.safe_turn_projection.is_some(),
+        row.safe_turn_projection_digest.is_some(),
+    ];
+    if present.iter().all(|value| !value) {
+        return Ok(None);
+    }
+    if !present.iter().all(|value| *value)
+        || !is_lower_hex_digest(&row.writer_request_digest)
+        || !is_lower_hex_digest(
+            row.writer_semantic_request_digest
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        || !is_lower_hex_digest(
+            row.writer_digest_key_fingerprint
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        || !is_lower_hex_digest(
+            row.safe_turn_projection_digest
+                .as_deref()
+                .unwrap_or_default(),
+        )
+    {
+        return Err(session_backend("trusted writer metadata is invalid").into());
+    }
+    let key_id = row
+        .writer_digest_key_id
+        .as_deref()
+        .ok_or_else(|| session_backend("trusted writer key identity is missing"))?;
+    if key_id.is_empty()
+        || key_id.len() > 64
+        || !key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(session_backend("trusted writer key identity is invalid").into());
+    }
+    let projection = row
+        .safe_turn_projection
+        .as_ref()
+        .ok_or_else(|| session_backend("trusted writer projection is missing"))?;
+    let projection_digest = row
+        .safe_turn_projection_digest
+        .as_deref()
+        .ok_or_else(|| session_backend("trusted writer projection digest is missing"))?;
+    if safe_projection_digest_v1(projection) != projection_digest
+        || SafeAuthoringTurnProjectionV1::from_canonical_json(projection).is_err()
+    {
+        return Err(session_backend("trusted writer projection is invalid").into());
+    }
+    Ok(Some(CopiedWriterMetadataV1 {
+        installation_authority_revision: positive_u64(row.installation_authority_revision)
+            .ok_or_else(|| session_backend("trusted writer authority revision is invalid"))?,
+        installation_authority_digest: row.authority_payload_digest.clone(),
+        writer_request_digest: row.writer_request_digest.clone(),
+        writer_semantic_request_digest: row
+            .writer_semantic_request_digest
+            .clone()
+            .ok_or_else(|| session_backend("trusted writer semantic digest is missing"))?,
+        writer_digest_key_id: row
+            .writer_digest_key_id
+            .clone()
+            .ok_or_else(|| session_backend("trusted writer key identity is missing"))?,
+        writer_digest_key_fingerprint: row
+            .writer_digest_key_fingerprint
+            .clone()
+            .ok_or_else(|| session_backend("trusted writer key fingerprint is missing"))?,
+        safe_turn_projection: projection.clone(),
+        safe_turn_projection_digest: projection_digest.to_string(),
+    }))
+}
+
+fn validate_safe_preview_projection(
+    metadata: &CopiedWriterMetadataV1,
+    artifact: &PreviewReadyArtifactV1,
+) -> Result<(), AuthorizedPromotionSnapshotError> {
+    let projection =
+        SafeAuthoringTurnProjectionV1::from_canonical_json(&metadata.safe_turn_projection)
+            .map_err(|_| session_backend("trusted writer projection is invalid"))?;
+    let preview = projection
+        .preview()
+        .filter(|_| projection.state() == SafeAuthoringTurnStateV1::PreviewReady)
+        .ok_or_else(|| session_backend("trusted writer projection is not preview ready"))?;
+    let ruleset = serde_json::to_value(artifact.ruleset())
+        .map_err(|_| session_backend("preview artifact could not be projected"))?;
+    if preview.revision() != artifact.preview().revision
+        || preview.draft() != &artifact.preview().draft
+        || preview.receipt() != artifact.receipt()
+        || preview.ruleset() != &ruleset
+        || projection.draft() != &artifact.preview().draft
+    {
+        return Err(session_backend("trusted writer projection does not match artifact").into());
+    }
+    Ok(())
+}
+
+fn safe_projection_digest_v1(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    const DOMAIN: &[u8] = b"starring.authoring.safe_turn_projection.v1";
+    let mut digest = Sha256::new();
+    for value in [DOMAIN, bytes] {
+        digest.update(
+            u64::try_from(value.len())
+                .expect("projection digest field exceeds u64::MAX")
+                .to_be_bytes(),
+        );
+        digest.update(value);
+    }
+    let mut output = String::with_capacity(64);
+    for byte in digest.finalize() {
+        use std::fmt::Write;
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
 }
 
 #[derive(Clone, Copy)]
@@ -711,6 +874,12 @@ mod tests {
             candidate_revision: Some(1),
             candidate_hash: Some("c".repeat(64)),
             harness_contract_revision: 1,
+            writer_request_digest: "e".repeat(64),
+            writer_semantic_request_digest: None,
+            writer_digest_key_id: None,
+            writer_digest_key_fingerprint: None,
+            safe_turn_projection: None,
+            safe_turn_projection_digest: None,
             authority_tenant_id: "tenant-1".to_string(),
             binding_revision: 1,
             authority_resource_bindings: Json(serde_json::json!({

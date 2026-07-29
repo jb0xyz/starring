@@ -13,6 +13,7 @@ pub(crate) struct ScopedFunctionContractV1<'a> {
     rows: f32,
     language: ScopedFunctionLanguageV1,
     identity_arguments: Option<&'a str>,
+    search_path: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +40,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
             rows,
             language: ScopedFunctionLanguageV1::Sql,
             identity_arguments: None,
+            search_path: "search_path=pg_catalog",
         }
     }
 
@@ -55,6 +57,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
             rows,
             language: ScopedFunctionLanguageV1::Sql,
             identity_arguments: Some(identity_arguments),
+            search_path: "search_path=pg_catalog",
         }
     }
 
@@ -66,6 +69,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
             rows: 0.0,
             language: ScopedFunctionLanguageV1::Sql,
             identity_arguments: None,
+            search_path: "search_path=pg_catalog",
         }
     }
 
@@ -77,6 +81,7 @@ impl<'a> ScopedFunctionContractV1<'a> {
             rows,
             language: ScopedFunctionLanguageV1::PlPgSql,
             identity_arguments: None,
+            search_path: "search_path=pg_catalog",
         }
     }
 
@@ -93,6 +98,23 @@ impl<'a> ScopedFunctionContractV1<'a> {
             rows,
             language: ScopedFunctionLanguageV1::PlPgSql,
             identity_arguments: Some(identity_arguments),
+            search_path: "search_path=pg_catalog",
+        }
+    }
+
+    pub(crate) const fn set_plpgsql_trusted_public(
+        identity: &'a str,
+        result: &'a str,
+        rows: f32,
+    ) -> Self {
+        Self {
+            identity,
+            result,
+            returns_set: true,
+            rows,
+            language: ScopedFunctionLanguageV1::PlPgSql,
+            identity_arguments: None,
+            search_path: "search_path=pg_catalog, public",
         }
     }
 }
@@ -628,7 +650,7 @@ async fn load_function_capability(
             AND NOT function_contract.proleakproof \
             AND function_contract.pronargdefaults = 0 \
             AND function_contract.provariadic = 0 \
-            AND function_contract.proconfig = ARRAY['search_path=pg_catalog']::TEXT[] \
+            AND function_contract.proconfig = ARRAY[$7::TEXT] \
             AND function_contract.lanname = $5 \
             AND function_contract.function_result = $2 \
             AND ($6::TEXT IS NULL \
@@ -678,6 +700,7 @@ async fn load_function_capability(
     .bind(contract.rows)
     .bind(contract.language.database_name())
     .bind(contract.identity_arguments)
+    .bind(contract.search_path)
     .fetch_one(&mut **transaction)
     .await
     .map_err(readiness_database)

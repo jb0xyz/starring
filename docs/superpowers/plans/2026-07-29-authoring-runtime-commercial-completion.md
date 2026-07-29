@@ -300,7 +300,7 @@ removing security, restart, failure, or release gates.
 
 - [x] A1. Extract the reusable Codex worker client
 - [x] A2. Add the pure conversation application
-- [ ] A3. Add authenticated snapshot encryption and writer persistence
+- [x] A3. Add authenticated snapshot encryption and writer persistence
 - [ ] A4. Provision the writer capability
 - [ ] A5. Expose authenticated authoring HTTP routes
 - [ ] A6. Pass the authoring milestone gate

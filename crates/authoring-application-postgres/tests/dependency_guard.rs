@@ -916,7 +916,7 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     assert!(snapshot.contains(".bind(scope.tenant_id().as_str())"));
     assert!(snapshot.contains(".bind(scope.installation_id().as_str())"));
     assert!(snapshot
-        .contains("public.starring_product_authorized_snapshot_read_v1($1, $2, $3, $4, $5)"));
+        .contains("public.starring_product_authorized_snapshot_read_v2($1, $2, $3, $4, $5)"));
     for forbidden in [
         "public.authoring_sessions",
         "public.product_principals",
@@ -981,7 +981,7 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
         "RELATIONS: [ScopedRelationContractV1<'static>; 7]",
         "ScopedRelationContractV1::ordinary_without_rls",
         "begin_scoped_database_readiness(",
-        "public.starring_product_authorized_snapshot_read_v1(",
+        "public.starring_product_authorized_snapshot_read_v2(",
         "PROBE_DIGEST: [u8; 31]",
     ] {
         assert!(
@@ -1063,7 +1063,9 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     for required in [
         "pg_catalog.to_regprocedure($1)",
         "pg_catalog.pg_get_function_result(function_row.oid)",
-        "function_contract.proconfig = ARRAY['search_path=pg_catalog']::TEXT[]",
+        "function_contract.proconfig = ARRAY[$7::TEXT]",
+        "search_path: \"search_path=pg_catalog\"",
+        "search_path: \"search_path=pg_catalog, public\"",
         "pg_catalog.aclexplode(COALESCE(",
         "privilege.is_grantable",
         "pg_catalog.has_table_privilege(",
@@ -1467,6 +1469,26 @@ fn source_files_contain_no_comments() {
             "src/authentication/readiness.rs",
             include_str!("../src/authentication/readiness.rs"),
         ),
+        (
+            "src/authoring_writer/mod.rs",
+            include_str!("../src/authoring_writer/mod.rs"),
+        ),
+        (
+            "src/authoring_writer/digest.rs",
+            include_str!("../src/authoring_writer/digest.rs"),
+        ),
+        (
+            "src/authoring_writer/readiness.rs",
+            include_str!("../src/authoring_writer/readiness.rs"),
+        ),
+        (
+            "src/authoring_writer/row.rs",
+            include_str!("../src/authoring_writer/row.rs"),
+        ),
+        (
+            "src/authoring_writer/store.rs",
+            include_str!("../src/authoring_writer/store.rs"),
+        ),
         ("src/bindings.rs", include_str!("../src/bindings.rs")),
         ("src/database.rs", include_str!("../src/database.rs")),
         (
@@ -1665,6 +1687,10 @@ fn source_files_contain_no_comments() {
         (
             "tests/dependency_guard.rs",
             include_str!("dependency_guard.rs"),
+        ),
+        (
+            "tests/authoring_writer_migration_guard.rs",
+            include_str!("authoring_writer_migration_guard.rs"),
         ),
         (
             "tests/postgres_adapter.rs",

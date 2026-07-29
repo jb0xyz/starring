@@ -36,6 +36,12 @@ pub enum SnapshotAuthenticatedDataError {
     InvalidCiphertext,
     #[error("snapshot nonce length is invalid")]
     InvalidNonce,
+    #[error("snapshot writer digest is invalid")]
+    InvalidWriterDigest,
+    #[error("snapshot writer digest key identifier is invalid")]
+    InvalidWriterDigestKeyId,
+    #[error("snapshot writer authority revision is invalid")]
+    InvalidAuthorityRevision,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -138,6 +144,88 @@ pub fn build_snapshot_authenticated_data_v1(
     Ok(SnapshotAuthenticatedDataV1 { bytes, digest_hex })
 }
 
+pub struct WriterSnapshotAuthenticatedDataInputV1<'a> {
+    pub snapshot: SnapshotAuthenticatedDataInputV1<'a>,
+    pub installation_authority_revision: u64,
+    pub installation_authority_digest: &'a str,
+    pub writer_request_digest: &'a str,
+    pub writer_semantic_request_digest: &'a str,
+    pub writer_digest_key_id: &'a str,
+    pub writer_digest_key_fingerprint: &'a str,
+    pub safe_turn_projection_digest: &'a str,
+}
+
+pub fn build_writer_snapshot_authenticated_data_v1(
+    input: WriterSnapshotAuthenticatedDataInputV1<'_>,
+) -> Result<SnapshotAuthenticatedDataV1, SnapshotAuthenticatedDataError> {
+    if input.installation_authority_revision == 0 {
+        return Err(SnapshotAuthenticatedDataError::InvalidAuthorityRevision);
+    }
+    for digest in [
+        input.installation_authority_digest,
+        input.writer_request_digest,
+        input.writer_semantic_request_digest,
+        input.writer_digest_key_fingerprint,
+        input.safe_turn_projection_digest,
+    ] {
+        if !is_lower_hex_digest(digest) {
+            return Err(SnapshotAuthenticatedDataError::InvalidWriterDigest);
+        }
+    }
+    if input.writer_digest_key_id.is_empty()
+        || input.writer_digest_key_id.len() > 64
+        || !input
+            .writer_digest_key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(SnapshotAuthenticatedDataError::InvalidWriterDigestKeyId);
+    }
+    let mut authenticated = build_snapshot_authenticated_data_v1(input.snapshot)?;
+    append_field(
+        &mut authenticated.bytes,
+        b"writer_metadata_domain",
+        b"starring.authoring.snapshot_writer.v1",
+    );
+    append_field(
+        &mut authenticated.bytes,
+        b"installation_authority_revision",
+        &input.installation_authority_revision.to_be_bytes(),
+    );
+    append_field(
+        &mut authenticated.bytes,
+        b"installation_authority_digest",
+        input.installation_authority_digest.as_bytes(),
+    );
+    append_field(
+        &mut authenticated.bytes,
+        b"writer_request_digest",
+        input.writer_request_digest.as_bytes(),
+    );
+    append_field(
+        &mut authenticated.bytes,
+        b"writer_semantic_request_digest",
+        input.writer_semantic_request_digest.as_bytes(),
+    );
+    append_field(
+        &mut authenticated.bytes,
+        b"writer_digest_key_id",
+        input.writer_digest_key_id.as_bytes(),
+    );
+    append_field(
+        &mut authenticated.bytes,
+        b"writer_digest_key_fingerprint",
+        input.writer_digest_key_fingerprint.as_bytes(),
+    );
+    append_field(
+        &mut authenticated.bytes,
+        b"safe_turn_projection_digest",
+        input.safe_turn_projection_digest.as_bytes(),
+    );
+    authenticated.digest_hex = lower_hex(Sha256::digest(&authenticated.bytes).as_slice());
+    Ok(authenticated)
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct EncryptedSnapshotEnvelopeV1 {
     ciphertext: Vec<u8>,
@@ -234,6 +322,20 @@ pub trait SnapshotEnvelopeCipher {
     ) -> Result<Zeroizing<Vec<u8>>, SnapshotEnvelopeCipherError>;
 }
 
+pub trait SnapshotEnvelopeEncryptionPort {
+    fn active_encryption_key_id(&self) -> &str;
+
+    fn encryption_suite(&self) -> &str;
+
+    fn encryption_suite_version(&self) -> u16;
+
+    fn encrypt(
+        &self,
+        plaintext: &Zeroizing<Vec<u8>>,
+        authenticated_data: &[u8],
+    ) -> Result<EncryptedSnapshotEnvelopeV1, SnapshotEnvelopeCipherError>;
+}
+
 fn validate_header(
     encryption_key_id: &str,
     encryption_suite: &str,
@@ -288,6 +390,13 @@ fn lower_hex(bytes: &[u8]) -> String {
         write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
     }
     output
+}
+
+fn is_lower_hex_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]
@@ -418,6 +527,41 @@ mod tests {
         ]
         .map(Input::digest);
         assert!(changed.iter().all(|digest| digest != &base));
+    }
+
+    #[test]
+    fn trusted_writer_authenticated_data_binds_authority_and_projection_identity() {
+        let tenant_id = TenantId::parse("tenant-1").unwrap();
+        let installation_id = AutomationInstallationId::parse("installation-1").unwrap();
+        let session_id = AuthoringSessionId::parse("session-1").unwrap();
+        let binding_fingerprint = ResourceBindingFingerprint::parse(&"a".repeat(64)).unwrap();
+        let build = |revision: u64, authority: char, projection: char| {
+            build_writer_snapshot_authenticated_data_v1(WriterSnapshotAuthenticatedDataInputV1 {
+                snapshot: SnapshotAuthenticatedDataInputV1 {
+                    tenant_id: &tenant_id,
+                    installation_id: &installation_id,
+                    session_id: &session_id,
+                    generation: SessionGeneration::new(1).unwrap(),
+                    snapshot_schema_version: 8,
+                    binding_fingerprint: &binding_fingerprint,
+                    encryption_key_id: "keychain:authoring-v1",
+                    encryption_suite: "xchacha20_poly1305",
+                    encryption_suite_version: 1,
+                },
+                installation_authority_revision: revision,
+                installation_authority_digest: &authority.to_string().repeat(64),
+                writer_request_digest: &"b".repeat(64),
+                writer_semantic_request_digest: &"c".repeat(64),
+                writer_digest_key_id: "active-v1",
+                writer_digest_key_fingerprint: &"d".repeat(64),
+                safe_turn_projection_digest: &projection.to_string().repeat(64),
+            })
+            .unwrap()
+        };
+        let baseline = build(1, 'e', 'f');
+        assert_ne!(baseline, build(2, 'e', 'f'));
+        assert_ne!(baseline, build(1, 'a', 'f'));
+        assert_ne!(baseline, build(1, 'e', '0'));
     }
 
     #[test]

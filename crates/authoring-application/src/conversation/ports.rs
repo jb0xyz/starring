@@ -7,7 +7,8 @@ use design_harness::{
 
 use super::{
     AuthoringExpectedGenerationV1, AuthoringHumanMessageV1, LocalAuthoringRequestKeyV1,
-    SafeAuthoringProjectionError, SafeAuthoringTurnProjectionV1, StartOrAdvanceAuthoringTurnV1,
+    ReadAuthoringSessionV1, SafeAuthoringProjectionError, SafeAuthoringTurnProjectionV1,
+    StartOrAdvanceAuthoringTurnV1,
 };
 use crate::{AuthenticatedActorV1, AuthorizedInstallationScopeV1, ProductIdempotencyKeyV1};
 
@@ -237,6 +238,7 @@ pub trait AuthoringSessionLoadPort<E> {
 
 pub struct AuthorizedAuthoringCommitV1<'a, E> {
     access: AuthorizedConversationAccessV1<'a, E>,
+    resource_bindings: ResourceBindingMap,
     binding_fingerprint: ResourceBindingFingerprint,
     snapshot: SessionSnapshot,
     projection: SafeAuthoringTurnProjectionV1,
@@ -246,6 +248,7 @@ pub struct AuthorizedAuthoringCommitV1<'a, E> {
 impl<'a, E> AuthorizedAuthoringCommitV1<'a, E> {
     pub(crate) fn new(
         access: AuthorizedConversationAccessV1<'a, E>,
+        resource_bindings: ResourceBindingMap,
         binding_fingerprint: ResourceBindingFingerprint,
         snapshot: SessionSnapshot,
         projection: SafeAuthoringTurnProjectionV1,
@@ -253,6 +256,7 @@ impl<'a, E> AuthorizedAuthoringCommitV1<'a, E> {
     ) -> Self {
         Self {
             access,
+            resource_bindings,
             binding_fingerprint,
             snapshot,
             projection,
@@ -266,6 +270,10 @@ impl<'a, E> AuthorizedAuthoringCommitV1<'a, E> {
 
     pub fn binding_fingerprint(&self) -> &ResourceBindingFingerprint {
         &self.binding_fingerprint
+    }
+
+    pub fn resource_bindings(&self) -> &ResourceBindingMap {
+        &self.resource_bindings
     }
 
     pub fn snapshot(&self) -> &SessionSnapshot {
@@ -309,6 +317,107 @@ pub trait AuthoringConversationStorePort<E>:
 impl<T, E> AuthoringConversationStorePort<E> for T where
     T: AuthoringSessionLoadPort<E> + AuthoringSessionCommitPort<E>
 {
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum AuthoringSessionObservationErrorV1 {
+    #[error("authoring session was not found")]
+    NotFound,
+    #[error("authoring session backend timed out")]
+    Timeout,
+    #[error("authoring session backend request can be retried")]
+    Retryable,
+    #[error("authoring session backend is unavailable")]
+    Unavailable,
+    #[error("authoring session state is invalid")]
+    InvalidState,
+}
+
+pub struct AuthorizedConversationReadAccessV1<'a, E> {
+    actor: &'a AuthenticatedActorV1,
+    scope: &'a AuthorizedInstallationScopeV1,
+    evidence: &'a E,
+    query: &'a ReadAuthoringSessionV1,
+}
+
+impl<'a, E> AuthorizedConversationReadAccessV1<'a, E> {
+    pub(crate) fn new(
+        actor: &'a AuthenticatedActorV1,
+        scope: &'a AuthorizedInstallationScopeV1,
+        evidence: &'a E,
+        query: &'a ReadAuthoringSessionV1,
+    ) -> Self {
+        Self {
+            actor,
+            scope,
+            evidence,
+            query,
+        }
+    }
+
+    pub fn actor(&self) -> &AuthenticatedActorV1 {
+        self.actor
+    }
+
+    pub fn scope(&self) -> &AuthorizedInstallationScopeV1 {
+        self.scope
+    }
+
+    pub fn evidence(&self) -> &E {
+        self.evidence
+    }
+
+    pub fn query(&self) -> &ReadAuthoringSessionV1 {
+        self.query
+    }
+}
+
+pub struct AuthoringSessionObservationV1 {
+    session_id: AuthoringSessionId,
+    generation: SessionGeneration,
+    projection: SafeAuthoringTurnProjectionV1,
+}
+
+impl AuthoringSessionObservationV1 {
+    pub fn from_storage(
+        session_id: AuthoringSessionId,
+        generation: SessionGeneration,
+        projection: SafeAuthoringTurnProjectionV1,
+        preview_ready_artifact: Option<&PreviewReadyArtifactV1>,
+    ) -> Result<Self, SafeAuthoringProjectionError> {
+        projection.validate_artifact_binding(preview_ready_artifact)?;
+        Ok(Self {
+            session_id,
+            generation,
+            projection,
+        })
+    }
+
+    pub fn session_id(&self) -> &AuthoringSessionId {
+        &self.session_id
+    }
+
+    pub fn generation(&self) -> SessionGeneration {
+        self.generation
+    }
+
+    pub fn projection(&self) -> &SafeAuthoringTurnProjectionV1 {
+        &self.projection
+    }
+}
+
+impl Debug for AuthoringSessionObservationV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthoringSessionObservationV1(<redacted>)")
+    }
+}
+
+#[allow(async_fn_in_trait)]
+pub trait AuthoringSessionReadPort<E> {
+    async fn read_authorized_session(
+        &self,
+        access: &AuthorizedConversationReadAccessV1<'_, E>,
+    ) -> Result<AuthoringSessionObservationV1, AuthoringSessionObservationErrorV1>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

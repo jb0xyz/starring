@@ -7,18 +7,19 @@ use design_harness::{
 use super::{
     AuthoringAdmissionError, AuthoringCommitOutcomeV1, AuthoringConversationConfigV1,
     AuthoringConversationStorePort, AuthoringExpectedGenerationError,
-    AuthoringMutationDispositionV1, AuthoringSessionLoadError, AuthoringStoredGenerationV1,
+    AuthoringMutationDispositionV1, AuthoringSessionLoadError, AuthoringSessionObservationErrorV1,
+    AuthoringSessionObservationV1, AuthoringSessionReadPort, AuthoringStoredGenerationV1,
     AuthoringStoredRequestIdentityV1, AuthoringTurnAdmissionPort, AuthoringTurnCheckV1,
     AuthoringTurnOutcomeV1, AuthoringTurnReceiptV1, AuthorizedAuthoringCommitV1,
-    AuthorizedConversationAccessV1, LocalAuthoringRequestKeyV1, SafeAuthoringPreviewV1,
-    SafeAuthoringProjectionError, SafeAuthoringTurnProjectionV1, SafeAuthoringTurnStateV1,
-    StartOrAdvanceAuthoringTurnV1,
+    AuthorizedConversationAccessV1, AuthorizedConversationReadAccessV1, LocalAuthoringRequestKeyV1,
+    ReadAuthoringSessionV1, SafeAuthoringPreviewV1, SafeAuthoringProjectionError,
+    SafeAuthoringTurnProjectionV1, SafeAuthoringTurnStateV1, StartOrAdvanceAuthoringTurnV1,
 };
 use crate::authority::validate_authorized_scope;
 use crate::{
-    AuthenticatedActorV1, AuthenticationError, CapabilityV1, FreshGuildAuthorityError,
-    FreshGuildAuthorityEvidence, FreshGuildAuthorityPort, InstallationSelectorV1,
-    MutationAuthenticationPort,
+    AuthenticatedActorV1, AuthenticationError, AuthenticationPort, CapabilityV1,
+    FreshGuildAuthorityError, FreshGuildAuthorityEvidence, FreshGuildAuthorityPort,
+    InstallationSelectorV1, MutationAuthenticationPort,
 };
 
 pub struct ConversationApplication<'a, A, G, S, Q, C> {
@@ -115,6 +116,7 @@ where
         let loaded = self.store.load_exact_generation(&access).await?;
         validate_loaded_generation(command.expected_generation().get(), &loaded)?;
         let (snapshot, bindings) = loaded.into_snapshot_and_bindings();
+        let commit_bindings = bindings.clone();
         let session_config = self.config.session_config();
         let mut session = match snapshot {
             Some(snapshot) => DesignSession::restore_intent_recipe(
@@ -195,6 +197,7 @@ where
         let candidate = projected.projection.clone();
         let commit = AuthorizedAuthoringCommitV1::new(
             final_access,
+            commit_bindings,
             binding_fingerprint,
             snapshot,
             projected.projection,
@@ -227,7 +230,11 @@ where
             .authorize_installation(&actor, installation, CapabilityV1::Author)
             .await?;
         validate_authorized_scope(installation, authorized.scope())?;
-        validate_author_evidence(authorized.scope(), authorized.evidence())?;
+        validate_author_evidence(
+            authorized.scope(),
+            authorized.evidence(),
+            CapabilityV1::Author,
+        )?;
         Ok((actor, authorized))
     }
 
@@ -322,6 +329,43 @@ where
     }
 }
 
+impl<A, G, S, Q, C> ConversationApplication<'_, A, G, S, Q, C>
+where
+    A: AuthenticationPort,
+    G: FreshGuildAuthorityPort,
+    G::Evidence: FreshGuildAuthorityEvidence,
+    S: AuthoringSessionReadPort<G::Evidence>,
+{
+    pub async fn read_session(
+        &self,
+        credential: &A::Credential,
+        installation: &InstallationSelectorV1,
+        query: ReadAuthoringSessionV1,
+    ) -> Result<AuthoringSessionObservationV1, AuthoringConversationError> {
+        let claims = self.authentication.authenticate(credential).await?;
+        let actor = AuthenticatedActorV1::from_authentication_claims(claims);
+        let authorized = self
+            .guild_authority
+            .authorize_installation(&actor, installation, CapabilityV1::Read)
+            .await?;
+        validate_authorized_scope(installation, authorized.scope())?;
+        validate_author_evidence(
+            authorized.scope(),
+            authorized.evidence(),
+            CapabilityV1::Read,
+        )?;
+        self.store
+            .read_authorized_session(&AuthorizedConversationReadAccessV1::new(
+                &actor,
+                authorized.scope(),
+                authorized.evidence(),
+                &query,
+            ))
+            .await
+            .map_err(AuthoringConversationError::from)
+    }
+}
+
 fn validate_loaded_generation(
     expected_generation: u64,
     loaded: &super::AuthoringSessionLoadV1,
@@ -339,8 +383,9 @@ fn validate_loaded_generation(
 fn validate_author_evidence<E: FreshGuildAuthorityEvidence>(
     scope: &crate::AuthorizedInstallationScopeV1,
     evidence: &E,
+    capability: CapabilityV1,
 ) -> Result<(), AuthoringConversationError> {
-    if evidence.capability() != CapabilityV1::Author
+    if evidence.capability() != capability
         || evidence.tenant_id() != scope.tenant_id()
         || evidence.installation_id() != scope.installation_id()
         || evidence.guild_id() != scope.guild_id()
@@ -496,6 +541,8 @@ pub enum AuthoringConversationError {
     Admission(#[from] AuthoringAdmissionError),
     #[error(transparent)]
     Store(#[from] AuthoringSessionLoadError),
+    #[error(transparent)]
+    Observation(#[from] AuthoringSessionObservationErrorV1),
     #[error(transparent)]
     Projection(#[from] SafeAuthoringProjectionError),
     #[error(transparent)]

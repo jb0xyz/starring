@@ -1,4 +1,5 @@
 mod authentication;
+mod authoring_writer;
 mod bindings;
 mod database;
 mod database_capability;
@@ -20,6 +21,10 @@ pub use authentication::{
     AuthenticationConfigError, AuthenticationReadinessErrorV1, PostgresAuthentication,
     PostgresAuthenticationConfig,
 };
+pub use authoring_writer::{
+    AuthoringConversationStoreConfigErrorV1, AuthoringConversationStoreReadinessErrorV1,
+    PostgresAuthoringConversationStoreConfigV1, PostgresAuthoringConversationStoreV1,
+};
 pub use database::ProductDatabaseFailureV1;
 pub use deployment_status::{
     PostgresProductDeploymentOperationalStatusesV2, PostgresProductDeploymentStatuses,
@@ -30,12 +35,14 @@ pub use digest::{
     digest_opaque_session_credential_v1, OpaqueSessionCredentialError, ProductSessionDigestV1,
 };
 pub use envelope::{
-    build_snapshot_authenticated_data_v1, EncryptedSnapshotEnvelopeV1,
-    SnapshotAuthenticatedDataError, SnapshotAuthenticatedDataInputV1, SnapshotAuthenticatedDataV1,
-    SnapshotEnvelopeCipher, SnapshotEnvelopeCipherError, SnapshotEnvelopeKeyError,
-    SnapshotEnvelopeKeyV1, SnapshotEnvelopeKeyringError, SnapshotEnvelopeKeyringV1,
-    XChaCha20Poly1305SnapshotEnvelopeCipherV1, XCHACHA20_POLY1305_SNAPSHOT_NONCE_BYTES_V1,
-    XCHACHA20_POLY1305_SNAPSHOT_SUITE_V1, XCHACHA20_POLY1305_SNAPSHOT_SUITE_VERSION_V1,
+    build_snapshot_authenticated_data_v1, build_writer_snapshot_authenticated_data_v1,
+    EncryptedSnapshotEnvelopeV1, SnapshotAuthenticatedDataError, SnapshotAuthenticatedDataInputV1,
+    SnapshotAuthenticatedDataV1, SnapshotEnvelopeCipher, SnapshotEnvelopeCipherError,
+    SnapshotEnvelopeEncryptionPort, SnapshotEnvelopeKeyError, SnapshotEnvelopeKeyV1,
+    SnapshotEnvelopeKeyringError, SnapshotEnvelopeKeyringV1,
+    WriterSnapshotAuthenticatedDataInputV1, XChaCha20Poly1305SnapshotEnvelopeCipherV1,
+    XCHACHA20_POLY1305_SNAPSHOT_NONCE_BYTES_V1, XCHACHA20_POLY1305_SNAPSHOT_SUITE_V1,
+    XCHACHA20_POLY1305_SNAPSHOT_SUITE_VERSION_V1,
 };
 pub use installation_authority::{
     InstallationAuthorityReadinessErrorV1, InstallationAuthoritySourceConfigError,
@@ -45,7 +52,9 @@ pub use product_action_digest::{
     ProductActionDigestKeyError, ProductActionDigestKeyV1, ProductActionDigestKeyringError,
     ProductActionDigestKeyringV1,
 };
-pub use product_api_readiness::{PostgresProductApiReadiness, ProductApiReadinessErrorV1};
+pub use product_api_readiness::{
+    PostgresProductApiReadiness, ProductApiAuthoringReadinessErrorV1, ProductApiReadinessErrorV1,
+};
 pub use product_decisions::{
     PostgresProductControl, PostgresProductDecisions, PostgresProductDecisionsConfig,
     PostgresProductLifecycleCancellations, PostgresProductRejections, ProductDecisionConfigError,

@@ -147,6 +147,21 @@ impl StartOrAdvanceAuthoringTurnV1 {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadAuthoringSessionV1 {
+    session_id: AuthoringSessionId,
+}
+
+impl ReadAuthoringSessionV1 {
+    pub fn new(session_id: AuthoringSessionId) -> Self {
+        Self { session_id }
+    }
+
+    pub fn session_id(&self) -> &AuthoringSessionId {
+        &self.session_id
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AuthoringConversationConfigError {
     #[error("authoring context budget must be between 8000 and 64000 characters")]
@@ -199,7 +214,7 @@ pub struct LocalAuthoringRequestKeyV1 {
 }
 
 impl LocalAuthoringRequestKeyV1 {
-    pub(crate) fn from_authorized_scope(
+    pub fn from_authorized_scope(
         principal_id: PrincipalId,
         scope: &AuthorizedInstallationScopeV1,
         command: &StartOrAdvanceAuthoringTurnV1,

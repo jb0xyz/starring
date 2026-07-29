@@ -2,9 +2,9 @@ use futures::FutureExt as _;
 use sqlx::Connection as _;
 
 const SNAPSHOT_FUNCTION: &str =
-    "public.starring_product_authorized_snapshot_read_v1(TEXT, TEXT, BYTEA, TEXT, TEXT)";
+    "public.starring_product_authorized_snapshot_read_v2(TEXT, TEXT, BYTEA, TEXT, TEXT)";
 const SNAPSHOT_FUNCTION_IDENTITY: &str =
-    "public.starring_product_authorized_snapshot_read_v1(text,text,bytea,text,text)";
+    "public.starring_product_authorized_snapshot_read_v2(text,text,bytea,text,text)";
 const SNAPSHOT_DATABASE_IDENTITY_FUNCTION: &str =
     "public.starring_product_authorized_snapshot_reader_database_identity_v1()";
 const SNAPSHOT_KEY_COVERAGE_FUNCTION: &str =
@@ -248,7 +248,7 @@ async fn snapshot_function_count(
 ) -> i64 {
     sqlx::query_scalar::<_, i64>(
         "SELECT pg_catalog.count(*) \
-         FROM public.starring_product_authorized_snapshot_read_v1($1, $2, $3, $4, $5)",
+         FROM public.starring_product_authorized_snapshot_read_v2($1, $2, $3, $4, $5)",
     )
     .bind(session_id)
     .bind(principal_id)
@@ -522,7 +522,7 @@ async fn authorized_snapshot_is_exactly_scoped_for_a_non_owner_role() {
         }
         assert_snapshot_permission_denied(
             &denied_pool,
-            "SELECT * FROM public.starring_product_authorized_snapshot_read_v1( \
+            "SELECT * FROM public.starring_product_authorized_snapshot_read_v2( \
              'missing', 'missing', decode(repeat('00', 32), 'hex'), 'missing', 'missing')",
         )
         .await;
@@ -764,7 +764,7 @@ async fn authorized_snapshot_is_exactly_scoped_for_a_non_owner_role() {
         .unwrap();
         let post_configuration_rows = sqlx::query_scalar::<_, i64>(
             "SELECT pg_catalog.count(*) \
-             FROM public.starring_product_authorized_snapshot_read_v1(\
+             FROM public.starring_product_authorized_snapshot_read_v2(\
               $1, $2, $3, $4, $5)",
         )
         .bind(fixture.session_id.as_str())
