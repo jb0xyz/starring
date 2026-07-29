@@ -702,6 +702,10 @@ fn app(
 }
 
 fn authoring_request(idempotency_key: &str) -> Request<Body> {
+    authoring_request_with_message(idempotency_key, "Discuss the design before building")
+}
+
+fn authoring_request_with_message(idempotency_key: &str, message: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri("/v1/installations/installation-1/authoring/sessions/session-1/turns")
@@ -715,7 +719,11 @@ fn authoring_request(idempotency_key: &str) -> Request<Body> {
             format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
         )
         .body(Body::from(
-            r#"{"expected_generation":0,"message":"Discuss the design before building"}"#,
+            serde_json::to_vec(&json!({
+                "expected_generation": 0,
+                "message": message
+            }))
+            .unwrap(),
         ))
         .unwrap()
 }
@@ -830,6 +838,46 @@ async fn concurrent_identical_posts_wait_then_recheck_and_replay_one_model_resul
     assert!(body_text(second_response)
         .await
         .contains("\"disposition\":\"exact_replay\""));
+    assert_eq!(worker.calls(), 1);
+    assert_eq!(worker.settled(), 1);
+    assert_eq!(facade.store.counts(), (3, 1, 1));
+}
+
+#[tokio::test]
+async fn concurrent_same_key_different_payload_waits_then_conflicts_without_second_model_call() {
+    let worker = WorkerServer::start(WorkerMode::Blocked, true).await;
+    let facade = Arc::new(IntegratedFacade::with_worker(worker.client()));
+    let router = app(
+        Arc::clone(&facade),
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        2,
+    );
+    let first = tokio::spawn(router.clone().oneshot(authoring_request_with_message(
+        IDEMPOTENCY,
+        "Discuss the first design",
+    )));
+    worker.wait_started().await;
+    let second = tokio::spawn(router.clone().oneshot(authoring_request_with_message(
+        IDEMPOTENCY,
+        "Discuss a different design",
+    )));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!second.is_finished());
+    assert_eq!(worker.calls(), 1);
+    assert_eq!(facade.store.counts(), (2, 1, 0));
+
+    worker.release();
+    let first_response = first.await.unwrap().unwrap();
+    let second_response = second.await.unwrap().unwrap();
+    assert_eq!(first_response.status(), StatusCode::CREATED);
+    assert_eq!(second_response.status(), StatusCode::CONFLICT);
+    assert!(body_text(first_response)
+        .await
+        .contains("\"disposition\":\"created\""));
+    assert!(body_text(second_response)
+        .await
+        .contains("\"code\":\"idempotency_conflict\""));
     assert_eq!(worker.calls(), 1);
     assert_eq!(worker.settled(), 1);
     assert_eq!(facade.store.counts(), (3, 1, 1));
