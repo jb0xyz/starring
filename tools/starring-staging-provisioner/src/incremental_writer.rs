@@ -332,6 +332,20 @@ SELECT
             'starring_authoring_session_writer'
         )
     )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_parameter_acl AS parameter_acl
+        WHERE pg_catalog.has_parameter_privilege(
+                'starring_authoring_session_writer',
+                parameter_acl.parname,
+                'SET'
+            )
+            OR pg_catalog.has_parameter_privilege(
+                'starring_authoring_session_writer',
+                parameter_acl.parname,
+                'ALTER SYSTEM'
+            )
+    )
     AND pg_catalog.has_database_privilege(
         'starring_authoring_session_writer',
         'starring_runtime_staging',
@@ -505,6 +519,13 @@ SELECT
         WHERE defaults.defaclrole = pg_catalog.to_regrole(
             'starring_authoring_session_writer'
         )
+    )
+    AND (
+        SELECT pg_catalog.count(*) = 2
+        FROM pg_catalog.pg_default_acl AS defaults
+        WHERE defaults.defaclrole = pg_catalog.to_regrole('starring_owner')
+            AND defaults.defaclnamespace = 0
+            AND defaults.defaclobjtype IN ('f', 'T')
     )
     AND NOT EXISTS (
         SELECT 1
@@ -1059,6 +1080,13 @@ SELECT
             'starring_authoring_session_writer'
         )
     )
+    AND (
+        SELECT pg_catalog.count(*) = 2
+        FROM pg_catalog.pg_default_acl AS defaults
+        WHERE defaults.defaclrole = pg_catalog.to_regrole('starring_owner')
+            AND defaults.defaclnamespace = 0
+            AND defaults.defaclobjtype IN ('f', 'T')
+    )
     AND NOT EXISTS (
         SELECT 1
         FROM pg_catalog.pg_default_acl AS defaults
@@ -1139,6 +1167,10 @@ SELECT
         assert!(VERIFY_WRITER_CONTRACT_SQL.contains(
             "pg_catalog.has_column_privilege(\n                'starring_authoring_session_writer'"
         ));
+        assert!(VERIFY_WRITER_CONTRACT_SQL
+            .contains("FROM pg_catalog.pg_parameter_acl AS parameter_acl"));
+        assert!(VERIFY_WRITER_CONTRACT_SQL
+            .contains("parameter_acl.parname,\n                'ALTER SYSTEM'"));
     }
 
     #[test]
@@ -1149,11 +1181,20 @@ SELECT
         assert!(VERIFY_WRITER_CONTRACT_SQL.contains(
             "CROSS JOIN LATERAL pg_catalog.aclexplode(defaults.defaclacl) AS privilege\n        WHERE privilege.grantee IN (\n            0,\n            pg_catalog.to_regrole('starring_authoring_session_writer')\n        )"
         ));
+        for contract in [
+            VERIFY_WRITER_CONTRACT_SQL,
+            VERIFY_WRITER_DEFAULT_ACL_CONTRACT_SQL,
+        ] {
+            assert!(contract.contains(
+                "SELECT pg_catalog.count(*) = 2\n        FROM pg_catalog.pg_default_acl AS defaults"
+            ));
+            assert!(contract.contains("defaults.defaclobjtype IN ('f', 'T')"));
+        }
         assert_eq!(
             VERIFY_WRITER_CONTRACT_SQL
                 .matches("FROM pg_catalog.pg_default_acl AS defaults")
                 .count(),
-            2
+            3
         );
     }
 

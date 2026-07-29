@@ -165,6 +165,14 @@ impl DisposableClusterV1 {
             .await
             .unwrap();
         apply_all_migrations(&mut owner).await;
+        for statement in [
+            "ALTER DEFAULT PRIVILEGES FOR ROLE starring_owner \
+             REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC",
+            "ALTER DEFAULT PRIVILEGES FOR ROLE starring_owner \
+             REVOKE USAGE ON TYPES FROM PUBLIC",
+        ] {
+            sqlx::query(statement).execute(&mut owner).await.unwrap();
+        }
         sqlx::query(&format!(
             "GRANT EXECUTE ON FUNCTION {SNAPSHOT_READER_V1} TO starring_authorized_snapshot_reader"
         ))
@@ -597,6 +605,26 @@ async fn assert_writer_negative_capability_matrix(target: &mut PgConnection) {
                 .to_owned(),
         ),
         (
+            "parameter_set",
+            "GRANT SET ON PARAMETER statement_timeout \
+             TO starring_authoring_session_writer"
+                .to_owned(),
+        ),
+        (
+            "parameter_alter_system",
+            "GRANT ALTER SYSTEM ON PARAMETER statement_timeout \
+             TO starring_authoring_session_writer"
+                .to_owned(),
+        ),
+        (
+            "parameter_set_public",
+            "GRANT SET ON PARAMETER statement_timeout TO PUBLIC".to_owned(),
+        ),
+        (
+            "parameter_alter_system_public",
+            "GRANT ALTER SYSTEM ON PARAMETER statement_timeout TO PUBLIC".to_owned(),
+        ),
+        (
             "staging_database_create",
             "GRANT CREATE ON DATABASE starring_runtime_staging \
              TO starring_authoring_session_writer"
@@ -778,12 +806,16 @@ async fn assert_writer_negative_capability_matrix(target: &mut PgConnection) {
     for (name, privilege, object_type) in [
         ("tables", "SELECT", "TABLES"),
         ("sequences", "USAGE", "SEQUENCES"),
+        ("functions", "EXECUTE", "FUNCTIONS"),
+        ("types", "USAGE", "TYPES"),
         ("schemas", "USAGE", "SCHEMAS"),
     ] {
         mutations.push((
             match name {
                 "tables" => "owner_default_acl_public_tables",
                 "sequences" => "owner_default_acl_public_sequences",
+                "functions" => "owner_default_acl_public_functions",
+                "types" => "owner_default_acl_public_types",
                 "schemas" => "owner_default_acl_public_schemas",
                 _ => unreachable!(),
             },
@@ -793,7 +825,7 @@ async fn assert_writer_negative_capability_matrix(target: &mut PgConnection) {
             ),
         ));
     }
-    assert_eq!(mutations.len(), 54);
+    assert_eq!(mutations.len(), 60);
     for (name, mutation) in mutations {
         assert_writer_contract_rejects_mutation(target, name, &mutation).await;
     }
