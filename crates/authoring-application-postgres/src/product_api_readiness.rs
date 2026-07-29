@@ -1,4 +1,6 @@
-use crate::database_capability::{verify_same_database_distinct_roles, ScopedDatabaseTopologyV1};
+use crate::database_capability::{
+    verify_same_database_distinct_roles, ScopedDatabaseSessionIdentityV1, ScopedDatabaseTopologyV1,
+};
 use crate::{
     AuthoringConversationStoreReadinessErrorV1, AuthorizedSnapshotReadinessErrorV1,
     InstallationAuthorityReadinessErrorV1, PostgresAuthoringConversationStoreV1,
@@ -83,11 +85,26 @@ impl<G, C: SnapshotEnvelopeCipher> PostgresProductApiReadiness<'_, G, C> {
         &self,
         writer: &PostgresAuthoringConversationStoreV1<W>,
     ) -> Result<(), ProductApiAuthoringReadinessErrorV1> {
+        let writer = match writer.check_readiness().await {
+            Ok(writer) => writer,
+            Err(AuthoringConversationStoreReadinessErrorV1::CapabilityMissing) => {
+                let core = self.load_core_topologies().await?;
+                let session_identity = writer.check_session_identity().await.ok();
+                if session_identity
+                    .as_ref()
+                    .is_some_and(|identity| reuses_core_role(&core, identity))
+                {
+                    return Err(ProductApiAuthoringReadinessErrorV1::TopologyMismatch);
+                }
+                return Err(ProductApiAuthoringReadinessErrorV1::AuthoringWriter(
+                    AuthoringConversationStoreReadinessErrorV1::CapabilityMissing,
+                ));
+            }
+            Err(error) => {
+                return Err(ProductApiAuthoringReadinessErrorV1::AuthoringWriter(error));
+            }
+        };
         let core = self.load_core_topologies().await?;
-        let writer = writer
-            .check_readiness()
-            .await
-            .map_err(ProductApiAuthoringReadinessErrorV1::AuthoringWriter)?;
         let topologies: [ScopedDatabaseTopologyV1; 15] = [
             core[0].clone(),
             core[1].clone(),
@@ -163,5 +180,41 @@ impl<G, C: SnapshotEnvelopeCipher> PostgresProductApiReadiness<'_, G, C> {
             deployment_status,
             operational_deployment_status,
         ])
+    }
+}
+
+fn reuses_core_role(
+    core: &[ScopedDatabaseTopologyV1],
+    writer: &ScopedDatabaseSessionIdentityV1,
+) -> bool {
+    core.iter()
+        .any(|topology| topology.role_name == writer.role_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_writer_override_is_role_reuse_not_database_identity_substitution() {
+        let core = [ScopedDatabaseTopologyV1 {
+            database_identity: "01234567-89ab-4def-8123-456789abcdef".to_string(),
+            database_name: "primary".to_string(),
+            role_name: "oauth".to_string(),
+        }];
+        assert!(reuses_core_role(
+            &core,
+            &ScopedDatabaseSessionIdentityV1 {
+                database_name: "secondary".to_string(),
+                role_name: "oauth".to_string(),
+            }
+        ));
+        assert!(!reuses_core_role(
+            &core,
+            &ScopedDatabaseSessionIdentityV1 {
+                database_name: "primary".to_string(),
+                role_name: "writer".to_string(),
+            }
+        ));
     }
 }

@@ -170,6 +170,12 @@ pub(crate) struct ScopedDatabaseTopologyV1 {
     pub(crate) role_name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScopedDatabaseSessionIdentityV1 {
+    pub(crate) database_name: String,
+    pub(crate) role_name: String,
+}
+
 #[derive(sqlx::FromRow)]
 struct FunctionCapabilityRow {
     metadata_valid: bool,
@@ -356,15 +362,39 @@ pub(crate) async fn load_scoped_database_topology(
     let Some(database_identity) = database_identity else {
         return Err(ScopedDatabaseReadinessErrorV1::ContractMismatch);
     };
-    if !canonical_database_identity(&database_identity)
-        || database_name.is_empty()
-        || database_name.len() > 63
-        || role_name != session_role
-    {
+    if !canonical_database_identity(&database_identity) {
         return Err(ScopedDatabaseReadinessErrorV1::ContractMismatch);
     }
+    let session_identity =
+        validate_scoped_database_session_identity(database_name, role_name, session_role)?;
     Ok(ScopedDatabaseTopologyV1 {
         database_identity,
+        database_name: session_identity.database_name,
+        role_name: session_identity.role_name,
+    })
+}
+
+pub(crate) async fn load_scoped_database_session_identity(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<ScopedDatabaseSessionIdentityV1, ScopedDatabaseReadinessErrorV1> {
+    let (database_name, role_name, session_role) = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT current_database()::TEXT, current_user::TEXT, session_user::TEXT",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(readiness_database)?;
+    validate_scoped_database_session_identity(database_name, role_name, session_role)
+}
+
+fn validate_scoped_database_session_identity(
+    database_name: String,
+    role_name: String,
+    session_role: String,
+) -> Result<ScopedDatabaseSessionIdentityV1, ScopedDatabaseReadinessErrorV1> {
+    if database_name.is_empty() || database_name.len() > 63 || role_name != session_role {
+        return Err(ScopedDatabaseReadinessErrorV1::ContractMismatch);
+    }
+    Ok(ScopedDatabaseSessionIdentityV1 {
         database_name,
         role_name,
     })
@@ -971,6 +1001,30 @@ mod tests {
             "g1234567-89ab-4def-8123-456789abcdef",
         ] {
             assert!(!canonical_database_identity(invalid));
+        }
+    }
+
+    #[test]
+    fn session_identity_contains_only_database_name_and_direct_role() {
+        let identity = validate_scoped_database_session_identity(
+            "starring".to_string(),
+            "writer".to_string(),
+            "writer".to_string(),
+        )
+        .unwrap();
+        assert_eq!(identity.database_name, "starring");
+        assert_eq!(identity.role_name, "writer");
+        for (database, role, session_role) in
+            [("", "writer", "writer"), ("starring", "writer", "reader")]
+        {
+            assert_eq!(
+                validate_scoped_database_session_identity(
+                    database.to_string(),
+                    role.to_string(),
+                    session_role.to_string(),
+                ),
+                Err(ScopedDatabaseReadinessErrorV1::ContractMismatch)
+            );
         }
     }
 

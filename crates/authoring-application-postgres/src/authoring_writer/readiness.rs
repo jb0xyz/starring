@@ -1,8 +1,10 @@
 use crate::database_capability::{
-    begin_scoped_database_readiness, load_scoped_database_topology,
+    begin_bounded_database_probe, begin_scoped_database_readiness,
+    load_scoped_database_session_identity, load_scoped_database_topology,
     verify_scoped_executable_allowlist, verify_scoped_global_user_object_deny,
-    verify_scoped_schema_trust, ScopedDatabaseReadinessErrorV1, ScopedDatabaseTopologyV1,
-    ScopedFunctionContractV1, ScopedRelationContractV1,
+    verify_scoped_schema_trust, ScopedDatabaseProbeModeV1, ScopedDatabaseReadinessErrorV1,
+    ScopedDatabaseSessionIdentityV1, ScopedDatabaseTopologyV1, ScopedFunctionContractV1,
+    ScopedRelationContractV1,
 };
 use crate::envelope::SnapshotEnvelopeCipher;
 use crate::ProductDatabaseFailureV1;
@@ -112,6 +114,21 @@ impl<C: SnapshotEnvelopeCipher> PostgresAuthoringConversationStoreV1<C> {
         }
         transaction.commit().await.map_err(readiness_database)?;
         Ok(topology)
+    }
+
+    pub(crate) async fn check_session_identity(
+        &self,
+    ) -> Result<ScopedDatabaseSessionIdentityV1, AuthoringConversationStoreReadinessErrorV1> {
+        let timeout = self.config.statement_timeout();
+        let mut transaction =
+            begin_bounded_database_probe(&self.pool, &timeout, ScopedDatabaseProbeModeV1::ReadOnly)
+                .await
+                .map_err(map_readiness)?;
+        let identity = load_scoped_database_session_identity(&mut transaction)
+            .await
+            .map_err(map_readiness)?;
+        transaction.commit().await.map_err(readiness_database)?;
+        Ok(identity)
     }
 }
 
