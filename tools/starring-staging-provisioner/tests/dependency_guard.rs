@@ -163,9 +163,11 @@ fn source_keeps_fixed_process_and_secret_transport_boundaries() {
         .unwrap();
     assert_eq!(keychain.matches("Command::new(SECURITY_PATH)").count(), 3);
     assert!(keychain.contains("const SECURITY_PATH: &str = \"/usr/bin/security\""));
-    assert!(keychain.contains("\"add-generic-password\""));
+    assert!(keychain.contains("add-generic-password"));
     assert!(keychain.contains("\"find-generic-password\""));
     assert!(keychain.contains("\"delete-generic-password\""));
+    assert!(keychain.contains(".arg(\"-i\")"));
+    assert!(keychain.contains("input.extend_from_slice(b\" -X \")"));
     assert!(keychain.contains(".stdin(Stdio::piped())"));
     assert!(keychain.contains(".stdout(Stdio::null())"));
     assert!(keychain.contains(".stderr(Stdio::null())"));

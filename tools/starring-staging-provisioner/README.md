@@ -14,11 +14,13 @@ readable and leaves them unchanged.
 
 It generates twenty distinct 32-byte passwords, two independent 32-byte API
 keyrings, and independent PostgreSQL SCRAM-SHA-256 verifiers. Plaintext
-passwords are passed only to the macOS `security` process over stdin and stored
-as fixed Keychain database URLs. Only verifier strings are sent to PostgreSQL,
-in one transaction. If a failure occurs before the database commit, previous
-managed Keychain values are restored. A commit-indeterminate error preserves
-the newly written Keychain values for operator reconciliation.
+passwords are hex-encoded in memory and passed only to the interactive macOS
+`security` process over stdin, never through an argument or environment
+variable, and stored as fixed Keychain database URLs. Only verifier strings
+are sent to PostgreSQL, in one transaction. If a failure occurs before the
+database commit, previous managed Keychain values are restored. A
+commit-indeterminate error preserves the newly written Keychain values for
+operator reconciliation.
 
 ```zsh
 env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \

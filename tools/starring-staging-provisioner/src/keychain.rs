@@ -132,15 +132,7 @@ impl KeychainClientV1 {
         }
         let mut command = Command::new(SECURITY_PATH);
         command
-            .args([
-                "add-generic-password",
-                "-U",
-                "-s",
-                identity.service,
-                "-a",
-                identity.account,
-                "-w",
-            ])
+            .arg("-i")
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -148,10 +140,18 @@ impl KeychainClientV1 {
         let mut child = command
             .spawn()
             .map_err(|_| ProvisionerErrorV1::KeychainWrite)?;
-        let mut input = Zeroizing::new(Vec::with_capacity(value.len() * 2 + 2));
-        input.extend_from_slice(value);
-        input.push(b'\n');
-        input.extend_from_slice(value);
+        let mut input = Zeroizing::new(Vec::with_capacity(
+            48 + identity.service.len() + identity.account.len() + value.len() * 2,
+        ));
+        input.extend_from_slice(b"add-generic-password -U -s ");
+        input.extend_from_slice(identity.service.as_bytes());
+        input.extend_from_slice(b" -a ");
+        input.extend_from_slice(identity.account.as_bytes());
+        input.extend_from_slice(b" -X ");
+        for byte in value {
+            input.push(b"0123456789abcdef"[(byte >> 4) as usize]);
+            input.push(b"0123456789abcdef"[(byte & 0x0f) as usize]);
+        }
         input.push(b'\n');
         let write_result = child
             .stdin
@@ -342,7 +342,8 @@ mod tests {
         };
         let client = KeychainClientV1::new().unwrap();
         let _ = client.delete(identity);
-        let secret = b"temporary-staging-provisioner-roundtrip-value";
+        let secret = b"postgresql://starring_identity_oauth:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@127.0.0.1:5432/starring_runtime_staging?sslmode=disable";
+        assert!(secret.len() > 128);
         client.write_and_verify(identity, secret).unwrap();
         let readback = client.read_required(identity).unwrap();
         assert_eq!(readback.as_slice(), secret);
