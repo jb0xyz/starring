@@ -3265,6 +3265,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "starring-db-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "automation-instance-postgres",
+ "libc",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "starring-demo"
 version = "0.1.0"
 dependencies = [
@@ -3305,6 +3317,23 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "twilight-gateway 0.17.1 (git+https://github.com/twilight-rs/twilight.git?rev=b4ce13b727e7731b917576ad977300ab6926bb6b)",
+ "zeroize",
+]
+
+[[package]]
+name = "starring-staging-provisioner"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "getrandom 0.4.3",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "thiserror 1.0.69",
+ "tokio",
  "zeroize",
 ]
 

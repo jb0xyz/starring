@@ -1,0 +1,12 @@
+[package]
+name = "starring-db-bootstrap"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+automation-instance-postgres = { path = "../../crates/automation-instance-postgres" }
+libc = "0.2"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "migrate"] }
+thiserror.workspace = true
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
+zeroize = "1"
