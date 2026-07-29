@@ -557,16 +557,9 @@ pub async fn provision_authoring_writer(
     acquire_incremental_lock(&mut target).await?;
     verify_existing_cluster_contract(&mut target).await?;
 
-    let role_exists = authoring_writer_role_exists(&mut target).await?;
     let writer_identity = writer_keychain_identity();
     let existing_secret = keychain.read_optional(writer_identity)?;
-    if role_exists != existing_secret.is_some() {
-        return Err(ProvisionerErrorV1::IncrementalAuthoringWriterPartialState);
-    }
-    verify_migration_contract(&mut target, role_exists).await?;
-    let snapshot_capability = load_snapshot_capability(&mut target).await?;
-    let state =
-        classify_incremental_state(role_exists, existing_secret.is_some(), snapshot_capability)?;
+    let state = inspect_incremental_state(&mut target, existing_secret.is_some()).await?;
 
     if state == IncrementalStateV1::ExactReplay {
         let existing_secret =
@@ -637,6 +630,19 @@ fn classify_incremental_state(
         (true, true, SnapshotCapabilityV1::Cutover) => Ok(IncrementalStateV1::ExactReplay),
         _ => Err(ProvisionerErrorV1::IncrementalAuthoringWriterPartialState),
     }
+}
+
+async fn inspect_incremental_state(
+    connection: &mut PgConnection,
+    credential_exists: bool,
+) -> Result<IncrementalStateV1, ProvisionerErrorV1> {
+    let role_exists = authoring_writer_role_exists(connection).await?;
+    if role_exists != credential_exists {
+        return Err(ProvisionerErrorV1::IncrementalAuthoringWriterPartialState);
+    }
+    verify_migration_contract(connection, role_exists).await?;
+    let snapshot_capability = load_snapshot_capability(&mut *connection).await?;
+    classify_incremental_state(role_exists, credential_exists, snapshot_capability)
 }
 
 async fn load_snapshot_capability<'e, E>(
@@ -1019,6 +1025,9 @@ async fn rollback_authoring_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[path = "lifecycle.rs"]
+    mod lifecycle;
 
     const VERIFY_WRITER_DEFAULT_ACL_CONTRACT_SQL: &str = r#"
 SELECT
