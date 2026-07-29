@@ -20,6 +20,9 @@ fn snapshot_cipher_keeps_audited_crypto_and_secret_memory_boundaries() {
     assert!(cipher.contains("keys: Arc<[SnapshotEnvelopeKeyV1]>"));
     assert!(cipher.contains("AeadInOut"));
     assert!(cipher.contains("decrypt_in_place"));
+    assert!(cipher.contains("let mut ciphertext = Zeroizing::new(plaintext.as_slice().to_vec());"));
+    assert!(cipher.contains("let ciphertext = std::mem::take(&mut *ciphertext);"));
+    assert!(!cipher.contains("let mut ciphertext = plaintext.as_slice().to_vec();"));
     assert!(cipher.contains("let cipher_key: &Key = key.secret().into()"));
     assert!(cipher.contains("ConstantTimeEq"));
     assert!(cipher.contains("MAX_SNAPSHOT_ENVELOPE_KEYS: usize = 8"));

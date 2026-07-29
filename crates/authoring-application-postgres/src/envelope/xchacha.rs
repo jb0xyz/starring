@@ -217,10 +217,11 @@ impl SnapshotEnvelopeEncryptionPort for XChaCha20Poly1305SnapshotEnvelopeCipherV
         let cipher_key: &Key = active.secret().into();
         let cipher = XChaCha20Poly1305::new(cipher_key);
         let nonce = XNonce::from(nonce_bytes);
-        let mut ciphertext = plaintext.as_slice().to_vec();
+        let mut ciphertext = Zeroizing::new(plaintext.as_slice().to_vec());
         cipher
-            .encrypt_in_place(&nonce, authenticated_data, &mut ciphertext)
+            .encrypt_in_place(&nonce, authenticated_data, &mut *ciphertext)
             .map_err(|_| SnapshotEnvelopeCipherError::Backend)?;
+        let ciphertext = std::mem::take(&mut *ciphertext);
         EncryptedSnapshotEnvelopeV1::from_persisted_parts(
             ciphertext,
             nonce_bytes.to_vec(),
