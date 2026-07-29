@@ -142,15 +142,15 @@ impl FreshGuildAuthorityPort for ReadAuthority {
     }
 }
 
-fn key_material(seed: u8) -> [u8; 32] {
+pub(super) fn key_material(seed: u8) -> [u8; 32] {
     std::array::from_fn(|index| seed.wrapping_add((index as u8).wrapping_mul(17)))
 }
 
-fn snapshot_key(key_id: &str, seed: u8) -> SnapshotEnvelopeKeyV1 {
+pub(super) fn snapshot_key(key_id: &str, seed: u8) -> SnapshotEnvelopeKeyV1 {
     SnapshotEnvelopeKeyV1::new(key_id, Zeroizing::new(key_material(seed))).unwrap()
 }
 
-fn cipher(
+pub(super) fn cipher(
     active_key_id: &str,
     active_seed: u8,
     retired: impl IntoIterator<Item = SnapshotEnvelopeKeyV1>,
@@ -360,7 +360,7 @@ async fn insert_other_tenant(
     (tenant_id, installation_id, authority_digest)
 }
 
-async fn writer_store_pool(database_name: &str, role: &str) -> PgPool {
+pub(super) async fn writer_store_pool(database_name: &str, role: &str) -> PgPool {
     let options = database_url().parse::<PgConnectOptions>().unwrap();
     let pool = PgPoolOptions::new()
         .max_connections(1)

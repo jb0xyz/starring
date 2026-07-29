@@ -13,6 +13,8 @@ use sqlx::Connection;
 mod migration_security;
 #[path = "postgres_authoring_writer/read_security.rs"]
 mod read_security;
+#[path = "postgres_authoring_writer/write_security.rs"]
+mod write_security;
 
 const COMMIT_QUERY: &str = "SELECT * FROM public.starring_authoring_session_writer_commit_v1(\
      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,\
@@ -316,6 +318,20 @@ async fn set_local_role(transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         .execute(&mut **transaction)
         .await
         .unwrap();
+}
+
+async fn assert_role_statement_denied(pool: &PgPool, role: &str, statement: &str) {
+    let mut transaction = pool.begin().await.unwrap();
+    set_local_role(&mut transaction, role).await;
+    let error = sqlx::query(statement)
+        .execute(&mut *transaction)
+        .await
+        .expect_err("restricted role statement must fail");
+    assert_eq!(
+        error.as_database_error().and_then(|error| error.code()),
+        Some(std::borrow::Cow::Borrowed("42501"))
+    );
+    transaction.rollback().await.unwrap();
 }
 
 async fn execute_commit(
@@ -668,17 +684,108 @@ async fn assert_writer_least_privilege(pool: &PgPool, role: &str) {
     .await
     .unwrap();
     assert_eq!(column_privileges, 0);
+
+    let expected_database_identity = sqlx::query_scalar::<_, String>(
+        "SELECT database_identity::TEXT \
+         FROM public.product_control_plane_identity \
+         WHERE singleton",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
     let mut transaction = pool.begin().await.unwrap();
     set_local_role(&mut transaction, role).await;
-    let error = sqlx::query("SELECT snapshot_ciphertext FROM public.authoring_session_generations")
-        .fetch_all(&mut *transaction)
-        .await
-        .expect_err("writer role must not read generation relations");
-    assert_eq!(
-        error.as_database_error().and_then(|error| error.code()),
-        Some(std::borrow::Cow::Borrowed("42501"))
-    );
+    let actual_database_identity = sqlx::query_scalar::<_, String>(
+        "SELECT public.starring_authoring_session_writer_database_identity_v1()",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(actual_database_identity, expected_database_identity);
     transaction.rollback().await.unwrap();
+
+    for statement in [
+        "SELECT snapshot_ciphertext FROM public.authoring_session_generations",
+        "INSERT INTO public.authoring_session_generations DEFAULT VALUES",
+        "UPDATE public.authoring_session_generations \
+         SET stage = 'discussion' WHERE FALSE",
+        "DELETE FROM public.authoring_session_generations WHERE FALSE",
+    ] {
+        assert_role_statement_denied(pool, role, statement).await;
+    }
+
+    let adjacent_api_function =
+        "public.starring_product_deployment_status_reader_database_identity_v1()";
+    let adjacent_reader_function =
+        "public.starring_product_authorized_snapshot_reader_database_identity_v1()";
+    let api_role = format!("{role}_api");
+    let reader_role = format!("{role}_reader");
+    let public_role = format!("{role}_public");
+    let unrelated_role = format!("{role}_unrelated");
+    for restricted_role in [&api_role, &reader_role, &public_role, &unrelated_role] {
+        sqlx::query(&format!(
+            "CREATE ROLE {restricted_role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE \
+             NOINHERIT NOREPLICATION NOBYPASSRLS"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(&format!("GRANT {restricted_role} TO CURRENT_USER"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    for restricted_role in [&api_role, &reader_role, &unrelated_role] {
+        sqlx::query(&format!(
+            "GRANT USAGE ON SCHEMA public TO {restricted_role}"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION {adjacent_api_function} TO {api_role}"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "GRANT EXECUTE ON FUNCTION {adjacent_reader_function} TO {reader_role}"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+
+    for restricted_role in [&api_role, &reader_role, &public_role, &unrelated_role] {
+        for writer_function in WRITER_FUNCTIONS {
+            let can_execute = sqlx::query_scalar::<_, bool>(
+                "SELECT pg_catalog.has_function_privilege($1, $2, 'EXECUTE')",
+            )
+            .bind(restricted_role)
+            .bind(writer_function)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert!(!can_execute);
+        }
+        assert_role_statement_denied(
+            pool,
+            restricted_role,
+            "SELECT public.starring_authoring_session_writer_database_identity_v1()",
+        )
+        .await;
+    }
+
+    for restricted_role in [&api_role, &reader_role, &public_role, &unrelated_role] {
+        sqlx::query(&format!("DROP OWNED BY {restricted_role}"))
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(&format!("DROP ROLE {restricted_role}"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
 }
 
 async fn cleanup(mut administrator: PgConnection, pool: PgPool, database_name: &str, role: &str) {
