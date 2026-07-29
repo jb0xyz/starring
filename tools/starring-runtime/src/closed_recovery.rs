@@ -1451,9 +1451,10 @@ impl RuntimeClosedRecoveryProductionHandoffProcessV2 {
         &self,
     ) -> Result<RuntimeGatewayReadyAttestationV2, crate::RuntimeGatewayReadyObservationErrorV1>
     {
-        let successor = self.recovery_resume_successor_generation_v2()?;
         self.gateway
-            .observe_exact_current_ready_attestation_v2(successor)
+            .observe_exact_recovery_resume_successor_ready_attestation_v2(
+                self.worker.coordinator_generation(),
+            )
     }
 
     pub(crate) fn revalidate_paused_v2(

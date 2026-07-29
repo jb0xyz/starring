@@ -4,6 +4,7 @@ use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 use automation_runtime_controller::{
+    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2,
     RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimeObserveWriterFenceV1,
     RuntimeWriterFenceObservationV1,
 };
@@ -293,6 +294,11 @@ pub(crate) struct RuntimeRecoveryResumeProcessV2 {
     foundation: RuntimeProcessFoundationV1,
     lifecycle: RuntimeClosedRecoveryProductionHandoffProcessV2,
     process_generation: NonZeroU64,
+}
+
+pub(crate) struct RuntimeRecoveryResumeGatewayStageV2 {
+    pub(crate) owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+    pub(crate) gateway_ready: RuntimeGatewayReadyAttestationV2,
 }
 
 pub(crate) struct RuntimeAdmissionAcknowledgingProcessV2 {
@@ -1159,61 +1165,17 @@ impl RuntimeRecoveryResumeProcessV2 {
                 cleanup,
             ));
         }
-        let coordinator_generation = self.lifecycle.coordinator_generation_v2();
-        let pause = match self.lifecycle.observe_exact_pause_reservation_v2() {
-            Ok(pause) => pause,
-            Err(_) => {
-                let cleanup = self.shutdown().await;
-                return Err(finish_production_handoff_transition_v2(
-                    RuntimeProcessProductionHandoffFailureV2::Gateway,
-                    cleanup,
-                ));
-            }
-        };
-        let owner_receipt = self
-            .lifecycle
-            .recovery_resume_permit_v2()
-            .owner_receipt()
-            .clone();
-        let resume_deadline = Instant::now() + Duration::from_secs(2);
-        let evidence = match self
-            .discord
-            .resume_reserved_admission_in_place_v2(coordinator_generation, pause, resume_deadline)
-            .await
+        let gateway_stage = match execute_recovery_resume_gateway_stage_v2(
+            &mut self.discord,
+            &self.lifecycle,
+            Duration::from_secs(2),
+        )
+        .await
         {
-            RuntimeDiscordRecoveryResumeAttemptV2::Applied(evidence) => evidence,
-            RuntimeDiscordRecoveryResumeAttemptV2::DefinitelyNotApplied(_) => {
+            Ok(stage) => stage,
+            Err(transition) => {
                 let cleanup = self.shutdown().await;
-                return Err(finish_production_handoff_transition_v2(
-                    RuntimeProcessProductionHandoffFailureV2::DiscordNotApplied,
-                    cleanup,
-                ));
-            }
-            RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(_) => {
-                let cleanup = self.shutdown().await;
-                return Err(finish_production_handoff_transition_v2(
-                    RuntimeProcessProductionHandoffFailureV2::DiscordIndeterminate,
-                    cleanup,
-                ));
-            }
-        };
-        if evidence.coordinator_generation_v2() != coordinator_generation
-            || evidence.expected_v2() != pause
-        {
-            let cleanup = self.shutdown().await;
-            return Err(finish_production_handoff_transition_v2(
-                RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
-                cleanup,
-            ));
-        }
-        let gateway_ready = match self.lifecycle.observe_exact_resumed_ready_attestation_v2() {
-            Ok(ready) => ready,
-            Err(_) => {
-                let cleanup = self.shutdown().await;
-                return Err(finish_production_handoff_transition_v2(
-                    RuntimeProcessProductionHandoffFailureV2::Gateway,
-                    cleanup,
-                ));
+                return Err(finish_production_handoff_transition_v2(transition, cleanup));
             }
         };
         self.foundation
@@ -1248,9 +1210,9 @@ impl RuntimeRecoveryResumeProcessV2 {
             ));
         }
         let observation = RuntimeClosedRecoveryResumeObservationV2 {
-            owner_receipt,
+            owner_receipt: gateway_stage.owner_receipt,
             readiness: post_database.readiness,
-            gateway_ready,
+            gateway_ready: gateway_stage.gateway_ready,
             writer_fence_generation: post_database.writer_fence_generation,
             maintenance_gate_generation: post_gate.generation(),
         };
@@ -1302,6 +1264,52 @@ impl RuntimeRecoveryResumeProcessV2 {
         }
         Ok(process)
     }
+}
+
+pub(crate) async fn execute_recovery_resume_gateway_stage_v2(
+    discord: &mut RuntimeDiscordProcessSupervisorV2,
+    lifecycle: &RuntimeClosedRecoveryProductionHandoffProcessV2,
+    resume_for: Duration,
+) -> Result<RuntimeRecoveryResumeGatewayStageV2, RuntimeProcessProductionHandoffFailureV2> {
+    let coordinator_generation = lifecycle.coordinator_generation_v2();
+    let pause = lifecycle
+        .observe_exact_pause_reservation_v2()
+        .map_err(|_| RuntimeProcessProductionHandoffFailureV2::Gateway)?;
+    let expected_gateway_successor = lifecycle
+        .recovery_resume_successor_generation_v2()
+        .map_err(|_| RuntimeProcessProductionHandoffFailureV2::Gateway)?;
+    let owner_receipt = lifecycle
+        .recovery_resume_permit_v2()
+        .owner_receipt()
+        .clone();
+    let resume_deadline = Instant::now() + resume_for;
+    let evidence = match discord
+        .resume_reserved_admission_in_place_v2(coordinator_generation, pause, resume_deadline)
+        .await
+    {
+        RuntimeDiscordRecoveryResumeAttemptV2::Applied(evidence) => evidence,
+        RuntimeDiscordRecoveryResumeAttemptV2::DefinitelyNotApplied(_) => {
+            return Err(RuntimeProcessProductionHandoffFailureV2::DiscordNotApplied);
+        }
+        RuntimeDiscordRecoveryResumeAttemptV2::Indeterminate(_) => {
+            return Err(RuntimeProcessProductionHandoffFailureV2::DiscordIndeterminate);
+        }
+    };
+    if evidence.coordinator_generation_v2() != coordinator_generation
+        || evidence.expected_v2() != pause
+    {
+        return Err(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation);
+    }
+    if lifecycle.coordinator_generation_v2() != expected_gateway_successor {
+        return Err(RuntimeProcessProductionHandoffFailureV2::Gateway);
+    }
+    let gateway_ready = lifecycle
+        .observe_exact_resumed_ready_attestation_v2()
+        .map_err(|_| RuntimeProcessProductionHandoffFailureV2::Gateway)?;
+    Ok(RuntimeRecoveryResumeGatewayStageV2 {
+        owner_receipt,
+        gateway_ready,
+    })
 }
 
 struct RuntimeRecoveryResumeDatabaseEvidenceV2 {

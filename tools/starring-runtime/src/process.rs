@@ -61,6 +61,8 @@ pub(crate) use execution::{
     execute_pending_drain_recovery_with_environment_v2, RuntimePendingDrainRecoveryEnvironmentV2,
     RuntimeStartupRecoveryExecutionAwaitFailureV2,
 };
+#[cfg(test)]
+pub(crate) use observation::execute_recovery_resume_gateway_stage_v2;
 pub use observation::{
     RuntimeProcessProductionHandoffErrorV2, RuntimeProcessProductionHandoffFailureV2,
     RuntimeProcessStartupRecoveryObservationErrorV2,

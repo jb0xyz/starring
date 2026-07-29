@@ -1541,6 +1541,205 @@ async fn in_place_startup_observation_finalizes_fixed_point_once() {
 }
 
 #[tokio::test]
+async fn production_resume_advances_exact_successor_and_reaches_admission_acknowledging() {
+    let process_instance_id = ProcessInstanceId::parse("process:handoff").unwrap();
+    let mut gateway = crate::compose_runtime_gateway_bootstrap_v1(
+        process_instance_id.clone(),
+        crate::GatewayResourceConfigV1::default(),
+    )
+    .unwrap();
+    let (signals, driver, _polls, _closes, _drops) = crate::discord::test_support::driver();
+    let discord = gateway
+        .start_discord_gateway_with_driver_v1(
+            driver,
+            Instant::now() + Duration::from_secs(4),
+            Instant::now() + Duration::from_secs(6),
+        )
+        .await
+        .unwrap();
+    signals
+        .send(crate::discord::RuntimeDiscordGatewaySignalV1::Ready)
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if gateway.observe_paused_connected_gateway_v2().is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let lease_for = Duration::from_secs(5);
+    let owner_receipt = receipt_with_epoch(lease_for, NonZeroU64::MIN);
+    let owner_port = FakePortV1::new(owner_receipt.clone(), []);
+    let owner_config = RuntimeGatewayOwnerStartupWatchdogConfigV1::new(
+        lease_for,
+        Duration::from_secs(4),
+        Duration::from_millis(500),
+        Duration::from_millis(20),
+        Duration::from_millis(500),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let owner = gateway
+        .start_gateway_owner_startup_watchdog_v1(
+            owner_port.clone(),
+            accepted_receipt(owner_receipt),
+            started,
+            started,
+            owner_config,
+        )
+        .unwrap()
+        .prepare_closed_recovery_v2()
+        .await
+        .unwrap();
+    let registry = crate::compose_runtime_registry_bootstrap_v1(
+        process_instance_id,
+        crate::GatewayResourceConfigV1::default(),
+    )
+    .unwrap();
+    registry.advance_empty_sequence_for_test_v2();
+    let readiness = crate::database::runtime_database_readiness_for_test_v1();
+    let paused_gateway = gateway.observe_paused_connected_gateway_v2().unwrap();
+    let pending = crate::closed_recovery::begin_initial_empty_recovery_v2(
+        &mut gateway,
+        &registry,
+        owner,
+        RuntimeRecoveryIdV2::parse("53535353535353535353535353535353").unwrap(),
+        &readiness,
+        &paused_gateway,
+        Instant::now() + Duration::from_secs(4),
+    )
+    .unwrap();
+    let session = pending.commit_owner_v2().await.unwrap();
+    let outcome = session
+        .observe_startup_recovery_with_test_observer_v2(|authorization, _cutoff| {
+            ready(Ok::<_, FakeErrorV1>(
+                complete_startup_recovery_observation_v2(
+                    authorization,
+                    at_millis(1_000_100),
+                    empty_startup_recovery_state_v2(),
+                ),
+            ))
+        })
+        .await
+        .unwrap();
+    let crate::closed_recovery::RuntimeClosedRecoveryStartupIterationOutcomeV2::FixedPoint(
+        fixed_point,
+    ) = outcome
+    else {
+        panic!("expected startup fixed point")
+    };
+    owner_port
+        .state
+        .receipt
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .database_now = at_millis(1_000_100);
+    let mut fixed_point = match fixed_point.into_worker_fixed_point_v2() {
+        Ok(fixed_point) => fixed_point,
+        Err(_) => panic!("expected worker fixed point"),
+    };
+    fixed_point
+        .enter_admission_frozen_in_place_v2()
+        .await
+        .unwrap();
+    let mut lifecycle = match fixed_point.try_into_admission_frozen_v2() {
+        Ok(lifecycle) => lifecycle,
+        Err(_) => panic!("expected admission-frozen lifecycle"),
+    };
+    let process_generation = NonZeroU64::MIN;
+    let discord = match discord.handoff_to_process_v2(process_generation).await {
+        crate::discord::RuntimeDiscordProcessHandoffV2::Process(discord) => discord,
+        outcome => {
+            drop(outcome);
+            panic!("expected Discord process handoff")
+        }
+    };
+    lifecycle
+        .activate_process_owner_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let lifecycle = match lifecycle.try_into_process_frozen_v2() {
+        Ok(lifecycle) => lifecycle,
+        Err(_) => panic!("expected process-frozen lifecycle"),
+    };
+    let finalizer_generation =
+        automation_runtime_worker::RuntimeMutationFinalizerGenerationV1::new(NonZeroU64::MIN)
+            .unwrap();
+    let lifecycle = match lifecycle
+        .into_production_handoff_v2(finalizer_generation)
+        .await
+    {
+        Ok(lifecycle) => lifecycle,
+        Err(_) => panic!("expected production-handoff lifecycle"),
+    };
+    let predecessor = lifecycle.coordinator_generation_v2();
+    let mut discord = discord;
+    let stage = crate::process::execute_recovery_resume_gateway_stage_v2(
+        &mut discord,
+        &lifecycle,
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let lifecycle = match lifecycle
+        .into_admission_acknowledging_v2(
+            crate::closed_recovery::RuntimeClosedRecoveryResumeObservationV2 {
+                owner_receipt: stage.owner_receipt,
+                readiness: crate::database::runtime_database_readiness_refresh_for_test_v2()
+                    .into_exact_capability_receipts(),
+                gateway_ready: stage.gateway_ready,
+                writer_fence_generation:
+                    automation_runtime_controller::RuntimeWriterFenceGenerationV1::new(
+                        NonZeroU64::MIN,
+                    ),
+                maintenance_gate_generation:
+                    automation_runtime_worker::RuntimeMaintenanceGateGenerationV2::new(
+                        NonZeroU64::MIN,
+                    )
+                    .unwrap(),
+            },
+        )
+        .await
+    {
+        Ok(lifecycle) => lifecycle,
+        Err(failure) => panic!(
+            "expected admission-acknowledging lifecycle: {:?}",
+            failure.error_v2()
+        ),
+    };
+
+    assert_eq!(
+        lifecycle.coordinator_generation_v2().get(),
+        predecessor.get() + 1
+    );
+    assert_eq!(lifecycle.process_generation_v2(), process_generation);
+    assert_eq!(
+        discord
+            .shutdown_until(
+                gateway.begin_discord_drain_v1(),
+                process_generation,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+            .exit(),
+        crate::discord::RuntimeDiscordGatewayExitV1::Commanded
+    );
+    assert_eq!(
+        lifecycle
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(owner_port.release_calls(), 1);
+}
+
+#[tokio::test]
 async fn in_place_startup_observer_error_retains_bounded_cleanup_authority() {
     let (gateway, _registry, mut iteration, owner_port) = ready_recovery_iteration_fixture_v2(
         "43434343434343434343434343434343",

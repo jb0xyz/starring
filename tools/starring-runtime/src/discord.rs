@@ -2010,38 +2010,21 @@ async fn wait_for_lifecycle_drain_v1(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::num::{NonZeroU64, NonZeroUsize};
+pub(crate) mod test_support {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
-    use automation_runtime::{
-        shared_gateway_control_channel_with_policy_v3, GatewayAdmissionPolicyV3,
-        GatewayControlConfigV3,
-    };
-    use automation_runtime_controller::RuntimeGatewayReadyKindV2;
-    use automation_runtime_convergence::ProcessInstanceId;
-    use automation_runtime_worker::RuntimeGatewayCoordinatorGenerationV2;
-    use tokio::sync::{mpsc, oneshot, watch};
-
-    use crate::gateway::{
-        compose_runtime_gateway_section_test_bootstrap_v2,
-        compose_runtime_gateway_section_test_bootstrap_with_capacity_v2,
-        RuntimeGatewayReadyObservationErrorV1,
-    };
+    use tokio::sync::{mpsc, oneshot};
 
     use super::{
-        RuntimeDiscordGatewayCloseOutcomeV1, RuntimeDiscordGatewayDriverV1,
-        RuntimeDiscordGatewayExitV1, RuntimeDiscordGatewayShutdownErrorV1,
-        RuntimeDiscordGatewaySignalV1, RuntimeDiscordProcessHandoffFailureV2,
-        RuntimeDiscordProcessHandoffV2, RuntimeDiscordRecoveryResumeOwnershipV2,
-        RuntimeDiscordRecoveryResumeV2,
+        RuntimeDiscordGatewayDriverV1, RuntimeDiscordGatewaySignalV1,
+        RuntimeDiscordGatewayTransportStateV1,
     };
 
-    struct TestDiscordGatewayDriverV1 {
+    pub(crate) struct TestDiscordGatewayDriverV1 {
         signals: mpsc::UnboundedReceiver<RuntimeDiscordGatewaySignalV1>,
-        transport_state: Arc<Mutex<super::RuntimeDiscordGatewayTransportStateV1>>,
+        transport_state: Arc<Mutex<RuntimeDiscordGatewayTransportStateV1>>,
         polls: Arc<AtomicUsize>,
         closes: Arc<AtomicUsize>,
         drops: Arc<AtomicUsize>,
@@ -2049,7 +2032,7 @@ mod tests {
     }
 
     impl RuntimeDiscordGatewayDriverV1 for TestDiscordGatewayDriverV1 {
-        fn transport_state(&self) -> super::RuntimeDiscordGatewayTransportStateV1 {
+        fn transport_state(&self) -> RuntimeDiscordGatewayTransportStateV1 {
             *self.transport_state.lock().unwrap()
         }
 
@@ -2061,8 +2044,8 @@ mod tests {
             Box::pin(async move {
                 {
                     let mut state = self.transport_state.lock().unwrap();
-                    if *state != super::RuntimeDiscordGatewayTransportStateV1::Active {
-                        *state = super::RuntimeDiscordGatewayTransportStateV1::Connecting;
+                    if *state != RuntimeDiscordGatewayTransportStateV1::Active {
+                        *state = RuntimeDiscordGatewayTransportStateV1::Connecting;
                     }
                 }
                 self.polls.fetch_add(1, Ordering::AcqRel);
@@ -2075,14 +2058,14 @@ mod tests {
                 match signal {
                     RuntimeDiscordGatewaySignalV1::Ready
                     | RuntimeDiscordGatewaySignalV1::Resumed => {
-                        *state = super::RuntimeDiscordGatewayTransportStateV1::Active;
+                        *state = RuntimeDiscordGatewayTransportStateV1::Active;
                     }
                     RuntimeDiscordGatewaySignalV1::Close
                     | RuntimeDiscordGatewaySignalV1::Reconnect
                     | RuntimeDiscordGatewaySignalV1::SessionInvalidated
                     | RuntimeDiscordGatewaySignalV1::ReceiveError
                     | RuntimeDiscordGatewaySignalV1::StreamEnded => {
-                        *state = super::RuntimeDiscordGatewayTransportStateV1::Disconnected;
+                        *state = RuntimeDiscordGatewayTransportStateV1::Disconnected;
                     }
                     RuntimeDiscordGatewaySignalV1::FatalReceiveError
                     | RuntimeDiscordGatewaySignalV1::Unrelated => {}
@@ -2120,7 +2103,7 @@ mod tests {
         }
     }
 
-    fn driver() -> (
+    pub(crate) fn driver() -> (
         mpsc::UnboundedSender<RuntimeDiscordGatewaySignalV1>,
         TestDiscordGatewayDriverV1,
         Arc<AtomicUsize>,
@@ -2131,9 +2114,8 @@ mod tests {
         let polls = Arc::new(AtomicUsize::new(0));
         let closes = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
-        let transport_state = Arc::new(Mutex::new(
-            super::RuntimeDiscordGatewayTransportStateV1::Unstarted,
-        ));
+        let transport_state =
+            Arc::new(Mutex::new(RuntimeDiscordGatewayTransportStateV1::Unstarted));
         (
             sender,
             TestDiscordGatewayDriverV1 {
@@ -2150,7 +2132,7 @@ mod tests {
         )
     }
 
-    fn delayed_close_driver() -> (
+    pub(crate) fn delayed_close_driver() -> (
         mpsc::UnboundedSender<RuntimeDiscordGatewaySignalV1>,
         TestDiscordGatewayDriverV1,
         oneshot::Sender<()>,
@@ -2162,6 +2144,36 @@ mod tests {
         driver.close_acknowledgement = Some(close_acknowledgement);
         (signals, driver, acknowledgement, closes, drops)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::{NonZeroU64, NonZeroUsize};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    use automation_runtime::{
+        shared_gateway_control_channel_with_policy_v3, GatewayAdmissionPolicyV3,
+        GatewayControlConfigV3,
+    };
+    use automation_runtime_controller::RuntimeGatewayReadyKindV2;
+    use automation_runtime_convergence::ProcessInstanceId;
+    use automation_runtime_worker::RuntimeGatewayCoordinatorGenerationV2;
+    use tokio::sync::watch;
+
+    use crate::gateway::{
+        compose_runtime_gateway_section_test_bootstrap_v2,
+        compose_runtime_gateway_section_test_bootstrap_with_capacity_v2,
+        RuntimeGatewayReadyObservationErrorV1,
+    };
+
+    use super::test_support::{delayed_close_driver, driver};
+    use super::{
+        RuntimeDiscordGatewayCloseOutcomeV1, RuntimeDiscordGatewayExitV1,
+        RuntimeDiscordGatewayShutdownErrorV1, RuntimeDiscordGatewaySignalV1,
+        RuntimeDiscordProcessHandoffFailureV2, RuntimeDiscordProcessHandoffV2,
+        RuntimeDiscordRecoveryResumeOwnershipV2, RuntimeDiscordRecoveryResumeV2,
+    };
 
     fn gateway() -> crate::RuntimeGatewayBootstrapV1 {
         compose_runtime_gateway_section_test_bootstrap_v2(

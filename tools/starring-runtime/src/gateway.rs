@@ -943,6 +943,23 @@ impl RuntimeGatewayProductionCoordinatorV2 {
             .ok_or(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceOutOfRange)
     }
 
+    pub(crate) fn observe_exact_recovery_resume_successor_ready_attestation_v2(
+        &self,
+        expected_predecessor: RuntimeGatewayCoordinatorGenerationV2,
+    ) -> Result<RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyObservationErrorV1> {
+        let expected_successor = runtime_gateway_successor_generation_v2(expected_predecessor)
+            .ok_or(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceOutOfRange)?;
+        let first =
+            self.require_completed_recovery_resume_successor_state_v2(expected_successor)?;
+        let ready = self.observe_exact_current_ready_attestation_v2(expected_successor)?;
+        let second =
+            self.require_completed_recovery_resume_successor_state_v2(expected_successor)?;
+        if first != second {
+            return Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain);
+        }
+        Ok(ready)
+    }
+
     pub(crate) fn current_interrupt_v2(&self) -> Option<RuntimeGatewayProductionInterruptV2> {
         let interrupt = self.interrupt.current();
         if interrupt == self.applied_interrupt
@@ -1118,6 +1135,29 @@ impl RuntimeGatewayProductionCoordinatorV2 {
             return Err(RuntimeGatewayReadyObservationErrorV1::Stopped);
         }
         Ok(())
+    }
+
+    fn require_completed_recovery_resume_successor_state_v2(
+        &self,
+        expected_successor: RuntimeGatewayCoordinatorGenerationV2,
+    ) -> Result<RuntimeGatewayCoordinatorArbiterObservationV2, RuntimeGatewayReadyObservationErrorV1>
+    {
+        self.require_resume_observation_generation_v2(expected_successor)?;
+        let state = self.interrupt.current_observation_v2();
+        if state.generation != expected_successor {
+            return Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot);
+        }
+        match state.interrupt {
+            RuntimeGatewayCoordinatorInterruptV2::None => {}
+            RuntimeGatewayCoordinatorInterruptV2::Shutdown => {
+                return Err(RuntimeGatewayReadyObservationErrorV1::Stopped);
+            }
+            _ => return Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain),
+        }
+        if !state.production_generation_active || state.resume_claim.is_some() {
+            return Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain);
+        }
+        Ok(state)
     }
 
     pub(crate) fn observe_exact_admission_snapshot_v2(
@@ -3911,6 +3951,10 @@ mod tests {
                 .unwrap(),
             successor
         );
+        assert_eq!(
+            production.observe_exact_recovery_resume_successor_ready_attestation_v2(predecessor),
+            Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot)
+        );
         let (observation, _) = watch::channel(None);
         let (lifecycle_drained, _) = watch::channel(1);
         let mut lifecycle_sequence = 1;
@@ -3952,14 +3996,97 @@ mod tests {
         assert_eq!(coordinator.current_generation_v2(), successor);
         assert!(pause_token.is_none());
         assert_eq!(
+            production
+                .recovery_resume_successor_generation_v2(predecessor)
+                .unwrap_err(),
+            RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot
+        );
+        assert_eq!(
             production.observe_exact_current_ready_attestation_v2(predecessor),
             Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot)
         );
         let ready = production
-            .observe_exact_current_ready_attestation_v2(successor)
+            .observe_exact_recovery_resume_successor_ready_attestation_v2(predecessor)
             .unwrap();
         assert_eq!(ready.connection_epoch.get(), expected.epoch().get());
         assert!(ready.was_explicitly_resumed());
+    }
+
+    #[tokio::test]
+    async fn resumed_successor_ready_observation_rejects_wrong_generation() {
+        let fixture = production_ready_fixture_v2().await;
+        assert_eq!(
+            fixture
+                .production
+                .observe_exact_recovery_resume_successor_ready_attestation_v2(
+                    coordinator_generation(1),
+                ),
+            Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot)
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_successor_ready_observation_rejects_inactive_production() {
+        let fixture = production_ready_fixture_v2().await;
+        fixture
+            .production
+            .interrupt
+            .deactivate_production_generation_v2(coordinator_generation(3));
+        assert_eq!(
+            fixture
+                .production
+                .observe_exact_recovery_resume_successor_ready_attestation_v2(
+                    coordinator_generation(2),
+                ),
+            Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_successor_ready_observation_rejects_an_active_resume_claim() {
+        let fixture = production_ready_fixture_v2().await;
+        assert!(fixture
+            .production
+            .interrupt
+            .claim_recovery_resume_v2(coordinator_generation(3)));
+        assert_eq!(
+            fixture
+                .production
+                .observe_exact_recovery_resume_successor_ready_attestation_v2(
+                    coordinator_generation(2),
+                ),
+            Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_successor_ready_observation_rejects_an_interrupt() {
+        let fixture = production_ready_fixture_v2().await;
+        fixture
+            .production
+            .interrupt
+            .trip_invalidation(RuntimeGatewayInvalidationCauseV2::TransportDisconnected);
+        assert_eq!(
+            fixture
+                .production
+                .observe_exact_recovery_resume_successor_ready_attestation_v2(
+                    coordinator_generation(2),
+                ),
+            Err(RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain)
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_successor_ready_observation_rejects_generation_overflow() {
+        let fixture = production_ready_fixture_v2().await;
+        assert_eq!(
+            fixture
+                .production
+                .observe_exact_recovery_resume_successor_ready_attestation_v2(
+                    coordinator_generation(i64::MAX as u64),
+                ),
+            Err(RuntimeGatewayReadyObservationErrorV1::ReadyEvidenceOutOfRange)
+        );
     }
 
     #[tokio::test]
