@@ -309,7 +309,10 @@ SELECT
             AND NOT writer.rolbypassrls
             AND writer.rolconnlimit = 4
             AND writer.rolvaliduntil = 'infinity'::TIMESTAMP WITH TIME ZONE
-            AND writer.rolpassword LIKE 'SCRAM-SHA-256$4096:%'
+            AND COALESCE(
+                writer.rolpassword LIKE 'SCRAM-SHA-256$4096:%',
+                FALSE
+            )
         )
      FROM writer)
     AND NOT EXISTS (
@@ -382,6 +385,24 @@ SELECT
                 'starring_authoring_session_writer',
                 relation.oid,
                 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'
+            )
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_attribute AS attribute
+        INNER JOIN pg_catalog.pg_class AS relation
+            ON relation.oid = attribute.attrelid
+        INNER JOIN pg_catalog.pg_namespace AS namespace
+            ON namespace.oid = relation.relnamespace
+        WHERE namespace.nspname = 'public'
+            AND relation.relkind IN ('r', 'p', 'v', 'm', 'f')
+            AND attribute.attnum > 0
+            AND NOT attribute.attisdropped
+            AND pg_catalog.has_column_privilege(
+                'starring_authoring_session_writer',
+                relation.oid,
+                attribute.attnum,
+                'SELECT,INSERT,UPDATE,REFERENCES'
             )
     )
     AND NOT EXISTS (
@@ -1114,6 +1135,9 @@ SELECT
             .ends_with("starring_product_authorized_snapshot_read_v2(text,text,bytea,text,text)"));
         assert!(VERIFY_WRITER_CONTRACT_SQL.contains(
             "WHEN relation.relkind = 'S'\n                THEN pg_catalog.has_sequence_privilege"
+        ));
+        assert!(VERIFY_WRITER_CONTRACT_SQL.contains(
+            "pg_catalog.has_column_privilege(\n                'starring_authoring_session_writer'"
         ));
     }
 
