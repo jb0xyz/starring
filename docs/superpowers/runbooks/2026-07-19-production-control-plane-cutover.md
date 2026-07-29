@@ -117,7 +117,7 @@ fail-closed quarantine before function validation: all managed roles become
 and direct database, schema, relation, column, sequence, routine, parameter,
 and default privileges are reconciled. The second transaction drains every
 client session in the dedicated cluster, rejects prepared transactions,
-verifies the owner and all 46 functions, grants the exact runtime capabilities,
+verifies the owner and all 48 functions, grants the exact runtime capabilities,
 and leaves all request roles quarantined as `NOLOGIN` with null passwords. If
 the second transaction fails, the first transaction remains committed; keep
 staging offline and repair the contract before rerunning it.
@@ -139,7 +139,7 @@ unset STAGING_SYSTEM_IDENTIFIER STAGING_CLUSTER_ADMIN \
 
 The bootstrap creates any missing request roles but does not enable login. It
 also removes legacy `starring_api` capabilities and grants exactly database
-`CONNECT`, `public` schema `USAGE`, and the 46 reviewed function identities.
+`CONNECT`, `public` schema `USAGE`, and the 48 reviewed function identities.
 Every rerun is fail-closed: it returns all fourteen request roles to quarantine
 and clears every password before validating capabilities. PostgreSQL preserves
 some database, schema, and object grants issued by an alternate grantor when a
@@ -1451,9 +1451,11 @@ reader readiness to become green.
 Migration 022 replaces the Apply adapter's direct artifact-table read with a
 seven-input bounded target-artifact function and adds Apply-only keyring
 coverage. It normalizes the existing lock and finalizer plus their complete
-internal helper and 24-trigger graph. The Apply caller manifest is exactly five
-functions over 18 direct and transitive ordinary non-RLS relations. The lock,
-pure Rust preparation, artifact validation, and finalizer remain in one bounded
+internal helper and 24-trigger graph. At migration 022, the Apply caller
+manifest was exactly five functions over 18 direct and transitive ordinary
+non-RLS relations. Later runtime-drain migrations extend the current manifest
+to the seven functions and 25 relations granted below. The lock, pure Rust
+preparation, artifact validation, and finalizer remain in one bounded
 `SERIALIZABLE, READ WRITE` transaction.
 
 Treat both 021 and 022 with their matching binaries as stopped-maintenance
@@ -1661,6 +1663,92 @@ TO starring_decision_apply;
 GRANT EXECUTE ON FUNCTION
     public.starring_product_apply_keyring_coverage_v1(TEXT[], TEXT[])
 TO starring_decision_apply;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_apply_begin_runtime_drain_v2(
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        BYTEA,
+        BYTEA,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        TIMESTAMPTZ,
+        TIMESTAMPTZ,
+        TEXT,
+        BOOLEAN,
+        TEXT,
+        TEXT,
+        TEXT[],
+        TEXT[],
+        TEXT[],
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT
+    )
+TO starring_decision_apply;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_apply_consume_runtime_drain_v2(
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        BYTEA,
+        BYTEA,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        TIMESTAMPTZ,
+        TIMESTAMPTZ,
+        TEXT,
+        BOOLEAN,
+        TEXT,
+        TEXT,
+        TEXT[],
+        TEXT[],
+        TEXT[],
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        BYTEA,
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        BYTEA,
+        TEXT,
+        BYTEA,
+        TEXT,
+        TEXT,
+        BYTEA
+    )
+TO starring_decision_apply;
 
 GRANT EXECUTE ON FUNCTION
     public.starring_product_lifecycle_cancellation_executor_database_identity_v1()
@@ -1733,11 +1821,12 @@ security-definer routine and every `public.starring_*` routine. An unrelated
 routine in that scope is a hard `ExcessCapability` failure.
 
 `PostgresProductDecisions::verify_apply_executor_readiness` verifies the exact
-five-function Apply interface, 18-relation manifest, full helper and trigger
+seven-function Apply interface, 25-relation manifest, full helper and trigger
 contract, dedicated keyring coverage, trusted topology, and rollback-only lock,
-artifact, and finalizer probes. Lifecycle-cancellation readiness verifies its
-exact three-function interface, 21-relation manifest, terminal journal
-contract, dedicated keyring coverage, and rollback-only cancellation probe.
+artifact, finalizer, drain-begin, and drain-consumption probes.
+Lifecycle-cancellation readiness verifies its exact three-function interface,
+21-relation manifest, terminal journal contract, dedicated keyring coverage,
+and rollback-only cancellation probe.
 `verify_product_decision_boundary_readiness` runs reader, approval, Apply, and
 lifecycle-cancellation readiness and then requires one logical database
 UUID/name with four distinct direct-login roles. The older
