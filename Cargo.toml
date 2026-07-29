@@ -56,6 +56,7 @@ members = [
     "tools/starring-db-bootstrap",
     "tools/starring-runtime",
     "tools/starring-staging-provisioner",
+    "tools/starring-staging-authority-operator",
 ]
 resolver = "2"
 
