@@ -23,14 +23,18 @@ guild or advertise production Live automation.
 - Product identity uses four distinct direct-login credentials: the OAuth flow
   writer, session issuer, session API, and security revoker. Do not reuse one
   login or pool for more than one of these capabilities.
-- The API process uses fourteen distinct direct-login database credentials in
-  total. The remaining capabilities are installation-authority read,
-  authorized-snapshot read, promotion execution, decision read, approval
-  execution, rejection execution, Apply execution, lifecycle-cancellation
-  execution, deployment-status read, and operational-deployment-status read.
-  All fourteen connect to one logical
-  database under different roles and are checked as one topology before the
-  process becomes ready.
+- The A4/A5 API process uses fifteen distinct direct-login database
+  credentials in total: fourteen core product-control credentials plus one
+  isolated authoring-session writer credential. The core capabilities beyond
+  product identity are installation-authority read, authorized-snapshot read,
+  promotion execution, decision read, approval execution, rejection execution,
+  Apply execution, lifecycle-cancellation execution, deployment-status read,
+  and operational-deployment-status read. The fifteenth credential may execute
+  only the authoring writer allowlist and is never reused by a reader, decision,
+  promotion, or identity adapter. All fifteen connect to one logical database
+  under different roles. The fourteen core roles are checked as one mandatory
+  topology before the process becomes ready; the authoring role is checked
+  independently before authoring admission is composed.
 - `starring_owner` is `NOLOGIN` and is never used by an application process.
 - Migration, API, the four product-identity roles, runtime, and maintenance
   credentials are separate secret references. They are never passed as
@@ -54,10 +58,11 @@ The reviewed staging role manifest uses these exact direct-login role names:
 | Lifecycle-cancellation executor | `starring_decision_cancellation` |
 | Deployment-status reader | `starring_deployment_status_reader` |
 | Operational-status reader | `starring_operational_deployment_status_reader` |
+| Authoring-session writer | `starring_authoring_session_writer` |
 
 ### Staging database role bootstrap
 
-The executable fourteen-role manifests are
+The executable fifteen-role manifests are
 `ops/postgres/staging-api-role-bootstrap.sql` and
 `ops/postgres/staging-api-role-enable.sql`. The component grant snippets later
 in this runbook explain individual contracts; they are not substitutes for
@@ -99,7 +104,7 @@ Before touching roles, stop the API, tunnel, migration process, schedulers, and
 every other database client. Isolate the dedicated cluster at the network
 boundary. Configure `pg_hba.conf` so a reviewed administrator rule and one
 first-match application rule cover only the exact staging database, the
-fourteen exact request roles, and the exact application source address. Use
+fifteen exact request roles, and the exact application source address. Use
 `scram-sha-256` for local and network password authentication and `hostssl` for
 network traffic. Put explicit reject rules after those allow rules for every
 other database, role, and source path. `trust`, `peer`, and `ident` are not
@@ -117,7 +122,8 @@ fail-closed quarantine before function validation: all managed roles become
 and direct database, schema, relation, column, sequence, routine, parameter,
 and default privileges are reconciled. The second transaction drains every
 client session in the dedicated cluster, rejects prepared transactions,
-verifies the owner and all 48 functions, grants the exact runtime capabilities,
+verifies the owner and all 53 API capability functions, grants the exact
+request capabilities,
 and leaves all request roles quarantined as `NOLOGIN` with null passwords. If
 the second transaction fails, the first transaction remains committed; keep
 staging offline and repair the contract before rerunning it.
@@ -139,8 +145,8 @@ unset STAGING_SYSTEM_IDENTIFIER STAGING_CLUSTER_ADMIN \
 
 The bootstrap creates any missing request roles but does not enable login. It
 also removes legacy `starring_api` capabilities and grants exactly database
-`CONNECT`, `public` schema `USAGE`, and the 48 reviewed function identities.
-Every rerun is fail-closed: it returns all fourteen request roles to quarantine
+`CONNECT`, `public` schema `USAGE`, and the 53 reviewed function identities.
+Every rerun is fail-closed: it returns all fifteen request roles to quarantine
 and clears every password before validating capabilities. PostgreSQL preserves
 some database, schema, and object grants issued by an alternate grantor when a
 cluster administrator performs an ordinary revoke. The manifest detects the
@@ -152,7 +158,7 @@ and resets the role. Review downstream revocation impact before execution, do
 not use object-dropping shortcuts, and rerun the full bootstrap afterward.
 
 Next prove `SHOW password_encryption` returns `scram-sha-256`. While the API,
-tunnel, and all other clients remain stopped, assign fourteen distinct,
+tunnel, and all other clients remain stopped, assign fifteen distinct,
 password-manager-generated values in the same interactive administrator
 `psql` session. Use the client-side prompt commands below; each command prompts
 twice and keeps the secret out of SQL text, arguments, shell history, logs, and
@@ -173,12 +179,13 @@ this repository. The roles remain `NOLOGIN` throughout this operation.
 \password starring_decision_cancellation
 \password starring_deployment_status_reader
 \password starring_operational_deployment_status_reader
+\password starring_authoring_session_writer
 ```
 
 Do not use `ALTER ROLE ... PASSWORD '...'`, reuse a value between roles, put a
 password-bearing database URL in an argument, or generate a SQL file containing
-secrets. Verify only the aggregate result without printing hashes: all fourteen
-rows must report `scram_passwords = 14`.
+secrets. Verify only the aggregate result without printing hashes: all fifteen
+rows must report `scram_passwords = 15`.
 
 ```sql
 SELECT pg_catalog.count(*) FILTER (
@@ -199,7 +206,8 @@ WHERE role.rolname IN (
     'starring_decision_apply',
     'starring_decision_cancellation',
     'starring_deployment_status_reader',
-    'starring_operational_deployment_status_reader'
+    'starring_operational_deployment_status_reader',
+    'starring_authoring_session_writer'
 );
 ```
 
@@ -227,7 +235,7 @@ unset STAGING_SYSTEM_IDENTIFIER STAGING_CLUSTER_ADMIN \
 ```
 
 After enable succeeds, prove a wrong password fails and every request role is
-denied on a different database before provisioning the fourteen distinct
+denied on a different database before provisioning the fifteen distinct
 database URLs through the prompt-only Keychain flow. Do not restore the API,
 tunnel, or external ingress before those negative probes and aggregate API
 readiness are green. A manifest failure or any unexpected capability keeps the
@@ -267,7 +275,7 @@ defaults.
 | `STARRING_API_PUBLIC_ORIGIN` | Canonical lowercase HTTPS domain origin with no explicit port, path, query, fragment, user information, or IP literal | `https://api.example.com` |
 | `STARRING_API_OAUTH_RETURN_PATHS_JSON` | JSON array of 1 through 64 unique bounded local paths | `["/","/app"]` |
 | `STARRING_API_OAUTH_DEFAULT_RETURN_PATH` | Exact member of the return-path array | `/app` |
-| `STARRING_API_DATABASE_MAX_CONNECTIONS` | 1 through 4 per role; the template ceiling is 28 connections across 14 pools | `2` |
+| `STARRING_API_DATABASE_MAX_CONNECTIONS` | 1 through 4 per role; the complete A4/A5 template ceiling is 30 connections across 15 pools, while the mandatory core ceiling is 28 across 14 pools | `2` |
 | `STARRING_API_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS` | 100 through 5000 milliseconds | `2000` |
 | `STARRING_API_DATABASE_IDLE_TIMEOUT_SECONDS` | 30 through 600 seconds | `120` |
 | `STARRING_API_DATABASE_MAX_LIFETIME_SECONDS` | 60 through 3600 seconds and strictly greater than idle timeout | `900` |
@@ -276,6 +284,7 @@ defaults.
 | `STARRING_API_DISCORD_REQUEST_TIMEOUT_MILLISECONDS` | 1 through 5000 milliseconds | `3000` |
 | `STARRING_API_DISCORD_WRITE_AUTHORITY_LIFETIME_MILLISECONDS` | 1 through 5000 milliseconds | `3000` |
 | `STARRING_API_DISCORD_READ_AUTHORITY_LIFETIME_MILLISECONDS` | 1 through 30000 milliseconds | `15000` |
+| `STARRING_API_AUTHORING_WORKER_URL` | Canonical `http://127.0.0.1:<port>` origin with an explicit port from 1024 through 65535 and no credentials, path, query, or fragment | `http://127.0.0.1:18181` |
 
 The OAuth callback registered with Discord must be exactly the configured
 public origin plus `/oauth/discord/callback`. The public TLS endpoint and Host
@@ -285,11 +294,18 @@ not a DNS-only operation.
 ### Exact secret-reference environment
 
 Secret-reference values use exactly `keychain:<service>:<account>` or
-`env:<UPPERCASE_NAME>`. The macOS staging template uses Keychain. The 14
-database references and the four other purpose references must all be unique;
-configuration rejects any alias.
+`env:<UPPERCASE_NAME>`. The macOS staging template uses Keychain. Its complete
+A4/A5 authoring profile contains twenty pairwise-distinct resolved references:
+fifteen database references, four core purpose references, and one authoring
+worker bearer reference. The fourteen core database references and four core
+purpose references are mandatory for general product composition. The writer
+database and worker bearer references are accepted only together with the
+canonical loopback worker URL; any incomplete, malformed, or aliased authoring
+profile is excluded from authoring composition. The worker bearer reference is
+Keychain-only even though the general reference grammar also supports
+environment references. Raw worker tokens are forbidden.
 
-| Variable | Capability | Template Keychain account |
+| Variable | Capability | Template Keychain identity |
 | --- | --- | --- |
 | `STARRING_API_OAUTH_FLOW_WRITER_DATABASE_SECRET_REFERENCE` | OAuth flow create and consume | `database.oauth-flow-writer` |
 | `STARRING_API_SESSION_ISSUER_DATABASE_SECRET_REFERENCE` | Session issue | `database.session-issuer` |
@@ -305,19 +321,24 @@ configuration rejects any alias.
 | `STARRING_API_CANCELLATION_EXECUTOR_DATABASE_SECRET_REFERENCE` | Lifecycle-cancellation execution | `database.cancellation-executor` |
 | `STARRING_API_DEPLOYMENT_STATUS_DATABASE_SECRET_REFERENCE` | Deployment status V1 read | `database.deployment-status-reader` |
 | `STARRING_API_OPERATIONAL_STATUS_DATABASE_SECRET_REFERENCE` | Operational deployment status V2 read | `database.operational-deployment-status-reader` |
+| `STARRING_API_AUTHORING_SESSION_WRITER_DATABASE_SECRET_REFERENCE` | Encrypted authoring session load, replay check, and atomic generation commit | `database.authoring-session-writer` |
+| `STARRING_API_AUTHORING_WORKER_TOKEN_SECRET_REFERENCE` | Private loopback Codex worker bearer authentication | `com.starring.llm-api-key/llm-api` |
 | `STARRING_API_DISCORD_OAUTH_CLIENT_SECRET_REFERENCE` | Discord OAuth token exchange | `discord.oauth-client-secret` |
 | `STARRING_API_DISCORD_BOT_TOKEN_REFERENCE` | Fresh Discord guild-authority queries | `discord.bot-token` |
 | `STARRING_API_PRODUCT_ACTION_KEYRING_SECRET_REFERENCE` | Product action digest creation and verification | `keyring.product-action` |
 | `STARRING_API_SNAPSHOT_ENVELOPE_KEYRING_SECRET_REFERENCE` | Authorized snapshot encryption and decryption | `keyring.snapshot-envelope` |
 
-The template Keychain service is `starring-api.staging`. Each database item
-contains one complete PostgreSQL URL for its capability login. All fourteen
-URLs must identify the same database but authenticate as fourteen distinct
-roles with no role membership. Local loopback or Unix-socket connections may
-disable TLS. A remote database URL must use full certificate and hostname
-verification. PostgreSQL startup `options` are rejected. Use a distinct random
-password for every login even though secret-reference uniqueness is the
-enforced startup boundary.
+The database and core-purpose template Keychain service is
+`starring-api.staging`; the pre-existing worker bearer uses service
+`com.starring.llm-api-key` and account `llm-api`. Each database item contains
+one complete PostgreSQL URL for its capability login. All fifteen URLs must
+identify the same database but authenticate as fifteen distinct roles with no
+role membership. The writer URL authenticates only as
+`starring_authoring_session_writer`; do not copy it into any core account.
+Local loopback or Unix-socket connections may disable TLS. A remote database
+URL must use full certificate and hostname verification. PostgreSQL startup
+`options` are rejected. Use a distinct random password for every login even
+though secret-reference uniqueness is the enforced startup boundary.
 
 The URL parser accepts only `postgres` or `postgresql`, an explicit lowercase
 role matching `[a-z][a-z0-9_]{0,62}`, an explicit 24 through 512 character
@@ -382,6 +403,7 @@ for ACCOUNT in \
   database.cancellation-executor \
   database.deployment-status-reader \
   database.operational-deployment-status-reader \
+  database.authoring-session-writer \
   discord.oauth-client-secret \
   discord.bot-token \
   keyring.product-action \
@@ -390,6 +412,17 @@ do
   /usr/bin/security add-generic-password -U -s "$SERVICE" -a "$ACCOUNT" -w || exit 1
 done
 unset ACCOUNT SERVICE
+```
+
+The authoring worker bearer already belongs to the private loopback worker
+boundary. Do not create, replace, print, or copy it as part of API database
+provisioning. Prove only that the fixed Keychain identity exists, without
+requesting its value:
+
+```bash
+/usr/bin/security find-generic-password \
+  -s com.starring.llm-api-key \
+  -a llm-api >/dev/null
 ```
 
 Verify lookup access without printing values. A Keychain prompt, missing item,
@@ -407,6 +440,7 @@ for ACCOUNT in \
   database.cancellation-executor \
   database.deployment-status-reader \
   database.operational-deployment-status-reader \
+  database.authoring-session-writer \
   discord.oauth-client-secret discord.bot-token \
   keyring.product-action keyring.snapshot-envelope
 do
@@ -414,6 +448,9 @@ do
     >/dev/null || exit 1
 done
 unset ACCOUNT SERVICE
+/usr/bin/security find-generic-password \
+  -s com.starring.llm-api-key \
+  -a llm-api >/dev/null
 ```
 
 Before enabling ingress, log out and back in or reboot the staging host and
@@ -502,6 +539,28 @@ then
 fi
 plutil -lint "$INSTALLED"
 test -x "$HOME/.local/libexec/starring-api"
+test "$(
+  /usr/libexec/PlistBuddy \
+    -c 'Print :EnvironmentVariables:STARRING_API_AUTHORING_SESSION_WRITER_DATABASE_SECRET_REFERENCE' \
+    "$INSTALLED"
+)" = 'keychain:starring-api.staging:database.authoring-session-writer'
+test "$(
+  /usr/libexec/PlistBuddy \
+    -c 'Print :EnvironmentVariables:STARRING_API_AUTHORING_WORKER_URL' \
+    "$INSTALLED"
+)" = 'http://127.0.0.1:18181'
+test "$(
+  /usr/libexec/PlistBuddy \
+    -c 'Print :EnvironmentVariables:STARRING_API_AUTHORING_WORKER_TOKEN_SECRET_REFERENCE' \
+    "$INSTALLED"
+)" = 'keychain:com.starring.llm-api-key:llm-api'
+if /usr/libexec/PlistBuddy \
+  -c 'Print :EnvironmentVariables:STARRING_API_AUTHORING_WORKER_TOKEN' \
+  "$INSTALLED" >/dev/null 2>&1
+then
+  echo "starring-api plist contains a raw authoring worker token" >&2
+  exit 1
+fi
 ```
 
 Keep public ingress disabled, then load the user LaunchAgent:
@@ -525,25 +584,51 @@ readable only by the service account.
 
 Startup is deliberately fail-closed and ordered:
 
-1. Parse every required non-secret value and all 18 unique secret references.
-2. Resolve Keychain items and validate database URL, OAuth secret, bot token,
-   both keyring payloads, and cross-purpose key-material separation.
-3. Connect all fourteen bounded pools. On partial failure, begin closing every
-   pool that connected and stop.
-4. Build the facade and run aggregate database capability readiness with a
-   45-second composition deadline. This verifies one database, fourteen
-   distinct direct-login roles, exact executable allowlists, relation and
+1. Parse every mandatory non-secret value and the eighteen unique core secret
+   references. For the fixed A4/A5 authoring profile, also parse the writer
+   database reference, canonical loopback worker URL, and Keychain-only worker
+   bearer reference. A raw worker-token environment value, partial authoring
+   tuple, malformed URL, or alias with any core or authoring purpose excludes
+   the complete authoring tuple rather than exposing a partial dependency.
+2. Resolve the eighteen core references and validate database URLs, OAuth
+   secret, bot token, both keyring payloads, and cross-purpose key-material
+   separation. A fully composed authoring profile resolves two more references,
+   for exactly twenty resolved references in total. Writer-database or worker
+   bearer resolution failure keeps authoring unavailable; it does not borrow a
+   core credential or stop the independently ready core product surface.
+3. Connect all fourteen bounded core pools. On partial core failure, begin
+   closing every pool that connected and stop. Independently connect the
+   fifteenth `starring_authoring_session_writer` pool only from its own URL.
+4. Build the core facade and run aggregate core database capability readiness
+   with a 45-second composition deadline. This verifies one database, fourteen
+   distinct direct-login core roles, exact executable allowlists, relation and
    schema denial, absence of explicit parameter privileges and per-role
    database settings, installation authority, snapshot encryption-key
    coverage, action-key coverage, decision paths, and both deployment-status
    readers.
-5. Bind only `127.0.0.1:<configured-port>`.
-6. While the listener is bound but the readiness gate is still closed, run the
-   facade readiness probe again with the server's 10-second startup deadline.
-   False, panic, timeout, or shutdown returns a stable typed failure without a
-   ready pulse.
-7. Open readiness only after the post-bind probe succeeds. A single atomic
-   lease owns readiness for the lifetime of the server.
+5. In parallel with core readiness, give authoring database readiness and the
+   private worker contract preflight separate five-second deadlines. Authoring
+   is composed only when the isolated writer proves its exact database identity,
+   function allowlist, direct relation denial, key coverage, and shared logical
+   database, and the worker proves its bounded contract. On authoring failure,
+   close the writer pool and leave authoring routes fail-closed while preserving
+   the core result.
+6. Bind only `127.0.0.1:<configured-port>`.
+7. While the listener is bound but the readiness gate is still closed, run the
+   core facade readiness probe again with the server's 10-second startup
+   deadline. False, panic, timeout, or shutdown returns a stable typed failure
+   without a ready pulse.
+8. Open general readiness only after the post-bind core probe succeeds. A
+   single atomic lease owns general readiness for the lifetime of the server.
+   General `/health/ready` is therefore not proof that authoring was composed.
+   After optional composition finishes, the process emits exactly one closed
+   startup line: `starring_api_authoring_status=ready` or
+   `starring_api_authoring_status=unavailable`. A release that declares the
+   A4/A5 product surface complete must retain the `ready` line from the current
+   process start together with general readiness. The line contains no role,
+   URL, token, database value, worker response, or error detail. It proves
+   composition only; it does not satisfy the A6 live Luna,
+   encrypted-generation, or promotion milestone.
 
 The HTTP server defaults are 512 accepted connections, a ten-second HTTP/1
 header deadline, 64 HTTP/1 headers, 64 KiB HTTP/1 buffer, 64 concurrent HTTP/2
@@ -581,19 +666,30 @@ The listener must be exactly `127.0.0.1`, never `*`, `0.0.0.0`, a LAN address,
 or a public address. Liveness proves only that the process event loop responds.
 Readiness reads only the atomic server lease and never runs a database probe in
 the request path. A single background supervisor runs aggregate fourteen-role
-readiness every 30 seconds with a ten-second deadline and no overlap. The first
-error, timeout, or panic closes business admission, removes the listener, drains
-accepted work, and exits with `server_runtime_readiness_failed`. The maximum
-scheduled detection window is 40 seconds. `/health/ready` and every non-health
-route return 503 `dependency_unavailable` while the lease is closed.
+core readiness every 30 seconds with a ten-second deadline and no overlap. The
+first error, timeout, or panic closes business admission, removes the listener,
+drains accepted work, and exits with `server_runtime_readiness_failed`. The
+maximum scheduled detection window is 40 seconds. `/health/ready` and every
+non-health route return 503 `dependency_unavailable` while the lease is closed.
 
-Before promoting a release candidate, rehearse this 14-role probe under the
-expected concurrent request load and database latency with the intended pool
-limit. Record probe duration, query volume, pool occupancy, request latency,
-false readiness exits, restart time, and database saturation. Confirm that a
-probe can acquire every required connection without starving business work.
-Until that evidence defines an operational margin and alert threshold, the
-template pool size and 30/10-second schedule are staging defaults rather than a
+The background supervisor intentionally retains the core readiness contract;
+it does not continuously probe the optional writer pool or private worker.
+Authoring request failures remain scoped to the authoring boundary. Monitor
+authoring saturation and dependency-unavailable outcomes separately, and treat
+loss of writer or worker availability as authoring degradation rather than as
+permission to substitute a core pool. Recomposition after a failed startup
+authoring preflight requires a controlled process restart; the running facade
+does not hot-add authoring dependencies.
+
+Before promoting a release candidate, rehearse the 14-role core probe and the
+isolated fifteenth authoring pool under the expected concurrent request load and
+database latency with the intended pool limit. Record core probe duration,
+authoring preflight duration, worker contract latency, query volume, per-pool
+occupancy, request latency, false readiness exits, restart time, and database
+saturation. Confirm that every probe can acquire its required connection
+without starving business work. Until that evidence defines an operational
+margin and alert threshold, the template pool size, 30/10-second core schedule,
+and five-second authoring startup deadlines are staging defaults rather than a
 production SLO.
 
 Cloudflare Tunnel is a separate service and may be enabled only after local
@@ -628,10 +724,10 @@ incident ticket.
 A controlled SIGTERM or launchd bootout closes the readiness lease and listener
 before draining active HTTP/1 and HTTP/2 work. HTTP drain is bounded to 15
 seconds; connections still pending at the deadline are aborted and joined.
-Only after the server returns should the process close all fourteen database
-pools concurrently, with a separate 15-second deadline. A pool-close timeout is
-a stable redacted shutdown failure, not permission to leave another instance
-running.
+Only after the server returns should the process close all fourteen core
+database pools and the optional fifteenth authoring pool concurrently, with a
+separate 15-second deadline. A pool-close timeout is a stable redacted shutdown
+failure, not permission to leave another instance running.
 
 ```bash
 DOMAIN="gui/$(id -u)"
@@ -878,10 +974,11 @@ database; never delete production evidence merely to satisfy this preflight.
    and direct-DML denial probes.
 5. Apply `ops/postgres/staging-api-role-bootstrap.sql` with the exact
    `ON_ERROR_STOP` and staging acknowledgement procedure above, assign all
-   fourteen distinct passwords through prompt-only `\password`, then apply
+   fifteen distinct passwords through prompt-only `\password`, then apply
    `ops/postgres/staging-api-role-enable.sql`. Complete the negative
    authentication probes before running aggregate product API readiness with
-   fourteen distinct direct-login pools against one logical database.
+   fourteen distinct core direct-login pools and the isolated authoring-writer
+   readiness probe against the same logical database.
 6. Start only the API readiness process. It must verify product-action receipt
    key coverage, snapshot-envelope key coverage, every exact executable
    allowlist, and both deployment-status readers.
@@ -1356,14 +1453,73 @@ function, apply a separate sealing migration that revokes every non-owner table
 and column grant, then require aggregate identity readiness to turn green. Do
 not reclassify the red readiness result as a warning.
 
-Migrations 014 through 022 and `202607200001` through `202607200006` now scope
-installation-authority reads, authentication, authorized-snapshot reads,
-promotion, decision reads, approval, rejection, Apply, and both deployment
-status projections behind exact functions. The application composition uses
-fourteen distinct direct-login pools and aggregate execute-only readiness.
-Runtime convergence mutation remains a separate worker capability and is not
-part of the API process. Direct table grants are not a valid workaround for any
+Migrations 014 through 022 and `202607200001` through `202607200006` established
+the pre-A4 fourteen-role core baseline: installation-authority reads,
+authentication, authorized-snapshot reads, promotion, decision reads, approval,
+rejection, Apply, and both deployment status projections are scoped behind
+exact functions and aggregate execute-only readiness. Migration
+`202607300001` adds the separate authoring writer boundary without broadening
+any of those core pools. Current A4/A5 composition may therefore own fifteen
+pools, while the original fourteen-role statement remains historical evidence
+of the core topology rather than the current complete inventory. Runtime
+convergence mutation remains a separate worker capability and is not part of
+the API process. Direct table grants are not a valid workaround for any
 request-serving role.
+
+### Trusted authoring writer and loopback worker isolation
+
+Migration `202607300001_add_trusted_authoring_generation_writer.sql` adds the
+trusted encrypted-generation writer contract. The
+`starring_authoring_session_writer` direct-login role receives database
+`CONNECT`, schema `USAGE`, and only these five function identities:
+
+```text
+public.starring_authoring_session_writer_database_identity_v1()
+public.starring_authoring_session_writer_check_v1(text,text,text,text,bigint,text[],text[],text[],text[])
+public.starring_authoring_session_writer_load_v1(text,text,text,text,bigint)
+public.starring_authoring_session_writer_commit_v1(text,text,text,text,bigint,text[],text[],text[],text[],text,text,text,text,bigint,bytea,bytea,text,text,smallint,text,jsonb,text,bigint,text,jsonb,text,bigint,text,bytea,text,bigint)
+public.starring_authoring_session_writer_key_coverage_v1(text[],text[],text[])
+```
+
+The role must have no direct relation or sequence privilege, no role
+membership, no schema or database creation capability, no grant option, and no
+executable user function outside that allowlist. Readiness is run through the
+writer's own direct login. It proves the shared logical-database identity,
+function ownership and ACLs, direct-relation denial, exact key-identity
+coverage, and a data-independent execution contract. A core API role, `PUBLIC`,
+runtime role, maintenance role, or legacy `starring_api` role must not execute
+these functions.
+
+The API encrypts authoring snapshots before the writer commit with the active
+XChaCha20-Poly1305 envelope key and a fresh 24-byte nonce. The database receives
+the ciphertext, authenticated metadata, bounded safe projection, and keyed
+request evidence; the model worker receives neither the database credential,
+snapshot keyring, Discord credential, product session credential, nor direct
+Discord or deployment authority. The worker is an HTTP dependency reachable
+only at the canonical loopback origin configured by
+`STARRING_API_AUTHORING_WORKER_URL`, authenticated with the independently
+stored Keychain bearer. Never place the bearer itself in the plist, process
+arguments, logs, receipts, or this runbook.
+
+A5 registers these authenticated authoring routes:
+
+```text
+POST /v1/installations/{installation_id}/authoring/sessions/{session_id}/turns
+GET  /v1/installations/{installation_id}/authoring/sessions/{session_id}
+```
+
+They return the closed dependency-unavailable outcome when authoring
+composition is absent. POST requires the product session, exact Host and
+Origin, CSRF token, valid idempotency key, installation ownership, fresh
+Discord authority, and bounded input. GET requires the product session, exact
+Host, installation ownership, fresh read authority, and exact
+session-owner/tenant/installation scope. Both expose only validated safe
+projections with `Cache-Control: no-store`. The model can propose a candidate
+but cannot approve, Apply, deploy, or call Discord. Writer readiness and route
+availability prove A4/A5 composition only. The A6 milestone additionally
+requires live one-shot and multi-turn Luna evidence, encrypted generation
+inspection, exact PreviewReady promotion, and an explicit stop before approval
+or Apply.
 
 ## Product decision capability boundaries
 
@@ -1898,17 +2054,20 @@ END;
 $grants$;
 ```
 
-The complete fourteen direct-login roles are the four identity roles, the
+The complete fifteen direct-login roles are the four identity roles, the
 installation-authority reader, the authorized-snapshot reader, the promotion
 executor, the decision reader, approval executor, rejection executor, Apply
-executor, lifecycle-cancellation executor, and the two status readers. Every
-role needs database `CONNECT` and
+executor, lifecycle-cancellation executor, the two status readers, and the
+isolated authoring-session writer. Every role needs database `CONNECT` and
 schema `USAGE`; no role may have database `CREATE` or `TEMPORARY`, schema
 `CREATE`, relation or sequence privilege, role membership, grant option, or an
 executable user function outside its exact readiness allowlist. Revoke legacy
-`starring_api` grants rather than keeping them during rollout. The service may
-listen only after `PostgresProductApiReadiness::verify_readiness` proves one
-logical database and fourteen distinct direct-login identities.
+`starring_api` grants rather than keeping them during rollout. General service
+readiness requires `PostgresProductApiReadiness::verify_readiness` to prove one
+logical database and fourteen distinct core direct-login identities. Authoring
+composition separately requires writer readiness to prove the same database
+and the distinct fifteenth direct-login identity; failure leaves authoring
+unavailable and must never cause credential reuse.
 
 `interaction-smoke` is test-only manual tooling, not an operational fallback.
 It requires the `legacy-smoke` compile feature,
@@ -1976,9 +2135,11 @@ Rotate one capability login at a time. Preserve the exact role's grants and
 direct-login restrictions, change only that role's credential, update only its
 matching Keychain account, then restart the single API process. The service is
 not eligible for ingress until aggregate readiness again proves one logical
-database and fourteen distinct roles. Never copy one database URL into a second
-account as a temporary fallback. Revoke the old credential only after the new
-process has passed local readiness and the old process has exited.
+database and fourteen distinct core roles, and an authoring-enabled release is
+not eligible until the isolated fifteenth writer and loopback worker preflight
+also succeed. Never copy one database URL into a second account as a temporary
+fallback. Revoke the old credential only after the new process has passed local
+readiness and the old process has exited.
 
 If the database is remote, rotation evidence must also prove `verify-full`
 certificate and hostname validation. Do not add PostgreSQL startup options or
@@ -2065,6 +2226,10 @@ recovery procedure.
 - product-identity aggregate and component readiness outcomes,
   authorized-snapshot readiness outcomes, function identities, and role names
   only
+- aggregate fourteen-role core readiness, isolated fifteenth-writer readiness,
+  the twenty-reference cardinality result, and the loopback worker contract
+  preflight outcome; retain only reference identities, the non-secret loopback
+  origin, bounded contract metadata, and stable redacted classifications
 - retention deleted counts and backlog flags
 - keyring coverage outcome and key IDs only
 - launchd label, installed binary digest, non-secret plist digest, local
