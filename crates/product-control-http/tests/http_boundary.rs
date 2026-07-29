@@ -43,6 +43,9 @@ struct FakeFacade {
     verify_calls: AtomicUsize,
     readiness_calls: AtomicUsize,
     promote_calls: AtomicUsize,
+    authority_check_calls: AtomicUsize,
+    authority_check_failure: AtomicUsize,
+    authority_check_installations: Mutex<Vec<String>>,
     fail_me: AtomicUsize,
     panic_me: AtomicUsize,
     disallowed_return: AtomicUsize,
@@ -171,6 +174,27 @@ impl ProductControlFacade for FakeFacade {
             principal_id: "principal-1".to_string(),
             display_name: "Manager".to_string(),
         })
+    }
+
+    async fn authority_check(
+        &self,
+        credential: &SessionCredential,
+        installation_id: &str,
+    ) -> Result<(), FacadeError> {
+        if credential.expose_secret() != SESSION {
+            return Err(FacadeError::new(FacadeErrorCode::AuthenticationRequired));
+        }
+        self.authority_check_calls.fetch_add(1, Ordering::SeqCst);
+        self.authority_check_installations
+            .lock()
+            .unwrap()
+            .push(installation_id.to_string());
+        match self.authority_check_failure.load(Ordering::SeqCst) {
+            1 => Err(FacadeError::new(FacadeErrorCode::NotFound)),
+            2 => Err(FacadeError::new(FacadeErrorCode::DependencyTimeout)),
+            3 => Err(FacadeError::new(FacadeErrorCode::DependencyUnavailable)),
+            _ => Ok(()),
+        }
     }
 
     async fn revoke_session(
@@ -1948,6 +1972,63 @@ async fn principal_requires_only_the_session_and_never_returns_csrf() {
     assert!(body.contains("principal-1"));
     assert!(!body.contains(CSRF));
     assert!(!body.contains("csrf_token"));
+}
+
+#[tokio::test]
+async fn authority_check_is_session_bound_validated_and_empty() {
+    let facade = Arc::new(FakeFacade::default());
+    let router = app(Arc::clone(&facade));
+    let missing_session = request_builder("GET", "/v1/installations/install-1/authority-check")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(missing_session).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(facade.authority_check_calls.load(Ordering::SeqCst), 0);
+
+    let invalid = request_builder("GET", "/v1/installations/invalid!/authority-check")
+        .header("cookie", format!("__Host-starring_session={SESSION}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(invalid).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(facade.authority_check_calls.load(Ordering::SeqCst), 0);
+
+    let valid = request_builder("GET", "/v1/installations/install-1/authority-check")
+        .header("cookie", format!("__Host-starring_session={SESSION}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(valid).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(body_text(response).await, "");
+    assert_eq!(facade.authority_check_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        facade
+            .authority_check_installations
+            .lock()
+            .unwrap()
+            .as_slice(),
+        ["install-1"]
+    );
+}
+
+#[tokio::test]
+async fn authority_check_preserves_fresh_authority_fail_closed_statuses() {
+    for (failure, expected) in [
+        (1, StatusCode::NOT_FOUND),
+        (2, StatusCode::GATEWAY_TIMEOUT),
+        (3, StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        let facade = Arc::new(FakeFacade::default());
+        facade
+            .authority_check_failure
+            .store(failure, Ordering::SeqCst);
+        let request = request_builder("GET", "/v1/installations/install-1/authority-check")
+            .header("cookie", format!("__Host-starring_session={SESSION}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app(facade).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), expected);
+    }
 }
 
 #[tokio::test]

@@ -228,7 +228,16 @@ bodies and concurrency, deadlines, panic isolation, double-submit CSRF,
 host-only Secure cookies, idempotency-key validation, no-store responses, and
 closed response validation. OAuth start has a process-wide bounded admission
 budget, and installation-scoped authority failures conceal whether a guessed
-installation exists. `tools/starring-api` now supplies the closed
+installation exists. The session-bound
+`GET /v1/installations/{installation_id}/authority-check` route performs the
+same fresh `Apply` authority evaluation used by product mutation admission and
+returns only an empty `204`; it does not retain authority evidence or mutate
+Discord, installation, promotion, or runtime state. A staging-only, fail-closed operator SQL
+workflow can atomically create a tenant, installation, immutable authority
+revision 1, and its initial runtime writer fence. It supports exact replay,
+requires the canonical empty-binding fingerprint, and does not create a
+permanent provisioner role. A public installation administration API remains
+deferred. `tools/starring-api` now supplies the closed
 production-facade bridge, validated environment and Keychain configuration,
 thirteen independently credentialed PostgreSQL pools, aggregate and post-bind
 deep readiness, and a bounded loopback-only HTTP process. Database connection

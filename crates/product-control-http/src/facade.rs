@@ -269,6 +269,12 @@ pub trait ProductControlFacade: Send + Sync + 'static {
         credential: &SessionCredential,
     ) -> Result<CurrentPrincipal, FacadeError>;
 
+    async fn authority_check(
+        &self,
+        credential: &SessionCredential,
+        installation_id: &str,
+    ) -> Result<(), FacadeError>;
+
     async fn revoke_session(
         &self,
         credential: &SessionCredential,

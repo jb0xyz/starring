@@ -16,7 +16,7 @@ use serde::Deserialize;
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
-use crate::facade::{is_live_exact_replay, validate_scoped_path};
+use crate::facade::{is_live_exact_replay, valid_resource_id, validate_scoped_path};
 use crate::{
     ApplyCommand, CurrentPrincipalView, DecisionCommand, FacadeError, FacadeErrorCode,
     HttpBoundaryConfig, LifecycleCancellationCommand, OAuthCallbackCommand, OAuthStartCommand,
@@ -216,6 +216,10 @@ where
         .route("/oauth/discord/start", get(oauth_start::<F>))
         .route("/oauth/discord/callback", get(oauth_callback::<F>))
         .route("/v1/me", get(current_principal::<F>))
+        .route(
+            "/v1/installations/{installation_id}/authority-check",
+            get(authority_check::<F>),
+        )
         .route("/v1/logout", post(logout::<F>))
         .route(
             "/v1/installations/{installation_id}/authoring/sessions/{session_id}/promotions",
@@ -479,6 +483,32 @@ where
                 map_facade(FacadeError::new(FacadeErrorCode::Internal), &request_id)
             }
         }
+        Err(error) => map_facade(error, &request_id),
+    }
+}
+
+async fn authority_check<F>(
+    State(state): State<HttpState<F>>,
+    Extension(request_id): Extension<RequestId>,
+    Path(installation_id): Path<String>,
+    headers: HeaderMap,
+) -> Response
+where
+    F: ProductControlFacade,
+{
+    let credential = match session_credential(&headers, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !valid_resource_id(&installation_id) {
+        return invalid_input(&request_id);
+    }
+    match state
+        .facade
+        .authority_check(&credential, &installation_id)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => map_facade(error, &request_id),
     }
 }

@@ -29,6 +29,7 @@ use product_control_http::{
     PromotionView, RejectCommand, SessionCredential,
 };
 
+use crate::input::parse_installation;
 use crate::{
     map_apply_command, map_approve_command, map_authoring_application_error,
     map_discord_authorization_code, map_discord_oauth_error, map_discord_oauth_state,
@@ -331,6 +332,18 @@ impl ProductControlFacade for ProductionProductControlFacadeV1 {
             .await
             .map_err(map_product_identity_error)?;
         Ok(project_current_principal(&principal))
+    }
+
+    async fn authority_check(
+        &self,
+        credential: &SessionCredential,
+        installation_id: &str,
+    ) -> Result<(), FacadeError> {
+        let installation = parse_installation(installation_id)?;
+        self.control_application()
+            .check_apply_authority(credential.expose_secret(), &installation)
+            .await
+            .map_err(map_product_application_error)
     }
 
     async fn revoke_session(
