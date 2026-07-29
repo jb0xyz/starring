@@ -390,12 +390,15 @@ SELECT
         INNER JOIN pg_catalog.pg_namespace AS namespace
             ON namespace.oid = relation.relnamespace
         WHERE namespace.nspname = 'public'
-            AND relation.relkind = 'S'
-            AND pg_catalog.has_sequence_privilege(
-                'starring_authoring_session_writer',
-                relation.oid,
-                'USAGE,SELECT,UPDATE'
-            )
+            AND CASE
+                WHEN relation.relkind = 'S'
+                THEN pg_catalog.has_sequence_privilege(
+                    'starring_authoring_session_writer',
+                    relation.oid,
+                    'USAGE,SELECT,UPDATE'
+                )
+                ELSE FALSE
+            END
     )
     AND (
         SELECT pg_catalog.count(*) = 5
@@ -1071,6 +1074,9 @@ mod tests {
             .ends_with("starring_product_authorized_snapshot_read_v1(text,text,bytea,text,text)"));
         assert!(SNAPSHOT_READER_V2
             .ends_with("starring_product_authorized_snapshot_read_v2(text,text,bytea,text,text)"));
+        assert!(VERIFY_WRITER_CONTRACT_SQL.contains(
+            "WHEN relation.relkind = 'S'\n                THEN pg_catalog.has_sequence_privilege"
+        ));
     }
 
     #[test]
