@@ -615,7 +615,8 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "tests/dependency_guard.rs",
             "tests/gateway_owner_startup_watchdog.rs",
             "tests/mutation_finalizer.rs",
-            "tests/process_contract.rs"
+            "tests/process_contract.rs",
+            "tests/staging_role_bootstrap_contract.rs"
         ]
     );
 }
