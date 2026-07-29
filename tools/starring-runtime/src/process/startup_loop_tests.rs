@@ -244,6 +244,23 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for FakeContinueProcessV2 {
         }))
     }
 
+    fn execute_recovery_owned_v3(
+        self,
+        _class: RuntimeStartupRecoveryClassV2,
+    ) -> RuntimeStartupRecoveryOwnedStepFutureV3<
+        Self,
+        Self::RecoveryCompletion,
+        Self::RecoveryFailure,
+        Self::Error,
+    > {
+        push_fake_loop_event_v2(&self.state, "recovery");
+        Box::pin(ready(Ok(if self.recovery_failure {
+            RuntimeStartupRecoveryOwnedStepOutcomeV3::Failed(self, ())
+        } else {
+            RuntimeStartupRecoveryOwnedStepOutcomeV3::Completed(self, ())
+        })))
+    }
+
     async fn cleanup_after_recovery_failure_v2(
         self,
         _failure: Self::RecoveryFailure,
@@ -322,6 +339,28 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for FakeCancelableContinueProcessV
         Box::pin(async move {
             recovery.await;
             Ok(())
+        })
+    }
+
+    fn execute_recovery_owned_v3(
+        self,
+        _class: RuntimeStartupRecoveryClassV2,
+    ) -> RuntimeStartupRecoveryOwnedStepFutureV3<
+        Self,
+        Self::RecoveryCompletion,
+        Self::RecoveryFailure,
+        Self::Error,
+    > {
+        let recovery = TrackedPendingWaitV2 {
+            polled: self.polled.clone(),
+            dropped: self.dropped.clone(),
+        };
+        Box::pin(async move {
+            recovery.await;
+            Ok(RuntimeStartupRecoveryOwnedStepOutcomeV3::Completed(
+                self,
+                (),
+            ))
         })
     }
 
@@ -466,22 +505,24 @@ async fn production_used_driver_cleans_each_failure_authority_exactly_once() {
 #[tokio::test]
 async fn foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_priority() {
     let deadline = RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed;
-    let all_ready = await_foreign_fresh_retry_v2(
+    let all_ready = await_bounded_startup_retry_v2(
         deadline,
         ready(()),
         ready(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated),
         ready(()),
         ready(()),
+        pending(),
     )
     .await;
     assert_eq!(all_ready, Err(deadline));
 
-    let discord_ready = await_foreign_fresh_retry_v2(
+    let discord_ready = await_bounded_startup_retry_v2(
         deadline,
         pending::<()>(),
         ready(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated),
         ready(()),
         ready(()),
+        pending(),
     )
     .await;
     assert_eq!(
@@ -493,12 +534,13 @@ async fn foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_prior
         )
     );
 
-    let owner_ready = await_foreign_fresh_retry_v2(
+    let owner_ready = await_bounded_startup_retry_v2(
         deadline,
         pending::<()>(),
         pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
         ready(()),
         ready(()),
+        pending(),
     )
     .await;
     assert_eq!(
@@ -510,12 +552,13 @@ async fn foreign_fresh_wait_has_deterministic_deadline_discord_owner_retry_prior
         )
     );
 
-    let retry_ready = await_foreign_fresh_retry_v2(
+    let retry_ready = await_bounded_startup_retry_v2(
         deadline,
         pending::<()>(),
         pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
         pending::<()>(),
         ready(()),
+        pending(),
     )
     .await;
     assert_eq!(retry_ready, Ok(()));
@@ -529,12 +572,13 @@ async fn dropping_a_polled_foreign_fresh_wait_drops_only_the_wait_future() {
         polled: polled.clone(),
         dropped: dropped.clone(),
     };
-    let mut wait = Box::pin(await_foreign_fresh_retry_v2(
+    let mut wait = Box::pin(await_bounded_startup_retry_v2(
         RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed,
         pending::<()>(),
         pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
         pending::<()>(),
         retry,
+        pending(),
     ));
 
     std::future::poll_fn(|context| {
@@ -651,7 +695,7 @@ fn all_recovery_classes_map_to_distinct_finite_fail_closed_failures() {
 fn foreign_fresh_deadline_classification_never_extends_owner_or_operation_lifetime() {
     let now = Instant::now();
     assert_eq!(
-        classify_foreign_fresh_wait_deadline_v2(
+        classify_bounded_startup_retry_deadline_v2(
             now + Duration::from_secs(2),
             now + Duration::from_secs(1),
         ),
@@ -660,7 +704,7 @@ fn foreign_fresh_deadline_classification_never_extends_owner_or_operation_lifeti
         )
     );
     assert_eq!(
-        classify_foreign_fresh_wait_deadline_v2(
+        classify_bounded_startup_retry_deadline_v2(
             now + Duration::from_secs(1),
             now + Duration::from_secs(2),
         ),
@@ -673,7 +717,7 @@ fn foreign_fresh_current_state_uses_cutoff_then_discord_then_owner_priority() {
     let now = Instant::now();
     let discord = Some(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated);
     assert_eq!(
-        classify_current_foreign_fresh_wait_transition_v2(
+        classify_current_bounded_startup_retry_transition_v2(
             now,
             now,
             now + Duration::from_secs(1),
@@ -683,7 +727,7 @@ fn foreign_fresh_current_state_uses_cutoff_then_discord_then_owner_priority() {
         Some(RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed)
     );
     assert_eq!(
-        classify_current_foreign_fresh_wait_transition_v2(
+        classify_current_bounded_startup_retry_transition_v2(
             now,
             now + Duration::from_secs(2),
             now + Duration::from_secs(1),
@@ -697,7 +741,7 @@ fn foreign_fresh_current_state_uses_cutoff_then_discord_then_owner_priority() {
         )
     );
     assert_eq!(
-        classify_current_foreign_fresh_wait_transition_v2(
+        classify_current_bounded_startup_retry_transition_v2(
             now,
             now + Duration::from_secs(2),
             now + Duration::from_secs(1),

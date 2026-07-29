@@ -9,6 +9,7 @@ automation-runtime-convergence = { path = "../automation-runtime-convergence" }
 automation-runtime-worker = { path = "../automation-runtime-worker" }
 chrono = "0.4"
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
+serde = { workspace = true }
 sha2 = "0.10"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "derive", "macros", "migrate"] }
 thiserror = { workspace = true }

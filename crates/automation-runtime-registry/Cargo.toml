@@ -6,6 +6,9 @@ edition = "2021"
 [dependencies]
 automation-ruleset = { path = "../automation-ruleset" }
 automation-runtime-convergence = { path = "../automation-runtime-convergence" }
+automation-runtime-controller = { path = "../automation-runtime-controller" }
+automation-runtime-worker = { path = "../automation-runtime-worker" }
+chrono = "0.4"
 discord-model = { path = "../discord-model" }
 resource-resolution = { path = "../resource-resolution" }
 thiserror = "1"

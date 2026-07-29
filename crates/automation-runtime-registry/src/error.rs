@@ -82,6 +82,24 @@ pub enum ServingSlotRegistryError {
     SlotSealed,
     #[error("serving slot seal capability is stale")]
     StaleSlotSeal,
+    #[error("V4 registry capability belongs to another registry lifetime")]
+    V4RegistryMismatch,
+    #[error("V4 registry capability is stale")]
+    V4CapabilityStale,
+    #[error("V4 registry capability route does not match")]
+    V4RouteMismatch,
+    #[error("V4 registry capability lifecycle does not match")]
+    V4LifecycleMismatch,
+    #[error("V4 registry capability fence does not match")]
+    V4FenceMismatch,
+    #[error("V4 registry capability guard count does not match")]
+    V4GuardMismatch,
+    #[error("V4 registry capability durable receipt does not match")]
+    V4ReceiptMismatch,
+    #[error("V4 registry capability observation does not match")]
+    V4ObservationMismatch,
+    #[error("V4 empty succession evidence does not match")]
+    V4EmptySuccessionMismatch,
     #[error("serving slot registry lock is poisoned")]
     RegistryPoisoned,
 }

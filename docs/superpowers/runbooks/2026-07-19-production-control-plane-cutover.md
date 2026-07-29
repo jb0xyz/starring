@@ -23,11 +23,12 @@ guild or advertise production Live automation.
 - Product identity uses four distinct direct-login credentials: the OAuth flow
   writer, session issuer, session API, and security revoker. Do not reuse one
   login or pool for more than one of these capabilities.
-- The API process uses thirteen distinct direct-login database credentials in
+- The API process uses fourteen distinct direct-login database credentials in
   total. The remaining capabilities are installation-authority read,
   authorized-snapshot read, promotion execution, decision read, approval
-  execution, rejection execution, Apply execution, deployment-status read, and
-  operational-deployment-status read. All thirteen connect to one logical
+  execution, rejection execution, Apply execution, lifecycle-cancellation
+  execution, deployment-status read, and operational-deployment-status read.
+  All fourteen connect to one logical
   database under different roles and are checked as one topology before the
   process becomes ready.
 - `starring_owner` is `NOLOGIN` and is never used by an application process.
@@ -50,12 +51,13 @@ The reviewed staging role manifest uses these exact direct-login role names:
 | Approval executor | `starring_decision_approval` |
 | Rejection executor | `starring_decision_rejection` |
 | Apply executor | `starring_decision_apply` |
+| Lifecycle-cancellation executor | `starring_decision_cancellation` |
 | Deployment-status reader | `starring_deployment_status_reader` |
 | Operational-status reader | `starring_operational_deployment_status_reader` |
 
 ### Staging database role bootstrap
 
-The executable thirteen-role manifests are
+The executable fourteen-role manifests are
 `ops/postgres/staging-api-role-bootstrap.sql` and
 `ops/postgres/staging-api-role-enable.sql`. The component grant snippets later
 in this runbook explain individual contracts; they are not substitutes for
@@ -97,7 +99,7 @@ Before touching roles, stop the API, tunnel, migration process, schedulers, and
 every other database client. Isolate the dedicated cluster at the network
 boundary. Configure `pg_hba.conf` so a reviewed administrator rule and one
 first-match application rule cover only the exact staging database, the
-thirteen exact request roles, and the exact application source address. Use
+fourteen exact request roles, and the exact application source address. Use
 `scram-sha-256` for local and network password authentication and `hostssl` for
 network traffic. Put explicit reject rules after those allow rules for every
 other database, role, and source path. `trust`, `peer`, and `ident` are not
@@ -115,7 +117,7 @@ fail-closed quarantine before function validation: all managed roles become
 and direct database, schema, relation, column, sequence, routine, parameter,
 and default privileges are reconciled. The second transaction drains every
 client session in the dedicated cluster, rejects prepared transactions,
-verifies the owner and all 43 functions, grants the exact runtime capabilities,
+verifies the owner and all 46 functions, grants the exact runtime capabilities,
 and leaves all request roles quarantined as `NOLOGIN` with null passwords. If
 the second transaction fails, the first transaction remains committed; keep
 staging offline and repair the contract before rerunning it.
@@ -137,8 +139,8 @@ unset STAGING_SYSTEM_IDENTIFIER STAGING_CLUSTER_ADMIN \
 
 The bootstrap creates any missing request roles but does not enable login. It
 also removes legacy `starring_api` capabilities and grants exactly database
-`CONNECT`, `public` schema `USAGE`, and the 43 reviewed function identities.
-Every rerun is fail-closed: it returns all thirteen request roles to quarantine
+`CONNECT`, `public` schema `USAGE`, and the 46 reviewed function identities.
+Every rerun is fail-closed: it returns all fourteen request roles to quarantine
 and clears every password before validating capabilities. PostgreSQL preserves
 some database, schema, and object grants issued by an alternate grantor when a
 cluster administrator performs an ordinary revoke. The manifest detects the
@@ -150,7 +152,7 @@ and resets the role. Review downstream revocation impact before execution, do
 not use object-dropping shortcuts, and rerun the full bootstrap afterward.
 
 Next prove `SHOW password_encryption` returns `scram-sha-256`. While the API,
-tunnel, and all other clients remain stopped, assign thirteen distinct,
+tunnel, and all other clients remain stopped, assign fourteen distinct,
 password-manager-generated values in the same interactive administrator
 `psql` session. Use the client-side prompt commands below; each command prompts
 twice and keeps the secret out of SQL text, arguments, shell history, logs, and
@@ -168,14 +170,15 @@ this repository. The roles remain `NOLOGIN` throughout this operation.
 \password starring_decision_approval
 \password starring_decision_rejection
 \password starring_decision_apply
+\password starring_decision_cancellation
 \password starring_deployment_status_reader
 \password starring_operational_deployment_status_reader
 ```
 
 Do not use `ALTER ROLE ... PASSWORD '...'`, reuse a value between roles, put a
 password-bearing database URL in an argument, or generate a SQL file containing
-secrets. Verify only the aggregate result without printing hashes: all thirteen
-rows must report `scram_passwords = 13`.
+secrets. Verify only the aggregate result without printing hashes: all fourteen
+rows must report `scram_passwords = 14`.
 
 ```sql
 SELECT pg_catalog.count(*) FILTER (
@@ -194,6 +197,7 @@ WHERE role.rolname IN (
     'starring_decision_approval',
     'starring_decision_rejection',
     'starring_decision_apply',
+    'starring_decision_cancellation',
     'starring_deployment_status_reader',
     'starring_operational_deployment_status_reader'
 );
@@ -223,7 +227,7 @@ unset STAGING_SYSTEM_IDENTIFIER STAGING_CLUSTER_ADMIN \
 ```
 
 After enable succeeds, prove a wrong password fails and every request role is
-denied on a different database before provisioning the thirteen distinct
+denied on a different database before provisioning the fourteen distinct
 database URLs through the prompt-only Keychain flow. Do not restore the API,
 tunnel, or external ingress before those negative probes and aggregate API
 readiness are green. A manifest failure or any unexpected capability keeps the
@@ -263,7 +267,7 @@ defaults.
 | `STARRING_API_PUBLIC_ORIGIN` | Canonical lowercase HTTPS domain origin with no explicit port, path, query, fragment, user information, or IP literal | `https://api.example.com` |
 | `STARRING_API_OAUTH_RETURN_PATHS_JSON` | JSON array of 1 through 64 unique bounded local paths | `["/","/app"]` |
 | `STARRING_API_OAUTH_DEFAULT_RETURN_PATH` | Exact member of the return-path array | `/app` |
-| `STARRING_API_DATABASE_MAX_CONNECTIONS` | 1 through 4 per role; the template ceiling is 26 connections across 13 pools | `2` |
+| `STARRING_API_DATABASE_MAX_CONNECTIONS` | 1 through 4 per role; the template ceiling is 28 connections across 14 pools | `2` |
 | `STARRING_API_DATABASE_ACQUIRE_TIMEOUT_MILLISECONDS` | 100 through 5000 milliseconds | `2000` |
 | `STARRING_API_DATABASE_IDLE_TIMEOUT_SECONDS` | 30 through 600 seconds | `120` |
 | `STARRING_API_DATABASE_MAX_LIFETIME_SECONDS` | 60 through 3600 seconds and strictly greater than idle timeout | `900` |
@@ -281,7 +285,7 @@ not a DNS-only operation.
 ### Exact secret-reference environment
 
 Secret-reference values use exactly `keychain:<service>:<account>` or
-`env:<UPPERCASE_NAME>`. The macOS staging template uses Keychain. The 13
+`env:<UPPERCASE_NAME>`. The macOS staging template uses Keychain. The 14
 database references and the four other purpose references must all be unique;
 configuration rejects any alias.
 
@@ -298,6 +302,7 @@ configuration rejects any alias.
 | `STARRING_API_APPROVAL_EXECUTOR_DATABASE_SECRET_REFERENCE` | Approval execution | `database.approval-executor` |
 | `STARRING_API_REJECTION_EXECUTOR_DATABASE_SECRET_REFERENCE` | Rejection execution | `database.rejection-executor` |
 | `STARRING_API_APPLY_EXECUTOR_DATABASE_SECRET_REFERENCE` | Apply execution | `database.apply-executor` |
+| `STARRING_API_CANCELLATION_EXECUTOR_DATABASE_SECRET_REFERENCE` | Lifecycle-cancellation execution | `database.cancellation-executor` |
 | `STARRING_API_DEPLOYMENT_STATUS_DATABASE_SECRET_REFERENCE` | Deployment status V1 read | `database.deployment-status-reader` |
 | `STARRING_API_OPERATIONAL_STATUS_DATABASE_SECRET_REFERENCE` | Operational deployment status V2 read | `database.operational-deployment-status-reader` |
 | `STARRING_API_DISCORD_OAUTH_CLIENT_SECRET_REFERENCE` | Discord OAuth token exchange | `discord.oauth-client-secret` |
@@ -306,8 +311,8 @@ configuration rejects any alias.
 | `STARRING_API_SNAPSHOT_ENVELOPE_KEYRING_SECRET_REFERENCE` | Authorized snapshot encryption and decryption | `keyring.snapshot-envelope` |
 
 The template Keychain service is `starring-api.staging`. Each database item
-contains one complete PostgreSQL URL for its capability login. All thirteen
-URLs must identify the same database but authenticate as thirteen distinct
+contains one complete PostgreSQL URL for its capability login. All fourteen
+URLs must identify the same database but authenticate as fourteen distinct
 roles with no role membership. Local loopback or Unix-socket connections may
 disable TLS. A remote database URL must use full certificate and hostname
 verification. PostgreSQL startup `options` are rejected. Use a distinct random
@@ -374,6 +379,7 @@ for ACCOUNT in \
   database.approval-executor \
   database.rejection-executor \
   database.apply-executor \
+  database.cancellation-executor \
   database.deployment-status-reader \
   database.operational-deployment-status-reader \
   discord.oauth-client-secret \
@@ -398,6 +404,7 @@ for ACCOUNT in \
   database.authorized-snapshot-reader database.promotion-executor \
   database.decision-reader database.approval-executor \
   database.rejection-executor database.apply-executor \
+  database.cancellation-executor \
   database.deployment-status-reader \
   database.operational-deployment-status-reader \
   discord.oauth-client-secret discord.bot-token \
@@ -518,13 +525,13 @@ readable only by the service account.
 
 Startup is deliberately fail-closed and ordered:
 
-1. Parse every required non-secret value and all 17 unique secret references.
+1. Parse every required non-secret value and all 18 unique secret references.
 2. Resolve Keychain items and validate database URL, OAuth secret, bot token,
    both keyring payloads, and cross-purpose key-material separation.
-3. Connect all thirteen bounded pools. On partial failure, begin closing every
+3. Connect all fourteen bounded pools. On partial failure, begin closing every
    pool that connected and stop.
 4. Build the facade and run aggregate database capability readiness with a
-   45-second composition deadline. This verifies one database, thirteen
+   45-second composition deadline. This verifies one database, fourteen
    distinct direct-login roles, exact executable allowlists, relation and
    schema denial, absence of explicit parameter privileges and per-role
    database settings, installation authority, snapshot encryption-key
@@ -573,14 +580,14 @@ unset PORT PUBLIC_HOST
 The listener must be exactly `127.0.0.1`, never `*`, `0.0.0.0`, a LAN address,
 or a public address. Liveness proves only that the process event loop responds.
 Readiness reads only the atomic server lease and never runs a database probe in
-the request path. A single background supervisor runs aggregate thirteen-role
+the request path. A single background supervisor runs aggregate fourteen-role
 readiness every 30 seconds with a ten-second deadline and no overlap. The first
 error, timeout, or panic closes business admission, removes the listener, drains
 accepted work, and exits with `server_runtime_readiness_failed`. The maximum
 scheduled detection window is 40 seconds. `/health/ready` and every non-health
 route return 503 `dependency_unavailable` while the lease is closed.
 
-Before promoting a release candidate, rehearse this 13-role probe under the
+Before promoting a release candidate, rehearse this 14-role probe under the
 expected concurrent request load and database latency with the intended pool
 limit. Record probe duration, query volume, pool occupancy, request latency,
 false readiness exits, restart time, and database saturation. Confirm that a
@@ -621,7 +628,7 @@ incident ticket.
 A controlled SIGTERM or launchd bootout closes the readiness lease and listener
 before draining active HTTP/1 and HTTP/2 work. HTTP drain is bounded to 15
 seconds; connections still pending at the deadline are aborted and joined.
-Only after the server returns should the process close all thirteen database
+Only after the server returns should the process close all fourteen database
 pools concurrently, with a separate 15-second deadline. A pool-close timeout is
 a stable redacted shutdown failure, not permission to leave another instance
 running.
@@ -871,10 +878,10 @@ database; never delete production evidence merely to satisfy this preflight.
    and direct-DML denial probes.
 5. Apply `ops/postgres/staging-api-role-bootstrap.sql` with the exact
    `ON_ERROR_STOP` and staging acknowledgement procedure above, assign all
-   thirteen distinct passwords through prompt-only `\password`, then apply
+   fourteen distinct passwords through prompt-only `\password`, then apply
    `ops/postgres/staging-api-role-enable.sql`. Complete the negative
    authentication probes before running aggregate product API readiness with
-   thirteen distinct direct-login pools against one logical database.
+   fourteen distinct direct-login pools against one logical database.
 6. Start only the API readiness process. It must verify product-action receipt
    key coverage, snapshot-envelope key coverage, every exact executable
    allowlist, and both deployment-status readers.
@@ -1353,7 +1360,7 @@ Migrations 014 through 022 and `202607200001` through `202607200006` now scope
 installation-authority reads, authentication, authorized-snapshot reads,
 promotion, decision reads, approval, rejection, Apply, and both deployment
 status projections behind exact functions. The application composition uses
-thirteen distinct direct-login pools and aggregate execute-only readiness.
+fourteen distinct direct-login pools and aggregate execute-only readiness.
 Runtime convergence mutation remains a separate worker capability and is not
 part of the API process. Direct table grants are not a valid workaround for any
 request-serving role.
@@ -1470,10 +1477,11 @@ migrator must not retain its own schema `CREATE` ACL. Internal trigger functions
 use only `pg_catalog` in their path and every application relation reference is
 schema-qualified.
 
-After migrations 019 through 022, create or verify three distinct direct-login
-roles with no membership. Replace `starring_production` below with the reviewed
-production database identifier. Revoke PostgreSQL defaults and any old
-database/schema privileges before granting only the staged manifest:
+After migrations 019 through 022 and
+`202607280005_cancel_runtime_product_drain_v2`, create or verify four distinct
+direct-login roles with no membership. Replace `starring_production` below with
+the reviewed production database identifier. Revoke PostgreSQL defaults and
+any old database/schema privileges before granting only the staged manifest:
 
 ```sql
 REVOKE CONNECT, TEMPORARY
@@ -1484,26 +1492,30 @@ REVOKE ALL PRIVILEGES
 ON DATABASE starring_production
 FROM starring_decision_reader,
      starring_decision_approval,
-     starring_decision_apply;
+     starring_decision_apply,
+     starring_decision_cancellation;
 
 REVOKE ALL PRIVILEGES
 ON SCHEMA public
 FROM PUBLIC,
      starring_decision_reader,
      starring_decision_approval,
-     starring_decision_apply;
+     starring_decision_apply,
+     starring_decision_cancellation;
 
 GRANT CONNECT
 ON DATABASE starring_production
 TO starring_decision_reader,
    starring_decision_approval,
-   starring_decision_apply;
+   starring_decision_apply,
+   starring_decision_cancellation;
 
 GRANT USAGE ON SCHEMA public TO starring_owner;
 GRANT USAGE ON SCHEMA public
 TO starring_decision_reader,
    starring_decision_approval,
-   starring_decision_apply;
+   starring_decision_apply,
+   starring_decision_cancellation;
 
 GRANT EXECUTE ON FUNCTION
     public.starring_product_decision_reader_database_identity_v1()
@@ -1649,23 +1661,69 @@ TO starring_decision_apply;
 GRANT EXECUTE ON FUNCTION
     public.starring_product_apply_keyring_coverage_v1(TEXT[], TEXT[])
 TO starring_decision_apply;
+
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_lifecycle_cancellation_executor_database_identity_v1()
+TO starring_decision_cancellation;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_lifecycle_cancellation_keyring_coverage_v1(TEXT[], TEXT[])
+TO starring_decision_cancellation;
+GRANT EXECUTE ON FUNCTION
+    public.starring_product_cancel_runtime_drain_v2(
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        BYTEA,
+        BYTEA,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        TIMESTAMPTZ,
+        TIMESTAMPTZ,
+        TEXT,
+        BOOLEAN,
+        TEXT,
+        TEXT,
+        TEXT[],
+        TEXT[],
+        TEXT[],
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        TEXT,
+        BIGINT,
+        TEXT,
+        TEXT,
+        BIGINT
+    )
+TO starring_decision_cancellation;
 ```
 
 Inventory `pg_namespace.nspacl` after the revokes and remove `CREATE` from every
-untrusted named grantee, not only these three request roles. The schema owner and
+untrusted named grantee, not only these four request roles. The schema owner and
 database owner are trusted operational principals. A separate migrator uses the
 owner role without retaining its own `CREATE` ACL. Do not grant database
 `CREATE` or `TEMPORARY`, schema `CREATE`, table access, column access, grant
 option, owner membership, any other membership, or another
 `public.starring_*` function.
 
-The three grant sets above are complete component credentials for decision
-reads, approval, and Apply. The Apply readiness path uses its own coverage
-function and never depends on the approval credential having run first. Do not
-start the whole product service or open ingress from this component manifest
-alone. Apply the remaining capability manifest below, seal relation ACLs, and
-require aggregate whole-process readiness. Runtime mutation remains a separate
-worker boundary.
+The four grant sets above are complete component credentials for decision
+reads, approval, Apply, and lifecycle cancellation. The mutation readiness paths
+use their own coverage functions and never depend on the approval credential
+having run first. Do not start the whole product service or open ingress from
+this component manifest alone. Apply the remaining capability manifest below,
+seal relation ACLs, and require aggregate whole-process readiness. Runtime
+mutation remains a separate worker boundary.
 
 `PostgresProductDecisions::verify_approval_executor_readiness` verifies the
 enumerated approval function, owner, role, 16-relation, internal trigger,
@@ -1677,9 +1735,12 @@ routine in that scope is a hard `ExcessCapability` failure.
 `PostgresProductDecisions::verify_apply_executor_readiness` verifies the exact
 five-function Apply interface, 18-relation manifest, full helper and trigger
 contract, dedicated keyring coverage, trusted topology, and rollback-only lock,
-artifact, and finalizer probes. `verify_product_decision_boundary_readiness`
-runs reader, approval, and Apply readiness and then requires one logical
-database UUID/name with three distinct direct-login roles. The older
+artifact, and finalizer probes. Lifecycle-cancellation readiness verifies its
+exact three-function interface, 21-relation manifest, terminal journal
+contract, dedicated keyring coverage, and rollback-only cancellation probe.
+`verify_product_decision_boundary_readiness` runs reader, approval, Apply, and
+lifecycle-cancellation readiness and then requires one logical database
+UUID/name with four distinct direct-login roles. The older
 `verify_approval_boundary_readiness` remains a compatibility gate and is not an
 ingress decision. Any legacy table or column grant on a protected component
 manifest intentionally makes readiness red.
@@ -1748,16 +1809,17 @@ END;
 $grants$;
 ```
 
-The complete thirteen direct-login roles are the four identity roles, the
+The complete fourteen direct-login roles are the four identity roles, the
 installation-authority reader, the authorized-snapshot reader, the promotion
 executor, the decision reader, approval executor, rejection executor, Apply
-executor, and the two status readers. Every role needs database `CONNECT` and
+executor, lifecycle-cancellation executor, and the two status readers. Every
+role needs database `CONNECT` and
 schema `USAGE`; no role may have database `CREATE` or `TEMPORARY`, schema
 `CREATE`, relation or sequence privilege, role membership, grant option, or an
 executable user function outside its exact readiness allowlist. Revoke legacy
 `starring_api` grants rather than keeping them during rollout. The service may
 listen only after `PostgresProductApiReadiness::verify_readiness` proves one
-logical database and thirteen distinct direct-login identities.
+logical database and fourteen distinct direct-login identities.
 
 `interaction-smoke` is test-only manual tooling, not an operational fallback.
 It requires the `legacy-smoke` compile feature,
@@ -1825,7 +1887,7 @@ Rotate one capability login at a time. Preserve the exact role's grants and
 direct-login restrictions, change only that role's credential, update only its
 matching Keychain account, then restart the single API process. The service is
 not eligible for ingress until aggregate readiness again proves one logical
-database and thirteen distinct roles. Never copy one database URL into a second
+database and fourteen distinct roles. Never copy one database URL into a second
 account as a temporary fallback. Revoke the old credential only after the new
 process has passed local readiness and the old process has exited.
 

@@ -87,6 +87,10 @@ pub enum RuntimeDeploymentError {
     InvalidFailure,
     #[error("terminal reason is invalid")]
     InvalidReason,
+    #[error("Product drain supersession source differs from the acknowledged source")]
+    ProductDrainSupersessionSourceMismatch,
+    #[error("Product drain cancellation source differs from the acknowledged source")]
+    ProductDrainCancellationSourceMismatch,
     #[error("deployment revision overflow")]
     RevisionOverflow,
     #[error("runtime deployment snapshot violates state invariants")]

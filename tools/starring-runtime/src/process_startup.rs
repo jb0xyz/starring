@@ -13,7 +13,8 @@ use crate::{
     RuntimeBuildRevisionBootstrapErrorV1, RuntimeClosedRecoveryProcessCleanupFailureV2,
     RuntimeClosedRecoveryProcessShutdownErrorV2, RuntimeConfigErrorV1, RuntimeConfigV1,
     RuntimePausedConnectedProcessShutdownErrorV1, RuntimeProcessClosedRecoveryTransitionErrorV2,
-    RuntimeProcessPausedConnectedTransitionErrorV1, RuntimeProcessRecoveryPendingTransitionErrorV2,
+    RuntimeProcessPausedConnectedTransitionErrorV1, RuntimeProcessProductionHandoffErrorV2,
+    RuntimeProcessRecoveryPendingTransitionErrorV2,
     RuntimeProcessRecoveryReadinessTransitionErrorV2, RuntimeProcessStartupRecoveryLoopErrorV2,
     RuntimeRecoveryPendingProcessShutdownErrorV2, RuntimeSecretsResolutionErrorV1,
 };
@@ -44,6 +45,8 @@ pub enum RuntimeProcessStagingErrorV1 {
     RecoveryReadiness(RuntimeProcessRecoveryReadinessTransitionErrorV2),
     #[error("runtime process startup recovery loop failed")]
     StartupRecovery(RuntimeProcessStartupRecoveryLoopErrorV2),
+    #[error("runtime process production handoff failed")]
+    ProductionHandoff(RuntimeProcessProductionHandoffErrorV2),
     #[error("runtime owner-held process shutdown failed")]
     OwnerHeldShutdown(RuntimeOwnerHeldProcessShutdownErrorV1),
     #[error("runtime paused-connected process shutdown failed")]
@@ -71,6 +74,7 @@ impl RuntimeProcessStagingErrorV1 {
             Self::ClosedRecovery(error) => error.code(),
             Self::RecoveryReadiness(error) => error.code(),
             Self::StartupRecovery(error) => error.code(),
+            Self::ProductionHandoff(error) => error.code(),
             Self::OwnerHeldShutdown(error) => error.code(),
             Self::PausedConnectedShutdown(error) => error.code(),
             Self::RecoveryPendingShutdown(error) => error.code(),
@@ -94,6 +98,7 @@ impl RuntimeProcessStagingErrorV1 {
             Self::ClosedRecovery(error) => error.context(),
             Self::RecoveryReadiness(error) => error.context(),
             Self::StartupRecovery(error) => error.context(),
+            Self::ProductionHandoff(error) => error.context(),
             Self::OwnerHeldShutdown(error) => error.context(),
             Self::PausedConnectedShutdown(error) => error.context(),
             Self::RecoveryPendingShutdown(error) => error.context(),
@@ -113,6 +118,7 @@ impl RuntimeProcessStagingErrorV1 {
     pub const fn cleanup_class(self) -> bool {
         match self {
             Self::StartupRecovery(error) => error.cleanup_class(),
+            Self::ProductionHandoff(error) => error.cleanup_class(),
             Self::OwnerHeldShutdown(_)
             | Self::PausedConnectedShutdown(_)
             | Self::RecoveryPendingShutdown(_)
@@ -245,10 +251,30 @@ async fn stage_runtime_process_from_environment_v1(
         .into_startup_recovery_fixed_point_v2()
         .await
         .map_err(RuntimeProcessStagingErrorV1::StartupRecovery)?;
-    fixed_point
-        .shutdown()
+    let paused_production = fixed_point
+        .into_paused_production_handoff_v2()
         .await
-        .map_err(RuntimeProcessStagingErrorV1::StartupRecoveryFixedPointShutdown)?;
+        .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
+    let process_bound = paused_production
+        .into_process_bound_handoff_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
+    let recovery_resume = process_bound
+        .into_recovery_resume_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
+    let admission_acknowledging = recovery_resume
+        .resume_recovery_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
+    let empty_open = admission_acknowledging
+        .enter_empty_open_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
+    empty_open
+        .run_until_shutdown_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
     Ok(RuntimeProcessStagingOutcomeV1 { _private: () })
 }
 

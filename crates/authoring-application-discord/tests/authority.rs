@@ -7,15 +7,18 @@ use authoring_application::{
     ApplyProductPromotionV1, ApprovalPayloadDigestV1, ApproveProductPromotionV1,
     AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationClaimsV1,
     AuthenticationError, AuthenticationPort, AuthorizedApplyProductV1, AuthorizedApprovalPreviewV1,
-    AuthorizedApproveProductV1, AuthorizedDeploymentStatusV1, AuthorizedProductStatusV1,
-    AuthorizedRejectProductV1, CapabilityV1, DeploymentStatusPort, DeploymentStatusPortError,
-    DeploymentStatusProjectionV1, FreshGuildAuthorityError, InstallationSelectorV1,
-    MutationAuthenticationPort, ProductApplicationError, ProductApplyPort, ProductApprovalPort,
-    ProductApprovalPreviewV1, ProductControlApplication, ProductControlPortError,
-    ProductDecisionPhaseV1, ProductDecisionProjectionV1, ProductDecisionQueryPort,
-    ProductIdempotencyKeyV1, ProductMutationReceiptV1, ProductRejectionPort, ProductRequestIdV1,
-    ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1, PromotionSelectorV1,
-    RejectProductPromotionV1, RejectionReasonV1,
+    AuthorizedApproveProductV1, AuthorizedCancelProductLifecycleV1, AuthorizedDeploymentStatusV1,
+    AuthorizedProductStatusV1, AuthorizedRejectProductV1, CancelProductLifecycleMutationV1,
+    CapabilityV1, DeploymentStatusPort, DeploymentStatusPortError, DeploymentStatusProjectionV1,
+    FreshGuildAuthorityError, InstallationSelectorV1, MutationAuthenticationPort,
+    ProductApplicationError, ProductApplyPort, ProductApprovalPort, ProductApprovalPreviewV1,
+    ProductControlApplication, ProductControlPortError, ProductDecisionPhaseV1,
+    ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductDrainSelectorV1,
+    ProductIdempotencyKeyV1, ProductLifecycleCancellationPort,
+    ProductLifecycleCancellationReasonV1, ProductLifecycleCancellationReceiptV1,
+    ProductMutationReceiptV1, ProductRejectionPort, ProductRequestIdV1, ProductRevisionV1,
+    ProductStatusQueryV1, ProductStatusV1, PromotionSelectorV1, RejectProductPromotionV1,
+    RejectionReasonV1,
 };
 use authoring_application_discord::{
     AuthorityClock, DiscordApplicationIdV1, DiscordAuthorityClientError, DiscordAuthorityConfigV1,
@@ -195,6 +198,27 @@ impl ProductApplyPort<FreshDiscordAuthorityEvidenceV1> for InspectingApplyDecisi
         &self,
         request: AuthorizedApplyProductV1<'_, FreshDiscordAuthorityEvidenceV1>,
     ) -> Result<ProductMutationReceiptV1, ProductControlPortError> {
+        self.evidence
+            .lock()
+            .unwrap()
+            .replace(request.evidence().clone());
+        Err(ProductControlPortError::Backend(
+            "inspection_complete".to_string(),
+        ))
+    }
+}
+
+struct InspectingLifecycleCancellations {
+    evidence: Arc<Mutex<Option<FreshDiscordAuthorityEvidenceV1>>>,
+}
+
+impl ProductLifecycleCancellationPort<FreshDiscordAuthorityEvidenceV1>
+    for InspectingLifecycleCancellations
+{
+    async fn cancel_lifecycle_idempotent(
+        &self,
+        request: AuthorizedCancelProductLifecycleV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<ProductLifecycleCancellationReceiptV1, ProductControlPortError> {
         self.evidence
             .lock()
             .unwrap()
@@ -410,6 +434,25 @@ fn apply_command() -> ApplyProductPromotionV1 {
     }
 }
 
+fn cancellation_command() -> CancelProductLifecycleMutationV1 {
+    CancelProductLifecycleMutationV1 {
+        promotion: PromotionSelectorV1::new(PromotionId::parse(&"b".repeat(64)).unwrap()),
+        expected_payload_digest: ApprovalPayloadDigestV1::parse(&"c".repeat(64)).unwrap(),
+        expected_revision: ProductRevisionV1::new(1).unwrap(),
+        drain_selector: ProductDrainSelectorV1::from_server_projection(
+            "d".repeat(32),
+            7,
+            "e".repeat(64),
+            "f".repeat(32),
+            10,
+        )
+        .unwrap(),
+        idempotency_key: ProductIdempotencyKeyV1::parse("cancel-request-1").unwrap(),
+        reason: ProductLifecycleCancellationReasonV1::parse("retain the current deployment")
+            .unwrap(),
+    }
+}
+
 async fn capture_apply_evidence<K>(
     adapter: &DiscordGuildAuthorityAdapter<Source, RuntimeClient, K>,
 ) -> Result<FreshDiscordAuthorityEvidenceV1, ProductApplicationError>
@@ -440,6 +483,40 @@ where
         .unwrap()
         .take()
         .expect("apply evidence must be captured");
+    Ok(evidence)
+}
+
+async fn capture_cancellation_evidence<K>(
+    adapter: &DiscordGuildAuthorityAdapter<Source, RuntimeClient, K>,
+) -> Result<FreshDiscordAuthorityEvidenceV1, ProductApplicationError>
+where
+    K: AuthorityClock,
+{
+    let captured = Arc::new(Mutex::new(None));
+    let cancellations = InspectingLifecycleCancellations {
+        evidence: captured.clone(),
+    };
+    let result =
+        ProductControlApplication::new(&Authentication, adapter, &cancellations, &Deployments)
+            .cancel_product_lifecycle(
+                "valid-credential",
+                "valid-csrf",
+                &ProductRequestIdV1::parse("request-1").unwrap(),
+                &installation(),
+                cancellation_command(),
+            )
+            .await;
+    match result {
+        Err(ProductApplicationError::Control(ProductControlPortError::Backend(code)))
+            if code == "inspection_complete" => {}
+        Err(error) => return Err(error),
+        Ok(_) => panic!("inspection cancellation must stop persistence"),
+    }
+    let evidence = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("cancellation evidence must be captured");
     Ok(evidence)
 }
 
@@ -640,6 +717,200 @@ async fn apply_captures_canonical_runtime_environment_in_the_bounded_observation
         assert!(!environment_debug.contains(sensitive));
         assert!(!evidence_debug.contains(sensitive));
     }
+}
+
+#[tokio::test]
+async fn cancel_lifecycle_captures_full_runtime_environment_with_write_lifetime() {
+    let mut snapshot = apply_snapshot(
+        Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES | Permissions::MANAGE_CHANNELS,
+    );
+    snapshot.authority.roles.push(DiscordRoleSnapshotV1 {
+        role_id: RoleId(13),
+        permissions: Permissions::SEND_MESSAGES,
+        position: 19,
+        managed: false,
+    });
+    snapshot.bot_member_role_ids = vec![RoleId(13), RoleId(12)];
+    let client = runtime_client(Ok(snapshot));
+    let authority_calls = client.authority_calls.clone();
+    let apply_calls = client.apply_calls.clone();
+    let evidence = capture_cancellation_evidence(&runtime_adapter(client))
+        .await
+        .unwrap();
+    let environment = evidence.runtime_environment().unwrap();
+    assert_eq!(evidence.capability(), CapabilityV1::CancelLifecycle);
+    assert_eq!(
+        evidence.expires_at() - evidence.observed_at(),
+        chrono::Duration::seconds(5)
+    );
+    assert_eq!(evidence.apply_runtime_environment(), Some(environment));
+    assert_eq!(environment.guild_id(), GuildId(10));
+    assert_eq!(environment.bot_user_id(), bot_id());
+    assert_eq!(environment.bot_role_ids(), &[RoleId(12), RoleId(13)]);
+    assert_eq!(environment.guild_role_permissions().len(), 4);
+    let bot_role = environment.guild_roles().get(&RoleId(12)).unwrap();
+    assert_eq!(bot_role.position, 20);
+    assert!(bot_role.managed);
+    assert_eq!(
+        environment
+            .guild_role_permissions()
+            .get(&RoleId(12))
+            .copied(),
+        Some(Permissions::VIEW_CHANNEL | Permissions::MANAGE_ROLES | Permissions::MANAGE_CHANNELS)
+    );
+    assert_eq!(*authority_calls.lock().unwrap(), 0);
+    assert_eq!(*apply_calls.lock().unwrap(), 1);
+    assert_eq!(
+        evidence.observation_digest(),
+        "79b4ee87069a5a135f125e1bba24469faa2b62f28df94d7a3aa69bc5604b90b4"
+    );
+}
+
+#[tokio::test]
+async fn cancel_lifecycle_and_apply_use_distinct_authority_digest_domains() {
+    let snapshot = apply_snapshot(Permissions::MANAGE_ROLES);
+    let apply = capture_apply_evidence(&runtime_adapter(runtime_client(Ok(snapshot.clone()))))
+        .await
+        .unwrap();
+    let cancellation =
+        capture_cancellation_evidence(&runtime_adapter(runtime_client(Ok(snapshot))))
+            .await
+            .unwrap();
+    assert_ne!(
+        cancellation.observation_digest(),
+        apply.observation_digest()
+    );
+}
+
+#[tokio::test]
+async fn cancel_lifecycle_digest_binds_permissions_hierarchy_and_managed_state() {
+    let original = apply_snapshot(Permissions::MANAGE_ROLES);
+    let mut permissions = original.clone();
+    permissions
+        .authority
+        .roles
+        .iter_mut()
+        .find(|role| role.role_id == RoleId(12))
+        .unwrap()
+        .permissions = Permissions::MANAGE_CHANNELS;
+    let mut hierarchy = original.clone();
+    hierarchy
+        .authority
+        .roles
+        .iter_mut()
+        .find(|role| role.role_id == RoleId(12))
+        .unwrap()
+        .position = 21;
+    let mut managed = original.clone();
+    managed
+        .authority
+        .roles
+        .iter_mut()
+        .find(|role| role.role_id == RoleId(12))
+        .unwrap()
+        .managed = false;
+    let original = capture_cancellation_evidence(&runtime_adapter(runtime_client(Ok(original))))
+        .await
+        .unwrap();
+    for changed in [permissions, hierarchy, managed] {
+        let changed = capture_cancellation_evidence(&runtime_adapter(runtime_client(Ok(changed))))
+            .await
+            .unwrap();
+        assert_ne!(original.observation_digest(), changed.observation_digest());
+    }
+}
+
+#[tokio::test]
+async fn cancel_lifecycle_never_falls_back_to_the_weaker_authority_snapshot() {
+    let client = runtime_client(Err(DiscordAuthorityClientError::Unavailable));
+    let authority_calls = client.authority_calls.clone();
+    let apply_calls = client.apply_calls.clone();
+    let error = capture_cancellation_evidence(&runtime_adapter(client))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        ProductApplicationError::FreshAuthority(FreshGuildAuthorityError::Backend(
+            "discord_authority_unavailable".to_string()
+        ))
+    );
+    assert_eq!(*authority_calls.lock().unwrap(), 0);
+    assert_eq!(*apply_calls.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn cancel_lifecycle_runtime_identity_and_snapshot_fail_closed() {
+    let mut missing_identity = runtime_client(Ok(apply_snapshot(Permissions::MANAGE_ROLES)));
+    missing_identity.bot_user_id = None;
+    let missing_identity_error = capture_cancellation_evidence(&runtime_adapter(missing_identity))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        missing_identity_error,
+        ProductApplicationError::FreshAuthority(FreshGuildAuthorityError::Backend(
+            "discord_apply_bot_identity_unavailable".to_string()
+        ))
+    );
+
+    let mut mismatched_identity = apply_snapshot(Permissions::MANAGE_ROLES);
+    mismatched_identity.bot_member_user_id = UserId(778);
+    let mismatch_error =
+        capture_cancellation_evidence(&runtime_adapter(runtime_client(Ok(mismatched_identity))))
+            .await
+            .unwrap_err();
+    assert_eq!(
+        mismatch_error,
+        ProductApplicationError::FreshAuthority(FreshGuildAuthorityError::ScopeMismatch)
+    );
+
+    let mut invalid_member = apply_snapshot(Permissions::MANAGE_ROLES);
+    invalid_member.bot_member_pending = true;
+    let invalid_member_error =
+        capture_cancellation_evidence(&runtime_adapter(runtime_client(Ok(invalid_member))))
+            .await
+            .unwrap_err();
+    assert_eq!(
+        invalid_member_error,
+        ProductApplicationError::FreshAuthority(FreshGuildAuthorityError::Backend(
+            "discord_apply_bot_member_invalid".to_string()
+        ))
+    );
+
+    let mut duplicate_roles = apply_snapshot(Permissions::MANAGE_ROLES);
+    duplicate_roles.bot_member_role_ids = vec![RoleId(12), RoleId(12)];
+    let duplicate_roles_error =
+        capture_cancellation_evidence(&runtime_adapter(runtime_client(Ok(duplicate_roles))))
+            .await
+            .unwrap_err();
+    assert_eq!(
+        duplicate_roles_error,
+        ProductApplicationError::FreshAuthority(FreshGuildAuthorityError::Backend(
+            "discord_authority_duplicate_member_role".to_string()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn cancel_lifecycle_write_window_starts_before_the_discord_fetch() {
+    let started_at = Utc.with_ymd_and_hms(2026, 7, 19, 0, 0, 0).unwrap();
+    let completed_at = started_at + chrono::Duration::seconds(5);
+    let client = runtime_client(Ok(apply_snapshot(Permissions::MANAGE_ROLES)));
+    let apply_calls = client.apply_calls.clone();
+    let adapter = DiscordGuildAuthorityAdapter::with_clock(
+        Source {
+            result: Ok(record()),
+            calls: Arc::new(Mutex::new(0)),
+        },
+        client,
+        SequenceClock::new([started_at, completed_at]),
+        DiscordAuthorityConfigV1::default(),
+    );
+    let error = capture_cancellation_evidence(&adapter).await.unwrap_err();
+    assert_eq!(
+        error,
+        ProductApplicationError::FreshAuthority(FreshGuildAuthorityError::Stale)
+    );
+    assert_eq!(*apply_calls.lock().unwrap(), 1);
 }
 
 #[tokio::test]

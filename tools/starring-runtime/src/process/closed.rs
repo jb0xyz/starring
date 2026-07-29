@@ -15,11 +15,9 @@ use crate::{
 };
 
 use super::connected::{
-    discord_transition_failure_v1, finish_paused_connected_shutdown_v1,
-    map_discord_shutdown_failure_v1, map_discord_transition_exit_v1,
-    RuntimeProcessPausedConnectedTransitionFailureV1,
+    discord_transition_failure_v1, map_discord_transition_exit_v1,
+    shutdown_paused_foundation_owner_v1, RuntimeProcessPausedConnectedTransitionFailureV1,
 };
-use super::owner::finish_runtime_owner_held_process_shutdown_v1;
 use super::recovery::RuntimeRecoveryPendingProcessV2;
 use super::RuntimeProcessFoundationV1;
 
@@ -268,10 +266,17 @@ impl RuntimeRecoveryPendingProcessV2 {
         }
         let commit_cutoff = pending.commit_cutoff_v2();
         let commit = pending.commit_owner_in_place_v2();
-        let discord_terminal =
-            async { map_discord_transition_exit_v1(discord.wait_terminal().await.exit()) };
+        let discord_terminal = async {
+            let transition = map_discord_transition_exit_v1(discord.wait_terminal().await.exit());
+            foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::DiscordTerminal);
+            transition
+        };
+        let mut shutdown = foundation.shutdown_observer_v1();
         let committed =
-            await_closed_recovery_commit_v2(commit_cutoff, commit, discord_terminal).await;
+            await_closed_recovery_commit_v2(commit_cutoff, commit, discord_terminal, async move {
+                shutdown.wait().await
+            })
+            .await;
         if let Err(transition) = committed {
             let cleanup = shutdown_pending_commit_v2(foundation, discord, pending).await;
             return Err(finish_closed_transition_v2(transition, cleanup));
@@ -293,6 +298,7 @@ impl RuntimeRecoveryPendingProcessV2 {
             .map_err(RuntimeProcessClosedRecoveryCommitFailureV2::from)
             .map_err(RuntimeProcessClosedRecoveryTransitionFailureV2::Commit);
         let final_transition = if let Some(error) = discord_transition_failure_v1(&discord) {
+            foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::DiscordTerminal);
             Some(RuntimeProcessClosedRecoveryTransitionFailureV2::PausedConnection(error))
         } else if !foundation.startup_budget.operation_is_open() {
             Some(RuntimeProcessClosedRecoveryTransitionFailureV2::OperationDeadlineElapsed)
@@ -326,6 +332,7 @@ fn require_current_recovery_pending_v2(
         return Err(RuntimeProcessClosedRecoveryTransitionFailureV2::OperationDeadlineElapsed);
     }
     if let Some(error) = discord_transition_failure_v1(discord) {
+        foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::DiscordTerminal);
         return Err(RuntimeProcessClosedRecoveryTransitionFailureV2::PausedConnection(error));
     }
     pending
@@ -333,6 +340,7 @@ fn require_current_recovery_pending_v2(
         .map_err(crate::RuntimeProcessClosedRecoveryBeginFailureV2::from)
         .map_err(RuntimeProcessClosedRecoveryTransitionFailureV2::Pending)?;
     if let Some(error) = discord_transition_failure_v1(discord) {
+        foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::DiscordTerminal);
         return Err(RuntimeProcessClosedRecoveryTransitionFailureV2::PausedConnection(error));
     }
     if !foundation.startup_budget.operation_is_open() {
@@ -341,14 +349,16 @@ fn require_current_recovery_pending_v2(
     Ok(())
 }
 
-async fn await_closed_recovery_commit_v2<Commit, DiscordTerminal>(
+async fn await_closed_recovery_commit_v2<Commit, DiscordTerminal, Shutdown>(
     commit_cutoff: Instant,
     commit: Commit,
     discord_terminal: DiscordTerminal,
+    shutdown: Shutdown,
 ) -> Result<(), RuntimeProcessClosedRecoveryTransitionFailureV2>
 where
     Commit: Future<Output = Result<(), RuntimeClosedRecoveryCommitErrorV2>>,
     DiscordTerminal: Future<Output = RuntimeProcessPausedConnectedTransitionFailureV1>,
+    Shutdown: Future<Output = crate::RuntimeShutdownObservationV1>,
 {
     let deadline_failure = RuntimeProcessClosedRecoveryTransitionFailureV2::Commit(
         RuntimeProcessClosedRecoveryCommitFailureV2::DeadlineElapsed,
@@ -358,8 +368,16 @@ where
     }
     tokio::pin!(commit);
     tokio::pin!(discord_terminal);
+    tokio::pin!(shutdown);
     tokio::select! {
         biased;
+        observation = &mut shutdown => {
+            Err(RuntimeProcessClosedRecoveryTransitionFailureV2::PausedConnection(
+                RuntimeProcessPausedConnectedTransitionFailureV1::ProcessShutdown(
+                    observation.cause(),
+                ),
+            ))
+        }
         _ = sleep_until(TokioInstant::from_std(commit_cutoff)) => Err(deadline_failure),
         transition = &mut discord_terminal => {
             Err(RuntimeProcessClosedRecoveryTransitionFailureV2::PausedConnection(transition))
@@ -377,19 +395,10 @@ async fn shutdown_pending_commit_v2(
     discord: RuntimeDiscordGatewaySupervisorV1,
     pending: RuntimeClosedRecoveryPendingPhaseV2,
 ) -> Result<(), RuntimePausedConnectedProcessShutdownErrorV1> {
-    let discord_shutdown = discord
-        .shutdown_until(
-            foundation.gateway.begin_discord_drain_v1(),
-            foundation.startup_budget.discord_cleanup_deadline(),
-        )
-        .await
-        .map_err(map_discord_shutdown_failure_v1);
-    let owner = pending
-        .abort_and_shutdown_until_v2(foundation.startup_budget.owner_cleanup_deadline())
-        .await;
-    let database = foundation.shutdown().await;
-    let owner_held = finish_runtime_owner_held_process_shutdown_v1(owner, database);
-    finish_paused_connected_shutdown_v1(discord_shutdown, owner_held)
+    shutdown_paused_foundation_owner_v1(foundation, discord, move |deadline| {
+        pending.abort_and_shutdown_until_v2(deadline)
+    })
+    .await
 }
 
 pub(super) async fn shutdown_committed_recovery_v2(
@@ -397,19 +406,10 @@ pub(super) async fn shutdown_committed_recovery_v2(
     discord: RuntimeDiscordGatewaySupervisorV1,
     session: RuntimeClosedRecoverySessionV2,
 ) -> Result<(), RuntimePausedConnectedProcessShutdownErrorV1> {
-    let discord_shutdown = discord
-        .shutdown_until(
-            foundation.gateway.begin_discord_drain_v1(),
-            foundation.startup_budget.discord_cleanup_deadline(),
-        )
-        .await
-        .map_err(map_discord_shutdown_failure_v1);
-    let owner = session
-        .abort_and_shutdown_until_v2(foundation.startup_budget.owner_cleanup_deadline())
-        .await;
-    let database = foundation.shutdown().await;
-    let owner_held = finish_runtime_owner_held_process_shutdown_v1(owner, database);
-    finish_paused_connected_shutdown_v1(discord_shutdown, owner_held)
+    shutdown_paused_foundation_owner_v1(foundation, discord, move |deadline| {
+        session.abort_and_shutdown_until_v2(deadline)
+    })
+    .await
 }
 
 fn finish_closed_transition_v2(
@@ -496,6 +496,7 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             ready(Ok(())),
             ready(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated),
+            pending(),
         )
         .await;
 
@@ -515,6 +516,7 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
             ready(Ok(())),
             pending(),
+            pending(),
         )
         .await;
 
@@ -528,6 +530,7 @@ mod tests {
             ready(Err(RuntimeClosedRecoveryCommitErrorV2::Owner(
                 RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::SupervisorUnavailable,
             ))),
+            pending(),
             pending(),
         )
         .await;
@@ -556,6 +559,7 @@ mod tests {
                     panic!("elapsed Discord future must not be polled")
                 },
             ),
+            pending(),
         )
         .await;
 

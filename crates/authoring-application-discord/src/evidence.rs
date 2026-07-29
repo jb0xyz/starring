@@ -245,6 +245,10 @@ impl FreshDiscordAuthorityEvidenceV1 {
     }
 
     pub fn apply_runtime_environment(&self) -> Option<&DiscordApplyRuntimeEnvironmentV1> {
+        self.runtime_environment()
+    }
+
+    pub fn runtime_environment(&self) -> Option<&DiscordApplyRuntimeEnvironmentV1> {
         self.apply_runtime_environment.as_ref()
     }
 

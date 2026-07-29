@@ -102,13 +102,15 @@ async fn private_issuer_core_persists_only_an_opaque_verified_projection() {
         .connect(&database_url)
         .await
         .unwrap();
+    let mut setup_connection = setup_pool.acquire().await.unwrap();
     let current_database = sqlx::query_scalar::<_, String>("SELECT pg_catalog.current_database()")
-        .fetch_one(&setup_pool)
+        .fetch_one(&mut *setup_connection)
         .await
         .unwrap();
     assert_test_database_name(&current_database);
     assert_eq!(current_database, expected_database);
-    MIGRATOR.run(&setup_pool).await.unwrap();
+    MIGRATOR.run_direct(&mut *setup_connection).await.unwrap();
+    drop(setup_connection);
     sqlx::query("CREATE SCHEMA IF NOT EXISTS authoring_identity_shadow")
         .execute(&setup_pool)
         .await

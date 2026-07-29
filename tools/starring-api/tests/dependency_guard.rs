@@ -374,7 +374,7 @@ fn executable_is_pinned_to_the_lifecycle_gated_operational_router() {
     let sources = source_files();
     let main = source_named(&sources, "main.rs");
     for required in [
-        "product_control_router_with_operational_v2_and_readiness_gate",
+        "product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate",
         "ProductApiReadinessGate",
         "initially_unready",
         "serve_verified_loopback_with_runtime_readiness",
@@ -385,6 +385,7 @@ fn executable_is_pinned_to_the_lifecycle_gated_operational_router() {
         "product_control_router",
         "product_control_router_with_readiness_gate",
         "product_control_router_with_operational_v2",
+        "product_control_router_with_operational_v2_and_readiness_gate",
         "serve_verified_loopback",
     ] {
         assert!(
@@ -430,10 +431,15 @@ fn edge_contract_keeps_typed_inputs_closed_errors_and_v2_projection() {
         "MappedApproveCommand",
         "MappedRejectCommand",
         "MappedApplyCommand",
+        "MappedLifecycleCancellationCommand",
+        "map_lifecycle_cancellation_command",
         "map_authoring_application_error",
         "map_product_application_error",
         "ProductControlPortError::RuntimeDrainRequired",
+        "ProductControlPortError::RuntimeDrainPending",
+        "ProductControlPortError::LifecycleCancelled",
         "project_promotion",
+        "project_lifecycle_cancellation",
         "project_deployment_operational_v2",
         "system_time_to_utc",
     ] {

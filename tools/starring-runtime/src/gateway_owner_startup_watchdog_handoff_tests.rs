@@ -3,7 +3,6 @@ use std::future::{ready, Future};
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use automation_runtime_controller::{
@@ -18,11 +17,13 @@ use automation_runtime_controller::{
     RuntimeStartupServingStateV2,
 };
 use automation_runtime_convergence::{ProcessInstanceId, RuntimeDeploymentTargetV1};
+use automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1 as PendingDrainPersistenceErrorV1;
 use automation_runtime_worker::{
     accept_gateway_owner_acquire_v1, accept_runtime_registry_recovery_empty_observation_v2,
     RuntimeAcceptedGatewayOwnerAcquireV1, RuntimeAcceptedGatewayOwnerReceiptV1,
     RuntimeAcceptedPendingDrainSelectionV2, RuntimeAuthorizedPendingDrainAcknowledgementV2,
-    RuntimeAuthorizedPendingDrainClaimV2, RuntimeAuthorizedPendingDrainSelectionV2,
+    RuntimeAuthorizedPendingDrainClaimV2, RuntimeAuthorizedPendingDrainSelectionV3,
+    RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3,
     RuntimeAuthorizedStartupRecoveryExecutionV2, RuntimeAuthorizedStartupRecoveryObservationV2,
     RuntimeCapabilityReadinessKindV2, RuntimeCapabilityReadinessReceiptV2,
     RuntimeCapabilityReadinessSetV2, RuntimeClosedDrainRecoveryPermitV2,
@@ -33,10 +34,13 @@ use automation_runtime_worker::{
     RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
     RuntimePendingDrainAcknowledgementReceiptV2, RuntimePendingDrainCandidateV2,
     RuntimePendingDrainClaimReceiptV2, RuntimePendingDrainNoCandidateReceiptV2,
-    RuntimePendingDrainSelectionOutcomeV2, RuntimePendingDrainSelectionReceiptV2,
-    RuntimePendingDrainStateDigestV2, RuntimeRegistryGlobalObservationSequenceV2,
-    RuntimeRegistryRecoveryObservationInputV2, RuntimeSelectedPendingDrainNoCandidateV2,
-    RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
+    RuntimePendingDrainPreviousOwnerClaimedCandidateV3, RuntimePendingDrainRegistrySealWitnessV2,
+    RuntimePendingDrainSelectionOutcomeV2, RuntimePendingDrainSelectionOutcomeV3,
+    RuntimePendingDrainSelectionReceiptV2, RuntimePendingDrainSelectionReceiptV3,
+    RuntimePendingDrainStateDigestV2, RuntimePendingDrainSuccessionAcknowledgementReceiptV3,
+    RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryObservationInputV2,
+    RuntimeSelectedPendingDrainNoCandidateV2, RuntimeStartupRecoveryClassV2,
+    RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryExecutionActionIdentityV2,
     RuntimeStartupRecoveryExecutionReceiptOutcomeV2, RuntimeStartupRecoveryExecutionReceiptV2,
     RuntimeStartupRecoveryExecutionTerminalDigestV2, RuntimeStartupRecoveryObservationPortV2,
 };
@@ -64,6 +68,7 @@ enum FakeObservationStepV1 {
 enum FakeRenewStepV1 {
     Renewed,
     OwnershipLost,
+    OutcomeUnknown,
     BlockedDefinitelyNotApplied(Arc<Notify>),
     Blocked(Arc<Notify>),
 }
@@ -127,18 +132,6 @@ impl FakePortV1 {
         self.state.maximum_active_operations.load(Ordering::Acquire)
     }
 
-    fn active_operations(&self) -> usize {
-        self.state.active_operations.load(Ordering::Acquire)
-    }
-
-    fn block_release(&self, gate: Arc<Notify>) {
-        *self
-            .state
-            .release_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
-    }
-
     fn block_next_observation(&self, gate: Arc<Notify>) {
         *self
             .state
@@ -178,20 +171,6 @@ enum StartupObservationFixtureOutcomeV2 {
 struct PendingStartupObservationGuardV2 {
     active: Arc<AtomicUsize>,
     dropped: Arc<AtomicUsize>,
-}
-
-struct WakeCounterV1 {
-    wakes: AtomicUsize,
-}
-
-impl Wake for WakeCounterV1 {
-    fn wake(self: Arc<Self>) {
-        self.wakes.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.wakes.fetch_add(1, Ordering::AcqRel);
-    }
 }
 
 impl FakeOperationGuardV1 {
@@ -357,6 +336,11 @@ impl RuntimeGatewayOwnerLeasePortV1 for FakePortV1 {
                         },
                     ))
                 }
+                FakeRenewStepV1::OutcomeUnknown => {
+                    Err(RuntimeGatewayOwnerMutationErrorV1::OutcomeUnknown {
+                        source: FakeErrorV1::Retryable,
+                    })
+                }
                 FakeRenewStepV1::BlockedDefinitelyNotApplied(gate) => {
                     gate.notified().await;
                     Err(RuntimeGatewayOwnerMutationErrorV1::DefinitelyNotApplied {
@@ -462,9 +446,19 @@ fn lease_id() -> RuntimeGatewayOwnerLeaseIdV1 {
 }
 
 fn receipt(lease_for: Duration) -> RuntimeGatewayOwnerLeaseReceiptV1 {
+    receipt_with_epoch(lease_for, NonZeroU64::new(1).unwrap())
+}
+
+fn receipt_with_epoch(
+    lease_for: Duration,
+    lease_epoch: NonZeroU64,
+) -> RuntimeGatewayOwnerLeaseReceiptV1 {
     let database_now = at_millis(1_000_000);
     RuntimeGatewayOwnerLeaseReceiptV1 {
-        lease_id: lease_id(),
+        lease_id: RuntimeGatewayOwnerLeaseIdV1 {
+            lease_epoch,
+            ..lease_id()
+        },
         owner_revision: NonZeroU64::new(3).unwrap(),
         database_now,
         expires_at: database_now + TimeDelta::from_std(lease_for).unwrap(),
@@ -671,53 +665,162 @@ enum PendingDrainTestStageV2 {
     NoCandidate,
     Claim,
     Acknowledgement,
+    Succession,
 }
 
 #[derive(Clone, Copy)]
 enum PendingDrainTestSelectionV2 {
-    Candidate,
+    Unclaimed,
     NoCandidate,
+    FreshPreviousOwner,
+    ExpiredPreviousOwner,
 }
 
 #[derive(Clone, Copy)]
 enum PendingDrainTestAwaitFailureV2 {
     Transition(crate::process::RuntimeProcessStartupRecoveryLoopFailureV2),
-    Database(automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1),
+    Database(PendingDrainPersistenceErrorV1),
+}
+
+#[derive(PartialEq, Eq)]
+enum PendingDrainTestMutationFingerprintV2 {
+    NoCandidate {
+        authorization_address: usize,
+        request_address: usize,
+        action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2,
+    },
+    Claim {
+        authorization_address: usize,
+        request_address: usize,
+        action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2,
+        candidate: RuntimePendingDrainCandidateV2,
+        seal: RuntimePendingDrainRegistrySealWitnessV2,
+        minimum_database_now: DateTime<Utc>,
+    },
+    Acknowledgement {
+        authorization_address: usize,
+        request_address: usize,
+        action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2,
+        claim_action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2,
+        candidate: RuntimePendingDrainCandidateV2,
+        seal: RuntimePendingDrainRegistrySealWitnessV2,
+        claim_terminal_digest: [u8; 32],
+        claimed_intent_revision: NonZeroU64,
+        claimed_state_digest: [u8; 32],
+        minimum_database_now: DateTime<Utc>,
+    },
+    Succession {
+        authorization_address: usize,
+        request_address: usize,
+        action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2,
+        candidate: Box<RuntimePendingDrainPreviousOwnerClaimedCandidateV3>,
+        seal: RuntimePendingDrainRegistrySealWitnessV2,
+        minimum_database_now: DateTime<Utc>,
+    },
+}
+
+impl PendingDrainTestMutationFingerprintV2 {
+    fn stage(&self) -> PendingDrainTestStageV2 {
+        match self {
+            Self::NoCandidate { .. } => PendingDrainTestStageV2::NoCandidate,
+            Self::Claim { .. } => PendingDrainTestStageV2::Claim,
+            Self::Acknowledgement { .. } => PendingDrainTestStageV2::Acknowledgement,
+            Self::Succession { .. } => PendingDrainTestStageV2::Succession,
+        }
+    }
 }
 
 struct FakePendingDrainRecoveryEnvironmentV2 {
     selection: PendingDrainTestSelectionV2,
-    failure: Option<(PendingDrainTestStageV2, PendingDrainTestAwaitFailureV2)>,
+    failures: VecDeque<(PendingDrainTestStageV2, PendingDrainTestAwaitFailureV2)>,
+    transition_after: Option<(
+        PendingDrainTestStageV2,
+        usize,
+        crate::process::RuntimeProcessStartupRecoveryLoopFailureV2,
+    )>,
+    session_invalidation_after: Option<(PendingDrainTestStageV2, usize)>,
+    succession_revision_delta: u64,
     events: Vec<PendingDrainTestStageV2>,
+    mutation_fingerprints: Vec<PendingDrainTestMutationFingerprintV2>,
 }
 
 impl FakePendingDrainRecoveryEnvironmentV2 {
-    fn candidate() -> Self {
+    fn new(selection: PendingDrainTestSelectionV2) -> Self {
         Self {
-            selection: PendingDrainTestSelectionV2::Candidate,
-            failure: None,
+            selection,
+            failures: VecDeque::new(),
+            transition_after: None,
+            session_invalidation_after: None,
+            succession_revision_delta: 1,
             events: Vec::new(),
+            mutation_fingerprints: Vec::new(),
         }
+    }
+
+    fn candidate() -> Self {
+        Self::new(PendingDrainTestSelectionV2::Unclaimed)
     }
 
     fn no_candidate() -> Self {
-        Self {
-            selection: PendingDrainTestSelectionV2::NoCandidate,
-            failure: None,
-            events: Vec::new(),
-        }
+        Self::new(PendingDrainTestSelectionV2::NoCandidate)
+    }
+
+    fn fresh_previous_owner() -> Self {
+        Self::new(PendingDrainTestSelectionV2::FreshPreviousOwner)
+    }
+
+    fn expired_previous_owner() -> Self {
+        Self::new(PendingDrainTestSelectionV2::ExpiredPreviousOwner)
     }
 
     fn failing(stage: PendingDrainTestStageV2, failure: PendingDrainTestAwaitFailureV2) -> Self {
-        Self {
-            selection: if stage == PendingDrainTestStageV2::NoCandidate {
-                PendingDrainTestSelectionV2::NoCandidate
-            } else {
-                PendingDrainTestSelectionV2::Candidate
-            },
-            failure: Some((stage, failure)),
-            events: Vec::new(),
-        }
+        Self::failing_sequence([(stage, failure)])
+    }
+
+    fn failing_sequence(
+        failures: impl IntoIterator<Item = (PendingDrainTestStageV2, PendingDrainTestAwaitFailureV2)>,
+    ) -> Self {
+        let failures: VecDeque<_> = failures.into_iter().collect();
+        let selection = if failures
+            .iter()
+            .any(|(stage, _)| *stage == PendingDrainTestStageV2::NoCandidate)
+        {
+            PendingDrainTestSelectionV2::NoCandidate
+        } else if failures
+            .iter()
+            .any(|(stage, _)| *stage == PendingDrainTestStageV2::Succession)
+        {
+            PendingDrainTestSelectionV2::ExpiredPreviousOwner
+        } else {
+            PendingDrainTestSelectionV2::Unclaimed
+        };
+        let mut environment = Self::new(selection);
+        environment.failures = failures;
+        environment
+    }
+
+    fn with_transition_after(
+        mut self,
+        stage: PendingDrainTestStageV2,
+        invocation_count: usize,
+        transition: crate::process::RuntimeProcessStartupRecoveryLoopFailureV2,
+    ) -> Self {
+        self.transition_after = Some((stage, invocation_count, transition));
+        self
+    }
+
+    fn with_session_invalidation_after(
+        mut self,
+        stage: PendingDrainTestStageV2,
+        invocation_count: usize,
+    ) -> Self {
+        self.session_invalidation_after = Some((stage, invocation_count));
+        self
+    }
+
+    fn with_succession_revision_delta(mut self, delta: u64) -> Self {
+        self.succession_revision_delta = delta;
+        self
     }
 
     fn finish_stage_v2<T>(
@@ -727,23 +830,24 @@ impl FakePendingDrainRecoveryEnvironmentV2 {
     ) -> Result<
         T,
         crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
-            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+            PendingDrainPersistenceErrorV1,
         >,
     > {
         self.events.push(stage);
-        match self.failure {
-            Some((failed_stage, PendingDrainTestAwaitFailureV2::Transition(error)))
-                if failed_stage == stage =>
-            {
-                Err(
-                    crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2::Transition(
-                        error,
-                    ),
-                )
-            }
-            Some((failed_stage, PendingDrainTestAwaitFailureV2::Database(error)))
-                if failed_stage == stage =>
-            {
+        let failure = self
+            .failures
+            .front()
+            .copied()
+            .filter(|(failed_stage, _)| *failed_stage == stage)
+            .map(|(_, failure)| {
+                self.failures.pop_front();
+                failure
+            });
+        match failure {
+            Some(PendingDrainTestAwaitFailureV2::Transition(error)) => Err(
+                crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2::Transition(error),
+            ),
+            Some(PendingDrainTestAwaitFailureV2::Database(error)) => {
                 Err(crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(error))
             }
             _ => Ok(value),
@@ -763,30 +867,55 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
 {
     fn current_transition_v2(
         &self,
-        _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
     ) -> Option<crate::process::RuntimeProcessStartupRecoveryLoopFailureV2> {
-        None
+        if self
+            .session_invalidation_after
+            .is_some_and(|(stage, invocation_count)| {
+                self.events.iter().filter(|event| **event == stage).count() >= invocation_count
+            })
+        {
+            session.invalidate_startup_recovery_execution_v2();
+        }
+        self.transition_after
+            .filter(|(stage, invocation_count, _)| {
+                self.events.iter().filter(|event| **event == *stage).count() >= *invocation_count
+            })
+            .map(|(_, _, transition)| transition)
     }
 
-    async fn select_pending_drain_v2(
+    async fn select_pending_drain_v3(
         &mut self,
         _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
-        authorization: &RuntimeAuthorizedPendingDrainSelectionV2,
+        authorization: &RuntimeAuthorizedPendingDrainSelectionV3,
     ) -> Result<
-        RuntimePendingDrainSelectionReceiptV2,
+        RuntimePendingDrainSelectionReceiptV3,
         crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
-            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+            PendingDrainPersistenceErrorV1,
         >,
     > {
         let outcome = match self.selection {
-            PendingDrainTestSelectionV2::Candidate => {
-                RuntimePendingDrainSelectionOutcomeV2::Candidate(pending_drain_candidate_v2())
+            PendingDrainTestSelectionV2::Unclaimed => {
+                RuntimePendingDrainSelectionOutcomeV3::Unclaimed(pending_drain_candidate_v2())
             }
             PendingDrainTestSelectionV2::NoCandidate => {
-                RuntimePendingDrainSelectionOutcomeV2::NoCandidate
+                RuntimePendingDrainSelectionOutcomeV3::NoCandidate
+            }
+            PendingDrainTestSelectionV2::FreshPreviousOwner => {
+                RuntimePendingDrainSelectionOutcomeV3::FreshPreviousOwner(
+                    crate::registry::succession_tests::candidate_with_claim_expiry(
+                        1,
+                        pending_drain_test_database_now_v2(authorization.request(), 500),
+                    ),
+                )
+            }
+            PendingDrainTestSelectionV2::ExpiredPreviousOwner => {
+                RuntimePendingDrainSelectionOutcomeV3::ExpiredPreviousOwner(
+                    crate::registry::succession_tests::candidate(1),
+                )
             }
         };
-        let receipt = RuntimePendingDrainSelectionReceiptV2::new(
+        let receipt = RuntimePendingDrainSelectionReceiptV3::new(
             authorization.request().correlation().clone(),
             pending_drain_owner_receipt_v2(
                 authorization.request(),
@@ -804,9 +933,15 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
     ) -> Result<
         RuntimePendingDrainNoCandidateReceiptV2,
         crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
-            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+            PendingDrainPersistenceErrorV1,
         >,
     > {
+        self.mutation_fingerprints
+            .push(PendingDrainTestMutationFingerprintV2::NoCandidate {
+                authorization_address: std::ptr::from_ref(selection).addr(),
+                request_address: std::ptr::from_ref(selection.request()).addr(),
+                action_identity: selection.request().action_identity().clone(),
+            });
         let receipt = RuntimePendingDrainNoCandidateReceiptV2::new(
             selection.request().action_identity().clone(),
             RuntimeStartupRecoveryExecutionTerminalDigestV2::new([46; 32]).unwrap(),
@@ -825,9 +960,18 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
     ) -> Result<
         RuntimePendingDrainClaimReceiptV2,
         crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
-            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+            PendingDrainPersistenceErrorV1,
         >,
     > {
+        self.mutation_fingerprints
+            .push(PendingDrainTestMutationFingerprintV2::Claim {
+                authorization_address: std::ptr::from_ref(authorization).addr(),
+                request_address: std::ptr::from_ref(authorization.request()).addr(),
+                action_identity: authorization.action_identity().clone(),
+                candidate: authorization.candidate().clone(),
+                seal: authorization.seal().clone(),
+                minimum_database_now: authorization.minimum_database_now(),
+            });
         let receipt = RuntimePendingDrainClaimReceiptV2::new(
             authorization.action_identity().clone(),
             authorization.candidate().clone(),
@@ -850,9 +994,22 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
     ) -> Result<
         RuntimePendingDrainAcknowledgementReceiptV2,
         crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
-            automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
+            PendingDrainPersistenceErrorV1,
         >,
     > {
+        self.mutation_fingerprints
+            .push(PendingDrainTestMutationFingerprintV2::Acknowledgement {
+                authorization_address: std::ptr::from_ref(authorization).addr(),
+                request_address: std::ptr::from_ref(authorization.request()).addr(),
+                action_identity: authorization.action_identity().clone(),
+                claim_action_identity: authorization.request().action_identity().clone(),
+                candidate: authorization.candidate().clone(),
+                seal: authorization.seal().clone(),
+                claim_terminal_digest: *authorization.claim_terminal_digest().as_bytes(),
+                claimed_intent_revision: authorization.claimed_intent_revision(),
+                claimed_state_digest: *authorization.claimed_state_digest().as_bytes(),
+                minimum_database_now: authorization.minimum_database_now(),
+            });
         let receipt = RuntimePendingDrainAcknowledgementReceiptV2::new(
             authorization.action_identity().clone(),
             authorization.request().action_identity().clone(),
@@ -870,6 +1027,129 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
             ),
         );
         self.finish_stage_v2(PendingDrainTestStageV2::Acknowledgement, receipt)
+    }
+
+    async fn execute_pending_drain_succession_v3(
+        &mut self,
+        _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        authorization: &RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3,
+    ) -> Result<
+        RuntimePendingDrainSuccessionAcknowledgementReceiptV3,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            PendingDrainPersistenceErrorV1,
+        >,
+    > {
+        self.mutation_fingerprints
+            .push(PendingDrainTestMutationFingerprintV2::Succession {
+                authorization_address: std::ptr::from_ref(authorization).addr(),
+                request_address: std::ptr::from_ref(authorization.request()).addr(),
+                action_identity: authorization.action_identity().clone(),
+                candidate: Box::new(authorization.candidate().clone()),
+                seal: authorization.seal().clone(),
+                minimum_database_now: authorization.minimum_database_now(),
+            });
+        let receipt = RuntimePendingDrainSuccessionAcknowledgementReceiptV3::new(
+            authorization.action_identity().clone(),
+            authorization.candidate().clone(),
+            authorization.seal().clone(),
+            NonZeroU64::new(
+                authorization.candidate().source_intent_revision().get()
+                    + self.succession_revision_delta,
+            )
+            .unwrap(),
+            RuntimePendingDrainStateDigestV2::new([47; 32]).unwrap(),
+            RuntimeStartupRecoveryExecutionTerminalDigestV2::new([48; 32]).unwrap(),
+            pending_drain_owner_receipt_v2(
+                authorization.request(),
+                pending_drain_test_database_now_v2(authorization.request(), 2),
+            ),
+        );
+        self.finish_stage_v2(PendingDrainTestStageV2::Succession, receipt)
+    }
+}
+
+impl crate::process::RuntimePendingDrainMutationEnvironmentV3
+    for FakePendingDrainRecoveryEnvironmentV2
+{
+    fn current_transition_v3(
+        &self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+    ) -> Option<crate::process::RuntimeProcessStartupRecoveryLoopFailureV2> {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::current_transition_v2(
+            self, session,
+        )
+    }
+
+    async fn record_no_candidate_v3(
+        &mut self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        selection: &RuntimeSelectedPendingDrainNoCandidateV2,
+    ) -> Result<
+        RuntimePendingDrainNoCandidateReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            PendingDrainPersistenceErrorV1,
+        >,
+    > {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::record_pending_drain_no_candidate_v2(
+            self,
+            session,
+            selection,
+        )
+        .await
+    }
+
+    async fn execute_claim_v3(
+        &mut self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        authorization: &RuntimeAuthorizedPendingDrainClaimV2,
+    ) -> Result<
+        RuntimePendingDrainClaimReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            PendingDrainPersistenceErrorV1,
+        >,
+    > {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::execute_pending_drain_claim_v2(
+            self,
+            session,
+            authorization,
+        )
+        .await
+    }
+
+    async fn execute_acknowledgement_v3(
+        &mut self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        authorization: &RuntimeAuthorizedPendingDrainAcknowledgementV2,
+    ) -> Result<
+        RuntimePendingDrainAcknowledgementReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            PendingDrainPersistenceErrorV1,
+        >,
+    > {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::execute_pending_drain_acknowledgement_v2(
+            self,
+            session,
+            authorization,
+        )
+        .await
+    }
+
+    async fn execute_succession_v3(
+        &mut self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        authorization: &RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3,
+    ) -> Result<
+        RuntimePendingDrainSuccessionAcknowledgementReceiptV3,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            PendingDrainPersistenceErrorV1,
+        >,
+    > {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::execute_pending_drain_succession_v3(
+            self,
+            session,
+            authorization,
+        )
+        .await
     }
 }
 
@@ -926,10 +1206,6 @@ fn fixture_with_startup_cleanup_deadline(
     )
     .unwrap();
     (handle, port, invalidated)
-}
-
-fn handoff_proof() -> RuntimeGatewayOwnerProductionHandoffProofV1 {
-    RuntimeGatewayOwnerProductionHandoffProofV1 { _private: () }
 }
 
 async fn wait_for(mut condition: impl FnMut() -> bool) {
@@ -991,6 +1267,26 @@ async fn initial_pending_recovery_fixture_until_with_registry_v2(
     crate::closed_recovery::RuntimeClosedRecoveryPendingPhaseV2,
     FakePortV1,
 ) {
+    initial_pending_recovery_fixture_until_with_registry_and_owner_v2(
+        recovery_id,
+        operation_cutoff,
+        registry_fixture,
+        NonZeroU64::new(1).unwrap(),
+    )
+    .await
+}
+
+async fn initial_pending_recovery_fixture_until_with_registry_and_owner_v2(
+    recovery_id: &str,
+    operation_cutoff: Instant,
+    registry_fixture: InitialRegistryFixtureV2,
+    owner_epoch: NonZeroU64,
+) -> (
+    crate::RuntimeGatewayBootstrapV1,
+    crate::RuntimeRegistryBootstrapV1,
+    crate::closed_recovery::RuntimeClosedRecoveryPendingPhaseV2,
+    FakePortV1,
+) {
     let process_instance_id = ProcessInstanceId::parse("process:handoff").unwrap();
     let mut gateway = crate::compose_runtime_gateway_bootstrap_v1(
         process_instance_id.clone(),
@@ -999,7 +1295,7 @@ async fn initial_pending_recovery_fixture_until_with_registry_v2(
     .unwrap();
     gateway.connect_ready_for_gateway_section_test_v2();
     let lease_for = Duration::from_secs(5);
-    let owner_receipt = receipt(lease_for);
+    let owner_receipt = receipt_with_epoch(lease_for, owner_epoch);
     let port = FakePortV1::new(owner_receipt.clone(), []);
     let config = RuntimeGatewayOwnerStartupWatchdogConfigV1::new(
         lease_for,
@@ -1034,7 +1330,7 @@ async fn initial_pending_recovery_fixture_until_with_registry_v2(
     let readiness = crate::database::runtime_database_readiness_for_test_v1();
     let paused_gateway = gateway.observe_paused_connected_gateway_v2().unwrap();
     let pending = crate::closed_recovery::begin_initial_empty_recovery_v2(
-        &gateway,
+        &mut gateway,
         &registry,
         owner,
         RuntimeRecoveryIdV2::parse(recovery_id).unwrap(),
@@ -1059,8 +1355,9 @@ async fn initial_committed_recovery_fixture_v2(
     (gateway, registry, session, port)
 }
 
-async fn initial_committed_fresh_registry_recovery_fixture_v2(
+async fn initial_committed_fresh_registry_recovery_with_owner_epoch_v2(
     recovery_id: &str,
+    owner_epoch: NonZeroU64,
 ) -> (
     crate::RuntimeGatewayBootstrapV1,
     crate::RuntimeRegistryBootstrapV1,
@@ -1068,10 +1365,11 @@ async fn initial_committed_fresh_registry_recovery_fixture_v2(
     FakePortV1,
 ) {
     let (gateway, registry, pending, port) =
-        initial_pending_recovery_fixture_until_with_registry_v2(
+        initial_pending_recovery_fixture_until_with_registry_and_owner_v2(
             recovery_id,
             Instant::now() + Duration::from_secs(4),
             InitialRegistryFixtureV2::Fresh,
+            owner_epoch,
         )
         .await;
     let session = pending.commit_owner_v2().await.unwrap();
@@ -1087,7 +1385,11 @@ async fn initial_pending_drain_continue_fresh_registry_fixture_v2(
     FakePortV1,
 ) {
     let (gateway, registry, session, port) =
-        initial_committed_fresh_registry_recovery_fixture_v2(recovery_id).await;
+        initial_committed_fresh_registry_recovery_with_owner_epoch_v2(
+            recovery_id,
+            NonZeroU64::new(7).unwrap(),
+        )
+        .await;
     let mut pending = empty_startup_recovery_state_v2();
     pending.pending_runtime_drain_intent_count = 1;
     let outcome = session
@@ -1567,6 +1869,417 @@ async fn owner_safety_deadline_is_the_startup_observer_cutoff_minimum() {
     wait_for(|| port.release_calls() == 1).await;
 }
 
+struct PendingDrainTestRunV2 {
+    outcome: Result<(), crate::process::RuntimeProcessStartupRecoveryLoopFailureV2>,
+    source: automation_runtime_worker::RuntimeRegistryRecoveryEmptyObservationV2,
+    successor: Result<
+        automation_runtime_worker::RuntimeRegistryRecoveryEmptyObservationV2,
+        crate::RuntimeRegistryRecoveryObservationErrorV1,
+    >,
+    environment: FakePendingDrainRecoveryEnvironmentV2,
+}
+
+impl PendingDrainTestRunV2 {
+    fn assert_success(&self) {
+        assert!(self.outcome.is_ok());
+    }
+
+    fn assert_error(&self, expected: crate::process::RuntimeProcessStartupRecoveryLoopFailureV2) {
+        assert_eq!(self.outcome, Err(expected));
+    }
+
+    fn assert_events(&self, expected: &[PendingDrainTestStageV2]) {
+        assert_eq!(self.environment.events, expected);
+    }
+
+    fn assert_event_count(&self, stage: PendingDrainTestStageV2, expected: usize) {
+        assert_eq!(
+            self.environment
+                .events
+                .iter()
+                .filter(|event| **event == stage)
+                .count(),
+            expected
+        );
+    }
+
+    fn assert_exact_mutation_fingerprints(&self, stage: PendingDrainTestStageV2, expected: usize) {
+        let fingerprints: Vec<_> = self
+            .environment
+            .mutation_fingerprints
+            .iter()
+            .filter(|fingerprint| fingerprint.stage() == stage)
+            .collect();
+        assert_eq!(fingerprints.len(), expected);
+        assert!(fingerprints.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    fn assert_registry_sealed(&self, sealed: bool) {
+        if sealed {
+            assert_eq!(
+                self.successor,
+                Err(crate::RuntimeRegistryRecoveryObservationErrorV1::NotEmpty)
+            );
+        } else {
+            assert!(self.successor.is_ok());
+        }
+    }
+
+    fn assert_no_candidate_completed(&self) {
+        self.assert_registry_sealed(false);
+        assert_eq!(self.successor.as_ref().unwrap(), &self.source);
+    }
+
+    fn assert_candidate_completed(&self) {
+        let successor = self.successor.as_ref().unwrap();
+        assert_eq!(
+            successor.observation_sequence().get(),
+            self.source.observation_sequence().get() + 2
+        );
+        assert_eq!(successor.retained_slot_count(), 1);
+        assert_eq!(successor.retained_empty_tombstone_count(), 1);
+    }
+}
+
+async fn run_pending_drain_test_v2(
+    recovery_id: &str,
+    mut environment: FakePendingDrainRecoveryEnvironmentV2,
+) -> PendingDrainTestRunV2 {
+    let (gateway, registry, mut session, port) =
+        initial_pending_drain_continue_fresh_registry_fixture_v2(recovery_id).await;
+    let source = registry.observe_recovery_empty_projection_v2().unwrap();
+    let outcome = crate::process::execute_pending_drain_recovery_with_environment_v2(
+        &mut session,
+        &mut environment,
+    )
+    .await
+    .map(|_| ());
+    let successor = registry.observe_recovery_empty_projection_v2();
+    let gateway = gateway.closed_snapshot();
+    if outcome.is_ok() {
+        assert!(matches!(
+            gateway,
+            automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending { .. }
+        ));
+    } else {
+        assert!(matches!(
+            gateway,
+            automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
+                cause:
+                    automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::CapabilityNotReady,
+                ..
+            }
+        ));
+    }
+    drop(session);
+    wait_for(|| port.release_calls() == 1).await;
+    PendingDrainTestRunV2 {
+        outcome,
+        source,
+        successor,
+        environment,
+    }
+}
+
+fn pending_drain_finalizer_supervisor_v3() -> crate::RuntimeMutationFinalizerSupervisorV1<
+    crate::process::RuntimePendingDrainFinalizerPortV3<FakePendingDrainRecoveryEnvironmentV2>,
+> {
+    crate::RuntimeMutationFinalizerSupervisorV1::start(
+        crate::RuntimeMutationFinalizerConfigV1::new(1).unwrap(),
+        automation_runtime_worker::RuntimeMutationFinalizerGenerationV1::new(
+            NonZeroU64::new(9).unwrap(),
+        )
+        .unwrap(),
+        crate::process::RuntimePendingDrainFinalizerPortV3::new(),
+    )
+    .unwrap()
+}
+
+async fn select_pending_drain_for_finalizer_v3(
+    session: &mut crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+    environment: &mut FakePendingDrainRecoveryEnvironmentV2,
+) -> automation_runtime_worker::RuntimeAcceptedPendingDrainSelectionV3 {
+    let authorization = session
+        .begin_startup_recovery_execution_v2(RuntimeStartupRecoveryContinuationV2::Recover(
+            RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent,
+        ))
+        .unwrap()
+        .into_pending_drain_selection_v3()
+        .unwrap();
+    let receipt =
+        match crate::process::RuntimePendingDrainRecoveryEnvironmentV2::select_pending_drain_v3(
+            environment,
+            session,
+            &authorization,
+        )
+        .await
+        {
+            Ok(receipt) => receipt,
+            Err(_) => panic!("pending-drain selection"),
+        };
+    authorization.accept_selection(receipt).unwrap()
+}
+
+#[tokio::test]
+async fn root_finalizer_owns_each_pending_drain_mutation_and_exactly_finalizes_once() {
+    let (gateway, registry, mut session, port) =
+        initial_pending_drain_continue_fresh_registry_fixture_v2(
+            "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+        )
+        .await;
+    let mut environment = FakePendingDrainRecoveryEnvironmentV2::failing_sequence([(
+        PendingDrainTestStageV2::NoCandidate,
+        PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate),
+    )]);
+    let selected = select_pending_drain_for_finalizer_v3(&mut session, &mut environment).await;
+    let automation_runtime_worker::RuntimeAcceptedPendingDrainSelectionV3::NoCandidate(selected) =
+        selected
+    else {
+        panic!("no-candidate selection")
+    };
+    let job = crate::process::RuntimePendingDrainFinalizerJobV3::new(
+        session,
+        environment,
+        crate::process::RuntimePendingDrainMutationStageV3::NoCandidate(selected),
+    );
+    let mut supervisor = pending_drain_finalizer_supervisor_v3();
+    let settled = crate::process::register_and_complete_pending_drain_job_v3(&mut supervisor, job)
+        .await
+        .unwrap();
+    let (session, environment, output) = settled.into_parts();
+    assert!(matches!(
+        output,
+        crate::process::RuntimePendingDrainMutationOutputV3::Completed(_)
+    ));
+    assert_eq!(
+        environment.events,
+        [
+            PendingDrainTestStageV2::Selection,
+            PendingDrainTestStageV2::NoCandidate,
+            PendingDrainTestStageV2::NoCandidate,
+        ]
+    );
+    let fingerprints: Vec<_> = environment
+        .mutation_fingerprints
+        .iter()
+        .filter(|fingerprint| fingerprint.stage() == PendingDrainTestStageV2::NoCandidate)
+        .collect();
+    assert_eq!(fingerprints.len(), 2);
+    assert!(fingerprints[0] == fingerprints[1]);
+    assert!(registry.observe_recovery_empty_projection_v2().is_ok());
+    drop(session);
+    drop(gateway);
+    let report = supervisor.join().await;
+    assert_eq!(report.exit(), crate::RuntimeSupervisorExitV1::Commanded);
+    wait_for(|| port.release_calls() == 1).await;
+
+    let (gateway, registry, mut session, port) =
+        initial_pending_drain_continue_fresh_registry_fixture_v2(
+            "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2",
+        )
+        .await;
+    let mut environment = FakePendingDrainRecoveryEnvironmentV2::failing_sequence([
+        (
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate),
+        ),
+        (
+            PendingDrainTestStageV2::Acknowledgement,
+            PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate),
+        ),
+    ]);
+    let selected = select_pending_drain_for_finalizer_v3(&mut session, &mut environment).await;
+    let automation_runtime_worker::RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selected) =
+        selected
+    else {
+        panic!("unclaimed selection")
+    };
+    let seal = session
+        .seal_pending_drain_candidate_v2(selected.candidate())
+        .unwrap();
+    let claim = selected.bind_registry_seal(seal).unwrap();
+    let mut supervisor = pending_drain_finalizer_supervisor_v3();
+    let job = crate::process::RuntimePendingDrainFinalizerJobV3::new(
+        session,
+        environment,
+        crate::process::RuntimePendingDrainMutationStageV3::Claim(Box::new(claim)),
+    );
+    let settled = crate::process::register_and_complete_pending_drain_job_v3(&mut supervisor, job)
+        .await
+        .unwrap();
+    let (session, environment, output) = settled.into_parts();
+    let crate::process::RuntimePendingDrainMutationOutputV3::ClaimAccepted(acknowledgement) =
+        output
+    else {
+        panic!("claim acknowledgement")
+    };
+    let job = crate::process::RuntimePendingDrainFinalizerJobV3::new(
+        session,
+        environment,
+        crate::process::RuntimePendingDrainMutationStageV3::Acknowledgement(Box::new(
+            acknowledgement,
+        )),
+    );
+    let settled = crate::process::register_and_complete_pending_drain_job_v3(&mut supervisor, job)
+        .await
+        .unwrap();
+    let (session, environment, output) = settled.into_parts();
+    assert!(matches!(
+        output,
+        crate::process::RuntimePendingDrainMutationOutputV3::Completed(_)
+    ));
+    assert_eq!(
+        environment.events,
+        [
+            PendingDrainTestStageV2::Selection,
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestStageV2::Acknowledgement,
+            PendingDrainTestStageV2::Acknowledgement,
+        ]
+    );
+    for stage in [
+        PendingDrainTestStageV2::Claim,
+        PendingDrainTestStageV2::Acknowledgement,
+    ] {
+        let fingerprints: Vec<_> = environment
+            .mutation_fingerprints
+            .iter()
+            .filter(|fingerprint| fingerprint.stage() == stage)
+            .collect();
+        assert_eq!(fingerprints.len(), 2);
+        assert!(fingerprints[0] == fingerprints[1]);
+    }
+    assert!(registry.observe_recovery_empty_projection_v2().is_ok());
+    drop(session);
+    drop(gateway);
+    let report = supervisor.join().await;
+    assert_eq!(report.exit(), crate::RuntimeSupervisorExitV1::Commanded);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn root_finalizer_keeps_seal_on_second_uncertainty_and_returns_session_to_mailbox() {
+    let (gateway, registry, mut session, port) =
+        initial_pending_drain_continue_fresh_registry_fixture_v2(
+            "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
+        )
+        .await;
+    let indeterminate =
+        PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate);
+    let mut environment = FakePendingDrainRecoveryEnvironmentV2::failing_sequence([
+        (PendingDrainTestStageV2::Claim, indeterminate),
+        (PendingDrainTestStageV2::Claim, indeterminate),
+    ]);
+    let selected = select_pending_drain_for_finalizer_v3(&mut session, &mut environment).await;
+    let automation_runtime_worker::RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selected) =
+        selected
+    else {
+        panic!("unclaimed selection")
+    };
+    let seal = session
+        .seal_pending_drain_candidate_v2(selected.candidate())
+        .unwrap();
+    let claim = selected.bind_registry_seal(seal).unwrap();
+    let job = crate::process::RuntimePendingDrainFinalizerJobV3::new(
+        session,
+        environment,
+        crate::process::RuntimePendingDrainMutationStageV3::Claim(Box::new(claim)),
+    );
+    let mut supervisor = pending_drain_finalizer_supervisor_v3();
+    let failed = crate::process::register_and_complete_pending_drain_job_v3(&mut supervisor, job)
+        .await
+        .unwrap_err();
+    let crate::process::RuntimePendingDrainFinalizerDispatchFailureV3::Failed(failed) = failed
+    else {
+        panic!("terminal mutation failure")
+    };
+    let (session, environment, failure) = (*failed).into_parts();
+    assert_eq!(
+        failure,
+        crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(
+            PendingDrainPersistenceErrorV1::Indeterminate,
+        )
+    );
+    assert_eq!(
+        environment.events,
+        [
+            PendingDrainTestStageV2::Selection,
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestStageV2::Claim,
+        ]
+    );
+    assert_eq!(
+        registry.observe_recovery_empty_projection_v2(),
+        Err(crate::RuntimeRegistryRecoveryObservationErrorV1::NotEmpty)
+    );
+    session.invalidate_startup_recovery_execution_v2();
+    drop(session);
+    drop(gateway);
+    let report = supervisor.join().await;
+    assert_eq!(report.exit(), crate::RuntimeSupervisorExitV1::Commanded);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn root_finalizer_preserves_expired_owner_succession_identity() {
+    let (gateway, registry, mut session, port) =
+        initial_pending_drain_continue_fresh_registry_fixture_v2(
+            "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+        )
+        .await;
+    let mut environment = FakePendingDrainRecoveryEnvironmentV2::failing_sequence([(
+        PendingDrainTestStageV2::Succession,
+        PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate),
+    )]);
+    let selected = select_pending_drain_for_finalizer_v3(&mut session, &mut environment).await;
+    let automation_runtime_worker::RuntimeAcceptedPendingDrainSelectionV3::ExpiredPreviousOwner(
+        selected,
+    ) = selected
+    else {
+        panic!("expired previous owner selection")
+    };
+    let seal = session
+        .seal_pending_drain_succession_candidate_v3(selected.candidate())
+        .unwrap();
+    let succession = selected.bind_registry_seal(seal).unwrap();
+    let job = crate::process::RuntimePendingDrainFinalizerJobV3::new(
+        session,
+        environment,
+        crate::process::RuntimePendingDrainMutationStageV3::Succession(Box::new(succession)),
+    );
+    let mut supervisor = pending_drain_finalizer_supervisor_v3();
+    let settled = crate::process::register_and_complete_pending_drain_job_v3(&mut supervisor, job)
+        .await
+        .unwrap();
+    let (session, environment, output) = settled.into_parts();
+    assert!(matches!(
+        output,
+        crate::process::RuntimePendingDrainMutationOutputV3::Completed(_)
+    ));
+    assert_eq!(
+        environment.events,
+        [
+            PendingDrainTestStageV2::Selection,
+            PendingDrainTestStageV2::Succession,
+            PendingDrainTestStageV2::Succession,
+        ]
+    );
+    let fingerprints: Vec<_> = environment
+        .mutation_fingerprints
+        .iter()
+        .filter(|fingerprint| fingerprint.stage() == PendingDrainTestStageV2::Succession)
+        .collect();
+    assert_eq!(fingerprints.len(), 2);
+    assert!(fingerprints[0] == fingerprints[1]);
+    assert!(registry.observe_recovery_empty_projection_v2().is_ok());
+    drop(session);
+    drop(gateway);
+    let report = supervisor.join().await;
+    assert_eq!(report.exit(), crate::RuntimeSupervisorExitV1::Commanded);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
 #[tokio::test]
 async fn startup_recovery_continue_requires_a_fresh_ready_iteration_before_fixed_point() {
     let (gateway, _registry, session, port) =
@@ -1666,81 +2379,486 @@ async fn startup_recovery_continue_requires_a_fresh_ready_iteration_before_fixed
 }
 
 #[tokio::test]
-async fn production_pending_drain_driver_rolls_fresh_slot_s0_s1_s2() {
-    let (gateway, registry, mut session, port) =
-        initial_pending_drain_continue_fresh_registry_fixture_v2(
-            "36363636363636363636363636363636",
+async fn production_pending_drain_driver_defers_fresh_previous_owner_without_sealing() {
+    let run = run_pending_drain_test_v2(
+        "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        FakePendingDrainRecoveryEnvironmentV2::fresh_previous_owner(),
+    )
+    .await;
+    run.assert_success();
+    run.assert_events(&[PendingDrainTestStageV2::Selection]);
+    assert!(run.environment.mutation_fingerprints.is_empty());
+    assert_eq!(run.successor.as_ref().unwrap(), &run.source);
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_rolls_expired_previous_owner_s0_s1_s2() {
+    let run = run_pending_drain_test_v2(
+        "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+        FakePendingDrainRecoveryEnvironmentV2::expired_previous_owner(),
+    )
+    .await;
+    run.assert_success();
+    run.assert_events(&[
+        PendingDrainTestStageV2::Selection,
+        PendingDrainTestStageV2::Succession,
+    ]);
+    run.assert_exact_mutation_fingerprints(PendingDrainTestStageV2::Succession, 1);
+    run.assert_candidate_completed();
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_finalizes_succession_indeterminate_once() {
+    let run = run_pending_drain_test_v2(
+        "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+        FakePendingDrainRecoveryEnvironmentV2::failing_sequence([(
+            PendingDrainTestStageV2::Succession,
+            PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate),
+        )]),
+    )
+    .await;
+    run.assert_success();
+    run.assert_events(&[
+        PendingDrainTestStageV2::Selection,
+        PendingDrainTestStageV2::Succession,
+        PendingDrainTestStageV2::Succession,
+    ]);
+    run.assert_exact_mutation_fingerprints(PendingDrainTestStageV2::Succession, 2);
+    run.assert_candidate_completed();
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_keeps_succession_s1_on_terminal_failures() {
+    for (recovery_id, failure) in [
+        (
+            "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+            PendingDrainPersistenceErrorV1::Timeout,
+        ),
+        (
+            "c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5",
+            PendingDrainPersistenceErrorV1::OwnershipLost,
+        ),
+        (
+            "c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6",
+            PendingDrainPersistenceErrorV1::PersistenceCorrupt,
+        ),
+    ] {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing(
+                PendingDrainTestStageV2::Succession,
+                PendingDrainTestAwaitFailureV2::Database(failure),
+            ),
         )
         .await;
-    let source = registry.observe_recovery_empty_projection_v2().unwrap();
-    assert_eq!(source.retained_slot_count(), 0);
-    assert_eq!(source.retained_empty_tombstone_count(), 0);
-    let mut environment = FakePendingDrainRecoveryEnvironmentV2::candidate();
+        run.assert_error(
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(
+                failure,
+            ),
+        );
+        run.assert_event_count(PendingDrainTestStageV2::Succession, 1);
+        run.assert_registry_sealed(true);
+    }
+}
 
-    crate::process::execute_pending_drain_recovery_with_environment_v2(
-        &mut session,
-        &mut environment,
+#[tokio::test]
+async fn production_pending_drain_driver_keeps_succession_s1_on_invalid_durable_receipt() {
+    let run = run_pending_drain_test_v2(
+        "cbcbcbcbcbcbcbcbcbcbcbcbcbcbcbcb",
+        FakePendingDrainRecoveryEnvironmentV2::expired_previous_owner()
+            .with_succession_revision_delta(2),
     )
-    .await
-    .unwrap();
+    .await;
+    run.assert_error(
+        crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainCompound,
+    );
+    run.assert_event_count(PendingDrainTestStageV2::Succession, 1);
+    run.assert_registry_sealed(true);
+}
 
-    assert_eq!(
-        environment.events,
-        [
-            PendingDrainTestStageV2::Selection,
-            PendingDrainTestStageV2::Claim,
-            PendingDrainTestStageV2::Acknowledgement,
-        ]
+#[tokio::test]
+async fn production_pending_drain_driver_stops_after_second_succession_indeterminate() {
+    let indeterminate =
+        PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate);
+    let run = run_pending_drain_test_v2(
+        "c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7",
+        FakePendingDrainRecoveryEnvironmentV2::failing_sequence([
+            (PendingDrainTestStageV2::Succession, indeterminate),
+            (PendingDrainTestStageV2::Succession, indeterminate),
+        ]),
+    )
+    .await;
+    run.assert_error(
+        crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(
+            PendingDrainPersistenceErrorV1::Indeterminate,
+        ),
     );
-    let successor = registry.observe_recovery_empty_projection_v2().unwrap();
-    assert_eq!(
-        successor.observation_sequence().get(),
-        source.observation_sequence().get() + 2
-    );
-    assert_eq!(successor.retained_slot_count(), 1);
-    assert_eq!(successor.retained_empty_tombstone_count(), 1);
-    assert!(matches!(
-        gateway.closed_snapshot(),
-        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending { .. }
-    ));
-    drop(session);
-    wait_for(|| port.release_calls() == 1).await;
+    run.assert_event_count(PendingDrainTestStageV2::Succession, 2);
+    run.assert_exact_mutation_fingerprints(PendingDrainTestStageV2::Succession, 2);
+    run.assert_registry_sealed(true);
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_prefers_transition_before_succession_replay() {
+    for (recovery_id, transition) in [
+        (
+            "c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8",
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed,
+        ),
+        (
+            "c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9",
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PausedConnection(
+                crate::RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated,
+            ),
+        ),
+        (
+            "cacacacacacacacacacacacacacacaca",
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PausedConnection(
+                crate::RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated,
+            ),
+        ),
+    ] {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing(
+                PendingDrainTestStageV2::Succession,
+                PendingDrainTestAwaitFailureV2::Database(
+                    PendingDrainPersistenceErrorV1::Indeterminate,
+                ),
+            )
+            .with_transition_after(PendingDrainTestStageV2::Succession, 1, transition),
+        )
+        .await;
+        run.assert_error(transition);
+        run.assert_event_count(PendingDrainTestStageV2::Succession, 1);
+        run.assert_registry_sealed(true);
+    }
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_rolls_fresh_slot_s0_s1_s2() {
+    let run = run_pending_drain_test_v2(
+        "36363636363636363636363636363636",
+        FakePendingDrainRecoveryEnvironmentV2::candidate(),
+    )
+    .await;
+    run.assert_success();
+    assert_eq!(run.source.retained_slot_count(), 0);
+    assert_eq!(run.source.retained_empty_tombstone_count(), 0);
+    run.assert_events(&[
+        PendingDrainTestStageV2::Selection,
+        PendingDrainTestStageV2::Claim,
+        PendingDrainTestStageV2::Acknowledgement,
+    ]);
+    run.assert_candidate_completed();
 }
 
 #[tokio::test]
 async fn production_pending_drain_driver_records_no_candidate_without_sealing() {
-    let (gateway, registry, mut session, port) =
-        initial_pending_drain_continue_fresh_registry_fixture_v2(
-            "35353535353535353535353535353535",
+    let run = run_pending_drain_test_v2(
+        "35353535353535353535353535353535",
+        FakePendingDrainRecoveryEnvironmentV2::no_candidate(),
+    )
+    .await;
+    run.assert_success();
+    run.assert_events(&[
+        PendingDrainTestStageV2::Selection,
+        PendingDrainTestStageV2::NoCandidate,
+    ]);
+    run.assert_no_candidate_completed();
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_finalizes_each_indeterminate_mutation_exactly_once() {
+    let indeterminate =
+        PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate);
+    for (recovery_id, failures, events, no_candidate) in [
+        (
+            "29292929292929292929292929292929",
+            vec![(PendingDrainTestStageV2::NoCandidate, indeterminate)],
+            vec![
+                PendingDrainTestStageV2::Selection,
+                PendingDrainTestStageV2::NoCandidate,
+                PendingDrainTestStageV2::NoCandidate,
+            ],
+            true,
+        ),
+        (
+            "28282828282828282828282828282828",
+            vec![(PendingDrainTestStageV2::Claim, indeterminate)],
+            vec![
+                PendingDrainTestStageV2::Selection,
+                PendingDrainTestStageV2::Claim,
+                PendingDrainTestStageV2::Claim,
+                PendingDrainTestStageV2::Acknowledgement,
+            ],
+            false,
+        ),
+        (
+            "27272727272727272727272727272727",
+            vec![(PendingDrainTestStageV2::Acknowledgement, indeterminate)],
+            vec![
+                PendingDrainTestStageV2::Selection,
+                PendingDrainTestStageV2::Claim,
+                PendingDrainTestStageV2::Acknowledgement,
+                PendingDrainTestStageV2::Acknowledgement,
+            ],
+            false,
+        ),
+        (
+            "26262626262626262626262626262626",
+            vec![
+                (PendingDrainTestStageV2::Claim, indeterminate),
+                (PendingDrainTestStageV2::Acknowledgement, indeterminate),
+            ],
+            vec![
+                PendingDrainTestStageV2::Selection,
+                PendingDrainTestStageV2::Claim,
+                PendingDrainTestStageV2::Claim,
+                PendingDrainTestStageV2::Acknowledgement,
+                PendingDrainTestStageV2::Acknowledgement,
+            ],
+            false,
+        ),
+    ] {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing_sequence(failures),
         )
         .await;
-    let source = registry.observe_recovery_empty_projection_v2().unwrap();
-    let mut environment = FakePendingDrainRecoveryEnvironmentV2::no_candidate();
-
-    crate::process::execute_pending_drain_recovery_with_environment_v2(
-        &mut session,
-        &mut environment,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        environment.events,
-        [
-            PendingDrainTestStageV2::Selection,
+        run.assert_success();
+        run.assert_events(&events);
+        for stage in [
             PendingDrainTestStageV2::NoCandidate,
-        ]
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestStageV2::Acknowledgement,
+        ] {
+            let expected = events.iter().filter(|event| **event == stage).count();
+            if expected > 0 {
+                run.assert_exact_mutation_fingerprints(stage, expected);
+            }
+        }
+        if no_candidate {
+            run.assert_no_candidate_completed();
+        } else {
+            run.assert_candidate_completed();
+        }
+    }
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_prefers_transition_around_mutation_finalization() {
+    for (recovery_id, transition) in [
+        (
+            "abababababababababababababababab",
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed,
+        ),
+        (
+            "acacacacacacacacacacacacacacacac",
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PausedConnection(
+                crate::RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated,
+            ),
+        ),
+        (
+            "adadadadadadadadadadadadadadadad",
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PausedConnection(
+                crate::RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated,
+            ),
+        ),
+        (
+            "aeaeaeaeaeaeaeaeaeaeaeaeaeaeaeae",
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::ProtocolViolation,
+        ),
+    ] {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing_sequence([(
+                PendingDrainTestStageV2::Claim,
+                PendingDrainTestAwaitFailureV2::Database(
+                    PendingDrainPersistenceErrorV1::Indeterminate,
+                ),
+            )])
+            .with_transition_after(PendingDrainTestStageV2::Claim, 1, transition),
+        )
+        .await;
+        run.assert_error(transition);
+        run.assert_event_count(PendingDrainTestStageV2::Claim, 1);
+        assert!(!run
+            .environment
+            .events
+            .contains(&PendingDrainTestStageV2::Acknowledgement));
+        run.assert_exact_mutation_fingerprints(PendingDrainTestStageV2::Claim, 1);
+        run.assert_registry_sealed(true);
+    }
+
+    let transition =
+        crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::OperationDeadlineElapsed;
+    for (recovery_id, stage, leaves_sealed) in [
+        (
+            "afafafafafafafafafafafafafafafaf",
+            PendingDrainTestStageV2::NoCandidate,
+            false,
+        ),
+        (
+            "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+            PendingDrainTestStageV2::Claim,
+            true,
+        ),
+        (
+            "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+            PendingDrainTestStageV2::Acknowledgement,
+            true,
+        ),
+    ] {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing_sequence([(
+                stage,
+                PendingDrainTestAwaitFailureV2::Database(
+                    PendingDrainPersistenceErrorV1::Indeterminate,
+                ),
+            )])
+            .with_transition_after(stage, 2, transition),
+        )
+        .await;
+        run.assert_error(transition);
+        run.assert_event_count(stage, 2);
+        run.assert_registry_sealed(leaves_sealed);
+    }
+
+    let run = run_pending_drain_test_v2(
+        "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+        FakePendingDrainRecoveryEnvironmentV2::failing_sequence([(
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate),
+        )])
+        .with_session_invalidation_after(PendingDrainTestStageV2::Claim, 1),
+    )
+    .await;
+    run.assert_error(
+        crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecutionRejected(
+            crate::RuntimeProcessClosedRecoveryCommitFailureV2::GatewayObservation(
+                crate::RuntimeGatewayReadyObservationErrorV1::OwnershipUncertain,
+            ),
+        ),
     );
-    assert_eq!(
-        registry.observe_recovery_empty_projection_v2().unwrap(),
-        source
-    );
-    assert!(matches!(
-        gateway.closed_snapshot(),
-        automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::RecoveryPending { .. }
-    ));
-    drop(session);
-    wait_for(|| port.release_calls() == 1).await;
+    run.assert_event_count(PendingDrainTestStageV2::Claim, 1);
+    run.assert_registry_sealed(true);
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_stops_after_two_mutation_failures() {
+    let indeterminate =
+        PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Indeterminate);
+    let cases = [
+        (
+            "25252525252525252525252525252525",
+            PendingDrainTestStageV2::NoCandidate,
+            indeterminate,
+            false,
+        ),
+        (
+            "24242424242424242424242424242424",
+            PendingDrainTestStageV2::Claim,
+            indeterminate,
+            true,
+        ),
+        (
+            "23232323232323232323232323232323",
+            PendingDrainTestStageV2::Acknowledgement,
+            indeterminate,
+            true,
+        ),
+        (
+            "22222222222222222222222222222222",
+            PendingDrainTestStageV2::Claim,
+            PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::Timeout),
+            true,
+        ),
+        (
+            "21212121212121212121212121212121",
+            PendingDrainTestStageV2::Acknowledgement,
+            PendingDrainTestAwaitFailureV2::Database(PendingDrainPersistenceErrorV1::OwnershipLost),
+            true,
+        ),
+        (
+            "20202020202020202020202020202020",
+            PendingDrainTestStageV2::NoCandidate,
+            PendingDrainTestAwaitFailureV2::Database(
+                PendingDrainPersistenceErrorV1::PersistenceCorrupt,
+            ),
+            false,
+        ),
+    ];
+
+    for (recovery_id, stage, terminal_failure, leaves_sealed) in cases {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing_sequence([
+                (stage, indeterminate),
+                (stage, terminal_failure),
+            ]),
+        )
+        .await;
+        let PendingDrainTestAwaitFailureV2::Database(expected) = terminal_failure else {
+            unreachable!()
+        };
+        run.assert_error(
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(
+                expected,
+            ),
+        );
+        run.assert_event_count(stage, 2);
+        run.assert_registry_sealed(leaves_sealed);
+    }
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_never_finalizes_selection_or_terminal_mutation_failure() {
+    let cases = [
+        (
+            "19191919191919191919191919191919",
+            PendingDrainTestStageV2::Selection,
+            PendingDrainPersistenceErrorV1::Indeterminate,
+            false,
+        ),
+        (
+            "18181818181818181818181818181818",
+            PendingDrainTestStageV2::NoCandidate,
+            PendingDrainPersistenceErrorV1::Timeout,
+            false,
+        ),
+        (
+            "17171717171717171717171717171717",
+            PendingDrainTestStageV2::Claim,
+            PendingDrainPersistenceErrorV1::OwnershipLost,
+            true,
+        ),
+        (
+            "16161616161616161616161616161616",
+            PendingDrainTestStageV2::Acknowledgement,
+            PendingDrainPersistenceErrorV1::PersistenceCorrupt,
+            true,
+        ),
+    ];
+
+    for (recovery_id, stage, failure, leaves_sealed) in cases {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing(
+                stage,
+                PendingDrainTestAwaitFailureV2::Database(failure),
+            ),
+        )
+        .await;
+        run.assert_error(
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(
+                failure,
+            ),
+        );
+        run.assert_event_count(stage, 1);
+        run.assert_registry_sealed(leaves_sealed);
+    }
 }
 
 #[tokio::test]
@@ -1750,7 +2868,7 @@ async fn production_pending_drain_driver_invalidates_and_preserves_seal_on_every
             "34343434343434343434343434343434",
             PendingDrainTestStageV2::Selection,
             PendingDrainTestAwaitFailureV2::Database(
-                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Timeout,
+                PendingDrainPersistenceErrorV1::Timeout,
             ),
             false,
         ),
@@ -1758,7 +2876,7 @@ async fn production_pending_drain_driver_invalidates_and_preserves_seal_on_every
             "33333333333333333333333333333333",
             PendingDrainTestStageV2::NoCandidate,
             PendingDrainTestAwaitFailureV2::Database(
-                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Indeterminate,
+                PendingDrainPersistenceErrorV1::Unavailable,
             ),
             false,
         ),
@@ -1766,7 +2884,7 @@ async fn production_pending_drain_driver_invalidates_and_preserves_seal_on_every
             "32323232323232323232323232323232",
             PendingDrainTestStageV2::Claim,
             PendingDrainTestAwaitFailureV2::Database(
-                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Timeout,
+                PendingDrainPersistenceErrorV1::Timeout,
             ),
             true,
         ),
@@ -1774,7 +2892,7 @@ async fn production_pending_drain_driver_invalidates_and_preserves_seal_on_every
             "31313131313131313131313131313131",
             PendingDrainTestStageV2::Acknowledgement,
             PendingDrainTestAwaitFailureV2::Database(
-                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Indeterminate,
+                PendingDrainPersistenceErrorV1::Concurrency,
             ),
             true,
         ),
@@ -1789,48 +2907,25 @@ async fn production_pending_drain_driver_invalidates_and_preserves_seal_on_every
     ];
 
     for (recovery_id, stage, failure, leaves_sealed) in cases {
-        let (gateway, registry, mut session, port) =
-            initial_pending_drain_continue_fresh_registry_fixture_v2(recovery_id).await;
-        let mut environment = FakePendingDrainRecoveryEnvironmentV2::failing(stage, failure);
-
-        let error = match crate::process::execute_pending_drain_recovery_with_environment_v2(
-            &mut session,
-            &mut environment,
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::failing(stage, failure),
         )
-        .await
-        {
-            Ok(_) => panic!("pending drain recovery unexpectedly completed"),
-            Err(error) => error,
-        };
-
+        .await;
         match failure {
             PendingDrainTestAwaitFailureV2::Transition(expected) => {
-                assert_eq!(error, expected);
+                run.assert_error(expected);
             }
             PendingDrainTestAwaitFailureV2::Database(expected) => {
-                assert_eq!(
-                    error,
+                run.assert_error(
                     crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(
                         expected,
-                    )
+                    ),
                 );
             }
         }
-        assert_eq!(environment.events.last(), Some(&stage));
-        assert_eq!(
-            registry.observe_recovery_empty_projection_v2().is_err(),
-            leaves_sealed
-        );
-        assert!(matches!(
-            gateway.closed_snapshot(),
-            automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
-                cause:
-                    automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::CapabilityNotReady,
-                ..
-            }
-        ));
-        drop(session);
-        wait_for(|| port.release_calls() == 1).await;
+        assert_eq!(run.environment.events.last(), Some(&stage));
+        run.assert_registry_sealed(leaves_sealed);
     }
 }
 
@@ -2473,8 +3568,8 @@ async fn disconnect_during_startup_observation_prevents_authority_advance() {
     assert_eq!(
         error,
         crate::closed_recovery::RuntimeClosedRecoveryStartupObservationErrorV2::Gateway(
-            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
-                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                crate::RuntimeGatewayReadyObservationErrorV1::Stopped,
             ),
         )
     );
@@ -2482,8 +3577,8 @@ async fn disconnect_during_startup_observation_prevents_authority_advance() {
         gateway.closed_snapshot(),
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
             generation,
-            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
-        } if generation.get() == 4
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::TransportDisconnected,
+        } if generation.get() == 3
     ));
     wait_for(|| port.release_calls() == 1).await;
 }
@@ -2512,8 +3607,8 @@ async fn disconnect_after_startup_observation_refuses_the_successor_session() {
     assert_eq!(
         error,
         crate::closed_recovery::RuntimeClosedRecoveryStartupObservationErrorV2::Gateway(
-            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
-                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                crate::RuntimeGatewayReadyObservationErrorV1::Stopped,
             ),
         )
     );
@@ -2521,8 +3616,8 @@ async fn disconnect_after_startup_observation_refuses_the_successor_session() {
         gateway.closed_snapshot(),
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
             generation,
-            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
-        } if generation.get() == 4
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::TransportDisconnected,
+        } if generation.get() == 3
     ));
     wait_for(|| port.release_calls() == 1).await;
 }
@@ -2579,7 +3674,7 @@ async fn prepared_owner_is_bound_to_one_gateway_and_snapshot_guard_blocks_public
     .unwrap();
     let readiness = crate::database::runtime_database_readiness_for_test_v1();
     let mut pending = crate::closed_recovery::begin_initial_empty_recovery_v2(
-        &owner_gateway,
+        &mut owner_gateway,
         &registry,
         prepared,
         RuntimeRecoveryIdV2::parse("0123456789abcdef0123456789abcdef").unwrap(),
@@ -2687,7 +3782,7 @@ async fn initial_recovery_rejects_a_replaced_paused_connection_epoch() {
     .unwrap();
     let readiness = crate::database::runtime_database_readiness_for_test_v1();
     let failure = match crate::closed_recovery::begin_initial_empty_recovery_retained_v2(
-        &gateway,
+        &mut gateway,
         &registry,
         prepared,
         RuntimeRecoveryIdV2::parse("cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd").unwrap(),
@@ -2761,7 +3856,7 @@ async fn retained_recovery_begin_deadline_returns_owner_for_bounded_cleanup() {
     .unwrap();
     let readiness = crate::database::runtime_database_readiness_for_test_v1();
     let failure = match crate::closed_recovery::begin_initial_empty_recovery_retained_v2(
-        &gateway,
+        &mut gateway,
         &registry,
         prepared,
         RuntimeRecoveryIdV2::parse("abababababababababababababababab").unwrap(),
@@ -3286,8 +4381,8 @@ async fn post_commit_disconnect_refuses_the_compound_session() {
     assert_eq!(
         error,
         crate::closed_recovery::RuntimeClosedRecoveryCommitErrorV2::Gateway(
-            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
-                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                crate::RuntimeGatewayReadyObservationErrorV1::Stopped,
             ),
         )
     );
@@ -3295,8 +4390,8 @@ async fn post_commit_disconnect_refuses_the_compound_session() {
         gateway.closed_snapshot(),
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
             generation,
-            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
-        } if generation.get() == 4
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::TransportDisconnected,
+        } if generation.get() == 3
     ));
     wait_for(|| port.release_calls() == 1).await;
     assert_eq!(port.renew_calls(), 0);
@@ -3661,8 +4756,8 @@ async fn disconnect_during_readiness_wait_prevents_authority_advance() {
     assert_eq!(
         error,
         crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway(
-            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
-                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                crate::RuntimeGatewayReadyObservationErrorV1::Stopped,
             ),
         )
     );
@@ -3670,8 +4765,8 @@ async fn disconnect_during_readiness_wait_prevents_authority_advance() {
         gateway.closed_snapshot(),
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
             generation,
-            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
-        } if generation.get() == 4
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::TransportDisconnected,
+        } if generation.get() == 3
     ));
     wait_for(|| port.release_calls() == 1).await;
 }
@@ -3725,8 +4820,8 @@ async fn disconnect_after_readiness_advance_refuses_the_successor_session() {
     assert_eq!(
         error,
         crate::closed_recovery::RuntimeClosedRecoveryReadinessRefreshErrorV2::Gateway(
-            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Coordinator(
-                automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2::StaleRecoveryPermit,
+            crate::gateway::RuntimeGatewayRecoverySectionErrorV2::Gateway(
+                crate::RuntimeGatewayReadyObservationErrorV1::Stopped,
             ),
         )
     );
@@ -3734,33 +4829,10 @@ async fn disconnect_after_readiness_advance_refuses_the_successor_session() {
         gateway.closed_snapshot(),
         automation_runtime_worker::RuntimeGatewayClosedSnapshotV2::Emergency {
             generation,
-            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::OwnershipUncertain,
-        } if generation.get() == 4
+            cause: automation_runtime_worker::RuntimeGatewayEmergencyCauseV2::TransportDisconnected,
+        } if generation.get() == 3
     ));
     wait_for(|| port.release_calls() == 1).await;
-}
-
-#[test]
-fn handoff_observation_requires_strict_positive_monotonic_safety() {
-    let observed_at = Instant::now();
-    for safety_deadline in [
-        observed_at.checked_sub(Duration::from_nanos(1)).unwrap(),
-        observed_at,
-    ] {
-        let observation = RuntimeGatewayOwnerCurrentObservationV1 {
-            receipt: receipt(Duration::from_secs(5)),
-            safety_deadline,
-        };
-        assert_eq!(
-            accept_production_handoff_observation_v1(observation, observed_at),
-            Err(RuntimeGatewayOwnerProductionHandoffErrorV1::SafetyElapsed)
-        );
-    }
-    let observation = RuntimeGatewayOwnerCurrentObservationV1 {
-        receipt: receipt(Duration::from_secs(5)),
-        safety_deadline: observed_at.checked_add(Duration::from_nanos(1)).unwrap(),
-    };
-    assert!(accept_production_handoff_observation_v1(observation, observed_at).is_ok());
 }
 
 #[test]
@@ -3806,301 +4878,6 @@ fn closed_recovery_commit_ack_classifies_elapsed_before_protocol_mismatch() {
         ),
         Err(RuntimeGatewayOwnerClosedRecoveryCommitErrorV2::SafetyElapsed)
     );
-}
-
-#[tokio::test]
-async fn production_handoff_keeps_one_actor_and_contiguous_owner_revision() {
-    let (handle, port, invalidated) = fixture(
-        Duration::from_millis(700),
-        Duration::from_millis(500),
-        Duration::from_millis(100),
-        [],
-    );
-
-    let production = handle.into_production_v1(handoff_proof()).await.unwrap();
-
-    assert_eq!(
-        production.handoff_observation().receipt().owner_revision,
-        NonZeroU64::new(3).unwrap()
-    );
-    assert_eq!(port.acquire_calls(), 0);
-    assert_eq!(port.observe_calls(), 0);
-    assert_eq!(port.release_calls(), 0);
-    assert_eq!(production.terminal_status(), None);
-    wait_for(|| port.renew_calls() == 1).await;
-    let observation = production.observe_current_gateway_owner_v1().await.unwrap();
-    assert_eq!(
-        observation.receipt().owner_revision,
-        NonZeroU64::new(4).unwrap()
-    );
-    assert_eq!(port.maximum_active_operations(), 1);
-    assert!(!invalidated.load(Ordering::Acquire));
-    assert_eq!(
-        production.shutdown().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
-    );
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn canceled_after_promotion_ack_retains_the_startup_cleanup_cap() {
-    let cleanup_deadline = Instant::now() + Duration::from_millis(300);
-    let (handle, port, _invalidated) = fixture_with_startup_cleanup_deadline(
-        Duration::from_secs(1),
-        Duration::from_millis(400),
-        Duration::from_millis(100),
-        [],
-        Some(cleanup_deadline),
-    );
-    port.block_release(Arc::new(Notify::new()));
-    let mut handoff = Box::pin(handle.into_production_v1(handoff_proof()));
-    let wake_counter = Arc::new(WakeCounterV1 {
-        wakes: AtomicUsize::new(0),
-    });
-    let waker = Waker::from(wake_counter.clone());
-    let mut context = Context::from_waker(&waker);
-
-    assert!(matches!(handoff.as_mut().poll(&mut context), Poll::Pending));
-    wait_for(|| wake_counter.wakes.load(Ordering::Acquire) != 0).await;
-
-    drop(handoff);
-
-    wait_for(|| port.release_calls() == 1).await;
-    wait_for(|| port.active_operations() == 0).await;
-    assert!(Instant::now() <= cleanup_deadline + Duration::from_millis(100));
-}
-
-#[tokio::test]
-async fn completed_production_handoff_clears_the_startup_cleanup_cap() {
-    let (handle, port, _invalidated) = fixture_with_startup_cleanup_deadline(
-        Duration::from_secs(1),
-        Duration::from_millis(400),
-        Duration::from_millis(100),
-        [],
-        Some(Instant::now() + Duration::from_millis(300)),
-    );
-    let production = handle.into_production_v1(handoff_proof()).await.unwrap();
-
-    sleep(Duration::from_millis(350)).await;
-
-    assert_eq!(
-        production.shutdown().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
-    );
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn handoff_queued_behind_renewal_receives_the_exact_successor() {
-    let gate = Arc::new(Notify::new());
-    let (handle, port, invalidated) = fixture(
-        Duration::from_millis(800),
-        Duration::from_millis(600),
-        Duration::from_millis(100),
-        [FakeRenewStepV1::Blocked(gate.clone())],
-    );
-    wait_for(|| port.renew_calls() == 1).await;
-    let mut handoff = Box::pin(handle.into_production_v1(handoff_proof()));
-
-    tokio::select! {
-        _ = &mut handoff => panic!("handoff completed before renewal"),
-        _ = sleep(Duration::from_millis(20)) => {}
-    }
-    gate.notify_one();
-    let production = handoff.await.unwrap();
-
-    assert_eq!(
-        production.handoff_observation().receipt().owner_revision,
-        NonZeroU64::new(4).unwrap()
-    );
-    assert_eq!(port.acquire_calls(), 0);
-    assert_eq!(port.observe_calls(), 0);
-    assert_eq!(port.release_calls(), 0);
-    assert_eq!(port.maximum_active_operations(), 1);
-    assert!(!invalidated.load(Ordering::Acquire));
-    assert_eq!(
-        production.shutdown().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
-    );
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn canceled_handoff_invalidates_synchronously_and_releases_once() {
-    let gate = Arc::new(Notify::new());
-    let (handle, port, invalidated) = fixture(
-        Duration::from_millis(800),
-        Duration::from_millis(600),
-        Duration::from_millis(100),
-        [FakeRenewStepV1::Blocked(gate.clone())],
-    );
-    wait_for(|| port.renew_calls() == 1).await;
-    let mut handoff = Box::pin(handle.into_production_v1(handoff_proof()));
-    tokio::select! {
-        _ = &mut handoff => panic!("blocked handoff completed"),
-        _ = sleep(Duration::from_millis(20)) => {}
-    }
-
-    drop(handoff);
-
-    assert!(invalidated.load(Ordering::Acquire));
-    gate.notify_one();
-    wait_for(|| port.release_calls() == 1).await;
-    assert_eq!(port.acquire_calls(), 0);
-    assert_eq!(port.maximum_active_operations(), 1);
-}
-
-#[tokio::test]
-async fn lost_handoff_acknowledgement_invalidates_and_stops_the_actor() {
-    let (mut handle, port, invalidated) = fixture(
-        Duration::from_secs(5),
-        Duration::from_secs(2),
-        Duration::from_millis(500),
-        [],
-    );
-    let (response, acknowledgement) = oneshot::channel();
-    drop(acknowledgement);
-    handle
-        .inner()
-        .supervisor_commands
-        .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote { response })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        handle.wait_terminal().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
-    );
-    assert!(invalidated.load(Ordering::Acquire));
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn dropping_startup_after_actor_ack_invalidates_the_promoted_actor() {
-    let (handle, port, invalidated) = fixture(
-        Duration::from_secs(5),
-        Duration::from_secs(2),
-        Duration::from_millis(500),
-        [],
-    );
-    let (response, acknowledgement) = oneshot::channel();
-    handle
-        .inner()
-        .supervisor_commands
-        .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote { response })
-        .await
-        .unwrap();
-    assert_eq!(
-        acknowledgement.await.unwrap().receipt().owner_revision,
-        NonZeroU64::new(3).unwrap()
-    );
-    assert!(!invalidated.load(Ordering::Acquire));
-
-    drop(handle);
-
-    assert!(invalidated.load(Ordering::Acquire));
-    wait_for(|| port.release_calls() == 1).await;
-}
-
-#[tokio::test]
-async fn duplicate_private_handoff_is_a_terminal_protocol_violation() {
-    let (mut handle, port, invalidated) = fixture(
-        Duration::from_secs(5),
-        Duration::from_secs(2),
-        Duration::from_millis(500),
-        [],
-    );
-    let commands = handle.inner().supervisor_commands.clone();
-    let (first_response, first_acknowledgement) = oneshot::channel();
-    commands
-        .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote {
-            response: first_response,
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        first_acknowledgement
-            .await
-            .unwrap()
-            .receipt()
-            .owner_revision,
-        NonZeroU64::new(3).unwrap()
-    );
-    let (second_response, second_acknowledgement) = oneshot::channel();
-    commands
-        .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote {
-            response: second_response,
-        })
-        .await
-        .unwrap();
-
-    assert!(second_acknowledgement.await.is_err());
-    assert_eq!(
-        handle.wait_terminal().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
-    );
-    assert!(invalidated.load(Ordering::Acquire));
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn dropping_production_invalidates_synchronously_and_releases_once() {
-    let (handle, port, invalidated) = fixture(
-        Duration::from_secs(5),
-        Duration::from_secs(2),
-        Duration::from_millis(500),
-        [],
-    );
-    let production = handle.into_production_v1(handoff_proof()).await.unwrap();
-
-    drop(production);
-
-    assert!(invalidated.load(Ordering::Acquire));
-    wait_for(|| port.release_calls() == 1).await;
-}
-
-#[tokio::test]
-async fn shutdown_queued_with_handoff_wins_before_production_transition() {
-    let gate = Arc::new(Notify::new());
-    let (mut handle, port, invalidated) = fixture(
-        Duration::from_millis(800),
-        Duration::from_millis(600),
-        Duration::from_millis(100),
-        [FakeRenewStepV1::Blocked(gate.clone())],
-    );
-    wait_for(|| port.renew_calls() == 1).await;
-    let (promotion_response, promotion_acknowledgement) = oneshot::channel();
-    handle
-        .inner()
-        .supervisor_commands
-        .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote {
-            response: promotion_response,
-        })
-        .await
-        .unwrap();
-    let (shutdown_response, shutdown_acknowledgement) = oneshot::channel();
-    handle
-        .inner()
-        .shutdown_commands
-        .send(RuntimeGatewayOwnerStartupShutdownCommandV1 {
-            response: shutdown_response,
-            cleanup_deadline: None,
-        })
-        .await
-        .unwrap();
-    gate.notify_one();
-
-    assert_eq!(
-        shutdown_acknowledgement.await.unwrap(),
-        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
-    );
-    assert!(promotion_acknowledgement.await.is_err());
-    assert_eq!(
-        handle.wait_terminal().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
-    );
-    assert!(invalidated.load(Ordering::Acquire));
-    assert_eq!(port.release_calls(), 1);
 }
 
 #[tokio::test]
@@ -4564,6 +5341,968 @@ async fn closed_recovery_commit_rechecks_exact_permit_receipt_and_stays_frozen()
 }
 
 #[tokio::test]
+async fn committed_closed_recovery_freezes_the_exact_owner_without_renewal() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_millis(700),
+        Duration::from_millis(500),
+        Duration::from_millis(100),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let mut closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+    let committed = closed.observation().receipt().clone();
+    let authority =
+        crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::for_test_v2(
+            committed.clone(),
+            Instant::now() + Duration::from_millis(300),
+        );
+
+    closed
+        .enter_admission_frozen_in_place_v2(authority)
+        .await
+        .unwrap();
+    let frozen = closed.try_into_admission_frozen_v2().unwrap();
+
+    assert_eq!(frozen.handoff_observation_v2().receipt(), &committed);
+    assert_eq!(port.observe_calls(), 2);
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(port.acquire_calls(), 0);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        frozen
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn admission_frozen_rejects_a_strict_owner_revision_successor() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_millis(700),
+        Duration::from_millis(500),
+        Duration::from_millis(100),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let mut closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+    let committed = closed.observation().receipt().clone();
+    {
+        let mut receipt = port
+            .state
+            .receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        receipt.owner_revision =
+            NonZeroU64::new(receipt.owner_revision.get().saturating_add(1)).unwrap();
+        receipt.expires_at += TimeDelta::milliseconds(100);
+    }
+    let authority =
+        crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::for_test_v2(
+            committed,
+            Instant::now() + Duration::from_millis(300),
+        );
+
+    assert_eq!(
+        closed.enter_admission_frozen_in_place_v2(authority).await,
+        Err(RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::ProtocolViolation)
+    );
+    assert_eq!(
+        closed.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert_eq!(port.renew_calls(), 0);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn admission_frozen_keeps_the_startup_cutoff_and_cancellation_fails_closed() {
+    let (handle, port, invalidated) = fixture(
+        Duration::from_secs(2),
+        Duration::from_millis(900),
+        Duration::from_millis(100),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let mut closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+    let committed = closed.observation().receipt().clone();
+    let gate = Arc::new(Notify::new());
+    port.block_next_observation(gate.clone());
+    let authority =
+        crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::for_test_v2(
+            committed,
+            Instant::now() + Duration::from_millis(400),
+        );
+    let mut handoff = Box::pin(closed.enter_admission_frozen_in_place_v2(authority));
+    tokio::select! {
+        biased;
+        result = &mut handoff => panic!("unexpected admission-frozen result: {result:?}"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+    wait_for(|| port.observe_calls() == 2).await;
+    drop(handoff);
+    gate.notify_waiters();
+
+    assert_eq!(
+        closed.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.renew_calls(), 0);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+
+    let (handle, port, invalidated) = fixture(
+        Duration::from_secs(2),
+        Duration::from_millis(900),
+        Duration::from_millis(100),
+        [],
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let mut closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+    let committed = closed.observation().receipt().clone();
+    let cutoff = Instant::now() + Duration::from_millis(80);
+    let authority =
+        crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::for_test_v2(
+            committed, cutoff,
+        );
+    closed
+        .enter_admission_frozen_in_place_v2(authority)
+        .await
+        .unwrap();
+    let frozen = closed.try_into_admission_frozen_v2().unwrap();
+    assert_eq!(frozen.handoff_cutoff_v2(), cutoff);
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed
+    );
+    assert_eq!(port.renew_calls(), 0);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn admission_frozen_cleanup_remains_bounded_by_the_original_startup_cap() {
+    let startup_cleanup_deadline = Instant::now() + Duration::from_millis(250);
+    let (handle, port, invalidated) = fixture_with_startup_cleanup_deadline(
+        Duration::from_secs(2),
+        Duration::from_millis(900),
+        Duration::from_millis(100),
+        [],
+        Some(startup_cleanup_deadline),
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let mut closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+    let authority =
+        crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::for_test_v2(
+            closed.observation().receipt().clone(),
+            Instant::now() + Duration::from_secs(1),
+        );
+    closed
+        .enter_admission_frozen_in_place_v2(authority)
+        .await
+        .unwrap();
+    let frozen = closed.try_into_admission_frozen_v2().unwrap();
+    *port
+        .state
+        .release_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(Notify::new()));
+
+    let exit = timeout(
+        Duration::from_millis(700),
+        frozen.abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(2)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        exit,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
+    );
+    assert!(Instant::now() >= startup_cleanup_deadline);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+async fn process_activation_fixture(
+    lease_for: Duration,
+    renew_before: Duration,
+    safety_margin: Duration,
+    startup_cleanup_deadline: Option<Instant>,
+    handoff_cutoff: Instant,
+) -> (
+    RuntimeGatewayOwnerAdmissionFrozenSupervisorV2,
+    FakePortV1,
+    Arc<AtomicBool>,
+    RuntimeGatewayOwnerLeaseReceiptV1,
+) {
+    process_activation_fixture_with_renew_steps(
+        lease_for,
+        renew_before,
+        safety_margin,
+        startup_cleanup_deadline,
+        handoff_cutoff,
+        [],
+    )
+    .await
+}
+
+async fn process_activation_fixture_with_renew_steps(
+    lease_for: Duration,
+    renew_before: Duration,
+    safety_margin: Duration,
+    startup_cleanup_deadline: Option<Instant>,
+    handoff_cutoff: Instant,
+    renew_steps: impl IntoIterator<Item = FakeRenewStepV1>,
+) -> (
+    RuntimeGatewayOwnerAdmissionFrozenSupervisorV2,
+    FakePortV1,
+    Arc<AtomicBool>,
+    RuntimeGatewayOwnerLeaseReceiptV1,
+) {
+    let (handle, port, invalidated) = fixture_with_startup_cleanup_deadline(
+        lease_for,
+        renew_before,
+        safety_margin,
+        renew_steps,
+        startup_cleanup_deadline,
+    );
+    let prepared = handle.prepare_closed_recovery_v2().await.unwrap();
+    let permit = closed_recovery_permit(prepared.observation().receipt().clone());
+    let mut closed = prepared.commit_closed_recovery_v2(&permit).await.unwrap();
+    let receipt = closed.observation().receipt().clone();
+    let authority =
+        crate::closed_recovery::RuntimeGatewayOwnerAdmissionFrozenAuthorityV2::for_test_v2(
+            receipt.clone(),
+            handoff_cutoff,
+        );
+    closed
+        .enter_admission_frozen_in_place_v2(authority)
+        .await
+        .unwrap();
+    (
+        closed.try_into_admission_frozen_v2().unwrap(),
+        port,
+        invalidated,
+        receipt,
+    )
+}
+
+#[tokio::test]
+async fn exact_process_activation_preserves_the_frozen_receipt_and_generation() {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    let process_generation = NonZeroU64::new(7).unwrap();
+
+    let activated = frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let process = frozen.try_into_process_frozen_v2().unwrap();
+
+    assert_eq!(activated.receipt(), &receipt);
+    assert_eq!(process.activation_observation_v2().receipt(), &receipt);
+    assert_eq!(process.process_generation_v2(), process_generation);
+    assert_eq!(
+        process.observe_current_v2().await.unwrap().receipt(),
+        &receipt
+    );
+    assert_eq!(port.renew_calls(), 0);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        process
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn lost_process_activation_acknowledgement_exact_observes_the_applied_generation() {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    let process_generation = NonZeroU64::new(11).unwrap();
+    frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let (sender, acknowledgement) = oneshot::channel();
+    drop(sender);
+
+    let recovered = frozen
+        .inner()
+        .accept_process_activation_acknowledgement_v2(process_generation, acknowledgement)
+        .await
+        .unwrap();
+
+    assert_eq!(recovered.receipt(), &receipt);
+    assert_eq!(port.renew_calls(), 0);
+    assert!(!invalidated.load(Ordering::Acquire));
+    let process = frozen.try_into_process_frozen_v2().unwrap();
+    assert_eq!(
+        process
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+}
+
+#[tokio::test]
+async fn stale_process_activation_receipt_is_rejected_and_invalidates() {
+    let (frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    let mut stale = receipt;
+    stale.owner_revision = NonZeroU64::new(stale.owner_revision.get() + 1).unwrap();
+
+    assert_eq!(
+        frozen
+            .inner()
+            .activate_process_ownership_v2(stale, NonZeroU64::new(3).unwrap())
+            .await,
+        Err(RuntimeGatewayOwnerProcessActivationErrorV2::OwnerReceiptMismatch)
+    );
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn stale_process_generation_cannot_replace_an_activated_generation() {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(5).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        frozen
+            .inner()
+            .activate_process_ownership_v2(receipt, NonZeroU64::new(4).unwrap())
+            .await,
+        Err(RuntimeGatewayOwnerProcessActivationErrorV2::ProtocolViolation)
+    );
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn process_frozen_survives_the_expired_startup_handoff_cutoff() {
+    let cutoff = Instant::now() + Duration::from_millis(80);
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_millis(900),
+        Duration::from_millis(500),
+        Duration::from_millis(100),
+        None,
+        cutoff,
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(9).unwrap())
+        .await
+        .unwrap();
+    let process = frozen.try_into_process_frozen_v2().unwrap();
+
+    sleep(Duration::from_millis(140)).await;
+
+    assert!(Instant::now() >= cutoff);
+    assert_eq!(
+        process.observe_current_v2().await.unwrap().receipt(),
+        &receipt
+    );
+    assert_eq!(process.terminal_status_v2(), None);
+    assert_eq!(port.renew_calls(), 0);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        process
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+}
+
+#[tokio::test]
+async fn process_activation_clears_the_original_startup_cleanup_cap() {
+    let startup_cleanup_deadline = Instant::now() + Duration::from_millis(250);
+    let (mut frozen, port, invalidated, _) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        Some(startup_cleanup_deadline),
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(13).unwrap())
+        .await
+        .unwrap();
+    let process = frozen.try_into_process_frozen_v2().unwrap();
+    let release_gate = Arc::new(Notify::new());
+    *port
+        .state
+        .release_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(release_gate.clone());
+    let release = tokio::spawn(async move {
+        sleep(Duration::from_millis(350)).await;
+        release_gate.notify_one();
+    });
+
+    let exit = process
+        .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    release.await.unwrap();
+    assert_eq!(exit, RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown);
+    assert!(Instant::now() >= startup_cleanup_deadline);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+    assert_eq!(port.renew_calls(), 0);
+}
+
+#[tokio::test]
+async fn process_frozen_does_not_renew_at_the_production_renewal_boundary() {
+    let (mut frozen, port, invalidated, _) = process_activation_fixture(
+        Duration::from_millis(1_200),
+        Duration::from_millis(900),
+        Duration::from_millis(100),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(17).unwrap())
+        .await
+        .unwrap();
+    let process = frozen.try_into_process_frozen_v2().unwrap();
+
+    sleep(Duration::from_millis(450)).await;
+
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(process.terminal_status_v2(), None);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        process
+            .abort_and_shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn exact_process_renewal_start_preserves_identity_and_enters_production() {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    let process_generation = NonZeroU64::new(19).unwrap();
+    frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let mut process = frozen.try_into_process_frozen_v2().unwrap();
+
+    let started = process
+        .start_production_renewal_in_place_v2()
+        .await
+        .unwrap();
+    let production = process.try_into_production_v2().unwrap();
+
+    assert_eq!(started.receipt(), &receipt);
+    assert_eq!(production.start_observation_v2().receipt(), &receipt);
+    assert_eq!(production.process_generation_v2(), process_generation);
+    assert_eq!(
+        format!("{production:?}"),
+        "RuntimeGatewayOwnerProductionSupervisorV2(<redacted>)"
+    );
+    assert_eq!(
+        production
+            .observe_current_v2()
+            .await
+            .unwrap()
+            .receipt()
+            .lease_id,
+        receipt.lease_id
+    );
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        production
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn lost_process_renewal_start_acknowledgement_reconciles_without_reactivation() {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    let process_generation = NonZeroU64::new(23).unwrap();
+    frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let mut process = frozen.try_into_process_frozen_v2().unwrap();
+    process
+        .start_production_renewal_in_place_v2()
+        .await
+        .unwrap();
+    let (sender, acknowledgement) = oneshot::channel();
+    drop(sender);
+
+    let recovered = process
+        .inner()
+        .accept_process_renewal_acknowledgement_v2(process_generation, acknowledgement)
+        .await
+        .unwrap();
+
+    assert_eq!(recovered.receipt().lease_id, receipt.lease_id);
+    assert!(recovered.receipt().owner_revision >= receipt.owner_revision);
+    assert_eq!(
+        process
+            .inner()
+            .production_generation
+            .load(Ordering::Acquire),
+        process_generation.get()
+    );
+    assert!(!invalidated.load(Ordering::Acquire));
+    let production = process.try_into_production_v2().unwrap();
+    assert_eq!(
+        production
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn stale_process_renewal_receipt_is_terminal_and_fail_closed() {
+    let (mut frozen, port, invalidated, mut receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    let process_generation = NonZeroU64::new(29).unwrap();
+    frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let process = frozen.try_into_process_frozen_v2().unwrap();
+    receipt.owner_revision = NonZeroU64::new(receipt.owner_revision.get() + 1).unwrap();
+
+    assert_eq!(
+        process
+            .inner()
+            .start_process_renewal_v2(receipt, process_generation)
+            .await,
+        Err(RuntimeGatewayOwnerProcessRenewalStartErrorV2::OwnerReceiptMismatch)
+    );
+    assert_eq!(
+        process.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn stale_process_renewal_generation_is_terminal_and_fail_closed() {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    let process_generation = NonZeroU64::new(31).unwrap();
+    frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let process = frozen.try_into_process_frozen_v2().unwrap();
+
+    assert_eq!(
+        process
+            .inner()
+            .start_process_renewal_v2(receipt, NonZeroU64::new(30).unwrap())
+            .await,
+        Err(RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProcessGenerationMismatch)
+    );
+    assert_eq!(
+        process.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn duplicate_process_renewal_start_is_terminal_and_fail_closed() {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    let process_generation = NonZeroU64::new(37).unwrap();
+    frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let mut process = frozen.try_into_process_frozen_v2().unwrap();
+    process
+        .start_production_renewal_in_place_v2()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        process
+            .inner()
+            .start_process_renewal_v2(receipt, process_generation)
+            .await,
+        Err(RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProtocolViolation)
+    );
+    assert_eq!(
+        process.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn process_renewal_start_in_another_role_is_terminal_and_fail_closed() {
+    let (frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+
+    assert_eq!(
+        frozen
+            .inner()
+            .start_process_renewal_v2(receipt, NonZeroU64::new(41).unwrap())
+            .await,
+        Err(RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProtocolViolation)
+    );
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 0);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn production_immediately_renews_and_publishes_a_strict_successor_without_polling() {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_millis(900),
+        Duration::from_millis(600),
+        Duration::from_millis(100),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(43).unwrap())
+        .await
+        .unwrap();
+    let mut process = frozen.try_into_process_frozen_v2().unwrap();
+    process
+        .start_production_renewal_in_place_v2()
+        .await
+        .unwrap();
+    let production = process.try_into_production_v2().unwrap();
+    let observation_calls = port.observe_calls();
+
+    let successor = production
+        .wait_for_strict_successor_v2(
+            receipt.owner_revision,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        successor.receipt().owner_revision.get(),
+        receipt.owner_revision.get() + 1
+    );
+    assert_eq!(port.renew_calls(), 1);
+    assert_eq!(port.observe_calls(), observation_calls);
+    assert_eq!(production.terminal_status_v2(), None);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        production
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+}
+
+#[tokio::test]
+async fn canceling_a_strict_successor_wait_does_not_cancel_the_production_renewal() {
+    let gate = Arc::new(Notify::new());
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture_with_renew_steps(
+        Duration::from_millis(900),
+        Duration::from_millis(600),
+        Duration::from_millis(100),
+        None,
+        Instant::now() + Duration::from_secs(1),
+        [FakeRenewStepV1::Blocked(gate.clone())],
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(46).unwrap())
+        .await
+        .unwrap();
+    let mut process = frozen.try_into_process_frozen_v2().unwrap();
+    process
+        .start_production_renewal_in_place_v2()
+        .await
+        .unwrap();
+    let production = process.try_into_production_v2().unwrap();
+    wait_for(|| port.renew_calls() == 1).await;
+    let mut successor = Box::pin(production.wait_for_strict_successor_v2(
+        receipt.owner_revision,
+        Instant::now() + Duration::from_secs(1),
+    ));
+    tokio::select! {
+        biased;
+        result = &mut successor => panic!("unexpected strict successor result: {result:?}"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+    drop(successor);
+
+    gate.notify_one();
+    let observed = production
+        .wait_for_strict_successor_v2(
+            receipt.owner_revision,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    assert!(observed.receipt().owner_revision > receipt.owner_revision);
+    assert_eq!(port.renew_calls(), 1);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        production
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+}
+
+#[tokio::test]
+async fn production_renewal_continues_past_the_startup_handoff_cutoff() {
+    let cutoff = Instant::now() + Duration::from_millis(150);
+    let (mut frozen, port, invalidated, _) = process_activation_fixture(
+        Duration::from_millis(600),
+        Duration::from_millis(400),
+        Duration::from_millis(100),
+        None,
+        cutoff,
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(47).unwrap())
+        .await
+        .unwrap();
+    let mut process = frozen.try_into_process_frozen_v2().unwrap();
+    let started = process
+        .start_production_renewal_in_place_v2()
+        .await
+        .unwrap();
+    let production = process.try_into_production_v2().unwrap();
+    let first = production
+        .wait_for_strict_successor_v2(
+            started.receipt().owner_revision,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    let second = production
+        .wait_for_strict_successor_v2(
+            first.receipt().owner_revision,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    assert!(Instant::now() >= cutoff);
+    assert!(second.receipt().owner_revision > first.receipt().owner_revision);
+    assert!(port.renew_calls() >= 2);
+    assert_eq!(production.terminal_status_v2(), None);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        production
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+}
+
+#[tokio::test]
+async fn production_renewal_ownership_loss_is_terminal_and_fail_closed() {
+    let (mut frozen, port, invalidated, _) = process_activation_fixture_with_renew_steps(
+        Duration::from_millis(900),
+        Duration::from_millis(600),
+        Duration::from_millis(100),
+        None,
+        Instant::now() + Duration::from_secs(1),
+        [FakeRenewStepV1::OwnershipLost],
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(53).unwrap())
+        .await
+        .unwrap();
+    let mut process = frozen.try_into_process_frozen_v2().unwrap();
+    let started = process
+        .start_production_renewal_in_place_v2()
+        .await
+        .unwrap();
+    let production = process.try_into_production_v2().unwrap();
+
+    assert_eq!(
+        production
+            .wait_for_strict_successor_v2(
+                started.receipt().owner_revision,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await,
+        Err(RuntimeGatewayOwnerStrictSuccessorErrorV2::OwnershipLost)
+    );
+    assert_eq!(
+        production.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 1);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn production_renewal_unknown_is_terminal_and_fail_closed() {
+    let (mut frozen, port, invalidated, _) = process_activation_fixture_with_renew_steps(
+        Duration::from_millis(900),
+        Duration::from_millis(600),
+        Duration::from_millis(100),
+        None,
+        Instant::now() + Duration::from_secs(1),
+        [FakeRenewStepV1::OutcomeUnknown],
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(NonZeroU64::new(59).unwrap())
+        .await
+        .unwrap();
+    let mut process = frozen.try_into_process_frozen_v2().unwrap();
+    let started = process
+        .start_production_renewal_in_place_v2()
+        .await
+        .unwrap();
+    let production = process.try_into_production_v2().unwrap();
+
+    assert_eq!(
+        production
+            .wait_for_strict_successor_v2(
+                started.receipt().owner_revision,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await,
+        Err(RuntimeGatewayOwnerStrictSuccessorErrorV2::SupervisorUnavailable)
+    );
+    assert_eq!(
+        production.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::RenewalUnknown
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 1);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
 async fn closed_recovery_commit_rejects_mismatched_permit_and_invalidates() {
     let (handle, port, invalidated) = fixture(
         Duration::from_secs(5),
@@ -4684,51 +6423,5 @@ async fn committed_closed_recovery_never_renews_and_expires_fail_closed() {
 
     assert_eq!(port.renew_calls(), 0);
     drop(closed);
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn safety_deadline_wins_over_handoff_queued_behind_renewal() {
-    let gate = Arc::new(Notify::new());
-    let (mut handle, port, invalidated) = fixture(
-        Duration::from_millis(400),
-        Duration::from_millis(300),
-        Duration::from_millis(100),
-        [FakeRenewStepV1::Blocked(gate.clone())],
-    );
-    wait_for(|| port.renew_calls() == 1).await;
-    let (response, acknowledgement) = oneshot::channel();
-    handle
-        .inner()
-        .supervisor_commands
-        .send(RuntimeGatewayOwnerSupervisorCommandV1::Promote { response })
-        .await
-        .unwrap();
-    wait_for(|| invalidated.load(Ordering::Acquire)).await;
-    gate.notify_one();
-
-    assert!(acknowledgement.await.is_err());
-    assert_eq!(
-        handle.wait_terminal().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed
-    );
-    assert_eq!(port.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn production_wait_reports_ownership_loss_from_the_same_actor() {
-    let (handle, port, invalidated) = fixture(
-        Duration::from_millis(700),
-        Duration::from_millis(500),
-        Duration::from_millis(100),
-        [FakeRenewStepV1::OwnershipLost],
-    );
-    let mut production = handle.into_production_v1(handoff_proof()).await.unwrap();
-
-    assert_eq!(
-        production.wait_terminal().await,
-        RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost
-    );
-    assert!(invalidated.load(Ordering::Acquire));
     assert_eq!(port.release_calls(), 1);
 }

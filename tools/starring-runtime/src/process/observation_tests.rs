@@ -12,6 +12,80 @@ use crate::{
     RuntimeOwnerHeldProcessShutdownErrorV1,
 };
 
+#[test]
+fn ingress_acknowledgement_schedule_is_fail_closed_at_expiry_and_safety_equality() {
+    let now = Instant::now();
+    assert_eq!(
+        ingress_acknowledgement_schedule_from_remaining_v2(Duration::ZERO, now, now),
+        None
+    );
+    assert_eq!(
+        ingress_acknowledgement_schedule_from_remaining_v2(
+            INGRESS_ACKNOWLEDGEMENT_SAFETY_MARGIN_V2,
+            now,
+            now,
+        ),
+        None
+    );
+
+    let remaining = INGRESS_ACKNOWLEDGEMENT_SAFETY_MARGIN_V2 + Duration::from_nanos(1);
+    let schedule = ingress_acknowledgement_schedule_from_remaining_v2(remaining, now, now).unwrap();
+    assert_eq!(schedule.refresh_at, now);
+    assert_eq!(schedule.safety_deadline, now + Duration::from_nanos(1));
+}
+
+#[test]
+fn ingress_acknowledgement_schedule_refreshes_before_its_safety_deadline() {
+    let now = Instant::now();
+    let schedule = ingress_acknowledgement_schedule_from_remaining_v2(
+        INGRESS_ACKNOWLEDGEMENT_LEASE_V2,
+        now,
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        schedule.refresh_at,
+        now + INGRESS_ACKNOWLEDGEMENT_LEASE_V2
+            .checked_sub(INGRESS_ACKNOWLEDGEMENT_REFRESH_ADVANCE_V2)
+            .unwrap()
+    );
+    assert_eq!(
+        schedule.safety_deadline,
+        now + INGRESS_ACKNOWLEDGEMENT_LEASE_V2
+            .checked_sub(INGRESS_ACKNOWLEDGEMENT_SAFETY_MARGIN_V2)
+            .unwrap()
+    );
+    assert!(schedule.refresh_at < schedule.safety_deadline);
+}
+
+#[test]
+fn ingress_acknowledgement_schedule_keeps_the_pre_observation_monotonic_anchor() {
+    let observation_started_at = Instant::now();
+    let observed_at = observation_started_at + Duration::from_secs(7);
+    let schedule = ingress_acknowledgement_schedule_from_remaining_v2(
+        INGRESS_ACKNOWLEDGEMENT_LEASE_V2,
+        observation_started_at,
+        observed_at,
+    )
+    .unwrap();
+    assert_eq!(
+        schedule.refresh_at,
+        observation_started_at + Duration::from_secs(5)
+    );
+    assert_eq!(
+        schedule.safety_deadline,
+        observation_started_at + Duration::from_secs(8)
+    );
+    assert_eq!(
+        ingress_acknowledgement_schedule_from_remaining_v2(
+            INGRESS_ACKNOWLEDGEMENT_LEASE_V2,
+            observation_started_at,
+            schedule.safety_deadline,
+        ),
+        None
+    );
+}
+
 const FAKE_PROCESS_CLEANUP_EVENTS_V2: [&str; 8] = [
     "discord_start",
     "discord_done",
@@ -131,6 +205,7 @@ impl RuntimeStartupRecoveryObservationProcessStepV2<()> for FakeObservationProce
                     let interrupt = await_startup_recovery_observation_interrupt_v2(
                         discord_terminal,
                         owner_terminal,
+                        pending(),
                     );
                     let pending_observation = async move {
                         active.fetch_add(1, Ordering::AcqRel);
@@ -149,6 +224,11 @@ impl RuntimeStartupRecoveryObservationProcessStepV2<()> for FakeObservationProce
                                 RuntimeStartupRecoveryObservationInterruptV2::Owner => {
                                     RuntimeProcessStartupRecoveryObservationFailureV2::PausedConnection(
                                         RuntimeProcessPausedConnectedTransitionFailureV1::GatewayOwnerTerminated,
+                                    )
+                                }
+                                RuntimeStartupRecoveryObservationInterruptV2::Shutdown(cause) => {
+                                    RuntimeProcessStartupRecoveryObservationFailureV2::PausedConnection(
+                                        RuntimeProcessPausedConnectedTransitionFailureV1::ProcessShutdown(cause),
                                     )
                                 }
                             })
@@ -569,6 +649,7 @@ async fn interrupt_race_prioritizes_discord_when_both_signals_are_ready() {
     let interrupt = await_startup_recovery_observation_interrupt_v2(
         ready(RuntimeProcessPausedConnectedTransitionFailureV1::DiscordTerminated),
         ready(()),
+        pending(),
     )
     .await;
 
@@ -585,6 +666,7 @@ async fn interrupt_race_observes_owner_termination_while_discord_is_live() {
     let interrupt = await_startup_recovery_observation_interrupt_v2(
         pending::<RuntimeProcessPausedConnectedTransitionFailureV1>(),
         ready(()),
+        pending(),
     )
     .await;
 
@@ -592,6 +674,84 @@ async fn interrupt_race_observes_owner_termination_while_discord_is_live() {
         interrupt,
         RuntimeStartupRecoveryObservationInterruptV2::Owner
     ));
+}
+
+#[tokio::test]
+async fn production_handoff_shutdown_wins_at_every_long_wait_boundary() {
+    for _boundary in 0..3 {
+        let stage_polls = Arc::new(AtomicUsize::new(0));
+        let stage_polls_for_future = stage_polls.clone();
+        let latch = crate::process_supervisor::create_runtime_process_shutdown_latch_v1();
+        let trigger = latch.trigger();
+        let mut shutdown = latch.observer();
+        trigger.trip(crate::RuntimeShutdownCauseV1::Explicit);
+        let output = await_production_handoff_stage_v2(
+            async move {
+                stage_polls_for_future.fetch_add(1, Ordering::AcqRel);
+                ready::<()>(()).await
+            },
+            &mut shutdown,
+        )
+        .await;
+        assert_eq!(output, None);
+        assert_eq!(stage_polls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            trigger.observed().unwrap().cause(),
+            crate::RuntimeShutdownCauseV1::Explicit
+        );
+    }
+}
+
+#[tokio::test]
+async fn production_handoff_shutdown_cancels_a_started_stage_without_losing_its_owner() {
+    for _boundary in 0..3 {
+        let active = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let stage_active = active.clone();
+        let stage_dropped = dropped.clone();
+        let latch = crate::process_supervisor::create_runtime_process_shutdown_latch_v1();
+        let trigger = latch.trigger();
+        let mut shutdown = latch.observer();
+        let mut handoff = Box::pin(await_production_handoff_stage_v2(
+            async move {
+                stage_active.fetch_add(1, Ordering::AcqRel);
+                let _guard = FakePendingObservationGuardV2 {
+                    active: stage_active,
+                    dropped: stage_dropped,
+                };
+                pending::<()>().await
+            },
+            &mut shutdown,
+        ));
+        std::future::poll_fn(|context| {
+            assert!(Future::poll(handoff.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        assert!(trigger
+            .trip(crate::RuntimeShutdownCauseV1::Explicit)
+            .first());
+        assert_eq!(handoff.await, None);
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+    }
+}
+
+#[test]
+fn production_handoff_final_revalidation_rejects_latched_root_shutdown() {
+    let latch = crate::process_supervisor::create_runtime_process_shutdown_latch_v1();
+    let shutdown = latch.observer();
+    assert_eq!(production_handoff_shutdown_failure_v2(&shutdown), None);
+
+    latch
+        .trigger()
+        .trip(crate::RuntimeShutdownCauseV1::Explicit);
+
+    assert_eq!(
+        production_handoff_shutdown_failure_v2(&shutdown),
+        Some(RuntimeProcessProductionHandoffFailureV2::ProcessShutdown)
+    );
 }
 
 #[test]
@@ -741,4 +901,79 @@ fn cleanup_failure_preserves_transition_class_without_exposing_sources() {
         "RuntimeProcessStartupRecoveryObservationErrorV2(<redacted>)"
     );
     assert!(std::error::Error::source(&cleanup).is_none());
+}
+
+#[test]
+fn observation_outer_shutdown_error_forces_failed_closed_terminal_total() {
+    let (recorder, observer) =
+        crate::lifecycle_timing::RuntimeLifecycleTimingRecorderV2::create_v2();
+    let terminal = crate::lifecycle_timing::RuntimeLifecycleTimingTerminalReporterV2::new_v2(
+        recorder,
+        observer.clone(),
+    );
+    let result = finish_observation_shutdown_timing_v2(
+        terminal,
+        Err::<(), _>(RuntimeClosedRecoveryProcessCleanupFailureV2::Discord(
+            RuntimeDiscordGatewayShutdownFailureV1::UnexpectedExit,
+        )),
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        observer
+            .snapshot_v2()
+            .sample_v2(RuntimeLifecycleTimingMetricV2::ShutdownTotal)
+            .unwrap()
+            .outcome(),
+        RuntimeLifecycleTimingOutcomeV2::FailedClosed
+    );
+    assert_eq!(observer.terminal_emission_count_v2(), 1);
+}
+
+#[tokio::test]
+async fn observation_phase_wrapper_preserves_discord_and_owner_deadlines() {
+    let (recorder, observer) =
+        crate::lifecycle_timing::RuntimeLifecycleTimingRecorderV2::create_v2();
+    let discord = ready(Err::<
+        (),
+        crate::discord::RuntimeDiscordGatewayShutdownErrorV1,
+    >(
+        crate::discord::RuntimeDiscordGatewayShutdownErrorV1::CloseDeadlineElapsed,
+    ));
+    let _ = time_shutdown_result_v2(
+        &recorder,
+        RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+        discord,
+        discord_shutdown_timing_outcome_v2,
+    )
+    .await;
+    let owner = ready(Err::<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        crate::gateway_owner_startup_watchdog::
+            RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    >(
+        crate::gateway_owner_startup_watchdog::
+            RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1::DeadlineElapsed,
+    ));
+    let _ = time_shutdown_result_v2(
+        &recorder,
+        RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin,
+        owner,
+        owner_shutdown_timing_outcome_v2,
+    )
+    .await;
+    let snapshot = observer.snapshot_v2();
+    assert_eq!(
+        snapshot
+            .sample_v2(RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin)
+            .unwrap()
+            .outcome(),
+        RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed
+    );
+    assert_eq!(
+        snapshot
+            .sample_v2(RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin)
+            .unwrap()
+            .outcome(),
+        RuntimeLifecycleTimingOutcomeV2::DeadlineElapsed
+    );
 }

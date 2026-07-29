@@ -239,6 +239,22 @@ impl RuntimeAuthorizedStartupRecoveryExecutionV2 {
         crate::startup_pending_drain::authorize_pending_drain_selection_v2(self)
     }
 
+    pub fn into_pending_drain_selection_v3(
+        self,
+    ) -> Result<
+        crate::RuntimeAuthorizedPendingDrainSelectionV3,
+        crate::RuntimePendingDrainCompoundErrorV2,
+    > {
+        crate::startup_pending_drain::authorize_pending_drain_selection_v3(self)
+    }
+
+    pub fn into_pending_drain_selection_v4(
+        self,
+    ) -> Result<crate::RuntimeAuthorizedPendingDrainSelectionV4, crate::RuntimePendingDrainV4Error>
+    {
+        crate::startup_pending_drain::authorize_pending_drain_selection_v4(self)
+    }
+
     pub(crate) fn complete_pending_drain(
         self,
         receipt: RuntimeStartupRecoveryExecutionReceiptV2,
@@ -251,6 +267,13 @@ impl RuntimeAuthorizedStartupRecoveryExecutionV2 {
             pending_drain_proof: Some(proof),
             pending_registry_successor: registry_successor,
         }
+    }
+}
+
+impl RuntimeStartupRecoveryExecutionCorrelationV2 {
+    pub(crate) fn replace_authority_revision_for_v4(&mut self, authority_revision: NonZeroU64) {
+        self.selection_authority_revision = self.authority_revision;
+        self.authority_revision = authority_revision;
     }
 }
 
@@ -424,6 +447,7 @@ pub(crate) fn validate_startup_recovery_execution_v2(
         || pending_drain_proof.as_ref().is_some_and(|proof| {
             !proof.matches_request(&request)
                 || proof.requires_registry_successor() != pending_registry_successor.is_some()
+                || !proof.matches_outcome(&receipt.outcome)
         })
         || (pending_drain_proof.is_none() && pending_registry_successor.is_some())
     {

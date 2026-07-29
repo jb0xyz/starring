@@ -475,6 +475,7 @@ dependencies = [
  "resource-resolution",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
@@ -488,6 +489,7 @@ dependencies = [
  "automation-runtime-convergence",
  "automation-runtime-worker",
  "chrono",
+ "serde",
  "serde_json",
  "sha2",
  "sqlx",
@@ -553,8 +555,11 @@ name = "automation-runtime-registry"
 version = "0.1.0"
 dependencies = [
  "automation-ruleset",
+ "automation-runtime-controller",
  "automation-runtime-convergence",
+ "automation-runtime-worker",
  "automation-state",
+ "chrono",
  "desired-state",
  "discord-model",
  "resource-resolution",

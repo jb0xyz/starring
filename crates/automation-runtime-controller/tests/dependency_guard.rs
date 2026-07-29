@@ -139,6 +139,58 @@ fn v2_evidence_stays_domain_only_and_runtime_independent() {
 }
 
 #[test]
+fn ingress_open_acknowledgement_contract_is_canonical_pure_and_non_authorizing() {
+    let source = include_str!("../src/v2_ingress_acknowledgement.rs");
+    let root = include_str!("../src/lib.rs");
+
+    for required in [
+        "RuntimeIngressOpenAcknowledgementLeaseDurationV2",
+        "MIN_INGRESS_OPEN_ACKNOWLEDGEMENT_LEASE_MILLISECONDS: u64 = 1_000",
+        "MAX_INGRESS_OPEN_ACKNOWLEDGEMENT_LEASE_MILLISECONDS: u64 = 10_000",
+        "RuntimeIngressOpenAcknowledgementRequestDigestV2",
+        "RuntimePublishIngressOpenAcknowledgementV2",
+        "RuntimeIngressOpenAcknowledgementV2",
+        "RuntimeIngressOpenAcknowledgementReceiptV2",
+        "RuntimeObservedIngressOpenAcknowledgementV2",
+        "source_acknowledgement_revision",
+        "canonical_request_bytes",
+        "Sha256::digest",
+        "RuntimeGatewayReadyKindV2::Ready => 1",
+        "RuntimeGatewayReadyKindV2::Resumed => 2",
+    ] {
+        assert!(source.contains(required), "{required}");
+    }
+    for forbidden in [
+        "sqlx",
+        "rusqlite",
+        "tokio",
+        "twilight",
+        "Serialize",
+        "Deserialize",
+        "Default",
+        "Future",
+        "PortV2",
+        "Authority",
+        "Permit",
+        "Utc::now",
+        "SystemTime",
+        "async fn",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+    }
+    for exported in [
+        "RuntimeIngressOpenAcknowledgementLeaseDurationV2",
+        "RuntimeIngressOpenAcknowledgementRequestDigestV2",
+        "RuntimePublishIngressOpenAcknowledgementV2",
+        "RuntimeIngressOpenAcknowledgementV2",
+        "RuntimeIngressOpenAcknowledgementReceiptV2",
+        "RuntimeObservedIngressOpenAcknowledgementV2",
+    ] {
+        assert!(root.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn v2_route_mutation_provenance_is_exact_inert_evidence() {
     let source = include_str!("../src/v2_route_provenance.rs");
     for forbidden in [
@@ -1730,8 +1782,6 @@ fn v2_drain_intent_state_is_closed_immutable_and_non_authorizing() {
         "pub state:",
         "pub fn new(",
         "pub fn pending(",
-        "pub fn consumed(",
-        "pub fn cancelled(",
         ".next()",
         "checked_add",
         "SystemTime",
@@ -1791,7 +1841,7 @@ fn v2_drain_intent_state_is_closed_immutable_and_non_authorizing() {
 }
 
 #[test]
-fn v2_drain_intent_canonical_state_is_strict_pure_and_two_phase() {
+fn v2_drain_intent_canonical_state_is_strict_pure_and_closed() {
     let source = include_str!("../src/v2_drain_intent_canonical_state.rs");
     let wire = include_str!("../src/v2_drain_intent_canonical_state/wire.rs");
     let tests = include_str!("../src/v2_drain_intent_canonical_state/tests.rs");
@@ -1814,9 +1864,20 @@ fn v2_drain_intent_canonical_state_is_strict_pure_and_two_phase() {
     for declaration in [
         "pub struct RuntimeCanonicalDrainIntentStateV2",
         "pub struct RuntimePersistedUnclaimedPendingDrainIntentV2",
+        "pub struct RuntimePersistedRoutedClaimedPendingDrainIntentV2",
+        "pub struct RuntimePersistedRefencedPendingDrainIntentV2",
+        "pub struct RuntimeRoutedPendingDrainClaimInputV2",
+        "pub struct RuntimeRoutedPendingDrainClaimTransitionV2",
+        "pub struct RuntimeRoutedPendingDrainRefenceInputV2",
+        "pub struct RuntimeRoutedPendingDrainRefenceTransitionV2",
+        "pub struct RuntimeSameProcessRefencedDrainAcknowledgementInputV2",
+        "pub struct RuntimeSameProcessRefencedDrainAcknowledgementTransitionV2",
         "pub struct RuntimePersistedRouteAbsenceCandidateDrainIntentV2",
+        "pub struct RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2",
         "pub struct RuntimeClosedRecoveryEmptyRegistryPendingDrainClaimTransitionV2",
         "pub struct RuntimeClosedRecoveryPendingDrainAcknowledgementTransitionV2",
+        "pub struct RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementInputV2",
+        "pub struct RuntimeClosedRecoveryPendingDrainSuccessionAcknowledgementTransitionV2",
         "const DRAIN_INTENT_STATE_MAX_OCTETS: usize = 1_048_576;",
     ] {
         assert!(source.contains(declaration), "{declaration}");
@@ -1826,6 +1887,16 @@ fn v2_drain_intent_canonical_state_is_strict_pure_and_two_phase() {
         "RuntimeCanonicalDrainIntentStateV2::from_persisted(",
         "RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(",
         "RuntimeDrainIntentReceiptV2::acknowledged(",
+        "RuntimeDrainAcknowledgementSourceV2::from_refenced(",
+        "RuntimeDrainIntentReceiptV2::refenced(",
+        "NonZeroU64::MIN",
+        "next_controller_fence(input.expected_route.controller_fencing_token)",
+        "is_exact_initial_routed_claim",
+        "is_exact_initial_refenced_claim",
+        "is_exact_fence_successor",
+        "validate_same_process_provenance",
+        "RuntimeDrainSuccessionAcknowledgementSourceV2::from_expired_route_absent_claimed(",
+        "RuntimeDrainIntentReceiptV2::succession_acknowledged(",
         "RuntimeDrainClaimProgressKindV2::Claimed => None",
         "RuntimeDrainClaimProgressKindV2::Refenced => {",
         "claim.progress().removal_target().cloned()",
@@ -1847,15 +1918,155 @@ fn v2_drain_intent_canonical_state_is_strict_pure_and_two_phase() {
         "decoder_rejects_unknown_noncanonical_and_mismatched_root_state",
         "pending_subtype_and_nested_provenance_corruption_fail_closed",
         "payload_limit_matches_the_one_mebibyte_execution_frame_cap",
-        "closed_recovery_requires_two_persisted_cas_transitions",
+        "routed_claim_refence_and_acknowledgement_are_exact_canonical_successors",
+        "routed_and_refenced_classifiers_require_exact_initial_lineage",
+        "same_process_transitions_reject_route_owner_provenance_and_observation_drift",
+        "unclaimed_closed_recovery_requires_two_persisted_cas_transitions",
         "persisted_refenced_candidate_acknowledges_the_exact_removal_target",
         "routed_claimed_state_is_not_a_route_absence_candidate",
         "closed_recovery_builder_rejects_owner_drift_and_revision_overflow",
+        "expired_route_absent_claim_succeeds_directly_with_exact_current_evidence",
+        "succession_predecessor_classifier_accepts_only_route_absent_claimed",
+        "succession_requires_expired_predecessor_distinct_newer_current_owner",
+        "succession_rejects_committed_certification_and_invalid_current_provenance",
+        "succession_rejects_each_persistence_successor_overflow",
     ] {
         assert!(
             tests.contains(&format!("fn {test_name}(")),
             "missing V2 drain-intent canonical-state test: {test_name}"
         );
+    }
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimePersistedRoutedClaimedPendingDrainIntentV2",
+        "RuntimePersistedRefencedPendingDrainIntentV2",
+        "RuntimeRoutedPendingDrainClaimInputV2",
+        "RuntimeRoutedPendingDrainClaimTransitionV2",
+        "RuntimeRoutedPendingDrainRefenceInputV2",
+        "RuntimeRoutedPendingDrainRefenceTransitionV2",
+        "RuntimeSameProcessRefencedDrainAcknowledgementInputV2",
+        "RuntimeSameProcessRefencedDrainAcknowledgementTransitionV2",
+    ] {
+        assert!(library.contains(exported), "missing export {exported}");
+    }
+}
+
+#[test]
+fn v3_previous_process_drain_teardown_is_strict_pure_and_closed() {
+    let source = include_str!("../src/v3_drain_teardown.rs");
+    let wire = include_str!("../src/v3_drain_teardown/wire.rs");
+    let tests = include_str!("../src/v3_drain_teardown/tests.rs");
+    let library = include_str!("../src/lib.rs");
+
+    for forbidden in [
+        "sqlx",
+        "rusqlite",
+        "twilight",
+        "std::fs",
+        "std::net",
+        "SystemTime",
+        "Utc::now",
+        "impl Future",
+        "async fn",
+        "Registry",
+        "Worker",
+        "Postgres",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+        assert!(!wire.contains(forbidden), "{forbidden}");
+    }
+
+    for declaration in [
+        "pub struct RuntimeRouteAbsentAcknowledgementV3",
+        "pub struct RuntimePreviousProcessRouteAbsenceBasisV3",
+        "pub enum RuntimePreviousProcessDrainProgressV3",
+        "pub struct RuntimeDrainCanonicalStateDigestV3",
+        "pub struct RuntimeDrainActionDigestV3",
+        "pub struct RuntimePreviousProcessDrainCertificationResolutionV3",
+        "pub struct RuntimeCanonicalDrainIntentStateV3",
+        "pub struct RuntimePreviousProcessDrainTeardownSuccessionInputV3",
+        "pub struct RuntimePreviousProcessDrainTeardownSuccessionTransitionV3",
+        "const DRAIN_INTENT_STATE_MAX_OCTETS_V3: usize = 1_048_576;",
+    ] {
+        assert!(source.contains(declaration), "{declaration}");
+    }
+
+    for exact_check in [
+        "Self::build(\n            source.canonical().clone(),\n            RuntimePreviousProcessDrainProgressV3::RoutedClaimed,",
+        "Self::build(\n            source.canonical().clone(),\n            RuntimePreviousProcessDrainProgressV3::Refenced,",
+        "RuntimeDrainCanonicalStateDigestV3::from_state_bytes(\n                source.state_bytes(),\n            )",
+        "self.source_route_fence.next() != Ok(self.possible_route_fence_ceiling)",
+        "absence_basis.possible_route_fence_ceiling.next()",
+        "next_persistence_revision(\n            predecessor_claim.claim_revision(),",
+        "next_persistence_revision(\n                source.intent().intent_revision(),",
+        "if intent_revision != expected_intent_revision",
+        "validate_closed_recovery_witness(witness)",
+        "witness.gateway_owner_lease_id.lease_epoch\n        <= predecessor_claim.gateway_owner_lease_id().lease_epoch",
+        "RuntimePreviousProcessDrainCertificationResolutionV3::from_predecessor(",
+        "persisted != self.result",
+        "RuntimeDrainTeardownCanonicalErrorV3::PersistedResultMismatch",
+        "const FORMAT_VERSION: u8 = 3;",
+        "#[serde(deny_unknown_fields)]",
+        "#[serde(tag = \"kind\", deny_unknown_fields)]",
+        "if canonical.state_bytes() != encoded",
+        "deserialize_required_option",
+        "RouteAbsentAcknowledged",
+        "Consumed",
+        "Cancelled",
+    ] {
+        assert!(
+            source.contains(exact_check) || wire.contains(exact_check),
+            "{exact_check}"
+        );
+    }
+
+    assert!(!wire.contains("Pending {"));
+    assert!(wire.contains("\"previous_process_route_teardown\""));
+    assert!(wire.contains("\"routed_claimed\""));
+    assert!(wire.contains("\"refenced\""));
+
+    for test_name in [
+        "routed_teardown_is_the_exact_current_owner_successor",
+        "refenced_teardown_preserves_refence_and_predecessor_certification",
+        "no_attestation_certification_round_trips_without_successor_claim_rebinding",
+        "v3_terminal_successors_are_closed_and_round_trip_exactly",
+        "v3_decoder_dispatches_exactly_and_rejects_noncanonical_encodings",
+        "v3_decoder_rejects_missing_or_malformed_teardown_evidence",
+        "standalone_decoder_requires_exact_predecessor_intent_revision_successorship",
+        "checked_reconstruction_rejects_canonical_predecessor_and_journal_drift",
+        "checked_reconstruction_rejects_canonical_successor_owner_process_and_time_drift",
+        "committed_certification_decoder_rejects_serving_and_revision_drift",
+        "succession_rejects_owner_process_epoch_time_and_provenance_drift",
+        "succession_requires_exact_journal_shapes_and_predecessor_certification",
+        "succession_preflights_intent_fence_and_classifier_overflow_boundaries",
+        "routed_classifier_rejects_missing_or_drifted_durable_route_evidence",
+        "v3_payload_limit_matches_the_one_mebibyte_execution_frame_cap",
+        "routed_and_refenced_teardown_bytes_match_independent_goldens",
+    ] {
+        assert!(
+            tests.contains(&format!("fn {test_name}(")),
+            "missing V3 drain-teardown test: {test_name}"
+        );
+    }
+
+    for golden in [
+        "goldens/routed_claimed_teardown_v3.json",
+        "goldens/refenced_teardown_v3.json",
+        "1deb34ccff32711691a1dbd125c8ce1e14850cc6480c7ca94571087773418f59",
+        "5db6b51cf693a4ffb5ecb74569d299148492f7f64e42c5d5b25306bbadd446a1",
+    ] {
+        assert!(tests.contains(golden), "{golden}");
+    }
+
+    for exported in [
+        "RuntimeCanonicalDrainIntentStateV3",
+        "RuntimePreviousProcessDrainTeardownSuccessionInputV3",
+        "RuntimePreviousProcessDrainTeardownSuccessionTransitionV3",
+        "RuntimePreviousProcessRouteAbsenceBasisV3",
+        "RuntimeRouteAbsentAcknowledgementV3",
+    ] {
+        assert!(library.contains(exported), "{exported}");
     }
 }
 
@@ -1886,10 +2097,7 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "pub fn claimed(",
         "pub fn claim_initial(",
         "pub fn claim_successor(",
-        "pub fn consumed(",
-        "pub fn cancelled(",
         ".next()",
-        "checked_add",
         "SystemTime",
         "Instant",
         "Utc::now",
@@ -1907,16 +2115,25 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "pub enum RuntimeDrainIntentMutationOutcomeV2",
         "pub struct RuntimeDrainRefenceSourceV2",
         "pub struct RuntimeDrainAcknowledgementSourceV2",
+        "pub struct RuntimeDrainSuccessionAcknowledgementExpectationV2",
+        "pub struct RuntimeDrainSuccessionAcknowledgementSourceV2",
         "pub struct RuntimeRouteAbsentDrainIntentSourceV2",
+        "pub struct RuntimeDrainConsumptionSourceV2",
+        "pub struct RuntimeDrainCancellationSourceV2",
         "pub struct RuntimeDrainIntentReceiptV2",
         "pub fn from_claimed(",
         "pub fn from_route_absence_candidate(",
+        "pub fn from_refenced(",
+        "pub fn from_expired_route_absent_claimed(",
         "pub fn from_acknowledged(",
         "pub fn inserted(",
         "pub fn replayed(",
         "pub fn claim_replayed(",
         "pub fn refenced(",
         "pub fn acknowledged(",
+        "pub fn succession_acknowledged(",
+        "pub fn consumed(",
+        "pub fn cancelled(",
     ] {
         assert!(source.contains(declaration), "missing {declaration}");
     }
@@ -1926,10 +2143,17 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "persisted_intent.state().pending_claim().is_some()",
         "persisted_intent != source",
         "source.canonical() == result.canonical()",
-        "persisted_intent.intent_revision() <= source.source().intent_revision()",
-        "result_claim.claim_revision() <= source_claim.claim_revision()",
+        "source.source().intent_revision().get(),",
+        "persisted_intent.intent_revision().get(),",
+        "source_claim.claim_revision().get(),",
+        "result_claim.claim_revision().get(),",
         "result_claim.progress().seal() != source_claim.progress().seal()",
         "acknowledgement.claim() != source_claim",
+        "RuntimePersistenceU64V2::from_u64(expected_resulting_revision.get())",
+        "RuntimeUnixMicrosecondsV2::from_datetime(cancelled_at)",
+        "persisted_intent.state().consumed_at()",
+        "persisted_intent.state().cancelled_at()",
+        "cancelled_at != source.cancelled_at",
         "source.gateway_owner_lease_id() == result.gateway_owner_lease_id()",
         "source.observed_owner_revision() == result.observed_owner_revision()",
         "source.process_instance_id() == result.process_instance_id()",
@@ -1937,6 +2161,7 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "source.controller_fencing_token() == result.controller_fencing_token()",
         "source.claim_epoch() == result.claim_epoch()",
         "source.expires_at() == result.expires_at()",
+        "current.checked_add(1) == Some(successor)",
     ] {
         assert!(
             source.contains(exact_check),
@@ -1948,11 +2173,19 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "inserted_and_replayed_receipts_bind_the_exact_operation_roots",
         "source_classifiers_accept_only_their_exact_mutable_states",
         "claim_replay_requires_an_exact_unchanged_claimed_aggregate",
-        "refence_receipt_allows_only_progress_and_strictly_newer_database_revisions",
+        "refence_receipt_allows_only_progress_and_exact_database_revision_successors",
         "refence_receipt_rejects_root_state_revision_identity_and_seal_drift",
         "acknowledgement_receipt_accepts_initial_absence_and_durable_refence",
         "acknowledgement_receipt_rejects_root_revision_state_and_claim_drift",
         "transition_receipts_accept_canonical_timestamps_without_host_clock_ordering",
+        "succession_receipt_accepts_only_the_exact_atomic_successor",
+        "succession_receipt_rejects_root_state_and_intent_revision_drift",
+        "succession_receipt_rejects_claim_revision_fence_and_identity_drift",
+        "succession_receipt_rejects_seal_provenance_acknowledgement_and_certification_drift",
+        "terminal_receipts_accept_only_exact_acknowledged_successors",
+        "terminal_receipts_reject_root_revision_state_and_result_drift",
+        "cancellation_source_binds_only_canonical_database_time",
+        "consumption_source_binds_only_persistable_resulting_revision",
         "receipt_surface_is_closed_data_without_claim_or_terminal_authority",
     ] {
         assert!(
@@ -1968,7 +2201,11 @@ fn v2_drain_intent_receipts_close_only_structurally_proven_transitions() {
         "RuntimeDrainIntentReceiptErrorV2",
         "RuntimeDrainIntentReceiptV2",
         "RuntimeDrainRefenceSourceV2",
+        "RuntimeDrainSuccessionAcknowledgementExpectationV2",
+        "RuntimeDrainSuccessionAcknowledgementSourceV2",
         "RuntimeRouteAbsentDrainIntentSourceV2",
+        "RuntimeDrainConsumptionSourceV2",
+        "RuntimeDrainCancellationSourceV2",
     ] {
         assert!(library.contains(exported), "missing export {exported}");
     }
@@ -3422,9 +3659,25 @@ fn source_files_contain_no_comments() {
             "src/v2_drain_intent_receipt/tests.rs",
             include_str!("../src/v2_drain_intent_receipt/tests.rs"),
         ),
+        (
+            "src/v3_drain_teardown.rs",
+            include_str!("../src/v3_drain_teardown.rs"),
+        ),
+        (
+            "src/v3_drain_teardown/wire.rs",
+            include_str!("../src/v3_drain_teardown/wire.rs"),
+        ),
+        (
+            "src/v3_drain_teardown/tests.rs",
+            include_str!("../src/v3_drain_teardown/tests.rs"),
+        ),
         ("src/v2_evidence.rs", include_str!("../src/v2_evidence.rs")),
         ("src/v2_gateway.rs", include_str!("../src/v2_gateway.rs")),
         ("src/v2_identity.rs", include_str!("../src/v2_identity.rs")),
+        (
+            "src/v2_ingress_acknowledgement.rs",
+            include_str!("../src/v2_ingress_acknowledgement.rs"),
+        ),
         ("src/v2_product.rs", include_str!("../src/v2_product.rs")),
         (
             "src/v2_product_drain_canonical.rs",

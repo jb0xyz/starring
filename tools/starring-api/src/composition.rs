@@ -125,7 +125,7 @@ impl Debug for ComposedProductionServiceV1 {
 
 #[derive(Clone)]
 pub struct ProductionDatabasePoolShutdownV1 {
-    pools: Arc<[PgPool; 13]>,
+    pools: Arc<[PgPool; 14]>,
 }
 
 impl ProductionDatabasePoolShutdownV1 {
@@ -285,6 +285,7 @@ fn build_facade_v1(
             pools.apply_executor.clone(),
         ),
         pools.rejection_executor.clone(),
+        pools.cancellation_executor.clone(),
         dependencies.action_keyring,
     )
     .map_err(|_| ProductionCompositionErrorV1::ProductPersistenceConfiguration)?;
@@ -322,6 +323,7 @@ struct ConnectedDatabasePoolsV1 {
     approval_executor: PgPool,
     rejection_executor: PgPool,
     apply_executor: PgPool,
+    cancellation_executor: PgPool,
     deployment_status: PgPool,
     operational_deployment_status: PgPool,
 }
@@ -331,7 +333,7 @@ impl ConnectedDatabasePoolsV1 {
         close_pool_refs_with_deadline(self.pools().map(Some)).await
     }
 
-    fn pools(&self) -> [&PgPool; 13] {
+    fn pools(&self) -> [&PgPool; 14] {
         [
             &self.oauth_flow_writer,
             &self.session_issuer,
@@ -344,6 +346,7 @@ impl ConnectedDatabasePoolsV1 {
             &self.approval_executor,
             &self.rejection_executor,
             &self.apply_executor,
+            &self.cancellation_executor,
             &self.deployment_status,
             &self.operational_deployment_status,
         ]
@@ -363,6 +366,7 @@ impl ConnectedDatabasePoolsV1 {
                 self.approval_executor,
                 self.rejection_executor,
                 self.apply_executor,
+                self.cancellation_executor,
                 self.deployment_status,
                 self.operational_deployment_status,
             ]),
@@ -378,10 +382,10 @@ enum DatabasePoolConnectErrorV1 {
 }
 
 async fn connect_database_pools_v1(
-    database_urls: [DatabaseUrlSecretV1; 13],
+    database_urls: [DatabaseUrlSecretV1; 14],
     config: PoolConfigV1,
 ) -> Result<ConnectedDatabasePoolsV1, ProductionCompositionErrorV1> {
-    let [oauth_flow_writer, session_issuer, session_api, security_revoker, installation_authority, authorized_snapshot, promotion, decision_reader, approval_executor, rejection_executor, apply_executor, deployment_status, operational_deployment_status] =
+    let [oauth_flow_writer, session_issuer, session_api, security_revoker, installation_authority, authorized_snapshot, promotion, decision_reader, approval_executor, rejection_executor, apply_executor, cancellation_executor, deployment_status, operational_deployment_status] =
         database_urls;
     let (
         oauth_flow_writer,
@@ -395,6 +399,7 @@ async fn connect_database_pools_v1(
         approval_executor,
         rejection_executor,
         apply_executor,
+        cancellation_executor,
         deployment_status,
         operational_deployment_status,
     ) = tokio::join!(
@@ -409,6 +414,7 @@ async fn connect_database_pools_v1(
         connect_pool_v1(approval_executor, config),
         connect_pool_v1(rejection_executor, config),
         connect_pool_v1(apply_executor, config),
+        connect_pool_v1(cancellation_executor, config),
         connect_pool_v1(deployment_status, config),
         connect_pool_v1(operational_deployment_status, config),
     );
@@ -424,6 +430,7 @@ async fn connect_database_pools_v1(
         &approval_executor,
         &rejection_executor,
         &apply_executor,
+        &cancellation_executor,
         &deployment_status,
         &operational_deployment_status,
     ];
@@ -445,6 +452,7 @@ async fn connect_database_pools_v1(
         approval_executor: approval_executor.expect("database results were checked"),
         rejection_executor: rejection_executor.expect("database results were checked"),
         apply_executor: apply_executor.expect("database results were checked"),
+        cancellation_executor: cancellation_executor.expect("database results were checked"),
         deployment_status: deployment_status.expect("database results were checked"),
         operational_deployment_status: operational_deployment_status
             .expect("database results were checked"),
@@ -452,7 +460,7 @@ async fn connect_database_pools_v1(
 }
 
 fn first_database_error<T>(
-    results: [&Result<T, DatabasePoolConnectErrorV1>; 13],
+    results: [&Result<T, DatabasePoolConnectErrorV1>; 14],
 ) -> ProductionCompositionErrorV1 {
     DatabaseRoleV1::ALL
         .into_iter()
@@ -547,14 +555,14 @@ fn validate_database_transport_v1(
 }
 
 async fn close_pool_refs_with_deadline(
-    pools: [Option<&PgPool>; 13],
+    pools: [Option<&PgPool>; 14],
 ) -> Result<(), ProductionDatabasePoolShutdownErrorV1> {
     let close = begin_pool_closures(pools);
     await_pool_shutdown_with_timeout(close, DATABASE_POOL_SHUTDOWN_TIMEOUT).await
 }
 
-fn begin_pool_closures<'a>(pools: [Option<&'a PgPool>; 13]) -> impl Future<Output = ()> + 'a {
-    let [oauth_flow_writer, session_issuer, session_api, security_revoker, installation_authority, authorized_snapshot, promotion, decision_reader, approval_executor, rejection_executor, apply_executor, deployment_status, operational_deployment_status] =
+fn begin_pool_closures<'a>(pools: [Option<&'a PgPool>; 14]) -> impl Future<Output = ()> + 'a {
+    let [oauth_flow_writer, session_issuer, session_api, security_revoker, installation_authority, authorized_snapshot, promotion, decision_reader, approval_executor, rejection_executor, apply_executor, cancellation_executor, deployment_status, operational_deployment_status] =
         pools;
     let oauth_flow_writer = oauth_flow_writer.map(|pool| pool.close());
     let session_issuer = session_issuer.map(|pool| pool.close());
@@ -567,6 +575,7 @@ fn begin_pool_closures<'a>(pools: [Option<&'a PgPool>; 13]) -> impl Future<Outpu
     let approval_executor = approval_executor.map(|pool| pool.close());
     let rejection_executor = rejection_executor.map(|pool| pool.close());
     let apply_executor = apply_executor.map(|pool| pool.close());
+    let cancellation_executor = cancellation_executor.map(|pool| pool.close());
     let deployment_status = deployment_status.map(|pool| pool.close());
     let operational_deployment_status = operational_deployment_status.map(|pool| pool.close());
     async move {
@@ -582,6 +591,7 @@ fn begin_pool_closures<'a>(pools: [Option<&'a PgPool>; 13]) -> impl Future<Outpu
             await_optional_pool_close(approval_executor),
             await_optional_pool_close(rejection_executor),
             await_optional_pool_close(apply_executor),
+            await_optional_pool_close(cancellation_executor),
             await_optional_pool_close(deployment_status),
             await_optional_pool_close(operational_deployment_status),
         );
@@ -705,7 +715,7 @@ mod tests {
 
     #[test]
     fn first_database_failure_preserves_exact_role_and_array_order() {
-        let mut results: [Result<(), DatabasePoolConnectErrorV1>; 13] =
+        let mut results: [Result<(), DatabasePoolConnectErrorV1>; 14] =
             std::array::from_fn(|_| Ok(()));
         results[DatabaseRoleV1::DecisionReader.index()] =
             Err(DatabasePoolConnectErrorV1::Unavailable);

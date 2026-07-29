@@ -13,7 +13,9 @@ use super::connected::{
     discord_transition_failure_v1, map_discord_transition_exit_v1,
     RuntimeProcessPausedConnectedTransitionFailureV1,
 };
-use super::execution::RuntimeStartupRecoveryExecutionCompletionV2;
+use super::execution::{
+    RuntimeOwnedStartupRecoveryExecutionOutcomeV3, RuntimeStartupRecoveryExecutionCompletionV2,
+};
 use super::observation::{
     RuntimeProcessStartupRecoveryObservationErrorV2, RuntimeStartupRecoveryClassV2,
     RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryContinueProcessV2,
@@ -223,8 +225,21 @@ enum RuntimeStartupRecoveryLoopIterationOutcomeV2<Continue, FixedPoint> {
     FixedPoint(FixedPoint),
 }
 
+enum RuntimeStartupRecoveryOwnedStepOutcomeV3<Continue, Completion, Failure, Error> {
+    Completed(Continue, Completion),
+    Failed(Continue, Failure),
+    Terminal(Error),
+}
+
 type RuntimeStartupRecoveryBorrowedStepFutureV2<'a, Output, Failure> =
     Pin<Box<dyn Future<Output = Result<Output, Failure>> + 'a>>;
+
+type RuntimeStartupRecoveryOwnedStepFutureV3<Continue, Completion, Failure, Error> =
+    RuntimeStartupRecoveryBorrowedStepFutureV2<
+        'static,
+        RuntimeStartupRecoveryOwnedStepOutcomeV3<Continue, Completion, Failure, Error>,
+        std::convert::Infallible,
+    >;
 
 trait RuntimeStartupRecoveryLoopReadyStepV2: Sized {
     type Observed;
@@ -254,7 +269,7 @@ trait RuntimeStartupRecoveryLoopReadyStepV2: Sized {
     async fn cleanup_after_finalize_failure_v2(failure: Self::FinalizeFailure) -> Self::Error;
 }
 
-trait RuntimeStartupRecoveryLoopContinueStepV2: Sized {
+trait RuntimeStartupRecoveryLoopContinueStepV2: Sized + 'static {
     type Ready;
     type WaitCompletion;
     type WaitFailure;
@@ -277,6 +292,16 @@ trait RuntimeStartupRecoveryLoopContinueStepV2: Sized {
         '_,
         Self::RecoveryCompletion,
         Self::RecoveryFailure,
+    >;
+
+    fn execute_recovery_owned_v3(
+        self,
+        class: RuntimeStartupRecoveryClassV2,
+    ) -> RuntimeStartupRecoveryOwnedStepFutureV3<
+        Self,
+        Self::RecoveryCompletion,
+        Self::RecoveryFailure,
+        Self::Error,
     >;
 
     async fn cleanup_after_recovery_failure_v2(self, failure: Self::RecoveryFailure)
@@ -319,14 +344,42 @@ where
             RuntimeStartupRecoveryLoopIterationOutcomeV2::Continue(mut process) => {
                 match process.continuation_v2() {
                     RuntimeStartupRecoveryContinuationV2::Recover(class) => {
-                        let completion = match process.execute_recovery_in_place_v2(class).await {
-                            Ok(completion) => completion,
-                            Err(failure) => {
-                                return Err(process
-                                    .cleanup_after_recovery_failure_v2(failure)
-                                    .await);
-                            }
-                        };
+                        let (process, completion) =
+                            if class == RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent {
+                                let outcome = match process.execute_recovery_owned_v3(class).await {
+                                    Ok(outcome) => outcome,
+                                    Err(error) => match error {},
+                                };
+                                match outcome {
+                                    RuntimeStartupRecoveryOwnedStepOutcomeV3::Completed(
+                                        process,
+                                        completion,
+                                    ) => (process, completion),
+                                    RuntimeStartupRecoveryOwnedStepOutcomeV3::Failed(
+                                        process,
+                                        failure,
+                                    ) => {
+                                        return Err(process
+                                            .cleanup_after_recovery_failure_v2(failure)
+                                            .await);
+                                    }
+                                    RuntimeStartupRecoveryOwnedStepOutcomeV3::Terminal(error) => {
+                                        return Err(error);
+                                    }
+                                }
+                            } else {
+                                let mut process = process;
+                                let completion =
+                                    match process.execute_recovery_in_place_v2(class).await {
+                                        Ok(completion) => completion,
+                                        Err(failure) => {
+                                            return Err(process
+                                                .cleanup_after_recovery_failure_v2(failure)
+                                                .await);
+                                        }
+                                    };
+                                (process, completion)
+                            };
                         ready = process
                             .into_next_ready_after_recovery_v2(completion)
                             .await?;
@@ -429,6 +482,30 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for RuntimeStartupRecoveryContinue
         Box::pin(self.execute_startup_recovery_in_place_v2(class))
     }
 
+    fn execute_recovery_owned_v3(
+        self,
+        class: RuntimeStartupRecoveryClassV2,
+    ) -> RuntimeStartupRecoveryOwnedStepFutureV3<
+        Self,
+        Self::RecoveryCompletion,
+        Self::RecoveryFailure,
+        Self::Error,
+    > {
+        Box::pin(async move {
+            Ok(match self.execute_startup_recovery_owned_v3(class).await {
+                RuntimeOwnedStartupRecoveryExecutionOutcomeV3::Completed(process, completion) => {
+                    RuntimeStartupRecoveryOwnedStepOutcomeV3::Completed(process, completion)
+                }
+                RuntimeOwnedStartupRecoveryExecutionOutcomeV3::Failed(process, failure) => {
+                    RuntimeStartupRecoveryOwnedStepOutcomeV3::Failed(process, failure)
+                }
+                RuntimeOwnedStartupRecoveryExecutionOutcomeV3::Terminal(error) => {
+                    RuntimeStartupRecoveryOwnedStepOutcomeV3::Terminal(error)
+                }
+            })
+        })
+    }
+
     async fn cleanup_after_recovery_failure_v2(
         self,
         failure: Self::RecoveryFailure,
@@ -438,9 +515,23 @@ impl RuntimeStartupRecoveryLoopContinueStepV2 for RuntimeStartupRecoveryContinue
     }
 
     async fn into_next_ready_after_recovery_v2(
-        self,
-        _completion: Self::RecoveryCompletion,
+        mut self,
+        completion: Self::RecoveryCompletion,
     ) -> Result<Self::Ready, Self::Error> {
+        if let Some(retry_after) = completion.bounded_retry_after_v2() {
+            if let Err(failure) = self
+                .wait_for_bounded_startup_retry_in_place_v2(
+                    retry_after,
+                    RuntimeProcessStartupRecoveryLoopFailureV2::ProtocolViolation,
+                )
+                .await
+            {
+                return Err(finish_startup_recovery_loop_transition_v2(
+                    failure,
+                    self.shutdown().await,
+                ));
+            }
+        }
         let Self {
             discord,
             foundation,
@@ -506,42 +597,65 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
         if retry_after.is_zero() {
             return Err(RuntimeProcessStartupRecoveryLoopFailureV2::InvalidForeignFreshRetry);
         }
-        if let Some(transition) = current_foreign_fresh_wait_transition_v2(self) {
+        self.wait_for_bounded_startup_retry_in_place_v2(
+            retry_after,
+            RuntimeProcessStartupRecoveryLoopFailureV2::InvalidForeignFreshRetry,
+        )
+        .await?;
+        Ok(RuntimeForeignFreshWaitCompletionV2 { retry_after })
+    }
+
+    async fn wait_for_bounded_startup_retry_in_place_v2(
+        &mut self,
+        retry_after: Duration,
+        invalid_retry: RuntimeProcessStartupRecoveryLoopFailureV2,
+    ) -> Result<(), RuntimeProcessStartupRecoveryLoopFailureV2> {
+        if retry_after.is_zero() {
+            return Err(invalid_retry);
+        }
+        if let Some(transition) = current_bounded_startup_retry_transition_v2(self) {
             return Err(transition);
         }
         let now = Instant::now();
-        let retry_at = now
-            .checked_add(retry_after)
-            .ok_or(RuntimeProcessStartupRecoveryLoopFailureV2::InvalidForeignFreshRetry)?;
+        let retry_at = now.checked_add(retry_after).ok_or(invalid_retry)?;
         let operation_cutoff = self.foundation.startup_budget.operation_cutoff();
         let owner_safety_deadline = self.session.owner_safety_deadline_v2();
         let wait_cutoff = operation_cutoff.min(owner_safety_deadline);
         if now >= wait_cutoff {
-            return Err(classify_foreign_fresh_wait_deadline_v2(
+            return Err(classify_bounded_startup_retry_deadline_v2(
                 operation_cutoff,
                 owner_safety_deadline,
             ));
         }
         let deadline_failure =
-            classify_foreign_fresh_wait_deadline_v2(operation_cutoff, owner_safety_deadline);
+            classify_bounded_startup_retry_deadline_v2(operation_cutoff, owner_safety_deadline);
         let owner_terminal = self.session.owner_terminal_observation_v2();
-        let discord_terminal =
-            async { map_discord_transition_exit_v1(self.discord.wait_terminal().await.exit()) };
+        let discord_terminal = async {
+            let transition =
+                map_discord_transition_exit_v1(self.discord.wait_terminal().await.exit());
+            self.foundation
+                .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::DiscordTerminal);
+            transition
+        };
         let owner_terminal = async {
             let _exit = owner_terminal.await;
+            self.foundation
+                .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
         };
-        await_foreign_fresh_retry_v2(
+        let mut shutdown = self.foundation.shutdown_observer_v1();
+        await_bounded_startup_retry_v2(
             deadline_failure,
             sleep_until(TokioInstant::from_std(wait_cutoff)),
             discord_terminal,
             owner_terminal,
             sleep_until(TokioInstant::from_std(retry_at)),
+            async move { shutdown.wait().await },
         )
         .await?;
-        if let Some(transition) = current_foreign_fresh_wait_transition_v2(self) {
+        if let Some(transition) = current_bounded_startup_retry_transition_v2(self) {
             return Err(transition);
         }
-        Ok(RuntimeForeignFreshWaitCompletionV2 { retry_after })
+        Ok(())
     }
 
     fn into_closed_recovery_after_foreign_fresh_v2(
@@ -572,19 +686,31 @@ impl RuntimeStartupRecoveryContinueProcessV2 {
     }
 }
 
-fn current_foreign_fresh_wait_transition_v2(
+fn current_bounded_startup_retry_transition_v2(
     process: &RuntimeStartupRecoveryContinueProcessV2,
 ) -> Option<RuntimeProcessStartupRecoveryLoopFailureV2> {
-    classify_current_foreign_fresh_wait_transition_v2(
+    let discord = discord_transition_failure_v1(&process.discord);
+    let owner_terminal = process.session.owner_terminal_status_v2().is_some();
+    if discord.is_some() {
+        process
+            .foundation
+            .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::DiscordTerminal);
+    }
+    if owner_terminal {
+        process
+            .foundation
+            .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
+    }
+    classify_current_bounded_startup_retry_transition_v2(
         Instant::now(),
         process.foundation.startup_budget.operation_cutoff(),
         process.session.owner_safety_deadline_v2(),
-        discord_transition_failure_v1(&process.discord),
-        process.session.owner_terminal_status_v2().is_some(),
+        discord,
+        owner_terminal,
     )
 }
 
-fn classify_current_foreign_fresh_wait_transition_v2(
+fn classify_current_bounded_startup_retry_transition_v2(
     now: Instant,
     operation_cutoff: Instant,
     owner_safety_deadline: Instant,
@@ -592,7 +718,7 @@ fn classify_current_foreign_fresh_wait_transition_v2(
     owner_terminal: bool,
 ) -> Option<RuntimeProcessStartupRecoveryLoopFailureV2> {
     if now >= operation_cutoff.min(owner_safety_deadline) {
-        return Some(classify_foreign_fresh_wait_deadline_v2(
+        return Some(classify_bounded_startup_retry_deadline_v2(
             operation_cutoff,
             owner_safety_deadline,
         ));
@@ -607,7 +733,7 @@ fn classify_current_foreign_fresh_wait_transition_v2(
     )
 }
 
-fn classify_foreign_fresh_wait_deadline_v2(
+fn classify_bounded_startup_retry_deadline_v2(
     operation_cutoff: Instant,
     owner_safety_deadline: Instant,
 ) -> RuntimeProcessStartupRecoveryLoopFailureV2 {
@@ -620,25 +746,35 @@ fn classify_foreign_fresh_wait_deadline_v2(
     }
 }
 
-async fn await_foreign_fresh_retry_v2<Deadline, DiscordTerminal, OwnerTerminal, Retry>(
+async fn await_bounded_startup_retry_v2<Deadline, DiscordTerminal, OwnerTerminal, Retry, Shutdown>(
     deadline_failure: RuntimeProcessStartupRecoveryLoopFailureV2,
     deadline: Deadline,
     discord_terminal: DiscordTerminal,
     owner_terminal: OwnerTerminal,
     retry: Retry,
+    shutdown: Shutdown,
 ) -> Result<(), RuntimeProcessStartupRecoveryLoopFailureV2>
 where
     Deadline: Future<Output = ()>,
     DiscordTerminal: Future<Output = RuntimeProcessPausedConnectedTransitionFailureV1>,
     OwnerTerminal: Future<Output = ()>,
     Retry: Future<Output = ()>,
+    Shutdown: Future<Output = crate::RuntimeShutdownObservationV1>,
 {
     tokio::pin!(deadline);
     tokio::pin!(discord_terminal);
     tokio::pin!(owner_terminal);
     tokio::pin!(retry);
+    tokio::pin!(shutdown);
     tokio::select! {
         biased;
+        observation = &mut shutdown => {
+            Err(RuntimeProcessStartupRecoveryLoopFailureV2::PausedConnection(
+                RuntimeProcessPausedConnectedTransitionFailureV1::ProcessShutdown(
+                    observation.cause(),
+                ),
+            ))
+        }
         () = &mut deadline => Err(deadline_failure),
         transition = &mut discord_terminal => {
             Err(RuntimeProcessStartupRecoveryLoopFailureV2::PausedConnection(transition))

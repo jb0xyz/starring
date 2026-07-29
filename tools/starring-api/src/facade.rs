@@ -23,19 +23,20 @@ use authoring_application_postgres::{
 use product_control_http::{
     ApplyCommand, ApplyView, ApprovalPreviewView, CsrfSecret, CurrentPrincipal, DecisionCommand,
     DecisionView, DeploymentOperationalViewV2, DeploymentView, FacadeError, FacadeErrorCode,
-    OAuthCallbackCommand, OAuthCallbackResult, OAuthStartCommand, OAuthStartResult,
-    ProductControlFacade, ProductControlOperationalFacadeV2, PromoteCommand, PromotionView,
-    RejectCommand, SessionCredential,
+    LifecycleCancellationCommand, LifecycleCancellationView, OAuthCallbackCommand,
+    OAuthCallbackResult, OAuthStartCommand, OAuthStartResult, ProductControlFacade,
+    ProductControlLifecycleFacadeV1, ProductControlOperationalFacadeV2, PromoteCommand,
+    PromotionView, RejectCommand, SessionCredential,
 };
 
 use crate::{
     map_apply_command, map_approve_command, map_authoring_application_error,
     map_discord_authorization_code, map_discord_oauth_error, map_discord_oauth_state,
-    map_oauth_flow_error, map_product_application_error, map_product_identity_error,
-    map_product_target, map_promote_command, map_reject_command, project_apply,
-    project_approval_preview, project_current_principal, project_decision_mutation,
-    project_deployment, project_deployment_operational_v2, project_oauth_callback,
-    project_oauth_start, project_product_status, project_promotion,
+    map_lifecycle_cancellation_command, map_oauth_flow_error, map_product_application_error,
+    map_product_identity_error, map_product_target, map_promote_command, map_reject_command,
+    project_apply, project_approval_preview, project_current_principal, project_decision_mutation,
+    project_deployment, project_deployment_operational_v2, project_lifecycle_cancellation,
+    project_oauth_callback, project_oauth_start, project_product_status, project_promotion,
 };
 
 type ProductionIdentityStore = PostgresProductIdentityStore<OperatingSystemSecretGenerator>;
@@ -535,6 +536,31 @@ impl ProductControlOperationalFacadeV2 for ProductionProductControlFacadeV1 {
     }
 }
 
+#[async_trait]
+impl ProductControlLifecycleFacadeV1 for ProductionProductControlFacadeV1 {
+    async fn cancel_lifecycle(
+        &self,
+        credential: &SessionCredential,
+        csrf: &CsrfSecret,
+        command: LifecycleCancellationCommand,
+    ) -> Result<LifecycleCancellationView, FacadeError> {
+        let (request_id, installation, command) =
+            map_lifecycle_cancellation_command(command)?.into_parts();
+        let receipt = self
+            .control_application()
+            .cancel_product_lifecycle(
+                credential.expose_secret(),
+                csrf.expose_secret(),
+                &request_id,
+                &installation,
+                command,
+            )
+            .await
+            .map_err(map_product_application_error)?;
+        project_lifecycle_cancellation(&receipt)
+    }
+}
+
 fn map_readiness_error(error: ProductApiReadinessErrorV1) -> FacadeError {
     match error {
         ProductApiReadinessErrorV1::Identity(_)
@@ -559,10 +585,12 @@ mod tests {
     use super::*;
 
     fn assert_operational_facade<T: ProductControlOperationalFacadeV2>() {}
+    fn assert_lifecycle_facade<T: ProductControlLifecycleFacadeV1>() {}
 
     #[test]
     fn production_facade_closes_the_complete_http_contract() {
         assert_operational_facade::<ProductionProductControlFacadeV1>();
+        assert_lifecycle_facade::<ProductionProductControlFacadeV1>();
     }
 
     #[test]

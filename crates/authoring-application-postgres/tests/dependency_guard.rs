@@ -81,6 +81,7 @@ fn adapter_uses_only_opaque_discord_identity_and_avoids_transport_or_foreign_dec
 fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     let approval = include_str!("../src/product_decisions/approve.rs");
     let apply = include_str!("../src/product_decisions/apply.rs");
+    let apply_consume = include_str!("../src/product_decisions/apply_consume.rs");
     let apply_contract = include_str!("../src/product_decisions/apply_contract.rs");
     let apply_readiness = include_str!("../src/product_decisions/apply_readiness.rs");
     let apply_sql = include_str!("../src/product_decisions/apply_sql.rs");
@@ -147,6 +148,10 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
             !apply_contract.contains(relation),
             "raw product Apply relation in contract: {relation}"
         );
+        assert!(
+            !apply_consume.contains(relation),
+            "raw product Apply relation in consume adapter: {relation}"
+        );
     }
     for required in [
         "public.starring_product_apply_executor_database_identity_v1()",
@@ -154,6 +159,8 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "public.starring_product_apply_target_artifact_v1(text,text,text,text,bytea,text,text)",
         "public.starring_product_apply_finalize_v1(text,text,text,bigint",
         "public.starring_product_apply_keyring_coverage_v1(text[],text[])",
+        "public.starring_product_apply_begin_runtime_drain_v2(text,text,text,bigint",
+        "public.starring_product_apply_consume_runtime_drain_v2(text,text,text,text,bigint",
         "FROM public.starring_product_apply_target_artifact_v1($1, $2, $3, $4, $5, $6, $7)",
         "LIMIT 2",
     ] {
@@ -163,8 +170,8 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         );
     }
     for required in [
-        "FUNCTIONS: [ScopedFunctionContractV1<'static>; 5]",
-        "RELATIONS: [ScopedRelationContractV1<'static>; 21]",
+        "FUNCTIONS: [ScopedFunctionContractV1<'static>; 7]",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 25]",
         "ScopedFunctionContractV1::set_named(",
         "ScopedFunctionContractV1::set_plpgsql_named(",
         "verify_apply_executor_readiness",
@@ -178,10 +185,16 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "starring_product_apply_lock_core_unfenced_v1",
         "pg_catalog.count(*) = 12",
         "private_routine_contract",
-        "pg_catalog.count(*) = 2",
+        "pg_catalog.count(*) = 13",
         "starring_runtime_private_v2",
         "starring_runtime_slot_writer_fence_lock_v2",
         "starring_runtime_slot_writer_fence_begin_unsafe_v2",
+        "starring_runtime_slot_writer_fence_mark_drain_v2",
+        "starring_runtime_product_drain_first_apply_core_v2",
+        "starring_runtime_product_mutation_bytes_v2",
+        "starring_runtime_product_mutation_digest_v2",
+        "starring_runtime_drain_intent_bytes_v2",
+        "starring_runtime_drain_intent_digest_v2",
         "runtime_drain_intents_v2",
         "runtime_slot_writer_fences_v2",
         "runtime_serving_leases",
@@ -191,6 +204,8 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "idempotency_keyring_incomplete",
         "lock_probe_row_is_exact(row, \"invalid_input\")",
         "lock_probe_row_is_exact(row, \"runtime_writer_fenced\")",
+        "BEGIN_RUNTIME_DRAIN_PROBE_QUERY",
+        "CONSUME_RUNTIME_DRAIN_PROBE_QUERY",
         "outcome: \"lock_required\"",
     ] {
         assert!(
@@ -210,9 +225,20 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
     assert!(apply.contains("\"runtime_writer_fenced\""));
     assert!(apply.contains("\"runtime_writer_fence_invalid\""));
     assert!(apply.contains("\"runtime_drain_required\""));
+    assert!(apply.contains("begin_runtime_drain("));
+    assert!(apply.contains("validate_runtime_drain_observation("));
+    assert!(apply.contains("consume_acknowledged_runtime_drain("));
+    assert!(apply.contains("call_consume_runtime_drain("));
+    assert!(apply.contains("commit_apply(transaction).await?"));
     assert!(apply.contains("ProductControlPortError::RuntimeDrainRequired"));
     assert!(apply.contains("product apply is temporarily unavailable"));
     assert!(apply.contains("runtime writer fence is unavailable"));
+    assert!(apply_consume.contains("requested_phase => $1"));
+    assert!(apply_consume.contains("expected_preparation_token => $40"));
+    assert!(apply_consume.contains("prepare_product_drain_source_supersession_v1"));
+    assert!(apply_consume.contains("RuntimeDrainIntentReceiptV2::consumed"));
+    assert!(apply_consume.contains("RuntimeUnixMicrosecondsV2::from_datetime"));
+    assert!(!apply_consume.contains("unwrap_or(0)"));
     assert!(readiness.contains("fetch_all(&mut *probe)"));
     assert!(database_capability.contains("function_row.prosecdef"));
     assert!(database_capability.contains("function_row.proleakproof"));
@@ -643,8 +669,12 @@ fn product_rejection_adapter_is_separate_payload_bound_and_fail_closed() {
     ] {
         assert!(digest_production.contains(domain));
     }
+    let rejection_digest_production = digest_production
+        .split("fn rejection_digests_from_material(")
+        .nth(1)
+        .unwrap();
     assert_eq!(
-        digest_production
+        rejection_digest_production
             .matches("material.reason.as_bytes()")
             .count(),
         1
@@ -656,7 +686,67 @@ fn product_rejection_adapter_is_separate_payload_bound_and_fail_closed() {
 }
 
 #[test]
-fn product_control_facade_composes_exact_ports_and_four_role_readiness() {
+fn lifecycle_cancellation_adapter_is_typed_bounded_and_relation_blind() {
+    let cancellation = include_str!("../src/product_decisions/lifecycle_cancel.rs");
+    let digest = include_str!("../src/product_decisions/digest.rs");
+    let module = include_str!("../src/product_decisions/mod.rs");
+    let library = include_str!("../src/lib.rs");
+    for required in [
+        "pub struct PostgresProductLifecycleCancellations",
+        "cancellation_executor: PgPool",
+        "ProductLifecycleCancellationPort<FreshDiscordAuthorityEvidenceV1>",
+        "CapabilityV1::CancelLifecycle",
+        "public.starring_product_cancel_runtime_drain_v2(",
+        "MAX_TRANSACTION_ATTEMPTS: usize = 2",
+        "configure_apply_transaction(&mut transaction, &self.config)",
+        "is_safe_transaction_retry(&error)",
+        "RuntimePersistedProductDrainRootV2::from_persisted(",
+        "RuntimeCanonicalDrainIntentStateV2::from_persisted(",
+        "RuntimeDrainIntentReceiptV2::cancelled(",
+        "prepare_product_drain_source_cancellation_v1(",
+        "Json<Box<RawValue>>",
+        "value.0.get().as_bytes()",
+        "failure_is_closed",
+    ] {
+        assert!(
+            cancellation.contains(required),
+            "missing lifecycle cancellation guard: {required}"
+        );
+    }
+    for forbidden in [
+        "INSERT INTO ",
+        "UPDATE ",
+        "DELETE FROM ",
+        "runtime_deployments",
+        "runtime_drain_intents_v2",
+        "runtime_product_operations_v2",
+        "runtime_product_drain_terminal_actions_v2",
+        "tokio::time::sleep",
+        ".bind(request.command().idempotency_key.as_str())",
+    ] {
+        assert!(
+            !cancellation.contains(forbidden),
+            "forbidden lifecycle cancellation adapter edge: {forbidden}"
+        );
+    }
+    for domain in [
+        "starring.product.lifecycle-cancellation.idempotency.v1",
+        "starring.product.lifecycle-cancellation.request.v1",
+        "starring.product.lifecycle-cancellation.receipt.v1",
+        "starring.product.lifecycle-cancellation.audit.v1",
+        "starring.product.lifecycle-cancellation.terminal-action.v1",
+        "starring.product.lifecycle-cancellation.reason.v1",
+        "starring.product.lifecycle-cancellation.session-subject.v1",
+        "starring.product.lifecycle-cancellation.digest-key-fingerprint.v1",
+    ] {
+        assert!(digest.contains(domain));
+    }
+    assert!(module.contains("pub use lifecycle_cancel::PostgresProductLifecycleCancellations"));
+    assert!(library.contains("PostgresProductLifecycleCancellations"));
+}
+
+#[test]
+fn product_control_facade_composes_exact_ports_and_five_role_readiness() {
     let facade = include_str!("../src/product_decisions/facade.rs");
     let module = include_str!("../src/product_decisions/mod.rs");
     let library = include_str!("../src/lib.rs");
@@ -664,20 +754,25 @@ fn product_control_facade_composes_exact_ports_and_four_role_readiness() {
         "pub struct PostgresProductControl",
         "decisions: PostgresProductDecisions",
         "rejections: PostgresProductRejections",
+        "cancellations: PostgresProductLifecycleCancellations",
         "decision_pools: ProductDecisionDatabasePoolsV1",
         "rejection_executor: PgPool",
+        "cancellation_executor: PgPool",
         "PostgresProductDecisionsConfig::production(keyring)?",
         "PostgresProductDecisions::with_config(decision_pools, config.clone())",
-        "PostgresProductRejections::with_config(rejection_executor, config)",
+        "PostgresProductRejections::with_config(",
+        "PostgresProductLifecycleCancellations::with_config(",
         "ProductDecisionQueryPort<FreshDiscordAuthorityEvidenceV1>",
         "ProductDecisionObservationPort<FreshDiscordAuthorityEvidenceV1>",
         "ProductApprovalPort<FreshDiscordAuthorityEvidenceV1>",
         "ProductRejectionPort<FreshDiscordAuthorityEvidenceV1>",
         "ProductApplyPort<FreshDiscordAuthorityEvidenceV1>",
+        "ProductLifecycleCancellationPort<FreshDiscordAuthorityEvidenceV1>",
         "self.decisions.check_decision_reader_readiness().await?",
         "self.decisions.check_approval_executor_readiness().await?",
         ".check_product_rejection_readiness()",
         "self.decisions.check_apply_executor_readiness().await?",
+        ".check_product_lifecycle_cancellation_readiness()",
         "verify_same_database_distinct_roles(&topologies)",
     ] {
         assert!(
@@ -689,10 +784,17 @@ fn product_control_facade_composes_exact_ports_and_four_role_readiness() {
     assert_eq!(facade.matches("async fn approve_payload_bound").count(), 1);
     assert_eq!(facade.matches("async fn reject_payload_bound").count(), 1);
     assert_eq!(facade.matches("async fn apply_idempotent").count(), 1);
+    assert_eq!(
+        facade
+            .matches("async fn cancel_lifecycle_idempotent")
+            .count(),
+        1
+    );
     for forbidden in [
         "from_parts",
         "pub fn decisions(",
         "pub fn rejections(",
+        "pub fn cancellations(",
         "impl ProductDecisionPort<",
     ] {
         assert!(
@@ -1473,6 +1575,10 @@ fn source_files_contain_no_comments() {
         (
             "src/product_decisions/digest.rs",
             include_str!("../src/product_decisions/digest.rs"),
+        ),
+        (
+            "src/product_decisions/lifecycle_cancel.rs",
+            include_str!("../src/product_decisions/lifecycle_cancel.rs"),
         ),
         (
             "src/product_decisions/mod.rs",

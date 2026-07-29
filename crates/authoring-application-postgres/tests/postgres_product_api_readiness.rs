@@ -28,8 +28,9 @@ const DECISION_READER: usize = 7;
 const APPROVAL_EXECUTOR: usize = 8;
 const REJECTION_EXECUTOR: usize = 9;
 const APPLY_EXECUTOR: usize = 10;
-const DEPLOYMENT_STATUS: usize = 11;
-const OPERATIONAL_DEPLOYMENT_STATUS: usize = 12;
+const CANCELLATION_EXECUTOR: usize = 11;
+const DEPLOYMENT_STATUS: usize = 12;
+const OPERATIONAL_DEPLOYMENT_STATUS: usize = 13;
 
 const OAUTH_FLOW_FUNCTIONS: &[&str] = &[
     "public.starring_product_oauth_database_identity_v1()",
@@ -91,6 +92,13 @@ const APPLY_EXECUTOR_FUNCTIONS: &[&str] = &[
     "public.starring_product_apply_target_artifact_v1(text,text,text,text,bytea,text,text)",
     "public.starring_product_apply_finalize_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb)",
     "public.starring_product_apply_keyring_coverage_v1(text[],text[])",
+    "public.starring_product_apply_begin_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text)",
+    "public.starring_product_apply_consume_runtime_drain_v2(text,text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,bigint,bytea,text,text,text,bigint,text,text,bytea,text,bytea,text,text,bytea)",
+];
+const CANCELLATION_EXECUTOR_FUNCTIONS: &[&str] = &[
+    "public.starring_product_lifecycle_cancellation_executor_database_identity_v1()",
+    "public.starring_product_lifecycle_cancellation_keyring_coverage_v1(text[],text[])",
+    "public.starring_product_cancel_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text,bigint,text,text,bigint)",
 ];
 const DEPLOYMENT_STATUS_FUNCTIONS: &[&str] = &[
     "public.starring_product_deployment_status_reader_database_identity_v1()",
@@ -101,7 +109,7 @@ const OPERATIONAL_DEPLOYMENT_STATUS_FUNCTIONS: &[&str] = &[
     "public.starring_product_deployment_status_read_v2(text,text,text,text,text,text,text,text,bytea)",
 ];
 
-const CAPABILITIES: [(&str, &[&str]); 13] = [
+const CAPABILITIES: [(&str, &[&str]); 14] = [
     ("oauth", OAUTH_FLOW_FUNCTIONS),
     ("issuer", SESSION_ISSUER_FUNCTIONS),
     ("session", SESSION_API_FUNCTIONS),
@@ -113,6 +121,7 @@ const CAPABILITIES: [(&str, &[&str]); 13] = [
     ("approval", APPROVAL_EXECUTOR_FUNCTIONS),
     ("rejection", REJECTION_EXECUTOR_FUNCTIONS),
     ("apply", APPLY_EXECUTOR_FUNCTIONS),
+    ("cancellation", CANCELLATION_EXECUTOR_FUNCTIONS),
     ("status", DEPLOYMENT_STATUS_FUNCTIONS),
     ("operational", OPERATIONAL_DEPLOYMENT_STATUS_FUNCTIONS),
 ];
@@ -466,6 +475,7 @@ async fn verify_api(
             pools[APPLY_EXECUTOR].clone(),
         ),
         pools[REJECTION_EXECUTOR].clone(),
+        pools[CANCELLATION_EXECUTOR].clone(),
         action_keyring(),
     )
     .unwrap();
@@ -521,7 +531,7 @@ async fn destroy_databases(
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
-async fn product_api_readiness_enforces_thirteen_isolated_database_capabilities() {
+async fn product_api_readiness_enforces_fourteen_isolated_database_capabilities() {
     let mut primary = isolated_database("primary").await;
     let mut secondary = isolated_database("secondary").await;
     let roles = primary_roles();
@@ -558,6 +568,61 @@ async fn product_api_readiness_enforces_thirteen_isolated_database_capabilities(
         )
         .await;
 
+        verify_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "ALTER TABLE public.product_action_receipts \
+             DROP CONSTRAINT product_action_receipts_approval_key_identity_required, \
+             ADD CONSTRAINT product_action_receipts_approval_key_identity_required CHECK ( \
+                endpoint_domain NOT IN ( \
+                    'product_approve_v1', \
+                    'product_apply_v1', \
+                    'product_promote_v1', \
+                    'product_reject_v1' \
+                ) OR ( \
+                    idempotency_digest_key_id IS NOT NULL \
+                    AND idempotency_digest_key_fingerprint IS NOT NULL \
+                ) \
+             )",
+        )
+        .execute(&primary.owner_pool)
+        .await
+        .unwrap();
+        let missing_cancellation_contract = verify_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+        )
+        .await;
+        assert!(matches!(
+            missing_cancellation_contract,
+            Err(ProductApiReadinessErrorV1::Promotion(
+                authoring_application_postgres::ProductPromotionReadinessErrorV1::ContractMismatch
+            ))
+        ));
+        sqlx::query(
+            "ALTER TABLE public.product_action_receipts \
+             DROP CONSTRAINT product_action_receipts_approval_key_identity_required, \
+             ADD CONSTRAINT product_action_receipts_approval_key_identity_required CHECK ( \
+                endpoint_domain NOT IN ( \
+                    'product_approve_v1', \
+                    'product_apply_v1', \
+                    'product_promote_v1', \
+                    'product_reject_v1', \
+                    'product_cancel_lifecycle_v1' \
+                ) OR ( \
+                    idempotency_digest_key_id IS NOT NULL \
+                    AND idempotency_digest_key_fingerprint IS NOT NULL \
+                ) \
+             )",
+        )
+        .execute(&primary.owner_pool)
+        .await
+        .unwrap();
         verify_api(
             &primary_pools,
             primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),

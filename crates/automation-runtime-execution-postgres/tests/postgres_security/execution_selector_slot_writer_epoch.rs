@@ -20,7 +20,7 @@ const EXECUTION_SELECTOR_SLOT_WRITER_CATALOG: [&str; 6] = [
 type ExecutionSelectorCatalogRow = (String, i64, i64, String, String);
 
 fn pre_enable_executor_functions() -> &'static [&'static str] {
-    &EXECUTOR_FUNCTIONS[..15]
+    &PRE_INGRESS_ACK_EXECUTOR_FUNCTIONS
 }
 
 async fn raw_selector_claim(

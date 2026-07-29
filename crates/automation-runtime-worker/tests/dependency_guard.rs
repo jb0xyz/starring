@@ -57,11 +57,26 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/gateway_lifecycle_tests.rs"),
             PathBuf::from("src/gateway_owner.rs"),
             PathBuf::from("src/gateway_owner_watchdog.rs"),
+            PathBuf::from("src/ingress_acknowledgement.rs"),
             PathBuf::from("src/lib.rs"),
             PathBuf::from("src/paused_gateway.rs"),
             PathBuf::from("src/product_drain.rs"),
+            PathBuf::from("src/production_lifecycle/admission.rs"),
+            PathBuf::from("src/production_lifecycle/handoff.rs"),
+            PathBuf::from("src/production_lifecycle/refresh.rs"),
+            PathBuf::from("src/production_lifecycle/shutdown.rs"),
+            PathBuf::from("src/production_lifecycle/tests.rs"),
+            PathBuf::from("src/production_lifecycle.rs"),
             PathBuf::from("src/recovery.rs"),
             PathBuf::from("src/registry_recovery.rs"),
+            PathBuf::from("src/startup_pending_drain/v3/tests.rs"),
+            PathBuf::from("src/startup_pending_drain/v3.rs"),
+            PathBuf::from("src/startup_pending_drain/v4/mutation.rs"),
+            PathBuf::from("src/startup_pending_drain/v4/orchestration.rs"),
+            PathBuf::from("src/startup_pending_drain/v4/selection.rs"),
+            PathBuf::from("src/startup_pending_drain/v4/terminal.rs"),
+            PathBuf::from("src/startup_pending_drain/v4/tests.rs"),
+            PathBuf::from("src/startup_pending_drain/v4.rs"),
             PathBuf::from("src/startup_pending_drain.rs"),
             PathBuf::from("src/startup_recovery.rs"),
             PathBuf::from("src/startup_recovery_execution.rs"),
@@ -1309,6 +1324,312 @@ fn pending_drain_compound_authority_is_linear_and_registry_rollover_gated() {
 }
 
 #[test]
+fn pending_drain_v3_succession_authority_is_linear_compact_and_outcome_bound() {
+    let source = include_str!("../src/startup_pending_drain/v3.rs");
+    let parent = include_str!("../src/startup_pending_drain.rs");
+    let execution = include_str!("../src/startup_recovery_execution.rs");
+    for authority in [
+        "RuntimeAuthorizedPendingDrainSelectionV3",
+        "RuntimePendingDrainFreshPreviousOwnerSelectionV3",
+        "RuntimeSelectedPendingDrainSuccessionV3",
+        "RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3",
+        "RuntimeDurablyAcknowledgedPendingDrainSuccessionV3",
+    ] {
+        let declaration = source
+            .split(&format!("pub struct {authority} {{"))
+            .next()
+            .unwrap();
+        let attributes = declaration.rsplit_once("\n\n").unwrap().1;
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!attributes.contains(forbidden), "{authority}: {forbidden}");
+            assert!(!implements_trait(source, authority, forbidden));
+        }
+        let fields = source
+            .split(&format!("pub struct {authority} {{"))
+            .nth(1)
+            .and_then(|value| value.split("}\n\n").next())
+            .unwrap();
+        assert!(!fields.contains("pub "), "{authority}");
+        assert!(source.contains(&format!("{authority}(<redacted>)")));
+    }
+
+    for required in [
+        "pub struct RuntimePendingDrainPreviousOwnerClaimedCandidateInputV3",
+        "source: RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2",
+        "pub struct RuntimePendingDrainPreviousOwnerClaimedCandidateV3",
+        "intent_id: RuntimeDrainIntentIdV2",
+        "slot: RuntimeServingSlotV2",
+        "expected_target: RuntimeDeploymentTargetV1",
+        "source_intent_revision: NonZeroU64",
+        "source_state_digest: RuntimePendingDrainStateDigestV2",
+        "predecessor_claim: RuntimeDrainClaimV2",
+        "predecessor_claim_terminal_digest: RuntimeStartupRecoveryExecutionTerminalDigestV2",
+        "product_mutation_request_sha256: [u8; 32]",
+        "drain_intent_request_sha256: [u8; 32]",
+        "RuntimePendingDrainSelectionOutcomeV3::FreshPreviousOwner(candidate)",
+        "RuntimePendingDrainSelectionOutcomeV3::ExpiredPreviousOwner(candidate)",
+        "Duration::from_secs(1)",
+        ".min(remaining_predecessor)",
+        ".min(remaining_owner)",
+        "validate_registry_rollover_v2(&self.seal, &unseal)?",
+        "RuntimePendingDrainExecutionProofV2::Succession",
+        "RuntimePendingDrainExecutionProofV2::Deferred",
+    ] {
+        assert!(source.contains(required), "{required}");
+    }
+    for forbidden in [
+        "source_state_bytes",
+        "sqlx",
+        "twilight",
+        "serde",
+        "deploy",
+        "activate",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+    }
+    let compact_candidate = source
+        .split("pub struct RuntimePendingDrainPreviousOwnerClaimedCandidateV3 {")
+        .nth(1)
+        .and_then(|value| value.split("}\n\n").next())
+        .unwrap();
+    assert!(!compact_candidate.contains("RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2"));
+    assert_eq!(
+        source
+            .matches(".pending_drain_acknowledgement_successor()")
+            .count(),
+        1
+    );
+    let unclaimed = source
+        .find("RuntimePendingDrainSelectionOutcomeV3::Unclaimed(candidate)")
+        .unwrap();
+    let acknowledgement = source
+        .find(".pending_drain_acknowledgement_successor()")
+        .unwrap();
+    assert!(unclaimed < acknowledgement);
+
+    for (port_name, method, authority, receipt) in [
+        (
+            "RuntimePendingDrainSelectionPortV3",
+            "select_pending_drain_v3",
+            "RuntimeAuthorizedPendingDrainSelectionV3",
+            "RuntimePendingDrainSelectionReceiptV3",
+        ),
+        (
+            "RuntimePendingDrainSuccessionAcknowledgementExecutionPortV3",
+            "execute_pending_drain_succession_acknowledgement",
+            "RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3",
+            "RuntimePendingDrainSuccessionAcknowledgementReceiptV3",
+        ),
+    ] {
+        let port = source
+            .split(&format!("pub trait {port_name} {{"))
+            .nth(1)
+            .and_then(|value| value.split("\n}\n\n").next())
+            .unwrap();
+        assert_eq!(port.matches(&format!("fn {method}(")).count(), 1);
+        assert!(port.contains(&format!("&{authority}")));
+        assert!(port.contains("operation_cutoff: Instant"));
+        assert!(port.contains(&format!("Result<{receipt}, Self::Error>")));
+        assert!(port.contains("impl Future"));
+        assert!(port.contains("+ Send"));
+    }
+
+    assert!(parent.contains("pub(crate) fn matches_outcome("));
+    assert!(parent.contains("Self::Deferred(proof)"));
+    assert!(parent.contains("Self::Succession(proof)"));
+    assert!(execution.contains("|| !proof.matches_outcome(&receipt.outcome)"));
+}
+
+#[test]
+fn pending_drain_v4_authority_is_linear_and_ports_require_checked_receipts() {
+    let model = include_str!("../src/startup_pending_drain/v4.rs");
+    let mutation = include_str!("../src/startup_pending_drain/v4/mutation.rs");
+    let orchestration = include_str!("../src/startup_pending_drain/v4/orchestration.rs");
+    let selection = include_str!("../src/startup_pending_drain/v4/selection.rs");
+    let terminal = include_str!("../src/startup_pending_drain/v4/terminal.rs");
+    let source = format!("{model}\n{selection}\n{mutation}\n{terminal}\n{orchestration}");
+    assert!(model.lines().count() < 900);
+    for required in [
+        "RuntimePendingDrainCandidateEvidenceInputV4",
+        "RuntimePendingDrainSelectionClassV4",
+        "RuntimeAuthorizedPendingDrainSelectionV4",
+    ] {
+        assert!(selection.contains(required), "{required}");
+    }
+    for forbidden in [
+        "RuntimePendingDrainMutationReceiptV4",
+        "RuntimePendingDrainTerminalIdentityV4",
+        "RuntimePendingDrainRegistryTransitionPortV4",
+    ] {
+        assert!(!selection.contains(forbidden), "{forbidden}");
+    }
+    for required in [
+        "RuntimePendingDrainActionIdentityV4",
+        "RuntimeRoutedSealedWitnessV4",
+        "RuntimeDurableRoutedClaimReceiptV4",
+        "RuntimeDurableRefenceReceiptV4",
+    ] {
+        assert!(mutation.contains(required), "{required}");
+    }
+    for required in [
+        "RuntimePendingDrainTerminalIdentityV4",
+        "RuntimePendingDrainUnknownResultV4",
+        "RuntimePendingDrainFinalizerRegistrationV4",
+    ] {
+        assert!(terminal.contains(required), "{required}");
+    }
+    for required in [
+        "RuntimePendingDrainRegistryTransitionPortV4",
+        "RuntimeRoutedDrainClaimExecutionPortV4",
+        "RuntimePreviousProcessDrainTeardownExecutionPortV4",
+    ] {
+        assert!(orchestration.contains(required), "{required}");
+    }
+    for authority in [
+        "RuntimeAuthorizedPendingDrainSelectionV4",
+        "RuntimeSelectedUnclaimedPendingDrainV4",
+        "RuntimeSelectedCurrentRouteAbsentClaimedV4",
+        "RuntimeSelectedCurrentRoutedClaimedV4",
+        "RuntimeSelectedCurrentRefencedV4",
+        "RuntimeReconstructedDurablyRefencedV4",
+        "RuntimeAuthorizedRoutedDrainClaimV4",
+        "RuntimeAuthorizedDrainRefenceProgressV4",
+        "RuntimeAuthorizedSameProcessDrainAcknowledgementV4",
+        "RuntimeAuthorizedPreviousProcessDrainTeardownV4",
+        "RuntimeDurableRoutedClaimReceiptV4",
+        "RuntimeDurableRefenceReceiptV4",
+        "RuntimeDurableSameProcessDrainAcknowledgementV4",
+        "RuntimeDurablePreviousProcessDrainTeardownV4",
+        "RuntimeRoutedDrainRollbackPermitV4",
+        "RuntimeRoutedSealedClaimV4",
+        "RuntimeDurableRoutedClaimBoundaryV4",
+        "RuntimeRoutedDrainRollbackAuthorizationV4",
+        "RuntimeRoutedClaimedContinuationV4",
+        "RuntimePendingDrainLaneJoinedV4",
+        "RuntimePendingDrainServingResolvedV4",
+        "RuntimeAuthorizedRegistryRefenceV4",
+        "RuntimeLocalRefenceProgressV4",
+        "RuntimeDurableRefenceBoundaryV4",
+        "RuntimeDurablyRefencedBoundaryV4",
+        "RuntimeRouteAbsentAcknowledgementV4",
+        "RuntimeDurableSameProcessAcknowledgementBoundaryV4",
+        "RuntimePreviousProcessTeardownV4",
+        "RuntimeDurablePreviousProcessTeardownBoundaryV4",
+    ] {
+        let marker = format!("pub struct {authority}");
+        let start = source.find(&marker).unwrap();
+        let attributes = source[..start].rsplit_once("\n\n").unwrap().1;
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!attributes.contains(forbidden), "{authority}: {forbidden}");
+            assert!(!implements_trait(&source, authority, forbidden));
+        }
+        let declaration = &source[start + marker.len()..];
+        let fields = declaration
+            .split_once('{')
+            .and_then(|(_, value)| value.split("\n}\n\n").next())
+            .unwrap();
+        assert!(!fields.contains("pub "), "{authority}");
+        assert!(source.contains(&format!("{authority}(<redacted>)")));
+    }
+
+    let registry = orchestration
+        .split("pub trait RuntimePendingDrainRegistryTransitionPortV4 {")
+        .nth(1)
+        .and_then(|value| value.split("\n}\n\n").next())
+        .unwrap();
+    for required in [
+        "RuntimeRoutedSealPortObservationV4",
+        "RuntimeRoutedClaimedSealPortObservationV4",
+        "RuntimeLocalRefencePortObservationV4",
+        "RuntimeDurableRefencePortObservationV4",
+        "RuntimeRouteAbsentPortObservationV4",
+        "RuntimeEmptySuccessionPortObservationV4",
+        "RuntimeAuthorizedRegistryRefenceEvidenceV4",
+        "RuntimeSelectedExpiredPreviousOwnerV4",
+        "RuntimeDurableRoutedClaimReceiptV4",
+        "RuntimeDurableRefenceReceiptV4",
+        "RuntimeDurableSameProcessDrainAcknowledgementV4",
+        "RuntimeDurablePreviousProcessDrainTeardownV4",
+    ] {
+        assert!(registry.contains(required), "{required}");
+    }
+    for forbidden in [
+        "RuntimePendingDrainEvidenceDigestV4",
+        "[u8; 32]",
+        "RuntimeDrainIntentIdV2",
+        "ProcessInstanceId",
+    ] {
+        assert!(!registry.contains(forbidden), "{forbidden}");
+    }
+
+    let rollback = orchestration
+        .split("pub trait RuntimeRoutedDrainRollbackPortV4 {")
+        .nth(1)
+        .and_then(|value| value.split("\n}\n\n").next())
+        .unwrap();
+    assert!(rollback.contains("source: Self::RoutedSealed"));
+    assert!(rollback.contains("permit: RuntimeRoutedDrainRollbackPermitV4"));
+    for forbidden in [
+        "RuntimePendingDrainEvidenceDigestV4",
+        "[u8; 32]",
+        "RuntimeDrainIntentIdV2",
+        "ProcessInstanceId",
+    ] {
+        assert!(!rollback.contains(forbidden), "{forbidden}");
+    }
+
+    for (port_name, authorization) in [
+        (
+            "RuntimeRoutedDrainClaimExecutionPortV4",
+            "RuntimeRoutedSealedClaimV4",
+        ),
+        (
+            "RuntimeDrainRefenceProgressExecutionPortV4",
+            "RuntimeLocalRefenceProgressV4",
+        ),
+        (
+            "RuntimeSameProcessDrainAcknowledgementExecutionPortV4",
+            "RuntimeRouteAbsentAcknowledgementV4",
+        ),
+        (
+            "RuntimePreviousProcessDrainTeardownExecutionPortV4",
+            "RuntimePreviousProcessTeardownV4",
+        ),
+    ] {
+        let port = orchestration
+            .split(&format!("pub trait {port_name} {{"))
+            .nth(1)
+            .and_then(|value| value.split("\n}\n\n").next())
+            .unwrap();
+        assert!(port.contains("RuntimeRegisteredPendingDrainFinalizerV4<"));
+        assert!(port.contains(authorization));
+        assert!(port.contains("operation_cutoff: Instant"));
+    }
+
+    let root = include_str!("../src/lib.rs");
+    for forbidden in [
+        "RuntimeRoutedSealedWitnessInputV4",
+        "RuntimeRoutedClaimedSealedWitnessInputV4",
+        "RuntimeLocallyRefencedSealedWitnessInputV4",
+        "RuntimeDurablyRefencedSealedWitnessInputV4",
+        "RuntimeRouteAbsentSealedWitnessInputV4",
+        "RuntimeEmptySuccessionSealedWitnessInputV4",
+        "RuntimePendingDrainMutationReceiptInputV4",
+        "RuntimePendingDrainMutationReceiptV4",
+        "RuntimeAuthorizedRoutedDrainClaimV4",
+        "RuntimeAuthorizedDrainRefenceProgressV4",
+        "RuntimeAuthorizedSameProcessDrainAcknowledgementV4",
+        "RuntimeAuthorizedPreviousProcessDrainTeardownV4",
+        "RuntimeRoutedDrainClaimReceiptV4",
+        "RuntimeDrainRefenceProgressReceiptV4",
+        "RuntimeSameProcessDrainAcknowledgementReceiptV4",
+        "RuntimePreviousProcessDrainTeardownReceiptV4",
+    ] {
+        assert!(!contains_identifier(root, forbidden), "{forbidden}");
+    }
+}
+
+#[test]
 fn worker_coordinator_authority_and_state_surface_stay_exact() {
     let lifecycle = include_str!("../src/gateway_lifecycle.rs");
     let invalidation = lifecycle
@@ -1500,4 +1821,246 @@ fn worker_gateway_owner_watchdog_state_is_nonclone_and_monotonic() {
         "}"
     )));
     assert!(!owner_source.contains("impl Clone for RuntimeAcceptedGatewayOwnerReceiptV1"));
+}
+
+#[test]
+fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
+    let model = include_str!("../src/production_lifecycle.rs");
+    let handoff = include_str!("../src/production_lifecycle/handoff.rs");
+    let admission = include_str!("../src/production_lifecycle/admission.rs");
+    let refresh = include_str!("../src/production_lifecycle/refresh.rs");
+    let shutdown = include_str!("../src/production_lifecycle/shutdown.rs");
+    let source = format!("{model}\n{handoff}\n{admission}\n{refresh}\n{shutdown}");
+    let root = include_str!("../src/lib.rs");
+    let closed = include_str!("../src/gateway_lifecycle.rs");
+
+    assert!(model.lines().count() < 400);
+    assert!(handoff.lines().count() < 500);
+    assert!(admission.lines().count() < 700);
+    assert!(refresh.lines().count() < 400);
+    assert!(shutdown.lines().count() < 650);
+
+    for authority in [
+        "RuntimeStartupRecoveryFixedPointProcessV2",
+        "RuntimeProductionFixedPointAcceptanceFailureV2",
+        "RuntimeProductionTransitionFailureV2",
+        "RuntimeProductionHandoffProcessV2",
+        "RuntimeRecoveryResumePermitV2",
+        "RuntimeAdmissionAcknowledgingProcessV2",
+        "RuntimeEmptyOpenEpochV2",
+        "RuntimeEmptyOpenProcessV2",
+        "RuntimeProductionEmergencyProcessV2",
+        "RuntimeShuttingDownProcessV2",
+    ] {
+        let marker = format!("pub struct {authority}");
+        let start = source.find(&marker).unwrap();
+        let attributes = source[..start].rsplit("\n\n").next().unwrap();
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !attributes.contains(forbidden),
+                "{authority} derives {forbidden}"
+            );
+            assert!(
+                !source.contains(&format!("{forbidden} for {authority}")),
+                "{authority} implements {forbidden}"
+            );
+        }
+        let fields = source[start..]
+            .split_once('{')
+            .unwrap()
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0;
+        assert!(
+            fields.lines().all(|line| !line.starts_with("    pub ")),
+            "{authority} exposes authority fields"
+        );
+    }
+
+    for transition in [
+        "pub fn begin_production_handoff<P>(\n        self,",
+        "pub fn resume_recovery<P>(\n        self,",
+        "pub fn observe_open_production<P>(\n        self,",
+        "pub fn invalidate_production(\n        self,",
+        "pub fn begin_shutdown(\n        self,",
+    ] {
+        assert!(source.contains(transition), "{transition}");
+    }
+
+    for port in [
+        "RuntimeProductionHandoffObservationPortV2",
+        "RuntimeRecoveryResumePortV2",
+        "RuntimeOpenProductionObservationPortV2",
+    ] {
+        let body = source
+            .split(&format!("pub trait {port} {{"))
+            .nth(1)
+            .and_then(|value| value.split("\n}\n").next())
+            .unwrap();
+        assert_eq!(body.matches("\n    fn ").count(), 1, "{port}");
+        assert!(!body.contains("RuntimeGatewayClosedLifecycleV2"), "{port}");
+        assert!(
+            !body.contains("RuntimeClosedDrainRecoveryPermitV2"),
+            "{port}"
+        );
+    }
+
+    for required in [
+        "into_production_fixed_point",
+        "RuntimeStartupRecoveryFixedPointProofV2",
+        "RuntimeProductionLifecycleStageV2::AdmissionAcknowledging",
+        "RuntimeProductionLifecycleStageV2::OpenProduction",
+        "RuntimeProductionLifecycleStageV2::Shutdown",
+        "RuntimeIngressOpenAcknowledgementObservationV2",
+        "RuntimeProductionInvalidationOutcomeV2",
+        "RuntimeShutdownCauseV2::GenerationOverflow",
+    ] {
+        assert!(source.contains(required), "{required}");
+    }
+
+    for forbidden in [
+        "RuntimePublicAdmissionPermit",
+        "AdmittedInteraction",
+        "execute_interaction",
+        "interaction_consumer",
+        "GatewayPauseToken",
+        "SharedGatewayControl",
+        "sqlx",
+        "twilight",
+        "tokio",
+        "serde",
+        "async fn",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+    }
+
+    for exported in [
+        "RuntimeStartupRecoveryFixedPointProcessV2",
+        "RuntimeProductionHandoffProcessV2",
+        "RuntimeRecoveryResumePermitV2",
+        "RuntimeAdmissionAcknowledgingProcessV2",
+        "RuntimeEmptyOpenProcessV2",
+        "RuntimeProductionEmergencyProcessV2",
+        "RuntimeShuttingDownProcessV2",
+    ] {
+        assert!(contains_identifier(root, exported), "{exported}");
+    }
+    assert!(!contains_identifier(root, "RuntimePublicAdmissionPermitV2"));
+    assert!(!closed.contains("AdmissionAcknowledging"));
+    assert!(!closed.contains("OpenProduction"));
+}
+
+#[test]
+fn ingress_acknowledgement_authority_is_linear_replayable_and_controller_composed() {
+    let source = include_str!("../src/ingress_acknowledgement.rs");
+    let admission = include_str!("../src/production_lifecycle/admission.rs");
+    let refresh = include_str!("../src/production_lifecycle/refresh.rs");
+    let lifecycle = include_str!("../src/production_lifecycle.rs");
+    let root = include_str!("../src/lib.rs");
+
+    let authority = source
+        .split("pub struct RuntimeAuthorizedIngressOpenAcknowledgementV2 {")
+        .next()
+        .unwrap()
+        .rsplit_once("\n\n")
+        .unwrap()
+        .1;
+    for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+        assert!(!authority.contains(forbidden), "{forbidden}");
+        assert!(!source.contains(&format!(
+            "impl {forbidden} for RuntimeAuthorizedIngressOpenAcknowledgementV2"
+        )));
+    }
+    assert!(source.contains("authorization: &RuntimeAuthorizedIngressOpenAcknowledgementV2,"));
+    assert_eq!(
+        source
+            .matches("authorization: &RuntimeAuthorizedIngressOpenAcknowledgementV2,")
+            .count(),
+        3
+    );
+    let accepted = source
+        .split("pub struct RuntimeAcceptedIngressOpenAcknowledgementV2 {")
+        .nth(1)
+        .unwrap()
+        .split("impl Debug for RuntimeAcceptedIngressOpenAcknowledgementV2")
+        .next()
+        .unwrap();
+    assert!(accepted.contains("request: RuntimePublishIngressOpenAcknowledgementV2,"));
+    assert!(accepted.contains("receipt: RuntimeIngressOpenAcknowledgementReceiptV2,"));
+    assert!(
+        accepted.contains("pub fn request(&self) -> &RuntimePublishIngressOpenAcknowledgementV2")
+    );
+    for required in [
+        "pub trait RuntimeIngressOpenAcknowledgementPortV2",
+        "fn publish_ingress_open_acknowledgement<'a>(",
+        "fn observe_ingress_open_acknowledgement<'a>(",
+        "fn observe_ingress_open_acknowledgement_predecessor(",
+        "DefinitelyNotApplied",
+        "OutcomeUnknown",
+        "RuntimeIngressOpenAcknowledgementObservationErrorClassV2",
+        "RuntimeIngressOpenAcknowledgementResolutionV2",
+        "ReplaySameRequest",
+        "ReplayBudgetExhausted",
+        "RuntimeIngressOpenAcknowledgementSingleFlightV2",
+        "RuntimeIngressOpenAcknowledgementAttemptV2",
+        "RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2",
+        "Divergent",
+        "ProtocolViolation",
+        "RuntimeIngressOpenAcknowledgementMutationErrorV2::DefinitelyNotApplied(<redacted>)",
+        "RuntimeAuthorizedIngressOpenAcknowledgementV2(<redacted>)",
+    ] {
+        assert!(source.contains(required), "{required}");
+    }
+    for forbidden in [
+        "sqlx",
+        "rusqlite",
+        "twilight",
+        "tokio",
+        "Serialize",
+        "Deserialize",
+        "async fn",
+        "Utc::now",
+        "SystemTime",
+    ] {
+        assert!(!source.contains(forbidden), "{forbidden}");
+    }
+    assert!(admission.contains("pub fn authorize_ingress_open_acknowledgement("));
+    assert!(admission
+        .contains("pub fn authorize_ingress_open_acknowledgement_predecessor_observation("));
+    assert!(
+        refresh.contains("pub fn authorize_ingress_open_acknowledgement_refresh(\n        self,")
+    );
+    assert!(refresh.contains("RuntimeEmptyOpenAcknowledgementRefreshV2"));
+    assert!(admission.contains(
+        "RuntimeIngressOpenAcknowledgementV2 as RuntimeDurableIngressOpenAcknowledgementV2"
+    ));
+    let open_observation = admission
+        .split("pub struct RuntimeIngressOpenAcknowledgementObservationV2 {")
+        .nth(1)
+        .unwrap()
+        .split("impl Debug for RuntimeIngressOpenAcknowledgementObservationV2")
+        .next()
+        .unwrap();
+    assert!(open_observation.contains("accepted: RuntimeAcceptedIngressOpenAcknowledgementV2,"));
+    assert!(open_observation.contains(
+        "pub fn from_accepted(accepted: RuntimeAcceptedIngressOpenAcknowledgementV2) -> Self"
+    ));
+    assert!(!open_observation.contains("RuntimeDurableIngressOpenAcknowledgementV2,"));
+    assert!(!open_observation.contains("pub fn new("));
+    assert!(!source.contains("pub fn into_acknowledgement("));
+    assert!(!admission.contains("RuntimeIngressOpenAcknowledgementObservationInputV2"));
+    assert!(!lifecycle.contains("RuntimeIngressOpenAcknowledgementObservationInputV2"));
+    assert!(!root.contains("RuntimeIngressOpenAcknowledgementObservationInputV2"));
+    for exported in [
+        "RuntimeAuthorizedIngressOpenAcknowledgementV2",
+        "RuntimeIngressOpenAcknowledgementPortV2",
+        "RuntimeIngressOpenAcknowledgementMutationErrorV2",
+        "RuntimeIngressOpenAcknowledgementResolutionV2",
+        "RuntimeIngressOpenAcknowledgementSingleFlightV2",
+        "RuntimeIngressOpenAcknowledgementPredecessorV2",
+        "RuntimeEmptyOpenAcknowledgementRefreshV2",
+    ] {
+        assert!(contains_identifier(root, exported), "{exported}");
+    }
 }

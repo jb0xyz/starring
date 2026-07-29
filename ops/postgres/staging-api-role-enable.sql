@@ -64,6 +64,7 @@ VALUES
     ('starring_decision_approval'),
     ('starring_decision_rejection'),
     ('starring_decision_apply'),
+    ('starring_decision_cancellation'),
     ('starring_deployment_status_reader'),
     ('starring_operational_deployment_status_reader');
 
@@ -119,6 +120,9 @@ VALUES
     ('starring_decision_apply', 'public.starring_product_apply_target_artifact_v1(text,text,text,text,bytea,text,text)'),
     ('starring_decision_apply', 'public.starring_product_apply_finalize_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb)'),
     ('starring_decision_apply', 'public.starring_product_apply_keyring_coverage_v1(text[],text[])'),
+    ('starring_decision_cancellation', 'public.starring_product_lifecycle_cancellation_executor_database_identity_v1()'),
+    ('starring_decision_cancellation', 'public.starring_product_lifecycle_cancellation_keyring_coverage_v1(text[],text[])'),
+    ('starring_decision_cancellation', 'public.starring_product_cancel_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text,bigint,text,text,bigint)'),
     ('starring_deployment_status_reader', 'public.starring_product_deployment_status_reader_database_identity_v1()'),
     ('starring_deployment_status_reader', 'public.starring_product_deployment_status_read_v1(text,text,text,text,text,text,text,text,bytea)'),
     ('starring_operational_deployment_status_reader', 'public.starring_product_deployment_status_reader_database_identity_v2()'),
@@ -135,8 +139,8 @@ BEGIN
     WHERE namespace.nspname <> 'information_schema'
         AND pg_catalog.left(namespace.nspname, 3) <> 'pg_';
 
-    IF (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_request_roles) <> 13
-        OR (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_capability_manifest) <> 43
+    IF (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_request_roles) <> 14
+        OR (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_capability_manifest) <> 46
         OR EXISTS (
             SELECT 1
             FROM pg_temp.starring_api_capability_manifest AS expected
@@ -198,7 +202,7 @@ BEGIN
         FROM pg_catalog.pg_authid AS role
         INNER JOIN pg_temp.starring_api_request_roles AS expected
             ON expected.role_name = role.rolname
-    ) <> 13 THEN
+    ) <> 14 THEN
         RAISE EXCEPTION 'staging request role enable attribute preflight failed'
             USING ERRCODE = '55000';
     END IF;
@@ -603,7 +607,7 @@ BEGIN
         FROM pg_catalog.pg_authid AS role
         INNER JOIN pg_temp.starring_api_request_roles AS expected
             ON expected.role_name = role.rolname
-    ) <> 13 THEN
+    ) <> 14 THEN
         RAISE EXCEPTION 'staging request role enable postflight failed'
             USING ERRCODE = '55000';
     END IF;

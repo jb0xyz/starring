@@ -4,9 +4,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use authoring_application_postgres::MIGRATOR;
 use automation_ruleset::{RuleSetContentHash, RuleSetKey, RuleSetVersionId};
 use automation_runtime_convergence::{
-    ActivationRequestId, BindingRevision, DeploymentId, InstallationId, PromotionId,
-    RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1, RuntimeGeneration,
-    RuntimeProcessIdentityV1, TenantId,
+    ActivationAttestationV1, ActivationOutcomeKindV1, ActivationRequestId, BindingRevision,
+    CommandGuardV1, ControllerId, DeploymentId, DrainAttestationV1, FencingToken, InstallationId,
+    LeaseRequestV1, PanelCertificateId, PanelCertificateV1, PanelReportDigestV1,
+    PreflightAttestationV1, ProcessInstanceId, ProductDrainSourceSupersessionPermitV1, PromotionId,
+    RuntimeDeployment, RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1, RuntimeGeneration,
+    RuntimeProcessIdentityV1, SupersedingDeploymentV1, TenantId,
 };
 use automation_runtime_convergence_postgres::{
     prepare_requested_deployment_v1, EnqueueDeploymentV1, PostgresRuntimeConvergence,

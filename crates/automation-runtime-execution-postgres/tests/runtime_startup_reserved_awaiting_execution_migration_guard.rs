@@ -12,7 +12,7 @@ const EXECUTOR: &str = "public.starring_runtime_startup_recovery_execute_reserve
 const MIGRATION_READINESS_DIGEST: &str =
     "4e58c914016de080372586cc2efc7e9a5221c8703450d767934389a5c4c07db8";
 const CURRENT_READINESS_DIGEST: &str =
-    "1c20dcc6c6e01b440d9a5813bad12b109d89a67c5d6815f9fd15551fa3c0f4e5";
+    "572d7ffd19d6f2edb5ec84ea6b7bfebd178c7da0568bce61af2f7907cfe72647";
 const MANIFEST_DIGEST: &str = "c2de6cf64ce6efbcf22e31f06da774195996060a692c45b48f073ff93fa4d630";
 
 fn dollar_block(tag: &str) -> &'static str {
@@ -197,10 +197,10 @@ fn manifest_readiness_acl_and_rust_pins_advance_together() {
     ] {
         assert!(MIGRATION.contains(required), "{required}");
     }
-    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 22]"));
+    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 26]"));
     assert!(CONTRACT_SOURCE.contains(EXECUTOR));
-    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 24"));
-    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 24]"));
+    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 28"));
+    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 28]"));
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
         assert!(source.contains(CURRENT_READINESS_DIGEST));
     }

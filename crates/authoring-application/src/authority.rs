@@ -28,6 +28,7 @@ pub enum CapabilityV1 {
     Approve,
     Reject,
     Apply,
+    CancelLifecycle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

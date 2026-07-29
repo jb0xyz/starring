@@ -20,6 +20,7 @@ use crate::gateway_owner_startup_watchdog::{
     release_runtime_gateway_owner_until_v1, RuntimeGatewayOwnerClosedRecoveryPrepareErrorV2,
     RuntimeGatewayOwnerPreparedClosedRecoveryV2, RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
 };
+use crate::shutdown::RuntimeShutdownObserverV1;
 use crate::{
     GatewayOwnerTimingConfigV1, RuntimeGatewayBootstrapV1,
     RuntimeGatewayOwnerCurrentObservationErrorV1, RuntimeGatewayOwnerCurrentObservationV1,
@@ -162,19 +163,29 @@ enum RuntimeGatewayOwnerUnknownResolutionV1 {
     Contended,
 }
 
+pub(crate) struct RuntimeGatewayOwnerStartupBoundsV1<'a> {
+    pub(crate) operation_cutoff: Instant,
+    pub(crate) cleanup_deadline: Instant,
+    pub(crate) shutdown: &'a mut RuntimeShutdownObserverV1,
+}
+
 pub(crate) async fn acquire_runtime_gateway_owner_startup_v1<P>(
     gateway: &mut RuntimeGatewayBootstrapV1,
     port: P,
     process_instance_id: &ProcessInstanceId,
     build_revision: &RuntimeBuildRevisionV1,
     timing: GatewayOwnerTimingConfigV1,
-    operation_cutoff: Instant,
-    cleanup_deadline: Instant,
+    bounds: RuntimeGatewayOwnerStartupBoundsV1<'_>,
 ) -> Result<RuntimeAcquiredGatewayOwnerV1, RuntimeGatewayOwnerStartupAcquisitionErrorV1>
 where
     P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync + 'static,
     P::Error: Send + 'static,
 {
+    let RuntimeGatewayOwnerStartupBoundsV1 {
+        operation_cutoff,
+        cleanup_deadline,
+        shutdown,
+    } = bounds;
     let config = RuntimeGatewayOwnerStartupWatchdogConfigV1::from_runtime_config(timing)
         .map_err(RuntimeGatewayOwnerStartupAcquisitionErrorV1::Configuration)?;
     let request = RuntimeAcquireGatewayOwnerLeaseV1 {
@@ -183,16 +194,28 @@ where
         expected_build_revision: build_revision.clone(),
         lease_for: config.lease_for(),
     };
-    let first =
-        acquire_gateway_owner_once_v1(&port, &request, operation_cutoff, cleanup_deadline).await?;
+    let first = acquire_gateway_owner_once_v1(
+        &port,
+        &request,
+        operation_cutoff,
+        cleanup_deadline,
+        shutdown,
+    )
+    .await?;
     let accepted = match first {
         RuntimeGatewayOwnerAcquireAttemptV1::Accepted(accepted) => accepted,
         RuntimeGatewayOwnerAcquireAttemptV1::Contended => {
             return Err(RuntimeGatewayOwnerStartupAcquisitionErrorV1::Contended);
         }
         RuntimeGatewayOwnerAcquireAttemptV1::ReplaySameRequest => {
-            acquire_gateway_owner_second_v1(&port, &request, operation_cutoff, cleanup_deadline)
-                .await?
+            acquire_gateway_owner_second_v1(
+                &port,
+                &request,
+                operation_cutoff,
+                cleanup_deadline,
+                shutdown,
+            )
+            .await?
         }
         RuntimeGatewayOwnerAcquireAttemptV1::OutcomeUnknown => {
             match resolve_unknown_gateway_owner_acquire_v1(
@@ -200,6 +223,7 @@ where
                 &request,
                 operation_cutoff,
                 cleanup_deadline,
+                shutdown,
             )
             .await?
             {
@@ -213,6 +237,7 @@ where
                         &request,
                         operation_cutoff,
                         cleanup_deadline,
+                        shutdown,
                     )
                     .await?
                 }
@@ -226,6 +251,7 @@ where
         config,
         operation_cutoff,
         cleanup_deadline,
+        shutdown,
     )
     .await
 }
@@ -235,11 +261,14 @@ async fn acquire_gateway_owner_second_v1<P>(
     request: &RuntimeAcquireGatewayOwnerLeaseV1,
     operation_cutoff: Instant,
     cleanup_deadline: Instant,
+    shutdown: &mut RuntimeShutdownObserverV1,
 ) -> Result<RuntimeAcceptedGatewayOwnerStartupV1, RuntimeGatewayOwnerStartupAcquisitionErrorV1>
 where
     P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync,
 {
-    match acquire_gateway_owner_once_v1(port, request, operation_cutoff, cleanup_deadline).await? {
+    match acquire_gateway_owner_once_v1(port, request, operation_cutoff, cleanup_deadline, shutdown)
+        .await?
+    {
         RuntimeGatewayOwnerAcquireAttemptV1::Accepted(accepted) => Ok(accepted),
         RuntimeGatewayOwnerAcquireAttemptV1::Contended => {
             Err(RuntimeGatewayOwnerStartupAcquisitionErrorV1::Contended)
@@ -253,6 +282,7 @@ where
                 request,
                 operation_cutoff,
                 cleanup_deadline,
+                shutdown,
             )
             .await?
             {
@@ -273,23 +303,36 @@ async fn acquire_gateway_owner_once_v1<P>(
     request: &RuntimeAcquireGatewayOwnerLeaseV1,
     operation_cutoff: Instant,
     cleanup_deadline: Instant,
+    shutdown: &mut RuntimeShutdownObserverV1,
 ) -> Result<RuntimeGatewayOwnerAcquireAttemptV1, RuntimeGatewayOwnerStartupAcquisitionErrorV1>
 where
     P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync,
 {
+    if shutdown.observed().is_some() {
+        return Err(RuntimeGatewayOwnerStartupAcquisitionErrorV1::OperationDeadlineElapsed);
+    }
     if Instant::now() >= operation_cutoff {
         return Err(RuntimeGatewayOwnerStartupAcquisitionErrorV1::OperationDeadlineElapsed);
     }
     let request_started_at = Instant::now();
-    let result = {
+    let (result, shutdown_deadline) = {
         let acquisition = port.acquire_gateway_owner(request.clone());
         tokio::pin!(acquisition);
         tokio::select! {
             biased;
-            _ = sleep_until(TokioInstant::from_std(operation_cutoff)) => None,
-            result = &mut acquisition => Some(result),
+            observation = shutdown.wait() => (None, Some(observation.deadline())),
+            _ = sleep_until(TokioInstant::from_std(operation_cutoff)) => (None, None),
+            result = &mut acquisition => (Some(result), None),
         }
     };
+    if let Some(shutdown_deadline) = shutdown_deadline {
+        return Err(operation_deadline_after_unknown_acquire_v1(
+            port,
+            request,
+            cleanup_deadline.min(shutdown_deadline),
+        )
+        .await);
+    }
     let response_observed_at = Instant::now();
     let Some(result) = result else {
         return Err(
@@ -348,10 +391,19 @@ async fn resolve_unknown_gateway_owner_acquire_v1<P>(
     request: &RuntimeAcquireGatewayOwnerLeaseV1,
     operation_cutoff: Instant,
     cleanup_deadline: Instant,
+    shutdown: &mut RuntimeShutdownObserverV1,
 ) -> Result<RuntimeGatewayOwnerUnknownResolutionV1, RuntimeGatewayOwnerStartupAcquisitionErrorV1>
 where
     P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync,
 {
+    if let Some(observation) = shutdown.observed() {
+        return Err(operation_deadline_after_unknown_acquire_v1(
+            port,
+            request,
+            cleanup_deadline.min(observation.deadline()),
+        )
+        .await);
+    }
     if Instant::now() >= operation_cutoff {
         return Err(
             operation_deadline_after_unknown_acquire_v1(port, request, cleanup_deadline).await,
@@ -361,15 +413,24 @@ where
         gateway_shard_id: request.gateway_shard_id.clone(),
     };
     let request_started_at = Instant::now();
-    let result = {
+    let (result, shutdown_deadline) = {
         let observation = port.observe_gateway_owner(observation_request.clone());
         tokio::pin!(observation);
         tokio::select! {
             biased;
-            _ = sleep_until(TokioInstant::from_std(operation_cutoff)) => None,
-            result = &mut observation => Some(result),
+            observation = shutdown.wait() => (None, Some(observation.deadline())),
+            _ = sleep_until(TokioInstant::from_std(operation_cutoff)) => (None, None),
+            result = &mut observation => (Some(result), None),
         }
     };
+    if let Some(shutdown_deadline) = shutdown_deadline {
+        return Err(operation_deadline_after_unknown_acquire_v1(
+            port,
+            request,
+            cleanup_deadline.min(shutdown_deadline),
+        )
+        .await);
+    }
     let response_observed_at = Instant::now();
     let Some(result) = result else {
         return Err(
@@ -443,11 +504,21 @@ async fn start_and_confirm_gateway_owner_watchdog_v1<P>(
     config: RuntimeGatewayOwnerStartupWatchdogConfigV1,
     operation_cutoff: Instant,
     cleanup_deadline: Instant,
+    shutdown: &mut RuntimeShutdownObserverV1,
 ) -> Result<RuntimeAcquiredGatewayOwnerV1, RuntimeGatewayOwnerStartupAcquisitionErrorV1>
 where
     P: RuntimeGatewayOwnerLeasePortV1 + Send + Sync + 'static,
     P::Error: Send + 'static,
 {
+    if let Some(observation) = shutdown.observed() {
+        let release = release_runtime_gateway_owner_until_v1(
+            &port,
+            accepted.accepted.receipt().lease_id.clone(),
+            cleanup_deadline.min(observation.deadline()),
+        )
+        .await;
+        return Err(deadline_or_cleanup_error_v1(release));
+    }
     if Instant::now() >= operation_cutoff {
         let release = release_runtime_gateway_owner_until_v1(
             &port,
@@ -484,15 +555,23 @@ where
     if Instant::now() >= operation_cutoff {
         return Err(shutdown_watchdog_after_deadline_v1(watchdog, cleanup_deadline).await);
     }
-    let observation = {
+    let (observation, shutdown_deadline) = {
         let observation = watchdog.observe_current_gateway_owner_v1();
         tokio::pin!(observation);
         tokio::select! {
             biased;
-            _ = sleep_until(TokioInstant::from_std(operation_cutoff)) => None,
-            result = &mut observation => Some((result, Instant::now())),
+            shutdown = shutdown.wait() => (None, Some(shutdown.deadline())),
+            _ = sleep_until(TokioInstant::from_std(operation_cutoff)) => (None, None),
+            result = &mut observation => (Some((result, Instant::now())), None),
         }
     };
+    if let Some(shutdown_deadline) = shutdown_deadline {
+        return Err(shutdown_watchdog_after_deadline_v1(
+            watchdog,
+            cleanup_deadline.min(shutdown_deadline),
+        )
+        .await);
+    }
     let Some((observation, response_observed_at)) = observation else {
         return Err(shutdown_watchdog_after_deadline_v1(watchdog, cleanup_deadline).await);
     };
@@ -1158,14 +1237,19 @@ mod tests {
             GatewayResourceConfigV1::default(),
         )
         .unwrap();
+        let shutdown_latch = crate::RuntimeShutdownSignalLatchV1::create();
+        let mut shutdown = shutdown_latch.observer();
         let result = acquire_runtime_gateway_owner_startup_v1(
             &mut gateway,
             port,
             request_process,
             &build_revision(),
             timing(),
-            operation_cutoff,
-            cleanup_deadline,
+            RuntimeGatewayOwnerStartupBoundsV1 {
+                operation_cutoff,
+                cleanup_deadline,
+                shutdown: &mut shutdown,
+            },
         )
         .await;
         assert!(matches!(

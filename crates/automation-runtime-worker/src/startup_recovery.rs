@@ -84,6 +84,10 @@ impl RuntimeStartupRecoveryFixedPointProofV2 {
     pub fn acknowledged_product_handoff_count(&self) -> u32 {
         self.acknowledged_product_handoff_count
     }
+
+    pub(crate) fn owner_receipt(&self) -> &RuntimeGatewayOwnerLeaseReceiptV1 {
+        &self.owner_receipt
+    }
 }
 
 impl Debug for RuntimeStartupRecoveryFixedPointProofV2 {

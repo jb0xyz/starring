@@ -7,30 +7,28 @@ use starring_runtime::{
 
 #[derive(Clone, Copy)]
 enum RuntimeProcessExitStatusV1 {
-    StartupRecoveryFixedPointAndClosed,
+    CleanShutdown,
     Failed(RuntimeProcessStagingErrorV1),
 }
 
 impl RuntimeProcessExitStatusV1 {
     const fn code(self) -> &'static str {
         match self {
-            Self::StartupRecoveryFixedPointAndClosed => {
-                "runtime_staging_startup_recovery_fixed_point_and_closed"
-            }
+            Self::CleanShutdown => "runtime_process_clean_shutdown",
             Self::Failed(error) => error.code(),
         }
     }
 
     const fn context(self) -> Option<&'static str> {
         match self {
-            Self::StartupRecoveryFixedPointAndClosed => None,
+            Self::CleanShutdown => None,
             Self::Failed(error) => error.context(),
         }
     }
 
     fn exit_code(self) -> ExitCode {
         match self {
-            Self::StartupRecoveryFixedPointAndClosed => ExitCode::from(70),
+            Self::CleanShutdown => ExitCode::SUCCESS,
             Self::Failed(error) if error.configuration_class() => ExitCode::from(78),
             Self::Failed(RuntimeProcessStagingErrorV1::AsyncRuntimeUnavailable) => {
                 ExitCode::from(70)
@@ -44,7 +42,7 @@ impl RuntimeProcessExitStatusV1 {
 fn main() -> ExitCode {
     install_panic_hook();
     let status = match run_runtime_process_staging_from_environment_v1() {
-        Ok(_) => RuntimeProcessExitStatusV1::StartupRecoveryFixedPointAndClosed,
+        Ok(_) => RuntimeProcessExitStatusV1::CleanShutdown,
         Err(error) => RuntimeProcessExitStatusV1::Failed(error),
     };
     emit_status(status.code(), status.context());
@@ -81,7 +79,7 @@ mod tests {
 
     #[test]
     fn status_codes_context_and_exit_classes_are_finite() {
-        let staged = RuntimeProcessExitStatusV1::StartupRecoveryFixedPointAndClosed;
+        let staged = RuntimeProcessExitStatusV1::CleanShutdown;
         let configuration =
             RuntimeProcessExitStatusV1::Failed(RuntimeProcessStagingErrorV1::Configuration(
                 RuntimeConfigErrorV1::Missing(RuntimeConfigurationFieldV1::HealthBindAddress),
@@ -125,12 +123,9 @@ mod tests {
                 ),
             ),
         );
-        assert_eq!(
-            staged.code(),
-            "runtime_staging_startup_recovery_fixed_point_and_closed"
-        );
+        assert_eq!(staged.code(), "runtime_process_clean_shutdown");
         assert_eq!(staged.context(), None);
-        assert_eq!(staged.exit_code(), ExitCode::from(70));
+        assert_eq!(staged.exit_code(), ExitCode::SUCCESS);
         assert_eq!(configuration.code(), "runtime_config_missing");
         assert_eq!(configuration.context(), Some("health_bind_address"));
         assert_eq!(configuration.exit_code(), ExitCode::from(78));

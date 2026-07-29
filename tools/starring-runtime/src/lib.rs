@@ -1,19 +1,30 @@
 mod build_revision;
+mod capability_readiness_supervisor;
 mod closed_recovery;
 mod config;
 mod controller_identity;
 mod database;
 mod discord;
+mod discord_lifecycle;
 mod gateway;
 mod gateway_owner_startup;
 mod gateway_owner_startup_watchdog;
+mod health;
 mod identity_encoding;
+mod ingress_acknowledgement_safety;
+mod ingress_acknowledgement_supervisor;
+mod lifecycle_timing;
+#[cfg_attr(not(test), allow(dead_code))]
+mod maintenance_ingress_gate;
+mod mutation_finalizer;
 mod process;
 mod process_identity;
 mod process_startup;
+mod process_supervisor;
 mod recovery_identity;
 mod registry;
 mod secret;
+mod shutdown;
 mod startup;
 
 pub use build_revision::RuntimeBuildRevisionBootstrapErrorV1;
@@ -39,6 +50,19 @@ pub use gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerStartupWatchdogHandleV1, RuntimeGatewayOwnerStartupWatchdogStartErrorV1,
     RuntimeGatewayOwnerStartupWatchdogStartFailureV1,
 };
+pub use mutation_finalizer::{
+    RuntimeMutationFinalizerCompletionResultV1, RuntimeMutationFinalizerCompletionV1,
+    RuntimeMutationFinalizerConfigErrorV1, RuntimeMutationFinalizerConfigV1,
+    RuntimeMutationFinalizerHandoffStateV1, RuntimeMutationFinalizerIntakeV1,
+    RuntimeMutationFinalizerJobIdV1, RuntimeMutationFinalizerJobV1,
+    RuntimeMutationFinalizerJoinReportV1, RuntimeMutationFinalizerPortV1,
+    RuntimeMutationFinalizerRegistrationRejectedV1,
+    RuntimeMutationFinalizerRegistrationRejectionReasonV1, RuntimeMutationFinalizerSealOutcomeV1,
+    RuntimeMutationFinalizerSnapshotV1, RuntimeMutationFinalizerStartErrorV1,
+    RuntimeMutationFinalizerSupervisorV1, RuntimeMutationFinalizerWaitOutcomeV1,
+    RuntimeMutationFinalizerWaitStatusV1, RuntimeMutationFinalizerWaiterV1,
+    RuntimeSupervisorExitV1,
+};
 pub use process::connected::{
     RuntimeDiscordGatewayShutdownFailureV1, RuntimePausedConnectedProcessShutdownErrorV1,
     RuntimeProcessPausedConnectedTransitionErrorV1,
@@ -49,8 +73,10 @@ pub use process::{
     RuntimeGatewayOwnerShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,
     RuntimeProcessClosedRecoveryBeginFailureV2, RuntimeProcessClosedRecoveryCommitFailureV2,
     RuntimeProcessClosedRecoveryTransitionErrorV2, RuntimeProcessClosedRecoveryTransitionFailureV2,
-    RuntimeProcessFoundationCompositionErrorV1, RuntimeProcessGatewayOwnerCommitFailureV2,
+    RuntimeProcessFoundationCompositionErrorV1, RuntimeProcessFoundationShutdownErrorV1,
+    RuntimeProcessFoundationShutdownFailureV1, RuntimeProcessGatewayOwnerCommitFailureV2,
     RuntimeProcessGatewayOwnerPrepareFailureV2, RuntimeProcessGatewayOwnerTransitionErrorV1,
+    RuntimeProcessProductionHandoffErrorV2, RuntimeProcessProductionHandoffFailureV2,
     RuntimeProcessRecoveryPendingTransitionErrorV2,
     RuntimeProcessRecoveryPendingTransitionFailureV2, RuntimeProcessRecoveryReadinessFailureV2,
     RuntimeProcessRecoveryReadinessTransitionErrorV2,
@@ -74,4 +100,9 @@ pub use secret::{
     RuntimeDatabasePasswordV1, RuntimeDatabaseSecretsByCapabilityV1, RuntimeDatabaseSslModeV1,
     RuntimeDatabaseUrlSecretV1, RuntimeDiscordBotTokenV1, RuntimeSecretResolutionErrorV1,
     RuntimeSecretsResolutionErrorV1,
+};
+pub use shutdown::{
+    RuntimeOsShutdownSignalsV1, RuntimeShutdownCauseV1, RuntimeShutdownObservationV1,
+    RuntimeShutdownSignalErrorV1, RuntimeShutdownSignalLatchV1, RuntimeShutdownTriggerV1,
+    RuntimeShutdownTripV1,
 };

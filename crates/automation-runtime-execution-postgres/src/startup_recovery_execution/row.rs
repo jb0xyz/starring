@@ -98,6 +98,15 @@ pub(super) struct RuntimePendingDrainProgressedDatabaseReceiptV2 {
     pub successor_state_digest: RuntimePendingDrainStateDigestV2,
 }
 
+pub(super) struct RuntimePendingDrainSuccessionDatabaseRecordV3 {
+    pub owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+    pub terminal_digest: RuntimeStartupRecoveryExecutionTerminalDigestV2,
+    pub database_now: DateTime<Utc>,
+    pub minimum_database_now: DateTime<Utc>,
+    pub recorded_at: DateTime<Utc>,
+    pub terminal_projection_bytes: Box<[u8]>,
+}
+
 impl RuntimeStartupRecoveryExecutionRowV2 {
     pub(super) fn decode(
         self,
@@ -187,6 +196,25 @@ impl RuntimeStartupRecoveryExecutionRowV2 {
     ) -> Result<RuntimePendingDrainProgressedDatabaseReceiptV2, RuntimeExecutionPersistenceErrorV1>
     {
         self.decode_pending_progressed(expected, pending, false)
+    }
+
+    pub(super) fn decode_pending_succession(
+        self,
+        expected: &RuntimeStartupRecoveryExecutionExpectedV2,
+    ) -> Result<RuntimePendingDrainSuccessionDatabaseRecordV3, RuntimeExecutionPersistenceErrorV1>
+    {
+        if self.terminal_outcome_name != "route_absent_acknowledged" {
+            return Err(invalid());
+        }
+        let (owner_receipt, terminal_digest) = self.decode_pending_common(expected, false)?;
+        Ok(RuntimePendingDrainSuccessionDatabaseRecordV3 {
+            owner_receipt,
+            terminal_digest,
+            database_now: self.database_now,
+            minimum_database_now: self.minimum_database_now,
+            recorded_at: self.recorded_at,
+            terminal_projection_bytes: self.terminal_projection_bytes.clone().into_boxed_slice(),
+        })
     }
 
     fn decode_pending_progressed(

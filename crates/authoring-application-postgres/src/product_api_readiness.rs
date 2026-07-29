@@ -98,7 +98,7 @@ impl<G, C: SnapshotEnvelopeCipher> PostgresProductApiReadiness<'_, G, C> {
             .check_readiness()
             .await
             .map_err(ProductApiReadinessErrorV1::OperationalDeploymentStatus)?;
-        let topologies: [ScopedDatabaseTopologyV1; 13] = [
+        let topologies: [ScopedDatabaseTopologyV1; 14] = [
             identity[0].clone(),
             identity[1].clone(),
             identity[2].clone(),
@@ -110,6 +110,7 @@ impl<G, C: SnapshotEnvelopeCipher> PostgresProductApiReadiness<'_, G, C> {
             decisions[1].clone(),
             decisions[2].clone(),
             decisions[3].clone(),
+            decisions[4].clone(),
             deployment_status,
             operational_deployment_status,
         ];

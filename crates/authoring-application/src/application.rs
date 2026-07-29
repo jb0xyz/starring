@@ -1,5 +1,6 @@
 mod approval_query;
 mod decision_mutation;
+mod lifecycle_cancellation;
 mod projection_validation;
 mod promotion_flow;
 mod status_query;

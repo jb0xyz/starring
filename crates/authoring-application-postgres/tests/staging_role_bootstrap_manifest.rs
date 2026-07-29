@@ -10,7 +10,7 @@ const ENABLE: &str = include_str!(concat!(
 ));
 const API_READINESS_TEST: &str = include_str!("postgres_product_api_readiness.rs");
 
-const EXPECTED_CAPABILITIES: [(&str, &str); 43] = [
+const EXPECTED_CAPABILITIES: [(&str, &str); 46] = [
     (
         "starring_identity_oauth",
         "public.starring_product_oauth_database_identity_v1()",
@@ -168,6 +168,18 @@ const EXPECTED_CAPABILITIES: [(&str, &str); 43] = [
         "public.starring_product_apply_keyring_coverage_v1(text[],text[])",
     ),
     (
+        "starring_decision_cancellation",
+        "public.starring_product_lifecycle_cancellation_executor_database_identity_v1()",
+    ),
+    (
+        "starring_decision_cancellation",
+        "public.starring_product_lifecycle_cancellation_keyring_coverage_v1(text[],text[])",
+    ),
+    (
+        "starring_decision_cancellation",
+        "public.starring_product_cancel_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text,bigint,text,text,bigint)",
+    ),
+    (
         "starring_deployment_status_reader",
         "public.starring_product_deployment_status_reader_database_identity_v1()",
     ),
@@ -295,7 +307,7 @@ fn staging_role_bootstrap_is_atomic_bounded_and_secret_free() {
 }
 
 #[test]
-fn staging_role_bootstrap_matches_the_thirteen_readiness_allowlists() {
+fn staging_role_bootstrap_matches_the_fourteen_readiness_allowlists() {
     let role_section = values_section(
         BOOTSTRAP,
         "INSERT INTO pg_temp.starring_api_request_roles",
@@ -316,7 +328,7 @@ fn staging_role_bootstrap_matches_the_thirteen_readiness_allowlists() {
             counts
         },
     );
-    assert_eq!(roles.len(), 13);
+    assert_eq!(roles.len(), 14);
     assert_eq!(
         roles,
         expected_counts
@@ -358,7 +370,7 @@ fn staging_role_bootstrap_matches_the_thirteen_readiness_allowlists() {
         .map(|(role, function)| ((*role).to_string(), (*function).to_string()))
         .collect::<Vec<_>>();
     assert_eq!(actual, expected);
-    assert_eq!(actual.len(), 43);
+    assert_eq!(actual.len(), 46);
 
     let enable_capability_section = values_section(
         ENABLE,

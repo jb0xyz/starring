@@ -7,8 +7,9 @@ use authoring_application::{
     DeploymentServingFreshnessV2, DeploymentStatusObservationV1, DeploymentStatusProjectionV1,
     DeploymentStatusV1, ProductApplyResultV1, ProductApprovalPreviewObservationV1,
     ProductDecisionPhaseV1, ProductDecisionProjectionV1, ProductDeploymentOperationalStatusV2,
-    ProductDeploymentStatusObservationV1, ProductMutationReceiptV1, ProductPromotionObservationV1,
-    ProductPromotionStateV1, ProductStatusObservationV1, ProductStatusV1,
+    ProductDeploymentStatusObservationV1, ProductLifecycleCancellationReceiptV1,
+    ProductMutationReceiptV1, ProductPromotionObservationV1, ProductPromotionStateV1,
+    ProductStatusObservationV1, ProductStatusV1,
 };
 use authoring_application_discord::DiscordApplicationIdV1;
 use authoring_application_postgres::{
@@ -21,8 +22,9 @@ use product_control_http::{
     DeploymentOperationalViewV2, DeploymentOperatorActionV2, DeploymentRetryStateV2,
     DeploymentRetryViewV2, DeploymentRuntimePhaseV2, DeploymentServingFreshnessStateV2,
     DeploymentServingFreshnessViewV2, DeploymentState, DeploymentView, DiscordAuthorizationRequest,
-    FacadeError, FacadeErrorCode, OAuthCallbackResult, OAuthStartResult, OAuthState, ProductState,
-    PromotionView, RuntimeDeploymentOperationalViewV2, SafeApprovalSummary, SessionCredential,
+    FacadeError, FacadeErrorCode, LifecycleCancellationView, OAuthCallbackResult, OAuthStartResult,
+    OAuthState, ProductState, PromotionView, RuntimeDeploymentOperationalViewV2,
+    SafeApprovalSummary, SessionCredential,
 };
 
 pub fn project_oauth_start(
@@ -153,6 +155,35 @@ pub fn project_apply(result: &ProductApplyResultV1) -> ApplyView {
         state: product_state(result.status()),
         replayed: result.exact_replay(),
     }
+}
+
+pub fn project_lifecycle_cancellation(
+    receipt: &ProductLifecycleCancellationReceiptV1,
+) -> Result<LifecycleCancellationView, FacadeError> {
+    let decision = receipt.decision();
+    let source = receipt.source_drain_selector();
+    if decision.phase() != &ProductDecisionPhaseV1::Approved {
+        return Err(internal());
+    }
+    Ok(LifecycleCancellationView {
+        installation_id: decision.installation_id().as_str().to_string(),
+        promotion_id: decision.promotion_id().as_str().to_string(),
+        revision: decision.revision().get(),
+        state: ProductState::Approved,
+        drain_intent_id: source.drain_intent_id().to_string(),
+        source_intent_revision: source.acknowledged_intent_revision().get(),
+        terminal_intent_revision: receipt.terminal_intent_revision().get(),
+        terminal_state_digest: receipt.terminal_state_digest().to_string(),
+        product_operation_id: source.product_operation_id().to_string(),
+        source_runtime_deployment_revision: source.expected_runtime_deployment_revision().get(),
+        resulting_runtime_deployment_revision: receipt
+            .resulting_runtime_deployment_revision()
+            .get(),
+        source_slot_writer_epoch: receipt.source_slot_writer_epoch().get(),
+        successor_slot_writer_epoch: receipt.successor_slot_writer_epoch().get(),
+        cancelled_at: system_time_to_utc(receipt.cancelled_at())?,
+        replayed: receipt.exact_replay(),
+    })
 }
 
 pub fn project_deployment(
@@ -625,7 +656,10 @@ mod tests {
 
     use authoring_application::{
         DeploymentOperationalProjectionV2, ExactDeploymentSelectorV1, ExactLiveProjectionV1,
-        ProductDecisionProjectionV1, ProductRevisionV1,
+        ProductDecisionProjectionV1, ProductDrainSelectorV1,
+        ProductLifecycleCancellationDeploymentProjectionV1,
+        ProductLifecycleCancellationDrainProjectionV1,
+        ProductLifecycleCancellationSlotProjectionV1, ProductRevisionV1,
     };
     use authoring_promotion::{AutomationInstallationId, PromotionId, TenantId};
     use discord_model::GuildId;
@@ -634,6 +668,10 @@ mod tests {
 
     fn digest(character: char) -> String {
         character.to_string().repeat(64)
+    }
+
+    fn identifier(character: char) -> String {
+        character.to_string().repeat(32)
     }
 
     fn exact_deployment() -> authoring_application::ExactDeploymentSelectorV1 {
@@ -689,6 +727,74 @@ mod tests {
         assert_eq!(view.revision, 4);
         assert_eq!(view.state, ProductState::Approved);
         assert!(view.replayed);
+    }
+
+    #[test]
+    fn lifecycle_cancellation_projection_preserves_all_concurrency_boundaries() {
+        let source = ProductDrainSelectorV1::from_server_projection(
+            identifier('b'),
+            11,
+            digest('c'),
+            identifier('d'),
+            17,
+        )
+        .unwrap();
+        let receipt = ProductLifecycleCancellationReceiptV1::from_server_projection(
+            decision(ProductDecisionPhaseV1::Approved),
+            ProductLifecycleCancellationDeploymentProjectionV1::from_server_projection(18).unwrap(),
+            ProductLifecycleCancellationDrainProjectionV1::from_server_projection(
+                source,
+                12,
+                digest('e'),
+            )
+            .unwrap(),
+            ProductLifecycleCancellationSlotProjectionV1::from_server_projection(23, 24).unwrap(),
+            UNIX_EPOCH + Duration::from_secs(100),
+            true,
+        )
+        .unwrap();
+        let view = project_lifecycle_cancellation(&receipt).unwrap();
+        assert_eq!(view.revision, 4);
+        assert_eq!(view.state, ProductState::Approved);
+        assert_eq!(view.drain_intent_id, identifier('b'));
+        assert_eq!(view.source_intent_revision, 11);
+        assert_eq!(view.terminal_intent_revision, 12);
+        assert_eq!(view.terminal_state_digest, digest('e'));
+        assert_eq!(view.product_operation_id, identifier('d'));
+        assert_eq!(view.source_runtime_deployment_revision, 17);
+        assert_eq!(view.resulting_runtime_deployment_revision, 18);
+        assert_eq!(view.source_slot_writer_epoch, 23);
+        assert_eq!(view.successor_slot_writer_epoch, 24);
+        assert_eq!(view.cancelled_at.timestamp(), 100);
+        assert!(view.replayed);
+
+        let invalid = ProductLifecycleCancellationReceiptV1::from_server_projection(
+            decision(ProductDecisionPhaseV1::Applying),
+            ProductLifecycleCancellationDeploymentProjectionV1::from_server_projection(18).unwrap(),
+            ProductLifecycleCancellationDrainProjectionV1::from_server_projection(
+                ProductDrainSelectorV1::from_server_projection(
+                    identifier('b'),
+                    11,
+                    digest('c'),
+                    identifier('d'),
+                    17,
+                )
+                .unwrap(),
+                12,
+                digest('e'),
+            )
+            .unwrap(),
+            ProductLifecycleCancellationSlotProjectionV1::from_server_projection(23, 24).unwrap(),
+            UNIX_EPOCH + Duration::from_secs(100),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            project_lifecycle_cancellation(&invalid)
+                .unwrap_err()
+                .error_code(),
+            FacadeErrorCode::Internal
+        );
     }
 
     #[test]

@@ -1,16 +1,18 @@
 use authoring_application::{
     ApplyProductPromotionV1, ApprovalPayloadDigestV1, ApproveProductPromotionV1,
-    InstallationSelectorV1, ProductIdempotencyKeyV1, ProductPromotionIdempotencyKeyV1,
-    ProductRequestIdV1, ProductRevisionV1, ProductStatusQueryV1, PromoteOwnedSessionV1,
-    PromotionSelectorV1, RejectProductPromotionV1, RejectionReasonV1, RuntimeDeploymentQueryV1,
+    CancelProductLifecycleMutationV1, InstallationSelectorV1, ProductDrainSelectorV1,
+    ProductIdempotencyKeyV1, ProductLifecycleCancellationReasonV1,
+    ProductPromotionIdempotencyKeyV1, ProductRequestIdV1, ProductRevisionV1, ProductStatusQueryV1,
+    PromoteOwnedSessionV1, PromotionSelectorV1, RejectProductPromotionV1, RejectionReasonV1,
+    RuntimeDeploymentQueryV1,
 };
 use authoring_application_discord::{DiscordAuthorizationCodeV1, DiscordOAuthStateV1};
 use authoring_promotion::{
     AuthoringSessionId, AutomationInstallationId, PromotionId, SessionGeneration,
 };
 use product_control_http::{
-    ApplyCommand, DecisionCommand, FacadeError, FacadeErrorCode, OAuthCode, OAuthState,
-    PromoteCommand, RejectCommand,
+    ApplyCommand, DecisionCommand, FacadeError, FacadeErrorCode, LifecycleCancellationCommand,
+    OAuthCode, OAuthState, PromoteCommand, RejectCommand,
 };
 
 pub struct MappedProductTarget {
@@ -140,6 +142,36 @@ pub struct MappedApplyCommand {
     command: ApplyProductPromotionV1,
 }
 
+pub struct MappedLifecycleCancellationCommand {
+    request_id: ProductRequestIdV1,
+    installation: InstallationSelectorV1,
+    command: CancelProductLifecycleMutationV1,
+}
+
+impl MappedLifecycleCancellationCommand {
+    pub fn request_id(&self) -> &ProductRequestIdV1 {
+        &self.request_id
+    }
+
+    pub fn installation(&self) -> &InstallationSelectorV1 {
+        &self.installation
+    }
+
+    pub fn command(&self) -> &CancelProductLifecycleMutationV1 {
+        &self.command
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ProductRequestIdV1,
+        InstallationSelectorV1,
+        CancelProductLifecycleMutationV1,
+    ) {
+        (self.request_id, self.installation, self.command)
+    }
+}
+
 impl MappedApplyCommand {
     pub fn request_id(&self) -> &ProductRequestIdV1 {
         &self.request_id
@@ -259,6 +291,40 @@ pub fn map_apply_command(command: ApplyCommand) -> Result<MappedApplyCommand, Fa
     })
 }
 
+pub fn map_lifecycle_cancellation_command(
+    command: LifecycleCancellationCommand,
+) -> Result<MappedLifecycleCancellationCommand, FacadeError> {
+    let reason = ProductLifecycleCancellationReasonV1::parse(&command.reason).map_err(internal)?;
+    let drain_selector = ProductDrainSelectorV1::from_server_projection(
+        command.drain_intent_id,
+        command.acknowledged_intent_revision,
+        command.acknowledged_state_digest,
+        command.product_operation_id,
+        command.expected_runtime_deployment_revision,
+    )
+    .map_err(internal)?;
+    let (
+        request_id,
+        installation,
+        promotion,
+        expected_payload_digest,
+        expected_revision,
+        idempotency_key,
+    ) = map_decision(command.decision)?;
+    Ok(MappedLifecycleCancellationCommand {
+        request_id,
+        installation,
+        command: CancelProductLifecycleMutationV1 {
+            promotion,
+            expected_payload_digest,
+            expected_revision,
+            drain_selector,
+            idempotency_key,
+            reason,
+        },
+    })
+}
+
 pub fn map_discord_oauth_state(value: &OAuthState) -> Result<DiscordOAuthStateV1, FacadeError> {
     DiscordOAuthStateV1::from_owned(value.expose_secret().to_string()).map_err(internal)
 }
@@ -319,6 +385,10 @@ mod tests {
 
     fn digest(character: char) -> String {
         character.to_string().repeat(64)
+    }
+
+    fn identifier(character: char) -> String {
+        character.to_string().repeat(32)
     }
 
     fn request_id() -> ProductRequestId {
@@ -395,6 +465,41 @@ mod tests {
         })
         .unwrap();
         assert_eq!(apply.command().expected_revision.get(), 7);
+
+        let cancellation = map_lifecycle_cancellation_command(LifecycleCancellationCommand {
+            decision: decision(),
+            drain_intent_id: identifier('c'),
+            acknowledged_intent_revision: 11,
+            acknowledged_state_digest: digest('d'),
+            product_operation_id: identifier('e'),
+            expected_runtime_deployment_revision: 17,
+            reason: "  retain current automation  ".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            cancellation.command().drain_selector.drain_intent_id(),
+            identifier('c')
+        );
+        assert_eq!(
+            cancellation
+                .command()
+                .drain_selector
+                .acknowledged_intent_revision()
+                .get(),
+            11
+        );
+        assert_eq!(
+            cancellation
+                .command()
+                .drain_selector
+                .expected_runtime_deployment_revision()
+                .get(),
+            17
+        );
+        assert_eq!(
+            cancellation.command().reason.as_str(),
+            "retain current automation"
+        );
     }
 
     #[test]
@@ -407,6 +512,38 @@ mod tests {
         );
         assert_eq!(
             map_product_target("invalid/path", &digest('a'))
+                .err()
+                .unwrap()
+                .error_code(),
+            FacadeErrorCode::Internal
+        );
+        let mut cancellation = LifecycleCancellationCommand {
+            decision: decision(),
+            drain_intent_id: identifier('c'),
+            acknowledged_intent_revision: 0,
+            acknowledged_state_digest: digest('d'),
+            product_operation_id: identifier('e'),
+            expected_runtime_deployment_revision: 17,
+            reason: "retain current automation".to_string(),
+        };
+        assert_eq!(
+            map_lifecycle_cancellation_command(cancellation)
+                .err()
+                .unwrap()
+                .error_code(),
+            FacadeErrorCode::Internal
+        );
+        cancellation = LifecycleCancellationCommand {
+            decision: decision(),
+            drain_intent_id: identifier('c'),
+            acknowledged_intent_revision: 11,
+            acknowledged_state_digest: digest('d'),
+            product_operation_id: identifier('e'),
+            expected_runtime_deployment_revision: 17,
+            reason: "\n".to_string(),
+        };
+        assert_eq!(
+            map_lifecycle_cancellation_command(cancellation)
                 .err()
                 .unwrap()
                 .error_code(),

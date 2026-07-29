@@ -1,8 +1,10 @@
+use chrono::{DateTime, Utc};
+
 use crate::{
     ActivationAttestationV1, DrainAttestationV1, GatewayReadyAttestationV1, PanelCertificateV1,
     PanelIneligibilityV1, PreflightAttestationV1, RuntimeDeploymentError, RuntimeDeploymentPhaseV1,
     RuntimeDeploymentTargetV1, RuntimeFailureDispositionV1, RuntimeFailureV1, RuntimeGeneration,
-    RuntimePendingConditionV1,
+    RuntimePendingConditionV1, SupersedingDeploymentV1,
 };
 
 use super::RuntimeDeployment;
@@ -197,6 +199,31 @@ impl RuntimeDeployment {
         }
     }
 
+    pub(super) fn validate_supersession(
+        &self,
+        by: &SupersedingDeploymentV1,
+        reason: &str,
+        superseded_at: DateTime<Utc>,
+    ) -> Result<(), RuntimeDeploymentError> {
+        Self::validate_reason(reason)?;
+        if by.runtime_generation <= self.runtime_generation {
+            return Err(RuntimeDeploymentError::RuntimeGenerationNotMonotonic);
+        }
+        if by.identity.deployment_id == self.identity.deployment_id {
+            return Err(RuntimeDeploymentError::SupersedingDeploymentIdentityConflict);
+        }
+        if !by.identity.same_product_scope(&self.identity) {
+            return Err(RuntimeDeploymentError::SupersedingDeploymentScopeMismatch);
+        }
+        if !by.target.same_slot(&self.target) {
+            return Err(RuntimeDeploymentError::PreviousRuntimeSlotMismatch);
+        }
+        if superseded_at < self.requested_at {
+            return Err(RuntimeDeploymentError::AttestationTimeRegression);
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_snapshot(&self) -> Result<(), RuntimeDeploymentError> {
         if let Some(previous) = &self.previous_runtime {
             if !self.target.same_slot(&previous.target)
@@ -228,11 +255,21 @@ impl RuntimeDeployment {
                 } => (failure, Some(*retry_not_before)),
                 RuntimeFailureDispositionV1::Blocked { failure } => (failure, None),
             };
+            let failure_is_current = matches!(
+                &self.phase,
+                RuntimeDeploymentPhaseV1::RuntimePending { condition }
+                    if condition.disposition().as_ref() == Some(disposition)
+            );
+            let evidence_floor = if failure_is_current {
+                self.runtime_evidence_floor()
+            } else {
+                self.activation
+                    .as_ref()
+                    .map(|activation| activation.activated_at)
+            };
             if Self::validate_failure(failure).is_err()
                 || failure.recorded_at < self.requested_at
-                || self
-                    .runtime_evidence_floor()
-                    .is_some_and(|floor| failure.recorded_at < floor)
+                || evidence_floor.is_none_or(|floor| failure.recorded_at < floor)
                 || retry_not_before.is_some_and(|retry_at| retry_at < failure.recorded_at)
             {
                 return Err(RuntimeDeploymentError::InvalidSnapshot);

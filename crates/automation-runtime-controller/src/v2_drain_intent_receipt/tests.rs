@@ -12,20 +12,23 @@ use discord_model::GuildId;
 use resource_resolution::ResourceBindingFingerprint;
 
 use super::{
-    RuntimeDrainAcknowledgementSourceV2, RuntimeDrainIntentMutationOutcomeV2,
+    RuntimeDrainAcknowledgementSourceV2, RuntimeDrainCancellationSourceV2,
+    RuntimeDrainConsumptionSourceV2, RuntimeDrainIntentMutationOutcomeV2,
     RuntimeDrainIntentReceiptErrorV2, RuntimeDrainIntentReceiptV2, RuntimeDrainRefenceSourceV2,
-    RuntimeRouteAbsentDrainIntentSourceV2,
+    RuntimeDrainSuccessionAcknowledgementExpectationV2,
+    RuntimeDrainSuccessionAcknowledgementSourceV2, RuntimeRouteAbsentDrainIntentSourceV2,
 };
 use crate::{
     GatewayShardIdV1, RuntimeBarrierIdV1, RuntimeBarrierPauseWitnessV2, RuntimeBuildRevisionV1,
-    RuntimeCanonicalProductDrainV2, RuntimeDrainCertificationResolutionV2,
-    RuntimeDrainClaimProgressV2, RuntimeDrainClaimSealWitnessV2, RuntimeDrainClaimV2,
-    RuntimeDrainIntentIdV2, RuntimeDrainIntentV2, RuntimeExactLocalRouteIdentityV2,
-    RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayOwnerLeaseIdV1,
-    RuntimePersistedProductDrainRootV2, RuntimeProductDrainOperationV2,
-    RuntimeProductMutationKindV2, RuntimeProductMutationPreimageV2, RuntimeProductOperationIdV2,
-    RuntimeProductSemanticRequestDigestV2, RuntimeRouteAbsentAcknowledgementV2,
-    RuntimeRouteMutationProvenanceV2, RuntimeServingSlotV2,
+    RuntimeCanonicalProductDrainV2, RuntimeCertificationIntentFingerprintV2,
+    RuntimeCertificationOperationIdV2, RuntimeClosedRecoveryRouteWitnessV2,
+    RuntimeDrainCertificationResolutionV2, RuntimeDrainClaimProgressV2,
+    RuntimeDrainClaimSealWitnessV2, RuntimeDrainClaimV2, RuntimeDrainIntentIdV2,
+    RuntimeDrainIntentV2, RuntimeExactLocalRouteIdentityV2, RuntimeGatewayAdmissionSequenceV2,
+    RuntimeGatewayOwnerLeaseIdV1, RuntimePersistedProductDrainRootV2,
+    RuntimeProductDrainOperationV2, RuntimeProductMutationKindV2, RuntimeProductMutationPreimageV2,
+    RuntimeProductOperationIdV2, RuntimeProductSemanticRequestDigestV2, RuntimeRecoveryIdV2,
+    RuntimeRouteAbsentAcknowledgementV2, RuntimeRouteMutationProvenanceV2, RuntimeServingSlotV2,
 };
 
 const PRODUCT_OPERATION_ID: &str = "00112233445566778899aabbccddeeff";
@@ -42,6 +45,10 @@ fn at(second: i64) -> DateTime<Utc> {
 
 fn process_id() -> ProcessInstanceId {
     ProcessInstanceId::parse("process:1").unwrap()
+}
+
+fn successor_process_id() -> ProcessInstanceId {
+    ProcessInstanceId::parse("process:2").unwrap()
 }
 
 fn target() -> RuntimeDeploymentTargetV1 {
@@ -123,6 +130,15 @@ fn owner() -> RuntimeGatewayOwnerLeaseIdV1 {
         process_instance_id: process_id(),
         lease_epoch: non_zero(3),
         expected_build_revision: RuntimeBuildRevisionV1::parse("build:1").unwrap(),
+    }
+}
+
+fn successor_owner() -> RuntimeGatewayOwnerLeaseIdV1 {
+    RuntimeGatewayOwnerLeaseIdV1 {
+        gateway_shard_id: GatewayShardIdV1::parse("shard:0").unwrap(),
+        process_instance_id: successor_process_id(),
+        lease_epoch: non_zero(4),
+        expected_build_revision: RuntimeBuildRevisionV1::parse("build:2").unwrap(),
     }
 }
 
@@ -350,6 +366,105 @@ fn acknowledged(
     .unwrap()
 }
 
+fn succession_witness() -> RuntimeClosedRecoveryRouteWitnessV2 {
+    RuntimeClosedRecoveryRouteWitnessV2 {
+        recovery_id: RuntimeRecoveryIdV2::parse("22223333444455556666777788889999").unwrap(),
+        originating_emergency_generation: non_zero(20),
+        recovery_generation: non_zero(21),
+        recovery_authority_revision: non_zero(22),
+        gateway_owner_lease_id: successor_owner(),
+        observed_owner_revision: non_zero(23),
+        owner_expires_at: at(1_000),
+        process_instance_id: successor_process_id(),
+        connection_epoch: non_zero(24),
+        paused_admission_revision: non_zero(25),
+        connected_event_sequence: RuntimeGatewayAdmissionSequenceV2::new(non_zero(26)),
+        pause_sequence: RuntimeGatewayAdmissionSequenceV2::new(non_zero(27)),
+    }
+}
+
+fn succession_expectation() -> RuntimeDrainSuccessionAcknowledgementExpectationV2 {
+    RuntimeDrainSuccessionAcknowledgementExpectationV2 {
+        database_now: at(500),
+        recovery_witness: succession_witness(),
+        controller_id: ControllerId::parse("controller:2").unwrap(),
+        seal_generation: non_zero(28),
+        seal_observation_sequence: non_zero(29),
+        acknowledgement_observation_sequence: non_zero(30),
+        certification: RuntimeDrainCertificationResolutionV2::no_operation_reserved(),
+        acknowledged_at: at(501),
+    }
+}
+
+fn succession_claim(
+    operation: &RuntimeProductDrainOperationV2,
+    expectation: &RuntimeDrainSuccessionAcknowledgementExpectationV2,
+    claim_revision: u64,
+    controller_fencing_token: u64,
+    seal_generation: u64,
+    seal_observation_sequence: u64,
+) -> RuntimeDrainClaimV2 {
+    let witness = &expectation.recovery_witness;
+    let key = &operation.canonical().drain_preimage().key;
+    let seal = RuntimeDrainClaimSealWitnessV2::new(
+        key,
+        witness.process_instance_id.clone(),
+        non_zero(seal_generation),
+        None,
+        non_zero(seal_observation_sequence),
+    )
+    .unwrap();
+    RuntimeDrainClaimV2::new(
+        key,
+        witness.gateway_owner_lease_id.clone(),
+        witness.observed_owner_revision,
+        witness.process_instance_id.clone(),
+        expectation.controller_id.clone(),
+        FencingToken::new(controller_fencing_token).unwrap(),
+        witness.recovery_generation,
+        non_zero(claim_revision),
+        witness.owner_expires_at,
+        RuntimeDrainClaimProgressV2::claimed(seal),
+    )
+    .unwrap()
+}
+
+fn succession_result(
+    operation: &RuntimeProductDrainOperationV2,
+    intent_revision: u64,
+    claim: RuntimeDrainClaimV2,
+    expectation: &RuntimeDrainSuccessionAcknowledgementExpectationV2,
+) -> RuntimeDrainIntentV2 {
+    let acknowledgement = RuntimeRouteAbsentAcknowledgementV2::new(
+        &operation.canonical().drain_preimage().key,
+        claim,
+        None,
+        RuntimeRouteMutationProvenanceV2::ClosedRecovery(expectation.recovery_witness.clone()),
+        expectation.acknowledgement_observation_sequence,
+        expectation.certification.clone(),
+        expectation.acknowledged_at,
+    )
+    .unwrap();
+    RuntimeDrainIntentV2::route_absent_acknowledged_from_persisted(
+        &root(operation),
+        non_zero(intent_revision),
+        acknowledgement,
+    )
+    .unwrap()
+}
+
+fn succession_source(
+    operation: &RuntimeProductDrainOperationV2,
+    expectation: RuntimeDrainSuccessionAcknowledgementExpectationV2,
+) -> RuntimeDrainSuccessionAcknowledgementSourceV2 {
+    let predecessor = claimed(operation, None, 13, 10, 8);
+    RuntimeDrainSuccessionAcknowledgementSourceV2::from_expired_route_absent_claimed(
+        pending(operation, 20, Some(predecessor)),
+        expectation,
+    )
+    .unwrap()
+}
+
 #[test]
 fn inserted_and_replayed_receipts_bind_the_exact_operation_roots() {
     let operation = operation_for(DRAIN_INTENT_ID);
@@ -426,6 +541,16 @@ fn source_classifiers_accept_only_their_exact_mutable_states() {
     let routed = pending(&operation, 2, Some(routed_claim));
     let refenced = pending(&operation, 3, Some(refenced_claim.clone()));
     let acknowledged = acknowledged(&operation, 4, refenced_claim);
+    let consumed = RuntimeDrainIntentV2::consumed_from_persisted(
+        &root(&operation),
+        non_zero(5),
+        DeploymentRevision::new(9).unwrap(),
+        at(700),
+    )
+    .unwrap();
+    let cancelled =
+        RuntimeDrainIntentV2::cancelled_from_persisted(&root(&operation), non_zero(5), at(700))
+            .unwrap();
 
     assert_eq!(
         RuntimeDrainRefenceSourceV2::from_claimed(unclaimed.clone()),
@@ -447,11 +572,11 @@ fn source_classifiers_accept_only_their_exact_mutable_states() {
     );
 
     assert_eq!(
-        RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(unclaimed),
+        RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(unclaimed.clone()),
         Err(RuntimeDrainIntentReceiptErrorV2::SourceStateMismatch)
     );
     assert_eq!(
-        RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(routed),
+        RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(routed.clone()),
         Err(RuntimeDrainIntentReceiptErrorV2::SourceStateMismatch)
     );
     assert_eq!(
@@ -466,11 +591,23 @@ fn source_classifiers_accept_only_their_exact_mutable_states() {
             .source(),
         &refenced
     );
-
     assert_eq!(
-        RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(refenced),
+        RuntimeDrainAcknowledgementSourceV2::from_refenced(absent.clone()),
         Err(RuntimeDrainIntentReceiptErrorV2::SourceStateMismatch)
     );
+    assert_eq!(
+        RuntimeDrainAcknowledgementSourceV2::from_refenced(refenced.clone())
+            .unwrap()
+            .source(),
+        &refenced
+    );
+
+    for rejected in [unclaimed, routed, absent, refenced, consumed, cancelled] {
+        assert_eq!(
+            RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(rejected),
+            Err(RuntimeDrainIntentReceiptErrorV2::SourceStateMismatch)
+        );
+    }
     assert_eq!(
         RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged.clone())
             .unwrap()
@@ -505,14 +642,13 @@ fn claim_replay_requires_an_exact_unchanged_claimed_aggregate() {
 }
 
 #[test]
-fn refence_receipt_allows_only_progress_and_strictly_newer_database_revisions() {
+fn refence_receipt_allows_only_progress_and_exact_database_revision_successors() {
     let operation = operation_for(DRAIN_INTENT_ID);
     let source_claim = claimed(&operation, Some(route(10, 5)), 13, 10, 8);
     let source_intent = pending(&operation, 20, Some(source_claim.clone()));
     let source = RuntimeDrainRefenceSourceV2::from_claimed(source_intent).unwrap();
-    let maximum = i64::MAX as u64;
-    let result_claim = refenced_from(&operation, &source_claim, maximum, 10);
-    let result = pending(&operation, maximum, Some(result_claim.clone()));
+    let result_claim = refenced_from(&operation, &source_claim, 14, 10);
+    let result = pending(&operation, 21, Some(result_claim.clone()));
 
     let receipt = RuntimeDrainIntentReceiptV2::refenced(&source, result.clone()).unwrap();
     assert_eq!(
@@ -568,10 +704,28 @@ fn refence_receipt_rejects_root_state_revision_identity_and_seal_drift() {
     assert_eq!(
         RuntimeDrainIntentReceiptV2::refenced(
             &source,
+            pending(&operation, 22, Some(valid_refenced.clone())),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::IntentRevisionNotNewer)
+    );
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::refenced(
+            &source,
             pending(
                 &operation,
                 21,
                 Some(refenced_from(&operation, &source_claim, 13, 10)),
+            ),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::ClaimRevisionNotNewer)
+    );
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::refenced(
+            &source,
+            pending(
+                &operation,
+                21,
+                Some(refenced_from(&operation, &source_claim, 15, 10)),
             ),
         ),
         Err(RuntimeDrainIntentReceiptErrorV2::ClaimRevisionNotNewer)
@@ -640,7 +794,7 @@ fn acknowledgement_receipt_accepts_initial_absence_and_durable_refence() {
     let absent_source =
         RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(absent_source_intent)
             .unwrap();
-    let absent_result = acknowledged(&operation, 31, absent_claim);
+    let absent_result = acknowledged(&operation, 21, absent_claim);
     let absent_receipt =
         RuntimeDrainIntentReceiptV2::acknowledged(&absent_source, absent_result.clone()).unwrap();
     assert_eq!(
@@ -655,7 +809,7 @@ fn acknowledgement_receipt_accepts_initial_absence_and_durable_refence() {
     let refenced_source =
         RuntimeDrainAcknowledgementSourceV2::from_route_absence_candidate(refenced_source_intent)
             .unwrap();
-    let refenced_result = acknowledged(&operation, 90, refenced_claim);
+    let refenced_result = acknowledged(&operation, 51, refenced_claim);
     assert!(RuntimeDrainIntentReceiptV2::acknowledged(&refenced_source, refenced_result).is_ok());
 }
 
@@ -676,6 +830,13 @@ fn acknowledgement_receipt_rejects_root_revision_state_and_claim_drift() {
         RuntimeDrainIntentReceiptV2::acknowledged(
             &source,
             acknowledged(&operation, 20, source_claim.clone()),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::IntentRevisionNotNewer)
+    );
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::acknowledged(
+            &source,
+            acknowledged(&operation, 22, source_claim.clone()),
         ),
         Err(RuntimeDrainIntentReceiptErrorV2::IntentRevisionNotNewer)
     );
@@ -736,6 +897,408 @@ fn transition_receipts_accept_canonical_timestamps_without_host_clock_ordering()
 }
 
 #[test]
+fn succession_receipt_accepts_only_the_exact_atomic_successor() {
+    let operation = operation_for(DRAIN_INTENT_ID);
+    let expectation = succession_expectation();
+    let source = succession_source(&operation, expectation.clone());
+    let successor = succession_claim(&operation, &expectation, 14, 12, 28, 29);
+    let result = succession_result(&operation, 21, successor, &expectation);
+    let receipt =
+        RuntimeDrainIntentReceiptV2::succession_acknowledged(&source, result.clone()).unwrap();
+
+    assert_eq!(
+        receipt.outcome(),
+        RuntimeDrainIntentMutationOutcomeV2::Acknowledged
+    );
+    assert_eq!(receipt.intent(), &result);
+}
+
+#[test]
+fn succession_receipt_rejects_root_state_and_intent_revision_drift() {
+    let operation = operation_for(DRAIN_INTENT_ID);
+    let expectation = succession_expectation();
+    let source = succession_source(&operation, expectation.clone());
+
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::succession_acknowledged(
+            &source,
+            pending(
+                &operation,
+                21,
+                Some(succession_claim(&operation, &expectation, 14, 12, 28, 29)),
+            ),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
+    for revision in [20, 22] {
+        assert_eq!(
+            RuntimeDrainIntentReceiptV2::succession_acknowledged(
+                &source,
+                succession_result(
+                    &operation,
+                    revision,
+                    succession_claim(&operation, &expectation, 14, 12, 28, 29),
+                    &expectation,
+                ),
+            ),
+            Err(RuntimeDrainIntentReceiptErrorV2::SuccessionIntentRevisionMismatch)
+        );
+    }
+
+    let foreign = operation_for(FOREIGN_DRAIN_INTENT_ID);
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::succession_acknowledged(
+            &source,
+            succession_result(
+                &foreign,
+                21,
+                succession_claim(&foreign, &expectation, 14, 12, 28, 29),
+                &expectation,
+            ),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::ImmutableRootMismatch)
+    );
+}
+
+#[test]
+fn succession_receipt_rejects_claim_revision_fence_and_identity_drift() {
+    let operation = operation_for(DRAIN_INTENT_ID);
+    let expectation = succession_expectation();
+    let source = succession_source(&operation, expectation.clone());
+
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::succession_acknowledged(
+            &source,
+            acknowledged(&operation, 21, claimed(&operation, None, 13, 10, 8)),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::SuccessionClaimMismatch)
+    );
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::succession_acknowledged(
+            &source,
+            succession_result(
+                &operation,
+                21,
+                succession_claim(&operation, &expectation, 15, 12, 28, 29),
+                &expectation,
+            ),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::SuccessionClaimRevisionMismatch)
+    );
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::succession_acknowledged(
+            &source,
+            succession_result(
+                &operation,
+                21,
+                succession_claim(&operation, &expectation, 14, 13, 28, 29),
+                &expectation,
+            ),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::SuccessionFenceMismatch)
+    );
+
+    let mut identity_drift = expectation.clone();
+    identity_drift.controller_id = ControllerId::parse("controller:3").unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::succession_acknowledged(
+            &source,
+            succession_result(
+                &operation,
+                21,
+                succession_claim(&operation, &identity_drift, 14, 12, 28, 29),
+                &expectation,
+            ),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::SuccessionClaimMismatch)
+    );
+}
+
+#[test]
+fn succession_receipt_rejects_seal_provenance_acknowledgement_and_certification_drift() {
+    let operation = operation_for(DRAIN_INTENT_ID);
+    let expectation = succession_expectation();
+    let source = succession_source(&operation, expectation.clone());
+
+    for (seal_generation, seal_observation) in [(31, 29), (28, 31)] {
+        assert_eq!(
+            RuntimeDrainIntentReceiptV2::succession_acknowledged(
+                &source,
+                succession_result(
+                    &operation,
+                    21,
+                    succession_claim(
+                        &operation,
+                        &expectation,
+                        14,
+                        12,
+                        seal_generation,
+                        seal_observation,
+                    ),
+                    &expectation,
+                ),
+            ),
+            Err(RuntimeDrainIntentReceiptErrorV2::SuccessionSealMismatch)
+        );
+    }
+
+    let successor = || succession_claim(&operation, &expectation, 14, 12, 28, 29);
+    let mut provenance_drift = expectation.clone();
+    provenance_drift.recovery_witness.recovery_id =
+        RuntimeRecoveryIdV2::parse("3333444455556666777788889999aaaa").unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::succession_acknowledged(
+            &source,
+            succession_result(&operation, 21, successor(), &provenance_drift),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::SuccessionAcknowledgementMismatch)
+    );
+
+    let mut observation_drift = expectation.clone();
+    observation_drift.acknowledgement_observation_sequence = non_zero(31);
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::succession_acknowledged(
+            &source,
+            succession_result(&operation, 21, successor(), &observation_drift),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::SuccessionAcknowledgementMismatch)
+    );
+
+    let mut timestamp_drift = expectation.clone();
+    timestamp_drift.acknowledged_at = at(502);
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::succession_acknowledged(
+            &source,
+            succession_result(&operation, 21, successor(), &timestamp_drift),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::SuccessionAcknowledgementMismatch)
+    );
+
+    let mut certification_drift = expectation.clone();
+    certification_drift.certification =
+        RuntimeDrainCertificationResolutionV2::no_attestation_for_reserved_operation(
+            RuntimeCertificationOperationIdV2::parse("444455556666777788889999aaaabbbb").unwrap(),
+            RuntimeCertificationIntentFingerprintV2::parse("f".repeat(64)).unwrap(),
+        );
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::succession_acknowledged(
+            &source,
+            succession_result(&operation, 21, successor(), &certification_drift),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::SuccessionCertificationMismatch)
+    );
+}
+
+#[test]
+fn terminal_receipts_accept_only_exact_acknowledged_successors() {
+    let operation = operation_for(DRAIN_INTENT_ID);
+    let acknowledged = acknowledged(&operation, 20, claimed(&operation, None, 13, 10, 8));
+    let resulting_revision = DeploymentRevision::new(9).unwrap();
+    let consumption_source = RuntimeDrainConsumptionSourceV2::from_acknowledged(
+        RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged.clone()).unwrap(),
+        resulting_revision,
+    )
+    .unwrap();
+    assert_eq!(
+        consumption_source.expected_resulting_revision(),
+        resulting_revision
+    );
+    let consumed = RuntimeDrainIntentV2::consumed_from_persisted(
+        &root(&operation),
+        non_zero(21),
+        resulting_revision,
+        at(-100),
+    )
+    .unwrap();
+    let consumed_receipt =
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, consumed.clone()).unwrap();
+    assert_eq!(
+        consumed_receipt.outcome(),
+        RuntimeDrainIntentMutationOutcomeV2::Consumed
+    );
+    assert_eq!(consumed_receipt.intent(), &consumed);
+
+    let cancellation_source = RuntimeDrainCancellationSourceV2::from_acknowledged(
+        RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged).unwrap(),
+        at(1_000),
+    )
+    .unwrap();
+    assert_eq!(cancellation_source.cancelled_at(), at(1_000));
+    let cancelled =
+        RuntimeDrainIntentV2::cancelled_from_persisted(&root(&operation), non_zero(21), at(1_000))
+            .unwrap();
+    let cancelled_receipt =
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, cancelled.clone()).unwrap();
+    assert_eq!(
+        cancelled_receipt.outcome(),
+        RuntimeDrainIntentMutationOutcomeV2::Cancelled
+    );
+    assert_eq!(cancelled_receipt.intent(), &cancelled);
+}
+
+#[test]
+fn terminal_receipts_reject_root_revision_state_and_result_drift() {
+    let operation = operation_for(DRAIN_INTENT_ID);
+    let acknowledged_intent = acknowledged(&operation, 20, claimed(&operation, None, 13, 10, 8));
+    let resulting_revision = DeploymentRevision::new(9).unwrap();
+    let consumption_source = RuntimeDrainConsumptionSourceV2::from_acknowledged(
+        RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged_intent.clone())
+            .unwrap(),
+        resulting_revision,
+    )
+    .unwrap();
+    let cancellation_source = RuntimeDrainCancellationSourceV2::from_acknowledged(
+        RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged_intent).unwrap(),
+        at(1),
+    )
+    .unwrap();
+
+    let foreign_operation = operation_for(FOREIGN_DRAIN_INTENT_ID);
+    let foreign_consumed = RuntimeDrainIntentV2::consumed_from_persisted(
+        &root(&foreign_operation),
+        non_zero(21),
+        resulting_revision,
+        at(1),
+    )
+    .unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, foreign_consumed),
+        Err(RuntimeDrainIntentReceiptErrorV2::ImmutableRootMismatch)
+    );
+    let foreign_cancelled = RuntimeDrainIntentV2::cancelled_from_persisted(
+        &root(&foreign_operation),
+        non_zero(21),
+        at(1),
+    )
+    .unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, foreign_cancelled),
+        Err(RuntimeDrainIntentReceiptErrorV2::ImmutableRootMismatch)
+    );
+
+    for rejected_revision in [19, 20, 22] {
+        let consumed = RuntimeDrainIntentV2::consumed_from_persisted(
+            &root(&operation),
+            non_zero(rejected_revision),
+            resulting_revision,
+            at(1),
+        )
+        .unwrap();
+        assert_eq!(
+            RuntimeDrainIntentReceiptV2::consumed(&consumption_source, consumed),
+            Err(RuntimeDrainIntentReceiptErrorV2::TerminalIntentRevisionMismatch)
+        );
+        let cancelled = RuntimeDrainIntentV2::cancelled_from_persisted(
+            &root(&operation),
+            non_zero(rejected_revision),
+            at(1),
+        )
+        .unwrap();
+        assert_eq!(
+            RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, cancelled),
+            Err(RuntimeDrainIntentReceiptErrorV2::TerminalIntentRevisionMismatch)
+        );
+    }
+
+    let wrong_revision = RuntimeDrainIntentV2::consumed_from_persisted(
+        &root(&operation),
+        non_zero(21),
+        DeploymentRevision::new(10).unwrap(),
+        at(1),
+    )
+    .unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, wrong_revision),
+        Err(RuntimeDrainIntentReceiptErrorV2::ConsumptionResultingRevisionMismatch)
+    );
+
+    let acknowledged_successor = acknowledged(&operation, 21, claimed(&operation, None, 13, 10, 8));
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, acknowledged_successor),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
+    let pending_successor = pending(&operation, 21, None);
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, pending_successor.clone()),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, pending_successor),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
+
+    let consumed = RuntimeDrainIntentV2::consumed_from_persisted(
+        &root(&operation),
+        non_zero(21),
+        resulting_revision,
+        at(1),
+    )
+    .unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, consumed),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
+
+    let cancelled =
+        RuntimeDrainIntentV2::cancelled_from_persisted(&root(&operation), non_zero(21), at(1))
+            .unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::consumed(&consumption_source, cancelled),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
+    let acknowledged_successor = acknowledged(&operation, 21, claimed(&operation, None, 13, 10, 8));
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, acknowledged_successor),
+        Err(RuntimeDrainIntentReceiptErrorV2::ResultStateMismatch)
+    );
+
+    let timestamp_drift =
+        RuntimeDrainIntentV2::cancelled_from_persisted(&root(&operation), non_zero(21), at(2))
+            .unwrap();
+    assert_eq!(
+        RuntimeDrainIntentReceiptV2::cancelled(&cancellation_source, timestamp_drift),
+        Err(RuntimeDrainIntentReceiptErrorV2::CancellationTimestampMismatch)
+    );
+}
+
+#[test]
+fn cancellation_source_binds_only_canonical_database_time() {
+    let operation = operation_for(DRAIN_INTENT_ID);
+    let acknowledged = acknowledged(&operation, 20, claimed(&operation, None, 13, 10, 8));
+    let source = RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged).unwrap();
+    let canonical =
+        RuntimeDrainCancellationSourceV2::from_acknowledged(source.clone(), at(-1)).unwrap();
+    assert_eq!(canonical.source(), source.source());
+    assert_eq!(canonical.cancelled_at(), at(-1));
+
+    let sub_microsecond = DateTime::from_timestamp(1, 1).unwrap();
+    assert_eq!(
+        RuntimeDrainCancellationSourceV2::from_acknowledged(source, sub_microsecond),
+        Err(RuntimeDrainIntentReceiptErrorV2::TerminalTimestampInvalid)
+    );
+}
+
+#[test]
+fn consumption_source_binds_only_persistable_resulting_revision() {
+    let operation = operation_for(DRAIN_INTENT_ID);
+    let acknowledged = acknowledged(&operation, 20, claimed(&operation, None, 13, 10, 8));
+    let source = RuntimeRouteAbsentDrainIntentSourceV2::from_acknowledged(acknowledged).unwrap();
+    let expected = DeploymentRevision::new(i64::MAX as u64).unwrap();
+    let canonical =
+        RuntimeDrainConsumptionSourceV2::from_acknowledged(source.clone(), expected).unwrap();
+    assert_eq!(canonical.source(), source.source());
+    assert_eq!(canonical.expected_resulting_revision(), expected);
+
+    assert_eq!(
+        RuntimeDrainConsumptionSourceV2::from_acknowledged(
+            source,
+            DeploymentRevision::new(i64::MAX as u64 + 1).unwrap(),
+        ),
+        Err(RuntimeDrainIntentReceiptErrorV2::ConsumptionResultingRevisionInvalid)
+    );
+}
+
+#[test]
 fn receipt_surface_is_closed_data_without_claim_or_terminal_authority() {
     let source = include_str!("../v2_drain_intent_receipt.rs");
 
@@ -760,8 +1323,6 @@ fn receipt_surface_is_closed_data_without_claim_or_terminal_authority() {
         "pub fn claimed(",
         "pub fn claim_initial(",
         "pub fn claim_successor(",
-        "pub fn consumed(",
-        "pub fn cancelled(",
         "pub outcome:",
         "pub intent:",
         "pub source:",
@@ -772,13 +1333,22 @@ fn receipt_surface_is_closed_data_without_claim_or_terminal_authority() {
         "pub enum RuntimeDrainIntentMutationOutcomeV2",
         "pub struct RuntimeDrainRefenceSourceV2",
         "pub struct RuntimeDrainAcknowledgementSourceV2",
+        "pub struct RuntimeDrainSuccessionAcknowledgementExpectationV2",
+        "pub struct RuntimeDrainSuccessionAcknowledgementSourceV2",
         "pub struct RuntimeRouteAbsentDrainIntentSourceV2",
+        "pub struct RuntimeDrainConsumptionSourceV2",
+        "pub struct RuntimeDrainCancellationSourceV2",
         "pub struct RuntimeDrainIntentReceiptV2",
+        "pub fn from_refenced(",
+        "pub fn from_expired_route_absent_claimed(",
         "pub fn inserted(",
         "pub fn replayed(",
         "pub fn claim_replayed(",
         "pub fn refenced(",
         "pub fn acknowledged(",
+        "pub fn succession_acknowledged(",
+        "pub fn consumed(",
+        "pub fn cancelled(",
     ] {
         assert!(source.contains(declaration), "{declaration}");
     }

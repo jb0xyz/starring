@@ -19,15 +19,16 @@ use zeroize::Zeroizing;
 use crate::facade::{is_live_exact_replay, validate_scoped_path};
 use crate::{
     ApplyCommand, CurrentPrincipalView, DecisionCommand, FacadeError, FacadeErrorCode,
-    HttpBoundaryConfig, OAuthCallbackCommand, OAuthStartCommand, ProductControlFacade,
-    ProductControlOperationalFacadeV2, PromoteCommand, RejectCommand, SessionCredential,
+    HttpBoundaryConfig, LifecycleCancellationCommand, OAuthCallbackCommand, OAuthStartCommand,
+    ProductControlFacade, ProductControlLifecycleFacadeV1, ProductControlOperationalFacadeV2,
+    PromoteCommand, RejectCommand, SessionCredential,
 };
 use abuse_budget::{OAuthStartAdmission, OAuthStartBudget};
 use boundary::*;
 use response_validation::{
     valid_apply_view, valid_approval_view, valid_current_principal, valid_decision_view,
-    valid_deployment_operational_view_v2, valid_deployment_view, valid_preview_view,
-    valid_promotion_view, valid_rejection_view,
+    valid_deployment_operational_view_v2, valid_deployment_view, valid_lifecycle_cancellation_view,
+    valid_preview_view, valid_promotion_view, valid_rejection_view,
 };
 
 struct HttpState<F> {
@@ -68,6 +69,19 @@ struct DigestBody {
 struct RejectionBody {
     expected_payload_digest: String,
     expected_revision: u64,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleCancellationBody {
+    expected_payload_digest: String,
+    expected_revision: u64,
+    drain_intent_id: String,
+    acknowledged_intent_revision: u64,
+    acknowledged_state_digest: String,
+    product_operation_id: String,
+    expected_runtime_deployment_revision: u64,
     reason: String,
 }
 
@@ -118,6 +132,62 @@ where
 {
     let state = http_state(facade, config, readiness_gate);
     let routes = product_control_routes::<F>().route(
+        "/v2/installations/{installation_id}/promotions/{promotion_id}/deployment",
+        get(deployment_operational_v2::<F>),
+    );
+    finish_product_control_router(routes, state)
+}
+
+pub fn product_control_router_with_lifecycle_v1<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+) -> Router
+where
+    F: ProductControlLifecycleFacadeV1,
+{
+    product_control_router_with_lifecycle_v1_and_readiness_gate(
+        facade,
+        config,
+        crate::ProductApiReadinessGate::always_ready(),
+    )
+}
+
+pub fn product_control_router_with_lifecycle_v1_and_readiness_gate<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+    readiness_gate: crate::ProductApiReadinessGate,
+) -> Router
+where
+    F: ProductControlLifecycleFacadeV1,
+{
+    let state = http_state(facade, config, readiness_gate);
+    finish_product_control_router(product_control_lifecycle_routes::<F>(), state)
+}
+
+pub fn product_control_router_with_operational_v2_and_lifecycle_v1<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+) -> Router
+where
+    F: ProductControlOperationalFacadeV2 + ProductControlLifecycleFacadeV1,
+{
+    product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate(
+        facade,
+        config,
+        crate::ProductApiReadinessGate::always_ready(),
+    )
+}
+
+pub fn product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+    readiness_gate: crate::ProductApiReadinessGate,
+) -> Router
+where
+    F: ProductControlOperationalFacadeV2 + ProductControlLifecycleFacadeV1,
+{
+    let state = http_state(facade, config, readiness_gate);
+    let routes = product_control_lifecycle_routes::<F>().route(
         "/v2/installations/{installation_id}/promotions/{promotion_id}/deployment",
         get(deployment_operational_v2::<F>),
     );
@@ -179,6 +249,16 @@ where
         .route("/health/ready", get(readiness::<F>))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
+}
+
+fn product_control_lifecycle_routes<F>() -> Router<HttpState<F>>
+where
+    F: ProductControlLifecycleFacadeV1,
+{
+    product_control_routes::<F>().route(
+        "/v1/installations/{installation_id}/promotions/{promotion_id}/lifecycle-cancellations",
+        post(cancel_lifecycle::<F>),
+    )
 }
 
 fn finish_product_control_router<F>(routes: Router<HttpState<F>>, state: HttpState<F>) -> Router
@@ -663,6 +743,71 @@ where
                 StatusCode::ACCEPTED
             };
             (status, Json(view)).into_response()
+        }
+        Ok(_) => map_facade(FacadeError::new(FacadeErrorCode::Internal), &request_id),
+        Err(error) => map_facade(error, &request_id),
+    }
+}
+
+async fn cancel_lifecycle<F>(
+    State(state): State<HttpState<F>>,
+    Extension(request_id): Extension<RequestId>,
+    Path((installation_id, promotion_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<LifecycleCancellationBody>, JsonRejection>,
+) -> Response
+where
+    F: ProductControlLifecycleFacadeV1,
+{
+    if let Err(response) = require_json(&headers, &request_id) {
+        return response;
+    }
+    let (credential, csrf) = match mutation_credential(&state, &headers, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let body = match parse_json(body, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let idempotency_key = match idempotency_key(&headers, &request_id) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let command = LifecycleCancellationCommand {
+        decision: DecisionCommand {
+            request_id: request_id.clone(),
+            installation_id,
+            promotion_id,
+            expected_payload_digest: body.expected_payload_digest,
+            expected_revision: body.expected_revision,
+            idempotency_key,
+        },
+        drain_intent_id: body.drain_intent_id,
+        acknowledged_intent_revision: body.acknowledged_intent_revision,
+        acknowledged_state_digest: body.acknowledged_state_digest,
+        product_operation_id: body.product_operation_id,
+        expected_runtime_deployment_revision: body.expected_runtime_deployment_revision,
+        reason: body.reason,
+    };
+    let Some(command) = command.normalize() else {
+        return invalid_input(&request_id);
+    };
+    let expected_installation = command.decision.installation_id.clone();
+    let expected_promotion = command.decision.promotion_id.clone();
+    match state
+        .facade
+        .cancel_lifecycle(&credential, &csrf, command)
+        .await
+    {
+        Ok(view)
+            if valid_lifecycle_cancellation_view(
+                &view,
+                &expected_installation,
+                &expected_promotion,
+            ) =>
+        {
+            Json(view).into_response()
         }
         Ok(_) => map_facade(FacadeError::new(FacadeErrorCode::Internal), &request_id),
         Err(error) => map_facade(error, &request_id),

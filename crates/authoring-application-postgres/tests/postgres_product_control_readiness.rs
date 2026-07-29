@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use authoring_application_postgres::{
-    PostgresProductControl, ProductDecisionDatabasePoolsV1, ProductDecisionDigestKeyV1,
+    PostgresProductControl, PostgresProductDecisions, PostgresProductLifecycleCancellations,
+    PostgresProductRejections, ProductDecisionDatabasePoolsV1, ProductDecisionDigestKeyV1,
     ProductDecisionDigestKeyringV1, ProductDecisionReadinessErrorV1, MIGRATOR,
 };
 use futures::FutureExt;
@@ -24,12 +25,19 @@ const REJECTION_FUNCTIONS: [&str; 3] = [
     "public.starring_product_rejection_keyring_coverage_v1(text[],text[])",
     "public.starring_product_reject_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text)",
 ];
-const APPLY_FUNCTIONS: [&str; 5] = [
+const APPLY_FUNCTIONS: [&str; 7] = [
     "public.starring_product_apply_executor_database_identity_v1()",
     "public.starring_product_apply_lock_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text)",
     "public.starring_product_apply_target_artifact_v1(text,text,text,text,bytea,text,text)",
     "public.starring_product_apply_finalize_v1(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,jsonb,text,jsonb,jsonb,jsonb)",
     "public.starring_product_apply_keyring_coverage_v1(text[],text[])",
+    "public.starring_product_apply_begin_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text)",
+    "public.starring_product_apply_consume_runtime_drain_v2(text,text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,bigint,bytea,text,text,text,bigint,text,text,bytea,text,bytea,text,text,bytea)",
+];
+const CANCELLATION_FUNCTIONS: [&str; 3] = [
+    "public.starring_product_lifecycle_cancellation_executor_database_identity_v1()",
+    "public.starring_product_lifecycle_cancellation_keyring_coverage_v1(text[],text[])",
+    "public.starring_product_cancel_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text,bigint,text,text,bigint)",
 ];
 
 static SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -46,10 +54,12 @@ struct BoundaryRoles {
     approval: String,
     rejection: String,
     apply: String,
+    cancellation: String,
     reader_password: String,
     approval_password: String,
     rejection_password: String,
     apply_password: String,
+    cancellation_password: String,
 }
 
 impl BoundaryRoles {
@@ -61,10 +71,12 @@ impl BoundaryRoles {
             approval: format!("starring_pcr_{label}_approval_{suffix}"),
             rejection: format!("starring_pcr_{label}_rejection_{suffix}"),
             apply: format!("starring_pcr_{label}_apply_{suffix}"),
+            cancellation: format!("starring_pcr_{label}_cancellation_{suffix}"),
             reader_password: password(),
             approval_password: password(),
             rejection_password: password(),
             apply_password: password(),
+            cancellation_password: password(),
         };
         for role in roles.names() {
             assert_safe_identifier(&role);
@@ -79,6 +91,7 @@ impl BoundaryRoles {
             self.approval.clone(),
             self.rejection.clone(),
             self.apply.clone(),
+            self.cancellation.clone(),
         ]
     }
 }
@@ -88,6 +101,7 @@ struct BoundaryPools {
     approval: PgPool,
     rejection: PgPool,
     apply: PgPool,
+    cancellation: PgPool,
 }
 
 fn database_url() -> String {
@@ -267,6 +281,7 @@ async fn provision_boundary(database: &TestDatabase, roles: &BoundaryRoles) {
         (&roles.approval, &roles.approval_password),
         (&roles.rejection, &roles.rejection_password),
         (&roles.apply, &roles.apply_password),
+        (&roles.cancellation, &roles.cancellation_password),
     ] {
         create_login(&database.pool, role, password).await;
     }
@@ -295,15 +310,20 @@ async fn provision_boundary(database: &TestDatabase, roles: &BoundaryRoles) {
         .await
         .unwrap();
     sqlx::query(&format!(
-        "GRANT CONNECT ON DATABASE {} TO {}, {}, {}, {}",
-        database.name, roles.reader, roles.approval, roles.rejection, roles.apply
+        "GRANT CONNECT ON DATABASE {} TO {}, {}, {}, {}, {}",
+        database.name,
+        roles.reader,
+        roles.approval,
+        roles.rejection,
+        roles.apply,
+        roles.cancellation
     ))
     .execute(&database.pool)
     .await
     .unwrap();
     sqlx::query(&format!(
-        "GRANT USAGE ON SCHEMA public TO {}, {}, {}, {}, {}",
-        roles.owner, roles.reader, roles.approval, roles.rejection, roles.apply
+        "GRANT USAGE ON SCHEMA public TO {}, {}, {}, {}, {}, {}",
+        roles.owner, roles.reader, roles.approval, roles.rejection, roles.apply, roles.cancellation
     ))
     .execute(&database.pool)
     .await
@@ -312,6 +332,7 @@ async fn provision_boundary(database: &TestDatabase, roles: &BoundaryRoles) {
     grant_functions(&database.pool, &roles.approval, &APPROVAL_FUNCTIONS).await;
     grant_functions(&database.pool, &roles.rejection, &REJECTION_FUNCTIONS).await;
     grant_functions(&database.pool, &roles.apply, &APPLY_FUNCTIONS).await;
+    grant_functions(&database.pool, &roles.cancellation, &CANCELLATION_FUNCTIONS).await;
 }
 
 async fn role_pool(database: &str, role: &str, password: &str) -> PgPool {
@@ -335,6 +356,12 @@ async fn boundary_pools(database: &TestDatabase, roles: &BoundaryRoles) -> Bound
         approval: role_pool(&database.name, &roles.approval, &roles.approval_password).await,
         rejection: role_pool(&database.name, &roles.rejection, &roles.rejection_password).await,
         apply: role_pool(&database.name, &roles.apply, &roles.apply_password).await,
+        cancellation: role_pool(
+            &database.name,
+            &roles.cancellation,
+            &roles.cancellation_password,
+        )
+        .await,
     }
 }
 
@@ -355,10 +382,12 @@ fn control(
     approval: PgPool,
     rejection: PgPool,
     apply: PgPool,
+    cancellation: PgPool,
 ) -> PostgresProductControl {
     PostgresProductControl::new(
         ProductDecisionDatabasePoolsV1::new(reader, approval, apply),
         rejection,
+        cancellation,
         keyring(),
     )
     .unwrap()
@@ -373,7 +402,7 @@ async fn assert_excess(control: &PostgresProductControl) {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
-async fn product_control_readiness_requires_four_exact_direct_login_capabilities() {
+async fn product_control_readiness_requires_five_exact_direct_login_capabilities() {
     let primary = isolated_database("readiness_a").await;
     let secondary = isolated_database("readiness_b").await;
     let primary_roles = BoundaryRoles::new("a");
@@ -386,18 +415,68 @@ async fn product_control_readiness_requires_four_exact_direct_login_capabilities
         provision_boundary(&secondary, &secondary_roles).await;
         let primary_pools = boundary_pools(&primary, &primary_roles).await;
         let secondary_pools = boundary_pools(&secondary, &secondary_roles).await;
+        let decisions = PostgresProductDecisions::new(
+            ProductDecisionDatabasePoolsV1::new(
+                primary_pools.reader.clone(),
+                primary_pools.approval.clone(),
+                primary_pools.apply.clone(),
+            ),
+            keyring(),
+        )
+        .unwrap();
+        decisions.verify_decision_reader_readiness().await.unwrap();
+        decisions
+            .verify_approval_executor_readiness()
+            .await
+            .unwrap();
+        decisions.verify_apply_executor_readiness().await.unwrap();
+        PostgresProductRejections::new(primary_pools.rejection.clone(), keyring())
+            .unwrap()
+            .verify_product_rejection_readiness()
+            .await
+            .unwrap();
+        PostgresProductLifecycleCancellations::new(primary_pools.cancellation.clone(), keyring())
+            .unwrap()
+            .verify_product_lifecycle_cancellation_readiness()
+            .await
+            .unwrap();
         let primary_control = control(
             primary_pools.reader.clone(),
             primary_pools.approval.clone(),
             primary_pools.rejection.clone(),
             primary_pools.apply.clone(),
+            primary_pools.cancellation.clone(),
         );
+        primary_control.verify_readiness().await.unwrap();
+        sqlx::query(
+            "ALTER FUNCTION \
+             starring_runtime_private_v2.starring_product_lifecycle_cancellation_unkeyed_digest_v2( \
+                TEXT, TEXT[] \
+             ) PARALLEL UNSAFE",
+        )
+        .execute(&primary.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            primary_control.verify_readiness().await,
+            Err(ProductDecisionReadinessErrorV1::ContractMismatch)
+        );
+        sqlx::query(
+            "ALTER FUNCTION \
+             starring_runtime_private_v2.starring_product_lifecycle_cancellation_unkeyed_digest_v2( \
+                TEXT, TEXT[] \
+             ) PARALLEL SAFE",
+        )
+        .execute(&primary.pool)
+        .await
+        .unwrap();
         primary_control.verify_readiness().await.unwrap();
         control(
             secondary_pools.reader.clone(),
             secondary_pools.approval.clone(),
             secondary_pools.rejection.clone(),
             secondary_pools.apply.clone(),
+            secondary_pools.cancellation.clone(),
         )
         .verify_readiness()
         .await
@@ -408,9 +487,22 @@ async fn product_control_readiness_requires_four_exact_direct_login_capabilities
             primary_pools.approval.clone(),
             primary_pools.approval.clone(),
             primary_pools.apply.clone(),
+            primary_pools.cancellation.clone(),
         );
         assert_eq!(
             reused_role.verify_readiness().await,
+            Err(ProductDecisionReadinessErrorV1::CapabilityMissing)
+        );
+
+        let reused_cancellation_role = control(
+            primary_pools.reader.clone(),
+            primary_pools.approval.clone(),
+            primary_pools.rejection.clone(),
+            primary_pools.apply.clone(),
+            primary_pools.apply.clone(),
+        );
+        assert_eq!(
+            reused_cancellation_role.verify_readiness().await,
             Err(ProductDecisionReadinessErrorV1::CapabilityMissing)
         );
 
@@ -419,11 +511,49 @@ async fn product_control_readiness_requires_four_exact_direct_login_capabilities
             primary_pools.approval.clone(),
             primary_pools.rejection.clone(),
             secondary_pools.apply.clone(),
+            primary_pools.cancellation.clone(),
         );
         assert_eq!(
             mixed_database.verify_readiness().await,
             Err(ProductDecisionReadinessErrorV1::ContractMismatch)
         );
+
+        sqlx::query(&format!(
+            "REVOKE EXECUTE ON FUNCTION {} FROM {}",
+            CANCELLATION_FUNCTIONS[2], primary_roles.cancellation
+        ))
+        .execute(&primary.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            primary_control.verify_readiness().await,
+            Err(ProductDecisionReadinessErrorV1::CapabilityMissing)
+        );
+        sqlx::query(&format!(
+            "GRANT EXECUTE ON FUNCTION {} TO {}",
+            CANCELLATION_FUNCTIONS[2], primary_roles.cancellation
+        ))
+        .execute(&primary.pool)
+        .await
+        .unwrap();
+        primary_control.verify_readiness().await.unwrap();
+
+        sqlx::query(&format!(
+            "GRANT SELECT ON TABLE public.runtime_product_drain_terminal_actions_v2 TO {}",
+            primary_roles.cancellation
+        ))
+        .execute(&primary.pool)
+        .await
+        .unwrap();
+        assert_excess(&primary_control).await;
+        sqlx::query(&format!(
+            "REVOKE SELECT ON TABLE public.runtime_product_drain_terminal_actions_v2 FROM {}",
+            primary_roles.cancellation
+        ))
+        .execute(&primary.pool)
+        .await
+        .unwrap();
+        primary_control.verify_readiness().await.unwrap();
 
         let unrelated_function = format!("facade_unrelated_{}", suffix());
         assert_safe_identifier(&unrelated_function);

@@ -7,6 +7,7 @@ mod controller;
 mod database;
 mod error;
 mod gateway_owner;
+mod ingress_acknowledgement;
 mod mutation;
 mod observation;
 mod product_drain;

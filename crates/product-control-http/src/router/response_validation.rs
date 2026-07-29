@@ -3,7 +3,7 @@ use crate::{
     ApplyView, ApprovalPreviewView, CurrentPrincipalView, DecisionView,
     DeploymentOperationalStateV2, DeploymentOperationalViewV2, DeploymentOperatorActionV2,
     DeploymentRetryStateV2, DeploymentRuntimePhaseV2, DeploymentServingFreshnessStateV2,
-    DeploymentState, DeploymentView, ProductState, PromotionView,
+    DeploymentState, DeploymentView, LifecycleCancellationView, ProductState, PromotionView,
 };
 
 pub(super) fn valid_current_principal(view: &CurrentPrincipalView) -> bool {
@@ -88,6 +88,46 @@ pub(super) fn valid_apply_view(
         view.state,
         ProductState::RuntimePending | ProductState::Live
     )
+}
+
+pub(super) fn valid_lifecycle_cancellation_view(
+    view: &LifecycleCancellationView,
+    installation_id: &str,
+    promotion_id: &str,
+) -> bool {
+    valid_decision_identity(
+        &view.installation_id,
+        &view.promotion_id,
+        installation_id,
+        promotion_id,
+    ) && view.revision > 0
+        && view.state == ProductState::Approved
+        && valid_runtime_id(&view.drain_intent_id)
+        && valid_runtime_id(&view.product_operation_id)
+        && view.drain_intent_id != view.product_operation_id
+        && view.source_intent_revision > 0
+        && view
+            .source_intent_revision
+            .checked_add(1)
+            .is_some_and(|value| value == view.terminal_intent_revision)
+        && valid_digest(&view.terminal_state_digest)
+        && view.source_runtime_deployment_revision > 0
+        && view
+            .source_runtime_deployment_revision
+            .checked_add(1)
+            .is_some_and(|value| value == view.resulting_runtime_deployment_revision)
+        && view.source_slot_writer_epoch > 0
+        && view
+            .source_slot_writer_epoch
+            .checked_add(1)
+            .is_some_and(|value| value == view.successor_slot_writer_epoch)
+}
+
+fn valid_runtime_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub(super) fn valid_deployment_view(
