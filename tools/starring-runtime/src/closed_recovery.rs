@@ -1097,6 +1097,15 @@ fn ingress_acknowledgement_authority_surface_is_unified_v2() {
     let _retained = RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2::into_retained_state_v2;
 }
 
+#[cfg(test)]
+#[test]
+fn certification_frozen_monitor_observer_surface_is_available_v2() {
+    let _gateway =
+        RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2::bind_gateway_ready_invalidation_observer_v2;
+    let _owner =
+        RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2::owner_terminal_observation_v2;
+}
+
 impl RuntimeClosedRecoveryFixedPointV2 {
     fn revalidate_v2(&self) -> Result<(), RuntimeClosedRecoveryCommitErrorV2> {
         revalidate_committed_recovery_v2(
@@ -2486,6 +2495,22 @@ impl RuntimeClosedRecoveryCertificationFreezeAuthorityV2 {
 
 #[allow(dead_code)]
 impl RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2 {
+    pub(crate) fn bind_gateway_ready_invalidation_observer_v2(
+        &self,
+        expected_ready: &RuntimeGatewayReadyAttestationV2,
+    ) -> RuntimeGatewayReadyInvalidationObserverV2 {
+        self.gateway.bind_current_ready_invalidation_observer_v2(
+            self.worker.coordinator_generation(),
+            expected_ready,
+        )
+    }
+
+    pub(crate) fn owner_terminal_observation_v2(
+        &self,
+    ) -> impl Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static {
+        self.owner.terminal_observation_v2()
+    }
+
     pub(crate) fn ordinary_barrier_port_v3(
         &self,
     ) -> Result<RuntimeDiscordOrdinaryBarrierPortV3, RuntimeDiscordOrdinaryBarrierFailureV3> {
