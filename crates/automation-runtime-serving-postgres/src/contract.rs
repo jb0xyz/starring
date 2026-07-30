@@ -19,3 +19,15 @@ pub(crate) const HEARTBEAT_QUERY: &str =
 pub(crate) const DISCONNECT_QUERY: &str =
     "SELECT * FROM public.starring_runtime_serving_disconnect_v1(\
         $1, $2, $3, $4, $5, $6, $7, $8)";
+
+pub(crate) const OBSERVE_V2_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_serving_observe_v2(\
+        $1, $2, $3, $4, $5, $6, $7, $8)";
+
+pub(crate) const HEARTBEAT_V2_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_serving_heartbeat_v2(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+
+pub(crate) const DISCONNECT_V2_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_serving_disconnect_if_current_v2(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9)";

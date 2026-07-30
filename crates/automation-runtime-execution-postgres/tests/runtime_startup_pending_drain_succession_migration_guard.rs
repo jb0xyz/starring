@@ -501,8 +501,8 @@ fn manifests_readiness_acl_and_postflight_keep_capabilities_quarantined() {
         assert!(postflight.contains(identity), "{identity}");
         assert!(CONTRACT_SOURCE.contains(identity), "{identity}");
     }
-    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 26]"));
-    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 28"));
+    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 29]"));
+    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 31"));
     for identity in [
         PREDECESSOR_IDENTITY,
         SUCCESSOR_IDENTITY,

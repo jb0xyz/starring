@@ -11,8 +11,10 @@ const PUBLISH_IDENTITY: &str =
     "public.starring_runtime_ingress_open_acknowledgement_publish_v2(text,bigint,bytea,bytea,bigint,bigint,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,bigint,bigint,bigint,bigint,bigint)";
 const MANIFEST_DEFINITION_DIGEST: &str =
     "72ab1200d416d069371db605ffef6f5f6197fc3f9c0fdd241001d43dd9c82434";
-const READINESS_DEFINITION_DIGEST: &str =
+const MIGRATION_READINESS_DEFINITION_DIGEST: &str =
     "572d7ffd19d6f2edb5ec84ea6b7bfebd178c7da0568bce61af2f7907cfe72647";
+const LATEST_READINESS_DEFINITION_DIGEST: &str =
+    "2a19a8895be1dcc8596ae9413864dc444827c40255e378c0e06b2e1a359304cf";
 
 fn dollar_block(tag: &str) -> &'static str {
     MIGRATION
@@ -176,15 +178,18 @@ fn executor_surface_is_function_only_and_exclusive() {
 fn manifest_readiness_and_rust_pins_advance_together() {
     assert!(MIGRATION.contains("RETURN observed_count = 948"));
     assert!(MIGRATION.contains("bd8e47e52db30d06ac726b2763a20f54b993f1e04c374975a96a510a31919ade"));
-    for digest in [MANIFEST_DEFINITION_DIGEST, READINESS_DEFINITION_DIGEST] {
+    for digest in [
+        MANIFEST_DEFINITION_DIGEST,
+        MIGRATION_READINESS_DEFINITION_DIGEST,
+    ] {
         assert!(MIGRATION.contains(digest), "{digest}");
     }
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
-        assert!(source.contains(READINESS_DEFINITION_DIGEST));
+        assert!(source.contains(LATEST_READINESS_DEFINITION_DIGEST));
     }
-    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 26]"));
-    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 28"));
-    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 28]"));
+    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 29]"));
+    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 31"));
+    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 31]"));
     let postflight = dollar_block("postflight");
     assert!(postflight.contains("NOT public.starring_runtime_execution_schema_manifest_v1()"));
     assert!(postflight.contains("invalid_acl_count"));

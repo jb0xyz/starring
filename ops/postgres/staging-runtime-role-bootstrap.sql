@@ -116,6 +116,9 @@ VALUES
     ('execution', 'public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)'),
     ('execution', 'public.starring_runtime_certification_reserve_intent_v2(bigint,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,text,text,bigint,bigint,text,text,text,bigint,bytea,text)'),
     ('execution', 'public.starring_runtime_certification_reservation_observe_v2(text,text,text,bigint,bigint)'),
+    ('execution', 'public.starring_runtime_certification_prepare_v2(text,text,text,text,text,bigint,text,bigint,bigint,bigint,timestamp with time zone)'),
+    ('execution', 'public.starring_runtime_certification_commit_v2(text,text,text,text,text,bigint,text,bigint,bigint,bigint,bytea,text,bytea,text)'),
+    ('execution', 'public.starring_runtime_certification_observe_v2(text,text,text,text,bigint,bigint,text)'),
     ('execution', 'public.starring_runtime_startup_recovery_observe_v2(text,text,bigint,text,bigint,timestamp with time zone)'),
     ('execution', 'public.starring_runtime_startup_recovery_execute_stale_live_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)'),
     ('execution', 'public.starring_runtime_startup_recovery_execute_reserved_awaiting_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)'),
@@ -141,6 +144,9 @@ VALUES
     ('serving', 'public.starring_runtime_serving_database_identity_v1()'),
     ('serving', 'public.starring_runtime_serving_heartbeat_v1(text,text,text,text,text,bigint,bigint,bigint,bigint)'),
     ('serving', 'public.starring_runtime_serving_disconnect_v1(text,text,text,text,text,bigint,bigint,bigint)'),
+    ('serving', 'public.starring_runtime_serving_observe_v2(text,text,text,text,text,text,bigint,bigint)'),
+    ('serving', 'public.starring_runtime_serving_heartbeat_v2(text,text,text,text,text,text,bigint,bigint,bigint,bigint)'),
+    ('serving', 'public.starring_runtime_serving_disconnect_if_current_v2(text,text,text,text,text,text,bigint,bigint,bigint)'),
     ('interaction', 'public.starring_runtime_interaction_database_readiness_v1()'),
     ('interaction', 'public.starring_runtime_interaction_database_identity_v1()'),
     ('interaction', 'public.starring_runtime_interaction_route_read_v1(text,text)'),
@@ -248,7 +254,7 @@ BEGIN
     IF (
         SELECT pg_catalog.count(*)
         FROM pg_temp.starring_runtime_capability_functions
-    ) <> 49 THEN
+    ) <> 55 THEN
         RAISE EXCEPTION 'runtime capability function manifest is invalid'
             USING ERRCODE = '55000';
     END IF;

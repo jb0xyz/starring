@@ -265,6 +265,19 @@ pub(crate) async fn begin_execution_mutation_transaction(
     Ok(transaction)
 }
 
+pub(crate) async fn begin_owned_execution_mutation_transaction(
+    pool: &PgPool,
+    timeouts: RuntimeExecutionDatabaseTimeoutsV1,
+) -> Result<Transaction<'static, Postgres>, RuntimeExecutionPersistenceErrorV1> {
+    let mut transaction = pool.begin().await.map_err(map_query_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_query_error)?;
+    configure_execution_transaction(&mut transaction, timeouts).await?;
+    Ok(transaction)
+}
+
 pub(crate) async fn begin_execution_serializable_observation_transaction(
     connection: &mut PgConnection,
     timeouts: RuntimeExecutionDatabaseTimeoutsV1,
@@ -283,6 +296,19 @@ pub(crate) async fn begin_execution_locked_observation_transaction(
     timeouts: RuntimeExecutionDatabaseTimeoutsV1,
 ) -> Result<Transaction<'_, Postgres>, RuntimeExecutionPersistenceErrorV1> {
     let mut transaction = connection.begin().await.map_err(map_query_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ WRITE")
+        .execute(&mut *transaction)
+        .await
+        .map_err(map_query_error)?;
+    configure_execution_transaction(&mut transaction, timeouts).await?;
+    Ok(transaction)
+}
+
+pub(crate) async fn begin_owned_execution_locked_observation_transaction(
+    pool: &PgPool,
+    timeouts: RuntimeExecutionDatabaseTimeoutsV1,
+) -> Result<Transaction<'static, Postgres>, RuntimeExecutionPersistenceErrorV1> {
+    let mut transaction = pool.begin().await.map_err(map_query_error)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ WRITE")
         .execute(&mut *transaction)
         .await
@@ -448,7 +474,7 @@ mod tests {
         assert!(canonical_sha256_digest(digest));
         assert_eq!(
             digest,
-            "572d7ffd19d6f2edb5ec84ea6b7bfebd178c7da0568bce61af2f7907cfe72647"
+            "2a19a8895be1dcc8596ae9413864dc444827c40255e378c0e06b2e1a359304cf"
         );
     }
 }

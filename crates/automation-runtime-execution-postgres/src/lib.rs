@@ -1,6 +1,7 @@
 mod bootstrap;
 mod certification;
 mod certification_reservation;
+mod certification_v2;
 mod connection;
 mod contract;
 mod controller;
@@ -28,6 +29,10 @@ pub use bootstrap::{
 pub use certification::{
     MAX_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
     MIN_RUNTIME_CERTIFICATION_SERVING_LEASE_DURATION,
+};
+pub use certification_v2::{
+    PostgresPreparedRuntimeCertificationV2, PostgresRuntimeCertificationAbortRecoveryV2,
+    PostgresRuntimeCertificationCommitRecoveryV2,
 };
 pub use database::{
     verify_runtime_execution_database_v1, verify_runtime_execution_database_with_timeouts_v1,

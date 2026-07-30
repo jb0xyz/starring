@@ -73,6 +73,9 @@ fn adapter_contract_uses_only_private_serving_capabilities() {
         "starring_runtime_serving_database_identity_v1",
         "starring_runtime_serving_heartbeat_v1",
         "starring_runtime_serving_disconnect_v1",
+        "starring_runtime_serving_observe_v2",
+        "starring_runtime_serving_heartbeat_v2",
+        "starring_runtime_serving_disconnect_if_current_v2",
     ] {
         assert!(contract.contains(capability));
     }
@@ -100,6 +103,9 @@ fn adapter_contract_placeholder_shapes_are_exact() {
         ("DATABASE_BINDING_QUERY", 0),
         ("HEARTBEAT_QUERY", 9),
         ("DISCONNECT_QUERY", 8),
+        ("OBSERVE_V2_QUERY", 8),
+        ("HEARTBEAT_V2_QUERY", 10),
+        ("DISCONNECT_V2_QUERY", 9),
     ];
     for (name, expected_maximum) in expected {
         let query = contract
@@ -139,6 +145,32 @@ fn adapter_implements_only_the_serving_lease_port() {
     ] {
         assert!(!store.contains(forbidden), "broad capability: {forbidden}");
     }
+}
+
+#[test]
+fn v2_serving_uses_exact_certified_identity_and_bounded_mutations() {
+    let adapter = include_str!("../src/v2.rs");
+    for required in [
+        "identity.operation_id.as_str()",
+        "identity.attestation_digest.as_str()",
+        "identity.process_identity.process_instance_id",
+        "identity.process_identity.runtime_generation",
+        "identity.lease_epoch",
+        "identity.revision",
+        "target.version",
+        "target.content_hash",
+        "target.binding_revision",
+        "target.binding_fingerprint",
+        "MAX_RUNTIME_SERVING_LEASE_DURATION",
+        "MIN_RUNTIME_SERVING_LEASE_DURATION",
+        "ServingConnectionGuardV1",
+        "verify_runtime_serving_binding_v1",
+    ] {
+        assert!(adapter.contains(required), "{required}");
+    }
+    assert!(adapter.contains("RuntimeServingObservationV2::Absent"));
+    assert!(adapter.contains("RuntimeServingObservationV2::Current"));
+    assert!(adapter.contains("RuntimeServingObservationV2::Diverged"));
 }
 
 #[test]
@@ -256,6 +288,7 @@ fn errors_are_redacted_at_the_adapter_boundary() {
         include_str!("../src/database.rs"),
         include_str!("../src/error.rs"),
         include_str!("../src/store.rs"),
+        include_str!("../src/v2.rs"),
     ];
     for source in sources {
         for leak in [

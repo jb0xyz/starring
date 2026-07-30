@@ -215,9 +215,9 @@ fn manifest_readiness_and_rust_capabilities_advance_together() {
     for source in [MIGRATION, CONTRACT_SOURCE, SECURITY_SUPPORT_SOURCE] {
         assert!(source.contains(FUNCTION_IDENTITY));
     }
-    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 26]"));
-    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 28"));
-    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 28]"));
+    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 29]"));
+    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 31"));
+    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 31]"));
     let readiness = CONTRACT_SOURCE
         .split("RUNTIME_EXECUTION_READINESS_DEFINITION_DIGEST_V1")
         .nth(1)
