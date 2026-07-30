@@ -374,6 +374,7 @@ impl RuntimeServingOpenProcessV2 {
             writer_fence_generation,
             maintenance_gate_generation: gate.generation(),
             maintenance_gate_open: true,
+            maintenance_gate_opening: false,
             finalizer_generation: self.lifecycle.finalizer_generation_v2(),
             finalizer_accepting,
             supervisors_running,

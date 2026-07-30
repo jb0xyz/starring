@@ -431,6 +431,25 @@ impl RuntimeGatewayCoordinatorInterruptHandleV2 {
         })
     }
 
+    #[allow(dead_code)]
+    fn ordinary_barrier_pause_is_current_v3(
+        &self,
+        reservation: &RuntimeDiscordOrdinaryBarrierReservationV3,
+    ) -> bool {
+        let state = self.current_observation_v2();
+        state.interrupt == RuntimeGatewayCoordinatorInterruptV2::None
+            && state.generation == reservation.coordinator_generation
+            && state.production_generation_active
+            && state.resume_claim.is_none()
+            && state.ordinary_barrier
+                == Some(RuntimeGatewayOrdinaryBarrierStateV3::Paused {
+                    coordinator_generation: reservation.coordinator_generation,
+                    correlation: reservation.correlation,
+                    expected: reservation.expected,
+                    connected_event_sequence: reservation.connected_event_sequence,
+                })
+    }
+
     fn begin_ordinary_barrier_resume_v3(
         &self,
         reservation: &RuntimeDiscordOrdinaryBarrierReservationV3,
@@ -1451,6 +1470,48 @@ impl RuntimeGatewayProductionCoordinatorV2 {
             return Err(RuntimeDiscordOrdinaryBarrierFailureV3::StaleAuthority);
         }
         Ok(RuntimeDiscordOrdinaryBarrierPortV3 { commands })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn observe_exact_paused_ordinary_barrier_v3(
+        &self,
+        reservation: &RuntimeDiscordOrdinaryBarrierReservationV3,
+    ) -> Result<RuntimePausedGatewayObservationV2, RuntimeDiscordOrdinaryBarrierFailureV3> {
+        if !self
+            .interrupt
+            .ordinary_barrier_pause_is_current_v3(reservation)
+        {
+            return Err(RuntimeDiscordOrdinaryBarrierFailureV3::StaleAuthority);
+        }
+        let first_admission = self.observer.current_admission_snapshot();
+        let first_watch = *self.admission_snapshot.borrow();
+        let first_reservation = *self.discord_reservation.borrow();
+        if first_admission != first_watch
+            || first_reservation.admission() != first_admission
+            || first_reservation.reservation() != Some(reservation.expected)
+        {
+            return Err(RuntimeDiscordOrdinaryBarrierFailureV3::StaleAuthority);
+        }
+        let (paused, connection_epoch) = map_paused_connected_observation_v2(
+            &self.process_instance_id,
+            reservation.coordinator_generation,
+            first_admission,
+        )
+        .map_err(|_| RuntimeDiscordOrdinaryBarrierFailureV3::StaleAuthority)?;
+        if connection_epoch.get() != reservation.connection_epoch_v3()
+            || paused.admission_revision().get() != reservation.admission_revision_v3()
+            || paused.transition_sequence().get() != reservation.pause_sequence_v3()
+            || paused.connected_event_sequence().get() != reservation.connected_event_sequence_v3()
+            || self.observer.current_admission_snapshot() != first_admission
+            || *self.admission_snapshot.borrow() != first_watch
+            || *self.discord_reservation.borrow() != first_reservation
+            || !self
+                .interrupt
+                .ordinary_barrier_pause_is_current_v3(reservation)
+        {
+            return Err(RuntimeDiscordOrdinaryBarrierFailureV3::StaleAuthority);
+        }
+        Ok(paused)
     }
 
     pub(crate) fn complete_ordinary_barrier_v3(
@@ -5058,6 +5119,27 @@ mod tests {
             RuntimeDiscordOrdinaryBarrierPauseOutcomeV3::Applied(reservation) => reservation,
             _ => panic!("ordinary pause was not applied"),
         };
+        let paused = fixture
+            .production
+            .observe_exact_paused_ordinary_barrier_v3(&reservation)
+            .unwrap();
+        assert_eq!(paused.coordinator_generation(), generation);
+        assert_eq!(
+            paused.connection_epoch().get(),
+            reservation.connection_epoch_v3()
+        );
+        assert_eq!(
+            paused.admission_revision().get(),
+            reservation.admission_revision_v3()
+        );
+        assert_eq!(
+            paused.transition_sequence().get(),
+            reservation.pause_sequence_v3()
+        );
+        assert_eq!(
+            paused.connected_event_sequence().get(),
+            reservation.connected_event_sequence_v3()
+        );
         let (resume_outcome, runtime_resume_outcome) = tokio::join!(
             resume_ordinary_discord_admission_v3(
                 RuntimeDiscordOrdinaryBarrierControlContextV3 {

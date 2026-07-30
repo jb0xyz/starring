@@ -1982,7 +1982,7 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
     assert!(handoff.lines().count() < 500);
     assert!(admission.lines().count() < 700);
     assert!(refresh.lines().count() < 400);
-    assert!(serving.lines().count() < 900);
+    assert!(serving.lines().count() < 925);
     assert!(serving_route_set.lines().count() < 200);
     assert!(serving_slot_work.lines().count() < 350);
     assert!(shutdown.lines().count() < 650);

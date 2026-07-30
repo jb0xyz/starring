@@ -580,6 +580,7 @@ pub struct RuntimeServingOpenAcknowledgementRefreshInputV2 {
     pub writer_fence_open: bool,
     pub maintenance_gate_generation: RuntimeMaintenanceGateGenerationV2,
     pub maintenance_gate_open: bool,
+    pub maintenance_gate_opening: bool,
     pub route_set: RuntimeRouteSetObservationV2,
     pub finalizer_generation: RuntimeMutationFinalizerGenerationV1,
     pub finalizer_accepting: bool,
@@ -855,10 +856,21 @@ fn validate_serving_refresh(
     {
         return Err(RuntimeProductionLifecycleErrorV2::WriterFenceMismatch);
     }
-    if !input.maintenance_gate_open
-        || input.maintenance_gate_generation.get()
-            != current_acknowledgement.maintenance_gate_generation().get()
-    {
+    let current_gate_generation = current_acknowledgement.maintenance_gate_generation().get();
+    let current_open = input.maintenance_gate_open
+        && !input.maintenance_gate_opening
+        && input.maintenance_gate_generation.get() == current_gate_generation;
+    let resumed_opening = !input.maintenance_gate_open
+        && input.maintenance_gate_opening
+        && current_gate_generation
+            .checked_add(2)
+            .filter(|generation| *generation <= i64::MAX as u64)
+            == Some(input.maintenance_gate_generation.get());
+    let maintenance_gate_matches = match gateway_transition {
+        RuntimeServingGatewayReadyRefreshV3::Current => current_open,
+        RuntimeServingGatewayReadyRefreshV3::ResumedSuccessor => current_open || resumed_opening,
+    };
+    if !maintenance_gate_matches {
         return Err(RuntimeProductionLifecycleErrorV2::MaintenanceGateMismatch);
     }
     let route_set_sequence = input.route_set.observation_sequence();

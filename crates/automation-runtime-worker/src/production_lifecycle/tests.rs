@@ -2113,6 +2113,7 @@ fn serving_refresh_input(
             .ingress_acknowledgement()
             .maintenance_gate_generation(),
         maintenance_gate_open: true,
+        maintenance_gate_opening: false,
         route_set: serving_route_set(serving, observation_sequence, nonempty),
         finalizer_generation: serving.epoch().finalizer_generation(),
         finalizer_accepting: true,
@@ -2242,6 +2243,61 @@ fn serving_refresh_accepts_and_stores_only_an_exact_resumed_successor() {
             .ingress_acknowledgement()
             .acknowledgement_revision(),
         non_zero(4)
+    );
+}
+
+#[test]
+fn resumed_serving_refresh_accepts_only_the_exact_closed_to_opening_gate_successor() {
+    let serving = serving_open_with_capacity(1);
+    let sequence = serving.epoch().route_set().observation_sequence().get();
+    let current_gate = serving
+        .epoch()
+        .ingress_acknowledgement()
+        .maintenance_gate_generation()
+        .get();
+    let mut input = serving_refresh_input(&serving, sequence, false);
+    input.gateway_ready = serving_ready_successor(&serving);
+    input.maintenance_gate_open = false;
+    input.maintenance_gate_opening = true;
+    input.maintenance_gate_generation =
+        RuntimeMaintenanceGateGenerationV2::new(non_zero(current_gate + 2)).unwrap();
+    let refresh = serving
+        .authorize_resumed_ingress_open_acknowledgement_refresh_v3(input)
+        .unwrap();
+    assert_eq!(
+        refresh.request().maintenance_gate_generation().get(),
+        current_gate + 2
+    );
+
+    for delta in [1, 3] {
+        let serving = serving_open_with_capacity(1);
+        let sequence = serving.epoch().route_set().observation_sequence().get();
+        let mut input = serving_refresh_input(&serving, sequence, false);
+        input.gateway_ready = serving_ready_successor(&serving);
+        input.maintenance_gate_open = false;
+        input.maintenance_gate_opening = true;
+        input.maintenance_gate_generation =
+            RuntimeMaintenanceGateGenerationV2::new(non_zero(current_gate + delta)).unwrap();
+        let failure = serving
+            .authorize_resumed_ingress_open_acknowledgement_refresh_v3(input)
+            .unwrap_err();
+        assert_eq!(
+            failure.error(),
+            RuntimeProductionLifecycleErrorV2::MaintenanceGateMismatch
+        );
+    }
+
+    let serving = serving_open_with_capacity(1);
+    let sequence = serving.epoch().route_set().observation_sequence().get();
+    let mut input = serving_refresh_input(&serving, sequence, false);
+    input.gateway_ready = serving_ready_successor(&serving);
+    input.maintenance_gate_opening = true;
+    let failure = serving
+        .authorize_resumed_ingress_open_acknowledgement_refresh_v3(input)
+        .unwrap_err();
+    assert_eq!(
+        failure.error(),
+        RuntimeProductionLifecycleErrorV2::MaintenanceGateMismatch
     );
 }
 

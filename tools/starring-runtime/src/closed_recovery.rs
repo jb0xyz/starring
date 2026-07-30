@@ -52,7 +52,12 @@ use crate::gateway::{
 };
 use crate::gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2,
-    RuntimeGatewayOwnerAdmissionFrozenSupervisorV2, RuntimeGatewayOwnerClosedRecoveryCommitErrorV2,
+    RuntimeGatewayOwnerAdmissionFrozenSupervisorV2,
+    RuntimeGatewayOwnerCertificationFreezeAuthorityV2,
+    RuntimeGatewayOwnerCertificationFreezeErrorV2,
+    RuntimeGatewayOwnerCertificationFrozenObservationV2,
+    RuntimeGatewayOwnerCertificationFrozenSupervisorV2,
+    RuntimeGatewayOwnerCertificationThawErrorV2, RuntimeGatewayOwnerClosedRecoveryCommitErrorV2,
     RuntimeGatewayOwnerClosedRecoverySupervisorV2, RuntimeGatewayOwnerPreparedClosedRecoveryV2,
     RuntimeGatewayOwnerProcessActivationErrorV2, RuntimeGatewayOwnerProcessFrozenSupervisorV2,
     RuntimeGatewayOwnerProcessRenewalStartErrorV2, RuntimeGatewayOwnerProductionSupervisorV2,
@@ -308,6 +313,31 @@ pub(crate) struct RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
     worker: RuntimeServingOpenProcessV2,
 }
 
+#[allow(dead_code)]
+pub(crate) struct RuntimeClosedRecoveryCertificationFreezeAuthorityV2 {
+    owner: RuntimeGatewayOwnerCertificationFreezeAuthorityV2,
+    gateway: RuntimeGatewayProductionCoordinatorV2,
+    registry: RuntimeRegistryServingBindingV2,
+    worker: RuntimeServingOpenProcessV2,
+}
+
+#[allow(dead_code)]
+pub(crate) struct RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2 {
+    owner: RuntimeGatewayOwnerCertificationFrozenSupervisorV2,
+    gateway: RuntimeGatewayProductionCoordinatorV2,
+    registry: RuntimeRegistryServingBindingV2,
+    worker: RuntimeServingOpenProcessV2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[allow(dead_code)]
+pub(crate) enum RuntimeClosedRecoveryCertificationFreezeErrorV2 {
+    #[error("runtime serving certification owner freeze failed")]
+    Freeze(RuntimeGatewayOwnerCertificationFreezeErrorV2),
+    #[error("runtime serving certification owner thaw failed")]
+    Thaw(RuntimeGatewayOwnerCertificationThawErrorV2),
+}
+
 pub(crate) struct RuntimeClosedRecoveryOrdinaryBarrierCompletionAuthorityV3 {
     evidence: RuntimeDiscordOrdinaryBarrierResumeEvidenceV3,
     worker: RuntimeServingOpenBarrierCompletionAuthorityV3,
@@ -327,6 +357,7 @@ pub(crate) struct RuntimeClosedRecoveryServingAcknowledgementEvidenceV2 {
     pub(crate) maintenance_gate_generation:
         automation_runtime_worker::RuntimeMaintenanceGateGenerationV2,
     pub(crate) maintenance_gate_open: bool,
+    pub(crate) maintenance_gate_opening: bool,
     pub(crate) finalizer_generation:
         automation_runtime_worker::RuntimeMutationFinalizerGenerationV1,
     pub(crate) finalizer_accepting: bool,
@@ -2410,7 +2441,136 @@ impl RuntimeClosedRecoveryPreparedServingOpenProcessV2 {
     }
 }
 
+#[allow(dead_code)]
+impl RuntimeClosedRecoveryCertificationFreezeAuthorityV2 {
+    pub(crate) fn expected_owner_observation_v2(
+        &self,
+    ) -> &crate::RuntimeGatewayOwnerCurrentObservationV1 {
+        self.owner.expected_observation_v2()
+    }
+
+    pub(crate) fn cutoff_v2(&self) -> Instant {
+        self.owner.cutoff_v2()
+    }
+
+    pub(crate) async fn freeze_v2(
+        self,
+    ) -> Result<
+        (
+            RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2,
+            RuntimeGatewayOwnerCertificationFrozenObservationV2,
+        ),
+        RuntimeClosedRecoveryCertificationFreezeErrorV2,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        let (owner, observation) = owner
+            .freeze_v2()
+            .await
+            .map_err(RuntimeClosedRecoveryCertificationFreezeErrorV2::Freeze)?;
+        Ok((
+            RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2 {
+                owner,
+                gateway,
+                registry,
+                worker,
+            },
+            observation,
+        ))
+    }
+}
+
+#[allow(dead_code)]
+impl RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2 {
+    pub(crate) fn ordinary_barrier_port_v3(
+        &self,
+    ) -> Result<RuntimeDiscordOrdinaryBarrierPortV3, RuntimeDiscordOrdinaryBarrierFailureV3> {
+        self.gateway.ordinary_barrier_port_v3()
+    }
+
+    pub(crate) fn coordinator_generation_v3(&self) -> RuntimeGatewayCoordinatorGenerationV2 {
+        self.worker.coordinator_generation()
+    }
+
+    pub(crate) fn observe_exact_paused_ordinary_barrier_v3(
+        &self,
+        reservation: &crate::gateway::RuntimeDiscordOrdinaryBarrierReservationV3,
+    ) -> Result<RuntimePausedGatewayObservationV2, RuntimeDiscordOrdinaryBarrierFailureV3> {
+        self.gateway
+            .observe_exact_paused_ordinary_barrier_v3(reservation)
+    }
+
+    pub(crate) fn observe_exact_resumed_ordinary_barrier_ready_v3(
+        &self,
+        evidence: &RuntimeDiscordOrdinaryBarrierResumeEvidenceV3,
+    ) -> Result<RuntimeGatewayReadyAttestationV2, RuntimeDiscordOrdinaryBarrierFailureV3> {
+        self.gateway
+            .observe_exact_resumed_ordinary_barrier_ready_v3(evidence)
+    }
+
+    pub(crate) async fn thaw_v2(
+        self,
+        authority: RuntimeGatewayOwnerCertificationFrozenObservationV2,
+        successor_deadline: Instant,
+    ) -> Result<
+        (
+            RuntimeClosedRecoverySupervisedServingOpenProcessV2,
+            crate::RuntimeGatewayOwnerCurrentObservationV1,
+        ),
+        RuntimeClosedRecoveryCertificationFreezeErrorV2,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        let (owner, successor) = owner
+            .thaw_v2(authority, successor_deadline)
+            .await
+            .map_err(RuntimeClosedRecoveryCertificationFreezeErrorV2::Thaw)?;
+        Ok((
+            RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
+                owner,
+                gateway,
+                registry,
+                worker,
+            },
+            successor,
+        ))
+    }
+}
+
 impl RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
+    #[allow(dead_code)]
+    pub(crate) fn prepare_certification_freeze_v2(
+        self,
+        cutoff: Instant,
+    ) -> Result<
+        RuntimeClosedRecoveryCertificationFreezeAuthorityV2,
+        RuntimeClosedRecoveryCertificationFreezeErrorV2,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        let owner = owner
+            .prepare_certification_freeze_v2(cutoff)
+            .map_err(RuntimeClosedRecoveryCertificationFreezeErrorV2::Freeze)?;
+        Ok(RuntimeClosedRecoveryCertificationFreezeAuthorityV2 {
+            owner,
+            gateway,
+            registry,
+            worker,
+        })
+    }
+
     #[allow(dead_code)]
     pub(crate) fn authorize_slot_work_v2(
         &self,
@@ -2724,6 +2884,7 @@ impl RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
             writer_fence_open: true,
             maintenance_gate_generation: evidence.maintenance_gate_generation,
             maintenance_gate_open: evidence.maintenance_gate_open,
+            maintenance_gate_opening: evidence.maintenance_gate_opening,
             route_set,
             finalizer_generation: evidence.finalizer_generation,
             finalizer_accepting: evidence.finalizer_accepting,
