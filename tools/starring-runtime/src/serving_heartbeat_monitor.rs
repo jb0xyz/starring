@@ -15,11 +15,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout_at, Instant as TokioInstant};
 
 use crate::gateway::RuntimeGatewayReadyInvalidationObserverV2;
+use crate::process_supervisor::RuntimeProcessShutdownTriggerV1;
 use crate::registry::{
     RuntimeRegistryBarrierBServingErrorV2, RuntimeRegistryBarrierBServingMonitorAuthorityV2,
 };
 use crate::shutdown::RuntimeShutdownObserverV1;
-use crate::{RuntimeShutdownCauseV1, RuntimeShutdownTriggerV1};
+use crate::{RuntimeShutdownCauseV1, RuntimeShutdownTriggerV1, RuntimeShutdownTripV1};
 
 const RUNTIME_SERVING_HEARTBEAT_INTERVAL_V2: Duration = Duration::from_secs(15);
 const RUNTIME_SERVING_HEARTBEAT_LEASE_V2: Duration = Duration::from_secs(45);
@@ -27,6 +28,33 @@ const RUNTIME_SERVING_HEARTBEAT_OPERATION_TIMEOUT_V2: Duration = Duration::from_
 
 type RuntimeServingHeartbeatSignalFutureV2 = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type RuntimeServingHeartbeatDatabaseFutureV2<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Clone)]
+enum RuntimeServingHeartbeatShutdownTriggerV2 {
+    Standalone(RuntimeShutdownTriggerV1),
+    Process(RuntimeProcessShutdownTriggerV1),
+}
+
+impl RuntimeServingHeartbeatShutdownTriggerV2 {
+    fn trip(&self, cause: RuntimeShutdownCauseV1) -> RuntimeShutdownTripV1 {
+        match self {
+            Self::Standalone(trigger) => trigger.trip(cause),
+            Self::Process(trigger) => trigger.trip(cause),
+        }
+    }
+}
+
+impl From<RuntimeShutdownTriggerV1> for RuntimeServingHeartbeatShutdownTriggerV2 {
+    fn from(trigger: RuntimeShutdownTriggerV1) -> Self {
+        Self::Standalone(trigger)
+    }
+}
+
+impl From<RuntimeProcessShutdownTriggerV1> for RuntimeServingHeartbeatShutdownTriggerV2 {
+    fn from(trigger: RuntimeProcessShutdownTriggerV1) -> Self {
+        Self::Process(trigger)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum RuntimeServingHeartbeatMonitorConfigErrorV2 {
@@ -433,7 +461,7 @@ pub(crate) struct RuntimeServingHeartbeatMonitorCoreV2<R> {
     health: watch::Receiver<RuntimeServingHeartbeatMonitorHealthV2>,
     terminal: RuntimeServingHeartbeatTerminalObserverV2,
     actor: Option<JoinHandle<RuntimeServingHeartbeatActorExitV2<R>>>,
-    shutdown: RuntimeShutdownTriggerV1,
+    shutdown: RuntimeServingHeartbeatShutdownTriggerV2,
     armed: bool,
 }
 
@@ -578,11 +606,32 @@ pub(crate) async fn start_runtime_serving_heartbeat_monitor_v2(
     .await
 }
 
-async fn start_runtime_serving_heartbeat_monitor_with_ports_v2<D, R>(
+pub(crate) async fn start_runtime_process_serving_heartbeat_monitor_v2(
+    receipt: RuntimeServingReceiptV2,
+    database: PostgresRuntimeServingLeaseV1,
+    registry: RuntimeRegistryBarrierBServingMonitorAuthorityV2,
+    shutdown_trigger: RuntimeProcessShutdownTriggerV1,
+    shutdown_observer: RuntimeShutdownObserverV1,
+    observers: RuntimeServingHeartbeatExternalObserversV2,
+    config: RuntimeServingHeartbeatMonitorConfigV2,
+) -> Result<RuntimeServingHeartbeatMonitorReadyV2, RuntimeServingHeartbeatStartFailureV2> {
+    start_runtime_serving_heartbeat_monitor_with_ports_v2(
+        receipt,
+        database,
+        registry,
+        shutdown_trigger,
+        shutdown_observer,
+        observers,
+        config,
+    )
+    .await
+}
+
+async fn start_runtime_serving_heartbeat_monitor_with_ports_v2<D, R, S>(
     receipt: RuntimeServingReceiptV2,
     database: D,
     registry: R,
-    shutdown_trigger: RuntimeShutdownTriggerV1,
+    shutdown_trigger: S,
     mut shutdown_observer: RuntimeShutdownObserverV1,
     mut observers: RuntimeServingHeartbeatExternalObserversV2,
     config: RuntimeServingHeartbeatMonitorConfigV2,
@@ -590,7 +639,9 @@ async fn start_runtime_serving_heartbeat_monitor_with_ports_v2<D, R>(
 where
     D: RuntimeServingHeartbeatDatabasePortV2,
     R: RuntimeServingHeartbeatRegistryPortV2,
+    S: Into<RuntimeServingHeartbeatShutdownTriggerV2>,
 {
+    let shutdown_trigger = shutdown_trigger.into();
     let mut emergency = RuntimeServingHeartbeatEmergencyGuardV2::new_v2(
         shutdown_trigger.clone(),
         RuntimeShutdownCauseV1::SupervisorFailure,
@@ -737,7 +788,7 @@ struct RuntimeServingHeartbeatActorInputsV2<D, R> {
     receipt: RuntimeServingReceiptV2,
     database: D,
     registry: R,
-    shutdown_trigger: RuntimeShutdownTriggerV1,
+    shutdown_trigger: RuntimeServingHeartbeatShutdownTriggerV2,
     shutdown_observer: RuntimeShutdownObserverV1,
     observers: RuntimeServingHeartbeatExternalObserversV2,
     stop: oneshot::Receiver<()>,
@@ -899,7 +950,7 @@ fn failed_closed_actor_exit_v2<R>(
     failure: RuntimeServingHeartbeatFailureV2,
     receipt: RuntimeServingReceiptV2,
     registry: R,
-    shutdown: &RuntimeShutdownTriggerV1,
+    shutdown: &RuntimeServingHeartbeatShutdownTriggerV2,
     health: &watch::Sender<RuntimeServingHeartbeatMonitorHealthV2>,
 ) -> RuntimeServingHeartbeatActorExitV2<R> {
     shutdown.trip(failure.shutdown_cause_v2());
@@ -1063,7 +1114,7 @@ fn one_step_successor_identity_v2(
 
 fn map_initial_receipt_failure_v2(
     _failure: RuntimeServingHeartbeatFailureV2,
-    shutdown: &RuntimeShutdownTriggerV1,
+    shutdown: &RuntimeServingHeartbeatShutdownTriggerV2,
 ) -> RuntimeServingHeartbeatStartFailureV2 {
     shutdown.trip(RuntimeShutdownCauseV1::HealthTerminal);
     RuntimeServingHeartbeatStartFailureV2::InvalidReceipt
@@ -1173,13 +1224,16 @@ fn millisecond_aligned_v2(duration: Duration) -> bool {
 }
 
 struct RuntimeServingHeartbeatEmergencyGuardV2 {
-    shutdown: RuntimeShutdownTriggerV1,
+    shutdown: RuntimeServingHeartbeatShutdownTriggerV2,
     cause: RuntimeShutdownCauseV1,
     armed: bool,
 }
 
 impl RuntimeServingHeartbeatEmergencyGuardV2 {
-    fn new_v2(shutdown: RuntimeShutdownTriggerV1, cause: RuntimeShutdownCauseV1) -> Self {
+    fn new_v2(
+        shutdown: RuntimeServingHeartbeatShutdownTriggerV2,
+        cause: RuntimeShutdownCauseV1,
+    ) -> Self {
         Self {
             shutdown,
             cause,

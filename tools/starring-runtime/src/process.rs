@@ -53,6 +53,7 @@ mod pending_drain_finalizer;
 mod readiness;
 mod recovery;
 mod serving;
+mod serving_certification;
 mod startup_loop;
 
 #[allow(unused_imports)]

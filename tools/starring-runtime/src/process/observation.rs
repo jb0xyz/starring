@@ -19,9 +19,10 @@ pub(super) use automation_runtime_worker::{
 
 use crate::closed_recovery::{
     RuntimeClosedRecoveryAdmissionAcknowledgingProcessV2,
-    RuntimeClosedRecoveryAdmissionFrozenProcessV2, RuntimeClosedRecoveryEmptyOpenProcessV2,
-    RuntimeClosedRecoveryFixedPointHandoffErrorV2, RuntimeClosedRecoveryFixedPointV2,
-    RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2,
+    RuntimeClosedRecoveryAdmissionFrozenProcessV2,
+    RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2,
+    RuntimeClosedRecoveryEmptyOpenProcessV2, RuntimeClosedRecoveryFixedPointHandoffErrorV2,
+    RuntimeClosedRecoveryFixedPointV2, RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2,
     RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2,
     RuntimeClosedRecoveryIngressAcknowledgementRetainedStateV2,
     RuntimeClosedRecoveryProcessFrozenProcessV2, RuntimeClosedRecoveryProductionHandoffErrorV2,
@@ -2929,12 +2930,12 @@ async fn shutdown_ingress_acknowledgement_supervisor_v2(
     timing.finish_v2(outcome);
 }
 
-pub(super) async fn shutdown_orphaned_empty_open_process_v2(
+pub(super) async fn shutdown_orphaned_empty_open_process_v2<G>(
     foundation: RuntimeProcessFoundationV1,
     discord: RuntimeDiscordProcessSupervisorV2,
     lifecycle: RuntimeClosedRecoverySupervisedEmptyOpenProcessV2,
     ingress_acknowledgement: RuntimeIngressAcknowledgementCleanupV2,
-    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    maintenance_ingress: G,
     readiness: crate::health::RuntimeHealthReadinessPublisherV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
@@ -2950,12 +2951,12 @@ pub(super) async fn shutdown_orphaned_empty_open_process_v2(
     .await
 }
 
-pub(super) async fn shutdown_orphaned_admission_process_v2(
+pub(super) async fn shutdown_orphaned_admission_process_v2<G>(
     foundation: RuntimeProcessFoundationV1,
     discord: RuntimeDiscordProcessSupervisorV2,
     lifecycle: RuntimeClosedRecoveryAdmissionAcknowledgingProcessV2,
     ingress_acknowledgement: RuntimeIngressAcknowledgementCleanupV2,
-    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    maintenance_ingress: G,
     readiness: crate::health::RuntimeHealthReadinessPublisherV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
@@ -3112,12 +3113,12 @@ async fn shutdown_frozen_empty_open_process_v2(
     finish_observation_shutdown_timing_v2(terminal, result)
 }
 
-pub(super) async fn shutdown_empty_open_process_v2(
+pub(super) async fn shutdown_empty_open_process_v2<G>(
     mut foundation: RuntimeProcessFoundationV1,
     discord: RuntimeDiscordProcessSupervisorV2,
     lifecycle: RuntimeClosedRecoverySupervisedEmptyOpenProcessV2,
     ingress_acknowledgement: RuntimeIngressAcknowledgementCleanupV2,
-    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    maintenance_ingress: G,
     readiness: crate::health::RuntimeHealthReadinessPublisherV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
@@ -3158,12 +3159,12 @@ pub(super) async fn shutdown_empty_open_process_v2(
     finish_observation_shutdown_timing_v2(terminal, result)
 }
 
-pub(super) async fn shutdown_refreshing_empty_open_process_v2(
+pub(super) async fn shutdown_refreshing_empty_open_process_v2<G>(
     mut foundation: RuntimeProcessFoundationV1,
     discord: RuntimeDiscordProcessSupervisorV2,
     lifecycle: crate::closed_recovery::RuntimeClosedRecoveryEmptyOpenAcknowledgementRefreshV2,
     ingress_acknowledgement: RuntimeIngressAcknowledgementCleanupV2,
-    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    maintenance_ingress: G,
     readiness: crate::health::RuntimeHealthReadinessPublisherV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
@@ -3204,12 +3205,12 @@ pub(super) async fn shutdown_refreshing_empty_open_process_v2(
     finish_observation_shutdown_timing_v2(terminal, result)
 }
 
-pub(super) async fn shutdown_serving_open_process_v2(
+pub(super) async fn shutdown_serving_open_process_v2<G>(
     mut foundation: RuntimeProcessFoundationV1,
     discord: RuntimeDiscordProcessSupervisorV2,
     lifecycle: RuntimeClosedRecoverySupervisedServingOpenProcessV2,
     ingress_acknowledgement: RuntimeIngressAcknowledgementCleanupV2,
-    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    maintenance_ingress: G,
     readiness: crate::health::RuntimeHealthReadinessPublisherV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
@@ -3251,12 +3252,59 @@ pub(super) async fn shutdown_serving_open_process_v2(
     finish_observation_shutdown_timing_v2(terminal, result)
 }
 
-pub(super) async fn shutdown_refreshing_serving_open_process_v2(
+pub(super) async fn shutdown_certification_frozen_serving_open_process_v2<G>(
+    mut foundation: RuntimeProcessFoundationV1,
+    discord: RuntimeDiscordProcessSupervisorV2,
+    lifecycle: RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2,
+    ingress_acknowledgement: RuntimeIngressAcknowledgementCleanupV2,
+    maintenance_ingress: G,
+    readiness: crate::health::RuntimeHealthReadinessPublisherV2,
+    process_generation: NonZeroU64,
+) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    let (lifecycle, registry_observation) = lifecycle.begin_shutdown_v2();
+    let RuntimeIngressAcknowledgementCleanupV2 { supervisor, safety } = ingress_acknowledgement;
+    readiness.remove_readiness_v2();
+    drop(maintenance_ingress);
+    let (cleanup_deadline, terminal) = foundation
+        .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
+        .await;
+    if let Some(acknowledgement_safety) = safety {
+        acknowledgement_safety.stop_v2().await;
+    }
+    shutdown_ingress_acknowledgement_supervisor_v2(&mut foundation, supervisor, cleanup_deadline)
+        .await;
+    foundation.observe_shutdown_serving_registry_v2(registry_observation);
+    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let timing = foundation.lifecycle_timing_v2();
+    let discord_shutdown = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin,
+        discord.shutdown_until(discord_drain, process_generation, cleanup_deadline),
+        discord_shutdown_timing_outcome_v2,
+    )
+    .await
+    .map_err(map_discord_shutdown_failure_v1);
+    let owner = time_shutdown_result_v2(
+        &timing,
+        RuntimeLifecycleTimingMetricV2::ShutdownOwnerJoin,
+        lifecycle.shutdown_until_v2(cleanup_deadline),
+        owner_shutdown_timing_outcome_v2,
+    )
+    .await;
+    let foundation = foundation.finish_shutdown_v1(cleanup_deadline).await;
+    let owner_shutdown =
+        super::owner::finish_runtime_owner_held_process_shutdown_v1(owner, foundation);
+    let result =
+        finish_paused_connected_shutdown_v1(discord_shutdown, owner_shutdown).map_err(Into::into);
+    finish_observation_shutdown_timing_v2(terminal, result)
+}
+
+pub(super) async fn shutdown_refreshing_serving_open_process_v2<G>(
     mut foundation: RuntimeProcessFoundationV1,
     discord: RuntimeDiscordProcessSupervisorV2,
     lifecycle: RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2,
     ingress_acknowledgement: RuntimeIngressAcknowledgementCleanupV2,
-    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    maintenance_ingress: G,
     readiness: crate::health::RuntimeHealthReadinessPublisherV2,
     process_generation: NonZeroU64,
 ) -> Result<(), RuntimeClosedRecoveryProcessCleanupFailureV2> {

@@ -54,16 +54,18 @@ struct RuntimeServingBarrierAPausedStateV3 {
 }
 
 pub(crate) struct RuntimeServingOpenProcessV2 {
-    controller: RuntimeServingControllerSupervisorV2,
-    discord: RuntimeDiscordProcessSupervisorV2,
-    foundation: RuntimeProcessFoundationV1,
-    lifecycle: RuntimeClosedRecoverySupervisedServingOpenProcessV2,
-    maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
-    readiness: crate::health::RuntimeHealthReadinessPublisherV2,
-    ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
-    acknowledgement_schedule: RuntimeIngressAcknowledgementScheduleV2,
-    acknowledgement_safety: RuntimeIngressAcknowledgementSafetyMonitorV2,
-    process_generation: NonZeroU64,
+    pub(super) controller: RuntimeServingControllerSupervisorV2,
+    pub(super) discord: RuntimeDiscordProcessSupervisorV2,
+    pub(super) foundation: RuntimeProcessFoundationV1,
+    pub(super) lifecycle: RuntimeClosedRecoverySupervisedServingOpenProcessV2,
+    pub(super) maintenance_ingress: RuntimeMaintenanceIngressGateOpenAuthorityV2,
+    pub(super) readiness: crate::health::RuntimeHealthReadinessPublisherV2,
+    pub(super) ingress_acknowledgement: RuntimeProcessIngressAcknowledgementSupervisorV2,
+    pub(super) acknowledgement_schedule: RuntimeIngressAcknowledgementScheduleV2,
+    pub(super) acknowledgement_safety: RuntimeIngressAcknowledgementSafetyMonitorV2,
+    pub(super) certification_monitors:
+        super::serving_certification::RuntimeServingCertificationMonitorSetV2,
+    pub(super) process_generation: NonZeroU64,
 }
 
 impl RuntimeEmptyOpenProcessV2 {
@@ -219,6 +221,10 @@ impl RuntimeEmptyOpenProcessV2 {
             ingress_acknowledgement,
             acknowledgement_schedule,
             acknowledgement_safety,
+            certification_monitors:
+                super::serving_certification::RuntimeServingCertificationMonitorSetV2::production_v2(
+                    crate::registry::runtime_registry_max_slots_v2(),
+                ),
             process_generation,
         };
         if let Err(transition) = process.revalidate_v2().await {
@@ -230,7 +236,9 @@ impl RuntimeEmptyOpenProcessV2 {
 }
 
 impl RuntimeServingOpenProcessV2 {
-    async fn revalidate_v2(&self) -> Result<(), RuntimeProcessProductionHandoffFailureV2> {
+    pub(super) async fn revalidate_v2(
+        &self,
+    ) -> Result<(), RuntimeProcessProductionHandoffFailureV2> {
         if self.discord.terminal_status_v2().is_some() || self.discord.is_finished_v2() {
             return Err(RuntimeProcessProductionHandoffFailureV2::DiscordIndeterminate);
         }
@@ -391,6 +399,7 @@ impl RuntimeServingOpenProcessV2 {
             mut ingress_acknowledgement,
             acknowledgement_schedule,
             acknowledgement_safety,
+            certification_monitors,
             process_generation,
         } = self;
         let refresh = match if require_normal_revalidation {
@@ -411,6 +420,7 @@ impl RuntimeServingOpenProcessV2 {
                     ingress_acknowledgement,
                     acknowledgement_schedule,
                     acknowledgement_safety,
+                    certification_monitors,
                     process_generation,
                 };
                 return Err(process.cleanup_transition_v2(transition).await);
@@ -558,6 +568,7 @@ impl RuntimeServingOpenProcessV2 {
             ingress_acknowledgement,
             acknowledgement_schedule: schedule.unwrap_or(acknowledgement_schedule),
             acknowledgement_safety,
+            certification_monitors,
             process_generation,
         };
         match (final_observation, schedule) {
@@ -590,7 +601,7 @@ impl RuntimeServingOpenProcessV2 {
         }
     }
 
-    fn start_gateway_monitor_v2(
+    pub(super) fn start_gateway_monitor_v2(
         &self,
         gateway_ready: &automation_runtime_controller::RuntimeGatewayReadyAttestationV2,
     ) -> Result<RuntimeEmptyOpenMonitorV2, RuntimeProcessProductionHandoffFailureV2> {
@@ -644,6 +655,9 @@ impl RuntimeServingOpenProcessV2 {
         enum RuntimeServingOpenLoopEventV2 {
             Shutdown(crate::RuntimeShutdownObservationV1),
             Controller(Box<RuntimeServingControllerEventV2>),
+            CertificationMonitorTerminal(
+                super::serving_certification::RuntimeServingCertificationMonitorTerminalV2,
+            ),
             RefreshAcknowledgement,
         }
         let observation = loop {
@@ -664,6 +678,9 @@ impl RuntimeServingOpenProcessV2 {
                 event = self.controller.next_event_v2() => {
                     RuntimeServingOpenLoopEventV2::Controller(Box::new(event))
                 },
+                terminal = self.certification_monitors.next_terminal_v2() => {
+                    RuntimeServingOpenLoopEventV2::CertificationMonitorTerminal(terminal)
+                },
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(refresh_at)),
                     if paused_barrier.is_none() => {
                     RuntimeServingOpenLoopEventV2::RefreshAcknowledgement
@@ -671,6 +688,16 @@ impl RuntimeServingOpenProcessV2 {
             };
             match selected {
                 RuntimeServingOpenLoopEventV2::Shutdown(observation) => break observation,
+                RuntimeServingOpenLoopEventV2::CertificationMonitorTerminal(terminal) => {
+                    let _ = (
+                        terminal.slot_v2(),
+                        terminal.status_v2(),
+                        terminal.outcomes_v2(),
+                    );
+                    break self
+                        .foundation
+                        .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::HealthTerminal);
+                }
                 RuntimeServingOpenLoopEventV2::Controller(event) => match *event {
                     RuntimeServingControllerEventV2::AcquireSlot { slot, reply } => {
                         let request = self.lifecycle.authorize_slot_work_v2(slot);
@@ -996,6 +1023,51 @@ impl RuntimeServingOpenProcessV2 {
                         },
                     ));
                     }
+                    RuntimeServingControllerEventV2::Certification { handoff, reply } => {
+                        if paused_barrier.is_some() || monitor.is_none() {
+                            let _ = reply.send(handoff.reject_v2(
+                                crate::runtime_controller::RuntimeControllerCertificationHandoffRejectionV2::Unavailable,
+                            ));
+                            continue;
+                        }
+                        let gateway_monitor =
+                            monitor.take().expect("validated serving gateway monitor");
+                        match super::serving_certification::handle_certification_v2(
+                            self,
+                            gateway_monitor,
+                            handoff,
+                        )
+                        .await
+                        {
+                            super::serving_certification::RuntimeServingCertificationHandleOutcomeV2::Completed {
+                                process,
+                                gateway_monitor,
+                                reply: accepted,
+                            } => {
+                                self = *process;
+                                monitor = Some(gateway_monitor);
+                                if reply.send(accepted).is_err() {
+                                    self.foundation.trip_shutdown_v1(
+                                        crate::RuntimeShutdownCauseV1::SupervisorFailure,
+                                    );
+                                }
+                            }
+                            super::serving_certification::RuntimeServingCertificationHandleOutcomeV2::Rejected {
+                                process,
+                                gateway_monitor,
+                                reply: rejected,
+                            } => {
+                                self = *process;
+                                monitor = Some(gateway_monitor);
+                                let _ = reply.send(rejected);
+                            }
+                            super::serving_certification::RuntimeServingCertificationHandleOutcomeV2::Terminal(
+                                error,
+                            ) => {
+                                return Err(error);
+                            }
+                        }
+                    }
                     RuntimeServingControllerEventV2::Terminal => {
                         break self
                             .foundation
@@ -1048,8 +1120,17 @@ impl RuntimeServingOpenProcessV2 {
             ingress_acknowledgement,
             acknowledgement_schedule: _,
             acknowledgement_safety,
+            mut certification_monitors,
             process_generation,
         } = self;
+        let certification_deadline = foundation
+            .shutdown_observer_v1()
+            .observed()
+            .map(|observation| foundation.effective_shutdown_deadline_v1(observation))
+            .unwrap_or_else(Instant::now);
+        let _certification_outcomes = certification_monitors
+            .stop_all_until_v2(certification_deadline)
+            .await;
         drop(controller);
         shutdown_serving_open_process_v2(
             foundation,
@@ -1066,7 +1147,7 @@ impl RuntimeServingOpenProcessV2 {
         .await
     }
 
-    async fn cleanup_transition_v2(
+    pub(super) async fn cleanup_transition_v2(
         self,
         transition: RuntimeProcessProductionHandoffFailureV2,
     ) -> RuntimeProcessProductionHandoffErrorV2 {
@@ -1075,7 +1156,7 @@ impl RuntimeServingOpenProcessV2 {
     }
 }
 
-async fn stop_runtime_controller_before_cleanup_v2(
+pub(super) async fn stop_runtime_controller_before_cleanup_v2(
     controller: &mut RuntimeServingControllerSupervisorV2,
     foundation: &mut RuntimeProcessFoundationV1,
 ) {

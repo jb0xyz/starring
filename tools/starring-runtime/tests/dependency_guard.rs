@@ -618,6 +618,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/process/readiness.rs",
             "src/process/recovery.rs",
             "src/process/serving.rs",
+            "src/process/serving_certification.rs",
             "src/process/startup_loop.rs",
             "src/process/startup_loop_tests.rs",
             "src/process.rs",
@@ -783,6 +784,11 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
                 {
                     continue;
                 }
+                if path == Path::new("src/process/serving_certification.rs")
+                    && forbidden == "PostgresRuntimeExecutionV1"
+                {
+                    continue;
+                }
                 if path == Path::new("src/serving_heartbeat_monitor.rs")
                     && forbidden == "PostgresRuntimeServingLeaseV1"
                 {
@@ -810,6 +816,18 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
                 "        RuntimeProcessIngressAcknowledgementJobV2,\n",
                 "    >;"
             )));
+        } else if path == Path::new("src/process/serving_certification.rs") {
+            let finalizer_wait =
+                braced_declaration(&source, "async fn await_committed_certification_v2(");
+            let empty_monitor_test = braced_declaration(
+                &source,
+                "async fn empty_monitor_set_never_emits_a_terminal_event(",
+            );
+            assert_eq!(source.matches("tokio::").count(), 6);
+            assert_eq!(finalizer_wait.matches("tokio::").count(), 3);
+            assert_eq!(empty_monitor_test.matches("tokio::").count(), 1);
+            assert!(source.contains("use tokio::task::JoinSet;"));
+            assert!(source.contains("#[tokio::test]"));
         } else if path != Path::new("src/capability_readiness_supervisor.rs")
             && path != Path::new("src/database.rs")
             && path != Path::new("src/gateway.rs")
@@ -1370,6 +1388,14 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             let allowed_certification_finalizer_dependency = path
                 == Path::new("src/process/certification_finalizer.rs")
                 && identifier == "automation_runtime_worker";
+            let allowed_serving_certification_dependency = path
+                == Path::new("src/process/serving_certification.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime_controller"
+                        | "automation_runtime_convergence"
+                        | "automation_runtime_worker"
+                );
             let allowed_certification_identity_dependency = path
                 == Path::new("src/certification_identity.rs")
                 && identifier == "automation_runtime_controller";
@@ -1506,6 +1532,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     || path == Path::new("src/process.rs")
                     || path == Path::new("src/process/observation.rs")
                     || path == Path::new("src/process/serving.rs")
+                    || path == Path::new("src/process/serving_certification.rs")
             );
             assert!(
                 (!identifier.ends_with("V3")
@@ -1523,6 +1550,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_execution_process
                         || allowed_pending_drain_finalizer_dependency
                         || allowed_certification_finalizer_dependency
+                        || allowed_serving_certification_dependency
                         || allowed_certification_identity_dependency
                         || allowed_serving_heartbeat_dependency
                         || allowed_observation_process
@@ -2383,7 +2411,7 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
     }
     let empty_open_shutdown = braced_declaration(
         process_observation,
-        "async fn shutdown_empty_open_process_v2(",
+        "async fn shutdown_empty_open_process_v2<G>(",
     );
     let readiness_remove = empty_open_shutdown
         .find("readiness.remove_readiness_v2()")
@@ -3222,8 +3250,8 @@ fn serving_shutdown_observes_valid_route_sets_without_weakening_empty_shutdown()
     assert!(lost_serving.contains("self.observe_shutdown_serving_registry_v2(observation)"));
 
     for marker in [
-        "pub(super) async fn shutdown_serving_open_process_v2(",
-        "pub(super) async fn shutdown_refreshing_serving_open_process_v2(",
+        "pub(super) async fn shutdown_serving_open_process_v2<G>(",
+        "pub(super) async fn shutdown_refreshing_serving_open_process_v2<G>(",
     ] {
         let shutdown = braced_declaration(observation, marker);
         let sealed = shutdown
@@ -3252,8 +3280,8 @@ fn serving_shutdown_observes_valid_route_sets_without_weakening_empty_shutdown()
     }
 
     for marker in [
-        "pub(super) async fn shutdown_empty_open_process_v2(",
-        "pub(super) async fn shutdown_refreshing_empty_open_process_v2(",
+        "pub(super) async fn shutdown_empty_open_process_v2<G>(",
+        "pub(super) async fn shutdown_refreshing_empty_open_process_v2<G>(",
     ] {
         let shutdown = braced_declaration(observation, marker);
         assert!(shutdown.contains("foundation.observe_shutdown_registry_v1()"));
@@ -3269,6 +3297,72 @@ fn serving_shutdown_observes_valid_route_sets_without_weakening_empty_shutdown()
     assert!(lost.contains("RuntimeLifecycleLostRegistryObservationV2::Serving"));
     assert!(lost.contains("foundation.observe_shutdown_serving_registry_without_lifecycle_v2()"));
     assert!(serving_process.contains("RuntimeLifecycleLostRegistryObservationV2::Serving,"));
+}
+
+#[test]
+fn serving_certification_is_linear_supervised_bounded_and_fail_closed() {
+    let process = include_str!("../src/process.rs");
+    let serving = include_str!("../src/process/serving.rs");
+    let certification = include_str!("../src/process/serving_certification.rs");
+    assert!(process.contains("mod serving_certification;"));
+    for required in [
+        "RuntimeServingControllerEventV2::Certification",
+        "handle_certification_v2",
+        "RuntimeServingCertificationMonitorSetV2::production_v2",
+        "runtime_registry_max_slots_v2()",
+        "next_terminal_v2()",
+        "stop_all_until_v2",
+    ] {
+        assert!(serving.contains(required), "{required}");
+    }
+    let orchestration = braced_declaration(certification, "async fn execute_certification_v2(");
+    let ordered = [
+        "remove_readiness_v2",
+        "begin_close_v2",
+        "prepare_certification_freeze_v2",
+        "freeze_v2",
+        "reserve_and_prepare_certification_v2",
+        "pause_certification_barrier_b_v2",
+        "activate_certification_barrier_b_v2",
+        "resume_certification_barrier_b_v2",
+        "prepare_serving_monitor_v2",
+        "submit_certification_finalizer_v2",
+        "await_committed_certification_v2",
+        "apply_certification_v2",
+        "start_runtime_process_serving_heartbeat_monitor_v2",
+        "thaw_v2",
+        "begin_open_v2",
+        "publish_preopen_acknowledgement_v2",
+        "commit_open_v2",
+        "authorize_certification_barrier_b_completion_v2",
+        "complete_certification_barrier_b_v2",
+        "complete_slot_work_v2",
+        "insert_v2",
+        "revalidate_v2",
+        "start_gateway_monitor_v2",
+        "publish_ready_v2",
+    ];
+    let mut previous = 0;
+    for required in ordered {
+        let position = orchestration.find(required).unwrap();
+        assert!(position >= previous, "{required}");
+        previous = position;
+    }
+    for required in [
+        "shutdown_serving_open_process_v2",
+        "shutdown_certification_frozen_serving_open_process_v2",
+        "shutdown_refreshing_serving_open_process_v2",
+        "shutdown_orphaned_admission_process_v2",
+        "shutdown_orphaned_empty_open_process_v2",
+        "shutdown_refreshing_empty_open_process_v2",
+        "shutdown_process_without_lifecycle_v2",
+        "stop_runtime_controller_before_cleanup_v2",
+        "std::future::pending::<()>().await",
+        "self.stop_all_until_v2(Instant::now()).await",
+    ] {
+        assert!(certification.contains(required), "{required}");
+    }
+    assert!(!certification.contains("start_runtime_serving_heartbeat_monitor_v2"));
 }
 
 #[test]

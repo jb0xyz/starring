@@ -3,7 +3,7 @@ use std::future::Future;
 use std::time::Instant;
 
 use automation_runtime_controller::{
-    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2,
+    RuntimeBarrierIdV1, RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2,
     RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimeRecoveryIdV2, RuntimeServingSlotV2,
     RuntimeWriterFenceGenerationV1,
 };
@@ -43,12 +43,16 @@ use crate::database::{
 };
 use crate::discord_lifecycle::RuntimeDiscordPauseReservationIdentityV2;
 use crate::gateway::{
-    RuntimeDiscordOrdinaryBarrierFailureV3, RuntimeDiscordOrdinaryBarrierPortV3,
-    RuntimeDiscordOrdinaryBarrierResumeEvidenceV3, RuntimeGatewayBootstrapV1,
-    RuntimeGatewayFixedPointAcceptanceErrorV2, RuntimeGatewayProductionCoordinatorV2,
-    RuntimeGatewayProductionInterruptV2, RuntimeGatewayReadyInvalidationObserverV2,
-    RuntimeGatewayRecoveryOwnerCommitErrorV2, RuntimeGatewayRecoverySectionErrorV2,
-    RuntimeRecoveryPendingGatewayBindingV2,
+    RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2,
+    RuntimeDiscordCertificationBarrierBActivatedV2, RuntimeDiscordCertificationBarrierBCompletedV2,
+    RuntimeDiscordCertificationBarrierBFailureV2,
+    RuntimeDiscordCertificationBarrierBPauseOutcomeV2, RuntimeDiscordCertificationBarrierBPausedV2,
+    RuntimeDiscordCertificationBarrierBResumeOutcomeV2, RuntimeDiscordOrdinaryBarrierFailureV3,
+    RuntimeDiscordOrdinaryBarrierPortV3, RuntimeDiscordOrdinaryBarrierResumeEvidenceV3,
+    RuntimeGatewayBootstrapV1, RuntimeGatewayFixedPointAcceptanceErrorV2,
+    RuntimeGatewayProductionCoordinatorV2, RuntimeGatewayProductionInterruptV2,
+    RuntimeGatewayReadyInvalidationObserverV2, RuntimeGatewayRecoveryOwnerCommitErrorV2,
+    RuntimeGatewayRecoverySectionErrorV2, RuntimeRecoveryPendingGatewayBindingV2,
 };
 use crate::gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2,
@@ -66,9 +70,10 @@ use crate::gateway_owner_startup_watchdog::{
 };
 use crate::ingress_acknowledgement_supervisor::RuntimeIngressAcknowledgementAuthorityV2;
 use crate::registry::{
-    RuntimeRegistryBootstrapV1, RuntimeRegistryEmptyRecoveryBindingV2,
-    RuntimeRegistryPendingDrainSealBindingV2, RuntimeRegistryPendingDrainSuccessionSealBindingV3,
-    RuntimeRegistryPreparedServingTransitionV2, RuntimeRegistryRecoveryObservationErrorV1,
+    RuntimeRegistryBootstrapV1, RuntimeRegistryCertificationBarrierBActivationFailureV2,
+    RuntimeRegistryEmptyRecoveryBindingV2, RuntimeRegistryPendingDrainSealBindingV2,
+    RuntimeRegistryPendingDrainSuccessionSealBindingV3, RuntimeRegistryPreparedServingTransitionV2,
+    RuntimeRegistryRecoveryObservationErrorV1, RuntimeRegistryReplacementRouteV2,
     RuntimeRegistryServingBindingV2, RuntimeRegistryStagingPortV2,
 };
 
@@ -329,6 +334,14 @@ pub(crate) struct RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2 {
     worker: RuntimeServingOpenProcessV2,
 }
 
+#[allow(dead_code)]
+pub(crate) struct RuntimeClosedRecoveryCertificationFrozenShuttingDownProcessV2 {
+    owner: RuntimeGatewayOwnerCertificationFrozenSupervisorV2,
+    gateway: RuntimeGatewayProductionCoordinatorV2,
+    registry: RuntimeRegistryServingBindingV2,
+    worker: RuntimeShuttingDownProcessV2,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[allow(dead_code)]
 pub(crate) enum RuntimeClosedRecoveryCertificationFreezeErrorV2 {
@@ -343,9 +356,22 @@ pub(crate) struct RuntimeClosedRecoveryOrdinaryBarrierCompletionAuthorityV3 {
     worker: RuntimeServingOpenBarrierCompletionAuthorityV3,
 }
 
+pub(crate) struct RuntimeClosedRecoveryCertificationBarrierBCompletionAuthorityV2 {
+    pending: RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2,
+    worker: RuntimeServingOpenBarrierCompletionAuthorityV3,
+}
+
 impl Debug for RuntimeClosedRecoveryOrdinaryBarrierCompletionAuthorityV3 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeClosedRecoveryOrdinaryBarrierCompletionAuthorityV3(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeClosedRecoveryCertificationBarrierBCompletionAuthorityV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "RuntimeClosedRecoveryCertificationBarrierBCompletionAuthorityV2(<redacted>)",
+        )
     }
 }
 
@@ -2517,6 +2543,44 @@ impl RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2 {
         self.gateway.ordinary_barrier_port_v3()
     }
 
+    pub(crate) async fn pause_certification_barrier_b_v2(
+        &self,
+        port: &RuntimeDiscordOrdinaryBarrierPortV3,
+        barrier_id: RuntimeBarrierIdV1,
+        deadline: Instant,
+    ) -> RuntimeDiscordCertificationBarrierBPauseOutcomeV2 {
+        self.gateway
+            .pause_certification_barrier_b_v2(
+                port,
+                barrier_id,
+                self.worker.coordinator_generation(),
+                deadline,
+            )
+            .await
+    }
+
+    pub(crate) fn activate_certification_barrier_b_v2(
+        &self,
+        staged: RuntimeRegistryReplacementRouteV2,
+        paused: RuntimeDiscordCertificationBarrierBPausedV2,
+    ) -> Result<
+        RuntimeDiscordCertificationBarrierBActivatedV2,
+        RuntimeRegistryCertificationBarrierBActivationFailureV2,
+    > {
+        staged.activate_certification_barrier_b_v2(paused)
+    }
+
+    pub(crate) async fn resume_certification_barrier_b_v2(
+        &self,
+        port: &RuntimeDiscordOrdinaryBarrierPortV3,
+        activated: RuntimeDiscordCertificationBarrierBActivatedV2,
+        deadline: Instant,
+    ) -> RuntimeDiscordCertificationBarrierBResumeOutcomeV2 {
+        self.gateway
+            .resume_certification_barrier_b_v2(port, activated, deadline)
+            .await
+    }
+
     pub(crate) fn coordinator_generation_v3(&self) -> RuntimeGatewayCoordinatorGenerationV2 {
         self.worker.coordinator_generation()
     }
@@ -2567,6 +2631,35 @@ impl RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2 {
             },
             successor,
         ))
+    }
+
+    pub(crate) fn begin_shutdown_v2(
+        self,
+    ) -> (
+        RuntimeClosedRecoveryCertificationFrozenShuttingDownProcessV2,
+        Result<RuntimeRouteSetObservationV2, RuntimeRegistryRecoveryObservationErrorV1>,
+    ) {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        let generation = worker.coordinator_generation();
+        let worker = match worker.begin_shutdown(generation, RuntimeShutdownCauseV2::Explicit) {
+            Ok(worker) => worker,
+            Err(_) => unreachable!("current serving generation must authorize shutdown"),
+        };
+        let registry_observation = registry.observe_shutdown_route_set_v2();
+        (
+            RuntimeClosedRecoveryCertificationFrozenShuttingDownProcessV2 {
+                owner,
+                gateway,
+                registry,
+                worker,
+            },
+            registry_observation,
+        )
     }
 }
 
@@ -2685,6 +2778,58 @@ impl RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
     ) -> Result<RuntimeGatewayReadyAttestationV2, RuntimeDiscordOrdinaryBarrierFailureV3> {
         self.gateway
             .complete_ordinary_barrier_v3(authority.evidence, authority.worker)
+    }
+
+    pub(crate) async fn authorize_certification_barrier_b_completion_v2(
+        &self,
+        pending: RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2,
+        final_observation: crate::process::RuntimeExactIngressAcknowledgementReobservationV3,
+    ) -> Result<
+        RuntimeClosedRecoveryCertificationBarrierBCompletionAuthorityV2,
+        RuntimeClosedRecoveryProductionHandoffErrorV2,
+    > {
+        if self.owner.terminal_status_v2().is_some()
+            || self.gateway.current_interrupt_v2().is_some()
+            || self.worker.coordinator_generation() != self.gateway.coordinator_generation_v2()
+        {
+            return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);
+        }
+        let expected_ready = pending.gateway_v2().ready_v2();
+        let current_ready = self
+            .observe_exact_current_ready_attestation_v2()
+            .map_err(|_| RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway)?;
+        if &current_ready != expected_ready {
+            return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);
+        }
+        let worker = self
+            .worker
+            .authorize_ordinary_barrier_completion_v3(final_observation.receipt_v3())
+            .map_err(RuntimeClosedRecoveryProductionHandoffErrorV2::Worker)?;
+        if worker.coordinator_generation_v3() != self.worker.coordinator_generation()
+            || worker.gateway_ready_v3() != expected_ready
+            || !worker.accepts_final_reobservation_v3(final_observation.receipt_v3())
+        {
+            return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);
+        }
+        self.revalidate_owner_and_registry_v2().await?;
+        if self
+            .observe_exact_current_ready_attestation_v2()
+            .map_or(true, |ready| ready != current_ready)
+        {
+            return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);
+        }
+        Ok(RuntimeClosedRecoveryCertificationBarrierBCompletionAuthorityV2 { pending, worker })
+    }
+
+    pub(crate) fn complete_certification_barrier_b_v2(
+        &self,
+        authority: RuntimeClosedRecoveryCertificationBarrierBCompletionAuthorityV2,
+    ) -> Result<
+        RuntimeDiscordCertificationBarrierBCompletedV2,
+        RuntimeDiscordCertificationBarrierBFailureV2,
+    > {
+        self.gateway
+            .complete_certification_barrier_b_v2(authority.pending, authority.worker)
     }
 
     pub(crate) fn begin_shutdown_v2(
@@ -3033,6 +3178,26 @@ impl RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2 {
 }
 
 impl RuntimeClosedRecoveryShuttingDownServingOpenProcessV2 {
+    pub(crate) async fn shutdown_until_v2(
+        self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        drop((gateway, registry, worker));
+        owner.shutdown_until_v2(cleanup_deadline).await
+    }
+}
+
+#[allow(dead_code)]
+impl RuntimeClosedRecoveryCertificationFrozenShuttingDownProcessV2 {
     pub(crate) async fn shutdown_until_v2(
         self,
         cleanup_deadline: Instant,

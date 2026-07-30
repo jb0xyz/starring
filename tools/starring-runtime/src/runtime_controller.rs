@@ -8,14 +8,14 @@ use automation_runtime_controller::{
     plan_runtime_action_v1, RuntimeBindingPinV1, RuntimeClaimNextExecutionV1,
     RuntimeControllerActionV1, RuntimeControllerConfigV1, RuntimeConvergenceErrorClassV1,
     RuntimeConvergenceMutationV1, RuntimeConvergenceSessionStateV1, RuntimeConvergenceSessionV1,
-    RuntimeDisconnectServingV1, RuntimeExecutionReceiptV1, RuntimeMutationReceiptV1,
-    RuntimeMutationRequestV1, RuntimeObservePreviousServingV1,
+    RuntimeDeploymentScopeV1, RuntimeDisconnectServingV1, RuntimeExecutionReceiptV1,
+    RuntimeMutationReceiptV1, RuntimeMutationRequestV1, RuntimeObservePreviousServingV1,
     RuntimePreviousServingObservationReceiptV1, RuntimeServingLeasePort, RuntimeServingReceiptV2,
     RuntimeServingSlotV2, RuntimeServingUpdateReceiptV1,
 };
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ControllerId, RuntimeDeploymentPhaseV1,
-    RuntimeFailureId, RuntimeFailureKindV1, RuntimePendingConditionV1,
+    RuntimeFailureId, RuntimeFailureKindV1, RuntimePendingConditionV1, RuntimeProcessIdentityV1,
 };
 use automation_runtime_convergence_postgres::{RuntimeConvergenceStoreError, RuntimeExactTargetV1};
 use automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1;
@@ -133,6 +133,10 @@ pub(crate) enum RuntimeServingControllerEventV2 {
         command: RuntimeControllerBarrierAResumeCommandV2,
         reply: oneshot::Sender<RuntimeBarrierAResumeReplyV2>,
     },
+    Certification {
+        handoff: Box<RuntimeControllerCertificationHandoffV2>,
+        reply: oneshot::Sender<RuntimeControllerCertificationHandoffReplyV2>,
+    },
     Terminal,
 }
 
@@ -233,6 +237,9 @@ impl RuntimeServingControllerSupervisorV2 {
                 RuntimeServingControllerCommandV2::ResumeBarrierA { command, reply } => {
                     RuntimeServingControllerEventV2::ResumeBarrierA { command, reply }
                 }
+                RuntimeServingControllerCommandV2::Certification { handoff, reply } => {
+                    RuntimeServingControllerEventV2::Certification { handoff, reply }
+                }
             },
             SelectedV2::Closed => {
                 self.observe_join_v2().await;
@@ -308,6 +315,10 @@ enum RuntimeServingControllerCommandV2 {
     ResumeBarrierA {
         command: RuntimeControllerBarrierAResumeCommandV2,
         reply: oneshot::Sender<RuntimeBarrierAResumeReplyV2>,
+    },
+    Certification {
+        handoff: Box<RuntimeControllerCertificationHandoffV2>,
+        reply: oneshot::Sender<RuntimeControllerCertificationHandoffReplyV2>,
     },
 }
 
@@ -402,7 +413,8 @@ impl RuntimeServingControllerActorV2 {
                             RuntimeHeldAdvanceOutcomeV2::Continue => break,
                             RuntimeHeldAdvanceOutcomeV2::Exit(exit) => return exit,
                         };
-                        match self.hold_drained_v2(held).await {
+                        match self.handoff_certification_v2(held).await {
+                            RuntimeHeldRouteOutcomeV2::Continue => break,
                             RuntimeHeldRouteOutcomeV2::Retry => {
                                 if runtime_wait_until_stop_v2(
                                     &mut self.stop,
@@ -1188,77 +1200,107 @@ impl RuntimeServingControllerActorV2 {
             .map_err(|_| RuntimeHeldAdvanceFailureV2::Failed)
     }
 
-    async fn hold_drained_v2(
+    async fn handoff_certification_v2(
         &mut self,
-        mut held: RuntimeHeldDrainedRouteV2,
+        held: RuntimeHeldDrainedRouteV2,
     ) -> RuntimeHeldRouteOutcomeV2 {
-        loop {
-            if held.ensure_active_v2().is_err()
-                || runtime_held_continuation_v2(&held.session.snapshot().phase)
-                    != Some(RuntimeHeldContinuationV2::HoldAwaitingGatewayReady)
-            {
+        let acceptance_deadline = match runtime_certification_acceptance_deadline_v2(
+            held.session.expires_at(),
+            &self.config,
+            Utc::now(),
+        ) {
+            Some(deadline) => deadline,
+            None => return held.finish_retry_v2(),
+        };
+        let handoff = match RuntimeControllerCertificationHandoffV2::from_ready_held_v2(
+            Box::new(held),
+            self.config.serving_lease_for,
+            acceptance_deadline,
+        ) {
+            Ok(handoff) => handoff,
+            Err(held) => {
                 return RuntimeHeldRouteOutcomeV2::Exit(
                     held.finish_v2(RuntimeServingControllerActorExitV2::Failed),
                 );
             }
-            let renew_at = runtime_renewal_instant_v2(
-                held.session.expires_at(),
-                self.config.controller_renew_before,
-            );
-            if runtime_operation_until_stop_v2(&mut self.stop, sleep_until(renew_at))
-                .await
-                .is_err()
-            {
-                return RuntimeHeldRouteOutcomeV2::Exit(
-                    held.finish_v2(RuntimeServingControllerActorExitV2::Commanded),
-                );
-            }
-            let renewal = match held.session.begin_renewal(self.config.controller_lease_for) {
-                Ok(renewal) => renewal,
-                Err(_) => {
-                    return RuntimeHeldRouteOutcomeV2::Exit(
-                        held.finish_v2(RuntimeServingControllerActorExitV2::Failed),
-                    )
-                }
-            };
-            let renewal = match runtime_operation_until_stop_v2(
-                &mut self.stop,
-                self.database.execution().renew_execution(renewal),
-            )
-            .await
-            {
+        };
+        let expected =
+            match RuntimeControllerCertificationReceiptExpectationV2::from_handoff_v2(&handoff) {
+                Ok(expected) => expected,
                 Err(()) => {
                     return RuntimeHeldRouteOutcomeV2::Exit(
-                        held.finish_v2(RuntimeServingControllerActorExitV2::Commanded),
-                    );
-                }
-                Ok(Ok(renewal)) => renewal,
-                Ok(Err(error)) if retryable_execution_error_v2(error) => {
-                    return held.finish_retry_v2();
-                }
-                Ok(Err(_)) => {
-                    return RuntimeHeldRouteOutcomeV2::Exit(
-                        held.finish_v2(RuntimeServingControllerActorExitV2::Failed),
+                        handoff
+                            .into_held_v2()
+                            .finish_v2(RuntimeServingControllerActorExitV2::Failed),
                     );
                 }
             };
-            if held.session.apply_renewal(renewal).is_err() {
+        let deadline = runtime_datetime_deadline_v2(acceptance_deadline);
+        let permit = tokio::select! {
+            biased;
+            _ = runtime_wait_for_stop_v2(&mut self.stop) => {
                 return RuntimeHeldRouteOutcomeV2::Exit(
-                    held.finish_v2(RuntimeServingControllerActorExitV2::Failed),
+                    handoff
+                        .into_held_v2()
+                        .finish_v2(RuntimeServingControllerActorExitV2::Commanded),
                 );
             }
-            let evidence = match held
-                .staged
-                .advance_authority_v2(held.session.fencing_token())
-            {
-                Ok(evidence) => evidence,
+            _ = sleep_until(deadline) => {
+                return handoff
+                    .into_held_v2()
+                    .finish_retry_v2();
+            }
+            permit = self.events.reserve() => match permit {
+                Ok(permit) => permit,
                 Err(_) => {
+                    self.shutdown.trip(RuntimeShutdownCauseV1::SupervisorFailure);
+                    return RuntimeHeldRouteOutcomeV2::Exit(
+                        handoff
+                            .into_held_v2()
+                            .finish_v2(RuntimeServingControllerActorExitV2::Failed),
+                    );
+                }
+            },
+        };
+        let (reply, response) = oneshot::channel();
+        permit.send(RuntimeServingControllerCommandV2::Certification { handoff, reply });
+        let response = tokio::select! {
+            biased;
+            _ = runtime_wait_for_stop_v2(&mut self.stop) => None,
+            _ = sleep_until(deadline) => None,
+            response = response => response.ok(),
+        };
+        let Some(response) = response else {
+            self.shutdown
+                .trip(RuntimeShutdownCauseV1::SupervisorFailure);
+            return RuntimeHeldRouteOutcomeV2::Exit(RuntimeServingControllerActorExitV2::Failed);
+        };
+        match response.into_controller_outcome_v2() {
+            Ok(serving) if expected.matches_v2(&serving) => RuntimeHeldRouteOutcomeV2::Continue,
+            Ok(_) => {
+                self.shutdown
+                    .trip(RuntimeShutdownCauseV1::SupervisorFailure);
+                RuntimeHeldRouteOutcomeV2::Exit(RuntimeServingControllerActorExitV2::Failed)
+            }
+            Err(rejected) => {
+                let (held, source) = *rejected;
+                if held.ensure_active_v2().is_err() {
                     return RuntimeHeldRouteOutcomeV2::Exit(
                         held.finish_v2(RuntimeServingControllerActorExitV2::Failed),
-                    )
+                    );
                 }
-            };
-            held.apply_staged_evidence_v2(&evidence);
+                match source {
+                    RuntimeControllerCertificationHandoffRejectionV2::Unavailable
+                    | RuntimeControllerCertificationHandoffRejectionV2::DeadlineElapsed => {
+                        held.finish_retry_v2()
+                    }
+                    RuntimeControllerCertificationHandoffRejectionV2::StaleAuthority => {
+                        RuntimeHeldRouteOutcomeV2::Exit(
+                            held.finish_v2(RuntimeServingControllerActorExitV2::Failed),
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -1279,6 +1321,7 @@ enum RuntimeControllerPreparedClaimV2 {
 }
 
 enum RuntimeHeldRouteOutcomeV2 {
+    Continue,
     Retry,
     Exit(RuntimeServingControllerActorExitV2),
 }
@@ -1411,6 +1454,8 @@ pub(crate) struct RuntimeHeldDrainedRouteV2 {
 #[allow(dead_code)]
 pub(crate) struct RuntimeControllerCertificationHandoffV2 {
     held: RuntimeHeldDrainedRouteV2,
+    serving_lease_for: Duration,
+    acceptance_deadline: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -1469,14 +1514,22 @@ struct RuntimeHeldRouteRemovedV2 {
 impl RuntimeControllerCertificationHandoffV2 {
     fn from_ready_held_v2(
         held: Box<RuntimeHeldDrainedRouteV2>,
+        serving_lease_for: Duration,
+        acceptance_deadline: DateTime<Utc>,
     ) -> RuntimeControllerCertificationHandoffPreparationV2 {
         if held.ensure_active_v2().is_err()
             || runtime_held_continuation_v2(&held.session.snapshot().phase)
                 != Some(RuntimeHeldContinuationV2::HoldAwaitingGatewayReady)
+            || serving_lease_for.is_zero()
+            || acceptance_deadline >= held.session.expires_at()
         {
             return Err(held);
         }
-        Ok(Box::new(Self { held: *held }))
+        Ok(Box::new(Self {
+            held: *held,
+            serving_lease_for,
+            acceptance_deadline,
+        }))
     }
 
     pub(crate) fn ensure_exact_awaiting_v2(&self) -> Result<(), ()> {
@@ -1505,6 +1558,14 @@ impl RuntimeControllerCertificationHandoffV2 {
         &self.held.witness
     }
 
+    pub(crate) fn serving_lease_for_v2(&self) -> Duration {
+        self.serving_lease_for
+    }
+
+    pub(crate) fn acceptance_deadline_v2(&self) -> DateTime<Utc> {
+        self.acceptance_deadline
+    }
+
     pub(crate) fn reject_v2(
         self,
         source: RuntimeControllerCertificationHandoffRejectionV2,
@@ -1516,19 +1577,71 @@ impl RuntimeControllerCertificationHandoffV2 {
     }
 
     pub(crate) fn accept_v2(self) -> RuntimeControllerAcceptedCertificationPartsV2 {
-        let RuntimeHeldDrainedRouteV2 {
-            staged,
-            session,
-            permit,
-            evidence,
-            hydrated,
-            witness,
-        } = self.held;
+        let Self {
+            held:
+                RuntimeHeldDrainedRouteV2 {
+                    staged,
+                    session,
+                    permit,
+                    evidence,
+                    hydrated,
+                    witness,
+                },
+            serving_lease_for: _,
+            acceptance_deadline: _,
+        } = self;
         (staged, session, permit, evidence, hydrated, witness)
     }
 
     fn into_held_v2(self) -> RuntimeHeldDrainedRouteV2 {
         self.held
+    }
+}
+
+struct RuntimeControllerCertificationReceiptExpectationV2 {
+    scope: RuntimeDeploymentScopeV1,
+    process_identity: RuntimeProcessIdentityV1,
+    serving_lease_for: Duration,
+    acceptance_deadline: DateTime<Utc>,
+}
+
+impl RuntimeControllerCertificationReceiptExpectationV2 {
+    fn from_handoff_v2(handoff: &RuntimeControllerCertificationHandoffV2) -> Result<Self, ()> {
+        handoff.ensure_exact_awaiting_v2()?;
+        let snapshot = handoff.session_v2().snapshot();
+        let panel = snapshot.panel_certificate.as_ref().ok_or(())?;
+        let process_identity = RuntimeProcessIdentityV1 {
+            target: snapshot.target.clone(),
+            runtime_generation: snapshot.runtime_generation,
+            process_instance_id: panel.process_instance_id.clone(),
+        };
+        if panel.target != process_identity.target
+            || panel.runtime_generation != process_identity.runtime_generation
+        {
+            return Err(());
+        }
+        Ok(Self {
+            scope: RuntimeDeploymentScopeV1::from_identity(&snapshot.identity),
+            process_identity,
+            serving_lease_for: handoff.serving_lease_for_v2(),
+            acceptance_deadline: handoff.acceptance_deadline_v2(),
+        })
+    }
+
+    fn matches_v2(&self, receipt: &RuntimeServingReceiptV2) -> bool {
+        receipt.identity.scope == self.scope
+            && receipt.identity.process_identity == self.process_identity
+            && receipt.connected
+            && receipt.serving
+            && receipt.acquired_at <= receipt.last_heartbeat_at
+            && receipt.last_heartbeat_at <= self.acceptance_deadline
+            && receipt.last_heartbeat_at < receipt.expires_at
+            && receipt
+                .expires_at
+                .signed_duration_since(receipt.last_heartbeat_at)
+                .to_std()
+                .ok()
+                == Some(self.serving_lease_for)
     }
 }
 
@@ -2365,12 +2478,17 @@ fn retryable_hydration_error_v2(error: &RuntimeConvergenceStoreError) -> bool {
         )
 }
 
-fn runtime_renewal_instant_v2(expires_at: DateTime<Utc>, renew_before: Duration) -> TokioInstant {
-    let renew_before = TimeDelta::from_std(renew_before).unwrap_or(TimeDelta::MAX);
-    let renew_at = expires_at
-        .checked_sub_signed(renew_before)
-        .unwrap_or(expires_at);
-    runtime_datetime_deadline_v2(renew_at)
+fn runtime_certification_acceptance_deadline_v2(
+    expires_at: DateTime<Utc>,
+    config: &RuntimeControllerConfigV1,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let renewal_cutoff =
+        expires_at.checked_sub_signed(TimeDelta::from_std(config.controller_renew_before).ok()?)?;
+    let configured_cutoff =
+        now.checked_add_signed(TimeDelta::from_std(config.gateway_ready_timeout).ok()?)?;
+    let deadline = renewal_cutoff.min(configured_cutoff);
+    (deadline > now).then_some(deadline)
 }
 
 fn runtime_claim_requires_renewal_v2(
@@ -2662,6 +2780,8 @@ mod tests {
         fn assert_send<T: Send>() {}
         let _: fn(
             Box<RuntimeHeldDrainedRouteV2>,
+            Duration,
+            DateTime<Utc>,
         ) -> RuntimeControllerCertificationHandoffPreparationV2 =
             RuntimeControllerCertificationHandoffV2::from_ready_held_v2;
         let _: fn(
@@ -2684,6 +2804,30 @@ mod tests {
                 RuntimeControllerCertificationHandoffRejectionV2::Unavailable
             ),
             "Unavailable"
+        );
+    }
+
+    #[test]
+    fn certification_acceptance_deadline_is_bounded_by_configured_gateway_budget() {
+        let config = RuntimeControllerConfigV1::default();
+
+        assert_eq!(
+            runtime_certification_acceptance_deadline_v2(at(100), &config, at(10)),
+            Some(at(40))
+        );
+    }
+
+    #[test]
+    fn certification_acceptance_deadline_never_crosses_lease_renewal_cutoff() {
+        let config = RuntimeControllerConfigV1::default();
+
+        assert_eq!(
+            runtime_certification_acceptance_deadline_v2(at(100), &config, at(50)),
+            Some(at(70))
+        );
+        assert_eq!(
+            runtime_certification_acceptance_deadline_v2(at(100), &config, at(70)),
+            None
         );
     }
 }
