@@ -11,7 +11,6 @@ pub enum ApprovalState {
     Blocked,
     ReadyToExecute,
     PendingApproval,
-    PendingSecondApproval,
     Approved,
     Rejected,
 }
@@ -49,7 +48,6 @@ fn required_for(verdict: Verdict) -> usize {
     match verdict {
         Verdict::Allow | Verdict::Warn | Verdict::Deny => 0,
         Verdict::RequireApproval => 1,
-        Verdict::RequireSecondApproval => 2,
     }
 }
 
@@ -80,9 +78,6 @@ impl ApprovalRequest {
         }
         if self.approvals.len() >= self.required_approvals {
             return ApprovalState::Approved;
-        }
-        if self.required_approvals == 2 && self.approvals.len() == 1 {
-            return ApprovalState::PendingSecondApproval;
         }
         ApprovalState::PendingApproval
     }
@@ -118,7 +113,7 @@ impl ApprovalRequest {
             ApprovalState::Rejected => Err(ApprovalError::AlreadyRejected),
             ApprovalState::ReadyToExecute => Err(ApprovalError::NotRequired),
             ApprovalState::Approved => Err(ApprovalError::AlreadyApproved),
-            ApprovalState::PendingApproval | ApprovalState::PendingSecondApproval => Ok(()),
+            ApprovalState::PendingApproval => Ok(()),
         }
     }
 }
@@ -156,15 +151,9 @@ mod tests {
     }
 
     #[test]
-    fn second_approval_needs_two_distinct_users() {
-        let mut r = ApprovalRequest::new(Verdict::RequireSecondApproval, UserId(1));
-        assert_eq!(r.required_approvals, 2);
-        assert_eq!(r.state(), ApprovalState::PendingApproval);
-        assert!(r.approve(UserId(2)).is_ok());
-        assert_eq!(r.state(), ApprovalState::PendingSecondApproval);
-        assert!(!r.can_execute());
-        assert_eq!(r.approve(UserId(2)), Err(ApprovalError::DuplicateApproval));
-        assert!(r.approve(UserId(3)).is_ok());
+    fn requester_can_approve_alone() {
+        let mut r = ApprovalRequest::new(Verdict::RequireApproval, UserId(1));
+        assert!(r.approve(UserId(1)).is_ok());
         assert_eq!(r.state(), ApprovalState::Approved);
         assert!(r.can_execute());
     }
@@ -198,8 +187,8 @@ mod tests {
 
     #[test]
     fn approval_request_serde_roundtrip() {
-        let mut r = ApprovalRequest::new(Verdict::RequireSecondApproval, UserId(1));
-        r.approve(UserId(2)).unwrap();
+        let mut r = ApprovalRequest::new(Verdict::RequireApproval, UserId(1));
+        r.approve(UserId(1)).unwrap();
         let json = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<ApprovalRequest>(&json).unwrap(), r);
     }
