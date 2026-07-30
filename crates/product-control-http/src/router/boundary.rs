@@ -507,7 +507,7 @@ pub(super) fn secure_http_only_cookie(
 
 pub(super) fn secure_csrf_cookie(value: &str, max_age_seconds: u32) -> Zeroizing<String> {
     Zeroizing::new(format!(
-        "{CSRF_COOKIE}={value}; Path=/; Max-Age={max_age_seconds}; Secure; SameSite=Strict"
+        "{CSRF_COOKIE}={value}; Path=/; Max-Age={max_age_seconds}; Secure; SameSite=Lax"
     ))
 }
 
@@ -519,7 +519,7 @@ pub(super) fn clear_cookie(name: &str) -> Zeroizing<String> {
 
 pub(super) fn clear_csrf_cookie() -> Zeroizing<String> {
     Zeroizing::new(format!(
-        "{CSRF_COOKIE}=; Path=/; Max-Age=0; Secure; SameSite=Strict"
+        "{CSRF_COOKIE}=; Path=/; Max-Age=0; Secure; SameSite=Lax"
     ))
 }
 

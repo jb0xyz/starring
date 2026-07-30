@@ -2663,7 +2663,7 @@ async fn oauth_callback_sets_session_and_clears_nonce_cookie() {
     assert_eq!(cookies.len(), 3);
     assert!(cookies[0].starts_with("__Host-starring_session="));
     assert!(cookies[1].starts_with("__Host-starring_csrf="));
-    assert!(cookies[1].contains("SameSite=Strict"));
+    assert!(cookies[1].contains("SameSite=Lax"));
     assert!(!cookies[1].contains("HttpOnly"));
     assert!(cookies[2].starts_with("__Host-starring_oauth=;"));
     assert!(cookies.iter().all(|cookie| !cookie.contains("Domain=")));
@@ -2800,7 +2800,7 @@ async fn logout_clears_session_and_csrf_cookies() {
     assert_eq!(cookies.len(), 2);
     assert!(cookies[0].starts_with("__Host-starring_session=;"));
     assert!(cookies[1].starts_with("__Host-starring_csrf=;"));
-    assert!(cookies[1].contains("SameSite=Strict"));
+    assert!(cookies[1].contains("SameSite=Lax"));
     assert!(!cookies[1].contains("HttpOnly"));
 }
 
