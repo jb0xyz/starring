@@ -29,15 +29,19 @@ use chrono::{DateTime, Utc};
 
 use super::{
     RuntimeAbortErrorV2, RuntimeAbortRecoveryPortV2, RuntimeAuthorizedCertificationRequestV2,
-    RuntimeCertificationAbortOutcomeV2, RuntimeCertificationCommitAuthorityV2,
+    RuntimeCertificationAbortOutcomeV2, RuntimeCertificationAuthorizationErrorV2,
     RuntimeCertificationFinalizationOutcomeV2, RuntimeCertificationFinalizerPortV2,
     RuntimeCertificationFinalizerRegistrationV2, RuntimeCertificationFinalizerRejectionV2,
     RuntimeCertificationPrepareFailedV2, RuntimeCertificationRecoveryOutcomeV2,
     RuntimeCertificationRecoveryResolutionV2, RuntimeCertificationReservationProposalV2,
     RuntimeCommitCompletionErrorV2, RuntimeCommitRecoveryPortV2, RuntimeLiveCertificationPortV2,
-    RuntimePreparedLiveCertificationPortV2, RuntimeReservedCertificationV2,
+    RuntimePreparedCertificationV2, RuntimePreparedLiveCertificationPortV2,
+    RuntimeReservedCertificationV2,
 };
-use crate::{RuntimeCertificationReservationPortV2, RuntimeRecoveryPendingV2};
+use crate::{
+    RuntimeCertificationReservationPortV2, RuntimeGatewayCoordinatorGenerationV2,
+    RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2, RuntimeRecoveryPendingV2,
+};
 
 fn complete<F: Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
@@ -262,6 +266,26 @@ fn route_admission() -> RuntimeRouteAdmissionAttestationV2 {
             activation_sequence: non_zero(15),
         },
     }
+}
+
+fn barrier_id() -> RuntimeBarrierIdV1 {
+    RuntimeBarrierIdV1::parse("ffeeddccbbaa99887766554433221100").unwrap()
+}
+
+fn paused_gateway() -> RuntimePausedGatewayObservationV2 {
+    RuntimePausedGatewayObservationV2::new(
+        RuntimeGatewayCoordinatorGenerationV2::new(non_zero(8)),
+        ProcessInstanceId::parse("process:1").unwrap(),
+        non_zero(9),
+        RuntimeGatewayReadyKindV2::Ready,
+        non_zero(10),
+        RuntimePausedGatewaySequenceV2::new(
+            RuntimeGatewayAdmissionSequenceV2::new(non_zero(12)),
+            RuntimeGatewayAdmissionSequenceV2::new(non_zero(11)),
+            None,
+        )
+        .unwrap(),
+    )
 }
 
 struct ReservationPort {
@@ -546,6 +570,15 @@ impl RuntimeCertificationFinalizerPortV2<Prepared> for ThreadFinalizer {
     }
 }
 
+fn prepared_fixture(mode: CommitMode) -> RuntimePreparedCertificationV2<Prepared> {
+    let (reserved, awaiting) = reserved_fixture();
+    complete(reserved.prepare(&LivePort {
+        awaiting,
+        mode: Some(mode),
+    }))
+    .unwrap()
+}
+
 #[test]
 fn reservation_outcome_must_cross_the_session_before_worker_authority_exists() {
     let (reserved, snapshot) = reserved_fixture();
@@ -579,18 +612,15 @@ fn prepare_failure_has_no_finalizer_or_commit_authority() {
 
 #[test]
 fn accepted_finalizer_owns_the_irreversible_job_and_commits_exactly() {
-    let (reserved, awaiting) = reserved_fixture();
-    let prepared = complete(reserved.prepare(&LivePort {
-        awaiting,
-        mode: Some(CommitMode::Committed),
-    }))
-    .unwrap();
-    let registration = prepared
-        .authorize_finalization(
-            RuntimeCertificationCommitAuthorityV2::from_barrier_completion_v2(),
-            route_admission(),
-        )
+    let route_admission = route_admission();
+    let completed = prepared_fixture(CommitMode::Committed)
+        .complete_barrier_b_v2(barrier_id(), paused_gateway(), route_admission.clone())
         .unwrap();
+    assert_eq!(completed.request().route_admission, route_admission);
+    let registration = completed
+        .authorize_finalization()
+        .into_owned_job()
+        .into_registration();
     let accepted = registration.accept(&ThreadFinalizer).unwrap();
     let outcome = accepted.join().unwrap();
 
@@ -606,19 +636,11 @@ fn accepted_finalizer_owns_the_irreversible_job_and_commits_exactly() {
 
 #[test]
 fn rollback_and_unknown_commit_have_disjoint_terminal_paths() {
-    let (reserved, awaiting) = reserved_fixture();
-    let prepared = complete(reserved.prepare(&LivePort {
-        awaiting,
-        mode: Some(CommitMode::RolledBack),
-    }))
-    .unwrap();
     let outcome = complete(
-        prepared
-            .authorize_finalization(
-                RuntimeCertificationCommitAuthorityV2::from_barrier_completion_v2(),
-                route_admission(),
-            )
+        prepared_fixture(CommitMode::RolledBack)
+            .complete_barrier_b_v2(barrier_id(), paused_gateway(), route_admission())
             .unwrap()
+            .authorize_finalization()
             .into_owned_job()
             .run(),
     );
@@ -630,19 +652,11 @@ fn rollback_and_unknown_commit_have_disjoint_terminal_paths() {
         }
     ));
 
-    let (reserved, awaiting) = reserved_fixture();
-    let prepared = complete(reserved.prepare(&LivePort {
-        awaiting,
-        mode: Some(CommitMode::Unknown),
-    }))
-    .unwrap();
     let outcome = complete(
-        prepared
-            .authorize_finalization(
-                RuntimeCertificationCommitAuthorityV2::from_barrier_completion_v2(),
-                route_admission(),
-            )
+        prepared_fixture(CommitMode::Unknown)
+            .complete_barrier_b_v2(barrier_id(), paused_gateway(), route_admission())
             .unwrap()
+            .authorize_finalization()
             .into_owned_job()
             .run(),
     );
@@ -671,5 +685,71 @@ fn prepared_abort_is_explicitly_definite_and_never_a_commit_unknown() {
     assert!(matches!(
         complete(prepared.abort()),
         RuntimeCertificationAbortOutcomeV2::DefinitelyRolledBack(_)
+    ));
+}
+
+#[test]
+fn barrier_b_completion_rejects_mismatched_barrier_and_retains_prepared() {
+    let failure = prepared_fixture(CommitMode::Committed)
+        .complete_barrier_b_v2(
+            RuntimeBarrierIdV1::parse("00112233445566778899aabbccddeeff").unwrap(),
+            paused_gateway(),
+            route_admission(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        failure.source(),
+        RuntimeCertificationAuthorizationErrorV2::BarrierIdMismatch
+    ));
+    assert_eq!(
+        failure.prepared().reserved_intent().operation_id().as_str(),
+        "00112233445566778899aabbccddeeff"
+    );
+}
+
+#[test]
+fn barrier_b_completion_rejects_paused_or_resumed_gateway_drift() {
+    let mut pause_drift = route_admission();
+    pause_drift.pause.paused_admission_revision = non_zero(11);
+    let failure = prepared_fixture(CommitMode::Committed)
+        .complete_barrier_b_v2(barrier_id(), paused_gateway(), pause_drift)
+        .unwrap_err();
+    assert!(matches!(
+        failure.source(),
+        RuntimeCertificationAuthorizationErrorV2::PausedGatewayMismatch
+    ));
+
+    let mut resume_drift = route_admission();
+    resume_drift.gateway.kind = RuntimeGatewayReadyKindV2::Ready;
+    let failure = prepared_fixture(CommitMode::Committed)
+        .complete_barrier_b_v2(barrier_id(), paused_gateway(), resume_drift)
+        .unwrap_err();
+    assert!(matches!(
+        failure.source(),
+        RuntimeCertificationAuthorizationErrorV2::ResumedGatewayMismatch
+    ));
+}
+
+#[test]
+fn barrier_b_completion_rejects_route_owner_and_target_mismatch_canonically() {
+    let mut owner_drift = route_admission();
+    owner_drift.attested_owner_revision = non_zero(8);
+    let failure = prepared_fixture(CommitMode::Committed)
+        .complete_barrier_b_v2(barrier_id(), paused_gateway(), owner_drift)
+        .unwrap_err();
+    assert!(matches!(
+        failure.source(),
+        RuntimeCertificationAuthorizationErrorV2::Canonical(_)
+    ));
+
+    let mut route_drift = route_admission();
+    route_drift.route.identity.runtime_generation = RuntimeGeneration::new(5).unwrap();
+    let failure = prepared_fixture(CommitMode::Committed)
+        .complete_barrier_b_v2(barrier_id(), paused_gateway(), route_drift)
+        .unwrap_err();
+    assert!(matches!(
+        failure.source(),
+        RuntimeCertificationAuthorizationErrorV2::Canonical(_)
     ));
 }

@@ -6,20 +6,24 @@ use std::future::Future;
 use std::time::Duration;
 
 use automation_runtime_controller::{
-    RuntimeCanonicalLiveAttestationV2, RuntimeCertificationDivergenceV2,
+    RuntimeBarrierIdV1, RuntimeCanonicalLiveAttestationV2, RuntimeCertificationDivergenceV2,
     RuntimeCertificationIntentReservationOutcomeV2, RuntimeCertificationLookupV2,
     RuntimeCertificationObservationV2, RuntimeCertificationReceiptV2,
     RuntimeCertificationRequestV2, RuntimeCertificationReservationAuthorityV2,
     RuntimeCertificationReservationScopeLookupV2,
     RuntimeCertificationReservationScopeObservationKindV2,
-    RuntimeCertificationReservationScopeObservationV2, RuntimeLiveAttestationRecordV2,
-    RuntimeReservedCertificationIntentV2, RuntimeRouteAdmissionAttestationV2,
+    RuntimeCertificationReservationScopeObservationV2, RuntimeGatewayReadyKindV2,
+    RuntimeLiveAttestationRecordV2, RuntimeReservedCertificationIntentV2,
+    RuntimeRouteAdmissionAttestationV2,
 };
 use automation_runtime_convergence::{
     RuntimeDeployment, RuntimeDeploymentPhaseV1, TransitionOutcomeV1,
 };
 
-use crate::{RuntimeCertificationReservationPortV2, RuntimeRecoveryPendingV2};
+use crate::{
+    RuntimeCertificationReservationPortV2, RuntimePausedGatewayObservationV2,
+    RuntimeRecoveryPendingV2,
+};
 
 pub type RuntimeCertificationCommitResultV2<E, R, W> =
     Result<RuntimeCertificationReceiptV2, RuntimeCommitCompletionErrorV2<E, R, W>>;
@@ -384,46 +388,90 @@ where
         }
     }
 
-    pub fn authorize_finalization(
+    pub fn complete_barrier_b_v2(
         self,
-        authority: RuntimeCertificationCommitAuthorityV2,
+        barrier_id: RuntimeBarrierIdV1,
+        paused_gateway: RuntimePausedGatewayObservationV2,
         route_admission: RuntimeRouteAdmissionAttestationV2,
     ) -> Result<
-        RuntimeCertificationFinalizerRegistrationV2<P>,
-        RuntimeCertificationAuthorizationErrorV2,
+        RuntimeCompletedCertificationBarrierBV2<P>,
+        RuntimeCertificationBarrierBCompletionFailureV2<P>,
     > {
-        let request = RuntimeCertificationRequestV2 {
-            intent: self
-                .reservation
-                .reserved_intent()
-                .canonical_intent()
-                .intent()
-                .clone(),
-            intent_fingerprint: self
-                .reservation
-                .reserved_intent()
-                .intent_fingerprint()
-                .clone(),
-            must_commit_before: self.prepared.must_commit_before(),
+        let canonical = match canonicalize_barrier_b_completion_v2(
+            &self,
+            &barrier_id,
+            &paused_gateway,
             route_admission,
+        ) {
+            Ok(canonical) => canonical,
+            Err(source) => {
+                return Err(RuntimeCertificationBarrierBCompletionFailureV2 {
+                    prepared: Box::new(self),
+                    source,
+                });
+            }
         };
-        let record = RuntimeLiveAttestationRecordV2::from_request(request)?;
-        let canonical = self
-            .reservation
-            .reserved_intent()
-            .canonical_intent()
-            .bind_live_record(record)?;
-        let authorized = RuntimeAuthorizedCertificationRequestV2 {
+        Ok(RuntimeCompletedCertificationBarrierBV2 {
+            prepared: self.prepared,
             canonical,
-            authority,
-        };
-        Ok(RuntimeCertificationFinalizerRegistrationV2 {
-            job: RuntimeCertificationFinalizerJobV2 {
-                prepared: self.prepared,
-                authorized,
-            },
         })
     }
+}
+
+fn canonicalize_barrier_b_completion_v2<P>(
+    prepared: &RuntimePreparedCertificationV2<P>,
+    barrier_id: &RuntimeBarrierIdV1,
+    paused_gateway: &RuntimePausedGatewayObservationV2,
+    route_admission: RuntimeRouteAdmissionAttestationV2,
+) -> Result<RuntimeCanonicalLiveAttestationV2, RuntimeCertificationAuthorizationErrorV2>
+where
+    P: RuntimePreparedLiveCertificationPortV2,
+{
+    let intent = prepared
+        .reservation
+        .reserved_intent()
+        .canonical_intent()
+        .intent();
+    if paused_gateway.process_instance_id() != &intent.process_identity.process_instance_id {
+        return Err(RuntimeCertificationAuthorizationErrorV2::PausedGatewayMismatch);
+    }
+    if &route_admission.barrier_id != barrier_id {
+        return Err(RuntimeCertificationAuthorizationErrorV2::BarrierIdMismatch);
+    }
+    if route_admission.pause.coordinator_generation.get()
+        != paused_gateway.coordinator_generation().get()
+        || route_admission.pause.connection_epoch != paused_gateway.connection_epoch()
+        || route_admission.pause.paused_admission_revision != paused_gateway.admission_revision()
+        || route_admission.pause.pause_sequence != paused_gateway.transition_sequence()
+    {
+        return Err(RuntimeCertificationAuthorizationErrorV2::PausedGatewayMismatch);
+    }
+    if route_admission.gateway.kind != RuntimeGatewayReadyKindV2::Resumed
+        || route_admission.gateway.process_instance_id != *paused_gateway.process_instance_id()
+        || route_admission.gateway.connection_epoch != paused_gateway.connection_epoch()
+        || route_admission.gateway.admission_revision != paused_gateway.admission_revision()
+        || route_admission.gateway.connected_event_sequence
+            != paused_gateway.connected_event_sequence()
+    {
+        return Err(RuntimeCertificationAuthorizationErrorV2::ResumedGatewayMismatch);
+    }
+    let request = RuntimeCertificationRequestV2 {
+        intent: intent.clone(),
+        intent_fingerprint: prepared
+            .reservation
+            .reserved_intent()
+            .intent_fingerprint()
+            .clone(),
+        must_commit_before: prepared.prepared.must_commit_before(),
+        route_admission,
+    };
+    let record = RuntimeLiveAttestationRecordV2::from_request(request)?;
+    prepared
+        .reservation
+        .reserved_intent()
+        .canonical_intent()
+        .bind_live_record(record)
+        .map_err(Into::into)
 }
 
 impl<P> Debug for RuntimePreparedCertificationV2<P> {
@@ -432,21 +480,82 @@ impl<P> Debug for RuntimePreparedCertificationV2<P> {
     }
 }
 
+#[must_use]
+pub struct RuntimeCompletedCertificationBarrierBV2<P> {
+    prepared: P,
+    canonical: RuntimeCanonicalLiveAttestationV2,
+}
+
+impl<P> RuntimeCompletedCertificationBarrierBV2<P> {
+    pub fn request(&self) -> &RuntimeCertificationRequestV2 {
+        self.canonical.request()
+    }
+
+    pub fn authorize_finalization(self) -> RuntimeCertificationFinalizerRegistrationV2<P> {
+        let authorized = RuntimeAuthorizedCertificationRequestV2 {
+            canonical: self.canonical,
+            authority: RuntimeCertificationCommitAuthorityV2 { _private: () },
+        };
+        RuntimeCertificationFinalizerRegistrationV2 {
+            job: RuntimeCertificationFinalizerJobV2 {
+                prepared: self.prepared,
+                authorized,
+            },
+        }
+    }
+}
+
+impl<P> Debug for RuntimeCompletedCertificationBarrierBV2<P> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeCompletedCertificationBarrierBV2(<redacted>)")
+    }
+}
+
+#[must_use]
+pub struct RuntimeCertificationBarrierBCompletionFailureV2<P> {
+    prepared: Box<RuntimePreparedCertificationV2<P>>,
+    source: RuntimeCertificationAuthorizationErrorV2,
+}
+
+impl<P> RuntimeCertificationBarrierBCompletionFailureV2<P> {
+    pub fn prepared(&self) -> &RuntimePreparedCertificationV2<P> {
+        &self.prepared
+    }
+
+    pub fn source(&self) -> &RuntimeCertificationAuthorizationErrorV2 {
+        &self.source
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        RuntimePreparedCertificationV2<P>,
+        RuntimeCertificationAuthorizationErrorV2,
+    ) {
+        (*self.prepared, self.source)
+    }
+}
+
+impl<P> Debug for RuntimeCertificationBarrierBCompletionFailureV2<P> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeCertificationBarrierBCompletionFailureV2(<redacted>)")
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeCertificationAuthorizationErrorV2 {
+    #[error("runtime certification Barrier B identifier does not match")]
+    BarrierIdMismatch,
+    #[error("runtime certification Barrier B paused gateway evidence does not match")]
+    PausedGatewayMismatch,
+    #[error("runtime certification Barrier B resumed gateway evidence does not match")]
+    ResumedGatewayMismatch,
     #[error("runtime certification request canonicalization failed")]
     Canonical(#[from] automation_runtime_controller::RuntimeCertificationCanonicalErrorV2),
 }
 
-pub struct RuntimeCertificationCommitAuthorityV2 {
+struct RuntimeCertificationCommitAuthorityV2 {
     _private: (),
-}
-
-impl RuntimeCertificationCommitAuthorityV2 {
-    #[allow(dead_code)]
-    pub(crate) fn from_barrier_completion_v2() -> Self {
-        Self { _private: () }
-    }
 }
 
 impl Debug for RuntimeCertificationCommitAuthorityV2 {
@@ -539,6 +648,10 @@ impl<P> RuntimeCertificationFinalizerJobV2<P>
 where
     P: RuntimePreparedLiveCertificationPortV2 + Send,
 {
+    pub fn into_registration(self) -> RuntimeCertificationFinalizerRegistrationV2<P> {
+        RuntimeCertificationFinalizerRegistrationV2 { job: self }
+    }
+
     pub fn request(&self) -> &RuntimeCertificationRequestV2 {
         self.authorized.request()
     }

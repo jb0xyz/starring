@@ -25,7 +25,7 @@ pub use certification_finalization::{
     RuntimeAbortErrorV2, RuntimeAbortRecoveryPortV2, RuntimeAuthorizedCertificationRequestV2,
     RuntimeCertificationAbortOutcomeV2, RuntimeCertificationAbortRecoveryResultV2,
     RuntimeCertificationAbortRecoveryV2, RuntimeCertificationAuthorizationErrorV2,
-    RuntimeCertificationCommitAuthorityV2, RuntimeCertificationCommitResultV2,
+    RuntimeCertificationBarrierBCompletionFailureV2, RuntimeCertificationCommitResultV2,
     RuntimeCertificationFinalizationOutcomeV2, RuntimeCertificationFinalizerJobV2,
     RuntimeCertificationFinalizerPortV2, RuntimeCertificationFinalizerRegistrationV2,
     RuntimeCertificationFinalizerRejectionV2, RuntimeCertificationLookupOnlyRecoveryV2,
@@ -35,9 +35,10 @@ pub use certification_finalization::{
     RuntimeCertificationReservationProposalV2, RuntimeCheckedCertificationReservationObservationV2,
     RuntimeCheckedCertificationReservationOutcomeV2, RuntimeCommitCompletionErrorV2,
     RuntimeCommitRecoveryPortV2, RuntimeCommittedCertificationV2,
-    RuntimeDefinitelyRolledBackCertificationV2, RuntimeLiveCertificationPortV2,
-    RuntimePreparedCertificationV2, RuntimePreparedLiveCertificationPortV2,
-    RuntimeRejectedCommittedCertificationV2, RuntimeReservedCertificationV2,
+    RuntimeCompletedCertificationBarrierBV2, RuntimeDefinitelyRolledBackCertificationV2,
+    RuntimeLiveCertificationPortV2, RuntimePreparedCertificationV2,
+    RuntimePreparedLiveCertificationPortV2, RuntimeRejectedCommittedCertificationV2,
+    RuntimeReservedCertificationV2,
 };
 pub use certification_reservation::RuntimeCertificationReservationPortV2;
 pub use closed_recovery::{

@@ -241,13 +241,47 @@ fn certification_finalization_is_session_bound_linear_and_lookup_only_after_unkn
     assert!(source.contains(
         "RuntimeCertificationIntentReservationOutcomeV2::Diverged(\n                    RuntimeCertificationDivergenceV2::ReservationMismatch,"
     ));
-    assert!(
-        source.contains("pub struct RuntimeCertificationCommitAuthorityV2 {\n    _private: (),\n}")
-    );
-    assert!(source.contains("pub(crate) fn from_barrier_completion_v2() -> Self"));
+    assert!(source.contains("struct RuntimeCertificationCommitAuthorityV2 {\n    _private: (),\n}"));
+    assert!(!source.contains("from_barrier_completion_v2"));
     assert!(source.contains(
-        "pub fn authorize_finalization(\n        self,\n        authority: RuntimeCertificationCommitAuthorityV2,"
+        "pub fn complete_barrier_b_v2(\n        self,\n        barrier_id: RuntimeBarrierIdV1,\n        paused_gateway: RuntimePausedGatewayObservationV2,\n        route_admission: RuntimeRouteAdmissionAttestationV2,"
     ));
+    assert!(source.contains("fn canonicalize_barrier_b_completion_v2<P>("));
+    for exact_check in [
+        "paused_gateway.process_instance_id() != &intent.process_identity.process_instance_id",
+        "&route_admission.barrier_id != barrier_id",
+        "route_admission.pause.coordinator_generation.get()",
+        "route_admission.pause.connection_epoch != paused_gateway.connection_epoch()",
+        "route_admission.pause.paused_admission_revision != paused_gateway.admission_revision()",
+        "route_admission.pause.pause_sequence != paused_gateway.transition_sequence()",
+        "route_admission.gateway.kind != RuntimeGatewayReadyKindV2::Resumed",
+        "route_admission.gateway.connected_event_sequence",
+        "RuntimeLiveAttestationRecordV2::from_request(request)?",
+        ".bind_live_record(record)",
+    ] {
+        assert!(source.contains(exact_check), "{exact_check}");
+    }
+    assert!(source.contains(
+        "pub struct RuntimeCompletedCertificationBarrierBV2<P> {\n    prepared: P,\n    canonical: RuntimeCanonicalLiveAttestationV2,\n}"
+    ));
+    assert!(source.contains(
+        "pub fn authorize_finalization(self) -> RuntimeCertificationFinalizerRegistrationV2<P>"
+    ));
+    assert!(source.contains(
+        "pub fn into_registration(self) -> RuntimeCertificationFinalizerRegistrationV2<P>"
+    ));
+    assert_eq!(
+        source
+            .matches("authority: RuntimeCertificationCommitAuthorityV2 { _private: () },")
+            .count(),
+        1
+    );
+    let prepared_impl = source
+        .split("impl<P> RuntimePreparedCertificationV2<P>")
+        .nth(1)
+        .and_then(|source| source.split("\n}\n\nfn canonicalize_barrier_b").next())
+        .unwrap();
+    assert!(!prepared_impl.contains("authorize_finalization"));
     assert!(source.contains(
         "pub struct RuntimeAuthorizedCertificationRequestV2 {\n    canonical: RuntimeCanonicalLiveAttestationV2,\n    authority: RuntimeCertificationCommitAuthorityV2,\n}"
     ));
@@ -262,6 +296,8 @@ fn certification_finalization_is_session_bound_linear_and_lookup_only_after_unkn
     for name in [
         "RuntimeReservedCertificationV2",
         "RuntimePreparedCertificationV2<P>",
+        "RuntimeCompletedCertificationBarrierBV2<P>",
+        "RuntimeCertificationBarrierBCompletionFailureV2<P>",
         "RuntimeCertificationCommitAuthorityV2",
         "RuntimeAuthorizedCertificationRequestV2",
         "RuntimeCertificationFinalizerRegistrationV2<P>",
