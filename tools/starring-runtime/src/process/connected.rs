@@ -180,6 +180,8 @@ impl RuntimeOwnerHeldProcessV1 {
         let operation_cutoff = self.foundation.startup_budget.operation_cutoff();
         let discord_cleanup_deadline = self.foundation.startup_budget.discord_cleanup_deadline();
         let interaction_dispatch = self.foundation.interaction_dispatch_port_v1();
+        let interaction_dispatch_status =
+            self.foundation.interaction_dispatch_status_publisher_v1();
         let gateway_config = self.foundation.config.gateway();
         let product_readiness = self.foundation.product_readiness_observer_v1();
         let mut shutdown = self.foundation.shutdown_observer_v1();
@@ -190,6 +192,7 @@ impl RuntimeOwnerHeldProcessV1 {
                 RuntimeDiscordProductionStartV1::new(
                     self.foundation.secrets.discord_bot_token(),
                     interaction_dispatch,
+                    interaction_dispatch_status,
                     gateway_config,
                     product_readiness,
                     operation_cutoff,

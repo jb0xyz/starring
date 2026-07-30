@@ -63,7 +63,9 @@ use crate::gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerEmergencyInvalidatorV1,
     RuntimeGatewayOwnerPreparedClosedRecoveryV2, RuntimeGatewayOwnerStartupWatchdogStartContextV1,
 };
-use crate::health::RuntimeHealthReadinessObserverV1;
+use crate::health::{
+    RuntimeHealthInteractionDispatchPublisherV1, RuntimeHealthReadinessObserverV1,
+};
 use crate::lifecycle_timing::RuntimeLifecycleTimingRecorderV2;
 use crate::process_supervisor::RuntimeProcessInvalidationTriggerV1;
 use crate::registry::{
@@ -1504,6 +1506,7 @@ enum RuntimeDiscordControlCommandV1 {
 pub(crate) struct RuntimeDiscordProductionStartV1<'a> {
     token: &'a RuntimeDiscordBotTokenV1,
     interaction_dispatch: RuntimeInteractionDispatchDatabasePortV1,
+    interaction_dispatch_status: RuntimeHealthInteractionDispatchPublisherV1,
     gateway_config: GatewayResourceConfigV1,
     product_readiness: RuntimeHealthReadinessObserverV1,
     operation_cutoff: Instant,
@@ -1514,6 +1517,7 @@ impl<'a> RuntimeDiscordProductionStartV1<'a> {
     pub(crate) fn new(
         token: &'a RuntimeDiscordBotTokenV1,
         interaction_dispatch: RuntimeInteractionDispatchDatabasePortV1,
+        interaction_dispatch_status: RuntimeHealthInteractionDispatchPublisherV1,
         gateway_config: GatewayResourceConfigV1,
         product_readiness: RuntimeHealthReadinessObserverV1,
         operation_cutoff: Instant,
@@ -1522,6 +1526,7 @@ impl<'a> RuntimeDiscordProductionStartV1<'a> {
         Self {
             token,
             interaction_dispatch,
+            interaction_dispatch_status,
             gateway_config,
             product_readiness,
             operation_cutoff,
@@ -2535,6 +2540,7 @@ impl RuntimeGatewayBootstrapV1 {
         let RuntimeDiscordProductionStartV1 {
             token,
             interaction_dispatch,
+            interaction_dispatch_status,
             gateway_config,
             product_readiness,
             operation_cutoff,
@@ -2554,6 +2560,7 @@ impl RuntimeGatewayBootstrapV1 {
             gateway_config,
             self.adapter.connection_observer.clone(),
             product_readiness,
+            interaction_dispatch_status,
         );
         let mut supervisor = start_runtime_discord_gateway_v1(
             driver,

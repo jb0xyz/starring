@@ -15,9 +15,9 @@ use crate::gateway::{
     runtime_gateway_shutdown_projection_confirmed_v2, RuntimeGatewayShutdownHandleV1,
 };
 use crate::health::{
-    RuntimeHealthReadinessHandleV1, RuntimeHealthReadinessObserverV1,
-    RuntimeHealthReadinessPublisherV2, RuntimeHealthShutdownErrorV1, RuntimeHealthStartErrorV1,
-    RuntimeHealthSupervisorV1,
+    RuntimeHealthInteractionDispatchPublisherV1, RuntimeHealthReadinessHandleV1,
+    RuntimeHealthReadinessObserverV1, RuntimeHealthReadinessPublisherV2,
+    RuntimeHealthShutdownErrorV1, RuntimeHealthStartErrorV1, RuntimeHealthSupervisorV1,
 };
 use crate::ingress_acknowledgement_supervisor::{
     RuntimeIngressAcknowledgementShutdownHandleV2, RuntimeIngressAcknowledgementSupervisorExitV2,
@@ -279,6 +279,15 @@ impl RuntimeProcessRootSupervisorV1 {
             .as_ref()
             .expect("runtime health supervisor")
             .readiness_observer_v1()
+    }
+
+    pub(crate) fn interaction_dispatch_publisher_v1(
+        &self,
+    ) -> RuntimeHealthInteractionDispatchPublisherV1 {
+        self.health
+            .as_ref()
+            .expect("runtime health supervisor")
+            .interaction_dispatch_publisher_v1()
     }
 
     pub(crate) fn take_readiness_publisher_v2(

@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Formatter};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,6 +60,44 @@ pub(crate) struct RuntimeHealthReadinessObserverV1 {
     state: Arc<RuntimeHealthStateV1>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RuntimeHealthInteractionDispatchStatusV1 {
+    pub(crate) normalization_ignored: u64,
+    pub(crate) normalization_rejected: u64,
+    pub(crate) enqueued: u64,
+    pub(crate) completed: u64,
+    pub(crate) execution_failed: u64,
+    pub(crate) ignored: u64,
+    pub(crate) not_accepting: u64,
+    pub(crate) product_not_ready: u64,
+    pub(crate) route_rejected: u64,
+    pub(crate) gateway_not_ready: u64,
+    pub(crate) overloaded: u64,
+    pub(crate) admission_rejected: u64,
+    pub(crate) rejection_acknowledged: u64,
+    pub(crate) rejection_acknowledgement_failed: u64,
+    pub(crate) rejection_acknowledgement_timed_out: u64,
+    pub(crate) rejection_acknowledgement_dropped: u64,
+    pub(crate) dispatch_cancelled: u64,
+    pub(crate) rejection_acknowledgement_cancelled: u64,
+    pub(crate) in_flight: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeHealthInteractionDispatchPublisherV1 {
+    state: Arc<RuntimeHealthStateV1>,
+}
+
+impl RuntimeHealthInteractionDispatchPublisherV1 {
+    pub(crate) fn publish_v1(&self, status: RuntimeHealthInteractionDispatchStatusV1) {
+        *self
+            .state
+            .interaction_dispatch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
+    }
+}
+
 impl RuntimeHealthReadinessHandleV1 {
     pub(crate) fn seal_readiness(&self) {
         self.state.readiness_sealed.store(true, Ordering::Release);
@@ -101,6 +139,7 @@ struct RuntimeHealthStateV1 {
     live: AtomicBool,
     ready: AtomicBool,
     readiness_sealed: AtomicBool,
+    interaction_dispatch: Mutex<RuntimeHealthInteractionDispatchStatusV1>,
     stopped: watch::Sender<bool>,
 }
 
@@ -184,6 +223,7 @@ impl RuntimeHealthSupervisorV1 {
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
             readiness_sealed: AtomicBool::new(false),
+            interaction_dispatch: Mutex::new(RuntimeHealthInteractionDispatchStatusV1::default()),
             stopped,
         });
         let (stop, stop_receiver) = mpsc::channel(1);
@@ -211,6 +251,14 @@ impl RuntimeHealthSupervisorV1 {
 
     pub(crate) fn readiness_observer_v1(&self) -> RuntimeHealthReadinessObserverV1 {
         RuntimeHealthReadinessObserverV1 {
+            state: self.state.clone(),
+        }
+    }
+
+    pub(crate) fn interaction_dispatch_publisher_v1(
+        &self,
+    ) -> RuntimeHealthInteractionDispatchPublisherV1 {
+        RuntimeHealthInteractionDispatchPublisherV1 {
             state: self.state.clone(),
         }
     }
@@ -359,15 +407,16 @@ async fn handle_runtime_health_connection_v1(
             }
         }
         let response = runtime_health_response_v1(&bytes[..count], state);
-        connection.write_all(response).await?;
+        connection.write_all(&response).await?;
         connection.shutdown().await
     };
     let _ = timeout(RUNTIME_HEALTH_CONNECTION_TIMEOUT, request).await;
 }
 
-fn runtime_health_response_v1(request: &[u8], state: &RuntimeHealthStateV1) -> &'static [u8] {
+fn runtime_health_response_v1(request: &[u8], state: &RuntimeHealthStateV1) -> Vec<u8> {
     if !request.windows(4).any(|window| window == b"\r\n\r\n") {
-        return b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_found";
+        return b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_found"
+            .to_vec();
     }
     let request_line = request
         .windows(2)
@@ -380,9 +429,11 @@ fn runtime_health_response_v1(request: &[u8], state: &RuntimeHealthStateV1) -> &
                 || line == b"GET /health/live HTTP/1.0"
     ) {
         if state.live.load(Ordering::Acquire) {
-            return b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nlive";
+            return b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nlive"
+                .to_vec();
         }
-        return b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot_live";
+        return b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot_live"
+            .to_vec();
     }
     if matches!(
         request_line,
@@ -391,11 +442,61 @@ fn runtime_health_response_v1(request: &[u8], state: &RuntimeHealthStateV1) -> &
                 || line == b"GET /health/ready HTTP/1.0"
     ) {
         if state.ready.load(Ordering::Acquire) {
-            return b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nready";
+            return b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nready"
+                .to_vec();
         }
-        return b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_ready";
+        return b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_ready"
+            .to_vec();
     }
-    b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_found"
+    if matches!(
+        request_line,
+        Some(line)
+            if line == b"GET /health/interactions HTTP/1.1"
+                || line == b"GET /health/interactions HTTP/1.0"
+    ) {
+        let status = *state
+            .interaction_dispatch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let body = format!(
+            concat!(
+                "{{\"normalization_ignored\":{},\"normalization_rejected\":{},",
+                "\"enqueued\":{},\"completed\":{},\"execution_failed\":{},\"ignored\":{},",
+                "\"not_accepting\":{},\"product_not_ready\":{},\"route_rejected\":{},",
+                "\"gateway_not_ready\":{},\"overloaded\":{},\"admission_rejected\":{},",
+                "\"rejection_acknowledged\":{},\"rejection_acknowledgement_failed\":{},",
+                "\"rejection_acknowledgement_timed_out\":{},",
+                "\"rejection_acknowledgement_dropped\":{},\"dispatch_cancelled\":{},",
+                "\"rejection_acknowledgement_cancelled\":{},\"in_flight\":{}}}"
+            ),
+            status.normalization_ignored,
+            status.normalization_rejected,
+            status.enqueued,
+            status.completed,
+            status.execution_failed,
+            status.ignored,
+            status.not_accepting,
+            status.product_not_ready,
+            status.route_rejected,
+            status.gateway_not_ready,
+            status.overloaded,
+            status.admission_rejected,
+            status.rejection_acknowledged,
+            status.rejection_acknowledgement_failed,
+            status.rejection_acknowledgement_timed_out,
+            status.rejection_acknowledgement_dropped,
+            status.dispatch_cancelled,
+            status.rejection_acknowledgement_cancelled,
+            status.in_flight,
+        );
+        return format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes();
+    }
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_found".to_vec()
 }
 
 #[cfg(test)]
@@ -426,6 +527,7 @@ mod tests {
         let addr = supervisor.bound_addr();
         let publisher = supervisor.take_readiness_publisher_v2().unwrap();
         let observer = supervisor.readiness_observer_v1();
+        let interaction_dispatch = supervisor.interaction_dispatch_publisher_v1();
 
         assert!(supervisor.is_live());
         assert!(!supervisor.readiness_handle().is_ready());
@@ -436,6 +538,19 @@ mod tests {
         assert!(request(addr, "/health/ready")
             .await
             .starts_with("HTTP/1.1 503"));
+        interaction_dispatch.publish_v1(RuntimeHealthInteractionDispatchStatusV1 {
+            normalization_rejected: 2,
+            execution_failed: 3,
+            rejection_acknowledgement_failed: 5,
+            in_flight: 7,
+            ..RuntimeHealthInteractionDispatchStatusV1::default()
+        });
+        let interactions = request(addr, "/health/interactions").await;
+        assert!(interactions.starts_with("HTTP/1.1 200"));
+        assert!(interactions.contains("\"normalization_rejected\":2"));
+        assert!(interactions.contains("\"execution_failed\":3"));
+        assert!(interactions.contains("\"rejection_acknowledgement_failed\":5"));
+        assert!(interactions.contains("\"in_flight\":7"));
         assert!(request(addr, "/unknown").await.starts_with("HTTP/1.1 404"));
         assert_eq!(
             format!("{supervisor:?}"),
@@ -508,6 +623,7 @@ mod tests {
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
             readiness_sealed: AtomicBool::new(false),
+            interaction_dispatch: Mutex::new(RuntimeHealthInteractionDispatchStatusV1::default()),
             stopped,
         };
 
@@ -533,6 +649,7 @@ mod tests {
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
             readiness_sealed: AtomicBool::new(false),
+            interaction_dispatch: Mutex::new(RuntimeHealthInteractionDispatchStatusV1::default()),
             stopped,
         });
         let publisher = RuntimeHealthReadinessPublisherV2 {
@@ -569,6 +686,9 @@ mod tests {
                 live: AtomicBool::new(true),
                 ready: AtomicBool::new(false),
                 readiness_sealed: AtomicBool::new(false),
+                interaction_dispatch: Mutex::new(
+                    RuntimeHealthInteractionDispatchStatusV1::default(),
+                ),
                 stopped,
             });
             let publisher = RuntimeHealthReadinessPublisherV2 {

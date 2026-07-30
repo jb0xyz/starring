@@ -22,7 +22,10 @@ use crate::discord_interaction_normalizer::{
     RuntimeDiscordInteractionNormalizationErrorV1, RuntimeDiscordInteractionNormalizationOutcomeV1,
     ZeroizingPinnedDiscordInteractionV1,
 };
-use crate::health::RuntimeHealthReadinessObserverV1;
+use crate::health::{
+    RuntimeHealthInteractionDispatchPublisherV1, RuntimeHealthInteractionDispatchStatusV1,
+    RuntimeHealthReadinessObserverV1,
+};
 use crate::GatewayResourceConfigV1;
 
 pub(crate) type RuntimeInteractionDispatchFutureV1 =
@@ -115,6 +118,8 @@ enum RuntimeInteractionLaneStateV1 {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RuntimeInteractionDispatchReportV1 {
+    pub(crate) normalization_ignored: u64,
+    pub(crate) normalization_rejected: u64,
     pub(crate) enqueued: u64,
     pub(crate) completed: u64,
     pub(crate) execution_failed: u64,
@@ -179,6 +184,7 @@ where
     connection_observer: GatewayConnectionObserverV3,
     product_readiness: RuntimeHealthReadinessObserverV1,
     accepting_lease: Option<GatewayReadyLeaseV3>,
+    status: Option<RuntimeHealthInteractionDispatchPublisherV1>,
 }
 
 pub(crate) type RuntimeProductionDiscordInteractionActorLaneV1 =
@@ -189,12 +195,14 @@ pub(crate) fn compose_runtime_discord_interaction_actor_lane_v1(
     gateway: GatewayResourceConfigV1,
     connection_observer: GatewayConnectionObserverV3,
     product_readiness: RuntimeHealthReadinessObserverV1,
+    status: RuntimeHealthInteractionDispatchPublisherV1,
 ) -> RuntimeProductionDiscordInteractionActorLaneV1 {
-    RuntimeDiscordInteractionActorLaneV1::new_v1(
+    RuntimeDiscordInteractionActorLaneV1::new_observed_v1(
         port,
         gateway.rejection_acknowledgement_capacity(),
         connection_observer,
         product_readiness,
+        status,
     )
 }
 
@@ -208,11 +216,46 @@ where
         connection_observer: GatewayConnectionObserverV3,
         product_readiness: RuntimeHealthReadinessObserverV1,
     ) -> Self {
+        Self::new_with_status_v1(
+            port,
+            rejection_capacity,
+            connection_observer,
+            product_readiness,
+            None,
+        )
+    }
+
+    fn new_observed_v1(
+        port: P,
+        rejection_capacity: NonZeroUsize,
+        connection_observer: GatewayConnectionObserverV3,
+        product_readiness: RuntimeHealthReadinessObserverV1,
+        status: RuntimeHealthInteractionDispatchPublisherV1,
+    ) -> Self {
+        let actor = Self::new_with_status_v1(
+            port,
+            rejection_capacity,
+            connection_observer,
+            product_readiness,
+            Some(status),
+        );
+        actor.publish_status_v1();
+        actor
+    }
+
+    fn new_with_status_v1(
+        port: P,
+        rejection_capacity: NonZeroUsize,
+        connection_observer: GatewayConnectionObserverV3,
+        product_readiness: RuntimeHealthReadinessObserverV1,
+        status: Option<RuntimeHealthInteractionDispatchPublisherV1>,
+    ) -> Self {
         Self {
             lane: RuntimeDiscordInteractionDispatchLaneV1::new_v1(port, rejection_capacity),
             connection_observer,
             product_readiness,
             accepting_lease: None,
+            status,
         }
     }
 
@@ -258,7 +301,7 @@ where
         &mut self,
         interaction: Box<ZeroizingPinnedDiscordInteractionV1>,
     ) -> RuntimeDiscordInteractionActorHandlingOutcomeV1 {
-        match normalize_pinned_runtime_discord_interaction_v1(interaction) {
+        let outcome = match normalize_pinned_runtime_discord_interaction_v1(interaction) {
             RuntimeDiscordInteractionNormalizationOutcomeV1::Normalized(envelope) => {
                 let _ = self.reconcile_accepting_v1();
                 let ready_lease = self.current_ready_lease_v1();
@@ -276,16 +319,22 @@ where
                 ))
             }
             RuntimeDiscordInteractionNormalizationOutcomeV1::Ignored(reason) => {
+                self.lane.record_normalization_ignored_v1();
                 RuntimeDiscordInteractionActorHandlingOutcomeV1::Ignored(reason)
             }
             RuntimeDiscordInteractionNormalizationOutcomeV1::Rejected(error) => {
+                self.lane.record_normalization_rejected_v1();
                 RuntimeDiscordInteractionActorHandlingOutcomeV1::Rejected(error)
             }
-        }
+        };
+        self.publish_status_v1();
+        outcome
     }
 
     pub(crate) async fn poll_next_completion_v1(&mut self) -> RuntimeInteractionCompletionV1 {
-        self.lane.poll_next_completion_v1().await
+        let completion = self.lane.poll_next_completion_v1().await;
+        self.publish_status_v1();
+        completion
     }
 
     pub(crate) async fn pause_and_drain_until_v1(
@@ -293,7 +342,9 @@ where
         deadline: Instant,
     ) -> RuntimeInteractionDrainOutcomeV1 {
         self.accepting_lease = None;
-        self.lane.pause_and_drain_until_v1(deadline).await
+        let outcome = self.lane.pause_and_drain_until_v1(deadline).await;
+        self.publish_status_v1();
+        outcome
     }
 
     pub(crate) async fn seal_and_drain_until_v1(
@@ -301,12 +352,15 @@ where
         deadline: Instant,
     ) -> RuntimeInteractionDrainOutcomeV1 {
         self.accepting_lease = None;
-        self.lane.seal_and_drain_until_v1(deadline).await
+        let outcome = self.lane.seal_and_drain_until_v1(deadline).await;
+        self.publish_status_v1();
+        outcome
     }
 
     pub(crate) fn abort_v1(&mut self) {
         self.accepting_lease = None;
         self.lane.abort_v1();
+        self.publish_status_v1();
     }
 
     fn current_ready_lease_v1(&self) -> Option<GatewayReadyLeaseV3> {
@@ -315,6 +369,34 @@ where
             .current_connection()
             .current_epoch()?;
         self.connection_observer.issue_ready_lease(epoch).ok()
+    }
+
+    fn publish_status_v1(&self) {
+        let Some(status) = self.status.as_ref() else {
+            return;
+        };
+        let report = self.lane.report_v1();
+        status.publish_v1(RuntimeHealthInteractionDispatchStatusV1 {
+            normalization_ignored: report.normalization_ignored,
+            normalization_rejected: report.normalization_rejected,
+            enqueued: report.enqueued,
+            completed: report.completed,
+            execution_failed: report.execution_failed,
+            ignored: report.ignored,
+            not_accepting: report.not_accepting,
+            product_not_ready: report.product_not_ready,
+            route_rejected: report.route_rejected,
+            gateway_not_ready: report.gateway_not_ready,
+            overloaded: report.overloaded,
+            admission_rejected: report.admission_rejected,
+            rejection_acknowledged: report.rejection_acknowledged,
+            rejection_acknowledgement_failed: report.rejection_acknowledgement_failed,
+            rejection_acknowledgement_timed_out: report.rejection_acknowledgement_timed_out,
+            rejection_acknowledgement_dropped: report.rejection_acknowledgement_dropped,
+            dispatch_cancelled: report.dispatch_cancelled,
+            rejection_acknowledgement_cancelled: report.rejection_acknowledgement_cancelled,
+            in_flight: self.lane.in_flight_count_v1(),
+        });
     }
 }
 
@@ -403,8 +485,20 @@ where
         !self.dispatches.is_empty() || !self.rejections.is_empty()
     }
 
+    fn in_flight_count_v1(&self) -> u64 {
+        (self.dispatches.len() as u64).saturating_add(self.rejections.len() as u64)
+    }
+
     pub(crate) fn report_v1(&self) -> RuntimeInteractionDispatchReportV1 {
         self.report
+    }
+
+    fn record_normalization_ignored_v1(&mut self) {
+        increment_v1(&mut self.report.normalization_ignored);
+    }
+
+    fn record_normalization_rejected_v1(&mut self) {
+        increment_v1(&mut self.report.normalization_rejected);
     }
 
     fn is_accepting_v1(&self) -> bool {

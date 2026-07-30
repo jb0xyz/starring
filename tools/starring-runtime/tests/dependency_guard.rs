@@ -762,6 +762,7 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
     let lane = source_before_test_module(include_str!("../src/runtime_interaction_dispatch.rs"));
     let normalizer =
         source_before_test_module(include_str!("../src/discord_interaction_normalizer.rs"));
+    let health = source_before_test_module(include_str!("../src/health.rs"));
     let database = source_before_test_module(include_str!("../src/database.rs"));
     let facade = source_before_test_module(include_str!(
         "../../../crates/automation-runtime/src/shared_gateway_dispatcher.rs"
@@ -780,6 +781,7 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
         "compose_runtime_discord_interaction_actor_lane_v1(",
         "connection_observer: GatewayConnectionObserverV3",
         "product_readiness: RuntimeHealthReadinessObserverV1",
+        "status: Option<RuntimeHealthInteractionDispatchPublisherV1>",
         "accepting_lease: Option<GatewayReadyLeaseV3>",
         "pub(crate) fn reconcile_accepting_v1(",
         "pub(crate) fn handle_raw_interaction_v1(",
@@ -788,6 +790,12 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
         "fn seal_until_v1(",
         "RuntimeDiscordInteractionActorLaneV1::seal_and_drain_until_v1(self, deadline).await",
         "fn abort_v1(&mut self)",
+        "status.publish_v1(RuntimeHealthInteractionDispatchStatusV1 {",
+        "normalization_ignored: report.normalization_ignored",
+        "normalization_rejected: report.normalization_rejected",
+        "execution_failed: report.execution_failed",
+        "rejection_acknowledgement_failed: report.rejection_acknowledgement_failed",
+        "in_flight: self.lane.in_flight_count_v1()",
         ".current_connection()",
         ".current_epoch()?",
         "self.connection_observer.issue_ready_lease(epoch).ok()",
@@ -819,6 +827,17 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
         "pub(crate) fn normalize_pinned_runtime_discord_interaction_v1(",
     ] {
         assert!(normalizer.contains(required), "{required}");
+    }
+    for required in [
+        "RuntimeHealthInteractionDispatchStatusV1",
+        "RuntimeHealthInteractionDispatchPublisherV1",
+        "GET /health/interactions HTTP/1.1",
+        "\\\"normalization_rejected\\\":{}",
+        "\\\"execution_failed\\\":{}",
+        "\\\"rejection_acknowledgement_failed\\\":{}",
+        "\\\"in_flight\\\":{}",
+    ] {
+        assert!(health.contains(required), "{required}");
     }
     let enqueue = braced_declaration(lane, "pub(crate) fn try_enqueue_v1<F>(");
     let readiness_checks = enqueue
@@ -2805,6 +2824,7 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         ".begin_discord_drain_until_v1(discord_cleanup_deadline)",
         "foundation.finish_shutdown_v1(cleanup_deadline).await",
         "self.foundation.interaction_dispatch_port_v1()",
+        "self.foundation.interaction_dispatch_status_publisher_v1()",
         "self.foundation.product_readiness_observer_v1()",
         "self.foundation.config.gateway()",
     ] {

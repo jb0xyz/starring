@@ -16,7 +16,10 @@ use crate::database::{
     compose_runtime_database_dependencies_v1, RuntimeInteractionDispatchCompositionErrorV1,
     RuntimeInteractionDispatchDatabasePortV1,
 };
-use crate::health::{RuntimeHealthReadinessObserverV1, RuntimeHealthReadinessPublisherV2};
+use crate::health::{
+    RuntimeHealthInteractionDispatchPublisherV1, RuntimeHealthReadinessObserverV1,
+    RuntimeHealthReadinessPublisherV2,
+};
 use crate::ingress_acknowledgement_supervisor::{
     RuntimeIngressAcknowledgementSupervisorConfigV2, RuntimeIngressAcknowledgementSupervisorExitV2,
     RuntimeIngressAcknowledgementSupervisorV2, RuntimeWorkerIngressAcknowledgementJobV2,
@@ -424,6 +427,12 @@ impl RuntimeProcessFoundationV1 {
 
     pub(super) fn interaction_dispatch_port_v1(&self) -> RuntimeInteractionDispatchDatabasePortV1 {
         self.interaction_dispatch_port.clone()
+    }
+
+    pub(super) fn interaction_dispatch_status_publisher_v1(
+        &self,
+    ) -> RuntimeHealthInteractionDispatchPublisherV1 {
+        self.root_supervisor.interaction_dispatch_publisher_v1()
     }
 
     pub(super) fn trip_shutdown_v1(
