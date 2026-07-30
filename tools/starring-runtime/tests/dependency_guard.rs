@@ -5702,6 +5702,115 @@ fn staged_registry_port_is_process_bound_owned_and_fail_closed() {
 }
 
 #[test]
+fn barrier_b_registry_activation_is_linear_exact_and_token_sealed() {
+    let registry = source_before_test_module(include_str!("../src/registry.rs"));
+
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryBarrierBServingAuthorityV2 {\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "    token: SlotMutationTokenV1,\n",
+        "    route: SlotRouteWitnessV1,\n",
+        "    activation_sequence: NonZeroU64,\n",
+        "    emergency: RuntimeRegistryEmergencyTriggerV2,\n",
+        "    armed: bool,\n",
+        "}"
+    )));
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryBarrierBActivationEvidenceV2 {\n",
+        "    outcome: RuntimeRegistryBarrierBActivationOutcomeV2,\n",
+        "    route: SlotRouteWitnessV1,\n",
+        "    activation_sequence: NonZeroU64,\n",
+        "    active_interactions: u32,\n",
+        "    admission_generation: NonZeroU64,\n",
+        "    slot_observation_sequence: NonZeroU64,\n",
+        "}"
+    )));
+    for authority in [
+        "RuntimeRegistryBarrierBActivationV2",
+        "RuntimeRegistryBarrierBServingAuthorityV2",
+    ] {
+        assert!(!contains_identifier(
+            declaration_attribute_block(registry, authority),
+            "Clone"
+        ));
+        assert!(!implements_trait(registry, authority, "Clone"));
+    }
+    let replacement = braced_declaration(registry, "impl RuntimeRegistryReplacementRouteV2");
+    let activate = braced_declaration(replacement, "pub(crate) fn activate_barrier_b_v2(");
+    for required in [
+        "self,",
+        "let expected_identity = self.identity",
+        ".state\n            .into_inner()",
+        "RuntimeRegistryPredecessorStateV2::Removed { .. }",
+        "state.staged.identity != expected_identity",
+        "activate_barrier_b_staged_route_v2(state.staged)",
+    ] {
+        assert!(activate.contains(required), "{required}");
+    }
+    let activation = braced_declaration(registry, "fn activate_barrier_b_staged_route_v2(");
+    let candidate = activation
+        .find("validate_barrier_b_activation_candidate_v2")
+        .unwrap();
+    let registry_activation = activation
+        .find(".activate_with_sequence_v2(token, &staged.identity)")
+        .unwrap();
+    let exact_route = activation.find("let exact_route = staged").unwrap();
+    let authority_route = activation
+        .find("let route = evidence.route.clone()")
+        .unwrap();
+    let take_token = activation.find(".token\n        .take()").unwrap();
+    assert!(
+        candidate < registry_activation
+            && registry_activation < exact_route
+            && exact_route < authority_route
+            && authority_route < take_token
+    );
+    for required in [
+        "SlotActivationOutcomeV1::Activated",
+        "SlotActivationOutcomeV1::AlreadyServing",
+        "route.identity != staged_route.identity",
+        "route.fencing_token != staged_route.fencing_token",
+        "route.incarnation != staged_route.incarnation",
+        "route.lifecycle != SlotLifecycleV1::Serving",
+        "atomic.admission_state != SlotAdmissionStateV2::Serving",
+        "exact_route != *route || exact_atomic != *atomic",
+        "let registry = staged.registry.clone()",
+        "let route = evidence.route.clone()",
+        "let activation_sequence = evidence.activation_sequence",
+        "let emergency = staged.emergency.clone()",
+        "token,",
+    ] {
+        assert!(activation.contains(required), "{required}");
+    }
+    let authority = braced_declaration(registry, "impl RuntimeRegistryBarrierBServingAuthorityV2");
+    assert!(authority.contains("pub(crate) fn ensure_exact_serving_v2("));
+    assert!(authority.contains("activation.outcome() != SlotActivationOutcomeV1::AlreadyServing"));
+    for forbidden in [
+        "fn token",
+        "fn into_token",
+        "-> &SlotMutationTokenV1",
+        "-> SlotMutationTokenV1",
+    ] {
+        assert!(!authority.contains(forbidden), "{forbidden}");
+    }
+    let authority_drop = braced_declaration(
+        registry,
+        "impl Drop for RuntimeRegistryBarrierBServingAuthorityV2",
+    );
+    assert!(authority_drop.contains("if self.armed"));
+    assert!(authority_drop.contains("self.emergency.trip_v2()"));
+    for redacted in [
+        "RuntimeRegistryBarrierBActivationV2",
+        "RuntimeRegistryBarrierBServingAuthorityV2",
+        "RuntimeRegistryBarrierBActivationEvidenceV2",
+    ] {
+        let debug = braced_declaration(registry, &format!("impl Debug for {redacted}"));
+        assert!(debug.contains(&format!("{redacted}(<redacted>)")));
+        assert!(!debug.contains("self.token"));
+    }
+}
+
+#[test]
 fn database_composition_is_five_pool_function_only_and_fail_closed() {
     let sources = source_files();
     let database = sources

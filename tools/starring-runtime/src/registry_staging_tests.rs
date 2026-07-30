@@ -9,6 +9,8 @@ use serde_json::json;
 
 use super::{
     complete_staged_install_v2, compose_runtime_registry_bootstrap_v1,
+    RuntimeRegistryBarrierBActivationErrorV2, RuntimeRegistryBarrierBActivationOutcomeV2,
+    RuntimeRegistryBarrierBActivationV2, RuntimeRegistryBarrierBServingAuthorityV2,
     RuntimeRegistryEmergencyTriggerV2, RuntimeRegistryServingBindingV2,
     RuntimeRegistryStagedInstallOutcomeV2, RuntimeRegistryStagedInstallV2,
     RuntimeRegistryStagedRouteV2, RuntimeRegistryStagingErrorV2, RuntimeRegistryStagingPortV2,
@@ -101,6 +103,8 @@ fn staging_port_is_clone_send_sync_and_install_authority_is_send() {
     assert_port::<RuntimeRegistryStagingPortV2>();
     assert_authority::<RuntimeRegistryStagedInstallV2>();
     assert_authority::<RuntimeRegistryStagedRouteV2>();
+    assert_authority::<RuntimeRegistryBarrierBActivationV2>();
+    assert_authority::<RuntimeRegistryBarrierBServingAuthorityV2>();
 }
 
 #[test]
@@ -396,4 +400,193 @@ fn witness_failure_drops_authority_and_removes_the_installed_route() {
         Err(ServingSlotRegistryError::StaleMutationToken)
     );
     assert_eq!(trips.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn barrier_b_activation_returns_exact_evidence_and_linear_serving_authority() {
+    let (port, registry) = staging_port("runtime-process:barrier-b");
+    let route = route("runtime-process:barrier-b");
+    let (emergency, trips) = emergency();
+    let replacement = authority(
+        port.install_staged_route_v2(route.clone(), fence(1), emergency)
+            .unwrap(),
+    )
+    .into_replacement_v2();
+    replacement
+        .transition_predecessor_to_draining_v2(None)
+        .unwrap();
+    replacement.remove_drained_predecessor_v2().unwrap();
+
+    let activation = replacement.activate_barrier_b_v2().unwrap();
+
+    assert_eq!(
+        activation.evidence_v2().outcome_v2(),
+        RuntimeRegistryBarrierBActivationOutcomeV2::Activated
+    );
+    assert_eq!(activation.evidence_v2().identity_v2(), route.identity());
+    assert_eq!(activation.evidence_v2().fencing_token_v2(), fence(1));
+    assert_eq!(activation.evidence_v2().active_interactions_v2(), 0);
+    assert_eq!(
+        format!("{activation:?}"),
+        "RuntimeRegistryBarrierBActivationV2(<redacted>)"
+    );
+    let (evidence, mut authority) = activation.into_parts_v2();
+    assert_eq!(authority.identity_v2(), evidence.identity_v2());
+    assert_eq!(authority.fencing_token_v2(), evidence.fencing_token_v2());
+    assert_eq!(
+        authority.route_incarnation_v2(),
+        evidence.route_incarnation_v2()
+    );
+    assert_eq!(
+        authority.activation_sequence_v2(),
+        evidence.activation_sequence_v2()
+    );
+    assert!(evidence.admission_generation_v2().get() > 0);
+    assert!(evidence.slot_observation_sequence_v2().get() > 0);
+    assert_eq!(
+        format!("{authority:?}"),
+        "RuntimeRegistryBarrierBServingAuthorityV2(<redacted>)"
+    );
+    authority.ensure_exact_serving_v2().unwrap();
+    registry.begin_drain(&authority.token).unwrap();
+    registry.remove(&authority.token).unwrap();
+    authority.armed = false;
+    drop(authority);
+    assert_eq!(trips.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn barrier_b_rejects_non_final_predecessor_and_drop_cleans_the_staged_route() {
+    let (port, registry) = staging_port("runtime-process:barrier-b-not-final");
+    let route = route("runtime-process:barrier-b-not-final");
+    let (emergency, trips) = emergency();
+    let staged = authority(
+        port.install_staged_route_v2(route, fence(1), emergency)
+            .unwrap(),
+    );
+    let token = staged.token.as_ref().unwrap().clone();
+    let replacement = staged.into_replacement_v2();
+    replacement
+        .transition_predecessor_to_draining_v2(None)
+        .unwrap();
+
+    assert!(matches!(
+        replacement.activate_barrier_b_v2(),
+        Err(RuntimeRegistryBarrierBActivationErrorV2::PredecessorNotFinal)
+    ));
+    assert_eq!(
+        registry.route_witness(&token),
+        Err(ServingSlotRegistryError::StaleMutationToken)
+    );
+    assert_eq!(trips.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn barrier_b_accepts_only_the_exact_already_serving_replay() {
+    let (port, registry) = staging_port("runtime-process:barrier-b-replay");
+    let route = route("runtime-process:barrier-b-replay");
+    let (emergency, trips) = emergency();
+    let replacement = authority(
+        port.install_staged_route_v2(route.clone(), fence(1), emergency)
+            .unwrap(),
+    )
+    .into_replacement_v2();
+    replacement
+        .transition_predecessor_to_draining_v2(None)
+        .unwrap();
+    replacement.remove_drained_predecessor_v2().unwrap();
+    let token = replacement
+        .state
+        .lock()
+        .unwrap()
+        .staged
+        .token
+        .as_ref()
+        .unwrap()
+        .clone();
+    registry.activate(&token, route.identity()).unwrap();
+
+    let (evidence, mut authority) = replacement.activate_barrier_b_v2().unwrap().into_parts_v2();
+
+    assert_eq!(
+        evidence.outcome_v2(),
+        RuntimeRegistryBarrierBActivationOutcomeV2::AlreadyServing
+    );
+    assert_eq!(
+        registry.route_witness(&token).unwrap().incarnation,
+        evidence.route_incarnation_v2()
+    );
+    authority.ensure_exact_serving_v2().unwrap();
+    registry.begin_drain(&authority.token).unwrap();
+    registry.remove(&authority.token).unwrap();
+    authority.armed = false;
+    drop(authority);
+    assert_eq!(trips.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn barrier_b_activation_failure_preserves_emergency_cleanup() {
+    let (port, registry) = staging_port("runtime-process:barrier-b-failure");
+    let route = route("runtime-process:barrier-b-failure");
+    let (emergency, trips) = emergency();
+    let replacement = authority(
+        port.install_staged_route_v2(route.clone(), fence(1), emergency)
+            .unwrap(),
+    )
+    .into_replacement_v2();
+    replacement
+        .transition_predecessor_to_draining_v2(None)
+        .unwrap();
+    replacement.remove_drained_predecessor_v2().unwrap();
+    let token = replacement
+        .state
+        .lock()
+        .unwrap()
+        .staged
+        .token
+        .as_ref()
+        .unwrap()
+        .clone();
+    registry.activate(&token, route.identity()).unwrap();
+    registry.begin_drain(&token).unwrap();
+
+    assert!(matches!(
+        replacement.activate_barrier_b_v2(),
+        Err(RuntimeRegistryBarrierBActivationErrorV2::StagedAuthorityInvalid)
+    ));
+    assert_eq!(
+        registry.route_witness(&token),
+        Err(ServingSlotRegistryError::StaleMutationToken)
+    );
+    assert_eq!(trips.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn serving_authority_detects_exact_route_loss_and_drop_trips_emergency() {
+    let (port, registry) = staging_port("runtime-process:barrier-b-loss");
+    let route = route("runtime-process:barrier-b-loss");
+    let (emergency, trips) = emergency();
+    let replacement = authority(
+        port.install_staged_route_v2(route, fence(1), emergency)
+            .unwrap(),
+    )
+    .into_replacement_v2();
+    replacement
+        .transition_predecessor_to_draining_v2(None)
+        .unwrap();
+    replacement.remove_drained_predecessor_v2().unwrap();
+    let (_, authority) = replacement.activate_barrier_b_v2().unwrap().into_parts_v2();
+    registry.begin_drain(&authority.token).unwrap();
+
+    assert_eq!(
+        authority.ensure_exact_serving_v2(),
+        Err(RuntimeRegistryBarrierBActivationErrorV2::ExactServingLost)
+    );
+    registry.remove(&authority.token).unwrap();
+    assert_eq!(
+        authority.ensure_exact_serving_v2(),
+        Err(RuntimeRegistryBarrierBActivationErrorV2::ExactServingLost)
+    );
+    drop(authority);
+    assert_eq!(trips.load(Ordering::SeqCst), 1);
 }

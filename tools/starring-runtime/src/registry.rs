@@ -8,8 +8,9 @@ use automation_runtime_registry::{
     ExactServingRouteV1, RegistryEmptyRecoveryCursorV2, RegistryRecoveryObservationGuardV2,
     RegistryRecoveryObservationV2, SealedEmptyRecoveryDrainClaimV2, ServingSlotKeyV1,
     ServingSlotRegistryConfigV1, ServingSlotRegistryError, ServingSlotRegistryV1,
-    SlotAdmissionStateV2, SlotAtomicObservationV2, SlotDrainOutcomeV1, SlotInstallOutcomeV1,
-    SlotLifecycleV1, SlotMutationTokenV1, SlotRemovalOutcomeV1, SlotRouteWitnessV1, SlotSealKeyV2,
+    SlotActivationOutcomeV1, SlotAdmissionStateV2, SlotAtomicObservationV2, SlotDrainOutcomeV1,
+    SlotInstallOutcomeV1, SlotLifecycleV1, SlotMutationTokenV1, SlotRemovalOutcomeV1,
+    SlotRouteWitnessV1, SlotSealKeyV2,
 };
 use automation_runtime_worker::{
     accept_runtime_registry_recovery_empty_observation_v2, accept_runtime_route_set_observation_v2,
@@ -292,6 +293,40 @@ pub(crate) struct RuntimeRegistryReplacementRouteV2 {
     state: Mutex<RuntimeRegistryReplacementStateV2>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeRegistryBarrierBActivationV2 {
+    evidence: RuntimeRegistryBarrierBActivationEvidenceV2,
+    authority: RuntimeRegistryBarrierBServingAuthorityV2,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeRegistryBarrierBServingAuthorityV2 {
+    registry: ServingSlotRegistryV1,
+    token: SlotMutationTokenV1,
+    route: SlotRouteWitnessV1,
+    activation_sequence: NonZeroU64,
+    emergency: RuntimeRegistryEmergencyTriggerV2,
+    armed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RuntimeRegistryBarrierBActivationOutcomeV2 {
+    Activated,
+    AlreadyServing,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeRegistryBarrierBActivationEvidenceV2 {
+    outcome: RuntimeRegistryBarrierBActivationOutcomeV2,
+    route: SlotRouteWitnessV1,
+    activation_sequence: NonZeroU64,
+    active_interactions: u32,
+    admission_generation: NonZeroU64,
+    slot_observation_sequence: NonZeroU64,
+}
+
 struct RuntimeRegistryReplacementStateV2 {
     staged: RuntimeRegistryStagedRouteV2,
     predecessor: RuntimeRegistryPredecessorStateV2,
@@ -352,6 +387,23 @@ pub(crate) enum RuntimeRegistryPredecessorReplacementErrorV2 {
     Registry(ServingSlotRegistryError),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RuntimeRegistryBarrierBActivationErrorV2 {
+    #[error("runtime registry predecessor replacement is not final")]
+    PredecessorNotFinal,
+    #[error("runtime Barrier B staged route authority is invalid")]
+    StagedAuthorityInvalid,
+    #[error("runtime Barrier B activation evidence is inconsistent")]
+    EvidenceMismatch,
+    #[error("runtime Barrier B serving authority no longer identifies the exact serving route")]
+    ExactServingLost,
+    #[error("runtime Barrier B replacement state is unavailable")]
+    StateUnavailable,
+    #[error("runtime Barrier B registry operation failed")]
+    Registry(ServingSlotRegistryError),
+}
+
 pub(crate) struct RuntimeRegistryStagedInstallV2 {
     outcome: RuntimeRegistryStagedInstallOutcomeV2,
     evidence: RuntimeRegistryStagedInstallEvidenceV2,
@@ -383,6 +435,120 @@ impl RuntimeRegistryStagedInstallEvidenceV2 {
         &self,
     ) -> RuntimeRegistryGlobalObservationSequenceV2 {
         self.registry_observation_sequence
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeRegistryBarrierBActivationEvidenceV2 {
+    pub(crate) fn outcome_v2(&self) -> RuntimeRegistryBarrierBActivationOutcomeV2 {
+        self.outcome
+    }
+
+    pub(crate) fn identity_v2(&self) -> &RuntimeProcessIdentityV1 {
+        &self.route.identity
+    }
+
+    pub(crate) fn fencing_token_v2(&self) -> FencingToken {
+        self.route.fencing_token
+    }
+
+    pub(crate) fn route_incarnation_v2(&self) -> NonZeroU64 {
+        self.route.incarnation
+    }
+
+    pub(crate) fn activation_sequence_v2(&self) -> NonZeroU64 {
+        self.activation_sequence
+    }
+
+    pub(crate) fn active_interactions_v2(&self) -> u32 {
+        self.active_interactions
+    }
+
+    pub(crate) fn admission_generation_v2(&self) -> NonZeroU64 {
+        self.admission_generation
+    }
+
+    pub(crate) fn slot_observation_sequence_v2(&self) -> NonZeroU64 {
+        self.slot_observation_sequence
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeRegistryBarrierBActivationV2 {
+    pub(crate) fn evidence_v2(&self) -> &RuntimeRegistryBarrierBActivationEvidenceV2 {
+        &self.evidence
+    }
+
+    pub(crate) fn into_parts_v2(
+        self,
+    ) -> (
+        RuntimeRegistryBarrierBActivationEvidenceV2,
+        RuntimeRegistryBarrierBServingAuthorityV2,
+    ) {
+        (self.evidence, self.authority)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeRegistryBarrierBServingAuthorityV2 {
+    pub(crate) fn identity_v2(&self) -> &RuntimeProcessIdentityV1 {
+        &self.route.identity
+    }
+
+    pub(crate) fn fencing_token_v2(&self) -> FencingToken {
+        self.route.fencing_token
+    }
+
+    pub(crate) fn route_incarnation_v2(&self) -> NonZeroU64 {
+        self.route.incarnation
+    }
+
+    pub(crate) fn activation_sequence_v2(&self) -> NonZeroU64 {
+        self.activation_sequence
+    }
+
+    pub(crate) fn ensure_exact_serving_v2(
+        &self,
+    ) -> Result<(), RuntimeRegistryBarrierBActivationErrorV2> {
+        let route = self
+            .registry
+            .route_witness(&self.token)
+            .map_err(map_barrier_b_serving_observation_error_v2)?;
+        let atomic = self
+            .registry
+            .atomic_observation_v2(self.token.key())
+            .map_err(map_barrier_b_serving_observation_error_v2)?
+            .ok_or(RuntimeRegistryBarrierBActivationErrorV2::ExactServingLost)?;
+        if route != self.route
+            || route.lifecycle != SlotLifecycleV1::Serving
+            || atomic.route.as_ref() != Some(&self.route)
+            || atomic.admission_state != SlotAdmissionStateV2::Serving
+        {
+            return Err(RuntimeRegistryBarrierBActivationErrorV2::ExactServingLost);
+        }
+        let activation = self
+            .registry
+            .activate_with_sequence_v2(&self.token, &self.route.identity)
+            .map_err(map_barrier_b_serving_observation_error_v2)?;
+        if activation.outcome() != SlotActivationOutcomeV1::AlreadyServing
+            || activation.route() != &self.route
+            || activation.activation_sequence() != self.activation_sequence
+        {
+            return Err(RuntimeRegistryBarrierBActivationErrorV2::ExactServingLost);
+        }
+        Ok(())
+    }
+}
+
+fn map_barrier_b_serving_observation_error_v2(
+    error: ServingSlotRegistryError,
+) -> RuntimeRegistryBarrierBActivationErrorV2 {
+    match error {
+        ServingSlotRegistryError::StaleMutationToken
+        | ServingSlotRegistryError::ActivationTargetMismatch => {
+            RuntimeRegistryBarrierBActivationErrorV2::ExactServingLost
+        }
+        error => RuntimeRegistryBarrierBActivationErrorV2::Registry(error),
     }
 }
 
@@ -798,6 +964,27 @@ impl RuntimeRegistryReplacementRouteV2 {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn activate_barrier_b_v2(
+        self,
+    ) -> Result<RuntimeRegistryBarrierBActivationV2, RuntimeRegistryBarrierBActivationErrorV2> {
+        let expected_identity = self.identity;
+        let state = self
+            .state
+            .into_inner()
+            .map_err(|_| RuntimeRegistryBarrierBActivationErrorV2::StateUnavailable)?;
+        if !matches!(
+            &state.predecessor,
+            RuntimeRegistryPredecessorStateV2::Removed { .. }
+        ) {
+            return Err(RuntimeRegistryBarrierBActivationErrorV2::PredecessorNotFinal);
+        }
+        if state.staged.identity != expected_identity {
+            return Err(RuntimeRegistryBarrierBActivationErrorV2::StagedAuthorityInvalid);
+        }
+        activate_barrier_b_staged_route_v2(state.staged)
+    }
+
     pub(crate) fn remove_v2(self) -> Result<(), RuntimeRegistryStagingErrorV2> {
         self.state
             .into_inner()
@@ -816,6 +1003,122 @@ impl RuntimeRegistryReplacementRouteV2 {
             .lock()
             .map_err(|_| RuntimeRegistryPredecessorReplacementErrorV2::StateUnavailable)
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn activate_barrier_b_staged_route_v2(
+    mut staged: RuntimeRegistryStagedRouteV2,
+) -> Result<RuntimeRegistryBarrierBActivationV2, RuntimeRegistryBarrierBActivationErrorV2> {
+    let token = staged
+        .token
+        .as_ref()
+        .ok_or(RuntimeRegistryBarrierBActivationErrorV2::StagedAuthorityInvalid)?;
+    let staged_route = staged
+        .registry
+        .route_witness(token)
+        .map_err(RuntimeRegistryBarrierBActivationErrorV2::Registry)?;
+    let staged_atomic = staged
+        .registry
+        .atomic_observation_v2(token.key())
+        .map_err(RuntimeRegistryBarrierBActivationErrorV2::Registry)?
+        .ok_or(RuntimeRegistryBarrierBActivationErrorV2::StagedAuthorityInvalid)?;
+    validate_barrier_b_activation_candidate_v2(&staged, &staged_route, &staged_atomic)?;
+    let activation = staged
+        .registry
+        .activate_with_sequence_v2(token, &staged.identity)
+        .map_err(RuntimeRegistryBarrierBActivationErrorV2::Registry)?;
+    let outcome = match activation.outcome() {
+        SlotActivationOutcomeV1::Activated => RuntimeRegistryBarrierBActivationOutcomeV2::Activated,
+        SlotActivationOutcomeV1::AlreadyServing => {
+            RuntimeRegistryBarrierBActivationOutcomeV2::AlreadyServing
+        }
+    };
+    if staged_route.lifecycle == SlotLifecycleV1::Serving
+        && outcome != RuntimeRegistryBarrierBActivationOutcomeV2::AlreadyServing
+    {
+        return Err(RuntimeRegistryBarrierBActivationErrorV2::EvidenceMismatch);
+    }
+    let route = activation.route();
+    let atomic = activation.observation();
+    if route.identity != staged_route.identity
+        || route.fencing_token != staged_route.fencing_token
+        || route.incarnation != staged_route.incarnation
+        || route.lifecycle != SlotLifecycleV1::Serving
+        || atomic.route.as_ref() != Some(route)
+        || atomic.admission_state != SlotAdmissionStateV2::Serving
+        || atomic.active_interactions != 0
+    {
+        return Err(RuntimeRegistryBarrierBActivationErrorV2::EvidenceMismatch);
+    }
+    let exact_route = staged
+        .registry
+        .route_witness(token)
+        .map_err(RuntimeRegistryBarrierBActivationErrorV2::Registry)?;
+    let exact_atomic = staged
+        .registry
+        .atomic_observation_v2(token.key())
+        .map_err(RuntimeRegistryBarrierBActivationErrorV2::Registry)?
+        .ok_or(RuntimeRegistryBarrierBActivationErrorV2::EvidenceMismatch)?;
+    if exact_route != *route || exact_atomic != *atomic {
+        return Err(RuntimeRegistryBarrierBActivationErrorV2::EvidenceMismatch);
+    }
+    let evidence = RuntimeRegistryBarrierBActivationEvidenceV2 {
+        outcome,
+        route: route.clone(),
+        activation_sequence: activation.activation_sequence(),
+        active_interactions: atomic.active_interactions,
+        admission_generation: atomic.admission_generation,
+        slot_observation_sequence: atomic.observation_sequence,
+    };
+    let registry = staged.registry.clone();
+    let route = evidence.route.clone();
+    let activation_sequence = evidence.activation_sequence;
+    let emergency = staged.emergency.clone();
+    let token = staged
+        .token
+        .take()
+        .ok_or(RuntimeRegistryBarrierBActivationErrorV2::StagedAuthorityInvalid)?;
+    let authority = RuntimeRegistryBarrierBServingAuthorityV2 {
+        registry,
+        token,
+        route,
+        activation_sequence,
+        emergency,
+        armed: true,
+    };
+    Ok(RuntimeRegistryBarrierBActivationV2 {
+        evidence,
+        authority,
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_barrier_b_activation_candidate_v2(
+    staged: &RuntimeRegistryStagedRouteV2,
+    route: &SlotRouteWitnessV1,
+    atomic: &SlotAtomicObservationV2,
+) -> Result<(), RuntimeRegistryBarrierBActivationErrorV2> {
+    let token = staged
+        .token
+        .as_ref()
+        .ok_or(RuntimeRegistryBarrierBActivationErrorV2::StagedAuthorityInvalid)?;
+    let expected_admission = match route.lifecycle {
+        SlotLifecycleV1::Staged => SlotAdmissionStateV2::Staged,
+        SlotLifecycleV1::Serving => SlotAdmissionStateV2::Serving,
+        SlotLifecycleV1::Draining => {
+            return Err(RuntimeRegistryBarrierBActivationErrorV2::StagedAuthorityInvalid);
+        }
+    };
+    if route.identity != staged.identity
+        || token.identity() != &staged.identity
+        || route.fencing_token != token.fencing_token()
+        || atomic.route.as_ref() != Some(route)
+        || atomic.admission_state != expected_admission
+        || atomic.active_interactions != 0
+    {
+        return Err(RuntimeRegistryBarrierBActivationErrorV2::StagedAuthorityInvalid);
+    }
+    Ok(())
 }
 
 fn replacement_transition_observation_v2(
@@ -896,9 +1199,35 @@ impl Drop for RuntimeRegistryStagedRouteV2 {
     }
 }
 
+impl Drop for RuntimeRegistryBarrierBServingAuthorityV2 {
+    fn drop(&mut self) {
+        if self.armed {
+            self.emergency.trip_v2();
+        }
+    }
+}
+
 impl Debug for RuntimeRegistryReplacementRouteV2 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeRegistryReplacementRouteV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRegistryBarrierBActivationV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryBarrierBActivationV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRegistryBarrierBServingAuthorityV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryBarrierBServingAuthorityV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRegistryBarrierBActivationEvidenceV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryBarrierBActivationEvidenceV2(<redacted>)")
     }
 }
 
