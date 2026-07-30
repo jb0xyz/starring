@@ -65,7 +65,9 @@ pub(super) async fn request_boundary(mut request: Request<Body>, next: Next) -> 
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response.headers_mut().insert(
         CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; base-uri 'none'"),
+        HeaderValue::from_static(
+            "default-src 'none'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+        ),
     );
     response
         .headers_mut()

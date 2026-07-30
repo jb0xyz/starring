@@ -1696,6 +1696,10 @@ async fn health_requires_exact_host_and_emits_security_headers() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        response.headers()["content-security-policy"],
+        "default-src 'none'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
+    );
     assert_eq!(response.headers()["x-content-type-options"], "nosniff");
     assert_eq!(
         response.headers()["strict-transport-security"],
