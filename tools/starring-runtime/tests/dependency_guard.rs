@@ -1640,6 +1640,70 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
 }
 
 #[test]
+fn certification_owner_freeze_thaw_is_linear_exact_and_fail_closed() {
+    let owner_supervisor = include_str!("../src/gateway_owner_startup_watchdog.rs");
+    for required in [
+        "RuntimeGatewayOwnerCertificationFreezeAuthorityV2",
+        "RuntimeGatewayOwnerCertificationFrozenObservationV2",
+        "RuntimeGatewayOwnerCertificationFrozenSupervisorV2",
+        "RuntimeGatewayOwnerSupervisorRoleV1::CertificationFrozen",
+        "RuntimeGatewayOwnerSupervisorCommandV1::FreezeCertification",
+        "RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification",
+        "pub(crate) fn prepare_certification_freeze_v2(\n        self,",
+        "owner: Option<Box<RuntimeGatewayOwnerProductionSupervisorV2>>",
+        "authority: RuntimeGatewayOwnerCertificationFrozenObservationV2",
+        "current.receipt().lease_id == expected.receipt().lease_id",
+        ".checked_add(1)\n            == Some(current.receipt().owner_revision.get())",
+        "current.receipt().database_now > expected.receipt().database_now",
+        "current.receipt().expires_at > expected.receipt().expires_at",
+        "force_production_renewal = false;",
+        "force_production_renewal = true;",
+        "let completion_deadline = self.cutoff.min(successor_deadline);",
+        ".wait_for_strict_successor_v2(previous_revision, completion_deadline)",
+        "RuntimeGatewayOwnerCertificationFreezeAuthorityV2(<redacted>)",
+        "RuntimeGatewayOwnerCertificationFrozenObservationV2(<redacted>)",
+        "RuntimeGatewayOwnerCertificationFrozenSupervisorV2(<redacted>)",
+    ] {
+        assert!(owner_supervisor.contains(required), "{required}");
+    }
+    assert_eq!(
+        owner_supervisor
+            .matches("timeout_at(TokioInstant::from_std(cutoff), acknowledgement)")
+            .count(),
+        2
+    );
+    assert_eq!(
+        owner_supervisor
+            .matches("wait_for_certification_freeze_terminal_until_v2")
+            .count(),
+        3
+    );
+    assert_eq!(
+        owner_supervisor
+            .matches("wait_for_certification_thaw_terminal_until_v2")
+            .count(),
+        3
+    );
+    for name in [
+        "RuntimeGatewayOwnerCertificationFreezeAuthorityV2",
+        "RuntimeGatewayOwnerCertificationFrozenObservationV2",
+        "RuntimeGatewayOwnerCertificationFrozenSupervisorV2",
+    ] {
+        let attributes = declaration_attribute_block(owner_supervisor, name);
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(owner_supervisor, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
 fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
     let sources = source_files();
     let gate = sources

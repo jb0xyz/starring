@@ -5797,6 +5797,41 @@ async fn process_activation_fixture_with_renew_steps(
     )
 }
 
+async fn certification_production_fixture(
+    renew_steps: impl IntoIterator<Item = FakeRenewStepV1>,
+    process_generation: NonZeroU64,
+) -> (
+    RuntimeGatewayOwnerProductionSupervisorV2,
+    FakePortV1,
+    Arc<AtomicBool>,
+    RuntimeGatewayOwnerLeaseReceiptV1,
+) {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture_with_renew_steps(
+        Duration::from_secs(2),
+        Duration::from_millis(1_200),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+        renew_steps,
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let mut process = frozen.try_into_process_frozen_v2().unwrap();
+    process
+        .start_production_renewal_in_place_v2()
+        .await
+        .unwrap();
+    (
+        process.try_into_production_v2().unwrap(),
+        port,
+        invalidated,
+        receipt,
+    )
+}
+
 #[tokio::test]
 async fn exact_process_activation_preserves_the_frozen_receipt_and_generation() {
     let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
@@ -6498,6 +6533,436 @@ async fn production_renewal_unknown_is_terminal_and_fail_closed() {
     );
     assert!(invalidated.load(Ordering::Acquire));
     assert_eq!(port.renew_calls(), 1);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn certification_freeze_queues_behind_inflight_renewal_and_stops_automatic_renewal() {
+    let gate = Arc::new(Notify::new());
+    let process_generation = NonZeroU64::new(61).unwrap();
+    let (production, port, invalidated, receipt) = certification_production_fixture(
+        [FakeRenewStepV1::Blocked(gate.clone())],
+        process_generation,
+    )
+    .await;
+    wait_for(|| port.renew_calls() == 1).await;
+    let cutoff = Instant::now() + Duration::from_millis(1_350);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let expected_revision = authority.expected_observation_v2().receipt().owner_revision;
+
+    assert_eq!(authority.process_generation_v2(), process_generation);
+    assert_eq!(authority.cutoff_v2(), cutoff);
+    assert_eq!(
+        format!("{authority:?}"),
+        "RuntimeGatewayOwnerCertificationFreezeAuthorityV2(<redacted>)"
+    );
+    let mut freezing = Box::pin(authority.freeze_v2());
+    tokio::select! {
+        biased;
+        result = &mut freezing => panic!("unexpected certification freeze result: {result:?}"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+
+    gate.notify_one();
+    let (frozen, observation) = freezing.await.unwrap();
+
+    assert_eq!(
+        observation.observation_v2().receipt().lease_id,
+        receipt.lease_id
+    );
+    assert_eq!(
+        observation.observation_v2().receipt().owner_revision.get(),
+        expected_revision.get() + 1
+    );
+    assert_eq!(observation.process_generation_v2(), process_generation);
+    assert_eq!(observation.cutoff_v2(), cutoff);
+    assert_eq!(frozen.frozen_observation_v2(), observation.observation_v2());
+    assert_eq!(frozen.process_generation_v2(), process_generation);
+    assert_eq!(frozen.cutoff_v2(), cutoff);
+    assert_eq!(
+        format!("{observation:?}"),
+        "RuntimeGatewayOwnerCertificationFrozenObservationV2(<redacted>)"
+    );
+    assert_eq!(
+        format!("{frozen:?}"),
+        "RuntimeGatewayOwnerCertificationFrozenSupervisorV2(<redacted>)"
+    );
+    sleep(Duration::from_millis(900)).await;
+    assert_eq!(port.renew_calls(), 1);
+    assert_eq!(
+        frozen.observe_current_v2().await.unwrap(),
+        *observation.observation_v2()
+    );
+    assert_eq!(frozen.terminal_status_v2(), None);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        frozen
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn certification_freeze_send_queue_stall_is_bounded_by_the_cutoff() {
+    let gate = Arc::new(Notify::new());
+    let process_generation = NonZeroU64::new(62).unwrap();
+    let (production, port, invalidated, _) = certification_production_fixture(
+        [FakeRenewStepV1::Blocked(gate.clone())],
+        process_generation,
+    )
+    .await;
+    wait_for(|| port.renew_calls() == 1).await;
+    let (response, observation_acknowledgement) = oneshot::channel();
+    production
+        .inner()
+        .supervisor_commands
+        .send(RuntimeGatewayOwnerSupervisorCommandV1::Observe { response })
+        .await
+        .unwrap();
+    let cutoff = Instant::now() + Duration::from_millis(120);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let started_at = Instant::now();
+
+    assert!(matches!(
+        authority.freeze_v2().await,
+        Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed)
+    ));
+    assert!(Instant::now() >= cutoff);
+    assert!(started_at.elapsed() < Duration::from_millis(400));
+    assert!(invalidated.load(Ordering::Acquire));
+
+    gate.notify_one();
+    drop(observation_acknowledgement);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn certification_freeze_ack_stall_is_bounded_by_the_cutoff() {
+    let gate = Arc::new(Notify::new());
+    let process_generation = NonZeroU64::new(63).unwrap();
+    let (production, port, invalidated, _) = certification_production_fixture(
+        [FakeRenewStepV1::Blocked(gate.clone())],
+        process_generation,
+    )
+    .await;
+    wait_for(|| port.renew_calls() == 1).await;
+    let cutoff = Instant::now() + Duration::from_millis(120);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let started_at = Instant::now();
+
+    assert!(matches!(
+        authority.freeze_v2().await,
+        Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed)
+    ));
+    assert!(Instant::now() >= cutoff);
+    assert!(started_at.elapsed() < Duration::from_millis(400));
+    assert!(invalidated.load(Ordering::Acquire));
+
+    gate.notify_one();
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn stale_certification_freeze_process_generation_is_terminal_and_fail_closed() {
+    let process_generation = NonZeroU64::new(65).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let expected_observation = production.inner().current_observation.borrow().clone();
+
+    assert_eq!(
+        production
+            .inner()
+            .freeze_certification_v2(
+                expected_observation,
+                NonZeroU64::new(64).unwrap(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await,
+        Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::ProcessGenerationMismatch)
+    );
+    assert_eq!(
+        production.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn stale_certification_freeze_receipt_after_queued_renewal_is_terminal() {
+    let gate = Arc::new(Notify::new());
+    let process_generation = NonZeroU64::new(66).unwrap();
+    let (production, port, invalidated, _) = certification_production_fixture(
+        [FakeRenewStepV1::Blocked(gate.clone())],
+        process_generation,
+    )
+    .await;
+    wait_for(|| port.renew_calls() == 1).await;
+    let mut expected_observation = production.inner().current_observation.borrow().clone();
+    expected_observation.receipt.owner_revision = NonZeroU64::new(
+        expected_observation
+            .receipt
+            .owner_revision
+            .get()
+            .checked_add(2)
+            .unwrap(),
+    )
+    .unwrap();
+    let release = tokio::spawn(async move {
+        sleep(Duration::from_millis(20)).await;
+        gate.notify_one();
+    });
+
+    assert_eq!(
+        production
+            .inner()
+            .freeze_certification_v2(
+                expected_observation,
+                process_generation,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await,
+        Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::OwnerReceiptMismatch)
+    );
+    release.await.unwrap();
+    assert_eq!(
+        production.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 1);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn certification_frozen_cutoff_is_terminal_without_an_automatic_renewal() {
+    let process_generation = NonZeroU64::new(67).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let cutoff = Instant::now() + Duration::from_millis(150);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let (frozen, _observation) = authority.freeze_v2().await.unwrap();
+    let renew_calls = port.renew_calls();
+
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed
+    );
+    assert_eq!(port.renew_calls(), renew_calls);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn exact_certification_thaw_resumes_with_a_strict_successor() {
+    let gate = Arc::new(Notify::new());
+    let process_generation = NonZeroU64::new(71).unwrap();
+    let (production, port, invalidated, _) = certification_production_fixture(
+        [FakeRenewStepV1::Blocked(gate.clone())],
+        process_generation,
+    )
+    .await;
+    wait_for(|| port.renew_calls() == 1).await;
+    let authority = production
+        .prepare_certification_freeze_v2(Instant::now() + Duration::from_millis(1_350))
+        .unwrap();
+    let mut freezing = Box::pin(authority.freeze_v2());
+    tokio::select! {
+        biased;
+        result = &mut freezing => panic!("unexpected certification freeze result: {result:?}"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+    gate.notify_one();
+    let (frozen, observation) = freezing.await.unwrap();
+    let frozen_revision = observation.observation_v2().receipt().owner_revision;
+
+    let (production, successor) = frozen
+        .thaw_v2(observation, Instant::now() + Duration::from_millis(800))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        successor.receipt().owner_revision.get(),
+        frozen_revision.get() + 1
+    );
+    assert_eq!(production.process_generation_v2(), process_generation);
+    assert_eq!(port.renew_calls(), 2);
+    assert_eq!(production.terminal_status_v2(), None);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        production
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn certification_thaw_send_queue_stall_is_bounded_by_the_authority_cutoff() {
+    let process_generation = NonZeroU64::new(72).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let cutoff = Instant::now() + Duration::from_millis(300);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let renew_calls = port.renew_calls();
+    let sender = frozen.inner().supervisor_commands.clone();
+    let permit = sender.reserve_owned().await.unwrap();
+    let started_at = Instant::now();
+
+    assert!(matches!(
+        frozen
+            .thaw_v2(observation, Instant::now() + Duration::from_secs(1))
+            .await,
+        Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed)
+    ));
+    assert!(Instant::now() >= cutoff);
+    assert!(started_at.elapsed() < Duration::from_millis(600));
+    assert_eq!(port.renew_calls(), renew_calls);
+    assert!(invalidated.load(Ordering::Acquire));
+
+    drop(permit);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn certification_thaw_strict_successor_stall_is_bounded_by_the_authority_cutoff() {
+    let process_generation = NonZeroU64::new(74).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let cutoff = Instant::now() + Duration::from_millis(300);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let gate = Arc::new(Notify::new());
+    port.state
+        .renew_steps
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push_back(FakeRenewStepV1::Blocked(gate.clone()));
+    let started_at = Instant::now();
+
+    assert!(matches!(
+        frozen
+            .thaw_v2(observation, Instant::now() + Duration::from_secs(1))
+            .await,
+        Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed)
+    ));
+    assert!(Instant::now() >= cutoff);
+    assert!(started_at.elapsed() < Duration::from_millis(600));
+    assert!(invalidated.load(Ordering::Acquire));
+
+    gate.notify_one();
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn stale_certification_thaw_authority_is_fail_closed() {
+    let process_generation = NonZeroU64::new(73).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let authority = production
+        .prepare_certification_freeze_v2(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let (frozen, mut observation) = authority.freeze_v2().await.unwrap();
+    observation.observation.receipt.owner_revision = NonZeroU64::new(
+        observation
+            .observation
+            .receipt
+            .owner_revision
+            .get()
+            .checked_add(1)
+            .unwrap(),
+    )
+    .unwrap();
+    let terminal = frozen.terminal_observation_v2();
+
+    assert!(matches!(
+        frozen
+            .thaw_v2(observation, Instant::now() + Duration::from_millis(500),)
+            .await,
+        Err(RuntimeGatewayOwnerCertificationThawErrorV2::StaleAuthority)
+    ));
+    assert_eq!(
+        terminal.await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn lost_certification_freeze_acknowledgement_is_terminal_and_fail_closed() {
+    let gate = Arc::new(Notify::new());
+    let process_generation = NonZeroU64::new(79).unwrap();
+    let (production, port, invalidated, _) = certification_production_fixture(
+        [FakeRenewStepV1::Blocked(gate.clone())],
+        process_generation,
+    )
+    .await;
+    wait_for(|| port.renew_calls() == 1).await;
+    let expected_observation = production.inner().current_observation.borrow().clone();
+    let cutoff = Instant::now() + Duration::from_secs(1);
+    let (response, acknowledgement) = oneshot::channel();
+    drop(acknowledgement);
+    production
+        .inner()
+        .supervisor_commands
+        .send(
+            RuntimeGatewayOwnerSupervisorCommandV1::FreezeCertification {
+                expected_observation,
+                process_generation,
+                cutoff,
+                response,
+            },
+        )
+        .await
+        .unwrap();
+    let terminal = production.terminal_observation_v2();
+
+    gate.notify_one();
+
+    assert_eq!(
+        terminal.await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 1);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn lost_certification_thaw_acknowledgement_is_terminal_before_renewal() {
+    let process_generation = NonZeroU64::new(83).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let authority = production
+        .prepare_certification_freeze_v2(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let renew_calls = port.renew_calls();
+    let (response, acknowledgement) = oneshot::channel();
+    drop(acknowledgement);
+    frozen
+        .inner()
+        .supervisor_commands
+        .send(RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification {
+            authority: observation,
+            response,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert_eq!(port.renew_calls(), renew_calls);
+    assert!(invalidated.load(Ordering::Acquire));
     assert_eq!(port.release_calls(), 1);
 }
 

@@ -534,6 +534,105 @@ impl RuntimeGatewayOwnerSupervisorHandleV1 {
         }
     }
 
+    async fn freeze_certification_v2(
+        &self,
+        expected_observation: RuntimeGatewayOwnerCurrentObservationV1,
+        process_generation: NonZeroU64,
+        cutoff: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerCurrentObservationV1,
+        RuntimeGatewayOwnerCertificationFreezeErrorV2,
+    > {
+        if Instant::now() >= cutoff {
+            self.invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed);
+        }
+        let (response, acknowledgement) = oneshot::channel();
+        let terminal = self.terminal.clone();
+        match timeout_at(
+            TokioInstant::from_std(cutoff),
+            self.supervisor_commands.send(
+                RuntimeGatewayOwnerSupervisorCommandV1::FreezeCertification {
+                    expected_observation,
+                    process_generation,
+                    cutoff,
+                    response,
+                },
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.invalidation.invalidate();
+                return Err(
+                    wait_for_certification_freeze_terminal_until_v2(terminal, cutoff).await,
+                );
+            }
+            Err(_) => {
+                self.invalidation.invalidate();
+                return Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed);
+            }
+        }
+        match timeout_at(TokioInstant::from_std(cutoff), acknowledgement).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                self.invalidation.invalidate();
+                Err(wait_for_certification_freeze_terminal_until_v2(terminal, cutoff).await)
+            }
+            Err(_) => {
+                self.invalidation.invalidate();
+                Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed)
+            }
+        }
+    }
+
+    async fn thaw_certification_v2(
+        &self,
+        authority: RuntimeGatewayOwnerCertificationFrozenObservationV2,
+    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerCertificationThawErrorV2>
+    {
+        let cutoff = authority.cutoff_v2();
+        if Instant::now() >= cutoff {
+            self.invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed);
+        }
+        let (response, acknowledgement) = oneshot::channel();
+        let terminal = self.terminal.clone();
+        match timeout_at(
+            TokioInstant::from_std(cutoff),
+            self.supervisor_commands.send(
+                RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification {
+                    authority,
+                    response,
+                },
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.invalidation.invalidate();
+                return Err(wait_for_certification_thaw_terminal_until_v2(terminal, cutoff).await);
+            }
+            Err(_) => {
+                self.invalidation.invalidate();
+                return Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed);
+            }
+        }
+        match timeout_at(TokioInstant::from_std(cutoff), acknowledgement).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                self.invalidation.invalidate();
+                Err(wait_for_certification_thaw_terminal_until_v2(terminal, cutoff).await)
+            }
+            Err(_) => {
+                self.invalidation.invalidate();
+                Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed)
+            }
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     async fn prepare_closed_recovery_v2(
         &self,
@@ -1176,6 +1275,40 @@ pub(crate) enum RuntimeGatewayOwnerStrictSuccessorErrorV2 {
     SupervisorUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RuntimeGatewayOwnerCertificationFreezeErrorV2 {
+    #[error("runtime gateway owner certification freeze deadline elapsed")]
+    DeadlineElapsed,
+    #[error("runtime gateway owner certification freeze receipt mismatched")]
+    OwnerReceiptMismatch,
+    #[error("runtime gateway owner certification freeze process generation mismatched")]
+    ProcessGenerationMismatch,
+    #[error("runtime gateway owner certification freeze found ownership loss")]
+    OwnershipLost,
+    #[error("runtime gateway owner certification freeze violated its protocol")]
+    ProtocolViolation,
+    #[error("runtime gateway owner certification freeze supervisor is unavailable")]
+    SupervisorUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum RuntimeGatewayOwnerCertificationThawErrorV2 {
+    #[error("runtime gateway owner certification thaw deadline elapsed")]
+    DeadlineElapsed,
+    #[error("runtime gateway owner certification thaw authority is stale")]
+    StaleAuthority,
+    #[error("runtime gateway owner certification thaw process generation mismatched")]
+    ProcessGenerationMismatch,
+    #[error("runtime gateway owner certification thaw found ownership loss")]
+    OwnershipLost,
+    #[error("runtime gateway owner certification thaw violated its protocol")]
+    ProtocolViolation,
+    #[error("runtime gateway owner certification thaw supervisor is unavailable")]
+    SupervisorUnavailable,
+}
+
 pub(crate) struct RuntimeGatewayOwnerAdmissionFrozenSupervisorV2 {
     inner: Option<Box<RuntimeGatewayOwnerSupervisorHandleV1>>,
     handoff_observation: Box<RuntimeGatewayOwnerCurrentObservationV1>,
@@ -1497,6 +1630,40 @@ impl RuntimeGatewayOwnerProductionSupervisorV2 {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn prepare_certification_freeze_v2(
+        self,
+        cutoff: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerCertificationFreezeAuthorityV2,
+        RuntimeGatewayOwnerCertificationFreezeErrorV2,
+    > {
+        let now = Instant::now();
+        let expected_observation = self.inner().current_observation.borrow().clone();
+        if now >= cutoff || expected_observation.safety_deadline() <= cutoff {
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed);
+        }
+        if self.inner().process_generation.load(Ordering::Acquire) != self.process_generation.get()
+        {
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::ProcessGenerationMismatch);
+        }
+        if self.inner().production_generation.load(Ordering::Acquire)
+            != self.process_generation.get()
+        {
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::OwnershipLost);
+        }
+        let process_generation = self.process_generation;
+        Ok(RuntimeGatewayOwnerCertificationFreezeAuthorityV2 {
+            owner: Some(Box::new(self)),
+            expected_observation: Box::new(expected_observation),
+            process_generation,
+            cutoff,
+        })
+    }
+
     pub(crate) async fn shutdown_until_v2(
         mut self,
         cleanup_deadline: Instant,
@@ -1518,6 +1685,260 @@ impl RuntimeGatewayOwnerProductionSupervisorV2 {
             .inner
             .take()
             .expect("production gateway owner supervisor")
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeGatewayOwnerCertificationFreezeAuthorityV2 {
+    owner: Option<Box<RuntimeGatewayOwnerProductionSupervisorV2>>,
+    expected_observation: Box<RuntimeGatewayOwnerCurrentObservationV1>,
+    process_generation: NonZeroU64,
+    cutoff: Instant,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeGatewayOwnerCertificationFreezeAuthorityV2 {
+    pub(crate) fn expected_observation_v2(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
+        &self.expected_observation
+    }
+
+    pub(crate) fn process_generation_v2(&self) -> NonZeroU64 {
+        self.process_generation
+    }
+
+    pub(crate) fn cutoff_v2(&self) -> Instant {
+        self.cutoff
+    }
+
+    pub(crate) async fn freeze_v2(
+        mut self,
+    ) -> Result<
+        (
+            RuntimeGatewayOwnerCertificationFrozenSupervisorV2,
+            RuntimeGatewayOwnerCertificationFrozenObservationV2,
+        ),
+        RuntimeGatewayOwnerCertificationFreezeErrorV2,
+    > {
+        let expected_observation = (*self.expected_observation).clone();
+        let process_generation = self.process_generation;
+        let cutoff = self.cutoff;
+        let acknowledged = self
+            .owner()
+            .inner()
+            .freeze_certification_v2(expected_observation.clone(), process_generation, cutoff)
+            .await?;
+        if Instant::now() >= cutoff {
+            self.owner().inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed);
+        }
+        if !accept_certification_freeze_observation_v2(&expected_observation, &acknowledged, cutoff)
+            || self
+                .owner()
+                .inner()
+                .process_generation
+                .load(Ordering::Acquire)
+                != process_generation.get()
+            || self
+                .owner()
+                .inner()
+                .production_generation
+                .load(Ordering::Acquire)
+                != 0
+        {
+            self.owner().inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::ProtocolViolation);
+        }
+        let mut owner = self.take_owner();
+        let inner = owner.take_inner();
+        let frozen = RuntimeGatewayOwnerCertificationFrozenSupervisorV2 {
+            inner: Some(Box::new(inner)),
+            frozen_observation: Box::new(acknowledged.clone()),
+            process_generation,
+            cutoff,
+        };
+        let observation = RuntimeGatewayOwnerCertificationFrozenObservationV2 {
+            observation: Box::new(acknowledged),
+            process_generation,
+            cutoff,
+        };
+        Ok((frozen, observation))
+    }
+
+    fn owner(&self) -> &RuntimeGatewayOwnerProductionSupervisorV2 {
+        self.owner
+            .as_deref()
+            .expect("certification freeze authority")
+    }
+
+    fn take_owner(&mut self) -> RuntimeGatewayOwnerProductionSupervisorV2 {
+        *self.owner.take().expect("certification freeze authority")
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeGatewayOwnerCertificationFrozenObservationV2 {
+    observation: Box<RuntimeGatewayOwnerCurrentObservationV1>,
+    process_generation: NonZeroU64,
+    cutoff: Instant,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeGatewayOwnerCertificationFrozenObservationV2 {
+    pub(crate) fn observation_v2(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
+        &self.observation
+    }
+
+    pub(crate) fn process_generation_v2(&self) -> NonZeroU64 {
+        self.process_generation
+    }
+
+    pub(crate) fn cutoff_v2(&self) -> Instant {
+        self.cutoff
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeGatewayOwnerCertificationFrozenSupervisorV2 {
+    inner: Option<Box<RuntimeGatewayOwnerSupervisorHandleV1>>,
+    frozen_observation: Box<RuntimeGatewayOwnerCurrentObservationV1>,
+    process_generation: NonZeroU64,
+    cutoff: Instant,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RuntimeGatewayOwnerCertificationFrozenSupervisorV2 {
+    pub(crate) fn frozen_observation_v2(&self) -> &RuntimeGatewayOwnerCurrentObservationV1 {
+        &self.frozen_observation
+    }
+
+    pub(crate) fn process_generation_v2(&self) -> NonZeroU64 {
+        self.process_generation
+    }
+
+    pub(crate) fn cutoff_v2(&self) -> Instant {
+        self.cutoff
+    }
+
+    pub(crate) fn terminal_status_v2(&self) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.inner().terminal_status()
+    }
+
+    pub(crate) fn terminal_observation_v2(
+        &self,
+    ) -> impl std::future::Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static
+    {
+        let mut terminal = self.inner().terminal.clone();
+        async move {
+            loop {
+                if let Some(exit) = *terminal.borrow() {
+                    return exit;
+                }
+                if terminal.changed().await.is_err() {
+                    return RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped;
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn observe_current_v2(
+        &self,
+    ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerCurrentObservationErrorV1>
+    {
+        self.inner().observe_current_gateway_owner_v1().await
+    }
+
+    pub(crate) async fn thaw_v2(
+        mut self,
+        authority: RuntimeGatewayOwnerCertificationFrozenObservationV2,
+        successor_deadline: Instant,
+    ) -> Result<
+        (
+            RuntimeGatewayOwnerProductionSupervisorV2,
+            RuntimeGatewayOwnerCurrentObservationV1,
+        ),
+        RuntimeGatewayOwnerCertificationThawErrorV2,
+    > {
+        let now = Instant::now();
+        let completion_deadline = self.cutoff.min(successor_deadline);
+        if now >= completion_deadline {
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed);
+        }
+        if authority.process_generation != self.process_generation {
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerCertificationThawErrorV2::ProcessGenerationMismatch);
+        }
+        if authority.cutoff != self.cutoff
+            || authority.observation.as_ref() != self.frozen_observation.as_ref()
+        {
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerCertificationThawErrorV2::StaleAuthority);
+        }
+        let previous_revision = authority.observation.receipt().owner_revision;
+        let acknowledged = self.inner().thaw_certification_v2(authority).await?;
+        if acknowledged != *self.frozen_observation
+            || self.inner().process_generation.load(Ordering::Acquire)
+                != self.process_generation.get()
+            || self.inner().production_generation.load(Ordering::Acquire)
+                != self.process_generation.get()
+        {
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerCertificationThawErrorV2::ProtocolViolation);
+        }
+        let process_generation = self.process_generation;
+        let production = RuntimeGatewayOwnerProductionSupervisorV2 {
+            inner: Some(Box::new(self.take_inner())),
+            process_generation,
+            start_observation: Box::new(acknowledged),
+        };
+        match production
+            .wait_for_strict_successor_v2(previous_revision, completion_deadline)
+            .await
+        {
+            Ok(successor) => Ok((production, successor)),
+            Err(error) => Err(map_strict_successor_thaw_error_v2(error)),
+        }
+    }
+
+    pub(crate) async fn shutdown_until_v2(
+        mut self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        self.take_inner().shutdown_until(cleanup_deadline).await
+    }
+
+    fn inner(&self) -> &RuntimeGatewayOwnerSupervisorHandleV1 {
+        self.inner
+            .as_deref()
+            .expect("certification-frozen gateway owner supervisor")
+    }
+
+    fn take_inner(&mut self) -> RuntimeGatewayOwnerSupervisorHandleV1 {
+        *self
+            .inner
+            .take()
+            .expect("certification-frozen gateway owner supervisor")
+    }
+}
+
+impl std::fmt::Debug for RuntimeGatewayOwnerCertificationFreezeAuthorityV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeGatewayOwnerCertificationFreezeAuthorityV2(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for RuntimeGatewayOwnerCertificationFrozenObservationV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeGatewayOwnerCertificationFrozenObservationV2(<redacted>)")
+    }
+}
+
+impl std::fmt::Debug for RuntimeGatewayOwnerCertificationFrozenSupervisorV2 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeGatewayOwnerCertificationFrozenSupervisorV2(<redacted>)")
     }
 }
 
@@ -1546,6 +1967,7 @@ enum RuntimeGatewayOwnerSupervisorRoleV1 {
     ClosedRecovery,
     AdmissionFrozen,
     ProcessFrozen,
+    CertificationFrozen,
     Production,
 }
 
@@ -1589,6 +2011,26 @@ enum RuntimeGatewayOwnerSupervisorCommandV1 {
             Result<
                 RuntimeGatewayOwnerCurrentObservationV1,
                 RuntimeGatewayOwnerProcessRenewalStartErrorV2,
+            >,
+        >,
+    },
+    FreezeCertification {
+        expected_observation: RuntimeGatewayOwnerCurrentObservationV1,
+        process_generation: NonZeroU64,
+        cutoff: Instant,
+        response: oneshot::Sender<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerCertificationFreezeErrorV2,
+            >,
+        >,
+    },
+    ThawCertification {
+        authority: RuntimeGatewayOwnerCertificationFrozenObservationV2,
+        response: oneshot::Sender<
+            Result<
+                RuntimeGatewayOwnerCurrentObservationV1,
+                RuntimeGatewayOwnerCertificationThawErrorV2,
             >,
         >,
     },
@@ -1645,6 +2087,62 @@ async fn wait_for_admission_frozen_handoff_terminal_v2(
         }
         if terminal.changed().await.is_err() {
             return RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2::SupervisorUnavailable;
+        }
+    }
+}
+
+async fn wait_for_certification_freeze_terminal_until_v2(
+    terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
+    cutoff: Instant,
+) -> RuntimeGatewayOwnerCertificationFreezeErrorV2 {
+    match timeout_at(
+        TokioInstant::from_std(cutoff),
+        wait_for_certification_freeze_terminal_v2(terminal),
+    )
+    .await
+    {
+        Ok(error) => error,
+        Err(_) => RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed,
+    }
+}
+
+async fn wait_for_certification_freeze_terminal_v2(
+    mut terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
+) -> RuntimeGatewayOwnerCertificationFreezeErrorV2 {
+    loop {
+        if let Some(exit) = *terminal.borrow() {
+            return map_terminal_certification_freeze_error_v2(exit);
+        }
+        if terminal.changed().await.is_err() {
+            return RuntimeGatewayOwnerCertificationFreezeErrorV2::SupervisorUnavailable;
+        }
+    }
+}
+
+async fn wait_for_certification_thaw_terminal_until_v2(
+    terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
+    cutoff: Instant,
+) -> RuntimeGatewayOwnerCertificationThawErrorV2 {
+    match timeout_at(
+        TokioInstant::from_std(cutoff),
+        wait_for_certification_thaw_terminal_v2(terminal),
+    )
+    .await
+    {
+        Ok(error) => error,
+        Err(_) => RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed,
+    }
+}
+
+async fn wait_for_certification_thaw_terminal_v2(
+    mut terminal: watch::Receiver<Option<RuntimeGatewayOwnerStartupWatchdogExitV1>>,
+) -> RuntimeGatewayOwnerCertificationThawErrorV2 {
+    loop {
+        if let Some(exit) = *terminal.borrow() {
+            return map_terminal_certification_thaw_error_v2(exit);
+        }
+        if terminal.changed().await.is_err() {
+            return RuntimeGatewayOwnerCertificationThawErrorV2::SupervisorUnavailable;
         }
     }
 }
@@ -1757,6 +2255,88 @@ fn map_terminal_strict_successor_error_v2(
         | RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
         | RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped => {
             RuntimeGatewayOwnerStrictSuccessorErrorV2::SupervisorUnavailable
+        }
+    }
+}
+
+fn accept_certification_freeze_observation_v2(
+    expected: &RuntimeGatewayOwnerCurrentObservationV1,
+    current: &RuntimeGatewayOwnerCurrentObservationV1,
+    cutoff: Instant,
+) -> bool {
+    if Instant::now() >= cutoff || current.safety_deadline() <= cutoff {
+        return false;
+    }
+    if current == expected {
+        return true;
+    }
+    current.receipt().lease_id == expected.receipt().lease_id
+        && expected.receipt().owner_revision.get().checked_add(1)
+            == Some(current.receipt().owner_revision.get())
+        && current.receipt().database_now > expected.receipt().database_now
+        && current.receipt().expires_at > expected.receipt().expires_at
+        && current.safety_deadline() > expected.safety_deadline()
+}
+
+fn map_terminal_certification_freeze_error_v2(
+    exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
+) -> RuntimeGatewayOwnerCertificationFreezeErrorV2 {
+    match exit {
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed => {
+            RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost => {
+            RuntimeGatewayOwnerCertificationFreezeErrorV2::OwnershipLost
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation => {
+            RuntimeGatewayOwnerCertificationFreezeErrorV2::ProtocolViolation
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::RenewalUnknown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped => {
+            RuntimeGatewayOwnerCertificationFreezeErrorV2::SupervisorUnavailable
+        }
+    }
+}
+
+fn map_terminal_certification_thaw_error_v2(
+    exit: RuntimeGatewayOwnerStartupWatchdogExitV1,
+) -> RuntimeGatewayOwnerCertificationThawErrorV2 {
+    match exit {
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed => {
+            RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost => {
+            RuntimeGatewayOwnerCertificationThawErrorV2::OwnershipLost
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation => {
+            RuntimeGatewayOwnerCertificationThawErrorV2::ProtocolViolation
+        }
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::RenewalUnknown
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::ReleaseUnconfirmed
+        | RuntimeGatewayOwnerStartupWatchdogExitV1::TaskStopped => {
+            RuntimeGatewayOwnerCertificationThawErrorV2::SupervisorUnavailable
+        }
+    }
+}
+
+fn map_strict_successor_thaw_error_v2(
+    error: RuntimeGatewayOwnerStrictSuccessorErrorV2,
+) -> RuntimeGatewayOwnerCertificationThawErrorV2 {
+    match error {
+        RuntimeGatewayOwnerStrictSuccessorErrorV2::DeadlineElapsed => {
+            RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed
+        }
+        RuntimeGatewayOwnerStrictSuccessorErrorV2::OwnershipLost => {
+            RuntimeGatewayOwnerCertificationThawErrorV2::OwnershipLost
+        }
+        RuntimeGatewayOwnerStrictSuccessorErrorV2::ProtocolViolation => {
+            RuntimeGatewayOwnerCertificationThawErrorV2::ProtocolViolation
+        }
+        RuntimeGatewayOwnerStrictSuccessorErrorV2::SupervisorUnavailable => {
+            RuntimeGatewayOwnerCertificationThawErrorV2::SupervisorUnavailable
         }
     }
 }
@@ -1980,6 +2560,7 @@ where
     let mut current = Some(watchdog);
     let mut role = RuntimeGatewayOwnerSupervisorRoleV1::Startup;
     let mut admission_frozen_cutoff = None;
+    let mut certification_frozen_cutoff = None;
     let mut pending_supervisor_command = None;
     let mut pending_closed_recovery_command = None;
     let mut shutdown_acknowledgement = None;
@@ -2042,19 +2623,31 @@ where
                 | RuntimeGatewayOwnerSupervisorRoleV1::ClosedRecovery
                 | RuntimeGatewayOwnerSupervisorRoleV1::AdmissionFrozen
                 | RuntimeGatewayOwnerSupervisorRoleV1::ProcessFrozen
+                | RuntimeGatewayOwnerSupervisorRoleV1::CertificationFrozen
         ) {
             let watchdog = current.take().expect("gateway owner watchdog state");
-            let safety_deadline = if role == RuntimeGatewayOwnerSupervisorRoleV1::AdmissionFrozen {
-                let Some(cutoff) = admission_frozen_cutoff else {
-                    guard.invalidate_now();
-                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
-                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
-                        config.cleanup,
-                    );
-                };
-                watchdog.schedule().safety_deadline().min(cutoff)
-            } else {
-                watchdog.schedule().safety_deadline()
+            let safety_deadline = match role {
+                RuntimeGatewayOwnerSupervisorRoleV1::AdmissionFrozen => {
+                    let Some(cutoff) = admission_frozen_cutoff else {
+                        guard.invalidate_now();
+                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                            RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                            config.cleanup,
+                        );
+                    };
+                    watchdog.schedule().safety_deadline().min(cutoff)
+                }
+                RuntimeGatewayOwnerSupervisorRoleV1::CertificationFrozen => {
+                    let Some(cutoff) = certification_frozen_cutoff else {
+                        guard.invalidate_now();
+                        break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                            RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                            config.cleanup,
+                        );
+                    };
+                    watchdog.schedule().safety_deadline().min(cutoff)
+                }
+                _ => watchdog.schedule().safety_deadline(),
             };
             if Instant::now() >= safety_deadline {
                 guard.invalidate_now();
@@ -2256,7 +2849,11 @@ where
                             continue 'supervisor;
                         }
                         RuntimeGatewayOwnerSupervisorCommandV1::Observe { response }
-                            if role == RuntimeGatewayOwnerSupervisorRoleV1::ProcessFrozen =>
+                            if matches!(
+                                role,
+                                RuntimeGatewayOwnerSupervisorRoleV1::ProcessFrozen
+                                    | RuntimeGatewayOwnerSupervisorRoleV1::CertificationFrozen
+                            ) =>
                         {
                             if response.is_closed() {
                                 current = Some(watchdog);
@@ -2266,6 +2863,95 @@ where
                                 RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&watchdog);
                             current = Some(watchdog);
                             let _result = response.send(Ok(observation));
+                            continue 'supervisor;
+                        }
+                        RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification {
+                            authority,
+                            response,
+                        } if role == RuntimeGatewayOwnerSupervisorRoleV1::CertificationFrozen => {
+                            if response.is_closed() {
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            let Some(cutoff) = certification_frozen_cutoff else {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerCertificationThawErrorV2::ProtocolViolation,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            };
+                            if Instant::now() >= cutoff {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
+                                    config.cleanup,
+                                );
+                            }
+                            if process_generation.load(Ordering::Acquire)
+                                != authority.process_generation.get()
+                            {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerCertificationThawErrorV2::ProcessGenerationMismatch,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            let observation =
+                                RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(&watchdog);
+                            if authority.cutoff != cutoff
+                                || authority.observation.as_ref() != &observation
+                            {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerCertificationThawErrorV2::StaleAuthority,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            if production_generation
+                                .compare_exchange(
+                                    0,
+                                    authority.process_generation.get(),
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_err()
+                            {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerCertificationThawErrorV2::ProtocolViolation,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            role = RuntimeGatewayOwnerSupervisorRoleV1::Production;
+                            certification_frozen_cutoff = None;
+                            force_production_renewal = true;
+                            let _result = current_observation_sender.send(observation.clone());
+                            current = Some(watchdog);
+                            if response.send(Ok(observation)).is_err() {
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
                             continue 'supervisor;
                         }
                         RuntimeGatewayOwnerSupervisorCommandV1::StartProcessRenewal {
@@ -2517,6 +3203,132 @@ where
                                     config.cleanup,
                                 );
                             }
+                            RuntimeGatewayOwnerSupervisorCommandV1::FreezeCertification {
+                                expected_observation,
+                                process_generation: requested_process_generation,
+                                cutoff,
+                                response,
+                            } if role == RuntimeGatewayOwnerSupervisorRoleV1::Production => {
+                                if response.is_closed() {
+                                    guard.invalidate_now();
+                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                        config.cleanup,
+                                    );
+                                }
+                                if Instant::now() >= cutoff {
+                                    let _result = response.send(Err(
+                                        RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed,
+                                    ));
+                                    guard.invalidate_now();
+                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
+                                        config.cleanup,
+                                    );
+                                }
+                                if process_generation.load(Ordering::Acquire)
+                                    != requested_process_generation.get()
+                                {
+                                    let _result = response.send(Err(
+                                        RuntimeGatewayOwnerCertificationFreezeErrorV2::ProcessGenerationMismatch,
+                                    ));
+                                    guard.invalidate_now();
+                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                        config.cleanup,
+                                    );
+                                }
+                                if production_generation.load(Ordering::Acquire)
+                                    != requested_process_generation.get()
+                                {
+                                    let _result = response.send(Err(
+                                        RuntimeGatewayOwnerCertificationFreezeErrorV2::OwnershipLost,
+                                    ));
+                                    guard.invalidate_now();
+                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                        config.cleanup,
+                                    );
+                                }
+                                let observation =
+                                    RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(
+                                        &watchdog,
+                                    );
+                                if !accept_certification_freeze_observation_v2(
+                                    &expected_observation,
+                                    &observation,
+                                    cutoff,
+                                ) {
+                                    let error = if observation.safety_deadline() <= cutoff {
+                                        RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed
+                                    } else {
+                                        RuntimeGatewayOwnerCertificationFreezeErrorV2::OwnerReceiptMismatch
+                                    };
+                                    let _result = response.send(Err(error));
+                                    guard.invalidate_now();
+                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                        config.cleanup,
+                                    );
+                                }
+                                if production_generation
+                                    .compare_exchange(
+                                        requested_process_generation.get(),
+                                        0,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_err()
+                                {
+                                    let _result = response.send(Err(
+                                        RuntimeGatewayOwnerCertificationFreezeErrorV2::ProtocolViolation,
+                                    ));
+                                    guard.invalidate_now();
+                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                        config.cleanup,
+                                    );
+                                }
+                                role =
+                                    RuntimeGatewayOwnerSupervisorRoleV1::CertificationFrozen;
+                                certification_frozen_cutoff = Some(cutoff);
+                                force_production_renewal = false;
+                                current = Some(watchdog);
+                                if response.send(Ok(observation)).is_err() {
+                                    guard.invalidate_now();
+                                    break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                        config.cleanup,
+                                    );
+                                }
+                                continue 'supervisor;
+                            }
+                            RuntimeGatewayOwnerSupervisorCommandV1::FreezeCertification {
+                                response,
+                                ..
+                            } => {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerCertificationFreezeErrorV2::ProtocolViolation,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification {
+                                response,
+                                ..
+                            } => {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerCertificationThawErrorV2::ProtocolViolation,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
                         }
                     }
                 }
@@ -2692,6 +3504,16 @@ fn reject_frozen_supervisor_command_v2(command: RuntimeGatewayOwnerSupervisorCom
         RuntimeGatewayOwnerSupervisorCommandV1::StartProcessRenewal { response, .. } => {
             let _result = response.send(Err(
                 RuntimeGatewayOwnerProcessRenewalStartErrorV2::ProtocolViolation,
+            ));
+        }
+        RuntimeGatewayOwnerSupervisorCommandV1::FreezeCertification { response, .. } => {
+            let _result = response.send(Err(
+                RuntimeGatewayOwnerCertificationFreezeErrorV2::ProtocolViolation,
+            ));
+        }
+        RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification { response, .. } => {
+            let _result = response.send(Err(
+                RuntimeGatewayOwnerCertificationThawErrorV2::ProtocolViolation,
             ));
         }
     }
