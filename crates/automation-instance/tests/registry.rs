@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceIdError, InstanceKind,
     InstanceMessageRef, InstanceResources, InstanceRuleSetVersion, InstanceStatus, InstanceStore,
-    InstanceStoreError,
+    InstanceStoreError, InstanceTeardownClaimOutcomeV1, InstanceTeardownMarkOutcomeV1,
+    InstanceTeardownStoreV1, MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1,
 };
 use discord_model::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use futures::executor::block_on;
@@ -254,6 +257,89 @@ fn list_deleting_filters_and_orders() {
         .map(|instance| instance.id.as_str().to_string())
         .collect();
     assert_eq!(ids, vec!["a", "c"]);
+}
+
+#[test]
+fn narrow_teardown_state_machine_is_idempotent_and_bounded() {
+    let store = InMemoryInstanceStore::new();
+    for id in ["c", "a", "b"] {
+        block_on(store.register(instance(7, id))).unwrap();
+    }
+    let a = InstanceId::parse("a").unwrap();
+    let b = InstanceId::parse("b").unwrap();
+    let c = InstanceId::parse("c").unwrap();
+
+    assert_eq!(
+        block_on(store.claim_deleting_v1(GuildId(7), &a)).unwrap(),
+        InstanceTeardownClaimOutcomeV1::Claimed
+    );
+    assert_eq!(
+        block_on(store.claim_deleting_v1(GuildId(7), &a)).unwrap(),
+        InstanceTeardownClaimOutcomeV1::AlreadyDeleting
+    );
+    assert_eq!(
+        block_on(store.claim_deleting_v1(GuildId(7), &b)).unwrap(),
+        InstanceTeardownClaimOutcomeV1::Claimed
+    );
+    block_on(store.update_status(GuildId(7), &c, InstanceStatus::Disabled)).unwrap();
+    assert_eq!(
+        block_on(store.claim_deleting_v1(GuildId(7), &c)).unwrap(),
+        InstanceTeardownClaimOutcomeV1::Claimed
+    );
+    let retryable =
+        block_on(store.list_retryable_v1(GuildId(7), NonZeroUsize::new(1).unwrap())).unwrap();
+    assert_eq!(retryable.len(), 1);
+    assert_eq!(retryable[0].id, a);
+    assert_eq!(
+        block_on(store.mark_deleted_v1(GuildId(7), &a)).unwrap(),
+        InstanceTeardownMarkOutcomeV1::MarkedDeleted
+    );
+    assert_eq!(
+        block_on(store.mark_deleted_v1(GuildId(7), &a)).unwrap(),
+        InstanceTeardownMarkOutcomeV1::AlreadyDeleted
+    );
+    assert_eq!(
+        block_on(store.claim_deleting_v1(GuildId(7), &a)).unwrap(),
+        InstanceTeardownClaimOutcomeV1::AlreadyDeleted
+    );
+    assert_eq!(
+        block_on(store.list_retryable_v1(
+            GuildId(7),
+            NonZeroUsize::new(MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1 + 1).unwrap(),
+        )),
+        Err(InstanceStoreError::Backend(
+            "instance_teardown_retry_batch_invalid".to_string()
+        ))
+    );
+}
+
+#[test]
+fn concurrent_teardown_claim_has_one_owner() {
+    let store = Arc::new(InMemoryInstanceStore::new());
+    let id = InstanceId::parse("room1").unwrap();
+    block_on(store.register(instance(7, "room1"))).unwrap();
+    let outcomes = (0..8)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let id = id.clone();
+            std::thread::spawn(move || block_on(store.claim_deleting_v1(GuildId(7), &id)).unwrap())
+        })
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == InstanceTeardownClaimOutcomeV1::Claimed)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == InstanceTeardownClaimOutcomeV1::AlreadyDeleting)
+            .count(),
+        7
+    );
 }
 
 #[test]

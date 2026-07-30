@@ -81,7 +81,7 @@ fn adapter_sources_contain_no_comments() {
 }
 
 #[test]
-fn adapter_contract_uses_only_five_private_capabilities() {
+fn adapter_contract_uses_only_nine_private_capabilities() {
     let contract = include_str!("../src/contract.rs");
     let capabilities = [
         "starring_runtime_interaction_database_identity_v1",
@@ -89,9 +89,13 @@ fn adapter_contract_uses_only_five_private_capabilities() {
         "starring_runtime_interaction_route_read_v1",
         "starring_runtime_interaction_pinned_read_v1",
         "starring_runtime_interaction_instance_register_v1",
+        "starring_runtime_interaction_instance_get_for_teardown_v1",
+        "starring_runtime_interaction_instance_claim_deleting_v1",
+        "starring_runtime_interaction_instance_mark_deleted_v1",
+        "starring_runtime_interaction_instance_list_retryable_v1",
     ];
-    assert_eq!(contract.matches("pub(crate) const ").count(), 5);
-    assert_eq!(contract.matches("SELECT ").count(), 5);
+    assert_eq!(contract.matches("pub(crate) const ").count(), 9);
+    assert_eq!(contract.matches("SELECT ").count(), 9);
     for capability in capabilities {
         assert_eq!(
             contract.matches(capability).count(),
@@ -124,6 +128,10 @@ fn adapter_contract_placeholder_shapes_are_exact() {
         ("ROUTE_READ_QUERY", 2),
         ("PINNED_READ_QUERY", 2),
         ("INSTANCE_REGISTER_QUERY", 7),
+        ("INSTANCE_TEARDOWN_GET_QUERY", 2),
+        ("INSTANCE_TEARDOWN_CLAIM_QUERY", 2),
+        ("INSTANCE_TEARDOWN_MARK_QUERY", 2),
+        ("INSTANCE_TEARDOWN_RETRY_QUERY", 2),
     ];
     for (name, expected_maximum) in expected {
         let query = contract
@@ -156,6 +164,7 @@ fn adapter_implements_only_the_narrow_interaction_traits() {
     for capability in [
         "impl InstanceRouteReaderV1 for PostgresRuntimeInteractionV1",
         "impl InstanceRegistrarV1 for PostgresRuntimeInteractionV1",
+        "impl InstanceTeardownStoreV1 for PostgresRuntimeInteractionV1",
         "impl PinnedInstanceResolverV1 for PostgresRuntimeInteractionV1",
     ] {
         assert!(
@@ -238,7 +247,7 @@ fn every_interaction_operation_rechecks_database_binding() {
         store
             .matches("verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)")
             .count(),
-        3
+        6
     );
 }
 

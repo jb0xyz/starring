@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use automation_instance::{
     AutomationInstance, InstanceId, InstanceKind, InstanceRegistrarV1, InstanceResources,
     InstanceRouteReaderV1, InstanceRuleSetVersion, InstanceStatus, InstanceStoreError,
+    InstanceTeardownClaimOutcomeV1, InstanceTeardownMarkOutcomeV1, InstanceTeardownStoreV1,
+    MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1,
 };
 use automation_ruleset_dispatch::{PinnedInstanceResolverErrorV1, PinnedInstanceResolverV1};
 use automation_runtime_interaction_postgres::{
@@ -21,6 +24,14 @@ const ROUTE_FUNCTION: &str = "public.starring_runtime_interaction_route_read_v1(
 const PINNED_FUNCTION: &str = "public.starring_runtime_interaction_pinned_read_v1(TEXT,TEXT)";
 const REGISTER_FUNCTION: &str =
     "public.starring_runtime_interaction_instance_register_v1(TEXT,TEXT,TEXT,BIGINT,TEXT,TEXT,JSONB)";
+const TEARDOWN_GET_FUNCTION: &str =
+    "public.starring_runtime_interaction_instance_get_for_teardown_v1(TEXT,TEXT)";
+const TEARDOWN_CLAIM_FUNCTION: &str =
+    "public.starring_runtime_interaction_instance_claim_deleting_v1(TEXT,TEXT)";
+const TEARDOWN_MARK_FUNCTION: &str =
+    "public.starring_runtime_interaction_instance_mark_deleted_v1(TEXT,TEXT)";
+const TEARDOWN_RETRY_FUNCTION: &str =
+    "public.starring_runtime_interaction_instance_list_retryable_v1(TEXT,BIGINT)";
 
 struct IsolatedDatabase {
     name: String,
@@ -102,6 +113,10 @@ async fn isolated_database() -> IsolatedDatabase {
         function_grant(ROUTE_FUNCTION, &role),
         function_grant(PINNED_FUNCTION, &role),
         function_grant(REGISTER_FUNCTION, &role),
+        function_grant(TEARDOWN_GET_FUNCTION, &role),
+        function_grant(TEARDOWN_CLAIM_FUNCTION, &role),
+        function_grant(TEARDOWN_MARK_FUNCTION, &role),
+        function_grant(TEARDOWN_RETRY_FUNCTION, &role),
     ] {
         owner_pool.execute(statement.as_str()).await.unwrap();
     }
@@ -184,6 +199,77 @@ fn interaction_migration_follows_convergence_exactness() {
         .position(|version| *version == 202_607_220_027)
         .unwrap();
     assert_eq!(interaction, convergence + 1);
+}
+
+#[test]
+fn teardown_migration_is_ordered_idempotent_bounded_and_private() {
+    let versions = MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    let certification = versions
+        .iter()
+        .position(|version| *version == 202_607_300_003)
+        .unwrap();
+    let teardown = versions
+        .iter()
+        .position(|version| *version == 202_607_300_004)
+        .unwrap();
+    assert_eq!(teardown, certification + 1);
+
+    let migration =
+        include_str!("../../../migrations/202607300004_add_runtime_interaction_teardown_v1.sql");
+    for function in [
+        "starring_runtime_interaction_instance_get_for_teardown_v1",
+        "starring_runtime_interaction_instance_claim_deleting_v1",
+        "starring_runtime_interaction_instance_mark_deleted_v1",
+        "starring_runtime_interaction_instance_list_retryable_v1",
+    ] {
+        assert_eq!(
+            migration
+                .matches(&format!("CREATE FUNCTION public.{function}("))
+                .count(),
+            1
+        );
+    }
+    for required in [
+        "CREATE OR REPLACE FUNCTION public.starring_runtime_interaction_database_readiness_v1()",
+        "SECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "expected_limit NOT BETWEEN 1 AND 256",
+        "ROWS 256",
+        "FOR UPDATE",
+        "RETURN 'claimed'",
+        "RETURN 'already_deleting'",
+        "RETURN 'already_deleted'",
+        "RETURN 'marked_deleted'",
+        "RETURN 'conflict'",
+        "RETURN 'not_found'",
+        "REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE",
+        "invalid_relation_acl_count",
+        "invalid_attribute_count",
+        "pg_get_function_arguments",
+        "pg_get_function_result",
+        "ORDER BY instance.instance_id COLLATE \"C\"",
+        "ORDER BY route.instance_id COLLATE \"C\"",
+    ] {
+        assert!(migration.contains(required), "missing contract: {required}");
+    }
+    for forbidden in [
+        "GRANT EXECUTE",
+        "GRANT SELECT",
+        "GRANT INSERT",
+        "GRANT UPDATE",
+        "GRANT DELETE",
+        "COMMENT ON",
+    ] {
+        assert!(!migration.contains(forbidden), "{forbidden}");
+    }
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
 }
 
 #[test]
@@ -336,6 +422,80 @@ async fn exact_capabilities_preserve_binding_inactivity_and_least_privilege() {
             .await
             .unwrap()
             .is_none());
+
+        let mut teardown_instance = instance("study_room");
+        teardown_instance.id = InstanceId::parse("teardown_room").unwrap();
+        store
+            .register_instance_v1(teardown_instance)
+            .await
+            .unwrap();
+        let teardown_room = InstanceId::parse("teardown_room").unwrap();
+        assert_eq!(
+            store
+                .get_for_teardown_v1(GuildId(7), &teardown_room)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            InstanceStatus::Active
+        );
+        assert_eq!(
+            store
+                .claim_deleting_v1(GuildId(7), &teardown_room)
+                .await
+                .unwrap(),
+            InstanceTeardownClaimOutcomeV1::Claimed
+        );
+        assert_eq!(
+            store
+                .claim_deleting_v1(GuildId(7), &teardown_room)
+                .await
+                .unwrap(),
+            InstanceTeardownClaimOutcomeV1::AlreadyDeleting
+        );
+        let retryable = store
+            .list_retryable_v1(GuildId(7), NonZeroUsize::new(1).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(retryable.len(), 1);
+        assert_eq!(retryable[0].id, teardown_room);
+        assert_eq!(
+            store
+                .mark_deleted_v1(GuildId(7), &teardown_room)
+                .await
+                .unwrap(),
+            InstanceTeardownMarkOutcomeV1::MarkedDeleted
+        );
+        assert_eq!(
+            store
+                .mark_deleted_v1(GuildId(7), &teardown_room)
+                .await
+                .unwrap(),
+            InstanceTeardownMarkOutcomeV1::AlreadyDeleted
+        );
+        assert_eq!(
+            store
+                .claim_deleting_v1(GuildId(7), &teardown_room)
+                .await
+                .unwrap(),
+            InstanceTeardownClaimOutcomeV1::AlreadyDeleted
+        );
+        assert!(store
+            .list_retryable_v1(GuildId(7), NonZeroUsize::new(1).unwrap())
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .list_retryable_v1(
+                    GuildId(7),
+                    NonZeroUsize::new(MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1 + 1).unwrap(),
+                )
+                .await,
+            Err(InstanceStoreError::Backend(
+                "runtime_interaction_invalid_input".to_string()
+            ))
+        );
 
         let held_connection = deadline_pool.acquire().await.unwrap();
         let deadline_result = tokio::time::timeout(

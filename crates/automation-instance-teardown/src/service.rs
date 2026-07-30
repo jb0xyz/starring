@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use automation_instance::{InstanceId, InstanceStatus, InstanceStore};
+use automation_instance::{InstanceId, InstanceTeardownClaimOutcomeV1, InstanceTeardownStoreV1};
 use discord_model::GuildId;
 
 use crate::domain::{InstanceDeleter, InstanceResource, TeardownError, TeardownOutcome};
@@ -78,7 +78,7 @@ impl<S, D> Teardown<S, D> {
 
 impl<S, D> Teardown<S, D>
 where
-    S: InstanceStore,
+    S: InstanceTeardownStoreV1,
     D: InstanceDeleter,
 {
     async fn teardown_locked(
@@ -88,19 +88,20 @@ where
     ) -> Result<TeardownOutcome, TeardownError> {
         let instance = self
             .store
-            .get(guild_id, instance_id)
+            .get_for_teardown_v1(guild_id, instance_id)
             .await
             .map_err(TeardownError::Lookup)?
             .ok_or(TeardownError::InstanceNotFound)?;
-        let first_owner = match instance.status {
-            InstanceStatus::Deleted => return Ok(TeardownOutcome::AlreadyDeleted),
-            InstanceStatus::Deleting => false,
-            InstanceStatus::Active | InstanceStatus::Disabled => {
-                self.store
-                    .transition_to_deleting(guild_id, instance_id)
-                    .await
-                    .map_err(TeardownError::Store)?;
-                true
+        let first_owner = match self
+            .store
+            .claim_deleting_v1(guild_id, instance_id)
+            .await
+            .map_err(TeardownError::Store)?
+        {
+            InstanceTeardownClaimOutcomeV1::Claimed => true,
+            InstanceTeardownClaimOutcomeV1::AlreadyDeleting => false,
+            InstanceTeardownClaimOutcomeV1::AlreadyDeleted => {
+                return Ok(TeardownOutcome::AlreadyDeleted);
             }
         };
 
@@ -137,7 +138,7 @@ where
         }
 
         self.store
-            .mark_deleted(guild_id, instance_id)
+            .mark_deleted_v1(guild_id, instance_id)
             .await
             .map_err(TeardownError::Store)?;
         Ok(if first_owner {
@@ -150,7 +151,7 @@ where
 
 impl<S, D> InstanceTeardownService for Teardown<S, D>
 where
-    S: InstanceStore,
+    S: InstanceTeardownStoreV1,
     D: InstanceDeleter,
 {
     async fn teardown(

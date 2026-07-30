@@ -75,6 +75,19 @@ impl InstanceRowV1 {
             expected_instance_id,
         )
     }
+
+    pub(crate) fn decode_retryable(
+        self,
+        expected_guild_id: GuildId,
+    ) -> Result<AutomationInstance, RuntimeInteractionPersistenceErrorV1> {
+        let expected_instance_id = InstanceId::parse(&self.instance_id)
+            .map_err(|_| RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt)?;
+        let instance = self.decode(expected_guild_id, &expected_instance_id)?;
+        if instance.status != InstanceStatus::Deleting {
+            return Err(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt);
+        }
+        Ok(instance)
+    }
 }
 
 impl PinnedInstanceRowV1 {
@@ -345,6 +358,24 @@ mod tests {
         };
         assert_eq!(
             row.decode(GuildId(7), &InstanceId::parse("room_1").unwrap()),
+            Err(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt)
+        );
+    }
+
+    #[test]
+    fn retryable_row_requires_deleting_status() {
+        let row = InstanceRowV1 {
+            guild_id: "7".to_string(),
+            instance_id: "room_1".to_string(),
+            ruleset_key: "studyroom".to_string(),
+            ruleset_version: 3,
+            kind: "studyroom".to_string(),
+            created_by: "9".to_string(),
+            status: "active".to_string(),
+            resources: Json(json!({})),
+        };
+        assert_eq!(
+            row.decode_retryable(GuildId(7)),
             Err(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt)
         );
     }

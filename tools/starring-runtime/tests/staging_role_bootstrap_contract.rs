@@ -245,7 +245,7 @@ fn staging_runtime_capability_manifest_is_exact_and_unique() {
         "INSERT INTO pg_temp.starring_runtime_capability_functions",
         "SELECT pg_catalog.pg_advisory_lock",
     ));
-    assert_eq!(functions.len(), 55);
+    assert_eq!(functions.len(), 59);
 
     let mut identities = BTreeSet::new();
     let mut counts = BTreeMap::new();
@@ -258,7 +258,7 @@ fn staging_runtime_capability_manifest_is_exact_and_unique() {
         BTreeMap::from([
             ("exact_target".to_owned(), 3),
             ("execution".to_owned(), 31),
-            ("interaction".to_owned(), 5),
+            ("interaction".to_owned(), 9),
             ("panel".to_owned(), 9),
             ("serving".to_owned(), 7),
         ])

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
 use discord_model::GuildId;
@@ -12,6 +13,48 @@ pub enum InstanceStoreError {
     NotFound,
     TimedOut,
     Backend(String),
+}
+
+pub const MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstanceTeardownClaimOutcomeV1 {
+    Claimed,
+    AlreadyDeleting,
+    AlreadyDeleted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstanceTeardownMarkOutcomeV1 {
+    MarkedDeleted,
+    AlreadyDeleted,
+}
+
+#[allow(async_fn_in_trait)]
+pub trait InstanceTeardownStoreV1 {
+    async fn get_for_teardown_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<Option<AutomationInstance>, InstanceStoreError>;
+
+    async fn claim_deleting_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<InstanceTeardownClaimOutcomeV1, InstanceStoreError>;
+
+    async fn mark_deleted_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<InstanceTeardownMarkOutcomeV1, InstanceStoreError>;
+
+    async fn list_retryable_v1(
+        &self,
+        guild_id: GuildId,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError>;
 }
 
 #[allow(async_fn_in_trait)]
@@ -225,6 +268,80 @@ impl InstanceRegistrarV1 for InMemoryInstanceStore {
         instance: AutomationInstance,
     ) -> Result<(), InstanceStoreError> {
         self.register(instance).await
+    }
+}
+
+impl InstanceTeardownStoreV1 for InMemoryInstanceStore {
+    async fn get_for_teardown_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<Option<AutomationInstance>, InstanceStoreError> {
+        self.get(guild_id, instance_id).await
+    }
+
+    async fn claim_deleting_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<InstanceTeardownClaimOutcomeV1, InstanceStoreError> {
+        let mut guilds = self.inner.lock().unwrap();
+        let instance = guilds
+            .get_mut(&guild_id)
+            .and_then(|entries| entries.get_mut(instance_id))
+            .ok_or(InstanceStoreError::NotFound)?;
+        match instance.status {
+            InstanceStatus::Active | InstanceStatus::Disabled => {
+                instance.status = InstanceStatus::Deleting;
+                Ok(InstanceTeardownClaimOutcomeV1::Claimed)
+            }
+            InstanceStatus::Deleting => Ok(InstanceTeardownClaimOutcomeV1::AlreadyDeleting),
+            InstanceStatus::Deleted => Ok(InstanceTeardownClaimOutcomeV1::AlreadyDeleted),
+        }
+    }
+
+    async fn mark_deleted_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<InstanceTeardownMarkOutcomeV1, InstanceStoreError> {
+        let mut guilds = self.inner.lock().unwrap();
+        let instance = guilds
+            .get_mut(&guild_id)
+            .and_then(|entries| entries.get_mut(instance_id))
+            .ok_or(InstanceStoreError::NotFound)?;
+        match instance.status {
+            InstanceStatus::Deleting => {
+                instance.status = InstanceStatus::Deleted;
+                Ok(InstanceTeardownMarkOutcomeV1::MarkedDeleted)
+            }
+            InstanceStatus::Deleted => Ok(InstanceTeardownMarkOutcomeV1::AlreadyDeleted),
+            InstanceStatus::Active | InstanceStatus::Disabled => Err(InstanceStoreError::NotFound),
+        }
+    }
+
+    async fn list_retryable_v1(
+        &self,
+        guild_id: GuildId,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
+        if limit.get() > MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1 {
+            return Err(InstanceStoreError::Backend(
+                "instance_teardown_retry_batch_invalid".to_string(),
+            ));
+        }
+        let guilds = self.inner.lock().unwrap();
+        Ok(guilds
+            .get(&guild_id)
+            .map(|entries| {
+                entries
+                    .values()
+                    .filter(|instance| instance.status == InstanceStatus::Deleting)
+                    .take(limit.get())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
 

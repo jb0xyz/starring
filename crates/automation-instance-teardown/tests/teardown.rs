@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceMessageRef,
     InstanceResources, InstanceRuleSetVersion, InstanceStatus, InstanceStore, InstanceStoreError,
+    InstanceTeardownClaimOutcomeV1, InstanceTeardownMarkOutcomeV1, InstanceTeardownStoreV1,
 };
 use automation_instance_teardown::{
     DeleteOutcome, DeleterError, DeleterErrorKind, InstanceDeleter, InstanceResource,
@@ -114,6 +116,56 @@ impl InstanceStore for SharedStore {
         guild_id: GuildId,
     ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
         self.0.inner.list_deleting(guild_id).await
+    }
+}
+
+impl InstanceTeardownStoreV1 for SharedStore {
+    async fn get_for_teardown_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<Option<AutomationInstance>, InstanceStoreError> {
+        self.0.get_calls.fetch_add(1, Ordering::SeqCst);
+        self.0
+            .inner
+            .get_for_teardown_v1(guild_id, instance_id)
+            .await
+    }
+
+    async fn claim_deleting_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<InstanceTeardownClaimOutcomeV1, InstanceStoreError> {
+        let outcome = self
+            .0
+            .inner
+            .claim_deleting_v1(guild_id, instance_id)
+            .await?;
+        if outcome == InstanceTeardownClaimOutcomeV1::Claimed {
+            self.0.transition_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(outcome)
+    }
+
+    async fn mark_deleted_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<InstanceTeardownMarkOutcomeV1, InstanceStoreError> {
+        self.0.mark_calls.fetch_add(1, Ordering::SeqCst);
+        if self.0.fail_mark.load(Ordering::SeqCst) {
+            return Err(InstanceStoreError::Backend("mark failed".to_string()));
+        }
+        self.0.inner.mark_deleted_v1(guild_id, instance_id).await
+    }
+
+    async fn list_retryable_v1(
+        &self,
+        guild_id: GuildId,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
+        self.0.inner.list_retryable_v1(guild_id, limit).await
     }
 }
 

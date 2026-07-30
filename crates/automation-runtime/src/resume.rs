@@ -1,6 +1,9 @@
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use automation_instance::{InstanceId, InstanceStore, InstanceStoreError};
+use automation_instance::{
+    InstanceId, InstanceStoreError, InstanceTeardownStoreV1, MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1,
+};
 use automation_instance_teardown::{InstanceTeardownService, TeardownError, TeardownOutcome};
 use discord_model::GuildId;
 use futures::{stream, StreamExt};
@@ -48,10 +51,15 @@ pub async fn resume_deleting_instances<S, T>(
     config: ResumeConfig,
 ) -> Result<ResumeReport, InstanceStoreError>
 where
-    S: InstanceStore,
+    S: InstanceTeardownStoreV1,
     T: InstanceTeardownService,
 {
-    let pending = store.list_deleting(guild_id).await?;
+    let pending = store
+        .list_retryable_v1(
+            guild_id,
+            NonZeroUsize::new(MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1).unwrap(),
+        )
+        .await?;
     let timeout = config.per_instance_timeout;
     let mut entries = stream::iter(pending.into_iter().map(|instance| {
         let instance_id = instance.id;

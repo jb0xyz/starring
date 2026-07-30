@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use automation_instance::{InstanceRegistrarV1, InstanceRouteReaderV1};
+use automation_instance::{InstanceRegistrarV1, InstanceRouteReaderV1, InstanceTeardownStoreV1};
 use automation_ruleset_dispatch::PinnedInstanceResolverV1;
 use automation_runtime_interaction_postgres::{
     PostgresRuntimeInteractionV1, RuntimeInteractionDatabaseExpectationV1,
@@ -13,12 +13,18 @@ use automation_runtime_interaction_postgres::{
 
 fn assert_interaction_capabilities<T>()
 where
-    T: Clone + Send + Sync + InstanceRouteReaderV1 + InstanceRegistrarV1 + PinnedInstanceResolverV1,
+    T: Clone
+        + Send
+        + Sync
+        + InstanceRouteReaderV1
+        + InstanceRegistrarV1
+        + InstanceTeardownStoreV1
+        + PinnedInstanceResolverV1,
 {
 }
 
 #[test]
-fn postgres_adapter_exposes_the_three_narrow_capabilities() {
+fn postgres_adapter_exposes_the_four_narrow_capabilities() {
     assert_interaction_capabilities::<PostgresRuntimeInteractionV1>();
 }
 
@@ -214,6 +220,11 @@ fn interaction_database_migration_is_registered_after_convergence_identity() {
         .iter()
         .position(|version| *version == 202_607_220_027)
         .unwrap();
+    let teardown = versions
+        .iter()
+        .position(|version| *version == 202_607_300_004)
+        .unwrap();
     assert!(convergence_identity < persisted_controller);
     assert_eq!(interaction, persisted_controller + 1);
+    assert!(interaction < teardown);
 }
