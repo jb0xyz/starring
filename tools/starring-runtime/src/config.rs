@@ -4,6 +4,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
+use crate::runtime_controller::RuntimeServingControllerConfigV2;
+
 const MAX_CONFIGURATION_VALUE_BYTES: usize = 8 * 1024;
 const MAX_ENVIRONMENT_NAME_BYTES: usize = 128;
 const MAX_KEYCHAIN_COMPONENT_BYTES: usize = 128;
@@ -472,6 +474,7 @@ pub struct RuntimeConfigV1 {
     database_operation: DatabaseOperationConfigV1,
     gateway: GatewayResourceConfigV1,
     gateway_owner: GatewayOwnerTimingConfigV1,
+    runtime_controller: RuntimeServingControllerConfigV2,
     secret_references: RuntimeSecretReferencesV1,
 }
 
@@ -491,7 +494,9 @@ impl RuntimeConfigV1 {
         let database_pool = parse_database_pool(source)?;
         let database_operation = parse_database_operation(source)?;
         let gateway = parse_gateway_resources(source)?;
-        let gateway_owner = parse_gateway_owner_timing(source, database_operation)?;
+        let runtime_controller = RuntimeServingControllerConfigV2::production_v2();
+        let gateway_owner =
+            parse_gateway_owner_timing(source, database_operation, &runtime_controller)?;
         let secret_references = parse_secret_references(source)?;
         Ok(Self {
             health_bind_addr,
@@ -499,6 +504,7 @@ impl RuntimeConfigV1 {
             database_operation,
             gateway,
             gateway_owner,
+            runtime_controller,
             secret_references,
         })
     }
@@ -523,6 +529,10 @@ impl RuntimeConfigV1 {
         self.gateway_owner
     }
 
+    pub(crate) fn runtime_controller(&self) -> RuntimeServingControllerConfigV2 {
+        self.runtime_controller.clone()
+    }
+
     pub fn secret_references(&self) -> &RuntimeSecretReferencesV1 {
         &self.secret_references
     }
@@ -537,6 +547,7 @@ impl Debug for RuntimeConfigV1 {
             .field("database_operation", &self.database_operation)
             .field("gateway", &self.gateway)
             .field("gateway_owner", &self.gateway_owner)
+            .field("runtime_controller", &self.runtime_controller)
             .field("secret_references", &"<redacted>")
             .finish()
     }
@@ -672,6 +683,7 @@ fn parse_gateway_resources(
 fn parse_gateway_owner_timing(
     source: &impl ConfigurationSourceV1,
     database_operation: DatabaseOperationConfigV1,
+    runtime_controller: &RuntimeServingControllerConfigV2,
 ) -> Result<GatewayOwnerTimingConfigV1, RuntimeConfigErrorV1> {
     if database_operation.statement_timeout() > MAX_STARTUP_OWNER_STATEMENT_TIMEOUT {
         return Err(RuntimeConfigErrorV1::InvalidValue(
@@ -680,19 +692,19 @@ fn parse_gateway_owner_timing(
     }
     let lease_field = RuntimeConfigurationFieldV1::GatewayOwnerLease;
     let lease_for =
-        Duration::from_millis(parse_optional_number::<u64>(source, lease_field, 30_000)?);
+        Duration::from_millis(parse_optional_number::<u64>(source, lease_field, 60_000)?);
     if !(MIN_GATEWAY_OWNER_LEASE..=MAX_GATEWAY_OWNER_LEASE).contains(&lease_for) {
         return Err(RuntimeConfigErrorV1::InvalidValue(lease_field));
     }
     let renew_field = RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore;
     let renew_before =
-        Duration::from_millis(parse_optional_number::<u64>(source, renew_field, 10_000)?);
+        Duration::from_millis(parse_optional_number::<u64>(source, renew_field, 40_000)?);
     if renew_before.is_zero() || renew_before >= lease_for {
         return Err(RuntimeConfigErrorV1::InvalidValue(renew_field));
     }
     let safety_field = RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin;
     let safety_margin =
-        Duration::from_millis(parse_optional_number::<u64>(source, safety_field, 3_000)?);
+        Duration::from_millis(parse_optional_number::<u64>(source, safety_field, 5_000)?);
     if safety_margin <= database_operation.statement_timeout() || safety_margin >= renew_before {
         return Err(RuntimeConfigErrorV1::InvalidValue(safety_field));
     }
@@ -700,6 +712,13 @@ fn parse_gateway_owner_timing(
         .checked_sub(safety_margin)
         .ok_or(RuntimeConfigErrorV1::InvalidValue(renew_field))?;
     if renewal_window <= database_operation.statement_timeout() {
+        return Err(RuntimeConfigErrorV1::InvalidValue(renew_field));
+    }
+    let certification_runway = runtime_controller
+        .gateway_ready_timeout_v2()
+        .checked_add(database_operation.statement_timeout())
+        .ok_or(RuntimeConfigErrorV1::InvalidValue(renew_field))?;
+    if renewal_window <= certification_runway {
         return Err(RuntimeConfigErrorV1::InvalidValue(renew_field));
     }
     Ok(GatewayOwnerTimingConfigV1 {
@@ -922,14 +941,14 @@ mod tests {
             config.gateway().instance_lookup_timeout(),
             Duration::from_millis(500)
         );
-        assert_eq!(config.gateway_owner().lease_for(), Duration::from_secs(30));
+        assert_eq!(config.gateway_owner().lease_for(), Duration::from_secs(60));
         assert_eq!(
             config.gateway_owner().renew_before(),
-            Duration::from_secs(10)
+            Duration::from_secs(40)
         );
         assert_eq!(
             config.gateway_owner().safety_margin(),
-            Duration::from_secs(3)
+            Duration::from_secs(5)
         );
     }
 
@@ -1139,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn gateway_owner_timing_is_bounded_ordered_and_covers_database_latency() {
+    fn gateway_owner_timing_is_bounded_ordered_and_covers_certification_runway() {
         for (field, rejected) in [
             (RuntimeConfigurationFieldV1::GatewayOwnerLease, "999"),
             (RuntimeConfigurationFieldV1::GatewayOwnerLease, "300001"),
@@ -1155,7 +1174,7 @@ mod tests {
             ),
             (
                 RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
-                "10000",
+                "40000",
             ),
         ] {
             let mut source = valid_source();
@@ -1167,13 +1186,33 @@ mod tests {
         }
 
         let mut short_window = valid_source();
-        short_window.insert(RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore, "5000");
+        short_window.insert(
+            RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore,
+            "35000",
+        );
         short_window.insert(
             RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
             "3000",
         );
         assert_eq!(
             RuntimeConfigV1::from_source(&short_window).unwrap_err(),
+            RuntimeConfigErrorV1::InvalidValue(
+                RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore
+            )
+        );
+
+        let mut legacy_timing = valid_source();
+        legacy_timing.insert(RuntimeConfigurationFieldV1::GatewayOwnerLease, "30000");
+        legacy_timing.insert(
+            RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore,
+            "10000",
+        );
+        legacy_timing.insert(
+            RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
+            "3000",
+        );
+        assert_eq!(
+            RuntimeConfigV1::from_source(&legacy_timing).unwrap_err(),
             RuntimeConfigErrorV1::InvalidValue(
                 RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore
             )
@@ -1196,10 +1235,10 @@ mod tests {
         );
 
         let mut custom = valid_source();
-        custom.insert(RuntimeConfigurationFieldV1::GatewayOwnerLease, "60000");
+        custom.insert(RuntimeConfigurationFieldV1::GatewayOwnerLease, "90000");
         custom.insert(
             RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore,
-            "20000",
+            "50000",
         );
         custom.insert(
             RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
@@ -1208,8 +1247,8 @@ mod tests {
         let timing = RuntimeConfigV1::from_source(&custom)
             .unwrap()
             .gateway_owner();
-        assert_eq!(timing.lease_for(), Duration::from_secs(60));
-        assert_eq!(timing.renew_before(), Duration::from_secs(20));
+        assert_eq!(timing.lease_for(), Duration::from_secs(90));
+        assert_eq!(timing.renew_before(), Duration::from_secs(50));
         assert_eq!(timing.safety_margin(), Duration::from_secs(5));
     }
 

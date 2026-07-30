@@ -67,6 +67,35 @@ const RUNTIME_CONTROLLER_COMMAND_CAPACITY_V2: usize = 1;
 const RUNTIME_CONTROLLER_IDLE_BACKOFF_V2: Duration = Duration::from_secs(1);
 const RUNTIME_CONTROLLER_RETRY_BACKOFF_V2: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
+pub(crate) struct RuntimeServingControllerConfigV2 {
+    inner: RuntimeControllerConfigV1,
+}
+
+impl RuntimeServingControllerConfigV2 {
+    pub(crate) fn production_v2() -> Self {
+        let inner = RuntimeControllerConfigV1::default();
+        inner
+            .validate()
+            .expect("default runtime controller configuration must remain valid");
+        Self { inner }
+    }
+
+    pub(crate) fn gateway_ready_timeout_v2(&self) -> Duration {
+        self.inner.gateway_ready_timeout
+    }
+
+    fn into_inner_v2(self) -> RuntimeControllerConfigV1 {
+        self.inner
+    }
+}
+
+impl Debug for RuntimeServingControllerConfigV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeServingControllerConfigV2(<validated>)")
+    }
+}
+
 type RuntimeSlotPermitReplyV2 =
     Result<RuntimeServingSlotWorkPermitV2, RuntimeServingSlotWorkErrorV2>;
 type RuntimeBarrierAPauseReplyV2 = Result<
@@ -175,11 +204,12 @@ impl RuntimeServingControllerSupervisorV2 {
         registry: RuntimeRegistryStagingPortV2,
         controller_id: ControllerId,
         shutdown: RuntimeProcessShutdownTriggerV1,
+        config: RuntimeServingControllerConfigV2,
     ) -> Self {
-        let config = RuntimeControllerConfigV1::default();
+        let config = config.into_inner_v2();
         config
             .validate()
-            .expect("default runtime controller configuration must remain valid");
+            .expect("validated runtime controller configuration must remain valid");
         let (events_tx, events) = mpsc::channel(RUNTIME_CONTROLLER_COMMAND_CAPACITY_V2);
         let (stop, stop_rx) = watch::channel(false);
         let actor = RuntimeServingControllerActorV2 {

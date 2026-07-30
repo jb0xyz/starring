@@ -210,6 +210,7 @@ impl RuntimeEmptyOpenProcessV2 {
             lifecycle.staging_port_v2(),
             foundation.controller_id.clone(),
             foundation.shutdown_trigger_v1(),
+            foundation.config.runtime_controller(),
         );
         let process = RuntimeServingOpenProcessV2 {
             controller,
