@@ -5788,6 +5788,16 @@ fn barrier_b_registry_activation_is_linear_exact_and_token_sealed() {
         "}"
     )));
     assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryBarrierBServingMonitorAuthorityV2 {\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "    token: SlotMutationTokenV1,\n",
+        "    route: SlotRouteWitnessV1,\n",
+        "    activation_sequence: NonZeroU64,\n",
+        "    emergency: RuntimeRegistryEmergencyTriggerV2,\n",
+        "    armed: bool,\n",
+        "}"
+    )));
+    assert!(registry.contains(concat!(
         "pub(crate) struct RuntimeRegistryBarrierBActivationEvidenceV2 {\n",
         "    outcome: RuntimeRegistryBarrierBActivationOutcomeV2,\n",
         "    route: SlotRouteWitnessV1,\n",
@@ -5800,6 +5810,7 @@ fn barrier_b_registry_activation_is_linear_exact_and_token_sealed() {
     for authority in [
         "RuntimeRegistryBarrierBActivationV2",
         "RuntimeRegistryBarrierBServingAuthorityV2",
+        "RuntimeRegistryBarrierBServingMonitorAuthorityV2",
     ] {
         assert!(!contains_identifier(
             declaration_attribute_block(registry, authority),
@@ -5855,15 +5866,84 @@ fn barrier_b_registry_activation_is_linear_exact_and_token_sealed() {
         assert!(activation.contains(required), "{required}");
     }
     let authority = braced_declaration(registry, "impl RuntimeRegistryBarrierBServingAuthorityV2");
-    assert!(authority.contains("pub(crate) fn ensure_exact_serving_v2("));
-    assert!(authority.contains("activation.outcome() != SlotActivationOutcomeV1::AlreadyServing"));
-    for forbidden in [
-        "fn token",
-        "fn into_token",
-        "-> &SlotMutationTokenV1",
-        "-> SlotMutationTokenV1",
+    for required in [
+        "pub(crate) fn ensure_exact_serving_v2(",
+        "pub(crate) fn remove_exact_serving_v2(",
+        "pub(crate) fn into_serving_monitor_v2(",
+        "RuntimeRegistryBarrierBServingMonitorAuthorityV2 {",
+        "self.armed = false",
     ] {
-        assert!(!authority.contains(forbidden), "{forbidden}");
+        assert!(authority.contains(required), "{required}");
+    }
+    let monitor = braced_declaration(
+        registry,
+        "impl RuntimeRegistryBarrierBServingMonitorAuthorityV2",
+    );
+    for required in [
+        "pub(crate) fn observe_exact_serving_v2(",
+        "pub(crate) fn remove_exact_serving_v2(",
+        "observe_exact_barrier_b_serving_v2(",
+        "remove_exact_barrier_b_serving_v2(",
+        "self.armed = false",
+    ] {
+        assert!(monitor.contains(required), "{required}");
+    }
+    for sealed in [authority, monitor] {
+        for forbidden in [
+            "fn token",
+            "fn into_token",
+            "-> &SlotMutationTokenV1",
+            "-> SlotMutationTokenV1",
+            "fn registry",
+            "fn into_registry",
+            "-> &ServingSlotRegistryV1",
+            "-> ServingSlotRegistryV1",
+        ] {
+            assert!(!sealed.contains(forbidden), "{forbidden}");
+        }
+    }
+    let observe = braced_declaration(registry, "fn observe_exact_barrier_b_serving_v2(");
+    for required in [
+        ".route_witness(token)",
+        ".atomic_observation_v2(token.key())",
+        "route != *expected_route",
+        "route.lifecycle != SlotLifecycleV1::Serving",
+        "atomic.route.as_ref() != Some(expected_route)",
+        "atomic.admission_state != SlotAdmissionStateV2::Serving",
+        ".activate_with_sequence_v2(token, &expected_route.identity)",
+        "activation.outcome() != SlotActivationOutcomeV1::AlreadyServing",
+        "activation.route() != expected_route",
+        "activation.activation_sequence() != expected_activation_sequence",
+        "activation.observation() != &atomic",
+    ] {
+        assert!(observe.contains(required), "{required}");
+    }
+    let removal = braced_declaration(registry, "fn remove_exact_barrier_b_serving_v2(");
+    let exact_observation = removal.find("observe_exact_barrier_b_serving_v2(").unwrap();
+    let begin_drain = removal.find(".begin_drain(token)").unwrap();
+    let active_check = removal.find("if active != 0").unwrap();
+    let draining_observation = removal.find("let draining_route = registry").unwrap();
+    let remove = removal.find(".remove(token)").unwrap();
+    let removed_observation = removal.find("let removed_atomic = registry").unwrap();
+    assert!(
+        exact_observation < begin_drain
+            && begin_drain < active_check
+            && active_check < draining_observation
+            && draining_observation < remove
+            && remove < removed_observation
+    );
+    for required in [
+        "SlotDrainOutcomeV1::DrainStarted",
+        "SlotDrainOutcomeV1::AlreadyDraining",
+        "RuntimeRegistryBarrierBServingErrorV2::ExactServingLost",
+        "expected_draining_route.lifecycle = SlotLifecycleV1::Draining",
+        "draining_atomic.route.as_ref() != Some(&expected_draining_route)",
+        "draining_atomic.admission_state != SlotAdmissionStateV2::Draining",
+        "removal != SlotRemovalOutcomeV1::RemovedDraining",
+        "removed_atomic.route.is_some()",
+        "removed_atomic.admission_state != SlotAdmissionStateV2::Empty",
+    ] {
+        assert!(removal.contains(required), "{required}");
     }
     let authority_drop = braced_declaration(
         registry,
@@ -5871,10 +5951,21 @@ fn barrier_b_registry_activation_is_linear_exact_and_token_sealed() {
     );
     assert!(authority_drop.contains("if self.armed"));
     assert!(authority_drop.contains("self.emergency.trip_v2()"));
+    let monitor_drop = braced_declaration(
+        registry,
+        "impl Drop for RuntimeRegistryBarrierBServingMonitorAuthorityV2",
+    );
+    assert!(monitor_drop.contains("if self.armed"));
+    assert!(monitor_drop.contains("remove_exact_barrier_b_serving_v2("));
+    assert!(monitor_drop.contains(".is_err()"));
+    assert!(monitor_drop.contains("self.emergency.trip_v2()"));
     for redacted in [
         "RuntimeRegistryBarrierBActivationV2",
         "RuntimeRegistryBarrierBServingAuthorityV2",
+        "RuntimeRegistryBarrierBServingMonitorAuthorityV2",
         "RuntimeRegistryBarrierBActivationEvidenceV2",
+        "RuntimeRegistryBarrierBExactServingObservationV2",
+        "RuntimeRegistryBarrierBRemovalEvidenceV2",
     ] {
         let debug = braced_declaration(registry, &format!("impl Debug for {redacted}"));
         assert!(debug.contains(&format!("{redacted}(<redacted>)")));

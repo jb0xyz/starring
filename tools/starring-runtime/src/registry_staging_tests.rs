@@ -11,6 +11,7 @@ use super::{
     complete_staged_install_v2, compose_runtime_registry_bootstrap_v1,
     RuntimeRegistryBarrierBActivationErrorV2, RuntimeRegistryBarrierBActivationOutcomeV2,
     RuntimeRegistryBarrierBActivationV2, RuntimeRegistryBarrierBServingAuthorityV2,
+    RuntimeRegistryBarrierBServingErrorV2, RuntimeRegistryBarrierBServingMonitorAuthorityV2,
     RuntimeRegistryEmergencyTriggerV2, RuntimeRegistryServingBindingV2,
     RuntimeRegistryStagedInstallOutcomeV2, RuntimeRegistryStagedInstallV2,
     RuntimeRegistryStagedRouteV2, RuntimeRegistryStagingErrorV2, RuntimeRegistryStagingPortV2,
@@ -95,6 +96,30 @@ fn authority(install: RuntimeRegistryStagedInstallV2) -> RuntimeRegistryStagedRo
     install.into_parts_v2().2
 }
 
+fn barrier_b_serving_authority(
+    process_instance_id: &str,
+) -> (
+    ExactServingRouteV1,
+    ServingSlotRegistryV1,
+    RuntimeRegistryBarrierBServingAuthorityV2,
+    Arc<AtomicUsize>,
+) {
+    let (port, registry) = staging_port(process_instance_id);
+    let route = route(process_instance_id);
+    let (emergency, trips) = emergency();
+    let replacement = authority(
+        port.install_staged_route_v2(route.clone(), fence(1), emergency)
+            .unwrap(),
+    )
+    .into_replacement_v2();
+    replacement
+        .transition_predecessor_to_draining_v2(None)
+        .unwrap();
+    replacement.remove_drained_predecessor_v2().unwrap();
+    let (_, authority) = replacement.activate_barrier_b_v2().unwrap().into_parts_v2();
+    (route, registry, authority, trips)
+}
+
 #[test]
 fn staging_port_is_clone_send_sync_and_install_authority_is_send() {
     fn assert_port<T: Clone + Send + Sync>() {}
@@ -105,6 +130,7 @@ fn staging_port_is_clone_send_sync_and_install_authority_is_send() {
     assert_authority::<RuntimeRegistryStagedRouteV2>();
     assert_authority::<RuntimeRegistryBarrierBActivationV2>();
     assert_authority::<RuntimeRegistryBarrierBServingAuthorityV2>();
+    assert_authority::<RuntimeRegistryBarrierBServingMonitorAuthorityV2>();
 }
 
 #[test]
@@ -404,7 +430,7 @@ fn witness_failure_drops_authority_and_removes_the_installed_route() {
 
 #[test]
 fn barrier_b_activation_returns_exact_evidence_and_linear_serving_authority() {
-    let (port, registry) = staging_port("runtime-process:barrier-b");
+    let (port, _) = staging_port("runtime-process:barrier-b");
     let route = route("runtime-process:barrier-b");
     let (emergency, trips) = emergency();
     let replacement = authority(
@@ -430,7 +456,7 @@ fn barrier_b_activation_returns_exact_evidence_and_linear_serving_authority() {
         format!("{activation:?}"),
         "RuntimeRegistryBarrierBActivationV2(<redacted>)"
     );
-    let (evidence, mut authority) = activation.into_parts_v2();
+    let (evidence, authority) = activation.into_parts_v2();
     assert_eq!(authority.identity_v2(), evidence.identity_v2());
     assert_eq!(authority.fencing_token_v2(), evidence.fencing_token_v2());
     assert_eq!(
@@ -448,10 +474,22 @@ fn barrier_b_activation_returns_exact_evidence_and_linear_serving_authority() {
         "RuntimeRegistryBarrierBServingAuthorityV2(<redacted>)"
     );
     authority.ensure_exact_serving_v2().unwrap();
-    registry.begin_drain(&authority.token).unwrap();
-    registry.remove(&authority.token).unwrap();
-    authority.armed = false;
-    drop(authority);
+    let removal = authority.remove_exact_serving_v2().unwrap();
+    assert_eq!(removal.identity_v2(), evidence.identity_v2());
+    assert_eq!(removal.fencing_token_v2(), evidence.fencing_token_v2());
+    assert_eq!(
+        removal.route_incarnation_v2(),
+        evidence.route_incarnation_v2()
+    );
+    assert_eq!(
+        removal.activation_sequence_v2(),
+        evidence.activation_sequence_v2()
+    );
+    assert!(removal.removed_admission_generation_v2() > removal.draining_admission_generation_v2());
+    assert!(
+        removal.removed_slot_observation_sequence_v2()
+            > removal.draining_slot_observation_sequence_v2()
+    );
     assert_eq!(trips.load(Ordering::SeqCst), 0);
 }
 
@@ -506,7 +544,7 @@ fn barrier_b_accepts_only_the_exact_already_serving_replay() {
         .clone();
     registry.activate(&token, route.identity()).unwrap();
 
-    let (evidence, mut authority) = replacement.activate_barrier_b_v2().unwrap().into_parts_v2();
+    let (evidence, authority) = replacement.activate_barrier_b_v2().unwrap().into_parts_v2();
 
     assert_eq!(
         evidence.outcome_v2(),
@@ -517,10 +555,7 @@ fn barrier_b_accepts_only_the_exact_already_serving_replay() {
         evidence.route_incarnation_v2()
     );
     authority.ensure_exact_serving_v2().unwrap();
-    registry.begin_drain(&authority.token).unwrap();
-    registry.remove(&authority.token).unwrap();
-    authority.armed = false;
-    drop(authority);
+    authority.remove_exact_serving_v2().unwrap();
     assert_eq!(trips.load(Ordering::SeqCst), 0);
 }
 
@@ -580,13 +615,117 @@ fn serving_authority_detects_exact_route_loss_and_drop_trips_emergency() {
 
     assert_eq!(
         authority.ensure_exact_serving_v2(),
-        Err(RuntimeRegistryBarrierBActivationErrorV2::ExactServingLost)
+        Err(RuntimeRegistryBarrierBServingErrorV2::ExactServingLost)
     );
     registry.remove(&authority.token).unwrap();
     assert_eq!(
         authority.ensure_exact_serving_v2(),
-        Err(RuntimeRegistryBarrierBActivationErrorV2::ExactServingLost)
+        Err(RuntimeRegistryBarrierBServingErrorV2::ExactServingLost)
     );
     drop(authority);
     assert_eq!(trips.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn serving_authority_handoff_returns_exact_non_clone_monitor_authority() {
+    let (route, _, authority, trips) =
+        barrier_b_serving_authority("runtime-process:barrier-b-monitor");
+
+    let monitor = authority.into_serving_monitor_v2().unwrap();
+    let observation = monitor.observe_exact_serving_v2().unwrap();
+
+    assert_eq!(monitor.identity_v2(), route.identity());
+    assert_eq!(monitor.fencing_token_v2(), fence(1));
+    assert_eq!(
+        monitor.route_incarnation_v2(),
+        observation.route_incarnation_v2()
+    );
+    assert_eq!(
+        monitor.activation_sequence_v2(),
+        observation.activation_sequence_v2()
+    );
+    assert_eq!(observation.identity_v2(), route.identity());
+    assert_eq!(observation.fencing_token_v2(), fence(1));
+    assert_eq!(observation.active_interactions_v2(), 0);
+    assert!(observation.admission_generation_v2().get() > 0);
+    assert!(observation.slot_observation_sequence_v2().get() > 0);
+    assert_eq!(
+        format!("{monitor:?}"),
+        "RuntimeRegistryBarrierBServingMonitorAuthorityV2(<redacted>)"
+    );
+    monitor.remove_exact_serving_v2().unwrap();
+    assert_eq!(trips.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn serving_monitor_drop_conditionally_removes_the_exact_idle_route() {
+    let (_, registry, authority, trips) =
+        barrier_b_serving_authority("runtime-process:barrier-b-monitor-drop");
+    let token = authority.token.clone();
+    let monitor = authority.into_serving_monitor_v2().unwrap();
+
+    drop(monitor);
+
+    assert_eq!(
+        registry.route_witness(&token),
+        Err(ServingSlotRegistryError::StaleMutationToken)
+    );
+    assert_eq!(trips.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn serving_monitor_teardown_with_active_interactions_fails_closed() {
+    let (route, registry, authority, trips) =
+        barrier_b_serving_authority("runtime-process:barrier-b-monitor-active");
+    let token = authority.token.clone();
+    let interaction = registry.admit(&route.slot_key()).unwrap();
+    let monitor = authority.into_serving_monitor_v2().unwrap();
+
+    assert_eq!(
+        monitor.remove_exact_serving_v2(),
+        Err(RuntimeRegistryBarrierBServingErrorV2::ActiveInteractionsRemain { active: 1 })
+    );
+    assert_eq!(
+        registry.route_witness(&token).unwrap().lifecycle,
+        SlotLifecycleV1::Draining
+    );
+    assert_eq!(trips.load(Ordering::SeqCst), 1);
+
+    drop(interaction);
+    registry.remove(&token).unwrap();
+}
+
+#[test]
+fn stale_monitor_never_removes_a_replacement_serving_route() {
+    let (route, registry, authority, trips) =
+        barrier_b_serving_authority("runtime-process:barrier-b-monitor-stale");
+    let stale_token = authority.token.clone();
+    let monitor = authority.into_serving_monitor_v2().unwrap();
+    let replacement = registry
+        .install(route.slot_key(), route.clone(), fence(2))
+        .unwrap();
+    registry
+        .activate(&replacement.token, route.identity())
+        .unwrap();
+
+    assert_eq!(
+        monitor.observe_exact_serving_v2(),
+        Err(RuntimeRegistryBarrierBServingErrorV2::ExactServingLost)
+    );
+    drop(monitor);
+
+    assert_eq!(
+        registry.route_witness(&stale_token),
+        Err(ServingSlotRegistryError::StaleMutationToken)
+    );
+    assert_eq!(
+        registry
+            .route_witness(&replacement.token)
+            .unwrap()
+            .lifecycle,
+        SlotLifecycleV1::Serving
+    );
+    assert_eq!(trips.load(Ordering::SeqCst), 1);
+    registry.begin_drain(&replacement.token).unwrap();
+    registry.remove(&replacement.token).unwrap();
 }
