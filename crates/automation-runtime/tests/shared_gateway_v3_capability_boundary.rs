@@ -104,3 +104,65 @@ fn synchronous_invalidation_precedes_every_observable_close_boundary() {
         assert!(!runtime.contains(forbidden), "{forbidden}");
     }
 }
+
+#[test]
+fn barrier_commands_are_reserved_before_pause_and_resume_without_queue_wait() {
+    let control = production_prefix(include_str!("../src/shared_gateway_control.rs"));
+    let reservation = control
+        .split("pub fn try_reserve_barrier_commands_v3(")
+        .nth(1)
+        .unwrap()
+        .split("pub async fn pause_admission_reserved_v3(")
+        .next()
+        .unwrap();
+    assert_eq!(reservation.matches(".try_reserve_owned()").count(), 2);
+    let first_permit = reservation.find(".try_reserve_owned()").unwrap();
+    let second_permit = reservation.rfind(".try_reserve_owned()").unwrap();
+    let pause_channel = reservation
+        .find("let (pause_acknowledgement, pause_observation) = oneshot::channel()")
+        .unwrap();
+    let resume_channel = reservation
+        .find("let (resume_acknowledgement, resume_observation) = oneshot::channel()")
+        .unwrap();
+    assert!(
+        first_permit < second_permit
+            && second_permit < pause_channel
+            && pause_channel < resume_channel
+    );
+
+    let pause = control
+        .split("pub async fn pause_admission_reserved_v3(")
+        .nth(1)
+        .unwrap()
+        .split("pub async fn resume_admission_reserved_v3(")
+        .next()
+        .unwrap();
+    assert!(pause.contains("pause.permit.send(GatewayCommandV3::Pause"));
+    assert!(!pause.contains("oneshot::channel"));
+    assert!(!pause.contains("self.commands.send"));
+    assert!(!pause.contains("reserve_owned"));
+
+    let resume = control
+        .split("pub async fn resume_admission_reserved_v3(")
+        .nth(1)
+        .unwrap()
+        .split("pub async fn pause_admission(")
+        .next()
+        .unwrap();
+    assert!(resume.contains("reservation.resume.permit.send(GatewayCommandV3::Resume"));
+    assert!(!resume.contains("oneshot::channel"));
+    assert!(!resume.contains("self.commands.send"));
+    assert!(!resume.contains("reserve_owned"));
+
+    for authority in [
+        "GatewayBarrierCommandReservationV3",
+        "GatewayReservedResumeCommandV3",
+    ] {
+        let prefix = control
+            .split(&format!("pub struct {authority} {{"))
+            .next()
+            .unwrap();
+        assert!(!prefix.ends_with("#[derive(Clone)]\n"));
+        assert!(control.contains(&format!("formatter.write_str(\"{authority}(<redacted>)\")")));
+    }
+}

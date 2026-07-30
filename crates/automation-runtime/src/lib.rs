@@ -58,13 +58,14 @@ pub use shared_gateway_control::{
     shared_gateway_control_channel_with_policy_and_invalidator_v3,
     shared_gateway_control_channel_with_policy_v3, GatewayAdmissionPolicyV3,
     GatewayAdmissionRevisionV3, GatewayAdmissionSequenceV3, GatewayAdmissionSnapshotV3,
+    GatewayBarrierCommandReservationErrorV3, GatewayBarrierCommandReservationV3,
     GatewayCommandAckV3, GatewayConnectionEpochV3, GatewayConnectionObserverV3,
     GatewayConnectionStateV3, GatewayControlConfigV3, GatewayControlConfigurationErrorV3,
     GatewayControlErrorV3, GatewayControlTransitionErrorV3, GatewayDisconnectKindV3,
     GatewayDrainCauseV3, GatewayInvalidationSignalV3, GatewayLifecycleEventV3, GatewayPauseTokenV3,
     GatewayPausedConnectionV3, GatewayReadyKindV3, GatewayReadyLeaseV3,
-    GatewayRuntimeCommandOutcomeV3, GatewaySynchronousInvalidatorV3, SharedGatewayControlV3,
-    SharedGatewayRuntimeControlV3,
+    GatewayReservedResumeCommandV3, GatewayRuntimeCommandOutcomeV3,
+    GatewaySynchronousInvalidatorV3, SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
 };
 pub use shared_gateway_executor::execute_admitted_interaction_v3;
 pub use shared_gateway_router::{
