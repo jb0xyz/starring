@@ -489,6 +489,101 @@ fn apply_accepts_only_the_exact_reserved_operation_and_mints_authority() {
     assert_eq!(authority.into_reserved_intent(), expected);
 }
 
+#[test]
+fn observed_persisted_reservation_restores_its_original_action_and_authority() {
+    let mut original = awaiting_session();
+    let execution = original.current_execution_receipt().unwrap();
+    let lookup =
+        RuntimeCertificationReservationScopeLookupV2::from_awaiting_execution(&execution).unwrap();
+    let reservation = reserve(&mut original, "00112233445566778899aabbccddeeff");
+    assert!(reservation.canonical_intent().intent().action_id.get() > 1);
+    let observation = RuntimeCertificationReservationScopeObservationV2::reserved(
+        lookup,
+        execution.snapshot.clone(),
+        reservation.clone(),
+        at(20),
+    )
+    .unwrap();
+    let mut restored = RuntimeConvergenceSessionV1::from_claim(execution).unwrap();
+
+    let authority = restored
+        .apply_observed_certification_reservation_v2(observation)
+        .unwrap();
+
+    assert_authority(
+        &authority,
+        "00112233445566778899aabbccddeeff",
+        reservation.certification_intent_bytes(),
+        reservation.intent_fingerprint(),
+    );
+    assert_eq!(
+        restored.in_flight_action(),
+        Some(reservation.canonical_intent().intent().action_id)
+    );
+    assert_eq!(
+        restored.begin_renewal(Duration::from_secs(30)).unwrap_err(),
+        RuntimeConvergenceSessionError::ActionInFlight
+    );
+}
+
+#[test]
+fn observed_reservation_rejects_absence_expiry_and_divergence_without_authority() {
+    let mut source = awaiting_session();
+    let execution = source.current_execution_receipt().unwrap();
+    let lookup =
+        RuntimeCertificationReservationScopeLookupV2::from_awaiting_execution(&execution).unwrap();
+    let reservation = reserve(&mut source, "00112233445566778899aabbccddeeff");
+
+    let absent = RuntimeCertificationReservationScopeObservationV2::absent(
+        lookup.clone(),
+        execution.snapshot.clone(),
+        at(20),
+    )
+    .unwrap();
+    let mut absent_session = RuntimeConvergenceSessionV1::from_claim(execution.clone()).unwrap();
+    assert_eq!(
+        absent_session
+            .apply_observed_certification_reservation_v2(absent)
+            .unwrap_err(),
+        RuntimeCertificationSessionErrorV2::Session(
+            RuntimeConvergenceSessionError::ReceiptMismatch
+        )
+    );
+    assert!(absent_session.in_flight_action().is_none());
+
+    let expired = RuntimeCertificationReservationScopeObservationV2::reserved(
+        lookup,
+        execution.snapshot.clone(),
+        reservation,
+        at(101),
+    )
+    .unwrap();
+    let mut expired_session = RuntimeConvergenceSessionV1::from_claim(execution.clone()).unwrap();
+    assert_eq!(
+        expired_session
+            .apply_observed_certification_reservation_v2(expired)
+            .unwrap_err(),
+        RuntimeCertificationSessionErrorV2::Session(
+            RuntimeConvergenceSessionError::ReceiptMismatch
+        )
+    );
+    assert!(expired_session.in_flight_action().is_none());
+
+    let divergence = RuntimeCertificationDivergenceV2::PersistenceCorrupt;
+    let mut diverged_session = RuntimeConvergenceSessionV1::from_claim(execution).unwrap();
+    assert_eq!(
+        diverged_session
+            .apply_observed_certification_reservation_v2(
+                RuntimeCertificationReservationScopeObservationV2::diverged(divergence.clone())
+            )
+            .unwrap_err(),
+        RuntimeCertificationSessionErrorV2::Diverged {
+            divergence: Box::new(divergence)
+        }
+    );
+    assert!(diverged_session.in_flight_action().is_none());
+}
+
 fn assert_authority(
     authority: &RuntimeCertificationReservationAuthorityV2,
     operation_id: &str,

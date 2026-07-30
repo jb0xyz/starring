@@ -555,6 +555,49 @@ impl RuntimeConvergenceSessionV1 {
         Ok(RuntimeCertificationReservationAuthorityV2::new(observed))
     }
 
+    pub fn apply_observed_certification_reservation_v2(
+        &mut self,
+        observation: RuntimeCertificationReservationScopeObservationV2,
+    ) -> Result<RuntimeCertificationReservationAuthorityV2, RuntimeCertificationSessionErrorV2>
+    {
+        self.require_action_slot()?;
+        let execution = self.current_execution_receipt()?;
+        let reservation = match observation.kind() {
+            RuntimeCertificationReservationScopeObservationKindV2::Reserved {
+                lookup,
+                snapshot,
+                reservation,
+                observed_at,
+            } if lookup.operation_scope() == reservation.operation_scope()
+                && snapshot == &self.snapshot
+                && *observed_at >= self.acquired_at
+                && *observed_at <= self.expires_at =>
+            {
+                reservation.clone()
+            }
+            RuntimeCertificationReservationScopeObservationKindV2::Diverged(divergence) => {
+                return Err(RuntimeCertificationSessionErrorV2::Diverged {
+                    divergence: Box::new(divergence.clone()),
+                });
+            }
+            RuntimeCertificationReservationScopeObservationKindV2::Absent { .. }
+            | RuntimeCertificationReservationScopeObservationKindV2::Reserved { .. } => {
+                return Err(RuntimeConvergenceSessionError::ReceiptMismatch.into());
+            }
+        };
+        let reconstructed = RuntimeReservedCertificationIntentV2::new(
+            &execution,
+            reservation.canonical_intent().clone(),
+        )?;
+        reconstructed
+            .require_byte_exact_replay(&reservation)
+            .map_err(|_| RuntimeConvergenceSessionError::ReceiptMismatch)?;
+        self.in_flight = Some(ExecutionActionV1::FinalizeCertificationV2(Box::new(
+            reservation.clone(),
+        )));
+        Ok(RuntimeCertificationReservationAuthorityV2::new(reservation))
+    }
+
     pub fn apply_absent_certification_reservation_v2(
         &mut self,
         observation: RuntimeCertificationReservationScopeObservationV2,

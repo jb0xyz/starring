@@ -1327,6 +1327,46 @@ fn v2_certification_session_action_is_internal_exact_and_pure() {
                 .rfind("RuntimeCertificationReservationAuthorityV2::new(observed)")
                 .unwrap()
     );
+    let adopt = session
+        .split("pub fn apply_observed_certification_reservation_v2(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("pub fn apply_absent_certification_reservation_v2(")
+                .next()
+        })
+        .unwrap();
+    for required in [
+        "self.require_action_slot()?",
+        "let execution = self.current_execution_receipt()?",
+        "RuntimeCertificationReservationScopeObservationKindV2::Reserved",
+        "snapshot == &self.snapshot",
+        "*observed_at >= self.acquired_at",
+        "*observed_at <= self.expires_at",
+        "RuntimeReservedCertificationIntentV2::new(",
+        "require_byte_exact_replay(&reservation)",
+        "ExecutionActionV1::FinalizeCertificationV2",
+        "RuntimeCertificationReservationAuthorityV2::new(reservation)",
+    ] {
+        assert!(adopt.contains(required), "{required}");
+    }
+    assert!(!adopt.contains("allocate_action_id"));
+    assert!(
+        adopt
+            .find("RuntimeReservedCertificationIntentV2::new")
+            .unwrap()
+            < adopt
+                .find("require_byte_exact_replay(&reservation)")
+                .unwrap()
+    );
+    assert!(
+        adopt
+            .find("require_byte_exact_replay(&reservation)")
+            .unwrap()
+            < adopt
+                .find("ExecutionActionV1::FinalizeCertificationV2")
+                .unwrap()
+    );
     assert!(session.contains("ReserveCertificationV2(Box<RuntimeReservedCertificationIntentV2>)"));
     assert!(session.contains("FinalizeCertificationV2(Box<RuntimeReservedCertificationIntentV2>)"));
     assert!(session.contains(
@@ -1347,6 +1387,8 @@ fn v2_certification_session_action_is_internal_exact_and_pure() {
         "begin_requires_awaiting_phase_and_an_empty_action_slot",
         "begin_rejects_scope_process_panel_and_duration_tampering_without_an_action",
         "apply_accepts_only_the_exact_reserved_operation_and_mints_authority",
+        "observed_persisted_reservation_restores_its_original_action_and_authority",
+        "observed_reservation_rejects_absence_expiry_and_divergence_without_authority",
         "exact_committed_completion_is_the_only_path_out_of_finalizing",
         "mismatched_completion_keeps_the_exact_action_frozen",
         "exact_absent_observation_is_the_only_pre_persist_release",
