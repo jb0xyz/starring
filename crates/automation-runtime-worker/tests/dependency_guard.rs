@@ -51,6 +51,8 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
         relative_sources,
         [
             PathBuf::from("src/capability_readiness.rs"),
+            PathBuf::from("src/certification_finalization/tests.rs"),
+            PathBuf::from("src/certification_finalization.rs"),
             PathBuf::from("src/certification_reservation.rs"),
             PathBuf::from("src/closed_recovery.rs"),
             PathBuf::from("src/convergence/hydration.rs"),
@@ -209,6 +211,98 @@ fn certification_reservation_port_is_pure_checked_and_non_authorizing() {
             .count(),
         1
     );
+}
+
+#[test]
+fn certification_finalization_is_session_bound_linear_and_lookup_only_after_unknown() {
+    let source = include_str!("../src/certification_finalization.rs");
+    let finalizer_port = source
+        .split("pub trait RuntimeCertificationFinalizerPortV2<P> {")
+        .nth(1)
+        .and_then(|source| source.split("\n}").next())
+        .unwrap();
+    let reserved = source
+        .split("impl RuntimeReservedCertificationV2 {")
+        .nth(1)
+        .and_then(|source| source.split("\n}\n\nimpl Debug").next())
+        .unwrap();
+    let lookup_only = source
+        .split("impl<E, R> RuntimeCertificationLookupOnlyRecoveryV2<E, R>")
+        .nth(1)
+        .and_then(|source| source.split("\n}\n\nimpl<E, R> Debug").next())
+        .unwrap();
+
+    assert!(reserved.contains("authority: RuntimeCertificationReservationAuthorityV2,"));
+    assert!(reserved.contains("authority.into_reserved_intent()"));
+    assert!(!reserved.contains("reservation: RuntimeReservedCertificationIntentV2,"));
+    assert!(source.contains(
+        "pub fn into_session_outcome(self) -> RuntimeCertificationIntentReservationOutcomeV2"
+    ));
+    assert!(source.contains(
+        "RuntimeCertificationIntentReservationOutcomeV2::Diverged(\n                    RuntimeCertificationDivergenceV2::ReservationMismatch,"
+    ));
+    assert!(
+        source.contains("pub struct RuntimeCertificationCommitAuthorityV2 {\n    _private: (),\n}")
+    );
+    assert!(source.contains("pub(crate) fn from_barrier_completion_v2() -> Self"));
+    assert!(source.contains(
+        "pub fn authorize_finalization(\n        self,\n        authority: RuntimeCertificationCommitAuthorityV2,"
+    ));
+    assert!(source.contains(
+        "pub struct RuntimeAuthorizedCertificationRequestV2 {\n    canonical: RuntimeCanonicalLiveAttestationV2,\n    authority: RuntimeCertificationCommitAuthorityV2,\n}"
+    ));
+    assert!(source.contains(
+        "pub struct RuntimeCommittedCertificationV2 {\n    canonical: RuntimeCanonicalLiveAttestationV2,\n    receipt: RuntimeCertificationReceiptV2,\n}"
+    ));
+    assert!(source.contains("pub fn canonical(&self) -> &RuntimeCanonicalLiveAttestationV2"));
+    assert!(source.contains("pub fn into_parts("));
+    assert!(source.contains(
+        "RuntimeCommittedCertificationV2 {\n            canonical: expected.clone(),\n            receipt,"
+    ));
+    for name in [
+        "RuntimeReservedCertificationV2",
+        "RuntimePreparedCertificationV2<P>",
+        "RuntimeCertificationCommitAuthorityV2",
+        "RuntimeAuthorizedCertificationRequestV2",
+        "RuntimeCertificationFinalizerRegistrationV2<P>",
+        "RuntimeCertificationFinalizerJobV2<P>",
+        "RuntimeCommittedCertificationV2",
+        "RuntimeCertificationLookupOnlyRecoveryV2<E, R>",
+    ] {
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !implements_trait(source, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
+    }
+    for expected in [
+        "fn accept_certification_finalizer(",
+        "registration: RuntimeCertificationFinalizerRegistrationV2<P>,",
+        "RuntimeCertificationFinalizerRejectionV2<P, Self::Error>",
+    ] {
+        assert!(finalizer_port.contains(expected), "{expected}");
+    }
+    assert!(!finalizer_port.contains("Future"));
+    assert!(!finalizer_port.contains("async"));
+    for expected in [
+        "RuntimeCertificationFinalizationOutcomeV2::Committed",
+        "RuntimeCertificationFinalizationOutcomeV2::DefinitelyRolledBack",
+        "RuntimeCertificationFinalizationOutcomeV2::Indeterminate",
+        "RuntimeCertificationRecoveryResolutionV2::DefinitelyRolledBack",
+    ] {
+        assert!(source.contains(expected), "{expected}");
+    }
+    assert!(lookup_only.contains("pub fn lookup(&self)"));
+    assert!(lookup_only.contains("pub fn quiesce_and_observe("));
+    for forbidden in [
+        "commit_live_v2",
+        "prepare_live_v2",
+        "authorize_finalization",
+        "heartbeat",
+    ] {
+        assert!(!lookup_only.contains(forbidden), "{forbidden}");
+    }
 }
 
 #[test]

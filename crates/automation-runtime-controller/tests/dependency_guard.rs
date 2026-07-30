@@ -1176,6 +1176,198 @@ fn v2_certification_reservation_derives_and_closes_its_natural_scope() {
 }
 
 #[test]
+fn v2_certification_session_action_is_internal_exact_and_pure() {
+    let action = include_str!("../src/v2_certification_session.rs");
+    let session = include_str!("../src/session.rs");
+    let tests = include_str!("../src/v2_certification_session/tests.rs");
+    let before_session = session
+        .split("pub struct RuntimeConvergenceSessionV1 {")
+        .next()
+        .unwrap();
+    assert!(!before_session.ends_with("#[derive(Clone, Debug)]\n"));
+    for forbidden in [
+        "sqlx",
+        "rusqlite",
+        "tokio",
+        "twilight",
+        "reqwest",
+        "automation_runtime::",
+        "Serialize",
+        "Deserialize",
+        "pub action_id:",
+        "pub guard:",
+        "pub target:",
+        "pub process_identity:",
+    ] {
+        assert!(
+            !action.contains(forbidden),
+            "forbidden V2 certification session surface: {forbidden}"
+        );
+    }
+
+    let input = action
+        .split("pub struct RuntimeCertificationReservationInputV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\n#[derive").next())
+        .unwrap();
+    for field in [
+        "pub operation_id: RuntimeCertificationOperationIdV2,",
+        "pub binding_pin: RuntimeBindingPinV1,",
+        "pub gateway_owner_lease_id: RuntimeGatewayOwnerLeaseIdV1,",
+        "pub observed_owner_revision: NonZeroU64,",
+        "pub runtime_build_revision: RuntimeBuildRevisionV1,",
+        "pub panel: RuntimePanelEvidenceV2,",
+        "pub serving_lease_for: Duration,",
+    ] {
+        assert!(input.contains(field), "{field}");
+    }
+    assert_eq!(
+        input
+            .lines()
+            .filter(|line| line.starts_with("    pub "))
+            .count(),
+        7
+    );
+
+    let authority = action
+        .split("pub struct RuntimeCertificationReservationAuthorityV2 {")
+        .nth(1)
+        .and_then(|source| source.split("}\n\nimpl").next())
+        .unwrap();
+    assert!(authority.contains("reservation: RuntimeReservedCertificationIntentV2,"));
+    assert!(!authority.contains("pub "));
+    let before_authority = action
+        .split("pub struct RuntimeCertificationReservationAuthorityV2 {")
+        .next()
+        .unwrap();
+    assert!(!before_authority.ends_with("#[derive(Clone)]\n"));
+    assert!(!before_authority.ends_with("Clone, Debug, PartialEq, Eq)]\n"));
+    assert!(action
+        .contains("pub(crate) fn new(reservation: RuntimeReservedCertificationIntentV2) -> Self"));
+    assert!(action
+        .contains("pub fn into_reserved_intent(self) -> RuntimeReservedCertificationIntentV2"));
+    assert!(action.contains(
+        "formatter.write_str(\"RuntimeCertificationReservationAuthorityV2(<redacted>)\")"
+    ));
+
+    let begin = session
+        .split("pub fn begin_certification_reservation_v2(")
+        .nth(1)
+        .and_then(|source| {
+            source
+                .split("pub fn apply_certification_reservation_v2(")
+                .next()
+        })
+        .unwrap();
+    for required in [
+        "self.require_action_slot()?",
+        "RuntimeDeploymentPhaseV1::AwaitingGatewayReady",
+        "let action_id = self.allocate_action_id()?",
+        "RuntimeCanonicalCertificationIntentV2::new(RuntimeCertificationIntentV2",
+        "action_id,",
+        "guard: self.guard()",
+        "target: self.snapshot.target.clone()",
+        "process_identity: input.panel.process_identity.clone()",
+        "RuntimeReservedCertificationIntentV2::new(&execution, canonical_intent)?",
+        "ExecutionActionV1::ReserveCertificationV2",
+    ] {
+        assert!(begin.contains(required), "{required}");
+    }
+    assert!(
+        begin.find("self.require_action_slot()?").unwrap()
+            < begin
+                .find("RuntimeDeploymentPhaseV1::AwaitingGatewayReady")
+                .unwrap()
+    );
+    assert!(
+        begin
+            .find("RuntimeDeploymentPhaseV1::AwaitingGatewayReady")
+            .unwrap()
+            < begin
+                .find("let action_id = self.allocate_action_id()?")
+                .unwrap()
+    );
+    assert!(
+        begin
+            .find("RuntimeReservedCertificationIntentV2::new")
+            .unwrap()
+            < begin
+                .find("ExecutionActionV1::ReserveCertificationV2")
+                .unwrap()
+    );
+
+    let apply = session
+        .split("pub fn apply_certification_reservation_v2(")
+        .nth(1)
+        .and_then(|source| source.split("pub fn apply_certification(").next())
+        .unwrap();
+    for required in [
+        "Some(ExecutionActionV1::ReserveCertificationV2(expected))",
+        "self.validate_guard(&expected.canonical_intent().intent().guard)?",
+        "RuntimeCertificationIntentReservationOutcomeV2::Reserved(observed)",
+        "RuntimeCertificationIntentReservationOutcomeV2::Diverged(divergence)",
+        "observed.canonical_intent().intent().action_id",
+        "expected.canonical_intent().intent().action_id",
+        "require_byte_exact_replay(&observed)",
+        "RuntimeConvergenceSessionError::ReceiptMismatch",
+        "ExecutionActionV1::FinalizeCertificationV2",
+        "RuntimeCertificationReservationAuthorityV2::new(observed)",
+    ] {
+        assert!(apply.contains(required), "{required}");
+    }
+    assert!(
+        apply
+            .find("observed.canonical_intent().intent().action_id")
+            .unwrap()
+            < apply.find("require_byte_exact_replay(&observed)").unwrap()
+    );
+    assert!(
+        apply.find("require_byte_exact_replay(&observed)").unwrap()
+            < apply
+                .rfind("RuntimeCertificationReservationAuthorityV2::new(observed)")
+                .unwrap()
+    );
+    assert!(session.contains("ReserveCertificationV2(Box<RuntimeReservedCertificationIntentV2>)"));
+    assert!(session.contains("FinalizeCertificationV2(Box<RuntimeReservedCertificationIntentV2>)"));
+    assert!(session.contains(
+        "Self::ReserveCertificationV2(reservation) => {\n                reservation.canonical_intent().intent().action_id"
+    ));
+    assert!(session.contains(
+        "Self::FinalizeCertificationV2(reservation) => {\n                reservation.canonical_intent().intent().action_id"
+    ));
+    assert!(session.contains("pub fn apply_absent_certification_reservation_v2("));
+    assert!(session.contains("pub fn apply_certification_v2("));
+    assert!(session.contains(
+        "ExecutionActionV1::ReserveCertificationV2(_)\n                | ExecutionActionV1::FinalizeCertificationV2(_)"
+    ));
+    assert!(session.contains("validate_certification_v2_completion("));
+
+    for coverage in [
+        "begin_mints_and_binds_the_exact_current_awaiting_action",
+        "begin_requires_awaiting_phase_and_an_empty_action_slot",
+        "begin_rejects_scope_process_panel_and_duration_tampering_without_an_action",
+        "apply_accepts_only_the_exact_reserved_operation_and_mints_authority",
+        "exact_committed_completion_is_the_only_path_out_of_finalizing",
+        "mismatched_completion_keeps_the_exact_action_frozen",
+        "exact_absent_observation_is_the_only_pre_persist_release",
+        "apply_rejects_foreign_and_byte_distinct_receipts_without_releasing_action",
+        "generic_abort_cannot_release_reserved_or_finalizing_certification",
+        "divergence_keeps_the_current_action_frozen_without_minting_authority",
+    ] {
+        assert!(tests.contains(coverage), "{coverage}");
+    }
+
+    let library = include_str!("../src/lib.rs");
+    for exported in [
+        "RuntimeCertificationReservationAuthorityV2",
+        "RuntimeCertificationReservationInputV2",
+        "RuntimeCertificationSessionErrorV2",
+    ] {
+        assert!(library.contains(exported), "{exported}");
+    }
+}
+
+#[test]
 fn v2_awaiting_reset_is_checked_closed_and_non_authorizing() {
     let source = include_str!("../src/v2_awaiting_reset.rs");
     for forbidden in [
@@ -3616,6 +3808,14 @@ fn source_files_contain_no_comments() {
         (
             "src/v2_certification_operation.rs",
             include_str!("../src/v2_certification_operation.rs"),
+        ),
+        (
+            "src/v2_certification_session.rs",
+            include_str!("../src/v2_certification_session.rs"),
+        ),
+        (
+            "src/v2_certification_session/tests.rs",
+            include_str!("../src/v2_certification_session/tests.rs"),
         ),
         (
             "src/v2_awaiting_reset.rs",

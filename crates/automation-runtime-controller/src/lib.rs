@@ -20,6 +20,7 @@ mod v2_certification;
 mod v2_certification_canonical;
 mod v2_certification_operation;
 mod v2_certification_outcome;
+mod v2_certification_session;
 mod v2_digest;
 mod v2_drain;
 mod v2_drain_claim;
@@ -113,6 +114,10 @@ pub use v2_certification_outcome::{
     AwaitingCertificationScopeObservationV2, RuntimeCertificationDivergenceV2,
     RuntimeCertificationLookupV2, RuntimeCertificationObservationV2, RuntimeCertificationReceiptV2,
     RuntimeCertificationRecoveryDispositionV2, RuntimeServingIdentityV2, RuntimeServingReceiptV2,
+};
+pub use v2_certification_session::{
+    RuntimeCertificationReservationAuthorityV2, RuntimeCertificationReservationInputV2,
+    RuntimeCertificationSessionErrorV2,
 };
 pub use v2_digest::{
     RuntimeCertificationIntentFingerprintV2, RuntimeCertificationRequestDigestV2,

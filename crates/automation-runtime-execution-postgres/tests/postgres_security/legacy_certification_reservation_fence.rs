@@ -313,7 +313,8 @@ async fn legacy_certification_fence_fixture(
     let mut session = gateway_ready_session(database, controller).await;
     let gateway_ready = gateway_ready_attestation(database, &session).await;
     let guard = session.execution_guard().unwrap().clone();
-    let mut renewal_session = session.clone();
+    let execution = session.current_execution_receipt().unwrap();
+    let mut renewal_session = RuntimeConvergenceSessionV1::from_claim(execution).unwrap();
     let renewal = renewal_session
         .begin_renewal(Duration::from_secs(400))
         .unwrap();
