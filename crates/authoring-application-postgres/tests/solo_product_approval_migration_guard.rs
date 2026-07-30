@@ -1,5 +1,7 @@
 const MIGRATION: &str =
     include_str!("../../../migrations/202607310001_enforce_solo_product_approval.sql");
+const MANIFEST_MIGRATION: &str =
+    include_str!("../../../migrations/202607310002_refresh_solo_approval_schema_manifests.sql");
 const APPROVAL_SOURCE: &str =
     include_str!("../../../migrations/202607190009_separate_product_binding_identities.sql");
 const REPAIR_SOURCE: &str =
@@ -61,4 +63,35 @@ fn solo_product_approval_migration_targets_both_historical_gates_exactly() {
     assert_eq!(MIGRATION.matches(repair_gate).count(), 1);
     assert_eq!(MIGRATION.matches("self_approval_forbidden").count(), 2);
     assert!(MIGRATION.contains("EXECUTE pg_catalog.replace(function_definition"));
+}
+
+#[test]
+fn solo_product_approval_refreshes_every_affected_runtime_manifest() {
+    assert!(!MANIFEST_MIGRATION.contains("--"));
+    assert!(!MANIFEST_MIGRATION.contains("/*"));
+    assert!(!MANIFEST_MIGRATION.contains("//"));
+    for required in [
+        "public.starring_runtime_exact_target_schema_manifest_v1()",
+        "public.starring_runtime_exact_target_schema_manifest_v2()",
+        "public.starring_runtime_execution_schema_manifest_v1()",
+        "public.starring_runtime_serving_schema_manifest_v1()",
+        "RETURN observed_count = 358",
+        "RETURN observed_count = 969",
+        "RETURN observed_count = 492",
+        "aee90f2f78d8106e298c8075b0710bca6d47b3b37cc9d2c6598a4f9f769b9f7d",
+        "metadata_after IS DISTINCT FROM metadata_before",
+        "pg_catalog.pg_get_functiondef",
+        "solo approval schema manifest postflight failed",
+    ] {
+        assert!(
+            MANIFEST_MIGRATION.contains(required),
+            "missing solo approval schema manifest guard: {required}"
+        );
+    }
+    for forbidden in ["GRANT ", "DROP FUNCTION", "DELETE FROM", "UPDATE public."] {
+        assert!(
+            !MANIFEST_MIGRATION.contains(forbidden),
+            "forbidden solo approval schema manifest edge: {forbidden}"
+        );
+    }
 }
