@@ -233,7 +233,7 @@ fn readers_and_manifests_accept_terminal_history_without_selecting_it() {
         assert!(MIGRATION.contains(required), "{required}");
     }
     assert!(CONTRACT_SOURCE
-        .contains("2a19a8895be1dcc8596ae9413864dc444827c40255e378c0e06b2e1a359304cf"));
+        .contains("1d00ad69e8c2633713f35670b831d274329d24fb3e7410b13d429a19b5fb7c34"));
     assert!(MIGRATION.contains(
         "CREATE UNIQUE INDEX runtime_drain_intents_v2_one_pending_per_slot ON public.runtime_drain_intents_v2 USING btree (slot_guild_id, slot_ruleset_key) WHERE (intent_state = ANY (ARRAY[''pending''::text, ''route_absent_acknowledged''::text]))"
     ));

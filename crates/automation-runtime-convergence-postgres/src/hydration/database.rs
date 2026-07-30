@@ -15,7 +15,7 @@ pub const DEFAULT_RUNTIME_EXACT_TARGET_STATEMENT_TIMEOUT: Duration = Duration::f
 pub const DEFAULT_RUNTIME_EXACT_TARGET_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_RUNTIME_EXACT_TARGET_DATABASE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_EXACT_TARGET_READINESS_DEFINITION_DIGEST_V2: &str =
-    "f51338cfbfc8d360c90d6ebdbfeebf8c8f5c26165e1d53b837d38cb670733d46";
+    "2b28b5bac9a444333d1681ccc158243d8a0d010818fa0719374699f8d0275c43";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeExactTargetDatabaseTimeoutsV1 {
