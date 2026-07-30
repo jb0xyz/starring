@@ -228,9 +228,9 @@ fn manifests_readiness_and_roles_expose_only_six_capabilities() {
     assert!(!acl.contains("GRANT DELETE"));
     assert!(ROLE_BOOTSTRAP.contains(") <> 60 THEN"));
     assert!(EXECUTION_CONTRACT
-        .contains("1d00ad69e8c2633713f35670b831d274329d24fb3e7410b13d429a19b5fb7c34"));
+        .contains("fc2b7bceeb3e9b9fc98335c3c358652e76b3f13edf87bbbb2506b62de3577e0a"));
     assert!(EXECUTION_DATABASE
-        .contains("1d00ad69e8c2633713f35670b831d274329d24fb3e7410b13d429a19b5fb7c34"));
+        .contains("fc2b7bceeb3e9b9fc98335c3c358652e76b3f13edf87bbbb2506b62de3577e0a"));
     assert!(SERVING_DATABASE
         .contains("977410de87917e582c6018c0ddcea164045b82a4550fb166ff138e3efa65238d"));
 }

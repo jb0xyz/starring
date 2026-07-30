@@ -28,3 +28,4 @@ include!("postgres_security/startup_pending_drain_execution_adapter.rs");
 include!("postgres_security/startup_pending_drain_succession.rs");
 include!("postgres_security/startup_pending_drain_succession_adapter.rs");
 include!("postgres_security/product_drain_terminal_substrate.rs");
+include!("postgres_security/runtime_certification_ready_semantics.rs");
