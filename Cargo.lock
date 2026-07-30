@@ -3334,6 +3334,7 @@ dependencies = [
  "automation-runtime-worker",
  "chrono",
  "discord-model",
+ "futures",
  "getrandom 0.4.3",
  "serde_json",
  "sqlx",

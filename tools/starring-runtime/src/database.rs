@@ -5,6 +5,12 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
+use automation_runtime::{
+    GatewayConnectionObserverV3, GatewayReadyLeaseV3,
+    OwnedSharedGatewayDispatchServicesCompositionErrorV3, OwnedSharedGatewayDispatchServicesV3,
+    SharedGatewayAdmissionConfigV3, SharedGatewayInteractionEnvelopeV3,
+    SharedGatewayInteractionReservationOutcomeV3, SharedGatewayReservedInteractionV3,
+};
 use automation_runtime_convergence_postgres::{
     PostgresRuntimeExactTargetReader, RuntimeConvergenceStoreError,
     RuntimeExactTargetDatabaseExpectationV1, RuntimeExactTargetDatabaseReadinessV1,
@@ -43,11 +49,18 @@ use automation_runtime_worker::{
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::ConnectOptions;
 use tokio::time::{sleep_until, timeout, timeout_at, Instant as TokioInstant};
+use zeroize::Zeroizing;
 
+use crate::registry::RuntimeInteractionDispatchRegistryV1;
+use crate::runtime_interaction_dispatch::{
+    RuntimeInteractionDispatchFutureV1, RuntimeInteractionDispatchPortV1,
+    RuntimeInteractionDispatchReservationOutcomeV1, RuntimeInteractionRejectionFutureV1,
+};
 use crate::startup::RuntimeStartupBudgetV1;
 use crate::{
     DatabaseCapabilityV1, DatabasePoolConfigV1, ResolvedRuntimeSecretsV1, RuntimeConfigV1,
     RuntimeDatabaseConnectionSecretV1, RuntimeDatabaseEndpointV1, RuntimeDatabaseSslModeV1,
+    RuntimeDiscordBotTokenV1,
 };
 
 const PERIODIC_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -341,6 +354,87 @@ impl Debug for RuntimeControllerDatabaseV2 {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[allow(dead_code)]
+pub(crate) enum RuntimeInteractionDispatchCompositionErrorV1 {
+    #[error("runtime interaction dispatch admission configuration is invalid")]
+    AdmissionConfiguration,
+    #[error("runtime interaction dispatch route configuration is invalid")]
+    RouteConfiguration,
+    #[error("runtime interaction dispatch service composition timed out")]
+    TimedOut,
+    #[error("runtime interaction dispatch role snapshot provider is unavailable")]
+    SnapshotUnavailable,
+}
+
+#[allow(dead_code)]
+impl RuntimeInteractionDispatchCompositionErrorV1 {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::AdmissionConfiguration => "runtime_interaction_dispatch_admission_configuration",
+            Self::RouteConfiguration => "runtime_interaction_dispatch_route_configuration",
+            Self::TimedOut => "runtime_interaction_dispatch_composition_timed_out",
+            Self::SnapshotUnavailable => "runtime_interaction_dispatch_snapshot_unavailable",
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct RuntimeInteractionDispatchDatabasePortV1 {
+    inner: OwnedSharedGatewayDispatchServicesV3<PostgresRuntimeInteractionV1>,
+}
+
+impl Debug for RuntimeInteractionDispatchDatabasePortV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeInteractionDispatchDatabasePortV1(<redacted>)")
+    }
+}
+
+impl RuntimeInteractionDispatchPortV1 for RuntimeInteractionDispatchDatabasePortV1 {
+    type Reservation = SharedGatewayReservedInteractionV3;
+
+    fn dispatch_capacity_v1(&self) -> std::num::NonZeroUsize {
+        self.inner.dispatch_capacity_v3()
+    }
+
+    fn reserve_v1(
+        &self,
+        envelope: SharedGatewayInteractionEnvelopeV3,
+        ready_lease: Option<GatewayReadyLeaseV3>,
+        observer: &GatewayConnectionObserverV3,
+    ) -> RuntimeInteractionDispatchReservationOutcomeV1<Self::Reservation> {
+        match self.inner.reserve_v3(envelope, ready_lease, observer) {
+            SharedGatewayInteractionReservationOutcomeV3::Reserved(reserved) => {
+                RuntimeInteractionDispatchReservationOutcomeV1::Reserved(*reserved)
+            }
+            SharedGatewayInteractionReservationOutcomeV3::Ignored => {
+                RuntimeInteractionDispatchReservationOutcomeV1::Ignored
+            }
+            SharedGatewayInteractionReservationOutcomeV3::Rejected { reason, envelope } => {
+                RuntimeInteractionDispatchReservationOutcomeV1::Rejected { reason, envelope }
+            }
+        }
+    }
+
+    fn cancel_v1(&self, reservation: Self::Reservation) -> Box<SharedGatewayInteractionEnvelopeV3> {
+        self.inner.cancel_v3(reservation)
+    }
+
+    fn dispatch_v1(
+        self: Arc<Self>,
+        reservation: Self::Reservation,
+    ) -> RuntimeInteractionDispatchFutureV1 {
+        Box::pin(async move { self.inner.dispatch_v3(reservation).await })
+    }
+
+    fn acknowledge_rejection_v1(
+        self: Arc<Self>,
+        envelope: Box<SharedGatewayInteractionEnvelopeV3>,
+    ) -> RuntimeInteractionRejectionFutureV1 {
+        Box::pin(async move { self.inner.acknowledge_rejection_v3(envelope).await })
+    }
+}
+
 impl RuntimePendingDrainMutationDatabaseV3 {
     pub(crate) async fn record_no_candidate_v3(
         &self,
@@ -411,6 +505,43 @@ impl RuntimeDatabaseDependenciesV1 {
             panel: self.panel.clone(),
             serving: self.serving.clone(),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn compose_interaction_dispatch_port_v1(
+        &self,
+        registry: RuntimeInteractionDispatchRegistryV1,
+        token: &RuntimeDiscordBotTokenV1,
+        gateway: crate::GatewayResourceConfigV1,
+        operation_deadline: StdInstant,
+    ) -> Result<
+        RuntimeInteractionDispatchDatabasePortV1,
+        RuntimeInteractionDispatchCompositionErrorV1,
+    > {
+        let admission_config =
+            SharedGatewayAdmissionConfigV3::new(gateway.global_admission_capacity())
+                .map_err(|_| RuntimeInteractionDispatchCompositionErrorV1::AdmissionConfiguration)?
+                .with_instance_lookup_timeout(gateway.instance_lookup_timeout())
+                .map_err(|_| RuntimeInteractionDispatchCompositionErrorV1::RouteConfiguration)?;
+        let inner = OwnedSharedGatewayDispatchServicesV3::compose_v3(
+            Zeroizing::new(token.expose_secret().to_owned()),
+            registry.into_registry_v1(),
+            self.interaction.clone(),
+            admission_config,
+            operation_deadline,
+        )
+        .await
+        .map_err(
+            |error: OwnedSharedGatewayDispatchServicesCompositionErrorV3| match error {
+                OwnedSharedGatewayDispatchServicesCompositionErrorV3::TimedOut => {
+                    RuntimeInteractionDispatchCompositionErrorV1::TimedOut
+                }
+                OwnedSharedGatewayDispatchServicesCompositionErrorV3::SnapshotUnavailable => {
+                    RuntimeInteractionDispatchCompositionErrorV1::SnapshotUnavailable
+                }
+            },
+        )?;
+        Ok(RuntimeInteractionDispatchDatabasePortV1 { inner })
     }
 
     pub fn exact_target(&self) -> &PostgresRuntimeExactTargetReader {

@@ -1,11 +1,16 @@
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use automation_core::InteractionResponder;
-use automation_instance::{InstanceIdGenerator, InstanceRegistrarV1, InstanceRouteReaderV1};
-use automation_instance_teardown::InstanceTeardownService;
+use automation_instance::{
+    InstanceIdGenerator, InstanceRegistrarV1, InstanceRouteReaderV1, InstanceTeardownStoreV1,
+    SecureRandomInstanceIdGenerator,
+};
+use automation_instance_teardown::{InstanceTeardownService, Teardown};
 use automation_ruleset_dispatch::{GuildRoleSnapshotProvider, PinnedInstanceResolverV1};
 use automation_runtime_registry::ServingSlotRegistryV1;
 use discord_model::{ChannelId, GuildId, UserId};
@@ -24,15 +29,17 @@ use twilight_model::oauth::ApplicationIntegrationMap;
 use twilight_model::user::User;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::instance_deleter::OwnedTwilightInstanceDeleter;
 use crate::responder::TwilightInteractionResponder;
 use crate::runner::InteractionExecutionOutcomeV3;
 use crate::shared_gateway_admission::{
-    SharedGatewayAdmissionBudgetV3, SharedGatewayAdmissionErrorV3,
+    SharedGatewayAdmissionBudgetV3, SharedGatewayAdmissionConfigV3, SharedGatewayAdmissionErrorV3,
     SharedGatewayAdmissionReservationV3,
 };
 use crate::shared_gateway_control::{GatewayConnectionObserverV3, GatewayReadyLeaseV3};
 use crate::shared_gateway_executor::execute_admitted_interaction_v3;
 use crate::shared_gateway_router::{parse_shared_gateway_route_v1, SharedGatewayRouteErrorV1};
+use crate::snapshot::OwnedTwilightGuildRoleSnapshotProvider;
 
 pub const MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3: usize = 100;
 pub const MAX_SHARED_GATEWAY_INTERACTION_TOKEN_BYTES_V3: usize = 4_096;
@@ -41,6 +48,9 @@ pub const MAX_SHARED_GATEWAY_MODAL_INPUTS_V3: usize = 5;
 pub const MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3: usize = 4_000;
 pub const MAX_SHARED_GATEWAY_MODAL_PAYLOAD_BYTES_V3: usize = 20_000;
 const SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3: Duration = Duration::from_secs(2);
+const SHARED_GATEWAY_MUTATION_HTTP_TIMEOUT_V3: Duration = Duration::from_secs(15);
+pub const SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3: &str =
+    "Starring is temporarily unable to process this request. Please try again.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SharedGatewayInteractionApplicationIdV3(NonZeroU64);
@@ -613,6 +623,165 @@ where
     }
 }
 
+pub fn cancel_reserved_shared_gateway_interaction_v3(
+    reserved: SharedGatewayReservedInteractionV3,
+) -> Box<SharedGatewayInteractionEnvelopeV3> {
+    let SharedGatewayReservedInteractionV3 {
+        reservation,
+        envelope,
+    } = reserved;
+    drop(reservation);
+    Box::new(envelope)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum OwnedSharedGatewayDispatchServicesCompositionErrorV3 {
+    #[error("shared gateway dispatch service composition timed out")]
+    TimedOut,
+    #[error("shared gateway dispatch role snapshot provider is unavailable")]
+    SnapshotUnavailable,
+}
+
+impl OwnedSharedGatewayDispatchServicesCompositionErrorV3 {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::TimedOut => "shared_gateway_dispatch_composition_timed_out",
+            Self::SnapshotUnavailable => "shared_gateway_dispatch_snapshot_unavailable",
+        }
+    }
+}
+
+pub struct OwnedSharedGatewayDispatchServicesV3<I> {
+    registry: ServingSlotRegistryV1,
+    instances: I,
+    instance_ids: SecureRandomInstanceIdGenerator,
+    teardown: Teardown<I, OwnedTwilightInstanceDeleter>,
+    snapshot_provider: OwnedTwilightGuildRoleSnapshotProvider,
+    mutation_http: Arc<Client>,
+    interaction_http: Arc<Client>,
+    admission_budget: SharedGatewayAdmissionBudgetV3,
+}
+
+impl<I> OwnedSharedGatewayDispatchServicesV3<I>
+where
+    I: Clone
+        + Send
+        + Sync
+        + 'static
+        + InstanceRouteReaderV1
+        + InstanceRegistrarV1
+        + InstanceTeardownStoreV1
+        + PinnedInstanceResolverV1,
+{
+    pub async fn compose_v3(
+        token: Zeroizing<String>,
+        registry: ServingSlotRegistryV1,
+        instances: I,
+        admission_config: SharedGatewayAdmissionConfigV3,
+        operation_deadline: Instant,
+    ) -> Result<Self, OwnedSharedGatewayDispatchServicesCompositionErrorV3> {
+        if Instant::now() >= operation_deadline {
+            return Err(OwnedSharedGatewayDispatchServicesCompositionErrorV3::TimedOut);
+        }
+        let mutation_http = Arc::new(
+            Client::builder()
+                .token(token.to_string())
+                .timeout(SHARED_GATEWAY_MUTATION_HTTP_TIMEOUT_V3)
+                .build(),
+        );
+        let interaction_http = Arc::new(
+            Client::builder()
+                .token(token.to_string())
+                .ratelimiter(None)
+                .timeout(SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3)
+                .build(),
+        );
+        let snapshot_provider = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(operation_deadline),
+            OwnedTwilightGuildRoleSnapshotProvider::new(Arc::clone(&mutation_http)),
+        )
+        .await
+        .map_err(|_| OwnedSharedGatewayDispatchServicesCompositionErrorV3::TimedOut)?
+        .map_err(|_| OwnedSharedGatewayDispatchServicesCompositionErrorV3::SnapshotUnavailable)?;
+        let teardown = Teardown::new(
+            instances.clone(),
+            OwnedTwilightInstanceDeleter::new(Arc::clone(&mutation_http)),
+        );
+        Ok(Self {
+            registry,
+            instances,
+            instance_ids: SecureRandomInstanceIdGenerator::new(),
+            teardown,
+            snapshot_provider,
+            mutation_http,
+            interaction_http,
+            admission_budget: SharedGatewayAdmissionBudgetV3::new(admission_config),
+        })
+    }
+
+    pub fn dispatch_capacity_v3(&self) -> std::num::NonZeroUsize {
+        self.admission_budget.capacity()
+    }
+
+    pub fn reserve_v3(
+        &self,
+        envelope: SharedGatewayInteractionEnvelopeV3,
+        ready_lease: Option<GatewayReadyLeaseV3>,
+        observer: &GatewayConnectionObserverV3,
+    ) -> SharedGatewayInteractionReservationOutcomeV3 {
+        reserve_shared_gateway_interaction_v3(
+            envelope,
+            ready_lease,
+            observer,
+            &self.admission_budget,
+        )
+    }
+
+    pub fn cancel_v3(
+        &self,
+        reserved: SharedGatewayReservedInteractionV3,
+    ) -> Box<SharedGatewayInteractionEnvelopeV3> {
+        cancel_reserved_shared_gateway_interaction_v3(reserved)
+    }
+
+    pub async fn dispatch_v3(
+        &self,
+        reserved: SharedGatewayReservedInteractionV3,
+    ) -> SharedGatewayInteractionDispatchOutcomeV3 {
+        dispatch_reserved_shared_gateway_interaction_v3(
+            reserved,
+            &self.registry,
+            &self.instances,
+            &self.instance_ids,
+            &self.teardown,
+            &self.instances,
+            &self.snapshot_provider,
+            &self.mutation_http,
+            &self.interaction_http,
+            SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3,
+        )
+        .await
+    }
+
+    pub async fn acknowledge_rejection_v3(
+        &self,
+        envelope: Box<SharedGatewayInteractionEnvelopeV3>,
+    ) -> SharedGatewayRejectionAcknowledgementOutcomeV3 {
+        acknowledge_shared_gateway_interaction_rejection_v3(
+            &self.interaction_http,
+            envelope,
+            SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3,
+        )
+        .await
+    }
+}
+
+impl<I> Debug for OwnedSharedGatewayDispatchServicesV3<I> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OwnedSharedGatewayDispatchServicesV3(<redacted>)")
+    }
+}
+
 fn validate_custom_id_v3(custom_id: &str) -> Result<(), SharedGatewayInteractionEnvelopeErrorV3> {
     if custom_id.is_empty() || custom_id.len() > MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3 {
         return Err(SharedGatewayInteractionEnvelopeErrorV3::CustomId);
@@ -992,7 +1161,7 @@ mod tests {
         let reserved =
             reserve_shared_gateway_interaction_v3(button(), Some(lease), &observer, &budget);
         assert!(matches!(
-            reserved,
+            &reserved,
             SharedGatewayInteractionReservationOutcomeV3::Reserved(_)
         ));
         assert!(matches!(
@@ -1004,7 +1173,14 @@ mod tests {
                 ..
             }
         ));
-        drop(reserved);
+        let SharedGatewayInteractionReservationOutcomeV3::Reserved(reserved) = reserved else {
+            panic!("interaction must remain reserved")
+        };
+        let cancelled = cancel_reserved_shared_gateway_interaction_v3(*reserved);
+        assert_eq!(
+            cancelled.custom_id_v3(),
+            encode_button(GuildId(7), "study", "create")
+        );
         assert!(matches!(
             reserve_shared_gateway_interaction_v3(button(), Some(lease), &observer, &budget),
             SharedGatewayInteractionReservationOutcomeV3::Reserved(_)

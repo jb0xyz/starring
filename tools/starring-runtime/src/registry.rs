@@ -103,7 +103,31 @@ pub struct RuntimeRegistryBootstrapV1 {
     registry: ServingSlotRegistryV1,
 }
 
+#[allow(dead_code)]
+pub(crate) struct RuntimeInteractionDispatchRegistryV1 {
+    registry: ServingSlotRegistryV1,
+}
+
+impl RuntimeInteractionDispatchRegistryV1 {
+    pub(crate) fn into_registry_v1(self) -> ServingSlotRegistryV1 {
+        self.registry
+    }
+}
+
+impl Debug for RuntimeInteractionDispatchRegistryV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeInteractionDispatchRegistryV1(<redacted>)")
+    }
+}
+
 impl RuntimeRegistryBootstrapV1 {
+    #[allow(dead_code)]
+    pub(crate) fn interaction_dispatch_registry_v1(&self) -> RuntimeInteractionDispatchRegistryV1 {
+        RuntimeInteractionDispatchRegistryV1 {
+            registry: self.registry.clone(),
+        }
+    }
+
     pub fn observe_recovery_empty_projection_v2(
         &self,
     ) -> Result<RuntimeRegistryRecoveryEmptyObservationV2, RuntimeRegistryRecoveryObservationErrorV1>

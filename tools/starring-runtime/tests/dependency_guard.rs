@@ -631,6 +631,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/registry_staging_tests.rs",
             "src/registry_succession_tests.rs",
             "src/runtime_controller.rs",
+            "src/runtime_interaction_dispatch.rs",
             "src/secret.rs",
             "src/serving_heartbeat_monitor.rs",
             "src/serving_heartbeat_monitor_tests.rs",
@@ -714,6 +715,7 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
             ("automation-runtime-worker".to_string(), None),
             ("chrono".to_string(), None),
             ("discord-model".to_string(), None),
+            ("futures".to_string(), None),
             ("getrandom".to_string(), None),
             ("serde_json".to_string(), Some("dev".to_string())),
             ("sqlx".to_string(), None),
@@ -752,6 +754,89 @@ fn paused_discord_gateway_dependency_is_feature_isolated() {
         resolved["features"],
         serde_json::json!(["rustls-platform-verifier"])
     );
+}
+
+#[test]
+fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
+    let lane = source_before_test_module(include_str!("../src/runtime_interaction_dispatch.rs"));
+    let facade = source_before_test_module(include_str!(
+        "../../../crates/automation-runtime/src/shared_gateway_dispatcher.rs"
+    ));
+    for required in [
+        "FuturesUnordered<RuntimeInteractionDispatchFutureV1>",
+        "FuturesUnordered<RuntimeInteractionRejectionFutureV1>",
+        "dyn Future<Output = SharedGatewayInteractionDispatchOutcomeV3> + Send + 'static",
+        "dyn Future<Output = SharedGatewayRejectionAcknowledgementOutcomeV3> + Send + 'static",
+        "dispatch_capacity: NonZeroUsize",
+        "rejection_capacity: NonZeroUsize",
+        "RuntimeProductionDiscordInteractionDispatchLaneV1",
+        "compose_runtime_discord_interaction_dispatch_lane_v1(",
+        "gateway.rejection_acknowledgement_capacity()",
+        "state: RuntimeInteractionLaneStateV1::Paused",
+        "not_accepting: u64",
+        "pub(crate) fn try_enqueue_v1<F>(",
+        "F: FnMut() -> bool",
+        "pub(crate) async fn pause_and_drain_until_v1(",
+        "pub(crate) async fn seal_and_drain_until_v1(",
+        "pub(crate) fn reopen_v1<F>(",
+        "observer.ready_lease_is_current(&ready_lease)",
+        "RuntimeInteractionReopenErrorV1::InFlight",
+        "RuntimeInteractionReopenErrorV1::Sealed",
+        "self.dispatches.len() >= self.dispatch_capacity.get()",
+        "self.rejections.len() >= self.rejection_capacity.get()",
+        "TokioInstant::from_std(deadline)",
+        "self.abort_v1()",
+        "RuntimeDiscordInteractionDispatchLaneV1(<redacted>)",
+    ] {
+        assert!(lane.contains(required), "{required}");
+    }
+    let enqueue = braced_declaration(lane, "pub(crate) fn try_enqueue_v1<F>(");
+    let readiness_checks = enqueue
+        .match_indices("product_ready()")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let reserve = enqueue.find("self.port.reserve_v1(").unwrap();
+    let push = enqueue.find(".dispatch_v1(reservation)").unwrap();
+    assert_eq!(readiness_checks.len(), 2);
+    assert!(
+        readiness_checks[0] < reserve
+            && reserve < readiness_checks[1]
+            && readiness_checks[1] < push
+    );
+    for forbidden in [
+        "twilight_http",
+        "twilight_model",
+        "PostgresRuntimeInteractionV1",
+        "sqlx",
+        "tokio::spawn",
+        "JoinSet",
+        "mpsc",
+        "unbounded",
+        "SequenceInstanceIdGenerator",
+        "Serialize",
+        "Deserialize",
+    ] {
+        assert!(!contains_identifier(lane, forbidden), "{forbidden}");
+    }
+    for required in [
+        "pub struct OwnedSharedGatewayDispatchServicesV3<I>",
+        "registry: ServingSlotRegistryV1",
+        "instances: I",
+        "instance_ids: SecureRandomInstanceIdGenerator",
+        "teardown: Teardown<I, OwnedTwilightInstanceDeleter>",
+        "snapshot_provider: OwnedTwilightGuildRoleSnapshotProvider",
+        "mutation_http: Arc<Client>",
+        "interaction_http: Arc<Client>",
+        "admission_budget: SharedGatewayAdmissionBudgetV3",
+        "token: Zeroizing<String>",
+        ".ratelimiter(None)",
+        "tokio::time::timeout_at(",
+        "SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3",
+        "OwnedSharedGatewayDispatchServicesV3(<redacted>)",
+    ] {
+        assert!(facade.contains(required), "{required}");
+    }
+    assert!(!facade.contains("SequenceInstanceIdGenerator"));
 }
 
 #[test]
@@ -868,6 +953,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/process_startup.rs")
             && path != Path::new("src/process_supervisor.rs")
             && path != Path::new("src/runtime_controller.rs")
+            && path != Path::new("src/runtime_interaction_dispatch.rs")
             && path != Path::new("src/mutation_finalizer.rs")
             && path != Path::new("src/panel_reconciliation.rs")
             && path != Path::new("src/serving_heartbeat_monitor.rs")
@@ -1365,6 +1451,40 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         {
             let allowed_readiness_worker =
                 path == Path::new("src/database.rs") && identifier == "automation_runtime_worker";
+            let allowed_interaction_dispatch_lane = path
+                == Path::new("src/runtime_interaction_dispatch.rs")
+                && identifier == "automation_runtime";
+            let allowed_interaction_dispatch_database =
+                path == Path::new("src/database.rs") && identifier == "automation_runtime";
+            let allowed_interaction_dispatch_v3 = matches!(
+                identifier,
+                "GatewayConnectionObserverV3"
+                    | "GatewayReadyLeaseV3"
+                    | "InteractionExecutionOutcomeV3"
+                    | "SharedGatewayAdmissionErrorV3"
+                    | "SharedGatewayInteractionDispatchOutcomeV3"
+                    | "SharedGatewayInteractionEnvelopeV3"
+                    | "SharedGatewayInteractionRejectionV3"
+                    | "SharedGatewayRejectionAcknowledgementOutcomeV3"
+                    | "GatewayControlConfigV3"
+                    | "GatewayReadyKindV3"
+                    | "SharedGatewayInteractionApplicationIdV3"
+                    | "SharedGatewayInteractionIdV3"
+                    | "SharedGatewayInteractionIdentityV3"
+                    | "SharedGatewayInteractionTokenV3"
+            ) && path
+                == Path::new("src/runtime_interaction_dispatch.rs")
+                || matches!(
+                    identifier,
+                    "GatewayConnectionObserverV3"
+                        | "GatewayReadyLeaseV3"
+                        | "OwnedSharedGatewayDispatchServicesCompositionErrorV3"
+                        | "OwnedSharedGatewayDispatchServicesV3"
+                        | "SharedGatewayAdmissionConfigV3"
+                        | "SharedGatewayInteractionEnvelopeV3"
+                        | "SharedGatewayInteractionReservationOutcomeV3"
+                        | "SharedGatewayReservedInteractionV3"
+                ) && path == Path::new("src/database.rs");
             let allowed_registry_adapter = path == Path::new("src/registry.rs")
                 && matches!(
                     identifier,
@@ -1569,8 +1689,11 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     || allowed_pending_drain_succession
                     || allowed_pending_drain_finalizer_v3
                     || allowed_ordinary_barrier_v3
-                    || allowed_discord_interaction_normalizer)
+                    || allowed_discord_interaction_normalizer
+                    || allowed_interaction_dispatch_v3)
                     && (allowed_readiness_worker
+                        || allowed_interaction_dispatch_lane
+                        || allowed_interaction_dispatch_database
                         || allowed_registry_adapter
                         || allowed_closed_recovery
                         || allowed_startup_observation

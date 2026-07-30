@@ -29,6 +29,8 @@ mod process_supervisor;
 mod recovery_identity;
 mod registry;
 mod runtime_controller;
+#[allow(dead_code)]
+mod runtime_interaction_dispatch;
 mod secret;
 #[cfg_attr(not(test), allow(dead_code))]
 mod serving_heartbeat_monitor;
