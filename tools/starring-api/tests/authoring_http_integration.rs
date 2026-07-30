@@ -408,7 +408,7 @@ async fn worker_health(State(state): State<Arc<WorkerState>>) -> AxumResponse {
         "model": "gpt-5.6-luna",
         "reasoning_effort": "medium",
         "auth_mode": "chatgpt",
-        "codex_cli_version": "codex-cli 0.144.2",
+        "codex_cli_version": "codex-cli 0.146.0-alpha.3.1",
         "instance_id": "authoring-http-integration",
         "worker_source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "concurrency_limit": 1,
@@ -459,7 +459,7 @@ async fn worker_completion(
         "model": "gpt-5.6-luna",
         "reasoning_effort": "medium",
         "auth_mode": "chatgpt",
-        "codex_cli_version": "codex-cli 0.144.2",
+        "codex_cli_version": "codex-cli 0.146.0-alpha.3.1",
         "tool_call": {
             "id": "interpret",
             "name": frontier,

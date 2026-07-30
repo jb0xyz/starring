@@ -21,7 +21,7 @@ const WORKER_IDENTITY = Object.freeze({
   model: 'gpt-5.6-luna',
   reasoning_effort: 'medium',
   auth_mode: 'chatgpt',
-  codex_cli_version: 'codex-cli 0.144.2',
+  codex_cli_version: 'codex-cli 0.146.0-alpha.3.1',
   concurrency_limit: 1,
   queue_capacity: 0,
   request_timeout_ms: 55000,

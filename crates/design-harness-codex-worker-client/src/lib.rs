@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RETAINED_MODEL_CALL_METRICS: usize = 4096;
-const SERVING_CODEX_CLI_VERSION: &str = "codex-cli 0.144.2";
+const SERVING_CODEX_CLI_VERSION: &str = "codex-cli 0.146.0-alpha.3.1";
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
 pub const SERVING_AUTH_MODE: &str = "chatgpt";
 pub const SERVING_MODEL: &str = "gpt-5.6-luna";
@@ -532,7 +532,7 @@ mod tests {
             "model": "gpt-5.6-luna",
             "reasoning_effort": "medium",
             "auth_mode": "chatgpt",
-            "codex_cli_version": "codex-cli 0.144.2",
+            "codex_cli_version": "codex-cli 0.146.0-alpha.3.1",
             "tool_call": {
                 "id": "call-1",
                 "name": "interpret_intent_core",
@@ -650,7 +650,7 @@ mod tests {
             "model": "gpt-5.6-luna",
             "reasoning_effort": "medium",
             "auth_mode": "chatgpt",
-            "codex_cli_version": "codex-cli 0.144.2",
+            "codex_cli_version": "codex-cli 0.146.0-alpha.3.1",
             "instance_id": "test-worker-instance",
             "worker_source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "concurrency_limit": 2,
