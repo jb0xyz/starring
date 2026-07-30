@@ -304,7 +304,7 @@ removing security, restart, failure, or release gates.
 - [x] A4. Provision the writer capability
 - [x] A5. Expose authenticated authoring HTTP routes
 - [x] A6. Pass the authoring milestone gate
-- [ ] B1. Extend the existing production lifecycle for route serving
+- [x] B1. Extend the existing production lifecycle for route serving
 - [ ] B2. Compose the convergence lane and exact hydration
 - [ ] B3. Replace prior routes and reconcile panels
 - [ ] B4. Finalize V2 certification and serving monitor

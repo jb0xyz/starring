@@ -271,7 +271,11 @@ async fn stage_runtime_process_from_environment_v1(
         .enter_empty_open_v2()
         .await
         .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
-    empty_open
+    let serving_open = empty_open
+        .enter_serving_open_v2()
+        .await
+        .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;
+    serving_open
         .run_until_shutdown_v2()
         .await
         .map_err(RuntimeProcessStagingErrorV1::ProductionHandoff)?;

@@ -4,13 +4,13 @@ use std::time::Instant;
 
 use automation_runtime_controller::{
     RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2,
-    RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimeRecoveryIdV2,
+    RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimeRecoveryIdV2, RuntimeServingSlotV2,
     RuntimeWriterFenceGenerationV1,
 };
 use automation_runtime_worker::{
     RuntimeAcceptedIngressOpenAcknowledgementV2, RuntimeAuthorizedStartupRecoveryIterationV2,
-    RuntimeEmptyOpenAcknowledgementRefreshInputV2, RuntimeEmptyOpenAcknowledgementRefreshV2,
-    RuntimeGatewayCoordinatorGenerationV2,
+    RuntimeCapabilityReadinessSetV2, RuntimeEmptyOpenAcknowledgementRefreshInputV2,
+    RuntimeEmptyOpenAcknowledgementRefreshV2, RuntimeGatewayCoordinatorGenerationV2,
     RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
     RuntimeIngressOpenAcknowledgementPredecessorV2,
     RuntimeIngressOpenAcknowledgementSingleFlightV2, RuntimeOpenProductionObservationInputV2,
@@ -19,8 +19,14 @@ use automation_runtime_worker::{
     RuntimeProductionHandoffObservationInputV2, RuntimeProductionHandoffObservationPortV2,
     RuntimeProductionHandoffObservationV2, RuntimeProductionHandoffProcessV2,
     RuntimeProductionLifecycleErrorV2, RuntimeRecoveryResumeObservationInputV2,
-    RuntimeRecoveryResumeObservationV2, RuntimeRecoveryResumePortV2,
-    RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryFixedPointProofV2,
+    RuntimeRecoveryResumeObservationV2, RuntimeRecoveryResumePortV2, RuntimeRouteSetObservationV2,
+    RuntimeServingOpenAcknowledgementRefreshInputV2, RuntimeServingOpenAcknowledgementRefreshV2,
+    RuntimeServingOpenObservationInputV2, RuntimeServingOpenObservationPortV2,
+    RuntimeServingOpenObservationV2, RuntimeServingOpenPreparedV2, RuntimeServingOpenProcessV2,
+    RuntimeServingOpenRequestV2, RuntimeServingOpenSupervisorConfigV2,
+    RuntimeServingSlotWorkErrorV2, RuntimeServingSlotWorkPermitV2, RuntimeServingSlotWorkRequestV2,
+    RuntimeShutdownCauseV2, RuntimeShuttingDownProcessV2, RuntimeStartupRecoveryContinuationV2,
+    RuntimeStartupRecoveryFixedPointProofV2,
 };
 use automation_runtime_worker::{
     RuntimeAcceptedStartupRecoveryExecutionOutcomeV2, RuntimeAuthorizedStartupRecoveryExecutionV2,
@@ -54,7 +60,8 @@ use crate::ingress_acknowledgement_supervisor::RuntimeIngressAcknowledgementAuth
 use crate::registry::{
     RuntimeRegistryBootstrapV1, RuntimeRegistryEmptyRecoveryBindingV2,
     RuntimeRegistryPendingDrainSealBindingV2, RuntimeRegistryPendingDrainSuccessionSealBindingV3,
-    RuntimeRegistryRecoveryObservationErrorV1,
+    RuntimeRegistryPreparedServingTransitionV2, RuntimeRegistryRecoveryObservationErrorV1,
+    RuntimeRegistryServingBindingV2,
 };
 
 #[path = "startup_recovery_observation.rs"]
@@ -270,11 +277,69 @@ pub(crate) struct RuntimeClosedRecoverySupervisedEmptyOpenProcessV2 {
     worker: automation_runtime_worker::RuntimeEmptyOpenProcessV2,
 }
 
+pub(crate) struct RuntimeClosedRecoveryPreparedServingOpenProcessV2 {
+    owner: RuntimeGatewayOwnerProductionSupervisorV2,
+    gateway: RuntimeGatewayProductionCoordinatorV2,
+    registry: RuntimeRegistryPreparedServingTransitionV2,
+    worker: RuntimeServingOpenPreparedV2,
+}
+
+pub(crate) struct RuntimeClosedRecoveryServingOpenEvidenceV2 {
+    pub(crate) owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+    pub(crate) readiness: RuntimeCapabilityReadinessSetV2,
+    pub(crate) writer_fence_generation: RuntimeWriterFenceGenerationV1,
+    pub(crate) maintenance_gate_generation:
+        automation_runtime_worker::RuntimeMaintenanceGateGenerationV2,
+    pub(crate) maintenance_gate_open: bool,
+    pub(crate) finalizer_generation:
+        automation_runtime_worker::RuntimeMutationFinalizerGenerationV1,
+    pub(crate) finalizer_accepting: bool,
+    pub(crate) supervisors_running: bool,
+    pub(crate) ingress_acknowledgement_predecessor: RuntimeIngressOpenAcknowledgementPredecessorV2,
+}
+
+pub(crate) struct RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
+    owner: RuntimeGatewayOwnerProductionSupervisorV2,
+    gateway: RuntimeGatewayProductionCoordinatorV2,
+    registry: RuntimeRegistryServingBindingV2,
+    worker: RuntimeServingOpenProcessV2,
+}
+
+pub(crate) struct RuntimeClosedRecoveryServingAcknowledgementEvidenceV2 {
+    pub(crate) owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
+    pub(crate) readiness: RuntimeCapabilityReadinessSetV2,
+    pub(crate) gateway_ready: RuntimeGatewayReadyAttestationV2,
+    pub(crate) writer_fence_generation: RuntimeWriterFenceGenerationV1,
+    pub(crate) maintenance_gate_generation:
+        automation_runtime_worker::RuntimeMaintenanceGateGenerationV2,
+    pub(crate) maintenance_gate_open: bool,
+    pub(crate) finalizer_generation:
+        automation_runtime_worker::RuntimeMutationFinalizerGenerationV1,
+    pub(crate) finalizer_accepting: bool,
+    pub(crate) supervisors_running: bool,
+    pub(crate) predecessor: RuntimeIngressOpenAcknowledgementPredecessorV2,
+    pub(crate) lease_for: RuntimeIngressOpenAcknowledgementLeaseDurationV2,
+}
+
 pub(crate) struct RuntimeClosedRecoveryEmptyOpenAcknowledgementRefreshV2 {
     owner: RuntimeGatewayOwnerProductionSupervisorV2,
     gateway: RuntimeGatewayProductionCoordinatorV2,
     registry: RuntimeRegistryEmptyRecoveryBindingV2,
     worker: RuntimeEmptyOpenAcknowledgementRefreshV2,
+}
+
+pub(crate) struct RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2 {
+    owner: RuntimeGatewayOwnerProductionSupervisorV2,
+    gateway: RuntimeGatewayProductionCoordinatorV2,
+    registry: RuntimeRegistryServingBindingV2,
+    worker: RuntimeServingOpenAcknowledgementRefreshV2,
+}
+
+pub(crate) struct RuntimeClosedRecoveryShuttingDownServingOpenProcessV2 {
+    owner: RuntimeGatewayOwnerProductionSupervisorV2,
+    gateway: RuntimeGatewayProductionCoordinatorV2,
+    registry: RuntimeRegistryServingBindingV2,
+    worker: RuntimeShuttingDownProcessV2,
 }
 
 pub(crate) struct RuntimeClosedRecoveryAdmissionAcknowledgementAuthorityV2 {
@@ -285,6 +350,7 @@ pub(crate) struct RuntimeClosedRecoveryAdmissionAcknowledgementAuthorityV2 {
 pub(crate) enum RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2 {
     Admission(Box<RuntimeClosedRecoveryAdmissionAcknowledgementAuthorityV2>),
     EmptyOpenRefresh(Box<RuntimeClosedRecoveryEmptyOpenAcknowledgementRefreshV2>),
+    ServingOpenRefresh(Box<RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2>),
 }
 
 pub(crate) enum RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2 {
@@ -297,16 +363,23 @@ pub(crate) enum RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2 {
         accepted_receipt:
             Box<automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2>,
     },
+    ServingOpenRefresh {
+        lifecycle: Box<RuntimeClosedRecoverySupervisedServingOpenProcessV2>,
+        accepted_receipt:
+            Box<automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2>,
+    },
 }
 
 pub(crate) enum RuntimeClosedRecoveryIngressAcknowledgementRetainedStateV2 {
     Admission(Box<RuntimeClosedRecoveryAdmissionAcknowledgingProcessV2>),
     EmptyOpenRefresh(Box<RuntimeClosedRecoveryEmptyOpenAcknowledgementRefreshV2>),
+    ServingOpenRefresh(Box<RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeClosedRecoveryIngressAcknowledgementCompletionErrorV2 {
     EmptyOpenRefresh(RuntimeProductionLifecycleErrorV2),
+    ServingOpenRefresh(RuntimeProductionLifecycleErrorV2),
 }
 
 pub(crate) struct RuntimeClosedRecoveryAdmissionAcknowledgementAuthorizationFailureV2 {
@@ -386,6 +459,16 @@ pub(crate) struct RuntimeClosedRecoveryProductionOwnerStartFailureV2 {
 
 pub(crate) struct RuntimeClosedRecoveryAcknowledgementRefreshFailureV2 {
     state: Box<RuntimeClosedRecoverySupervisedEmptyOpenProcessV2>,
+    error: RuntimeProductionLifecycleErrorV2,
+}
+
+pub(crate) struct RuntimeClosedRecoveryServingOpenTransitionFailureV2 {
+    state: Box<RuntimeClosedRecoverySupervisedEmptyOpenProcessV2>,
+    error: RuntimeClosedRecoveryProductionHandoffErrorV2,
+}
+
+pub(crate) struct RuntimeClosedRecoveryServingAcknowledgementRefreshFailureV2 {
+    state: Box<RuntimeClosedRecoverySupervisedServingOpenProcessV2>,
     error: RuntimeProductionLifecycleErrorV2,
 }
 
@@ -1934,16 +2017,6 @@ impl RuntimeClosedRecoverySupervisedEmptyOpenProcessV2 {
             .arm_process_invalidation_v2(self.worker.coordinator_generation(), trigger)
     }
 
-    pub(crate) fn bind_gateway_ready_invalidation_observer_v2(
-        &self,
-        expected_ready: &RuntimeGatewayReadyAttestationV2,
-    ) -> RuntimeGatewayReadyInvalidationObserverV2 {
-        self.gateway.bind_current_ready_invalidation_observer_v2(
-            self.worker.coordinator_generation(),
-            expected_ready,
-        )
-    }
-
     pub(crate) fn observe_registry_empty_v2(
         &self,
     ) -> Result<
@@ -1951,15 +2024,6 @@ impl RuntimeClosedRecoverySupervisedEmptyOpenProcessV2 {
         RuntimeRegistryRecoveryObservationErrorV1,
     > {
         self.registry.revalidate_production_empty_projection_v2()
-    }
-
-    pub(crate) async fn observe_current_owner_v2(
-        &self,
-    ) -> Result<
-        crate::RuntimeGatewayOwnerCurrentObservationV1,
-        crate::RuntimeGatewayOwnerCurrentObservationErrorV1,
-    > {
-        self.owner.observe_current_v2().await
     }
 
     pub(crate) async fn wait_for_owner_successor_v2(
@@ -1975,16 +2039,19 @@ impl RuntimeClosedRecoverySupervisedEmptyOpenProcessV2 {
             .await
     }
 
+    pub(crate) async fn observe_current_owner_v2(
+        &self,
+    ) -> Result<
+        crate::RuntimeGatewayOwnerCurrentObservationV1,
+        crate::RuntimeGatewayOwnerCurrentObservationErrorV1,
+    > {
+        self.owner.observe_current_v2().await
+    }
+
     pub(crate) fn owner_terminal_status_v2(
         &self,
     ) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
         self.owner.terminal_status_v2()
-    }
-
-    pub(crate) fn owner_terminal_observation_v2(
-        &self,
-    ) -> impl Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static {
-        self.owner.terminal_observation_v2()
     }
 
     pub(crate) fn authorize_acknowledgement_refresh_v2(
@@ -2022,6 +2089,89 @@ impl RuntimeClosedRecoverySupervisedEmptyOpenProcessV2 {
         }
     }
 
+    pub(crate) fn prepare_serving_open_v2(
+        self,
+        config: RuntimeServingOpenSupervisorConfigV2,
+        evidence: RuntimeClosedRecoveryServingOpenEvidenceV2,
+    ) -> Result<
+        RuntimeClosedRecoveryPreparedServingOpenProcessV2,
+        RuntimeClosedRecoveryServingOpenTransitionFailureV2,
+    > {
+        if let Err(error) = self.revalidate_v2() {
+            return Err(RuntimeClosedRecoveryServingOpenTransitionFailureV2 {
+                state: Box::new(self),
+                error,
+            });
+        }
+        let gateway_ready = match self.observe_exact_current_ready_attestation_v2() {
+            Ok(gateway_ready) => gateway_ready,
+            Err(_) => {
+                return Err(RuntimeClosedRecoveryServingOpenTransitionFailureV2 {
+                    state: Box::new(self),
+                    error: RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway,
+                });
+            }
+        };
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        let port = RuntimeClosedRecoveryServingOpenObserverV2 {
+            coordinator_generation: gateway.coordinator_generation_v2(),
+            gateway_ready,
+            evidence: std::cell::RefCell::new(Some(evidence)),
+            registry: std::cell::RefCell::new(Some(
+                RuntimeClosedRecoveryServingRegistryPreparationV2::Empty(registry),
+            )),
+        };
+        let worker = match worker.prepare_serving_open(&port, config) {
+            Ok(worker) => worker,
+            Err(failure) => {
+                let error = match failure.port_error() {
+                    Some(_) => RuntimeClosedRecoveryProductionHandoffErrorV2::Registry,
+                    None => RuntimeClosedRecoveryProductionHandoffErrorV2::Worker(
+                        failure
+                            .contract_error()
+                            .unwrap_or(RuntimeProductionLifecycleErrorV2::SupervisorsNotReady),
+                    ),
+                };
+                let worker = failure.into_state();
+                let registry = port.into_empty_v2();
+                return Err(RuntimeClosedRecoveryServingOpenTransitionFailureV2 {
+                    state: Box::new(Self {
+                        owner,
+                        gateway,
+                        registry,
+                        worker,
+                    }),
+                    error,
+                });
+            }
+        };
+        let registry = match port.into_prepared_v2() {
+            Ok(registry) => registry,
+            Err(registry) => {
+                return Err(RuntimeClosedRecoveryServingOpenTransitionFailureV2 {
+                    state: Box::new(Self {
+                        owner,
+                        gateway,
+                        registry,
+                        worker: worker.cancel(),
+                    }),
+                    error: RuntimeClosedRecoveryProductionHandoffErrorV2::Registry,
+                });
+            }
+        };
+        Ok(RuntimeClosedRecoveryPreparedServingOpenProcessV2 {
+            owner,
+            gateway,
+            registry,
+            worker,
+        })
+    }
+
     pub(crate) fn revalidate_v2(
         &self,
     ) -> Result<(), RuntimeClosedRecoveryProductionHandoffErrorV2> {
@@ -2041,6 +2191,510 @@ impl RuntimeClosedRecoverySupervisedEmptyOpenProcessV2 {
         Ok(())
     }
 
+    pub(crate) async fn shutdown_until_v2(
+        self,
+        cleanup_deadline: Instant,
+    ) -> Result<
+        RuntimeGatewayOwnerStartupWatchdogExitV1,
+        RuntimeGatewayOwnerStartupWatchdogShutdownErrorV1,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        drop((gateway, registry, worker));
+        owner.shutdown_until_v2(cleanup_deadline).await
+    }
+}
+
+enum RuntimeClosedRecoveryServingRegistryPreparationV2 {
+    Empty(RuntimeRegistryEmptyRecoveryBindingV2),
+    Prepared(RuntimeRegistryPreparedServingTransitionV2),
+}
+
+struct RuntimeClosedRecoveryServingOpenObserverV2 {
+    coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+    gateway_ready: RuntimeGatewayReadyAttestationV2,
+    evidence: std::cell::RefCell<Option<RuntimeClosedRecoveryServingOpenEvidenceV2>>,
+    registry: std::cell::RefCell<Option<RuntimeClosedRecoveryServingRegistryPreparationV2>>,
+}
+
+impl RuntimeClosedRecoveryServingOpenObserverV2 {
+    fn into_empty_v2(self) -> RuntimeRegistryEmptyRecoveryBindingV2 {
+        match self
+            .registry
+            .into_inner()
+            .expect("serving registry preparation must remain recoverable")
+        {
+            RuntimeClosedRecoveryServingRegistryPreparationV2::Empty(registry) => registry,
+            RuntimeClosedRecoveryServingRegistryPreparationV2::Prepared(registry) => {
+                registry.cancel_v2()
+            }
+        }
+    }
+
+    fn into_prepared_v2(
+        self,
+    ) -> Result<RuntimeRegistryPreparedServingTransitionV2, RuntimeRegistryEmptyRecoveryBindingV2>
+    {
+        match self
+            .registry
+            .into_inner()
+            .expect("serving registry preparation must remain recoverable")
+        {
+            RuntimeClosedRecoveryServingRegistryPreparationV2::Empty(registry) => Err(registry),
+            RuntimeClosedRecoveryServingRegistryPreparationV2::Prepared(registry) => Ok(registry),
+        }
+    }
+}
+
+impl RuntimeServingOpenObservationPortV2 for RuntimeClosedRecoveryServingOpenObserverV2 {
+    type Error = RuntimeRegistryRecoveryObservationErrorV1;
+
+    fn observe_serving_open(
+        &self,
+        request: &RuntimeServingOpenRequestV2,
+    ) -> Result<RuntimeServingOpenObservationV2, Self::Error> {
+        let evidence = self
+            .evidence
+            .borrow_mut()
+            .take()
+            .ok_or(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation)?;
+        let acknowledgement = evidence
+            .ingress_acknowledgement_predecessor
+            .present_receipt()
+            .ok_or(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation)?
+            .acknowledgement()
+            .clone();
+        let observed_database_now = evidence
+            .ingress_acknowledgement_predecessor
+            .observed_database_now();
+        let state = self
+            .registry
+            .borrow_mut()
+            .take()
+            .expect("serving registry preparation must be consumed exactly once");
+        let registry = match state {
+            RuntimeClosedRecoveryServingRegistryPreparationV2::Empty(registry) => registry,
+            RuntimeClosedRecoveryServingRegistryPreparationV2::Prepared(registry) => {
+                self.registry.replace(Some(
+                    RuntimeClosedRecoveryServingRegistryPreparationV2::Prepared(registry),
+                ));
+                return Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation);
+            }
+        };
+        let registry = match registry.prepare_serving_transition_v2(request.route_set_epoch()) {
+            Ok(registry) => registry,
+            Err(failure) => {
+                let error = failure.error_v2();
+                self.registry.replace(Some(
+                    RuntimeClosedRecoveryServingRegistryPreparationV2::Empty(
+                        failure.into_binding_v2(),
+                    ),
+                ));
+                return Err(error);
+            }
+        };
+        let route_set = match registry.observe_route_set_v2(request.route_set_epoch()) {
+            Ok(route_set) => route_set,
+            Err(error) => {
+                self.registry.replace(Some(
+                    RuntimeClosedRecoveryServingRegistryPreparationV2::Empty(registry.cancel_v2()),
+                ));
+                return Err(error);
+            }
+        };
+        self.registry.replace(Some(
+            RuntimeClosedRecoveryServingRegistryPreparationV2::Prepared(registry),
+        ));
+        Ok(RuntimeServingOpenObservationV2::new(
+            RuntimeServingOpenObservationInputV2 {
+                coordinator_generation: self.coordinator_generation,
+                process_instance_id: evidence.owner_receipt.lease_id.process_instance_id.clone(),
+                gateway_owner: evidence.owner_receipt,
+                readiness: evidence.readiness,
+                gateway_ready: self.gateway_ready.clone(),
+                ingress_acknowledgement_revision: acknowledgement.acknowledgement_revision(),
+                writer_fence_generation: evidence.writer_fence_generation,
+                writer_fence_open: true,
+                maintenance_gate_generation: evidence.maintenance_gate_generation,
+                maintenance_gate_open: evidence.maintenance_gate_open,
+                ingress_acknowledgement_expires_at: acknowledgement.expires_at(),
+                observed_database_now,
+                ingress_acknowledgement_predecessor: evidence.ingress_acknowledgement_predecessor,
+                finalizer_generation: evidence.finalizer_generation,
+                finalizer_accepting: evidence.finalizer_accepting,
+                route_set_epoch_coordinator_generation: self.coordinator_generation,
+                route_set_epoch_process_instance_id: request.process_instance_id().clone(),
+                route_set_epoch_registry_observation_sequence: request
+                    .route_set_epoch()
+                    .initial_registry_observation_sequence(),
+                route_set,
+                supervisors_running: evidence.supervisors_running,
+            },
+        ))
+    }
+}
+
+impl RuntimeClosedRecoveryPreparedServingOpenProcessV2 {
+    #[allow(dead_code)]
+    pub(crate) fn cancel_v2(self) -> RuntimeClosedRecoverySupervisedEmptyOpenProcessV2 {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        RuntimeClosedRecoverySupervisedEmptyOpenProcessV2 {
+            owner,
+            gateway,
+            registry: registry.cancel_v2(),
+            worker: worker.cancel(),
+        }
+    }
+
+    pub(crate) fn commit_v2(
+        self,
+    ) -> Result<
+        RuntimeClosedRecoverySupervisedServingOpenProcessV2,
+        RuntimeClosedRecoveryServingOpenTransitionFailureV2,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        let registry = match registry.commit_v2(worker.route_set_epoch()) {
+            Ok((registry, _)) => registry,
+            Err(failure) => {
+                return Err(RuntimeClosedRecoveryServingOpenTransitionFailureV2 {
+                    state: Box::new(RuntimeClosedRecoverySupervisedEmptyOpenProcessV2 {
+                        owner,
+                        gateway,
+                        registry: failure.into_binding_v2(),
+                        worker: worker.cancel(),
+                    }),
+                    error: RuntimeClosedRecoveryProductionHandoffErrorV2::Registry,
+                });
+            }
+        };
+        Ok(RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
+            owner,
+            gateway,
+            registry,
+            worker: worker.commit(),
+        })
+    }
+}
+
+impl RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
+    #[allow(dead_code)]
+    pub(crate) fn authorize_slot_work_v2(
+        &self,
+        slot: RuntimeServingSlotV2,
+    ) -> RuntimeServingSlotWorkRequestV2 {
+        self.worker.authorize_slot_work(slot)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn begin_slot_work_v2(
+        &mut self,
+        request: RuntimeServingSlotWorkRequestV2,
+    ) -> Result<RuntimeServingSlotWorkPermitV2, RuntimeServingSlotWorkErrorV2> {
+        self.worker.begin_slot_work(request)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn complete_slot_work_v2(
+        &mut self,
+        permit: RuntimeServingSlotWorkPermitV2,
+    ) -> Result<(), RuntimeServingSlotWorkErrorV2> {
+        self.worker.complete_slot_work(permit)
+    }
+
+    pub(crate) fn begin_shutdown_v2(
+        self,
+    ) -> (
+        RuntimeClosedRecoveryShuttingDownServingOpenProcessV2,
+        Result<RuntimeRouteSetObservationV2, RuntimeRegistryRecoveryObservationErrorV1>,
+    ) {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        let generation = worker.coordinator_generation();
+        let worker = match worker.begin_shutdown(generation, RuntimeShutdownCauseV2::Explicit) {
+            Ok(worker) => worker,
+            Err(_) => unreachable!("current serving generation must authorize shutdown"),
+        };
+        let registry_observation = registry.observe_shutdown_route_set_v2();
+        (
+            RuntimeClosedRecoveryShuttingDownServingOpenProcessV2 {
+                owner,
+                gateway,
+                registry,
+                worker,
+            },
+            registry_observation,
+        )
+    }
+
+    pub(crate) fn process_generation_v2(&self) -> std::num::NonZeroU64 {
+        self.owner.process_generation_v2()
+    }
+
+    pub(crate) fn finalizer_generation_v2(
+        &self,
+    ) -> automation_runtime_worker::RuntimeMutationFinalizerGenerationV1 {
+        self.worker.epoch().finalizer_generation()
+    }
+
+    pub(crate) fn authorize_ingress_acknowledgement_predecessor_observation_v2(
+        &self,
+    ) -> RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2 {
+        self.worker
+            .authorize_ingress_open_acknowledgement_predecessor_observation()
+    }
+
+    pub(crate) fn observe_exact_current_ready_attestation_v2(
+        &self,
+    ) -> Result<RuntimeGatewayReadyAttestationV2, crate::RuntimeGatewayReadyObservationErrorV1>
+    {
+        self.gateway
+            .observe_exact_current_ready_attestation_v2(self.worker.coordinator_generation())
+    }
+
+    pub(crate) fn bind_gateway_ready_invalidation_observer_v2(
+        &self,
+        expected_ready: &RuntimeGatewayReadyAttestationV2,
+    ) -> RuntimeGatewayReadyInvalidationObserverV2 {
+        self.gateway.bind_current_ready_invalidation_observer_v2(
+            self.worker.coordinator_generation(),
+            expected_ready,
+        )
+    }
+
+    pub(crate) fn observe_registry_route_set_v2(
+        &self,
+    ) -> Result<RuntimeRouteSetObservationV2, RuntimeRegistryRecoveryObservationErrorV1> {
+        self.registry
+            .observe_route_set_v2(self.worker.epoch().route_set_epoch())
+    }
+
+    pub(crate) async fn observe_current_owner_v2(
+        &self,
+    ) -> Result<
+        crate::RuntimeGatewayOwnerCurrentObservationV1,
+        crate::RuntimeGatewayOwnerCurrentObservationErrorV1,
+    > {
+        self.owner.observe_current_v2().await
+    }
+
+    pub(crate) fn owner_terminal_status_v2(
+        &self,
+    ) -> Option<RuntimeGatewayOwnerStartupWatchdogExitV1> {
+        self.owner.terminal_status_v2()
+    }
+
+    pub(crate) fn owner_terminal_observation_v2(
+        &self,
+    ) -> impl Future<Output = RuntimeGatewayOwnerStartupWatchdogExitV1> + Send + 'static {
+        self.owner.terminal_observation_v2()
+    }
+
+    pub(crate) async fn revalidate_v2(
+        &self,
+    ) -> Result<(), RuntimeClosedRecoveryProductionHandoffErrorV2> {
+        if self.owner.terminal_status_v2().is_some()
+            || self.gateway.current_interrupt_v2().is_some()
+            || self.worker.coordinator_generation() != self.gateway.coordinator_generation_v2()
+            || self.observe_exact_current_ready_attestation_v2().is_err()
+        {
+            return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);
+        }
+        let owner = self
+            .owner
+            .observe_current_v2()
+            .await
+            .map_err(|_| RuntimeClosedRecoveryProductionHandoffErrorV2::Owner)?;
+        let previous_owner = self.worker.epoch().gateway_owner();
+        let successor_owner_revision = previous_owner
+            .owner_revision
+            .get()
+            .checked_add(1)
+            .filter(|value| *value <= i64::MAX as u64)
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or(RuntimeClosedRecoveryProductionHandoffErrorV2::Owner)?;
+        let observed_owner = owner.receipt();
+        let exact_current_owner = observed_owner.owner_revision == previous_owner.owner_revision
+            && observed_owner.expires_at == previous_owner.expires_at;
+        let exact_successor_owner = observed_owner.owner_revision == successor_owner_revision
+            && observed_owner.expires_at > previous_owner.expires_at;
+        if observed_owner.lease_id != previous_owner.lease_id
+            || (!exact_current_owner && !exact_successor_owner)
+            || observed_owner.database_now < previous_owner.database_now
+            || observed_owner.database_lease_duration().is_none()
+        {
+            return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Owner);
+        }
+        let route_set = self
+            .observe_registry_route_set_v2()
+            .map_err(|_| RuntimeClosedRecoveryProductionHandoffErrorV2::Registry)?;
+        if route_set.process_instance_id() != self.worker.epoch().process_instance_id()
+            || route_set.observation_sequence()
+                < self.worker.epoch().route_set().observation_sequence()
+        {
+            return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Registry);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn authorize_acknowledgement_refresh_v2(
+        self,
+        evidence: RuntimeClosedRecoveryServingAcknowledgementEvidenceV2,
+    ) -> Result<
+        RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2,
+        RuntimeClosedRecoveryServingAcknowledgementRefreshFailureV2,
+    > {
+        let route_set = match self.observe_registry_route_set_v2() {
+            Ok(route_set) => route_set,
+            Err(_) => {
+                return Err(
+                    RuntimeClosedRecoveryServingAcknowledgementRefreshFailureV2 {
+                        state: Box::new(self),
+                        error: RuntimeProductionLifecycleErrorV2::RegistryMismatch,
+                    },
+                );
+            }
+        };
+        let input = RuntimeServingOpenAcknowledgementRefreshInputV2 {
+            owner_receipt: evidence.owner_receipt,
+            readiness: evidence.readiness,
+            gateway_ready: evidence.gateway_ready,
+            writer_fence_generation: evidence.writer_fence_generation,
+            writer_fence_open: true,
+            maintenance_gate_generation: evidence.maintenance_gate_generation,
+            maintenance_gate_open: evidence.maintenance_gate_open,
+            route_set,
+            finalizer_generation: evidence.finalizer_generation,
+            finalizer_accepting: evidence.finalizer_accepting,
+            supervisors_running: evidence.supervisors_running,
+            predecessor: evidence.predecessor,
+            lease_for: evidence.lease_for,
+        };
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        match worker.authorize_ingress_open_acknowledgement_refresh(input) {
+            Ok(worker) => Ok(RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2 {
+                owner,
+                gateway,
+                registry,
+                worker,
+            }),
+            Err(failure) => {
+                let error = failure.error();
+                Err(
+                    RuntimeClosedRecoveryServingAcknowledgementRefreshFailureV2 {
+                        state: Box::new(Self {
+                            owner,
+                            gateway,
+                            registry,
+                            worker: failure.into_state(),
+                        }),
+                        error,
+                    },
+                )
+            }
+        }
+    }
+}
+
+impl RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2 {
+    pub(crate) fn begin_shutdown_v2(
+        self,
+    ) -> (
+        RuntimeClosedRecoveryShuttingDownServingOpenProcessV2,
+        Result<RuntimeRouteSetObservationV2, RuntimeRegistryRecoveryObservationErrorV1>,
+    ) {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        let worker = worker.begin_shutdown(RuntimeShutdownCauseV2::Explicit);
+        let registry_observation = registry.observe_shutdown_route_set_v2();
+        (
+            RuntimeClosedRecoveryShuttingDownServingOpenProcessV2 {
+                owner,
+                gateway,
+                registry,
+                worker,
+            },
+            registry_observation,
+        )
+    }
+
+    pub(crate) fn into_ingress_acknowledgement_authority_v2(
+        self,
+    ) -> RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2 {
+        RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2::ServingOpenRefresh(Box::new(self))
+    }
+
+    pub(crate) fn operation_mut_v2(
+        &mut self,
+    ) -> &mut RuntimeIngressOpenAcknowledgementSingleFlightV2 {
+        self.worker.operation_mut()
+    }
+
+    pub(crate) fn complete_v2(
+        self,
+        accepted: RuntimeAcceptedIngressOpenAcknowledgementV2,
+    ) -> Result<
+        RuntimeClosedRecoverySupervisedServingOpenProcessV2,
+        RuntimeClosedRecoveryServingAcknowledgementRefreshCompletionFailureV2,
+    > {
+        let Self {
+            owner,
+            gateway,
+            registry,
+            worker,
+        } = self;
+        match worker.complete(accepted) {
+            Ok(worker) => Ok(RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
+                owner,
+                gateway,
+                registry,
+                worker,
+            }),
+            Err(failure) => {
+                let error = failure.error();
+                Err(
+                    RuntimeClosedRecoveryServingAcknowledgementRefreshCompletionFailureV2 {
+                        state: Box::new(Self {
+                            owner,
+                            gateway,
+                            registry,
+                            worker: failure.into_refresh(),
+                        }),
+                        error,
+                    },
+                )
+            }
+        }
+    }
+}
+
+impl RuntimeClosedRecoveryShuttingDownServingOpenProcessV2 {
     pub(crate) async fn shutdown_until_v2(
         self,
         cleanup_deadline: Instant,
@@ -2147,6 +2801,11 @@ impl RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2 {
                     refresh,
                 )
             }
+            Self::ServingOpenRefresh(refresh) => {
+                RuntimeClosedRecoveryIngressAcknowledgementRetainedStateV2::ServingOpenRefresh(
+                    refresh,
+                )
+            }
         }
     }
 }
@@ -2161,6 +2820,7 @@ impl RuntimeIngressAcknowledgementAuthorityV2
         match self {
             Self::Admission(authority) => &mut authority.operation,
             Self::EmptyOpenRefresh(refresh) => refresh.operation_mut_v2(),
+            Self::ServingOpenRefresh(refresh) => refresh.operation_mut_v2(),
         }
     }
 
@@ -2201,12 +2861,36 @@ impl RuntimeIngressAcknowledgementAuthorityV2
                     }
                 }
             }
+            Self::ServingOpenRefresh(refresh) => {
+                let accepted_receipt = accepted.receipt().clone();
+                match (*refresh).complete_v2(accepted) {
+                    Ok(lifecycle) => Ok(
+                        RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2::ServingOpenRefresh {
+                            lifecycle: Box::new(lifecycle),
+                            accepted_receipt: Box::new(accepted_receipt),
+                        },
+                    ),
+                    Err(failure) => {
+                        let error =
+                            RuntimeClosedRecoveryIngressAcknowledgementCompletionErrorV2::ServingOpenRefresh(
+                                failure.error_v2(),
+                            );
+                        let authority = Self::ServingOpenRefresh(Box::new(failure.into_state_v2()));
+                        Err((authority, error))
+                    }
+                }
+            }
         }
     }
 }
 
 pub(crate) struct RuntimeClosedRecoveryAcknowledgementRefreshCompletionFailureV2 {
     state: Box<RuntimeClosedRecoveryEmptyOpenAcknowledgementRefreshV2>,
+    error: RuntimeProductionLifecycleErrorV2,
+}
+
+pub(crate) struct RuntimeClosedRecoveryServingAcknowledgementRefreshCompletionFailureV2 {
+    state: Box<RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2>,
     error: RuntimeProductionLifecycleErrorV2,
 }
 
@@ -2248,6 +2932,36 @@ impl RuntimeClosedRecoveryAcknowledgementRefreshCompletionFailureV2 {
     }
 
     pub(crate) fn into_state_v2(self) -> RuntimeClosedRecoveryEmptyOpenAcknowledgementRefreshV2 {
+        *self.state
+    }
+}
+
+impl RuntimeClosedRecoveryServingOpenTransitionFailureV2 {
+    pub(crate) fn error_v2(&self) -> RuntimeClosedRecoveryProductionHandoffErrorV2 {
+        self.error
+    }
+
+    pub(crate) fn into_state_v2(self) -> RuntimeClosedRecoverySupervisedEmptyOpenProcessV2 {
+        *self.state
+    }
+}
+
+impl RuntimeClosedRecoveryServingAcknowledgementRefreshFailureV2 {
+    pub(crate) fn error_v2(&self) -> RuntimeProductionLifecycleErrorV2 {
+        self.error
+    }
+
+    pub(crate) fn into_state_v2(self) -> RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
+        *self.state
+    }
+}
+
+impl RuntimeClosedRecoveryServingAcknowledgementRefreshCompletionFailureV2 {
+    pub(crate) fn error_v2(&self) -> RuntimeProductionLifecycleErrorV2 {
+        self.error
+    }
+
+    pub(crate) fn into_state_v2(self) -> RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2 {
         *self.state
     }
 }

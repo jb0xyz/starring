@@ -599,6 +599,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/process/pending_drain_finalizer.rs",
             "src/process/readiness.rs",
             "src/process/recovery.rs",
+            "src/process/serving.rs",
             "src/process/startup_loop.rs",
             "src/process/startup_loop_tests.rs",
             "src/process.rs",
@@ -799,6 +800,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/process/pending_drain_finalizer.rs")
             && path != Path::new("src/process/readiness.rs")
             && path != Path::new("src/process/recovery.rs")
+            && path != Path::new("src/process/serving.rs")
             && path != Path::new("src/process/startup_loop.rs")
             && path != Path::new("src/process/startup_loop_tests.rs")
             && path != Path::new("src/process_startup.rs")
@@ -1217,7 +1219,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     || path == Path::new("src/process/startup_loop.rs")
                     || path == Path::new("src/process/startup_loop_tests.rs")
             );
-            let allowed_observation_process = path == Path::new("src/process/observation.rs")
+            let allowed_observation_process = (path == Path::new("src/process/observation.rs")
+                || path == Path::new("src/process/serving.rs"))
                 && matches!(
                     identifier,
                     "automation_runtime_controller" | "automation_runtime_worker"
@@ -1312,7 +1315,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         process_observation
             .matches("automation_runtime_controller")
             .count(),
-        6
+        7
     );
     assert!(process_observation.contains(concat!(
         "use automation_runtime_controller::{\n",
@@ -2082,11 +2085,16 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         "async fn stage_runtime_process_from_environment_v1(",
     );
     let startup_open = startup.find(".enter_empty_open_v2()").unwrap();
+    let startup_serving = startup.find(".enter_serving_open_v2()").unwrap();
     let startup_run = startup.find(".run_until_shutdown_v2()").unwrap();
     let startup_done = startup
         .find("Ok(RuntimeProcessStagingOutcomeV1 { _private: () })")
         .unwrap();
-    assert!(startup_open < startup_run && startup_run < startup_done);
+    assert!(
+        startup_open < startup_serving
+            && startup_serving < startup_run
+            && startup_run < startup_done
+    );
     assert!(!startup.contains("empty_open\n        .shutdown()"));
     for forbidden in [
         "RuntimeMaintenanceIngressGatePermitV2",
@@ -2578,6 +2586,159 @@ fn recovery_pending_process_is_fresh_closed_linear_and_bounded() {
 }
 
 #[test]
+fn serving_open_successor_is_linear_bounded_refreshable_and_non_mutating() {
+    let sources = source_files();
+    let serving = include_str!("../src/process/serving.rs");
+    let closed = include_str!("../src/closed_recovery.rs");
+    let startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let transition = braced_declaration(serving, "pub(crate) async fn enter_serving_open_v2(");
+    let prepare = transition
+        .find(".prepare_serving_open_v2(config, serving_evidence)")
+        .unwrap();
+    let commit = transition.find("prepared.commit_v2()").unwrap();
+    let revalidate = transition.rfind("process.revalidate_v2().await").unwrap();
+    assert!(prepare < commit && commit < revalidate);
+    assert_eq!(startup.matches(".enter_empty_open_v2()").count(), 1);
+    assert_eq!(startup.matches(".enter_serving_open_v2()").count(), 1);
+    assert_eq!(startup.matches(".run_until_shutdown_v2()").count(), 1);
+    let empty = startup.find(".enter_empty_open_v2()").unwrap();
+    let successor = startup.find(".enter_serving_open_v2()").unwrap();
+    let run = startup.find(".run_until_shutdown_v2()").unwrap();
+    assert!(empty < successor && successor < run);
+    for required in [
+        "const SERVING_OPEN_SLOT_WORK_CAPACITY_V2: usize = 64;",
+        "RuntimeClosedRecoveryServingOpenEvidenceV2",
+        "RuntimeClosedRecoveryServingAcknowledgementEvidenceV2",
+        ".authorize_acknowledgement_refresh_v2(evidence)",
+        "RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2::ServingOpenRefresh",
+        "RuntimeClosedRecoveryIngressAcknowledgementRetainedStateV2::ServingOpenRefresh",
+        "shutdown_serving_open_process_v2(",
+        "shutdown_refreshing_serving_open_process_v2(",
+    ] {
+        assert!(serving.contains(required), "{required}");
+    }
+    for required in [
+        "RuntimeClosedRecoveryPreparedServingOpenProcessV2",
+        "RuntimeClosedRecoverySupervisedServingOpenProcessV2",
+        "RuntimeRegistryPreparedServingTransitionV2",
+        "RuntimeRegistryServingBindingV2",
+        "worker.prepare_serving_open(&port, config)",
+        "registry.commit_v2(worker.route_set_epoch())",
+        "let route_set = match self.observe_registry_route_set_v2()",
+        "RuntimeServingOpenAcknowledgementRefreshInputV2",
+        "RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2::ServingOpenRefresh",
+    ] {
+        assert!(closed.contains(required), "{required}");
+    }
+    for forbidden in [
+        "Shard::new(",
+        "run_shared_gateway_v3",
+        "begin_paused_discord_connection_v1",
+        "enter_empty_open_v2",
+        "RuntimeMaintenanceIngressGatePermitV2",
+        "try_acquire_v2",
+        "INTERACTION_CREATE",
+        "hydrate",
+        "activate",
+        "deploy",
+        "sqlx",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+    ] {
+        assert!(
+            !contains_identifier(serving, forbidden),
+            "serving: {forbidden}"
+        );
+    }
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|(path, _)| path.starts_with("src"))
+            .map(|(_, source)| source.matches("Shard::new(").count())
+            .sum::<usize>(),
+        1
+    );
+}
+
+#[test]
+fn serving_shutdown_observes_valid_route_sets_without_weakening_empty_shutdown() {
+    let process = source_before_test_module(include_str!("../src/process.rs"));
+    let observation = include_str!("../src/process/observation.rs");
+    let serving_process = include_str!("../src/process/serving.rs");
+    let empty = braced_declaration(
+        process,
+        "pub(super) fn observe_shutdown_registry_v1(&mut self)",
+    );
+    let serving = braced_declaration(
+        process,
+        "pub(super) fn observe_shutdown_serving_registry_v2(",
+    );
+
+    assert!(empty.contains("self.registry.observe_recovery_empty_projection_v2()"));
+    assert!(!empty.contains("RuntimeRouteSetObservationV2"));
+    assert!(serving.contains("RuntimeRouteSetObservationV2"));
+    assert!(serving.contains("accept_shutdown_serving_registry_observation_v2(observation)"));
+    assert!(!serving.contains("observe_recovery_empty_projection_v2()"));
+    let lost_serving = braced_declaration(
+        process,
+        "pub(super) fn observe_shutdown_serving_registry_without_lifecycle_v2(&mut self)",
+    );
+    assert!(lost_serving.contains("self.registry.observe_shutdown_route_set_v2()"));
+    assert!(lost_serving.contains("self.observe_shutdown_serving_registry_v2(observation)"));
+
+    for marker in [
+        "pub(super) async fn shutdown_serving_open_process_v2(",
+        "pub(super) async fn shutdown_refreshing_serving_open_process_v2(",
+    ] {
+        let shutdown = braced_declaration(observation, marker);
+        let sealed = shutdown
+            .find("let (lifecycle, registry_observation) = lifecycle.begin_shutdown_v2();")
+            .unwrap();
+        let first_await = shutdown.find(".await").unwrap();
+        let foundation = shutdown
+            .find("foundation.observe_shutdown_serving_registry_v2(registry_observation);")
+            .unwrap();
+        let discord_drain = shutdown
+            .find("foundation.gateway.begin_discord_drain_v1()")
+            .unwrap();
+        assert!(sealed < first_await);
+        assert!(sealed < foundation && foundation < discord_drain);
+        assert!(!shutdown.contains("lifecycle.observe_registry_route_set_v2()"));
+        assert!(!shutdown.contains("foundation.observe_shutdown_registry_v1()"));
+    }
+
+    for required in [
+        "RuntimeClosedRecoveryShuttingDownServingOpenProcessV2",
+        "let worker = match worker.begin_shutdown(generation, RuntimeShutdownCauseV2::Explicit)",
+        "let worker = worker.begin_shutdown(RuntimeShutdownCauseV2::Explicit);",
+        "let registry_observation = registry.observe_shutdown_route_set_v2();",
+    ] {
+        assert!(include_str!("../src/closed_recovery.rs").contains(required));
+    }
+
+    for marker in [
+        "pub(super) async fn shutdown_empty_open_process_v2(",
+        "pub(super) async fn shutdown_refreshing_empty_open_process_v2(",
+    ] {
+        let shutdown = braced_declaration(observation, marker);
+        assert!(shutdown.contains("foundation.observe_shutdown_registry_v1()"));
+        assert!(!shutdown.contains("observe_shutdown_serving_registry_v2"));
+    }
+
+    let lost = braced_declaration(
+        observation,
+        "pub(super) async fn shutdown_process_without_lifecycle_v2(",
+    );
+    assert!(lost.contains("RuntimeLifecycleLostRegistryObservationV2::Empty"));
+    assert!(lost.contains("foundation.observe_shutdown_registry_v1()"));
+    assert!(lost.contains("RuntimeLifecycleLostRegistryObservationV2::Serving"));
+    assert!(lost.contains("foundation.observe_shutdown_serving_registry_without_lifecycle_v2()"));
+    assert!(serving_process.contains("RuntimeLifecycleLostRegistryObservationV2::Serving,"));
+}
+
+#[test]
 fn committed_closed_recovery_process_is_linear_retained_and_non_serving() {
     let sources = source_files();
     let process = source_before_test_module(include_str!("../src/process/closed.rs"));
@@ -2877,6 +3038,7 @@ fn committed_closed_recovery_process_is_linear_retained_and_non_serving() {
     let recovery_resume = startup_stage.find(".into_recovery_resume_v2()").unwrap();
     let admission = startup_stage.find(".resume_recovery_v2()").unwrap();
     let empty_open = startup_stage.find(".enter_empty_open_v2()").unwrap();
+    let serving_open = startup_stage.find(".enter_serving_open_v2()").unwrap();
     let run = startup_stage.find(".run_until_shutdown_v2()").unwrap();
     assert!(
         pending < committed
@@ -2887,7 +3049,8 @@ fn committed_closed_recovery_process_is_linear_retained_and_non_serving() {
             && process_bound < recovery_resume
             && recovery_resume < admission
             && admission < empty_open
-            && empty_open < run
+            && empty_open < serving_open
+            && serving_open < run
     );
     assert!(!startup_stage.contains("empty_open\n        .shutdown()"));
     assert!(!library.contains("RuntimeClosedRecoveryProcessV2"));
@@ -4765,6 +4928,20 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "pub(crate) fn revalidate_empty_projection_v2(",
         "_section: &RuntimeRecoveryPendingGatewaySectionV2<'_>",
         "fn revalidate_empty_projection_unordered_v2(",
+        "pub(crate) struct RuntimeRegistryPreparedServingTransitionV2",
+        "pub(crate) struct RuntimeRegistryServingBindingV2",
+        "pub(crate) struct RuntimeRegistryServingTransitionFailureV2",
+        "pub(crate) fn prepare_serving_transition_v2(",
+        "route_set_epoch: &RuntimeRouteSetEpochV2",
+        "pub(crate) fn observe_route_set_v2(",
+        "pub(crate) fn commit_v2(",
+        "pub(crate) fn cancel_v2(self) -> RuntimeRegistryEmptyRecoveryBindingV2",
+        "pub(crate) fn into_binding_v2(self) -> RuntimeRegistryEmptyRecoveryBindingV2",
+        "accept_runtime_route_set_observation_v2(",
+        "RuntimeRouteSetObservationInputV2 {",
+        "RuntimeRegistryPreparedServingTransitionV2(<redacted>)",
+        "RuntimeRegistryServingBindingV2(<redacted>)",
+        "RuntimeRegistryServingTransitionFailureV2(<redacted>)",
         "RuntimeRegistryRecoveryObservationInputV2 {",
         "observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(",
         "retained_slot_count: observation.retained_slot_count()",
@@ -4819,6 +4996,9 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "RuntimeRegistryRecoveryGuardV1",
         "RuntimeLockedRegistryEmptyEvidenceV2",
         "RuntimeRegistryEmptyRecoveryBindingV2",
+        "RuntimeRegistryPreparedServingTransitionV2",
+        "RuntimeRegistryServingBindingV2",
+        "RuntimeRegistryServingTransitionFailureV2",
         "RuntimeRegistryPendingDrainSealBindingV2",
         "RuntimeRegistryPendingDrainSuccessionSealBindingV3",
     ] {
@@ -4852,6 +5032,29 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "    process_instance_id: ProcessInstanceId,\n",
         "    registry: ServingSlotRegistryV1,\n",
         "    cursor: RegistryEmptyRecoveryCursorV2,\n",
+        "}"
+    )));
+    assert!(production.contains(concat!(
+        "pub(crate) struct RuntimeRegistryPreparedServingTransitionV2 {\n",
+        "    binding: RuntimeRegistryEmptyRecoveryBindingV2,\n",
+        "    initial_registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,\n",
+        "    initial_retained_slot_count: u64,\n",
+        "    initial_retained_empty_tombstone_count: u64,\n",
+        "}"
+    )));
+    assert!(production.contains(concat!(
+        "pub(crate) struct RuntimeRegistryServingBindingV2 {\n",
+        "    process_instance_id: ProcessInstanceId,\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "    initial_registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,\n",
+        "    initial_retained_slot_count: u64,\n",
+        "    initial_retained_empty_tombstone_count: u64,\n",
+        "}"
+    )));
+    assert!(production.contains(concat!(
+        "pub(crate) struct RuntimeRegistryServingTransitionFailureV2 {\n",
+        "    binding: RuntimeRegistryEmptyRecoveryBindingV2,\n",
+        "    error: RuntimeRegistryRecoveryObservationErrorV1,\n",
         "}"
     )));
     assert_eq!(
@@ -4932,6 +5135,25 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         1
     );
     assert!(!production.contains(".unseal_drain_claim_v2("));
+    let serving_binding = braced_declaration(production, "impl RuntimeRegistryServingBindingV2");
+    assert_eq!(
+        serving_binding
+            .matches("pub(crate) fn observe_route_set_v2(")
+            .count(),
+        1
+    );
+    for forbidden in [
+        "pub(crate) fn install",
+        "pub(crate) fn activate",
+        "pub(crate) fn begin_drain",
+        "pub(crate) fn remove",
+        "pub(crate) fn admit",
+        "pub(crate) fn registry",
+        "pub(crate) fn into_registry",
+        "pub(crate) fn cursor",
+    ] {
+        assert!(!serving_binding.contains(forbidden), "{forbidden}");
+    }
     for forbidden in [
         "pub fn cursor",
         "pub fn registry",
@@ -4953,6 +5175,9 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
             "RegistryEmptyRecoveryCursorV2",
             "RuntimeRegistryRecoveryGuardV1",
             "RuntimeRegistryEmptyRecoveryBindingV2",
+            "RuntimeRegistryPreparedServingTransitionV2",
+            "RuntimeRegistryServingBindingV2",
+            "RuntimeRegistryServingTransitionFailureV2",
         ] {
             assert!(
                 !contains_identifier(header, forbidden),
@@ -4969,6 +5194,9 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "RuntimeRegistryRecoveryGuardV1",
         "RuntimeLockedRegistryEmptyEvidenceV2",
         "RuntimeRegistryEmptyRecoveryBindingV2",
+        "RuntimeRegistryPreparedServingTransitionV2",
+        "RuntimeRegistryServingBindingV2",
+        "RuntimeRegistryServingTransitionFailureV2",
         "RuntimeRegistryPendingDrainSealBindingV2",
         "RuntimeRegistryPendingDrainSuccessionSealBindingV3",
     ] {
@@ -5456,6 +5684,7 @@ fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_en
     let recovery_resume = staging.find(".into_recovery_resume_v2()").unwrap();
     let admission = staging.find(".resume_recovery_v2()").unwrap();
     let empty_open = staging.find(".enter_empty_open_v2()").unwrap();
+    let serving_open = staging.find(".enter_serving_open_v2()").unwrap();
     let run = staging.find(".run_until_shutdown_v2()").unwrap();
     let outcome = staging.find("Ok(RuntimeProcessStagingOutcomeV1").unwrap();
     assert!(
@@ -5475,7 +5704,8 @@ fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_en
             && process_bound < recovery_resume
             && recovery_resume < admission
             && admission < empty_open
-            && empty_open < run
+            && empty_open < serving_open
+            && serving_open < run
             && owner < run
             && run < outcome
     );
@@ -5503,6 +5733,7 @@ fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_en
         ".into_recovery_resume_v2()",
         ".resume_recovery_v2()",
         ".enter_empty_open_v2()",
+        ".enter_serving_open_v2()",
         ".run_until_shutdown_v2()",
     ] {
         assert_eq!(staging.matches(operation).count(), 1, "{operation}");

@@ -64,6 +64,9 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/production_lifecycle/admission.rs"),
             PathBuf::from("src/production_lifecycle/handoff.rs"),
             PathBuf::from("src/production_lifecycle/refresh.rs"),
+            PathBuf::from("src/production_lifecycle/serving/route_set.rs"),
+            PathBuf::from("src/production_lifecycle/serving/slot_work.rs"),
+            PathBuf::from("src/production_lifecycle/serving.rs"),
             PathBuf::from("src/production_lifecycle/shutdown.rs"),
             PathBuf::from("src/production_lifecycle/tests.rs"),
             PathBuf::from("src/production_lifecycle.rs"),
@@ -1829,8 +1832,13 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
     let handoff = include_str!("../src/production_lifecycle/handoff.rs");
     let admission = include_str!("../src/production_lifecycle/admission.rs");
     let refresh = include_str!("../src/production_lifecycle/refresh.rs");
+    let serving = include_str!("../src/production_lifecycle/serving.rs");
+    let serving_route_set = include_str!("../src/production_lifecycle/serving/route_set.rs");
+    let serving_slot_work = include_str!("../src/production_lifecycle/serving/slot_work.rs");
     let shutdown = include_str!("../src/production_lifecycle/shutdown.rs");
-    let source = format!("{model}\n{handoff}\n{admission}\n{refresh}\n{shutdown}");
+    let source = format!(
+        "{model}\n{handoff}\n{admission}\n{refresh}\n{serving}\n{serving_route_set}\n{serving_slot_work}\n{shutdown}"
+    );
     let root = include_str!("../src/lib.rs");
     let closed = include_str!("../src/gateway_lifecycle.rs");
 
@@ -1838,6 +1846,9 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
     assert!(handoff.lines().count() < 500);
     assert!(admission.lines().count() < 700);
     assert!(refresh.lines().count() < 400);
+    assert!(serving.lines().count() < 900);
+    assert!(serving_route_set.lines().count() < 200);
+    assert!(serving_slot_work.lines().count() < 350);
     assert!(shutdown.lines().count() < 650);
 
     for authority in [
@@ -1849,6 +1860,12 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
         "RuntimeAdmissionAcknowledgingProcessV2",
         "RuntimeEmptyOpenEpochV2",
         "RuntimeEmptyOpenProcessV2",
+        "RuntimeRouteSetEpochV2",
+        "RuntimeServingOpenPreparedV2",
+        "RuntimeServingOpenEpochV2",
+        "RuntimeServingOpenProcessV2",
+        "RuntimeServingSlotWorkRequestV2",
+        "RuntimeServingSlotWorkPermitV2",
         "RuntimeProductionEmergencyProcessV2",
         "RuntimeShuttingDownProcessV2",
     ] {
@@ -1882,6 +1899,11 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
         "pub fn begin_production_handoff<P>(\n        self,",
         "pub fn resume_recovery<P>(\n        self,",
         "pub fn observe_open_production<P>(\n        self,",
+        "pub fn prepare_serving_open<P>(\n        self,",
+        "pub fn commit(self) -> RuntimeServingOpenProcessV2",
+        "pub fn cancel(self) -> RuntimeEmptyOpenProcessV2",
+        "pub fn authorize_slot_work(\n        &self,",
+        "pub fn begin_slot_work(\n        &mut self,",
         "pub fn invalidate_production(\n        self,",
         "pub fn begin_shutdown(\n        self,",
     ] {
@@ -1892,6 +1914,7 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
         "RuntimeProductionHandoffObservationPortV2",
         "RuntimeRecoveryResumePortV2",
         "RuntimeOpenProductionObservationPortV2",
+        "RuntimeServingOpenObservationPortV2",
     ] {
         let body = source
             .split(&format!("pub trait {port} {{"))
@@ -1913,6 +1936,8 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
         "RuntimeProductionLifecycleStageV2::OpenProduction",
         "RuntimeProductionLifecycleStageV2::Shutdown",
         "RuntimeIngressOpenAcknowledgementObservationV2",
+        "RuntimeRouteSetEpochV2",
+        "RuntimeServingSlotWorkSupervisorV2",
         "RuntimeProductionInvalidationOutcomeV2",
         "RuntimeShutdownCauseV2::GenerationOverflow",
     ] {
@@ -1941,6 +1966,11 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
         "RuntimeRecoveryResumePermitV2",
         "RuntimeAdmissionAcknowledgingProcessV2",
         "RuntimeEmptyOpenProcessV2",
+        "RuntimeRouteSetEpochV2",
+        "RuntimeServingOpenPreparedV2",
+        "RuntimeServingOpenProcessV2",
+        "RuntimeServingSlotWorkRequestV2",
+        "RuntimeServingSlotWorkPermitV2",
         "RuntimeProductionEmergencyProcessV2",
         "RuntimeShuttingDownProcessV2",
     ] {
@@ -1949,6 +1979,118 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
     assert!(!contains_identifier(root, "RuntimePublicAdmissionPermitV2"));
     assert!(!closed.contains("AdmissionAcknowledging"));
     assert!(!closed.contains("OpenProduction"));
+}
+
+#[test]
+fn serving_open_authority_is_linear_epoch_fenced_and_keyed() {
+    let serving_root = include_str!("../src/production_lifecycle/serving.rs");
+    let serving_route_set = include_str!("../src/production_lifecycle/serving/route_set.rs");
+    let serving_slot_work = include_str!("../src/production_lifecycle/serving/slot_work.rs");
+    let serving = format!("{serving_root}\n{serving_route_set}\n{serving_slot_work}");
+    let shutdown = include_str!("../src/production_lifecycle/shutdown.rs");
+    let lifecycle = include_str!("../src/production_lifecycle.rs");
+    let root = include_str!("../src/lib.rs");
+
+    let prepared = serving_root
+        .split("pub struct RuntimeServingOpenPreparedV2 {")
+        .nth(1)
+        .and_then(|source| source.split("\n}\n").next())
+        .unwrap();
+    assert!(prepared.contains("state: Box<RuntimeEmptyOpenProcessV2>,"));
+    assert!(prepared.contains("route_set_epoch: RuntimeRouteSetEpochV2,"));
+
+    let process = serving_root
+        .split("pub struct RuntimeServingOpenProcessV2 {")
+        .nth(1)
+        .and_then(|source| source.split("\n}\n").next())
+        .unwrap();
+    assert!(!process.contains("RuntimeEmptyOpenProcessV2"));
+    assert!(process.contains("_admission: RuntimeAdmissionAcknowledgingProcessV2,"));
+    assert!(process.contains("epoch: RuntimeServingOpenEpochV2,"));
+    assert!(process.contains("supervisor: RuntimeServingSlotWorkSupervisorV2,"));
+
+    let route_epoch = serving_root
+        .split("pub struct RuntimeRouteSetEpochV2 {")
+        .nth(1)
+        .and_then(|source| source.split("impl Debug for RuntimeRouteSetEpochV2").next())
+        .unwrap();
+    assert!(!route_epoch.contains("pub fn new("));
+    assert!(route_epoch.contains(
+        "initial_registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,"
+    ));
+    assert!(route_epoch.contains("initial_retained_slot_count: u64,"));
+    assert!(route_epoch.contains("initial_retained_empty_tombstone_count: u64,"));
+
+    for required in [
+        "let RuntimeEmptyOpenProcessV2 { _admission, epoch } = *state;",
+        "registry_empty: _,",
+        "RuntimeProductionLifecycleStageV2::OpenProduction",
+        "observed.route_set.observation_sequence() != request.registry_observation_sequence",
+        "observed.route_set.retained_slot_count()",
+        "request.route_set_epoch.initial_retained_slot_count",
+        "observed.route_set.retained_empty_tombstone_count()",
+        "request\n                .route_set_epoch\n                .initial_retained_empty_tombstone_count",
+        "observed.gateway_owner.database_now < previous_owner.database_now",
+        "observed.writer_fence_open",
+        "observed.maintenance_gate_open",
+        "observed.finalizer_accepting",
+        "ingress_acknowledgement_predecessor",
+        "if !observed.supervisors_running",
+        "BTreeMap<RuntimeServingSlotV2, NonZeroU64>",
+        "state.active.contains_key(&slot)",
+        "state.active.len() >= state.max_in_flight.get()",
+        "impl Drop for RuntimeServingSlotWorkPermitV2",
+        "state.active.get(&identity.slot)",
+        "Arc::downgrade(&self.state)",
+        "RuntimeServingSlotWorkErrorV2::StaleRouteSetEpoch",
+        "RuntimeServingOpenAcknowledgementRefreshV2",
+        "route_set_sequence < previous_route_set_sequence",
+        "route_set_sequence == previous_route_set_sequence",
+        "input.route_set != epoch.route_set",
+    ] {
+        assert!(serving.contains(required), "{required}");
+    }
+
+    for forbidden in [
+        "successor_generation(",
+        "RuntimeProductionLifecycleStageV2::Serving",
+        "pub route_set_epoch:",
+        "pub supervisor:",
+        "async fn",
+        "tokio",
+        "sqlx",
+        "twilight",
+        "serde",
+    ] {
+        assert!(!serving.contains(forbidden), "{forbidden}");
+    }
+
+    for authority in [
+        "RuntimeRouteSetEpochV2",
+        "RuntimeServingOpenPreparedV2",
+        "RuntimeServingOpenEpochV2",
+        "RuntimeServingOpenProcessV2",
+        "RuntimeServingSlotWorkRequestV2",
+        "RuntimeServingSlotWorkPermitV2",
+        "RuntimeServingOpenAcknowledgementRefreshV2",
+    ] {
+        assert!(
+            serving.contains(&format!("{authority}(<redacted>)")),
+            "{authority}"
+        );
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !implements_trait(&serving, authority, forbidden),
+                "{authority} implements {forbidden}"
+            );
+        }
+        assert!(contains_identifier(lifecycle, authority), "{authority}");
+        assert!(contains_identifier(root, authority), "{authority}");
+    }
+
+    assert!(shutdown.contains("RuntimeProductionEmergencySourceV2::ServingOpen"));
+    assert!(shutdown.contains("RuntimeProductionTerminalSourceV2::ServingOpen"));
+    assert!(shutdown.contains("impl RuntimeServingOpenProcessV2"));
 }
 
 #[test]

@@ -72,7 +72,7 @@ pub use product_drain::{
     RuntimeProductDrainUnknownRecoveryPortV2,
 };
 pub use production_lifecycle::{
-    RuntimeAdmissionAcknowledgingProcessV2,
+    accept_runtime_route_set_observation_v2, RuntimeAdmissionAcknowledgingProcessV2,
     RuntimeEmptyOpenAcknowledgementRefreshAuthorizationFailureV2,
     RuntimeEmptyOpenAcknowledgementRefreshCompletionFailureV2,
     RuntimeEmptyOpenAcknowledgementRefreshInputV2, RuntimeEmptyOpenAcknowledgementRefreshV2,
@@ -87,8 +87,18 @@ pub use production_lifecycle::{
     RuntimeProductionInvalidationOutcomeV2, RuntimeProductionLifecycleErrorV2,
     RuntimeProductionLifecycleStageV2, RuntimeProductionTransitionFailureV2,
     RuntimeRecoveryResumeObservationInputV2, RuntimeRecoveryResumeObservationV2,
-    RuntimeRecoveryResumePermitV2, RuntimeRecoveryResumePortV2, RuntimeShutdownCauseV2,
-    RuntimeShuttingDownProcessV2, RuntimeStartupRecoveryFixedPointProcessV2,
+    RuntimeRecoveryResumePermitV2, RuntimeRecoveryResumePortV2, RuntimeRouteSetEpochV2,
+    RuntimeRouteSetObservationErrorV2, RuntimeRouteSetObservationInputV2,
+    RuntimeRouteSetObservationV2, RuntimeServingOpenAcknowledgementRefreshAuthorizationFailureV2,
+    RuntimeServingOpenAcknowledgementRefreshCompletionFailureV2,
+    RuntimeServingOpenAcknowledgementRefreshInputV2, RuntimeServingOpenAcknowledgementRefreshV2,
+    RuntimeServingOpenEpochV2, RuntimeServingOpenObservationInputV2,
+    RuntimeServingOpenObservationPortV2, RuntimeServingOpenObservationV2,
+    RuntimeServingOpenPreparedV2, RuntimeServingOpenProcessV2, RuntimeServingOpenRequestV2,
+    RuntimeServingOpenSupervisorConfigErrorV2, RuntimeServingOpenSupervisorConfigV2,
+    RuntimeServingSlotWorkErrorV2, RuntimeServingSlotWorkPermitV2, RuntimeServingSlotWorkRequestV2,
+    RuntimeShutdownCauseV2, RuntimeShuttingDownProcessV2,
+    RuntimeStartupRecoveryFixedPointProcessV2,
 };
 pub use recovery::RuntimeRecoveryPendingV2;
 pub use registry_recovery::{

@@ -3,7 +3,9 @@ use std::num::{NonZeroU64, NonZeroU8};
 
 use automation_runtime_controller::RuntimeBuildRevisionV1;
 use automation_runtime_convergence::{ControllerId, ProcessInstanceId};
-use automation_runtime_worker::RuntimeMutationFinalizerGenerationV1;
+use automation_runtime_worker::{
+    RuntimeMutationFinalizerGenerationV1, RuntimeRouteSetObservationV2,
+};
 
 use crate::build_revision::CompiledRuntimeBuildRevisionV1;
 use crate::capability_readiness_supervisor::{
@@ -49,6 +51,7 @@ mod owner;
 mod pending_drain_finalizer;
 mod readiness;
 mod recovery;
+mod serving;
 mod startup_loop;
 
 pub use closed::{
@@ -648,6 +651,31 @@ impl RuntimeProcessFoundationV1 {
         }
     }
 
+    pub(super) fn observe_shutdown_serving_registry_v2(
+        &mut self,
+        observation: Result<
+            RuntimeRouteSetObservationV2,
+            RuntimeRegistryRecoveryObservationErrorV1,
+        >,
+    ) {
+        let timing = self
+            .lifecycle_timing
+            .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownRegistryObservation);
+        match accept_shutdown_serving_registry_observation_v2(observation) {
+            Ok(()) => timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::Completed),
+            Err(error) => {
+                self.shutdown_failures
+                    .record(RuntimeProcessFoundationShutdownFailureV1::Registry(error));
+                timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::FailedClosed);
+            }
+        }
+    }
+
+    pub(super) fn observe_shutdown_serving_registry_without_lifecycle_v2(&mut self) {
+        let observation = self.registry.observe_shutdown_route_set_v2();
+        self.observe_shutdown_serving_registry_v2(observation);
+    }
+
     pub(super) fn record_finalizer_shutdown_exit_v1(&mut self, exit: RuntimeSupervisorExitV1) {
         if exit != RuntimeSupervisorExitV1::Commanded {
             self.shutdown_failures
@@ -1118,6 +1146,12 @@ fn map_root_supervisor_composition_error_v1(
     }
 }
 
+fn accept_shutdown_serving_registry_observation_v2(
+    observation: Result<RuntimeRouteSetObservationV2, RuntimeRegistryRecoveryObservationErrorV1>,
+) -> Result<(), RuntimeRegistryRecoveryObservationErrorV1> {
+    observation.map(drop)
+}
+
 async fn cleanup_after_operation_deadline_v1(
     databases: RuntimeDatabaseDependenciesV1,
     startup_budget: &RuntimeStartupBudgetV1,
@@ -1192,7 +1226,9 @@ mod tests {
     use std::rc::Rc;
 
     use automation_runtime_worker::{
-        RuntimeGatewayClosedSnapshotV2, RuntimeGatewayEmergencyCauseV2,
+        accept_runtime_route_set_observation_v2, RuntimeGatewayClosedSnapshotV2,
+        RuntimeGatewayEmergencyCauseV2, RuntimeRegistryGlobalObservationSequenceV2,
+        RuntimeRegistryRecoveryObservationInputV2, RuntimeRouteSetObservationInputV2,
     };
 
     use super::*;
@@ -1272,6 +1308,41 @@ mod tests {
     fn shutdown_finish_drops_secrets_only_after_close_returns_on_every_result() {
         assert_shutdown_finish_drop_order(Ok(()));
         assert_shutdown_finish_drop_order(Err(RuntimeDatabasePoolShutdownErrorV1::TimedOut));
+    }
+
+    #[test]
+    fn serving_shutdown_accepts_nonempty_route_sets_and_preserves_registry_errors() {
+        let observation =
+            accept_runtime_route_set_observation_v2(RuntimeRouteSetObservationInputV2 {
+                process_instance_id: process_instance_id(),
+                registry: RuntimeRegistryRecoveryObservationInputV2 {
+                    observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(
+                        NonZeroU64::MIN,
+                    ),
+                    retained_slot_count: 1,
+                    retained_empty_tombstone_count: 0,
+                    staged_route_count: 0,
+                    serving_route_count: 1,
+                    draining_route_count: 0,
+                    sealed_slot_count: 0,
+                    active_interaction_count: 1,
+                    failed_closed_slot_count: 0,
+                    registry_failed_closed: false,
+                },
+            })
+            .unwrap();
+
+        assert!(!observation.is_empty());
+        assert_eq!(
+            accept_shutdown_serving_registry_observation_v2(Ok(observation)),
+            Ok(())
+        );
+        assert_eq!(
+            accept_shutdown_serving_registry_observation_v2(Err(
+                RuntimeRegistryRecoveryObservationErrorV1::RegistryUnavailable,
+            )),
+            Err(RuntimeRegistryRecoveryObservationErrorV1::RegistryUnavailable)
+        );
     }
 
     #[test]

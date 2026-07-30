@@ -10,7 +10,7 @@ use automation_runtime_registry::{
     SlotAdmissionStateV2, SlotSealKeyV2,
 };
 use automation_runtime_worker::{
-    accept_runtime_registry_recovery_empty_observation_v2,
+    accept_runtime_registry_recovery_empty_observation_v2, accept_runtime_route_set_observation_v2,
     RuntimeDurablyAcknowledgedPendingDrainSuccessionV3, RuntimeDurablyAcknowledgedPendingDrainV2,
     RuntimePendingDrainCandidateV2, RuntimePendingDrainCompoundErrorV2,
     RuntimePendingDrainPreviousOwnerClaimedCandidateV3,
@@ -18,6 +18,8 @@ use automation_runtime_worker::{
     RuntimePendingDrainRegistryUnsealWitnessV2, RuntimePendingDrainSlotObservationV2,
     RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryEmptyObservationV2,
     RuntimeRegistryRecoveryObservationErrorV2, RuntimeRegistryRecoveryObservationInputV2,
+    RuntimeRouteSetEpochV2, RuntimeRouteSetObservationErrorV2, RuntimeRouteSetObservationInputV2,
+    RuntimeRouteSetObservationV2,
 };
 
 use crate::closed_recovery::RuntimeClosedRecoveryTransitionAuthorityV2;
@@ -93,6 +95,17 @@ impl RuntimeRegistryBootstrapV1 {
     {
         self.recovery_observation_guard_unordered_v2()?
             .empty_projection_v2()
+    }
+
+    pub(crate) fn observe_shutdown_route_set_v2(
+        &self,
+    ) -> Result<RuntimeRouteSetObservationV2, RuntimeRegistryRecoveryObservationErrorV1> {
+        let observation = self
+            .registry
+            .recovery_observation_guard_v2()
+            .map_err(map_registry_observation_error)?
+            .observation();
+        project_route_set_observation_v2(&self.process_instance_id, observation)
     }
 
     pub(crate) fn recovery_observation_guard_v2(
@@ -194,6 +207,26 @@ pub(crate) struct RuntimeRegistryEmptyRecoveryBindingV2 {
     cursor: RegistryEmptyRecoveryCursorV2,
 }
 
+pub(crate) struct RuntimeRegistryPreparedServingTransitionV2 {
+    binding: RuntimeRegistryEmptyRecoveryBindingV2,
+    initial_registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,
+    initial_retained_slot_count: u64,
+    initial_retained_empty_tombstone_count: u64,
+}
+
+pub(crate) struct RuntimeRegistryServingBindingV2 {
+    process_instance_id: ProcessInstanceId,
+    registry: ServingSlotRegistryV1,
+    initial_registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,
+    initial_retained_slot_count: u64,
+    initial_retained_empty_tombstone_count: u64,
+}
+
+pub(crate) struct RuntimeRegistryServingTransitionFailureV2 {
+    binding: RuntimeRegistryEmptyRecoveryBindingV2,
+    error: RuntimeRegistryRecoveryObservationErrorV1,
+}
+
 impl RuntimeRegistryEmptyRecoveryBindingV2 {
     pub(crate) fn revalidate_empty_projection_v2(
         &self,
@@ -219,6 +252,40 @@ impl RuntimeRegistryEmptyRecoveryBindingV2 {
     ) -> Result<RuntimeRegistryRecoveryEmptyObservationV2, RuntimeRegistryRecoveryObservationErrorV1>
     {
         self.revalidate_empty_projection_unordered_v2()
+    }
+
+    pub(crate) fn prepare_serving_transition_v2(
+        self,
+        route_set_epoch: &RuntimeRouteSetEpochV2,
+    ) -> Result<RuntimeRegistryPreparedServingTransitionV2, RuntimeRegistryServingTransitionFailureV2>
+    {
+        let observation = match self.revalidate_empty_projection_unordered_v2() {
+            Ok(observation) => observation,
+            Err(error) => {
+                return Err(RuntimeRegistryServingTransitionFailureV2 {
+                    binding: self,
+                    error,
+                });
+            }
+        };
+        if route_set_epoch.process_instance_id() != &self.process_instance_id
+            || route_set_epoch.initial_registry_observation_sequence()
+                != observation.observation_sequence()
+            || route_set_epoch.initial_retained_slot_count() != observation.retained_slot_count()
+            || route_set_epoch.initial_retained_empty_tombstone_count()
+                != observation.retained_empty_tombstone_count()
+        {
+            return Err(RuntimeRegistryServingTransitionFailureV2 {
+                binding: self,
+                error: RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation,
+            });
+        }
+        Ok(RuntimeRegistryPreparedServingTransitionV2 {
+            binding: self,
+            initial_registry_observation_sequence: observation.observation_sequence(),
+            initial_retained_slot_count: observation.retained_slot_count(),
+            initial_retained_empty_tombstone_count: observation.retained_empty_tombstone_count(),
+        })
     }
 
     pub(crate) fn into_pending_drain_seal_binding_v2(
@@ -299,6 +366,140 @@ impl RuntimeRegistryEmptyRecoveryBindingV2 {
             witness: witness.clone(),
         };
         Ok((binding, witness))
+    }
+}
+
+impl RuntimeRegistryPreparedServingTransitionV2 {
+    pub(crate) fn observe_route_set_v2(
+        &self,
+        route_set_epoch: &RuntimeRouteSetEpochV2,
+    ) -> Result<RuntimeRouteSetObservationV2, RuntimeRegistryRecoveryObservationErrorV1> {
+        validate_route_set_epoch_v2(
+            &self.binding.process_instance_id,
+            self.initial_registry_observation_sequence,
+            self.initial_retained_slot_count,
+            self.initial_retained_empty_tombstone_count,
+            route_set_epoch,
+        )?;
+        let observation = self
+            .binding
+            .registry
+            .revalidate_empty_recovery_cursor_v2(&self.binding.cursor)
+            .map_err(map_registry_observation_error)?;
+        if RuntimeRegistryGlobalObservationSequenceV2::new(
+            observation.observation_sequence().as_non_zero(),
+        ) != self.initial_registry_observation_sequence
+        {
+            return Err(RuntimeRegistryRecoveryObservationErrorV1::StaleEmptyBinding);
+        }
+        project_route_set_observation_v2(&self.binding.process_instance_id, observation)
+    }
+
+    pub(crate) fn commit_v2(
+        self,
+        route_set_epoch: &RuntimeRouteSetEpochV2,
+    ) -> Result<
+        (
+            RuntimeRegistryServingBindingV2,
+            RuntimeRouteSetObservationV2,
+        ),
+        RuntimeRegistryServingTransitionFailureV2,
+    > {
+        let observation = match self.observe_route_set_v2(route_set_epoch) {
+            Ok(observation) => observation,
+            Err(error) => {
+                return Err(RuntimeRegistryServingTransitionFailureV2 {
+                    binding: self.binding,
+                    error,
+                });
+            }
+        };
+        let Self {
+            binding,
+            initial_registry_observation_sequence,
+            initial_retained_slot_count,
+            initial_retained_empty_tombstone_count,
+        } = self;
+        let RuntimeRegistryEmptyRecoveryBindingV2 {
+            process_instance_id,
+            registry,
+            cursor,
+        } = binding;
+        drop(cursor);
+        Ok((
+            RuntimeRegistryServingBindingV2 {
+                process_instance_id,
+                registry,
+                initial_registry_observation_sequence,
+                initial_retained_slot_count,
+                initial_retained_empty_tombstone_count,
+            },
+            observation,
+        ))
+    }
+
+    pub(crate) fn cancel_v2(self) -> RuntimeRegistryEmptyRecoveryBindingV2 {
+        self.binding
+    }
+}
+
+impl RuntimeRegistryServingBindingV2 {
+    pub(crate) fn observe_route_set_v2(
+        &self,
+        route_set_epoch: &RuntimeRouteSetEpochV2,
+    ) -> Result<RuntimeRouteSetObservationV2, RuntimeRegistryRecoveryObservationErrorV1> {
+        validate_route_set_epoch_v2(
+            &self.process_instance_id,
+            self.initial_registry_observation_sequence,
+            self.initial_retained_slot_count,
+            self.initial_retained_empty_tombstone_count,
+            route_set_epoch,
+        )?;
+        let observation = self
+            .registry
+            .recovery_observation_guard_v2()
+            .map_err(map_registry_observation_error)?
+            .observation();
+        project_route_set_observation_v2(&self.process_instance_id, observation)
+    }
+
+    pub(crate) fn observe_shutdown_route_set_v2(
+        &self,
+    ) -> Result<RuntimeRouteSetObservationV2, RuntimeRegistryRecoveryObservationErrorV1> {
+        let observation = self
+            .registry
+            .recovery_observation_guard_v2()
+            .map_err(map_registry_observation_error)?
+            .observation();
+        project_route_set_observation_v2(&self.process_instance_id, observation)
+    }
+}
+
+impl RuntimeRegistryServingTransitionFailureV2 {
+    pub(crate) fn error_v2(&self) -> RuntimeRegistryRecoveryObservationErrorV1 {
+        self.error
+    }
+
+    pub(crate) fn into_binding_v2(self) -> RuntimeRegistryEmptyRecoveryBindingV2 {
+        self.binding
+    }
+}
+
+impl Debug for RuntimeRegistryPreparedServingTransitionV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryPreparedServingTransitionV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRegistryServingBindingV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryServingBindingV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRegistryServingTransitionFailureV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryServingTransitionFailureV2(<redacted>)")
     }
 }
 
@@ -782,6 +983,79 @@ pub fn compose_runtime_registry_bootstrap_v1(
         process_instance_id,
         registry,
     })
+}
+
+fn validate_route_set_epoch_v2(
+    process_instance_id: &ProcessInstanceId,
+    initial_registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,
+    initial_retained_slot_count: u64,
+    initial_retained_empty_tombstone_count: u64,
+    route_set_epoch: &RuntimeRouteSetEpochV2,
+) -> Result<(), RuntimeRegistryRecoveryObservationErrorV1> {
+    if route_set_epoch.process_instance_id() != process_instance_id
+        || route_set_epoch.initial_registry_observation_sequence()
+            != initial_registry_observation_sequence
+        || route_set_epoch.initial_retained_slot_count() != initial_retained_slot_count
+        || route_set_epoch.initial_retained_empty_tombstone_count()
+            != initial_retained_empty_tombstone_count
+    {
+        Err(RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation)
+    } else {
+        Ok(())
+    }
+}
+
+fn project_route_set_observation_v2(
+    process_instance_id: &ProcessInstanceId,
+    observation: RegistryRecoveryObservationV2,
+) -> Result<RuntimeRouteSetObservationV2, RuntimeRegistryRecoveryObservationErrorV1> {
+    if observation.registry_failed_closed() || observation.failed_closed_slot_count() != 0 {
+        return Err(RuntimeRegistryRecoveryObservationErrorV1::FailedClosed);
+    }
+    accept_projected_route_set_observation_v2(
+        process_instance_id.clone(),
+        RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(
+                observation.observation_sequence().as_non_zero(),
+            ),
+            retained_slot_count: observation.retained_slot_count(),
+            retained_empty_tombstone_count: observation.retained_empty_tombstone_count(),
+            staged_route_count: observation.staged_route_count(),
+            serving_route_count: observation.serving_route_count(),
+            draining_route_count: observation.draining_route_count(),
+            sealed_slot_count: observation.sealed_slot_count(),
+            active_interaction_count: observation.active_interaction_count(),
+            failed_closed_slot_count: observation.failed_closed_slot_count(),
+            registry_failed_closed: observation.registry_failed_closed(),
+        },
+    )
+}
+
+fn accept_projected_route_set_observation_v2(
+    process_instance_id: ProcessInstanceId,
+    registry: RuntimeRegistryRecoveryObservationInputV2,
+) -> Result<RuntimeRouteSetObservationV2, RuntimeRegistryRecoveryObservationErrorV1> {
+    accept_runtime_route_set_observation_v2(RuntimeRouteSetObservationInputV2 {
+        process_instance_id,
+        registry,
+    })
+    .map_err(map_route_set_observation_error)
+}
+
+fn map_route_set_observation_error(
+    error: RuntimeRouteSetObservationErrorV2,
+) -> RuntimeRegistryRecoveryObservationErrorV1 {
+    match error {
+        RuntimeRouteSetObservationErrorV2::ObservationSequenceOutOfRange => {
+            RuntimeRegistryRecoveryObservationErrorV1::ObservationSequenceOutOfRange
+        }
+        RuntimeRouteSetObservationErrorV2::FailedClosed => {
+            RuntimeRegistryRecoveryObservationErrorV1::FailedClosed
+        }
+        RuntimeRouteSetObservationErrorV2::InconsistentRetainedCounts => {
+            RuntimeRegistryRecoveryObservationErrorV1::InconsistentRetainedCounts
+        }
+    }
 }
 
 fn registry_active_interaction_capacity(

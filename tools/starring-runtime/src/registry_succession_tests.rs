@@ -1,3 +1,4 @@
+use std::cell::{Cell, RefCell};
 use std::num::NonZeroU64;
 
 use automation_runtime_controller::{
@@ -5,38 +6,54 @@ use automation_runtime_controller::{
     RuntimeCanonicalProductDrainV2, RuntimeDrainClaimProgressV2, RuntimeDrainClaimSealWitnessV2,
     RuntimeDrainClaimV2, RuntimeDrainIntentDigestV2, RuntimeDrainIntentV2,
     RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayOwnerLeaseIdV1,
-    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyKindV2,
+    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2,
+    RuntimeIngressOpenAcknowledgementInputV2, RuntimeIngressOpenAcknowledgementLeaseDurationV2,
+    RuntimeIngressOpenAcknowledgementReceiptInputV2, RuntimeIngressOpenAcknowledgementReceiptV2,
+    RuntimeIngressOpenAcknowledgementV2, RuntimeObservedIngressOpenAcknowledgementV2,
     RuntimePersistedProductDrainRootV2, RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2,
-    RuntimeProductMutationDigestV2, RuntimeRecoveryIdV2, RuntimeStartupRecoveryStateV2,
-    RuntimeStartupServingStateV2,
+    RuntimeProductMutationDigestV2, RuntimePublishIngressOpenAcknowledgementOutcomeV2,
+    RuntimeRecoveryIdV2, RuntimeStartupRecoveryObservationReceiptV2, RuntimeStartupRecoveryStateV2,
+    RuntimeStartupServingStateV2, RuntimeWriterFenceGenerationV1,
 };
 use automation_runtime_convergence::{
     ControllerId, FencingToken, ProcessInstanceId, RuntimeDeploymentTargetV1,
 };
 use automation_runtime_registry::{ServingSlotKeyV1, SlotAdmissionStateV2, SlotSealKeyV2};
 use automation_runtime_worker::{
-    accept_runtime_registry_recovery_empty_observation_v2, RuntimeAcceptedPendingDrainSelectionV3,
-    RuntimeAcceptedStartupRecoveryOutcomeV2, RuntimeCapabilityReadinessKindV2,
-    RuntimeCapabilityReadinessReceiptV2, RuntimeCapabilityReadinessSetV2,
-    RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryInputV2,
-    RuntimeClosedRecoveryRegistryEvidenceV2, RuntimeGatewayClosedLifecycleV2,
+    accept_runtime_registry_recovery_empty_observation_v2,
+    RuntimeAcceptedIngressOpenAcknowledgementV2, RuntimeAcceptedPendingDrainSelectionV3,
+    RuntimeAcceptedStartupRecoveryOutcomeV2, RuntimeAdmissionAcknowledgingProcessV2,
+    RuntimeCapabilityReadinessKindV2, RuntimeCapabilityReadinessReceiptV2,
+    RuntimeCapabilityReadinessSetV2, RuntimeClosedDrainRecoveryPermitV2,
+    RuntimeClosedRecoveryInputV2, RuntimeClosedRecoveryRegistryEvidenceV2,
+    RuntimeEmptyOpenProcessV2, RuntimeGatewayClosedLifecycleV2,
+    RuntimeIngressOpenAcknowledgementObservationV2, RuntimeIngressOpenAcknowledgementResolutionV2,
+    RuntimeMaintenanceGateGenerationV2, RuntimeMutationFinalizerGenerationV1,
+    RuntimeOpenProductionObservationInputV2, RuntimeOpenProductionObservationPortV2,
+    RuntimeOpenProductionObservationV2, RuntimeOpenProductionRequestV2,
     RuntimePausedGatewayObservationV2, RuntimePausedGatewaySequenceV2,
     RuntimePendingDrainPreviousOwnerClaimedCandidateInputV3,
     RuntimePendingDrainPreviousOwnerClaimedCandidateV3,
     RuntimePendingDrainRegistrySealWitnessInputV2, RuntimePendingDrainRegistrySealWitnessV2,
     RuntimePendingDrainSelectionOutcomeV3, RuntimePendingDrainSelectionReceiptV3,
-    RuntimePendingDrainStateDigestV2, RuntimeRegistryGlobalObservationSequenceV2,
-    RuntimeRegistryRecoveryObservationInputV2, RuntimeSelectedPendingDrainSuccessionV3,
-    RuntimeStartupRecoveryClassV2, RuntimeStartupRecoveryContinuationV2,
-    RuntimeStartupRecoveryExecutionReceiptOutcomeV2,
-    RuntimeStartupRecoveryExecutionTerminalDigestV2,
+    RuntimePendingDrainStateDigestV2, RuntimeProductionHandoffObservationInputV2,
+    RuntimeProductionHandoffObservationPortV2, RuntimeProductionHandoffObservationV2,
+    RuntimeProductionHandoffRequestV2, RuntimeRecoveryResumeObservationInputV2,
+    RuntimeRecoveryResumeObservationV2, RuntimeRecoveryResumePermitV2, RuntimeRecoveryResumePortV2,
+    RuntimeRegistryGlobalObservationSequenceV2, RuntimeRegistryRecoveryObservationInputV2,
+    RuntimeSelectedPendingDrainSuccessionV3, RuntimeServingOpenObservationPortV2,
+    RuntimeServingOpenObservationV2, RuntimeServingOpenRequestV2,
+    RuntimeServingOpenSupervisorConfigV2, RuntimeStartupRecoveryClassV2,
+    RuntimeStartupRecoveryContinuationV2, RuntimeStartupRecoveryExecutionReceiptOutcomeV2,
+    RuntimeStartupRecoveryExecutionTerminalDigestV2, RuntimeStartupRecoveryFixedPointProcessV2,
 };
 use chrono::{DateTime, Utc};
 
 use super::{
-    compose_runtime_registry_bootstrap_v1, successor_persistence_non_zero_u64_v2,
-    RuntimeRegistryBootstrapV1, RuntimeRegistryPendingDrainSuccessionSealBindingV3,
-    RuntimeRegistryRecoveryObservationErrorV1,
+    accept_projected_route_set_observation_v2, compose_runtime_registry_bootstrap_v1,
+    successor_persistence_non_zero_u64_v2, RuntimeRegistryBootstrapV1,
+    RuntimeRegistryPendingDrainSuccessionSealBindingV3, RuntimeRegistryRecoveryObservationErrorV1,
+    RuntimeRegistryServingBindingV2,
 };
 use crate::GatewayResourceConfigV1;
 
@@ -612,6 +629,588 @@ fn v3_s1_rejects_foreign_registry_advance_before_unseal() {
         observation.admission_state,
         SlotAdmissionStateV2::DrainClaimSealed { .. }
     ));
+}
+
+fn serving_owner(
+    process_instance_id: &ProcessInstanceId,
+    database_now: i64,
+) -> RuntimeGatewayOwnerLeaseReceiptV1 {
+    RuntimeGatewayOwnerLeaseReceiptV1 {
+        lease_id: RuntimeGatewayOwnerLeaseIdV1 {
+            gateway_shard_id: GatewayShardIdV1::parse("shard:0").unwrap(),
+            process_instance_id: process_instance_id.clone(),
+            lease_epoch: non_zero(7),
+            expected_build_revision: RuntimeBuildRevisionV1::parse("build:1").unwrap(),
+        },
+        owner_revision: non_zero(8),
+        database_now: at(database_now),
+        expires_at: at(1_000),
+    }
+}
+
+fn serving_empty_registry(
+    process_instance_id: ProcessInstanceId,
+    observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,
+    retained_slot_count: u64,
+    retained_empty_tombstone_count: u64,
+) -> automation_runtime_worker::RuntimeRegistryRecoveryEmptyObservationV2 {
+    accept_runtime_registry_recovery_empty_observation_v2(
+        process_instance_id,
+        RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence,
+            retained_slot_count,
+            retained_empty_tombstone_count,
+            staged_route_count: 0,
+            serving_route_count: 0,
+            draining_route_count: 0,
+            sealed_slot_count: 0,
+            active_interaction_count: 0,
+            failed_closed_slot_count: 0,
+            registry_failed_closed: false,
+        },
+    )
+    .unwrap()
+}
+
+fn serving_fixed_point(
+    process_instance_id: ProcessInstanceId,
+    observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,
+    retained_slot_count: u64,
+    retained_empty_tombstone_count: u64,
+) -> RuntimeStartupRecoveryFixedPointProcessV2 {
+    let mut lifecycle = RuntimeGatewayClosedLifecycleV2::starting();
+    let generation = lifecycle.snapshot().generation();
+    let paused = RuntimePausedGatewayObservationV2::new(
+        generation,
+        process_instance_id.clone(),
+        non_zero(2),
+        RuntimeGatewayReadyKindV2::Ready,
+        non_zero(3),
+        RuntimePausedGatewaySequenceV2::new(
+            RuntimeGatewayAdmissionSequenceV2::new(non_zero(5)),
+            RuntimeGatewayAdmissionSequenceV2::new(non_zero(4)),
+            None,
+        )
+        .unwrap(),
+    );
+    let (_, mut permit) = lifecycle
+        .begin_recovery(
+            generation,
+            RuntimeClosedRecoveryInputV2::new(
+                RuntimeRecoveryIdV2::parse("fedcba9876543210fedcba9876543210").unwrap(),
+                serving_owner(&process_instance_id, 100),
+                readiness(100),
+                paused,
+                RuntimeClosedRecoveryRegistryEvidenceV2::Empty(serving_empty_registry(
+                    process_instance_id.clone(),
+                    observation_sequence,
+                    retained_slot_count,
+                    retained_empty_tombstone_count,
+                )),
+            ),
+        )
+        .unwrap();
+    let iteration = lifecycle
+        .refresh_recovery_readiness(&mut permit, readiness(200))
+        .unwrap();
+    let observation = lifecycle
+        .begin_startup_recovery_observation(&mut permit, iteration)
+        .unwrap();
+    let correlation = observation.request().correlation.clone();
+    let completed = observation.complete(RuntimeStartupRecoveryObservationReceiptV2 {
+        correlation,
+        owner_receipt: serving_owner(&process_instance_id, 210),
+        state: RuntimeStartupRecoveryStateV2 {
+            serving: RuntimeStartupServingStateV2::Empty,
+            recoverable_awaiting_certification_count: 0,
+            suspended_local_effect_count: 0,
+            pending_runtime_drain_intent_count: 0,
+            acknowledged_product_handoff_count: 0,
+        },
+    });
+    let RuntimeAcceptedStartupRecoveryOutcomeV2::FixedPoint(proof) = lifecycle
+        .complete_startup_recovery_observation(&mut permit, completed)
+        .unwrap()
+    else {
+        panic!("expected startup fixed point")
+    };
+    lifecycle
+        .into_production_fixed_point(permit, proof)
+        .unwrap()
+}
+
+struct ServingHandoffPort;
+
+impl RuntimeProductionHandoffObservationPortV2 for ServingHandoffPort {
+    type Error = ();
+
+    fn observe_production_handoff(
+        &self,
+        request: &RuntimeProductionHandoffRequestV2,
+    ) -> Result<RuntimeProductionHandoffObservationV2, Self::Error> {
+        Ok(RuntimeProductionHandoffObservationV2::new(
+            RuntimeProductionHandoffObservationInputV2 {
+                coordinator_generation: request.coordinator_generation(),
+                recovery_id: request.recovery_id().clone(),
+                recovery_authority_revision: request.recovery_authority_revision(),
+                owner_receipt: request.owner_receipt().clone(),
+                process_instance_id: request.process_instance_id().clone(),
+                connection_epoch: request.connection_epoch(),
+                paused_admission_revision: request.paused_admission_revision(),
+                connected_event_sequence: request.connected_event_sequence(),
+                pause_sequence: request.pause_sequence(),
+                registry_observation_sequence: request.registry_observation_sequence(),
+                finalizer_generation: RuntimeMutationFinalizerGenerationV1::new(non_zero(9))
+                    .unwrap(),
+                startup_intake_sealed: true,
+                startup_jobs_settled: true,
+                supervisors_started: true,
+            },
+        ))
+    }
+}
+
+struct ServingResumePort;
+
+impl RuntimeRecoveryResumePortV2 for ServingResumePort {
+    type Error = ();
+
+    fn resume_or_observe_recovery(
+        &self,
+        permit: &RuntimeRecoveryResumePermitV2,
+    ) -> Result<RuntimeRecoveryResumeObservationV2, Self::Error> {
+        let mut owner_receipt = permit.owner_receipt().clone();
+        owner_receipt.database_now = at(250);
+        Ok(RuntimeRecoveryResumeObservationV2::new(
+            RuntimeRecoveryResumeObservationInputV2 {
+                coordinator_generation: permit.coordinator_generation(),
+                recovery_id: permit.recovery_id().clone(),
+                recovery_authority_revision: permit.recovery_authority_revision(),
+                process_instance_id: permit.process_instance_id().clone(),
+                connection_epoch: permit.connection_epoch(),
+                paused_admission_revision: permit.paused_admission_revision(),
+                connected_event_sequence: permit.connected_event_sequence(),
+                pause_sequence: permit.pause_sequence(),
+                owner_receipt,
+                readiness: readiness(200),
+                registry_observation_sequence: permit.registry_observation_sequence(),
+                finalizer_generation: permit.finalizer_generation(),
+                writer_fence_generation: RuntimeWriterFenceGenerationV1::new(non_zero(7)),
+                writer_fence_open: true,
+                maintenance_gate_generation: RuntimeMaintenanceGateGenerationV2::new(non_zero(11))
+                    .unwrap(),
+                maintenance_gate_closed: true,
+                gateway_ready: RuntimeGatewayReadyAttestationV2 {
+                    process_instance_id: permit.process_instance_id().clone(),
+                    connection_epoch: permit.connection_epoch(),
+                    kind: permit.ready_kind(),
+                    admission_revision: permit.paused_admission_revision(),
+                    connected_event_sequence: permit.connected_event_sequence(),
+                    resume_sequence: RuntimeGatewayAdmissionSequenceV2::new(non_zero(6)),
+                },
+            },
+        ))
+    }
+}
+
+fn serving_open_acknowledgement(
+    state: &RuntimeAdmissionAcknowledgingProcessV2,
+) -> RuntimeAcceptedIngressOpenAcknowledgementV2 {
+    let predecessor_authorization =
+        state.authorize_ingress_open_acknowledgement_predecessor_observation();
+    let gateway_shard_id = predecessor_authorization.request().gateway_shard_id.clone();
+    let predecessor = predecessor_authorization
+        .accept(
+            RuntimeObservedIngressOpenAcknowledgementV2::missing(gateway_shard_id, at(250))
+                .unwrap(),
+        )
+        .unwrap();
+    let open_gate = RuntimeMaintenanceGateGenerationV2::new(non_zero(
+        state.closed_maintenance_gate_generation().get() + 1,
+    ))
+    .unwrap();
+    let mut operation = state
+        .authorize_ingress_open_acknowledgement(
+            open_gate,
+            predecessor,
+            RuntimeIngressOpenAcknowledgementLeaseDurationV2::from_milliseconds(5_000).unwrap(),
+        )
+        .unwrap();
+    let attempt = operation.begin_attempt().unwrap();
+    let request = attempt.request();
+    let acknowledgement =
+        RuntimeIngressOpenAcknowledgementV2::new(RuntimeIngressOpenAcknowledgementInputV2 {
+            fence_generation: request.fence_generation(),
+            maintenance_gate_generation: request.maintenance_gate_generation(),
+            gateway_owner_lease_id: request.owner_receipt().lease_id.clone(),
+            observed_owner_revision: request.owner_receipt().owner_revision,
+            process_instance_id: request.gateway_ready().process_instance_id.clone(),
+            connection_epoch: request.gateway_ready().connection_epoch,
+            admission_revision: request.gateway_ready().admission_revision,
+            connected_event_sequence: request.gateway_ready().connected_event_sequence,
+            resume_sequence: request.gateway_ready().resume_sequence,
+            acknowledgement_revision: non_zero(1),
+            acknowledged_at: at(251),
+            expires_at: at(256),
+        })
+        .unwrap();
+    let receipt = RuntimeIngressOpenAcknowledgementReceiptV2::new(
+        RuntimeIngressOpenAcknowledgementReceiptInputV2 {
+            source_acknowledgement_revision: request.source_acknowledgement_revision(),
+            request_digest: request.request_digest(),
+            acknowledgement,
+            observed_database_now: at(252),
+        },
+    )
+    .unwrap();
+    let RuntimeIngressOpenAcknowledgementResolutionV2::AppliedExact(accepted) = attempt
+        .resolve_outcome(RuntimePublishIngressOpenAcknowledgementOutcomeV2::Applied(
+            receipt,
+        ))
+    else {
+        panic!("expected exact ingress acknowledgement")
+    };
+    accepted
+}
+
+struct ServingOpenPort {
+    process_instance_id: ProcessInstanceId,
+    observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,
+    retained_slot_count: u64,
+    retained_empty_tombstone_count: u64,
+    acknowledgement: RefCell<Option<RuntimeAcceptedIngressOpenAcknowledgementV2>>,
+}
+
+impl RuntimeOpenProductionObservationPortV2 for ServingOpenPort {
+    type Error = ();
+
+    fn observe_open_production(
+        &self,
+        request: &RuntimeOpenProductionRequestV2,
+    ) -> Result<RuntimeOpenProductionObservationV2, Self::Error> {
+        let mut owner_receipt = serving_owner(&self.process_instance_id, 252);
+        owner_receipt.expires_at = request.owner_expires_at();
+        Ok(RuntimeOpenProductionObservationV2::new(
+            RuntimeOpenProductionObservationInputV2 {
+                coordinator_generation: request.coordinator_generation(),
+                writer_fence_generation: request.writer_fence_generation(),
+                writer_fence_open: true,
+                maintenance_gate_generation: RuntimeMaintenanceGateGenerationV2::new(non_zero(
+                    request.closed_maintenance_gate_generation().get() + 1,
+                ))
+                .unwrap(),
+                maintenance_gate_open: true,
+                owner_receipt,
+                readiness: readiness(200),
+                gateway_ready: request.gateway_ready().clone(),
+                registry_empty: serving_empty_registry(
+                    self.process_instance_id.clone(),
+                    self.observation_sequence,
+                    self.retained_slot_count,
+                    self.retained_empty_tombstone_count,
+                ),
+                finalizer_generation: request.finalizer_generation(),
+                finalizer_accepting: true,
+                supervisors_running: true,
+                observed_database_now: at(252),
+                ingress_acknowledgement:
+                    RuntimeIngressOpenAcknowledgementObservationV2::from_accepted(
+                        self.acknowledgement
+                            .borrow_mut()
+                            .take()
+                            .expect("open acknowledgement must be consumed once"),
+                    ),
+            },
+        ))
+    }
+}
+
+fn serving_empty_open(
+    process_instance_id: ProcessInstanceId,
+    observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,
+    retained_slot_count: u64,
+    retained_empty_tombstone_count: u64,
+) -> RuntimeEmptyOpenProcessV2 {
+    let handoff = serving_fixed_point(
+        process_instance_id.clone(),
+        observation_sequence,
+        retained_slot_count,
+        retained_empty_tombstone_count,
+    )
+    .begin_production_handoff(&ServingHandoffPort)
+    .unwrap();
+    let admission = handoff.resume_recovery(&ServingResumePort).unwrap();
+    let port = ServingOpenPort {
+        process_instance_id,
+        observation_sequence,
+        retained_slot_count,
+        retained_empty_tombstone_count,
+        acknowledgement: RefCell::new(Some(serving_open_acknowledgement(&admission))),
+    };
+    admission.observe_open_production(&port).unwrap()
+}
+
+struct ExactServingRegistryTransitionPort {
+    binding: RefCell<Option<super::RuntimeRegistryEmptyRecoveryBindingV2>>,
+    completed: Cell<bool>,
+}
+
+impl RuntimeServingOpenObservationPortV2 for ExactServingRegistryTransitionPort {
+    type Error = ();
+
+    fn observe_serving_open(
+        &self,
+        request: &RuntimeServingOpenRequestV2,
+    ) -> Result<RuntimeServingOpenObservationV2, Self::Error> {
+        let binding = self.binding.borrow_mut().take().unwrap();
+        let prepared = binding
+            .prepare_serving_transition_v2(request.route_set_epoch())
+            .unwrap();
+        let prepared_observation = prepared
+            .observe_route_set_v2(request.route_set_epoch())
+            .unwrap();
+        assert!(prepared_observation.is_empty());
+        let (serving, committed_observation) =
+            prepared.commit_v2(request.route_set_epoch()).unwrap();
+        assert_eq!(committed_observation, prepared_observation);
+        assert_eq!(
+            serving
+                .observe_route_set_v2(request.route_set_epoch())
+                .unwrap(),
+            committed_observation
+        );
+        self.completed.set(true);
+        Err(())
+    }
+}
+
+struct StaleServingRegistryTransitionPort {
+    binding: RefCell<Option<super::RuntimeRegistryEmptyRecoveryBindingV2>>,
+    expected_sequence: RuntimeRegistryGlobalObservationSequenceV2,
+    expected_retained_slot_count: u64,
+    expected_retained_empty_tombstone_count: u64,
+    completed: Cell<bool>,
+}
+
+impl RuntimeServingOpenObservationPortV2 for StaleServingRegistryTransitionPort {
+    type Error = ();
+
+    fn observe_serving_open(
+        &self,
+        request: &RuntimeServingOpenRequestV2,
+    ) -> Result<RuntimeServingOpenObservationV2, Self::Error> {
+        let binding = self.binding.borrow_mut().take().unwrap();
+        let failure = binding
+            .prepare_serving_transition_v2(request.route_set_epoch())
+            .unwrap_err();
+        assert_eq!(
+            failure.error_v2(),
+            RuntimeRegistryRecoveryObservationErrorV1::ProtocolViolation
+        );
+        let recovered = failure
+            .into_binding_v2()
+            .revalidate_empty_projection_unordered_v2()
+            .unwrap();
+        assert_eq!(recovered.observation_sequence(), self.expected_sequence);
+        assert_eq!(
+            recovered.retained_slot_count(),
+            self.expected_retained_slot_count
+        );
+        assert_eq!(
+            recovered.retained_empty_tombstone_count(),
+            self.expected_retained_empty_tombstone_count
+        );
+        self.completed.set(true);
+        Err(())
+    }
+}
+
+#[test]
+fn serving_transition_prepares_observes_and_commits_the_exact_empty_binding() {
+    let process = ProcessInstanceId::parse("runtime-process:serving-registry").unwrap();
+    let bootstrap =
+        compose_runtime_registry_bootstrap_v1(process.clone(), GatewayResourceConfigV1::default())
+            .unwrap();
+    let source = bootstrap.observe_recovery_empty_projection_v2().unwrap();
+    let binding = bootstrap
+        .recovery_observation_guard_unordered_v2()
+        .unwrap()
+        .into_empty_binding_v2()
+        .unwrap();
+    let open = serving_empty_open(
+        process,
+        source.observation_sequence(),
+        source.retained_slot_count(),
+        source.retained_empty_tombstone_count(),
+    );
+    let port = ExactServingRegistryTransitionPort {
+        binding: RefCell::new(Some(binding)),
+        completed: Cell::new(false),
+    };
+
+    assert!(open
+        .prepare_serving_open(
+            &port,
+            RuntimeServingOpenSupervisorConfigV2::new(std::num::NonZeroUsize::new(1).unwrap())
+                .unwrap(),
+        )
+        .is_err());
+    assert!(port.completed.get());
+    assert!(port.binding.borrow().is_none());
+}
+
+#[test]
+fn stale_route_set_epoch_returns_the_exact_empty_binding() {
+    let process = ProcessInstanceId::parse("runtime-process:stale-serving-registry").unwrap();
+    let bootstrap =
+        compose_runtime_registry_bootstrap_v1(process.clone(), GatewayResourceConfigV1::default())
+            .unwrap();
+    let source = bootstrap.observe_recovery_empty_projection_v2().unwrap();
+    let binding = bootstrap
+        .recovery_observation_guard_unordered_v2()
+        .unwrap()
+        .into_empty_binding_v2()
+        .unwrap();
+    let stale_sequence = RuntimeRegistryGlobalObservationSequenceV2::new(non_zero(
+        source.observation_sequence().get() + 1,
+    ));
+    let open = serving_empty_open(
+        process,
+        stale_sequence,
+        source.retained_slot_count(),
+        source.retained_empty_tombstone_count(),
+    );
+    let port = StaleServingRegistryTransitionPort {
+        binding: RefCell::new(Some(binding)),
+        expected_sequence: source.observation_sequence(),
+        expected_retained_slot_count: source.retained_slot_count(),
+        expected_retained_empty_tombstone_count: source.retained_empty_tombstone_count(),
+        completed: Cell::new(false),
+    };
+
+    assert!(open
+        .prepare_serving_open(
+            &port,
+            RuntimeServingOpenSupervisorConfigV2::new(std::num::NonZeroUsize::new(1).unwrap())
+                .unwrap(),
+        )
+        .is_err());
+    assert!(port.completed.get());
+    assert!(port.binding.borrow().is_none());
+}
+
+#[test]
+fn serving_transition_rejects_a_nonempty_bound_registry() {
+    let process = ProcessInstanceId::parse("process:serving").unwrap();
+    let bootstrap =
+        compose_runtime_registry_bootstrap_v1(process.clone(), GatewayResourceConfigV1::default())
+            .unwrap();
+    let binding = bootstrap
+        .recovery_observation_guard_unordered_v2()
+        .unwrap()
+        .into_empty_binding_v2()
+        .unwrap();
+    let selected = candidate(4);
+    let key = ServingSlotKeyV1::new(
+        selected.slot().guild_id,
+        selected.slot().ruleset_key.clone(),
+    );
+    bootstrap
+        .registry
+        .seal_drain_claim_v2(
+            &key,
+            SlotSealKeyV2::try_from([11_u8; 16].as_slice()).unwrap(),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        binding.revalidate_empty_projection_unordered_v2(),
+        Err(RuntimeRegistryRecoveryObservationErrorV1::StaleEmptyBinding)
+    );
+    assert_eq!(
+        bootstrap.observe_recovery_empty_projection_v2(),
+        Err(RuntimeRegistryRecoveryObservationErrorV1::NotEmpty)
+    );
+}
+
+#[test]
+fn serving_projection_preserves_safe_aggregate_and_rejects_failed_closed_state() {
+    let process = ProcessInstanceId::parse("process:serving").unwrap();
+    let observation = accept_projected_route_set_observation_v2(
+        process.clone(),
+        RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(non_zero(7)),
+            retained_slot_count: 3,
+            retained_empty_tombstone_count: 1,
+            staged_route_count: 1,
+            serving_route_count: 1,
+            draining_route_count: 0,
+            sealed_slot_count: 0,
+            active_interaction_count: 2,
+            failed_closed_slot_count: 0,
+            registry_failed_closed: false,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(observation.process_instance_id(), &process);
+    assert_eq!(observation.observation_sequence().get(), 7);
+    assert_eq!(observation.retained_slot_count(), 3);
+    assert_eq!(observation.retained_empty_tombstone_count(), 1);
+    assert_eq!(observation.staged_route_count(), 1);
+    assert_eq!(observation.serving_route_count(), 1);
+    assert_eq!(observation.draining_route_count(), 0);
+    assert_eq!(observation.sealed_slot_count(), 0);
+    assert_eq!(observation.active_interaction_count(), 2);
+
+    for registry in [
+        RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(non_zero(8)),
+            retained_slot_count: 0,
+            retained_empty_tombstone_count: 0,
+            staged_route_count: 0,
+            serving_route_count: 0,
+            draining_route_count: 0,
+            sealed_slot_count: 0,
+            active_interaction_count: 0,
+            failed_closed_slot_count: 1,
+            registry_failed_closed: false,
+        },
+        RuntimeRegistryRecoveryObservationInputV2 {
+            observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(non_zero(8)),
+            retained_slot_count: 0,
+            retained_empty_tombstone_count: 0,
+            staged_route_count: 0,
+            serving_route_count: 0,
+            draining_route_count: 0,
+            sealed_slot_count: 0,
+            active_interaction_count: 0,
+            failed_closed_slot_count: 0,
+            registry_failed_closed: true,
+        },
+    ] {
+        assert_eq!(
+            accept_projected_route_set_observation_v2(process.clone(), registry),
+            Err(RuntimeRegistryRecoveryObservationErrorV1::FailedClosed)
+        );
+    }
+
+    let bootstrap =
+        compose_runtime_registry_bootstrap_v1(process, GatewayResourceConfigV1::default()).unwrap();
+    let serving = RuntimeRegistryServingBindingV2 {
+        process_instance_id: bootstrap.process_instance_id.clone(),
+        registry: bootstrap.registry.clone(),
+        initial_registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(
+            non_zero(1),
+        ),
+        initial_retained_slot_count: 0,
+        initial_retained_empty_tombstone_count: 0,
+    };
+    assert_eq!(
+        format!("{serving:?}"),
+        "RuntimeRegistryServingBindingV2(<redacted>)"
+    );
 }
 
 #[test]
