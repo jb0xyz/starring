@@ -3,7 +3,6 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::time::Duration;
 
-use automation_core::InteractionResponder;
 use automation_instance::{InstanceIdGenerator, InstanceRegistrarV1, InstanceRouteReaderV1};
 use automation_instance_teardown::InstanceTeardownService;
 use automation_ruleset_dispatch::{GuildRoleSnapshotProvider, PinnedInstanceResolverV1};
@@ -14,7 +13,6 @@ use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt
 use twilight_http::Client;
 use twilight_model::gateway::CloseFrame;
 
-use crate::responder::TwilightInteractionResponder;
 use crate::runner::InteractionExecutionOutcomeV3;
 use crate::shared_gateway_admission::{
     SharedGatewayAdmissionBudgetV3, SharedGatewayAdmissionErrorV3,
@@ -24,14 +22,15 @@ use crate::shared_gateway_control::{
     GatewayReadyLeaseV3, GatewayRuntimeCommandOutcomeV3, SharedGatewayRuntimeControlV3,
 };
 use crate::shared_gateway_dispatcher::{
+    acknowledge_shared_gateway_interaction_rejection_v3,
     dispatch_reserved_shared_gateway_interaction_v3, reserve_shared_gateway_interaction_v3,
     SharedGatewayInteractionDispatchOutcomeV3, SharedGatewayInteractionEnvelopeV3,
     SharedGatewayInteractionRejectionV3, SharedGatewayInteractionReservationOutcomeV3,
+    SharedGatewayRejectionAcknowledgementOutcomeV3,
 };
 
 const MAX_SHARED_GATEWAY_DRAIN_TIMEOUT_V3: Duration = Duration::from_secs(60);
 const MAX_SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENTS_V3: usize = 1_024;
-const SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SharedGatewayRuntimeConfigV3 {
@@ -127,13 +126,6 @@ pub struct SharedGatewayExitV3 {
     pub report: SharedGatewayRuntimeReportV3,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SharedGatewayRejectionAcknowledgementOutcomeV3 {
-    Sent,
-    Failed,
-    TimedOut,
-}
-
 type SharedGatewayDispatchFutureV3<'a> =
     Pin<Box<dyn Future<Output = SharedGatewayInteractionDispatchOutcomeV3> + 'a>>;
 type SharedGatewayRejectionAcknowledgementFutureV3<'a> =
@@ -213,7 +205,7 @@ fn interaction_callback_client(token: String) -> Client {
     Client::builder()
         .token(token)
         .ratelimiter(None)
-        .timeout(SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3)
+        .timeout(Duration::from_secs(2))
         .build()
 }
 
@@ -601,22 +593,8 @@ async fn acknowledge_rejection(
     envelope: Box<SharedGatewayInteractionEnvelopeV3>,
     failure_message: &str,
 ) -> SharedGatewayRejectionAcknowledgementOutcomeV3 {
-    let interaction = envelope.twilight_interaction_v3();
-    let responder = TwilightInteractionResponder::from_interaction(
-        interaction_http,
-        interaction.as_interaction_v3(),
-        "",
-    );
-    match tokio::time::timeout(
-        SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3,
-        responder.respond_ephemeral(failure_message.to_string()),
-    )
-    .await
-    {
-        Ok(Ok(())) => SharedGatewayRejectionAcknowledgementOutcomeV3::Sent,
-        Ok(Err(_)) => SharedGatewayRejectionAcknowledgementOutcomeV3::Failed,
-        Err(_) => SharedGatewayRejectionAcknowledgementOutcomeV3::TimedOut,
-    }
+    acknowledge_shared_gateway_interaction_rejection_v3(interaction_http, envelope, failure_message)
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]

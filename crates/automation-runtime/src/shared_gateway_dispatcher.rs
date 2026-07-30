@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
+use std::time::Duration;
 
+use automation_core::InteractionResponder;
 use automation_instance::{InstanceIdGenerator, InstanceRegistrarV1, InstanceRouteReaderV1};
 use automation_instance_teardown::InstanceTeardownService;
 use automation_ruleset_dispatch::{GuildRoleSnapshotProvider, PinnedInstanceResolverV1};
@@ -22,6 +24,7 @@ use twilight_model::oauth::ApplicationIntegrationMap;
 use twilight_model::user::User;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::responder::TwilightInteractionResponder;
 use crate::runner::InteractionExecutionOutcomeV3;
 use crate::shared_gateway_admission::{
     SharedGatewayAdmissionBudgetV3, SharedGatewayAdmissionErrorV3,
@@ -37,6 +40,7 @@ pub const MAX_SHARED_GATEWAY_INTERACTION_LOCALE_BYTES_V3: usize = 64;
 pub const MAX_SHARED_GATEWAY_MODAL_INPUTS_V3: usize = 5;
 pub const MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3: usize = 4_000;
 pub const MAX_SHARED_GATEWAY_MODAL_PAYLOAD_BYTES_V3: usize = 20_000;
+const SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SharedGatewayInteractionApplicationIdV3(NonZeroU64);
@@ -479,6 +483,36 @@ pub enum SharedGatewayInteractionDispatchOutcomeV3 {
 impl Debug for SharedGatewayInteractionDispatchOutcomeV3 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("SharedGatewayInteractionDispatchOutcomeV3(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedGatewayRejectionAcknowledgementOutcomeV3 {
+    Sent,
+    Failed,
+    TimedOut,
+}
+
+pub async fn acknowledge_shared_gateway_interaction_rejection_v3(
+    interaction_http: &Client,
+    envelope: Box<SharedGatewayInteractionEnvelopeV3>,
+    failure_message: &str,
+) -> SharedGatewayRejectionAcknowledgementOutcomeV3 {
+    let interaction = envelope.twilight_interaction_v3();
+    let responder = TwilightInteractionResponder::from_interaction(
+        interaction_http,
+        interaction.as_interaction_v3(),
+        "",
+    );
+    match tokio::time::timeout(
+        SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3,
+        responder.respond_ephemeral(failure_message.to_string()),
+    )
+    .await
+    {
+        Ok(Ok(())) => SharedGatewayRejectionAcknowledgementOutcomeV3::Sent,
+        Ok(Err(_)) => SharedGatewayRejectionAcknowledgementOutcomeV3::Failed,
+        Err(_) => SharedGatewayRejectionAcknowledgementOutcomeV3::TimedOut,
     }
 }
 
