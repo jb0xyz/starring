@@ -21,9 +21,15 @@ struct LockEntry {
     held: AtomicBool,
 }
 
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TeardownKey {
+    guild_id: GuildId,
+    instance_id: InstanceId,
+}
+
 struct KeyLockGuard<'a> {
-    registry: &'a Mutex<BTreeMap<InstanceId, Arc<LockEntry>>>,
-    key: InstanceId,
+    registry: &'a Mutex<BTreeMap<TeardownKey, Arc<LockEntry>>>,
+    key: TeardownKey,
     entry: Arc<LockEntry>,
 }
 
@@ -44,7 +50,7 @@ impl Drop for KeyLockGuard<'_> {
 pub struct Teardown<S, D> {
     store: S,
     deleter: D,
-    locks: Mutex<BTreeMap<InstanceId, Arc<LockEntry>>>,
+    locks: Mutex<BTreeMap<TeardownKey, Arc<LockEntry>>>,
 }
 
 impl<S, D> Teardown<S, D> {
@@ -56,7 +62,11 @@ impl<S, D> Teardown<S, D> {
         }
     }
 
-    fn try_lock(&self, key: &InstanceId) -> Option<KeyLockGuard<'_>> {
+    fn try_lock(&self, guild_id: GuildId, instance_id: &InstanceId) -> Option<KeyLockGuard<'_>> {
+        let key = TeardownKey {
+            guild_id,
+            instance_id: instance_id.clone(),
+        };
         let entry = {
             let mut locks = self.locks.lock().unwrap();
             locks.entry(key.clone()).or_default().clone()
@@ -159,7 +169,7 @@ where
         guild_id: GuildId,
         instance_id: InstanceId,
     ) -> Result<TeardownOutcome, TeardownError> {
-        let Some(_guard) = self.try_lock(&instance_id) else {
+        let Some(_guard) = self.try_lock(guild_id, &instance_id) else {
             return Ok(TeardownOutcome::InProgress);
         };
         self.teardown_locked(guild_id, &instance_id).await
@@ -169,6 +179,7 @@ where
 #[cfg(test)]
 mod tests {
     use automation_instance::InstanceId;
+    use discord_model::GuildId;
 
     use super::Teardown;
 
@@ -177,7 +188,7 @@ mod tests {
         let service = Teardown::new((), ());
         let id = InstanceId::parse("room_001").unwrap();
         {
-            let _guard = service.try_lock(&id).unwrap();
+            let _guard = service.try_lock(GuildId(7), &id).unwrap();
             assert_eq!(service.locks.lock().unwrap().len(), 1);
         }
         assert!(service.locks.lock().unwrap().is_empty());

@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceMessageRef,
@@ -271,10 +273,10 @@ fn resources() -> InstanceResources {
     }
 }
 
-fn instance(status: InstanceStatus) -> AutomationInstance {
+fn instance_for_guild(guild_id: GuildId, status: InstanceStatus) -> AutomationInstance {
     AutomationInstance {
         id: instance_id(),
-        guild_id: GUILD,
+        guild_id,
         ruleset_key: "studyroom_demo".to_string(),
         ruleset_version: InstanceRuleSetVersion::new(1).unwrap(),
         kind: InstanceKind("study_room".to_string()),
@@ -285,13 +287,17 @@ fn instance(status: InstanceStatus) -> AutomationInstance {
 }
 
 fn register(store: &SharedStore, status: InstanceStatus) {
-    block_on(store.register(instance(InstanceStatus::Active))).unwrap();
+    register_for_guild(store, GUILD, status);
+}
+
+fn register_for_guild(store: &SharedStore, guild_id: GuildId, status: InstanceStatus) {
+    block_on(store.register(instance_for_guild(guild_id, InstanceStatus::Active))).unwrap();
     if status == InstanceStatus::Deleting {
-        block_on(store.transition_to_deleting(GUILD, &instance_id())).unwrap();
+        block_on(store.transition_to_deleting(guild_id, &instance_id())).unwrap();
     }
     if status == InstanceStatus::Deleted {
-        block_on(store.transition_to_deleting(GUILD, &instance_id())).unwrap();
-        block_on(store.mark_deleted(GUILD, &instance_id())).unwrap();
+        block_on(store.transition_to_deleting(guild_id, &instance_id())).unwrap();
+        block_on(store.mark_deleted(guild_id, &instance_id())).unwrap();
     }
 }
 
@@ -449,7 +455,7 @@ impl InstanceDeleter for BlockingDeleter {
 }
 
 #[test]
-fn concurrent_call_returns_in_progress_without_store_read() {
+fn identical_guild_and_instance_returns_in_progress_without_store_read() {
     let store = SharedStore::default();
     register(&store, InstanceStatus::Active);
     let started = Arc::new((Mutex::new(false), Condvar::new()));
@@ -481,6 +487,78 @@ fn concurrent_call_returns_in_progress_without_store_read() {
     *release_lock.lock().unwrap() = true;
     release_ready.notify_all();
     assert_eq!(first.join().unwrap(), TeardownOutcome::Completed);
+}
+
+struct GuildBlockingDeleter {
+    started: mpsc::Sender<GuildId>,
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl InstanceDeleter for GuildBlockingDeleter {
+    async fn delete_message(
+        &self,
+        guild: GuildId,
+        _: ChannelId,
+        _: MessageId,
+    ) -> Result<DeleteOutcome, DeleterError> {
+        self.started.send(guild).unwrap();
+        let (release, release_ready) = &*self.release;
+        let mut released = release.lock().unwrap();
+        while !*released {
+            released = release_ready.wait(released).unwrap();
+        }
+        Ok(DeleteOutcome::Deleted)
+    }
+
+    async fn delete_channel(
+        &self,
+        _: GuildId,
+        _: ChannelId,
+    ) -> Result<DeleteOutcome, DeleterError> {
+        Ok(DeleteOutcome::Deleted)
+    }
+
+    async fn delete_role(&self, _: GuildId, _: RoleId) -> Result<DeleteOutcome, DeleterError> {
+        Ok(DeleteOutcome::Deleted)
+    }
+}
+
+#[test]
+fn same_instance_id_in_different_guilds_executes_concurrently() {
+    let other_guild = GuildId(8);
+    let store = SharedStore::default();
+    register_for_guild(&store, GUILD, InstanceStatus::Active);
+    register_for_guild(&store, other_guild, InstanceStatus::Active);
+    let (started_tx, started_rx) = mpsc::channel();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let service = Arc::new(Teardown::new(
+        store.clone(),
+        GuildBlockingDeleter {
+            started: started_tx,
+            release: release.clone(),
+        },
+    ));
+    let first_service = service.clone();
+    let first =
+        std::thread::spawn(move || block_on(first_service.teardown(GUILD, instance_id())).unwrap());
+    let first_started = started_rx.recv_timeout(Duration::from_secs(1));
+    let second_service = service.clone();
+    let second = std::thread::spawn(move || {
+        block_on(second_service.teardown(other_guild, instance_id())).unwrap()
+    });
+    let second_started = started_rx.recv_timeout(Duration::from_secs(1));
+    let (release_lock, release_ready) = &*release;
+    *release_lock.lock().unwrap() = true;
+    release_ready.notify_all();
+    let first_outcome = first.join().unwrap();
+    let second_outcome = second.join().unwrap();
+
+    assert_eq!(first_started, Ok(GUILD));
+    assert_eq!(second_started, Ok(other_guild));
+    assert_eq!(first_outcome, TeardownOutcome::Completed);
+    assert_eq!(second_outcome, TeardownOutcome::Completed);
+    assert_eq!(store.transition_calls(), 2);
+    assert_eq!(store.mark_calls(), 2);
 }
 
 #[test]
