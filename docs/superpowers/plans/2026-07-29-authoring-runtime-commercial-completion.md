@@ -305,7 +305,7 @@ removing security, restart, failure, or release gates.
 - [x] A5. Expose authenticated authoring HTTP routes
 - [x] A6. Pass the authoring milestone gate
 - [x] B1. Extend the existing production lifecycle for route serving
-- [ ] B2. Compose the convergence lane and exact hydration
+- [x] B2. Compose the convergence lane and exact hydration
 - [ ] B3. Replace prior routes and reconcile panels
 - [ ] B4. Finalize V2 certification and serving monitor
 - [ ] B5. Dispatch interactions on the canonical shard

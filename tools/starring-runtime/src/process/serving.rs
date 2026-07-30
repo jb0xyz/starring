@@ -16,6 +16,9 @@ use crate::closed_recovery::{
 use crate::discord::RuntimeDiscordProcessSupervisorV2;
 use crate::ingress_acknowledgement_safety::RuntimeIngressAcknowledgementSafetyMonitorV2;
 use crate::maintenance_ingress_gate::RuntimeMaintenanceIngressGateOpenAuthorityV2;
+use crate::runtime_controller::{
+    RuntimeServingControllerEventV2, RuntimeServingControllerSupervisorV2,
+};
 
 use super::observation::{
     collect_recovery_resume_database_evidence_v2, exact_reobserve_ingress_acknowledgement_v2,
@@ -33,10 +36,11 @@ use super::observation::{
 };
 use super::{RuntimeProcessFoundationV1, RuntimeProcessIngressAcknowledgementSupervisorV2};
 
-const SERVING_OPEN_SLOT_WORK_CAPACITY_V2: usize = 64;
+const SERVING_OPEN_SLOT_WORK_CAPACITY_V2: usize = 1;
 const INGRESS_ACKNOWLEDGEMENT_LEASE_V2: Duration = Duration::from_secs(10);
 
 pub(crate) struct RuntimeServingOpenProcessV2 {
+    controller: RuntimeServingControllerSupervisorV2,
     discord: RuntimeDiscordProcessSupervisorV2,
     foundation: RuntimeProcessFoundationV1,
     lifecycle: RuntimeClosedRecoverySupervisedServingOpenProcessV2,
@@ -180,7 +184,19 @@ impl RuntimeEmptyOpenProcessV2 {
                 return Err(process.cleanup_transition_v2(transition).await);
             }
         };
+        let controller = RuntimeServingControllerSupervisorV2::start_v2(
+            foundation.databases.runtime_controller_v2(),
+            foundation
+                .secrets
+                .discord_bot_token()
+                .expose_secret()
+                .to_owned(),
+            lifecycle.staging_port_v2(),
+            foundation.controller_id.clone(),
+            foundation.shutdown_trigger_v1(),
+        );
         let process = RuntimeServingOpenProcessV2 {
+            controller,
             discord,
             foundation,
             lifecycle,
@@ -332,8 +348,9 @@ impl RuntimeServingOpenProcessV2 {
             lease_for,
         };
         let Self {
+            mut controller,
             discord,
-            foundation,
+            mut foundation,
             lifecycle,
             maintenance_ingress,
             readiness,
@@ -347,6 +364,7 @@ impl RuntimeServingOpenProcessV2 {
             Err(failure) => {
                 let transition = map_production_lifecycle_failure_v2(failure.error_v2());
                 let process = Self {
+                    controller,
                     discord,
                     foundation,
                     lifecycle: failure.into_state_v2(),
@@ -377,6 +395,7 @@ impl RuntimeServingOpenProcessV2 {
                 lifecycle,
                 ..
             }) => {
+                stop_runtime_controller_before_cleanup_v2(&mut controller, &mut foundation).await;
                 let cleanup = shutdown_orphaned_admission_process_v2(
                     foundation,
                     discord,
@@ -399,6 +418,7 @@ impl RuntimeServingOpenProcessV2 {
                 lifecycle,
                 ..
             }) => {
+                stop_runtime_controller_before_cleanup_v2(&mut controller, &mut foundation).await;
                 let cleanup = shutdown_orphaned_empty_open_process_v2(
                     foundation,
                     discord,
@@ -426,6 +446,8 @@ impl RuntimeServingOpenProcessV2 {
                     refresh,
                 ) = retained
                 else {
+                    stop_runtime_controller_before_cleanup_v2(&mut controller, &mut foundation)
+                        .await;
                     let cleanup = shutdown_orphaned_ingress_acknowledgement_v2(
                         foundation,
                         discord,
@@ -441,6 +463,7 @@ impl RuntimeServingOpenProcessV2 {
                     .await;
                     return Err(finish_production_handoff_transition_v2(transition, cleanup));
                 };
+                stop_runtime_controller_before_cleanup_v2(&mut controller, &mut foundation).await;
                 let cleanup = shutdown_refreshing_serving_open_process_v2(
                     foundation,
                     discord,
@@ -459,6 +482,7 @@ impl RuntimeServingOpenProcessV2 {
             Err(RuntimeProcessIngressAcknowledgementExecutionFailureV2::AuthorityLost(
                 transition,
             )) => {
+                stop_runtime_controller_before_cleanup_v2(&mut controller, &mut foundation).await;
                 let cleanup = shutdown_process_without_lifecycle_v2(
                     foundation,
                     discord,
@@ -484,6 +508,7 @@ impl RuntimeServingOpenProcessV2 {
             ingress_acknowledgement_schedule_v2(receipt, final_observation_started_at)
         });
         let process = Self {
+            controller,
             discord,
             foundation,
             lifecycle,
@@ -563,6 +588,11 @@ impl RuntimeServingOpenProcessV2 {
             }
         });
         let mut shutdown = self.foundation.shutdown_observer_v1();
+        enum RuntimeServingOpenLoopEventV2 {
+            Shutdown(crate::RuntimeShutdownObservationV1),
+            Controller(RuntimeServingControllerEventV2),
+            RefreshAcknowledgement,
+        }
         let observation = loop {
             if let Some(observation) = shutdown.observed() {
                 break observation;
@@ -575,17 +605,40 @@ impl RuntimeServingOpenProcessV2 {
             let refresh_at = self.acknowledgement_schedule.refresh_at;
             let selected = tokio::select! {
                 biased;
-                observation = shutdown.wait() => Some(observation),
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(refresh_at)) => None,
+                observation = shutdown.wait() => {
+                    RuntimeServingOpenLoopEventV2::Shutdown(observation)
+                },
+                event = self.controller.next_event_v2() => {
+                    RuntimeServingOpenLoopEventV2::Controller(event)
+                },
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(refresh_at)) => {
+                    RuntimeServingOpenLoopEventV2::RefreshAcknowledgement
+                },
             };
-            if let Some(observation) = selected {
-                break observation;
-            }
-            match self.refresh_acknowledgement_v2().await {
-                Ok(process) => self = process,
-                Err(error) => {
-                    monitor.stop_v2().await;
-                    return Err(error);
+            match selected {
+                RuntimeServingOpenLoopEventV2::Shutdown(observation) => break observation,
+                RuntimeServingOpenLoopEventV2::Controller(
+                    RuntimeServingControllerEventV2::AcquireSlot { slot, reply },
+                ) => {
+                    let request = self.lifecycle.authorize_slot_work_v2(slot);
+                    let permit = self.lifecycle.begin_slot_work_v2(request);
+                    let _ = reply.send(permit);
+                }
+                RuntimeServingOpenLoopEventV2::Controller(
+                    RuntimeServingControllerEventV2::Terminal,
+                ) => {
+                    break self
+                        .foundation
+                        .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::SupervisorFailure);
+                }
+                RuntimeServingOpenLoopEventV2::RefreshAcknowledgement => {
+                    match self.refresh_acknowledgement_v2().await {
+                        Ok(process) => self = process,
+                        Err(error) => {
+                            monitor.stop_v2().await;
+                            return Err(error);
+                        }
+                    }
                 }
             }
         };
@@ -607,19 +660,33 @@ impl RuntimeServingOpenProcessV2 {
         }
     }
 
-    async fn shutdown(self) -> Result<(), crate::RuntimeClosedRecoveryProcessCleanupFailureV2> {
+    async fn shutdown(mut self) -> Result<(), crate::RuntimeClosedRecoveryProcessCleanupFailureV2> {
         let _revalidation = self.revalidate_v2().await;
+        stop_runtime_controller_before_cleanup_v2(&mut self.controller, &mut self.foundation).await;
+        let Self {
+            controller,
+            discord,
+            foundation,
+            lifecycle,
+            maintenance_ingress,
+            readiness,
+            ingress_acknowledgement,
+            acknowledgement_schedule: _,
+            acknowledgement_safety,
+            process_generation,
+        } = self;
+        drop(controller);
         shutdown_serving_open_process_v2(
-            self.foundation,
-            self.discord,
-            self.lifecycle,
+            foundation,
+            discord,
+            lifecycle,
             RuntimeIngressAcknowledgementCleanupV2::new_v2(
-                self.ingress_acknowledgement,
-                Some(self.acknowledgement_safety),
+                ingress_acknowledgement,
+                Some(acknowledgement_safety),
             ),
-            self.maintenance_ingress,
-            self.readiness,
-            self.process_generation,
+            maintenance_ingress,
+            readiness,
+            process_generation,
         )
         .await
     }
@@ -630,5 +697,17 @@ impl RuntimeServingOpenProcessV2 {
     ) -> RuntimeProcessProductionHandoffErrorV2 {
         let cleanup = self.shutdown().await;
         finish_production_handoff_transition_v2(transition, cleanup)
+    }
+}
+
+async fn stop_runtime_controller_before_cleanup_v2(
+    controller: &mut RuntimeServingControllerSupervisorV2,
+    foundation: &mut RuntimeProcessFoundationV1,
+) {
+    let observation = foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit);
+    let deadline = foundation.effective_shutdown_deadline_v1(observation);
+    if controller.shutdown_until_v2(deadline).await.is_err() {
+        foundation.record_runtime_controller_shutdown_failure_v2();
+        foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::SupervisorFailure);
     }
 }

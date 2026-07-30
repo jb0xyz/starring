@@ -122,6 +122,14 @@ impl RuntimeServingSlotWorkPermitV2 {
             .slot
     }
 
+    pub fn process_instance_id(&self) -> &ProcessInstanceId {
+        &self
+            .identity
+            .as_ref()
+            .expect("live serving slot permit must retain identity")
+            .process_instance_id
+    }
+
     pub fn route_set_sequence(&self) -> RuntimeRegistryGlobalObservationSequenceV2 {
         self.identity
             .as_ref()
@@ -280,4 +288,55 @@ fn lock_state(
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RuntimeServingSlotWorkTestHandleV2 {
+    state: Arc<Mutex<RuntimeServingSlotWorkStateV2>>,
+}
+
+#[cfg(test)]
+impl RuntimeServingSlotWorkTestHandleV2 {
+    pub(crate) fn seal(&self) {
+        let mut state = lock_state(&self.state);
+        state.sealed = true;
+        state.active.clear();
+    }
+
+    pub(crate) fn active_count(&self) -> usize {
+        lock_state(&self.state).active.len()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_serving_slot_work_test_authority_v2(
+    slot: RuntimeServingSlotV2,
+    process_instance_id: ProcessInstanceId,
+) -> (
+    RuntimeServingSlotWorkPermitV2,
+    RuntimeServingSlotWorkTestHandleV2,
+) {
+    let work_sequence = NonZeroU64::MIN;
+    let route_set_sequence = RuntimeRegistryGlobalObservationSequenceV2::new(NonZeroU64::MIN);
+    let mut active = BTreeMap::new();
+    active.insert(slot.clone(), work_sequence);
+    let state = Arc::new(Mutex::new(RuntimeServingSlotWorkStateV2 {
+        max_in_flight: NonZeroUsize::MIN,
+        next_work_sequence: work_sequence.get(),
+        active,
+        sealed: false,
+    }));
+    let permit = RuntimeServingSlotWorkPermitV2 {
+        identity: Some(RuntimeServingSlotWorkPermitIdentityV2 {
+            slot,
+            coordinator_generation: RuntimeGatewayCoordinatorGenerationV2::FIRST,
+            process_instance_id,
+            route_set_sequence,
+            work_sequence,
+        }),
+        supervisor: Arc::downgrade(&state),
+    };
+    let handle = RuntimeServingSlotWorkTestHandleV2 { state };
+    (permit, handle)
 }

@@ -18,6 +18,11 @@ mod refresh;
 mod serving;
 mod shutdown;
 
+#[cfg(test)]
+pub(crate) use serving::{
+    runtime_serving_slot_work_test_authority_v2, RuntimeServingSlotWorkTestHandleV2,
+};
+
 pub use admission::{
     RuntimeAdmissionAcknowledgingProcessV2, RuntimeEmptyOpenEpochV2, RuntimeEmptyOpenProcessV2,
     RuntimeIngressOpenAcknowledgementObservationV2, RuntimeOpenProductionObservationInputV2,

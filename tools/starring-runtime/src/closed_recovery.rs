@@ -61,7 +61,7 @@ use crate::registry::{
     RuntimeRegistryBootstrapV1, RuntimeRegistryEmptyRecoveryBindingV2,
     RuntimeRegistryPendingDrainSealBindingV2, RuntimeRegistryPendingDrainSuccessionSealBindingV3,
     RuntimeRegistryPreparedServingTransitionV2, RuntimeRegistryRecoveryObservationErrorV1,
-    RuntimeRegistryServingBindingV2,
+    RuntimeRegistryServingBindingV2, RuntimeRegistryStagingPortV2,
 };
 
 #[path = "startup_recovery_observation.rs"]
@@ -2413,6 +2413,10 @@ impl RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
         permit: RuntimeServingSlotWorkPermitV2,
     ) -> Result<(), RuntimeServingSlotWorkErrorV2> {
         self.worker.complete_slot_work(permit)
+    }
+
+    pub(crate) fn staging_port_v2(&self) -> RuntimeRegistryStagingPortV2 {
+        self.registry.staging_port_v2()
     }
 
     pub(crate) fn begin_shutdown_v2(

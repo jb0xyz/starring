@@ -34,6 +34,10 @@ pub use route_set::{
     RuntimeRouteSetObservationInputV2, RuntimeRouteSetObservationV2,
 };
 use slot_work::RuntimeServingSlotWorkSupervisorV2;
+#[cfg(test)]
+pub(crate) use slot_work::{
+    runtime_serving_slot_work_test_authority_v2, RuntimeServingSlotWorkTestHandleV2,
+};
 pub use slot_work::{
     RuntimeServingOpenSupervisorConfigErrorV2, RuntimeServingOpenSupervisorConfigV2,
     RuntimeServingSlotWorkErrorV2, RuntimeServingSlotWorkPermitV2, RuntimeServingSlotWorkRequestV2,

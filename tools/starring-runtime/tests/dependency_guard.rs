@@ -608,7 +608,9 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/process_supervisor.rs",
             "src/recovery_identity.rs",
             "src/registry.rs",
+            "src/registry_staging_tests.rs",
             "src/registry_succession_tests.rs",
+            "src/runtime_controller.rs",
             "src/secret.rs",
             "src/shutdown.rs",
             "src/startup.rs",
@@ -674,7 +676,7 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
             ("automation-runtime-registry".to_string(), None),
             ("automation-runtime-serving-postgres".to_string(), None),
             ("automation-runtime-worker".to_string(), None),
-            ("chrono".to_string(), Some("dev".to_string())),
+            ("chrono".to_string(), None),
             ("getrandom".to_string(), None),
             ("serde_json".to_string(), Some("dev".to_string())),
             ("sqlx".to_string(), None),
@@ -805,6 +807,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/process/startup_loop_tests.rs")
             && path != Path::new("src/process_startup.rs")
             && path != Path::new("src/process_supervisor.rs")
+            && path != Path::new("src/runtime_controller.rs")
             && path != Path::new("src/mutation_finalizer.rs")
             && path != Path::new("src/shutdown.rs")
             && path != Path::new("src/startup_recovery_observation.rs")
@@ -1104,7 +1107,9 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         } else {
             source
         };
-        if path == Path::new("src/registry_succession_tests.rs") {
+        if path == Path::new("src/registry_staging_tests.rs")
+            || path == Path::new("src/registry_succession_tests.rs")
+        {
             continue;
         }
         if path == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs") {
@@ -1245,6 +1250,14 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     identifier,
                     "automation_runtime_controller" | "automation_runtime_worker"
                 );
+            let allowed_runtime_controller = path == Path::new("src/runtime_controller.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime"
+                        | "automation_runtime_controller"
+                        | "automation_runtime_convergence"
+                        | "automation_runtime_worker"
+                );
             let allowed_pending_drain_succession = path
                 == Path::new("src/process/pending_drain_finalizer.rs")
                 || matches!(
@@ -1294,6 +1307,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_mutation_finalizer
                         || allowed_maintenance_ingress_gate
                         || allowed_ingress_acknowledgement_supervisor
+                        || allowed_runtime_controller
                         || !matches!(
                             identifier,
                             "automation_runtime"
@@ -2606,7 +2620,7 @@ fn serving_open_successor_is_linear_bounded_refreshable_and_non_mutating() {
     let run = startup.find(".run_until_shutdown_v2()").unwrap();
     assert!(empty < successor && successor < run);
     for required in [
-        "const SERVING_OPEN_SLOT_WORK_CAPACITY_V2: usize = 64;",
+        "const SERVING_OPEN_SLOT_WORK_CAPACITY_V2: usize = 1;",
         "RuntimeClosedRecoveryServingOpenEvidenceV2",
         "RuntimeClosedRecoveryServingAcknowledgementEvidenceV2",
         ".authorize_acknowledgement_refresh_v2(evidence)",
@@ -2659,6 +2673,86 @@ fn serving_open_successor_is_linear_bounded_refreshable_and_non_mutating() {
             .map(|(_, source)| source.matches("Shard::new(").count())
             .sum::<usize>(),
         1
+    );
+}
+
+#[test]
+fn runtime_controller_is_exact_refreshing_installation_scoped_and_cleanup_ordered() {
+    let controller = source_before_test_module(include_str!("../src/runtime_controller.rs"));
+    let serving = include_str!("../src/process/serving.rs");
+
+    for required in [
+        "const RUNTIME_CONTROLLER_COMMAND_CAPACITY_V2: usize = 1;",
+        "claim_next_execution(RuntimeClaimNextExecutionV1",
+        "prepare_claim_v2(retained_receipt).await",
+        "runtime_discord_preflight_blocking_mutation_v2()",
+        "RuntimeConvergenceMutationV1::Cancel",
+        "reason: \"runtime_discord_preflight_blocked\".to_owned()",
+        "stage_ready.begin_exact_hydration_refresh()",
+        "refresh.execute(&self.database)",
+        "stage_ready.stage(&stage, Utc::now())",
+        "RuntimeControllerDiscordPreflightDispositionV2::DeploymentBlocked",
+        "self.cancel_blocked_preflight_v2(preflight_failure_receipt)",
+        "RuntimeControllerAttemptV2::RetryRetained(Box::new(",
+        "retained_receipt = receipt",
+        "runtime_claim_requires_renewal_v2(receipt.expires_at, &self.config, now)",
+        "RuntimeHeldRouteOutcomeV2::Retry",
+        "held.finish_retry_v2()",
+    ] {
+        assert!(controller.contains(required), "{required}");
+    }
+    for forbidden in [
+        "RuntimeEmergencyGatewaySection",
+        "RuntimeRecoveryPendingGatewaySection",
+        "GatewayBarrier",
+        "gateway_barrier",
+        ".activate(",
+        "resume_reserved_runtime_discord_admission",
+    ] {
+        assert!(!controller.contains(forbidden), "{forbidden}");
+    }
+
+    let converge = braced_declaration(controller, "async fn converge_claim_v2(");
+    let initial_hydration = converge.find("claimed.begin_hydration()").unwrap();
+    let discord_preflight = converge.find("preflight.execute(&self.discord)").unwrap();
+    let accept_preflight = converge.find("mutation.execute(&self.database").unwrap();
+    let exact_refresh = converge
+        .find("stage_ready.begin_exact_hydration_refresh()")
+        .unwrap();
+    let registry_stage = converge
+        .find("stage_ready.stage(&stage, Utc::now())")
+        .unwrap();
+    assert!(
+        initial_hydration < discord_preflight
+            && discord_preflight < accept_preflight
+            && accept_preflight < exact_refresh
+            && exact_refresh < registry_stage
+    );
+
+    let held = braced_declaration(controller, "struct RuntimeHeldStagedRouteV2");
+    assert!(
+        held.find("staged: RuntimeRegistryStagedRouteV2").unwrap()
+            < held.find("permit: RuntimeServingSlotWorkPermitV2").unwrap()
+    );
+    let renewal = braced_declaration(controller, "async fn hold_staged_v2(");
+    let database_renewal = renewal.find(".renew_execution(renewal)").unwrap();
+    let session_renewal = renewal.find("held.session.apply_renewal(renewal)").unwrap();
+    let registry_renewal = renewal
+        .find(".advance_authority_v2(held.session.fencing_token())")
+        .unwrap();
+    assert!(database_renewal < session_renewal && session_renewal < registry_renewal);
+    let finish = braced_declaration(controller, "fn finish_v2(");
+    assert!(
+        finish.find("staged.remove_v2()").unwrap() < finish.find("drop((session, permit").unwrap()
+    );
+
+    assert!(!serving.contains("OwnedDiscordRuntimePreflightV1"));
+    let shutdown = braced_declaration(serving, "async fn shutdown(mut self)");
+    assert!(
+        shutdown
+            .find("stop_runtime_controller_before_cleanup_v2")
+            .unwrap()
+            < shutdown.find("shutdown_serving_open_process_v2(").unwrap()
     );
 }
 
@@ -4889,7 +4983,9 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
 
     for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
         if path != Path::new("src/registry.rs")
+            && path != Path::new("src/registry_staging_tests.rs")
             && path != Path::new("src/registry_succession_tests.rs")
+            && path != Path::new("src/runtime_controller.rs")
         {
             assert!(
                 !contains_identifier(source, "automation_runtime_registry"),
@@ -4907,6 +5003,26 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
                 );
             }
         }
+    }
+    let runtime_controller = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/runtime_controller.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    assert!(runtime_controller.contains(
+        "use automation_runtime_registry::{ExactServingRouteError, ExactServingRouteV1};"
+    ));
+    for forbidden in [
+        "ServingSlotRegistryV1",
+        "SlotMutationTokenV1",
+        "SlotAdmissionStateV2",
+        "RegistryRecoveryObservationGuardV2",
+        "RegistryEmptyRecoveryCursorV2",
+    ] {
+        assert!(
+            !contains_identifier(runtime_controller, forbidden),
+            "{forbidden}"
+        );
     }
     for required in [
         "const REGISTRY_MAX_SLOTS: NonZeroU32 = NonZeroU32::new(4_096).unwrap();",
@@ -5143,7 +5259,7 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         1
     );
     for forbidden in [
-        "pub(crate) fn install",
+        "pub(crate) fn install(",
         "pub(crate) fn activate",
         "pub(crate) fn begin_drain",
         "pub(crate) fn remove",
@@ -5201,6 +5317,195 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "RuntimeRegistryPendingDrainSuccessionSealBindingV3",
     ] {
         assert!(!library.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn staged_registry_port_is_process_bound_owned_and_fail_closed() {
+    let registry = source_before_test_module(include_str!("../src/registry.rs"));
+    let closed_recovery = include_str!("../src/closed_recovery.rs");
+
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryStagingPortV2 {\n",
+        "    process_instance_id: ProcessInstanceId,\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "}"
+    )));
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryStagedRouteV2 {\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "    identity: RuntimeProcessIdentityV1,\n",
+        "    token: Option<SlotMutationTokenV1>,\n",
+        "    emergency: RuntimeRegistryEmergencyTriggerV2,\n",
+        "}"
+    )));
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryStagedInstallEvidenceV2 {\n",
+        "    route: SlotRouteWitnessV1,\n",
+        "    active_interactions: u32,\n",
+        "    admission_generation: NonZeroU64,\n",
+        "    slot_observation_sequence: NonZeroU64,\n",
+        "    registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,\n",
+        "}"
+    )));
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryStagedInstallV2 {\n",
+        "    outcome: RuntimeRegistryStagedInstallOutcomeV2,\n",
+        "    evidence: RuntimeRegistryStagedInstallEvidenceV2,\n",
+        "    authority: RuntimeRegistryStagedRouteV2,\n",
+        "}"
+    )));
+    assert!(contains_identifier(
+        declaration_attribute_block(registry, "RuntimeRegistryStagingPortV2"),
+        "Clone"
+    ));
+    assert!(!contains_identifier(
+        declaration_attribute_block(registry, "RuntimeRegistryStagedRouteV2"),
+        "Clone"
+    ));
+    assert!(!implements_trait(
+        registry,
+        "RuntimeRegistryStagedRouteV2",
+        "Clone"
+    ));
+    assert!(!contains_identifier(
+        declaration_attribute_block(registry, "RuntimeRegistryStagedInstallV2"),
+        "Clone"
+    ));
+    assert!(!implements_trait(
+        registry,
+        "RuntimeRegistryStagedInstallV2",
+        "Clone"
+    ));
+    assert!(!registry.contains("RuntimeRouteWitnessV2"));
+
+    let binding = braced_declaration(registry, "impl RuntimeRegistryServingBindingV2");
+    let factory = braced_declaration(
+        binding,
+        "pub(crate) fn staging_port_v2(&self) -> RuntimeRegistryStagingPortV2",
+    );
+    assert!(factory.contains("process_instance_id: self.process_instance_id.clone()"));
+    assert!(factory.contains("registry: self.registry.clone()"));
+    assert!(!binding.contains("install_staged_route_v2"));
+
+    let port = braced_declaration(registry, "impl RuntimeRegistryStagingPortV2");
+    let install = braced_declaration(port, "pub(crate) fn install_staged_route_v2(");
+    let process_match = install
+        .find("route.identity().process_instance_id")
+        .unwrap();
+    let registry_install = install.find(".install(key, route, fencing_token)").unwrap();
+    let lifecycle = install.find("SlotInstallOutcomeV1::Staged").unwrap();
+    let authority = install
+        .find("let staged = RuntimeRegistryStagedRouteV2")
+        .unwrap();
+    let witness = install.find("self.registry.route_witness(token)").unwrap();
+    let atomic = install
+        .find("self.registry.atomic_observation_v2(token.key())")
+        .unwrap();
+    let global = install
+        .find("self.registry.recovery_observation_v2()")
+        .unwrap();
+    let complete = install.find("complete_staged_install_v2(").unwrap();
+    assert!(
+        process_match < registry_install
+            && registry_install < lifecycle
+            && lifecycle < authority
+            && authority < witness
+            && witness < atomic
+            && atomic < global
+            && global < complete
+    );
+    assert!(install.contains(concat!(
+        "SlotInstallOutcomeV1::Staged => ",
+        "RuntimeRegistryStagedInstallOutcomeV2::Installed"
+    )));
+    assert!(install.contains(concat!(
+        "SlotInstallOutcomeV1::AlreadyStaged => {\n",
+        "                RuntimeRegistryStagedInstallOutcomeV2::ExactReplay\n",
+        "            }"
+    )));
+    assert!(install
+        .contains(") -> Result<RuntimeRegistryStagedInstallV2, RuntimeRegistryStagingErrorV2>"));
+    assert!(install.contains(concat!(
+        "SlotInstallOutcomeV1::AlreadyServing | SlotInstallOutcomeV1::AlreadyDraining => {\n",
+        "                return Err(RuntimeRegistryStagingErrorV2::UnexpectedLifecycle);\n",
+        "            }"
+    )));
+    let completion = braced_declaration(registry, "fn complete_staged_install_v2(");
+    for required in [
+        "staged: RuntimeRegistryStagedRouteV2",
+        "witness: Result<SlotRouteWitnessV1, ServingSlotRegistryError>",
+        "atomic: Result<Option<SlotAtomicObservationV2>, ServingSlotRegistryError>",
+        "registry_observation: Result<RegistryRecoveryObservationV2, ServingSlotRegistryError>",
+        "validate_staged_evidence_v2(&staged, witness, atomic, registry_observation)?",
+        "authority: staged",
+    ] {
+        assert!(completion.contains(required), "{required}");
+    }
+    let validation = braced_declaration(registry, "fn validate_staged_evidence_v2(");
+    for required in [
+        "witness.identity != staged.identity",
+        "witness.fencing_token != token.fencing_token()",
+        "witness.lifecycle != SlotLifecycleV1::Staged",
+        "atomic.route.as_ref() != Some(&witness)",
+        "atomic.admission_state != SlotAdmissionStateV2::Staged",
+        "atomic.active_interactions != 0",
+        "registry_observation.registry_failed_closed()",
+        "registry_observation.failed_closed_slot_count() != 0",
+        "registry_observation.staged_route_count() == 0",
+        "registry_observation.observation_sequence().get() < atomic.observation_sequence.get()",
+        "staged.ensure_staged_v2()?",
+        "route: witness",
+    ] {
+        assert!(validation.contains(required), "{required}");
+    }
+    for forbidden in ["pub(crate) fn registry", "pub(crate) fn into_registry"] {
+        assert!(!port.contains(forbidden), "{forbidden}");
+    }
+
+    let staged = braced_declaration(registry, "impl RuntimeRegistryStagedRouteV2");
+    let advance = braced_declaration(staged, "pub(crate) fn advance_authority_v2(");
+    let advance_registry = advance.find(".advance_authority(").unwrap();
+    let retain_successor = advance.find("self.token = Some(successor)").unwrap();
+    let refresh_evidence = advance.find("self.observe_staged_evidence_v2()").unwrap();
+    assert!(advance_registry < retain_successor && retain_successor < refresh_evidence);
+    assert!(advance.contains(
+        ") -> Result<RuntimeRegistryStagedInstallEvidenceV2, RuntimeRegistryStagingErrorV2>"
+    ));
+    let explicit = braced_declaration(
+        staged,
+        "pub(crate) fn remove_v2(mut self) -> Result<(), RuntimeRegistryStagingErrorV2>",
+    );
+    assert!(explicit.contains("let result = self.remove_inner_v2()"));
+    assert!(explicit.contains("if result.is_err()"));
+    assert!(explicit.contains("self.emergency.trip_v2()"));
+    let cleanup = braced_declaration(
+        staged,
+        "fn remove_inner_v2(&mut self) -> Result<(), RuntimeRegistryStagingErrorV2>",
+    );
+    assert!(cleanup.contains("SlotRemovalOutcomeV1::RemovedStaged => Ok(())"));
+    assert!(cleanup.contains("SlotRemovalOutcomeV1::RemovedDraining"));
+    assert!(cleanup.contains("RuntimeRegistryStagingErrorV2::UnexpectedLifecycle"));
+    let drop_impl = braced_declaration(registry, "impl Drop for RuntimeRegistryStagedRouteV2");
+    assert!(drop_impl.contains("self.token.is_some() && self.remove_inner_v2().is_err()"));
+    assert!(drop_impl.contains("self.emergency.trip_v2()"));
+
+    let lifecycle = braced_declaration(
+        closed_recovery,
+        "impl RuntimeClosedRecoverySupervisedServingOpenProcessV2",
+    );
+    let getter = braced_declaration(
+        lifecycle,
+        "pub(crate) fn staging_port_v2(&self) -> RuntimeRegistryStagingPortV2",
+    );
+    assert!(getter.contains("self.registry.staging_port_v2()"));
+    assert!(!lifecycle.contains("install_staged_route_v2"));
+    for forbidden in [
+        "ExactServingRouteV1",
+        "SlotMutationTokenV1",
+        "ServingSlotRegistryV1",
+    ] {
+        assert!(!getter.contains(forbidden), "{forbidden}");
     }
 }
 

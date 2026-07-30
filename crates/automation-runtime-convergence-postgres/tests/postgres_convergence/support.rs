@@ -429,7 +429,14 @@ async fn rotate_authority(pool: &PgPool, rotation: AuthorityRotation<'_>) {
         required_approvals,
         activation_ttl_seconds,
     } = rotation;
-    let authority_payload_digest = format!("{:x}", revision + 3).repeat(64);
+    let authority_payload_digest = authority_payload_digest_for_test(
+        revision,
+        binding_revision,
+        binding_fingerprint,
+        policy_revision,
+        required_approvals,
+        activation_ttl_seconds,
+    );
     let request_digest = format!("{:x}", revision + 8).repeat(64);
     let mut transaction = pool.begin().await.unwrap();
     sqlx::query("SET CONSTRAINTS ALL DEFERRED")
@@ -481,13 +488,7 @@ async fn converge_claimed(
     automation_runtime_convergence_postgres::MutationReceiptV1,
     automation_runtime_convergence_postgres::ServingLeaseReceiptV1,
 ) {
-    converge_claimed_with_lease(
-        adapter,
-        claim,
-        process_instance_id,
-        Duration::from_secs(45),
-    )
-    .await
+    converge_claimed_with_lease(adapter, claim, process_instance_id, Duration::from_secs(45)).await
 }
 
 async fn converge_claimed_with_lease(
@@ -885,7 +886,14 @@ async fn seed_product_target(pool: &PgPool) {
     .bind(INSTALLATION)
     .bind(TENANT)
     .bind(BINDING_FINGERPRINT)
-    .bind("3".repeat(64))
+    .bind(authority_payload_digest_for_test(
+        1,
+        1,
+        BINDING_FINGERPRINT,
+        1,
+        1,
+        3600,
+    ))
     .bind(PRINCIPAL)
     .bind("4".repeat(64))
     .execute(&mut *transaction)
@@ -1093,14 +1101,12 @@ async fn replace_seeded_target_with_future_schema(pool: &PgPool) {
     .fetch_one(&mut *transaction)
     .await
     .unwrap();
-    sqlx::query(
-        "UPDATE public.activation_requests SET target_content_hash = $2 WHERE id = $1",
-    )
-    .bind(ACTIVATION)
-    .bind(&future_hash)
-    .execute(&mut *transaction)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE public.activation_requests SET target_content_hash = $2 WHERE id = $1")
+        .bind(ACTIVATION)
+        .bind(&future_hash)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
     sqlx::query(
         "UPDATE public.authoring_promotions \
          SET record = pg_catalog.jsonb_set(\
@@ -1178,13 +1184,8 @@ async fn seed_next_product_journal(pool: &PgPool, request: &EnqueueDeploymentV1)
         .execute(&mut *transaction)
         .await
         .unwrap();
-    insert_activation_pending_promotion(
-        &mut transaction,
-        NEXT_PROMOTION,
-        &request_digest,
-        &record,
-    )
-    .await;
+    insert_activation_pending_promotion(&mut transaction, NEXT_PROMOTION, &request_digest, &record)
+        .await;
     sqlx::query(
         "INSERT INTO public.activation_requests (id, guild_id, ruleset_key, target_version, \
          target_content_hash, requester_id, required_approvals, state, created_at, expires_at, \
@@ -1429,6 +1430,34 @@ fn promotion_record(
         "created_at": created_at,
         "updated_at": created_at
     })
+}
+
+fn authority_payload_digest_for_test(
+    revision: i64,
+    binding_revision: i64,
+    binding_fingerprint: &str,
+    policy_revision: i64,
+    required_approvals: i32,
+    activation_ttl_seconds: i64,
+) -> String {
+    let fingerprint = ResourceBindingFingerprint::parse(binding_fingerprint).unwrap();
+    let policy = InstallationAuthorityPolicyV1::new(
+        NonZeroU64::new(u64::try_from(policy_revision).unwrap()).unwrap(),
+        NonZeroU32::new(u32::try_from(required_approvals).unwrap()).unwrap(),
+        NonZeroU64::new(u64::try_from(activation_ttl_seconds).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let identity = InstallationAuthorityPayloadIdentityV1::new(
+        InstallationAuthorityScopeV1::new(TENANT, INSTALLATION).unwrap(),
+        NonZeroU64::new(u64::try_from(revision).unwrap()).unwrap(),
+        NonZeroU64::new(u64::try_from(binding_revision).unwrap()).unwrap(),
+        &fingerprint,
+        policy,
+    )
+    .unwrap();
+    installation_authority_payload_digest_v1(&identity)
+        .as_str()
+        .to_owned()
 }
 
 async fn insert_activation_pending_promotion(

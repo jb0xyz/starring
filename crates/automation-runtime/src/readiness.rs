@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use automation_ruleset::RuleSetVersion;
 use automation_ruleset_readiness::{
@@ -10,6 +11,7 @@ use automation_ruleset_readiness::{
 use desired_state::ResourceKey;
 use discord_model::{GuildId, Permissions, RoleId};
 use resource_resolution::ResourceBindingMap;
+use tokio::sync::OnceCell;
 use twilight_http::Client;
 use twilight_model::id::marker::{GuildMarker, UserMarker};
 use twilight_model::id::Id;
@@ -94,6 +96,70 @@ impl RuntimeTargetReadyV1 {
 
     pub fn into_runtime_ruleset(self) -> RuntimeRuleSet {
         self.runtime_ruleset
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeDiscordPreflightErrorV1 {
+    #[error("Discord readiness snapshot failed: {0}")]
+    Snapshot(RuntimeReadinessSnapshotErrorV1),
+    #[error("runtime target readiness check failed")]
+    Target(RuntimeTargetReadinessErrorV1),
+    #[error("runtime target guild does not match the requested Discord guild")]
+    TargetGuildMismatch,
+}
+
+impl RuntimeDiscordPreflightErrorV1 {
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Snapshot(error) => error.is_retryable(),
+            Self::Target(_) | Self::TargetGuildMismatch => false,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct OwnedDiscordRuntimePreflightV1 {
+    http: Arc<Client>,
+    bot_user_id: Arc<OnceCell<Id<UserMarker>>>,
+}
+
+impl OwnedDiscordRuntimePreflightV1 {
+    pub fn new(discord_token: String) -> Self {
+        Self {
+            http: Arc::new(Client::new(discord_token)),
+            bot_user_id: Arc::new(OnceCell::new()),
+        }
+    }
+
+    pub async fn preflight(
+        &self,
+        guild_id: GuildId,
+        artifact: &RuleSetVersion,
+        bindings: &ResourceBindingMap,
+    ) -> Result<RuntimeTargetReadyV1, RuntimeDiscordPreflightErrorV1> {
+        if artifact.guild_id != guild_id {
+            return Err(RuntimeDiscordPreflightErrorV1::TargetGuildMismatch);
+        }
+        let bot_user_id = *self
+            .bot_user_id
+            .get_or_try_init(|| async {
+                TwilightRuntimeReadinessProvider::new(self.http.as_ref())
+                    .await
+                    .map(|provider| provider.bot_user_id)
+            })
+            .await
+            .map_err(RuntimeDiscordPreflightErrorV1::Snapshot)?;
+        let provider = TwilightRuntimeReadinessProvider {
+            http: self.http.as_ref(),
+            bot_user_id,
+        };
+        let context = provider
+            .snapshot(guild_id, bindings)
+            .await
+            .map_err(RuntimeDiscordPreflightErrorV1::Snapshot)?;
+        check_runtime_target_readiness_v1(artifact, bindings, &context)
+            .map_err(RuntimeDiscordPreflightErrorV1::Target)
     }
 }
 
@@ -358,5 +424,51 @@ mod tests {
         assert!(RuntimeReadinessSnapshotErrorV1::GuildRolesUnavailable.is_retryable());
         assert!(!RuntimeReadinessSnapshotErrorV1::GuildRolesInvalid.is_retryable());
         assert!(!RuntimeReadinessSnapshotErrorV1::BoundRoleMissing.is_retryable());
+    }
+
+    #[test]
+    fn owned_preflight_is_clone_send_and_sync() {
+        fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
+
+        assert_clone_send_sync::<OwnedDiscordRuntimePreflightV1>();
+    }
+
+    #[test]
+    fn owned_preflight_preserves_retryability() {
+        assert!(RuntimeDiscordPreflightErrorV1::Snapshot(
+            RuntimeReadinessSnapshotErrorV1::BotIdentityUnavailable
+        )
+        .is_retryable());
+        assert!(!RuntimeDiscordPreflightErrorV1::Snapshot(
+            RuntimeReadinessSnapshotErrorV1::BotIdentityInvalid
+        )
+        .is_retryable());
+        assert!(
+            !RuntimeDiscordPreflightErrorV1::Target(RuntimeTargetReadinessErrorV1::Readiness(
+                ReadinessError::HashMismatch
+            ))
+            .is_retryable()
+        );
+        assert!(!RuntimeDiscordPreflightErrorV1::TargetGuildMismatch.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn owned_preflight_rejects_guild_mismatch_before_discord_io() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let provider = OwnedDiscordRuntimePreflightV1::new("unused-token".to_string());
+        let artifact = artifact(Vec::new());
+
+        let result = provider
+            .preflight(
+                GuildId(GUILD.0 + 1),
+                &artifact,
+                &ResourceBindingMap::default(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(RuntimeDiscordPreflightErrorV1::TargetGuildMismatch)
+        ));
     }
 }

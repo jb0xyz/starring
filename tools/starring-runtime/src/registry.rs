@@ -1,13 +1,15 @@
 use std::fmt::{Debug, Formatter};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
 
 use automation_runtime_controller::RuntimeServingSlotV2;
-use automation_runtime_convergence::ProcessInstanceId;
+use automation_runtime_convergence::{FencingToken, ProcessInstanceId, RuntimeProcessIdentityV1};
 use automation_runtime_registry::{
-    RegistryEmptyRecoveryCursorV2, RegistryRecoveryObservationGuardV2,
+    ExactServingRouteV1, RegistryEmptyRecoveryCursorV2, RegistryRecoveryObservationGuardV2,
     RegistryRecoveryObservationV2, SealedEmptyRecoveryDrainClaimV2, ServingSlotKeyV1,
     ServingSlotRegistryConfigV1, ServingSlotRegistryError, ServingSlotRegistryV1,
-    SlotAdmissionStateV2, SlotSealKeyV2,
+    SlotAdmissionStateV2, SlotAtomicObservationV2, SlotInstallOutcomeV1, SlotLifecycleV1,
+    SlotMutationTokenV1, SlotRemovalOutcomeV1, SlotRouteWitnessV1, SlotSealKeyV2,
 };
 use automation_runtime_worker::{
     accept_runtime_registry_recovery_empty_observation_v2, accept_runtime_route_set_observation_v2,
@@ -220,6 +222,251 @@ pub(crate) struct RuntimeRegistryServingBindingV2 {
     initial_registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,
     initial_retained_slot_count: u64,
     initial_retained_empty_tombstone_count: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeRegistryStagingPortV2 {
+    process_instance_id: ProcessInstanceId,
+    registry: ServingSlotRegistryV1,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeRegistryEmergencyTriggerV2 {
+    trip: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl RuntimeRegistryEmergencyTriggerV2 {
+    pub(crate) fn new(trip: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            trip: Arc::new(trip),
+        }
+    }
+
+    fn trip_v2(&self) {
+        (self.trip)();
+    }
+}
+
+impl Debug for RuntimeRegistryEmergencyTriggerV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryEmergencyTriggerV2(<redacted>)")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RuntimeRegistryStagingErrorV2 {
+    #[error("runtime staged route belongs to another process")]
+    ProcessMismatch,
+    #[error("runtime exact route is not exclusively staged")]
+    UnexpectedLifecycle,
+    #[error("runtime staged route evidence is inconsistent")]
+    EvidenceMismatch,
+    #[error("runtime staged route registry operation failed")]
+    Registry(ServingSlotRegistryError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeRegistryStagedInstallOutcomeV2 {
+    Installed,
+    ExactReplay,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeRegistryStagedInstallEvidenceV2 {
+    route: SlotRouteWitnessV1,
+    active_interactions: u32,
+    admission_generation: NonZeroU64,
+    slot_observation_sequence: NonZeroU64,
+    registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,
+}
+
+pub(crate) struct RuntimeRegistryStagedRouteV2 {
+    registry: ServingSlotRegistryV1,
+    identity: RuntimeProcessIdentityV1,
+    token: Option<SlotMutationTokenV1>,
+    emergency: RuntimeRegistryEmergencyTriggerV2,
+}
+
+pub(crate) struct RuntimeRegistryStagedInstallV2 {
+    outcome: RuntimeRegistryStagedInstallOutcomeV2,
+    evidence: RuntimeRegistryStagedInstallEvidenceV2,
+    authority: RuntimeRegistryStagedRouteV2,
+}
+
+impl RuntimeRegistryStagedInstallEvidenceV2 {
+    pub(crate) fn identity_v2(&self) -> &RuntimeProcessIdentityV1 {
+        &self.route.identity
+    }
+
+    pub(crate) fn fencing_token_v2(&self) -> FencingToken {
+        self.route.fencing_token
+    }
+
+    pub(crate) fn route_incarnation_v2(&self) -> NonZeroU64 {
+        self.route.incarnation
+    }
+
+    pub(crate) fn active_interactions_v2(&self) -> u32 {
+        self.active_interactions
+    }
+
+    pub(crate) fn admission_generation_v2(&self) -> NonZeroU64 {
+        self.admission_generation
+    }
+
+    pub(crate) fn registry_observation_sequence_v2(
+        &self,
+    ) -> RuntimeRegistryGlobalObservationSequenceV2 {
+        self.registry_observation_sequence
+    }
+}
+
+impl RuntimeRegistryStagedInstallV2 {
+    pub(crate) fn outcome_v2(&self) -> RuntimeRegistryStagedInstallOutcomeV2 {
+        self.outcome
+    }
+
+    pub(crate) fn evidence_v2(&self) -> &RuntimeRegistryStagedInstallEvidenceV2 {
+        &self.evidence
+    }
+
+    pub(crate) fn into_parts_v2(
+        self,
+    ) -> (
+        RuntimeRegistryStagedInstallOutcomeV2,
+        RuntimeRegistryStagedInstallEvidenceV2,
+        RuntimeRegistryStagedRouteV2,
+    ) {
+        (self.outcome, self.evidence, self.authority)
+    }
+}
+
+impl RuntimeRegistryStagedRouteV2 {
+    pub(crate) fn identity_v2(&self) -> &RuntimeProcessIdentityV1 {
+        &self.identity
+    }
+
+    pub(crate) fn fencing_token_v2(&self) -> FencingToken {
+        self.token
+            .as_ref()
+            .expect("live staged route authority must retain its token")
+            .fencing_token()
+    }
+
+    pub(crate) fn ensure_staged_v2(&self) -> Result<(), RuntimeRegistryStagingErrorV2> {
+        let token = self
+            .token
+            .as_ref()
+            .ok_or(RuntimeRegistryStagingErrorV2::UnexpectedLifecycle)?;
+        let witness = self
+            .registry
+            .route_witness(token)
+            .map_err(RuntimeRegistryStagingErrorV2::Registry)?;
+        if witness.identity != self.identity
+            || witness.fencing_token != token.fencing_token()
+            || witness.lifecycle != SlotLifecycleV1::Staged
+        {
+            return Err(RuntimeRegistryStagingErrorV2::UnexpectedLifecycle);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn advance_authority_v2(
+        &mut self,
+        next_fencing_token: FencingToken,
+    ) -> Result<RuntimeRegistryStagedInstallEvidenceV2, RuntimeRegistryStagingErrorV2> {
+        self.ensure_staged_v2()?;
+        let token = self
+            .token
+            .as_ref()
+            .ok_or(RuntimeRegistryStagingErrorV2::UnexpectedLifecycle)?;
+        let successor = self
+            .registry
+            .advance_authority(token, &self.identity, next_fencing_token)
+            .map_err(RuntimeRegistryStagingErrorV2::Registry)?;
+        self.token = Some(successor);
+        self.observe_staged_evidence_v2()
+    }
+
+    pub(crate) fn remove_v2(mut self) -> Result<(), RuntimeRegistryStagingErrorV2> {
+        let result = self.remove_inner_v2();
+        if result.is_err() {
+            self.emergency.trip_v2();
+        }
+        result
+    }
+
+    fn remove_inner_v2(&mut self) -> Result<(), RuntimeRegistryStagingErrorV2> {
+        let token = self
+            .token
+            .take()
+            .ok_or(RuntimeRegistryStagingErrorV2::UnexpectedLifecycle)?;
+        match self
+            .registry
+            .remove(&token)
+            .map_err(RuntimeRegistryStagingErrorV2::Registry)?
+        {
+            SlotRemovalOutcomeV1::RemovedStaged => Ok(()),
+            SlotRemovalOutcomeV1::RemovedDraining => {
+                Err(RuntimeRegistryStagingErrorV2::UnexpectedLifecycle)
+            }
+        }
+    }
+
+    fn observe_staged_evidence_v2(
+        &self,
+    ) -> Result<RuntimeRegistryStagedInstallEvidenceV2, RuntimeRegistryStagingErrorV2> {
+        let token = self
+            .token
+            .as_ref()
+            .ok_or(RuntimeRegistryStagingErrorV2::UnexpectedLifecycle)?;
+        let witness = self
+            .registry
+            .route_witness(token)
+            .map_err(RuntimeRegistryStagingErrorV2::Registry)?;
+        let atomic = self
+            .registry
+            .atomic_observation_v2(token.key())
+            .map_err(RuntimeRegistryStagingErrorV2::Registry)?
+            .ok_or(RuntimeRegistryStagingErrorV2::EvidenceMismatch)?;
+        let registry_observation = self
+            .registry
+            .recovery_observation_v2()
+            .map_err(RuntimeRegistryStagingErrorV2::Registry)?;
+        validate_staged_evidence_v2(self, witness, atomic, registry_observation)
+    }
+}
+
+impl Drop for RuntimeRegistryStagedRouteV2 {
+    fn drop(&mut self) {
+        if self.token.is_some() && self.remove_inner_v2().is_err() {
+            self.emergency.trip_v2();
+        }
+    }
+}
+
+impl Debug for RuntimeRegistryStagedRouteV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryStagedRouteV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRegistryStagedInstallEvidenceV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryStagedInstallEvidenceV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRegistryStagedInstallV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryStagedInstallV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRegistryStagingPortV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryStagingPortV2(<redacted>)")
+    }
 }
 
 pub(crate) struct RuntimeRegistryServingTransitionFailureV2 {
@@ -444,6 +691,13 @@ impl RuntimeRegistryPreparedServingTransitionV2 {
 }
 
 impl RuntimeRegistryServingBindingV2 {
+    pub(crate) fn staging_port_v2(&self) -> RuntimeRegistryStagingPortV2 {
+        RuntimeRegistryStagingPortV2 {
+            process_instance_id: self.process_instance_id.clone(),
+            registry: self.registry.clone(),
+        }
+    }
+
     pub(crate) fn observe_route_set_v2(
         &self,
         route_set_epoch: &RuntimeRouteSetEpochV2,
@@ -473,6 +727,103 @@ impl RuntimeRegistryServingBindingV2 {
             .observation();
         project_route_set_observation_v2(&self.process_instance_id, observation)
     }
+}
+
+impl RuntimeRegistryStagingPortV2 {
+    pub(crate) fn install_staged_route_v2(
+        &self,
+        route: ExactServingRouteV1,
+        fencing_token: FencingToken,
+        emergency: RuntimeRegistryEmergencyTriggerV2,
+    ) -> Result<RuntimeRegistryStagedInstallV2, RuntimeRegistryStagingErrorV2> {
+        if route.identity().process_instance_id != self.process_instance_id {
+            return Err(RuntimeRegistryStagingErrorV2::ProcessMismatch);
+        }
+        let key = route.slot_key();
+        let receipt = self
+            .registry
+            .install(key, route, fencing_token)
+            .map_err(RuntimeRegistryStagingErrorV2::Registry)?;
+        let outcome = match receipt.outcome {
+            SlotInstallOutcomeV1::Staged => RuntimeRegistryStagedInstallOutcomeV2::Installed,
+            SlotInstallOutcomeV1::AlreadyStaged => {
+                RuntimeRegistryStagedInstallOutcomeV2::ExactReplay
+            }
+            SlotInstallOutcomeV1::AlreadyServing | SlotInstallOutcomeV1::AlreadyDraining => {
+                return Err(RuntimeRegistryStagingErrorV2::UnexpectedLifecycle);
+            }
+        };
+        let staged = RuntimeRegistryStagedRouteV2 {
+            registry: self.registry.clone(),
+            identity: receipt.token.identity().clone(),
+            token: Some(receipt.token),
+            emergency,
+        };
+        let token = staged
+            .token
+            .as_ref()
+            .ok_or(RuntimeRegistryStagingErrorV2::UnexpectedLifecycle)?;
+        let witness = self.registry.route_witness(token);
+        let atomic = self.registry.atomic_observation_v2(token.key());
+        let registry_observation = self.registry.recovery_observation_v2();
+        complete_staged_install_v2(outcome, staged, witness, atomic, registry_observation)
+    }
+}
+
+fn complete_staged_install_v2(
+    outcome: RuntimeRegistryStagedInstallOutcomeV2,
+    staged: RuntimeRegistryStagedRouteV2,
+    witness: Result<SlotRouteWitnessV1, ServingSlotRegistryError>,
+    atomic: Result<Option<SlotAtomicObservationV2>, ServingSlotRegistryError>,
+    registry_observation: Result<RegistryRecoveryObservationV2, ServingSlotRegistryError>,
+) -> Result<RuntimeRegistryStagedInstallV2, RuntimeRegistryStagingErrorV2> {
+    let witness = witness.map_err(RuntimeRegistryStagingErrorV2::Registry)?;
+    let atomic = atomic
+        .map_err(RuntimeRegistryStagingErrorV2::Registry)?
+        .ok_or(RuntimeRegistryStagingErrorV2::EvidenceMismatch)?;
+    let registry_observation =
+        registry_observation.map_err(RuntimeRegistryStagingErrorV2::Registry)?;
+    let evidence = validate_staged_evidence_v2(&staged, witness, atomic, registry_observation)?;
+    Ok(RuntimeRegistryStagedInstallV2 {
+        outcome,
+        evidence,
+        authority: staged,
+    })
+}
+
+fn validate_staged_evidence_v2(
+    staged: &RuntimeRegistryStagedRouteV2,
+    witness: SlotRouteWitnessV1,
+    atomic: SlotAtomicObservationV2,
+    registry_observation: RegistryRecoveryObservationV2,
+) -> Result<RuntimeRegistryStagedInstallEvidenceV2, RuntimeRegistryStagingErrorV2> {
+    let token = staged
+        .token
+        .as_ref()
+        .ok_or(RuntimeRegistryStagingErrorV2::UnexpectedLifecycle)?;
+    if witness.identity != staged.identity
+        || witness.fencing_token != token.fencing_token()
+        || witness.lifecycle != SlotLifecycleV1::Staged
+        || atomic.route.as_ref() != Some(&witness)
+        || atomic.admission_state != SlotAdmissionStateV2::Staged
+        || atomic.active_interactions != 0
+        || registry_observation.registry_failed_closed()
+        || registry_observation.failed_closed_slot_count() != 0
+        || registry_observation.staged_route_count() == 0
+        || registry_observation.observation_sequence().get() < atomic.observation_sequence.get()
+    {
+        return Err(RuntimeRegistryStagingErrorV2::EvidenceMismatch);
+    }
+    staged.ensure_staged_v2()?;
+    Ok(RuntimeRegistryStagedInstallEvidenceV2 {
+        route: witness,
+        active_interactions: atomic.active_interactions,
+        admission_generation: atomic.admission_generation,
+        slot_observation_sequence: atomic.observation_sequence,
+        registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(
+            registry_observation.observation_sequence().as_non_zero(),
+        ),
+    })
 }
 
 impl RuntimeRegistryServingTransitionFailureV2 {
@@ -1170,6 +1521,10 @@ fn map_worker_observation_error(
 #[cfg(test)]
 #[path = "registry_succession_tests.rs"]
 pub(crate) mod succession_tests;
+
+#[cfg(test)]
+#[path = "registry_staging_tests.rs"]
+mod staging_tests;
 
 #[cfg(test)]
 mod tests {

@@ -309,6 +309,28 @@ pub(crate) struct RuntimePendingDrainMutationDatabaseV3 {
     execution: PostgresRuntimeExecutionV1,
 }
 
+#[derive(Clone)]
+pub(crate) struct RuntimeControllerDatabaseV2 {
+    execution: PostgresRuntimeExecutionV1,
+    exact_target: PostgresRuntimeExactTargetReader,
+}
+
+impl RuntimeControllerDatabaseV2 {
+    pub(crate) fn execution(&self) -> &PostgresRuntimeExecutionV1 {
+        &self.execution
+    }
+
+    pub(crate) fn exact_target(&self) -> &PostgresRuntimeExactTargetReader {
+        &self.exact_target
+    }
+}
+
+impl Debug for RuntimeControllerDatabaseV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeControllerDatabaseV2(<redacted>)")
+    }
+}
+
 impl RuntimePendingDrainMutationDatabaseV3 {
     pub(crate) async fn record_no_candidate_v3(
         &self,
@@ -369,6 +391,13 @@ impl RuntimeDatabaseDependenciesV1 {
     pub(crate) fn pending_drain_mutation_v3(&self) -> RuntimePendingDrainMutationDatabaseV3 {
         RuntimePendingDrainMutationDatabaseV3 {
             execution: self.execution.clone(),
+        }
+    }
+
+    pub(crate) fn runtime_controller_v2(&self) -> RuntimeControllerDatabaseV2 {
+        RuntimeControllerDatabaseV2 {
+            execution: self.execution.clone(),
+            exact_target: self.exact_target.clone(),
         }
     }
 

@@ -1,6 +1,7 @@
 mod capability_readiness;
 mod certification_reservation;
 mod closed_recovery;
+mod convergence;
 mod gateway_lifecycle;
 mod gateway_owner;
 mod gateway_owner_watchdog;
@@ -23,6 +24,24 @@ pub use certification_reservation::RuntimeCertificationReservationPortV2;
 pub use closed_recovery::{
     RuntimeClosedDrainRecoveryPermitV2, RuntimeClosedRecoveryAuthorityRevisionV2,
     RuntimeClosedRecoveryInputV2, RuntimeClosedRecoveryRegistryEvidenceV2,
+};
+pub use convergence::{
+    RuntimeAcceptPreflightMutationErrorV2, RuntimeAuthorityPayloadDigestErrorV2,
+    RuntimeAuthorityPayloadDigestV2, RuntimeClaimedConvergenceV2, RuntimeConvergenceClaimKindV2,
+    RuntimeConvergenceFutureV2, RuntimeConvergenceMutationPortV2, RuntimeConvergenceStartErrorV2,
+    RuntimeDiscordPreflightErrorV2, RuntimeDiscordPreflightEvidenceErrorV2,
+    RuntimeDiscordPreflightObservationV2, RuntimeDiscordPreflightOutcomeV2,
+    RuntimeDiscordPreflightPortV2, RuntimeDiscordPreflightRequestV2, RuntimeDiscordPreflightV2,
+    RuntimeExactTargetEvidenceErrorV2, RuntimeExactTargetEvidenceV2,
+    RuntimeExactTargetHydrationErrorV2, RuntimeExactTargetHydrationPortV2,
+    RuntimeExactTargetHydrationRequestV2, RuntimeExactTargetHydrationResultV2,
+    RuntimeExactTargetHydrationV2, RuntimeExactTargetObservationV2, RuntimeHydratedConvergenceV2,
+    RuntimePreflightedConvergenceV2, RuntimeRefreshedStageReadyConvergenceV2,
+    RuntimeRouteLifecycleV2, RuntimeRouteStageErrorV2, RuntimeRouteStageEvidenceErrorV2,
+    RuntimeRouteStageObservationV2, RuntimeRouteStageOutcomeV2, RuntimeRouteStageRequestV2,
+    RuntimeRouteWitnessV2, RuntimeStageReadyConvergenceV2,
+    RuntimeStageReadyHydrationRefreshResultV2, RuntimeStageReadyHydrationRefreshV2,
+    RuntimeStagedConvergenceV2, RuntimeStagedRoutePortV2,
 };
 pub use gateway_lifecycle::{
     RuntimeGatewayClosedLifecycleV2, RuntimeGatewayClosedSnapshotV2,

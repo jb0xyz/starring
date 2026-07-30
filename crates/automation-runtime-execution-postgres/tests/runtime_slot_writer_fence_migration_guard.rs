@@ -25,7 +25,7 @@ starring_runtime_slot_writer_fence_installation_insert_v2()";
 const MIGRATION_EXACT_TARGET_READINESS_DIGEST: &str =
     "e4bae4b38acc529accd4401af853eb7e96d2a34ad8fb1224b9965166ff40c229";
 const CURRENT_EXACT_TARGET_READINESS_DIGEST: &str =
-    "35903afa3bb9bebe712559a80a503823f4eeedf0d15ebd3d24ce3dbf706b5c14";
+    "f51338cfbfc8d360c90d6ebdbfeebf8c8f5c26165e1d53b837d38cb670733d46";
 const MIGRATION_SERVING_READINESS_DIGEST: &str =
     "1c0c79c6fbf528f28fb56e91a54b78cd1fe17c70d2bc3e8d7e3dc515d8a7f8f7";
 const CURRENT_SERVING_READINESS_DIGEST: &str =

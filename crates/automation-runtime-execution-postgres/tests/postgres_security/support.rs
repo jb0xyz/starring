@@ -47,9 +47,9 @@ use sqlx::{Connection, Executor, PgPool};
 
 const READINESS_FUNCTION: &str = "public.starring_runtime_execution_database_readiness_v1()";
 const EXACT_TARGET_FUNCTIONS: [&str; 3] = [
-    "public.starring_runtime_exact_target_database_readiness_v1()",
+    "public.starring_runtime_exact_target_database_readiness_v2()",
     "public.starring_runtime_exact_target_reader_database_identity_v1()",
-    "public.starring_runtime_exact_target_read_v1(text,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text)",
+    "public.starring_runtime_exact_target_read_v2(text,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text)",
 ];
 const SERVING_FUNCTIONS: [&str; 4] = [
     "public.starring_runtime_serving_database_readiness_v1()",
@@ -410,7 +410,7 @@ async fn cleanup(mut database: IsolatedDatabase) {
 async fn assert_cross_runtime_readiness(database: &mut IsolatedDatabase) {
     assert_controller_lookup_index(&database.owner_pool).await;
     let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
-        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v2(), \
             public.starring_runtime_serving_schema_manifest_v1(), \
             public.starring_runtime_execution_schema_manifest_v1()",
     )
@@ -428,7 +428,7 @@ async fn assert_cross_runtime_readiness(database: &mut IsolatedDatabase) {
     .await
     .unwrap();
     let drifted = sqlx::query_as::<_, (bool, bool, bool)>(
-        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v2(), \
             public.starring_runtime_serving_schema_manifest_v1(), \
             public.starring_runtime_execution_schema_manifest_v1()",
     )
@@ -442,7 +442,7 @@ async fn assert_cross_runtime_readiness(database: &mut IsolatedDatabase) {
         restricted_readiness_pool(database, "exact", EXACT_TARGET_FUNCTIONS.as_slice()).await;
     let exact_rows = sqlx::query_scalar::<_, i64>(
         "SELECT pg_catalog.count(*) \
-         FROM public.starring_runtime_exact_target_database_readiness_v1()",
+         FROM public.starring_runtime_exact_target_database_readiness_v2()",
     )
     .fetch_one(&exact_pool)
     .await
@@ -548,7 +548,7 @@ async fn assert_controller_lookup_index(pool: &PgPool) {
         .await
         .unwrap();
     let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
-        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v2(), \
             public.starring_runtime_serving_schema_manifest_v1(), \
             public.starring_runtime_execution_schema_manifest_v1()",
     )
@@ -572,7 +572,7 @@ async fn assert_controller_lookup_index(pool: &PgPool) {
     .await
     .unwrap();
     let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
-        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v2(), \
             public.starring_runtime_serving_schema_manifest_v1(), \
             public.starring_runtime_execution_schema_manifest_v1()",
     )

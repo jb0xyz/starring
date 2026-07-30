@@ -1,7 +1,7 @@
 #![allow(dead_code, unused_imports)]
 
 use std::future::Future;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,8 +18,9 @@ use automation_ruleset::{
     RuleSetContentHash, RuleSetVersion, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
 };
 use automation_runtime_controller::{
-    RuntimeClaimNextExecutionV1, RuntimeConvergenceMutationV1, RuntimeConvergenceSessionV1,
-    RuntimeExecutionConvergencePort, RuntimeExecutionGuardV1, RuntimeExecutionReceiptV1,
+    runtime_desired_target_digest_v1, RuntimeClaimNextExecutionV1, RuntimeConvergenceMutationV1,
+    RuntimeConvergenceSessionV1, RuntimeExecutionConvergencePort, RuntimeExecutionGuardV1,
+    RuntimeExecutionReceiptV1,
 };
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ActivationRequestId, BindingRevision,
@@ -48,7 +49,11 @@ use automation_state::{InteractionRuleSet, PanelSpec};
 use chrono::{DateTime, TimeDelta, Utc};
 use desired_state::ResourceKey;
 use discord_model::{ChannelId, GuildId, MessageId, UserId};
-use resource_resolution::{ResourceBindingFingerprint, ResourceBindingMap};
+use resource_resolution::{
+    installation_authority_payload_digest_v1, InstallationAuthorityPayloadDigestV1,
+    InstallationAuthorityPayloadIdentityV1, InstallationAuthorityPolicyV1,
+    InstallationAuthorityScopeV1, ResourceBindingFingerprint, ResourceBindingMap,
+};
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::types::Json;
@@ -320,8 +325,23 @@ async fn advance_to_panel_reconciliation(
     ));
     let exact = RuntimeExactTargetV1 {
         snapshot: session.snapshot().clone(),
+        desired_target_digest: runtime_desired_target_digest_v1(
+            &session.snapshot().identity,
+            &session.snapshot().target,
+            session.snapshot().runtime_generation.get(),
+            1,
+            session.snapshot().previous_runtime.as_ref(),
+        ),
         installation_authority_revision: 1,
+        installation_authority_payload_digest: InstallationAuthorityPayloadDigestV1::parse(
+            "3".repeat(64),
+        )
+        .unwrap(),
         current_authority_revision: 1,
+        current_authority_payload_digest: InstallationAuthorityPayloadDigestV1::parse(
+            "3".repeat(64),
+        )
+        .unwrap(),
         artifact: RuleSetVersion {
             guild_id: GUILD,
             ruleset_key: RULESET.parse().unwrap(),
@@ -338,6 +358,7 @@ async fn advance_to_panel_reconciliation(
             created_by: UserId(9_200_201),
         },
         bindings: ResourceBindingMap::default(),
+        database_observed_at: session.acquired_at(),
     };
     (adapter, session, exact)
 }

@@ -207,6 +207,7 @@ pub enum RuntimeProcessFoundationShutdownFailureV1 {
     HealthListener,
     IngressAcknowledgement,
     CapabilityReadiness,
+    RuntimeController,
 }
 
 impl RuntimeProcessFoundationShutdownFailureV1 {
@@ -223,6 +224,7 @@ impl RuntimeProcessFoundationShutdownFailureV1 {
                 "runtime_process_ingress_acknowledgement_supervisor_shutdown"
             }
             Self::CapabilityReadiness => "runtime_process_capability_readiness_supervisor_shutdown",
+            Self::RuntimeController => "runtime_process_serving_controller_shutdown",
         }
     }
 }
@@ -692,6 +694,11 @@ impl RuntimeProcessFoundationV1 {
             self.shutdown_failures
                 .record(RuntimeProcessFoundationShutdownFailureV1::IngressAcknowledgement);
         }
+    }
+
+    pub(super) fn record_runtime_controller_shutdown_failure_v2(&mut self) {
+        self.shutdown_failures
+            .record(RuntimeProcessFoundationShutdownFailureV1::RuntimeController);
     }
 
     pub(crate) async fn shutdown(mut self) -> Result<(), RuntimeProcessFoundationShutdownErrorV1> {

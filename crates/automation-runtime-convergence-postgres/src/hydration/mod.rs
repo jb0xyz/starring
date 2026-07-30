@@ -5,9 +5,10 @@ mod database;
 mod row;
 
 use automation_ruleset::RuleSetVersion;
-use automation_runtime_controller::RuntimeExecutionReceiptV1;
+use automation_runtime_controller::{RuntimeDesiredTargetDigestV1, RuntimeExecutionReceiptV1};
 use automation_runtime_convergence::{ControllerId, FencingToken, RuntimeDeploymentSnapshotV1};
-use resource_resolution::ResourceBindingMap;
+use chrono::{DateTime, Utc};
+use resource_resolution::{InstallationAuthorityPayloadDigestV1, ResourceBindingMap};
 use sqlx::{PgConnection, PgPool};
 
 use crate::error::database;
@@ -35,6 +36,8 @@ pub(super) struct RuntimeExactTargetExecutionV1<'a> {
     pub(super) controller_id: &'a ControllerId,
     pub(super) fencing_token: FencingToken,
     pub(super) convergence_attempt: std::num::NonZeroU32,
+    pub(super) acquired_at: DateTime<Utc>,
+    pub(super) expires_at: DateTime<Utc>,
 }
 
 impl<'a> From<&'a ClaimExecutionReceiptV1> for RuntimeExactTargetExecutionV1<'a> {
@@ -44,6 +47,8 @@ impl<'a> From<&'a ClaimExecutionReceiptV1> for RuntimeExactTargetExecutionV1<'a>
             controller_id: &value.controller_id,
             fencing_token: value.fencing_token,
             convergence_attempt: value.convergence_attempt,
+            acquired_at: value.acquired_at,
+            expires_at: value.expires_at,
         }
     }
 }
@@ -55,6 +60,8 @@ impl<'a> From<&'a RuntimeExecutionReceiptV1> for RuntimeExactTargetExecutionV1<'
             controller_id: &value.controller_id,
             fencing_token: value.fencing_token,
             convergence_attempt: value.convergence_attempt,
+            acquired_at: value.acquired_at,
+            expires_at: value.expires_at,
         }
     }
 }
@@ -62,10 +69,14 @@ impl<'a> From<&'a RuntimeExecutionReceiptV1> for RuntimeExactTargetExecutionV1<'
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeExactTargetV1 {
     pub snapshot: RuntimeDeploymentSnapshotV1,
+    pub desired_target_digest: RuntimeDesiredTargetDigestV1,
     pub installation_authority_revision: u64,
+    pub installation_authority_payload_digest: InstallationAuthorityPayloadDigestV1,
     pub current_authority_revision: u64,
+    pub current_authority_payload_digest: InstallationAuthorityPayloadDigestV1,
     pub artifact: RuleSetVersion,
     pub bindings: ResourceBindingMap,
+    pub database_observed_at: DateTime<Utc>,
 }
 
 #[derive(Clone)]

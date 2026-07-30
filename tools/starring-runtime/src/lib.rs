@@ -23,6 +23,7 @@ mod process_startup;
 mod process_supervisor;
 mod recovery_identity;
 mod registry;
+mod runtime_controller;
 mod secret;
 mod shutdown;
 mod startup;

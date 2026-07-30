@@ -14,6 +14,7 @@ automation-runtime-panel-postgres = { path = "../../crates/automation-runtime-pa
 automation-runtime-registry = { path = "../../crates/automation-runtime-registry" }
 automation-runtime-serving-postgres = { path = "../../crates/automation-runtime-serving-postgres" }
 automation-runtime-worker = { path = "../../crates/automation-runtime-worker" }
+chrono = "0.4"
 getrandom = "0.4"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 thiserror.workspace = true
@@ -22,5 +23,4 @@ paused-discord-gateway = { package = "twilight-gateway", git = "https://github.c
 zeroize = "1"
 
 [dev-dependencies]
-chrono = "0.4"
 serde_json.workspace = true
