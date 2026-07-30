@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 use automation_runtime_controller::{
     RuntimeBarrierPauseWitnessV2, RuntimeCertificationOperationIdV2,
     RuntimeCertificationReservationInputV2, RuntimeCertificationReservationScopeLookupV2,
-    RuntimeConvergenceSessionV1, RuntimeIngressOpenAcknowledgementLeaseDurationV2,
-    RuntimePanelEvidenceV2, RuntimeRouteAdmissionAttestationV2, RuntimeServingRouteAttestationV2,
-    RuntimeServingSlotV2,
+    RuntimeConvergenceSessionV1, RuntimeExecutionReceiptV1,
+    RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimePanelEvidenceV2,
+    RuntimeRouteAdmissionAttestationV2, RuntimeServingRouteAttestationV2, RuntimeServingSlotV2,
 };
 use automation_runtime_convergence::RuntimeDeploymentPhaseV1;
 use automation_runtime_execution_postgres::PostgresPreparedRuntimeCertificationV2;
@@ -1234,6 +1234,9 @@ fn build_certification_reservation_input_v2(
     serving_lease_for: Duration,
 ) -> Result<RuntimeCertificationReservationInputV2, RuntimeServingCertificationFailureV2> {
     let snapshot = session.snapshot();
+    let current_execution = session
+        .current_execution_receipt()
+        .map_err(|_| RuntimeServingCertificationFailureV2::Protocol)?;
     let panel = snapshot
         .panel_certificate
         .as_ref()
@@ -1241,12 +1244,13 @@ fn build_certification_reservation_input_v2(
     if !matches!(
         snapshot.phase,
         RuntimeDeploymentPhaseV1::AwaitingGatewayReady
-    ) || evidence.execution().snapshot != *snapshot
+    ) || !certification_execution_lineage_matches_v2(evidence.execution(), &current_execution)
         || witness.identity.target != snapshot.target
         || witness.identity.runtime_generation != snapshot.runtime_generation
         || witness.identity.process_instance_id != panel.process_instance_id
         || panel.target != snapshot.target
         || panel.runtime_generation != snapshot.runtime_generation
+        || witness.controller_fencing_token != current_execution.fencing_token
         || owner.lease_id.process_instance_id != witness.identity.process_instance_id
         || owner.lease_id.expected_build_revision != build_revision
         || !evidence.binding_pin().matches(
@@ -1273,6 +1277,57 @@ fn build_certification_reservation_input_v2(
         },
         serving_lease_for,
     })
+}
+
+fn certification_execution_lineage_matches_v2(
+    evidence: &RuntimeExecutionReceiptV1,
+    current: &RuntimeExecutionReceiptV1,
+) -> bool {
+    let Some(revision_delta) = current
+        .snapshot
+        .revision
+        .get()
+        .checked_sub(evidence.snapshot.revision.get())
+    else {
+        return false;
+    };
+    let Some(fencing_delta) = current
+        .fencing_token
+        .get()
+        .checked_sub(evidence.fencing_token.get())
+    else {
+        return false;
+    };
+    let lease_time_matches = if fencing_delta == 0 {
+        evidence.acquired_at == current.acquired_at && evidence.expires_at == current.expires_at
+    } else {
+        evidence.acquired_at <= current.acquired_at && evidence.expires_at < current.expires_at
+    };
+    revision_delta >= fencing_delta
+        && lease_time_matches
+        && execution_receipt_lease_matches_v2(evidence)
+        && execution_receipt_lease_matches_v2(current)
+        && evidence.snapshot.identity == current.snapshot.identity
+        && evidence.snapshot.target == current.snapshot.target
+        && evidence.snapshot.runtime_generation == current.snapshot.runtime_generation
+        && evidence.snapshot.previous_runtime == current.snapshot.previous_runtime
+        && evidence.snapshot.requested_at == current.snapshot.requested_at
+        && evidence.controller_id == current.controller_id
+        && evidence.convergence_attempt == current.convergence_attempt
+}
+
+fn execution_receipt_lease_matches_v2(execution: &RuntimeExecutionReceiptV1) -> bool {
+    execution
+        .snapshot
+        .controller_lease
+        .as_ref()
+        .is_some_and(|lease| {
+            lease.controller_id == execution.controller_id
+                && lease.fencing_token == execution.fencing_token
+                && lease.acquired_at == execution.acquired_at
+                && lease.expires_at == execution.expires_at
+                && execution.snapshot.last_fencing_token == Some(execution.fencing_token)
+        })
 }
 
 async fn reserve_and_prepare_certification_v2(
@@ -1857,7 +1912,267 @@ fn classify_monitor_admission_v2(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
+    use automation_runtime_convergence::{
+        BindingRevision, CommandGuardV1, ControllerId, FencingToken, LeaseRequestV1,
+        PreflightAttestationV1, PromotionId, RuntimeDeployment, RuntimeDeploymentIdentityV1,
+        RuntimeDeploymentTargetV1, RuntimeGeneration,
+    };
+    use serde_json::json;
+
     use super::*;
+
+    fn at(second: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(second, 0).unwrap()
+    }
+
+    fn lineage_execution_v2() -> RuntimeExecutionReceiptV1 {
+        let identity: RuntimeDeploymentIdentityV1 = serde_json::from_value(json!({
+            "deployment_id": "deployment:lineage",
+            "tenant_id": "tenant:lineage",
+            "installation_id": "installation:lineage",
+            "promotion_id": "a".repeat(64),
+            "activation_request_id": "activation:lineage"
+        }))
+        .unwrap();
+        let target: RuntimeDeploymentTargetV1 = serde_json::from_value(json!({
+            "guild_id": "7",
+            "ruleset_key": "lineage",
+            "version": 1,
+            "content_hash": "b".repeat(64),
+            "binding_revision": 3,
+            "binding_fingerprint": "c".repeat(64)
+        }))
+        .unwrap();
+        let controller_id = ControllerId::parse("controller:lineage").unwrap();
+        let fencing_token = FencingToken::new(5).unwrap();
+        let mut deployment = RuntimeDeployment::request(
+            identity,
+            target,
+            RuntimeGeneration::new(4).unwrap(),
+            None,
+            at(1),
+        )
+        .unwrap();
+        deployment
+            .acquire_lease(LeaseRequestV1 {
+                expected_revision: deployment.revision(),
+                controller_id,
+                fencing_token,
+                now: at(10),
+                expires_at: at(30),
+            })
+            .unwrap();
+        execution_from_deployment_v2(&deployment)
+    }
+
+    fn execution_from_deployment_v2(deployment: &RuntimeDeployment) -> RuntimeExecutionReceiptV1 {
+        let snapshot = deployment.snapshot();
+        let lease = snapshot.controller_lease.as_ref().unwrap();
+        RuntimeExecutionReceiptV1 {
+            controller_id: lease.controller_id.clone(),
+            fencing_token: lease.fencing_token,
+            convergence_attempt: NonZeroU32::new(6).unwrap(),
+            acquired_at: lease.acquired_at,
+            expires_at: lease.expires_at,
+            snapshot,
+        }
+    }
+
+    #[test]
+    fn certification_lineage_accepts_valid_mutation_and_renewal_progress() {
+        let evidence = lineage_execution_v2();
+        let mut mutation = RuntimeDeployment::restore(evidence.snapshot.clone()).unwrap();
+        mutation
+            .accept_preflight(
+                &CommandGuardV1 {
+                    expected_revision: mutation.revision(),
+                    controller_id: evidence.controller_id.clone(),
+                    fencing_token: evidence.fencing_token,
+                    runtime_generation: evidence.snapshot.runtime_generation,
+                    now: at(11),
+                },
+                PreflightAttestationV1 {
+                    target: evidence.snapshot.target.clone(),
+                    runtime_generation: evidence.snapshot.runtime_generation,
+                    observed_runtime: None,
+                    checked_at: at(11),
+                },
+            )
+            .unwrap();
+        let mutation = execution_from_deployment_v2(&mutation);
+        assert!(certification_execution_lineage_matches_v2(
+            &evidence, &mutation
+        ));
+
+        let mut renewed = RuntimeDeployment::restore(evidence.snapshot.clone()).unwrap();
+        renewed
+            .acquire_lease(LeaseRequestV1 {
+                expected_revision: renewed.revision(),
+                controller_id: evidence.controller_id.clone(),
+                fencing_token: evidence.fencing_token.next().unwrap(),
+                now: at(11),
+                expires_at: at(40),
+            })
+            .unwrap();
+        renewed
+            .accept_preflight(
+                &CommandGuardV1 {
+                    expected_revision: renewed.revision(),
+                    controller_id: evidence.controller_id.clone(),
+                    fencing_token: evidence.fencing_token.next().unwrap(),
+                    runtime_generation: evidence.snapshot.runtime_generation,
+                    now: at(12),
+                },
+                PreflightAttestationV1 {
+                    target: evidence.snapshot.target.clone(),
+                    runtime_generation: evidence.snapshot.runtime_generation,
+                    observed_runtime: None,
+                    checked_at: at(12),
+                },
+            )
+            .unwrap();
+        let renewed = execution_from_deployment_v2(&renewed);
+        assert!(certification_execution_lineage_matches_v2(
+            &evidence, &renewed
+        ));
+        assert_ne!(evidence.snapshot, renewed.snapshot);
+    }
+
+    #[test]
+    fn certification_lineage_rejects_identity_authority_and_time_drift() {
+        let evidence = lineage_execution_v2();
+
+        let mut promotion = evidence.clone();
+        promotion.snapshot.identity.promotion_id = PromotionId::parse("d".repeat(64)).unwrap();
+        assert!(!certification_execution_lineage_matches_v2(
+            &evidence, &promotion
+        ));
+
+        let mut target = evidence.clone();
+        target.snapshot.target.binding_revision = BindingRevision::new(4).unwrap();
+        assert!(!certification_execution_lineage_matches_v2(
+            &evidence, &target
+        ));
+
+        let mut controller = evidence.clone();
+        controller.controller_id = ControllerId::parse("controller:other").unwrap();
+        assert!(!certification_execution_lineage_matches_v2(
+            &evidence,
+            &controller
+        ));
+
+        let mut fence = evidence.clone();
+        fence.fencing_token = FencingToken::new(4).unwrap();
+        fence
+            .snapshot
+            .controller_lease
+            .as_mut()
+            .unwrap()
+            .fencing_token = fence.fencing_token;
+        fence.snapshot.last_fencing_token = Some(fence.fencing_token);
+        assert!(!certification_execution_lineage_matches_v2(
+            &evidence, &fence
+        ));
+
+        let mut attempt = evidence.clone();
+        attempt.convergence_attempt = NonZeroU32::new(7).unwrap();
+        assert!(!certification_execution_lineage_matches_v2(
+            &evidence, &attempt
+        ));
+
+        let mut revision = evidence.clone();
+        revision.snapshot.revision = revision.snapshot.revision.next().unwrap();
+        assert!(!certification_execution_lineage_matches_v2(
+            &revision, &evidence
+        ));
+
+        let mut acquired = evidence.clone();
+        acquired.acquired_at = at(9);
+        acquired
+            .snapshot
+            .controller_lease
+            .as_mut()
+            .unwrap()
+            .acquired_at = acquired.acquired_at;
+        assert!(!certification_execution_lineage_matches_v2(
+            &evidence, &acquired
+        ));
+
+        let mut expiry = evidence.clone();
+        expiry.expires_at = at(29);
+        expiry
+            .snapshot
+            .controller_lease
+            .as_mut()
+            .unwrap()
+            .expires_at = expiry.expires_at;
+        assert!(!certification_execution_lineage_matches_v2(
+            &evidence, &expiry
+        ));
+
+        let mut same_revision_new_fence = evidence.clone();
+        same_revision_new_fence.fencing_token =
+            same_revision_new_fence.fencing_token.next().unwrap();
+        same_revision_new_fence.expires_at = at(40);
+        same_revision_new_fence
+            .snapshot
+            .controller_lease
+            .as_mut()
+            .unwrap()
+            .fencing_token = same_revision_new_fence.fencing_token;
+        same_revision_new_fence
+            .snapshot
+            .controller_lease
+            .as_mut()
+            .unwrap()
+            .expires_at = same_revision_new_fence.expires_at;
+        same_revision_new_fence.snapshot.last_fencing_token =
+            Some(same_revision_new_fence.fencing_token);
+        assert!(!certification_execution_lineage_matches_v2(
+            &evidence,
+            &same_revision_new_fence
+        ));
+
+        let mut same_fence_new_expiry = evidence.clone();
+        same_fence_new_expiry.expires_at = at(40);
+        same_fence_new_expiry
+            .snapshot
+            .controller_lease
+            .as_mut()
+            .unwrap()
+            .expires_at = same_fence_new_expiry.expires_at;
+        assert!(!certification_execution_lineage_matches_v2(
+            &evidence,
+            &same_fence_new_expiry
+        ));
+
+        let mut fence_outpaces_revision = evidence.clone();
+        fence_outpaces_revision.snapshot.revision =
+            fence_outpaces_revision.snapshot.revision.next().unwrap();
+        fence_outpaces_revision.fencing_token =
+            FencingToken::new(evidence.fencing_token.get() + 2).unwrap();
+        fence_outpaces_revision.expires_at = at(40);
+        fence_outpaces_revision
+            .snapshot
+            .controller_lease
+            .as_mut()
+            .unwrap()
+            .fencing_token = fence_outpaces_revision.fencing_token;
+        fence_outpaces_revision
+            .snapshot
+            .controller_lease
+            .as_mut()
+            .unwrap()
+            .expires_at = fence_outpaces_revision.expires_at;
+        fence_outpaces_revision.snapshot.last_fencing_token =
+            Some(fence_outpaces_revision.fencing_token);
+        assert!(!certification_execution_lineage_matches_v2(
+            &evidence,
+            &fence_outpaces_revision
+        ));
+    }
 
     #[test]
     fn monitor_set_rejects_duplicates_and_capacity_without_replacement() {
