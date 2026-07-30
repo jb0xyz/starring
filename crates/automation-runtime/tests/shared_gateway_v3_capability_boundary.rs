@@ -115,20 +115,24 @@ fn barrier_commands_are_reserved_before_pause_and_resume_without_queue_wait() {
         .split("pub async fn pause_admission_reserved_v3(")
         .next()
         .unwrap();
-    assert_eq!(reservation.matches(".try_reserve_owned()").count(), 2);
-    let first_permit = reservation.find(".try_reserve_owned()").unwrap();
-    let second_permit = reservation.rfind(".try_reserve_owned()").unwrap();
+    let permits = reservation
+        .match_indices(".try_reserve_owned()")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(permits.len(), 4);
+    let lifecycle_upgrade = reservation.find(".lifecycle_reservations").unwrap();
     let pause_channel = reservation
         .find("let (pause_acknowledgement, pause_observation) = oneshot::channel()")
         .unwrap();
     let resume_channel = reservation
         .find("let (resume_acknowledgement, resume_observation) = oneshot::channel()")
         .unwrap();
-    assert!(
-        first_permit < second_permit
-            && second_permit < pause_channel
-            && pause_channel < resume_channel
-    );
+    assert!(permits[0] < permits[1]);
+    assert!(permits[1] < lifecycle_upgrade);
+    assert!(lifecycle_upgrade < permits[2]);
+    assert!(permits[2] < permits[3]);
+    assert!(permits[3] < pause_channel);
+    assert!(pause_channel < resume_channel);
 
     let pause = control
         .split("pub async fn pause_admission_reserved_v3(")
@@ -137,9 +141,11 @@ fn barrier_commands_are_reserved_before_pause_and_resume_without_queue_wait() {
         .split("pub async fn resume_admission_reserved_v3(")
         .next()
         .unwrap();
-    assert!(pause.contains("pause.permit.send(GatewayCommandV3::Pause"));
+    assert!(pause.contains("pause.permit.send(GatewayCommandV3::PauseReserved"));
+    assert!(pause.contains("lifecycle: pause.lifecycle"));
     assert!(!pause.contains("oneshot::channel"));
     assert!(!pause.contains("self.commands.send"));
+    assert!(!pause.contains("try_send"));
     assert!(!pause.contains("reserve_owned"));
 
     let resume = control
@@ -149,10 +155,48 @@ fn barrier_commands_are_reserved_before_pause_and_resume_without_queue_wait() {
         .split("pub async fn pause_admission(")
         .next()
         .unwrap();
-    assert!(resume.contains("reservation.resume.permit.send(GatewayCommandV3::Resume"));
+    assert!(resume.contains("GatewayCommandV3::ResumeReserved"));
+    assert!(resume.contains("lifecycle: reservation.resume.lifecycle"));
     assert!(!resume.contains("oneshot::channel"));
     assert!(!resume.contains("self.commands.send"));
+    assert!(!resume.contains("try_send"));
     assert!(!resume.contains("reserve_owned"));
+
+    let runtime_pause = control
+        .split("fn pause_reserved(")
+        .nth(1)
+        .unwrap()
+        .split("fn resume(")
+        .next()
+        .unwrap();
+    let runtime_resume = control
+        .split("fn resume_reserved(")
+        .nth(1)
+        .unwrap()
+        .split("fn drain(")
+        .next()
+        .unwrap();
+    for transition in [runtime_pause, runtime_resume] {
+        assert!(transition.contains("self.publish_reserved_transition("));
+        assert!(!transition.contains("self.publish_transition("));
+        assert!(!transition.contains("try_reserve"));
+        assert!(!transition.contains("reserve_owned"));
+        assert!(!transition.contains("oneshot::channel"));
+        assert!(!transition.contains(".await"));
+    }
+    let publication = control
+        .split("fn publish_reserved_transition(")
+        .nth(1)
+        .unwrap()
+        .split("fn fail_closed(")
+        .next()
+        .unwrap();
+    assert!(publication.contains("lifecycle.send(event)"));
+    assert!(!publication.contains("try_reserve"));
+    assert!(!publication.contains("reserve_owned"));
+    assert!(!publication.contains("oneshot::channel"));
+    assert!(!publication.contains(".await"));
+    assert!(control.contains("lifecycle_reservations: mpsc::WeakSender<GatewayLifecycleEventV3>"));
 
     for authority in [
         "GatewayBarrierCommandReservationV3",

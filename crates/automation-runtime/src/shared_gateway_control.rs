@@ -306,8 +306,10 @@ pub enum GatewayBarrierCommandReservationErrorV3 {
     ControlOrphaned,
     #[error("gateway runtime is no longer accepting commands")]
     RuntimeStopped,
-    #[error("gateway barrier command capacity is unavailable")]
+    #[error("gateway barrier capacity is unavailable")]
     CapacityUnavailable,
+    #[error("gateway admission snapshot changed during barrier reservation")]
+    StaleAdmissionSnapshot,
 }
 
 #[derive(Clone)]
@@ -446,8 +448,20 @@ enum GatewayCommandV3 {
         acknowledgement:
             oneshot::Sender<Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3>>,
     },
+    PauseReserved {
+        expected_snapshot: GatewayAdmissionSnapshotV3,
+        lifecycle: mpsc::OwnedPermit<GatewayLifecycleEventV3>,
+        acknowledgement:
+            oneshot::Sender<Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3>>,
+    },
     Resume {
         pause_token: GatewayPauseTokenV3,
+        acknowledgement:
+            oneshot::Sender<Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3>>,
+    },
+    ResumeReserved {
+        pause_token: GatewayPauseTokenV3,
+        lifecycle: mpsc::OwnedPermit<GatewayLifecycleEventV3>,
         acknowledgement:
             oneshot::Sender<Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3>>,
     },
@@ -459,12 +473,14 @@ enum GatewayCommandV3 {
 
 struct GatewayReservedCommandV3 {
     permit: mpsc::OwnedPermit<GatewayCommandV3>,
+    lifecycle: mpsc::OwnedPermit<GatewayLifecycleEventV3>,
     acknowledgement: oneshot::Sender<Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3>>,
     observation: oneshot::Receiver<Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3>>,
 }
 
 pub struct GatewayBarrierCommandReservationV3 {
     control_alive: Weak<AtomicBool>,
+    expected_snapshot: GatewayAdmissionSnapshotV3,
     pause: GatewayReservedCommandV3,
     resume: GatewayReservedCommandV3,
 }
@@ -489,6 +505,7 @@ impl fmt::Debug for GatewayReservedResumeCommandV3 {
 pub struct SharedGatewayControlV3 {
     commands: mpsc::Sender<GatewayCommandV3>,
     lifecycle: mpsc::Receiver<GatewayLifecycleEventV3>,
+    lifecycle_reservations: mpsc::WeakSender<GatewayLifecycleEventV3>,
     connection: watch::Receiver<GatewayConnectionStateV3>,
     admission: watch::Receiver<GatewayAdmissionSnapshotV3>,
     control_alive: Arc<AtomicBool>,
@@ -549,6 +566,7 @@ impl SharedGatewayControlV3 {
         if !self.control_alive.load(Ordering::Acquire) || !self.invalidation.is_healthy() {
             return Err(GatewayBarrierCommandReservationErrorV3::ControlOrphaned);
         }
+        let expected_snapshot = self.current_admission_snapshot();
         let pause_permit = self
             .commands
             .clone()
@@ -559,20 +577,37 @@ impl SharedGatewayControlV3 {
             .clone()
             .try_reserve_owned()
             .map_err(map_barrier_reservation_error_v3)?;
+        let lifecycle = self
+            .lifecycle_reservations
+            .upgrade()
+            .ok_or(GatewayBarrierCommandReservationErrorV3::RuntimeStopped)?;
+        let pause_lifecycle = lifecycle
+            .clone()
+            .try_reserve_owned()
+            .map_err(map_barrier_reservation_error_v3)?;
+        let resume_lifecycle = lifecycle
+            .try_reserve_owned()
+            .map_err(map_barrier_reservation_error_v3)?;
         if !self.control_alive.load(Ordering::Acquire) || !self.invalidation.is_healthy() {
             return Err(GatewayBarrierCommandReservationErrorV3::ControlOrphaned);
+        }
+        if self.current_admission_snapshot() != expected_snapshot {
+            return Err(GatewayBarrierCommandReservationErrorV3::StaleAdmissionSnapshot);
         }
         let (pause_acknowledgement, pause_observation) = oneshot::channel();
         let (resume_acknowledgement, resume_observation) = oneshot::channel();
         Ok(GatewayBarrierCommandReservationV3 {
             control_alive: Arc::downgrade(&self.control_alive),
+            expected_snapshot,
             pause: GatewayReservedCommandV3 {
                 permit: pause_permit,
+                lifecycle: pause_lifecycle,
                 acknowledgement: pause_acknowledgement,
                 observation: pause_observation,
             },
             resume: GatewayReservedCommandV3 {
                 permit: resume_permit,
+                lifecycle: resume_lifecycle,
                 acknowledgement: resume_acknowledgement,
                 observation: resume_observation,
             },
@@ -594,10 +629,16 @@ impl SharedGatewayControlV3 {
         }
         let GatewayBarrierCommandReservationV3 {
             control_alive,
+            expected_snapshot,
             pause,
             resume,
         } = reservation;
-        pause.permit.send(GatewayCommandV3::Pause {
+        if self.current_admission_snapshot() != expected_snapshot {
+            return Err(GatewayControlTransitionErrorV3::StaleAdmissionSnapshot.into());
+        }
+        pause.permit.send(GatewayCommandV3::PauseReserved {
+            expected_snapshot,
+            lifecycle: pause.lifecycle,
             acknowledgement: pause.acknowledgement,
         });
         let acknowledgement = pause
@@ -635,10 +676,14 @@ impl SharedGatewayControlV3 {
         {
             return Err(GatewayControlTransitionErrorV3::StaleAdmissionSnapshot.into());
         }
-        reservation.resume.permit.send(GatewayCommandV3::Resume {
-            pause_token,
-            acknowledgement: reservation.resume.acknowledgement,
-        });
+        reservation
+            .resume
+            .permit
+            .send(GatewayCommandV3::ResumeReserved {
+                pause_token,
+                lifecycle: reservation.resume.lifecycle,
+                acknowledgement: reservation.resume.acknowledgement,
+            });
         let acknowledgement = reservation
             .resume
             .observation
@@ -762,8 +807,8 @@ impl SharedGatewayControlV3 {
     }
 }
 
-fn map_barrier_reservation_error_v3(
-    error: mpsc::error::TrySendError<mpsc::Sender<GatewayCommandV3>>,
+fn map_barrier_reservation_error_v3<T>(
+    error: mpsc::error::TrySendError<T>,
 ) -> GatewayBarrierCommandReservationErrorV3 {
     match error {
         mpsc::error::TrySendError::Full(_) => {
@@ -918,6 +963,7 @@ fn shared_gateway_control_channel_inner_v3(
         SharedGatewayControlV3 {
             commands: command_sender,
             lifecycle: lifecycle_receiver,
+            lifecycle_reservations: lifecycle_sender.downgrade(),
             connection: connection_receiver,
             admission: admission_receiver,
             control_alive: control_alive.clone(),
@@ -1055,6 +1101,16 @@ impl SharedGatewayRuntimeControlV3 {
                 let _ = acknowledgement.send(result);
                 outcome
             }
+            GatewayCommandV3::PauseReserved {
+                expected_snapshot,
+                lifecycle,
+                acknowledgement,
+            } => {
+                let result = self.pause_reserved(expected_snapshot, lifecycle);
+                let outcome = command_outcome(&result);
+                let _ = acknowledgement.send(result);
+                outcome
+            }
             GatewayCommandV3::Resume {
                 pause_token,
                 acknowledgement,
@@ -1063,6 +1119,26 @@ impl SharedGatewayRuntimeControlV3 {
                     Err(GatewayControlTransitionErrorV3::StaleAdmissionSnapshot)
                 } else {
                     self.resume(&pause_token)
+                };
+                if !self.control_alive.load(Ordering::Acquire) {
+                    self.fail_closed(GatewayDrainCauseV3::ControlOrphaned);
+                    let _ =
+                        acknowledgement.send(Err(GatewayControlTransitionErrorV3::ControlOrphaned));
+                    return GatewayRuntimeCommandOutcomeV3::ControlOrphaned;
+                }
+                let outcome = command_outcome(&result);
+                let _ = acknowledgement.send(result);
+                outcome
+            }
+            GatewayCommandV3::ResumeReserved {
+                pause_token,
+                lifecycle,
+                acknowledgement,
+            } => {
+                let result = if acknowledgement.is_closed() {
+                    Err(GatewayControlTransitionErrorV3::StaleAdmissionSnapshot)
+                } else {
+                    self.resume_reserved(&pause_token, lifecycle)
                 };
                 if !self.control_alive.load(Ordering::Acquire) {
                     self.fail_closed(GatewayDrainCauseV3::ControlOrphaned);
@@ -1129,6 +1205,47 @@ impl SharedGatewayRuntimeControlV3 {
     }
 
     fn pause(&mut self) -> Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3> {
+        let (connection, epoch, admission_revision) = self.prepare_pause_transition(None)?;
+        self.publish_transition(
+            GatewayConnectionStateV3::Paused { connection },
+            GatewayLifecycleEventV3::Paused { epoch },
+            admission_revision,
+            GatewayAdmissionEvidenceUpdateV3::Preserve,
+        )?;
+        Ok(self.paused_acknowledgement(epoch))
+    }
+
+    fn pause_reserved(
+        &mut self,
+        expected_snapshot: GatewayAdmissionSnapshotV3,
+        lifecycle: mpsc::OwnedPermit<GatewayLifecycleEventV3>,
+    ) -> Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3> {
+        let (connection, epoch, admission_revision) =
+            self.prepare_pause_transition(Some(expected_snapshot))?;
+        self.publish_reserved_transition(
+            GatewayConnectionStateV3::Paused { connection },
+            GatewayLifecycleEventV3::Paused { epoch },
+            admission_revision,
+            GatewayAdmissionEvidenceUpdateV3::Preserve,
+            lifecycle,
+        )?;
+        Ok(self.paused_acknowledgement(epoch))
+    }
+
+    fn prepare_pause_transition(
+        &mut self,
+        expected_snapshot: Option<GatewayAdmissionSnapshotV3>,
+    ) -> Result<
+        (
+            GatewayPausedConnectionV3,
+            Option<GatewayConnectionEpochV3>,
+            GatewayAdmissionRevisionV3,
+        ),
+        GatewayControlTransitionErrorV3,
+    > {
+        if expected_snapshot.is_some_and(|expected| self.admission_snapshot != expected) {
+            return Err(GatewayControlTransitionErrorV3::StaleAdmissionSnapshot);
+        }
         let connection = match self.state {
             GatewayConnectionStateV3::Starting => GatewayPausedConnectionV3::Starting,
             GatewayConnectionStateV3::Connected { epoch, kind } => {
@@ -1145,15 +1262,18 @@ impl SharedGatewayRuntimeControlV3 {
                 return Err(GatewayControlTransitionErrorV3::Stopped)
             }
         };
-        let epoch = connection.current_epoch();
-        let admission_revision = self.next_admission_revision()?;
-        self.publish_transition(
-            GatewayConnectionStateV3::Paused { connection },
-            GatewayLifecycleEventV3::Paused { epoch },
-            admission_revision,
-            GatewayAdmissionEvidenceUpdateV3::Preserve,
-        )?;
-        Ok(GatewayCommandAckV3::Paused {
+        Ok((
+            connection,
+            connection.current_epoch(),
+            self.next_admission_revision()?,
+        ))
+    }
+
+    fn paused_acknowledgement(
+        &self,
+        epoch: Option<GatewayConnectionEpochV3>,
+    ) -> GatewayCommandAckV3 {
+        GatewayCommandAckV3::Paused {
             epoch,
             resume_token: GatewayPauseTokenV3 {
                 control_alive: Arc::downgrade(&self.control_alive),
@@ -1161,13 +1281,50 @@ impl SharedGatewayRuntimeControlV3 {
                 admission_revision: self.admission_snapshot.admission_revision,
                 transition_sequence: self.admission_snapshot.transition_sequence,
             },
-        })
+        }
     }
 
     fn resume(
         &mut self,
         pause_token: &GatewayPauseTokenV3,
     ) -> Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3> {
+        let (epoch, kind) = self.prepare_resume_transition(pause_token)?;
+        if let Some(kind) = kind {
+            self.publish_transition(
+                GatewayConnectionStateV3::Connected { epoch, kind },
+                GatewayLifecycleEventV3::AdmissionResumed { epoch },
+                self.admission_snapshot.admission_revision,
+                GatewayAdmissionEvidenceUpdateV3::Resumed,
+            )?;
+        }
+        Ok(GatewayCommandAckV3::AdmissionResumed { epoch })
+    }
+
+    fn resume_reserved(
+        &mut self,
+        pause_token: &GatewayPauseTokenV3,
+        lifecycle: mpsc::OwnedPermit<GatewayLifecycleEventV3>,
+    ) -> Result<GatewayCommandAckV3, GatewayControlTransitionErrorV3> {
+        let (epoch, kind) = self.prepare_resume_transition(pause_token)?;
+        if let Some(kind) = kind {
+            self.publish_reserved_transition(
+                GatewayConnectionStateV3::Connected { epoch, kind },
+                GatewayLifecycleEventV3::AdmissionResumed { epoch },
+                self.admission_snapshot.admission_revision,
+                GatewayAdmissionEvidenceUpdateV3::Resumed,
+                lifecycle,
+            )?;
+        }
+        Ok(GatewayCommandAckV3::AdmissionResumed { epoch })
+    }
+
+    fn prepare_resume_transition(
+        &self,
+        pause_token: &GatewayPauseTokenV3,
+    ) -> Result<
+        (GatewayConnectionEpochV3, Option<GatewayReadyKindV3>),
+        GatewayControlTransitionErrorV3,
+    > {
         if !Weak::ptr_eq(
             &pause_token.control_alive,
             &Arc::downgrade(&self.control_alive),
@@ -1182,13 +1339,7 @@ impl SharedGatewayRuntimeControlV3 {
                 connection: GatewayPausedConnectionV3::Connected { epoch, kind },
             } if epoch == expected_epoch => {
                 self.require_admission_snapshot(pause_token)?;
-                self.publish_transition(
-                    GatewayConnectionStateV3::Connected { epoch, kind },
-                    GatewayLifecycleEventV3::AdmissionResumed { epoch },
-                    self.admission_snapshot.admission_revision,
-                    GatewayAdmissionEvidenceUpdateV3::Resumed,
-                )?;
-                Ok(GatewayCommandAckV3::AdmissionResumed { epoch })
+                Ok((epoch, Some(kind)))
             }
             GatewayConnectionStateV3::Paused {
                 connection: GatewayPausedConnectionV3::Connected { .. },
@@ -1198,9 +1349,7 @@ impl SharedGatewayRuntimeControlV3 {
                     && matches!(self.state, GatewayConnectionStateV3::Connected { .. })
                 {
                     self.require_admission_snapshot(pause_token)?;
-                    Ok(GatewayCommandAckV3::AdmissionResumed {
-                        epoch: expected_epoch,
-                    })
+                    Ok((expected_epoch, None))
                 } else {
                     Err(GatewayControlTransitionErrorV3::StaleConnectionEpoch)
                 }
@@ -1355,6 +1504,20 @@ impl SharedGatewayRuntimeControlV3 {
             }
         };
         result
+    }
+
+    fn publish_reserved_transition(
+        &mut self,
+        state: GatewayConnectionStateV3,
+        event: GatewayLifecycleEventV3,
+        admission_revision: GatewayAdmissionRevisionV3,
+        evidence: GatewayAdmissionEvidenceUpdateV3,
+        lifecycle: mpsc::OwnedPermit<GatewayLifecycleEventV3>,
+    ) -> Result<(), GatewayControlTransitionErrorV3> {
+        let snapshot = self.next_admission_snapshot(state, admission_revision, evidence)?;
+        self.replace_snapshot(snapshot);
+        lifecycle.send(event);
+        Ok(())
     }
 
     fn fail_closed(&mut self, cause: GatewayDrainCauseV3) {
@@ -2551,10 +2714,10 @@ mod tests {
 
     #[tokio::test]
     async fn reserved_barrier_preallocates_pause_and_resume_before_transition() {
-        let (control, mut runtime) = shared_gateway_control_channel_with_policy_v3(
+        let (mut control, mut runtime) = shared_gateway_control_channel_with_policy_v3(
             GatewayControlConfigV3::new(
                 NonZeroUsize::new(2).unwrap(),
-                NonZeroUsize::new(8).unwrap(),
+                NonZeroUsize::new(4).unwrap(),
             )
             .unwrap(),
             GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
@@ -2597,12 +2760,48 @@ mod tests {
             GatewayCommandAckV3::AdmissionResumed { epoch }
         );
         assert!(control.issue_ready_lease(epoch).is_ok());
+        for expected in [
+            GatewayLifecycleEventV3::Starting,
+            GatewayLifecycleEventV3::Connected {
+                epoch,
+                kind: GatewayReadyKindV3::Ready,
+                paused: true,
+            },
+            GatewayLifecycleEventV3::Paused { epoch: Some(epoch) },
+            GatewayLifecycleEventV3::AdmissionResumed { epoch },
+        ] {
+            assert_eq!(control.next_lifecycle().await, Some(expected));
+        }
     }
 
     #[tokio::test]
     async fn insufficient_barrier_capacity_fails_before_pause_and_releases_reservation() {
         let (control, mut runtime) = shared_gateway_control_channel_with_policy_v3(
             GatewayControlConfigV3::new(NonZeroUsize::MIN, NonZeroUsize::new(8).unwrap()).unwrap(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        );
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        assert!(matches!(
+            control.try_reserve_barrier_commands_v3(),
+            Err(GatewayBarrierCommandReservationErrorV3::CapacityUnavailable)
+        ));
+        assert!(matches!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Paused {
+                connection: GatewayPausedConnectionV3::Connected { epoch: value, .. }
+            } if value == epoch
+        ));
+        assert!(pause(&control, &mut runtime).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn insufficient_lifecycle_capacity_fails_before_pause_and_releases_reservation() {
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_v3(
+            GatewayControlConfigV3::new(
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(3).unwrap(),
+            )
+            .unwrap(),
             GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
         );
         let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
@@ -2643,6 +2842,79 @@ mod tests {
             ))
         ));
         assert!(pause(&control_a, &mut runtime_a).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stale_barrier_reservation_is_rejected_before_dispatch() {
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        );
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let reservation = control.try_reserve_barrier_commands_v3().unwrap();
+        runtime
+            .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
+            .unwrap();
+        assert!(matches!(
+            control.pause_admission_reserved_v3(reservation).await,
+            Err(GatewayControlErrorV3::Transition(
+                GatewayControlTransitionErrorV3::StaleAdmissionSnapshot
+            ))
+        ));
+        assert!(matches!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Paused {
+                connection: GatewayPausedConnectionV3::Disconnected {
+                    last_epoch: Some(value),
+                    kind: GatewayDisconnectKindV3::Reconnect,
+                }
+            } if value == epoch
+        ));
+        assert!(pause(&control, &mut runtime).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatched_stale_barrier_reservation_is_rejected_by_runtime() {
+        let (control, mut runtime) = shared_gateway_control_channel_with_policy_v3(
+            GatewayControlConfigV3::default(),
+            GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect,
+        );
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let reservation = control.try_reserve_barrier_commands_v3().unwrap();
+        let GatewayBarrierCommandReservationV3 {
+            expected_snapshot,
+            pause,
+            resume,
+            ..
+        } = reservation;
+        drop(resume);
+        pause.permit.send(GatewayCommandV3::PauseReserved {
+            expected_snapshot,
+            lifecycle: pause.lifecycle,
+            acknowledgement: pause.acknowledgement,
+        });
+        runtime
+            .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
+            .unwrap();
+        assert_eq!(
+            runtime.process_next_command().await,
+            GatewayRuntimeCommandOutcomeV3::Rejected(
+                GatewayControlTransitionErrorV3::StaleAdmissionSnapshot
+            )
+        );
+        assert_eq!(
+            pause.observation.await.unwrap(),
+            Err(GatewayControlTransitionErrorV3::StaleAdmissionSnapshot)
+        );
+        assert!(matches!(
+            control.current_connection(),
+            GatewayConnectionStateV3::Paused {
+                connection: GatewayPausedConnectionV3::Disconnected {
+                    last_epoch: Some(value),
+                    kind: GatewayDisconnectKindV3::Reconnect,
+                }
+            } if value == epoch
+        ));
     }
 
     #[test]
