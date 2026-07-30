@@ -10,8 +10,8 @@ use automation_runtime_controller::{
     RuntimeConvergenceMutationV1, RuntimeConvergenceSessionStateV1, RuntimeConvergenceSessionV1,
     RuntimeDisconnectServingV1, RuntimeExecutionReceiptV1, RuntimeMutationReceiptV1,
     RuntimeMutationRequestV1, RuntimeObservePreviousServingV1,
-    RuntimePreviousServingObservationReceiptV1, RuntimeServingLeasePort, RuntimeServingSlotV2,
-    RuntimeServingUpdateReceiptV1,
+    RuntimePreviousServingObservationReceiptV1, RuntimeServingLeasePort, RuntimeServingReceiptV2,
+    RuntimeServingSlotV2, RuntimeServingUpdateReceiptV1,
 };
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ControllerId, RuntimeDeploymentPhaseV1,
@@ -1398,7 +1398,7 @@ impl From<RuntimeHeldAdvanceFailureV2> for RuntimeHeldPostCleanupOutcomeV2 {
     }
 }
 
-struct RuntimeHeldDrainedRouteV2 {
+pub(crate) struct RuntimeHeldDrainedRouteV2 {
     staged: RuntimeRegistryReplacementRouteV2,
     session: RuntimeConvergenceSessionV1,
     permit: RuntimeServingSlotWorkPermitV2,
@@ -1407,12 +1407,157 @@ struct RuntimeHeldDrainedRouteV2 {
     witness: RuntimeRouteWitnessV2,
 }
 
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct RuntimeControllerCertificationHandoffV2 {
+    held: RuntimeHeldDrainedRouteV2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[allow(dead_code)]
+pub(crate) enum RuntimeControllerCertificationHandoffRejectionV2 {
+    #[error("runtime certification handoff receiver is unavailable")]
+    Unavailable,
+    #[error("runtime certification handoff acceptance deadline elapsed")]
+    DeadlineElapsed,
+    #[error("runtime certification handoff authority became stale before acceptance")]
+    StaleAuthority,
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) enum RuntimeControllerCertificationHandoffReplyV2 {
+    Rejected {
+        handoff: Box<RuntimeControllerCertificationHandoffV2>,
+        source: RuntimeControllerCertificationHandoffRejectionV2,
+    },
+    Accepted(Box<RuntimeServingReceiptV2>),
+}
+
+#[allow(dead_code)]
+pub(crate) type RuntimeControllerAcceptedCertificationPartsV2 = (
+    RuntimeRegistryReplacementRouteV2,
+    RuntimeConvergenceSessionV1,
+    RuntimeServingSlotWorkPermitV2,
+    RuntimeExactTargetEvidenceV2,
+    RuntimeExactTargetV1,
+    RuntimeRouteWitnessV2,
+);
+
+#[allow(dead_code)]
+type RuntimeControllerCertificationHandoffPreparationV2 =
+    Result<Box<RuntimeControllerCertificationHandoffV2>, Box<RuntimeHeldDrainedRouteV2>>;
+
+#[allow(dead_code)]
+type RuntimeControllerCertificationHandoffControllerOutcomeV2 = Result<
+    RuntimeServingReceiptV2,
+    Box<(
+        RuntimeHeldDrainedRouteV2,
+        RuntimeControllerCertificationHandoffRejectionV2,
+    )>,
+>;
+
 struct RuntimeHeldRouteRemovedV2 {
     session: RuntimeConvergenceSessionV1,
     permit: RuntimeServingSlotWorkPermitV2,
     evidence: RuntimeExactTargetEvidenceV2,
     hydrated: RuntimeExactTargetV1,
     witness: RuntimeRouteWitnessV2,
+}
+
+#[allow(dead_code)]
+impl RuntimeControllerCertificationHandoffV2 {
+    fn from_ready_held_v2(
+        held: Box<RuntimeHeldDrainedRouteV2>,
+    ) -> RuntimeControllerCertificationHandoffPreparationV2 {
+        if held.ensure_active_v2().is_err()
+            || runtime_held_continuation_v2(&held.session.snapshot().phase)
+                != Some(RuntimeHeldContinuationV2::HoldAwaitingGatewayReady)
+        {
+            return Err(held);
+        }
+        Ok(Box::new(Self { held: *held }))
+    }
+
+    pub(crate) fn ensure_exact_awaiting_v2(&self) -> Result<(), ()> {
+        self.held.ensure_active_v2()?;
+        if runtime_held_continuation_v2(&self.held.session.snapshot().phase)
+            != Some(RuntimeHeldContinuationV2::HoldAwaitingGatewayReady)
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn session_v2(&self) -> &RuntimeConvergenceSessionV1 {
+        &self.held.session
+    }
+
+    pub(crate) fn exact_target_evidence_v2(&self) -> &RuntimeExactTargetEvidenceV2 {
+        &self.held.evidence
+    }
+
+    pub(crate) fn hydrated_target_v2(&self) -> &RuntimeExactTargetV1 {
+        &self.held.hydrated
+    }
+
+    pub(crate) fn route_witness_v2(&self) -> &RuntimeRouteWitnessV2 {
+        &self.held.witness
+    }
+
+    pub(crate) fn reject_v2(
+        self,
+        source: RuntimeControllerCertificationHandoffRejectionV2,
+    ) -> RuntimeControllerCertificationHandoffReplyV2 {
+        RuntimeControllerCertificationHandoffReplyV2::Rejected {
+            handoff: Box::new(self),
+            source,
+        }
+    }
+
+    pub(crate) fn accept_v2(self) -> RuntimeControllerAcceptedCertificationPartsV2 {
+        let RuntimeHeldDrainedRouteV2 {
+            staged,
+            session,
+            permit,
+            evidence,
+            hydrated,
+            witness,
+        } = self.held;
+        (staged, session, permit, evidence, hydrated, witness)
+    }
+
+    fn into_held_v2(self) -> RuntimeHeldDrainedRouteV2 {
+        self.held
+    }
+}
+
+#[allow(dead_code)]
+impl RuntimeControllerCertificationHandoffReplyV2 {
+    pub(crate) fn accepted_v2(serving: RuntimeServingReceiptV2) -> Self {
+        Self::Accepted(Box::new(serving))
+    }
+
+    fn into_controller_outcome_v2(
+        self,
+    ) -> RuntimeControllerCertificationHandoffControllerOutcomeV2 {
+        match self {
+            Self::Rejected { handoff, source } => Err(Box::new((handoff.into_held_v2(), source))),
+            Self::Accepted(serving) => Ok(*serving),
+        }
+    }
+}
+
+impl Debug for RuntimeControllerCertificationHandoffV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeControllerCertificationHandoffV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeControllerCertificationHandoffReplyV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeControllerCertificationHandoffReplyV2(<redacted>)")
+    }
 }
 
 impl RuntimeHeldDrainedRouteV2 {
@@ -2510,5 +2655,35 @@ mod tests {
         assert_eq!(first, replay);
         assert_ne!(first, successor);
         assert!(first.as_str().len() <= 128);
+    }
+
+    #[test]
+    fn certification_handoff_contract_separates_rejection_from_accepted_ownership() {
+        fn assert_send<T: Send>() {}
+        let _: fn(
+            Box<RuntimeHeldDrainedRouteV2>,
+        ) -> RuntimeControllerCertificationHandoffPreparationV2 =
+            RuntimeControllerCertificationHandoffV2::from_ready_held_v2;
+        let _: fn(
+            RuntimeControllerCertificationHandoffV2,
+            RuntimeControllerCertificationHandoffRejectionV2,
+        ) -> RuntimeControllerCertificationHandoffReplyV2 =
+            RuntimeControllerCertificationHandoffV2::reject_v2;
+        let _: fn(
+            RuntimeControllerCertificationHandoffV2,
+        ) -> RuntimeControllerAcceptedCertificationPartsV2 =
+            RuntimeControllerCertificationHandoffV2::accept_v2;
+        let _: fn(RuntimeServingReceiptV2) -> RuntimeControllerCertificationHandoffReplyV2 =
+            RuntimeControllerCertificationHandoffReplyV2::accepted_v2;
+        assert_send::<RuntimeControllerCertificationHandoffV2>();
+        assert_send::<RuntimeControllerAcceptedCertificationPartsV2>();
+        assert_send::<RuntimeControllerCertificationHandoffReplyV2>();
+        assert_eq!(
+            format!(
+                "{:?}",
+                RuntimeControllerCertificationHandoffRejectionV2::Unavailable
+            ),
+            "Unavailable"
+        );
     }
 }
