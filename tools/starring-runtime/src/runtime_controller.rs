@@ -714,9 +714,10 @@ impl RuntimeServingControllerActorV2 {
             Err(_) => return RuntimeControllerAttemptV2::Failed,
         };
         match staged.into_staged_recovery() {
-            Ok(recovery) => RuntimeControllerAttemptV2::Drained(Box::new(
-                RuntimeHeldDrainedRouteV2::from_recovery(recovery),
-            )),
+            Ok(recovery) => match RuntimeHeldDrainedRouteV2::from_recovery(recovery) {
+                Ok(held) => RuntimeControllerAttemptV2::Drained(Box::new(held)),
+                Err(_) => RuntimeControllerAttemptV2::Failed,
+            },
             Err(staged) => self.replace_staged_v2(*staged).await,
         }
     }
@@ -1746,7 +1747,7 @@ impl RuntimeHeldDrainedRouteV2 {
             RuntimeExactTargetV1,
             RuntimeRegistryReplacementRouteV2,
         >,
-    ) -> Self {
+    ) -> Result<Self, RuntimeRegistryPredecessorReplacementErrorV2> {
         let route = match recovery {
             RuntimeStagedRecoveryHandoffV2::Drained(route)
             | RuntimeStagedRecoveryHandoffV2::ActivationApplying(route)
@@ -1762,16 +1763,19 @@ impl RuntimeHeldDrainedRouteV2 {
             RuntimeExactTargetV1,
             RuntimeRegistryReplacementRouteV2,
         >,
-    ) -> Self {
+    ) -> Result<Self, RuntimeRegistryPredecessorReplacementErrorV2> {
         let (staged, session, permit, evidence, hydrated, witness) = route.into_handoff();
-        Self {
+        let successor = staged.finalize_empty_recovery_predecessor_v2()?;
+        let mut held = Self {
             staged,
             session,
             permit,
             evidence,
             hydrated,
             witness,
-        }
+        };
+        held.apply_staged_evidence_v2(&successor);
+        Ok(held)
     }
 
     fn ensure_active_v2(&self) -> Result<(), ()> {

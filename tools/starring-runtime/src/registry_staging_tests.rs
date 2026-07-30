@@ -520,6 +520,30 @@ fn barrier_b_rejects_non_final_predecessor_and_drop_cleans_the_staged_route() {
 }
 
 #[test]
+fn empty_recovery_predecessor_finalization_is_replayable_and_unlocks_barrier_b() {
+    let (port, _) = staging_port("runtime-process:empty-recovery-finalization");
+    let route = route("runtime-process:empty-recovery-finalization");
+    let (emergency, trips) = emergency();
+    let replacement = authority(
+        port.install_staged_route_v2(route, fence(1), emergency)
+            .unwrap(),
+    )
+    .into_replacement_v2();
+
+    let first = replacement
+        .finalize_empty_recovery_predecessor_v2()
+        .unwrap();
+    let replay = replacement
+        .finalize_empty_recovery_predecessor_v2()
+        .unwrap();
+
+    assert_eq!(first, replay);
+    let (_, authority) = replacement.activate_barrier_b_v2().unwrap().into_parts_v2();
+    authority.remove_exact_serving_v2().unwrap();
+    assert_eq!(trips.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn barrier_b_accepts_only_the_exact_already_serving_replay() {
     let (port, registry) = staging_port("runtime-process:barrier-b-replay");
     let route = route("runtime-process:barrier-b-replay");

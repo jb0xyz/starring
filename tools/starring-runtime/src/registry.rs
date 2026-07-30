@@ -1183,6 +1183,26 @@ impl RuntimeRegistryReplacementRouteV2 {
         state.staged.advance_authority_v2(next_fencing_token)
     }
 
+    pub(crate) fn finalize_empty_recovery_predecessor_v2(
+        &self,
+    ) -> Result<RuntimeRegistryStagedInstallEvidenceV2, RuntimeRegistryPredecessorReplacementErrorV2>
+    {
+        let transition = self.transition_predecessor_to_draining_v2(None)?;
+        if transition.predecessor_v2().is_some() || transition.initial_active_interactions_v2() != 0
+        {
+            return Err(RuntimeRegistryPredecessorReplacementErrorV2::UnexpectedOutcome);
+        }
+        let drain = self.observe_predecessor_drain_v2()?;
+        if !drain.drained_v2() || drain.active_interactions_v2() != 0 {
+            return Err(RuntimeRegistryPredecessorReplacementErrorV2::UnexpectedOutcome);
+        }
+        let removal = self.remove_drained_predecessor_v2()?;
+        if removal.removed_predecessor_v2().is_some() {
+            return Err(RuntimeRegistryPredecessorReplacementErrorV2::UnexpectedOutcome);
+        }
+        Ok(removal.successor_v2().clone())
+    }
+
     pub(crate) fn transition_predecessor_to_draining_v2(
         &self,
         expected_predecessor: Option<&RuntimeProcessIdentityV1>,
