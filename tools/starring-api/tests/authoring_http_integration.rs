@@ -320,6 +320,7 @@ struct WorkerState {
     calls: AtomicUsize,
     settled: AtomicUsize,
     started: Notify,
+    settlement: Notify,
     released: AtomicBool,
     release: Notify,
 }
@@ -339,6 +340,7 @@ impl WorkerServer {
             calls: AtomicUsize::new(0),
             settled: AtomicUsize::new(0),
             started: Notify::new(),
+            settlement: Notify::new(),
             released: AtomicBool::new(false),
             release: Notify::new(),
         });
@@ -375,13 +377,31 @@ impl WorkerServer {
     }
 
     async fn wait_started(&self) {
-        loop {
-            let started = self.state.started.notified();
-            if self.calls() != 0 {
-                return;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let started = self.state.started.notified();
+                if self.calls() != 0 {
+                    return;
+                }
+                started.await;
             }
-            started.await;
-        }
+        })
+        .await
+        .expect("worker request did not start");
+    }
+
+    async fn wait_settled(&self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let settlement = self.state.settlement.notified();
+                if self.settled() != 0 {
+                    return;
+                }
+                settlement.await;
+            }
+        })
+        .await
+        .expect("worker request did not settle");
     }
 
     fn release(&self) {
@@ -431,12 +451,14 @@ async fn worker_completion(
     match state.mode {
         WorkerMode::Immediate => {
             state.settled.fetch_add(1, Ordering::SeqCst);
+            state.settlement.notify_waiters();
         }
         WorkerMode::Delayed(delay) => {
             let settled = Arc::clone(&state);
             tokio::spawn(async move {
                 tokio::time::sleep(delay).await;
                 settled.settled.fetch_add(1, Ordering::SeqCst);
+                settled.settlement.notify_waiters();
             });
             tokio::time::sleep(delay).await;
         }
@@ -449,6 +471,7 @@ async fn worker_completion(
                 released.await;
             }
             state.settled.fetch_add(1, Ordering::SeqCst);
+            state.settlement.notify_waiters();
         }
     }
     let frontier = request["frontier"]["name"].as_str().unwrap();
@@ -784,16 +807,20 @@ async fn real_admission_saturation_maps_to_retryable_503_without_worker_entry() 
 
 #[tokio::test]
 async fn http_timeout_cancels_the_application_future_before_any_commit() {
-    let worker = WorkerServer::start(WorkerMode::Delayed(Duration::from_millis(80)), true).await;
+    let worker = WorkerServer::start(WorkerMode::Delayed(Duration::from_millis(500)), true).await;
     let facade = Arc::new(IntegratedFacade::with_worker(worker.client()));
-    let response = app(
-        Arc::clone(&facade),
-        Duration::from_millis(5),
-        Duration::from_millis(5),
-        4,
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        app(
+            Arc::clone(&facade),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            4,
+        )
+        .oneshot(authoring_request(IDEMPOTENCY)),
     )
-    .oneshot(authoring_request(IDEMPOTENCY))
     .await
+    .expect("authoring request did not complete")
     .unwrap();
 
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
@@ -803,7 +830,7 @@ async fn http_timeout_cancels_the_application_future_before_any_commit() {
     worker.wait_started().await;
     assert_eq!(worker.calls(), 1);
     assert_eq!(facade.store.counts(), (2, 1, 0));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    worker.wait_settled().await;
     assert_eq!(worker.settled(), 1);
     assert_eq!(facade.store.counts(), (2, 1, 0));
 }
