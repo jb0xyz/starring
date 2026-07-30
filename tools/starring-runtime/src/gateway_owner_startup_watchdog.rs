@@ -2281,15 +2281,24 @@ fn accept_certification_freeze_observation_v2(
     current: &RuntimeGatewayOwnerCurrentObservationV1,
     cutoff: Instant,
 ) -> bool {
-    if Instant::now() >= cutoff || current.safety_deadline() <= cutoff {
+    if Instant::now() >= cutoff
+        || expected.safety_deadline() <= cutoff
+        || current.safety_deadline() <= cutoff
+        || expected.receipt().database_lease_duration().is_none()
+        || current.receipt().database_lease_duration().is_none()
+        || current.receipt().lease_id != expected.receipt().lease_id
+    {
         return false;
     }
-    if current == expected {
+    if current.receipt().owner_revision == expected.receipt().owner_revision
+        && current.receipt().expires_at == expected.receipt().expires_at
+        && current.receipt().database_now >= expected.receipt().database_now
+        && current.safety_deadline() <= expected.safety_deadline()
+    {
         return true;
     }
-    current.receipt().lease_id == expected.receipt().lease_id
-        && expected.receipt().owner_revision.get().checked_add(1)
-            == Some(current.receipt().owner_revision.get())
+    expected.receipt().owner_revision.get().checked_add(1)
+        == Some(current.receipt().owner_revision.get())
         && current.receipt().database_now > expected.receipt().database_now
         && current.receipt().expires_at > expected.receipt().expires_at
         && current.safety_deadline() > expected.safety_deadline()
@@ -3194,6 +3203,12 @@ where
                                         response,
                                         result,
                                     } => {
+                                        let observation =
+                                            RuntimeGatewayOwnerCurrentObservationV1::from_watchdog(
+                                                &successor,
+                                            );
+                                        let _result =
+                                            current_observation_sender.send(observation);
                                         current = Some(*successor);
                                         let _result = response.send(result);
                                     }

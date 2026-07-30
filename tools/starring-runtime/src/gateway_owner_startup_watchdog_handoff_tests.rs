@@ -6536,6 +6536,268 @@ async fn production_renewal_unknown_is_terminal_and_fail_closed() {
     assert_eq!(port.release_calls(), 1);
 }
 
+#[test]
+fn certification_freeze_observation_acceptance_is_exact_and_monotonic() {
+    let now = Instant::now();
+    let cutoff = now + Duration::from_secs(10);
+    let expected_safety_deadline = now + Duration::from_secs(30);
+    let expected = RuntimeGatewayOwnerCurrentObservationV1 {
+        receipt: receipt(Duration::from_secs(60)),
+        safety_deadline: expected_safety_deadline,
+    };
+
+    assert!(accept_certification_freeze_observation_v2(
+        &expected, &expected, cutoff
+    ));
+
+    let mut refined = expected.clone();
+    refined.receipt.database_now += TimeDelta::milliseconds(1);
+    assert!(accept_certification_freeze_observation_v2(
+        &expected, &refined, cutoff
+    ));
+
+    let mut tightened = refined.clone();
+    tightened.safety_deadline -= Duration::from_millis(1);
+    assert!(accept_certification_freeze_observation_v2(
+        &expected, &tightened, cutoff
+    ));
+
+    let mut regressed_database_time = expected.clone();
+    regressed_database_time.receipt.database_now -= TimeDelta::milliseconds(1);
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &regressed_database_time,
+        cutoff
+    ));
+
+    let mut drifted_expiry = refined.clone();
+    drifted_expiry.receipt.expires_at += TimeDelta::milliseconds(1);
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &drifted_expiry,
+        cutoff
+    ));
+
+    let mut extended_safety = refined.clone();
+    extended_safety.safety_deadline += Duration::from_millis(1);
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &extended_safety,
+        cutoff
+    ));
+
+    let mut foreign_lease = refined.clone();
+    foreign_lease.receipt.lease_id.lease_epoch = NonZeroU64::new(2).unwrap();
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &foreign_lease,
+        cutoff
+    ));
+
+    let mut successor = expected.clone();
+    successor.receipt.owner_revision = NonZeroU64::new(4).unwrap();
+    successor.receipt.database_now += TimeDelta::milliseconds(1);
+    successor.receipt.expires_at += TimeDelta::milliseconds(1);
+    successor.safety_deadline += Duration::from_millis(1);
+    assert!(accept_certification_freeze_observation_v2(
+        &expected, &successor, cutoff
+    ));
+
+    let mut revision_skip = successor.clone();
+    revision_skip.receipt.owner_revision = NonZeroU64::new(5).unwrap();
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &revision_skip,
+        cutoff
+    ));
+
+    let mut successor_without_database_advance = successor.clone();
+    successor_without_database_advance.receipt.database_now = expected.receipt.database_now;
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &successor_without_database_advance,
+        cutoff
+    ));
+
+    let mut successor_without_expiry_advance = successor.clone();
+    successor_without_expiry_advance.receipt.expires_at = expected.receipt.expires_at;
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &successor_without_expiry_advance,
+        cutoff
+    ));
+
+    let mut successor_without_safety_advance = successor.clone();
+    successor_without_safety_advance.safety_deadline = expected.safety_deadline;
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &successor_without_safety_advance,
+        cutoff
+    ));
+
+    let mut stale_current = refined.clone();
+    stale_current.receipt.database_now = stale_current.receipt.expires_at;
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &stale_current,
+        cutoff
+    ));
+
+    let mut unsafe_expected = expected.clone();
+    unsafe_expected.safety_deadline = cutoff;
+    assert!(!accept_certification_freeze_observation_v2(
+        &unsafe_expected,
+        &successor,
+        cutoff
+    ));
+
+    let mut unsafe_current = refined.clone();
+    unsafe_current.safety_deadline = cutoff;
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &unsafe_current,
+        cutoff
+    ));
+
+    let mut stale_expected = expected.clone();
+    stale_expected.receipt.database_now = stale_expected.receipt.expires_at;
+    assert!(!accept_certification_freeze_observation_v2(
+        &stale_expected,
+        &successor,
+        cutoff
+    ));
+
+    let mut maximum_revision = expected.clone();
+    maximum_revision.receipt.owner_revision = NonZeroU64::new(u64::MAX).unwrap();
+    let mut wrapped_successor = successor;
+    wrapped_successor.receipt.owner_revision = NonZeroU64::new(1).unwrap();
+    assert!(!accept_certification_freeze_observation_v2(
+        &maximum_revision,
+        &wrapped_successor,
+        cutoff
+    ));
+
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &refined,
+        Instant::now()
+    ));
+}
+
+#[tokio::test]
+async fn certification_freeze_uses_latest_published_same_revision_observation() {
+    let process_generation = NonZeroU64::new(60).unwrap();
+    let (production, port, invalidated, receipt) =
+        certification_production_fixture([], process_generation).await;
+    let renewed = production
+        .wait_for_strict_successor_v2(
+            receipt.owner_revision,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    {
+        let mut current = port
+            .state
+            .receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.database_now += TimeDelta::milliseconds(1);
+    }
+    let refreshed = production.observe_current_v2().await.unwrap();
+
+    assert_eq!(
+        refreshed.receipt().owner_revision,
+        renewed.receipt().owner_revision
+    );
+    assert_eq!(refreshed.receipt().expires_at, renewed.receipt().expires_at);
+    assert!(refreshed.receipt().database_now > renewed.receipt().database_now);
+    assert!(refreshed.safety_deadline() <= renewed.safety_deadline());
+
+    let authority = production
+        .prepare_certification_freeze_v2(Instant::now() + Duration::from_millis(500))
+        .unwrap();
+    assert_eq!(authority.expected_observation_v2(), &refreshed);
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+
+    assert_eq!(observation.observation_v2(), &refreshed);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        frozen
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn certification_freeze_accepts_a_queued_same_revision_observation_refinement() {
+    let process_generation = NonZeroU64::new(69).unwrap();
+    let (production, port, invalidated, receipt) =
+        certification_production_fixture([], process_generation).await;
+    let renewed = production
+        .wait_for_strict_successor_v2(
+            receipt.owner_revision,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    let renew_calls = port.renew_calls();
+    let gate = Arc::new(Notify::new());
+    port.block_next_observation(gate.clone());
+    let observe_calls = port.observe_calls();
+    let commands = production.inner().supervisor_commands.clone();
+    let (response, acknowledgement) = oneshot::channel();
+    commands
+        .send(RuntimeGatewayOwnerSupervisorCommandV1::Observe { response })
+        .await
+        .unwrap();
+    wait_for(|| port.observe_calls() > observe_calls).await;
+
+    let cutoff = Instant::now() + Duration::from_millis(500);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    assert_eq!(authority.expected_observation_v2(), &renewed);
+    {
+        let mut current = port
+            .state
+            .receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.database_now += TimeDelta::milliseconds(1);
+    }
+    let mut freezing = Box::pin(authority.freeze_v2());
+    tokio::select! {
+        biased;
+        result = &mut freezing => panic!("unexpected certification freeze result: {result:?}"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+
+    gate.notify_one();
+    let refined = acknowledgement.await.unwrap().unwrap();
+    let (frozen, observation) = freezing.await.unwrap();
+
+    assert_eq!(
+        refined.receipt().owner_revision,
+        renewed.receipt().owner_revision
+    );
+    assert_eq!(refined.receipt().expires_at, renewed.receipt().expires_at);
+    assert!(refined.receipt().database_now > renewed.receipt().database_now);
+    assert!(refined.safety_deadline() <= renewed.safety_deadline());
+    assert_eq!(observation.observation_v2(), &refined);
+    assert_eq!(port.renew_calls(), renew_calls);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        frozen
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
 #[tokio::test]
 async fn certification_freeze_queues_behind_inflight_renewal_and_stops_automatic_renewal() {
     let gate = Arc::new(Notify::new());
