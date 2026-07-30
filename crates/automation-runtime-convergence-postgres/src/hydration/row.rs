@@ -295,7 +295,7 @@ mod tests {
         let fingerprint = ResourceBindingFingerprint::parse(&"a".repeat(64)).unwrap();
         let policy = InstallationAuthorityPolicyV1::new(
             NonZeroU64::new(3).unwrap(),
-            NonZeroU32::new(2).unwrap(),
+            NonZeroU32::new(1).unwrap(),
             NonZeroU64::new(7200).unwrap(),
         )
         .unwrap();

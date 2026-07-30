@@ -441,7 +441,7 @@ async fn exact_preview_observation(
             binding_revision: BindingRevision::new(3).unwrap(),
             policy: ApprovalPolicyV1 {
                 revision: PolicyRevision::new(5).unwrap(),
-                required_approvals: NonZeroU32::new(2).unwrap(),
+                required_approvals: NonZeroU32::new(1).unwrap(),
                 ttl_seconds: NonZeroU64::new(3600).unwrap(),
             },
         },

@@ -351,9 +351,9 @@ async fn seed_fixture_with_required_approvals(
     let installation_id =
         AutomationInstallationId::parse(&format!("installation-e2e-{suffix}")).unwrap();
     let requester_principal = PrincipalId::parse(&format!("requester-e2e-{suffix}")).unwrap();
-    let approver_principal = PrincipalId::parse(&format!("approver-e2e-{suffix}")).unwrap();
     let requester_user = UserId(6_000_000_000 + numeric_tail);
-    let approver_user = UserId(7_000_000_000 + numeric_tail);
+    let approver_principal = requester_principal.clone();
+    let approver_user = requester_user;
     let application_id = DiscordApplicationIdV1::new(8_000_000_000 + numeric_tail).unwrap();
     let guild_id = GuildId(9_000_000_000 + numeric_tail);
     let manager_role_id = RoleId(guild_id.0 + 1);
@@ -638,12 +638,10 @@ async fn seed_fixture_with_required_approvals(
     sqlx::query(
         "INSERT INTO public.product_principals \
          (principal_id, discord_user_id, display_profile) \
-         VALUES ($1, $2, '{}'::JSONB), ($3, $4, '{}'::JSONB)",
+         VALUES ($1, $2, '{}'::JSONB)",
     )
     .bind(requester_principal.as_str())
     .bind(requester_user.to_string())
-    .bind(approver_principal.as_str())
-    .bind(approver_user.to_string())
     .execute(&mut *transaction)
     .await
     .unwrap();

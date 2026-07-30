@@ -298,7 +298,7 @@ async fn exact_target_restricted_role_scenario(
             resource_bindings: &unchanged_bindings,
             binding_fingerprint: BINDING_FINGERPRINT,
             policy_revision: 2,
-            required_approvals: 2,
+            required_approvals: 1,
             activation_ttl_seconds: 7200,
         },
     )
@@ -312,7 +312,7 @@ async fn exact_target_restricted_role_scenario(
     );
     assert_eq!(
         policy_rotated.current_authority_payload_digest.as_str(),
-        authority_payload_digest_for_test(2, 1, BINDING_FINGERPRINT, 2, 2, 7200)
+        authority_payload_digest_for_test(2, 1, BINDING_FINGERPRINT, 2, 1, 7200)
     );
     let desired_target_digest = policy_rotated.desired_target_digest.as_str().to_owned();
     replace_runtime_desired_target_digest_for_test(&owner_pool, &"0".repeat(64)).await;

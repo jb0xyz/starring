@@ -7,7 +7,7 @@ use crate::ResourceBindingFingerprint;
 const AUTHORITY_PAYLOAD_DOMAIN_V1: &[u8] = b"starring.installation-authority.payload.v1\0";
 const AUTHORITY_REQUEST_DOMAIN_V1: &[u8] = b"starring.installation-authority.request.v1\0";
 const MAX_DATABASE_REVISION: u64 = i64::MAX as u64;
-const MAX_REQUIRED_APPROVALS: u32 = 64;
+const REQUIRED_APPROVALS: u32 = 1;
 const MAX_ACTIVATION_TTL_SECONDS: u64 = 31_536_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -95,7 +95,7 @@ impl InstallationAuthorityPolicyV1 {
         if policy_revision.get() > MAX_DATABASE_REVISION {
             return Err(InstallationAuthorityIdentityErrorV1::Revision);
         }
-        if required_approvals.get() > MAX_REQUIRED_APPROVALS
+        if required_approvals.get() != REQUIRED_APPROVALS
             || activation_ttl_seconds.get() > MAX_ACTIVATION_TTL_SECONDS
         {
             return Err(InstallationAuthorityIdentityErrorV1::Policy);
@@ -376,14 +376,6 @@ mod tests {
                 NonZeroU64::new(2).unwrap(),
                 NonZeroU64::new(2).unwrap(),
                 &first_fingerprint,
-                policy(1, 2, 86_400),
-            )
-            .unwrap(),
-            InstallationAuthorityPayloadIdentityV1::new(
-                scope("tenant.staging", "installation.staging"),
-                NonZeroU64::new(2).unwrap(),
-                NonZeroU64::new(2).unwrap(),
-                &first_fingerprint,
                 policy(1, 1, 86_401),
             )
             .unwrap(),
@@ -469,7 +461,7 @@ mod tests {
         assert_eq!(
             InstallationAuthorityPolicyV1::new(
                 NonZeroU64::new(1).unwrap(),
-                NonZeroU32::new(65).unwrap(),
+                NonZeroU32::new(2).unwrap(),
                 NonZeroU64::new(86_400).unwrap(),
             ),
             Err(InstallationAuthorityIdentityErrorV1::Policy)

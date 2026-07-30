@@ -28,7 +28,7 @@ async fn runtime_authority_tracks_binding_identity_across_policy_rotation_scenar
             resource_bindings: &unchanged_bindings,
             binding_fingerprint: BINDING_FINGERPRINT,
             policy_revision: 2,
-            required_approvals: 2,
+            required_approvals: 1,
             activation_ttl_seconds: 7200,
         },
     )
@@ -84,7 +84,7 @@ async fn runtime_authority_tracks_binding_identity_across_policy_rotation_scenar
             resource_bindings: &spoofed_bindings,
             binding_fingerprint: BINDING_FINGERPRINT,
             policy_revision: 3,
-            required_approvals: 2,
+            required_approvals: 1,
             activation_ttl_seconds: 7200,
         },
     )
@@ -112,7 +112,7 @@ async fn runtime_authority_tracks_binding_identity_across_policy_rotation_scenar
             resource_bindings: &unchanged_bindings,
             binding_fingerprint: BINDING_FINGERPRINT,
             policy_revision: 4,
-            required_approvals: 2,
+            required_approvals: 1,
             activation_ttl_seconds: 7200,
         },
     )
@@ -153,7 +153,7 @@ async fn runtime_authority_tracks_binding_identity_across_policy_rotation_scenar
             resource_bindings: &unchanged_bindings,
             binding_fingerprint: ROTATED_BINDING_FINGERPRINT,
             policy_revision: 5,
-            required_approvals: 2,
+            required_approvals: 1,
             activation_ttl_seconds: 7200,
         },
     )

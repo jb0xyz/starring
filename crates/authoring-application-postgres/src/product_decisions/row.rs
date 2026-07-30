@@ -228,6 +228,8 @@ fn validate_record_and_activation(
             != row.historical_authority_binding_revision
         || i64::try_from(record.intent.authority.policy.revision.get()).ok()
             != row.historical_authority_policy_revision
+        || row.activation_required_approvals != 1
+        || row.historical_authority_required_approvals != Some(1)
         || i32::try_from(record.intent.authority.policy.required_approvals.get()).ok()
             != row.historical_authority_required_approvals
         || i64::try_from(record.intent.authority.policy.ttl_seconds.get()).ok()

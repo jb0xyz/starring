@@ -49,7 +49,6 @@ pub fn map_product_control_error(error: ProductControlPortError) -> FacadeError 
         | ProductControlPortError::LifecycleCancelled(_)
         | ProductControlPortError::DuplicateDecision
         | ProductControlPortError::Expired => FacadeErrorCode::InvalidState,
-        ProductControlPortError::SelfApprovalForbidden => FacadeErrorCode::Forbidden,
         ProductControlPortError::IdempotencyConflict => FacadeErrorCode::IdempotencyConflict,
         ProductControlPortError::InvalidServerCandidate(candidate) => map_candidate(candidate),
         ProductControlPortError::Superseded => FacadeErrorCode::Superseded,
@@ -368,12 +367,6 @@ mod tests {
                 ProductApplicationError::FreshAuthority(FreshGuildAuthorityError::Forbidden),
             )),
             FacadeErrorCode::NotFound
-        );
-        assert_eq!(
-            code(map_product_control_error(
-                ProductControlPortError::SelfApprovalForbidden,
-            )),
-            FacadeErrorCode::Forbidden
         );
         assert_eq!(
             code(map_fresh_authority_error(

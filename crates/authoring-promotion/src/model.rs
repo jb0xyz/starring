@@ -299,6 +299,9 @@ impl PromotionRecordV1 {
         if self.intent.authority.principal_id != self.intent.authority.session_owner_id {
             return Err(PromotionRecordValidationError::SessionOwner);
         }
+        if self.intent.authority.policy.required_approvals.get() != 1 {
+            return Err(PromotionRecordValidationError::Policy);
+        }
         validate_evidence(&self.intent)?;
         if self.updated_at < self.created_at {
             return Err(PromotionRecordValidationError::Timestamp);

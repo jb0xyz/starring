@@ -994,7 +994,7 @@ mod tests {
             }),
             binding_fingerprint: resource_binding_fingerprint_v2(&bindings).into_string(),
             policy_revision: 7,
-            required_approvals: 3,
+            required_approvals: 1,
             activation_ttl_seconds: 7_200,
             authority_payload_digest: "a".repeat(64),
             created_by_principal_id: "discord:1056857223529250906".to_string(),

@@ -132,7 +132,7 @@ pub(super) fn valid_preview_view(
         && view.summary.target_version > 0
         && valid_digest(&view.summary.target_content_hash)
         && valid_digest(&view.summary.binding_fingerprint)
-        && view.summary.required_approvals > 0
+        && view.summary.required_approvals == 1
 }
 
 pub(super) fn valid_apply_view(

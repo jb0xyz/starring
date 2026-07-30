@@ -753,6 +753,12 @@ fn exact_idempotent_replay_succeeds_and_changed_payload_conflicts() {
         let mut changed_quorum =
             start_input_from_artifact("same-key", "studyrooms", &sealed_artifact);
         changed_quorum.context.policy.required_approvals = NonZeroU32::new(2).unwrap();
+        assert_eq!(
+            service.start(changed_quorum).await.unwrap_err(),
+            PromotionError::Store(PromotionStoreError::InvalidRecord(
+                PromotionRecordValidationError::Policy,
+            ))
+        );
         let mut changed_ttl = start_input_from_artifact("same-key", "studyrooms", &sealed_artifact);
         changed_ttl.context.policy.ttl_seconds = NonZeroU64::new(7200).unwrap();
         let conflicting = [
@@ -764,7 +770,6 @@ fn exact_idempotent_replay_succeeds_and_changed_payload_conflicts() {
             changed_installation,
             changed_binding,
             changed_policy,
-            changed_quorum,
             changed_ttl,
         ];
         for input in conflicting {

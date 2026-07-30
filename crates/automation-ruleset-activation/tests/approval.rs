@@ -123,17 +123,14 @@ fn request_ids_validate_and_roundtrip() {
 }
 
 #[test]
-fn self_approval_is_rejected() {
+fn requester_can_complete_solo_approval() {
     let store = InMemoryActivationRequestStore::with_clock(clock());
     let id = create(&store, "self", 10, 1);
 
-    assert_eq!(
-        block_on(store.approve(&id, UserId(10))).unwrap_err(),
-        ApproveError::SelfApprovalForbidden
-    );
-    let request = block_on(store.get(&id)).unwrap().unwrap();
-    assert_eq!(request.state, ActivationRequestState::Pending);
-    assert!(request.approvals.is_empty());
+    let request = block_on(store.approve(&id, UserId(10))).unwrap();
+    assert_eq!(request.state, ActivationRequestState::Approved);
+    assert_eq!(request.approvals.len(), 1);
+    assert_eq!(request.approvals[0].approver, UserId(10));
 }
 
 #[test]
@@ -275,7 +272,7 @@ fn product_request_is_inert_until_exact_link_and_payload_bound_approval() {
         ApproveError::PayloadMismatch
     );
     let approved =
-        block_on(store.approve_bound(&id, UserId(20), &context.approval_payload_digest)).unwrap();
+        block_on(store.approve_bound(&id, UserId(10), &context.approval_payload_digest)).unwrap();
     assert_eq!(approved.state, ActivationRequestState::Approved);
     assert_eq!(
         approved.approvals[0].approval_payload_digest.as_ref(),

@@ -440,8 +440,6 @@ pub enum ProductControlPortError {
     RuntimeDrainPending(ProductDrainSelectorV1),
     #[error("the correlated Product lifecycle operation was cancelled")]
     LifecycleCancelled(ProductDrainSelectorV1),
-    #[error("requester self-approval is forbidden")]
-    SelfApprovalForbidden,
     #[error("the same product decision already exists")]
     DuplicateDecision,
     #[error("promotion approval window has expired")]

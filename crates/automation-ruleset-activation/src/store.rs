@@ -26,8 +26,6 @@ pub enum ActivationStoreError {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ApproveError {
-    #[error("self approval is forbidden")]
-    SelfApprovalForbidden,
     #[error("approval already exists")]
     DuplicateApproval,
     #[error("product activation requires payload-bound approval")]
@@ -47,7 +45,6 @@ pub enum ApproveError {
 impl From<ApprovalDecisionError> for ApproveError {
     fn from(error: ApprovalDecisionError) -> Self {
         match error {
-            ApprovalDecisionError::SelfApprovalForbidden => Self::SelfApprovalForbidden,
             ApprovalDecisionError::DuplicateApproval => Self::DuplicateApproval,
             ApprovalDecisionError::BoundApprovalRequired => Self::BoundApprovalRequired,
             ApprovalDecisionError::Unlinked => Self::Unlinked,

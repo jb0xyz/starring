@@ -162,7 +162,6 @@ fn map_approval_outcome(outcome: &str) -> ProductControlPortError {
         "invalid_state" | "authorization_stale" | "authority_mismatch" => {
             ProductControlPortError::InvalidState
         }
-        "self_approval_forbidden" => ProductControlPortError::SelfApprovalForbidden,
         "duplicate_decision" => ProductControlPortError::DuplicateDecision,
         "expired" => ProductControlPortError::Expired,
         "idempotency_conflict" => ProductControlPortError::IdempotencyConflict,

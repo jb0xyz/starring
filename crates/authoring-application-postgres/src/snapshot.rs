@@ -394,6 +394,9 @@ fn validate_and_copy_row<E: FreshGuildAuthorityEvidence>(
         .ok()
         .and_then(NonZeroU32::new)
         .ok_or_else(|| authority_backend("persisted approval quorum is invalid"))?;
+    if required_approvals.get() != 1 {
+        return Err(authority_backend("persisted approval quorum is invalid").into());
+    }
     let ttl_seconds = positive_u64(row.activation_ttl_seconds)
         .and_then(NonZeroU64::new)
         .ok_or_else(|| authority_backend("persisted activation TTL is invalid"))?;

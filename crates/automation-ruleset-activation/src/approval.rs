@@ -62,8 +62,9 @@ pub struct ApprovalPolicyBindingV1 {
 
 impl ApprovalPolicyBindingV1 {
     pub fn validate(&self) -> bool {
-        approval_policy_digest_v1(self.revision, self.required_approvals, self.ttl_seconds)
-            == self.digest
+        self.required_approvals.get() == 1
+            && approval_policy_digest_v1(self.revision, self.required_approvals, self.ttl_seconds)
+                == self.digest
     }
 }
 
@@ -267,6 +268,28 @@ mod tests {
                 NonZeroU64::new(1_800).unwrap(),
             )
         );
+    }
+
+    #[test]
+    fn product_policy_accepts_exactly_one_approval() {
+        let revision = NonZeroU64::new(5).unwrap();
+        let ttl_seconds = NonZeroU64::new(1_800).unwrap();
+        let solo = NonZeroU32::new(1).unwrap();
+        let multiple = NonZeroU32::new(2).unwrap();
+        assert!(ApprovalPolicyBindingV1 {
+            revision,
+            required_approvals: solo,
+            ttl_seconds,
+            digest: approval_policy_digest_v1(revision, solo, ttl_seconds),
+        }
+        .validate());
+        assert!(!ApprovalPolicyBindingV1 {
+            revision,
+            required_approvals: multiple,
+            ttl_seconds,
+            digest: approval_policy_digest_v1(revision, multiple, ttl_seconds),
+        }
+        .validate());
     }
 
     #[test]
