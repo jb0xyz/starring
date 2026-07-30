@@ -6,7 +6,8 @@ use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceIdError, InstanceKind,
     InstanceMessageRef, InstanceResources, InstanceRuleSetVersion, InstanceStatus, InstanceStore,
     InstanceStoreError, InstanceTeardownClaimOutcomeV1, InstanceTeardownMarkOutcomeV1,
-    InstanceTeardownStoreV1, MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1,
+    InstanceTeardownRetryScanCursorV2, InstanceTeardownRetryScannerV2, InstanceTeardownStoreV1,
+    MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1, MAX_INSTANCE_TEARDOWN_RETRY_SCAN_BATCH_V2,
 };
 use discord_model::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use futures::executor::block_on;
@@ -339,6 +340,73 @@ fn concurrent_teardown_claim_has_one_owner() {
             .filter(|outcome| **outcome == InstanceTeardownClaimOutcomeV1::AlreadyDeleting)
             .count(),
         7
+    );
+}
+
+#[test]
+fn global_retry_scan_advances_past_persistent_failures_and_fixes_cycle_bound() {
+    let store = InMemoryInstanceStore::new();
+    for ordinal in 0..600 {
+        let guild = match ordinal % 3 {
+            0 => 2,
+            1 => 10,
+            _ => 7,
+        };
+        let id = format!("i_{ordinal:04}");
+        block_on(store.register(instance(guild, &id))).unwrap();
+        block_on(store.claim_deleting_v1(GuildId(guild), &InstanceId::parse(&id).unwrap()))
+            .unwrap();
+    }
+
+    let limit = NonZeroUsize::new(128).unwrap();
+    let mut cursor = InstanceTeardownRetryScanCursorV2::initial();
+    let mut observed = Vec::new();
+    loop {
+        let page = block_on(store.scan_retryable_v2(&cursor, limit)).unwrap();
+        if observed.is_empty() {
+            block_on(store.register(instance(99, "inserted_later"))).unwrap();
+            block_on(
+                store.claim_deleting_v1(GuildId(99), &InstanceId::parse("inserted_later").unwrap()),
+            )
+            .unwrap();
+        }
+        observed.extend(page.keys().iter().cloned());
+        let Some(next) = page.next_cursor_v2() else {
+            break;
+        };
+        cursor = next;
+    }
+
+    assert_eq!(observed.len(), 600);
+    assert_eq!(observed.first().unwrap().guild_id(), GuildId(10));
+    assert!(observed
+        .windows(2)
+        .all(|pair| pair[0].cmp_c_v2(&pair[1]).is_lt()));
+    assert!(!observed
+        .iter()
+        .any(|key| key.instance_id().as_str() == "inserted_later"));
+
+    let next_cycle = block_on(store.scan_retryable_v2(
+        &InstanceTeardownRetryScanCursorV2::initial(),
+        NonZeroUsize::new(MAX_INSTANCE_TEARDOWN_RETRY_SCAN_BATCH_V2).unwrap(),
+    ))
+    .unwrap();
+    assert!(next_cycle
+        .through()
+        .is_some_and(|key| key.instance_id().as_str() == "inserted_later"));
+}
+
+#[test]
+fn global_retry_scan_rejects_oversized_pages() {
+    let store = InMemoryInstanceStore::new();
+    assert_eq!(
+        block_on(store.scan_retryable_v2(
+            &InstanceTeardownRetryScanCursorV2::initial(),
+            NonZeroUsize::new(MAX_INSTANCE_TEARDOWN_RETRY_SCAN_BATCH_V2 + 1).unwrap(),
+        )),
+        Err(InstanceStoreError::Backend(
+            "instance_teardown_retry_scan_batch_invalid".to_string()
+        ))
     );
 }
 

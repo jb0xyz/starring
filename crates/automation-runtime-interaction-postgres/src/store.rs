@@ -3,7 +3,9 @@ use std::num::NonZeroUsize;
 use automation_instance::{
     AutomationInstance, InstanceId, InstanceRegistrarV1, InstanceRouteReaderV1, InstanceStatus,
     InstanceStoreError, InstanceTeardownClaimOutcomeV1, InstanceTeardownMarkOutcomeV1,
-    InstanceTeardownStoreV1, MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1,
+    InstanceTeardownRetryScanCursorV2, InstanceTeardownRetryScanPageV2,
+    InstanceTeardownRetryScannerV2, InstanceTeardownStoreV1, MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1,
+    MAX_INSTANCE_TEARDOWN_RETRY_SCAN_BATCH_V2,
 };
 use automation_ruleset::RuleSetStoreError;
 use automation_ruleset_dispatch::{
@@ -16,8 +18,8 @@ use sqlx::{PgConnection, PgPool};
 
 use crate::contract::{
     INSTANCE_REGISTER_QUERY, INSTANCE_TEARDOWN_CLAIM_QUERY, INSTANCE_TEARDOWN_GET_QUERY,
-    INSTANCE_TEARDOWN_MARK_QUERY, INSTANCE_TEARDOWN_RETRY_QUERY, PINNED_READ_QUERY,
-    ROUTE_READ_QUERY,
+    INSTANCE_TEARDOWN_MARK_QUERY, INSTANCE_TEARDOWN_RETRY_QUERY,
+    INSTANCE_TEARDOWN_RETRY_SCAN_QUERY, PINNED_READ_QUERY, ROUTE_READ_QUERY,
 };
 use crate::database::{
     begin_interaction_transaction, begin_interaction_transaction_on_connection,
@@ -26,7 +28,8 @@ use crate::database::{
 use crate::error::{map_mutation_commit_error, map_mutation_error, map_query_error};
 use crate::route_connection::RouteConnectionGuardV1;
 use crate::row::{
-    InstanceRowV1, PinnedInstanceRowErrorV1, PinnedInstanceRowOutcomeV1, PinnedInstanceRowV1,
+    InstanceRowV1, InstanceTeardownRetryScanRowV2, PinnedInstanceRowErrorV1,
+    PinnedInstanceRowOutcomeV1, PinnedInstanceRowV1,
 };
 use crate::{
     RuntimeInteractionDatabaseExpectationV1, RuntimeInteractionDatabaseReadinessV1,
@@ -341,6 +344,91 @@ impl InstanceTeardownStoreV1 for PostgresRuntimeInteractionV1 {
             .await
             .map_err(|error| instance_route_error(map_query_error(&error)))?;
         Ok(instances)
+    }
+}
+
+impl InstanceTeardownRetryScannerV2 for PostgresRuntimeInteractionV1 {
+    async fn scan_retryable_v2(
+        &self,
+        cursor: &InstanceTeardownRetryScanCursorV2,
+        limit: NonZeroUsize,
+    ) -> Result<InstanceTeardownRetryScanPageV2, InstanceStoreError> {
+        if limit.get() > MAX_INSTANCE_TEARDOWN_RETRY_SCAN_BATCH_V2 {
+            return Err(instance_backend(
+                RuntimeInteractionPersistenceErrorV1::InvalidInput,
+            ));
+        }
+        let limit_i64 = i64::try_from(limit.get())
+            .map_err(|_| instance_backend(RuntimeInteractionPersistenceErrorV1::InvalidInput))?;
+        let after_guild_id = cursor
+            .after()
+            .map(|key| key.guild_id().to_string())
+            .unwrap_or_default();
+        let after_instance_id = cursor
+            .after()
+            .map(|key| key.instance_id().as_str())
+            .unwrap_or_default();
+        let through_guild_id = cursor
+            .through()
+            .map(|key| key.guild_id().to_string())
+            .unwrap_or_default();
+        let through_instance_id = cursor
+            .through()
+            .map(|key| key.instance_id().as_str())
+            .unwrap_or_default();
+        let mut transaction = begin_interaction_transaction(&self.pool, self.timeouts)
+            .await
+            .map_err(instance_route_error)?;
+        verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)
+            .await
+            .map_err(instance_route_error)?;
+        let rows =
+            sqlx::query_as::<_, InstanceTeardownRetryScanRowV2>(INSTANCE_TEARDOWN_RETRY_SCAN_QUERY)
+                .bind(after_guild_id)
+                .bind(after_instance_id)
+                .bind(through_guild_id)
+                .bind(through_instance_id)
+                .bind(limit_i64)
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|error| instance_route_error(map_query_error(&error)))?;
+        if rows.len() > limit.get() {
+            return Err(instance_corrupt());
+        }
+        let decoded = rows
+            .into_iter()
+            .map(InstanceTeardownRetryScanRowV2::decode)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(instance_backend)?;
+        let through = decoded
+            .first()
+            .map(|(_, through)| through.clone())
+            .or_else(|| cursor.through().cloned());
+        if decoded.iter().any(|(_, row_through)| {
+            through
+                .as_ref()
+                .is_none_or(|through| row_through != through)
+        }) || cursor
+            .through()
+            .is_some_and(|expected| through.as_ref() != Some(expected))
+        {
+            return Err(instance_corrupt());
+        }
+        let keys = decoded.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+        if keys.iter().any(|key| {
+            cursor
+                .after()
+                .is_some_and(|after| key.cmp_c_v2(after).is_le())
+        }) {
+            return Err(instance_corrupt());
+        }
+        let page = InstanceTeardownRetryScanPageV2::new(keys, through, limit)
+            .ok_or_else(instance_corrupt)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| instance_route_error(map_query_error(&error)))?;
+        Ok(page)
     }
 }
 

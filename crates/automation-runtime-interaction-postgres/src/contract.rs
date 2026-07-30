@@ -27,3 +27,7 @@ pub(crate) const INSTANCE_TEARDOWN_MARK_QUERY: &str =
 
 pub(crate) const INSTANCE_TEARDOWN_RETRY_QUERY: &str =
     "SELECT * FROM public.starring_runtime_interaction_instance_list_retryable_v1($1, $2)";
+
+pub(crate) const INSTANCE_TEARDOWN_RETRY_SCAN_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_instance_scan_retryable_v2(\
+        $1, $2, $3, $4, $5)";

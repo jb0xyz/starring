@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -5,8 +6,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use automation_instance::{
     AutomationInstance, InstanceId, InstanceKind, InstanceRegistrarV1, InstanceResources,
     InstanceRouteReaderV1, InstanceRuleSetVersion, InstanceStatus, InstanceStoreError,
-    InstanceTeardownClaimOutcomeV1, InstanceTeardownMarkOutcomeV1, InstanceTeardownStoreV1,
-    MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1,
+    InstanceTeardownClaimOutcomeV1, InstanceTeardownMarkOutcomeV1,
+    InstanceTeardownRetryScanCursorV2, InstanceTeardownRetryScannerV2, InstanceTeardownStoreV1,
+    MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1, MAX_INSTANCE_TEARDOWN_RETRY_SCAN_BATCH_V2,
 };
 use automation_ruleset_dispatch::{PinnedInstanceResolverErrorV1, PinnedInstanceResolverV1};
 use automation_runtime_interaction_postgres::{
@@ -15,6 +17,7 @@ use automation_runtime_interaction_postgres::{
     RuntimeInteractionRouteTimeoutV1, MIGRATOR,
 };
 use discord_model::{GuildId, RoleId, UserId};
+use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::{Connection, Executor, PgPool};
 
@@ -32,6 +35,8 @@ const TEARDOWN_MARK_FUNCTION: &str =
     "public.starring_runtime_interaction_instance_mark_deleted_v1(TEXT,TEXT)";
 const TEARDOWN_RETRY_FUNCTION: &str =
     "public.starring_runtime_interaction_instance_list_retryable_v1(TEXT,BIGINT)";
+const TEARDOWN_RETRY_SCAN_FUNCTION: &str =
+    "public.starring_runtime_interaction_instance_scan_retryable_v2(TEXT,TEXT,TEXT,TEXT,BIGINT)";
 
 struct IsolatedDatabase {
     name: String,
@@ -40,6 +45,8 @@ struct IsolatedDatabase {
     owner_pool: PgPool,
     executor_pool: PgPool,
     deadline_pool: PgPool,
+    cross_role: String,
+    cross_pool: PgPool,
 }
 
 fn function_grant(function: &str, role: &str) -> String {
@@ -47,6 +54,12 @@ fn function_grant(function: &str, role: &str) -> String {
 }
 
 async fn isolated_database() -> IsolatedDatabase {
+    isolated_database_with_upgrade_boundary(None).await
+}
+
+async fn isolated_database_with_upgrade_boundary(
+    upgrade_boundary: Option<i64>,
+) -> IsolatedDatabase {
     let url = std::env::var("STARRING_TEST_DATABASE_URL")
         .expect("STARRING_TEST_DATABASE_URL required for ignored PostgreSQL tests");
     let base = url
@@ -70,8 +83,10 @@ async fn isolated_database() -> IsolatedDatabase {
         .as_nanos();
     let name = format!("starring_ri_test_{suffix}");
     let role = format!("starring_ri_executor_{suffix}");
+    let cross_role = format!("starring_ri_cross_{suffix}");
     let password = format!("ri_test_password_{suffix}");
-    for identifier in [&name, &role] {
+    let cross_password = format!("ri_cross_password_{suffix}");
+    for identifier in [&name, &role, &cross_role] {
         assert!(
             identifier.len() <= 63
                 && identifier
@@ -90,6 +105,15 @@ async fn isolated_database() -> IsolatedDatabase {
     administrator
         .execute(
             format!(
+                "CREATE ROLE {cross_role} LOGIN PASSWORD '{cross_password}' NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 1"
+            )
+            .as_str(),
+        )
+        .await
+        .unwrap();
+    administrator
+        .execute(
+            format!(
                 "CREATE ROLE {role} LOGIN PASSWORD '{password}' NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 4"
             )
             .as_str(),
@@ -102,7 +126,34 @@ async fn isolated_database() -> IsolatedDatabase {
         .connect_with(base.clone().database(&name))
         .await
         .unwrap();
-    MIGRATOR.run(&owner_pool).await.unwrap();
+    if let Some(boundary) = upgrade_boundary {
+        let partial = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= boundary)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        partial.run(&owner_pool).await.unwrap();
+        assert!(
+            sqlx::query_scalar::<_, bool>(
+                "SELECT pg_catalog.to_regprocedure(\
+                    'public.starring_runtime_interaction_instance_scan_retryable_v2(text,text,text,text,bigint)'\
+                 ) IS NULL",
+            )
+            .fetch_one(&owner_pool)
+            .await
+            .unwrap()
+        );
+        MIGRATOR.run(&owner_pool).await.unwrap();
+    } else {
+        MIGRATOR.run(&owner_pool).await.unwrap();
+    }
     for statement in [
         format!("REVOKE ALL PRIVILEGES ON DATABASE {name} FROM PUBLIC"),
         "REVOKE ALL PRIVILEGES ON SCHEMA public FROM PUBLIC".to_string(),
@@ -117,11 +168,18 @@ async fn isolated_database() -> IsolatedDatabase {
         function_grant(TEARDOWN_CLAIM_FUNCTION, &role),
         function_grant(TEARDOWN_MARK_FUNCTION, &role),
         function_grant(TEARDOWN_RETRY_FUNCTION, &role),
+        function_grant(TEARDOWN_RETRY_SCAN_FUNCTION, &role),
+        format!("GRANT CONNECT ON DATABASE {name} TO {cross_role}"),
+        format!("GRANT USAGE ON SCHEMA public TO {cross_role}"),
     ] {
         owner_pool.execute(statement.as_str()).await.unwrap();
     }
 
-    let executor_options = base.database(&name).username(&role).password(&password);
+    let executor_options = base
+        .clone()
+        .database(&name)
+        .username(&role)
+        .password(&password);
     let executor_pool = PgPoolOptions::new()
         .max_connections(4)
         .connect_with(executor_options.clone())
@@ -132,6 +190,15 @@ async fn isolated_database() -> IsolatedDatabase {
         .connect_with(executor_options)
         .await
         .unwrap();
+    let cross_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            base.database(&name)
+                .username(&cross_role)
+                .password(&cross_password),
+        )
+        .await
+        .unwrap();
     IsolatedDatabase {
         name,
         role,
@@ -139,10 +206,13 @@ async fn isolated_database() -> IsolatedDatabase {
         owner_pool,
         executor_pool,
         deadline_pool,
+        cross_role,
+        cross_pool,
     }
 }
 
 async fn cleanup(mut database: IsolatedDatabase) {
+    database.cross_pool.close().await;
     database.deadline_pool.close().await;
     database.executor_pool.close().await;
     database.owner_pool.close().await;
@@ -154,6 +224,11 @@ async fn cleanup(mut database: IsolatedDatabase) {
     database
         .administrator
         .execute(format!("DROP ROLE {}", database.role).as_str())
+        .await
+        .unwrap();
+    database
+        .administrator
+        .execute(format!("DROP ROLE {}", database.cross_role).as_str())
         .await
         .unwrap();
 }
@@ -273,6 +348,66 @@ fn teardown_migration_is_ordered_idempotent_bounded_and_private() {
 }
 
 #[test]
+fn teardown_retry_scan_migration_is_ordered_key_only_bounded_and_private() {
+    let versions = MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    let teardown = versions
+        .iter()
+        .position(|version| *version == 202_607_300_004)
+        .unwrap();
+    let retry_scan = versions
+        .iter()
+        .position(|version| *version == 202_607_300_005)
+        .unwrap();
+    assert_eq!(retry_scan, teardown + 1);
+
+    let migration = include_str!(
+        "../../../migrations/202607300005_add_runtime_interaction_teardown_retry_scan_v2.sql"
+    );
+    for required in [
+        "CREATE INDEX automation_instances_deleting_retry_scan_v2_idx",
+        "guild_id COLLATE \"C\"",
+        "instance_id COLLATE \"C\"",
+        "WHERE status = 'deleting'",
+        "CREATE FUNCTION public.starring_runtime_interaction_instance_scan_retryable_v2(",
+        "through_guild_id TEXT",
+        "through_instance_id TEXT",
+        "expected_limit NOT BETWEEN 1 AND 256",
+        "ROWS 256",
+        "SECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "ORDER BY\n            instance.guild_id COLLATE \"C\" DESC",
+        "ORDER BY\n        instance.guild_id COLLATE \"C\"",
+        "REVOKE ALL PRIVILEGES ON FUNCTION %s FROM PUBLIC CASCADE",
+        "starring_runtime_interaction_schema_manifest_v1",
+        "starring_runtime_interaction_database_readiness_v1",
+        "pg_get_function_arguments",
+        "pg_get_function_result",
+    ] {
+        assert!(migration.contains(required), "missing contract: {required}");
+    }
+    for forbidden in [
+        "ruleset_key TEXT",
+        "resources JSONB",
+        "GRANT EXECUTE",
+        "GRANT SELECT",
+        "GRANT INSERT",
+        "GRANT UPDATE",
+        "GRANT DELETE",
+        "COMMENT ON",
+    ] {
+        assert!(!migration.contains(forbidden), "{forbidden}");
+    }
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
+}
+
+#[test]
 fn interaction_migration_is_private_bounded_and_comment_free() {
     let migration =
         include_str!("../../../migrations/202607220027_scope_runtime_interaction_database.sql");
@@ -321,6 +456,33 @@ fn interaction_migration_is_private_bounded_and_comment_free() {
 
 #[tokio::test]
 #[ignore]
+async fn teardown_retry_scan_upgrades_cleanly_from_teardown_v1() {
+    let database = isolated_database_with_upgrade_boundary(Some(202_607_300_004)).await;
+    let applied: i64 = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*) \
+         FROM public._sqlx_migrations \
+         WHERE version = 202607300005 AND success",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(applied, 1);
+    let executable: bool = sqlx::query_scalar(
+        "SELECT pg_catalog.has_function_privilege( \
+             $1, pg_catalog.to_regprocedure($2), 'EXECUTE' \
+         )",
+    )
+    .bind(&database.role)
+    .bind(TEARDOWN_RETRY_SCAN_FUNCTION)
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert!(executable);
+    cleanup(database).await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn exact_capabilities_preserve_binding_inactivity_and_least_privilege() {
     let database = isolated_database().await;
     let owner_pool = database.owner_pool.clone();
@@ -328,6 +490,8 @@ async fn exact_capabilities_preserve_binding_inactivity_and_least_privilege() {
     let deadline_pool = database.deadline_pool.clone();
     let database_name = database.name.clone();
     let executor_role = database.role.clone();
+    let cross_role = database.cross_role.clone();
+    let cross_pool = database.cross_pool.clone();
     let task = tokio::spawn(async move {
         let database_identity: String = sqlx::query_scalar(
             "SELECT database_identity::TEXT FROM public.product_control_plane_identity WHERE singleton",
@@ -496,6 +660,149 @@ async fn exact_capabilities_preserve_binding_inactivity_and_least_privilege() {
                 "runtime_interaction_invalid_input".to_string()
             ))
         );
+
+        sqlx::query(
+            "INSERT INTO public.automation_instances \
+             (guild_id, instance_id, ruleset_key, ruleset_version, kind, created_by, status, resources) \
+             SELECT CASE ordinal % 3 WHEN 0 THEN '2' WHEN 1 THEN '10' ELSE '7' END, \
+                    'scan_' || pg_catalog.lpad(ordinal::TEXT, 4, '0'), \
+                    'study', 1, 'study_room', '3', 'deleting', '{}'::JSONB \
+             FROM pg_catalog.generate_series(0, 599) AS ordinal",
+        )
+        .execute(&owner_pool)
+        .await
+        .unwrap();
+        let scan_limit = NonZeroUsize::new(128).unwrap();
+        let mut scan_cursor = InstanceTeardownRetryScanCursorV2::initial();
+        let mut scanned_keys = Vec::new();
+        let mut cycle_through = None;
+        loop {
+            let page = store
+                .scan_retryable_v2(&scan_cursor, scan_limit)
+                .await
+                .unwrap();
+            if cycle_through.is_none() {
+                cycle_through = page.through().cloned();
+                sqlx::query(
+                    "INSERT INTO public.automation_instances \
+                     (guild_id, instance_id, ruleset_key, ruleset_version, kind, created_by, status, resources) \
+                     VALUES ('99', 'inserted_later', 'study', 1, 'study_room', '3', 'deleting', '{}'::JSONB)",
+                )
+                .execute(&owner_pool)
+                .await
+                .unwrap();
+            }
+            assert_eq!(page.through(), cycle_through.as_ref());
+            scanned_keys.extend(page.keys().iter().cloned());
+            let Some(next) = page.next_cursor_v2() else {
+                break;
+            };
+            scan_cursor = next;
+        }
+        assert_eq!(scanned_keys.len(), 600);
+        assert_eq!(scanned_keys.first().unwrap().guild_id(), GuildId(10));
+        assert!(scanned_keys
+            .windows(2)
+            .all(|pair| pair[0].cmp_c_v2(&pair[1]).is_lt()));
+        assert!(!scanned_keys
+            .iter()
+            .any(|key| key.instance_id().as_str() == "inserted_later"));
+        let next_cycle = store
+            .scan_retryable_v2(
+                &InstanceTeardownRetryScanCursorV2::initial(),
+                NonZeroUsize::new(MAX_INSTANCE_TEARDOWN_RETRY_SCAN_BATCH_V2).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(next_cycle
+            .through()
+            .is_some_and(|key| key.instance_id().as_str() == "inserted_later"));
+        assert_eq!(
+            store
+                .scan_retryable_v2(
+                    &InstanceTeardownRetryScanCursorV2::initial(),
+                    NonZeroUsize::new(MAX_INSTANCE_TEARDOWN_RETRY_SCAN_BATCH_V2 + 1).unwrap(),
+                )
+                .await,
+            Err(InstanceStoreError::Backend(
+                "runtime_interaction_invalid_input".to_string()
+            ))
+        );
+
+        let public_scan_grants: i64 = sqlx::query_scalar(
+            "SELECT pg_catalog.count(*) \
+             FROM pg_catalog.pg_proc AS function_row \
+             CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE( \
+                 function_row.proacl, \
+                 pg_catalog.acldefault('f', function_row.proowner) \
+             )) AS privilege \
+             WHERE function_row.oid = pg_catalog.to_regprocedure($1) \
+                 AND privilege.grantee = 0",
+        )
+        .bind(TEARDOWN_RETRY_SCAN_FUNCTION)
+        .fetch_one(&owner_pool)
+        .await
+        .unwrap();
+        assert_eq!(public_scan_grants, 0);
+        let cross_can_scan: bool = sqlx::query_scalar(
+            "SELECT pg_catalog.has_function_privilege( \
+                 $1, pg_catalog.to_regprocedure($2), 'EXECUTE' \
+             )",
+        )
+        .bind(&cross_role)
+        .bind(TEARDOWN_RETRY_SCAN_FUNCTION)
+        .fetch_one(&owner_pool)
+        .await
+        .unwrap();
+        assert!(!cross_can_scan);
+        let cross_error = sqlx::query(
+            "SELECT * FROM public.starring_runtime_interaction_instance_scan_retryable_v2(\
+                '', '', '', '', 1\
+             )",
+        )
+        .fetch_all(&cross_pool)
+        .await
+        .unwrap_err();
+        assert_eq!(sqlstate(&cross_error).as_deref(), Some("42501"));
+
+        owner_pool
+            .execute(
+                format!(
+                    "REVOKE EXECUTE ON FUNCTION {TEARDOWN_RETRY_SCAN_FUNCTION} FROM {executor_role}"
+                )
+                .as_str(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.verify_database_v1().await,
+            Err(RuntimeInteractionPersistenceErrorV1::InvalidAuthority)
+        );
+        owner_pool
+            .execute(function_grant(TEARDOWN_RETRY_SCAN_FUNCTION, &executor_role).as_str())
+            .await
+            .unwrap();
+        store.verify_database_v1().await.unwrap();
+
+        owner_pool
+            .execute(
+                "ALTER INDEX public.automation_instances_deleting_retry_scan_v2_idx \
+                 RENAME TO automation_instances_deleting_retry_scan_v2_drift",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.verify_database_v1().await,
+            Err(RuntimeInteractionPersistenceErrorV1::InvalidAuthority)
+        );
+        owner_pool
+            .execute(
+                "ALTER INDEX public.automation_instances_deleting_retry_scan_v2_drift \
+                 RENAME TO automation_instances_deleting_retry_scan_v2_idx",
+            )
+            .await
+            .unwrap();
+        store.verify_database_v1().await.unwrap();
 
         let held_connection = deadline_pool.acquire().await.unwrap();
         let deadline_result = tokio::time::timeout(

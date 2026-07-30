@@ -155,7 +155,8 @@ VALUES
     ('interaction', 'public.starring_runtime_interaction_instance_get_for_teardown_v1(text,text)'),
     ('interaction', 'public.starring_runtime_interaction_instance_claim_deleting_v1(text,text)'),
     ('interaction', 'public.starring_runtime_interaction_instance_mark_deleted_v1(text,text)'),
-    ('interaction', 'public.starring_runtime_interaction_instance_list_retryable_v1(text,bigint)');
+    ('interaction', 'public.starring_runtime_interaction_instance_list_retryable_v1(text,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_instance_scan_retryable_v2(text,text,text,text,bigint)');
 
 SELECT pg_catalog.pg_advisory_lock(
     pg_catalog.hashtextextended(
@@ -258,7 +259,7 @@ BEGIN
     IF (
         SELECT pg_catalog.count(*)
         FROM pg_temp.starring_runtime_capability_functions
-    ) <> 59 THEN
+    ) <> 60 THEN
         RAISE EXCEPTION 'runtime capability function manifest is invalid'
             USING ERRCODE = '55000';
     END IF;

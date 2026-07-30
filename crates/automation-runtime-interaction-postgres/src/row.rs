@@ -27,6 +27,14 @@ pub(crate) struct InstanceRowV1 {
 }
 
 #[derive(sqlx::FromRow)]
+pub(crate) struct InstanceTeardownRetryScanRowV2 {
+    pub(crate) guild_id: String,
+    pub(crate) instance_id: String,
+    pub(crate) through_guild_id: String,
+    pub(crate) through_instance_id: String,
+}
+
+#[derive(sqlx::FromRow)]
 pub(crate) struct PinnedInstanceRowV1 {
     pub(crate) guild_id: String,
     pub(crate) instance_id: String,
@@ -87,6 +95,23 @@ impl InstanceRowV1 {
             return Err(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt);
         }
         Ok(instance)
+    }
+}
+
+impl InstanceTeardownRetryScanRowV2 {
+    pub(crate) fn decode(
+        self,
+    ) -> Result<
+        (
+            automation_instance::InstanceTeardownRetryKeyV2,
+            automation_instance::InstanceTeardownRetryKeyV2,
+        ),
+        RuntimeInteractionPersistenceErrorV1,
+    > {
+        Ok((
+            decode_retry_key(self.guild_id, self.instance_id)?,
+            decode_retry_key(self.through_guild_id, self.through_instance_id)?,
+        ))
     }
 }
 
@@ -249,6 +274,20 @@ fn decode_instance(
     })
 }
 
+fn decode_retry_key(
+    guild_id: String,
+    instance_id: String,
+) -> Result<automation_instance::InstanceTeardownRetryKeyV2, RuntimeInteractionPersistenceErrorV1> {
+    let invalid = || RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt;
+    let parsed_guild_id = guild_id.parse::<GuildId>().map_err(|_| invalid())?;
+    let parsed_instance_id = InstanceId::parse(&instance_id).map_err(|_| invalid())?;
+    if parsed_guild_id.0 == 0 || parsed_guild_id.to_string() != guild_id {
+        return Err(invalid());
+    }
+    automation_instance::InstanceTeardownRetryKeyV2::new(parsed_guild_id, parsed_instance_id)
+        .ok_or_else(invalid)
+}
+
 fn resources_have_nonzero_ids(resources: &InstanceResources) -> bool {
     resources
         .roles
@@ -376,6 +415,32 @@ mod tests {
         };
         assert_eq!(
             row.decode_retryable(GuildId(7)),
+            Err(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt)
+        );
+    }
+
+    #[test]
+    fn retry_scan_row_decodes_only_canonical_keys_and_fixed_bound() {
+        let row = InstanceTeardownRetryScanRowV2 {
+            guild_id: "10".to_string(),
+            instance_id: "room_a".to_string(),
+            through_guild_id: "99".to_string(),
+            through_instance_id: "room_z".to_string(),
+        };
+        let (key, through) = row.decode().unwrap();
+        assert_eq!(key.guild_id(), GuildId(10));
+        assert_eq!(key.instance_id().as_str(), "room_a");
+        assert_eq!(through.guild_id(), GuildId(99));
+        assert_eq!(through.instance_id().as_str(), "room_z");
+
+        let invalid = InstanceTeardownRetryScanRowV2 {
+            guild_id: "010".to_string(),
+            instance_id: "room_a".to_string(),
+            through_guild_id: "99".to_string(),
+            through_instance_id: "room_z".to_string(),
+        };
+        assert_eq!(
+            invalid.decode(),
             Err(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt)
         );
     }
