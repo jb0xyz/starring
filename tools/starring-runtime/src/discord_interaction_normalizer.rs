@@ -6,6 +6,9 @@ use automation_runtime::{
     SharedGatewayInteractionIdentityV3, SharedGatewayInteractionTokenV3, SharedGatewayModalInputV3,
 };
 use discord_model::{ChannelId, GuildId, UserId};
+use paused_discord_model::application::interaction::application_command::{
+    CommandDataOption, CommandOptionValue,
+};
 use paused_discord_model::application::interaction::modal::ModalInteractionComponent;
 use paused_discord_model::application::interaction::{
     Interaction, InteractionData, InteractionType,
@@ -343,6 +346,9 @@ fn collect_runtime_discord_modal_inputs_v1(
 fn zeroize_pinned_discord_interaction_v1(interaction: &mut Interaction) {
     interaction.token.zeroize();
     match interaction.data.as_mut() {
+        Some(InteractionData::ApplicationCommand(data)) => {
+            zeroize_pinned_discord_command_options_v1(&mut data.options);
+        }
         Some(InteractionData::MessageComponent(data)) => {
             for value in &mut data.values {
                 value.zeroize();
@@ -352,6 +358,43 @@ fn zeroize_pinned_discord_interaction_v1(interaction: &mut Interaction) {
             zeroize_pinned_discord_modal_components_v1(&mut data.components);
         }
         _ => {}
+    }
+}
+
+fn zeroize_pinned_discord_command_options_v1(options: &mut Vec<CommandDataOption>) {
+    let mut ancestors = Vec::new();
+    let mut current = std::mem::take(options);
+    'tree: loop {
+        while let Some(mut option) = current.pop() {
+            if let Some(nested) =
+                take_pinned_discord_command_children_after_zeroize_v1(&mut option.value)
+            {
+                if !nested.is_empty() {
+                    ancestors.push(current);
+                    current = nested;
+                    continue 'tree;
+                }
+            }
+        }
+        let Some(parent) = ancestors.pop() else {
+            break;
+        };
+        current = parent;
+    }
+}
+
+fn take_pinned_discord_command_children_after_zeroize_v1(
+    value: &mut CommandOptionValue,
+) -> Option<Vec<CommandDataOption>> {
+    match value {
+        CommandOptionValue::Focused(value, _) | CommandOptionValue::String(value) => {
+            value.zeroize();
+            None
+        }
+        CommandOptionValue::SubCommand(options) | CommandOptionValue::SubCommandGroup(options) => {
+            Some(std::mem::take(options))
+        }
+        _ => None,
     }
 }
 
@@ -383,13 +426,15 @@ mod tests {
         SharedGatewayInteractionEnvelopeErrorV3, SharedGatewayInteractionKindV3,
         MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3, MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3,
     };
+    use paused_discord_model::application::command::{CommandOptionType, CommandType};
+    use paused_discord_model::application::interaction::application_command::CommandData;
     use paused_discord_model::application::interaction::message_component::MessageComponentInteractionData;
     use paused_discord_model::application::interaction::modal::{
         ModalInteractionActionRow, ModalInteractionData, ModalInteractionLabel,
         ModalInteractionTextDisplay, ModalInteractionTextInput,
     };
     use paused_discord_model::id::marker::{
-        ApplicationMarker, ChannelMarker, GuildMarker, InteractionMarker, UserMarker,
+        ApplicationMarker, ChannelMarker, CommandMarker, GuildMarker, InteractionMarker, UserMarker,
     };
     use paused_discord_model::id::Id;
     use paused_discord_model::oauth::ApplicationIntegrationMap;
@@ -506,6 +551,41 @@ mod tests {
             ))),
             Some(42),
         )
+    }
+
+    fn application_command(options: Vec<CommandDataOption>) -> Interaction {
+        interaction(
+            InteractionType::ApplicationCommand,
+            Some(InteractionData::ApplicationCommand(Box::new(CommandData {
+                guild_id: Some(Id::<GuildMarker>::new(42)),
+                id: Id::<CommandMarker>::new(59),
+                name: "ignored".to_string(),
+                kind: CommandType::ChatInput,
+                options,
+                resolved: None,
+                target_id: None,
+            }))),
+            Some(42),
+        )
+    }
+
+    fn deeply_nested_command_options(depth: usize) -> Vec<CommandDataOption> {
+        let mut value = CommandOptionValue::String("deep-command-secret".to_string());
+        for index in 0..depth {
+            let option = CommandDataOption {
+                name: format!("level_{index}"),
+                value,
+            };
+            value = if index % 2 == 0 {
+                CommandOptionValue::SubCommand(vec![option])
+            } else {
+                CommandOptionValue::SubCommandGroup(vec![option])
+            };
+        }
+        vec![CommandDataOption {
+            name: "root".to_string(),
+            value,
+        }]
     }
 
     #[test]
@@ -681,5 +761,33 @@ mod tests {
         };
         assert!(first.value.is_empty());
         assert!(second.value.is_empty());
+    }
+
+    #[test]
+    fn ignored_command_values_are_zeroized_without_recursive_drop() {
+        let mut string = CommandOptionValue::String("string-secret".to_string());
+        assert!(take_pinned_discord_command_children_after_zeroize_v1(&mut string).is_none());
+        let CommandOptionValue::String(string) = string else {
+            panic!("expected string option");
+        };
+        assert!(string.is_empty());
+
+        let mut focused =
+            CommandOptionValue::Focused("focused-secret".to_string(), CommandOptionType::String);
+        assert!(take_pinned_discord_command_children_after_zeroize_v1(&mut focused).is_none());
+        let CommandOptionValue::Focused(focused, _) = focused else {
+            panic!("expected focused option");
+        };
+        assert!(focused.is_empty());
+
+        let outcome = normalize_runtime_discord_interaction_v1(application_command(
+            deeply_nested_command_options(4_096),
+        ));
+        assert!(matches!(
+            outcome,
+            RuntimeDiscordInteractionNormalizationOutcomeV1::Ignored(
+                RuntimeDiscordInteractionIgnoredV1::UnsupportedInteraction
+            )
+        ));
     }
 }
