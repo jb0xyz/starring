@@ -285,6 +285,15 @@ pub(super) enum RuntimeServingGatewayReadyRefreshV3 {
     ResumedSuccessor,
 }
 
+impl RuntimeServingGatewayReadyRefreshV3 {
+    pub(super) const fn admission_revision_delta_v3(self) -> u64 {
+        match self {
+            Self::Current => 0,
+            Self::ResumedSuccessor => 1,
+        }
+    }
+}
+
 impl RuntimeIngressOpenAcknowledgementObservationV2 {
     pub fn from_accepted(accepted: RuntimeAcceptedIngressOpenAcknowledgementV2) -> Self {
         Self { accepted }

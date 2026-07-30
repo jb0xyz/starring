@@ -2128,26 +2128,28 @@ fn serving_ready_successor(
     serving: &RuntimeServingOpenProcessV2,
 ) -> automation_runtime_controller::RuntimeGatewayReadyAttestationV2 {
     let mut ready = serving.epoch().gateway_ready().clone();
-    ready.resume_sequence = sequence(ready.resume_sequence.get() + 1);
+    ready.admission_revision = non_zero(ready.admission_revision.get() + 1);
+    ready.resume_sequence = sequence(ready.resume_sequence.get() + 2);
     ready
 }
 
 #[test]
-fn resumed_serving_refresh_preserves_the_discord_ready_kind() {
+fn resumed_serving_refresh_accepts_fresh_ready_trace_and_preserves_discord_kind() {
     for kind in [
         RuntimeGatewayReadyKindV2::Ready,
         RuntimeGatewayReadyKindV2::Resumed,
     ] {
         let current = automation_runtime_controller::RuntimeGatewayReadyAttestationV2 {
             process_instance_id: process(),
-            connection_epoch: non_zero(2),
+            connection_epoch: non_zero(1),
             kind,
-            admission_revision: non_zero(3),
-            connected_event_sequence: sequence(4),
-            resume_sequence: sequence(5),
+            admission_revision: non_zero(2),
+            connected_event_sequence: sequence(1),
+            resume_sequence: sequence(3),
         };
         let mut observed = current.clone();
-        observed.resume_sequence = sequence(6);
+        observed.admission_revision = non_zero(3);
+        observed.resume_sequence = sequence(5);
         assert_eq!(
             super::refresh::validate_serving_gateway_ready_refresh_v3(
                 &current,
@@ -2170,6 +2172,29 @@ fn resumed_serving_refresh_preserves_the_discord_ready_kind() {
             Err(RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch)
         );
     }
+}
+
+#[test]
+fn resumed_serving_refresh_rejects_admission_revision_persistence_overflow() {
+    let current = automation_runtime_controller::RuntimeGatewayReadyAttestationV2 {
+        process_instance_id: process(),
+        connection_epoch: non_zero(1),
+        kind: RuntimeGatewayReadyKindV2::Ready,
+        admission_revision: non_zero(i64::MAX as u64),
+        connected_event_sequence: sequence(1),
+        resume_sequence: sequence(3),
+    };
+    let mut observed = current.clone();
+    observed.admission_revision = non_zero(i64::MAX as u64 + 1);
+    observed.resume_sequence = sequence(5);
+    assert_eq!(
+        super::refresh::validate_serving_gateway_ready_refresh_v3(
+            &current,
+            &observed,
+            super::admission::RuntimeServingGatewayReadyRefreshV3::ResumedSuccessor,
+        ),
+        Err(RuntimeProductionLifecycleErrorV2::StaleAdmissionRevision)
+    );
 }
 
 fn assert_resumed_serving_refresh_rejected(
@@ -2235,6 +2260,14 @@ fn serving_refresh_accepts_and_stores_only_an_exact_resumed_successor() {
     let current_kind = serving.epoch().gateway_ready().kind;
     let successor = serving_ready_successor(&serving);
     assert_eq!(successor.kind, current_kind);
+    assert_eq!(
+        successor.admission_revision.get(),
+        serving.epoch().gateway_ready().admission_revision.get() + 1
+    );
+    assert_eq!(
+        successor.resume_sequence.get(),
+        serving.epoch().gateway_ready().resume_sequence.get() + 2
+    );
     assert!(successor.was_explicitly_resumed());
     let mut input = serving_refresh_input(&serving, current_sequence, false);
     input.gateway_ready = successor.clone();
@@ -2369,7 +2402,13 @@ fn resumed_serving_refresh_rejects_non_monotonic_and_identity_drift() {
         RuntimeProductionLifecycleErrorV2::StaleConnectionEpoch,
     );
     assert_resumed_serving_refresh_rejected(
-        |observed, _| observed.admission_revision = non_zero(observed.admission_revision.get() + 1),
+        |observed, current| observed.admission_revision = current.admission_revision,
+        RuntimeProductionLifecycleErrorV2::StaleAdmissionRevision,
+    );
+    assert_resumed_serving_refresh_rejected(
+        |observed, current| {
+            observed.admission_revision = non_zero(current.admission_revision.get() + 2)
+        },
         RuntimeProductionLifecycleErrorV2::StaleAdmissionRevision,
     );
     assert_resumed_serving_refresh_rejected(

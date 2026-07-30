@@ -6619,6 +6619,14 @@ mod tests {
             gateway.paused_v2().admission_revision(),
             gateway.ready_v2().admission_revision
         );
+        assert_eq!(
+            gateway.ready_v2().admission_revision.get(),
+            resumed.fixture.ready.admission_revision.get() + 1
+        );
+        assert_eq!(
+            gateway.ready_v2().resume_sequence.get(),
+            resumed.fixture.ready.resume_sequence.get() + 2
+        );
         assert!(gateway.ready_v2().resume_sequence > gateway.paused_v2().transition_sequence());
         let mut foreign_ready = gateway.ready_v2().clone();
         foreign_ready.process_instance_id =

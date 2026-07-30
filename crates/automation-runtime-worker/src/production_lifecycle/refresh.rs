@@ -102,7 +102,12 @@ pub(super) fn validate_serving_gateway_ready_refresh_v3(
     if observed.connection_epoch != current.connection_epoch {
         return Err(RuntimeProductionLifecycleErrorV2::StaleConnectionEpoch);
     }
-    if observed.admission_revision != current.admission_revision {
+    let expected_admission_revision = current
+        .admission_revision
+        .get()
+        .checked_add(transition.admission_revision_delta_v3())
+        .filter(|revision| *revision <= i64::MAX as u64);
+    if expected_admission_revision != Some(observed.admission_revision.get()) {
         return Err(RuntimeProductionLifecycleErrorV2::StaleAdmissionRevision);
     }
     let accepted = match transition {
