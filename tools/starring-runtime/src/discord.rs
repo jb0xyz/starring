@@ -290,6 +290,50 @@ pub(crate) struct RuntimeDiscordReservedResumeRequestV2 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeDiscordOrdinaryResumeAuthorizationV3 {
+    Inactive,
+    Authorized {
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+        correlation: NonZeroU64,
+        expected: RuntimeDiscordPauseReservationIdentityV2,
+    },
+    Indeterminate,
+}
+
+impl RuntimeDiscordOrdinaryResumeAuthorizationV3 {
+    pub(crate) fn actor_observation_v3(
+        self,
+        epoch: automation_runtime::GatewayConnectionEpochV3,
+    ) -> Option<RuntimeDiscordOrdinaryResumeActorObservationV3> {
+        let Self::Authorized {
+            coordinator_generation,
+            correlation,
+            expected,
+        } = self
+        else {
+            return None;
+        };
+        (expected.epoch() == epoch).then_some(
+            RuntimeDiscordOrdinaryResumeActorObservationV3::Observed {
+                coordinator_generation,
+                correlation,
+                expected,
+            },
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeDiscordOrdinaryResumeActorObservationV3 {
+    Inactive,
+    Observed {
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+        correlation: NonZeroU64,
+        expected: RuntimeDiscordPauseReservationIdentityV2,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeDiscordRecoveryResumeFailureV2 {
     CommandUnavailable,
     ActorRejected,
@@ -547,6 +591,10 @@ pub(crate) struct RuntimeDiscordGatewayActorStartV1 {
     pub(crate) shutdown_deadline: Instant,
     pub(crate) lifecycle_drained: watch::Receiver<u64>,
     pub(crate) discord_reservation: watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
+    pub(crate) ordinary_resume_authorization:
+        watch::Receiver<RuntimeDiscordOrdinaryResumeAuthorizationV3>,
+    pub(crate) ordinary_resume_actor_observation:
+        watch::Sender<RuntimeDiscordOrdinaryResumeActorObservationV3>,
     pub(crate) runtime: tokio::runtime::Handle,
     pub(crate) control_task: RuntimeDiscordControlTaskV1,
     pub(crate) stopped_sender: watch::Sender<bool>,
@@ -1305,6 +1353,8 @@ where
         shutdown_deadline,
         lifecycle_drained,
         discord_reservation,
+        ordinary_resume_authorization,
+        ordinary_resume_actor_observation,
         runtime,
         control_task,
         stopped_sender,
@@ -1329,6 +1379,8 @@ where
                 failure_deadline: shutdown_deadline,
                 lifecycle_drained,
                 discord_reservation,
+                ordinary_resume_authorization,
+                ordinary_resume_actor_observation,
                 process_handoff: process_handoff_receiver,
                 drain: drain_receiver,
                 recovery_resume: recovery_resume_receiver,
@@ -1411,6 +1463,9 @@ struct RuntimeDiscordGatewayActorV2<D> {
     failure_deadline: Instant,
     lifecycle_drained: watch::Receiver<u64>,
     discord_reservation: watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
+    ordinary_resume_authorization: watch::Receiver<RuntimeDiscordOrdinaryResumeAuthorizationV3>,
+    ordinary_resume_actor_observation:
+        watch::Sender<RuntimeDiscordOrdinaryResumeActorObservationV3>,
     process_handoff: oneshot::Receiver<RuntimeDiscordProcessHandoffCommandV2>,
     drain: oneshot::Receiver<RuntimeDiscordDrainCommandV2>,
     recovery_resume: mpsc::Receiver<RuntimeDiscordRecoveryResumeCommandV2>,
@@ -1431,6 +1486,8 @@ where
         failure_deadline,
         mut lifecycle_drained,
         mut discord_reservation,
+        mut ordinary_resume_authorization,
+        ordinary_resume_actor_observation,
         mut process_handoff,
         mut drain,
         mut recovery_resume,
@@ -1577,6 +1634,23 @@ where
                 )
                 .await;
             }
+            authorization = ordinary_resume_authorization.changed() => {
+                let indeterminate = authorization.is_err()
+                    || matches!(
+                        *ordinary_resume_authorization.borrow_and_update(),
+                        RuntimeDiscordOrdinaryResumeAuthorizationV3::Indeterminate
+                    );
+                if indeterminate {
+                    return finish_runtime_discord_gateway_if_connected_v1(
+                        &mut driver,
+                        &mut control,
+                        RuntimeDiscordGatewayExitV1::AdmissionOpened,
+                        runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
+                        &mut lifecycle_drained,
+                    )
+                    .await;
+                }
+            }
             command = control.process_next_command() => {
                 match command {
                     GatewayRuntimeCommandOutcomeV3::Applied(
@@ -1600,16 +1674,42 @@ where
                         }
                     }
                     GatewayRuntimeCommandOutcomeV3::Applied(
-                        GatewayCommandAckV3::AdmissionResumed { .. }
+                        GatewayCommandAckV3::AdmissionResumed { epoch }
                     ) => {
-                        return finish_runtime_discord_gateway_if_connected_v1(
-                            &mut driver,
-                            &mut control,
-                            RuntimeDiscordGatewayExitV1::AdmissionOpened,
-                            runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
-                            &mut lifecycle_drained,
-                        )
-                        .await;
+                        let Some(observation) = ordinary_resume_authorization
+                            .borrow()
+                            .actor_observation_v3(epoch)
+                        else {
+                            return finish_runtime_discord_gateway_if_connected_v1(
+                                &mut driver,
+                                &mut control,
+                                RuntimeDiscordGatewayExitV1::AdmissionOpened,
+                                runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
+                                &mut lifecycle_drained,
+                            )
+                            .await;
+                        };
+                        ordinary_resume_actor_observation.send_replace(observation);
+                        if !wait_for_lifecycle_drain_v1(
+                                &mut lifecycle_drained,
+                                lifecycle_sequence,
+                                runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
+                            )
+                            .await
+                            || matches!(
+                                *ordinary_resume_authorization.borrow(),
+                                RuntimeDiscordOrdinaryResumeAuthorizationV3::Indeterminate
+                            )
+                        {
+                            return finish_runtime_discord_gateway_if_connected_v1(
+                                &mut driver,
+                                &mut control,
+                                RuntimeDiscordGatewayExitV1::AdmissionOpened,
+                                runtime_discord_cleanup_deadline_v2(mode, failure_deadline),
+                                &mut lifecycle_drained,
+                            )
+                            .await;
+                        }
                     }
                     GatewayRuntimeCommandOutcomeV3::Applied(
                         GatewayCommandAckV3::Draining { .. }
@@ -2164,6 +2264,7 @@ mod tests {
     use crate::gateway::{
         compose_runtime_gateway_section_test_bootstrap_v2,
         compose_runtime_gateway_section_test_bootstrap_with_capacity_v2,
+        RuntimeDiscordOrdinaryBarrierPauseOutcomeV3, RuntimeDiscordOrdinaryBarrierResumeOutcomeV3,
         RuntimeGatewayReadyObservationErrorV1,
     };
 
@@ -2649,6 +2750,82 @@ mod tests {
         assert_eq!(second_evidence.expected_v2(), second_reservation);
         assert!(gateway.observe_current_ready_attestation().is_ok());
 
+        let terminal = process
+            .shutdown_until(
+                gateway.begin_discord_drain_v1(),
+                NonZeroU64::MIN,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.exit(), RuntimeDiscordGatewayExitV1::Commanded);
+        assert_eq!(closes.load(Ordering::Acquire), 1);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn ordinary_correlated_resume_keeps_the_process_actor_alive_and_closed() {
+        let mut gateway = gateway_with_lifecycle_capacity(1);
+        let (signals, driver, _polls, closes, drops) = driver();
+        let supervisor = gateway
+            .start_discord_gateway_with_driver_v1(
+                driver,
+                Instant::now() + Duration::from_secs(2),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        let observation = supervisor.observation_v1();
+        signals.send(RuntimeDiscordGatewaySignalV1::Ready).unwrap();
+        let _ready = wait_for_epoch(&gateway, 1).await;
+        let recovery_reservation = gateway
+            .discord_pause_reservation_for_test_v2()
+            .expect("Discord recovery pause reservation");
+        let process =
+            expect_process_handoff(supervisor.handoff_to_process_v2(NonZeroU64::MIN).await);
+        let (process, _) = expect_applied_resume(
+            process
+                .resume_reserved_admission_v2(
+                    RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                    recovery_reservation,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await,
+        );
+        assert!(gateway
+            .activate_ordinary_barrier_for_test_v3(RuntimeGatewayCoordinatorGenerationV2::FIRST));
+        let barrier = gateway
+            .ordinary_barrier_port_for_test_v3()
+            .expect("ordinary Discord barrier port");
+        let reservation = match barrier
+            .pause_v3(
+                RuntimeGatewayCoordinatorGenerationV2::FIRST,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+        {
+            RuntimeDiscordOrdinaryBarrierPauseOutcomeV3::Applied(reservation) => reservation,
+            _ => panic!("ordinary Discord pause was not applied"),
+        };
+        assert_eq!(reservation.connection_epoch_v3(), 1);
+        assert!(reservation.pause_sequence_v3() > reservation.connected_event_sequence_v3());
+        assert!(gateway.ordinary_barrier_is_held_for_test_v3());
+        let resumed = match barrier
+            .resume_v3(reservation, Instant::now() + Duration::from_secs(1))
+            .await
+        {
+            RuntimeDiscordOrdinaryBarrierResumeOutcomeV3::Applied(resumed) => resumed,
+            _ => panic!("ordinary Discord resume was not applied"),
+        };
+        assert_eq!(
+            resumed.coordinator_generation_v3(),
+            RuntimeGatewayCoordinatorGenerationV2::FIRST
+        );
+        assert_eq!(resumed.connection_epoch_v3(), 1);
+        assert!(resumed.resume_sequence_v3() > resumed.pause_sequence_v3());
+        assert!(gateway.ordinary_barrier_is_held_for_test_v3());
+        assert_eq!(observation.terminal_status(), None);
+        assert!(!observation.is_finished());
         let terminal = process
             .shutdown_until(
                 gateway.begin_discord_drain_v1(),

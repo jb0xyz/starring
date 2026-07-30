@@ -5,6 +5,7 @@ use automation_runtime_controller::RuntimeIngressOpenAcknowledgementLeaseDuratio
 use automation_runtime_worker::{
     RuntimeIngressOpenAcknowledgementPortV2, RuntimeServingOpenSupervisorConfigV2,
 };
+use chrono::{DateTime, Utc};
 
 use crate::closed_recovery::{
     RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2,
@@ -14,9 +15,15 @@ use crate::closed_recovery::{
     RuntimeClosedRecoverySupervisedServingOpenProcessV2,
 };
 use crate::discord::RuntimeDiscordProcessSupervisorV2;
+use crate::gateway::{
+    RuntimeDiscordOrdinaryBarrierFailureV3, RuntimeDiscordOrdinaryBarrierPauseOutcomeV3,
+    RuntimeDiscordOrdinaryBarrierReservationV3, RuntimeDiscordOrdinaryBarrierResumeOutcomeV3,
+};
 use crate::ingress_acknowledgement_safety::RuntimeIngressAcknowledgementSafetyMonitorV2;
 use crate::maintenance_ingress_gate::RuntimeMaintenanceIngressGateOpenAuthorityV2;
 use crate::runtime_controller::{
+    RuntimeControllerBarrierAPauseCommandV2, RuntimeControllerBarrierAPausedV2,
+    RuntimeControllerBarrierAResumedV2, RuntimeControllerBarrierBridgeErrorV2,
     RuntimeServingControllerEventV2, RuntimeServingControllerSupervisorV2,
 };
 
@@ -29,7 +36,8 @@ use super::observation::{
     shutdown_orphaned_admission_process_v2, shutdown_orphaned_empty_open_process_v2,
     shutdown_orphaned_ingress_acknowledgement_v2, shutdown_process_without_lifecycle_v2,
     shutdown_refreshing_serving_open_process_v2, shutdown_serving_open_process_v2,
-    RuntimeEmptyOpenMonitorV2, RuntimeEmptyOpenProcessV2, RuntimeIngressAcknowledgementCleanupV2,
+    RuntimeEmptyOpenMonitorV2, RuntimeEmptyOpenProcessV2,
+    RuntimeExactIngressAcknowledgementReobservationV3, RuntimeIngressAcknowledgementCleanupV2,
     RuntimeIngressAcknowledgementScheduleV2, RuntimeLifecycleLostRegistryObservationV2,
     RuntimeProcessIngressAcknowledgementExecutionFailureV2, RuntimeProcessProductionHandoffErrorV2,
     RuntimeProcessProductionHandoffFailureV2,
@@ -38,6 +46,12 @@ use super::{RuntimeProcessFoundationV1, RuntimeProcessIngressAcknowledgementSupe
 
 const SERVING_OPEN_SLOT_WORK_CAPACITY_V2: usize = 1;
 const INGRESS_ACKNOWLEDGEMENT_LEASE_V2: Duration = Duration::from_secs(10);
+
+struct RuntimeServingBarrierAPausedStateV3 {
+    handle: NonZeroU64,
+    command: RuntimeControllerBarrierAPauseCommandV2,
+    reservation: RuntimeDiscordOrdinaryBarrierReservationV3,
+}
 
 pub(crate) struct RuntimeServingOpenProcessV2 {
     controller: RuntimeServingControllerSupervisorV2,
@@ -248,21 +262,6 @@ impl RuntimeServingOpenProcessV2 {
     async fn refresh_acknowledgement_v2(
         self,
     ) -> Result<Self, RuntimeProcessProductionHandoffErrorV2> {
-        if Instant::now() >= self.acknowledgement_schedule.safety_deadline {
-            return Err(self
-                .cleanup_transition_v2(
-                    RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed,
-                )
-                .await);
-        }
-        if let Err(transition) = self.revalidate_v2().await {
-            return Err(self.cleanup_transition_v2(transition).await);
-        }
-        let database = match collect_recovery_resume_database_evidence_v2(&self.foundation).await {
-            Ok(database) => database,
-            Err(transition) => return Err(self.cleanup_transition_v2(transition).await),
-        };
-        let (readiness, writer_fence_generation) = database.into_parts_v2();
         let gateway_ready = match self.lifecycle.observe_exact_current_ready_attestation_v2() {
             Ok(ready) => ready,
             Err(_) => {
@@ -271,6 +270,40 @@ impl RuntimeServingOpenProcessV2 {
                     .await);
             }
         };
+        self.refresh_acknowledgement_with_ready_v3(gateway_ready, true)
+            .await
+            .map(|(process, _)| process)
+    }
+
+    async fn refresh_acknowledgement_with_ready_v3(
+        self,
+        gateway_ready: automation_runtime_controller::RuntimeGatewayReadyAttestationV2,
+        require_normal_revalidation: bool,
+    ) -> Result<
+        (Self, RuntimeExactIngressAcknowledgementReobservationV3),
+        RuntimeProcessProductionHandoffErrorV2,
+    > {
+        if Instant::now() >= self.acknowledgement_schedule.safety_deadline {
+            return Err(self
+                .cleanup_transition_v2(
+                    RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed,
+                )
+                .await);
+        }
+        if require_normal_revalidation {
+            if let Err(transition) = self.revalidate_v2().await {
+                return Err(self.cleanup_transition_v2(transition).await);
+            }
+        } else if let Some(transition) =
+            production_handoff_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+        {
+            return Err(self.cleanup_transition_v2(transition).await);
+        }
+        let database = match collect_recovery_resume_database_evidence_v2(&self.foundation).await {
+            Ok(database) => database,
+            Err(transition) => return Err(self.cleanup_transition_v2(transition).await),
+        };
+        let (readiness, writer_fence_generation) = database.into_parts_v2();
         let gate = self
             .foundation
             .maintenance_ingress_observer_v2()
@@ -359,7 +392,11 @@ impl RuntimeServingOpenProcessV2 {
             acknowledgement_safety,
             process_generation,
         } = self;
-        let refresh = match lifecycle.authorize_acknowledgement_refresh_v2(evidence) {
+        let refresh = match if require_normal_revalidation {
+            lifecycle.authorize_acknowledgement_refresh_v2(evidence)
+        } else {
+            lifecycle.authorize_resumed_acknowledgement_refresh_v3(evidence)
+        } {
             Ok(refresh) => refresh,
             Err(failure) => {
                 let transition = map_production_lifecycle_failure_v2(failure.error_v2());
@@ -504,8 +541,11 @@ impl RuntimeServingOpenProcessV2 {
             &accepted_receipt,
         )
         .await;
-        let schedule = final_observation.as_ref().ok().and_then(|receipt| {
-            ingress_acknowledgement_schedule_v2(receipt, final_observation_started_at)
+        let schedule = final_observation.as_ref().ok().and_then(|observation| {
+            ingress_acknowledgement_schedule_v2(
+                observation.receipt_v3(),
+                final_observation_started_at,
+            )
         });
         let process = Self {
             controller,
@@ -520,7 +560,7 @@ impl RuntimeServingOpenProcessV2 {
             process_generation,
         };
         match (final_observation, schedule) {
-            (Ok(_), Some(schedule)) => {
+            (Ok(receipt), Some(schedule)) => {
                 if !process
                     .acknowledgement_safety
                     .rearm_v2(schedule.safety_deadline)
@@ -530,10 +570,14 @@ impl RuntimeServingOpenProcessV2 {
                             RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed,
                         )
                         .await)
-                } else if let Err(transition) = process.revalidate_v2().await {
-                    Err(process.cleanup_transition_v2(transition).await)
+                } else if require_normal_revalidation {
+                    if let Err(transition) = process.revalidate_v2().await {
+                        Err(process.cleanup_transition_v2(transition).await)
+                    } else {
+                        Ok((process, receipt))
+                    }
                 } else {
-                    Ok(process)
+                    Ok((process, receipt))
                 }
             }
             (Err(transition), _) => Err(process.cleanup_transition_v2(transition).await),
@@ -543,6 +587,37 @@ impl RuntimeServingOpenProcessV2 {
                 )
                 .await),
         }
+    }
+
+    fn start_gateway_monitor_v2(
+        &self,
+        gateway_ready: &automation_runtime_controller::RuntimeGatewayReadyAttestationV2,
+    ) -> Result<RuntimeEmptyOpenMonitorV2, RuntimeProcessProductionHandoffFailureV2> {
+        let gateway_invalidation = self
+            .lifecycle
+            .bind_gateway_ready_invalidation_observer_v2(gateway_ready);
+        if gateway_invalidation.current_invalidation_v2().is_some() {
+            return Err(RuntimeProcessProductionHandoffFailureV2::Gateway);
+        }
+        let trigger = self.foundation.shutdown_trigger_v1();
+        let mut shutdown = self.foundation.shutdown_observer_v1();
+        let mut discord_terminal = self.discord.observation_v2();
+        let owner_terminal = self.lifecycle.owner_terminal_observation_v2();
+        Ok(RuntimeEmptyOpenMonitorV2::start(async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => {}
+                _ = gateway_invalidation.wait_v2() => {
+                    trigger.trip(crate::RuntimeShutdownCauseV1::ReadinessLost);
+                }
+                _ = discord_terminal.wait_terminal() => {
+                    trigger.trip(crate::RuntimeShutdownCauseV1::DiscordTerminal);
+                }
+                _ = owner_terminal => {
+                    trigger.trip(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
+                }
+            }
+        }))
     }
 
     pub(crate) async fn run_until_shutdown_v2(
@@ -558,39 +633,16 @@ impl RuntimeServingOpenProcessV2 {
                     .await);
             }
         };
-        let gateway_invalidation = self
-            .lifecycle
-            .bind_gateway_ready_invalidation_observer_v2(&gateway_ready);
-        if gateway_invalidation.current_invalidation_v2().is_some() {
-            self.foundation
-                .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
-            return Err(self
-                .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Gateway)
-                .await);
-        }
-        let trigger = self.foundation.shutdown_trigger_v1();
-        let mut shutdown_for_monitor = self.foundation.shutdown_observer_v1();
-        let mut discord_terminal = self.discord.observation_v2();
-        let owner_terminal = self.lifecycle.owner_terminal_observation_v2();
-        let monitor = RuntimeEmptyOpenMonitorV2::start(async move {
-            tokio::select! {
-                biased;
-                _ = shutdown_for_monitor.wait() => {}
-                _ = gateway_invalidation.wait_v2() => {
-                    trigger.trip(crate::RuntimeShutdownCauseV1::ReadinessLost);
-                }
-                _ = discord_terminal.wait_terminal() => {
-                    trigger.trip(crate::RuntimeShutdownCauseV1::DiscordTerminal);
-                }
-                _ = owner_terminal => {
-                    trigger.trip(crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal);
-                }
-            }
+        let mut monitor = Some(match self.start_gateway_monitor_v2(&gateway_ready) {
+            Ok(monitor) => monitor,
+            Err(transition) => return Err(self.cleanup_transition_v2(transition).await),
         });
+        let mut paused_barrier = None;
+        let mut next_barrier_handle = 0u64;
         let mut shutdown = self.foundation.shutdown_observer_v1();
         enum RuntimeServingOpenLoopEventV2 {
             Shutdown(crate::RuntimeShutdownObservationV1),
-            Controller(RuntimeServingControllerEventV2),
+            Controller(Box<RuntimeServingControllerEventV2>),
             RefreshAcknowledgement,
         }
         let observation = loop {
@@ -609,40 +661,362 @@ impl RuntimeServingOpenProcessV2 {
                     RuntimeServingOpenLoopEventV2::Shutdown(observation)
                 },
                 event = self.controller.next_event_v2() => {
-                    RuntimeServingOpenLoopEventV2::Controller(event)
+                    RuntimeServingOpenLoopEventV2::Controller(Box::new(event))
                 },
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(refresh_at)) => {
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(refresh_at)),
+                    if paused_barrier.is_none() => {
                     RuntimeServingOpenLoopEventV2::RefreshAcknowledgement
                 },
             };
             match selected {
                 RuntimeServingOpenLoopEventV2::Shutdown(observation) => break observation,
-                RuntimeServingOpenLoopEventV2::Controller(
-                    RuntimeServingControllerEventV2::AcquireSlot { slot, reply },
-                ) => {
-                    let request = self.lifecycle.authorize_slot_work_v2(slot);
-                    let permit = self.lifecycle.begin_slot_work_v2(request);
-                    let _ = reply.send(permit);
-                }
-                RuntimeServingOpenLoopEventV2::Controller(
-                    RuntimeServingControllerEventV2::Terminal,
-                ) => {
-                    break self
-                        .foundation
-                        .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::SupervisorFailure);
-                }
+                RuntimeServingOpenLoopEventV2::Controller(event) => match *event {
+                    RuntimeServingControllerEventV2::AcquireSlot { slot, reply } => {
+                        let request = self.lifecycle.authorize_slot_work_v2(slot);
+                        let permit = self.lifecycle.begin_slot_work_v2(request);
+                        let _ = reply.send(permit);
+                    }
+                    RuntimeServingControllerEventV2::PauseBarrierA { command, reply } => {
+                        if paused_barrier.is_some()
+                            || Utc::now() < command.started_at
+                            || Utc::now() > command.deadline
+                        {
+                            let _ = reply
+                                .send(Err(RuntimeControllerBarrierBridgeErrorV2::StaleAuthority));
+                            continue;
+                        }
+                        if let Some(active) = monitor.take() {
+                            active.stop_v2().await;
+                        }
+                        let port = match self.lifecycle.ordinary_barrier_port_v3() {
+                            Ok(port) => port,
+                            Err(error) => {
+                                let _ = reply.send(Err(map_ordinary_barrier_failure_v3(error)));
+                                if let Ok(ready) =
+                                    self.lifecycle.observe_exact_current_ready_attestation_v2()
+                                {
+                                    monitor = self.start_gateway_monitor_v2(&ready).ok();
+                                }
+                                if monitor.is_none() {
+                                    self.foundation.trip_shutdown_v1(
+                                        crate::RuntimeShutdownCauseV1::ReadinessLost,
+                                    );
+                                }
+                                continue;
+                            }
+                        };
+                        let generation = self.lifecycle.coordinator_generation_v3();
+                        let Some(deadline) = runtime_barrier_deadline_v3(command.deadline) else {
+                            let _ = reply
+                                .send(Err(RuntimeControllerBarrierBridgeErrorV2::DeadlineElapsed));
+                            if let Ok(ready) =
+                                self.lifecycle.observe_exact_current_ready_attestation_v2()
+                            {
+                                monitor = self.start_gateway_monitor_v2(&ready).ok();
+                            }
+                            if monitor.is_none() {
+                                self.foundation
+                                    .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
+                            }
+                            continue;
+                        };
+                        match port.pause_v3(generation, deadline).await {
+                            RuntimeDiscordOrdinaryBarrierPauseOutcomeV3::Applied(reservation) => {
+                                let handle_value = next_barrier_handle.checked_add(1);
+                                let fields = (
+                                    NonZeroU64::new(reservation.coordinator_generation_v3().get()),
+                                    NonZeroU64::new(reservation.connection_epoch_v3()),
+                                    NonZeroU64::new(reservation.admission_revision_v3()),
+                                    NonZeroU64::new(reservation.connected_event_sequence_v3()),
+                                    NonZeroU64::new(reservation.pause_sequence_v3()),
+                                    handle_value.and_then(NonZeroU64::new),
+                                );
+                                let (
+                                    Some(coordinator_generation),
+                                    Some(connection_epoch),
+                                    Some(admission_revision),
+                                    Some(connected_event_sequence),
+                                    Some(pause_sequence),
+                                    Some(handle),
+                                ) = fields
+                                else {
+                                    let _ = reply.send(Err(
+                                        RuntimeControllerBarrierBridgeErrorV2::Indeterminate,
+                                    ));
+                                    self.foundation.trip_shutdown_v1(
+                                        crate::RuntimeShutdownCauseV1::ReadinessLost,
+                                    );
+                                    continue;
+                                };
+                                let paused_at = Utc::now();
+                                if paused_at > command.deadline {
+                                    let _ = reply.send(Err(
+                                        RuntimeControllerBarrierBridgeErrorV2::Indeterminate,
+                                    ));
+                                    self.foundation.trip_shutdown_v1(
+                                        crate::RuntimeShutdownCauseV1::ReadinessLost,
+                                    );
+                                    continue;
+                                }
+                                next_barrier_handle = handle.get();
+                                paused_barrier = Some(RuntimeServingBarrierAPausedStateV3 {
+                                    handle,
+                                    command: command.clone(),
+                                    reservation,
+                                });
+                                let _ = reply.send(Ok(
+                                    automation_runtime_worker::RuntimeBarrierAPauseObservationV2 {
+                                        correlation: command.correlation,
+                                        coordinator_generation,
+                                        connection_epoch,
+                                        admission_revision,
+                                        connected_event_sequence,
+                                        pause_sequence,
+                                        paused_at,
+                                        paused: RuntimeControllerBarrierAPausedV2 { handle },
+                                    },
+                                ));
+                            }
+                            RuntimeDiscordOrdinaryBarrierPauseOutcomeV3::DefinitelyNotApplied(
+                                error,
+                            ) => {
+                                let _ = reply.send(Err(map_ordinary_barrier_failure_v3(error)));
+                                if let Ok(ready) =
+                                    self.lifecycle.observe_exact_current_ready_attestation_v2()
+                                {
+                                    monitor = self.start_gateway_monitor_v2(&ready).ok();
+                                }
+                                if monitor.is_none() {
+                                    self.foundation.trip_shutdown_v1(
+                                        crate::RuntimeShutdownCauseV1::ReadinessLost,
+                                    );
+                                }
+                            }
+                            RuntimeDiscordOrdinaryBarrierPauseOutcomeV3::Indeterminate(error) => {
+                                let _ = reply.send(Err(map_ordinary_barrier_failure_v3(error)));
+                                self.foundation
+                                    .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
+                            }
+                        }
+                    }
+                    RuntimeServingControllerEventV2::ResumeBarrierA { command, reply } => {
+                        let matches = paused_barrier.as_ref().is_some_and(|paused| {
+                            paused.handle == command.paused.handle
+                                && paused.command.correlation == command.correlation
+                                && paused.command.deadline == command.deadline
+                                && paused.reservation.coordinator_generation_v3().get()
+                                    == command.coordinator_generation.get()
+                                && paused.reservation.connection_epoch_v3()
+                                    == command.connection_epoch.get()
+                                && paused.reservation.admission_revision_v3()
+                                    == command.pause_admission_revision.get()
+                                && paused.reservation.connected_event_sequence_v3()
+                                    == command.connected_event_sequence.get()
+                                && paused.reservation.pause_sequence_v3()
+                                    == command.pause_sequence.get()
+                        });
+                        if !matches {
+                            let _ = reply
+                                .send(Err(RuntimeControllerBarrierBridgeErrorV2::StaleAuthority));
+                            self.foundation
+                                .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
+                            continue;
+                        }
+                        let paused = paused_barrier
+                            .take()
+                            .expect("validated runtime Barrier A paused state");
+                        let port = match self.lifecycle.ordinary_barrier_port_v3() {
+                            Ok(port) => port,
+                            Err(error) => {
+                                let _ = reply.send(Err(map_ordinary_barrier_failure_v3(error)));
+                                self.foundation
+                                    .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
+                                continue;
+                            }
+                        };
+                        let Some(deadline) = runtime_barrier_deadline_v3(command.deadline) else {
+                            let _ = reply
+                                .send(Err(RuntimeControllerBarrierBridgeErrorV2::DeadlineElapsed));
+                            self.foundation
+                                .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
+                            continue;
+                        };
+                        let evidence = match port.resume_v3(paused.reservation, deadline).await {
+                        RuntimeDiscordOrdinaryBarrierResumeOutcomeV3::Applied(evidence) => evidence,
+                        RuntimeDiscordOrdinaryBarrierResumeOutcomeV3::DefinitelyNotApplied {
+                            reservation,
+                            failure,
+                        } => {
+                            let exact_reservation =
+                                reservation.coordinator_generation_v3().get()
+                                    == command.coordinator_generation.get()
+                                    && reservation.connection_epoch_v3()
+                                        == command.connection_epoch.get()
+                                    && reservation.admission_revision_v3()
+                                        == command.pause_admission_revision.get()
+                                    && reservation.connected_event_sequence_v3()
+                                        == command.connected_event_sequence.get()
+                                    && reservation.pause_sequence_v3()
+                                        == command.pause_sequence.get();
+                            let failure = if exact_reservation {
+                                map_ordinary_barrier_failure_v3(failure)
+                            } else {
+                                RuntimeControllerBarrierBridgeErrorV2::StaleAuthority
+                            };
+                            let _ = reply.send(Err(failure));
+                            self.foundation
+                                .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
+                            continue;
+                        }
+                        RuntimeDiscordOrdinaryBarrierResumeOutcomeV3::Indeterminate(error) => {
+                            let _ = reply.send(Err(map_ordinary_barrier_failure_v3(error)));
+                            self.foundation
+                                .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
+                            continue;
+                        }
+                    };
+                        let resumed_at = Utc::now();
+                        let exact = evidence.coordinator_generation_v3().get()
+                            == command.coordinator_generation.get()
+                            && evidence.connection_epoch_v3() == command.connection_epoch.get()
+                            && evidence.admission_revision_v3()
+                                == command.pause_admission_revision.get()
+                            && evidence.connected_event_sequence_v3()
+                                == command.connected_event_sequence.get()
+                            && evidence.pause_sequence_v3() == command.pause_sequence.get()
+                            && evidence.resume_sequence_v3() > command.pause_sequence.get()
+                            && resumed_at >= command.transitioned_at
+                            && resumed_at <= command.deadline;
+                        if !exact {
+                            let _ = reply
+                                .send(Err(RuntimeControllerBarrierBridgeErrorV2::Indeterminate));
+                            self.foundation
+                                .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
+                            continue;
+                        }
+                        let gateway_ready = match self
+                            .lifecycle
+                            .revalidate_resumed_ordinary_barrier_v3(&evidence)
+                            .await
+                        {
+                            Ok(ready) => ready,
+                            Err(_) => {
+                                let _ = reply.send(Err(
+                                    RuntimeControllerBarrierBridgeErrorV2::Indeterminate,
+                                ));
+                                self.foundation
+                                    .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
+                                continue;
+                            }
+                        };
+                        let receipt;
+                        match self
+                            .refresh_acknowledgement_with_ready_v3(gateway_ready, false)
+                            .await
+                        {
+                            Ok((process, observed_receipt)) => {
+                                self = process;
+                                receipt = observed_receipt;
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(
+                                    RuntimeControllerBarrierBridgeErrorV2::Indeterminate,
+                                ));
+                                return Err(error);
+                            }
+                        }
+                        let completion = match self
+                            .lifecycle
+                            .authorize_ordinary_barrier_completion_v3(evidence, receipt)
+                            .await
+                        {
+                            Ok(completion) => completion,
+                            Err(_) => {
+                                let _ = reply.send(Err(
+                                    RuntimeControllerBarrierBridgeErrorV2::Indeterminate,
+                                ));
+                                self.foundation
+                                    .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
+                                return Err(self
+                                    .cleanup_transition_v2(
+                                        RuntimeProcessProductionHandoffFailureV2::Gateway,
+                                    )
+                                    .await);
+                            }
+                        };
+                        let ready = match self.lifecycle.complete_ordinary_barrier_v3(completion) {
+                            Ok(ready) => ready,
+                            Err(_) => {
+                                let _ = reply.send(Err(
+                                    RuntimeControllerBarrierBridgeErrorV2::Indeterminate,
+                                ));
+                                self.foundation
+                                    .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::ReadinessLost);
+                                return Err(self
+                                    .cleanup_transition_v2(
+                                        RuntimeProcessProductionHandoffFailureV2::Gateway,
+                                    )
+                                    .await);
+                            }
+                        };
+                        if let Err(transition) = self.revalidate_v2().await {
+                            let _ = reply
+                                .send(Err(RuntimeControllerBarrierBridgeErrorV2::Indeterminate));
+                            return Err(self.cleanup_transition_v2(transition).await);
+                        }
+                        monitor = match self.start_gateway_monitor_v2(&ready) {
+                            Ok(monitor) => Some(monitor),
+                            Err(transition) => {
+                                let _ = reply.send(Err(
+                                    RuntimeControllerBarrierBridgeErrorV2::Indeterminate,
+                                ));
+                                return Err(self.cleanup_transition_v2(transition).await);
+                            }
+                        };
+                        let Some(resume_sequence) = NonZeroU64::new(ready.resume_sequence.get())
+                        else {
+                            unreachable!()
+                        };
+                        let _ = reply.send(Ok(
+                        automation_runtime_worker::RuntimeBarrierAResumeObservationV2 {
+                            correlation: command.correlation,
+                            coordinator_generation: command.coordinator_generation,
+                            connection_epoch: command.connection_epoch,
+                            admission_revision: command.pause_admission_revision,
+                            connected_event_sequence: command.connected_event_sequence,
+                            pause_sequence: command.pause_sequence,
+                            resume_sequence,
+                            admission:
+                                automation_runtime_worker::RuntimeAdmissionDispositionV2::Closed,
+                            resumed_at,
+                            resumed: RuntimeControllerBarrierAResumedV2 {
+                                handle: paused.handle,
+                            },
+                        },
+                    ));
+                    }
+                    RuntimeServingControllerEventV2::Terminal => {
+                        break self
+                            .foundation
+                            .trip_shutdown_v1(crate::RuntimeShutdownCauseV1::SupervisorFailure);
+                    }
+                },
                 RuntimeServingOpenLoopEventV2::RefreshAcknowledgement => {
                     match self.refresh_acknowledgement_v2().await {
                         Ok(process) => self = process,
                         Err(error) => {
-                            monitor.stop_v2().await;
+                            if let Some(active) = monitor.take() {
+                                active.stop_v2().await;
+                            }
                             return Err(error);
                         }
                     }
                 }
             }
         };
-        monitor.stop_v2().await;
+        if let Some(active) = monitor.take() {
+            active.stop_v2().await;
+        }
         let cleanup = self.shutdown().await;
         match observation.cause() {
             crate::RuntimeShutdownCauseV1::Interrupt
@@ -709,5 +1083,32 @@ async fn stop_runtime_controller_before_cleanup_v2(
     if controller.shutdown_until_v2(deadline).await.is_err() {
         foundation.record_runtime_controller_shutdown_failure_v2();
         foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::SupervisorFailure);
+    }
+}
+
+fn runtime_barrier_deadline_v3(deadline: DateTime<Utc>) -> Option<Instant> {
+    let remaining = deadline.signed_duration_since(Utc::now()).to_std().ok()?;
+    if remaining.is_zero() {
+        return None;
+    }
+    Instant::now().checked_add(remaining)
+}
+
+fn map_ordinary_barrier_failure_v3(
+    error: RuntimeDiscordOrdinaryBarrierFailureV3,
+) -> RuntimeControllerBarrierBridgeErrorV2 {
+    match error {
+        RuntimeDiscordOrdinaryBarrierFailureV3::CommandUnavailable => {
+            RuntimeControllerBarrierBridgeErrorV2::Unavailable
+        }
+        RuntimeDiscordOrdinaryBarrierFailureV3::DeadlineElapsed => {
+            RuntimeControllerBarrierBridgeErrorV2::DeadlineElapsed
+        }
+        RuntimeDiscordOrdinaryBarrierFailureV3::StaleAuthority => {
+            RuntimeControllerBarrierBridgeErrorV2::StaleAuthority
+        }
+        RuntimeDiscordOrdinaryBarrierFailureV3::Indeterminate => {
+            RuntimeControllerBarrierBridgeErrorV2::Indeterminate
+        }
     }
 }

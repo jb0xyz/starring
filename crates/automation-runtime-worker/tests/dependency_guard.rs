@@ -55,6 +55,7 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/closed_recovery.rs"),
             PathBuf::from("src/convergence/hydration.rs"),
             PathBuf::from("src/convergence/preflight.rs"),
+            PathBuf::from("src/convergence/replacement.rs"),
             PathBuf::from("src/convergence/staging.rs"),
             PathBuf::from("src/convergence/tests.rs"),
             PathBuf::from("src/convergence.rs"),

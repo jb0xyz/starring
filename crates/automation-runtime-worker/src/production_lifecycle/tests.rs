@@ -2123,6 +2123,298 @@ fn serving_refresh_input(
     }
 }
 
+fn serving_ready_successor(
+    serving: &RuntimeServingOpenProcessV2,
+) -> automation_runtime_controller::RuntimeGatewayReadyAttestationV2 {
+    let mut ready = serving.epoch().gateway_ready().clone();
+    ready.kind = RuntimeGatewayReadyKindV2::Resumed;
+    ready.resume_sequence = sequence(ready.resume_sequence.get() + 1);
+    ready
+}
+
+fn assert_resumed_serving_refresh_rejected(
+    mutate: impl FnOnce(
+        &mut automation_runtime_controller::RuntimeGatewayReadyAttestationV2,
+        &automation_runtime_controller::RuntimeGatewayReadyAttestationV2,
+    ),
+    expected: RuntimeProductionLifecycleErrorV2,
+) {
+    let serving = serving_open_with_capacity(1);
+    let current = serving.epoch().gateway_ready().clone();
+    let mut input = serving_refresh_input(
+        &serving,
+        serving.epoch().route_set().observation_sequence().get(),
+        false,
+    );
+    input.gateway_ready = serving_ready_successor(&serving);
+    mutate(&mut input.gateway_ready, &current);
+    let failure = serving
+        .authorize_resumed_ingress_open_acknowledgement_refresh_v3(input)
+        .unwrap_err();
+    assert_eq!(failure.error(), expected);
+}
+
+fn serving_after_resumed_refresh() -> (
+    RuntimeServingOpenProcessV2,
+    RuntimeIngressOpenAcknowledgementReceiptV2,
+) {
+    let serving = serving_open_with_capacity(1);
+    let sequence = serving.epoch().route_set().observation_sequence().get();
+    let mut input = serving_refresh_input(&serving, sequence, false);
+    input.gateway_ready = serving_ready_successor(&serving);
+    let mut refresh = serving
+        .authorize_resumed_ingress_open_acknowledgement_refresh_v3(input)
+        .unwrap();
+    let receipt = receipt_for_authorization_at(refresh.operation_mut(), 3, 255, 260, 256);
+    let accepted_receipt = receipt.clone();
+    let attempt = refresh.operation_mut().begin_attempt().unwrap();
+    let RuntimeIngressOpenAcknowledgementResolutionV2::AppliedExact(accepted) = attempt
+        .resolve_outcome(RuntimePublishIngressOpenAcknowledgementOutcomeV2::Applied(
+            receipt,
+        ))
+    else {
+        panic!("resumed successor acknowledgement must apply")
+    };
+    let serving = refresh.complete(accepted).unwrap();
+    let final_receipt = RuntimeIngressOpenAcknowledgementReceiptV2::new(
+        RuntimeIngressOpenAcknowledgementReceiptInputV2 {
+            source_acknowledgement_revision: accepted_receipt.source_acknowledgement_revision(),
+            request_digest: accepted_receipt.request_digest(),
+            acknowledgement: accepted_receipt.acknowledgement().clone(),
+            observed_database_now: at(257),
+        },
+    )
+    .unwrap();
+    (serving, final_receipt)
+}
+
+#[test]
+fn serving_refresh_accepts_and_stores_only_an_exact_resumed_successor() {
+    let serving = serving_open_with_capacity(1);
+    let current_sequence = serving.epoch().route_set().observation_sequence().get();
+    let successor = serving_ready_successor(&serving);
+    let mut input = serving_refresh_input(&serving, current_sequence, false);
+    input.gateway_ready = successor.clone();
+    let mut refresh = serving
+        .authorize_resumed_ingress_open_acknowledgement_refresh_v3(input)
+        .unwrap();
+    assert_eq!(refresh.request().gateway_ready(), &successor);
+    let receipt = receipt_for_authorization_at(refresh.operation_mut(), 3, 255, 260, 256);
+    let attempt = refresh.operation_mut().begin_attempt().unwrap();
+    let RuntimeIngressOpenAcknowledgementResolutionV2::AppliedExact(accepted) = attempt
+        .resolve_outcome(RuntimePublishIngressOpenAcknowledgementOutcomeV2::Applied(
+            receipt,
+        ))
+    else {
+        panic!("resumed successor acknowledgement must apply")
+    };
+    let serving = refresh.complete(accepted).unwrap();
+    assert_eq!(serving.epoch().gateway_ready(), &successor);
+    assert_eq!(
+        serving
+            .epoch()
+            .ingress_acknowledgement()
+            .acknowledgement()
+            .resume_sequence(),
+        successor.resume_sequence
+    );
+
+    let mut ordinary_input = serving_refresh_input(&serving, current_sequence, false);
+    ordinary_input.owner_receipt.database_now = at(255);
+    let mut ordinary = serving
+        .authorize_ingress_open_acknowledgement_refresh(ordinary_input)
+        .unwrap();
+    assert_eq!(ordinary.request().gateway_ready(), &successor);
+    let receipt = receipt_for_authorization_at(ordinary.operation_mut(), 4, 256, 261, 257);
+    let attempt = ordinary.operation_mut().begin_attempt().unwrap();
+    let RuntimeIngressOpenAcknowledgementResolutionV2::AppliedExact(accepted) = attempt
+        .resolve_outcome(RuntimePublishIngressOpenAcknowledgementOutcomeV2::Applied(
+            receipt,
+        ))
+    else {
+        panic!("ordinary acknowledgement after resumed successor must apply")
+    };
+    let serving = ordinary.complete(accepted).unwrap();
+    assert_eq!(serving.epoch().gateway_ready(), &successor);
+    assert_eq!(
+        serving
+            .epoch()
+            .ingress_acknowledgement()
+            .acknowledgement_revision(),
+        non_zero(4)
+    );
+}
+
+#[test]
+fn resumed_serving_refresh_rejects_non_monotonic_and_identity_drift() {
+    assert_resumed_serving_refresh_rejected(
+        |observed, current| observed.resume_sequence = current.resume_sequence,
+        RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch,
+    );
+    assert_resumed_serving_refresh_rejected(
+        |observed, current| observed.resume_sequence = sequence(current.resume_sequence.get() - 1),
+        RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch,
+    );
+    assert_resumed_serving_refresh_rejected(
+        |observed, _| observed.kind = RuntimeGatewayReadyKindV2::Ready,
+        RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch,
+    );
+    assert_resumed_serving_refresh_rejected(
+        |observed, _| {
+            observed.process_instance_id =
+                ProcessInstanceId::parse("runtime-process:other").unwrap()
+        },
+        RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch,
+    );
+    assert_resumed_serving_refresh_rejected(
+        |observed, _| observed.connection_epoch = non_zero(observed.connection_epoch.get() + 1),
+        RuntimeProductionLifecycleErrorV2::StaleConnectionEpoch,
+    );
+    assert_resumed_serving_refresh_rejected(
+        |observed, _| observed.admission_revision = non_zero(observed.admission_revision.get() + 1),
+        RuntimeProductionLifecycleErrorV2::StaleAdmissionRevision,
+    );
+    assert_resumed_serving_refresh_rejected(
+        |observed, _| {
+            observed.connected_event_sequence =
+                sequence(observed.connected_event_sequence.get() + 1)
+        },
+        RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch,
+    );
+}
+
+#[test]
+fn serving_barrier_completion_authority_requires_the_stored_exact_reobservation() {
+    let (serving, final_receipt) = serving_after_resumed_refresh();
+    assert!(serving
+        .epoch()
+        .ingress_acknowledgement()
+        .accepts_exact_reobservation_v3(&final_receipt));
+    let authority = serving
+        .authorize_ordinary_barrier_completion_v3(&final_receipt)
+        .unwrap();
+    assert_eq!(
+        authority.coordinator_generation_v3(),
+        serving.coordinator_generation()
+    );
+    assert_eq!(
+        authority.gateway_ready_v3(),
+        serving.epoch().gateway_ready()
+    );
+    assert_eq!(
+        authority.acknowledgement_v3(),
+        final_receipt.acknowledgement()
+    );
+    assert!(authority.accepts_final_reobservation_v3(&final_receipt));
+
+    let digest_drift = RuntimeIngressOpenAcknowledgementReceiptV2::new(
+        RuntimeIngressOpenAcknowledgementReceiptInputV2 {
+            source_acknowledgement_revision: final_receipt.source_acknowledgement_revision(),
+            request_digest:
+                automation_runtime_controller::RuntimeIngressOpenAcknowledgementRequestDigestV2::from_bytes(
+                    [7; 32],
+                ),
+            acknowledgement: final_receipt.acknowledgement().clone(),
+            observed_database_now: final_receipt.observed_database_now(),
+        },
+    )
+    .unwrap();
+    assert!(!serving
+        .epoch()
+        .ingress_acknowledgement()
+        .accepts_exact_reobservation_v3(&digest_drift));
+    assert_eq!(
+        serving
+            .authorize_ordinary_barrier_completion_v3(&digest_drift)
+            .unwrap_err(),
+        RuntimeProductionLifecycleErrorV2::IngressAcknowledgementMismatch
+    );
+
+    let acknowledgement = final_receipt.acknowledgement();
+    let fence_drift_acknowledgement =
+        RuntimeIngressOpenAcknowledgementV2::new(RuntimeIngressOpenAcknowledgementInputV2 {
+            fence_generation: RuntimeWriterFenceGenerationV1::new(non_zero(
+                acknowledgement.fence_generation().get() + 1,
+            )),
+            maintenance_gate_generation: acknowledgement.maintenance_gate_generation(),
+            gateway_owner_lease_id: acknowledgement.gateway_owner_lease_id().clone(),
+            observed_owner_revision: acknowledgement.observed_owner_revision(),
+            process_instance_id: acknowledgement.process_instance_id().clone(),
+            connection_epoch: acknowledgement.connection_epoch(),
+            admission_revision: acknowledgement.admission_revision(),
+            connected_event_sequence: acknowledgement.connected_event_sequence(),
+            resume_sequence: acknowledgement.resume_sequence(),
+            acknowledgement_revision: acknowledgement.acknowledgement_revision(),
+            acknowledged_at: acknowledgement.acknowledged_at(),
+            expires_at: acknowledgement.expires_at(),
+        })
+        .unwrap();
+    let fence_drift = RuntimeIngressOpenAcknowledgementReceiptV2::new(
+        RuntimeIngressOpenAcknowledgementReceiptInputV2 {
+            source_acknowledgement_revision: final_receipt.source_acknowledgement_revision(),
+            request_digest: final_receipt.request_digest(),
+            acknowledgement: fence_drift_acknowledgement,
+            observed_database_now: final_receipt.observed_database_now(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serving
+            .authorize_ordinary_barrier_completion_v3(&fence_drift)
+            .unwrap_err(),
+        RuntimeProductionLifecycleErrorV2::IngressAcknowledgementMismatch
+    );
+
+    let old_observation = RuntimeIngressOpenAcknowledgementReceiptV2::new(
+        RuntimeIngressOpenAcknowledgementReceiptInputV2 {
+            source_acknowledgement_revision: final_receipt.source_acknowledgement_revision(),
+            request_digest: final_receipt.request_digest(),
+            acknowledgement: final_receipt.acknowledgement().clone(),
+            observed_database_now: at(255),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serving
+            .authorize_ordinary_barrier_completion_v3(&old_observation)
+            .unwrap_err(),
+        RuntimeProductionLifecycleErrorV2::IngressAcknowledgementMismatch
+    );
+
+    let expired_observation = RuntimeIngressOpenAcknowledgementReceiptV2::new(
+        RuntimeIngressOpenAcknowledgementReceiptInputV2 {
+            source_acknowledgement_revision: final_receipt.source_acknowledgement_revision(),
+            request_digest: final_receipt.request_digest(),
+            acknowledgement: final_receipt.acknowledgement().clone(),
+            observed_database_now: final_receipt.acknowledgement().expires_at(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serving
+            .authorize_ordinary_barrier_completion_v3(&expired_observation)
+            .unwrap_err(),
+        RuntimeProductionLifecycleErrorV2::IngressAcknowledgementMismatch
+    );
+}
+
+#[test]
+fn serving_barrier_completion_authority_has_a_private_single_use_surface() {
+    let source = include_str!("refresh.rs");
+    let declaration_start = source
+        .find("pub struct RuntimeServingOpenBarrierCompletionAuthorityV3")
+        .unwrap();
+    let declaration = &source[declaration_start..];
+    let body_start = declaration.find('{').unwrap() + 1;
+    let body_end = declaration.find('}').unwrap();
+    let fields = &declaration[body_start..body_end];
+    let derive_prefix_start = declaration_start.saturating_sub(80);
+    let derive_prefix = &source[derive_prefix_start..declaration_start];
+    assert!(!fields.contains("pub "));
+    assert!(!derive_prefix.contains("derive(Clone"));
+    assert!(!source.contains("impl Clone for RuntimeServingOpenBarrierCompletionAuthorityV3"));
+}
+
 #[test]
 fn serving_refresh_accepts_an_advanced_nonempty_route_snapshot() {
     let serving = serving_open_with_capacity(2);
@@ -2239,9 +2531,11 @@ fn serving_refresh_completion_mismatch_retains_the_exact_refresh_checkpoint() {
     let request = serving.authorize_slot_work(serving_slot(0));
     let permit = serving.begin_slot_work(request).unwrap();
     let sequence = serving.epoch().route_set().observation_sequence().get() + 1;
-    let input = serving_refresh_input(&serving, sequence, true);
+    let mut input = serving_refresh_input(&serving, sequence, true);
+    let expected_gateway_ready = serving_ready_successor(&serving);
+    input.gateway_ready = expected_gateway_ready.clone();
     let refresh = serving
-        .authorize_ingress_open_acknowledgement_refresh(input)
+        .authorize_resumed_ingress_open_acknowledgement_refresh_v3(input)
         .unwrap();
     let expected_request_digest = refresh.request().request_digest();
 
@@ -2278,6 +2572,7 @@ fn serving_refresh_completion_mismatch_retains_the_exact_refresh_checkpoint() {
     );
     let retained = failure.into_refresh();
     assert_eq!(retained.request().request_digest(), expected_request_digest);
+    assert_eq!(retained.request().gateway_ready(), &expected_gateway_ready);
     permit.ensure_active().unwrap();
     drop(retained);
     assert_eq!(

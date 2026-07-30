@@ -192,7 +192,9 @@ impl<H> RuntimeDiscordPreflightV2<H> {
                         },
                     )))
                 }
-                RuntimeConvergenceClaimKindV2::PreflightReady => {
+                RuntimeConvergenceClaimKindV2::PreflightReady
+                | RuntimeConvergenceClaimKindV2::DrainRequested
+                | RuntimeConvergenceClaimKindV2::StagedRecovery(_) => {
                     validate_durable_preflight(&self.core, &observation)
                         .map_err(RuntimeDiscordPreflightErrorV2::Evidence)?;
                     Ok(RuntimeDiscordPreflightOutcomeV2::StageReady(Box::new(

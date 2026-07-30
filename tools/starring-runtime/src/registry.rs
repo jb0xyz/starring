@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use automation_runtime_controller::RuntimeServingSlotV2;
 use automation_runtime_convergence::{FencingToken, ProcessInstanceId, RuntimeProcessIdentityV1};
@@ -8,8 +8,8 @@ use automation_runtime_registry::{
     ExactServingRouteV1, RegistryEmptyRecoveryCursorV2, RegistryRecoveryObservationGuardV2,
     RegistryRecoveryObservationV2, SealedEmptyRecoveryDrainClaimV2, ServingSlotKeyV1,
     ServingSlotRegistryConfigV1, ServingSlotRegistryError, ServingSlotRegistryV1,
-    SlotAdmissionStateV2, SlotAtomicObservationV2, SlotInstallOutcomeV1, SlotLifecycleV1,
-    SlotMutationTokenV1, SlotRemovalOutcomeV1, SlotRouteWitnessV1, SlotSealKeyV2,
+    SlotAdmissionStateV2, SlotAtomicObservationV2, SlotDrainOutcomeV1, SlotInstallOutcomeV1,
+    SlotLifecycleV1, SlotMutationTokenV1, SlotRemovalOutcomeV1, SlotRouteWitnessV1, SlotSealKeyV2,
 };
 use automation_runtime_worker::{
     accept_runtime_registry_recovery_empty_observation_v2, accept_runtime_route_set_observation_v2,
@@ -287,6 +287,71 @@ pub(crate) struct RuntimeRegistryStagedRouteV2 {
     emergency: RuntimeRegistryEmergencyTriggerV2,
 }
 
+pub(crate) struct RuntimeRegistryReplacementRouteV2 {
+    identity: RuntimeProcessIdentityV1,
+    state: Mutex<RuntimeRegistryReplacementStateV2>,
+}
+
+struct RuntimeRegistryReplacementStateV2 {
+    staged: RuntimeRegistryStagedRouteV2,
+    predecessor: RuntimeRegistryPredecessorStateV2,
+}
+
+enum RuntimeRegistryPredecessorStateV2 {
+    Unverified,
+    Absent,
+    Draining {
+        token: SlotMutationTokenV1,
+        witness: SlotRouteWitnessV1,
+        initial_active_interactions: u32,
+    },
+    Removed {
+        witness: Option<SlotRouteWitnessV1>,
+        initial_active_interactions: u32,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeRegistryPredecessorTransitionObservationV2 {
+    predecessor: Option<SlotRouteWitnessV1>,
+    successor: RuntimeRegistryStagedInstallEvidenceV2,
+    initial_active_interactions: u32,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RuntimeRegistryPredecessorRemovalObservationV2 {
+    removed_predecessor: Option<SlotRouteWitnessV1>,
+    successor: RuntimeRegistryStagedInstallEvidenceV2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeRegistryPredecessorDrainObservationV2 {
+    active_interactions: u32,
+    drained: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum RuntimeRegistryPredecessorReplacementErrorV2 {
+    #[error("runtime registry expected predecessor is absent")]
+    ExpectedPredecessorAbsent,
+    #[error("runtime registry contains an unexpected predecessor")]
+    UnexpectedPredecessorPresent,
+    #[error("runtime registry predecessor identity does not exactly match")]
+    PredecessorIdentityMismatch,
+    #[error("runtime registry predecessor still has active interactions")]
+    ActiveInteractionsRemain { active: u32 },
+    #[error("runtime registry predecessor transition has not been verified")]
+    PredecessorNotVerified,
+    #[error("runtime registry predecessor operation has an unexpected outcome")]
+    UnexpectedOutcome,
+    #[error("runtime staged route authority is invalid")]
+    StagedAuthorityInvalid,
+    #[error("runtime predecessor replacement state is unavailable")]
+    StateUnavailable,
+    #[error("runtime predecessor registry operation failed")]
+    Registry(ServingSlotRegistryError),
+}
+
 pub(crate) struct RuntimeRegistryStagedInstallV2 {
     outcome: RuntimeRegistryStagedInstallOutcomeV2,
     evidence: RuntimeRegistryStagedInstallEvidenceV2,
@@ -342,6 +407,7 @@ impl RuntimeRegistryStagedInstallV2 {
 }
 
 impl RuntimeRegistryStagedRouteV2 {
+    #[cfg(test)]
     pub(crate) fn identity_v2(&self) -> &RuntimeProcessIdentityV1 {
         &self.identity
     }
@@ -386,6 +452,44 @@ impl RuntimeRegistryStagedRouteV2 {
             .map_err(RuntimeRegistryStagingErrorV2::Registry)?;
         self.token = Some(successor);
         self.observe_staged_evidence_v2()
+    }
+
+    pub(crate) fn into_replacement_v2(self) -> RuntimeRegistryReplacementRouteV2 {
+        RuntimeRegistryReplacementRouteV2 {
+            identity: self.identity.clone(),
+            state: Mutex::new(RuntimeRegistryReplacementStateV2 {
+                staged: self,
+                predecessor: RuntimeRegistryPredecessorStateV2::Unverified,
+            }),
+        }
+    }
+
+    fn ensure_exclusively_staged_v2(
+        &self,
+    ) -> Result<(), RuntimeRegistryPredecessorReplacementErrorV2> {
+        self.ensure_staged_v2()
+            .map_err(|_| RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid)?;
+        let token = self
+            .token
+            .as_ref()
+            .ok_or(RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid)?;
+        let witness = self
+            .registry
+            .route_witness(token)
+            .map_err(RuntimeRegistryPredecessorReplacementErrorV2::Registry)?;
+        let atomic = self
+            .registry
+            .atomic_observation_v2(token.key())
+            .map_err(RuntimeRegistryPredecessorReplacementErrorV2::Registry)?
+            .ok_or(RuntimeRegistryPredecessorReplacementErrorV2::UnexpectedPredecessorPresent)?;
+        if atomic.route.as_ref() != Some(&witness)
+            || atomic.admission_state != SlotAdmissionStateV2::Staged
+            || atomic.active_interactions != 0
+        {
+            return Err(RuntimeRegistryPredecessorReplacementErrorV2::UnexpectedPredecessorPresent);
+        }
+        self.ensure_staged_v2()
+            .map_err(|_| RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid)
     }
 
     pub(crate) fn remove_v2(mut self) -> Result<(), RuntimeRegistryStagingErrorV2> {
@@ -437,11 +541,376 @@ impl RuntimeRegistryStagedRouteV2 {
     }
 }
 
+impl RuntimeRegistryReplacementRouteV2 {
+    pub(crate) fn identity_v2(&self) -> &RuntimeProcessIdentityV1 {
+        &self.identity
+    }
+
+    pub(crate) fn ensure_staged_v2(
+        &self,
+    ) -> Result<(), RuntimeRegistryPredecessorReplacementErrorV2> {
+        let state = self.lock_state_v2()?;
+        state
+            .staged
+            .ensure_staged_v2()
+            .map_err(|_| RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid)
+    }
+
+    pub(crate) fn fencing_token_v2(
+        &self,
+    ) -> Result<FencingToken, RuntimeRegistryPredecessorReplacementErrorV2> {
+        let state = self.lock_state_v2()?;
+        state
+            .staged
+            .ensure_staged_v2()
+            .map_err(|_| RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid)?;
+        Ok(state.staged.fencing_token_v2())
+    }
+
+    pub(crate) fn advance_authority_v2(
+        &self,
+        next_fencing_token: FencingToken,
+    ) -> Result<RuntimeRegistryStagedInstallEvidenceV2, RuntimeRegistryStagingErrorV2> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeRegistryStagingErrorV2::UnexpectedLifecycle)?;
+        state.staged.advance_authority_v2(next_fencing_token)
+    }
+
+    pub(crate) fn transition_predecessor_to_draining_v2(
+        &self,
+        expected_predecessor: Option<&RuntimeProcessIdentityV1>,
+    ) -> Result<
+        RuntimeRegistryPredecessorTransitionObservationV2,
+        RuntimeRegistryPredecessorReplacementErrorV2,
+    > {
+        let mut state = self.lock_state_v2()?;
+        state
+            .staged
+            .ensure_staged_v2()
+            .map_err(|_| RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid)?;
+        match &state.predecessor {
+            RuntimeRegistryPredecessorStateV2::Unverified => {}
+            RuntimeRegistryPredecessorStateV2::Absent if expected_predecessor.is_none() => {
+                return replacement_transition_observation_v2(&state);
+            }
+            RuntimeRegistryPredecessorStateV2::Draining { witness, .. }
+            | RuntimeRegistryPredecessorStateV2::Removed {
+                witness: Some(witness),
+                ..
+            } if expected_predecessor == Some(&witness.identity) => {
+                return replacement_transition_observation_v2(&state);
+            }
+            RuntimeRegistryPredecessorStateV2::Removed { witness: None, .. }
+                if expected_predecessor.is_none() =>
+            {
+                return replacement_transition_observation_v2(&state);
+            }
+            RuntimeRegistryPredecessorStateV2::Absent
+            | RuntimeRegistryPredecessorStateV2::Draining { .. }
+            | RuntimeRegistryPredecessorStateV2::Removed { .. } => {
+                return Err(
+                    RuntimeRegistryPredecessorReplacementErrorV2::PredecessorIdentityMismatch,
+                );
+            }
+        }
+        let staged_token = state
+            .staged
+            .token
+            .as_ref()
+            .ok_or(RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid)?;
+        let serving = state
+            .staged
+            .registry
+            .serving_snapshot(staged_token.key())
+            .map_err(RuntimeRegistryPredecessorReplacementErrorV2::Registry)?;
+        match (expected_predecessor, serving) {
+            (None, None) => {
+                state.staged.ensure_exclusively_staged_v2()?;
+                state.predecessor = RuntimeRegistryPredecessorStateV2::Absent;
+            }
+            (None, Some(_)) => {
+                return Err(
+                    RuntimeRegistryPredecessorReplacementErrorV2::UnexpectedPredecessorPresent,
+                );
+            }
+            (Some(_), None) => {
+                return Err(
+                    RuntimeRegistryPredecessorReplacementErrorV2::ExpectedPredecessorAbsent,
+                );
+            }
+            (Some(expected), Some(serving)) => {
+                if serving.identity() != expected {
+                    return Err(
+                        RuntimeRegistryPredecessorReplacementErrorV2::PredecessorIdentityMismatch,
+                    );
+                }
+                let predecessor = serving.token().clone();
+                let outcome = state
+                    .staged
+                    .registry
+                    .begin_drain_with_authority(staged_token, &predecessor)
+                    .map_err(RuntimeRegistryPredecessorReplacementErrorV2::Registry)?;
+                let initial_active_interactions = match outcome {
+                    SlotDrainOutcomeV1::DrainStarted {
+                        active_interactions,
+                    }
+                    | SlotDrainOutcomeV1::AlreadyDraining {
+                        active_interactions,
+                    } => active_interactions,
+                };
+                let witness = state
+                    .staged
+                    .registry
+                    .route_witness(&predecessor)
+                    .map_err(RuntimeRegistryPredecessorReplacementErrorV2::Registry)?;
+                if witness.identity != *expected || witness.lifecycle != SlotLifecycleV1::Draining {
+                    return Err(
+                        RuntimeRegistryPredecessorReplacementErrorV2::PredecessorIdentityMismatch,
+                    );
+                }
+                state.predecessor = RuntimeRegistryPredecessorStateV2::Draining {
+                    token: predecessor,
+                    witness,
+                    initial_active_interactions,
+                };
+            }
+        }
+        state
+            .staged
+            .ensure_staged_v2()
+            .map_err(|_| RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid)?;
+        replacement_transition_observation_v2(&state)
+    }
+
+    pub(crate) fn observe_predecessor_drain_v2(
+        &self,
+    ) -> Result<
+        RuntimeRegistryPredecessorDrainObservationV2,
+        RuntimeRegistryPredecessorReplacementErrorV2,
+    > {
+        let state = self.lock_state_v2()?;
+        state
+            .staged
+            .ensure_staged_v2()
+            .map_err(|_| RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid)?;
+        match &state.predecessor {
+            RuntimeRegistryPredecessorStateV2::Unverified => {
+                Err(RuntimeRegistryPredecessorReplacementErrorV2::PredecessorNotVerified)
+            }
+            RuntimeRegistryPredecessorStateV2::Absent
+            | RuntimeRegistryPredecessorStateV2::Removed { .. } => {
+                Ok(RuntimeRegistryPredecessorDrainObservationV2 {
+                    active_interactions: 0,
+                    drained: true,
+                })
+            }
+            RuntimeRegistryPredecessorStateV2::Draining { token, witness, .. } => {
+                if token.identity() != &witness.identity {
+                    return Err(
+                        RuntimeRegistryPredecessorReplacementErrorV2::PredecessorIdentityMismatch,
+                    );
+                }
+                let observation = state
+                    .staged
+                    .registry
+                    .observe_drain(token)
+                    .map_err(RuntimeRegistryPredecessorReplacementErrorV2::Registry)?;
+                Ok(RuntimeRegistryPredecessorDrainObservationV2 {
+                    active_interactions: observation.active_interactions,
+                    drained: observation.drained,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn remove_drained_predecessor_v2(
+        &self,
+    ) -> Result<
+        RuntimeRegistryPredecessorRemovalObservationV2,
+        RuntimeRegistryPredecessorReplacementErrorV2,
+    > {
+        let mut state = self.lock_state_v2()?;
+        state
+            .staged
+            .ensure_staged_v2()
+            .map_err(|_| RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid)?;
+        match &state.predecessor {
+            RuntimeRegistryPredecessorStateV2::Unverified => {
+                return Err(RuntimeRegistryPredecessorReplacementErrorV2::PredecessorNotVerified);
+            }
+            RuntimeRegistryPredecessorStateV2::Absent => {
+                state.predecessor = RuntimeRegistryPredecessorStateV2::Removed {
+                    witness: None,
+                    initial_active_interactions: 0,
+                };
+            }
+            RuntimeRegistryPredecessorStateV2::Removed { .. } => {}
+            RuntimeRegistryPredecessorStateV2::Draining {
+                token,
+                witness,
+                initial_active_interactions,
+            } => {
+                let observation = state
+                    .staged
+                    .registry
+                    .observe_drain(token)
+                    .map_err(RuntimeRegistryPredecessorReplacementErrorV2::Registry)?;
+                if !observation.drained {
+                    return Err(
+                        RuntimeRegistryPredecessorReplacementErrorV2::ActiveInteractionsRemain {
+                            active: observation.active_interactions,
+                        },
+                    );
+                }
+                let staged_token =
+                    state.staged.token.as_ref().ok_or(
+                        RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid,
+                    )?;
+                let outcome = state
+                    .staged
+                    .registry
+                    .remove_with_authority(staged_token, token)
+                    .map_err(RuntimeRegistryPredecessorReplacementErrorV2::Registry)?;
+                if outcome != SlotRemovalOutcomeV1::RemovedDraining {
+                    return Err(RuntimeRegistryPredecessorReplacementErrorV2::UnexpectedOutcome);
+                }
+                state.predecessor = RuntimeRegistryPredecessorStateV2::Removed {
+                    witness: Some(witness.clone()),
+                    initial_active_interactions: *initial_active_interactions,
+                };
+            }
+        }
+        let successor = state
+            .staged
+            .observe_staged_evidence_v2()
+            .map_err(|_| RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid)?;
+        let removed_predecessor = match &state.predecessor {
+            RuntimeRegistryPredecessorStateV2::Removed { witness, .. } => witness.clone(),
+            _ => {
+                return Err(RuntimeRegistryPredecessorReplacementErrorV2::UnexpectedOutcome);
+            }
+        };
+        Ok(RuntimeRegistryPredecessorRemovalObservationV2 {
+            removed_predecessor,
+            successor,
+        })
+    }
+
+    pub(crate) fn remove_v2(self) -> Result<(), RuntimeRegistryStagingErrorV2> {
+        self.state
+            .into_inner()
+            .map_err(|_| RuntimeRegistryStagingErrorV2::UnexpectedLifecycle)?
+            .staged
+            .remove_v2()
+    }
+
+    fn lock_state_v2(
+        &self,
+    ) -> Result<
+        std::sync::MutexGuard<'_, RuntimeRegistryReplacementStateV2>,
+        RuntimeRegistryPredecessorReplacementErrorV2,
+    > {
+        self.state
+            .lock()
+            .map_err(|_| RuntimeRegistryPredecessorReplacementErrorV2::StateUnavailable)
+    }
+}
+
+fn replacement_transition_observation_v2(
+    state: &RuntimeRegistryReplacementStateV2,
+) -> Result<
+    RuntimeRegistryPredecessorTransitionObservationV2,
+    RuntimeRegistryPredecessorReplacementErrorV2,
+> {
+    let successor = state
+        .staged
+        .observe_staged_evidence_v2()
+        .map_err(|_| RuntimeRegistryPredecessorReplacementErrorV2::StagedAuthorityInvalid)?;
+    let (predecessor, initial_active_interactions) = match &state.predecessor {
+        RuntimeRegistryPredecessorStateV2::Absent => (None, 0),
+        RuntimeRegistryPredecessorStateV2::Draining {
+            witness,
+            initial_active_interactions,
+            ..
+        }
+        | RuntimeRegistryPredecessorStateV2::Removed {
+            witness: Some(witness),
+            initial_active_interactions,
+        } => (Some(witness.clone()), *initial_active_interactions),
+        RuntimeRegistryPredecessorStateV2::Removed {
+            witness: None,
+            initial_active_interactions,
+        } => (None, *initial_active_interactions),
+        RuntimeRegistryPredecessorStateV2::Unverified => {
+            return Err(RuntimeRegistryPredecessorReplacementErrorV2::PredecessorNotVerified);
+        }
+    };
+    Ok(RuntimeRegistryPredecessorTransitionObservationV2 {
+        predecessor,
+        successor,
+        initial_active_interactions,
+    })
+}
+
+impl RuntimeRegistryPredecessorDrainObservationV2 {
+    pub(crate) fn active_interactions_v2(self) -> u32 {
+        self.active_interactions
+    }
+
+    pub(crate) fn drained_v2(self) -> bool {
+        self.drained
+    }
+}
+
+impl RuntimeRegistryPredecessorTransitionObservationV2 {
+    pub(crate) fn predecessor_v2(&self) -> Option<&SlotRouteWitnessV1> {
+        self.predecessor.as_ref()
+    }
+
+    pub(crate) fn successor_v2(&self) -> &RuntimeRegistryStagedInstallEvidenceV2 {
+        &self.successor
+    }
+
+    pub(crate) fn initial_active_interactions_v2(&self) -> u32 {
+        self.initial_active_interactions
+    }
+}
+
+impl RuntimeRegistryPredecessorRemovalObservationV2 {
+    pub(crate) fn removed_predecessor_v2(&self) -> Option<&SlotRouteWitnessV1> {
+        self.removed_predecessor.as_ref()
+    }
+
+    pub(crate) fn successor_v2(&self) -> &RuntimeRegistryStagedInstallEvidenceV2 {
+        &self.successor
+    }
+}
+
 impl Drop for RuntimeRegistryStagedRouteV2 {
     fn drop(&mut self) {
         if self.token.is_some() && self.remove_inner_v2().is_err() {
             self.emergency.trip_v2();
         }
+    }
+}
+
+impl Debug for RuntimeRegistryReplacementRouteV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryReplacementRouteV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRegistryPredecessorTransitionObservationV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryPredecessorTransitionObservationV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRegistryPredecessorRemovalObservationV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryPredecessorRemovalObservationV2(<redacted>)")
     }
 }
 
@@ -801,12 +1270,22 @@ fn validate_staged_evidence_v2(
         .token
         .as_ref()
         .ok_or(RuntimeRegistryStagingErrorV2::UnexpectedLifecycle)?;
+    let selected_route_is_valid = match atomic.route.as_ref() {
+        Some(selected) if selected == &witness => {
+            atomic.admission_state == SlotAdmissionStateV2::Staged
+                && atomic.active_interactions == 0
+        }
+        Some(selected) => match selected.lifecycle {
+            SlotLifecycleV1::Serving => atomic.admission_state == SlotAdmissionStateV2::Serving,
+            SlotLifecycleV1::Draining => atomic.admission_state == SlotAdmissionStateV2::Draining,
+            SlotLifecycleV1::Staged => false,
+        },
+        None => false,
+    };
     if witness.identity != staged.identity
         || witness.fencing_token != token.fencing_token()
         || witness.lifecycle != SlotLifecycleV1::Staged
-        || atomic.route.as_ref() != Some(&witness)
-        || atomic.admission_state != SlotAdmissionStateV2::Staged
-        || atomic.active_interactions != 0
+        || !selected_route_is_valid
         || registry_observation.registry_failed_closed()
         || registry_observation.failed_closed_slot_count() != 0
         || registry_observation.staged_route_count() == 0
@@ -817,7 +1296,7 @@ fn validate_staged_evidence_v2(
     staged.ensure_staged_v2()?;
     Ok(RuntimeRegistryStagedInstallEvidenceV2 {
         route: witness,
-        active_interactions: atomic.active_interactions,
+        active_interactions: 0,
         admission_generation: atomic.admission_generation,
         slot_observation_sequence: atomic.observation_sequence,
         registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(
@@ -1531,8 +2010,13 @@ mod tests {
     use std::num::{NonZeroU64, NonZeroUsize};
 
     use automation_runtime_controller::{RuntimeDrainIntentIdV2, RuntimeServingSlotV2};
-    use automation_runtime_convergence::{ProcessInstanceId, RuntimeDeploymentTargetV1};
-    use automation_runtime_registry::{ServingSlotKeyV1, ServingSlotRegistryError, SlotSealKeyV2};
+    use automation_runtime_convergence::{
+        FencingToken, ProcessInstanceId, RuntimeDeploymentTargetV1, RuntimeProcessIdentityV1,
+    };
+    use automation_runtime_registry::{
+        ExactServingRouteV1, ServingSlotKeyV1, ServingSlotRegistryError, ServingSlotRegistryV1,
+        SlotAdmissionStateV2, SlotLifecycleV1, SlotSealKeyV2,
+    };
     use automation_runtime_worker::{
         RuntimePendingDrainCandidateV2, RuntimePendingDrainStateDigestV2,
         RuntimeRegistryRecoveryObservationErrorV2,
@@ -1542,8 +2026,10 @@ mod tests {
     use super::{
         compose_runtime_registry_bootstrap_v1, map_registry_observation_error,
         map_worker_observation_error, registry_active_interaction_capacity,
-        RuntimeRegistryBootstrapErrorV1, RuntimeRegistryEmptyRecoveryBindingV2,
-        RuntimeRegistryRecoveryObservationErrorV1,
+        RuntimeRegistryBootstrapErrorV1, RuntimeRegistryEmergencyTriggerV2,
+        RuntimeRegistryEmptyRecoveryBindingV2, RuntimeRegistryPredecessorReplacementErrorV2,
+        RuntimeRegistryRecoveryObservationErrorV1, RuntimeRegistryReplacementRouteV2,
+        RuntimeRegistryStagingPortV2,
     };
     use crate::GatewayResourceConfigV1;
 
@@ -1577,6 +2063,74 @@ mod tests {
 
     fn seal_key() -> SlotSealKeyV2 {
         SlotSealKeyV2::try_from([7_u8; 16].as_slice()).unwrap()
+    }
+
+    fn replacement_route(
+        process_instance_id: &str,
+        runtime_generation: u64,
+        version: u64,
+    ) -> ExactServingRouteV1 {
+        let content_hash = "9f2bbed3d90d3439ebe5bb07a69f8ff179c29e8c71500b6890a7d24653a65ff6";
+        let binding_fingerprint =
+            "a44fd4f629a1183147a25a8afb93b026de7e3f92efe737637da222617df0c655";
+        let identity: RuntimeProcessIdentityV1 = serde_json::from_value(json!({
+            "target": {
+                "guild_id": "42",
+                "ruleset_key": "studyroom",
+                "version": version,
+                "content_hash": content_hash,
+                "binding_revision": 1,
+                "binding_fingerprint": binding_fingerprint
+            },
+            "runtime_generation": runtime_generation,
+            "process_instance_id": process_instance_id
+        }))
+        .unwrap();
+        let ruleset = serde_json::from_value(json!({
+            "guild_id": "42",
+            "ruleset_key": "studyroom",
+            "version": version,
+            "schema_version": 1,
+            "definition": {
+                "version": 1,
+                "panels": [],
+                "modals": [],
+                "rules": []
+            },
+            "content_hash": content_hash,
+            "created_by": "9"
+        }))
+        .unwrap();
+        ExactServingRouteV1::new(identity, ruleset, Default::default()).unwrap()
+    }
+
+    fn replacement_registry(
+        process_instance_id: &str,
+    ) -> (RuntimeRegistryStagingPortV2, ServingSlotRegistryV1) {
+        let registry = ServingSlotRegistryV1::new(Default::default());
+        (
+            RuntimeRegistryStagingPortV2 {
+                process_instance_id: ProcessInstanceId::parse(process_instance_id).unwrap(),
+                registry: registry.clone(),
+            },
+            registry,
+        )
+    }
+
+    fn install_replacement(
+        port: &RuntimeRegistryStagingPortV2,
+        route: ExactServingRouteV1,
+        fencing_token: u64,
+    ) -> RuntimeRegistryReplacementRouteV2 {
+        port.install_staged_route_v2(
+            route,
+            FencingToken::new(fencing_token).unwrap(),
+            RuntimeRegistryEmergencyTriggerV2::new(|| {}),
+        )
+        .unwrap()
+        .into_parts_v2()
+        .2
+        .into_replacement_v2()
     }
 
     impl super::RuntimeRegistryBootstrapV1 {
@@ -1996,6 +2550,207 @@ mod tests {
         ] {
             assert_eq!(map_worker_observation_error(source), expected);
         }
+    }
+
+    #[test]
+    fn predecessor_absence_returns_the_same_exclusively_staged_authority() {
+        fn assert_replacement<T: Send + Sync>() {}
+        assert_replacement::<RuntimeRegistryReplacementRouteV2>();
+
+        let process = "runtime-process:replacement-absent";
+        let (port, registry) = replacement_registry(process);
+        let route = replacement_route(process, 2, 2);
+        let staged = install_replacement(&port, route.clone(), 2);
+
+        let transition = staged.transition_predecessor_to_draining_v2(None).unwrap();
+
+        staged.ensure_staged_v2().unwrap();
+        assert_eq!(staged.identity_v2(), route.identity());
+        assert!(transition.predecessor_v2().is_none());
+        assert_eq!(transition.successor_v2().identity_v2(), route.identity());
+        assert_eq!(transition.initial_active_interactions_v2(), 0);
+        assert!(registry
+            .serving_snapshot(&route.slot_key())
+            .unwrap()
+            .is_none());
+        staged.remove_v2().unwrap();
+    }
+
+    #[test]
+    fn exact_predecessor_is_drained_observed_and_removed_without_losing_staged_authority() {
+        let process = "runtime-process:replacement-current";
+        let (port, registry) = replacement_registry(process);
+        let predecessor = replacement_route("runtime-process:predecessor", 1, 1);
+        let key = predecessor.slot_key();
+        let predecessor_token = registry
+            .install(
+                key.clone(),
+                predecessor.clone(),
+                FencingToken::new(1).unwrap(),
+            )
+            .unwrap()
+            .token;
+        registry
+            .activate(&predecessor_token, predecessor.identity())
+            .unwrap();
+        let interaction = registry.admit(&key).unwrap();
+        let replacement = replacement_route(process, 2, 2);
+        let staged = install_replacement(&port, replacement.clone(), 2);
+
+        let transition = staged
+            .transition_predecessor_to_draining_v2(Some(predecessor.identity()))
+            .unwrap();
+        let transition_replay = staged
+            .transition_predecessor_to_draining_v2(Some(predecessor.identity()))
+            .unwrap();
+
+        assert_eq!(staged.identity_v2(), replacement.identity());
+        assert_eq!(transition, transition_replay);
+        assert_eq!(
+            transition.predecessor_v2().unwrap().identity,
+            *predecessor.identity()
+        );
+        assert_eq!(transition.initial_active_interactions_v2(), 1);
+        assert_eq!(
+            staged.fencing_token_v2().unwrap(),
+            FencingToken::new(2).unwrap()
+        );
+        let pending = staged.observe_predecessor_drain_v2().unwrap();
+        assert_eq!(pending.active_interactions_v2(), 1);
+        assert!(!pending.drained_v2());
+        assert_eq!(
+            staged.remove_drained_predecessor_v2(),
+            Err(
+                RuntimeRegistryPredecessorReplacementErrorV2::ActiveInteractionsRemain {
+                    active: 1
+                }
+            )
+        );
+        assert!(registry.serving_snapshot(&key).unwrap().is_none());
+        drop(interaction);
+        let drained = staged.observe_predecessor_drain_v2().unwrap();
+        assert_eq!(drained.active_interactions_v2(), 0);
+        assert!(drained.drained_v2());
+        let removal = staged.remove_drained_predecessor_v2().unwrap();
+        let removal_replay = staged.remove_drained_predecessor_v2().unwrap();
+        assert_eq!(removal, removal_replay);
+        assert_eq!(
+            removal.removed_predecessor_v2().unwrap().identity,
+            *predecessor.identity()
+        );
+        assert_eq!(removal.successor_v2().identity_v2(), replacement.identity());
+        assert_eq!(
+            registry.route_witness(&predecessor_token),
+            Err(ServingSlotRegistryError::StaleMutationToken)
+        );
+        assert!(registry.serving_snapshot(&key).unwrap().is_none());
+        let evidence = staged
+            .advance_authority_v2(FencingToken::new(3).unwrap())
+            .unwrap();
+        assert_eq!(evidence.fencing_token_v2(), FencingToken::new(3).unwrap());
+        staged.ensure_staged_v2().unwrap();
+        staged.remove_v2().unwrap();
+    }
+
+    #[test]
+    fn predecessor_identity_mismatch_never_drains_the_fresh_serving_route() {
+        let process = "runtime-process:replacement-mismatch";
+        let (port, registry) = replacement_registry(process);
+        let serving = replacement_route("runtime-process:fresh-serving", 1, 1);
+        let key = serving.slot_key();
+        let serving_token = registry
+            .install(key.clone(), serving.clone(), FencingToken::new(1).unwrap())
+            .unwrap()
+            .token;
+        registry
+            .activate(&serving_token, serving.identity())
+            .unwrap();
+        let expected = replacement_route("runtime-process:stale-expected", 1, 1);
+        let replacement = replacement_route(process, 2, 2);
+        let staged = install_replacement(&port, replacement, 2);
+
+        assert!(matches!(
+            staged.transition_predecessor_to_draining_v2(Some(expected.identity())),
+            Err(RuntimeRegistryPredecessorReplacementErrorV2::PredecessorIdentityMismatch)
+        ));
+
+        let snapshot = registry.serving_snapshot(&key).unwrap().unwrap();
+        assert_eq!(snapshot.identity(), serving.identity());
+        assert_eq!(
+            registry.route_witness(&serving_token).unwrap().lifecycle,
+            SlotLifecycleV1::Serving
+        );
+        staged.remove_v2().unwrap();
+    }
+
+    #[test]
+    fn expected_absence_rejects_serving_and_draining_predecessors() {
+        for drain_first in [false, true] {
+            let process = if drain_first {
+                "runtime-process:replacement-unexpected-draining"
+            } else {
+                "runtime-process:replacement-unexpected-serving"
+            };
+            let (port, registry) = replacement_registry(process);
+            let predecessor = replacement_route("runtime-process:unexpected", 1, 1);
+            let key = predecessor.slot_key();
+            let predecessor_token = registry
+                .install(key, predecessor.clone(), FencingToken::new(1).unwrap())
+                .unwrap()
+                .token;
+            registry
+                .activate(&predecessor_token, predecessor.identity())
+                .unwrap();
+            let replacement = replacement_route(process, 2, 2);
+            let staged = install_replacement(&port, replacement, 2);
+            if drain_first {
+                let state = staged.state.lock().unwrap();
+                registry
+                    .begin_drain_with_authority(
+                        state.staged.token.as_ref().unwrap(),
+                        &predecessor_token,
+                    )
+                    .unwrap();
+            }
+
+            assert!(matches!(
+                staged.transition_predecessor_to_draining_v2(None),
+                Err(RuntimeRegistryPredecessorReplacementErrorV2::UnexpectedPredecessorPresent)
+            ));
+
+            assert_eq!(
+                registry
+                    .route_witness(&predecessor_token)
+                    .unwrap()
+                    .lifecycle,
+                if drain_first {
+                    SlotLifecycleV1::Draining
+                } else {
+                    SlotLifecycleV1::Serving
+                }
+            );
+            staged.remove_v2().unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_expected_predecessor_fails_closed_and_retains_staged_authority() {
+        let process = "runtime-process:replacement-missing";
+        let (port, registry) = replacement_registry(process);
+        let expected = replacement_route("runtime-process:missing", 1, 1);
+        let replacement = replacement_route(process, 2, 2);
+        let key = replacement.slot_key();
+        let staged = install_replacement(&port, replacement, 2);
+
+        assert!(matches!(
+            staged.transition_predecessor_to_draining_v2(Some(expected.identity())),
+            Err(RuntimeRegistryPredecessorReplacementErrorV2::ExpectedPredecessorAbsent)
+        ));
+
+        let atomic = registry.atomic_observation_v2(&key).unwrap().unwrap();
+        assert_eq!(atomic.admission_state, SlotAdmissionStateV2::Staged);
+        staged.ensure_staged_v2().unwrap();
+        staged.remove_v2().unwrap();
     }
 
     #[test]

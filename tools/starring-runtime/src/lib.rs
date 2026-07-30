@@ -17,6 +17,7 @@ mod lifecycle_timing;
 #[cfg_attr(not(test), allow(dead_code))]
 mod maintenance_ingress_gate;
 mod mutation_finalizer;
+mod panel_reconciliation;
 mod process;
 mod process_identity;
 mod process_startup;

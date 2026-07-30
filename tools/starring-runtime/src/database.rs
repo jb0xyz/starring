@@ -313,6 +313,8 @@ pub(crate) struct RuntimePendingDrainMutationDatabaseV3 {
 pub(crate) struct RuntimeControllerDatabaseV2 {
     execution: PostgresRuntimeExecutionV1,
     exact_target: PostgresRuntimeExactTargetReader,
+    panel: PostgresRuntimePanelV1,
+    serving: PostgresRuntimeServingLeaseV1,
 }
 
 impl RuntimeControllerDatabaseV2 {
@@ -322,6 +324,14 @@ impl RuntimeControllerDatabaseV2 {
 
     pub(crate) fn exact_target(&self) -> &PostgresRuntimeExactTargetReader {
         &self.exact_target
+    }
+
+    pub(crate) fn panel(&self) -> &PostgresRuntimePanelV1 {
+        &self.panel
+    }
+
+    pub(crate) fn serving(&self) -> &PostgresRuntimeServingLeaseV1 {
+        &self.serving
     }
 }
 
@@ -398,6 +408,8 @@ impl RuntimeDatabaseDependenciesV1 {
         RuntimeControllerDatabaseV2 {
             execution: self.execution.clone(),
             exact_target: self.exact_target.clone(),
+            panel: self.panel.clone(),
+            serving: self.serving.clone(),
         }
     }
 

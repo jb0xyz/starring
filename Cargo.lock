@@ -3316,12 +3316,14 @@ dependencies = [
 name = "starring-runtime"
 version = "0.1.0"
 dependencies = [
+ "automation-panel-installation",
  "automation-runtime",
  "automation-runtime-controller",
  "automation-runtime-convergence",
  "automation-runtime-convergence-postgres",
  "automation-runtime-execution-postgres",
  "automation-runtime-interaction-postgres",
+ "automation-runtime-panel-evidence",
  "automation-runtime-panel-postgres",
  "automation-runtime-registry",
  "automation-runtime-serving-postgres",

@@ -21,11 +21,12 @@ use automation_runtime_worker::{
     RuntimeProductionLifecycleErrorV2, RuntimeRecoveryResumeObservationInputV2,
     RuntimeRecoveryResumeObservationV2, RuntimeRecoveryResumePortV2, RuntimeRouteSetObservationV2,
     RuntimeServingOpenAcknowledgementRefreshInputV2, RuntimeServingOpenAcknowledgementRefreshV2,
-    RuntimeServingOpenObservationInputV2, RuntimeServingOpenObservationPortV2,
-    RuntimeServingOpenObservationV2, RuntimeServingOpenPreparedV2, RuntimeServingOpenProcessV2,
-    RuntimeServingOpenRequestV2, RuntimeServingOpenSupervisorConfigV2,
-    RuntimeServingSlotWorkErrorV2, RuntimeServingSlotWorkPermitV2, RuntimeServingSlotWorkRequestV2,
-    RuntimeShutdownCauseV2, RuntimeShuttingDownProcessV2, RuntimeStartupRecoveryContinuationV2,
+    RuntimeServingOpenBarrierCompletionAuthorityV3, RuntimeServingOpenObservationInputV2,
+    RuntimeServingOpenObservationPortV2, RuntimeServingOpenObservationV2,
+    RuntimeServingOpenPreparedV2, RuntimeServingOpenProcessV2, RuntimeServingOpenRequestV2,
+    RuntimeServingOpenSupervisorConfigV2, RuntimeServingSlotWorkErrorV2,
+    RuntimeServingSlotWorkPermitV2, RuntimeServingSlotWorkRequestV2, RuntimeShutdownCauseV2,
+    RuntimeShuttingDownProcessV2, RuntimeStartupRecoveryContinuationV2,
     RuntimeStartupRecoveryFixedPointProofV2,
 };
 use automation_runtime_worker::{
@@ -42,10 +43,12 @@ use crate::database::{
 };
 use crate::discord_lifecycle::RuntimeDiscordPauseReservationIdentityV2;
 use crate::gateway::{
-    RuntimeGatewayBootstrapV1, RuntimeGatewayFixedPointAcceptanceErrorV2,
-    RuntimeGatewayProductionCoordinatorV2, RuntimeGatewayProductionInterruptV2,
-    RuntimeGatewayReadyInvalidationObserverV2, RuntimeGatewayRecoveryOwnerCommitErrorV2,
-    RuntimeGatewayRecoverySectionErrorV2, RuntimeRecoveryPendingGatewayBindingV2,
+    RuntimeDiscordOrdinaryBarrierFailureV3, RuntimeDiscordOrdinaryBarrierPortV3,
+    RuntimeDiscordOrdinaryBarrierResumeEvidenceV3, RuntimeGatewayBootstrapV1,
+    RuntimeGatewayFixedPointAcceptanceErrorV2, RuntimeGatewayProductionCoordinatorV2,
+    RuntimeGatewayProductionInterruptV2, RuntimeGatewayReadyInvalidationObserverV2,
+    RuntimeGatewayRecoveryOwnerCommitErrorV2, RuntimeGatewayRecoverySectionErrorV2,
+    RuntimeRecoveryPendingGatewayBindingV2,
 };
 use crate::gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerAdmissionFrozenHandoffErrorV2,
@@ -305,6 +308,17 @@ pub(crate) struct RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
     worker: RuntimeServingOpenProcessV2,
 }
 
+pub(crate) struct RuntimeClosedRecoveryOrdinaryBarrierCompletionAuthorityV3 {
+    evidence: RuntimeDiscordOrdinaryBarrierResumeEvidenceV3,
+    worker: RuntimeServingOpenBarrierCompletionAuthorityV3,
+}
+
+impl Debug for RuntimeClosedRecoveryOrdinaryBarrierCompletionAuthorityV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeClosedRecoveryOrdinaryBarrierCompletionAuthorityV3(<redacted>)")
+    }
+}
+
 pub(crate) struct RuntimeClosedRecoveryServingAcknowledgementEvidenceV2 {
     pub(crate) owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
     pub(crate) readiness: RuntimeCapabilityReadinessSetV2,
@@ -319,6 +333,12 @@ pub(crate) struct RuntimeClosedRecoveryServingAcknowledgementEvidenceV2 {
     pub(crate) supervisors_running: bool,
     pub(crate) predecessor: RuntimeIngressOpenAcknowledgementPredecessorV2,
     pub(crate) lease_for: RuntimeIngressOpenAcknowledgementLeaseDurationV2,
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeClosedRecoveryServingAcknowledgementRefreshTransitionV3 {
+    Current,
+    ResumedSuccessor,
 }
 
 pub(crate) struct RuntimeClosedRecoveryEmptyOpenAcknowledgementRefreshV2 {
@@ -2419,6 +2439,69 @@ impl RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
         self.registry.staging_port_v2()
     }
 
+    pub(crate) fn ordinary_barrier_port_v3(
+        &self,
+    ) -> Result<RuntimeDiscordOrdinaryBarrierPortV3, RuntimeDiscordOrdinaryBarrierFailureV3> {
+        self.gateway.ordinary_barrier_port_v3()
+    }
+
+    pub(crate) fn coordinator_generation_v3(&self) -> RuntimeGatewayCoordinatorGenerationV2 {
+        self.worker.coordinator_generation()
+    }
+
+    pub(crate) fn observe_exact_resumed_ordinary_barrier_ready_v3(
+        &self,
+        evidence: &RuntimeDiscordOrdinaryBarrierResumeEvidenceV3,
+    ) -> Result<RuntimeGatewayReadyAttestationV2, RuntimeDiscordOrdinaryBarrierFailureV3> {
+        self.gateway
+            .observe_exact_resumed_ordinary_barrier_ready_v3(evidence)
+    }
+
+    pub(crate) async fn authorize_ordinary_barrier_completion_v3(
+        &self,
+        evidence: RuntimeDiscordOrdinaryBarrierResumeEvidenceV3,
+        final_observation: crate::process::RuntimeExactIngressAcknowledgementReobservationV3,
+    ) -> Result<
+        RuntimeClosedRecoveryOrdinaryBarrierCompletionAuthorityV3,
+        RuntimeClosedRecoveryProductionHandoffErrorV2,
+    > {
+        if self.owner.terminal_status_v2().is_some()
+            || self.gateway.current_interrupt_v2().is_some()
+            || self.worker.coordinator_generation() != self.gateway.coordinator_generation_v2()
+        {
+            return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);
+        }
+        let ready = self
+            .observe_exact_resumed_ordinary_barrier_ready_v3(&evidence)
+            .map_err(|_| RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway)?;
+        let worker = self
+            .worker
+            .authorize_ordinary_barrier_completion_v3(final_observation.receipt_v3())
+            .map_err(RuntimeClosedRecoveryProductionHandoffErrorV2::Worker)?;
+        if worker.coordinator_generation_v3() != evidence.coordinator_generation_v3()
+            || worker.gateway_ready_v3() != &ready
+            || !worker.accepts_final_reobservation_v3(final_observation.receipt_v3())
+        {
+            return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);
+        }
+        self.revalidate_owner_and_registry_v2().await?;
+        if self
+            .observe_exact_resumed_ordinary_barrier_ready_v3(&evidence)
+            .map_or(true, |current| current != ready)
+        {
+            return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);
+        }
+        Ok(RuntimeClosedRecoveryOrdinaryBarrierCompletionAuthorityV3 { evidence, worker })
+    }
+
+    pub(crate) fn complete_ordinary_barrier_v3(
+        &self,
+        authority: RuntimeClosedRecoveryOrdinaryBarrierCompletionAuthorityV3,
+    ) -> Result<RuntimeGatewayReadyAttestationV2, RuntimeDiscordOrdinaryBarrierFailureV3> {
+        self.gateway
+            .complete_ordinary_barrier_v3(authority.evidence, authority.worker)
+    }
+
     pub(crate) fn begin_shutdown_v2(
         self,
     ) -> (
@@ -2521,6 +2604,36 @@ impl RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
         {
             return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);
         }
+        self.revalidate_owner_and_registry_v2().await
+    }
+
+    pub(crate) async fn revalidate_resumed_ordinary_barrier_v3(
+        &self,
+        evidence: &RuntimeDiscordOrdinaryBarrierResumeEvidenceV3,
+    ) -> Result<RuntimeGatewayReadyAttestationV2, RuntimeClosedRecoveryProductionHandoffErrorV2>
+    {
+        if self.owner.terminal_status_v2().is_some()
+            || self.gateway.current_interrupt_v2().is_some()
+            || self.worker.coordinator_generation() != self.gateway.coordinator_generation_v2()
+        {
+            return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);
+        }
+        let ready = self
+            .observe_exact_resumed_ordinary_barrier_ready_v3(evidence)
+            .map_err(|_| RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway)?;
+        self.revalidate_owner_and_registry_v2().await?;
+        if self
+            .observe_exact_resumed_ordinary_barrier_ready_v3(evidence)
+            .map_or(true, |current| current != ready)
+        {
+            return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);
+        }
+        Ok(ready)
+    }
+
+    async fn revalidate_owner_and_registry_v2(
+        &self,
+    ) -> Result<(), RuntimeClosedRecoveryProductionHandoffErrorV2> {
         let owner = self
             .owner
             .observe_current_v2()
@@ -2565,6 +2678,33 @@ impl RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
         RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2,
         RuntimeClosedRecoveryServingAcknowledgementRefreshFailureV2,
     > {
+        self.authorize_acknowledgement_refresh_with_transition_v3(
+            evidence,
+            RuntimeClosedRecoveryServingAcknowledgementRefreshTransitionV3::Current,
+        )
+    }
+
+    pub(crate) fn authorize_resumed_acknowledgement_refresh_v3(
+        self,
+        evidence: RuntimeClosedRecoveryServingAcknowledgementEvidenceV2,
+    ) -> Result<
+        RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2,
+        RuntimeClosedRecoveryServingAcknowledgementRefreshFailureV2,
+    > {
+        self.authorize_acknowledgement_refresh_with_transition_v3(
+            evidence,
+            RuntimeClosedRecoveryServingAcknowledgementRefreshTransitionV3::ResumedSuccessor,
+        )
+    }
+
+    fn authorize_acknowledgement_refresh_with_transition_v3(
+        self,
+        evidence: RuntimeClosedRecoveryServingAcknowledgementEvidenceV2,
+        transition: RuntimeClosedRecoveryServingAcknowledgementRefreshTransitionV3,
+    ) -> Result<
+        RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2,
+        RuntimeClosedRecoveryServingAcknowledgementRefreshFailureV2,
+    > {
         let route_set = match self.observe_registry_route_set_v2() {
             Ok(route_set) => route_set,
             Err(_) => {
@@ -2597,7 +2737,15 @@ impl RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
             registry,
             worker,
         } = self;
-        match worker.authorize_ingress_open_acknowledgement_refresh(input) {
+        let authorization = match transition {
+            RuntimeClosedRecoveryServingAcknowledgementRefreshTransitionV3::Current => {
+                worker.authorize_ingress_open_acknowledgement_refresh(input)
+            }
+            RuntimeClosedRecoveryServingAcknowledgementRefreshTransitionV3::ResumedSuccessor => {
+                worker.authorize_resumed_ingress_open_acknowledgement_refresh_v3(input)
+            }
+        };
+        match authorization {
             Ok(worker) => Ok(RuntimeClosedRecoveryServingOpenAcknowledgementRefreshV2 {
                 owner,
                 gateway,

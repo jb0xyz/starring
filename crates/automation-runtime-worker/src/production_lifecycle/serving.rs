@@ -11,6 +11,8 @@ use automation_runtime_controller::{
 use automation_runtime_convergence::ProcessInstanceId;
 use chrono::{DateTime, Utc};
 
+use super::admission::RuntimeServingGatewayReadyRefreshV3;
+use super::refresh::validate_serving_gateway_ready_refresh_v3;
 use super::{
     RuntimeAdmissionAcknowledgingProcessV2, RuntimeEmptyOpenEpochV2, RuntimeEmptyOpenProcessV2,
     RuntimeIngressOpenAcknowledgementObservationV2, RuntimeMaintenanceGateGenerationV2,
@@ -618,6 +620,7 @@ pub struct RuntimeServingOpenAcknowledgementRefreshV2 {
     state: Box<RuntimeServingOpenProcessV2>,
     owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,
     readiness: RuntimeCapabilityReadinessSetV2,
+    gateway_ready: RuntimeGatewayReadyAttestationV2,
     route_set: RuntimeRouteSetObservationV2,
     operation: RuntimeIngressOpenAcknowledgementSingleFlightV2,
 }
@@ -663,6 +666,7 @@ impl RuntimeServingOpenAcknowledgementRefreshV2 {
             state,
             owner_receipt,
             readiness,
+            gateway_ready,
             route_set,
             ..
         } = self;
@@ -673,6 +677,7 @@ impl RuntimeServingOpenAcknowledgementRefreshV2 {
         } = *state;
         epoch.gateway_owner = owner_receipt;
         epoch.readiness = readiness;
+        epoch.gateway_ready = gateway_ready;
         epoch.ingress_acknowledgement =
             RuntimeIngressOpenAcknowledgementObservationV2::from_accepted(accepted);
         epoch.route_set = route_set;
@@ -728,7 +733,34 @@ impl RuntimeServingOpenProcessV2 {
         RuntimeServingOpenAcknowledgementRefreshV2,
         RuntimeServingOpenAcknowledgementRefreshAuthorizationFailureV2,
     > {
-        if let Err(error) = validate_serving_refresh(&self, &input) {
+        self.authorize_ingress_open_acknowledgement_refresh_with_gateway_transition_v3(
+            input,
+            RuntimeServingGatewayReadyRefreshV3::Current,
+        )
+    }
+
+    pub fn authorize_resumed_ingress_open_acknowledgement_refresh_v3(
+        self,
+        input: RuntimeServingOpenAcknowledgementRefreshInputV2,
+    ) -> Result<
+        RuntimeServingOpenAcknowledgementRefreshV2,
+        RuntimeServingOpenAcknowledgementRefreshAuthorizationFailureV2,
+    > {
+        self.authorize_ingress_open_acknowledgement_refresh_with_gateway_transition_v3(
+            input,
+            RuntimeServingGatewayReadyRefreshV3::ResumedSuccessor,
+        )
+    }
+
+    fn authorize_ingress_open_acknowledgement_refresh_with_gateway_transition_v3(
+        self,
+        input: RuntimeServingOpenAcknowledgementRefreshInputV2,
+        gateway_transition: RuntimeServingGatewayReadyRefreshV3,
+    ) -> Result<
+        RuntimeServingOpenAcknowledgementRefreshV2,
+        RuntimeServingOpenAcknowledgementRefreshAuthorizationFailureV2,
+    > {
+        if let Err(error) = validate_serving_refresh(&self, &input, gateway_transition) {
             return Err(
                 RuntimeServingOpenAcknowledgementRefreshAuthorizationFailureV2 {
                     state: Box::new(self),
@@ -747,7 +779,7 @@ impl RuntimeServingOpenProcessV2 {
                 )
                 .expect("validated maintenance gate generation must remain nonzero"),
                 owner_receipt: input.owner_receipt.clone(),
-                gateway_ready: input.gateway_ready,
+                gateway_ready: input.gateway_ready.clone(),
                 lease_for: input.lease_for,
             },
         ) {
@@ -765,6 +797,7 @@ impl RuntimeServingOpenProcessV2 {
             state: Box::new(self),
             owner_receipt: input.owner_receipt,
             readiness: input.readiness,
+            gateway_ready: input.gateway_ready,
             route_set: input.route_set,
             operation: RuntimeIngressOpenAcknowledgementSingleFlightV2::new(
                 RuntimeAuthorizedIngressOpenAcknowledgementV2::from_request(
@@ -779,6 +812,7 @@ impl RuntimeServingOpenProcessV2 {
 fn validate_serving_refresh(
     state: &RuntimeServingOpenProcessV2,
     input: &RuntimeServingOpenAcknowledgementRefreshInputV2,
+    gateway_transition: RuntimeServingGatewayReadyRefreshV3,
 ) -> Result<(), RuntimeProductionLifecycleErrorV2> {
     let epoch = &state.epoch;
     let previous_owner = &epoch.gateway_owner;
@@ -810,15 +844,11 @@ fn validate_serving_refresh(
     {
         return Err(RuntimeProductionLifecycleErrorV2::ReadinessMismatch);
     }
-    if input.gateway_ready != epoch.gateway_ready {
-        if input.gateway_ready.connection_epoch != epoch.gateway_ready.connection_epoch {
-            return Err(RuntimeProductionLifecycleErrorV2::StaleConnectionEpoch);
-        }
-        if input.gateway_ready.admission_revision != epoch.gateway_ready.admission_revision {
-            return Err(RuntimeProductionLifecycleErrorV2::StaleAdmissionRevision);
-        }
-        return Err(RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch);
-    }
+    validate_serving_gateway_ready_refresh_v3(
+        &epoch.gateway_ready,
+        &input.gateway_ready,
+        gateway_transition,
+    )?;
     let current_acknowledgement = epoch.ingress_acknowledgement.acknowledgement();
     if !input.writer_fence_open
         || input.writer_fence_generation != current_acknowledgement.fence_generation()

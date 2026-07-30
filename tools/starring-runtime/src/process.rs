@@ -66,6 +66,7 @@ pub(crate) use execution::{
 };
 #[cfg(test)]
 pub(crate) use observation::execute_recovery_resume_gateway_stage_v2;
+pub(crate) use observation::RuntimeExactIngressAcknowledgementReobservationV3;
 pub use observation::{
     RuntimeProcessProductionHandoffErrorV2, RuntimeProcessProductionHandoffFailureV2,
     RuntimeProcessStartupRecoveryObservationErrorV2,

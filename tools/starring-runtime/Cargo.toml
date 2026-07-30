@@ -4,12 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+automation-panel-installation = { path = "../../crates/automation-panel-installation" }
 automation-runtime = { path = "../../crates/automation-runtime" }
 automation-runtime-controller = { path = "../../crates/automation-runtime-controller" }
 automation-runtime-convergence = { path = "../../crates/automation-runtime-convergence" }
 automation-runtime-convergence-postgres = { path = "../../crates/automation-runtime-convergence-postgres" }
 automation-runtime-execution-postgres = { path = "../../crates/automation-runtime-execution-postgres" }
 automation-runtime-interaction-postgres = { path = "../../crates/automation-runtime-interaction-postgres" }
+automation-runtime-panel-evidence = { path = "../../crates/automation-runtime-panel-evidence" }
 automation-runtime-panel-postgres = { path = "../../crates/automation-runtime-panel-postgres" }
 automation-runtime-registry = { path = "../../crates/automation-runtime-registry" }
 automation-runtime-serving-postgres = { path = "../../crates/automation-runtime-serving-postgres" }

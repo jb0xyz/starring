@@ -39,9 +39,10 @@ pub use mutation::TwilightMutationAdapter;
 pub use panel_installer::TwilightPanelInstaller;
 pub use readiness::{
     build_runtime_readiness_context_v1, check_runtime_target_readiness_v1,
-    OwnedDiscordRuntimePreflightV1, RuntimeDiscordPreflightErrorV1, RuntimeObservedRoleV1,
-    RuntimeReadinessContextV1, RuntimeReadinessSnapshotErrorV1, RuntimeTargetReadinessErrorV1,
-    RuntimeTargetReadyV1, TwilightRuntimeReadinessProvider,
+    OwnedDiscordRuntimeOperationsV2, OwnedDiscordRuntimePreflightV1,
+    RuntimeDiscordPreflightErrorV1, RuntimeObservedRoleV1, RuntimeReadinessContextV1,
+    RuntimeReadinessSnapshotErrorV1, RuntimeTargetReadinessErrorV1, RuntimeTargetReadyV1,
+    TwilightRuntimeReadinessProvider,
 };
 pub use responder::TwilightInteractionResponder;
 pub use resume::{resume_deleting_instances, ResumeConfig, ResumeEntry, ResumeReport};

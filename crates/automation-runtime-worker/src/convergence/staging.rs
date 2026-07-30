@@ -2,15 +2,20 @@ use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
 
 use automation_runtime_controller::{
-    RuntimeBindingPinV1, RuntimeDesiredTargetDigestV1, RuntimeDrainIntentIdV2,
-    RuntimeExecutionGuardV1,
+    RuntimeBindingPinV1, RuntimeConvergenceSessionV1, RuntimeDesiredTargetDigestV1,
+    RuntimeDrainIntentIdV2, RuntimeExecutionGuardV1,
 };
-use automation_runtime_convergence::{FencingToken, RuntimeProcessIdentityV1};
+use automation_runtime_convergence::{
+    FencingToken, RuntimeDeploymentPhaseV1, RuntimeProcessIdentityV1,
+};
 use chrono::{DateTime, TimeDelta, Utc};
 
 use super::hydration::RuntimeHydratedCoreV2;
-use super::RuntimeAuthorityPayloadDigestV2;
-use crate::{RuntimeRegistryGlobalObservationSequenceV2, RuntimeServingSlotWorkErrorV2};
+use super::{RuntimeAuthorityPayloadDigestV2, RuntimeConvergenceClaimKindV2};
+use crate::{
+    RuntimeRegistryGlobalObservationSequenceV2, RuntimeServingSlotWorkErrorV2,
+    RuntimeServingSlotWorkPermitV2,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeRouteLifecycleV2 {
@@ -38,6 +43,15 @@ pub struct RuntimeRouteWitnessV2 {
 pub enum RuntimeRouteStageOutcomeV2 {
     Installed,
     ExactReplay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeStagedRecoveryPhaseV2 {
+    Drained,
+    ActivationApplying,
+    RuntimePendingReady,
+    ReconcilingPanels,
+    AwaitingGatewayReady,
 }
 
 pub struct RuntimeRouteStageRequestV2 {
@@ -281,9 +295,9 @@ impl<H> Debug for RuntimeRefreshedStageReadyConvergenceV2<H> {
 }
 
 pub struct RuntimeStagedConvergenceV2<H, S> {
-    staged: S,
-    witness: RuntimeRouteWitnessV2,
-    core: RuntimeHydratedCoreV2<H>,
+    pub(super) staged: S,
+    pub(super) witness: RuntimeRouteWitnessV2,
+    pub(super) core: RuntimeHydratedCoreV2<H>,
 }
 
 impl<H, S> RuntimeStagedConvergenceV2<H, S> {
@@ -322,12 +336,175 @@ impl<H, S> RuntimeStagedConvergenceV2<H, S> {
             self.staged,
         )
     }
+
+    pub fn into_staged_recovery(
+        self,
+    ) -> Result<RuntimeStagedRecoveryHandoffV2<H, S>, Box<RuntimeStagedConvergenceV2<H, S>>> {
+        let RuntimeConvergenceClaimKindV2::StagedRecovery(phase) = self.core.claimed.claim_kind
+        else {
+            return Err(Box::new(self));
+        };
+        if !phase_matches_snapshot(phase, &self.core.claimed.session.snapshot().phase) {
+            return Err(Box::new(self));
+        }
+        let route = RuntimeStagedRecoveryRouteV2 {
+            staged: self.staged,
+            witness: self.witness,
+            core: self.core,
+        };
+        Ok(match phase {
+            RuntimeStagedRecoveryPhaseV2::Drained => RuntimeStagedRecoveryHandoffV2::Drained(route),
+            RuntimeStagedRecoveryPhaseV2::ActivationApplying => {
+                RuntimeStagedRecoveryHandoffV2::ActivationApplying(route)
+            }
+            RuntimeStagedRecoveryPhaseV2::RuntimePendingReady => {
+                RuntimeStagedRecoveryHandoffV2::RuntimePendingReady(route)
+            }
+            RuntimeStagedRecoveryPhaseV2::ReconcilingPanels => {
+                RuntimeStagedRecoveryHandoffV2::ReconcilingPanels(route)
+            }
+            RuntimeStagedRecoveryPhaseV2::AwaitingGatewayReady => {
+                RuntimeStagedRecoveryHandoffV2::AwaitingGatewayReady(route)
+            }
+        })
+    }
 }
 
 impl<H, S> Debug for RuntimeStagedConvergenceV2<H, S> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeStagedConvergenceV2(<redacted>)")
     }
+}
+
+pub type RuntimeStagedRecoveryRouteHandoffV2<H, S> = (
+    S,
+    RuntimeConvergenceSessionV1,
+    RuntimeServingSlotWorkPermitV2,
+    super::RuntimeExactTargetEvidenceV2,
+    H,
+    RuntimeRouteWitnessV2,
+);
+
+pub struct RuntimeStagedRecoveryRouteV2<H, S> {
+    staged: S,
+    witness: RuntimeRouteWitnessV2,
+    core: RuntimeHydratedCoreV2<H>,
+}
+
+impl<H, S> RuntimeStagedRecoveryRouteV2<H, S> {
+    pub fn session(&self) -> &RuntimeConvergenceSessionV1 {
+        &self.core.claimed.session
+    }
+
+    pub fn staged(&self) -> &S {
+        &self.staged
+    }
+
+    pub fn hydrated(&self) -> &H {
+        &self.core.hydrated
+    }
+
+    pub fn witness(&self) -> &RuntimeRouteWitnessV2 {
+        &self.witness
+    }
+
+    pub fn evidence(&self) -> &super::RuntimeExactTargetEvidenceV2 {
+        &self.core.evidence
+    }
+
+    pub fn ensure_active(&self) -> Result<(), RuntimeServingSlotWorkErrorV2> {
+        self.core.claimed.ensure_active()
+    }
+
+    pub fn into_handoff(self) -> RuntimeStagedRecoveryRouteHandoffV2<H, S> {
+        (
+            self.staged,
+            self.core.claimed.session,
+            self.core.claimed.permit,
+            self.core.evidence,
+            self.core.hydrated,
+            self.witness,
+        )
+    }
+}
+
+impl<H, S> Debug for RuntimeStagedRecoveryRouteV2<H, S> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeStagedRecoveryRouteV2(<redacted>)")
+    }
+}
+
+pub enum RuntimeStagedRecoveryHandoffV2<H, S> {
+    Drained(RuntimeStagedRecoveryRouteV2<H, S>),
+    ActivationApplying(RuntimeStagedRecoveryRouteV2<H, S>),
+    RuntimePendingReady(RuntimeStagedRecoveryRouteV2<H, S>),
+    ReconcilingPanels(RuntimeStagedRecoveryRouteV2<H, S>),
+    AwaitingGatewayReady(RuntimeStagedRecoveryRouteV2<H, S>),
+}
+
+impl<H, S> RuntimeStagedRecoveryHandoffV2<H, S> {
+    pub fn phase(&self) -> RuntimeStagedRecoveryPhaseV2 {
+        match self {
+            Self::Drained(_) => RuntimeStagedRecoveryPhaseV2::Drained,
+            Self::ActivationApplying(_) => RuntimeStagedRecoveryPhaseV2::ActivationApplying,
+            Self::RuntimePendingReady(_) => RuntimeStagedRecoveryPhaseV2::RuntimePendingReady,
+            Self::ReconcilingPanels(_) => RuntimeStagedRecoveryPhaseV2::ReconcilingPanels,
+            Self::AwaitingGatewayReady(_) => RuntimeStagedRecoveryPhaseV2::AwaitingGatewayReady,
+        }
+    }
+
+    pub fn route(&self) -> &RuntimeStagedRecoveryRouteV2<H, S> {
+        match self {
+            Self::Drained(route)
+            | Self::ActivationApplying(route)
+            | Self::RuntimePendingReady(route)
+            | Self::ReconcilingPanels(route)
+            | Self::AwaitingGatewayReady(route) => route,
+        }
+    }
+
+    pub fn into_route(self) -> RuntimeStagedRecoveryRouteV2<H, S> {
+        match self {
+            Self::Drained(route)
+            | Self::ActivationApplying(route)
+            | Self::RuntimePendingReady(route)
+            | Self::ReconcilingPanels(route)
+            | Self::AwaitingGatewayReady(route) => route,
+        }
+    }
+}
+
+impl<H, S> Debug for RuntimeStagedRecoveryHandoffV2<H, S> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeStagedRecoveryHandoffV2(<redacted>)")
+    }
+}
+
+fn phase_matches_snapshot(
+    phase: RuntimeStagedRecoveryPhaseV2,
+    snapshot_phase: &RuntimeDeploymentPhaseV1,
+) -> bool {
+    matches!(
+        (phase, snapshot_phase),
+        (
+            RuntimeStagedRecoveryPhaseV2::Drained,
+            RuntimeDeploymentPhaseV1::Drained
+        ) | (
+            RuntimeStagedRecoveryPhaseV2::ActivationApplying,
+            RuntimeDeploymentPhaseV1::ActivationApplying
+        ) | (
+            RuntimeStagedRecoveryPhaseV2::RuntimePendingReady,
+            RuntimeDeploymentPhaseV1::RuntimePending {
+                condition: automation_runtime_convergence::RuntimePendingConditionV1::Ready
+            }
+        ) | (
+            RuntimeStagedRecoveryPhaseV2::ReconcilingPanels,
+            RuntimeDeploymentPhaseV1::ReconcilingPanels
+        ) | (
+            RuntimeStagedRecoveryPhaseV2::AwaitingGatewayReady,
+            RuntimeDeploymentPhaseV1::AwaitingGatewayReady
+        )
+    )
 }
 
 fn validate_stage_observation(

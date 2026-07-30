@@ -39,6 +39,7 @@ pub use refresh::{
     RuntimeEmptyOpenAcknowledgementRefreshAuthorizationFailureV2,
     RuntimeEmptyOpenAcknowledgementRefreshCompletionFailureV2,
     RuntimeEmptyOpenAcknowledgementRefreshInputV2, RuntimeEmptyOpenAcknowledgementRefreshV2,
+    RuntimeServingOpenBarrierCompletionAuthorityV3,
 };
 pub use serving::{
     accept_runtime_route_set_observation_v2, RuntimeRouteSetEpochV2,

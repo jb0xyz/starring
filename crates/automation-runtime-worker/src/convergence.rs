@@ -1,5 +1,6 @@
 mod hydration;
 mod preflight;
+mod replacement;
 mod staging;
 
 use std::fmt::{Debug, Formatter};
@@ -12,7 +13,9 @@ use automation_runtime_controller::{
     RuntimeControllerPlanError, RuntimeConvergenceSessionError, RuntimeConvergenceSessionV1,
     RuntimeExecutionReceiptV1, RuntimeServingSlotV2,
 };
-use automation_runtime_convergence::{RuntimeDeploymentPhaseV1, RuntimeProcessIdentityV1};
+use automation_runtime_convergence::{
+    RuntimeDeploymentPhaseV1, RuntimePendingConditionV1, RuntimeProcessIdentityV1,
+};
 use chrono::{DateTime, Utc};
 
 use crate::{RuntimeServingSlotWorkErrorV2, RuntimeServingSlotWorkPermitV2};
@@ -32,11 +35,42 @@ pub use preflight::{
     RuntimeDiscordPreflightPortV2, RuntimeDiscordPreflightRequestV2, RuntimeDiscordPreflightV2,
     RuntimePreflightedConvergenceV2,
 };
+pub use replacement::{
+    RuntimeAcceptDrainFutureV2, RuntimeAcceptDrainMutationErrorV2, RuntimeAcceptDrainMutationV2,
+    RuntimeAdmissionDispositionV2, RuntimeBarrierACorrelationV2, RuntimeBarrierAEvidenceV2,
+    RuntimeBarrierAPauseErrorV2, RuntimeBarrierAPauseEvidenceErrorV2,
+    RuntimeBarrierAPauseEvidenceV2, RuntimeBarrierAPauseFutureV2,
+    RuntimeBarrierAPauseObservationV2, RuntimeBarrierAPausePortV2, RuntimeBarrierAPauseRequestV2,
+    RuntimeBarrierAPauseV2, RuntimeBarrierAPausedConvergenceV2, RuntimeBarrierAResumeErrorV2,
+    RuntimeBarrierAResumeEvidenceErrorV2, RuntimeBarrierAResumeEvidenceV2,
+    RuntimeBarrierAResumeFutureV2, RuntimeBarrierAResumeObservationV2, RuntimeBarrierAResumePortV2,
+    RuntimeBarrierAResumeRequestStateV2, RuntimeBarrierAResumeRequestV2,
+    RuntimeBarrierAResumedConvergenceV2, RuntimeDrainRequestedConvergenceV2,
+    RuntimeDrainedConvergenceHandoffV2, RuntimeDrainedConvergenceV2,
+    RuntimeExactPreviousServingErrorV2, RuntimeExactPreviousServingEvidenceErrorV2,
+    RuntimeExactPreviousServingObservationPortV2, RuntimeExactPreviousServingV2,
+    RuntimeObservedPreviousServingConvergenceV2, RuntimePredecessorRemovedConvergenceV2,
+    RuntimePredecessorRetirementErrorV2, RuntimePredecessorRetirementEvidenceErrorV2,
+    RuntimePredecessorRetirementFutureV2, RuntimePredecessorRetirementObservationV2,
+    RuntimePredecessorRetirementPortV2, RuntimePredecessorRetirementReadyConvergenceV2,
+    RuntimePredecessorRetirementRequestV2, RuntimePredecessorRetirementV2,
+    RuntimePredecessorTransitionResultV2, RuntimePreviousServingDisconnectErrorV2,
+    RuntimePreviousServingDisconnectFutureV2, RuntimePreviousServingDisconnectOutcomeV2,
+    RuntimePreviousServingDisconnectPortV2, RuntimePreviousServingDisconnectV2,
+    RuntimeReplacementExecutionErrorV2, RuntimeReplacementFutureV2, RuntimeReplacementResultV2,
+    RuntimeRequestDrainMutationErrorV2, RuntimeRequestDrainMutationV2,
+    RuntimeRoutePredecessorDrainingConvergenceV2, RuntimeRoutePredecessorRemovalObservationV2,
+    RuntimeRoutePredecessorTransitionErrorV2, RuntimeRoutePredecessorTransitionEvidenceErrorV2,
+    RuntimeRoutePredecessorTransitionEvidenceV2, RuntimeRoutePredecessorTransitionObservationV2,
+    RuntimeRoutePredecessorTransitionPortV2, RuntimeRoutePredecessorTransitionRequestV2,
+    RuntimeRoutePredecessorTransitionV2,
+};
 pub use staging::{
     RuntimeRefreshedStageReadyConvergenceV2, RuntimeRouteLifecycleV2, RuntimeRouteStageErrorV2,
     RuntimeRouteStageEvidenceErrorV2, RuntimeRouteStageObservationV2, RuntimeRouteStageOutcomeV2,
     RuntimeRouteStageRequestV2, RuntimeRouteWitnessV2, RuntimeStageReadyConvergenceV2,
-    RuntimeStagedConvergenceV2, RuntimeStagedRoutePortV2,
+    RuntimeStagedConvergenceV2, RuntimeStagedRecoveryHandoffV2, RuntimeStagedRecoveryPhaseV2,
+    RuntimeStagedRecoveryRouteHandoffV2, RuntimeStagedRecoveryRouteV2, RuntimeStagedRoutePortV2,
 };
 
 pub type RuntimeConvergenceFutureV2<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -51,7 +85,7 @@ pub enum RuntimeConvergenceStartErrorV2 {
     Session(RuntimeConvergenceSessionError),
     #[error("runtime convergence claim cannot be planned")]
     Plan(RuntimeControllerPlanError),
-    #[error("runtime convergence staging slice requires Requested or PreflightReady")]
+    #[error("runtime convergence staging slice requires an active nonterminal deployment phase")]
     SupportedPhaseRequired,
     #[error("runtime convergence staging slice requires controller renewal")]
     RenewalRequired,
@@ -63,6 +97,8 @@ pub enum RuntimeConvergenceStartErrorV2 {
 pub enum RuntimeConvergenceClaimKindV2 {
     Requested,
     PreflightReady,
+    DrainRequested,
+    StagedRecovery(RuntimeStagedRecoveryPhaseV2),
 }
 
 pub struct RuntimeClaimedConvergenceV2 {
@@ -87,10 +123,36 @@ impl RuntimeClaimedConvergenceV2 {
         if !permit.slot().matches_target(&receipt.snapshot.target) {
             return Err(RuntimeConvergenceStartErrorV2::SlotMismatch);
         }
-        let claim_kind = match receipt.snapshot.phase {
+        let claim_kind = match &receipt.snapshot.phase {
             RuntimeDeploymentPhaseV1::Requested => RuntimeConvergenceClaimKindV2::Requested,
             RuntimeDeploymentPhaseV1::PreflightReady => {
                 RuntimeConvergenceClaimKindV2::PreflightReady
+            }
+            RuntimeDeploymentPhaseV1::DrainRequested => {
+                RuntimeConvergenceClaimKindV2::DrainRequested
+            }
+            RuntimeDeploymentPhaseV1::Drained => {
+                RuntimeConvergenceClaimKindV2::StagedRecovery(RuntimeStagedRecoveryPhaseV2::Drained)
+            }
+            RuntimeDeploymentPhaseV1::ActivationApplying => {
+                RuntimeConvergenceClaimKindV2::StagedRecovery(
+                    RuntimeStagedRecoveryPhaseV2::ActivationApplying,
+                )
+            }
+            RuntimeDeploymentPhaseV1::RuntimePending {
+                condition: RuntimePendingConditionV1::Ready,
+            } => RuntimeConvergenceClaimKindV2::StagedRecovery(
+                RuntimeStagedRecoveryPhaseV2::RuntimePendingReady,
+            ),
+            RuntimeDeploymentPhaseV1::ReconcilingPanels => {
+                RuntimeConvergenceClaimKindV2::StagedRecovery(
+                    RuntimeStagedRecoveryPhaseV2::ReconcilingPanels,
+                )
+            }
+            RuntimeDeploymentPhaseV1::AwaitingGatewayReady => {
+                RuntimeConvergenceClaimKindV2::StagedRecovery(
+                    RuntimeStagedRecoveryPhaseV2::AwaitingGatewayReady,
+                )
             }
             _ => return Err(RuntimeConvergenceStartErrorV2::SupportedPhaseRequired),
         };
@@ -109,6 +171,40 @@ impl RuntimeClaimedConvergenceV2 {
             (
                 RuntimeConvergenceClaimKindV2::PreflightReady,
                 RuntimeControllerActionV1::RequestDrain,
+            ) => config.preflight_timeout,
+            (
+                RuntimeConvergenceClaimKindV2::DrainRequested,
+                RuntimeControllerActionV1::DrainPreviousRuntime { .. },
+            ) => config.preflight_timeout,
+            (
+                RuntimeConvergenceClaimKindV2::StagedRecovery(
+                    RuntimeStagedRecoveryPhaseV2::Drained,
+                ),
+                RuntimeControllerActionV1::BeginActivation,
+            )
+            | (
+                RuntimeConvergenceClaimKindV2::StagedRecovery(
+                    RuntimeStagedRecoveryPhaseV2::ActivationApplying,
+                ),
+                RuntimeControllerActionV1::VerifyActiveTarget { .. },
+            )
+            | (
+                RuntimeConvergenceClaimKindV2::StagedRecovery(
+                    RuntimeStagedRecoveryPhaseV2::RuntimePendingReady,
+                ),
+                RuntimeControllerActionV1::BeginPanelReconciliation,
+            )
+            | (
+                RuntimeConvergenceClaimKindV2::StagedRecovery(
+                    RuntimeStagedRecoveryPhaseV2::ReconcilingPanels,
+                ),
+                RuntimeControllerActionV1::ReconcilePanels { .. },
+            )
+            | (
+                RuntimeConvergenceClaimKindV2::StagedRecovery(
+                    RuntimeStagedRecoveryPhaseV2::AwaitingGatewayReady,
+                ),
+                RuntimeControllerActionV1::StartGatewayAndCertifyLive { .. },
             ) => config.preflight_timeout,
             (_, RuntimeControllerActionV1::RenewControllerLease { .. }) => {
                 return Err(RuntimeConvergenceStartErrorV2::RenewalRequired);

@@ -79,6 +79,24 @@ const INGRESS_ACKNOWLEDGEMENT_LEASE_V2: Duration = Duration::from_secs(10);
 const INGRESS_ACKNOWLEDGEMENT_REFRESH_ADVANCE_V2: Duration = Duration::from_secs(5);
 const INGRESS_ACKNOWLEDGEMENT_SAFETY_MARGIN_V2: Duration = Duration::from_secs(2);
 
+pub(crate) struct RuntimeExactIngressAcknowledgementReobservationV3 {
+    receipt: automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2,
+}
+
+impl RuntimeExactIngressAcknowledgementReobservationV3 {
+    pub(crate) fn receipt_v3(
+        &self,
+    ) -> &automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2 {
+        &self.receipt
+    }
+}
+
+impl Debug for RuntimeExactIngressAcknowledgementReobservationV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeExactIngressAcknowledgementReobservationV3(<redacted>)")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeProcessStartupRecoveryObservationFailureV2 {
     OperationDeadlineElapsed,
@@ -1730,7 +1748,8 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                 return Err(self.cleanup_transition_v2(transition).await);
             }
         };
-        let final_acknowledgement_database_now = final_acknowledgement.observed_database_now();
+        let final_acknowledgement_database_now =
+            final_acknowledgement.receipt_v3().observed_database_now();
         if final_acknowledgement_database_now < current_owner.database_now
             || final_acknowledgement_database_now >= current_owner.expires_at
         {
@@ -2105,7 +2124,7 @@ pub(super) async fn exact_reobserve_ingress_acknowledgement_v2<P>(
         automation_runtime_worker::RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
     expected: &automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2,
 ) -> Result<
-    automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2,
+    RuntimeExactIngressAcknowledgementReobservationV3,
     RuntimeProcessProductionHandoffFailureV2,
 >
 where
@@ -2129,7 +2148,9 @@ where
     {
         return Err(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation);
     }
-    Ok(current.clone())
+    Ok(RuntimeExactIngressAcknowledgementReobservationV3 {
+        receipt: current.clone(),
+    })
 }
 
 pub(super) fn ingress_acknowledgement_schedule_v2(
@@ -2466,8 +2487,11 @@ impl RuntimeEmptyOpenProcessV2 {
             &accepted_receipt,
         )
         .await;
-        let schedule = final_observation.as_ref().ok().and_then(|receipt| {
-            ingress_acknowledgement_schedule_v2(receipt, final_observation_started_at)
+        let schedule = final_observation.as_ref().ok().and_then(|observation| {
+            ingress_acknowledgement_schedule_v2(
+                observation.receipt_v3(),
+                final_observation_started_at,
+            )
         });
         let process = Self {
             discord,

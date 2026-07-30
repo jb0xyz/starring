@@ -16,6 +16,8 @@ use twilight_http::Client;
 use twilight_model::id::marker::{GuildMarker, UserMarker};
 use twilight_model::id::Id;
 
+use crate::strict_panel_installer::TwilightStrictPanelInstaller;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeObservedRoleV1 {
     pub permissions: Permissions,
@@ -160,6 +162,32 @@ impl OwnedDiscordRuntimePreflightV1 {
             .map_err(RuntimeDiscordPreflightErrorV1::Snapshot)?;
         check_runtime_target_readiness_v1(artifact, bindings, &context)
             .map_err(RuntimeDiscordPreflightErrorV1::Target)
+    }
+}
+
+#[derive(Clone)]
+pub struct OwnedDiscordRuntimeOperationsV2 {
+    preflight: OwnedDiscordRuntimePreflightV1,
+}
+
+impl OwnedDiscordRuntimeOperationsV2 {
+    pub fn new(discord_token: String) -> Self {
+        Self {
+            preflight: OwnedDiscordRuntimePreflightV1::new(discord_token),
+        }
+    }
+
+    pub async fn preflight(
+        &self,
+        guild_id: GuildId,
+        artifact: &RuleSetVersion,
+        bindings: &ResourceBindingMap,
+    ) -> Result<RuntimeTargetReadyV1, RuntimeDiscordPreflightErrorV1> {
+        self.preflight.preflight(guild_id, artifact, bindings).await
+    }
+
+    pub fn strict_panel_installer(&self) -> TwilightStrictPanelInstaller<'_> {
+        TwilightStrictPanelInstaller::new(self.preflight.http.as_ref())
     }
 }
 
@@ -431,6 +459,13 @@ mod tests {
         fn assert_clone_send_sync<T: Clone + Send + Sync>() {}
 
         assert_clone_send_sync::<OwnedDiscordRuntimePreflightV1>();
+        assert_clone_send_sync::<OwnedDiscordRuntimeOperationsV2>();
+    }
+
+    #[tokio::test]
+    async fn owned_runtime_operations_reuse_one_private_http_capability() {
+        let operations = OwnedDiscordRuntimeOperationsV2::new("unused-token".to_owned());
+        let _installer = operations.strict_panel_installer();
     }
 
     #[test]
