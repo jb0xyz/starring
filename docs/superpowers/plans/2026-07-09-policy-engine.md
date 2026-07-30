@@ -1,5 +1,8 @@
 # Policy Engine Implementation Plan (Phase 7)
 
+> Historical plan: its second-approval steps are superseded by
+> `docs/superpowers/specs/2026-07-31-solo-product-approval-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development 또는 executing-plans. **Codex가 구현한다.** Task 끝에 보고.
 
 **Goal:** `crates/policy-engine` — `PolicyEngine::evaluate(&OperationGraph) -> PolicyDecision`. pluggable PolicyRule + 3규칙(privileged/destructive/everyone) + verdict 집계. 선행으로 discord-model 권한 비트 2개 추가.

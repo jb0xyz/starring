@@ -12,6 +12,10 @@ for the target contract and sequencing.
 Supersedes: the unimplemented production-edge and runtime-convergence sections of
 `2026-07-18-authoring-promotion-bridge-design.md`
 
+Product approval follows
+`2026-07-31-solo-product-approval-design.md`: exactly one authenticated manager
+approval is required, and the requester may provide it.
+
 ## Outcome
 
 Turn a server-owned `PreviewReady` authoring session into a production Discord
@@ -24,7 +28,7 @@ Discord identity
   -> atomic authorized authoring snapshot
   -> promotion and immutable RuleSet publication
   -> server-rendered approval preview
-  -> distinct payload-bound approval
+  -> one payload-bound manager approval
   -> guarded active-pointer apply
   -> durable runtime convergence
   -> exact Live attestation with a fresh serving lease
@@ -62,12 +66,13 @@ LLM billing, and public template distribution are outside this boundary.
 - Guild authority for a mutation is fetched with the bot credential immediately
   before that mutation. Owner, `ADMINISTRATOR`, or `MANAGE_GUILD` satisfies the
   initial manager policy.
-- The default activation policy requires one approval from a manager other than
-  the requester and expires after 24 hours. Policy revision, quorum, and TTL are
-  installation-owned values, never request-body values.
+- The Product activation policy requires exactly one manager approval and
+  expires after 24 hours. Approval cardinality is fixed by the Product contract;
+  policy revision and TTL are installation-owned values, never request-body
+  values.
 - Approval and apply remain separate actions. The apply actor may be the
-  requester or approver if they still have fresh manager authority; requester
-  self-approval is always forbidden.
+  requester or approver if they still have fresh manager authority. The
+  requester may provide the single approval.
 - No customer quota or business rate limit is introduced in this increment.
   Strict body limits, deadlines, bounded concurrency, and ingress-level abuse
   protection remain mandatory resource-safety controls.
@@ -103,7 +108,7 @@ The current repository already provides the following safety boundaries:
   an immutable RuleSet version without changing the active pointer.
 - `authoring-promotion-postgres` persists that journal and resumes interrupted
   publication and activation-request creation.
-- `automation-ruleset-activation` enforces self-approval prohibition, exact
+- `automation-ruleset-activation` enforces exact single approval,
   payload-bound approval, binding and active-baseline checks, readiness, leases,
   and guarded pointer mutation.
 - PostgreSQL triggers bind product activation requests to the exact
@@ -162,7 +167,7 @@ The browser may not supply or override:
 - Discord user, guild, role, or permission claims
 - authoring session snapshots, RuleSet JSON, or resource bindings
 - installation RuleSet key
-- approval policy, quorum, or TTL
+- approval policy, approval cardinality, or TTL
 - requester, approver, rejector, or apply actor
 - activation target or active baseline
 - apply attempt ID
@@ -722,7 +727,8 @@ already present in a successful resource view never enter errors.
 - Publication always creates an inactive immutable RuleSet version.
 - The approval payload is rendered from the exact promotion and activation
   records; client prose cannot alter it.
-- The approver must be a different Discord user from the requester.
+- Exactly one authenticated manager approval is required. The approver may be
+  the requester.
 - Every approval stores the exact expected payload digest and authenticated
   Discord user derived from the product session.
 - Duplicate exact approval is an idempotent replay. A different digest or actor
@@ -733,10 +739,10 @@ already present in a successful resource view never enter errors.
   valid retained result.
 - Rejection is terminal for that activation request and requires a new promotion
   idempotency key after redesign. Rejection never mutates the active pointer.
-- Apply requires linked product authority, satisfied quorum, unexpired request,
-  exact approval payload, fresh manager authority, unchanged active baseline,
-  unchanged resource-binding fingerprint, current server policy, readiness, and
-  a valid activation lease.
+- Apply requires linked product authority, exactly one approval, unexpired
+  request, exact approval payload, fresh manager authority, unchanged active
+  baseline, unchanged resource-binding fingerprint, current server policy,
+  readiness, and a valid activation lease.
 - Binding, active-baseline, or policy drift supersedes the request before pointer
   mutation. A missing, oversized, or hash-mismatched immutable target is
   persistence corruption rather than drift; it returns the bounded invalid-candidate
@@ -838,7 +844,8 @@ weakened attempt constraint keeps the role unready before it accepts traffic.
 
 The desired-target digest remains version 1 for this increment. It already
 binds the immutable installation-authority revision, whose referenced row binds
-policy revision, quorum, TTL, and resource bindings. `policy_revision` remains
+policy revision, fixed approval cardinality, TTL, and resource bindings.
+`policy_revision` remains
 an immutable deployment shadow for audit and query parity, while
 `desired_target_digest_version` explicitly records version 1. A future digest
 version uses dual-read and versioned golden vectors; version 1 is never changed
@@ -894,7 +901,7 @@ Runtime authorization preserves two identities. The deployment retains the exact
 historical installation-authority revision used by Apply for audit and digest
 verification. Every claim, mutation, recovery, heartbeat, and status read also
 checks the current authority head for active lifecycle and exact binding revision,
-fingerprint, and resource-binding map equality. A policy, quorum, or TTL-only
+fingerprint, and resource-binding map equality. A policy or TTL-only
 rotation therefore keeps the same deployment eligible and Live; an actual binding
 change or a spoofed fingerprint with different binding content fails closed.
 
@@ -1044,7 +1051,7 @@ contract.
 | Stale Discord role | Fresh bot-side guild/member/role fetch for every mutation, bounded observation, fail closed |
 | Session generation TOCTOU | Immutable generations, head CAS, one atomic artifact-and-authority snapshot |
 | Client RuleSet or binding injection | No raw snapshot/artifact/RuleSet/binding endpoint; typed export after harness restoration and validation |
-| Self-approval or quorum bypass | Existing domain invariant, payload-bound approval, fresh distinct Discord identity, DB guarded procedure |
+| Forged or duplicate approval | Exact single-approval invariant, payload-bound approval, fresh Discord manager authority, revision CAS, DB guarded procedure |
 | Approval of stale preview | Expected canonical digest, immutable payload context, baseline/binding/policy checks at apply |
 | Retry causes duplicate action | Required idempotency key, scoped request digest, deterministic apply attempt, atomic receipt |
 | Direct SQL state forgery | Separate roles, revoked table DML, narrow security-definer transitions, existing constraints and triggers |
@@ -1282,7 +1289,8 @@ checks remain green at every merge boundary.
   denied.
 - A cached read observation never authorizes a write.
 - Guild, application, member, or role mismatch fails closed.
-- Requester self-approval remains rejected through HTTP and direct adapter tests.
+- Requester approval succeeds through HTTP and direct adapter tests only with
+  exact payload, revision, session, CSRF, and fresh manager authority.
 - Payload digest mismatch, expiry, rejection, withdrawal, supersession, binding
   drift, policy drift, and active-baseline drift preserve the old pointer.
 - A role revoked after approval prevents apply until a currently authorized
@@ -1311,7 +1319,8 @@ checks remain green at every merge boundary.
 ### End-to-end and operational
 
 - A server-generated PreviewReady generation promotes, publishes inactive,
-  renders a digest, receives a distinct manager approval, applies, converges,
+  renders a digest, receives one manager approval that may come from the
+  requester, applies, converges,
   and reports Live only with exact attestation and serving heartbeat.
 - Repeating each network request after an injected lost response produces no
   duplicate publication, approval, pointer mutation, deployment, or audit gap.

@@ -5,6 +5,10 @@
 - **범위**: Phase 10 — `crates/preview` (코어 결과 → 승인용 PreviewModel)
 - **선행**: Phase 1~9 완료. 순수 결정론 코어의 **캡스톤**.
 
+> 승인 정책 변경 (2026-07-31): Preview의 승인 필요 여부는 단일
+> `RequireApproval` verdict만 사용합니다. 2인 승인 verdict는
+> `2026-07-31-solo-product-approval-design.md`에 의해 폐기되었습니다.
+
 ---
 
 ## 0. 목적

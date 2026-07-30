@@ -1,5 +1,8 @@
 # Approval Manager Implementation Plan (Phase 11)
 
+> Historical plan: its two-person approval state is superseded by
+> `docs/superpowers/specs/2026-07-31-solo-product-approval-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development 또는 executing-plans. **Codex가 구현한다.** Task 끝에 보고. **완료 후 git push origin main.**
 
 **Goal:** `crates/approval-manager` — verdict/PreviewModel → 순수 승인 상태머신. `ApprovalRequest`가 `state()`/`can_execute()`를 원시 데이터에서 파생하고 `approve`/`reject`로 변경.

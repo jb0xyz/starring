@@ -1,5 +1,12 @@
 # Phase 18f: Approval-Bound Activation — Design
 
+> Product approval update (2026-07-31): the distinct-actor, quorum, and
+> requester self-approval rules in this historical phase are superseded for the
+> Product control path by `2026-07-31-solo-product-approval-design.md`. Product
+> approval requires exactly one authenticated manager and permits the
+> requester to approve. The historical generic activation design remains
+> unchanged outside the Product path.
+
 ## Goal
 
 Unify the authority that changes the active RuleSet pointer. Concretely:
