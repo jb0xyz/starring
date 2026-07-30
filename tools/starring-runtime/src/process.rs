@@ -13,7 +13,7 @@ use crate::capability_readiness_supervisor::{
 };
 use crate::controller_identity::generate_runtime_controller_id_v1;
 use crate::database::compose_runtime_database_dependencies_v1;
-use crate::health::RuntimeHealthReadinessPublisherV2;
+use crate::health::{RuntimeHealthReadinessObserverV1, RuntimeHealthReadinessPublisherV2};
 use crate::ingress_acknowledgement_supervisor::{
     RuntimeIngressAcknowledgementSupervisorConfigV2, RuntimeIngressAcknowledgementSupervisorExitV2,
     RuntimeIngressAcknowledgementSupervisorV2, RuntimeWorkerIngressAcknowledgementJobV2,
@@ -399,6 +399,11 @@ impl RuntimeProcessFoundationV1 {
         &self,
     ) -> crate::process_supervisor::RuntimeProcessInvalidationTriggerV1 {
         self.root_supervisor.invalidation_trigger()
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn product_readiness_observer_v1(&self) -> RuntimeHealthReadinessObserverV1 {
+        self.root_supervisor.readiness_observer_v1()
     }
 
     pub(super) fn trip_shutdown_v1(

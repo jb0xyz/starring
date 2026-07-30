@@ -54,6 +54,12 @@ pub(crate) struct RuntimeHealthReadinessHandleV1 {
     state: Arc<RuntimeHealthStateV1>,
 }
 
+#[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeHealthReadinessObserverV1 {
+    state: Arc<RuntimeHealthStateV1>,
+}
+
 impl RuntimeHealthReadinessHandleV1 {
     pub(crate) fn seal_readiness(&self) {
         self.state.readiness_sealed.store(true, Ordering::Release);
@@ -71,9 +77,23 @@ impl RuntimeHealthReadinessHandleV1 {
     }
 }
 
+impl RuntimeHealthReadinessObserverV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_ready_v1(&self) -> bool {
+        self.state.ready.load(Ordering::Acquire)
+            && !self.state.readiness_sealed.load(Ordering::Acquire)
+    }
+}
+
 impl Debug for RuntimeHealthReadinessHandleV1 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeHealthReadinessHandleV1(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeHealthReadinessObserverV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeHealthReadinessObserverV1(<redacted>)")
     }
 }
 
@@ -185,6 +205,12 @@ impl RuntimeHealthSupervisorV1 {
 
     pub(crate) fn readiness_handle(&self) -> RuntimeHealthReadinessHandleV1 {
         RuntimeHealthReadinessHandleV1 {
+            state: self.state.clone(),
+        }
+    }
+
+    pub(crate) fn readiness_observer_v1(&self) -> RuntimeHealthReadinessObserverV1 {
+        RuntimeHealthReadinessObserverV1 {
             state: self.state.clone(),
         }
     }
@@ -399,9 +425,11 @@ mod tests {
         .unwrap();
         let addr = supervisor.bound_addr();
         let publisher = supervisor.take_readiness_publisher_v2().unwrap();
+        let observer = supervisor.readiness_observer_v1();
 
         assert!(supervisor.is_live());
         assert!(!supervisor.readiness_handle().is_ready());
+        assert!(!observer.is_ready_v1());
         assert!(request(addr, "/health/live")
             .await
             .starts_with("HTTP/1.1 200"));
@@ -418,14 +446,20 @@ mod tests {
             "RuntimeHealthReadinessHandleV1(<redacted>)"
         );
         assert_eq!(
+            format!("{observer:?}"),
+            "RuntimeHealthReadinessObserverV1(<redacted>)"
+        );
+        assert_eq!(
             format!("{publisher:?}"),
             "RuntimeHealthReadinessPublisherV2(<redacted>)"
         );
         assert!(publisher.publish_ready_v2());
+        assert!(observer.is_ready_v1());
         assert!(request(addr, "/health/ready")
             .await
             .starts_with("HTTP/1.1 200"));
         publisher.remove_readiness_v2();
+        assert!(!observer.is_ready_v1());
         assert!(request(addr, "/health/ready")
             .await
             .starts_with("HTTP/1.1 503"));
@@ -507,16 +541,24 @@ mod tests {
         let invalidator = RuntimeHealthReadinessHandleV1 {
             state: state.clone(),
         };
+        let observer = RuntimeHealthReadinessObserverV1 {
+            state: state.clone(),
+        };
 
         assert!(publisher.publish_ready_v2());
+        assert!(observer.is_ready_v1());
         publisher.remove_readiness_v2();
+        assert!(!observer.is_ready_v1());
         assert!(publisher.publish_ready_v2());
+        assert!(observer.is_ready_v1());
         invalidator.seal_readiness();
 
         assert!(invalidator.is_sealed());
         assert!(!invalidator.is_ready());
+        assert!(!observer.is_ready_v1());
         assert!(!publisher.publish_ready_v2());
         assert!(!invalidator.is_ready());
+        assert!(!observer.is_ready_v1());
     }
 
     #[test]
