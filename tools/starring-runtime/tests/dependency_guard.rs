@@ -592,6 +592,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/controller_identity.rs",
             "src/database.rs",
             "src/discord.rs",
+            "src/discord_interaction_normalizer.rs",
             "src/discord_lifecycle.rs",
             "src/gateway.rs",
             "src/gateway_owner_startup.rs",
@@ -663,6 +664,17 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
         twilight_gateway["features"],
         serde_json::json!(["rustls-platform-verifier"])
     );
+    let twilight_model = package_dependencies
+        .iter()
+        .find(|dependency| dependency["name"] == "twilight-model")
+        .unwrap();
+    assert_eq!(twilight_model["rename"], "paused-discord-model");
+    assert_eq!(
+        twilight_model["source"],
+        "git+https://github.com/twilight-rs/twilight.git?rev=b4ce13b727e7731b917576ad977300ab6926bb6b"
+    );
+    assert_eq!(twilight_model["uses_default_features"], false);
+    assert_eq!(twilight_model["features"], serde_json::json!([]));
     let tokio = package_dependencies
         .iter()
         .find(|dependency| dependency["name"] == "tokio")
@@ -675,7 +687,7 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
     let mut dependencies = package_dependencies
         .into_iter()
         .map(|dependency| {
-            if dependency["name"] != "twilight-gateway" {
+            if dependency["name"] != "twilight-gateway" && dependency["name"] != "twilight-model" {
                 assert!(dependency["rename"].is_null());
             }
             (
@@ -701,12 +713,14 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
             ("automation-runtime-serving-postgres".to_string(), None),
             ("automation-runtime-worker".to_string(), None),
             ("chrono".to_string(), None),
+            ("discord-model".to_string(), None),
             ("getrandom".to_string(), None),
             ("serde_json".to_string(), Some("dev".to_string())),
             ("sqlx".to_string(), None),
             ("thiserror".to_string(), None),
             ("tokio".to_string(), None),
             ("twilight-gateway".to_string(), None),
+            ("twilight-model".to_string(), None),
             ("zeroize".to_string(), None),
         ]
     );
@@ -1486,6 +1500,22 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         | "automation_runtime_controller"
                         | "automation_runtime_convergence"
                 );
+            let allowed_discord_interaction_normalizer = path
+                == Path::new("src/discord_interaction_normalizer.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime"
+                        | "MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3"
+                        | "MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3"
+                        | "SharedGatewayInteractionApplicationIdV3"
+                        | "SharedGatewayInteractionEnvelopeErrorV3"
+                        | "SharedGatewayInteractionEnvelopeV3"
+                        | "SharedGatewayInteractionIdV3"
+                        | "SharedGatewayInteractionIdentityV3"
+                        | "SharedGatewayInteractionKindV3"
+                        | "SharedGatewayInteractionTokenV3"
+                        | "SharedGatewayModalInputV3"
+                );
             let allowed_pending_drain_succession = path
                 == Path::new("src/process/pending_drain_finalizer.rs")
                 || matches!(
@@ -1538,7 +1568,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 (!identifier.ends_with("V3")
                     || allowed_pending_drain_succession
                     || allowed_pending_drain_finalizer_v3
-                    || allowed_ordinary_barrier_v3)
+                    || allowed_ordinary_barrier_v3
+                    || allowed_discord_interaction_normalizer)
                     && (allowed_readiness_worker
                         || allowed_registry_adapter
                         || allowed_closed_recovery
@@ -1563,6 +1594,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_ingress_acknowledgement_supervisor
                         || allowed_runtime_controller
                         || allowed_panel_reconciliation
+                        || allowed_discord_interaction_normalizer
                         || !matches!(
                             identifier,
                             "automation_runtime"

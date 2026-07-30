@@ -3333,12 +3333,14 @@ dependencies = [
  "automation-runtime-serving-postgres",
  "automation-runtime-worker",
  "chrono",
+ "discord-model",
  "getrandom 0.4.3",
  "serde_json",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
  "twilight-gateway 0.17.1 (git+https://github.com/twilight-rs/twilight.git?rev=b4ce13b727e7731b917576ad977300ab6926bb6b)",
+ "twilight-model 0.17.1 (git+https://github.com/twilight-rs/twilight.git?rev=b4ce13b727e7731b917576ad977300ab6926bb6b)",
  "zeroize",
 ]
 

@@ -7,6 +7,8 @@ mod config;
 mod controller_identity;
 mod database;
 mod discord;
+#[cfg_attr(not(test), allow(dead_code))]
+mod discord_interaction_normalizer;
 mod discord_lifecycle;
 mod gateway;
 mod gateway_owner_startup;

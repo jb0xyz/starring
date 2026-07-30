@@ -17,11 +17,13 @@ automation-runtime-registry = { path = "../../crates/automation-runtime-registry
 automation-runtime-serving-postgres = { path = "../../crates/automation-runtime-serving-postgres" }
 automation-runtime-worker = { path = "../../crates/automation-runtime-worker" }
 chrono = "0.4"
+discord-model = { path = "../../crates/discord-model" }
 getrandom = "0.4"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 paused-discord-gateway = { package = "twilight-gateway", git = "https://github.com/twilight-rs/twilight.git", rev = "b4ce13b727e7731b917576ad977300ab6926bb6b", default-features = false, features = ["rustls-platform-verifier"] }
+paused-discord-model = { package = "twilight-model", git = "https://github.com/twilight-rs/twilight.git", rev = "b4ce13b727e7731b917576ad977300ab6926bb6b", default-features = false }
 zeroize = "1"
 
 [dev-dependencies]
