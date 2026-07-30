@@ -34,18 +34,24 @@ use automation_runtime_worker::{
     RuntimeStartupRecoveryFixedPointProofV2,
 };
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::{sleep_until, timeout, timeout_at, Instant as TokioInstant};
+use tokio::time::{sleep_until, timeout_at, Instant as TokioInstant};
 
 use crate::closed_recovery::RuntimeClosedRecoveryTransitionAuthorityV2;
 #[cfg(test)]
 use crate::discord::RuntimeDiscordGatewayDriverV1;
 use crate::discord::{
-    prepare_twilight_runtime_discord_gateway_driver_v1, start_runtime_discord_gateway_v1,
-    RuntimeDiscordControlTaskV1, RuntimeDiscordGatewayActorStartV1,
+    prepare_twilight_runtime_discord_gateway_driver_v1,
+    runtime_discord_immediate_dispatch_drain_lane_v1, start_runtime_discord_gateway_v1,
+    RuntimeDiscordControlTaskV1, RuntimeDiscordDispatchDrainConfirmationV1,
+    RuntimeDiscordDispatchDrainRequestV1, RuntimeDiscordGatewayActorStartV1,
     RuntimeDiscordGatewayStartErrorV1, RuntimeDiscordGatewaySupervisorV1,
     RuntimeDiscordOrdinaryResumeActorObservationV3, RuntimeDiscordOrdinaryResumeAuthorizationV3,
     RuntimeDiscordRecoveryResumeControlOutcomeV2, RuntimeDiscordRecoveryResumeEvidenceV2,
-    RuntimeDiscordReservedResumeRequestV2,
+    RuntimeDiscordReservedResumeRequestV2, RUNTIME_DISCORD_DISPATCH_DRAIN_TIMEOUT_V1,
+};
+#[cfg(test)]
+use crate::discord::{
+    runtime_discord_dispatch_drain_test_lane_v1, RuntimeDiscordDispatchDrainTestControlV1,
 };
 use crate::discord_lifecycle::{
     RuntimeDiscordAdmissionReservationSnapshotV2, RuntimeDiscordPauseReservationIdentityV2,
@@ -1448,6 +1454,8 @@ struct RuntimePreparedDiscordGatewayStartV1 {
     runtime: SharedGatewayRuntimeHalfV3,
     control_task: RuntimeDiscordControlTaskV1,
     lifecycle_drained: watch::Receiver<u64>,
+    dispatch_drain_requests: watch::Receiver<RuntimeDiscordDispatchDrainRequestV1>,
+    dispatch_drain_confirmations: watch::Sender<RuntimeDiscordDispatchDrainConfirmationV1>,
     discord_reservation: watch::Receiver<RuntimeDiscordAdmissionReservationSnapshotV2>,
     ordinary_resume_authorization: watch::Receiver<RuntimeDiscordOrdinaryResumeAuthorizationV3>,
     ordinary_resume_actor_observation:
@@ -1461,6 +1469,9 @@ struct RuntimeDiscordControlStartV3 {
     commands: mpsc::Receiver<RuntimeDiscordControlCommandV1>,
     reserved_resume: mpsc::Receiver<RuntimeDiscordReservedResumeRequestV2>,
     lifecycle_drained: watch::Sender<u64>,
+    dispatch_drain_requests: watch::Sender<RuntimeDiscordDispatchDrainRequestV1>,
+    dispatch_drain_confirmations: watch::Receiver<RuntimeDiscordDispatchDrainConfirmationV1>,
+    startup_transition_sequence: GatewayAdmissionSequenceV3,
     discord_reservation: watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>,
     ordinary_resume_authorization: watch::Sender<RuntimeDiscordOrdinaryResumeAuthorizationV3>,
     ordinary_resume_actor_observation:
@@ -1470,6 +1481,7 @@ struct RuntimeDiscordControlStartV3 {
 
 enum RuntimeDiscordControlCommandV1 {
     BeginDrain {
+        deadline: Instant,
         response: oneshot::Sender<bool>,
     },
     PauseOrdinary {
@@ -1483,9 +1495,7 @@ enum RuntimeDiscordControlCommandV1 {
         response: oneshot::Sender<RuntimeDiscordOrdinaryBarrierResumeOutcomeV3>,
     },
     #[cfg(test)]
-    OpenAdmission {
-        response: oneshot::Sender<bool>,
-    },
+    OpenAdmission { response: oneshot::Sender<bool> },
 }
 
 pub struct RuntimeGatewayBootstrapV1 {
@@ -2508,6 +2518,9 @@ impl RuntimeGatewayBootstrapV1 {
                 operation_cutoff,
                 shutdown_deadline,
                 lifecycle_drained: prepared.lifecycle_drained,
+                dispatch_drain_requests: prepared.dispatch_drain_requests,
+                dispatch_drain_confirmations: prepared.dispatch_drain_confirmations,
+                dispatch_drain_lane: runtime_discord_immediate_dispatch_drain_lane_v1(),
                 discord_reservation: prepared.discord_reservation,
                 ordinary_resume_authorization: prepared.ordinary_resume_authorization,
                 ordinary_resume_actor_observation: prepared.ordinary_resume_actor_observation,
@@ -2550,6 +2563,62 @@ impl RuntimeGatewayBootstrapV1 {
     }
 
     #[cfg(test)]
+    pub(crate) async fn start_discord_gateway_with_driver_and_dispatch_drain_test_v1<D>(
+        &mut self,
+        driver: D,
+        operation_cutoff: Instant,
+        shutdown_deadline: Instant,
+    ) -> Result<
+        (
+            RuntimeDiscordGatewaySupervisorV1,
+            RuntimeDiscordDispatchDrainTestControlV1,
+        ),
+        RuntimeDiscordGatewayStartErrorV1,
+    >
+    where
+        D: RuntimeDiscordGatewayDriverV1,
+    {
+        let prepared = self
+            .prepare_discord_gateway_start_v1(operation_cutoff, None)
+            .await?;
+        let RuntimeDiscordDispatchDrainRequestV1::Startup {
+            transition_sequence,
+        } = *prepared.dispatch_drain_requests.borrow()
+        else {
+            return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeUnavailable);
+        };
+        let (dispatch_drain_lane, dispatch_drain_test) =
+            runtime_discord_dispatch_drain_test_lane_v1(transition_sequence);
+        let mut supervisor = start_runtime_discord_gateway_v1(
+            driver,
+            RuntimeDiscordGatewayActorStartV1 {
+                control: prepared.runtime._inner,
+                operation_cutoff,
+                shutdown_deadline,
+                lifecycle_drained: prepared.lifecycle_drained,
+                dispatch_drain_requests: prepared.dispatch_drain_requests,
+                dispatch_drain_confirmations: prepared.dispatch_drain_confirmations,
+                dispatch_drain_lane,
+                discord_reservation: prepared.discord_reservation,
+                ordinary_resume_authorization: prepared.ordinary_resume_authorization,
+                ordinary_resume_actor_observation: prepared.ordinary_resume_actor_observation,
+                runtime: prepared.runtime_handle,
+                control_task: prepared.control_task,
+                stopped_sender: prepared.stopped_sender,
+                stopped: prepared.stopped,
+            },
+        );
+        self.attach_discord_supervisor_v1(&supervisor)?;
+        if self.owner_invalidated.load(Ordering::Acquire) {
+            return Err(RuntimeDiscordGatewayStartErrorV1::OwnerInvalidated);
+        }
+        if !supervisor.release_start_v1() {
+            return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeUnavailable);
+        }
+        Ok((supervisor, dispatch_drain_test))
+    }
+
+    #[cfg(test)]
     pub(crate) async fn start_discord_gateway_with_driver_before_release_v1<D, F>(
         &mut self,
         driver: D,
@@ -2571,6 +2640,9 @@ impl RuntimeGatewayBootstrapV1 {
                 operation_cutoff,
                 shutdown_deadline,
                 lifecycle_drained: prepared.lifecycle_drained,
+                dispatch_drain_requests: prepared.dispatch_drain_requests,
+                dispatch_drain_confirmations: prepared.dispatch_drain_confirmations,
+                dispatch_drain_lane: runtime_discord_immediate_dispatch_drain_lane_v1(),
                 discord_reservation: prepared.discord_reservation,
                 ordinary_resume_authorization: prepared.ordinary_resume_authorization,
                 ordinary_resume_actor_observation: prepared.ordinary_resume_actor_observation,
@@ -2599,23 +2671,44 @@ impl RuntimeGatewayBootstrapV1 {
             .invalidate_gateway_ownership();
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_discord_drain_v1(
         &self,
+    ) -> impl std::future::Future<Output = bool> + Send + 'static {
+        let deadline = Instant::now()
+            .checked_add(DISCORD_CONTROL_OPERATION_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        self.begin_discord_drain_until_v1(deadline)
+    }
+
+    pub(crate) fn begin_discord_drain_until_v1(
+        &self,
+        deadline: Instant,
     ) -> impl std::future::Future<Output = bool> + Send + 'static {
         let commands = self.adapter.discord_commands.clone();
         async move {
             let Some(commands) = commands else {
                 return false;
             };
-            let (response, acknowledgement) = oneshot::channel();
-            if commands
-                .send(RuntimeDiscordControlCommandV1::BeginDrain { response })
-                .await
-                .is_err()
-            {
+            if Instant::now() >= deadline {
                 return false;
             }
-            acknowledgement.await.unwrap_or(false)
+            let (response, acknowledgement) = oneshot::channel();
+            if !matches!(
+                timeout_at(
+                    TokioInstant::from_std(deadline),
+                    commands
+                        .send(RuntimeDiscordControlCommandV1::BeginDrain { deadline, response }),
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                return false;
+            }
+            matches!(
+                timeout_at(TokioInstant::from_std(deadline), acknowledgement).await,
+                Ok(Ok(true))
+            )
         }
     }
 
@@ -2819,8 +2912,16 @@ impl RuntimeGatewayBootstrapV1 {
             let _stopped = stopped_sender.send(true);
             return Err(RuntimeDiscordGatewayStartErrorV1::RuntimeHalfUnavailable);
         };
+        let startup_transition_sequence =
+            control.current_admission_snapshot().transition_sequence();
         let (discord_commands, commands) = mpsc::channel(1);
         let (lifecycle_drained_sender, lifecycle_drained) = watch::channel(1);
+        let (dispatch_drain_requests_sender, dispatch_drain_requests) = watch::channel(
+            RuntimeDiscordDispatchDrainRequestV1::startup_v1(startup_transition_sequence),
+        );
+        let (dispatch_drain_confirmations, dispatch_drain_confirmations_receiver) = watch::channel(
+            RuntimeDiscordDispatchDrainConfirmationV1::startup_v1(startup_transition_sequence),
+        );
         let (reserved_resume, reserved_resume_receiver) = mpsc::channel(1);
         let (ordinary_resume_authorization_sender, ordinary_resume_authorization) =
             watch::channel(RuntimeDiscordOrdinaryResumeAuthorizationV3::Inactive);
@@ -2833,6 +2934,9 @@ impl RuntimeGatewayBootstrapV1 {
                     commands,
                     reserved_resume: reserved_resume_receiver,
                     lifecycle_drained: lifecycle_drained_sender,
+                    dispatch_drain_requests: dispatch_drain_requests_sender,
+                    dispatch_drain_confirmations: dispatch_drain_confirmations_receiver,
+                    startup_transition_sequence,
                     discord_reservation: discord_reservation_publisher,
                     ordinary_resume_authorization: ordinary_resume_authorization_sender.clone(),
                     ordinary_resume_actor_observation,
@@ -2850,6 +2954,8 @@ impl RuntimeGatewayBootstrapV1 {
             runtime,
             control_task,
             lifecycle_drained,
+            dispatch_drain_requests,
+            dispatch_drain_confirmations,
             discord_reservation: self.adapter.discord_reservation.clone(),
             ordinary_resume_authorization,
             ordinary_resume_actor_observation: ordinary_resume_actor_observation_sender,
@@ -3159,18 +3265,141 @@ impl RuntimeGatewayBootstrapV1 {
     }
 }
 
+struct RuntimeDiscordLifecycleDrainPublisherV2 {
+    lifecycle_drained: watch::Sender<u64>,
+    lifecycle_sequence: u64,
+    confirmation: RuntimeDiscordLifecycleDrainConfirmationV2,
+    requested_transition_sequence: GatewayAdmissionSequenceV3,
+}
+
+enum RuntimeDiscordLifecycleDrainConfirmationV2 {
+    Actor {
+        requests: watch::Sender<RuntimeDiscordDispatchDrainRequestV1>,
+        confirmations: watch::Receiver<RuntimeDiscordDispatchDrainConfirmationV1>,
+    },
+    #[cfg(test)]
+    Immediate,
+}
+
+impl RuntimeDiscordLifecycleDrainPublisherV2 {
+    fn new(
+        lifecycle_drained: watch::Sender<u64>,
+        dispatch_drain_requests: watch::Sender<RuntimeDiscordDispatchDrainRequestV1>,
+        dispatch_drain_confirmations: watch::Receiver<RuntimeDiscordDispatchDrainConfirmationV1>,
+        startup_transition_sequence: GatewayAdmissionSequenceV3,
+    ) -> Option<Self> {
+        if *dispatch_drain_requests.borrow()
+            != RuntimeDiscordDispatchDrainRequestV1::startup_v1(startup_transition_sequence)
+            || *dispatch_drain_confirmations.borrow()
+                != RuntimeDiscordDispatchDrainConfirmationV1::startup_v1(
+                    startup_transition_sequence,
+                )
+        {
+            return None;
+        }
+        Some(Self {
+            lifecycle_drained,
+            lifecycle_sequence: 1,
+            confirmation: RuntimeDiscordLifecycleDrainConfirmationV2::Actor {
+                requests: dispatch_drain_requests,
+                confirmations: dispatch_drain_confirmations,
+            },
+            requested_transition_sequence: startup_transition_sequence,
+        })
+    }
+
+    #[cfg(test)]
+    fn immediate_for_test_v2(
+        lifecycle_drained: watch::Sender<u64>,
+        startup_transition_sequence: GatewayAdmissionSequenceV3,
+    ) -> Self {
+        Self {
+            lifecycle_drained,
+            lifecycle_sequence: 1,
+            confirmation: RuntimeDiscordLifecycleDrainConfirmationV2::Immediate,
+            requested_transition_sequence: startup_transition_sequence,
+        }
+    }
+
+    async fn publish_transition_v2(
+        &mut self,
+        transition_sequence: GatewayAdmissionSequenceV3,
+        deadline: Instant,
+    ) -> bool {
+        if transition_sequence <= self.requested_transition_sequence || Instant::now() >= deadline {
+            return false;
+        }
+        let request =
+            RuntimeDiscordDispatchDrainRequestV1::transition_v1(transition_sequence, deadline);
+        self.requested_transition_sequence = transition_sequence;
+        let (requests, confirmations) = match &mut self.confirmation {
+            RuntimeDiscordLifecycleDrainConfirmationV2::Actor {
+                requests,
+                confirmations,
+            } => (requests, confirmations),
+            #[cfg(test)]
+            RuntimeDiscordLifecycleDrainConfirmationV2::Immediate => {
+                return publish_runtime_lifecycle_drain_v1(
+                    &self.lifecycle_drained,
+                    &mut self.lifecycle_sequence,
+                );
+            }
+        };
+        if requests.send(request).is_err() {
+            return false;
+        }
+        loop {
+            match *confirmations.borrow_and_update() {
+                RuntimeDiscordDispatchDrainConfirmationV1::Transition {
+                    transition_sequence: confirmed,
+                } if confirmed == transition_sequence => break,
+                RuntimeDiscordDispatchDrainConfirmationV1::Transition {
+                    transition_sequence: confirmed,
+                } if confirmed > transition_sequence => return false,
+                RuntimeDiscordDispatchDrainConfirmationV1::Startup {
+                    transition_sequence: confirmed,
+                } if confirmed >= transition_sequence => return false,
+                RuntimeDiscordDispatchDrainConfirmationV1::Startup { .. }
+                | RuntimeDiscordDispatchDrainConfirmationV1::Transition { .. } => {}
+            }
+            if Instant::now() >= deadline
+                || !matches!(
+                    timeout_at(TokioInstant::from_std(deadline), confirmations.changed(),).await,
+                    Ok(Ok(()))
+                )
+            {
+                return false;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        publish_runtime_lifecycle_drain_v1(&self.lifecycle_drained, &mut self.lifecycle_sequence)
+    }
+}
+
 async fn run_runtime_discord_control_v1(start: RuntimeDiscordControlStartV3) {
     let RuntimeDiscordControlStartV3 {
         mut control,
         mut commands,
         mut reserved_resume,
         lifecycle_drained,
+        dispatch_drain_requests,
+        dispatch_drain_confirmations,
+        startup_transition_sequence,
         discord_reservation,
         ordinary_resume_authorization,
         mut ordinary_resume_actor_observation,
         coordinator,
     } = start;
-    let mut lifecycle_sequence = 1u64;
+    let Some(mut lifecycle_drain) = RuntimeDiscordLifecycleDrainPublisherV2::new(
+        lifecycle_drained,
+        dispatch_drain_requests,
+        dispatch_drain_confirmations,
+        startup_transition_sequence,
+    ) else {
+        return;
+    };
     let mut ordinary_correlation = 0u64;
     let mut pause_token: Option<GatewayPauseTokenV3> = None;
     loop {
@@ -3188,18 +3417,33 @@ async fn run_runtime_discord_control_v1(start: RuntimeDiscordControlStartV3) {
                         control.current_admission_snapshot(),
                     ),
                 );
-                if !publish_runtime_lifecycle_drain_v1(
-                    &lifecycle_drained,
-                    &mut lifecycle_sequence,
-                ) {
+                let Some(deadline) =
+                    Instant::now().checked_add(RUNTIME_DISCORD_DISPATCH_DRAIN_TIMEOUT_V1)
+                else {
+                    return;
+                };
+                if !lifecycle_drain
+                    .publish_transition_v2(
+                        control
+                            .current_admission_snapshot()
+                            .transition_sequence(),
+                        deadline,
+                    )
+                    .await
+                {
                     return;
                 }
                 if matches!(
                     lifecycle,
                     GatewayLifecycleEventV3::Connected { paused: true, .. }
                 ) {
-                    let Ok(Ok(GatewayCommandAckV3::Paused { resume_token, .. })) = timeout(
-                        DISCORD_CONTROL_OPERATION_TIMEOUT,
+                    let Some(command_deadline) =
+                        Instant::now().checked_add(DISCORD_CONTROL_OPERATION_TIMEOUT)
+                    else {
+                        return;
+                    };
+                    let Ok(Ok(GatewayCommandAckV3::Paused { resume_token, .. })) = timeout_at(
+                        TokioInstant::from_std(command_deadline),
                         control.pause_admission(),
                     )
                     .await
@@ -3207,8 +3451,8 @@ async fn run_runtime_discord_control_v1(start: RuntimeDiscordControlStartV3) {
                         return;
                     };
                     if !matches!(
-                        timeout(
-                            DISCORD_CONTROL_OPERATION_TIMEOUT,
+                        timeout_at(
+                            TokioInstant::from_std(command_deadline),
                             control.next_lifecycle(),
                         )
                         .await,
@@ -3226,10 +3470,21 @@ async fn run_runtime_discord_control_v1(start: RuntimeDiscordControlStartV3) {
                     };
                     pause_token = Some(resume_token);
                     discord_reservation.send_replace(snapshot);
-                    if !publish_runtime_lifecycle_drain_v1(
-                        &lifecycle_drained,
-                        &mut lifecycle_sequence,
-                    ) {
+                    let Some(dispatch_deadline) =
+                        Instant::now()
+                            .checked_add(RUNTIME_DISCORD_DISPATCH_DRAIN_TIMEOUT_V1)
+                    else {
+                        return;
+                    };
+                    if !lifecycle_drain
+                        .publish_transition_v2(
+                            control
+                                .current_admission_snapshot()
+                                .transition_sequence(),
+                            dispatch_deadline,
+                        )
+                        .await
+                    {
                         return;
                     }
                 }
@@ -3244,12 +3499,12 @@ async fn run_runtime_discord_control_v1(start: RuntimeDiscordControlStartV3) {
                         pause_token: &mut pause_token,
                         coordinator: &coordinator,
                         observation: &request.observation,
-                        lifecycle_drained: &lifecycle_drained,
-                        lifecycle_sequence: &mut lifecycle_sequence,
+                        lifecycle_drain: &mut lifecycle_drain,
                         discord_reservation: &discord_reservation,
                     },
                     request.coordinator_generation,
                     request.expected,
+                    request.deadline,
                 )
                 .await;
                 let _response = request.response.send(resumed);
@@ -3259,17 +3514,17 @@ async fn run_runtime_discord_control_v1(start: RuntimeDiscordControlStartV3) {
                     return;
                 };
                 match command {
-                    RuntimeDiscordControlCommandV1::BeginDrain { response } => {
+                    RuntimeDiscordControlCommandV1::BeginDrain { deadline, response } => {
                         let drained = if matches!(
-                            timeout(
-                                DISCORD_CONTROL_OPERATION_TIMEOUT,
+                            timeout_at(
+                                TokioInstant::from_std(deadline),
                                 control.begin_drain(),
                             )
                             .await,
                             Ok(Ok(GatewayCommandAckV3::Draining { .. }))
                         ) {
-                            match timeout(
-                                DISCORD_CONTROL_OPERATION_TIMEOUT,
+                            match timeout_at(
+                                TokioInstant::from_std(deadline),
                                 control.next_lifecycle(),
                             )
                             .await
@@ -3284,10 +3539,14 @@ async fn run_runtime_discord_control_v1(start: RuntimeDiscordControlStartV3) {
                                             control.current_admission_snapshot(),
                                         ),
                                     );
-                                    publish_runtime_lifecycle_drain_v1(
-                                    &lifecycle_drained,
-                                    &mut lifecycle_sequence,
-                                    )
+                                    lifecycle_drain
+                                        .publish_transition_v2(
+                                            control
+                                                .current_admission_snapshot()
+                                                .transition_sequence(),
+                                            deadline,
+                                        )
+                                        .await
                                 }
                                 Ok(None) | Ok(Some(_)) | Err(_) => false,
                             }
@@ -3306,8 +3565,7 @@ async fn run_runtime_discord_control_v1(start: RuntimeDiscordControlStartV3) {
                                 control: &mut control,
                                 pause_token: &mut pause_token,
                                 coordinator: &coordinator,
-                                lifecycle_drained: &lifecycle_drained,
-                                lifecycle_sequence: &mut lifecycle_sequence,
+                                lifecycle_drain: &mut lifecycle_drain,
                                 discord_reservation: &discord_reservation,
                                 ordinary_resume_authorization:
                                     &ordinary_resume_authorization,
@@ -3331,8 +3589,7 @@ async fn run_runtime_discord_control_v1(start: RuntimeDiscordControlStartV3) {
                                 control: &mut control,
                                 pause_token: &mut pause_token,
                                 coordinator: &coordinator,
-                                lifecycle_drained: &lifecycle_drained,
-                                lifecycle_sequence: &mut lifecycle_sequence,
+                                lifecycle_drain: &mut lifecycle_drain,
                                 discord_reservation: &discord_reservation,
                                 ordinary_resume_authorization:
                                     &ordinary_resume_authorization,
@@ -3350,8 +3607,7 @@ async fn run_runtime_discord_control_v1(start: RuntimeDiscordControlStartV3) {
                         let opened = resume_unchecked_discord_admission_for_test_v2(
                             &mut control,
                             &mut pause_token,
-                            &lifecycle_drained,
-                            &mut lifecycle_sequence,
+                            &mut lifecycle_drain,
                             &discord_reservation,
                         )
                         .await;
@@ -3367,8 +3623,7 @@ struct RuntimeDiscordOrdinaryBarrierControlContextV3<'a> {
     control: &'a mut SharedGatewayControlV3,
     pause_token: &'a mut Option<GatewayPauseTokenV3>,
     coordinator: &'a RuntimeGatewayCoordinatorInterruptHandleV2,
-    lifecycle_drained: &'a watch::Sender<u64>,
-    lifecycle_sequence: &'a mut u64,
+    lifecycle_drain: &'a mut RuntimeDiscordLifecycleDrainPublisherV2,
     discord_reservation: &'a watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>,
     ordinary_resume_authorization: &'a watch::Sender<RuntimeDiscordOrdinaryResumeAuthorizationV3>,
     ordinary_resume_actor_observation:
@@ -3385,8 +3640,7 @@ async fn pause_ordinary_discord_admission_v3(
         control,
         pause_token,
         coordinator,
-        lifecycle_drained,
-        lifecycle_sequence,
+        lifecycle_drain,
         discord_reservation,
         ordinary_resume_authorization,
         ordinary_resume_actor_observation: _,
@@ -3524,7 +3778,9 @@ async fn pause_ordinary_discord_admission_v3(
     discord_reservation.send_replace(snapshot);
     if *discord_reservation.borrow() != snapshot
         || control.current_admission_snapshot() != paused
-        || !publish_runtime_lifecycle_drain_v1(lifecycle_drained, lifecycle_sequence)
+        || !lifecycle_drain
+            .publish_transition_v2(paused.transition_sequence(), deadline)
+            .await
         || *discord_reservation.borrow() != snapshot
         || control.current_admission_snapshot() != paused
     {
@@ -3548,8 +3804,7 @@ async fn resume_ordinary_discord_admission_v3(
         control,
         pause_token,
         coordinator,
-        lifecycle_drained,
-        lifecycle_sequence,
+        lifecycle_drain,
         discord_reservation,
         ordinary_resume_authorization,
         ordinary_resume_actor_observation,
@@ -3689,7 +3944,9 @@ async fn resume_ordinary_discord_admission_v3(
     if *discord_reservation.borrow() != snapshot
         || control.current_admission_snapshot() != first_admission
         || !control.ready_lease_is_current(&ready)
-        || !publish_runtime_lifecycle_drain_v1(lifecycle_drained, lifecycle_sequence)
+        || !lifecycle_drain
+            .publish_transition_v2(first_admission.transition_sequence(), deadline)
+            .await
         || *discord_reservation.borrow() != snapshot
         || control.current_admission_snapshot() != first_admission
         || !control.ready_lease_is_current(&ready)
@@ -3762,8 +4019,7 @@ struct RuntimeDiscordReservedResumeControlContextV2<'a> {
     pause_token: &'a mut Option<GatewayPauseTokenV3>,
     coordinator: &'a RuntimeGatewayCoordinatorInterruptHandleV2,
     observation: &'a watch::Sender<Option<RuntimeDiscordRecoveryResumeEvidenceV2>>,
-    lifecycle_drained: &'a watch::Sender<u64>,
-    lifecycle_sequence: &'a mut u64,
+    lifecycle_drain: &'a mut RuntimeDiscordLifecycleDrainPublisherV2,
     discord_reservation: &'a watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>,
 }
 
@@ -3771,16 +4027,19 @@ async fn resume_reserved_discord_admission_v2(
     context: RuntimeDiscordReservedResumeControlContextV2<'_>,
     coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
     expected: RuntimeDiscordPauseReservationIdentityV2,
+    deadline: Instant,
 ) -> RuntimeDiscordRecoveryResumeControlOutcomeV2 {
     let RuntimeDiscordReservedResumeControlContextV2 {
         control,
         pause_token,
         coordinator,
         observation,
-        lifecycle_drained,
-        lifecycle_sequence,
+        lifecycle_drain,
         discord_reservation,
     } = context;
+    if Instant::now() >= deadline {
+        return RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied;
+    }
     let Some(token) = pause_token.as_ref() else {
         return RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied;
     };
@@ -3798,8 +4057,8 @@ async fn resume_reserved_discord_admission_v2(
         coordinator.cancel_recovery_resume_claim_v2(coordinator_generation);
         return RuntimeDiscordRecoveryResumeControlOutcomeV2::DefinitelyNotApplied;
     };
-    match timeout(
-        DISCORD_CONTROL_OPERATION_TIMEOUT,
+    match timeout_at(
+        TokioInstant::from_std(deadline),
         control.resume_admission(&token),
     )
     .await
@@ -3818,8 +4077,8 @@ async fn resume_reserved_discord_admission_v2(
         return RuntimeDiscordRecoveryResumeControlOutcomeV2::Indeterminate;
     }
     if !matches!(
-        timeout(
-            DISCORD_CONTROL_OPERATION_TIMEOUT,
+        timeout_at(
+            TokioInstant::from_std(deadline),
             control.next_lifecycle(),
         )
         .await,
@@ -3851,7 +4110,9 @@ async fn resume_reserved_discord_admission_v2(
     if *discord_reservation.borrow() != reservation
         || control.current_admission_snapshot() != first_admission
         || !control.ready_lease_is_current(&ready)
-        || !publish_runtime_lifecycle_drain_v1(lifecycle_drained, lifecycle_sequence)
+        || !lifecycle_drain
+            .publish_transition_v2(first_admission.transition_sequence(), deadline)
+            .await
         || *discord_reservation.borrow() != reservation
         || control.current_admission_snapshot() != first_admission
         || !control.ready_lease_is_current(&ready)
@@ -3873,22 +4134,21 @@ async fn resume_reserved_discord_admission_v2(
 async fn resume_unchecked_discord_admission_for_test_v2(
     control: &mut SharedGatewayControlV3,
     pause_token: &mut Option<GatewayPauseTokenV3>,
-    lifecycle_drained: &watch::Sender<u64>,
-    lifecycle_sequence: &mut u64,
+    lifecycle_drain: &mut RuntimeDiscordLifecycleDrainPublisherV2,
     discord_reservation: &watch::Sender<RuntimeDiscordAdmissionReservationSnapshotV2>,
 ) -> bool {
     let Some(token) = pause_token.take() else {
         return false;
     };
     if !matches!(
-        timeout(
+        tokio::time::timeout(
             DISCORD_CONTROL_OPERATION_TIMEOUT,
             control.resume_admission(&token),
         )
         .await,
         Ok(Ok(GatewayCommandAckV3::AdmissionResumed { .. }))
     ) || !matches!(
-        timeout(DISCORD_CONTROL_OPERATION_TIMEOUT, control.next_lifecycle(),).await,
+        tokio::time::timeout(DISCORD_CONTROL_OPERATION_TIMEOUT, control.next_lifecycle(),).await,
         Ok(Some(GatewayLifecycleEventV3::AdmissionResumed { .. }))
     ) {
         return false;
@@ -3896,7 +4156,15 @@ async fn resume_unchecked_discord_admission_for_test_v2(
     discord_reservation.send_replace(RuntimeDiscordAdmissionReservationSnapshotV2::unreserved(
         control.current_admission_snapshot(),
     ));
-    publish_runtime_lifecycle_drain_v1(lifecycle_drained, lifecycle_sequence)
+    let Some(deadline) = Instant::now().checked_add(DISCORD_CONTROL_OPERATION_TIMEOUT) else {
+        return false;
+    };
+    lifecycle_drain
+        .publish_transition_v2(
+            control.current_admission_snapshot().transition_sequence(),
+            deadline,
+        )
+        .await
 }
 
 fn publish_runtime_lifecycle_drain_v1(
@@ -3906,8 +4174,10 @@ fn publish_runtime_lifecycle_drain_v1(
     let Some(next) = lifecycle_sequence.checked_add(1) else {
         return false;
     };
+    if lifecycle_drained.send(next).is_err() {
+        return false;
+    }
     *lifecycle_sequence = next;
-    lifecycle_drained.send_replace(next);
     true
 }
 
@@ -5232,6 +5502,80 @@ mod tests {
 
     struct TestPauseTokenV1(GatewayPauseTokenV3);
 
+    #[tokio::test]
+    async fn stale_dispatch_drain_confirmation_cannot_publish_a_newer_transition() {
+        let mut bootstrap = bootstrap();
+        let startup = bootstrap
+            .adapter
+            .control
+            .as_ref()
+            .expect("gateway control half")
+            .current_admission_snapshot()
+            .transition_sequence();
+        bootstrap
+            ._runtime
+            .as_mut()
+            .expect("gateway runtime half")
+            ._inner
+            .mark_connected(GatewayReadyKindV3::Ready)
+            .unwrap();
+        let stale = bootstrap
+            .adapter
+            .control
+            .as_ref()
+            .expect("gateway control half")
+            .current_admission_snapshot()
+            .transition_sequence();
+        bootstrap
+            ._runtime
+            .as_mut()
+            .expect("gateway runtime half")
+            ._inner
+            .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
+            .unwrap();
+        let current = bootstrap
+            .adapter
+            .control
+            .as_ref()
+            .expect("gateway control half")
+            .current_admission_snapshot()
+            .transition_sequence();
+        let (lifecycle_drained, mut lifecycle_observer) = watch::channel(1);
+        let (requests, mut requests_observer) = watch::channel(
+            crate::discord::RuntimeDiscordDispatchDrainRequestV1::startup_v1(startup),
+        );
+        let (confirmations, confirmation_observer) = watch::channel(
+            crate::discord::RuntimeDiscordDispatchDrainConfirmationV1::startup_v1(startup),
+        );
+        let mut publisher = super::RuntimeDiscordLifecycleDrainPublisherV2::new(
+            lifecycle_drained,
+            requests,
+            confirmation_observer,
+            startup,
+        )
+        .unwrap();
+        confirmations
+            .send(crate::discord::RuntimeDiscordDispatchDrainConfirmationV1::transition_v1(stale))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let publish =
+            tokio::spawn(async move { publisher.publish_transition_v2(current, deadline).await });
+        requests_observer.changed().await.unwrap();
+        assert_eq!(
+            *requests_observer.borrow_and_update(),
+            crate::discord::RuntimeDiscordDispatchDrainRequestV1::transition_v1(current, deadline)
+        );
+        tokio::task::yield_now().await;
+        assert!(!publish.is_finished());
+        assert_eq!(*lifecycle_observer.borrow(), 1);
+        confirmations
+            .send(crate::discord::RuntimeDiscordDispatchDrainConfirmationV1::transition_v1(current))
+            .unwrap();
+        assert!(publish.await.unwrap());
+        lifecycle_observer.changed().await.unwrap();
+        assert_eq!(*lifecycle_observer.borrow(), 2);
+    }
+
     struct PanickingInvalidatorV3;
 
     impl GatewaySynchronousInvalidatorV3 for PanickingInvalidatorV3 {
@@ -5474,8 +5818,12 @@ mod tests {
             snapshot,
         };
         let (observation, _) = watch::channel(None);
-        let (lifecycle_drained, _) = watch::channel(1);
-        let mut lifecycle_sequence = 1;
+        let (lifecycle_drained, _lifecycle_observer) = watch::channel(1);
+        let mut lifecycle_drain =
+            super::RuntimeDiscordLifecycleDrainPublisherV2::immediate_for_test_v2(
+                lifecycle_drained,
+                paused_admission.transition_sequence(),
+            );
         let (outcome, runtime_outcome) = tokio::join!(
             resume_reserved_discord_admission_v2(
                 RuntimeDiscordReservedResumeControlContextV2 {
@@ -5487,12 +5835,12 @@ mod tests {
                     pause_token: &mut pause_token,
                     coordinator: &coordinator,
                     observation: &observation,
-                    lifecycle_drained: &lifecycle_drained,
-                    lifecycle_sequence: &mut lifecycle_sequence,
+                    lifecycle_drain: &mut lifecycle_drain,
                     discord_reservation: &discord_reservation,
                 },
                 predecessor,
                 expected,
+                Instant::now() + Duration::from_secs(1),
             ),
             bootstrap
                 ._runtime
@@ -5530,8 +5878,19 @@ mod tests {
         fixture.production.ordinary_resume_authorization =
             Some(ordinary_resume_authorization.clone());
         fixture.production.ordinary_resume_actor_observation = Some(actor_observation.clone());
-        let (lifecycle_drained, _) = watch::channel(1);
-        let mut lifecycle_sequence = 1;
+        let (lifecycle_drained, _lifecycle_observer) = watch::channel(1);
+        let mut lifecycle_drain =
+            super::RuntimeDiscordLifecycleDrainPublisherV2::immediate_for_test_v2(
+                lifecycle_drained,
+                fixture
+                    .bootstrap
+                    .adapter
+                    .control
+                    .as_ref()
+                    .expect("gateway control half")
+                    .current_admission_snapshot()
+                    .transition_sequence(),
+            );
         let mut ordinary_correlation = 0;
         let mut pause_token = None;
         let (pause_outcome, runtime_pause_outcome) = tokio::join!(
@@ -5545,8 +5904,7 @@ mod tests {
                         .expect("gateway control half"),
                     pause_token: &mut pause_token,
                     coordinator: &fixture.production.interrupt,
-                    lifecycle_drained: &lifecycle_drained,
-                    lifecycle_sequence: &mut lifecycle_sequence,
+                    lifecycle_drain: &mut lifecycle_drain,
                     discord_reservation: &fixture.discord_reservation,
                     ordinary_resume_authorization: &ordinary_resume_authorization,
                     ordinary_resume_actor_observation: &mut actor_observation,
@@ -5618,8 +5976,7 @@ mod tests {
                         .expect("gateway control half"),
                     pause_token: &mut pause_token,
                     coordinator: &fixture.production.interrupt,
-                    lifecycle_drained: &lifecycle_drained,
-                    lifecycle_sequence: &mut lifecycle_sequence,
+                    lifecycle_drain: &mut lifecycle_drain,
                     discord_reservation: &fixture.discord_reservation,
                     ordinary_resume_authorization: &ordinary_resume_authorization,
                     ordinary_resume_actor_observation: &mut actor_observation,
@@ -5691,8 +6048,12 @@ mod tests {
             RuntimeGatewayClosedSnapshotV2::Shutdown { .. }
         ));
         let (observation, _) = watch::channel(None);
-        let (lifecycle_drained, _) = watch::channel(1);
-        let mut lifecycle_sequence = 1;
+        let (lifecycle_drained, _lifecycle_observer) = watch::channel(1);
+        let mut lifecycle_drain =
+            super::RuntimeDiscordLifecycleDrainPublisherV2::immediate_for_test_v2(
+                lifecycle_drained,
+                paused_admission.transition_sequence(),
+            );
         let reservation = RuntimeDiscordAdmissionReservationSnapshotV2::reserved(
             paused_admission,
             pause_token.as_ref().unwrap(),
@@ -5709,12 +6070,12 @@ mod tests {
                 pause_token: &mut pause_token,
                 coordinator: &coordinator,
                 observation: &observation,
-                lifecycle_drained: &lifecycle_drained,
-                lifecycle_sequence: &mut lifecycle_sequence,
+                lifecycle_drain: &mut lifecycle_drain,
                 discord_reservation: &discord_reservation,
             },
             generation,
             expected,
+            Instant::now() + Duration::from_secs(1),
         )
         .await;
         assert_eq!(
@@ -5803,8 +6164,12 @@ mod tests {
             Err(RuntimeGatewayReadyObservationErrorV1::StaleAdmissionSnapshot)
         );
         let (observation, _) = watch::channel(None);
-        let (lifecycle_drained, _) = watch::channel(1);
-        let mut lifecycle_sequence = 1;
+        let (lifecycle_drained, _lifecycle_observer) = watch::channel(1);
+        let mut lifecycle_drain =
+            super::RuntimeDiscordLifecycleDrainPublisherV2::immediate_for_test_v2(
+                lifecycle_drained,
+                paused_admission.transition_sequence(),
+            );
         let (outcome, runtime_outcome) = tokio::join!(
             resume_reserved_discord_admission_v2(
                 RuntimeDiscordReservedResumeControlContextV2 {
@@ -5816,12 +6181,12 @@ mod tests {
                     pause_token: &mut pause_token,
                     coordinator: &coordinator,
                     observation: &observation,
-                    lifecycle_drained: &lifecycle_drained,
-                    lifecycle_sequence: &mut lifecycle_sequence,
+                    lifecycle_drain: &mut lifecycle_drain,
                     discord_reservation: &discord_reservation,
                 },
                 predecessor,
                 expected,
+                Instant::now() + Duration::from_secs(1),
             ),
             bootstrap
                 ._runtime
@@ -6237,8 +6602,19 @@ mod tests {
         fixture.production.ordinary_resume_authorization =
             Some(ordinary_resume_authorization.clone());
         fixture.production.ordinary_resume_actor_observation = Some(actor_observation.clone());
-        let (lifecycle_drained, _) = watch::channel(1);
-        let mut lifecycle_sequence = 1;
+        let (lifecycle_drained, _lifecycle_observer) = watch::channel(1);
+        let mut lifecycle_drain =
+            super::RuntimeDiscordLifecycleDrainPublisherV2::immediate_for_test_v2(
+                lifecycle_drained,
+                fixture
+                    .bootstrap
+                    .adapter
+                    .control
+                    .as_ref()
+                    .expect("gateway control half")
+                    .current_admission_snapshot()
+                    .transition_sequence(),
+            );
         let mut ordinary_correlation = 0;
         let mut pause_token = None;
         let (pause_outcome, runtime_pause_outcome) = tokio::join!(
@@ -6252,8 +6628,7 @@ mod tests {
                         .expect("gateway control half"),
                     pause_token: &mut pause_token,
                     coordinator: &fixture.production.interrupt,
-                    lifecycle_drained: &lifecycle_drained,
-                    lifecycle_sequence: &mut lifecycle_sequence,
+                    lifecycle_drain: &mut lifecycle_drain,
                     discord_reservation: &fixture.discord_reservation,
                     ordinary_resume_authorization: &ordinary_resume_authorization,
                     ordinary_resume_actor_observation: &mut actor_observation,

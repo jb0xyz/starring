@@ -2699,7 +2699,7 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "self._runtime.take()",
         "GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect",
         "pub(crate) fn admission_change_watch_v1(",
-        "pub(crate) fn begin_discord_drain_v1(",
+        "pub(crate) fn begin_discord_drain_until_v1(",
         "run_runtime_discord_control_v1(",
         "control.next_lifecycle()",
         "prepare_twilight_runtime_discord_gateway_driver_v1(",
@@ -2738,7 +2738,7 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "shutdown_paused_foundation_owner_v1",
         ".begin_shutdown_v1(RuntimeShutdownCauseV1::Explicit)",
         "foundation.observe_shutdown_registry_v1()",
-        ".begin_discord_drain_v1()",
+        ".begin_discord_drain_until_v1(discord_cleanup_deadline)",
         "foundation.finish_shutdown_v1(cleanup_deadline).await",
     ] {
         assert!(connected.contains(required), "{required}");
@@ -2772,7 +2772,7 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         .find("foundation.observe_shutdown_registry_v1()")
         .unwrap();
     let discord_drain = connected_shutdown
-        .find(".begin_discord_drain_v1()")
+        .find(".begin_discord_drain_until_v1(discord_cleanup_deadline)")
         .unwrap();
     let discord_shutdown = connected_shutdown.find(".shutdown_until(").unwrap();
     let owner_shutdown = connected_shutdown
@@ -3417,7 +3417,7 @@ fn serving_shutdown_observes_valid_route_sets_without_weakening_empty_shutdown()
             .find("foundation.observe_shutdown_serving_registry_v2(registry_observation);")
             .unwrap();
         let discord_drain = shutdown
-            .find("foundation.gateway.begin_discord_drain_v1()")
+            .find(".begin_discord_drain_until_v1(cleanup_deadline)")
             .unwrap();
         assert!(sealed < first_await);
         assert!(sealed < foundation && foundation < discord_drain);

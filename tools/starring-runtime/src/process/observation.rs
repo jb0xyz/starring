@@ -2714,7 +2714,9 @@ async fn shutdown_transferred_production_handoff_v2(
         .owner_cleanup_deadline()
         .min(cleanup_deadline);
     foundation.observe_shutdown_registry_v1();
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(discord_cleanup_deadline);
     let timing = foundation.lifecycle_timing_v2();
     let discord_shutdown = time_shutdown_result_v2(
         &timing,
@@ -2749,7 +2751,9 @@ async fn shutdown_process_bound_production_handoff_v2(
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
     foundation.observe_shutdown_registry_v1();
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(cleanup_deadline);
     let timing = foundation.lifecycle_timing_v2();
     let discord_shutdown = time_shutdown_result_v2(
         &timing,
@@ -2799,7 +2803,9 @@ async fn shutdown_recovery_resume_transferred_v2(
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
     foundation.observe_shutdown_registry_v1();
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(cleanup_deadline);
     let timing = foundation.lifecycle_timing_v2();
     let discord_shutdown = time_shutdown_result_v2(
         &timing,
@@ -2841,7 +2847,9 @@ async fn shutdown_admission_acknowledging_process_v2(
     shutdown_ingress_acknowledgement_supervisor_v2(&mut foundation, supervisor, cleanup_deadline)
         .await;
     foundation.observe_shutdown_registry_v1();
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(cleanup_deadline);
     let timing = foundation.lifecycle_timing_v2();
     let discord_shutdown = time_shutdown_result_v2(
         &timing,
@@ -2876,7 +2884,9 @@ async fn shutdown_admission_acknowledging_process_without_lane_v2(
         .begin_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit)
         .await;
     foundation.observe_shutdown_registry_v1();
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(cleanup_deadline);
     let timing = foundation.lifecycle_timing_v2();
     let discord_shutdown = time_shutdown_result_v2(
         &timing,
@@ -3047,7 +3057,9 @@ pub(super) async fn shutdown_process_without_lifecycle_v2(
             foundation.observe_shutdown_serving_registry_without_lifecycle_v2()
         }
     }
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(cleanup_deadline);
     let timing = foundation.lifecycle_timing_v2();
     let discord_shutdown = time_shutdown_result_v2(
         &timing,
@@ -3088,7 +3100,9 @@ async fn shutdown_frozen_empty_open_process_v2(
     shutdown_ingress_acknowledgement_supervisor_v2(&mut foundation, supervisor, cleanup_deadline)
         .await;
     foundation.observe_shutdown_registry_v1();
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(cleanup_deadline);
     let timing = foundation.lifecycle_timing_v2();
     let discord_shutdown = time_shutdown_result_v2(
         &timing,
@@ -3134,7 +3148,9 @@ pub(super) async fn shutdown_empty_open_process_v2<G>(
     shutdown_ingress_acknowledgement_supervisor_v2(&mut foundation, supervisor, cleanup_deadline)
         .await;
     foundation.observe_shutdown_registry_v1();
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(cleanup_deadline);
     let timing = foundation.lifecycle_timing_v2();
     let discord_shutdown = time_shutdown_result_v2(
         &timing,
@@ -3180,7 +3196,9 @@ pub(super) async fn shutdown_refreshing_empty_open_process_v2<G>(
     shutdown_ingress_acknowledgement_supervisor_v2(&mut foundation, supervisor, cleanup_deadline)
         .await;
     foundation.observe_shutdown_registry_v1();
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(cleanup_deadline);
     let timing = foundation.lifecycle_timing_v2();
     let discord_shutdown = time_shutdown_result_v2(
         &timing,
@@ -3227,7 +3245,9 @@ pub(super) async fn shutdown_serving_open_process_v2<G>(
     shutdown_ingress_acknowledgement_supervisor_v2(&mut foundation, supervisor, cleanup_deadline)
         .await;
     foundation.observe_shutdown_serving_registry_v2(registry_observation);
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(cleanup_deadline);
     let timing = foundation.lifecycle_timing_v2();
     let discord_shutdown = time_shutdown_result_v2(
         &timing,
@@ -3274,7 +3294,9 @@ pub(super) async fn shutdown_certification_frozen_serving_open_process_v2<G>(
     shutdown_ingress_acknowledgement_supervisor_v2(&mut foundation, supervisor, cleanup_deadline)
         .await;
     foundation.observe_shutdown_serving_registry_v2(registry_observation);
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(cleanup_deadline);
     let timing = foundation.lifecycle_timing_v2();
     let discord_shutdown = time_shutdown_result_v2(
         &timing,
@@ -3321,7 +3343,9 @@ pub(super) async fn shutdown_refreshing_serving_open_process_v2<G>(
     shutdown_ingress_acknowledgement_supervisor_v2(&mut foundation, supervisor, cleanup_deadline)
         .await;
     foundation.observe_shutdown_serving_registry_v2(registry_observation);
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(cleanup_deadline);
     let timing = foundation.lifecycle_timing_v2();
     let discord_shutdown = time_shutdown_result_v2(
         &timing,

@@ -653,7 +653,9 @@ pub(super) async fn shutdown_paused_foundation_discord_v1(
         .discord_cleanup_deadline()
         .min(cleanup_deadline);
     foundation.observe_shutdown_registry_v1();
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(discord_cleanup_deadline);
     let timing = foundation
         .lifecycle_timing_v2()
         .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin);
@@ -700,7 +702,9 @@ where
         .min(cleanup_deadline);
     foundation.observe_shutdown_registry_v1();
     let _ = order.record(RuntimePausedShutdownEventV1::RegistryProved);
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(discord_cleanup_deadline);
     let lifecycle_timing = foundation.lifecycle_timing_v2();
     let discord_timing =
         lifecycle_timing.start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin);
