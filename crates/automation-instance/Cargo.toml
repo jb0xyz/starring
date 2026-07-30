@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 serde = { workspace = true }
 discord-model = { path = "../discord-model" }
+getrandom = "0.4"
 
 [dev-dependencies]
 serde_json = { workspace = true }
