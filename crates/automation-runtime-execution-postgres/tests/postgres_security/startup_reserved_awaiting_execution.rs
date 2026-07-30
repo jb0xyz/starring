@@ -107,6 +107,86 @@ async fn startup_reserved_awaiting_execution_progresses_and_replays_exactly_once
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires disposable PostgreSQL 16"]
+async fn terminalized_reserved_awaiting_execution_is_claimable_without_losing_audit_records() {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    certification_reservation_scenario(&database).await;
+
+    let owner = sqlx::query_as::<_, StartupObservationOwnerTuple>(
+        "SELECT gateway_shard_id, process_instance_id, lease_epoch, \
+         expected_build_revision, owner_revision, expires_at \
+         FROM public.runtime_gateway_owners WHERE gateway_shard_id = 'shard:0'",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let before = reserved_awaiting_execution_state(&database.owner_pool).await;
+    let recovered = execute_startup_reserved_awaiting(
+        &database.executor_pool,
+        &owner,
+        "78000000000000000000000000000078",
+        database_now(&database.owner_pool).await,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered["journal_outcome_name"], "applied");
+    assert_eq!(recovered["terminal_outcome_name"], "progressed");
+    let reset = reserved_awaiting_execution_state(&database.owner_pool).await;
+    assert_eq!(reset.0, before.0 + 1);
+    assert_eq!(reset.1, "reconciling_panels");
+    assert_eq!(reset.2, before.2);
+    assert_eq!(reset.4, 1);
+
+    let mut claim = database.executor_pool.begin().await.unwrap();
+    assert_eq!(
+        raw_selector_claim(
+            &mut claim,
+            "runtime-terminalized-certification-reclaim-controller",
+        )
+        .await
+        .unwrap(),
+        Some("applied".to_owned())
+    );
+    claim.commit().await.unwrap();
+
+    let claimed = reserved_awaiting_execution_state(&database.owner_pool).await;
+    assert_eq!(claimed.0, reset.0 + 1);
+    assert_eq!(claimed.1, "reconciling_panels");
+    assert_eq!(claimed.2, reset.2 + 1);
+    assert_eq!(claimed.3, reset.3 + 1);
+    assert_eq!(claimed.4, 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT pg_catalog.count(*) \
+             FROM public.runtime_certification_operations_v2",
+        )
+        .fetch_one(&database.owner_pool)
+        .await
+        .unwrap(),
+        1
+    );
+    let mut replay = database.executor_pool.begin().await.unwrap();
+    assert_eq!(
+        raw_selector_claim(
+            &mut replay,
+            "runtime-terminalized-certification-reclaim-controller",
+        )
+        .await
+        .unwrap(),
+        Some("replayed".to_owned())
+    );
+    replay.commit().await.unwrap();
+    assert_eq!(
+        reserved_awaiting_execution_state(&database.owner_pool).await,
+        claimed
+    );
+
+    cleanup(database).await;
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires disposable PostgreSQL 16"]
 async fn startup_unreserved_awaiting_execution_resets_old_process_evidence_and_replays() {
     let server = PostgresTestServer::start();
     let database = isolated_database(server.connect_options()).await;

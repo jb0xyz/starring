@@ -22,7 +22,7 @@ const MANIFEST_DEFINITION_DIGEST: &str =
 const READINESS_DEFINITION_DIGEST: &str =
     "1c20dcc6c6e01b440d9a5813bad12b109d89a67c5d6815f9fd15551fa3c0f4e5";
 const LATEST_READINESS_DEFINITION_DIGEST: &str =
-    "437eef0962f31be61e9fcb2f6705b2cda14f4d52105ae024ca4bc29b967e001c";
+    "d8e46c1204b36b3c909b7e6e88ee768d2ec7e60d05dd4eb99be7d8f064a24714";
 
 fn dollar_block(tag: &str) -> &'static str {
     MIGRATION

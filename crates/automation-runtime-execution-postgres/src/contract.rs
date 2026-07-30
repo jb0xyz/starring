@@ -45,7 +45,7 @@ pub(crate) const OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 29] = [
 ];
 
 pub(crate) const RUNTIME_EXECUTION_READINESS_DEFINITION_DIGEST_V1: Option<&str> =
-    Some("437eef0962f31be61e9fcb2f6705b2cda14f4d52105ae024ca4bc29b967e001c");
+    Some("d8e46c1204b36b3c909b7e6e88ee768d2ec7e60d05dd4eb99be7d8f064a24714");
 
 pub(crate) fn capability_manifest_is_well_formed_v1() -> bool {
     let capabilities = FOUNDATIONAL_CAPABILITY_IDENTITIES_V1
