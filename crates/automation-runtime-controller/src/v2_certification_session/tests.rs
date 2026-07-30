@@ -250,7 +250,9 @@ fn input(operation_id: &str) -> RuntimeCertificationReservationInputV2 {
     }
 }
 
-fn route_admission() -> RuntimeRouteAdmissionAttestationV2 {
+fn route_admission_with_kind(
+    kind: RuntimeGatewayReadyKindV2,
+) -> RuntimeRouteAdmissionAttestationV2 {
     let input = input("00112233445566778899aabbccddeeff");
     RuntimeRouteAdmissionAttestationV2 {
         barrier_id: RuntimeBarrierIdV1::parse("ffeeddccbbaa99887766554433221100").unwrap(),
@@ -263,7 +265,7 @@ fn route_admission() -> RuntimeRouteAdmissionAttestationV2 {
         gateway: RuntimeGatewayReadyAttestationV2 {
             process_instance_id: input.panel.process_identity.process_instance_id.clone(),
             connection_epoch: non_zero(9),
-            kind: RuntimeGatewayReadyKindV2::Resumed,
+            kind,
             admission_revision: non_zero(10),
             connected_event_sequence: RuntimeGatewayAdmissionSequenceV2::new(non_zero(11)),
             resume_sequence: RuntimeGatewayAdmissionSequenceV2::new(non_zero(13)),
@@ -286,11 +288,22 @@ fn committed_completion(
     crate::RuntimeCanonicalLiveAttestationV2,
     RuntimeCertificationReceiptV2,
 ) {
+    committed_completion_with_kind(awaiting, reservation, RuntimeGatewayReadyKindV2::Resumed)
+}
+
+fn committed_completion_with_kind(
+    awaiting: &RuntimeDeploymentSnapshotV1,
+    reservation: &crate::RuntimeReservedCertificationIntentV2,
+    kind: RuntimeGatewayReadyKindV2,
+) -> (
+    crate::RuntimeCanonicalLiveAttestationV2,
+    RuntimeCertificationReceiptV2,
+) {
     let request = RuntimeCertificationRequestV2 {
         intent: reservation.canonical_intent().intent().clone(),
         intent_fingerprint: reservation.intent_fingerprint().clone(),
         must_commit_before: at(90),
-        route_admission: route_admission(),
+        route_admission: route_admission_with_kind(kind),
     };
     let canonical = reservation
         .canonical_intent()
@@ -312,7 +325,10 @@ fn committed_completion(
                 target: intent.target.clone(),
                 runtime_generation: intent.guard.runtime_generation,
                 process_instance_id: intent.process_identity.process_instance_id.clone(),
-                kind: GatewayReadyKindV1::DiscordResumed,
+                kind: match kind {
+                    RuntimeGatewayReadyKindV2::Ready => GatewayReadyKindV1::DiscordReady,
+                    RuntimeGatewayReadyKindV2::Resumed => GatewayReadyKindV1::DiscordResumed,
+                },
                 ready_at: at(20),
             },
             certified_at,
@@ -638,6 +654,58 @@ fn exact_committed_completion_is_the_only_path_out_of_finalizing() {
         session.abort_action(action_id),
         Err(RuntimeConvergenceSessionError::NoActionInFlight)
     );
+}
+
+#[test]
+fn committed_completion_accepts_both_exact_gateway_ready_kinds() {
+    for kind in [
+        RuntimeGatewayReadyKindV2::Ready,
+        RuntimeGatewayReadyKindV2::Resumed,
+    ] {
+        let mut session = awaiting_session();
+        let awaiting = session.snapshot().clone();
+        let reservation = reserve(&mut session, "00112233445566778899aabbccddeeff");
+        session
+            .apply_certification_reservation_v2(
+                RuntimeCertificationIntentReservationOutcomeV2::Reserved(reservation.clone()),
+            )
+            .unwrap();
+        let (canonical, receipt) = committed_completion_with_kind(&awaiting, &reservation, kind);
+
+        assert!(session.apply_certification_v2(canonical, receipt).is_ok());
+        assert_eq!(
+            session.state(),
+            RuntimeConvergenceSessionStateV1::CertifiedLive
+        );
+    }
+}
+
+#[test]
+fn committed_completion_rejects_gateway_ready_kind_drift() {
+    let mut session = awaiting_session();
+    let awaiting = session.snapshot().clone();
+    let reservation = reserve(&mut session, "00112233445566778899aabbccddeeff");
+    let action_id = reservation.canonical_intent().intent().action_id;
+    session
+        .apply_certification_reservation_v2(
+            RuntimeCertificationIntentReservationOutcomeV2::Reserved(reservation.clone()),
+        )
+        .unwrap();
+    let (canonical, mut receipt) =
+        committed_completion_with_kind(&awaiting, &reservation, RuntimeGatewayReadyKindV2::Ready);
+    receipt.snapshot.gateway_ready.as_mut().unwrap().kind = GatewayReadyKindV1::DiscordResumed;
+    receipt.snapshot.live.as_mut().unwrap().gateway_ready.kind = GatewayReadyKindV1::DiscordResumed;
+
+    assert_eq!(
+        session
+            .apply_certification_v2(canonical, receipt)
+            .unwrap_err(),
+        RuntimeCertificationSessionErrorV2::Session(
+            RuntimeConvergenceSessionError::ReceiptMismatch
+        )
+    );
+    assert_eq!(session.in_flight_action(), Some(action_id));
+    assert_eq!(session.state(), RuntimeConvergenceSessionStateV1::Active);
 }
 
 #[test]

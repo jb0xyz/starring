@@ -2128,9 +2128,48 @@ fn serving_ready_successor(
     serving: &RuntimeServingOpenProcessV2,
 ) -> automation_runtime_controller::RuntimeGatewayReadyAttestationV2 {
     let mut ready = serving.epoch().gateway_ready().clone();
-    ready.kind = RuntimeGatewayReadyKindV2::Resumed;
     ready.resume_sequence = sequence(ready.resume_sequence.get() + 1);
     ready
+}
+
+#[test]
+fn resumed_serving_refresh_preserves_the_discord_ready_kind() {
+    for kind in [
+        RuntimeGatewayReadyKindV2::Ready,
+        RuntimeGatewayReadyKindV2::Resumed,
+    ] {
+        let current = automation_runtime_controller::RuntimeGatewayReadyAttestationV2 {
+            process_instance_id: process(),
+            connection_epoch: non_zero(2),
+            kind,
+            admission_revision: non_zero(3),
+            connected_event_sequence: sequence(4),
+            resume_sequence: sequence(5),
+        };
+        let mut observed = current.clone();
+        observed.resume_sequence = sequence(6);
+        assert_eq!(
+            super::refresh::validate_serving_gateway_ready_refresh_v3(
+                &current,
+                &observed,
+                super::admission::RuntimeServingGatewayReadyRefreshV3::ResumedSuccessor,
+            ),
+            Ok(())
+        );
+
+        observed.kind = match kind {
+            RuntimeGatewayReadyKindV2::Ready => RuntimeGatewayReadyKindV2::Resumed,
+            RuntimeGatewayReadyKindV2::Resumed => RuntimeGatewayReadyKindV2::Ready,
+        };
+        assert_eq!(
+            super::refresh::validate_serving_gateway_ready_refresh_v3(
+                &current,
+                &observed,
+                super::admission::RuntimeServingGatewayReadyRefreshV3::ResumedSuccessor,
+            ),
+            Err(RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch)
+        );
+    }
 }
 
 fn assert_resumed_serving_refresh_rejected(
@@ -2193,7 +2232,10 @@ fn serving_after_resumed_refresh() -> (
 fn serving_refresh_accepts_and_stores_only_an_exact_resumed_successor() {
     let serving = serving_open_with_capacity(1);
     let current_sequence = serving.epoch().route_set().observation_sequence().get();
+    let current_kind = serving.epoch().gateway_ready().kind;
     let successor = serving_ready_successor(&serving);
+    assert_eq!(successor.kind, current_kind);
+    assert!(successor.was_explicitly_resumed());
     let mut input = serving_refresh_input(&serving, current_sequence, false);
     input.gateway_ready = successor.clone();
     let mut refresh = serving
@@ -2312,7 +2354,7 @@ fn resumed_serving_refresh_rejects_non_monotonic_and_identity_drift() {
         RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch,
     );
     assert_resumed_serving_refresh_rejected(
-        |observed, _| observed.kind = RuntimeGatewayReadyKindV2::Ready,
+        |observed, _| observed.kind = RuntimeGatewayReadyKindV2::Resumed,
         RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch,
     );
     assert_resumed_serving_refresh_rejected(
@@ -2357,6 +2399,11 @@ fn serving_barrier_completion_authority_requires_the_stored_exact_reobservation(
         authority.gateway_ready_v3(),
         serving.epoch().gateway_ready()
     );
+    assert_eq!(
+        authority.gateway_ready_v3().kind,
+        RuntimeGatewayReadyKindV2::Ready
+    );
+    assert!(authority.gateway_ready_v3().was_explicitly_resumed());
     assert_eq!(
         authority.acknowledgement_v3(),
         final_receipt.acknowledgement()

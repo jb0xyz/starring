@@ -1179,6 +1179,7 @@ impl RuntimeResumedGatewayObservationV2 {
         ready: RuntimeGatewayReadyAttestationV2,
     ) -> Option<Self> {
         if !ready.was_explicitly_resumed()
+            || ready.kind != paused.kind()
             || ready.process_instance_id != *paused.process_instance_id()
             || ready.connection_epoch != paused.connection_epoch()
             || ready.admission_revision != paused.admission_revision()
@@ -6627,6 +6628,20 @@ mod tests {
             foreign_ready,
         )
         .is_none());
+        let mut kind_drift = gateway.ready_v2().clone();
+        kind_drift.kind = match kind_drift.kind {
+            automation_runtime_controller::RuntimeGatewayReadyKindV2::Ready => {
+                automation_runtime_controller::RuntimeGatewayReadyKindV2::Resumed
+            }
+            automation_runtime_controller::RuntimeGatewayReadyKindV2::Resumed => {
+                automation_runtime_controller::RuntimeGatewayReadyKindV2::Ready
+            }
+        };
+        assert!(RuntimeResumedGatewayObservationV2::from_exact_v2(
+            gateway.paused_v2().clone(),
+            kind_drift,
+        )
+        .is_none());
         assert!(matches!(
             resumed
                 .fixture
@@ -7075,6 +7090,10 @@ mod tests {
         assert_eq!(observed.admission_revision.get(), 2);
         assert_eq!(observed.connected_event_sequence.get(), 1);
         assert_eq!(observed.resume_sequence.get(), 3);
+        assert_eq!(
+            observed.kind,
+            automation_runtime_controller::RuntimeGatewayReadyKindV2::Ready
+        );
         assert!(observed.was_explicitly_resumed());
         assert!(bootstrap.ready_attestation_is_current(&observed));
         assert!(matches!(

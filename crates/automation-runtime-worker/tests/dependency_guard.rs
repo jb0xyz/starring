@@ -254,7 +254,7 @@ fn certification_finalization_is_session_bound_linear_and_lookup_only_after_unkn
         "route_admission.pause.connection_epoch != paused_gateway.connection_epoch()",
         "route_admission.pause.paused_admission_revision != paused_gateway.admission_revision()",
         "route_admission.pause.pause_sequence != paused_gateway.transition_sequence()",
-        "route_admission.gateway.kind != RuntimeGatewayReadyKindV2::Resumed",
+        "route_admission.gateway.kind != paused_gateway.kind()",
         "route_admission.gateway.connected_event_sequence",
         "RuntimeLiveAttestationRecordV2::from_request(request)?",
         ".bind_live_record(record)",

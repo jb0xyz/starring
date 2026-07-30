@@ -12,9 +12,8 @@ use automation_runtime_controller::{
     RuntimeCertificationRequestV2, RuntimeCertificationReservationAuthorityV2,
     RuntimeCertificationReservationScopeLookupV2,
     RuntimeCertificationReservationScopeObservationKindV2,
-    RuntimeCertificationReservationScopeObservationV2, RuntimeGatewayReadyKindV2,
-    RuntimeLiveAttestationRecordV2, RuntimeReservedCertificationIntentV2,
-    RuntimeRouteAdmissionAttestationV2,
+    RuntimeCertificationReservationScopeObservationV2, RuntimeLiveAttestationRecordV2,
+    RuntimeReservedCertificationIntentV2, RuntimeRouteAdmissionAttestationV2,
 };
 use automation_runtime_convergence::{
     RuntimeDeployment, RuntimeDeploymentPhaseV1, TransitionOutcomeV1,
@@ -446,7 +445,7 @@ where
     {
         return Err(RuntimeCertificationAuthorizationErrorV2::PausedGatewayMismatch);
     }
-    if route_admission.gateway.kind != RuntimeGatewayReadyKindV2::Resumed
+    if route_admission.gateway.kind != paused_gateway.kind()
         || route_admission.gateway.process_instance_id != *paused_gateway.process_instance_id()
         || route_admission.gateway.connection_epoch != paused_gateway.connection_epoch()
         || route_admission.gateway.admission_revision != paused_gateway.admission_revision()

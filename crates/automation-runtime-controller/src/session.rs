@@ -15,12 +15,13 @@ use crate::{
     RuntimeCertificationReservationScopeObservationKindV2,
     RuntimeCertificationReservationScopeObservationV2, RuntimeCertificationSessionErrorV2,
     RuntimeConvergenceMutationV1, RuntimeDisconnectServingV1, RuntimeExecutionGuardV1,
-    RuntimeExecutionReceiptV1, RuntimeExecutionUpdateReceiptV1, RuntimeHeartbeatServingV1,
-    RuntimeLiveMetadataV1, RuntimeMutationReceiptV1, RuntimeMutationRequestV1,
-    RuntimeObservePreviousServingV1, RuntimePreviousServingLeaseEvidenceV1,
-    RuntimePreviousServingObservationReceiptV1, RuntimePreviousServingStateV1,
-    RuntimeRenewExecutionV1, RuntimeReservedCertificationIntentV2, RuntimeServingReceiptV1,
-    RuntimeServingReceiptV2, RuntimeServingUpdateReceiptV1, RuntimeSessionActionIdV1,
+    RuntimeExecutionReceiptV1, RuntimeExecutionUpdateReceiptV1, RuntimeGatewayReadyKindV2,
+    RuntimeHeartbeatServingV1, RuntimeLiveMetadataV1, RuntimeMutationReceiptV1,
+    RuntimeMutationRequestV1, RuntimeObservePreviousServingV1,
+    RuntimePreviousServingLeaseEvidenceV1, RuntimePreviousServingObservationReceiptV1,
+    RuntimePreviousServingStateV1, RuntimeRenewExecutionV1, RuntimeReservedCertificationIntentV2,
+    RuntimeServingReceiptV1, RuntimeServingReceiptV2, RuntimeServingUpdateReceiptV1,
+    RuntimeSessionActionIdV1,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1004,6 +1005,10 @@ fn validate_certification_v2_completion(
         .gateway_ready
         .as_ref()
         .ok_or(RuntimeConvergenceSessionError::ReceiptMismatch)?;
+    let expected_gateway_ready_kind = match request.route_admission.gateway.kind {
+        RuntimeGatewayReadyKindV2::Ready => GatewayReadyKindV1::DiscordReady,
+        RuntimeGatewayReadyKindV2::Resumed => GatewayReadyKindV1::DiscordResumed,
+    };
     let serving_lease = receipt
         .serving
         .expires_at
@@ -1052,7 +1057,7 @@ fn validate_certification_v2_completion(
         || live.gateway_ready.target != intent.target
         || live.gateway_ready.runtime_generation != intent.guard.runtime_generation
         || live.gateway_ready.process_instance_id != intent.process_identity.process_instance_id
-        || live.gateway_ready.kind != GatewayReadyKindV1::DiscordResumed
+        || live.gateway_ready.kind != expected_gateway_ready_kind
         || live.gateway_ready.ready_at > receipt.certified_at
         || live.certified_at != receipt.certified_at
     {

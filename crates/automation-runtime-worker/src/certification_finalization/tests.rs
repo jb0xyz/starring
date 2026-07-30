@@ -252,7 +252,7 @@ fn route_admission() -> RuntimeRouteAdmissionAttestationV2 {
         gateway: RuntimeGatewayReadyAttestationV2 {
             process_instance_id: ProcessInstanceId::parse("process:1").unwrap(),
             connection_epoch: non_zero(9),
-            kind: RuntimeGatewayReadyKindV2::Resumed,
+            kind: RuntimeGatewayReadyKindV2::Ready,
             admission_revision: non_zero(10),
             connected_event_sequence: RuntimeGatewayAdmissionSequenceV2::new(non_zero(11)),
             resume_sequence: RuntimeGatewayAdmissionSequenceV2::new(non_zero(13)),
@@ -273,11 +273,15 @@ fn barrier_id() -> RuntimeBarrierIdV1 {
 }
 
 fn paused_gateway() -> RuntimePausedGatewayObservationV2 {
+    paused_gateway_with_kind(RuntimeGatewayReadyKindV2::Ready)
+}
+
+fn paused_gateway_with_kind(kind: RuntimeGatewayReadyKindV2) -> RuntimePausedGatewayObservationV2 {
     RuntimePausedGatewayObservationV2::new(
         RuntimeGatewayCoordinatorGenerationV2::new(non_zero(8)),
         ProcessInstanceId::parse("process:1").unwrap(),
         non_zero(9),
-        RuntimeGatewayReadyKindV2::Ready,
+        kind,
         non_zero(10),
         RuntimePausedGatewaySequenceV2::new(
             RuntimeGatewayAdmissionSequenceV2::new(non_zero(12)),
@@ -518,7 +522,10 @@ fn committed_receipt(
                 target: request.intent.target.clone(),
                 runtime_generation: request.intent.guard.runtime_generation,
                 process_instance_id: request.intent.process_identity.process_instance_id.clone(),
-                kind: GatewayReadyKindV1::DiscordResumed,
+                kind: match request.route_admission.gateway.kind {
+                    RuntimeGatewayReadyKindV2::Ready => GatewayReadyKindV1::DiscordReady,
+                    RuntimeGatewayReadyKindV2::Resumed => GatewayReadyKindV1::DiscordResumed,
+                },
                 ready_at: at(99),
             },
             at(100),
@@ -635,6 +642,21 @@ fn accepted_finalizer_owns_the_irreversible_job_and_commits_exactly() {
 }
 
 #[test]
+fn barrier_b_completion_preserves_the_discord_ready_kind() {
+    for kind in [
+        RuntimeGatewayReadyKindV2::Ready,
+        RuntimeGatewayReadyKindV2::Resumed,
+    ] {
+        let mut admission = route_admission();
+        admission.gateway.kind = kind;
+        let completed = prepared_fixture(CommitMode::Committed)
+            .complete_barrier_b_v2(barrier_id(), paused_gateway_with_kind(kind), admission)
+            .unwrap();
+        assert_eq!(completed.request().route_admission.gateway.kind, kind);
+    }
+}
+
+#[test]
 fn rollback_and_unknown_commit_have_disjoint_terminal_paths() {
     let outcome = complete(
         prepared_fixture(CommitMode::RolledBack)
@@ -721,7 +743,7 @@ fn barrier_b_completion_rejects_paused_or_resumed_gateway_drift() {
     ));
 
     let mut resume_drift = route_admission();
-    resume_drift.gateway.kind = RuntimeGatewayReadyKindV2::Ready;
+    resume_drift.gateway.kind = RuntimeGatewayReadyKindV2::Resumed;
     let failure = prepared_fixture(CommitMode::Committed)
         .complete_barrier_b_v2(barrier_id(), paused_gateway(), resume_drift)
         .unwrap_err();

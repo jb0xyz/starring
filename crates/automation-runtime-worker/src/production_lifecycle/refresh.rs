@@ -2,7 +2,7 @@ use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
 
 use automation_runtime_controller::{
-    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2,
+    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2,
     RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimeIngressOpenAcknowledgementReceiptV2,
     RuntimeIngressOpenAcknowledgementV2, RuntimePublishIngressOpenAcknowledgementInputV2,
     RuntimePublishIngressOpenAcknowledgementV2, RuntimeWriterFenceGenerationV1,
@@ -70,8 +70,7 @@ impl RuntimeServingOpenProcessV2 {
         }
         let acknowledgement = final_receipt.acknowledgement();
         let gateway_ready = epoch.gateway_ready();
-        if gateway_ready.kind != RuntimeGatewayReadyKindV2::Resumed
-            || !gateway_ready.was_explicitly_resumed()
+        if !gateway_ready.was_explicitly_resumed()
             || acknowledgement.process_instance_id() != epoch.process_instance_id()
             || acknowledgement.connection_epoch() != gateway_ready.connection_epoch
             || acknowledgement.admission_revision() != gateway_ready.admission_revision
@@ -110,7 +109,7 @@ pub(super) fn validate_serving_gateway_ready_refresh_v3(
         RuntimeServingGatewayReadyRefreshV3::Current => observed == current,
         RuntimeServingGatewayReadyRefreshV3::ResumedSuccessor => {
             observed.process_instance_id == current.process_instance_id
-                && observed.kind == RuntimeGatewayReadyKindV2::Resumed
+                && observed.kind == current.kind
                 && observed.connected_event_sequence == current.connected_event_sequence
                 && observed.resume_sequence > current.resume_sequence
                 && observed.was_explicitly_resumed()
