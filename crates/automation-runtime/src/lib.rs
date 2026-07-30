@@ -12,6 +12,7 @@ pub mod resume;
 pub mod runner;
 pub mod shared_gateway_admission;
 pub mod shared_gateway_control;
+pub mod shared_gateway_dispatcher;
 pub mod shared_gateway_executor;
 pub mod shared_gateway_router;
 pub mod shared_gateway_runtime;
@@ -66,6 +67,18 @@ pub use shared_gateway_control::{
     GatewayPausedConnectionV3, GatewayReadyKindV3, GatewayReadyLeaseV3,
     GatewayReservedResumeCommandV3, GatewayRuntimeCommandOutcomeV3,
     GatewaySynchronousInvalidatorV3, SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
+};
+pub use shared_gateway_dispatcher::{
+    dispatch_reserved_shared_gateway_interaction_v3, reserve_shared_gateway_interaction_v3,
+    SharedGatewayInteractionApplicationIdV3, SharedGatewayInteractionDispatchOutcomeV3,
+    SharedGatewayInteractionEnvelopeErrorV3, SharedGatewayInteractionEnvelopeV3,
+    SharedGatewayInteractionIdV3, SharedGatewayInteractionIdentityV3,
+    SharedGatewayInteractionKindV3, SharedGatewayInteractionRejectionV3,
+    SharedGatewayInteractionReservationOutcomeV3, SharedGatewayInteractionTokenV3,
+    SharedGatewayModalInputV3, SharedGatewayReservedInteractionV3,
+    MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3, MAX_SHARED_GATEWAY_INTERACTION_LOCALE_BYTES_V3,
+    MAX_SHARED_GATEWAY_INTERACTION_TOKEN_BYTES_V3, MAX_SHARED_GATEWAY_MODAL_INPUTS_V3,
+    MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3, MAX_SHARED_GATEWAY_MODAL_PAYLOAD_BYTES_V3,
 };
 pub use shared_gateway_executor::execute_admitted_interaction_v3;
 pub use shared_gateway_router::{

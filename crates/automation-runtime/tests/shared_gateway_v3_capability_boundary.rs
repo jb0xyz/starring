@@ -22,8 +22,9 @@ fn shared_gateway_v3_has_only_narrow_instance_and_pin_capabilities() {
     let runtime = production_prefix(include_str!("../src/shared_gateway_runtime.rs"));
     let executor = production_prefix(include_str!("../src/shared_gateway_executor.rs"));
     let admission = production_prefix(include_str!("../src/shared_gateway_admission.rs"));
+    let dispatcher = production_prefix(include_str!("../src/shared_gateway_dispatcher.rs"));
     let router = production_prefix(include_str!("../src/shared_gateway_router.rs"));
-    let combined = [runtime, executor, admission, router].join("\n");
+    let combined = [runtime, executor, admission, dispatcher, router].join("\n");
     assert!(runtime.contains("PinnedInstanceResolverV1"));
     assert!(runtime.contains("InstanceRegistrarV1"));
     assert!(runtime.contains("InstanceRouteReaderV1"));
@@ -34,6 +35,32 @@ fn shared_gateway_v3_has_only_narrow_instance_and_pin_capabilities() {
     assert!(!combined.contains("&impl InstanceStore"));
     assert!(!combined.contains("I: InstanceStore"));
     assert_forbidden_calls_absent(&combined);
+}
+
+#[test]
+fn shard_runtime_delegates_to_the_source_neutral_dispatcher() {
+    let runtime = production_prefix(include_str!("../src/shared_gateway_runtime.rs"));
+    let dispatcher = production_prefix(include_str!("../src/shared_gateway_dispatcher.rs"));
+    assert!(runtime.contains("SharedGatewayInteractionEnvelopeV3::from_twilight_interaction_v3"));
+    assert!(runtime.contains("reserve_shared_gateway_interaction_v3("));
+    assert!(runtime.contains("dispatch_reserved_shared_gateway_interaction_v3("));
+    for forbidden in [
+        "parse_shared_gateway_route_v1",
+        "admission_budget.try_reserve",
+        "execute_admitted_interaction_v3(",
+    ] {
+        assert!(!runtime.contains(forbidden), "{forbidden}");
+    }
+    assert!(!dispatcher.contains("twilight_gateway"));
+    assert!(!dispatcher.contains("Shard"));
+    assert!(dispatcher.contains("token: SharedGatewayInteractionTokenV3"));
+    assert!(dispatcher.contains("pub struct SharedGatewayInteractionTokenV3(Zeroizing<String>)"));
+    assert!(dispatcher.contains("pub(crate) fn from_twilight_interaction_v3("));
+    assert!(dispatcher.contains("impl Drop for ZeroizingTwilightInteractionV3"));
+    assert!(dispatcher.contains("zeroize_twilight_interaction_v3(&mut self.0)"));
+    assert!(dispatcher.contains(
+        "pub fn reserve_shared_gateway_interaction_v3(\n    envelope: SharedGatewayInteractionEnvelopeV3,"
+    ));
 }
 
 #[test]

@@ -10,6 +10,7 @@ use twilight_model::http::interaction::{
 };
 use twilight_model::id::marker::{ApplicationMarker, InteractionMarker};
 use twilight_model::id::Id;
+use zeroize::Zeroizing;
 
 use crate::custom_id;
 use crate::error::classify_error;
@@ -18,7 +19,7 @@ pub struct TwilightInteractionResponder<'a> {
     http: &'a Client,
     application_id: Id<ApplicationMarker>,
     interaction_id: Id<InteractionMarker>,
-    interaction_token: String,
+    interaction_token: Zeroizing<String>,
     guild_id: GuildId,
     ruleset_key: String,
 }
@@ -33,7 +34,7 @@ impl<'a> TwilightInteractionResponder<'a> {
             http,
             application_id: interaction.application_id,
             interaction_id: interaction.id,
-            interaction_token: interaction.token.clone(),
+            interaction_token: Zeroizing::new(interaction.token.clone()),
             guild_id: GuildId(interaction.guild_id.map_or(0, |guild| guild.get())),
             ruleset_key: ruleset_key.to_string(),
         }
