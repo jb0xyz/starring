@@ -15,7 +15,7 @@ pub use keychain::{
 
 pub const DATABASE_NAME: &str = "starring_runtime_staging";
 pub const OWNER_ROLE: &str = "starring_owner";
-pub const RELATION_COUNT: i64 = 171;
+pub const RELATION_COUNT: i64 = 174;
 pub const CAPABILITY_FUNCTION_COUNT: usize = 113;
 pub const CLUSTER_ADMIN_ROLE: &str = "starring_cluster_admin";
 pub const PEER_MAP_NAME: &str = "starring_bootstrap";
@@ -1084,7 +1084,7 @@ mod tests {
     fn fixed_identities_are_not_configurable() {
         assert_eq!(DATABASE_NAME, "starring_runtime_staging");
         assert_eq!(OWNER_ROLE, "starring_owner");
-        assert_eq!(RELATION_COUNT, 171);
+        assert_eq!(RELATION_COUNT, 174);
         assert_eq!(CAPABILITY_FUNCTION_COUNT, 113);
         assert_eq!(CLUSTER_ADMIN_ROLE, "starring_cluster_admin");
         assert_eq!(PEER_MAP_NAME, "starring_bootstrap");
@@ -1190,6 +1190,6 @@ mod tests {
             "ALTER SCHEMA public OWNER TO starring_owner"
         );
         assert!(VERIFY_PUBLIC_SCHEMA_SQL.contains("owner.rolname = 'starring_owner'"));
-        assert_eq!(RELATION_COUNT, 171);
+        assert_eq!(RELATION_COUNT, 174);
     }
 }
