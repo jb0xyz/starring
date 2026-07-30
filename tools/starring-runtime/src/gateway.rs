@@ -14,8 +14,8 @@ use automation_runtime::{
     GatewaySynchronousInvalidatorV3, SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
 };
 use automation_runtime_controller::{
-    GatewayShardIdV1, RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayReadyAttestationV2,
-    RuntimeGatewayReadyKindV2, RuntimeRecoveryIdV2,
+    GatewayShardIdV1, RuntimeBarrierIdV1, RuntimeGatewayAdmissionSequenceV2,
+    RuntimeGatewayReadyAttestationV2, RuntimeGatewayReadyKindV2, RuntimeRecoveryIdV2,
 };
 use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_worker::{
@@ -58,7 +58,12 @@ use crate::gateway_owner_startup_watchdog::{
 };
 use crate::lifecycle_timing::RuntimeLifecycleTimingRecorderV2;
 use crate::process_supervisor::RuntimeProcessInvalidationTriggerV1;
-use crate::registry::RuntimeLockedRegistryEmptyEvidenceV2;
+use crate::registry::{
+    RuntimeLockedRegistryEmptyEvidenceV2, RuntimeRegistryBarrierBActivationEvidenceV2,
+    RuntimeRegistryBarrierBActivationV2, RuntimeRegistryBarrierBServingAuthorityV2,
+    RuntimeRegistryBarrierBServingCompletionWitnessV2, RuntimeRegistryBarrierBServingErrorV2,
+    RuntimeRegistryBarrierBServingMonitorAuthorityV2,
+};
 use crate::shutdown::RuntimeShutdownObserverV1;
 use crate::{
     GatewayResourceConfigV1, RuntimeDiscordBotTokenV1, RuntimeGatewayOwnerStartupWatchdogConfigV1,
@@ -1045,6 +1050,271 @@ impl Debug for RuntimeDiscordOrdinaryBarrierResumeEvidenceV3 {
     }
 }
 
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct RuntimeDiscordCertificationBarrierBPausedV2 {
+    barrier_id: RuntimeBarrierIdV1,
+    reservation: RuntimeDiscordOrdinaryBarrierReservationV3,
+    paused_gateway: RuntimePausedGatewayObservationV2,
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct RuntimeDiscordCertificationBarrierBActivatedV2 {
+    paused: RuntimeDiscordCertificationBarrierBPausedV2,
+    registry_activation: RuntimeRegistryBarrierBActivationV2,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct RuntimeResumedGatewayObservationV2 {
+    paused: RuntimePausedGatewayObservationV2,
+    ready: RuntimeGatewayReadyAttestationV2,
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct RuntimeDiscordCertificationBarrierBResumedV2 {
+    barrier_id: RuntimeBarrierIdV1,
+    resume_evidence: RuntimeDiscordOrdinaryBarrierResumeEvidenceV3,
+    gateway: RuntimeResumedGatewayObservationV2,
+    registry_activation: RuntimeRegistryBarrierBActivationV2,
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2 {
+    barrier_id: RuntimeBarrierIdV1,
+    resume_evidence: RuntimeDiscordOrdinaryBarrierResumeEvidenceV3,
+    gateway: RuntimeResumedGatewayObservationV2,
+    activation_evidence: RuntimeRegistryBarrierBActivationEvidenceV2,
+    serving_completion: RuntimeRegistryBarrierBServingCompletionWitnessV2,
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct RuntimeDiscordCertificationBarrierBCompletedV2 {
+    barrier_id: RuntimeBarrierIdV1,
+    gateway: RuntimeResumedGatewayObservationV2,
+    activation_evidence: RuntimeRegistryBarrierBActivationEvidenceV2,
+}
+
+#[allow(dead_code)]
+pub(crate) enum RuntimeDiscordCertificationBarrierBPauseOutcomeV2 {
+    Applied(RuntimeDiscordCertificationBarrierBPausedV2),
+    DefinitelyNotApplied(RuntimeDiscordOrdinaryBarrierFailureV3),
+    Indeterminate(RuntimeDiscordOrdinaryBarrierFailureV3),
+}
+
+#[allow(dead_code)]
+pub(crate) enum RuntimeDiscordCertificationBarrierBResumeOutcomeV2 {
+    Applied(RuntimeDiscordCertificationBarrierBResumedV2),
+    DefinitelyNotApplied {
+        activated: RuntimeDiscordCertificationBarrierBActivatedV2,
+        failure: RuntimeDiscordOrdinaryBarrierFailureV3,
+    },
+    Indeterminate(RuntimeDiscordCertificationBarrierBFailureV2),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[allow(dead_code)]
+pub(crate) enum RuntimeDiscordCertificationBarrierBFailureV2 {
+    #[error("runtime Discord certification Barrier B gateway transition failed")]
+    Gateway(RuntimeDiscordOrdinaryBarrierFailureV3),
+    #[error("runtime Discord certification Barrier B serving authority failed")]
+    Registry(RuntimeRegistryBarrierBServingErrorV2),
+}
+
+#[allow(dead_code)]
+impl RuntimeDiscordCertificationBarrierBPausedV2 {
+    pub(crate) fn barrier_id_v2(&self) -> &RuntimeBarrierIdV1 {
+        &self.barrier_id
+    }
+
+    pub(crate) fn paused_gateway_v2(&self) -> &RuntimePausedGatewayObservationV2 {
+        &self.paused_gateway
+    }
+
+    pub(crate) fn bind_registry_activation_v2(
+        self,
+        registry_activation: RuntimeRegistryBarrierBActivationV2,
+    ) -> RuntimeDiscordCertificationBarrierBActivatedV2 {
+        RuntimeDiscordCertificationBarrierBActivatedV2 {
+            paused: self,
+            registry_activation,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl RuntimeDiscordCertificationBarrierBActivatedV2 {
+    pub(crate) fn barrier_id_v2(&self) -> &RuntimeBarrierIdV1 {
+        self.paused.barrier_id_v2()
+    }
+
+    pub(crate) fn paused_gateway_v2(&self) -> &RuntimePausedGatewayObservationV2 {
+        self.paused.paused_gateway_v2()
+    }
+
+    pub(crate) fn activation_evidence_v2(&self) -> &RuntimeRegistryBarrierBActivationEvidenceV2 {
+        self.registry_activation.evidence_v2()
+    }
+}
+
+#[allow(dead_code)]
+impl RuntimeResumedGatewayObservationV2 {
+    fn from_exact_v2(
+        paused: RuntimePausedGatewayObservationV2,
+        ready: RuntimeGatewayReadyAttestationV2,
+    ) -> Option<Self> {
+        if !ready.was_explicitly_resumed()
+            || ready.process_instance_id != *paused.process_instance_id()
+            || ready.connection_epoch != paused.connection_epoch()
+            || ready.admission_revision != paused.admission_revision()
+            || ready.connected_event_sequence != paused.connected_event_sequence()
+            || ready.resume_sequence <= paused.transition_sequence()
+        {
+            return None;
+        }
+        Some(Self { paused, ready })
+    }
+
+    pub(crate) fn paused_v2(&self) -> &RuntimePausedGatewayObservationV2 {
+        &self.paused
+    }
+
+    pub(crate) fn ready_v2(&self) -> &RuntimeGatewayReadyAttestationV2 {
+        &self.ready
+    }
+}
+
+#[allow(dead_code)]
+impl RuntimeDiscordCertificationBarrierBResumedV2 {
+    pub(crate) fn barrier_id_v2(&self) -> &RuntimeBarrierIdV1 {
+        &self.barrier_id
+    }
+
+    pub(crate) fn gateway_v2(&self) -> &RuntimeResumedGatewayObservationV2 {
+        &self.gateway
+    }
+
+    pub(crate) fn activation_evidence_v2(&self) -> &RuntimeRegistryBarrierBActivationEvidenceV2 {
+        self.registry_activation.evidence_v2()
+    }
+
+    pub(crate) fn serving_authority_v2(&self) -> &RuntimeRegistryBarrierBServingAuthorityV2 {
+        self.registry_activation.serving_authority_v2()
+    }
+
+    pub(crate) fn prepare_serving_monitor_v2(
+        self,
+    ) -> Result<
+        (
+            RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2,
+            RuntimeRegistryBarrierBServingMonitorAuthorityV2,
+        ),
+        RuntimeDiscordCertificationBarrierBFailureV2,
+    > {
+        let RuntimeDiscordCertificationBarrierBResumedV2 {
+            barrier_id,
+            resume_evidence,
+            gateway,
+            registry_activation,
+        } = self;
+        let (activation_evidence, serving_authority) = registry_activation.into_parts_v2();
+        let (monitor, serving_completion) = serving_authority
+            .into_serving_monitor_with_completion_v2()
+            .map_err(RuntimeDiscordCertificationBarrierBFailureV2::Registry)?;
+        Ok((
+            RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2 {
+                barrier_id,
+                resume_evidence,
+                gateway,
+                activation_evidence,
+                serving_completion,
+            },
+            monitor,
+        ))
+    }
+}
+
+#[allow(dead_code)]
+impl RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2 {
+    pub(crate) fn barrier_id_v2(&self) -> &RuntimeBarrierIdV1 {
+        &self.barrier_id
+    }
+
+    pub(crate) fn gateway_v2(&self) -> &RuntimeResumedGatewayObservationV2 {
+        &self.gateway
+    }
+
+    pub(crate) fn activation_evidence_v2(&self) -> &RuntimeRegistryBarrierBActivationEvidenceV2 {
+        &self.activation_evidence
+    }
+}
+
+#[allow(dead_code)]
+impl RuntimeDiscordCertificationBarrierBCompletedV2 {
+    pub(crate) fn barrier_id_v2(&self) -> &RuntimeBarrierIdV1 {
+        &self.barrier_id
+    }
+
+    pub(crate) fn gateway_v2(&self) -> &RuntimeResumedGatewayObservationV2 {
+        &self.gateway
+    }
+
+    pub(crate) fn activation_evidence_v2(&self) -> &RuntimeRegistryBarrierBActivationEvidenceV2 {
+        &self.activation_evidence
+    }
+
+    pub(crate) fn into_parts_v2(
+        self,
+    ) -> (
+        RuntimeBarrierIdV1,
+        RuntimeResumedGatewayObservationV2,
+        RuntimeRegistryBarrierBActivationEvidenceV2,
+    ) {
+        (self.barrier_id, self.gateway, self.activation_evidence)
+    }
+}
+
+impl Debug for RuntimeDiscordCertificationBarrierBPausedV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeDiscordCertificationBarrierBPausedV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeDiscordCertificationBarrierBActivatedV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeDiscordCertificationBarrierBActivatedV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeResumedGatewayObservationV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeResumedGatewayObservationV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeDiscordCertificationBarrierBResumedV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeDiscordCertificationBarrierBResumedV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .write_str("RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeDiscordCertificationBarrierBCompletedV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeDiscordCertificationBarrierBCompletedV2(<redacted>)")
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeDiscordOrdinaryBarrierPortV3 {
     commands: mpsc::Sender<RuntimeDiscordControlCommandV1>,
@@ -1470,6 +1740,179 @@ impl RuntimeGatewayProductionCoordinatorV2 {
             return Err(RuntimeDiscordOrdinaryBarrierFailureV3::StaleAuthority);
         }
         Ok(RuntimeDiscordOrdinaryBarrierPortV3 { commands })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn pause_certification_barrier_b_v2(
+        &self,
+        port: &RuntimeDiscordOrdinaryBarrierPortV3,
+        barrier_id: RuntimeBarrierIdV1,
+        coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+        deadline: Instant,
+    ) -> RuntimeDiscordCertificationBarrierBPauseOutcomeV2 {
+        match port.pause_v3(coordinator_generation, deadline).await {
+            RuntimeDiscordOrdinaryBarrierPauseOutcomeV3::Applied(reservation) => {
+                match self.observe_exact_paused_ordinary_barrier_v3(&reservation) {
+                    Ok(paused_gateway) => {
+                        RuntimeDiscordCertificationBarrierBPauseOutcomeV2::Applied(
+                            RuntimeDiscordCertificationBarrierBPausedV2 {
+                                barrier_id,
+                                reservation,
+                                paused_gateway,
+                            },
+                        )
+                    }
+                    Err(_) => {
+                        self.interrupt.trip_invalidation(
+                            RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+                        );
+                        RuntimeDiscordCertificationBarrierBPauseOutcomeV2::Indeterminate(
+                            RuntimeDiscordOrdinaryBarrierFailureV3::Indeterminate,
+                        )
+                    }
+                }
+            }
+            RuntimeDiscordOrdinaryBarrierPauseOutcomeV3::DefinitelyNotApplied(failure) => {
+                RuntimeDiscordCertificationBarrierBPauseOutcomeV2::DefinitelyNotApplied(failure)
+            }
+            RuntimeDiscordOrdinaryBarrierPauseOutcomeV3::Indeterminate(failure) => {
+                RuntimeDiscordCertificationBarrierBPauseOutcomeV2::Indeterminate(failure)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn resume_certification_barrier_b_v2(
+        &self,
+        port: &RuntimeDiscordOrdinaryBarrierPortV3,
+        activated: RuntimeDiscordCertificationBarrierBActivatedV2,
+        deadline: Instant,
+    ) -> RuntimeDiscordCertificationBarrierBResumeOutcomeV2 {
+        if let Err(error) = activated
+            .registry_activation
+            .serving_authority_v2()
+            .ensure_exact_serving_v2()
+        {
+            self.interrupt
+                .trip_invalidation(RuntimeGatewayInvalidationCauseV2::ProtocolViolation);
+            return RuntimeDiscordCertificationBarrierBResumeOutcomeV2::Indeterminate(
+                RuntimeDiscordCertificationBarrierBFailureV2::Registry(error),
+            );
+        }
+        let RuntimeDiscordCertificationBarrierBActivatedV2 {
+            paused,
+            registry_activation,
+        } = activated;
+        let RuntimeDiscordCertificationBarrierBPausedV2 {
+            barrier_id,
+            reservation,
+            paused_gateway,
+        } = paused;
+        match port.resume_v3(reservation, deadline).await {
+            RuntimeDiscordOrdinaryBarrierResumeOutcomeV3::Applied(resume_evidence) => {
+                let ready = match self
+                    .observe_exact_resumed_ordinary_barrier_ready_v3(&resume_evidence)
+                {
+                    Ok(ready) => ready,
+                    Err(_) => {
+                        self.interrupt.trip_invalidation(
+                            RuntimeGatewayInvalidationCauseV2::ProtocolViolation,
+                        );
+                        return RuntimeDiscordCertificationBarrierBResumeOutcomeV2::Indeterminate(
+                            RuntimeDiscordCertificationBarrierBFailureV2::Gateway(
+                                RuntimeDiscordOrdinaryBarrierFailureV3::Indeterminate,
+                            ),
+                        );
+                    }
+                };
+                let Some(gateway) =
+                    RuntimeResumedGatewayObservationV2::from_exact_v2(paused_gateway, ready)
+                else {
+                    self.interrupt
+                        .trip_invalidation(RuntimeGatewayInvalidationCauseV2::ProtocolViolation);
+                    return RuntimeDiscordCertificationBarrierBResumeOutcomeV2::Indeterminate(
+                        RuntimeDiscordCertificationBarrierBFailureV2::Gateway(
+                            RuntimeDiscordOrdinaryBarrierFailureV3::Indeterminate,
+                        ),
+                    );
+                };
+                if let Err(error) = registry_activation
+                    .serving_authority_v2()
+                    .ensure_exact_serving_v2()
+                {
+                    self.interrupt
+                        .trip_invalidation(RuntimeGatewayInvalidationCauseV2::ProtocolViolation);
+                    return RuntimeDiscordCertificationBarrierBResumeOutcomeV2::Indeterminate(
+                        RuntimeDiscordCertificationBarrierBFailureV2::Registry(error),
+                    );
+                }
+                RuntimeDiscordCertificationBarrierBResumeOutcomeV2::Applied(
+                    RuntimeDiscordCertificationBarrierBResumedV2 {
+                        barrier_id,
+                        resume_evidence,
+                        gateway,
+                        registry_activation,
+                    },
+                )
+            }
+            RuntimeDiscordOrdinaryBarrierResumeOutcomeV3::DefinitelyNotApplied {
+                reservation,
+                failure,
+            } => RuntimeDiscordCertificationBarrierBResumeOutcomeV2::DefinitelyNotApplied {
+                activated: RuntimeDiscordCertificationBarrierBActivatedV2 {
+                    paused: RuntimeDiscordCertificationBarrierBPausedV2 {
+                        barrier_id,
+                        reservation,
+                        paused_gateway,
+                    },
+                    registry_activation,
+                },
+                failure,
+            },
+            RuntimeDiscordOrdinaryBarrierResumeOutcomeV3::Indeterminate(failure) => {
+                self.interrupt
+                    .trip_invalidation(RuntimeGatewayInvalidationCauseV2::ProtocolViolation);
+                RuntimeDiscordCertificationBarrierBResumeOutcomeV2::Indeterminate(
+                    RuntimeDiscordCertificationBarrierBFailureV2::Gateway(failure),
+                )
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn complete_certification_barrier_b_v2(
+        &self,
+        pending: RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2,
+        authority: RuntimeServingOpenBarrierCompletionAuthorityV3,
+    ) -> Result<
+        RuntimeDiscordCertificationBarrierBCompletedV2,
+        RuntimeDiscordCertificationBarrierBFailureV2,
+    > {
+        let RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2 {
+            barrier_id,
+            resume_evidence,
+            gateway,
+            activation_evidence,
+            serving_completion,
+        } = pending;
+        let _serving_guard = serving_completion
+            .lock_exact_serving_v2()
+            .map_err(RuntimeDiscordCertificationBarrierBFailureV2::Registry)?;
+        let ready = self
+            .complete_ordinary_barrier_v3(resume_evidence, authority)
+            .map_err(RuntimeDiscordCertificationBarrierBFailureV2::Gateway)?;
+        if ready != *gateway.ready_v2() {
+            self.interrupt
+                .trip_invalidation(RuntimeGatewayInvalidationCauseV2::ProtocolViolation);
+            return Err(RuntimeDiscordCertificationBarrierBFailureV2::Gateway(
+                RuntimeDiscordOrdinaryBarrierFailureV3::Indeterminate,
+            ));
+        }
+        Ok(RuntimeDiscordCertificationBarrierBCompletedV2 {
+            barrier_id,
+            gateway,
+            activation_evidence,
+        })
     }
 
     #[allow(dead_code)]
@@ -4752,11 +5195,13 @@ mod tests {
         GatewayInvalidationSignalV3, GatewayLifecycleEventV3, GatewayPauseTokenV3,
         GatewayReadyKindV3, GatewayRuntimeCommandOutcomeV3, GatewaySynchronousInvalidatorV3,
     };
+    use automation_runtime_controller::RuntimeBarrierIdV1;
     use automation_runtime_convergence::ProcessInstanceId;
     use automation_runtime_worker::{
         RuntimeClosedRecoveryAuthorityRevisionV2, RuntimeGatewayClosedSnapshotV2,
         RuntimeGatewayCoordinatorGenerationV2, RuntimeGatewayEmergencyCauseV2,
-        RuntimeGatewayInvalidationCauseV2,
+        RuntimeGatewayInvalidationCauseV2, RuntimePausedGatewayObservationV2,
+        RuntimeServingOpenBarrierCompletionAuthorityV3,
     };
     use tokio::sync::watch;
 
@@ -4769,6 +5214,10 @@ mod tests {
     use super::{
         compose_with_control_config, pause_ordinary_discord_admission_v3,
         resume_ordinary_discord_admission_v3, resume_reserved_discord_admission_v2,
+        RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2,
+        RuntimeDiscordCertificationBarrierBCompletedV2,
+        RuntimeDiscordCertificationBarrierBFailureV2, RuntimeDiscordCertificationBarrierBPausedV2,
+        RuntimeDiscordCertificationBarrierBResumedV2,
         RuntimeDiscordOrdinaryBarrierControlContextV3, RuntimeDiscordOrdinaryBarrierFailureV3,
         RuntimeDiscordOrdinaryBarrierPauseOutcomeV3, RuntimeDiscordOrdinaryBarrierResumeEvidenceV3,
         RuntimeDiscordOrdinaryBarrierResumeOutcomeV3, RuntimeDiscordReservedResumeControlContextV2,
@@ -4777,7 +5226,8 @@ mod tests {
         RuntimeGatewayInvalidationBridgeV2, RuntimeGatewayOrdinaryBarrierStateV3,
         RuntimeGatewayOwnerInvalidationBridgeV2, RuntimeGatewayProductionCoordinatorV2,
         RuntimeGatewayReadyInvalidationV2, RuntimeGatewayReadyObservationErrorV1,
-        SharedGatewayControlAdapterV2, SharedGatewayRuntimeHalfV3,
+        RuntimeResumedGatewayObservationV2, SharedGatewayControlAdapterV2,
+        SharedGatewayRuntimeHalfV3,
     };
 
     struct TestPauseTokenV1(GatewayPauseTokenV3);
@@ -4970,6 +5420,8 @@ mod tests {
     struct TestOrdinaryBarrierResumedFixtureV3 {
         fixture: TestProductionReadyFixtureV2,
         authorization: watch::Receiver<RuntimeDiscordOrdinaryResumeAuthorizationV3>,
+        barrier_id: RuntimeBarrierIdV1,
+        paused_gateway: RuntimePausedGatewayObservationV2,
         evidence: RuntimeDiscordOrdinaryBarrierResumeEvidenceV3,
     }
 
@@ -5119,27 +5571,42 @@ mod tests {
             RuntimeDiscordOrdinaryBarrierPauseOutcomeV3::Applied(reservation) => reservation,
             _ => panic!("ordinary pause was not applied"),
         };
-        let paused = fixture
+        let paused_gateway = fixture
             .production
             .observe_exact_paused_ordinary_barrier_v3(&reservation)
             .unwrap();
-        assert_eq!(paused.coordinator_generation(), generation);
+        assert_eq!(paused_gateway.coordinator_generation(), generation);
         assert_eq!(
-            paused.connection_epoch().get(),
+            paused_gateway.connection_epoch().get(),
             reservation.connection_epoch_v3()
         );
         assert_eq!(
-            paused.admission_revision().get(),
+            paused_gateway.admission_revision().get(),
             reservation.admission_revision_v3()
         );
         assert_eq!(
-            paused.transition_sequence().get(),
+            paused_gateway.transition_sequence().get(),
             reservation.pause_sequence_v3()
         );
         assert_eq!(
-            paused.connected_event_sequence().get(),
+            paused_gateway.connected_event_sequence().get(),
             reservation.connected_event_sequence_v3()
         );
+        let barrier_id = RuntimeBarrierIdV1::parse("00112233445566778899aabbccddeeff").unwrap();
+        let paused = RuntimeDiscordCertificationBarrierBPausedV2 {
+            barrier_id,
+            reservation,
+            paused_gateway,
+        };
+        assert_eq!(
+            paused.barrier_id_v2().as_str(),
+            "00112233445566778899aabbccddeeff"
+        );
+        let RuntimeDiscordCertificationBarrierBPausedV2 {
+            barrier_id,
+            reservation,
+            paused_gateway,
+        } = paused;
         let (resume_outcome, runtime_resume_outcome) = tokio::join!(
             resume_ordinary_discord_admission_v3(
                 RuntimeDiscordOrdinaryBarrierControlContextV3 {
@@ -5194,6 +5661,8 @@ mod tests {
         TestOrdinaryBarrierResumedFixtureV3 {
             fixture,
             authorization,
+            barrier_id,
+            paused_gateway,
             evidence,
         }
     }
@@ -5658,6 +6127,210 @@ mod tests {
                 ..
             }) if coordinator_generation == generation
         ));
+    }
+
+    #[tokio::test]
+    async fn certification_barrier_b_binds_exact_identity_and_resumed_gateway_without_release() {
+        let resumed = ordinary_barrier_resumed_fixture_v3().await;
+        let generation = coordinator_generation(3);
+        let ready = resumed
+            .fixture
+            .production
+            .observe_exact_resumed_ordinary_barrier_ready_v3(&resumed.evidence)
+            .unwrap();
+        let gateway =
+            RuntimeResumedGatewayObservationV2::from_exact_v2(resumed.paused_gateway, ready)
+                .unwrap();
+
+        assert_eq!(
+            resumed.barrier_id.as_str(),
+            "00112233445566778899aabbccddeeff"
+        );
+        assert_eq!(
+            gateway.paused_v2().coordinator_generation(),
+            coordinator_generation(3)
+        );
+        assert_eq!(
+            gateway.paused_v2().connection_epoch(),
+            gateway.ready_v2().connection_epoch
+        );
+        assert_eq!(
+            gateway.paused_v2().admission_revision(),
+            gateway.ready_v2().admission_revision
+        );
+        assert!(gateway.ready_v2().resume_sequence > gateway.paused_v2().transition_sequence());
+        let mut foreign_ready = gateway.ready_v2().clone();
+        foreign_ready.process_instance_id =
+            ProcessInstanceId::parse("runtime-process:foreign").unwrap();
+        assert!(RuntimeResumedGatewayObservationV2::from_exact_v2(
+            gateway.paused_v2().clone(),
+            foreign_ready,
+        )
+        .is_none());
+        assert!(matches!(
+            resumed
+                .fixture
+                .production
+                .interrupt
+                .current_observation_v2()
+                .ordinary_barrier,
+            Some(RuntimeGatewayOrdinaryBarrierStateV3::Resumed {
+                coordinator_generation,
+                ..
+            }) if coordinator_generation == generation
+        ));
+    }
+
+    #[tokio::test]
+    async fn certification_monitor_loss_invalidates_completion_without_releasing_the_barrier() {
+        let resumed = ordinary_barrier_resumed_fixture_v3().await;
+        let generation = coordinator_generation(3);
+        let ready = resumed
+            .fixture
+            .production
+            .observe_exact_resumed_ordinary_barrier_ready_v3(&resumed.evidence)
+            .unwrap();
+        let gateway =
+            RuntimeResumedGatewayObservationV2::from_exact_v2(resumed.paused_gateway, ready)
+                .unwrap();
+        let registry_activation =
+            crate::registry::barrier_b_activation_for_gateway_test_v2("runtime-process:1");
+        let transition = RuntimeDiscordCertificationBarrierBResumedV2 {
+            barrier_id: resumed.barrier_id,
+            resume_evidence: resumed.evidence,
+            gateway,
+            registry_activation,
+        };
+        let (pending, monitor) = transition.prepare_serving_monitor_v2().unwrap();
+
+        assert_eq!(
+            pending.barrier_id_v2().as_str(),
+            "00112233445566778899aabbccddeeff"
+        );
+        drop(monitor);
+        assert!(matches!(
+            pending.serving_completion.lock_exact_serving_v2(),
+            Err(crate::registry::RuntimeRegistryBarrierBServingErrorV2::ExactServingLost)
+        ));
+        assert!(matches!(
+            resumed
+                .fixture
+                .production
+                .interrupt
+                .current_observation_v2()
+                .ordinary_barrier,
+            Some(RuntimeGatewayOrdinaryBarrierStateV3::Resumed {
+                coordinator_generation,
+                ..
+            }) if coordinator_generation == generation
+        ));
+    }
+
+    #[tokio::test]
+    async fn certification_activation_failure_returns_the_exact_paused_authority() {
+        let mut fixture = production_ready_fixture_v2().await;
+        let generation = coordinator_generation(3);
+        let (ordinary_resume_authorization, authorization) =
+            watch::channel(RuntimeDiscordOrdinaryResumeAuthorizationV3::Inactive);
+        let (_ordinary_resume_actor_observation, mut actor_observation) =
+            watch::channel(RuntimeDiscordOrdinaryResumeActorObservationV3::Inactive);
+        fixture.production.ordinary_resume_authorization =
+            Some(ordinary_resume_authorization.clone());
+        fixture.production.ordinary_resume_actor_observation = Some(actor_observation.clone());
+        let (lifecycle_drained, _) = watch::channel(1);
+        let mut lifecycle_sequence = 1;
+        let mut ordinary_correlation = 0;
+        let mut pause_token = None;
+        let (pause_outcome, runtime_pause_outcome) = tokio::join!(
+            pause_ordinary_discord_admission_v3(
+                RuntimeDiscordOrdinaryBarrierControlContextV3 {
+                    control: fixture
+                        .bootstrap
+                        .adapter
+                        .control
+                        .as_mut()
+                        .expect("gateway control half"),
+                    pause_token: &mut pause_token,
+                    coordinator: &fixture.production.interrupt,
+                    lifecycle_drained: &lifecycle_drained,
+                    lifecycle_sequence: &mut lifecycle_sequence,
+                    discord_reservation: &fixture.discord_reservation,
+                    ordinary_resume_authorization: &ordinary_resume_authorization,
+                    ordinary_resume_actor_observation: &mut actor_observation,
+                },
+                &mut ordinary_correlation,
+                generation,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            fixture
+                .bootstrap
+                ._runtime
+                .as_mut()
+                .expect("gateway runtime half")
+                ._inner
+                .process_next_command(),
+        );
+        assert!(matches!(
+            runtime_pause_outcome,
+            GatewayRuntimeCommandOutcomeV3::Applied(GatewayCommandAckV3::Paused { .. })
+        ));
+        let RuntimeDiscordOrdinaryBarrierPauseOutcomeV3::Applied(reservation) = pause_outcome
+        else {
+            panic!("ordinary pause was not applied")
+        };
+        let paused_gateway = fixture
+            .production
+            .observe_exact_paused_ordinary_barrier_v3(&reservation)
+            .unwrap();
+        let barrier_id = RuntimeBarrierIdV1::parse("ffeeddccbbaa99887766554433221100").unwrap();
+        let paused = RuntimeDiscordCertificationBarrierBPausedV2 {
+            barrier_id,
+            reservation,
+            paused_gateway,
+        };
+        let replacement = crate::registry::nonfinal_barrier_b_replacement_for_gateway_test_v2(
+            "runtime-process:1",
+        );
+
+        let failure = replacement
+            .activate_certification_barrier_b_v2(paused)
+            .unwrap_err();
+
+        assert_eq!(
+            failure.paused_v2().barrier_id_v2().as_str(),
+            "ffeeddccbbaa99887766554433221100"
+        );
+        assert_eq!(
+            failure.source_v2(),
+            &crate::registry::RuntimeRegistryBarrierBActivationErrorV2::PredecessorNotFinal
+        );
+        let (paused, source) = failure.into_parts_v2();
+        assert_eq!(
+            source,
+            crate::registry::RuntimeRegistryBarrierBActivationErrorV2::PredecessorNotFinal
+        );
+        assert_eq!(
+            paused.paused_gateway_v2().coordinator_generation(),
+            generation
+        );
+        assert!(pause_token.is_some());
+        assert!(matches!(
+            *authorization.borrow(),
+            RuntimeDiscordOrdinaryResumeAuthorizationV3::Inactive
+        ));
+    }
+
+    #[test]
+    fn certification_completion_surface_requires_nonforgeable_ack_authority() {
+        let completion: fn(
+            &RuntimeGatewayProductionCoordinatorV2,
+            RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2,
+            RuntimeServingOpenBarrierCompletionAuthorityV3,
+        ) -> Result<
+            RuntimeDiscordCertificationBarrierBCompletedV2,
+            RuntimeDiscordCertificationBarrierBFailureV2,
+        > = RuntimeGatewayProductionCoordinatorV2::complete_certification_barrier_b_v2;
+        let _completion = completion;
     }
 
     #[test]

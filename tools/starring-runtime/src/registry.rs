@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use automation_runtime_controller::RuntimeServingSlotV2;
 use automation_runtime_convergence::{FencingToken, ProcessInstanceId, RuntimeProcessIdentityV1};
@@ -26,11 +26,23 @@ use automation_runtime_worker::{
 };
 
 use crate::closed_recovery::RuntimeClosedRecoveryTransitionAuthorityV2;
-use crate::gateway::{RuntimeEmergencyGatewaySectionV2, RuntimeRecoveryPendingGatewaySectionV2};
+use crate::gateway::{
+    RuntimeDiscordCertificationBarrierBActivatedV2, RuntimeDiscordCertificationBarrierBPausedV2,
+    RuntimeEmergencyGatewaySectionV2, RuntimeRecoveryPendingGatewaySectionV2,
+};
 use crate::GatewayResourceConfigV1;
 
 const REGISTRY_MAX_SLOTS: NonZeroU32 = NonZeroU32::new(4_096).unwrap();
 const REGISTRY_MAX_RETIRED_ROUTES_PER_SLOT: NonZeroU32 = NonZeroU32::new(8).unwrap();
+
+#[allow(dead_code)]
+pub(crate) fn runtime_registry_max_slots_v2() -> NonZeroUsize {
+    NonZeroUsize::new(
+        usize::try_from(REGISTRY_MAX_SLOTS.get())
+            .expect("runtime registry maximum slots must fit usize"),
+    )
+    .expect("runtime registry maximum slots must remain nonzero")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeRegistryBootstrapErrorV1 {
@@ -299,6 +311,13 @@ pub(crate) struct RuntimeRegistryBarrierBActivationV2 {
     authority: RuntimeRegistryBarrierBServingAuthorityV2,
 }
 
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct RuntimeRegistryCertificationBarrierBActivationFailureV2 {
+    paused: Box<RuntimeDiscordCertificationBarrierBPausedV2>,
+    source: RuntimeRegistryBarrierBActivationErrorV2,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct RuntimeRegistryBarrierBServingAuthorityV2 {
     registry: ServingSlotRegistryV1,
@@ -316,7 +335,25 @@ pub(crate) struct RuntimeRegistryBarrierBServingMonitorAuthorityV2 {
     route: SlotRouteWitnessV1,
     activation_sequence: NonZeroU64,
     emergency: RuntimeRegistryEmergencyTriggerV2,
+    completion_liveness: Arc<Mutex<bool>>,
     armed: bool,
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct RuntimeRegistryBarrierBServingCompletionWitnessV2 {
+    registry: ServingSlotRegistryV1,
+    token: SlotMutationTokenV1,
+    route: SlotRouteWitnessV1,
+    activation_sequence: NonZeroU64,
+    emergency: RuntimeRegistryEmergencyTriggerV2,
+    completion_liveness: Arc<Mutex<bool>>,
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct RuntimeRegistryBarrierBServingCompletionGuardV2<'a> {
+    _liveness: MutexGuard<'a, bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -587,6 +624,10 @@ impl RuntimeRegistryBarrierBActivationV2 {
         &self.evidence
     }
 
+    pub(crate) fn serving_authority_v2(&self) -> &RuntimeRegistryBarrierBServingAuthorityV2 {
+        &self.authority
+    }
+
     pub(crate) fn into_parts_v2(
         self,
     ) -> (
@@ -594,6 +635,26 @@ impl RuntimeRegistryBarrierBActivationV2 {
         RuntimeRegistryBarrierBServingAuthorityV2,
     ) {
         (self.evidence, self.authority)
+    }
+}
+
+#[allow(dead_code)]
+impl RuntimeRegistryCertificationBarrierBActivationFailureV2 {
+    pub(crate) fn paused_v2(&self) -> &RuntimeDiscordCertificationBarrierBPausedV2 {
+        self.paused.as_ref()
+    }
+
+    pub(crate) fn source_v2(&self) -> &RuntimeRegistryBarrierBActivationErrorV2 {
+        &self.source
+    }
+
+    pub(crate) fn into_parts_v2(
+        self,
+    ) -> (
+        RuntimeDiscordCertificationBarrierBPausedV2,
+        RuntimeRegistryBarrierBActivationErrorV2,
+    ) {
+        (*self.paused, self.source)
     }
 }
 
@@ -644,22 +705,45 @@ impl RuntimeRegistryBarrierBServingAuthorityV2 {
     }
 
     pub(crate) fn into_serving_monitor_v2(
-        mut self,
+        self,
     ) -> Result<
         RuntimeRegistryBarrierBServingMonitorAuthorityV2,
         RuntimeRegistryBarrierBServingErrorV2,
     > {
+        let (monitor, _completion) = self.into_serving_monitor_with_completion_v2()?;
+        Ok(monitor)
+    }
+
+    pub(crate) fn into_serving_monitor_with_completion_v2(
+        mut self,
+    ) -> Result<
+        (
+            RuntimeRegistryBarrierBServingMonitorAuthorityV2,
+            RuntimeRegistryBarrierBServingCompletionWitnessV2,
+        ),
+        RuntimeRegistryBarrierBServingErrorV2,
+    > {
         self.ensure_exact_serving_v2()?;
+        let completion_liveness = Arc::new(Mutex::new(true));
         let monitor = RuntimeRegistryBarrierBServingMonitorAuthorityV2 {
             registry: self.registry.clone(),
             token: self.token.clone(),
             route: self.route.clone(),
             activation_sequence: self.activation_sequence,
             emergency: self.emergency.clone(),
+            completion_liveness: completion_liveness.clone(),
             armed: true,
         };
+        let completion = RuntimeRegistryBarrierBServingCompletionWitnessV2 {
+            registry: self.registry.clone(),
+            token: self.token.clone(),
+            route: self.route.clone(),
+            activation_sequence: self.activation_sequence,
+            emergency: self.emergency.clone(),
+            completion_liveness,
+        };
         self.armed = false;
-        Ok(monitor)
+        Ok((monitor, completion))
     }
 }
 
@@ -699,6 +783,7 @@ impl RuntimeRegistryBarrierBServingMonitorAuthorityV2 {
         mut self,
     ) -> Result<RuntimeRegistryBarrierBRemovalEvidenceV2, RuntimeRegistryBarrierBServingErrorV2>
     {
+        close_barrier_b_serving_completion_v2(&self.completion_liveness, &self.emergency);
         let result = remove_exact_barrier_b_serving_v2(
             &self.registry,
             &self.token,
@@ -709,6 +794,56 @@ impl RuntimeRegistryBarrierBServingMonitorAuthorityV2 {
             self.armed = false;
         }
         result
+    }
+}
+
+#[allow(dead_code)]
+impl RuntimeRegistryBarrierBServingCompletionWitnessV2 {
+    pub(crate) fn lock_exact_serving_v2(
+        &self,
+    ) -> Result<
+        RuntimeRegistryBarrierBServingCompletionGuardV2<'_>,
+        RuntimeRegistryBarrierBServingErrorV2,
+    > {
+        let liveness = match self.completion_liveness.lock() {
+            Ok(liveness) => liveness,
+            Err(poisoned) => {
+                let mut liveness = poisoned.into_inner();
+                *liveness = false;
+                self.completion_liveness.clear_poison();
+                self.emergency.trip_v2();
+                return Err(RuntimeRegistryBarrierBServingErrorV2::ExactServingLost);
+            }
+        };
+        if !*liveness {
+            return Err(RuntimeRegistryBarrierBServingErrorV2::ExactServingLost);
+        }
+        observe_exact_barrier_b_serving_v2(
+            &self.registry,
+            &self.token,
+            &self.route,
+            self.activation_sequence,
+        )?;
+        Ok(RuntimeRegistryBarrierBServingCompletionGuardV2 {
+            _liveness: liveness,
+        })
+    }
+}
+
+fn close_barrier_b_serving_completion_v2(
+    completion_liveness: &Mutex<bool>,
+    emergency: &RuntimeRegistryEmergencyTriggerV2,
+) {
+    match completion_liveness.lock() {
+        Ok(mut liveness) => {
+            *liveness = false;
+        }
+        Err(poisoned) => {
+            let mut liveness = poisoned.into_inner();
+            *liveness = false;
+            completion_liveness.clear_poison();
+            emergency.trip_v2();
+        }
     }
 }
 
@@ -1244,6 +1379,23 @@ impl RuntimeRegistryReplacementRouteV2 {
         })
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn activate_certification_barrier_b_v2(
+        self,
+        paused: RuntimeDiscordCertificationBarrierBPausedV2,
+    ) -> Result<
+        RuntimeDiscordCertificationBarrierBActivatedV2,
+        RuntimeRegistryCertificationBarrierBActivationFailureV2,
+    > {
+        match self.activate_barrier_b_v2() {
+            Ok(activation) => Ok(paused.bind_registry_activation_v2(activation)),
+            Err(source) => Err(RuntimeRegistryCertificationBarrierBActivationFailureV2 {
+                paused: Box::new(paused),
+                source,
+            }),
+        }
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn activate_barrier_b_v2(
         self,
@@ -1489,16 +1641,18 @@ impl Drop for RuntimeRegistryBarrierBServingAuthorityV2 {
 
 impl Drop for RuntimeRegistryBarrierBServingMonitorAuthorityV2 {
     fn drop(&mut self) {
-        if self.armed
-            && remove_exact_barrier_b_serving_v2(
+        if self.armed {
+            close_barrier_b_serving_completion_v2(&self.completion_liveness, &self.emergency);
+            if remove_exact_barrier_b_serving_v2(
                 &self.registry,
                 &self.token,
                 &self.route,
                 self.activation_sequence,
             )
             .is_err()
-        {
-            self.emergency.trip_v2();
+            {
+                self.emergency.trip_v2();
+            }
         }
     }
 }
@@ -1515,6 +1669,12 @@ impl Debug for RuntimeRegistryBarrierBActivationV2 {
     }
 }
 
+impl Debug for RuntimeRegistryCertificationBarrierBActivationFailureV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryCertificationBarrierBActivationFailureV2(<redacted>)")
+    }
+}
+
 impl Debug for RuntimeRegistryBarrierBServingAuthorityV2 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeRegistryBarrierBServingAuthorityV2(<redacted>)")
@@ -1524,6 +1684,18 @@ impl Debug for RuntimeRegistryBarrierBServingAuthorityV2 {
 impl Debug for RuntimeRegistryBarrierBServingMonitorAuthorityV2 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeRegistryBarrierBServingMonitorAuthorityV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRegistryBarrierBServingCompletionWitnessV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryBarrierBServingCompletionWitnessV2(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeRegistryBarrierBServingCompletionGuardV2<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeRegistryBarrierBServingCompletionGuardV2(<redacted>)")
     }
 }
 
@@ -2649,6 +2821,11 @@ pub(crate) mod succession_tests;
 mod staging_tests;
 
 #[cfg(test)]
+pub(crate) use tests::{
+    barrier_b_activation_for_gateway_test_v2, nonfinal_barrier_b_replacement_for_gateway_test_v2,
+};
+
+#[cfg(test)]
 mod tests {
     use std::num::{NonZeroU64, NonZeroUsize};
 
@@ -2774,6 +2951,31 @@ mod tests {
         .into_parts_v2()
         .2
         .into_replacement_v2()
+    }
+
+    pub(crate) fn nonfinal_barrier_b_replacement_for_gateway_test_v2(
+        process_instance_id: &str,
+    ) -> RuntimeRegistryReplacementRouteV2 {
+        let (port, _) = replacement_registry(process_instance_id);
+        let replacement =
+            install_replacement(&port, replacement_route(process_instance_id, 1, 1), 1);
+        replacement
+            .transition_predecessor_to_draining_v2(None)
+            .unwrap();
+        replacement
+    }
+
+    pub(crate) fn barrier_b_activation_for_gateway_test_v2(
+        process_instance_id: &str,
+    ) -> super::RuntimeRegistryBarrierBActivationV2 {
+        let (port, _) = replacement_registry(process_instance_id);
+        let replacement =
+            install_replacement(&port, replacement_route(process_instance_id, 1, 1), 1);
+        replacement
+            .transition_predecessor_to_draining_v2(None)
+            .unwrap();
+        replacement.remove_drained_predecessor_v2().unwrap();
+        replacement.activate_barrier_b_v2().unwrap()
     }
 
     impl super::RuntimeRegistryBootstrapV1 {
@@ -3394,6 +3596,70 @@ mod tests {
         assert_eq!(atomic.admission_state, SlotAdmissionStateV2::Staged);
         staged.ensure_staged_v2().unwrap();
         staged.remove_v2().unwrap();
+    }
+
+    #[test]
+    fn barrier_b_activation_keeps_exact_evidence_and_serving_authority_in_one_aggregate() {
+        let process = "runtime-process:barrier-b-aggregate";
+        let (port, _) = replacement_registry(process);
+        let route = replacement_route(process, 1, 1);
+        let replacement = install_replacement(&port, route, 1);
+        replacement
+            .transition_predecessor_to_draining_v2(None)
+            .unwrap();
+        replacement.remove_drained_predecessor_v2().unwrap();
+
+        let activation = replacement.activate_barrier_b_v2().unwrap();
+
+        assert_eq!(
+            activation.serving_authority_v2().identity_v2(),
+            activation.evidence_v2().identity_v2()
+        );
+        assert_eq!(
+            activation.serving_authority_v2().fencing_token_v2(),
+            activation.evidence_v2().fencing_token_v2()
+        );
+        assert_eq!(
+            activation.serving_authority_v2().activation_sequence_v2(),
+            activation.evidence_v2().activation_sequence_v2()
+        );
+        activation
+            .serving_authority_v2()
+            .ensure_exact_serving_v2()
+            .unwrap();
+        let (_, authority) = activation.into_parts_v2();
+        authority.remove_exact_serving_v2().unwrap();
+    }
+
+    #[test]
+    fn dropped_serving_monitor_invalidates_the_affine_completion_witness() {
+        let process = "runtime-process:barrier-b-completion-loss";
+        let (port, _) = replacement_registry(process);
+        let route = replacement_route(process, 1, 1);
+        let replacement = install_replacement(&port, route, 1);
+        replacement
+            .transition_predecessor_to_draining_v2(None)
+            .unwrap();
+        replacement.remove_drained_predecessor_v2().unwrap();
+        let (_, authority) = replacement.activate_barrier_b_v2().unwrap().into_parts_v2();
+        let (monitor, completion) = authority.into_serving_monitor_with_completion_v2().unwrap();
+
+        let _guard = completion.lock_exact_serving_v2().unwrap();
+        drop(_guard);
+        drop(monitor);
+
+        assert!(matches!(
+            completion.lock_exact_serving_v2(),
+            Err(super::RuntimeRegistryBarrierBServingErrorV2::ExactServingLost)
+        ));
+    }
+
+    #[test]
+    fn runtime_registry_max_slots_is_exact_and_nonzero() {
+        let max_slots = super::runtime_registry_max_slots_v2();
+
+        assert_eq!(max_slots.get(), 4_096);
+        assert_ne!(max_slots.get(), 0);
     }
 
     #[test]
