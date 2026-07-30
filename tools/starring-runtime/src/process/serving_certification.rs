@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
+use std::future::Future;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::{Duration, Instant};
 
@@ -13,10 +14,10 @@ use automation_runtime_controller::{
 use automation_runtime_convergence::RuntimeDeploymentPhaseV1;
 use automation_runtime_execution_postgres::PostgresPreparedRuntimeCertificationV2;
 use automation_runtime_worker::{
-    RuntimeCertificationFinalizationOutcomeV2, RuntimeCertificationRecoveryResolutionV2,
-    RuntimeCertificationReservationProposalV2, RuntimeCommittedCertificationV2,
-    RuntimeIngressOpenAcknowledgementPortV2, RuntimeReservedCertificationV2,
-    RuntimeRouteLifecycleV2, RuntimeRouteWitnessV2,
+    RuntimeCertificationAbortOutcomeV2, RuntimeCertificationFinalizationOutcomeV2,
+    RuntimeCertificationRecoveryResolutionV2, RuntimeCertificationReservationProposalV2,
+    RuntimeCommittedCertificationV2, RuntimeIngressOpenAcknowledgementPortV2,
+    RuntimeReservedCertificationV2, RuntimeRouteLifecycleV2, RuntimeRouteWitnessV2,
 };
 use chrono::{DateTime, Utc};
 use tokio::task::JoinSet;
@@ -804,17 +805,23 @@ async fn execute_certification_v2(
     let commit_deadline = match runtime_certification_deadline_v2(prepared.must_commit_before()) {
         Some(deadline) if Instant::now() < acceptance_deadline => deadline.min(acceptance_deadline),
         _ => {
-            return Err(frozen
-                .cleanup_v2(RuntimeServingCertificationFailureV2::Deadline.transition_v2())
-                .await);
+            let transition = abort_certification_before_cleanup_v2(
+                prepared.abort(),
+                RuntimeServingCertificationFailureV2::Deadline,
+            )
+            .await;
+            return Err(frozen.cleanup_v2(transition).await);
         }
     };
     let barrier_port = match frozen.lifecycle.ordinary_barrier_port_v3() {
         Ok(port) => port,
         Err(_) => {
-            return Err(frozen
-                .cleanup_v2(RuntimeServingCertificationFailureV2::Gateway.transition_v2())
-                .await);
+            let transition = abort_certification_before_cleanup_v2(
+                prepared.abort(),
+                RuntimeServingCertificationFailureV2::Gateway,
+            )
+            .await;
+            return Err(frozen.cleanup_v2(transition).await);
         }
     };
     let paused = match frozen
@@ -823,15 +830,14 @@ async fn execute_certification_v2(
         .await
     {
         RuntimeDiscordCertificationBarrierBPauseOutcomeV2::Applied(paused) => paused,
-        RuntimeDiscordCertificationBarrierBPauseOutcomeV2::DefinitelyNotApplied(_) => {
-            return Err(frozen
-                .cleanup_v2(RuntimeServingCertificationFailureV2::Gateway.transition_v2())
-                .await);
-        }
-        RuntimeDiscordCertificationBarrierBPauseOutcomeV2::Indeterminate(_) => {
-            return Err(frozen
-                .cleanup_v2(RuntimeServingCertificationFailureV2::Gateway.transition_v2())
-                .await);
+        RuntimeDiscordCertificationBarrierBPauseOutcomeV2::DefinitelyNotApplied(_)
+        | RuntimeDiscordCertificationBarrierBPauseOutcomeV2::Indeterminate(_) => {
+            let transition = abort_certification_before_cleanup_v2(
+                prepared.abort(),
+                RuntimeServingCertificationFailureV2::Gateway,
+            )
+            .await;
+            return Err(frozen.cleanup_v2(transition).await);
         }
     };
     let activated = match frozen
@@ -840,9 +846,12 @@ async fn execute_certification_v2(
     {
         Ok(activated) => activated,
         Err(_) => {
-            return Err(frozen
-                .cleanup_v2(RuntimeServingCertificationFailureV2::Registry.transition_v2())
-                .await);
+            let transition = abort_certification_before_cleanup_v2(
+                prepared.abort(),
+                RuntimeServingCertificationFailureV2::Registry,
+            )
+            .await;
+            return Err(frozen.cleanup_v2(transition).await);
         }
     };
     let resumed = match frozen
@@ -853,9 +862,12 @@ async fn execute_certification_v2(
         RuntimeDiscordCertificationBarrierBResumeOutcomeV2::Applied(resumed) => resumed,
         RuntimeDiscordCertificationBarrierBResumeOutcomeV2::DefinitelyNotApplied { .. }
         | RuntimeDiscordCertificationBarrierBResumeOutcomeV2::Indeterminate(_) => {
-            return Err(frozen
-                .cleanup_v2(RuntimeServingCertificationFailureV2::Gateway.transition_v2())
-                .await);
+            let transition = abort_certification_before_cleanup_v2(
+                prepared.abort(),
+                RuntimeServingCertificationFailureV2::Gateway,
+            )
+            .await;
+            return Err(frozen.cleanup_v2(transition).await);
         }
     };
     let route_admission = match build_route_admission_attestation_v2(
@@ -864,7 +876,8 @@ async fn execute_certification_v2(
     ) {
         Ok(attestation) => attestation,
         Err(failure) => {
-            return Err(frozen.cleanup_v2(failure.transition_v2()).await);
+            let transition = abort_certification_before_cleanup_v2(prepared.abort(), failure).await;
+            return Err(frozen.cleanup_v2(transition).await);
         }
     };
     let completed = match prepared.complete_barrier_b_v2(
@@ -873,28 +886,40 @@ async fn execute_certification_v2(
         route_admission,
     ) {
         Ok(completed) => completed,
-        Err(_) => {
-            return Err(frozen
-                .cleanup_v2(RuntimeServingCertificationFailureV2::Protocol.transition_v2())
-                .await);
+        Err(failure) => {
+            let (prepared, _) = failure.into_parts();
+            let transition = abort_certification_before_cleanup_v2(
+                prepared.abort(),
+                RuntimeServingCertificationFailureV2::Protocol,
+            )
+            .await;
+            return Err(frozen.cleanup_v2(transition).await);
         }
     };
     let gateway_ready = resumed.gateway_v2().ready_v2().clone();
     let (pending, registry_monitor) = match resumed.prepare_serving_monitor_v2() {
         Ok(prepared) => prepared,
         Err(_) => {
-            return Err(frozen
-                .cleanup_v2(RuntimeServingCertificationFailureV2::Registry.transition_v2())
-                .await);
+            let transition = abort_certification_before_cleanup_v2(
+                completed.abort(),
+                RuntimeServingCertificationFailureV2::Registry,
+            )
+            .await;
+            return Err(frozen.cleanup_v2(transition).await);
         }
     };
     let registration = completed.authorize_finalization();
     let registered = match finalizer_slot.submit_certification_finalizer_v2(registration) {
         Ok(registered) => registered,
-        Err(_) => {
-            return Err(frozen
-                .cleanup_v2(RuntimeServingCertificationFailureV2::Finalizer.transition_v2())
-                .await);
+        Err(rejected) => {
+            let registration = *rejected.registration;
+            let _ = rejected.source;
+            let transition = abort_certification_before_cleanup_v2(
+                registration.abort(),
+                RuntimeServingCertificationFailureV2::Finalizer,
+            )
+            .await;
+            return Err(frozen.cleanup_v2(transition).await);
         }
     };
     let committed = match await_committed_certification_v2(
@@ -1328,6 +1353,18 @@ fn execution_receipt_lease_matches_v2(execution: &RuntimeExecutionReceiptV1) -> 
                 && lease.expires_at == execution.expires_at
                 && execution.snapshot.last_fencing_token == Some(execution.fencing_token)
         })
+}
+
+async fn abort_certification_before_cleanup_v2<E, R, W>(
+    abort: impl Future<Output = RuntimeCertificationAbortOutcomeV2<E, R, W>>,
+    failure: RuntimeServingCertificationFailureV2,
+) -> RuntimeProcessProductionHandoffFailureV2 {
+    match abort.await {
+        RuntimeCertificationAbortOutcomeV2::DefinitelyRolledBack(_) => failure.transition_v2(),
+        RuntimeCertificationAbortOutcomeV2::Indeterminate(_) => {
+            RuntimeServingCertificationFailureV2::Database.transition_v2()
+        }
+    }
 }
 
 async fn reserve_and_prepare_certification_v2(
@@ -1925,6 +1962,91 @@ mod tests {
 
     fn at(second: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(second, 0).unwrap()
+    }
+
+    fn assert_abort_precedes_cleanup_v2(source: &str, start: &str, end: &str, abort: &str) {
+        let section = source
+            .split_once(start)
+            .and_then(|(_, tail)| tail.split_once(end).map(|(section, _)| section))
+            .unwrap();
+        let abort_at = section.find(abort).unwrap();
+        let cleanup_at = section.find("frozen.cleanup_v2(transition).await").unwrap();
+        assert!(abort_at < cleanup_at, "{start}");
+    }
+
+    #[test]
+    fn certification_pre_finalizer_failures_abort_before_process_cleanup() {
+        let source = include_str!("serving_certification.rs");
+        for (start, end, abort) in [
+            (
+                "let commit_deadline = match",
+                "let barrier_port = match",
+                "prepared.abort()",
+            ),
+            (
+                "let barrier_port = match",
+                "let paused = match",
+                "prepared.abort()",
+            ),
+            (
+                "let paused = match",
+                "let activated = match",
+                "prepared.abort()",
+            ),
+            (
+                "let activated = match",
+                "let resumed = match",
+                "prepared.abort()",
+            ),
+            (
+                "let resumed = match",
+                "let route_admission = match",
+                "prepared.abort()",
+            ),
+            (
+                "let route_admission = match",
+                "let completed = match",
+                "prepared.abort()",
+            ),
+            (
+                "let completed = match",
+                "let gateway_ready =",
+                "prepared.abort()",
+            ),
+            (
+                "let (pending, registry_monitor) = match",
+                "let registration =",
+                "completed.abort()",
+            ),
+            (
+                "let registered = match",
+                "let committed = match",
+                "registration.abort()",
+            ),
+        ] {
+            assert_abort_precedes_cleanup_v2(source, start, end, abort);
+        }
+        let completion_failure = source
+            .split_once("let completed = match")
+            .and_then(|(_, tail)| {
+                tail.split_once("let gateway_ready =")
+                    .map(|(section, _)| section)
+            })
+            .unwrap();
+        assert!(
+            completion_failure.find("failure.into_parts()").unwrap()
+                < completion_failure.find("prepared.abort()").unwrap()
+        );
+        let abort_resolution = source
+            .split_once("async fn abort_certification_before_cleanup_v2")
+            .and_then(|(_, tail)| {
+                tail.split_once("async fn reserve_and_prepare_certification_v2")
+                    .map(|(section, _)| section)
+            })
+            .unwrap();
+        assert!(abort_resolution.contains(
+            "RuntimeCertificationAbortOutcomeV2::Indeterminate(_) => {\n            RuntimeServingCertificationFailureV2::Database.transition_v2()"
+        ));
     }
 
     fn lineage_execution_v2() -> RuntimeExecutionReceiptV1 {

@@ -372,19 +372,7 @@ where
     where
         P: Send,
     {
-        async move {
-            match self.prepared.abort().await {
-                Ok(transaction_ended) => RuntimeCertificationAbortOutcomeV2::DefinitelyRolledBack(
-                    RuntimeDefinitelyRolledBackCertificationV2 { transaction_ended },
-                ),
-                Err(error) => RuntimeCertificationAbortOutcomeV2::Indeterminate(
-                    RuntimeCertificationAbortRecoveryV2 {
-                        source: error.source,
-                        recovery: error.recovery,
-                    },
-                ),
-            }
-        }
+        abort_prepared_certification_v2(self.prepared)
     }
 
     pub fn complete_barrier_b_v2(
@@ -504,6 +492,29 @@ impl<P> RuntimeCompletedCertificationBarrierBV2<P> {
     }
 }
 
+impl<P> RuntimeCompletedCertificationBarrierBV2<P>
+where
+    P: RuntimePreparedLiveCertificationPortV2 + Send,
+{
+    #[allow(clippy::manual_async_fn)]
+    pub fn abort(
+        self,
+    ) -> impl Future<
+        Output = RuntimeCertificationAbortOutcomeV2<
+            P::Error,
+            P::AbortRecovery,
+            P::TransactionEnded,
+        >,
+    > + Send {
+        let Self {
+            prepared,
+            canonical,
+        } = self;
+        drop(canonical);
+        abort_prepared_certification_v2(prepared)
+    }
+}
+
 impl<P> Debug for RuntimeCompletedCertificationBarrierBV2<P> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeCompletedCertificationBarrierBV2(<redacted>)")
@@ -610,6 +621,29 @@ impl<P> RuntimeCertificationFinalizerRegistrationV2<P> {
     }
 }
 
+impl<P> RuntimeCertificationFinalizerRegistrationV2<P>
+where
+    P: RuntimePreparedLiveCertificationPortV2 + Send,
+{
+    #[allow(clippy::manual_async_fn)]
+    pub fn abort(
+        self,
+    ) -> impl Future<
+        Output = RuntimeCertificationAbortOutcomeV2<
+            P::Error,
+            P::AbortRecovery,
+            P::TransactionEnded,
+        >,
+    > + Send {
+        let RuntimeCertificationFinalizerJobV2 {
+            prepared,
+            authorized,
+        } = self.job;
+        drop(authorized);
+        abort_prepared_certification_v2(prepared)
+    }
+}
+
 impl<P> Debug for RuntimeCertificationFinalizerRegistrationV2<P> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeCertificationFinalizerRegistrationV2(<redacted>)")
@@ -629,6 +663,30 @@ pub trait RuntimeCertificationFinalizerPortV2<P> {
 pub struct RuntimeCertificationFinalizerRejectionV2<P, E> {
     pub registration: Box<RuntimeCertificationFinalizerRegistrationV2<P>>,
     pub source: E,
+}
+
+#[allow(clippy::manual_async_fn)]
+fn abort_prepared_certification_v2<P>(
+    prepared: P,
+) -> impl Future<
+    Output = RuntimeCertificationAbortOutcomeV2<P::Error, P::AbortRecovery, P::TransactionEnded>,
+> + Send
+where
+    P: RuntimePreparedLiveCertificationPortV2 + Send,
+{
+    async move {
+        match prepared.abort().await {
+            Ok(transaction_ended) => RuntimeCertificationAbortOutcomeV2::DefinitelyRolledBack(
+                RuntimeDefinitelyRolledBackCertificationV2 { transaction_ended },
+            ),
+            Err(error) => RuntimeCertificationAbortOutcomeV2::Indeterminate(
+                RuntimeCertificationAbortRecoveryV2 {
+                    source: error.source,
+                    recovery: error.recovery,
+                },
+            ),
+        }
+    }
 }
 
 impl<P, E> Debug for RuntimeCertificationFinalizerRejectionV2<P, E> {

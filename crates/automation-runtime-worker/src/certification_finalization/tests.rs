@@ -577,6 +577,24 @@ impl RuntimeCertificationFinalizerPortV2<Prepared> for ThreadFinalizer {
     }
 }
 
+struct RejectingFinalizer;
+
+impl RuntimeCertificationFinalizerPortV2<Prepared> for RejectingFinalizer {
+    type Error = &'static str;
+    type Accepted = ();
+
+    fn accept_certification_finalizer(
+        &self,
+        registration: RuntimeCertificationFinalizerRegistrationV2<Prepared>,
+    ) -> Result<Self::Accepted, RuntimeCertificationFinalizerRejectionV2<Prepared, Self::Error>>
+    {
+        Err(RuntimeCertificationFinalizerRejectionV2 {
+            registration: Box::new(registration),
+            source: "rejected",
+        })
+    }
+}
+
 fn prepared_fixture(mode: CommitMode) -> RuntimePreparedCertificationV2<Prepared> {
     let (reserved, awaiting) = reserved_fixture();
     complete(reserved.prepare(&LivePort {
@@ -706,6 +724,33 @@ fn prepared_abort_is_explicitly_definite_and_never_a_commit_unknown() {
 
     assert!(matches!(
         complete(prepared.abort()),
+        RuntimeCertificationAbortOutcomeV2::DefinitelyRolledBack(_)
+    ));
+}
+
+#[test]
+fn completed_barrier_abort_is_explicitly_definite() {
+    let completed = prepared_fixture(CommitMode::Committed)
+        .complete_barrier_b_v2(barrier_id(), paused_gateway(), route_admission())
+        .unwrap();
+
+    assert!(matches!(
+        complete(completed.abort()),
+        RuntimeCertificationAbortOutcomeV2::DefinitelyRolledBack(_)
+    ));
+}
+
+#[test]
+fn rejected_finalizer_registration_retains_abort_authority() {
+    let registration = prepared_fixture(CommitMode::Committed)
+        .complete_barrier_b_v2(barrier_id(), paused_gateway(), route_admission())
+        .unwrap()
+        .authorize_finalization();
+    let rejected = registration.accept(&RejectingFinalizer).unwrap_err();
+
+    assert_eq!(rejected.source, "rejected");
+    assert!(matches!(
+        complete((*rejected.registration).abort()),
         RuntimeCertificationAbortOutcomeV2::DefinitelyRolledBack(_)
     ));
 }
