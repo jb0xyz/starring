@@ -27,7 +27,8 @@ use super::reserved_projection::{
     decode_reserved_terminal_projection_v2, RuntimeReservedStartupRecoveryTerminalProjectionV2,
 };
 use super::reserved_semantic::{
-    validate_reserved_progressed_projection_v2, RuntimeReservedStartupRecoveryExpectationV2,
+    validate_reserved_progressed_projection_v2, validate_unreserved_progressed_projection_v2,
+    RuntimeReservedStartupRecoveryExpectationV2,
 };
 use super::semantic::validate_progressed_projection_v2;
 use super::suspended_projection::{
@@ -396,6 +397,15 @@ impl RuntimeStartupRecoveryExecutionRowV2 {
                                 action_authority_revision: expected.action_authority_revision,
                                 selection_authority_revision: expected.selection_authority_revision,
                             },
+                            self.recorded_at,
+                        )?;
+                        Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::Progressed)
+                    }
+                    RuntimeReservedStartupRecoveryTerminalProjectionV2::UnreservedProgressed(
+                        projection,
+                    ) => {
+                        validate_unreserved_progressed_projection_v2(
+                            &projection,
                             self.recorded_at,
                         )?;
                         Ok(RuntimeStartupRecoveryDecodedProjectionOutcomeV2::Progressed)

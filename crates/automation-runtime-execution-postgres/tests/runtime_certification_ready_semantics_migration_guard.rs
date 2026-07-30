@@ -143,12 +143,15 @@ fn execution_readiness_refresh_is_exact_and_pinned_everywhere() {
         "4e61e3e8a9769f8ef9d1c68bde97cde6be5fb80d54cc5cba1aa5999e34d83bfa";
     let current_manifest_definition =
         "6731f361eb37f170d4cdb91a1c5931101ef6bc2d16c50e1114a452e05b228f7b";
-    let readiness_definition = "fc2b7bceeb3e9b9fc98335c3c358652e76b3f13edf87bbbb2506b62de3577e0a";
+    let previous_readiness_definition =
+        "fc2b7bceeb3e9b9fc98335c3c358652e76b3f13edf87bbbb2506b62de3577e0a";
+    let current_readiness_definition =
+        "437eef0962f31be61e9fcb2f6705b2cda14f4d52105ae024ca4bc29b967e001c";
     for required in [
         "public.starring_runtime_execution_database_readiness_v1()",
         previous_manifest_definition,
         current_manifest_definition,
-        readiness_definition,
+        previous_readiness_definition,
         "pg_catalog.pg_get_functiondef(function_oid)",
         "EXECUTE pg_catalog.replace(",
         "metadata_after IS DISTINCT FROM metadata_before",
@@ -167,7 +170,7 @@ fn execution_readiness_refresh_is_exact_and_pinned_everywhere() {
         EXECUTION_DATABASE,
         POSTGRES_SECURITY_SUPPORT,
     ] {
-        assert!(current_source.contains(readiness_definition));
+        assert!(current_source.contains(current_readiness_definition));
     }
 }
 

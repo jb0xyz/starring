@@ -17,7 +17,10 @@ use super::digest::{
     certification_terminal_digest_v2, reserved_reset_receipt_bytes_v2,
     RuntimeCertificationTerminalProofV2, RuntimeReservedResetReceiptProofV2,
 };
-use super::reserved_projection::RuntimeReservedStartupRecoveryProgressedProjectionV2;
+use super::reserved_projection::{
+    RuntimeReservedStartupRecoveryProgressedProjectionV2,
+    RuntimeUnreservedStartupRecoveryProgressedProjectionV2,
+};
 use crate::RuntimeExecutionPersistenceErrorV1;
 
 pub(super) struct RuntimeReservedStartupRecoveryExpectationV2<'a> {
@@ -36,10 +39,20 @@ pub(super) fn validate_reserved_progressed_projection_v2(
     if projection.terminal_at > recorded_at {
         return Err(invalid());
     }
-    let (source_snapshot, successor_snapshot, convergence_attempt) =
-        validate_deployment_rows(projection, recorded_at)?;
+    let (source_snapshot, successor_snapshot, convergence_attempt) = validate_deployment_rows(
+        &projection.source_deployment,
+        &projection.successor_deployment,
+        projection.terminal_at,
+        recorded_at,
+    )?;
     validate_reservation(projection, &source_snapshot, convergence_attempt)?;
-    validate_slot_rows(projection, &source_snapshot, recorded_at)?;
+    validate_slot_rows(
+        &projection.source_slot_fence,
+        &projection.successor_slot_fence,
+        &source_snapshot,
+        projection.terminal_at,
+        recorded_at,
+    )?;
     reconstruct_domain_transition(
         projection,
         source_snapshot,
@@ -50,8 +63,53 @@ pub(super) fn validate_reserved_progressed_projection_v2(
     Ok(())
 }
 
+pub(super) fn validate_unreserved_progressed_projection_v2(
+    projection: &RuntimeUnreservedStartupRecoveryProgressedProjectionV2,
+    recorded_at: DateTime<Utc>,
+) -> Result<(), RuntimeExecutionPersistenceErrorV1> {
+    if projection.terminal_at > recorded_at {
+        return Err(invalid());
+    }
+    let (source_snapshot, successor_snapshot, _) = validate_deployment_rows(
+        &projection.source_deployment,
+        &projection.successor_deployment,
+        projection.terminal_at,
+        recorded_at,
+    )?;
+    validate_slot_rows(
+        &projection.source_slot_fence,
+        &projection.successor_slot_fence,
+        &source_snapshot,
+        projection.terminal_at,
+        recorded_at,
+    )?;
+    let classification = RuntimeAwaitingGatewayReadyResetClassificationV2::from_observation(
+        AwaitingCertificationScopeObservationV2::NoOperationReserved {
+            snapshot: source_snapshot,
+            observed_at: projection.terminal_at,
+        },
+    );
+    let RuntimeAwaitingGatewayReadyResetClassificationV2::Eligible(basis) = classification else {
+        return Err(invalid());
+    };
+    let request = RuntimeResetAwaitingGatewayReadyV2::new(basis);
+    RuntimeAwaitingGatewayReadyResetReceiptV2::new(
+        &request,
+        TransitionOutcomeV1::Applied {
+            revision: successor_snapshot.revision,
+        },
+        successor_snapshot,
+        RuntimeCertificationReservationResetReceiptV2::NotReserved,
+        projection.terminal_at,
+    )
+    .map_err(|_| invalid())?;
+    Ok(())
+}
+
 fn validate_deployment_rows(
-    projection: &RuntimeReservedStartupRecoveryProgressedProjectionV2,
+    source_deployment: &Value,
+    successor_deployment: &Value,
+    terminal_at: DateTime<Utc>,
     recorded_at: DateTime<Utc>,
 ) -> Result<
     (
@@ -61,8 +119,8 @@ fn validate_deployment_rows(
     ),
     RuntimeExecutionPersistenceErrorV1,
 > {
-    let source = object(&projection.source_deployment)?;
-    let successor = object(&projection.successor_deployment)?;
+    let source = object(source_deployment)?;
+    let successor = object(successor_deployment)?;
     require_equal_except(
         source,
         successor,
@@ -108,7 +166,7 @@ fn validate_deployment_rows(
     }
     let source_updated_at = timestamp(source, "updated_at")?;
     let successor_updated_at = timestamp(successor, "updated_at")?;
-    let expected_updated_at = projection.terminal_at.max(
+    let expected_updated_at = terminal_at.max(
         source_updated_at
             .checked_add_signed(Duration::microseconds(1))
             .ok_or_else(invalid)?,
@@ -222,12 +280,14 @@ fn validate_reservation(
 }
 
 fn validate_slot_rows(
-    projection: &RuntimeReservedStartupRecoveryProgressedProjectionV2,
+    source_slot_fence: &Value,
+    successor_slot_fence: &Value,
     source_snapshot: &RuntimeDeploymentSnapshotV1,
+    terminal_at: DateTime<Utc>,
     recorded_at: DateTime<Utc>,
 ) -> Result<(), RuntimeExecutionPersistenceErrorV1> {
-    let source = object(&projection.source_slot_fence)?;
-    let successor = object(&projection.successor_slot_fence)?;
+    let source = object(source_slot_fence)?;
+    let successor = object(successor_slot_fence)?;
     require_equal_except(source, successor, &["writer_epoch", "updated_at"])?;
     let source_epoch = positive_i64(source, "writer_epoch")?;
     let successor_epoch = positive_i64(successor, "writer_epoch")?;
@@ -255,7 +315,7 @@ fn validate_slot_rows(
     let source_updated_at = timestamp(source, "updated_at")?;
     let successor_updated_at = timestamp(successor, "updated_at")?;
     if successor_updated_at < source_updated_at
-        || successor_updated_at < projection.terminal_at
+        || successor_updated_at < terminal_at
         || successor_updated_at > recorded_at
     {
         return Err(invalid());
@@ -829,6 +889,17 @@ mod tests {
         projection
     }
 
+    fn valid_unreserved_projection() -> RuntimeUnreservedStartupRecoveryProgressedProjectionV2 {
+        let projection = valid_projection();
+        RuntimeUnreservedStartupRecoveryProgressedProjectionV2 {
+            source_deployment: projection.source_deployment,
+            successor_deployment: projection.successor_deployment,
+            source_slot_fence: projection.source_slot_fence,
+            successor_slot_fence: projection.successor_slot_fence,
+            terminal_at: projection.terminal_at,
+        }
+    }
+
     #[test]
     fn reserved_progression_reconstructs_domain_receipt_and_both_digests() {
         validate_reserved_progressed_projection_v2(&valid_projection(), &expectation(), at(21))
@@ -873,5 +944,28 @@ mod tests {
         assert!(
             validate_reserved_progressed_projection_v2(&future, &expectation(), at(19)).is_err()
         );
+    }
+
+    #[test]
+    fn unreserved_progression_reconstructs_exact_not_reserved_reset() {
+        validate_unreserved_progressed_projection_v2(&valid_unreserved_projection(), at(21))
+            .unwrap();
+    }
+
+    #[test]
+    fn unreserved_progression_rejects_terminal_record_and_slot_forgery() {
+        let mut terminal = valid_unreserved_projection();
+        terminal.terminal_at = at(21);
+        assert!(validate_unreserved_progressed_projection_v2(&terminal, at(21)).is_err());
+
+        assert!(validate_unreserved_progressed_projection_v2(
+            &valid_unreserved_projection(),
+            at(19)
+        )
+        .is_err());
+
+        let mut slot = valid_unreserved_projection();
+        slot.successor_slot_fence["writer_epoch"] = json!(12);
+        assert!(validate_unreserved_progressed_projection_v2(&slot, at(21)).is_err());
     }
 }
