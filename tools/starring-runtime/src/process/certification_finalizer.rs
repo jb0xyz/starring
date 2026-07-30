@@ -21,7 +21,8 @@ use crate::mutation_finalizer::{
     RuntimeMutationFinalizerCompletionResultV1, RuntimeMutationFinalizerCompletionV1,
     RuntimeMutationFinalizerJobIdV1, RuntimeMutationFinalizerJobV1, RuntimeMutationFinalizerPortV1,
     RuntimeMutationFinalizerProcessSupervisorV1,
-    RuntimeMutationFinalizerRegistrationRejectionReasonV1, RuntimeMutationFinalizerSupervisorV1,
+    RuntimeMutationFinalizerRegistrationRejectionReasonV1,
+    RuntimeMutationFinalizerReservedProcessSlotV1, RuntimeMutationFinalizerSupervisorV1,
     RuntimeSupervisorExitV1,
 };
 
@@ -142,6 +143,18 @@ impl<'a> RuntimeProcessCertificationFinalizerPortV2<'a> {
     ) -> Self {
         Self { supervisor }
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn reserve_certification_finalizer_slot_v2(
+        &self,
+    ) -> Result<
+        RuntimeReservedCertificationFinalizerSlotV2,
+        RuntimeMutationFinalizerRegistrationRejectionReasonV1,
+    > {
+        self.supervisor
+            .try_reserve_process_job_slot()
+            .map(|slot| RuntimeReservedCertificationFinalizerSlotV2 { slot })
+    }
 }
 
 impl Debug for RuntimeProcessCertificationFinalizerPortV2<'_> {
@@ -168,10 +181,44 @@ impl RuntimeCertificationFinalizerPortV2<PostgresPreparedRuntimeCertificationV2>
             Self::Error,
         >,
     > {
+        let slot = match self.reserve_certification_finalizer_slot_v2() {
+            Ok(slot) => slot,
+            Err(source) => {
+                return Err(RuntimeCertificationFinalizerRejectionV2 {
+                    registration: Box::new(registration),
+                    source,
+                });
+            }
+        };
+        slot.submit_certification_finalizer_v2(registration)
+    }
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct RuntimeReservedCertificationFinalizerSlotV2 {
+    slot: RuntimeMutationFinalizerReservedProcessSlotV1<
+        RuntimeProcessMutationFinalizerPortV3<RuntimeProductionPendingDrainFinalizerEnvironmentV3>,
+    >,
+}
+
+#[allow(dead_code)]
+impl RuntimeReservedCertificationFinalizerSlotV2 {
+    pub(crate) fn submit_certification_finalizer_v2(
+        self,
+        registration: RuntimeCertificationFinalizerRegistrationV2<
+            PostgresPreparedRuntimeCertificationV2,
+        >,
+    ) -> Result<
+        RuntimeRegisteredCertificationFinalizerJobV2,
+        RuntimeCertificationFinalizerRejectionV2<
+            PostgresPreparedRuntimeCertificationV2,
+            RuntimeMutationFinalizerRegistrationRejectionReasonV1,
+        >,
+    > {
         let job = registration.into_owned_job();
-        match self.supervisor.try_register_process_job(
-            RuntimeProcessMutationFinalizerJobV3::Certification(Box::new(job)),
-        ) {
+        let job = RuntimeProcessMutationFinalizerJobV3::Certification(Box::new(job));
+        match self.slot.submit_process_job(job) {
             Ok(waiter) => Ok(RuntimeRegisteredCertificationFinalizerJobV2 {
                 job_id: waiter.job_id(),
             }),
@@ -187,6 +234,12 @@ impl RuntimeCertificationFinalizerPortV2<PostgresPreparedRuntimeCertificationV2>
                 })
             }
         }
+    }
+}
+
+impl Debug for RuntimeReservedCertificationFinalizerSlotV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeReservedCertificationFinalizerSlotV2(<redacted>)")
     }
 }
 

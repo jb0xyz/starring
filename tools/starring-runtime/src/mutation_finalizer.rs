@@ -595,6 +595,139 @@ struct RuntimeMutationFinalizerEnvelopeV1<J> {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeMutationFinalizerReservedProcessSlotV1<P>
+where
+    P: RuntimeMutationFinalizerPortV1,
+{
+    supervisor_id: NonZeroU64,
+    generation: RuntimeMutationFinalizerGenerationV1,
+    nonce: NonZeroU64,
+    shared: Arc<RuntimeMutationFinalizerSharedV1>,
+    controls: mpsc::Sender<RuntimeMutationFinalizerControlV1>,
+    jobs: mpsc::Sender<RuntimeMutationFinalizerEnvelopeV1<P::Job>>,
+    slot: OwnedSemaphorePermit,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<P> RuntimeMutationFinalizerReservedProcessSlotV1<P>
+where
+    P: RuntimeMutationFinalizerPortV1,
+{
+    pub(crate) fn submit_process_job(
+        self,
+        job: P::Job,
+    ) -> Result<
+        RuntimeMutationFinalizerWaiterV1,
+        RuntimeMutationFinalizerRegistrationRejectedV1<P::Job>,
+    > {
+        let Self {
+            supervisor_id,
+            generation,
+            nonce,
+            shared,
+            controls,
+            jobs,
+            slot,
+        } = self;
+        let queue = match jobs.try_reserve() {
+            Ok(queue) => queue,
+            Err(TrySendError::Full(_)) => {
+                let exit = shared.publish_terminal(RuntimeSupervisorExitV1::ProtocolViolation);
+                let _ = controls.try_send(RuntimeMutationFinalizerControlV1::ProtocolViolation);
+                return Err(registration_rejected_v1(
+                    job,
+                    RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit),
+                ));
+            }
+            Err(TrySendError::Closed(_)) => {
+                let exit = shared.publish_terminal(RuntimeSupervisorExitV1::Aborted);
+                return Err(registration_rejected_v1(
+                    job,
+                    RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit),
+                ));
+            }
+        };
+        let (waiter, receiver) = oneshot::channel();
+        let mut state = shared.lock();
+        if let Some(exit) = state.terminal {
+            return Err(registration_rejected_v1(
+                job,
+                RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit),
+            ));
+        }
+        if state.supervisor_id != supervisor_id
+            || state.generation != generation
+            || state.activation_nonce != Some(nonce)
+        {
+            drop(state);
+            let exit = shared.publish_terminal(RuntimeSupervisorExitV1::ProtocolViolation);
+            let _ = controls.try_send(RuntimeMutationFinalizerControlV1::ProtocolViolation);
+            return Err(registration_rejected_v1(
+                job,
+                RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit),
+            ));
+        }
+        if state.shutdown_sealed
+            || !matches!(
+                state.phase,
+                RuntimeMutationFinalizerPhaseV1::ProcessAccepting
+            )
+        {
+            return Err(registration_rejected_v1(
+                job,
+                RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed,
+            ));
+        }
+        let Some(sequence) = state.next_sequence else {
+            state.startup_intake_sealed = true;
+            state.shutdown_sealed = true;
+            state.phase = RuntimeMutationFinalizerPhaseV1::Terminal;
+            state.terminal = Some(RuntimeSupervisorExitV1::ProtocolViolation);
+            drop(state);
+            shared
+                .terminal_publisher
+                .send_replace(Some(RuntimeSupervisorExitV1::ProtocolViolation));
+            let _ = controls.try_send(RuntimeMutationFinalizerControlV1::ProtocolViolation);
+            return Err(registration_rejected_v1(
+                job,
+                RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(
+                    RuntimeSupervisorExitV1::ProtocolViolation,
+                ),
+            ));
+        };
+        state.next_sequence = sequence.get().checked_add(1).and_then(NonZeroU64::new);
+        let job_id = RuntimeMutationFinalizerJobIdV1 {
+            supervisor_id: state.supervisor_id,
+            generation: state.generation,
+            sequence,
+        };
+        state.queued_jobs = state.queued_jobs.saturating_add(1);
+        state.unsettled_jobs = state.unsettled_jobs.saturating_add(1);
+        queue.send(RuntimeMutationFinalizerEnvelopeV1 {
+            job_id,
+            job: RuntimeMutationFinalizerJobV1::ProcessMutation(job),
+            waiter,
+            slot,
+        });
+        drop(state);
+        Ok(RuntimeMutationFinalizerWaiterV1 {
+            job_id,
+            receiver,
+            shared,
+        })
+    }
+}
+
+impl<P> Debug for RuntimeMutationFinalizerReservedProcessSlotV1<P>
+where
+    P: RuntimeMutationFinalizerPortV1,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeMutationFinalizerReservedProcessSlotV1(<redacted>)")
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 enum RuntimeMutationFinalizerControlV1 {
     StartupSeal,
     ShutdownSeal,
@@ -706,31 +839,48 @@ where
         RuntimeMutationFinalizerWaiterV1,
         RuntimeMutationFinalizerRegistrationRejectedV1<P::Job>,
     > {
-        {
-            let state = self.shared.lock();
-            if state.supervisor_id != reservation.supervisor_id
-                || state.generation != reservation.generation
-                || state.activation_nonce != Some(reservation.nonce)
-            {
-                return Err(registration_rejected_v1(
-                    job,
-                    RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(
-                        RuntimeSupervisorExitV1::ProtocolViolation,
-                    ),
-                ));
-            }
+        match self.try_reserve_process_slot(reservation) {
+            Ok(slot) => slot.submit_process_job(job),
+            Err(reason) => Err(registration_rejected_v1(job, reason)),
         }
-        match self.try_register_for_phase_v1(
-            RuntimeMutationFinalizerJobV1::ProcessMutation(job),
-            RuntimeMutationFinalizerPhaseV1::ProcessAccepting,
-        ) {
-            Ok(waiter) => Ok(waiter),
-            Err(rejected) => {
-                let reason = rejected.reason();
-                let job = rejected.into_job().into_process_mutation();
-                Err(registration_rejected_v1(job, reason))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn try_reserve_process_slot(
+        &self,
+        reservation: &RuntimeMutationFinalizerProcessIntakeReservationV1,
+    ) -> Result<
+        RuntimeMutationFinalizerReservedProcessSlotV1<P>,
+        RuntimeMutationFinalizerRegistrationRejectionReasonV1,
+    > {
+        validate_process_intake_reservation_v1(&self.shared, reservation)?;
+        let slot = match self.slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(TryAcquireError::NoPermits) => {
+                return Err(RuntimeMutationFinalizerRegistrationRejectionReasonV1::Busy);
             }
+            Err(TryAcquireError::Closed) => {
+                return Err(self.shared.closed_registration_reason());
+            }
+        };
+        if self.jobs.is_closed() {
+            let exit = self
+                .shared
+                .publish_terminal(RuntimeSupervisorExitV1::Aborted);
+            return Err(
+                RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit),
+            );
         }
+        validate_process_intake_reservation_v1(&self.shared, reservation)?;
+        Ok(RuntimeMutationFinalizerReservedProcessSlotV1 {
+            supervisor_id: reservation.supervisor_id,
+            generation: reservation.generation,
+            nonce: reservation.nonce,
+            shared: self.shared.clone(),
+            controls: self.controls.clone(),
+            jobs: self.jobs.clone(),
+            slot,
+        })
     }
 
     fn try_register_for_phase_v1(
@@ -879,6 +1029,37 @@ fn registration_rejected_v1<J>(
         job: Box::new(job),
         reason,
     }
+}
+
+fn validate_process_intake_reservation_v1(
+    shared: &RuntimeMutationFinalizerSharedV1,
+    reservation: &RuntimeMutationFinalizerProcessIntakeReservationV1,
+) -> Result<(), RuntimeMutationFinalizerRegistrationRejectionReasonV1> {
+    let state = shared.lock();
+    if let Some(exit) = state.terminal {
+        return Err(
+            RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit),
+        );
+    }
+    if state.supervisor_id != reservation.supervisor_id
+        || state.generation != reservation.generation
+        || state.activation_nonce != Some(reservation.nonce)
+    {
+        return Err(
+            RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(
+                RuntimeSupervisorExitV1::ProtocolViolation,
+            ),
+        );
+    }
+    if state.shutdown_sealed
+        || !matches!(
+            state.phase,
+            RuntimeMutationFinalizerPhaseV1::ProcessAccepting
+        )
+    {
+        return Err(RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -1669,6 +1850,43 @@ where
         self.supervisor
             .intake
             .try_register_process(job, &self.process_intake)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn try_reserve_process_job_slot(
+        &self,
+    ) -> Result<
+        RuntimeMutationFinalizerReservedProcessSlotV1<P>,
+        RuntimeMutationFinalizerRegistrationRejectionReasonV1,
+    > {
+        match self.process_intake_health() {
+            RuntimeMutationFinalizerProcessIntakeHealthV1::Ready => self
+                .supervisor
+                .intake
+                .try_reserve_process_slot(&self.process_intake),
+            RuntimeMutationFinalizerProcessIntakeHealthV1::ShutdownSealed => {
+                Err(RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed)
+            }
+            RuntimeMutationFinalizerProcessIntakeHealthV1::Terminal(exit) => {
+                Err(RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit))
+            }
+            RuntimeMutationFinalizerProcessIntakeHealthV1::ActorStopped => {
+                let exit = self
+                    .supervisor
+                    .intake
+                    .shared
+                    .publish_terminal(RuntimeSupervisorExitV1::Aborted);
+                Err(RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit))
+            }
+            RuntimeMutationFinalizerProcessIntakeHealthV1::AuthorityMismatch => {
+                let exit = self
+                    .supervisor
+                    .intake
+                    .shared
+                    .publish_terminal(RuntimeSupervisorExitV1::ProtocolViolation);
+                Err(RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit))
+            }
+        }
     }
 
     pub(crate) async fn next_completion(
@@ -2525,6 +2743,157 @@ mod tests {
                 .await
                 .exit(),
             RuntimeSupervisorExitV1::Commanded
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_slot_reserves_exact_bounded_capacity_until_drop_or_fill() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut supervisor = RuntimeMutationFinalizerSupervisorV1::start(
+            RuntimeMutationFinalizerConfigV1::new(1).unwrap(),
+            generation_v1(),
+            ProcessTestPortV1 { entered, release },
+        )
+        .unwrap();
+        supervisor.seal_intake();
+        assert!(supervisor.wait_startup_jobs_settled().await);
+        let activation = supervisor.reserve_process_activation().unwrap();
+        let mut process = supervisor
+            .activate_process_until(activation, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let reserved = process.try_reserve_process_job_slot().unwrap();
+        assert_eq!(
+            format!("{reserved:?}"),
+            "RuntimeMutationFinalizerReservedProcessSlotV1(<redacted>)"
+        );
+        let busy = process
+            .try_register_process_job(ProcessTestJobV1::Rejected)
+            .unwrap_err();
+        assert_eq!(
+            busy.reason(),
+            RuntimeMutationFinalizerRegistrationRejectionReasonV1::Busy
+        );
+        assert!(matches!(busy.into_job(), ProcessTestJobV1::Rejected));
+        drop(reserved);
+
+        let reserved = process.try_reserve_process_job_slot().unwrap();
+        let waiter = reserved
+            .submit_process_job(ProcessTestJobV1::Marker)
+            .unwrap();
+        let job_id = waiter.job_id();
+        assert_eq!(
+            waiter.wait().await.status(),
+            RuntimeMutationFinalizerWaitStatusV1::Settled
+        );
+        let completion = process.next_completion().await.unwrap();
+        assert_eq!(completion.job_id(), job_id);
+        assert!(matches!(
+            completion.result(),
+            RuntimeMutationFinalizerCompletionResultV1::Settled(ProcessTestJobV1::Marker)
+        ));
+        drop(completion);
+        assert_eq!(
+            process
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .exit(),
+            RuntimeSupervisorExitV1::Commanded
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reserved_process_slot_rejects_shutdown_and_identity_mismatch_fail_closed() {
+        let mut shutdown_supervisor = supervisor_v1();
+        shutdown_supervisor.seal_intake();
+        assert!(shutdown_supervisor.wait_startup_jobs_settled().await);
+        let activation = shutdown_supervisor.reserve_process_activation().unwrap();
+        let shutdown_process = shutdown_supervisor
+            .activate_process_until(activation, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let reserved = shutdown_process.try_reserve_process_job_slot().unwrap();
+        shutdown_process.seal_handle().seal_intake();
+        let report = tokio::time::timeout(Duration::from_secs(1), shutdown_process.join())
+            .await
+            .expect("shutdown cannot be stranded by an unfilled reserved slot");
+        assert_eq!(report.exit(), RuntimeSupervisorExitV1::Commanded);
+        let rejected = reserved
+            .submit_process_job(())
+            .expect_err("shutdown must reject a reserved process job");
+        assert!(matches!(
+            rejected.reason(),
+            RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed
+                | RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(
+                    RuntimeSupervisorExitV1::Commanded
+                )
+        ));
+        rejected.into_job();
+
+        let mut mismatch_supervisor = supervisor_v1();
+        mismatch_supervisor.seal_intake();
+        assert!(mismatch_supervisor.wait_startup_jobs_settled().await);
+        let activation = mismatch_supervisor.reserve_process_activation().unwrap();
+        let mismatch_process = mismatch_supervisor
+            .activate_process_until(activation, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut reserved = mismatch_process.try_reserve_process_job_slot().unwrap();
+        reserved.nonce = NonZeroU64::new(reserved.nonce.get().checked_add(1).unwrap()).unwrap();
+        let rejected = reserved
+            .submit_process_job(())
+            .expect_err("identity mismatch must reject a reserved process job");
+        assert_eq!(
+            rejected.reason(),
+            RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(
+                RuntimeSupervisorExitV1::ProtocolViolation
+            )
+        );
+        rejected.into_job();
+        assert_eq!(
+            mismatch_process.terminal_observation(),
+            Some(RuntimeSupervisorExitV1::ProtocolViolation)
+        );
+        assert_eq!(
+            mismatch_process.join().await.exit(),
+            RuntimeSupervisorExitV1::ProtocolViolation
+        );
+
+        let mut stopped_supervisor = supervisor_v1();
+        stopped_supervisor.seal_intake();
+        assert!(stopped_supervisor.wait_startup_jobs_settled().await);
+        let activation = stopped_supervisor.reserve_process_activation().unwrap();
+        let stopped_process = stopped_supervisor
+            .activate_process_until(activation, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        stopped_process.supervisor.actor.as_ref().unwrap().abort();
+        loop {
+            if stopped_process
+                .supervisor
+                .actor
+                .as_ref()
+                .is_some_and(|actor| actor.is_finished())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            stopped_process.try_reserve_process_job_slot().unwrap_err(),
+            RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(
+                RuntimeSupervisorExitV1::Aborted
+            )
+        );
+        assert_eq!(
+            stopped_process.terminal_observation(),
+            Some(RuntimeSupervisorExitV1::Aborted)
+        );
+        assert_eq!(
+            stopped_process.join().await.exit(),
+            RuntimeSupervisorExitV1::Aborted
         );
     }
 
