@@ -904,6 +904,39 @@ fn cleanup_failure_preserves_transition_class_without_exposing_sources() {
 }
 
 #[test]
+fn production_handoff_cleanup_reports_the_redacted_transition_code() {
+    let transition = RuntimeProcessProductionHandoffFailureV2::Gateway;
+    let clean = finish_production_handoff_transition_v2(transition, Ok(()));
+    let cleanup = finish_production_handoff_transition_v2(
+        transition,
+        Err(RuntimeClosedRecoveryProcessCleanupFailureV2::OwnerHeld(
+            RuntimeOwnerHeldProcessShutdownErrorV1::Database(
+                RuntimeDatabasePoolShutdownErrorV1::TimedOut,
+            ),
+        )),
+    );
+
+    assert_eq!(
+        clean,
+        RuntimeProcessProductionHandoffErrorV2::Transition(transition)
+    );
+    assert_eq!(clean.context(), None);
+    assert_eq!(
+        cleanup.code(),
+        "runtime_process_production_handoff_transition_cleanup"
+    );
+    assert_eq!(
+        cleanup.context(),
+        Some("runtime_process_production_handoff_gateway")
+    );
+    assert_eq!(
+        format!("{cleanup:?}"),
+        "RuntimeProcessProductionHandoffErrorV2(<redacted>)"
+    );
+    assert!(std::error::Error::source(&cleanup).is_none());
+}
+
+#[test]
 fn observation_outer_shutdown_error_forces_failed_closed_terminal_total() {
     let (recorder, observer) =
         crate::lifecycle_timing::RuntimeLifecycleTimingRecorderV2::create_v2();

@@ -256,7 +256,10 @@ impl RuntimeProcessProductionHandoffErrorV2 {
     }
 
     pub const fn context(self) -> Option<&'static str> {
-        None
+        match self {
+            Self::Transition(_) => None,
+            Self::CleanupAfterTransition { transition, .. } => Some(transition.code()),
+        }
     }
 
     pub const fn cleanup_class(self) -> bool {
