@@ -759,6 +759,7 @@ fn paused_discord_gateway_dependency_is_feature_isolated() {
 #[test]
 fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
     let lane = source_before_test_module(include_str!("../src/runtime_interaction_dispatch.rs"));
+    let database = source_before_test_module(include_str!("../src/database.rs"));
     let facade = source_before_test_module(include_str!(
         "../../../crates/automation-runtime/src/shared_gateway_dispatcher.rs"
     ));
@@ -772,6 +773,19 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
         "RuntimeProductionDiscordInteractionDispatchLaneV1",
         "compose_runtime_discord_interaction_dispatch_lane_v1(",
         "gateway.rejection_acknowledgement_capacity()",
+        "RuntimeProductionDiscordInteractionActorLaneV1",
+        "compose_runtime_discord_interaction_actor_lane_v1(",
+        "connection_observer: GatewayConnectionObserverV3",
+        "product_readiness: RuntimeHealthReadinessObserverV1",
+        "accepting_lease: Option<GatewayReadyLeaseV3>",
+        "pub(crate) fn reconcile_accepting_v1(",
+        "pub(crate) fn handle_raw_interaction_v1(",
+        "normalize_runtime_discord_interaction_v1(interaction)",
+        ".current_connection()",
+        ".current_epoch()?",
+        "self.connection_observer.issue_ready_lease(epoch).ok()",
+        "self.connection_observer.ready_lease_is_current(&lease)",
+        "RuntimeDiscordInteractionActorLaneV1(<redacted>)",
         "state: RuntimeInteractionLaneStateV1::Paused",
         "not_accepting: u64",
         "pub(crate) fn try_enqueue_v1<F>(",
@@ -817,6 +831,14 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
         "Deserialize",
     ] {
         assert!(!contains_identifier(lane, forbidden), "{forbidden}");
+    }
+    for required in [
+        "#[derive(Clone)]\npub(crate) struct RuntimeInteractionDispatchDatabasePortV1",
+        "inner: Arc<OwnedSharedGatewayDispatchServicesV3<PostgresRuntimeInteractionV1>>",
+        "inner: Arc::new(inner)",
+        "RuntimeInteractionDispatchDatabasePortV1(<redacted>)",
+    ] {
+        assert!(database.contains(required), "{required}");
     }
     for required in [
         "pub struct OwnedSharedGatewayDispatchServicesV3<I>",
@@ -1459,6 +1481,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             let allowed_interaction_dispatch_v3 = matches!(
                 identifier,
                 "GatewayConnectionObserverV3"
+                    | "GatewayDisconnectKindV3"
                     | "GatewayReadyLeaseV3"
                     | "InteractionExecutionOutcomeV3"
                     | "SharedGatewayAdmissionErrorV3"
@@ -7392,6 +7415,12 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
     let cleanup = composer
         .find(".close_until(startup_budget.cleanup_deadline())")
         .unwrap();
+    let interaction_dispatch = composer
+        .find(".compose_interaction_dispatch_port_v1(")
+        .unwrap();
+    let finalizer = composer
+        .find("RuntimeProcessMutationFinalizerSupervisorV3::start(")
+        .unwrap();
 
     assert!(
         deadline_before_process_identity < process_identity
@@ -7406,6 +7435,8 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
             && closed < deadline_after_closed_result
             && deadline_after_closed_result < closed_result
             && closed_result < cleanup
+            && cleanup < interaction_dispatch
+            && interaction_dispatch < finalizer
     );
     for required in [
         "pub(crate) struct RuntimeProcessFoundationV1",
@@ -7417,6 +7448,10 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         "build_revision,",
         "process_instance_id: ProcessInstanceId,",
         "controller_id: ControllerId,",
+        "interaction_dispatch_port: RuntimeInteractionDispatchDatabasePortV1,",
+        "pub(super) fn interaction_dispatch_port_v1(",
+        "self.interaction_dispatch_port.clone()",
+        "secrets.discord_bot_token()",
         "compose_runtime_registry_bootstrap_v1(process_instance_id.clone(), gateway_config)",
         "compose_runtime_gateway_bootstrap_v1(",
         "RuntimeProcessFoundationV1(<redacted>)",
@@ -7443,7 +7478,13 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         composer
             .matches("if !startup_budget.operation_is_open()")
             .count(),
-        6
+        7
+    );
+    assert_eq!(
+        composer
+            .matches(".compose_interaction_dispatch_port_v1(")
+            .count(),
+        1
     );
     assert_eq!(
         composer
@@ -7524,7 +7565,7 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         .find("let shutdown = databases.shutdown()")
         .unwrap();
     let closed_components = shutdown
-        .find("drop((gateway, registry, databases))")
+        .find("drop((gateway, registry, interaction_dispatch_port, databases))")
         .unwrap();
     let close = shutdown
         .find("shutdown.close_until(cleanup_deadline).await")

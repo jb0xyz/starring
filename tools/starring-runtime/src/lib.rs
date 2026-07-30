@@ -47,6 +47,7 @@ pub use controller_identity::RuntimeControllerIdGenerationErrorV1;
 pub use database::{
     RuntimeDatabaseCompositionErrorV1, RuntimeDatabaseDependenciesV1,
     RuntimeDatabasePoolShutdownErrorV1, RuntimeDatabasePoolShutdownV1, RuntimeDatabaseReadinessV1,
+    RuntimeInteractionDispatchCompositionErrorV1,
 };
 pub use gateway::{
     compose_runtime_gateway_bootstrap_v1, RuntimeGatewayBootstrapErrorV1,

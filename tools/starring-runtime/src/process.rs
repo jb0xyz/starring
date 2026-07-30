@@ -12,7 +12,10 @@ use crate::capability_readiness_supervisor::{
     RuntimeCapabilityReadinessActivationErrorV2, RuntimeCapabilityReadinessSupervisorExitV2,
 };
 use crate::controller_identity::generate_runtime_controller_id_v1;
-use crate::database::compose_runtime_database_dependencies_v1;
+use crate::database::{
+    compose_runtime_database_dependencies_v1, RuntimeInteractionDispatchCompositionErrorV1,
+    RuntimeInteractionDispatchDatabasePortV1,
+};
 use crate::health::{RuntimeHealthReadinessObserverV1, RuntimeHealthReadinessPublisherV2};
 use crate::ingress_acknowledgement_supervisor::{
     RuntimeIngressAcknowledgementSupervisorConfigV2, RuntimeIngressAcknowledgementSupervisorExitV2,
@@ -119,6 +122,8 @@ pub enum RuntimeProcessFoundationCompositionErrorV1 {
     Registry(RuntimeRegistryBootstrapErrorV1),
     #[error("runtime process foundation gateway composition failed")]
     Gateway(RuntimeGatewayBootstrapErrorV1),
+    #[error("runtime process foundation interaction dispatch composition failed")]
+    InteractionDispatch(RuntimeInteractionDispatchCompositionErrorV1),
     #[error("runtime process foundation mutation finalizer composition failed")]
     MutationFinalizer(RuntimeMutationFinalizerStartErrorV1),
     #[error("runtime process foundation shutdown signal composition failed")]
@@ -133,6 +138,11 @@ pub enum RuntimeProcessFoundationCompositionErrorV1 {
     #[error("runtime process foundation gateway failure cleanup failed")]
     CleanupAfterGateway {
         composition: RuntimeGatewayBootstrapErrorV1,
+        cleanup: RuntimeDatabasePoolShutdownErrorV1,
+    },
+    #[error("runtime process foundation interaction dispatch failure cleanup failed")]
+    CleanupAfterInteractionDispatch {
+        composition: RuntimeInteractionDispatchCompositionErrorV1,
         cleanup: RuntimeDatabasePoolShutdownErrorV1,
     },
     #[error("runtime process foundation mutation finalizer failure cleanup failed")]
@@ -160,6 +170,7 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
             Self::Database(error) => error.code(),
             Self::Registry(error) => error.code(),
             Self::Gateway(error) => error.code(),
+            Self::InteractionDispatch(error) => error.code(),
             Self::MutationFinalizer(_) => "runtime_process_foundation_mutation_finalizer",
             Self::ShutdownSignal => "runtime_process_foundation_shutdown_signal",
             Self::HealthListener => "runtime_process_foundation_health_listener",
@@ -167,6 +178,9 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
                 "runtime_process_foundation_cleanup_after_registry"
             }
             Self::CleanupAfterGateway { .. } => "runtime_process_foundation_cleanup_after_gateway",
+            Self::CleanupAfterInteractionDispatch { .. } => {
+                "runtime_process_foundation_cleanup_after_interaction_dispatch"
+            }
             Self::CleanupAfterMutationFinalizer { .. } => {
                 "runtime_process_foundation_cleanup_after_mutation_finalizer"
             }
@@ -189,11 +203,13 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
             Self::Database(error) => error.context(),
             Self::Registry(_)
             | Self::Gateway(_)
+            | Self::InteractionDispatch(_)
             | Self::MutationFinalizer(_)
             | Self::ShutdownSignal
             | Self::HealthListener
             | Self::CleanupAfterRegistry { .. }
             | Self::CleanupAfterGateway { .. }
+            | Self::CleanupAfterInteractionDispatch { .. }
             | Self::CleanupAfterMutationFinalizer { .. }
             | Self::CleanupAfterRootSupervisor { .. }
             | Self::OperationDeadlineElapsed
@@ -338,6 +354,7 @@ pub(super) type RuntimeProcessIngressAcknowledgementSupervisorV2 =
 pub(crate) struct RuntimeProcessFoundationV1 {
     gateway: RuntimeGatewayBootstrapV1,
     registry: RuntimeRegistryBootstrapV1,
+    interaction_dispatch_port: RuntimeInteractionDispatchDatabasePortV1,
     databases: RuntimeDatabaseDependenciesV1,
     secrets: ResolvedRuntimeSecretsV1,
     config: RuntimeConfigV1,
@@ -404,6 +421,11 @@ impl RuntimeProcessFoundationV1 {
     #[allow(dead_code)]
     pub(super) fn product_readiness_observer_v1(&self) -> RuntimeHealthReadinessObserverV1 {
         self.root_supervisor.readiness_observer_v1()
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn interaction_dispatch_port_v1(&self) -> RuntimeInteractionDispatchDatabasePortV1 {
+        self.interaction_dispatch_port.clone()
     }
 
     pub(super) fn trip_shutdown_v1(
@@ -757,6 +779,7 @@ impl RuntimeProcessFoundationV1 {
         let Self {
             gateway,
             registry,
+            interaction_dispatch_port,
             databases,
             secrets,
             config,
@@ -870,7 +893,7 @@ impl RuntimeProcessFoundationV1 {
         let database_timing = lifecycle_timing
             .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownDatabasePoolsClose);
         let shutdown = databases.shutdown();
-        drop((gateway, registry, databases));
+        drop((gateway, registry, interaction_dispatch_port, databases));
         match shutdown.close_until(cleanup_deadline).await {
             Ok(()) => database_timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::Completed),
             Err(error) => {
@@ -1071,6 +1094,42 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         drop(closed_components);
         return Err(cleanup_after_operation_deadline_v1(databases, &startup_budget).await);
     }
+    let interaction_dispatch_port = databases
+        .compose_interaction_dispatch_port_v1(
+            closed_components
+                .registry
+                .interaction_dispatch_registry_v1(),
+            secrets.discord_bot_token(),
+            config.gateway(),
+            startup_budget.operation_cutoff(),
+        )
+        .await;
+    let interaction_dispatch_port = match interaction_dispatch_port {
+        Ok(port) => port,
+        Err(composition) => {
+            drop(closed_components);
+            let shutdown = databases.shutdown();
+            drop(databases);
+            return match shutdown
+                .close_until(startup_budget.cleanup_deadline())
+                .await
+            {
+                Ok(()) => Err(
+                    RuntimeProcessFoundationCompositionErrorV1::InteractionDispatch(composition),
+                ),
+                Err(cleanup) => Err(
+                    RuntimeProcessFoundationCompositionErrorV1::CleanupAfterInteractionDispatch {
+                        composition,
+                        cleanup,
+                    },
+                ),
+            };
+        }
+    };
+    if !startup_budget.operation_is_open() {
+        drop((closed_components, interaction_dispatch_port));
+        return Err(cleanup_after_operation_deadline_v1(databases, &startup_budget).await);
+    }
     let finalizer_generation =
         RuntimeMutationFinalizerGenerationV1::new(NonZeroU64::MIN).expect("finalizer generation");
     let mutation_finalizer =
@@ -1081,7 +1140,7 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         ) {
             Ok(finalizer) => finalizer,
             Err(composition) => {
-                drop(closed_components);
+                drop((closed_components, interaction_dispatch_port));
                 let shutdown = databases.shutdown();
                 drop(databases);
                 return match shutdown
@@ -1131,7 +1190,7 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
                 .shutdown_until(startup_budget.cleanup_deadline())
                 .await;
             drop(finalizer_report);
-            drop(closed_components);
+            drop((closed_components, interaction_dispatch_port));
             let shutdown = databases.shutdown();
             drop(databases);
             let cleanup = shutdown
@@ -1154,6 +1213,7 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
     Ok(RuntimeProcessFoundationV1 {
         gateway: closed_components.gateway,
         registry: closed_components.registry,
+        interaction_dispatch_port,
         databases,
         secrets,
         config,
@@ -1411,6 +1471,9 @@ mod tests {
         let controller_id = RuntimeProcessFoundationCompositionErrorV1::ControllerId(
             RuntimeControllerIdGenerationErrorV1::EntropyUnavailable,
         );
+        let interaction_dispatch = RuntimeProcessFoundationCompositionErrorV1::InteractionDispatch(
+            RuntimeInteractionDispatchCompositionErrorV1::SnapshotUnavailable,
+        );
 
         assert_eq!(
             process_instance_id.code(),
@@ -1439,6 +1502,11 @@ mod tests {
             "runtime_database_startup_cleanup_timed_out"
         );
         assert_eq!(database_cleanup.context(), None);
+        assert_eq!(
+            interaction_dispatch.code(),
+            "runtime_interaction_dispatch_snapshot_unavailable"
+        );
+        assert_eq!(interaction_dispatch.context(), None);
         let deadline = RuntimeProcessFoundationCompositionErrorV1::OperationDeadlineElapsed;
         let deadline_cleanup =
             RuntimeProcessFoundationCompositionErrorV1::CleanupAfterOperationDeadline {

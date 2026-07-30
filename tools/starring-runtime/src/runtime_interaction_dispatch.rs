@@ -13,9 +13,15 @@ use automation_runtime::{
 };
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use paused_discord_model::application::interaction::Interaction;
 use tokio::time::Instant as TokioInstant;
 
 use crate::database::RuntimeInteractionDispatchDatabasePortV1;
+use crate::discord_interaction_normalizer::{
+    normalize_runtime_discord_interaction_v1, RuntimeDiscordInteractionIgnoredV1,
+    RuntimeDiscordInteractionNormalizationErrorV1, RuntimeDiscordInteractionNormalizationOutcomeV1,
+};
+use crate::health::RuntimeHealthReadinessObserverV1;
 use crate::GatewayResourceConfigV1;
 
 pub(crate) type RuntimeInteractionDispatchFutureV1 =
@@ -152,6 +158,174 @@ pub(crate) fn compose_runtime_discord_interaction_dispatch_lane_v1(
     )
 }
 
+pub(crate) enum RuntimeDiscordInteractionActorHandlingOutcomeV1 {
+    Enqueue(RuntimeInteractionEnqueueOutcomeV1),
+    Ignored(RuntimeDiscordInteractionIgnoredV1),
+    Rejected(RuntimeDiscordInteractionNormalizationErrorV1),
+}
+
+impl Debug for RuntimeDiscordInteractionActorHandlingOutcomeV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeDiscordInteractionActorHandlingOutcomeV1(<redacted>)")
+    }
+}
+
+pub(crate) struct RuntimeDiscordInteractionActorLaneV1<P>
+where
+    P: RuntimeInteractionDispatchPortV1,
+{
+    lane: RuntimeDiscordInteractionDispatchLaneV1<P>,
+    connection_observer: GatewayConnectionObserverV3,
+    product_readiness: RuntimeHealthReadinessObserverV1,
+    accepting_lease: Option<GatewayReadyLeaseV3>,
+}
+
+pub(crate) type RuntimeProductionDiscordInteractionActorLaneV1 =
+    RuntimeDiscordInteractionActorLaneV1<RuntimeInteractionDispatchDatabasePortV1>;
+
+pub(crate) fn compose_runtime_discord_interaction_actor_lane_v1(
+    port: RuntimeInteractionDispatchDatabasePortV1,
+    gateway: GatewayResourceConfigV1,
+    connection_observer: GatewayConnectionObserverV3,
+    product_readiness: RuntimeHealthReadinessObserverV1,
+) -> RuntimeProductionDiscordInteractionActorLaneV1 {
+    RuntimeDiscordInteractionActorLaneV1::new_v1(
+        port,
+        gateway.rejection_acknowledgement_capacity(),
+        connection_observer,
+        product_readiness,
+    )
+}
+
+impl<P> RuntimeDiscordInteractionActorLaneV1<P>
+where
+    P: RuntimeInteractionDispatchPortV1,
+{
+    pub(crate) fn new_v1(
+        port: P,
+        rejection_capacity: NonZeroUsize,
+        connection_observer: GatewayConnectionObserverV3,
+        product_readiness: RuntimeHealthReadinessObserverV1,
+    ) -> Self {
+        Self {
+            lane: RuntimeDiscordInteractionDispatchLaneV1::new_v1(port, rejection_capacity),
+            connection_observer,
+            product_readiness,
+            accepting_lease: None,
+        }
+    }
+
+    pub(crate) fn has_in_flight_v1(&self) -> bool {
+        self.lane.has_in_flight_v1()
+    }
+
+    pub(crate) fn report_v1(&self) -> RuntimeInteractionDispatchReportV1 {
+        self.lane.report_v1()
+    }
+
+    pub(crate) fn reconcile_accepting_v1(&mut self) -> Result<(), RuntimeInteractionReopenErrorV1> {
+        if !self.product_readiness.is_ready_v1() {
+            self.lane.pause_intake_v1();
+            self.accepting_lease = None;
+            return Err(RuntimeInteractionReopenErrorV1::ProductNotReady);
+        }
+        let Some(ready_lease) = self.current_ready_lease_v1() else {
+            self.lane.pause_intake_v1();
+            self.accepting_lease = None;
+            return Err(RuntimeInteractionReopenErrorV1::GatewayNotReady);
+        };
+        if self.lane.is_accepting_v1() {
+            if self
+                .accepting_lease
+                .is_some_and(|lease| self.connection_observer.ready_lease_is_current(&lease))
+            {
+                return Ok(());
+            }
+            self.lane.pause_intake_v1();
+            self.accepting_lease = None;
+        }
+        let product_readiness = &self.product_readiness;
+        self.lane
+            .reopen_v1(&self.connection_observer, Some(ready_lease), || {
+                product_readiness.is_ready_v1()
+            })?;
+        self.accepting_lease = Some(ready_lease);
+        Ok(())
+    }
+
+    pub(crate) fn handle_raw_interaction_v1(
+        &mut self,
+        interaction: Interaction,
+    ) -> RuntimeDiscordInteractionActorHandlingOutcomeV1 {
+        match normalize_runtime_discord_interaction_v1(interaction) {
+            RuntimeDiscordInteractionNormalizationOutcomeV1::Normalized(envelope) => {
+                let _ = self.reconcile_accepting_v1();
+                let ready_lease = self.current_ready_lease_v1();
+                let Self {
+                    lane,
+                    connection_observer,
+                    product_readiness,
+                    ..
+                } = self;
+                RuntimeDiscordInteractionActorHandlingOutcomeV1::Enqueue(lane.try_enqueue_v1(
+                    *envelope,
+                    connection_observer,
+                    ready_lease,
+                    || product_readiness.is_ready_v1(),
+                ))
+            }
+            RuntimeDiscordInteractionNormalizationOutcomeV1::Ignored(reason) => {
+                RuntimeDiscordInteractionActorHandlingOutcomeV1::Ignored(reason)
+            }
+            RuntimeDiscordInteractionNormalizationOutcomeV1::Rejected(error) => {
+                RuntimeDiscordInteractionActorHandlingOutcomeV1::Rejected(error)
+            }
+        }
+    }
+
+    pub(crate) async fn poll_next_completion_v1(&mut self) -> RuntimeInteractionCompletionV1 {
+        self.lane.poll_next_completion_v1().await
+    }
+
+    pub(crate) async fn pause_and_drain_until_v1(
+        &mut self,
+        deadline: Instant,
+    ) -> RuntimeInteractionDrainOutcomeV1 {
+        self.accepting_lease = None;
+        self.lane.pause_and_drain_until_v1(deadline).await
+    }
+
+    pub(crate) async fn seal_and_drain_until_v1(
+        &mut self,
+        deadline: Instant,
+    ) -> RuntimeInteractionDrainOutcomeV1 {
+        self.accepting_lease = None;
+        self.lane.seal_and_drain_until_v1(deadline).await
+    }
+
+    pub(crate) fn abort_v1(&mut self) {
+        self.accepting_lease = None;
+        self.lane.abort_v1();
+    }
+
+    fn current_ready_lease_v1(&self) -> Option<GatewayReadyLeaseV3> {
+        let epoch = self
+            .connection_observer
+            .current_connection()
+            .current_epoch()?;
+        self.connection_observer.issue_ready_lease(epoch).ok()
+    }
+}
+
+impl<P> Debug for RuntimeDiscordInteractionActorLaneV1<P>
+where
+    P: RuntimeInteractionDispatchPortV1,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeDiscordInteractionActorLaneV1(<redacted>)")
+    }
+}
+
 impl<P> RuntimeDiscordInteractionDispatchLaneV1<P>
 where
     P: RuntimeInteractionDispatchPortV1,
@@ -175,6 +349,16 @@ where
 
     pub(crate) fn report_v1(&self) -> RuntimeInteractionDispatchReportV1 {
         self.report
+    }
+
+    fn is_accepting_v1(&self) -> bool {
+        self.state == RuntimeInteractionLaneStateV1::Accepting
+    }
+
+    fn pause_intake_v1(&mut self) {
+        if self.state != RuntimeInteractionLaneStateV1::Sealed {
+            self.state = RuntimeInteractionLaneStateV1::Paused;
+        }
     }
 
     pub(crate) fn try_enqueue_v1<F>(
@@ -436,12 +620,23 @@ mod tests {
 
     use automation_runtime::{
         encode_button, shared_gateway_control_channel_v3, GatewayControlConfigV3,
-        GatewayReadyKindV3, SharedGatewayInteractionApplicationIdV3, SharedGatewayInteractionIdV3,
-        SharedGatewayInteractionIdentityV3, SharedGatewayInteractionTokenV3,
+        GatewayDisconnectKindV3, GatewayReadyKindV3, SharedGatewayInteractionApplicationIdV3,
+        SharedGatewayInteractionIdV3, SharedGatewayInteractionIdentityV3,
+        SharedGatewayInteractionTokenV3,
     };
     use discord_model::{ChannelId, GuildId, UserId};
+    use paused_discord_model::application::interaction::message_component::MessageComponentInteractionData;
+    use paused_discord_model::application::interaction::{InteractionData, InteractionType};
+    use paused_discord_model::channel::message::component::ComponentType;
+    use paused_discord_model::id::marker::{
+        ApplicationMarker, ChannelMarker, GuildMarker, InteractionMarker, UserMarker,
+    };
+    use paused_discord_model::id::Id;
+    use paused_discord_model::oauth::ApplicationIntegrationMap;
+    use paused_discord_model::user::User;
 
     use super::*;
+    use crate::health::RuntimeHealthSupervisorV1;
 
     enum TestDispatchBehaviorV1 {
         Complete,
@@ -527,6 +722,77 @@ mod tests {
         .unwrap()
     }
 
+    fn pinned_user_v1(id: u64) -> User {
+        User {
+            accent_color: None,
+            avatar: None,
+            avatar_decoration: None,
+            avatar_decoration_data: None,
+            banner: None,
+            bot: false,
+            discriminator: 0,
+            email: None,
+            flags: None,
+            global_name: None,
+            id: Id::<UserMarker>::new(id),
+            locale: None,
+            mfa_enabled: None,
+            name: String::new(),
+            premium_type: None,
+            primary_guild: None,
+            public_flags: None,
+            system: None,
+            verified: None,
+        }
+    }
+
+    #[allow(deprecated)]
+    fn pinned_button_v1(guild_id: Option<u64>) -> Interaction {
+        Interaction {
+            app_permissions: None,
+            application_id: Id::<ApplicationMarker>::new(41),
+            authorizing_integration_owners: ApplicationIntegrationMap {
+                guild: None,
+                user: None,
+            },
+            channel: None,
+            channel_id: Some(Id::<ChannelMarker>::new(43)),
+            context: None,
+            data: Some(InteractionData::MessageComponent(Box::new(
+                MessageComponentInteractionData {
+                    custom_id: "join".to_string(),
+                    component_type: ComponentType::Button,
+                    resolved: None,
+                    values: Vec::new(),
+                },
+            ))),
+            entitlements: Vec::new(),
+            guild: None,
+            guild_id: guild_id.map(Id::<GuildMarker>::new),
+            guild_locale: None,
+            id: Id::<InteractionMarker>::new(47),
+            kind: InteractionType::MessageComponent,
+            locale: Some("ko".to_string()),
+            member: None,
+            message: None,
+            token: "interaction-token-secret".to_string(),
+            user: Some(pinned_user_v1(53)),
+        }
+    }
+
+    async fn health_v1() -> (
+        RuntimeHealthSupervisorV1,
+        crate::health::RuntimeHealthReadinessPublisherV2,
+        RuntimeHealthReadinessObserverV1,
+    ) {
+        let mut health = RuntimeHealthSupervisorV1::start("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let observer = health.readiness_observer_v1();
+        let publisher = health.take_readiness_publisher_v2().unwrap();
+        (health, publisher, observer)
+    }
+
     struct TestReadyV1 {
         _owners: Box<dyn std::any::Any>,
         observer: GatewayConnectionObserverV3,
@@ -558,6 +824,193 @@ mod tests {
         lane.reopen_v1(&ready.observer, Some(ready.lease), || true)
             .unwrap();
         (lane, ready)
+    }
+
+    #[tokio::test]
+    async fn actor_lane_normalizes_and_lazily_opens_the_same_bounded_lane() {
+        let reserve_calls = Arc::new(AtomicUsize::new(0));
+        let ready = ready_v1();
+        let (health, publisher, readiness) = health_v1().await;
+        assert!(publisher.publish_ready_v2());
+        let mut actor = RuntimeDiscordInteractionActorLaneV1::new_v1(
+            TestPortV1 {
+                dispatch_capacity: NonZeroUsize::new(1).unwrap(),
+                dispatch_behavior: TestDispatchBehaviorV1::Complete,
+                acknowledgement_pending: false,
+                reserve_calls: Arc::clone(&reserve_calls),
+            },
+            NonZeroUsize::new(1).unwrap(),
+            ready.observer.clone(),
+            readiness,
+        );
+
+        assert!(!actor.has_in_flight_v1());
+        assert!(matches!(
+            actor.handle_raw_interaction_v1(pinned_button_v1(Some(42))),
+            RuntimeDiscordInteractionActorHandlingOutcomeV1::Enqueue(
+                RuntimeInteractionEnqueueOutcomeV1::Enqueued
+            )
+        ));
+        assert!(actor.has_in_flight_v1());
+        assert_eq!(reserve_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            actor.poll_next_completion_v1().await,
+            RuntimeInteractionCompletionV1::Dispatch
+        );
+        assert_eq!(actor.report_v1().enqueued, 1);
+        assert_eq!(actor.report_v1().completed, 1);
+        assert_eq!(
+            format!("{actor:?}"),
+            "RuntimeDiscordInteractionActorLaneV1(<redacted>)"
+        );
+
+        drop(ready);
+        health
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_lane_fails_closed_then_lazily_reopens_after_product_readiness() {
+        let reserve_calls = Arc::new(AtomicUsize::new(0));
+        let ready = ready_v1();
+        let (health, publisher, readiness) = health_v1().await;
+        let mut actor = RuntimeDiscordInteractionActorLaneV1::new_v1(
+            TestPortV1 {
+                dispatch_capacity: NonZeroUsize::new(1).unwrap(),
+                dispatch_behavior: TestDispatchBehaviorV1::Complete,
+                acknowledgement_pending: false,
+                reserve_calls: Arc::clone(&reserve_calls),
+            },
+            NonZeroUsize::new(1).unwrap(),
+            ready.observer.clone(),
+            readiness,
+        );
+
+        assert!(matches!(
+            actor.handle_raw_interaction_v1(pinned_button_v1(Some(42))),
+            RuntimeDiscordInteractionActorHandlingOutcomeV1::Enqueue(
+                RuntimeInteractionEnqueueOutcomeV1::Rejected {
+                    acknowledgement: RuntimeInteractionRejectionSchedulingV1::Enqueued
+                }
+            )
+        ));
+        assert_eq!(reserve_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            actor.poll_next_completion_v1().await,
+            RuntimeInteractionCompletionV1::RejectionAcknowledgement
+        );
+        assert!(publisher.publish_ready_v2());
+        assert!(matches!(
+            actor.handle_raw_interaction_v1(pinned_button_v1(Some(42))),
+            RuntimeDiscordInteractionActorHandlingOutcomeV1::Enqueue(
+                RuntimeInteractionEnqueueOutcomeV1::Enqueued
+            )
+        ));
+        assert_eq!(reserve_calls.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            actor
+                .seal_and_drain_until_v1(Instant::now() + Duration::from_secs(1))
+                .await,
+            RuntimeInteractionDrainOutcomeV1::Clean
+        );
+        drop(ready);
+        health
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_lane_discards_ignored_raw_interactions_before_dispatch() {
+        let reserve_calls = Arc::new(AtomicUsize::new(0));
+        let ready = ready_v1();
+        let (health, publisher, readiness) = health_v1().await;
+        assert!(publisher.publish_ready_v2());
+        let mut actor = RuntimeDiscordInteractionActorLaneV1::new_v1(
+            TestPortV1 {
+                dispatch_capacity: NonZeroUsize::new(1).unwrap(),
+                dispatch_behavior: TestDispatchBehaviorV1::Complete,
+                acknowledgement_pending: false,
+                reserve_calls: Arc::clone(&reserve_calls),
+            },
+            NonZeroUsize::new(1).unwrap(),
+            ready.observer.clone(),
+            readiness,
+        );
+
+        assert!(matches!(
+            actor.handle_raw_interaction_v1(pinned_button_v1(None)),
+            RuntimeDiscordInteractionActorHandlingOutcomeV1::Ignored(
+                RuntimeDiscordInteractionIgnoredV1::DirectMessage
+            )
+        ));
+        assert_eq!(reserve_calls.load(Ordering::SeqCst), 0);
+        assert!(!actor.has_in_flight_v1());
+
+        drop(ready);
+        health
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_lane_replaces_stale_accepting_lease_before_a_successor_epoch() {
+        let reserve_calls = Arc::new(AtomicUsize::new(0));
+        let (control, mut runtime) =
+            shared_gateway_control_channel_v3(GatewayControlConfigV3::default());
+        let observer = control.connection_observer();
+        runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let (health, publisher, readiness) = health_v1().await;
+        assert!(publisher.publish_ready_v2());
+        let mut actor = RuntimeDiscordInteractionActorLaneV1::new_v1(
+            TestPortV1 {
+                dispatch_capacity: NonZeroUsize::new(1).unwrap(),
+                dispatch_behavior: TestDispatchBehaviorV1::Complete,
+                acknowledgement_pending: false,
+                reserve_calls: Arc::clone(&reserve_calls),
+            },
+            NonZeroUsize::new(1).unwrap(),
+            observer,
+            readiness,
+        );
+
+        assert!(matches!(
+            actor.handle_raw_interaction_v1(pinned_button_v1(Some(42))),
+            RuntimeDiscordInteractionActorHandlingOutcomeV1::Enqueue(
+                RuntimeInteractionEnqueueOutcomeV1::Enqueued
+            )
+        ));
+        assert_eq!(
+            actor.poll_next_completion_v1().await,
+            RuntimeInteractionCompletionV1::Dispatch
+        );
+        runtime
+            .mark_disconnected(GatewayDisconnectKindV3::Reconnect)
+            .unwrap();
+        runtime.mark_connected(GatewayReadyKindV3::Resumed).unwrap();
+        assert!(matches!(
+            actor.handle_raw_interaction_v1(pinned_button_v1(Some(42))),
+            RuntimeDiscordInteractionActorHandlingOutcomeV1::Enqueue(
+                RuntimeInteractionEnqueueOutcomeV1::Enqueued
+            )
+        ));
+        assert_eq!(reserve_calls.load(Ordering::SeqCst), 2);
+
+        assert_eq!(
+            actor
+                .seal_and_drain_until_v1(Instant::now() + Duration::from_secs(1))
+                .await,
+            RuntimeInteractionDrainOutcomeV1::Clean
+        );
+        drop((control, runtime));
+        health
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

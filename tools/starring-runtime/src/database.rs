@@ -355,8 +355,7 @@ impl Debug for RuntimeControllerDatabaseV2 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[allow(dead_code)]
-pub(crate) enum RuntimeInteractionDispatchCompositionErrorV1 {
+pub enum RuntimeInteractionDispatchCompositionErrorV1 {
     #[error("runtime interaction dispatch admission configuration is invalid")]
     AdmissionConfiguration,
     #[error("runtime interaction dispatch route configuration is invalid")]
@@ -367,9 +366,8 @@ pub(crate) enum RuntimeInteractionDispatchCompositionErrorV1 {
     SnapshotUnavailable,
 }
 
-#[allow(dead_code)]
 impl RuntimeInteractionDispatchCompositionErrorV1 {
-    pub(crate) fn code(self) -> &'static str {
+    pub const fn code(self) -> &'static str {
         match self {
             Self::AdmissionConfiguration => "runtime_interaction_dispatch_admission_configuration",
             Self::RouteConfiguration => "runtime_interaction_dispatch_route_configuration",
@@ -379,9 +377,9 @@ impl RuntimeInteractionDispatchCompositionErrorV1 {
     }
 }
 
-#[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct RuntimeInteractionDispatchDatabasePortV1 {
-    inner: OwnedSharedGatewayDispatchServicesV3<PostgresRuntimeInteractionV1>,
+    inner: Arc<OwnedSharedGatewayDispatchServicesV3<PostgresRuntimeInteractionV1>>,
 }
 
 impl Debug for RuntimeInteractionDispatchDatabasePortV1 {
@@ -541,7 +539,9 @@ impl RuntimeDatabaseDependenciesV1 {
                 }
             },
         )?;
-        Ok(RuntimeInteractionDispatchDatabasePortV1 { inner })
+        Ok(RuntimeInteractionDispatchDatabasePortV1 {
+            inner: Arc::new(inner),
+        })
     }
 
     pub fn exact_target(&self) -> &PostgresRuntimeExactTargetReader {
