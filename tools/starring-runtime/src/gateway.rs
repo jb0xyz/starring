@@ -37,11 +37,11 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{sleep_until, timeout_at, Instant as TokioInstant};
 
 use crate::closed_recovery::RuntimeClosedRecoveryTransitionAuthorityV2;
+use crate::database::RuntimeInteractionDispatchDatabasePortV1;
 #[cfg(test)]
 use crate::discord::RuntimeDiscordGatewayDriverV1;
 use crate::discord::{
-    prepare_twilight_runtime_discord_gateway_driver_v1,
-    runtime_discord_immediate_dispatch_drain_lane_v1, start_runtime_discord_gateway_v1,
+    prepare_twilight_runtime_discord_gateway_driver_v1, start_runtime_discord_gateway_v1,
     RuntimeDiscordControlTaskV1, RuntimeDiscordDispatchDrainConfirmationV1,
     RuntimeDiscordDispatchDrainRequestV1, RuntimeDiscordGatewayActorStartV1,
     RuntimeDiscordGatewayStartErrorV1, RuntimeDiscordGatewaySupervisorV1,
@@ -51,7 +51,8 @@ use crate::discord::{
 };
 #[cfg(test)]
 use crate::discord::{
-    runtime_discord_dispatch_drain_test_lane_v1, RuntimeDiscordDispatchDrainTestControlV1,
+    runtime_discord_dispatch_drain_test_lane_v1, runtime_discord_immediate_dispatch_drain_lane_v1,
+    RuntimeDiscordDispatchDrainLaneV1, RuntimeDiscordDispatchDrainTestControlV1,
 };
 use crate::discord_lifecycle::{
     RuntimeDiscordAdmissionReservationSnapshotV2, RuntimeDiscordPauseReservationIdentityV2,
@@ -62,6 +63,7 @@ use crate::gateway_owner_startup_watchdog::{
     RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerEmergencyInvalidatorV1,
     RuntimeGatewayOwnerPreparedClosedRecoveryV2, RuntimeGatewayOwnerStartupWatchdogStartContextV1,
 };
+use crate::health::RuntimeHealthReadinessObserverV1;
 use crate::lifecycle_timing::RuntimeLifecycleTimingRecorderV2;
 use crate::process_supervisor::RuntimeProcessInvalidationTriggerV1;
 use crate::registry::{
@@ -70,6 +72,7 @@ use crate::registry::{
     RuntimeRegistryBarrierBServingCompletionWitnessV2, RuntimeRegistryBarrierBServingErrorV2,
     RuntimeRegistryBarrierBServingMonitorAuthorityV2,
 };
+use crate::runtime_interaction_dispatch::compose_runtime_discord_interaction_actor_lane_v1;
 use crate::shutdown::RuntimeShutdownObserverV1;
 use crate::{
     GatewayResourceConfigV1, RuntimeDiscordBotTokenV1, RuntimeGatewayOwnerStartupWatchdogConfigV1,
@@ -1498,6 +1501,35 @@ enum RuntimeDiscordControlCommandV1 {
     OpenAdmission { response: oneshot::Sender<bool> },
 }
 
+pub(crate) struct RuntimeDiscordProductionStartV1<'a> {
+    token: &'a RuntimeDiscordBotTokenV1,
+    interaction_dispatch: RuntimeInteractionDispatchDatabasePortV1,
+    gateway_config: GatewayResourceConfigV1,
+    product_readiness: RuntimeHealthReadinessObserverV1,
+    operation_cutoff: Instant,
+    shutdown_deadline: Instant,
+}
+
+impl<'a> RuntimeDiscordProductionStartV1<'a> {
+    pub(crate) fn new(
+        token: &'a RuntimeDiscordBotTokenV1,
+        interaction_dispatch: RuntimeInteractionDispatchDatabasePortV1,
+        gateway_config: GatewayResourceConfigV1,
+        product_readiness: RuntimeHealthReadinessObserverV1,
+        operation_cutoff: Instant,
+        shutdown_deadline: Instant,
+    ) -> Self {
+        Self {
+            token,
+            interaction_dispatch,
+            gateway_config,
+            product_readiness,
+            operation_cutoff,
+            shutdown_deadline,
+        }
+    }
+}
+
 pub struct RuntimeGatewayBootstrapV1 {
     adapter: SharedGatewayControlAdapterV2,
     coordinator: Option<RuntimeGatewayCoordinatorOwnerV2>,
@@ -2497,11 +2529,17 @@ impl RuntimeGatewayBootstrapV1 {
 
     pub(crate) async fn start_discord_gateway_v1(
         &mut self,
-        token: &RuntimeDiscordBotTokenV1,
-        operation_cutoff: Instant,
-        shutdown_deadline: Instant,
+        start: RuntimeDiscordProductionStartV1<'_>,
         shutdown: &mut RuntimeShutdownObserverV1,
     ) -> Result<RuntimeDiscordGatewaySupervisorV1, RuntimeDiscordGatewayStartErrorV1> {
+        let RuntimeDiscordProductionStartV1 {
+            token,
+            interaction_dispatch,
+            gateway_config,
+            product_readiness,
+            operation_cutoff,
+            shutdown_deadline,
+        } = start;
         let driver =
             prepare_twilight_runtime_discord_gateway_driver_v1(token.expose_secret().to_owned());
         let prepared = self
@@ -2511,6 +2549,12 @@ impl RuntimeGatewayBootstrapV1 {
             let _stopped = prepared.stopped_sender.send(true);
             return Err(RuntimeDiscordGatewayStartErrorV1::OperationDeadlineElapsed);
         }
+        let interaction_lane = compose_runtime_discord_interaction_actor_lane_v1(
+            interaction_dispatch,
+            gateway_config,
+            self.adapter.connection_observer.clone(),
+            product_readiness,
+        );
         let mut supervisor = start_runtime_discord_gateway_v1(
             driver,
             RuntimeDiscordGatewayActorStartV1 {
@@ -2520,7 +2564,7 @@ impl RuntimeGatewayBootstrapV1 {
                 lifecycle_drained: prepared.lifecycle_drained,
                 dispatch_drain_requests: prepared.dispatch_drain_requests,
                 dispatch_drain_confirmations: prepared.dispatch_drain_confirmations,
-                dispatch_drain_lane: runtime_discord_immediate_dispatch_drain_lane_v1(),
+                dispatch_drain_lane: Box::new(interaction_lane),
                 discord_reservation: prepared.discord_reservation,
                 ordinary_resume_authorization: prepared.ordinary_resume_authorization,
                 ordinary_resume_actor_observation: prepared.ordinary_resume_actor_observation,
@@ -2630,6 +2674,50 @@ impl RuntimeGatewayBootstrapV1 {
         D: RuntimeDiscordGatewayDriverV1,
         F: FnOnce(&Self),
     {
+        self.start_discord_gateway_with_driver_and_lane_before_release_v1(
+            driver,
+            runtime_discord_immediate_dispatch_drain_lane_v1(),
+            operation_cutoff,
+            shutdown_deadline,
+            before_release,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn start_discord_gateway_with_driver_and_lane_v1<D>(
+        &mut self,
+        driver: D,
+        dispatch_drain_lane: Box<dyn RuntimeDiscordDispatchDrainLaneV1>,
+        operation_cutoff: Instant,
+        shutdown_deadline: Instant,
+    ) -> Result<RuntimeDiscordGatewaySupervisorV1, RuntimeDiscordGatewayStartErrorV1>
+    where
+        D: RuntimeDiscordGatewayDriverV1,
+    {
+        self.start_discord_gateway_with_driver_and_lane_before_release_v1(
+            driver,
+            dispatch_drain_lane,
+            operation_cutoff,
+            shutdown_deadline,
+            |_| {},
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn start_discord_gateway_with_driver_and_lane_before_release_v1<D, F>(
+        &mut self,
+        driver: D,
+        dispatch_drain_lane: Box<dyn RuntimeDiscordDispatchDrainLaneV1>,
+        operation_cutoff: Instant,
+        shutdown_deadline: Instant,
+        before_release: F,
+    ) -> Result<RuntimeDiscordGatewaySupervisorV1, RuntimeDiscordGatewayStartErrorV1>
+    where
+        D: RuntimeDiscordGatewayDriverV1,
+        F: FnOnce(&Self),
+    {
         let prepared = self
             .prepare_discord_gateway_start_v1(operation_cutoff, None)
             .await?;
@@ -2642,7 +2730,7 @@ impl RuntimeGatewayBootstrapV1 {
                 lifecycle_drained: prepared.lifecycle_drained,
                 dispatch_drain_requests: prepared.dispatch_drain_requests,
                 dispatch_drain_confirmations: prepared.dispatch_drain_confirmations,
-                dispatch_drain_lane: runtime_discord_immediate_dispatch_drain_lane_v1(),
+                dispatch_drain_lane,
                 discord_reservation: prepared.discord_reservation,
                 ordinary_resume_authorization: prepared.ordinary_resume_authorization,
                 ordinary_resume_actor_observation: prepared.ordinary_resume_actor_observation,

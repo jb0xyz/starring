@@ -13,13 +13,14 @@ use automation_runtime::{
 };
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
-use paused_discord_model::application::interaction::Interaction;
 use tokio::time::Instant as TokioInstant;
 
 use crate::database::RuntimeInteractionDispatchDatabasePortV1;
+use crate::discord::RuntimeDiscordDispatchDrainLaneV1;
 use crate::discord_interaction_normalizer::{
-    normalize_runtime_discord_interaction_v1, RuntimeDiscordInteractionIgnoredV1,
+    normalize_pinned_runtime_discord_interaction_v1, RuntimeDiscordInteractionIgnoredV1,
     RuntimeDiscordInteractionNormalizationErrorV1, RuntimeDiscordInteractionNormalizationOutcomeV1,
+    ZeroizingPinnedDiscordInteractionV1,
 };
 use crate::health::RuntimeHealthReadinessObserverV1;
 use crate::GatewayResourceConfigV1;
@@ -255,9 +256,9 @@ where
 
     pub(crate) fn handle_raw_interaction_v1(
         &mut self,
-        interaction: Interaction,
+        interaction: Box<ZeroizingPinnedDiscordInteractionV1>,
     ) -> RuntimeDiscordInteractionActorHandlingOutcomeV1 {
-        match normalize_runtime_discord_interaction_v1(interaction) {
+        match normalize_pinned_runtime_discord_interaction_v1(interaction) {
             RuntimeDiscordInteractionNormalizationOutcomeV1::Normalized(envelope) => {
                 let _ = self.reconcile_accepting_v1();
                 let ready_lease = self.current_ready_lease_v1();
@@ -314,6 +315,61 @@ where
             .current_connection()
             .current_epoch()?;
         self.connection_observer.issue_ready_lease(epoch).ok()
+    }
+}
+
+impl<P> RuntimeDiscordDispatchDrainLaneV1 for RuntimeDiscordInteractionActorLaneV1<P>
+where
+    P: RuntimeInteractionDispatchPortV1,
+{
+    fn has_in_flight_v1(&self) -> bool {
+        RuntimeDiscordInteractionActorLaneV1::has_in_flight_v1(self)
+    }
+
+    fn reconcile_accepting_v1(&mut self) {
+        let _outcome = RuntimeDiscordInteractionActorLaneV1::reconcile_accepting_v1(self);
+    }
+
+    fn handle_raw_interaction_v1(&mut self, interaction: Box<ZeroizingPinnedDiscordInteractionV1>) {
+        let _outcome =
+            RuntimeDiscordInteractionActorLaneV1::handle_raw_interaction_v1(self, interaction);
+    }
+
+    fn poll_next_completion_v1(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            let _completion =
+                RuntimeDiscordInteractionActorLaneV1::poll_next_completion_v1(self).await;
+        })
+    }
+
+    fn drain_until_v1(
+        &mut self,
+        _transition_sequence: u64,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            matches!(
+                RuntimeDiscordInteractionActorLaneV1::pause_and_drain_until_v1(self, deadline)
+                    .await,
+                RuntimeInteractionDrainOutcomeV1::Clean
+            )
+        })
+    }
+
+    fn seal_until_v1(
+        &mut self,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            matches!(
+                RuntimeDiscordInteractionActorLaneV1::seal_and_drain_until_v1(self, deadline).await,
+                RuntimeInteractionDrainOutcomeV1::Clean
+            )
+        })
+    }
+
+    fn abort_v1(&mut self) {
+        RuntimeDiscordInteractionActorLaneV1::abort_v1(self);
     }
 }
 
@@ -626,7 +682,9 @@ mod tests {
     };
     use discord_model::{ChannelId, GuildId, UserId};
     use paused_discord_model::application::interaction::message_component::MessageComponentInteractionData;
-    use paused_discord_model::application::interaction::{InteractionData, InteractionType};
+    use paused_discord_model::application::interaction::{
+        Interaction, InteractionData, InteractionType,
+    };
     use paused_discord_model::channel::message::component::ComponentType;
     use paused_discord_model::id::marker::{
         ApplicationMarker, ChannelMarker, GuildMarker, InteractionMarker, UserMarker,
@@ -747,8 +805,8 @@ mod tests {
     }
 
     #[allow(deprecated)]
-    fn pinned_button_v1(guild_id: Option<u64>) -> Interaction {
-        Interaction {
+    fn pinned_button_v1(guild_id: Option<u64>) -> Box<ZeroizingPinnedDiscordInteractionV1> {
+        crate::discord_interaction_normalizer::pin_runtime_discord_interaction_v1(Interaction {
             app_permissions: None,
             application_id: Id::<ApplicationMarker>::new(41),
             authorizing_integration_owners: ApplicationIntegrationMap {
@@ -777,7 +835,7 @@ mod tests {
             message: None,
             token: "interaction-token-secret".to_string(),
             user: Some(pinned_user_v1(53)),
-        }
+        })
     }
 
     async fn health_v1() -> (

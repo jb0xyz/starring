@@ -418,12 +418,10 @@ impl RuntimeProcessFoundationV1 {
         self.root_supervisor.invalidation_trigger()
     }
 
-    #[allow(dead_code)]
     pub(super) fn product_readiness_observer_v1(&self) -> RuntimeHealthReadinessObserverV1 {
         self.root_supervisor.readiness_observer_v1()
     }
 
-    #[allow(dead_code)]
     pub(super) fn interaction_dispatch_port_v1(&self) -> RuntimeInteractionDispatchDatabasePortV1 {
         self.interaction_dispatch_port.clone()
     }

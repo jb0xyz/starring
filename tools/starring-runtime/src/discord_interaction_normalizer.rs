@@ -112,7 +112,13 @@ enum RuntimeDiscordInteractionNormalizationDecisionV1 {
     Ignored(RuntimeDiscordInteractionIgnoredV1),
 }
 
-struct ZeroizingPinnedDiscordInteractionV1(Interaction);
+pub(crate) struct ZeroizingPinnedDiscordInteractionV1(Interaction);
+
+pub(crate) fn pin_runtime_discord_interaction_v1(
+    interaction: Interaction,
+) -> Box<ZeroizingPinnedDiscordInteractionV1> {
+    Box::new(ZeroizingPinnedDiscordInteractionV1(interaction))
+}
 
 impl Drop for ZeroizingPinnedDiscordInteractionV1 {
     fn drop(&mut self) {
@@ -123,7 +129,12 @@ impl Drop for ZeroizingPinnedDiscordInteractionV1 {
 pub(crate) fn normalize_runtime_discord_interaction_v1(
     interaction: Interaction,
 ) -> RuntimeDiscordInteractionNormalizationOutcomeV1 {
-    let mut interaction = ZeroizingPinnedDiscordInteractionV1(interaction);
+    normalize_pinned_runtime_discord_interaction_v1(pin_runtime_discord_interaction_v1(interaction))
+}
+
+pub(crate) fn normalize_pinned_runtime_discord_interaction_v1(
+    mut interaction: Box<ZeroizingPinnedDiscordInteractionV1>,
+) -> RuntimeDiscordInteractionNormalizationOutcomeV1 {
     match normalize_guarded_runtime_discord_interaction_v1(&mut interaction.0) {
         Ok(RuntimeDiscordInteractionNormalizationDecisionV1::Normalized(envelope)) => {
             RuntimeDiscordInteractionNormalizationOutcomeV1::Normalized(Box::new(envelope))

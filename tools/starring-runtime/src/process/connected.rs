@@ -9,7 +9,7 @@ use crate::discord::{
     RuntimeDiscordGatewayExitV1, RuntimeDiscordGatewayShutdownErrorV1,
     RuntimeDiscordGatewayStartErrorV1, RuntimeDiscordGatewaySupervisorV1,
 };
-use crate::gateway::RuntimeGatewayReadyObservationErrorV1;
+use crate::gateway::{RuntimeDiscordProductionStartV1, RuntimeGatewayReadyObservationErrorV1};
 use crate::lifecycle_timing::{
     RuntimeLifecycleTimingMetricV2, RuntimeLifecycleTimingOutcomeV2,
     RuntimeLifecycleTimingTerminalReporterV2,
@@ -179,14 +179,22 @@ impl RuntimeOwnerHeldProcessV1 {
         }
         let operation_cutoff = self.foundation.startup_budget.operation_cutoff();
         let discord_cleanup_deadline = self.foundation.startup_budget.discord_cleanup_deadline();
+        let interaction_dispatch = self.foundation.interaction_dispatch_port_v1();
+        let gateway_config = self.foundation.config.gateway();
+        let product_readiness = self.foundation.product_readiness_observer_v1();
         let mut shutdown = self.foundation.shutdown_observer_v1();
         let discord = self
             .foundation
             .gateway
             .start_discord_gateway_v1(
-                self.foundation.secrets.discord_bot_token(),
-                operation_cutoff,
-                discord_cleanup_deadline,
+                RuntimeDiscordProductionStartV1::new(
+                    self.foundation.secrets.discord_bot_token(),
+                    interaction_dispatch,
+                    gateway_config,
+                    product_readiness,
+                    operation_cutoff,
+                    discord_cleanup_deadline,
+                ),
                 &mut shutdown,
             )
             .await;

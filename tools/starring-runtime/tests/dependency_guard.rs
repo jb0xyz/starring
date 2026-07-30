@@ -592,6 +592,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/controller_identity.rs",
             "src/database.rs",
             "src/discord.rs",
+            "src/discord_actor_serving_tests.rs",
             "src/discord_interaction_normalizer.rs",
             "src/discord_lifecycle.rs",
             "src/gateway.rs",
@@ -759,6 +760,8 @@ fn paused_discord_gateway_dependency_is_feature_isolated() {
 #[test]
 fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
     let lane = source_before_test_module(include_str!("../src/runtime_interaction_dispatch.rs"));
+    let normalizer =
+        source_before_test_module(include_str!("../src/discord_interaction_normalizer.rs"));
     let database = source_before_test_module(include_str!("../src/database.rs"));
     let facade = source_before_test_module(include_str!(
         "../../../crates/automation-runtime/src/shared_gateway_dispatcher.rs"
@@ -780,7 +783,11 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
         "accepting_lease: Option<GatewayReadyLeaseV3>",
         "pub(crate) fn reconcile_accepting_v1(",
         "pub(crate) fn handle_raw_interaction_v1(",
-        "normalize_runtime_discord_interaction_v1(interaction)",
+        "normalize_pinned_runtime_discord_interaction_v1(interaction)",
+        "impl<P> RuntimeDiscordDispatchDrainLaneV1 for RuntimeDiscordInteractionActorLaneV1<P>",
+        "fn seal_until_v1(",
+        "RuntimeDiscordInteractionActorLaneV1::seal_and_drain_until_v1(self, deadline).await",
+        "fn abort_v1(&mut self)",
         ".current_connection()",
         ".current_epoch()?",
         "self.connection_observer.issue_ready_lease(epoch).ok()",
@@ -803,6 +810,15 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
         "RuntimeDiscordInteractionDispatchLaneV1(<redacted>)",
     ] {
         assert!(lane.contains(required), "{required}");
+    }
+    for required in [
+        "pub(crate) struct ZeroizingPinnedDiscordInteractionV1(Interaction)",
+        "pub(crate) fn pin_runtime_discord_interaction_v1(",
+        "impl Drop for ZeroizingPinnedDiscordInteractionV1",
+        "zeroize_pinned_discord_interaction_v1(&mut self.0)",
+        "pub(crate) fn normalize_pinned_runtime_discord_interaction_v1(",
+    ] {
+        assert!(normalizer.contains(required), "{required}");
     }
     let enqueue = braced_declaration(lane, "pub(crate) fn try_enqueue_v1<F>(");
     let readiness_checks = enqueue
@@ -957,6 +973,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
             && path != Path::new("src/health.rs")
             && path != Path::new("src/discord.rs")
+            && path != Path::new("src/discord_actor_serving_tests.rs")
             && path != Path::new("src/ingress_acknowledgement_safety.rs")
             && path != Path::new("src/ingress_acknowledgement_supervisor.rs")
             && path != Path::new("src/maintenance_ingress_gate.rs")
@@ -1476,6 +1493,18 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             let allowed_interaction_dispatch_lane = path
                 == Path::new("src/runtime_interaction_dispatch.rs")
                 && identifier == "automation_runtime";
+            let allowed_discord_actor_serving_tests = path
+                == Path::new("src/discord_actor_serving_tests.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime" | "automation_runtime_convergence"
+                );
+            let allowed_discord_actor_serving_v3 = path
+                == Path::new("src/discord_actor_serving_tests.rs")
+                && matches!(
+                    identifier,
+                    "GatewayAdmissionPolicyV3" | "GatewayControlConfigV3"
+                );
             let allowed_interaction_dispatch_database =
                 path == Path::new("src/database.rs") && identifier == "automation_runtime";
             let allowed_interaction_dispatch_v3 = matches!(
@@ -1712,10 +1741,12 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     || allowed_pending_drain_succession
                     || allowed_pending_drain_finalizer_v3
                     || allowed_ordinary_barrier_v3
+                    || allowed_discord_actor_serving_v3
                     || allowed_discord_interaction_normalizer
                     || allowed_interaction_dispatch_v3)
                     && (allowed_readiness_worker
                         || allowed_interaction_dispatch_lane
+                        || allowed_discord_actor_serving_tests
                         || allowed_interaction_dispatch_database
                         || allowed_registry_adapter
                         || allowed_closed_recovery
@@ -2671,6 +2702,10 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "EventTypeFlags::RESUMED",
         "EventTypeFlags::GATEWAY_RECONNECT",
         "EventTypeFlags::GATEWAY_INVALIDATE_SESSION",
+        "EventTypeFlags::INTERACTION_CREATE",
+        "Event::InteractionCreate(interaction)",
+        "RuntimeDiscordGatewayEventV1::Interaction(",
+        "pin_runtime_discord_interaction_v1(",
         "GatewayCommandAckV3::Paused { .. }",
         "GatewayCommandAckV3::AdmissionResumed { epoch }",
         "RuntimeDiscordGatewayExitV1::AdmissionOpened",
@@ -2696,20 +2731,24 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "finish_runtime_discord_gateway_if_connected_v1(",
         "start_receiver.await.is_ok()",
         "wait_for_lifecycle_drain_v1(",
+        "dispatch_drain.lane.poll_next_completion_v1()",
+        "if dispatch_drain.lane.has_in_flight_v1()",
+        "dispatch_drain.lane.handle_raw_interaction_v1(interaction)",
+        "dispatch_drain.lane.reconcile_accepting_v1()",
+        "seal_runtime_discord_dispatch_lane_until_v1(",
+        "dispatch_drain.lane.abort_v1()",
         "RuntimeDiscordGatewaySupervisorV1(<redacted>)",
     ] {
         assert!(discord.contains(required), "{required}");
     }
     assert_eq!(discord.matches("runtime.spawn(async move").count(), 2);
     for forbidden in [
-        "INTERACTION_CREATE",
         "twilight_http",
         "Client",
         "run_shared_gateway_v3",
         "resume_admission",
         "issue_ready_lease",
         "bot_runtime",
-        "InteractionCreate",
         "InteractionResponder",
         "transport_started",
         "catch_unwind",
@@ -2727,6 +2766,8 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "control.next_lifecycle()",
         "prepare_twilight_runtime_discord_gateway_driver_v1(",
         "prepare_discord_gateway_start_v1(operation_cutoff, Some(shutdown))",
+        "compose_runtime_discord_interaction_actor_lane_v1(",
+        "dispatch_drain_lane: Box::new(interaction_lane)",
         "shutdown: &mut RuntimeShutdownObserverV1,",
         "_observation = shutdown.wait()",
         "supervisor.release_start_v1()",
@@ -2763,6 +2804,9 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "foundation.observe_shutdown_registry_v1()",
         ".begin_discord_drain_until_v1(discord_cleanup_deadline)",
         "foundation.finish_shutdown_v1(cleanup_deadline).await",
+        "self.foundation.interaction_dispatch_port_v1()",
+        "self.foundation.product_readiness_observer_v1()",
+        "self.foundation.config.gateway()",
     ] {
         assert!(connected.contains(required), "{required}");
     }
@@ -2818,10 +2862,20 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
     let prepare = start
         .find("prepare_discord_gateway_start_v1(operation_cutoff, Some(shutdown))")
         .unwrap();
+    let compose = start
+        .find("compose_runtime_discord_interaction_actor_lane_v1(")
+        .unwrap();
     let spawn = start.find("start_runtime_discord_gateway_v1(").unwrap();
     let attach = start.find("attach_discord_supervisor_v1").unwrap();
     let release = start.find("supervisor.release_start_v1()").unwrap();
-    assert!(driver < prepare && prepare < spawn && spawn < attach && attach < release);
+    assert!(
+        driver < prepare
+            && prepare < compose
+            && compose < spawn
+            && spawn < attach
+            && attach < release
+    );
+    assert!(!start.contains("runtime_discord_immediate_dispatch_drain_lane_v1"));
     let prepare = braced_declaration(gateway, "async fn prepare_discord_gateway_start_v1(");
     let reserve = prepare.find("reserve_discord_supervisor_v1").unwrap();
     let recheck = prepare[reserve..]
@@ -2833,7 +2887,6 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
     for forbidden in [
         "resume_admission",
         "issue_ready_lease",
-        "dispatch",
         "execute",
         "serve",
         "activate",
@@ -2849,7 +2902,6 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
             "startup: {forbidden}"
         );
     }
-    assert!(!contains_identifier(connected, "readiness"));
     assert!(!contains_identifier(connected, "recovery"));
     assert!(!library.contains("RuntimeDiscordStartingProcessV1"));
     assert!(!library.contains("RuntimePausedConnectedProcessV1"));

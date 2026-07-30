@@ -18,6 +18,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{sleep_until, timeout_at, Instant as TokioInstant};
 
+use crate::discord_interaction_normalizer::{
+    pin_runtime_discord_interaction_v1, ZeroizingPinnedDiscordInteractionV1,
+};
 use crate::discord_lifecycle::{
     RuntimeDiscordActorModeV2, RuntimeDiscordAdmissionReservationSnapshotV2,
     RuntimeDiscordPauseReservationIdentityV2,
@@ -83,25 +86,66 @@ impl RuntimeDiscordDispatchDrainConfirmationV1 {
 }
 
 pub(crate) trait RuntimeDiscordDispatchDrainLaneV1: Send {
+    fn has_in_flight_v1(&self) -> bool;
+
+    fn reconcile_accepting_v1(&mut self);
+
+    fn handle_raw_interaction_v1(&mut self, interaction: Box<ZeroizingPinnedDiscordInteractionV1>);
+
+    fn poll_next_completion_v1(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
     fn drain_until_v1(
         &mut self,
-        transition_sequence: GatewayAdmissionSequenceV3,
+        transition_sequence: u64,
         deadline: Instant,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+
+    fn seal_until_v1(
+        &mut self,
+        deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+
+    fn abort_v1(&mut self);
 }
 
+#[cfg(test)]
 struct RuntimeDiscordImmediateDispatchDrainLaneV1;
 
+#[cfg(test)]
 impl RuntimeDiscordDispatchDrainLaneV1 for RuntimeDiscordImmediateDispatchDrainLaneV1 {
+    fn has_in_flight_v1(&self) -> bool {
+        false
+    }
+
+    fn reconcile_accepting_v1(&mut self) {}
+
+    fn handle_raw_interaction_v1(&mut self, interaction: Box<ZeroizingPinnedDiscordInteractionV1>) {
+        drop(interaction);
+    }
+
+    fn poll_next_completion_v1(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
     fn drain_until_v1(
         &mut self,
-        _transition_sequence: GatewayAdmissionSequenceV3,
+        _transition_sequence: u64,
         _deadline: Instant,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         Box::pin(async { true })
     }
+
+    fn seal_until_v1(
+        &mut self,
+        _deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async { true })
+    }
+
+    fn abort_v1(&mut self) {}
 }
 
+#[cfg(test)]
 pub(crate) fn runtime_discord_immediate_dispatch_drain_lane_v1(
 ) -> Box<dyn RuntimeDiscordDispatchDrainLaneV1> {
     Box::new(RuntimeDiscordImmediateDispatchDrainLaneV1)
@@ -114,7 +158,7 @@ pub(crate) enum RuntimeDiscordDispatchDrainTestObservationV1 {
         transition_sequence: GatewayAdmissionSequenceV3,
     },
     Transition {
-        transition_sequence: GatewayAdmissionSequenceV3,
+        transition_sequence: u64,
         deadline: Instant,
     },
 }
@@ -142,8 +186,8 @@ impl RuntimeDiscordDispatchDrainTestControlV1 {
                 deadline,
             } = *self.observation.borrow_and_update()
             {
-                if transition_sequence.get() > previous {
-                    return Some((transition_sequence.get(), deadline));
+                if transition_sequence > previous {
+                    return Some((transition_sequence, deadline));
                 }
             }
             if !matches!(
@@ -164,9 +208,23 @@ struct RuntimeDiscordDispatchDrainTestLaneV1 {
 
 #[cfg(test)]
 impl RuntimeDiscordDispatchDrainLaneV1 for RuntimeDiscordDispatchDrainTestLaneV1 {
+    fn has_in_flight_v1(&self) -> bool {
+        false
+    }
+
+    fn reconcile_accepting_v1(&mut self) {}
+
+    fn handle_raw_interaction_v1(&mut self, interaction: Box<ZeroizingPinnedDiscordInteractionV1>) {
+        drop(interaction);
+    }
+
+    fn poll_next_completion_v1(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
     fn drain_until_v1(
         &mut self,
-        transition_sequence: GatewayAdmissionSequenceV3,
+        transition_sequence: u64,
         deadline: Instant,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
         Box::pin(async move {
@@ -181,7 +239,7 @@ impl RuntimeDiscordDispatchDrainLaneV1 for RuntimeDiscordDispatchDrainTestLaneV1
                 return false;
             }
             loop {
-                if *self.release.borrow_and_update() >= transition_sequence.get() {
+                if *self.release.borrow_and_update() >= transition_sequence {
                     return true;
                 }
                 if !matches!(
@@ -193,6 +251,15 @@ impl RuntimeDiscordDispatchDrainLaneV1 for RuntimeDiscordDispatchDrainTestLaneV1
             }
         })
     }
+
+    fn seal_until_v1(
+        &mut self,
+        _deadline: Instant,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async { true })
+    }
+
+    fn abort_v1(&mut self) {}
 }
 
 #[cfg(test)]
@@ -232,6 +299,11 @@ pub(crate) enum RuntimeDiscordGatewaySignalV1 {
     Unrelated,
 }
 
+pub(crate) enum RuntimeDiscordGatewayEventV1 {
+    Signal(RuntimeDiscordGatewaySignalV1),
+    Interaction(Box<ZeroizingPinnedDiscordInteractionV1>),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeDiscordGatewayTransportStateV1 {
     Unstarted,
@@ -243,9 +315,9 @@ pub(crate) enum RuntimeDiscordGatewayTransportStateV1 {
 pub(crate) trait RuntimeDiscordGatewayDriverV1: Send + 'static {
     fn transport_state(&self) -> RuntimeDiscordGatewayTransportStateV1;
 
-    fn next_signal(
+    fn next_event(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = RuntimeDiscordGatewaySignalV1> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = RuntimeDiscordGatewayEventV1> + Send + '_>>;
 
     fn close_until(&mut self, deadline: Instant)
         -> Pin<Box<dyn Future<Output = bool> + Send + '_>>;
@@ -270,9 +342,9 @@ impl RuntimeDiscordGatewayDriverV1 for TwilightRuntimeDiscordGatewayDriverV1 {
         self.transport_state
     }
 
-    fn next_signal(
+    fn next_event(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = RuntimeDiscordGatewaySignalV1> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = RuntimeDiscordGatewayEventV1> + Send + '_>> {
         Box::pin(async move {
             if self.transport_state != RuntimeDiscordGatewayTransportStateV1::Active {
                 self.transport_state = RuntimeDiscordGatewayTransportStateV1::Connecting;
@@ -280,37 +352,64 @@ impl RuntimeDiscordGatewayDriverV1 for TwilightRuntimeDiscordGatewayDriverV1 {
             let event_types = EventTypeFlags::READY
                 | EventTypeFlags::RESUMED
                 | EventTypeFlags::GATEWAY_RECONNECT
-                | EventTypeFlags::GATEWAY_INVALIDATE_SESSION;
-            let signal = match self.shard.next_event(event_types).await {
-                Some(Ok(Event::Ready(_))) => RuntimeDiscordGatewaySignalV1::Ready,
-                Some(Ok(Event::Resumed)) => RuntimeDiscordGatewaySignalV1::Resumed,
-                Some(Ok(Event::GatewayClose(_))) => RuntimeDiscordGatewaySignalV1::Close,
-                Some(Ok(Event::GatewayReconnect)) => RuntimeDiscordGatewaySignalV1::Reconnect,
+                | EventTypeFlags::GATEWAY_INVALIDATE_SESSION
+                | EventTypeFlags::INTERACTION_CREATE;
+            let event = match self.shard.next_event(event_types).await {
+                Some(Ok(Event::Ready(_))) => {
+                    RuntimeDiscordGatewayEventV1::Signal(RuntimeDiscordGatewaySignalV1::Ready)
+                }
+                Some(Ok(Event::Resumed)) => {
+                    RuntimeDiscordGatewayEventV1::Signal(RuntimeDiscordGatewaySignalV1::Resumed)
+                }
+                Some(Ok(Event::GatewayClose(_))) => {
+                    RuntimeDiscordGatewayEventV1::Signal(RuntimeDiscordGatewaySignalV1::Close)
+                }
+                Some(Ok(Event::GatewayReconnect)) => {
+                    RuntimeDiscordGatewayEventV1::Signal(RuntimeDiscordGatewaySignalV1::Reconnect)
+                }
                 Some(Ok(Event::GatewayInvalidateSession(_))) => {
-                    RuntimeDiscordGatewaySignalV1::SessionInvalidated
+                    RuntimeDiscordGatewayEventV1::Signal(
+                        RuntimeDiscordGatewaySignalV1::SessionInvalidated,
+                    )
                 }
-                Some(Ok(_)) => RuntimeDiscordGatewaySignalV1::Unrelated,
+                Some(Ok(Event::InteractionCreate(interaction))) => {
+                    RuntimeDiscordGatewayEventV1::Interaction(pin_runtime_discord_interaction_v1(
+                        interaction.0,
+                    ))
+                }
+                Some(Ok(_)) => {
+                    RuntimeDiscordGatewayEventV1::Signal(RuntimeDiscordGatewaySignalV1::Unrelated)
+                }
                 Some(Err(error)) if matches!(error.kind(), ReceiveMessageErrorType::Reconnect) => {
-                    RuntimeDiscordGatewaySignalV1::ReceiveError
+                    RuntimeDiscordGatewayEventV1::Signal(
+                        RuntimeDiscordGatewaySignalV1::ReceiveError,
+                    )
                 }
-                Some(Err(_)) => RuntimeDiscordGatewaySignalV1::FatalReceiveError,
-                None => RuntimeDiscordGatewaySignalV1::StreamEnded,
+                Some(Err(_)) => RuntimeDiscordGatewayEventV1::Signal(
+                    RuntimeDiscordGatewaySignalV1::FatalReceiveError,
+                ),
+                None => {
+                    RuntimeDiscordGatewayEventV1::Signal(RuntimeDiscordGatewaySignalV1::StreamEnded)
+                }
             };
-            match signal {
-                RuntimeDiscordGatewaySignalV1::Ready | RuntimeDiscordGatewaySignalV1::Resumed => {
-                    self.transport_state = RuntimeDiscordGatewayTransportStateV1::Active;
+            if let RuntimeDiscordGatewayEventV1::Signal(signal) = &event {
+                match signal {
+                    RuntimeDiscordGatewaySignalV1::Ready
+                    | RuntimeDiscordGatewaySignalV1::Resumed => {
+                        self.transport_state = RuntimeDiscordGatewayTransportStateV1::Active;
+                    }
+                    RuntimeDiscordGatewaySignalV1::Close
+                    | RuntimeDiscordGatewaySignalV1::Reconnect
+                    | RuntimeDiscordGatewaySignalV1::SessionInvalidated
+                    | RuntimeDiscordGatewaySignalV1::ReceiveError
+                    | RuntimeDiscordGatewaySignalV1::StreamEnded => {
+                        self.transport_state = RuntimeDiscordGatewayTransportStateV1::Disconnected;
+                    }
+                    RuntimeDiscordGatewaySignalV1::FatalReceiveError
+                    | RuntimeDiscordGatewaySignalV1::Unrelated => {}
                 }
-                RuntimeDiscordGatewaySignalV1::Close
-                | RuntimeDiscordGatewaySignalV1::Reconnect
-                | RuntimeDiscordGatewaySignalV1::SessionInvalidated
-                | RuntimeDiscordGatewaySignalV1::ReceiveError
-                | RuntimeDiscordGatewaySignalV1::StreamEnded => {
-                    self.transport_state = RuntimeDiscordGatewayTransportStateV1::Disconnected;
-                }
-                RuntimeDiscordGatewaySignalV1::FatalReceiveError
-                | RuntimeDiscordGatewaySignalV1::Unrelated => {}
             }
-            signal
+            event
         })
     }
 
@@ -1974,6 +2073,7 @@ where
                             )
                             .await;
                         }
+                        dispatch_drain.lane.reconcile_accepting_v1();
                     }
                     GatewayRuntimeCommandOutcomeV3::Applied(
                         GatewayCommandAckV3::Draining { .. }
@@ -2023,7 +2123,16 @@ where
                     }
                 }
             }
-            signal = driver.next_signal() => {
+            _completion = dispatch_drain.lane.poll_next_completion_v1(),
+                if dispatch_drain.lane.has_in_flight_v1() => {}
+            event = driver.next_event() => {
+                let signal = match event {
+                    RuntimeDiscordGatewayEventV1::Signal(signal) => signal,
+                    RuntimeDiscordGatewayEventV1::Interaction(interaction) => {
+                        dispatch_drain.lane.handle_raw_interaction_v1(interaction);
+                        continue;
+                    }
+                };
                 let transition = match signal {
                     RuntimeDiscordGatewaySignalV1::Ready => {
                         control.mark_connected(GatewayReadyKindV3::Ready).map(|_| true)
@@ -2340,14 +2449,21 @@ async fn finish_runtime_discord_gateway_without_transport_v1(
     dispatch_drain: &mut RuntimeDiscordDispatchDrainActorPortV1,
 ) -> RuntimeDiscordGatewayTerminalV1 {
     let lifecycle_sequence = *lifecycle_drained.borrow();
-    let control_stopped = control.mark_stopped().is_ok()
-        && wait_for_lifecycle_drain_v1(
+    let dispatch_sealed =
+        seal_runtime_discord_dispatch_lane_until_v1(dispatch_drain, shutdown_deadline).await;
+    let control_marked_stopped = control.mark_stopped().is_ok();
+    let lifecycle_confirmed = if control_marked_stopped {
+        wait_for_lifecycle_drain_v1(
             lifecycle_drained,
             dispatch_drain,
             lifecycle_sequence,
             shutdown_deadline,
         )
-        .await;
+        .await
+    } else {
+        false
+    };
+    let control_stopped = dispatch_sealed && control_marked_stopped && lifecycle_confirmed;
     RuntimeDiscordGatewayTerminalV1 {
         exit: reason,
         close: RuntimeDiscordGatewayCloseOutcomeV1::Confirmed,
@@ -2367,14 +2483,21 @@ where
     D: RuntimeDiscordGatewayDriverV1,
 {
     let lifecycle_sequence = *lifecycle_drained.borrow();
-    let control_stopped = control.mark_stopped().is_ok()
-        && wait_for_lifecycle_drain_v1(
+    let dispatch_sealed =
+        seal_runtime_discord_dispatch_lane_until_v1(dispatch_drain, shutdown_deadline).await;
+    let control_marked_stopped = control.mark_stopped().is_ok();
+    let lifecycle_confirmed = if control_marked_stopped {
+        wait_for_lifecycle_drain_v1(
             lifecycle_drained,
             dispatch_drain,
             lifecycle_sequence,
             shutdown_deadline,
         )
-        .await;
+        .await
+    } else {
+        false
+    };
+    let control_stopped = dispatch_sealed && control_marked_stopped && lifecycle_confirmed;
     let absolute_close_deadline = shutdown_deadline
         .checked_sub(DISCORD_ACTOR_TERMINATION_RESERVE)
         .unwrap_or(shutdown_deadline);
@@ -2392,6 +2515,26 @@ where
         close,
         control_stopped,
     }
+}
+
+async fn seal_runtime_discord_dispatch_lane_until_v1(
+    dispatch_drain: &mut RuntimeDiscordDispatchDrainActorPortV1,
+    deadline: Instant,
+) -> bool {
+    if Instant::now() >= deadline {
+        dispatch_drain.lane.abort_v1();
+        return false;
+    }
+    let sealed = timeout_at(
+        TokioInstant::from_std(deadline),
+        dispatch_drain.lane.seal_until_v1(deadline),
+    )
+    .await;
+    if !matches!(sealed, Ok(true)) || Instant::now() >= deadline {
+        dispatch_drain.lane.abort_v1();
+        return false;
+    }
+    true
 }
 
 async fn wait_for_lifecycle_drain_v1(
@@ -2474,13 +2617,15 @@ pub(crate) async fn confirm_runtime_discord_dispatch_lane_drained_v1(
         TokioInstant::from_std(effective_deadline),
         dispatch_drain
             .lane
-            .drain_until_v1(transition_sequence, effective_deadline),
+            .drain_until_v1(transition_sequence.get(), effective_deadline),
     )
     .await;
-    if !matches!(drained, Ok(true))
-        || Instant::now() >= effective_deadline
-        || dispatch_drain.confirmations.send(confirmation).is_err()
-    {
+    if !matches!(drained, Ok(true)) || Instant::now() >= effective_deadline {
+        dispatch_drain.lane.abort_v1();
+        return None;
+    }
+    if dispatch_drain.confirmations.send(confirmation).is_err() {
+        dispatch_drain.lane.abort_v1();
         return None;
     }
     dispatch_drain.confirmed_transition_sequence = transition_sequence;
@@ -2496,12 +2641,35 @@ pub(crate) mod test_support {
     use tokio::sync::{mpsc, oneshot};
 
     use super::{
-        RuntimeDiscordGatewayDriverV1, RuntimeDiscordGatewaySignalV1,
+        RuntimeDiscordGatewayDriverV1, RuntimeDiscordGatewayEventV1, RuntimeDiscordGatewaySignalV1,
         RuntimeDiscordGatewayTransportStateV1,
     };
+    use crate::discord_interaction_normalizer::pin_runtime_discord_interaction_v1;
+    use paused_discord_model::application::interaction::Interaction;
+
+    #[derive(Clone)]
+    pub(crate) struct TestDiscordGatewayEventSenderV1 {
+        inner: mpsc::UnboundedSender<RuntimeDiscordGatewayEventV1>,
+    }
+
+    impl TestDiscordGatewayEventSenderV1 {
+        pub(crate) fn send(&self, signal: RuntimeDiscordGatewaySignalV1) -> Result<(), ()> {
+            self.inner
+                .send(RuntimeDiscordGatewayEventV1::Signal(signal))
+                .map_err(|_| ())
+        }
+
+        pub(crate) fn send_interaction(&self, interaction: Interaction) -> Result<(), ()> {
+            self.inner
+                .send(RuntimeDiscordGatewayEventV1::Interaction(
+                    pin_runtime_discord_interaction_v1(interaction),
+                ))
+                .map_err(|_| ())
+        }
+    }
 
     pub(crate) struct TestDiscordGatewayDriverV1 {
-        signals: mpsc::UnboundedReceiver<RuntimeDiscordGatewaySignalV1>,
+        events: mpsc::UnboundedReceiver<RuntimeDiscordGatewayEventV1>,
         transport_state: Arc<Mutex<RuntimeDiscordGatewayTransportStateV1>>,
         polls: Arc<AtomicUsize>,
         closes: Arc<AtomicUsize>,
@@ -2514,10 +2682,10 @@ pub(crate) mod test_support {
             *self.transport_state.lock().unwrap()
         }
 
-        fn next_signal(
+        fn next_event(
             &mut self,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = RuntimeDiscordGatewaySignalV1> + Send + '_>,
+            Box<dyn std::future::Future<Output = RuntimeDiscordGatewayEventV1> + Send + '_>,
         > {
             Box::pin(async move {
                 {
@@ -2527,29 +2695,33 @@ pub(crate) mod test_support {
                     }
                 }
                 self.polls.fetch_add(1, Ordering::AcqRel);
-                let signal = self
-                    .signals
-                    .recv()
-                    .await
-                    .unwrap_or(RuntimeDiscordGatewaySignalV1::StreamEnded);
+                let event =
+                    self.events
+                        .recv()
+                        .await
+                        .unwrap_or(RuntimeDiscordGatewayEventV1::Signal(
+                            RuntimeDiscordGatewaySignalV1::StreamEnded,
+                        ));
                 let mut state = self.transport_state.lock().unwrap();
-                match signal {
-                    RuntimeDiscordGatewaySignalV1::Ready
-                    | RuntimeDiscordGatewaySignalV1::Resumed => {
-                        *state = RuntimeDiscordGatewayTransportStateV1::Active;
+                if let RuntimeDiscordGatewayEventV1::Signal(signal) = &event {
+                    match signal {
+                        RuntimeDiscordGatewaySignalV1::Ready
+                        | RuntimeDiscordGatewaySignalV1::Resumed => {
+                            *state = RuntimeDiscordGatewayTransportStateV1::Active;
+                        }
+                        RuntimeDiscordGatewaySignalV1::Close
+                        | RuntimeDiscordGatewaySignalV1::Reconnect
+                        | RuntimeDiscordGatewaySignalV1::SessionInvalidated
+                        | RuntimeDiscordGatewaySignalV1::ReceiveError
+                        | RuntimeDiscordGatewaySignalV1::StreamEnded => {
+                            *state = RuntimeDiscordGatewayTransportStateV1::Disconnected;
+                        }
+                        RuntimeDiscordGatewaySignalV1::FatalReceiveError
+                        | RuntimeDiscordGatewaySignalV1::Unrelated => {}
                     }
-                    RuntimeDiscordGatewaySignalV1::Close
-                    | RuntimeDiscordGatewaySignalV1::Reconnect
-                    | RuntimeDiscordGatewaySignalV1::SessionInvalidated
-                    | RuntimeDiscordGatewaySignalV1::ReceiveError
-                    | RuntimeDiscordGatewaySignalV1::StreamEnded => {
-                        *state = RuntimeDiscordGatewayTransportStateV1::Disconnected;
-                    }
-                    RuntimeDiscordGatewaySignalV1::FatalReceiveError
-                    | RuntimeDiscordGatewaySignalV1::Unrelated => {}
                 }
                 drop(state);
-                signal
+                event
             })
         }
 
@@ -2582,22 +2754,22 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn driver() -> (
-        mpsc::UnboundedSender<RuntimeDiscordGatewaySignalV1>,
+        TestDiscordGatewayEventSenderV1,
         TestDiscordGatewayDriverV1,
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
         Arc<AtomicUsize>,
     ) {
-        let (sender, signals) = mpsc::unbounded_channel();
+        let (sender, events) = mpsc::unbounded_channel();
         let polls = Arc::new(AtomicUsize::new(0));
         let closes = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
         let transport_state =
             Arc::new(Mutex::new(RuntimeDiscordGatewayTransportStateV1::Unstarted));
         (
-            sender,
+            TestDiscordGatewayEventSenderV1 { inner: sender },
             TestDiscordGatewayDriverV1 {
-                signals,
+                events,
                 transport_state,
                 polls: polls.clone(),
                 closes: closes.clone(),
@@ -2611,7 +2783,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn delayed_close_driver() -> (
-        mpsc::UnboundedSender<RuntimeDiscordGatewaySignalV1>,
+        TestDiscordGatewayEventSenderV1,
         TestDiscordGatewayDriverV1,
         oneshot::Sender<()>,
         Arc<AtomicUsize>,
@@ -2623,6 +2795,10 @@ pub(crate) mod test_support {
         (signals, driver, acknowledgement, closes, drops)
     }
 }
+
+#[cfg(test)]
+#[path = "discord_actor_serving_tests.rs"]
+mod actor_serving_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2660,13 +2836,43 @@ mod tests {
     struct PendingDispatchDrainLaneV1;
 
     impl RuntimeDiscordDispatchDrainLaneV1 for PendingDispatchDrainLaneV1 {
+        fn has_in_flight_v1(&self) -> bool {
+            false
+        }
+
+        fn reconcile_accepting_v1(&mut self) {}
+
+        fn handle_raw_interaction_v1(
+            &mut self,
+            interaction: Box<
+                crate::discord_interaction_normalizer::ZeroizingPinnedDiscordInteractionV1,
+            >,
+        ) {
+            drop(interaction);
+        }
+
+        fn poll_next_completion_v1(
+            &mut self,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+
         fn drain_until_v1(
             &mut self,
-            _transition_sequence: automation_runtime::GatewayAdmissionSequenceV3,
+            _transition_sequence: u64,
             _deadline: Instant,
         ) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + '_>> {
             Box::pin(std::future::pending())
         }
+
+        fn seal_until_v1(
+            &mut self,
+            _deadline: Instant,
+        ) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+            Box::pin(async { true })
+        }
+
+        fn abort_v1(&mut self) {}
     }
 
     fn gateway() -> crate::RuntimeGatewayBootstrapV1 {
