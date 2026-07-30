@@ -281,8 +281,9 @@ OAuth errors never echo Discord response bodies, codes, or tokens to the client.
 - Authentication rejects revoked, absolute-expired, or idle-expired sessions.
 - `last_seen_at` is updated at a bounded interval rather than on every request.
 - `GET /v1/me` returns only a display-safe principal view. The callback sets the
-  raw CSRF secret in a separate Secure, non-HttpOnly, SameSite=Strict host cookie;
-  the secret is never serialized into an identity response.
+  raw CSRF secret in a separate Secure, non-HttpOnly, SameSite=Lax host cookie so
+  cross-origin OAuth redirect chains remain compatible across supported
+  browsers; the secret is never serialized into an identity response.
 - Every state-changing endpoint requires the session cookie, exact configured
   `Origin`, exactly one CSRF cookie, and exactly one `X-CSRF-Token`. The edge
   constant-time compares the cookie and header before the application hashes
@@ -1016,7 +1017,8 @@ contract.
   rejected.
 - Per-route timeouts, a global in-flight semaphore, database-pool bounds, and
   graceful shutdown prevent resource exhaustion.
-- Security responses include `Content-Security-Policy`, `frame-ancestors 'none'`,
+- Security responses use `default-src 'none'`, permit only same-origin control
+  requests through `connect-src 'self'`, deny framing, and include
   `X-Content-Type-Options: nosniff`, a strict referrer policy, and no-store where
   appropriate. HSTS is configured at the public TLS edge.
 - OAuth client secret, bot token, database DSNs, Cloudflare credentials, and
@@ -1036,7 +1038,7 @@ contract.
 | OAuth login CSRF or callback replay | Random state plus browser nonce, digest-only storage, exact redirect URI, atomic one-time consume, short expiry |
 | Authorization-code or OAuth-token leak | Sensitive-field redaction, no persistence, exact callback, immediate fail-closed revocation |
 | Product session theft | CSPRNG opaque cookie, digest-only storage, Secure/HttpOnly/Lax host cookie, idle and absolute expiry, revocation |
-| Cross-site mutation | Exact Origin, per-session CSRF secret, SameSite cookie, no wildcard credentialed CORS |
+| Cross-site mutation | Exact Origin, double-submitted per-session CSRF secret, SameSite=Lax cookie, no wildcard credentialed CORS |
 | Principal spoofing | No actor IDs in body, no public unchecked principal constructor, credential authenticated inside application facade |
 | Cross-tenant IDOR | Tenant and installation in every query, RLS, scoped procedures, indistinguishable 404 |
 | Stale Discord role | Fresh bot-side guild/member/role fetch for every mutation, bounded observation, fail closed |
