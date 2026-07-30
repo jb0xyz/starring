@@ -5967,12 +5967,23 @@ fn barrier_b_registry_activation_is_linear_exact_and_token_sealed() {
         "}"
     )));
     assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryBarrierBServingCompletionWitnessV2 {\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "    token: SlotMutationTokenV1,\n",
+        "    route: SlotRouteWitnessV1,\n",
+        "    activation_sequence: NonZeroU64,\n",
+        "    emergency: RuntimeRegistryEmergencyTriggerV2,\n",
+        "    completion_liveness: Arc<Mutex<bool>>,\n",
+        "}"
+    )));
+    assert!(registry.contains(concat!(
         "pub(crate) struct RuntimeRegistryBarrierBServingMonitorAuthorityV2 {\n",
         "    registry: ServingSlotRegistryV1,\n",
         "    token: SlotMutationTokenV1,\n",
         "    route: SlotRouteWitnessV1,\n",
         "    activation_sequence: NonZeroU64,\n",
         "    emergency: RuntimeRegistryEmergencyTriggerV2,\n",
+        "    completion_liveness: Arc<Mutex<bool>>,\n",
         "    armed: bool,\n",
         "}"
     )));
@@ -5990,6 +6001,8 @@ fn barrier_b_registry_activation_is_linear_exact_and_token_sealed() {
         "RuntimeRegistryBarrierBActivationV2",
         "RuntimeRegistryBarrierBServingAuthorityV2",
         "RuntimeRegistryBarrierBServingMonitorAuthorityV2",
+        "RuntimeRegistryBarrierBServingCompletionWitnessV2",
+        "RuntimeRegistryBarrierBServingCompletionGuardV2",
     ] {
         assert!(!contains_identifier(
             declaration_attribute_block(registry, authority),
@@ -6049,7 +6062,10 @@ fn barrier_b_registry_activation_is_linear_exact_and_token_sealed() {
         "pub(crate) fn ensure_exact_serving_v2(",
         "pub(crate) fn remove_exact_serving_v2(",
         "pub(crate) fn into_serving_monitor_v2(",
+        "pub(crate) fn into_serving_monitor_with_completion_v2(",
         "RuntimeRegistryBarrierBServingMonitorAuthorityV2 {",
+        "RuntimeRegistryBarrierBServingCompletionWitnessV2 {",
+        "let completion_liveness = Arc::new(Mutex::new(true))",
         "self.armed = false",
     ] {
         assert!(authority.contains(required), "{required}");
@@ -6063,6 +6079,7 @@ fn barrier_b_registry_activation_is_linear_exact_and_token_sealed() {
         "pub(crate) fn remove_exact_serving_v2(",
         "observe_exact_barrier_b_serving_v2(",
         "remove_exact_barrier_b_serving_v2(",
+        "close_barrier_b_serving_completion_v2(",
         "self.armed = false",
     ] {
         assert!(monitor.contains(required), "{required}");
@@ -6135,6 +6152,7 @@ fn barrier_b_registry_activation_is_linear_exact_and_token_sealed() {
         "impl Drop for RuntimeRegistryBarrierBServingMonitorAuthorityV2",
     );
     assert!(monitor_drop.contains("if self.armed"));
+    assert!(monitor_drop.contains("close_barrier_b_serving_completion_v2("));
     assert!(monitor_drop.contains("remove_exact_barrier_b_serving_v2("));
     assert!(monitor_drop.contains(".is_err()"));
     assert!(monitor_drop.contains("self.emergency.trip_v2()"));
@@ -6142,6 +6160,7 @@ fn barrier_b_registry_activation_is_linear_exact_and_token_sealed() {
         "RuntimeRegistryBarrierBActivationV2",
         "RuntimeRegistryBarrierBServingAuthorityV2",
         "RuntimeRegistryBarrierBServingMonitorAuthorityV2",
+        "RuntimeRegistryBarrierBServingCompletionWitnessV2",
         "RuntimeRegistryBarrierBActivationEvidenceV2",
         "RuntimeRegistryBarrierBExactServingObservationV2",
         "RuntimeRegistryBarrierBRemovalEvidenceV2",
