@@ -65,12 +65,30 @@ impl RuntimeMutationFinalizerJobIdV1 {
 
 pub enum RuntimeMutationFinalizerJobV1<J> {
     StartupPendingDrain(J),
+    ProcessMutation(J),
 }
 
 impl<J> RuntimeMutationFinalizerJobV1<J> {
     pub fn into_startup_pending_drain(self) -> J {
+        self.into_inner()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_process_mutation(self) -> J {
+        self.into_inner()
+    }
+
+    const fn is_startup_pending_drain(&self) -> bool {
+        matches!(self, Self::StartupPendingDrain(_))
+    }
+
+    const fn is_process_mutation(&self) -> bool {
+        matches!(self, Self::ProcessMutation(_))
+    }
+
+    pub(crate) fn into_inner(self) -> J {
         match self {
-            Self::StartupPendingDrain(job) => job,
+            Self::StartupPendingDrain(job) | Self::ProcessMutation(job) => job,
         }
     }
 }
@@ -676,6 +694,68 @@ where
         RuntimeMutationFinalizerWaiterV1,
         RuntimeMutationFinalizerRegistrationRejectedV1<RuntimeMutationFinalizerJobV1<P::Job>>,
     > {
+        self.try_register_for_phase_v1(job, RuntimeMutationFinalizerPhaseV1::StartupAccepting)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn try_register_process(
+        &self,
+        job: P::Job,
+        reservation: &RuntimeMutationFinalizerProcessIntakeReservationV1,
+    ) -> Result<
+        RuntimeMutationFinalizerWaiterV1,
+        RuntimeMutationFinalizerRegistrationRejectedV1<P::Job>,
+    > {
+        {
+            let state = self.shared.lock();
+            if state.supervisor_id != reservation.supervisor_id
+                || state.generation != reservation.generation
+                || state.activation_nonce != Some(reservation.nonce)
+            {
+                return Err(registration_rejected_v1(
+                    job,
+                    RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(
+                        RuntimeSupervisorExitV1::ProtocolViolation,
+                    ),
+                ));
+            }
+        }
+        match self.try_register_for_phase_v1(
+            RuntimeMutationFinalizerJobV1::ProcessMutation(job),
+            RuntimeMutationFinalizerPhaseV1::ProcessAccepting,
+        ) {
+            Ok(waiter) => Ok(waiter),
+            Err(rejected) => {
+                let reason = rejected.reason();
+                let job = rejected.into_job().into_process_mutation();
+                Err(registration_rejected_v1(job, reason))
+            }
+        }
+    }
+
+    fn try_register_for_phase_v1(
+        &self,
+        job: RuntimeMutationFinalizerJobV1<P::Job>,
+        expected_phase: RuntimeMutationFinalizerPhaseV1,
+    ) -> Result<
+        RuntimeMutationFinalizerWaiterV1,
+        RuntimeMutationFinalizerRegistrationRejectedV1<RuntimeMutationFinalizerJobV1<P::Job>>,
+    > {
+        let job_matches_phase = match expected_phase {
+            RuntimeMutationFinalizerPhaseV1::StartupAccepting => job.is_startup_pending_drain(),
+            RuntimeMutationFinalizerPhaseV1::ProcessAccepting => job.is_process_mutation(),
+            RuntimeMutationFinalizerPhaseV1::StartupSealing
+            | RuntimeMutationFinalizerPhaseV1::StartupSettled
+            | RuntimeMutationFinalizerPhaseV1::ProcessActivationReserved
+            | RuntimeMutationFinalizerPhaseV1::ShutdownSealed
+            | RuntimeMutationFinalizerPhaseV1::Terminal => false,
+        };
+        if !job_matches_phase {
+            return Err(registration_rejected_v1(
+                job,
+                RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed,
+            ));
+        }
         {
             let state = self.shared.lock();
             if let Some(exit) = state.terminal {
@@ -684,10 +764,7 @@ where
                     RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit),
                 ));
             }
-            if !matches!(
-                state.phase,
-                RuntimeMutationFinalizerPhaseV1::StartupAccepting
-            ) {
+            if state.phase != expected_phase {
                 return Err(registration_rejected_v1(
                     job,
                     RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed,
@@ -732,10 +809,7 @@ where
                 RuntimeMutationFinalizerRegistrationRejectionReasonV1::SupervisorTerminal(exit),
             ));
         }
-        if !matches!(
-            state.phase,
-            RuntimeMutationFinalizerPhaseV1::StartupAccepting
-        ) {
+        if state.phase != expected_phase {
             return Err(registration_rejected_v1(
                 job,
                 RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed,
@@ -1584,6 +1658,19 @@ where
         RuntimeMutationFinalizerProcessIntakeHealthV1::Ready
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn try_register_process_job(
+        &self,
+        job: P::Job,
+    ) -> Result<
+        RuntimeMutationFinalizerWaiterV1,
+        RuntimeMutationFinalizerRegistrationRejectedV1<P::Job>,
+    > {
+        self.supervisor
+            .intake
+            .try_register_process(job, &self.process_intake)
+    }
+
     pub(crate) async fn next_completion(
         &mut self,
     ) -> Option<RuntimeMutationFinalizerPortCompletionV1<P>> {
@@ -1769,7 +1856,6 @@ where
             snapshot.phase(),
             RuntimeMutationFinalizerPhaseV1::StartupSettled
                 | RuntimeMutationFinalizerPhaseV1::ProcessActivationReserved
-                | RuntimeMutationFinalizerPhaseV1::ProcessAccepting
         );
         let event = if control_only {
             RuntimeMutationFinalizerActorEventV1::Control(controls.recv().await)
@@ -1861,11 +1947,17 @@ where
                 return exit;
             }
         };
-        let may_dispatch = matches!(
-            shared.snapshot().phase(),
-            RuntimeMutationFinalizerPhaseV1::StartupAccepting
-                | RuntimeMutationFinalizerPhaseV1::StartupSealing
-        );
+        let phase = shared.snapshot().phase();
+        let may_dispatch = match &envelope.job {
+            RuntimeMutationFinalizerJobV1::StartupPendingDrain(_) => matches!(
+                phase,
+                RuntimeMutationFinalizerPhaseV1::StartupAccepting
+                    | RuntimeMutationFinalizerPhaseV1::StartupSealing
+            ),
+            RuntimeMutationFinalizerJobV1::ProcessMutation(_) => {
+                matches!(phase, RuntimeMutationFinalizerPhaseV1::ProcessAccepting)
+            }
+        };
         if !may_dispatch {
             let exit = if shared.snapshot().shutdown_sealed() {
                 RuntimeSupervisorExitV1::Commanded
@@ -2159,6 +2251,7 @@ fn snapshot_from_state_v1(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::Notify;
 
     struct NoopPort;
 
@@ -2172,6 +2265,35 @@ mod tests {
             _job: RuntimeMutationFinalizerJobV1<Self::Job>,
         ) -> Result<Self::Output, Self::Error> {
             Ok(())
+        }
+    }
+
+    enum ProcessTestJobV1 {
+        Block,
+        Marker,
+        Rejected,
+    }
+
+    struct ProcessTestPortV1 {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    impl RuntimeMutationFinalizerPortV1 for ProcessTestPortV1 {
+        type Job = ProcessTestJobV1;
+        type Output = ProcessTestJobV1;
+        type Error = ();
+
+        async fn execute(
+            &self,
+            job: RuntimeMutationFinalizerJobV1<Self::Job>,
+        ) -> Result<Self::Output, Self::Error> {
+            let job = job.into_inner();
+            if matches!(&job, ProcessTestJobV1::Block) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(job)
         }
     }
 
@@ -2265,6 +2387,14 @@ mod tests {
     async fn process_intake_health_detects_a_finished_tracked_actor() {
         let mut supervisor = supervisor_v1();
         let startup_intake = supervisor.intake().clone();
+        let process_job = startup_intake
+            .try_register(RuntimeMutationFinalizerJobV1::ProcessMutation(()))
+            .unwrap_err();
+        assert_eq!(
+            process_job.reason(),
+            RuntimeMutationFinalizerRegistrationRejectionReasonV1::IntakeSealed
+        );
+        process_job.into_job().into_process_mutation();
         let waiter = startup_intake
             .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(()))
             .unwrap();
@@ -2327,6 +2457,74 @@ mod tests {
         assert_eq!(
             report.snapshot().next_job_sequence(),
             before.next_job_sequence()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn process_registration_reuses_capacity_and_returns_undispatched_affine_job() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut supervisor = RuntimeMutationFinalizerSupervisorV1::start(
+            RuntimeMutationFinalizerConfigV1::new(2).unwrap(),
+            generation_v1(),
+            ProcessTestPortV1 {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        )
+        .unwrap();
+        supervisor.seal_intake();
+        assert!(supervisor.wait_startup_jobs_settled().await);
+        let activation = supervisor.reserve_process_activation().unwrap();
+        let mut process = supervisor
+            .activate_process_until(activation, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let first = process
+            .try_register_process_job(ProcessTestJobV1::Block)
+            .unwrap();
+        entered.notified().await;
+        let second = process
+            .try_register_process_job(ProcessTestJobV1::Marker)
+            .unwrap();
+        let second_id = second.job_id();
+        drop(second);
+        let rejected = process
+            .try_register_process_job(ProcessTestJobV1::Rejected)
+            .unwrap_err();
+        assert_eq!(
+            rejected.reason(),
+            RuntimeMutationFinalizerRegistrationRejectionReasonV1::Busy
+        );
+        assert!(matches!(rejected.into_job(), ProcessTestJobV1::Rejected));
+        process.seal_handle().seal_intake();
+        release.notify_waiters();
+
+        assert_eq!(
+            first.wait().await.status(),
+            RuntimeMutationFinalizerWaitStatusV1::Settled
+        );
+        let first_completion = process.next_completion().await.unwrap();
+        assert!(matches!(
+            first_completion.result(),
+            RuntimeMutationFinalizerCompletionResultV1::Settled(ProcessTestJobV1::Block)
+        ));
+        drop(first_completion);
+        let second_completion = process.next_completion().await.unwrap();
+        assert_eq!(second_completion.job_id(), second_id);
+        assert!(matches!(
+            second_completion.result(),
+            RuntimeMutationFinalizerCompletionResultV1::Undispatched {
+                job: RuntimeMutationFinalizerJobV1::ProcessMutation(ProcessTestJobV1::Marker),
+                exit: RuntimeSupervisorExitV1::Commanded,
+            }
+        ));
+        assert_eq!(
+            process
+                .shutdown_until(Instant::now() + Duration::from_secs(1))
+                .await
+                .exit(),
+            RuntimeSupervisorExitV1::Commanded
         );
     }
 

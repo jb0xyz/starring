@@ -1,5 +1,7 @@
 mod build_revision;
 mod capability_readiness_supervisor;
+#[cfg_attr(not(test), allow(dead_code))]
+mod certification_identity;
 mod closed_recovery;
 mod config;
 mod controller_identity;
@@ -26,6 +28,8 @@ mod recovery_identity;
 mod registry;
 mod runtime_controller;
 mod secret;
+#[cfg_attr(not(test), allow(dead_code))]
+mod serving_heartbeat_monitor;
 mod shutdown;
 mod startup;
 

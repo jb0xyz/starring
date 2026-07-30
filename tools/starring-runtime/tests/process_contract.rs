@@ -2,6 +2,28 @@ use std::process::Command;
 
 const ABANDONED_LIFECYCLE_TIMING: &str = "starring_runtime_lifecycle_timing_v2 source=unobserved shutdown_trip_to_readiness_seal=missing shutdown_trip_to_maintenance_ingress_seal=missing shutdown_trip_to_gateway_projection=missing recovery_resume_claim_to_exact_ready=missing exact_ready_to_durable_acknowledgement_terminal=missing shutdown_finalizer_join=missing shutdown_ingress_acknowledgement_join=missing shutdown_capability_readiness_join=missing shutdown_registry_observation=missing shutdown_gateway_drain_join=missing shutdown_owner_join=missing shutdown_root_signal_join=missing shutdown_database_pools_close=missing shutdown_health_stop=missing shutdown_total=abandoned:0ns\n";
 
+#[test]
+fn process_uses_one_mutation_finalizer_across_startup_and_certification() {
+    let process = include_str!("../src/process.rs");
+    let finalizer = include_str!("../src/process/certification_finalizer.rs");
+    assert_eq!(
+        process
+            .matches("RuntimeProcessMutationFinalizerSupervisorV3::start(")
+            .count(),
+        1
+    );
+    assert!(process.contains(
+        "type RuntimeProcessStartupMutationFinalizerV3 =\n    certification_finalizer::RuntimeProcessMutationFinalizerSupervisorV3<"
+    ));
+    assert!(process.contains(
+        "type RuntimeProcessMutationFinalizerV3 =\n    certification_finalizer::RuntimeProcessMutationFinalizerProcessSupervisorV3<"
+    ));
+    assert!(finalizer
+        .contains("RuntimeCertificationFinalizerJobV2<PostgresPreparedRuntimeCertificationV2>"));
+    assert!(!finalizer.contains("RuntimeMutationFinalizerSupervisorV1::start"));
+    assert!(!finalizer.contains("tokio::spawn"));
+}
+
 fn referenced_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_starring-runtime"));
     command.env_clear();

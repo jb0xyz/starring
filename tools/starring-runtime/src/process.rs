@@ -42,6 +42,7 @@ use crate::{
     RuntimeRegistryRecoveryObservationErrorV1, RuntimeShutdownCauseV1, RuntimeSupervisorExitV1,
 };
 
+mod certification_finalizer;
 mod closed;
 pub(crate) mod connected;
 mod execution;
@@ -54,6 +55,13 @@ mod recovery;
 mod serving;
 mod startup_loop;
 
+#[allow(unused_imports)]
+pub(crate) use certification_finalizer::{
+    complete_certification_finalizer_job_v2, RuntimeCertificationFinalizerCompletionFailureV2,
+    RuntimeProcessCertificationFinalizerPortV2,
+    RuntimeProductionCertificationFinalizationOutcomeV2,
+    RuntimeProductionMutationFinalizerCompletionV3, RuntimeRegisteredCertificationFinalizerJobV2,
+};
 pub use closed::{
     RuntimeClosedRecoveryProcessCleanupFailureV2, RuntimeClosedRecoveryProcessShutdownErrorV2,
     RuntimeProcessClosedRecoveryCommitFailureV2, RuntimeProcessClosedRecoveryTransitionErrorV2,
@@ -306,15 +314,13 @@ impl RuntimeProcessFoundationShutdownFailuresV1 {
 }
 
 type RuntimeProcessStartupMutationFinalizerV3 =
-    pending_drain_finalizer::RuntimePendingDrainFinalizerSupervisorV3<
+    certification_finalizer::RuntimeProcessMutationFinalizerSupervisorV3<
         execution::RuntimeProductionPendingDrainFinalizerEnvironmentV3,
     >;
 
 type RuntimeProcessMutationFinalizerV3 =
-    crate::mutation_finalizer::RuntimeMutationFinalizerProcessSupervisorV1<
-        pending_drain_finalizer::RuntimePendingDrainFinalizerPortV3<
-            execution::RuntimeProductionPendingDrainFinalizerEnvironmentV3,
-        >,
+    certification_finalizer::RuntimeProcessMutationFinalizerProcessSupervisorV3<
+        execution::RuntimeProductionPendingDrainFinalizerEnvironmentV3,
     >;
 
 pub(super) type RuntimeProcessIngressAcknowledgementJobV2 =
@@ -553,6 +559,28 @@ impl RuntimeProcessFoundationV1 {
         self.process_mutation_finalizer
             .as_ref()
             .map(|process| process.process_intake_health())
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn certification_finalizer_port_v2(
+        &self,
+    ) -> Option<RuntimeProcessCertificationFinalizerPortV2<'_>> {
+        self.process_mutation_finalizer
+            .as_ref()
+            .map(RuntimeProcessCertificationFinalizerPortV2::new)
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn next_process_mutation_finalizer_completion_v3(
+        &mut self,
+    ) -> Option<RuntimeProductionMutationFinalizerCompletionV3> {
+        match self.process_mutation_finalizer.as_mut() {
+            Some(process) => process
+                .next_completion()
+                .await
+                .map(RuntimeProductionMutationFinalizerCompletionV3::new),
+            None => None,
+        }
     }
 
     pub(super) async fn begin_shutdown_v1(
@@ -1040,10 +1068,10 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
     let finalizer_generation =
         RuntimeMutationFinalizerGenerationV1::new(NonZeroU64::MIN).expect("finalizer generation");
     let mutation_finalizer =
-        match pending_drain_finalizer::RuntimePendingDrainFinalizerSupervisorV3::start(
+        match certification_finalizer::RuntimeProcessMutationFinalizerSupervisorV3::start(
             pending_drain_finalizer::production_finalizer_config_v3(),
             finalizer_generation,
-            pending_drain_finalizer::RuntimePendingDrainFinalizerPortV3::new(),
+            certification_finalizer::RuntimeProcessMutationFinalizerPortV3::new(),
         ) {
             Ok(finalizer) => finalizer,
             Err(composition) => {

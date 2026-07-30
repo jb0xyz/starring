@@ -586,6 +586,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
         [
             "src/build_revision.rs",
             "src/capability_readiness_supervisor.rs",
+            "src/certification_identity.rs",
             "src/closed_recovery.rs",
             "src/config.rs",
             "src/controller_identity.rs",
@@ -606,6 +607,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/maintenance_ingress_gate.rs",
             "src/mutation_finalizer.rs",
             "src/panel_reconciliation.rs",
+            "src/process/certification_finalizer.rs",
             "src/process/closed.rs",
             "src/process/connected.rs",
             "src/process/execution.rs",
@@ -628,6 +630,8 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/registry_succession_tests.rs",
             "src/runtime_controller.rs",
             "src/secret.rs",
+            "src/serving_heartbeat_monitor.rs",
+            "src/serving_heartbeat_monitor_tests.rs",
             "src/shutdown.rs",
             "src/startup.rs",
             "src/startup_recovery_observation.rs",
@@ -635,6 +639,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "tests/gateway_owner_startup_watchdog.rs",
             "tests/mutation_finalizer.rs",
             "tests/process_contract.rs",
+            "tests/serving_heartbeat_monitor_guard.rs",
             "tests/staging_role_bootstrap_contract.rs"
         ]
     );
@@ -778,6 +783,11 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
                 {
                     continue;
                 }
+                if path == Path::new("src/serving_heartbeat_monitor.rs")
+                    && forbidden == "PostgresRuntimeServingLeaseV1"
+                {
+                    continue;
+                }
                 assert!(
                     !contains_identifier(&source, forbidden),
                     "{}: {forbidden}",
@@ -828,6 +838,8 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/runtime_controller.rs")
             && path != Path::new("src/mutation_finalizer.rs")
             && path != Path::new("src/panel_reconciliation.rs")
+            && path != Path::new("src/serving_heartbeat_monitor.rs")
+            && path != Path::new("src/serving_heartbeat_monitor_tests.rs")
             && path != Path::new("src/shutdown.rs")
             && path != Path::new("src/startup_recovery_observation.rs")
         {
@@ -836,6 +848,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
         if path != Path::new("src/process_identity.rs")
             && path != Path::new("src/controller_identity.rs")
             && path != Path::new("src/recovery_identity.rs")
+            && path != Path::new("src/certification_identity.rs")
         {
             assert!(
                 !contains_identifier(&source, "getrandom"),
@@ -856,6 +869,7 @@ fn mutation_finalizer_is_bounded_linear_supervised_and_handoff_compatible() {
         "const RUNTIME_MUTATION_FINALIZER_MAX_CAPACITY: usize = 1_024;",
         "RuntimeMutationFinalizerJobV1<J>",
         "StartupPendingDrain(J)",
+        "ProcessMutation(J)",
         "RuntimeMutationFinalizerGenerationV1",
         "RuntimeMutationFinalizerHandoffStateV1",
         "startup_intake_sealed",
@@ -914,6 +928,80 @@ fn mutation_finalizer_is_bounded_linear_supervised_and_handoff_compatible() {
             );
         }
     }
+}
+
+#[test]
+fn certification_finalizer_reuses_the_process_root_supervisor_with_a_typed_affine_job() {
+    let finalizer = include_str!("../src/process/certification_finalizer.rs");
+    let process = include_str!("../src/process.rs");
+    let mutation = include_str!("../src/mutation_finalizer.rs");
+    for required in [
+        "RuntimeCertificationFinalizerJobV2<PostgresPreparedRuntimeCertificationV2>",
+        "RuntimeProcessMutationFinalizerJobV3<E>",
+        "StartupPendingDrain(Box<RuntimePendingDrainFinalizerJobV3<E>>)",
+        "Certification(Box<RuntimeProductionCertificationFinalizerJobV2>)",
+        "RuntimeProcessMutationFinalizerOutputV3<E>",
+        "RuntimeProcessMutationFinalizerErrorV3<E>",
+        "RuntimeProcessCertificationFinalizerPortV2",
+        "RuntimeProcessCertificationFinalizerPortV2(<redacted>)",
+        "RuntimeCertificationFinalizerPortV2<PostgresPreparedRuntimeCertificationV2>",
+        "try_register_process_job(",
+        "RuntimeProcessMutationFinalizerJobV3::Certification(Box::new(job))",
+        "Box::new(job)",
+        "(*job).into_registration()",
+        "RuntimeRegisteredCertificationFinalizerJobV2",
+        "RuntimeCertificationFinalizerCompletionFailureV2",
+        "RuntimeProductionMutationFinalizerCompletionV3",
+        "RuntimeProcessMutationFinalizerPortV3::new()",
+        "RuntimeProcessMutationFinalizerPortV3(<redacted>)",
+        "process_mutation_finalizer: Option<RuntimeProcessMutationFinalizerV3>",
+        "certification_finalizer_port_v2",
+        "next_process_mutation_finalizer_completion_v3",
+    ] {
+        assert!(
+            finalizer.contains(required)
+                || process.contains(required)
+                || mutation.contains(required),
+            "{required}"
+        );
+    }
+    for forbidden in [
+        "dyn RuntimeCertification",
+        "BoxFuture",
+        "Pin<Box",
+        "tokio::spawn",
+        "RuntimeMutationFinalizerSupervisorV1::start",
+        "unbounded_channel",
+    ] {
+        assert!(!finalizer.contains(forbidden), "{forbidden}");
+    }
+    for type_name in [
+        "RuntimeProcessMutationFinalizerJobV3",
+        "RuntimeRegisteredCertificationFinalizerJobV2",
+        "RuntimeCertificationFinalizerCompletionFailureV2",
+        "RuntimeProductionMutationFinalizerCompletionV3",
+    ] {
+        let attributes = declaration_attribute_block(finalizer, type_name);
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{type_name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(finalizer, type_name, forbidden),
+                "{type_name}: {forbidden}"
+            );
+        }
+    }
+    assert_eq!(
+        process
+            .matches("RuntimeProcessStartupMutationFinalizerV3")
+            .count(),
+        2
+    );
+    assert_eq!(process.matches("process_mutation_finalizer:").count(), 2);
+    assert!(mutation.contains("RuntimeMutationFinalizerJobV1::ProcessMutation(job)"));
+    assert!(mutation.contains("RuntimeMutationFinalizerPhaseV1::ProcessAccepting"));
 }
 
 #[test]
@@ -1107,6 +1195,70 @@ fn startup_identity_entropy_is_exact_independent_and_confined() {
 }
 
 #[test]
+fn certification_identity_entropy_is_exact_separate_and_confined() {
+    let identity = source_before_test_module(include_str!("../src/certification_identity.rs"));
+    for required in [
+        "RuntimeCertificationOperationIdGenerationAuthorityV2",
+        "RuntimeBarrierIdGenerationAuthorityV1",
+        "RuntimeCertificationOperationIdV2::parse(encode_runtime_identity_lower_hex_v1(bytes))",
+        "RuntimeBarrierIdV1::parse(encode_runtime_identity_lower_hex_v1(bytes))",
+        "RuntimeCertificationOperationIdGenerationAuthorityV2(<redacted>)",
+        "RuntimeBarrierIdGenerationAuthorityV1(<redacted>)",
+    ] {
+        assert!(identity.contains(required), "{required}");
+    }
+    for declaration in ["pub(crate) fn generate_v2(", "pub(crate) fn generate_v1("] {
+        let wrapper = braced_declaration(identity, declaration);
+        assert_eq!(wrapper.matches("getrandom::fill").count(), 1);
+    }
+    for declaration in [
+        "fn generate_runtime_certification_operation_id_with_v2<F>(",
+        "fn generate_runtime_barrier_id_with_v1<F>(",
+    ] {
+        let seam = braced_declaration(identity, declaration);
+        assert!(seam.contains("F: FnOnce("));
+        assert!(seam.contains("&mut [u8; RUNTIME_IDENTITY_ENTROPY_BYTES]"));
+        assert!(seam.contains("let mut bytes = [0_u8; RUNTIME_IDENTITY_ENTROPY_BYTES];"));
+        assert_eq!(seam.matches("fill(&mut bytes)?;").count(), 1);
+        assert!(!seam.contains("getrandom"));
+    }
+    for type_name in [
+        "RuntimeCertificationOperationIdGenerationAuthorityV2",
+        "RuntimeBarrierIdGenerationAuthorityV1",
+    ] {
+        let attributes = declaration_attribute_block(identity, type_name);
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!contains_identifier(attributes, forbidden), "{type_name}");
+            assert!(
+                !implements_trait(identity, type_name, forbidden),
+                "{type_name}"
+            );
+        }
+    }
+    for forbidden in [
+        "SystemTime",
+        "Instant",
+        "process::id",
+        "hostname",
+        "Uuid",
+        "uuid",
+        "thread_rng",
+        "StdRng",
+        "getrandom::fill_uninit",
+        "getrandom::u32",
+        "getrandom::u64",
+        "OnceLock",
+        "LazyLock",
+        "thread_local",
+        "Atomic",
+        "hash(",
+        "xor",
+    ] {
+        assert!(!identity.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
 fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     let sources = source_files();
     let gateway = sources
@@ -1215,6 +1367,20 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             let allowed_pending_drain_finalizer_dependency = path
                 == Path::new("src/process/pending_drain_finalizer.rs")
                 && identifier == "automation_runtime_worker";
+            let allowed_certification_finalizer_dependency = path
+                == Path::new("src/process/certification_finalizer.rs")
+                && identifier == "automation_runtime_worker";
+            let allowed_certification_identity_dependency = path
+                == Path::new("src/certification_identity.rs")
+                && identifier == "automation_runtime_controller";
+            let allowed_serving_heartbeat_dependency = (path
+                == Path::new("src/serving_heartbeat_monitor.rs")
+                && identifier == "automation_runtime_controller")
+                || (path == Path::new("src/serving_heartbeat_monitor_tests.rs")
+                    && matches!(
+                        identifier,
+                        "automation_runtime_controller" | "automation_runtime_convergence"
+                    ));
             let allowed_pending_drain_finalizer_v3 = matches!(
                 identifier,
                 "RuntimeOwnedStartupRecoveryExecutionOutcomeV3"
@@ -1222,6 +1388,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     | "RuntimeProcessStartupMutationFinalizerV3"
                     | "RuntimePendingDrainMutationDatabaseV3"
                     | "RuntimePendingDrainFinalizerDispatchFailureV3"
+                    | "RuntimePendingDrainFinalizerFailedV3"
                     | "RuntimePendingDrainFinalizerJobV3"
                     | "RuntimePendingDrainFinalizerPortV3"
                     | "RuntimePendingDrainFinalizerSettledV3"
@@ -1231,6 +1398,14 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     | "RuntimePendingDrainMutationOutputV3"
                     | "RuntimePendingDrainMutationStageV3"
                     | "RuntimePendingDrainOwnedStageFailureV3"
+                    | "RuntimeProcessMutationFinalizerCompletionV3"
+                    | "RuntimeProcessMutationFinalizerErrorV3"
+                    | "RuntimeProcessMutationFinalizerJobV3"
+                    | "RuntimeProcessMutationFinalizerOutputV3"
+                    | "RuntimeProcessMutationFinalizerPortV3"
+                    | "RuntimeProcessMutationFinalizerProcessSupervisorV3"
+                    | "RuntimeProcessMutationFinalizerSupervisorV3"
+                    | "RuntimeProductionMutationFinalizerCompletionV3"
                     | "RuntimeProductionPendingDrainFinalizerEnvironmentV3"
                     | "RuntimeStartupRecoveryOwnedStepFutureV3"
                     | "RuntimeStartupRecoveryOwnedStepOutcomeV3"
@@ -1238,6 +1413,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 path.as_path(),
                 path if path == Path::new("src/database.rs")
                     || path == Path::new("src/process.rs")
+                    || path == Path::new("src/process/certification_finalizer.rs")
                     || path == Path::new("src/process/execution.rs")
                     || path == Path::new("src/process/pending_drain_finalizer.rs")
                     || path == Path::new("src/process/startup_loop.rs")
@@ -1346,6 +1522,9 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_recovery_process
                         || allowed_execution_process
                         || allowed_pending_drain_finalizer_dependency
+                        || allowed_certification_finalizer_dependency
+                        || allowed_certification_identity_dependency
+                        || allowed_serving_heartbeat_dependency
                         || allowed_observation_process
                         || allowed_observation_process_tests
                         || allowed_process_identity
