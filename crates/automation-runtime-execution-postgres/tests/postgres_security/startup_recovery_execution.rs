@@ -125,6 +125,26 @@ async fn startup_stale_live_execution_progresses_once_with_canonical_projection(
     let server = PostgresTestServer::start();
     let database = isolated_database(server.connect_options()).await;
     seed_live_for_startup_observation(&database, 1_000).await;
+    seed_committed_succession_certification(&database.owner_pool).await;
+    let certification_terminal = sqlx::query_as::<_, (String, String)>(
+        "SELECT terminal_outcome_name, resulting_phase \
+         FROM public.runtime_certification_operation_terminals_v2",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        certification_terminal,
+        ("certification_committed".to_owned(), "live".to_owned())
+    );
+    let retained_certification_operations = sqlx::query_scalar::<_, i64>(
+        "SELECT pg_catalog.count(*) \
+         FROM public.runtime_certification_operations_v2",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_certification_operations, 1);
     let expiry = sqlx::query_scalar::<_, DateTime<Utc>>(
         "SELECT expires_at FROM public.runtime_serving_leases \
          WHERE deployment_id = $1",
@@ -135,6 +155,11 @@ async fn startup_stale_live_execution_progresses_once_with_canonical_projection(
     .unwrap();
     wait_for_database_time(&database.owner_pool, expiry).await;
     let owner = acquire_startup_observation_owner(&database.executor_pool).await;
+    let observed = observe_startup_state(&database.executor_pool, &owner, owner.4).await;
+    assert_eq!(observed["outcome_name"], "observed");
+    assert_eq!(observed["serving_state_name"], "recoverable_stale");
+    assert_eq!(observed["serving_count"], 1);
+    assert_eq!(observed["recoverable_awaiting_certification_count"], 0);
     let input = startup_stale_live_execution_input(
         &owner,
         "33000000000000000000000000000033",
@@ -202,6 +227,26 @@ async fn startup_stale_live_execution_progresses_once_with_canonical_projection(
     assert_eq!(
         startup_stale_live_journal_count(&database.owner_pool, &input.recovery_id).await,
         1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT pg_catalog.count(*) \
+             FROM public.runtime_certification_operations_v2",
+        )
+        .fetch_one(&database.owner_pool)
+        .await
+        .unwrap(),
+        retained_certification_operations
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT terminal_outcome_name, resulting_phase \
+             FROM public.runtime_certification_operation_terminals_v2",
+        )
+        .fetch_one(&database.owner_pool)
+        .await
+        .unwrap(),
+        certification_terminal
     );
 
     cleanup(database).await;

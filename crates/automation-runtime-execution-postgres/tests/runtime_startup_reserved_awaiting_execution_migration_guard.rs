@@ -12,7 +12,7 @@ const EXECUTOR: &str = "public.starring_runtime_startup_recovery_execute_reserve
 const MIGRATION_READINESS_DIGEST: &str =
     "4e58c914016de080372586cc2efc7e9a5221c8703450d767934389a5c4c07db8";
 const CURRENT_READINESS_DIGEST: &str =
-    "7bd23bbaa7cef9cfcb88ac6a273dc6ac82af3e55e5ab71fff5a54b98cd90f81e";
+    "779d97c088a29027589ebdffa9753eb1333a1d9b511cd714211cde6ae8146c4e";
 const MANIFEST_DIGEST: &str = "c2de6cf64ce6efbcf22e31f06da774195996060a692c45b48f073ff93fa4d630";
 
 fn dollar_block(tag: &str) -> &'static str {

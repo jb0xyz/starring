@@ -96,7 +96,7 @@ fn terminalized_execution_writer_digest_chain_is_exact_and_current() {
     assert!(PREVIOUS_MIGRATION
         .contains("d8e46c1204b36b3c909b7e6e88ee768d2ec7e60d05dd4eb99be7d8f064a24714"));
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
-        assert!(source.contains("7bd23bbaa7cef9cfcb88ac6a273dc6ac82af3e55e5ab71fff5a54b98cd90f81e"));
+        assert!(source.contains("779d97c088a29027589ebdffa9753eb1333a1d9b511cd714211cde6ae8146c4e"));
         assert!(
             !source.contains("d8e46c1204b36b3c909b7e6e88ee768d2ec7e60d05dd4eb99be7d8f064a24714")
         );
