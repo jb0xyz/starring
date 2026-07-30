@@ -137,17 +137,18 @@ async fn terminalized_reserved_awaiting_execution_is_claimable_without_losing_au
     assert_eq!(reset.2, before.2);
     assert_eq!(reset.4, 1);
 
-    let mut claim = database.executor_pool.begin().await.unwrap();
-    assert_eq!(
-        raw_selector_claim(
-            &mut claim,
-            "runtime-terminalized-certification-reclaim-controller",
-        )
+    let adapter = verified_execution_adapter(&database).await;
+    let controller_id =
+        ControllerId::parse("runtime-terminalized-certification-reclaim-controller").unwrap();
+    let claim_request = RuntimeClaimNextExecutionV1 {
+        controller_id,
+        lease_for: Duration::from_secs(300),
+    };
+    let claim = adapter
+        .claim_next_execution(claim_request.clone())
         .await
-        .unwrap(),
-        Some("applied".to_owned())
-    );
-    claim.commit().await.unwrap();
+        .unwrap()
+        .expect("terminalized certification must permit a fresh claim");
 
     let claimed = reserved_awaiting_execution_state(&database.owner_pool).await;
     assert_eq!(claimed.0, reset.0 + 1);
@@ -165,20 +166,73 @@ async fn terminalized_reserved_awaiting_execution_is_claimable_without_losing_au
         .unwrap(),
         1
     );
-    let mut replay = database.executor_pool.begin().await.unwrap();
-    assert_eq!(
-        raw_selector_claim(
-            &mut replay,
-            "runtime-terminalized-certification-reclaim-controller",
-        )
+    let replayed_claim = adapter
+        .claim_next_execution(claim_request)
         .await
-        .unwrap(),
-        Some("replayed".to_owned())
-    );
-    replay.commit().await.unwrap();
+        .unwrap()
+        .expect("owned terminalized certification claim must replay");
+    assert_eq!(replayed_claim, claim);
     assert_eq!(
         reserved_awaiting_execution_state(&database.owner_pool).await,
         claimed
+    );
+
+    let mut session = RuntimeConvergenceSessionV1::from_claim(claim).unwrap();
+    let renewal_request = session.begin_renewal(Duration::from_secs(400)).unwrap();
+    let renewed = adapter
+        .renew_execution(renewal_request.clone())
+        .await
+        .unwrap();
+    let replayed_renewal = adapter.renew_execution(renewal_request).await.unwrap();
+    assert_eq!(replayed_renewal, renewed);
+    session.apply_renewal(renewed).unwrap();
+
+    let certificate = PanelCertificateV1 {
+        certificate_id: PanelCertificateId::parse(
+            "runtime-terminalized-certification-reclaim-panel",
+        )
+        .unwrap(),
+        report_digest: PanelReportDigestV1::parse(CERTIFICATION_REPORT).unwrap(),
+        target: session.snapshot().target.clone(),
+        runtime_generation: session.snapshot().runtime_generation,
+        process_instance_id: ProcessInstanceId::parse(
+            "runtime-terminalized-certification-reclaim-process",
+        )
+        .unwrap(),
+        declared_count: 1,
+        installed_count: 1,
+        unchanged_count: 0,
+        skipped_transient_count: 0,
+        skipped_unresolved_channel_count: 0,
+        failed_count: 0,
+        ambiguous_outcome_count: 0,
+        stale_message_cleanup_pending_count: 0,
+        orphan_message_cleanup_pending_count: 0,
+        reposted_old_message_cleanup_pending_count: 0,
+        reconciled_at: database_now(&database.owner_pool).await,
+    };
+    mutate_applied(
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::AcceptPanelCertificate(certificate),
+    )
+    .await;
+    assert!(matches!(
+        session.snapshot().phase,
+        RuntimeDeploymentPhaseV1::AwaitingGatewayReady
+    ));
+    assert_eq!(
+        sqlx::query_as::<_, (i64, i64)>(
+            "SELECT \
+                (SELECT pg_catalog.count(*) \
+                 FROM public.runtime_certification_operations_v2), \
+                (SELECT pg_catalog.count(*) \
+                 FROM public.runtime_certification_operation_terminals_v2)",
+        )
+        .fetch_one(&database.owner_pool)
+        .await
+        .unwrap(),
+        (1, 1)
     );
 
     cleanup(database).await;
