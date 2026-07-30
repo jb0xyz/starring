@@ -590,20 +590,22 @@ impl RuntimeGatewayOwnerSupervisorHandleV1 {
     async fn thaw_certification_v2(
         &self,
         authority: RuntimeGatewayOwnerCertificationFrozenObservationV2,
+        completion_deadline: Instant,
     ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerCertificationThawErrorV2>
     {
-        let cutoff = authority.cutoff_v2();
-        if Instant::now() >= cutoff {
+        let completion_deadline = authority.cutoff_v2().min(completion_deadline);
+        if Instant::now() >= completion_deadline {
             self.invalidation.invalidate();
             return Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed);
         }
         let (response, acknowledgement) = oneshot::channel();
         let terminal = self.terminal.clone();
         match timeout_at(
-            TokioInstant::from_std(cutoff),
+            TokioInstant::from_std(completion_deadline),
             self.supervisor_commands.send(
                 RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification {
                     authority,
+                    completion_deadline,
                     response,
                 },
             ),
@@ -613,18 +615,25 @@ impl RuntimeGatewayOwnerSupervisorHandleV1 {
             Ok(Ok(())) => {}
             Ok(Err(_)) => {
                 self.invalidation.invalidate();
-                return Err(wait_for_certification_thaw_terminal_until_v2(terminal, cutoff).await);
+                return Err(wait_for_certification_thaw_terminal_until_v2(
+                    terminal,
+                    completion_deadline,
+                )
+                .await);
             }
             Err(_) => {
                 self.invalidation.invalidate();
                 return Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed);
             }
         }
-        match timeout_at(TokioInstant::from_std(cutoff), acknowledgement).await {
+        match timeout_at(TokioInstant::from_std(completion_deadline), acknowledgement).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => {
                 self.invalidation.invalidate();
-                Err(wait_for_certification_thaw_terminal_until_v2(terminal, cutoff).await)
+                Err(
+                    wait_for_certification_thaw_terminal_until_v2(terminal, completion_deadline)
+                        .await,
+                )
             }
             Err(_) => {
                 self.invalidation.invalidate();
@@ -1875,7 +1884,14 @@ impl RuntimeGatewayOwnerCertificationFrozenSupervisorV2 {
             return Err(RuntimeGatewayOwnerCertificationThawErrorV2::StaleAuthority);
         }
         let previous_revision = authority.observation.receipt().owner_revision;
-        let acknowledged = self.inner().thaw_certification_v2(authority).await?;
+        let acknowledged = self
+            .inner()
+            .thaw_certification_v2(authority, completion_deadline)
+            .await?;
+        if Instant::now() >= completion_deadline {
+            self.inner().invalidation.invalidate();
+            return Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed);
+        }
         if acknowledged != *self.frozen_observation
             || self.inner().process_generation.load(Ordering::Acquire)
                 != self.process_generation.get()
@@ -2027,6 +2043,7 @@ enum RuntimeGatewayOwnerSupervisorCommandV1 {
     },
     ThawCertification {
         authority: RuntimeGatewayOwnerCertificationFrozenObservationV2,
+        completion_deadline: Instant,
         response: oneshot::Sender<
             Result<
                 RuntimeGatewayOwnerCurrentObservationV1,
@@ -2867,6 +2884,7 @@ where
                         }
                         RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification {
                             authority,
+                            completion_deadline,
                             response,
                         } if role == RuntimeGatewayOwnerSupervisorRoleV1::CertificationFrozen => {
                             if response.is_closed() {
@@ -2886,7 +2904,17 @@ where
                                     config.cleanup,
                                 );
                             };
-                            if Instant::now() >= cutoff {
+                            if completion_deadline > cutoff {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerCertificationThawErrorV2::ProtocolViolation,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            if Instant::now() >= completion_deadline {
                                 let _result = response.send(Err(
                                     RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed,
                                 ));
@@ -2919,6 +2947,16 @@ where
                                 guard.invalidate_now();
                                 break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
                                     RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+                                    config.cleanup,
+                                );
+                            }
+                            if Instant::now() >= completion_deadline {
+                                let _result = response.send(Err(
+                                    RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed,
+                                ));
+                                guard.invalidate_now();
+                                break 'supervisor RuntimeGatewayOwnerStartupWatchdogStopV1::new(
+                                    RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed,
                                     config.cleanup,
                                 );
                             }

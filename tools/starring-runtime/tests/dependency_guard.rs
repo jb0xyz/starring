@@ -1652,6 +1652,7 @@ fn certification_owner_freeze_thaw_is_linear_exact_and_fail_closed() {
         "pub(crate) fn prepare_certification_freeze_v2(\n        self,",
         "owner: Option<Box<RuntimeGatewayOwnerProductionSupervisorV2>>",
         "authority: RuntimeGatewayOwnerCertificationFrozenObservationV2",
+        "completion_deadline: Instant",
         "current.receipt().lease_id == expected.receipt().lease_id",
         ".checked_add(1)\n            == Some(current.receipt().owner_revision.get())",
         "current.receipt().database_now > expected.receipt().database_now",
@@ -1659,6 +1660,7 @@ fn certification_owner_freeze_thaw_is_linear_exact_and_fail_closed() {
         "force_production_renewal = false;",
         "force_production_renewal = true;",
         "let completion_deadline = self.cutoff.min(successor_deadline);",
+        ".thaw_certification_v2(authority, completion_deadline)",
         ".wait_for_strict_successor_v2(previous_revision, completion_deadline)",
         "RuntimeGatewayOwnerCertificationFreezeAuthorityV2(<redacted>)",
         "RuntimeGatewayOwnerCertificationFrozenObservationV2(<redacted>)",
@@ -1670,7 +1672,13 @@ fn certification_owner_freeze_thaw_is_linear_exact_and_fail_closed() {
         owner_supervisor
             .matches("timeout_at(TokioInstant::from_std(cutoff), acknowledgement)")
             .count(),
-        2
+        1
+    );
+    assert_eq!(
+        owner_supervisor
+            .matches("timeout_at(TokioInstant::from_std(completion_deadline), acknowledgement)")
+            .count(),
+        1
     );
     assert_eq!(
         owner_supervisor

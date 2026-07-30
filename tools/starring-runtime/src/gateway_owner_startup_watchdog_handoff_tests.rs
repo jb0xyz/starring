@@ -6831,6 +6831,74 @@ async fn certification_thaw_send_queue_stall_is_bounded_by_the_authority_cutoff(
 }
 
 #[tokio::test]
+async fn certification_thaw_send_queue_uses_the_earlier_successor_deadline() {
+    let process_generation = NonZeroU64::new(75).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let cutoff = Instant::now() + Duration::from_millis(600);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let renew_calls = port.renew_calls();
+    let sender = frozen.inner().supervisor_commands.clone();
+    let permit = sender.reserve_owned().await.unwrap();
+    let successor_deadline = Instant::now() + Duration::from_millis(100);
+    let started_at = Instant::now();
+
+    assert!(matches!(
+        frozen.thaw_v2(observation, successor_deadline).await,
+        Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed)
+    ));
+    assert!(Instant::now() >= successor_deadline);
+    assert!(Instant::now() < cutoff);
+    assert!(started_at.elapsed() < Duration::from_millis(350));
+    assert_eq!(port.renew_calls(), renew_calls);
+    assert!(invalidated.load(Ordering::Acquire));
+
+    drop(permit);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn late_certification_thaw_command_never_restores_production_generation() {
+    let process_generation = NonZeroU64::new(76).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let cutoff = Instant::now() + Duration::from_millis(600);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let renew_calls = port.renew_calls();
+    let completion_deadline = Instant::now() + Duration::from_millis(80);
+    sleep_until(TokioInstant::from_std(completion_deadline)).await;
+    let (response, acknowledgement) = oneshot::channel();
+    frozen
+        .inner()
+        .supervisor_commands
+        .send(RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification {
+            authority: observation,
+            completion_deadline,
+            response,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        acknowledgement.await.unwrap(),
+        Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed)
+    );
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed
+    );
+    assert_eq!(
+        frozen.inner().production_generation.load(Ordering::Acquire),
+        0
+    );
+    assert_eq!(port.renew_calls(), renew_calls);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
 async fn certification_thaw_strict_successor_stall_is_bounded_by_the_authority_cutoff() {
     let process_generation = NonZeroU64::new(74).unwrap();
     let (production, port, invalidated, _) =
@@ -6944,6 +7012,7 @@ async fn lost_certification_thaw_acknowledgement_is_terminal_before_renewal() {
         .prepare_certification_freeze_v2(Instant::now() + Duration::from_secs(1))
         .unwrap();
     let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let completion_deadline = observation.cutoff_v2();
     let renew_calls = port.renew_calls();
     let (response, acknowledgement) = oneshot::channel();
     drop(acknowledgement);
@@ -6952,6 +7021,7 @@ async fn lost_certification_thaw_acknowledgement_is_terminal_before_renewal() {
         .supervisor_commands
         .send(RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification {
             authority: observation,
+            completion_deadline,
             response,
         })
         .await
