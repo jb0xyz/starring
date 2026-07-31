@@ -939,10 +939,8 @@ fn teardown_retry_reuses_dispatch_authority_and_stops_before_database_close() {
     );
     assert!(composition.contains("teardown_retry_supervisor: None"));
     assert!(!composition.contains("start_teardown_retry_supervisor_v1"));
-    let activation = braced_declaration(
-        process,
-        "pub(super) fn activate_teardown_retry_supervisor_v1(",
-    );
+    let activation =
+        braced_declaration(process, "pub(super) fn start_teardown_retry_supervisor_v1(");
     assert_eq!(
         activation
             .matches("start_teardown_retry_supervisor_v1()")
@@ -958,7 +956,7 @@ fn teardown_retry_reuses_dispatch_authority_and_stops_before_database_close() {
     let owner_transition = braced_declaration(owner, "pub(crate) async fn into_owner_held_v1(");
     assert_eq!(
         owner_transition
-            .matches(".activate_teardown_retry_supervisor_v1()")
+            .matches(".start_teardown_retry_supervisor_v1()")
             .count(),
         1
     );
@@ -966,7 +964,7 @@ fn teardown_retry_reuses_dispatch_authority_and_stops_before_database_close() {
         .rfind("if !self.startup_budget.operation_is_open()")
         .unwrap();
     let activation = owner_transition
-        .find("self.activate_teardown_retry_supervisor_v1()")
+        .find("self.start_teardown_retry_supervisor_v1()")
         .unwrap();
     let owner_held = owner_transition
         .rfind("Ok(RuntimeOwnerHeldProcessV1 {")

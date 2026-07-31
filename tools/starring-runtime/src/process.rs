@@ -439,7 +439,7 @@ impl RuntimeProcessFoundationV1 {
         self.root_supervisor.interaction_dispatch_publisher_v1()
     }
 
-    pub(super) fn activate_teardown_retry_supervisor_v1(&mut self) {
+    pub(super) fn start_teardown_retry_supervisor_v1(&mut self) {
         assert!(
             self.teardown_retry_supervisor.is_none(),
             "runtime teardown retry supervisor already active"

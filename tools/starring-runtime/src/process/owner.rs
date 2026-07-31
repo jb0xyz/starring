@@ -268,7 +268,7 @@ impl RuntimeProcessFoundationV1 {
             };
             return Err(cleanup_runtime_gateway_owner_transition_failure_v1(self, error).await);
         }
-        self.activate_teardown_retry_supervisor_v1();
+        self.start_teardown_retry_supervisor_v1();
         Ok(RuntimeOwnerHeldProcessV1 {
             foundation: self,
             owner,
