@@ -26,6 +26,7 @@ struct FakePermitV1 {
     intent_dispositions: Mutex<VecDeque<InteractionInitialResponseIntentDispositionV1>>,
     intents: Mutex<Vec<InteractionInitialResponseIntentV1>>,
     results: Mutex<Vec<InteractionInitialResponseResultV1>>,
+    initial_response_deadline: Instant,
 }
 
 impl FakePermitV1 {
@@ -38,6 +39,7 @@ impl FakePermitV1 {
             intent_dispositions: Mutex::new(VecDeque::new()),
             intents: Mutex::new(Vec::new()),
             results: Mutex::new(Vec::new()),
+            initial_response_deadline: Instant::now() + std::time::Duration::from_secs(60),
         }
     }
 
@@ -55,6 +57,7 @@ impl FakePermitV1 {
             intent_dispositions: Mutex::new(VecDeque::new()),
             intents: Mutex::new(Vec::new()),
             results: Mutex::new(Vec::new()),
+            initial_response_deadline: Instant::now() + std::time::Duration::from_secs(60),
         }
     }
 
@@ -70,12 +73,33 @@ impl FakePermitV1 {
             intent_dispositions: Mutex::new(dispositions.into_iter().collect()),
             intents: Mutex::new(Vec::new()),
             results: Mutex::new(Vec::new()),
+            initial_response_deadline: Instant::now() + std::time::Duration::from_secs(60),
+        }
+    }
+
+    fn with_deadline(
+        trace: Arc<Mutex<Vec<&'static str>>>,
+        initial_response_deadline: Instant,
+    ) -> Self {
+        Self {
+            trace,
+            fail_intent: false,
+            fail_result: false,
+            fail_execution: false,
+            intent_dispositions: Mutex::new(VecDeque::new()),
+            intents: Mutex::new(Vec::new()),
+            results: Mutex::new(Vec::new()),
+            initial_response_deadline,
         }
     }
 }
 
 impl InteractionEffectPermitV1 for FakePermitV1 {
     type Error = SecretPermitError;
+
+    fn initial_response_deadline_v1(&self) -> tokio::time::Instant {
+        self.initial_response_deadline
+    }
 
     async fn commit_initial_response_intent_v1(
         &self,
@@ -162,6 +186,31 @@ impl InteractionResponder for FakeResponderV1 {
     async fn edit_response(&self, _: String) -> Result<(), AdapterError> {
         self.trace.lock().unwrap().push("external.edit");
         self.edit_error.clone().map_or(Ok(()), Err)
+    }
+}
+
+struct PendingInitialResponderV1 {
+    trace: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl InteractionResponder for PendingInitialResponderV1 {
+    async fn respond_ephemeral(&self, _: String) -> Result<(), AdapterError> {
+        self.trace.lock().unwrap().push("external.respond");
+        std::future::pending().await
+    }
+
+    async fn open_modal(&self, _: &ModalPresentation) -> Result<(), AdapterError> {
+        self.trace.lock().unwrap().push("external.modal");
+        std::future::pending().await
+    }
+
+    async fn defer_ephemeral(&self) -> Result<(), AdapterError> {
+        self.trace.lock().unwrap().push("external.defer");
+        std::future::pending().await
+    }
+
+    async fn edit_response(&self, _: String) -> Result<(), AdapterError> {
+        std::future::pending().await
     }
 }
 
@@ -330,6 +379,54 @@ async fn initial_intent_outage_produces_zero_external_calls() {
     assert_eq!(error.kind, AdapterErrorKind::Unknown);
     assert_eq!(error.message, RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1);
     assert!(!format!("{error:?}").contains("permit-intent-secret"));
+}
+
+#[tokio::test]
+async fn exhausted_initial_response_deadline_produces_zero_external_calls() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let permit = FakePermitV1::with_deadline(Arc::clone(&trace), Instant::now());
+    let responder = FakeResponderV1::successful(Arc::clone(&trace));
+    let fenced = ReceiptFencedInteractionResponderV1::new(&responder, &permit);
+
+    let error = fenced.defer_ephemeral().await.unwrap_err();
+
+    assert!(trace.lock().unwrap().is_empty());
+    assert!(permit.intents.lock().unwrap().is_empty());
+    assert!(permit.results.lock().unwrap().is_empty());
+    assert_eq!(error.kind, AdapterErrorKind::Unknown);
+    assert_eq!(error.message, RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1);
+}
+
+#[tokio::test]
+async fn initial_response_timeout_is_committed_as_indeterminate() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let permit = FakePermitV1::with_deadline(
+        Arc::clone(&trace),
+        Instant::now() + std::time::Duration::from_millis(20),
+    );
+    let responder = PendingInitialResponderV1 {
+        trace: Arc::clone(&trace),
+    };
+    let fenced = ReceiptFencedInteractionResponderV1::new(&responder, &permit);
+
+    let error = fenced.defer_ephemeral().await.unwrap_err();
+
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            "permit.initial_intent",
+            "external.defer",
+            "permit.initial_result"
+        ]
+    );
+    assert_eq!(permit.intents.lock().unwrap().len(), 1);
+    assert_eq!(permit.results.lock().unwrap().len(), 1);
+    assert_eq!(
+        permit.results.lock().unwrap()[0].result(),
+        InteractionInitialResponseResultKindV1::Indeterminate
+    );
+    assert_eq!(error.kind, AdapterErrorKind::Unknown);
+    assert_eq!(error.message, INITIAL_RESPONSE_FAILURE_MESSAGE_V1);
 }
 
 #[tokio::test]

@@ -822,7 +822,8 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
         assert!(lane.contains(required), "{required}");
     }
     for required in [
-        "pub(crate) struct ZeroizingPinnedDiscordInteractionV1(Interaction)",
+        "pub(crate) struct ZeroizingPinnedDiscordInteractionV1(",
+        "SharedGatewayInteractionReceivedAtV3",
         "pub(crate) fn pin_runtime_discord_interaction_v1(",
         "impl Drop for ZeroizingPinnedDiscordInteractionV1",
         "zeroize_pinned_discord_interaction_v1(&mut self.0)",
@@ -1900,6 +1901,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         | "SharedGatewayInteractionIdV3"
                         | "SharedGatewayInteractionIdentityV3"
                         | "SharedGatewayInteractionKindV3"
+                        | "SharedGatewayInteractionReceivedAtV3"
                         | "SharedGatewayInteractionTokenV3"
                         | "SharedGatewayModalInputV3"
                 );

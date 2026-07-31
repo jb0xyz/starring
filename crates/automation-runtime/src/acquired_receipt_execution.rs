@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::time::Duration;
 
 use automation_core::{
     prepare_event_execution, run, ActionPlan, AdapterError, AutomationServices,
@@ -16,6 +17,7 @@ use automation_runtime_interaction::{
     InteractionReceiptStateV1, InteractionRequestDigestV1, InteractionRouteBindingV1,
 };
 use sha2::{Digest, Sha256};
+use tokio::time::{sleep_until, Instant};
 
 use crate::action_plan_digest::build_interaction_action_plan_digest_v1;
 use crate::convert::interaction_to_event;
@@ -32,6 +34,18 @@ use crate::shared_gateway_executor::execution_inputs;
 
 const TERMINAL_DIGEST_DOMAIN_V1: &[u8] = b"starring.runtime.acquired_receipt.terminal.v1\0";
 const TERMINAL_DIGEST_VERSION_V1: u16 = 1;
+const ACQUIRED_INTERACTION_CLAIM_LEASE_SECONDS_V1: u64 = 5 * 60;
+const ACQUIRED_INTERACTION_EXECUTION_DEADLINE_SECONDS_V1: u64 = 4 * 60;
+const ACQUIRED_INTERACTION_RECOVERY_MARGIN_SECONDS_V1: u64 = 60;
+pub const ACQUIRED_INTERACTION_CLAIM_LEASE_V1: Duration =
+    Duration::from_secs(ACQUIRED_INTERACTION_CLAIM_LEASE_SECONDS_V1);
+pub const ACQUIRED_INTERACTION_EXECUTION_DEADLINE_V1: Duration =
+    Duration::from_secs(ACQUIRED_INTERACTION_EXECUTION_DEADLINE_SECONDS_V1);
+const _: () = assert!(
+    ACQUIRED_INTERACTION_EXECUTION_DEADLINE_SECONDS_V1
+        + ACQUIRED_INTERACTION_RECOVERY_MARGIN_SECONDS_V1
+        <= ACQUIRED_INTERACTION_CLAIM_LEASE_SECONDS_V1
+);
 
 pub struct AuthoritativeInteractionClaimV1<'a> {
     claim_root: &'a InteractionReceiptClaimRootV1,
@@ -183,6 +197,7 @@ pub enum AcquiredInteractionExecutionOutcomeV1 {
         result: InteractionInitialResponseResultKindV1,
     },
     AuthorityRejected,
+    ExecutionDeadlineElapsed,
     PersistenceFailed {
         stage: AcquiredInteractionPersistenceStageV1,
         external_effect_may_have_occurred: bool,
@@ -255,8 +270,52 @@ where
     PR: PinnedInstanceResolverV1,
     SP: GuildRoleSnapshotProvider,
 {
-    let outcome =
-        execute_acquired_interaction_inner_v1(&admitted, &envelope, &permit, &services).await;
+    execute_acquired_interaction_until_v1(
+        admitted,
+        envelope,
+        permit,
+        services,
+        Instant::now() + ACQUIRED_INTERACTION_EXECUTION_DEADLINE_V1,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_acquired_interaction_until_v1<P, M, R, S, G, T, PR, SP>(
+    admitted: SharedGatewayAdmittedInteractionV3,
+    envelope: SharedGatewayInteractionEnvelopeV3,
+    permit: P,
+    services: AcquiredInteractionExecutionServicesV1<'_, M, R, S, G, T, PR, SP>,
+    execution_deadline: Instant,
+) -> AcquiredInteractionExecutionOutcomeV1
+where
+    P: AcquiredInteractionLifecyclePermitV1,
+    M: DiscordMutationAdapter + ?Sized,
+    R: InteractionResponder + ?Sized,
+    S: InstanceRegistrarV1,
+    G: InstanceIdGenerator,
+    T: InstanceTeardownService,
+    PR: PinnedInstanceResolverV1,
+    SP: GuildRoleSnapshotProvider,
+{
+    if Instant::now() >= execution_deadline {
+        drop(envelope);
+        drop(permit);
+        drop(admitted);
+        return AcquiredInteractionExecutionOutcomeV1::ExecutionDeadlineElapsed;
+    }
+    let outcome = {
+        let execution =
+            execute_acquired_interaction_inner_v1(&admitted, &envelope, &permit, &services);
+        tokio::pin!(execution);
+        tokio::select! {
+            biased;
+            _ = sleep_until(execution_deadline) => {
+                AcquiredInteractionExecutionOutcomeV1::ExecutionDeadlineElapsed
+            }
+            outcome = &mut execution => outcome,
+        }
+    };
     drop(envelope);
     drop(permit);
     drop(admitted);
@@ -768,6 +827,10 @@ impl<P: InteractionEffectPermitV1> InteractionEffectPermitV1
     for TrackingInteractionEffectPermitV1<'_, P>
 {
     type Error = P::Error;
+
+    fn initial_response_deadline_v1(&self) -> Instant {
+        self.permit.initial_response_deadline_v1()
+    }
 
     async fn commit_initial_response_intent_v1(
         &self,

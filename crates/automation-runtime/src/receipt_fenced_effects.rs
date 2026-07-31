@@ -1,4 +1,5 @@
 use std::fmt::{Debug, Formatter};
+use std::future::Future;
 
 use automation_core::{
     AdapterError, AdapterErrorKind, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter,
@@ -11,6 +12,7 @@ use automation_instance_teardown::{InstanceTeardownService, TeardownError, Teard
 use automation_state::{ModalFieldSpec, ModalFieldStyle, ModalInputPolicy};
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
 use sha2::{Digest, Sha256};
+use tokio::time::{timeout_at, Instant};
 
 const CANONICAL_VERSION_V1: u16 = 1;
 const INITIAL_RESPONSE_OPERATION_DOMAIN_V1: &[u8] =
@@ -155,6 +157,8 @@ impl Debug for InteractionInitialResponseResultV1 {
 pub trait InteractionEffectPermitV1 {
     type Error;
 
+    fn initial_response_deadline_v1(&self) -> Instant;
+
     async fn commit_initial_response_intent_v1(
         &self,
         intent: &InteractionInitialResponseIntentV1,
@@ -198,14 +202,13 @@ where
             InteractionInitialResponseKindV1::RespondEphemeral,
             &operation,
         );
-        if !persist_initial_response_intent_v1(self.permit, &intent)
-            .await?
-            .external_call_authorized()
-        {
-            return Ok(());
-        }
-        let external = self.responder.respond_ephemeral(content).await;
-        finish_initial_response_v1(self.permit, intent, &operation, external).await
+        execute_initial_response_v1(
+            self.permit,
+            intent,
+            &operation,
+            self.responder.respond_ephemeral(content),
+        )
+        .await
     }
 
     async fn open_modal(&self, modal: &ModalPresentation) -> Result<(), AdapterError> {
@@ -215,14 +218,13 @@ where
             InteractionInitialResponseKindV1::OpenModal,
             &operation,
         );
-        if !persist_initial_response_intent_v1(self.permit, &intent)
-            .await?
-            .external_call_authorized()
-        {
-            return Ok(());
-        }
-        let external = self.responder.open_modal(modal).await;
-        finish_initial_response_v1(self.permit, intent, &operation, external).await
+        execute_initial_response_v1(
+            self.permit,
+            intent,
+            &operation,
+            self.responder.open_modal(modal),
+        )
+        .await
     }
 
     async fn defer_ephemeral(&self) -> Result<(), AdapterError> {
@@ -232,14 +234,13 @@ where
             InteractionInitialResponseKindV1::DeferEphemeral,
             &operation,
         );
-        if !persist_initial_response_intent_v1(self.permit, &intent)
-            .await?
-            .external_call_authorized()
-        {
-            return Ok(());
-        }
-        let external = self.responder.defer_ephemeral().await;
-        finish_initial_response_v1(self.permit, intent, &operation, external).await
+        execute_initial_response_v1(
+            self.permit,
+            intent,
+            &operation,
+            self.responder.defer_ephemeral(),
+        )
+        .await
     }
 
     async fn edit_response(&self, content: String) -> Result<(), AdapterError> {
@@ -412,19 +413,71 @@ async fn persist_initial_response_intent_v1<P: InteractionEffectPermitV1 + ?Size
     permit: &P,
     intent: &InteractionInitialResponseIntentV1,
 ) -> Result<InteractionInitialResponseIntentDispositionV1, AdapterError> {
-    permit
-        .commit_initial_response_intent_v1(intent)
-        .await
-        .map_err(|_| receipt_persistence_error_v1())
+    if Instant::now() >= permit.initial_response_deadline_v1() {
+        return Err(receipt_persistence_error_v1());
+    }
+    timeout_at(
+        permit.initial_response_deadline_v1(),
+        permit.commit_initial_response_intent_v1(intent),
+    )
+    .await
+    .map_err(|_| receipt_persistence_error_v1())?
+    .map_err(|_| receipt_persistence_error_v1())
 }
 
-async fn finish_initial_response_v1<P: InteractionEffectPermitV1 + ?Sized>(
+async fn execute_initial_response_v1<P, F>(
     permit: &P,
     intent: InteractionInitialResponseIntentV1,
     operation: &[u8],
+    external: F,
+) -> Result<(), AdapterError>
+where
+    P: InteractionEffectPermitV1 + ?Sized,
+    F: Future<Output = Result<(), AdapterError>>,
+{
+    if !persist_initial_response_intent_v1(permit, &intent)
+        .await?
+        .external_call_authorized()
+    {
+        return Ok(());
+    }
+    let deadline = permit.initial_response_deadline_v1();
+    if Instant::now() >= deadline {
+        return finish_initial_response_result_v1(
+            permit,
+            intent,
+            operation,
+            InteractionInitialResponseResultKindV1::DefinitiveFailure,
+            Err(initial_response_deadline_error_v1()),
+        )
+        .await;
+    }
+    match timeout_at(deadline, external).await {
+        Ok(external) => {
+            let result_kind = classify_initial_response_result_v1(&external);
+            finish_initial_response_result_v1(permit, intent, operation, result_kind, external)
+                .await
+        }
+        Err(_) => {
+            finish_initial_response_result_v1(
+                permit,
+                intent,
+                operation,
+                InteractionInitialResponseResultKindV1::Indeterminate,
+                Err(initial_response_deadline_error_v1()),
+            )
+            .await
+        }
+    }
+}
+
+async fn finish_initial_response_result_v1<P: InteractionEffectPermitV1 + ?Sized>(
+    permit: &P,
+    intent: InteractionInitialResponseIntentV1,
+    operation: &[u8],
+    result_kind: InteractionInitialResponseResultKindV1,
     external: Result<(), AdapterError>,
 ) -> Result<(), AdapterError> {
-    let result_kind = classify_initial_response_result_v1(&external);
     let result = build_initial_response_result_v1(intent.digest, result_kind, operation);
     permit
         .commit_initial_response_result_v1(&result)
@@ -467,6 +520,13 @@ fn receipt_persistence_error_v1() -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::Unknown,
         RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1,
+    )
+}
+
+fn initial_response_deadline_error_v1() -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::Unknown,
+        INITIAL_RESPONSE_FAILURE_MESSAGE_V1,
     )
 }
 

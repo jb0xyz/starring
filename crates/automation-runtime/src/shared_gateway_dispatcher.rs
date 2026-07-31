@@ -70,8 +70,28 @@ pub const MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3: usize = 4_000;
 pub const MAX_SHARED_GATEWAY_MODAL_PAYLOAD_BYTES_V3: usize = 20_000;
 const SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3: Duration = Duration::from_secs(2);
 const SHARED_GATEWAY_MUTATION_HTTP_TIMEOUT_V3: Duration = Duration::from_secs(15);
+const SHARED_GATEWAY_INITIAL_RESPONSE_BUDGET_V3: Duration = Duration::from_secs(3);
 pub const SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3: &str =
     "Starring is temporarily unable to process this request. Please try again.";
+
+#[derive(Clone, Copy)]
+pub struct SharedGatewayInteractionReceivedAtV3(Instant);
+
+impl SharedGatewayInteractionReceivedAtV3 {
+    pub fn now_v3() -> Self {
+        Self(Instant::now())
+    }
+
+    pub fn initial_response_deadline_v3(self) -> Instant {
+        self.0 + SHARED_GATEWAY_INITIAL_RESPONSE_BUDGET_V3
+    }
+}
+
+impl Debug for SharedGatewayInteractionReceivedAtV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayInteractionReceivedAtV3(<redacted>)")
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SharedGatewayInteractionApplicationIdV3(NonZeroU64);
@@ -245,10 +265,27 @@ pub struct SharedGatewayInteractionEnvelopeV3 {
     locale: Option<String>,
     token: SharedGatewayInteractionTokenV3,
     data: SharedGatewayInteractionDataV3,
+    received_at: SharedGatewayInteractionReceivedAtV3,
 }
 
 impl SharedGatewayInteractionEnvelopeV3 {
     pub fn message_component_v3(
+        identity: SharedGatewayInteractionIdentityV3,
+        custom_id: String,
+        locale: Option<String>,
+        token: SharedGatewayInteractionTokenV3,
+    ) -> Result<Self, SharedGatewayInteractionEnvelopeErrorV3> {
+        Self::received_message_component_v3(
+            SharedGatewayInteractionReceivedAtV3::now_v3(),
+            identity,
+            custom_id,
+            locale,
+            token,
+        )
+    }
+
+    pub fn received_message_component_v3(
+        received_at: SharedGatewayInteractionReceivedAtV3,
         identity: SharedGatewayInteractionIdentityV3,
         custom_id: String,
         locale: Option<String>,
@@ -261,10 +298,29 @@ impl SharedGatewayInteractionEnvelopeV3 {
             locale,
             token,
             data: SharedGatewayInteractionDataV3::MessageComponent { custom_id },
+            received_at,
         })
     }
 
     pub fn modal_submit_v3(
+        identity: SharedGatewayInteractionIdentityV3,
+        custom_id: String,
+        inputs: Vec<SharedGatewayModalInputV3>,
+        locale: Option<String>,
+        token: SharedGatewayInteractionTokenV3,
+    ) -> Result<Self, SharedGatewayInteractionEnvelopeErrorV3> {
+        Self::received_modal_submit_v3(
+            SharedGatewayInteractionReceivedAtV3::now_v3(),
+            identity,
+            custom_id,
+            inputs,
+            locale,
+            token,
+        )
+    }
+
+    pub fn received_modal_submit_v3(
+        received_at: SharedGatewayInteractionReceivedAtV3,
         identity: SharedGatewayInteractionIdentityV3,
         custom_id: String,
         inputs: Vec<SharedGatewayModalInputV3>,
@@ -295,7 +351,12 @@ impl SharedGatewayInteractionEnvelopeV3 {
             locale,
             token,
             data: SharedGatewayInteractionDataV3::ModalSubmit { custom_id, inputs },
+            received_at,
         })
+    }
+
+    pub fn initial_response_deadline_v3(&self) -> Instant {
+        self.received_at.initial_response_deadline_v3()
     }
 
     pub fn identity_v3(&self) -> SharedGatewayInteractionIdentityV3 {

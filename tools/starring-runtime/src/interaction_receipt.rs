@@ -7,6 +7,7 @@ use automation_runtime::{
     InteractionInitialResponseIntentV1, InteractionInitialResponseResultV1,
     InteractionTerminalFinishV1, SharedGatewayDurableReceiptClaimInputV1,
     SharedGatewayInteractionIdentityV3, SharedGatewayInteractionKindV3,
+    ACQUIRED_INTERACTION_CLAIM_LEASE_V1,
 };
 use automation_runtime_interaction::{
     InteractionActionPlanDigestV1, InteractionReceiptClaimRootV1,
@@ -16,7 +17,8 @@ use tokio::time::{timeout_at, Instant};
 
 pub(crate) const RUNTIME_INTERACTION_RECEIPT_CLAIM_DEADLINE_V1: Duration =
     Duration::from_millis(600);
-pub(crate) const RUNTIME_INTERACTION_RECEIPT_CLAIM_LEASE_V1: Duration = Duration::from_secs(5 * 60);
+pub(crate) const RUNTIME_INTERACTION_RECEIPT_CLAIM_LEASE_V1: Duration =
+    ACQUIRED_INTERACTION_CLAIM_LEASE_V1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeInteractionReceiptClosedReasonV1 {
@@ -177,6 +179,7 @@ where
 {
     persistence: P,
     claim_root: InteractionReceiptClaimRootV1,
+    initial_response_deadline: Instant,
     checkpoint: Mutex<RuntimeInteractionReceiptCheckpointV1<P::Claim>>,
 }
 
@@ -184,11 +187,12 @@ impl<P> RuntimeAcquiredInteractionPermitV1<P>
 where
     P: RuntimeInteractionReceiptPersistencePortV1,
 {
-    fn new(persistence: P, claim: P::Claim) -> Self {
+    fn new(persistence: P, claim: P::Claim, initial_response_deadline: Instant) -> Self {
         let claim_root = P::claim_root_v1(&claim).clone();
         Self {
             persistence,
             claim_root,
+            initial_response_deadline,
             checkpoint: Mutex::new(RuntimeInteractionReceiptCheckpointV1 {
                 claim,
                 execution_intent_applied_in_this_permit: false,
@@ -211,11 +215,15 @@ pub(crate) async fn claim_runtime_interaction_receipt_v1<P>(
     input: SharedGatewayDurableReceiptClaimInputV1,
     identity: SharedGatewayInteractionIdentityV3,
     kind: SharedGatewayInteractionKindV3,
+    initial_response_deadline: Instant,
 ) -> RuntimeInteractionReceiptClaimDispositionV1<P>
 where
     P: RuntimeInteractionReceiptPersistencePortV1,
 {
-    let deadline = Instant::now() + RUNTIME_INTERACTION_RECEIPT_CLAIM_DEADLINE_V1;
+    let deadline = std::cmp::min(
+        initial_response_deadline,
+        Instant::now() + RUNTIME_INTERACTION_RECEIPT_CLAIM_DEADLINE_V1,
+    );
     let result = timeout_at(
         deadline,
         persistence.claim_receipt_v1(input, identity, kind),
@@ -224,7 +232,11 @@ where
     match result {
         Ok(Ok(RuntimeInteractionReceiptPersistenceClaimOutcomeV1::Acquired(claim))) => {
             RuntimeInteractionReceiptClaimDispositionV1::Acquired(Box::new(
-                RuntimeAcquiredInteractionPermitV1::new(persistence.clone(), claim),
+                RuntimeAcquiredInteractionPermitV1::new(
+                    persistence.clone(),
+                    claim,
+                    initial_response_deadline,
+                ),
             ))
         }
         Ok(Ok(RuntimeInteractionReceiptPersistenceClaimOutcomeV1::CompletedDuplicate)) => {
@@ -259,6 +271,10 @@ where
     P: RuntimeInteractionReceiptPersistencePortV1,
 {
     type Error = RuntimeInteractionReceiptPermitErrorV1;
+
+    fn initial_response_deadline_v1(&self) -> Instant {
+        self.initial_response_deadline
+    }
 
     async fn commit_initial_response_intent_v1(
         &self,

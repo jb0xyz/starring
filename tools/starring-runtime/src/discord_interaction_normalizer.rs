@@ -3,7 +3,8 @@ use std::fmt::{Debug, Display, Formatter};
 use automation_runtime::{
     SharedGatewayInteractionApplicationIdV3, SharedGatewayInteractionEnvelopeErrorV3,
     SharedGatewayInteractionEnvelopeV3, SharedGatewayInteractionIdV3,
-    SharedGatewayInteractionIdentityV3, SharedGatewayInteractionTokenV3, SharedGatewayModalInputV3,
+    SharedGatewayInteractionIdentityV3, SharedGatewayInteractionReceivedAtV3,
+    SharedGatewayInteractionTokenV3, SharedGatewayModalInputV3,
 };
 use discord_model::{ChannelId, GuildId, UserId};
 use paused_discord_model::application::interaction::application_command::{
@@ -112,12 +113,18 @@ enum RuntimeDiscordInteractionNormalizationDecisionV1 {
     Ignored(RuntimeDiscordInteractionIgnoredV1),
 }
 
-pub(crate) struct ZeroizingPinnedDiscordInteractionV1(Interaction);
+pub(crate) struct ZeroizingPinnedDiscordInteractionV1(
+    Interaction,
+    SharedGatewayInteractionReceivedAtV3,
+);
 
 pub(crate) fn pin_runtime_discord_interaction_v1(
     interaction: Interaction,
 ) -> Box<ZeroizingPinnedDiscordInteractionV1> {
-    Box::new(ZeroizingPinnedDiscordInteractionV1(interaction))
+    Box::new(ZeroizingPinnedDiscordInteractionV1(
+        interaction,
+        SharedGatewayInteractionReceivedAtV3::now_v3(),
+    ))
 }
 
 impl Drop for ZeroizingPinnedDiscordInteractionV1 {
@@ -135,7 +142,8 @@ pub(crate) fn normalize_runtime_discord_interaction_v1(
 pub(crate) fn normalize_pinned_runtime_discord_interaction_v1(
     mut interaction: Box<ZeroizingPinnedDiscordInteractionV1>,
 ) -> RuntimeDiscordInteractionNormalizationOutcomeV1 {
-    match normalize_guarded_runtime_discord_interaction_v1(&mut interaction.0) {
+    let received_at = interaction.1;
+    match normalize_guarded_runtime_discord_interaction_v1(&mut interaction.0, received_at) {
         Ok(RuntimeDiscordInteractionNormalizationDecisionV1::Normalized(envelope)) => {
             RuntimeDiscordInteractionNormalizationOutcomeV1::Normalized(Box::new(envelope))
         }
@@ -148,6 +156,7 @@ pub(crate) fn normalize_pinned_runtime_discord_interaction_v1(
 
 fn normalize_guarded_runtime_discord_interaction_v1(
     interaction: &mut Interaction,
+    received_at: SharedGatewayInteractionReceivedAtV3,
 ) -> Result<
     RuntimeDiscordInteractionNormalizationDecisionV1,
     RuntimeDiscordInteractionNormalizationErrorV1,
@@ -205,7 +214,8 @@ fn normalize_guarded_runtime_discord_interaction_v1(
             };
             let token =
                 SharedGatewayInteractionTokenV3::new(std::mem::take(&mut interaction.token))?;
-            let envelope = SharedGatewayInteractionEnvelopeV3::message_component_v3(
+            let envelope = SharedGatewayInteractionEnvelopeV3::received_message_component_v3(
+                received_at,
                 identity,
                 custom_id,
                 interaction.locale.take(),
@@ -239,7 +249,8 @@ fn normalize_guarded_runtime_discord_interaction_v1(
             };
             let token =
                 SharedGatewayInteractionTokenV3::new(std::mem::take(&mut interaction.token))?;
-            let envelope = SharedGatewayInteractionEnvelopeV3::modal_submit_v3(
+            let envelope = SharedGatewayInteractionEnvelopeV3::received_modal_submit_v3(
+                received_at,
                 identity,
                 custom_id,
                 inputs,

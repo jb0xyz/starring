@@ -89,6 +89,10 @@ struct FakeLifecyclePermitV1 {
 impl InteractionEffectPermitV1 for FakeLifecyclePermitV1 {
     type Error = PermitErrorV1;
 
+    fn initial_response_deadline_v1(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
     async fn commit_initial_response_intent_v1(
         &self,
         intent: &InteractionInitialResponseIntentV1,
@@ -180,6 +184,7 @@ struct FakeResponderV1 {
     state: Arc<PermitStateV1>,
     initial_error: Option<AdapterError>,
     edit_error: Option<AdapterError>,
+    pending_initial: bool,
 }
 
 impl FakeResponderV1 {
@@ -188,6 +193,16 @@ impl FakeResponderV1 {
             state,
             initial_error: None,
             edit_error: None,
+            pending_initial: false,
+        }
+    }
+
+    fn pending_initial(state: Arc<PermitStateV1>) -> Self {
+        Self {
+            state,
+            initial_error: None,
+            edit_error: None,
+            pending_initial: true,
         }
     }
 }
@@ -199,6 +214,9 @@ impl InteractionResponder for FakeResponderV1 {
             .lock()
             .unwrap()
             .push("external.respond".to_string());
+        if self.pending_initial {
+            std::future::pending().await
+        }
         self.initial_error.clone().map_or(Ok(()), Err)
     }
 
@@ -208,6 +226,9 @@ impl InteractionResponder for FakeResponderV1 {
             .lock()
             .unwrap()
             .push("external.modal".to_string());
+        if self.pending_initial {
+            std::future::pending().await
+        }
         self.initial_error.clone().map_or(Ok(()), Err)
     }
 
@@ -217,6 +238,9 @@ impl InteractionResponder for FakeResponderV1 {
             .lock()
             .unwrap()
             .push("external.defer".to_string());
+        if self.pending_initial {
+            std::future::pending().await
+        }
         self.initial_error.clone().map_or(Ok(()), Err)
     }
 
@@ -783,6 +807,125 @@ async fn register_only_execution_commits_intent_before_the_registrar() {
             "permit.finish:interaction_static_completed",
         ]
     );
+}
+
+#[test]
+fn production_execution_deadline_preserves_the_recovery_margin() {
+    assert_eq!(
+        ACQUIRED_INTERACTION_CLAIM_LEASE_V1,
+        Duration::from_secs(5 * 60)
+    );
+    assert_eq!(
+        ACQUIRED_INTERACTION_EXECUTION_DEADLINE_V1,
+        Duration::from_secs(4 * 60)
+    );
+    assert!(
+        ACQUIRED_INTERACTION_CLAIM_LEASE_V1 - ACQUIRED_INTERACTION_EXECUTION_DEADLINE_V1
+            >= Duration::from_secs(60)
+    );
+}
+
+#[tokio::test]
+async fn execution_deadline_cancels_without_a_false_terminal_finish() {
+    let definition = static_ruleset(vec![ActionSpec::RespondEphemeral {
+        content: "hello".to_string(),
+    }]);
+    let admitted = admitted_v1(
+        artifact(definition),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), 51_026);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
+    let responder = FakeResponderV1::pending_initial(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = MockInstanceTeardownService::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: false,
+    };
+
+    let outcome = execute_acquired_interaction_until_v1(
+        admitted,
+        envelope,
+        permit,
+        services_v1(
+            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+        Instant::now() + Duration::from_millis(20),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        AcquiredInteractionExecutionOutcomeV1::ExecutionDeadlineElapsed
+    );
+    assert!(state.results.lock().unwrap().is_empty());
+    assert!(state.finishes.lock().unwrap().is_empty());
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.bind",
+            "permit.intent:respond_ephemeral",
+            "external.respond",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn elapsed_execution_deadline_wins_before_an_immediately_ready_effect() {
+    let definition = static_ruleset(vec![ActionSpec::RespondEphemeral {
+        content: "never".to_string(),
+    }]);
+    let admitted = admitted_v1(
+        artifact(definition),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), 51_027);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = MockInstanceTeardownService::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: false,
+    };
+
+    let outcome = execute_acquired_interaction_until_v1(
+        admitted,
+        envelope,
+        permit,
+        services_v1(
+            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+        Instant::now() - Duration::from_millis(1),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        AcquiredInteractionExecutionOutcomeV1::ExecutionDeadlineElapsed
+    );
+    assert!(state.trace.lock().unwrap().is_empty());
+    assert!(state.results.lock().unwrap().is_empty());
+    assert!(state.finishes.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1662,6 +1805,7 @@ async fn definitive_acknowledgement_failure_returns_the_committed_terminal_state
             "backend-ack-secret",
         )),
         edit_error: None,
+        pending_initial: false,
     };
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();

@@ -30,6 +30,7 @@ pub use acquired_receipt_execution::{
     AcquiredInteractionExecutionServicesV1, AcquiredInteractionLifecyclePermitV1,
     AcquiredInteractionPersistenceStageV1, AcquiredInteractionTerminalOutcomeV1,
     AuthoritativeInteractionClaimV1, InteractionTerminalDigestV1, InteractionTerminalFinishV1,
+    ACQUIRED_INTERACTION_CLAIM_LEASE_V1,
 };
 pub use action_plan_digest::build_interaction_action_plan_digest_v1;
 pub use convert::interaction_to_event;
@@ -102,9 +103,9 @@ pub use shared_gateway_dispatcher::{
     SharedGatewayAdmittedEnvelopeV1, SharedGatewayInteractionApplicationIdV3,
     SharedGatewayInteractionEnvelopeErrorV3, SharedGatewayInteractionEnvelopeV3,
     SharedGatewayInteractionIdV3, SharedGatewayInteractionIdentityV3,
-    SharedGatewayInteractionKindV3, SharedGatewayInteractionRejectionV3,
-    SharedGatewayInteractionReservationOutcomeV3, SharedGatewayInteractionTokenV3,
-    SharedGatewayModalInputV3, SharedGatewayReservedInteractionV3,
+    SharedGatewayInteractionKindV3, SharedGatewayInteractionReceivedAtV3,
+    SharedGatewayInteractionRejectionV3, SharedGatewayInteractionReservationOutcomeV3,
+    SharedGatewayInteractionTokenV3, SharedGatewayModalInputV3, SharedGatewayReservedInteractionV3,
     MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3, MAX_SHARED_GATEWAY_INTERACTION_LOCALE_BYTES_V3,
     MAX_SHARED_GATEWAY_INTERACTION_TOKEN_BYTES_V3, MAX_SHARED_GATEWAY_MODAL_INPUTS_V3,
     MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3, MAX_SHARED_GATEWAY_MODAL_PAYLOAD_BYTES_V3,

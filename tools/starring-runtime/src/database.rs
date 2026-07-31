@@ -537,6 +537,8 @@ impl RuntimeInteractionDispatchDatabasePortV1 {
     ) -> RuntimeInteractionDispatchOutcomeV1 {
         let identity = admitted.envelope_v1().identity_v3();
         let kind = admitted.envelope_v1().kind_v3();
+        let initial_response_deadline =
+            TokioInstant::from_std(admitted.envelope_v1().initial_response_deadline_v3());
         let input = build_shared_gateway_durable_receipt_claim_input_v1(
             admitted.envelope_v1(),
             admitted.admitted_v1(),
@@ -551,7 +553,15 @@ impl RuntimeInteractionDispatchDatabasePortV1 {
                 )
             }
         };
-        match claim_runtime_interaction_receipt_v1(&self.receipt, input, identity, kind).await {
+        match claim_runtime_interaction_receipt_v1(
+            &self.receipt,
+            input,
+            identity,
+            kind,
+            initial_response_deadline,
+        )
+        .await
+        {
             RuntimeInteractionReceiptClaimDispositionV1::Acquired(permit) => {
                 map_acquired_interaction_outcome_v1(
                     self.inner.execute_acquired_v1(admitted, *permit).await,
@@ -595,6 +605,9 @@ fn map_acquired_interaction_outcome_v1(
         }
         AcquiredInteractionExecutionOutcomeV1::AuthorityRejected => {
             RuntimeInteractionDispatchOutcomeV1::AuthorityRejected
+        }
+        AcquiredInteractionExecutionOutcomeV1::ExecutionDeadlineElapsed => {
+            RuntimeInteractionDispatchOutcomeV1::RecoveryRequired
         }
         AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
             external_effect_may_have_occurred,
