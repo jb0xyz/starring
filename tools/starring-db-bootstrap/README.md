@@ -4,7 +4,7 @@ This tool creates the fixed `starring_owner` role and
 `starring_runtime_staging` database, assigns the `public` schema directly to
 the owner, applies the repository SQLx migration ledger under
 `SET ROLE starring_owner`, and verifies the exact migration versions and
-checksums, all 171 user-schema relations, all 102 API and runtime capability
+checksums, all 178 user-schema relations, all 123 API and runtime capability
 function owners, and zero inbound or outbound owner memberships.
 
 The ordinary mode accepts the cluster-administrator URL only from a hidden

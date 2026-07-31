@@ -885,7 +885,7 @@ major, independently reviewed system identifier, acknowledgement, peer rule,
 and ident map before mutation. It creates or normalizes the non-login owner and
 fixed database, runs the compile-time SQLx migration set under
 `SET ROLE starring_owner`, verifies its own exact ledger, verifies every
-user-schema relation and all 102 capability functions, resets role, and removes
+user-schema relation and all 123 capability functions, resets role, and removes
 all inbound and outbound owner memberships. In peer mode it is the sole owner
 of cluster-administrator normalization. It creates no migrator login.
 
@@ -902,7 +902,7 @@ of cluster-administrator normalization. It creates no migrator login.
     "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
     >"$STARRING_CUTOVER_EVIDENCE/starring-db-bootstrap.txt"
   grep -E \
-    '^database=starring_runtime_staging owner=starring_owner migrations=[1-9][0-9]* relations=171 capability_functions=102$' \
+    '^database=starring_runtime_staging owner=starring_owner migrations=[1-9][0-9]* relations=178 capability_functions=123$' \
     "$STARRING_CUTOVER_EVIDENCE/starring-db-bootstrap.txt" >/dev/null
 )
 ```
@@ -2676,7 +2676,7 @@ The cutover is accepted only when a change record contains all of these facts:
 - exact seven-rule bootstrap HBA and ident proof, final fifteen-rule HBA
   proof, peer-removal proof, and physical replication rejection;
 - immutable bootstrap and provisioner binary SHA-256 values;
-- embedded bootstrap receipt with 171 relations and 102 capability functions;
+- embedded bootstrap receipt with 178 relations and 123 capability functions;
 - exact migration ledger diff with no difference;
 - exact database, `public` schema, ledger, relation, routine, and type ownership
   proof plus owner zero-membership postflight and migrator absence;
