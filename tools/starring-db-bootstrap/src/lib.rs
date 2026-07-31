@@ -15,7 +15,7 @@ pub use keychain::{
 
 pub const DATABASE_NAME: &str = "starring_runtime_staging";
 pub const OWNER_ROLE: &str = "starring_owner";
-pub const RELATION_COUNT: i64 = 178;
+pub const RELATION_COUNT: i64 = 184;
 pub const CAPABILITY_FUNCTION_COUNT: usize = 124;
 pub const CLUSTER_ADMIN_ROLE: &str = "starring_cluster_admin";
 pub const PEER_MAP_NAME: &str = "starring_bootstrap";
@@ -1000,6 +1000,20 @@ fn extract_manifest(sql: &'static str) -> Vec<&'static str> {
 mod tests {
     use super::*;
 
+    const EXPECTED_MIGRATION_COUNT: usize = 115;
+    const EXPECTED_MIGRATION_HEAD: i64 = 202607310022;
+    const RELATION_COUNT_BEFORE_MIGRATION_HEAD: i64 = 174;
+
+    fn count_sql_lines_with_prefix(sql: &str, prefix: &str) -> i64 {
+        sql.lines()
+            .filter(|line| line.trim_start().starts_with(prefix))
+            .count() as i64
+    }
+
+    fn count_sql_lines_containing(sql: &str, pattern: &str) -> i64 {
+        sql.lines().filter(|line| line.contains(pattern)).count() as i64
+    }
+
     #[test]
     fn manifest_is_exact_and_unique() {
         let identities = capability_function_identities().unwrap();
@@ -1014,9 +1028,12 @@ mod tests {
 
     #[test]
     fn migration_ledger_source_is_ordered_and_unique() {
-        let versions = MIGRATOR
+        let migrations = MIGRATOR
             .iter()
             .filter(|migration| migration.migration_type.is_up_migration())
+            .collect::<Vec<_>>();
+        let versions = migrations
+            .iter()
             .map(|migration| migration.version)
             .collect::<Vec<_>>();
         assert!(!versions.is_empty());
@@ -1024,6 +1041,23 @@ mod tests {
         assert!(MIGRATOR
             .iter()
             .all(|migration| migration.checksum.len() == 48));
+        assert_eq!(migrations.len(), EXPECTED_MIGRATION_COUNT);
+        let head = migrations.last().unwrap();
+        assert_eq!(head.version, EXPECTED_MIGRATION_HEAD);
+        assert_eq!(head.description, "add runtime interaction receipts v1");
+        let table_count = count_sql_lines_with_prefix(&head.sql, "CREATE TABLE public.");
+        let explicit_index_count = count_sql_lines_with_prefix(&head.sql, "CREATE INDEX ");
+        let primary_key_index_count = count_sql_lines_containing(&head.sql, " PRIMARY KEY (");
+        assert_eq!(table_count, 4);
+        assert_eq!(explicit_index_count, 2);
+        assert_eq!(primary_key_index_count, table_count);
+        assert_eq!(
+            RELATION_COUNT,
+            RELATION_COUNT_BEFORE_MIGRATION_HEAD
+                + table_count
+                + explicit_index_count
+                + primary_key_index_count
+        );
     }
 
     #[test]
@@ -1084,7 +1118,7 @@ mod tests {
     fn fixed_identities_are_not_configurable() {
         assert_eq!(DATABASE_NAME, "starring_runtime_staging");
         assert_eq!(OWNER_ROLE, "starring_owner");
-        assert_eq!(RELATION_COUNT, 178);
+        assert_eq!(RELATION_COUNT, 184);
         assert_eq!(CAPABILITY_FUNCTION_COUNT, 124);
         assert_eq!(CLUSTER_ADMIN_ROLE, "starring_cluster_admin");
         assert_eq!(PEER_MAP_NAME, "starring_bootstrap");
@@ -1190,6 +1224,17 @@ mod tests {
             "ALTER SCHEMA public OWNER TO starring_owner"
         );
         assert!(VERIFY_PUBLIC_SCHEMA_SQL.contains("owner.rolname = 'starring_owner'"));
-        assert_eq!(RELATION_COUNT, 178);
+        for required in [
+            "FROM pg_catalog.pg_class AS relation",
+            "namespace.nspname <> 'information_schema'",
+            "pg_catalog.left(namespace.nspname, 3) <> 'pg_'",
+        ] {
+            assert!(
+                VERIFY_RELATION_OWNERSHIP_SQL.contains(required),
+                "{required}"
+            );
+        }
+        assert!(!VERIFY_RELATION_OWNERSHIP_SQL.contains("relation.relkind"));
+        assert_eq!(RELATION_COUNT, 184);
     }
 }

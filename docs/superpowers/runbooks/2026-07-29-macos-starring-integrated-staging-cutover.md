@@ -902,7 +902,7 @@ of cluster-administrator normalization. It creates no migrator login.
     "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
     >"$STARRING_CUTOVER_EVIDENCE/starring-db-bootstrap.txt"
   grep -E \
-    '^database=starring_runtime_staging owner=starring_owner migrations=[1-9][0-9]* relations=178 capability_functions=124$' \
+    '^database=starring_runtime_staging owner=starring_owner migrations=[1-9][0-9]* relations=184 capability_functions=124$' \
     "$STARRING_CUTOVER_EVIDENCE/starring-db-bootstrap.txt" >/dev/null
 )
 ```
@@ -2715,7 +2715,7 @@ The cutover is accepted only when a change record contains all of these facts:
 - exact seven-rule bootstrap HBA and ident proof, final fifteen-rule HBA
   proof, peer-removal proof, and physical replication rejection;
 - immutable bootstrap and provisioner binary SHA-256 values;
-- embedded bootstrap receipt with 178 relations and 124 capability functions;
+- embedded bootstrap receipt with 184 relations and 124 capability functions;
 - exact migration ledger diff with no difference;
 - exact database, `public` schema, ledger, relation, routine, and type ownership
   proof plus owner zero-membership postflight and migrator absence;
