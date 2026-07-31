@@ -15,6 +15,7 @@ pub mod shared_gateway_admission;
 pub mod shared_gateway_control;
 pub mod shared_gateway_dispatcher;
 pub mod shared_gateway_executor;
+pub mod shared_gateway_receipt_claim;
 pub mod shared_gateway_router;
 pub mod shared_gateway_runtime;
 pub mod snapshot;
@@ -88,6 +89,10 @@ pub use shared_gateway_dispatcher::{
     SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3,
 };
 pub use shared_gateway_executor::execute_admitted_interaction_v3;
+pub use shared_gateway_receipt_claim::{
+    build_shared_gateway_durable_receipt_claim_input_v1,
+    SharedGatewayDurableReceiptClaimInputErrorV1, SharedGatewayDurableReceiptClaimInputV1,
+};
 pub use shared_gateway_router::{
     admit_shared_gateway_route_v1, admit_shared_gateway_route_with_config_v1,
     parse_shared_gateway_route_v1, SharedGatewayRouteConfigV1,

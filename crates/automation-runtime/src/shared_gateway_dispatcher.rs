@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Formatter};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
@@ -15,6 +15,11 @@ use automation_instance_teardown::{
     InstanceTeardownService, Teardown, TeardownError, TeardownOutcome,
 };
 use automation_ruleset_dispatch::{GuildRoleSnapshotProvider, PinnedInstanceResolverV1};
+use automation_runtime_interaction::{
+    build_interaction_request_digest_v1, InteractionReceiptIdentityV1,
+    InteractionRequestDigestErrorV1, InteractionRequestDigestInputV1, InteractionRequestDigestV1,
+    InteractionRequestPayloadV1,
+};
 use automation_runtime_registry::ServingSlotRegistryV1;
 use discord_model::{ChannelId, GuildId, UserId};
 use twilight_http::Client;
@@ -212,6 +217,16 @@ enum SharedGatewayInteractionDataV3 {
     },
 }
 
+struct ZeroizingModalInputsV1(BTreeMap<String, String>);
+
+impl Drop for ZeroizingModalInputsV1 {
+    fn drop(&mut self) {
+        for value in self.0.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
 pub struct SharedGatewayInteractionEnvelopeV3 {
     identity: SharedGatewayInteractionIdentityV3,
     locale: Option<String>,
@@ -294,6 +309,48 @@ impl SharedGatewayInteractionEnvelopeV3 {
 
     pub fn locale_v3(&self) -> Option<&str> {
         self.locale.as_deref()
+    }
+
+    pub(crate) fn receipt_request_digest_v1(
+        &self,
+        receipt_identity: InteractionReceiptIdentityV1,
+    ) -> Result<InteractionRequestDigestV1, InteractionRequestDigestErrorV1> {
+        let identity = self.identity;
+        match &self.data {
+            SharedGatewayInteractionDataV3::MessageComponent { custom_id } => {
+                build_interaction_request_digest_v1(InteractionRequestDigestInputV1 {
+                    receipt_identity,
+                    guild_id: identity.guild_id,
+                    channel_id: identity.channel_id,
+                    actor_id: identity.user_id,
+                    locale: self.locale.as_deref(),
+                    payload: InteractionRequestPayloadV1::Button { custom_id },
+                })
+            }
+            SharedGatewayInteractionDataV3::ModalSubmit { custom_id, inputs } => {
+                let inputs = ZeroizingModalInputsV1(
+                    inputs
+                        .iter()
+                        .map(|input| (input.custom_id.clone(), input.value.as_str().to_owned()))
+                        .collect::<BTreeMap<_, _>>(),
+                );
+                build_interaction_request_digest_v1(InteractionRequestDigestInputV1 {
+                    receipt_identity,
+                    guild_id: identity.guild_id,
+                    channel_id: identity.channel_id,
+                    actor_id: identity.user_id,
+                    locale: self.locale.as_deref(),
+                    payload: InteractionRequestPayloadV1::ModalSubmit {
+                        custom_id,
+                        inputs: &inputs.0,
+                    },
+                })
+            }
+        }
+    }
+
+    pub(crate) fn receipt_interaction_token_copy_v1(&self) -> Zeroizing<String> {
+        Zeroizing::new(self.token.expose_v3().to_owned())
     }
 
     pub(crate) fn twilight_interaction_v3(&self) -> ZeroizingTwilightInteractionV3 {
