@@ -1,6 +1,7 @@
 mod crypto;
 mod final_verify;
 mod identity;
+mod incremental_keyring;
 mod incremental_writer;
 mod keychain;
 mod keyring;
@@ -18,6 +19,10 @@ pub use identity::{
     ADMIN_DATABASE_NAME, ADMIN_KEYCHAIN_ACCOUNT, ADMIN_KEYCHAIN_SERVICE,
     APPLICATION_DATABASE_IDENTITIES, CLUSTER_ADMIN_ROLE, DATABASE_HOST, DATABASE_NAME,
     DATABASE_PORT, OWNER_ROLE, PEER_SOCKET_DIRECTORY,
+};
+pub use incremental_keyring::{
+    provision_interaction_token_keyring, IncrementalInteractionTokenKeyringOutcomeV1,
+    IncrementalInteractionTokenKeyringReportV1,
 };
 pub use incremental_writer::{
     provision_authoring_writer, IncrementalAuthoringWriterOutcomeV1,
@@ -84,6 +89,8 @@ pub enum ProvisionerErrorV1 {
     IncrementalAuthoringWriterPartialState,
     #[error("incremental_authoring_writer_rollback_failed")]
     IncrementalAuthoringWriterRollback,
+    #[error("incremental_interaction_token_keyring_busy")]
+    IncrementalInteractionTokenKeyringBusy,
 }
 
 impl ProvisionerErrorV1 {
@@ -123,6 +130,9 @@ impl ProvisionerErrorV1 {
             }
             Self::IncrementalAuthoringWriterRollback => {
                 "incremental_authoring_writer_rollback_failed"
+            }
+            Self::IncrementalInteractionTokenKeyringBusy => {
+                "incremental_interaction_token_keyring_busy"
             }
         }
     }
@@ -254,6 +264,7 @@ mod tests {
             ProvisionerErrorV1::IncrementalAuthoringWriterContract,
             ProvisionerErrorV1::IncrementalAuthoringWriterPartialState,
             ProvisionerErrorV1::IncrementalAuthoringWriterRollback,
+            ProvisionerErrorV1::IncrementalInteractionTokenKeyringBusy,
         ] {
             assert_eq!(error.to_string(), error.code());
             assert!(!error.to_string().contains("postgresql://"));

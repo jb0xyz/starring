@@ -783,6 +783,14 @@ separately reviewed standalone provision or rotation payload prepared without
 shell variables, arguments, history, clipboard evidence, or terminal logging.
 Record only its key ID.
 
+For an already-live legacy staging cluster missing only this item, keep the API
+and runtime stopped and use the staging provisioner's
+`--provision-interaction-token-keyring` mode. It rejects every ambient `PG*`
+variable, performs no database connection or mutation, revalidates both API
+keyrings, creates only the absent runtime item, and returns exact replay without
+rotation when the existing item is valid. Do not use the interactive command
+or rerun the one-shot provisioner for that backfill.
+
 The last prompt receives the Discord bot token, not a URL. Never use `-A`,
 never place a value after `-w`, and never export these values.
 

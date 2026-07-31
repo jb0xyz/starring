@@ -7,7 +7,9 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::SecretItemRefV1;
-use crate::identity::{KeychainIdentityV1, DISCORD_PREFLIGHT_IDENTITIES};
+use crate::identity::{
+    KeychainIdentityV1, DISCORD_PREFLIGHT_IDENTITIES, INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY,
+};
 use crate::ProvisionerErrorV1;
 
 const SECURITY_PATH: &str = "/usr/bin/security";
@@ -87,8 +89,32 @@ impl KeychainClientV1 {
         &self,
         item: SecretItemRefV1<'_>,
     ) -> Result<KeychainUpdateV1, ProvisionerErrorV1> {
+        self.begin_create_with_conflict(
+            item,
+            ProvisionerErrorV1::IncrementalAuthoringWriterPartialState,
+        )
+    }
+
+    pub(crate) fn begin_create_interaction_token_keyring(
+        &self,
+        item: SecretItemRefV1<'_>,
+    ) -> Result<KeychainUpdateV1, ProvisionerErrorV1> {
+        if item.identity != INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY {
+            return Err(ProvisionerErrorV1::KeyringContract);
+        }
+        self.begin_create_with_conflict(
+            item,
+            ProvisionerErrorV1::IncrementalInteractionTokenKeyringBusy,
+        )
+    }
+
+    fn begin_create_with_conflict(
+        &self,
+        item: SecretItemRefV1<'_>,
+        conflict: ProvisionerErrorV1,
+    ) -> Result<KeychainUpdateV1, ProvisionerErrorV1> {
         if self.read_optional(item.identity)?.is_some() {
-            return Err(ProvisionerErrorV1::IncrementalAuthoringWriterPartialState);
+            return Err(conflict);
         }
         self.write_new_and_verify(item.identity, item.value)?;
         Ok(KeychainUpdateV1 {

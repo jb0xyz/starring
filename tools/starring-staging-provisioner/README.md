@@ -77,6 +77,27 @@ cutover snapshot state, asymmetric state, mixed v1/v2 access, and excess ACLs
 are classified explicitly and fail closed unless they form one exact fresh or
 replay state.
 
+An already-live staging cluster that predates the runtime interaction receipt
+keyring must not rerun the one-shot mode. Keep the API and runtime stopped and
+run the dedicated incremental mode with an empty `PG*` environment:
+
+```zsh
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+  "$HOME/.local/libexec/starring-staging-provisioner" \
+  --provision-interaction-token-keyring \
+  "$STAGING_SYSTEM_IDENTIFIER" \
+  "starring-runtime-dedicated-staging-cluster-v2:$STAGING_SYSTEM_IDENTIFIER:starring_runtime_staging:cluster-wide-public-acl-reset:bidirectional-runtime-membership-revocation"
+```
+
+This mode performs no PostgreSQL connection or mutation. It requires both
+existing API keyrings to be readable and semantically valid, then either
+creates only
+`starring.runtime.staging/interaction.token-envelope-keyring` with independent
+32-byte material or returns exact replay for a valid existing item. An invalid
+API or runtime keyring fails closed. Successful output contains only
+`outcome=created|exact_replay` and the active key ID. It never rotates an
+existing item and never emits key material or a material hash.
+
 This is a disposable staging same-login-boundary tool. It does not create a
 production secret-isolation boundary: every process running under the same
 macOS login remains inside the Keychain threat boundary.

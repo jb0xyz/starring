@@ -351,6 +351,20 @@ fn generate_interaction_token_envelope_keyring(
     ))
 }
 
+pub(crate) fn generate_incremental_interaction_token_envelope_keyring(
+    source: &mut impl RandomSourceV1,
+    product_action_material: &[u8; KEYRING_MATERIAL_BYTES],
+    snapshot_envelope_material: &[u8; KEYRING_MATERIAL_BYTES],
+) -> Result<KeyringSecretV1, ProvisionerErrorV1> {
+    generate_interaction_token_envelope_keyring(
+        source,
+        INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY,
+        "interaction-token-envelope-v1",
+        &[product_action_material, snapshot_envelope_material],
+    )
+    .map(|(keyring, _)| keyring)
+}
+
 fn generate_key_material(
     source: &mut impl RandomSourceV1,
     forbidden_materials: &[&[u8; KEYRING_MATERIAL_BYTES]],

@@ -1977,9 +1977,48 @@ HBA:
 
 An historical staging installation created before C1 has no runtime
 interaction-token envelope keyring. It cannot rejoin this path until a
-separately reviewed rollback-capable standalone provision has created the
-exact runtime item and the current final verifier has accepted its semantic
-payload. Do not rerun the one-shot fresh provisioner to backfill it.
+dedicated incremental provision has created the exact runtime item and the
+current final verifier has accepted its semantic payload. Keep every service
+stopped and do not rerun the one-shot fresh provisioner to backfill it. The
+incremental mode rejects ambient `PG*` variables, makes no PostgreSQL
+connection or mutation, requires both API keyrings to be valid and distinct,
+and writes no secret through arguments, environment, logs, or output.
+
+Run the keyring mode twice. The first call creates only the absent runtime
+item. The second proves exact replay without rotation. Store only the outcome
+and active key ID as evidence:
+
+```zsh
+(
+  set -euo pipefail
+  set +x
+  env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$STARRING_PROVISIONER_BINARY" \
+    --provision-interaction-token-keyring \
+    "$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    >"$STARRING_CUTOVER_EVIDENCE/interaction-keyring-created.txt"
+  grep -E \
+    '^outcome=created active_key_id=[A-Za-z0-9_-]+$' \
+    "$STARRING_CUTOVER_EVIDENCE/interaction-keyring-created.txt" >/dev/null
+  env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$STARRING_PROVISIONER_BINARY" \
+    --provision-interaction-token-keyring \
+    "$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    >"$STARRING_CUTOVER_EVIDENCE/interaction-keyring-replay.txt"
+  grep -E \
+    '^outcome=exact_replay active_key_id=[A-Za-z0-9_-]+$' \
+    "$STARRING_CUTOVER_EVIDENCE/interaction-keyring-replay.txt" >/dev/null
+  test "$(cut -d= -f3 "$STARRING_CUTOVER_EVIDENCE/interaction-keyring-created.txt")" = \
+    "$(cut -d= -f3 "$STARRING_CUTOVER_EVIDENCE/interaction-keyring-replay.txt")"
+)
+```
+
+Any invalid pre-existing runtime item, invalid API keyring, different active
+key ID on replay, or nonzero exit is a fail-closed incident. Preserve the item,
+keep services stopped, and inspect only stable error codes. Never copy key
+material or its hash into evidence.
 
 Run the incremental mode twice. The first call must create exactly one
 credential and the second must prove exact replay:

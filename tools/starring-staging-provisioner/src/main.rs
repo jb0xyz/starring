@@ -1,8 +1,9 @@
 use std::process::ExitCode;
 
 use starring_staging_provisioner::{
-    postgres_environment_is_present, provision_authoring_writer, provision_staging, verify_final,
-    ProvisionerErrorV1, StagingAcknowledgementV1,
+    postgres_environment_is_present, provision_authoring_writer,
+    provision_interaction_token_keyring, provision_staging, verify_final, ProvisionerErrorV1,
+    StagingAcknowledgementV1,
 };
 
 #[tokio::main]
@@ -28,6 +29,15 @@ async fn main() -> ExitCode {
         [mode, system_identifier, acknowledgement] if *mode == "--provision-authoring-writer" => {
             ("authoring-writer", *system_identifier, *acknowledgement)
         }
+        [mode, system_identifier, acknowledgement]
+            if *mode == "--provision-interaction-token-keyring" =>
+        {
+            (
+                "interaction-token-keyring",
+                *system_identifier,
+                *acknowledgement,
+            )
+        }
         _ => {
             eprintln!("{}", ProvisionerErrorV1::CommandLineArguments.code());
             return ExitCode::from(64);
@@ -41,7 +51,22 @@ async fn main() -> ExitCode {
             return ExitCode::from(64);
         }
     };
-    if mode == "verify" {
+    if mode == "interaction-token-keyring" {
+        match provision_interaction_token_keyring(acknowledgement) {
+            Ok(report) => {
+                println!(
+                    "outcome={} active_key_id={}",
+                    report.outcome().as_str(),
+                    report.active_key_id()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{}", error.code());
+                ExitCode::from(1)
+            }
+        }
+    } else if mode == "verify" {
         match verify_final(acknowledgement).await {
             Ok(report) => {
                 println!(

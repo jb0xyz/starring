@@ -213,6 +213,40 @@ fn incremental_writer_mode_is_explicit_and_runbooked_once() {
 }
 
 #[test]
+fn incremental_interaction_keyring_mode_is_keychain_only_and_runbooked() {
+    let main = include_str!("../src/main.rs");
+    let incremental = include_str!("../src/incremental_keyring.rs");
+    let readme = include_str!("../README.md");
+    let runtime_runbook = include_str!(
+        "../../../docs/superpowers/runbooks/2026-07-29-macos-starring-runtime-staging-operations.md"
+    );
+    let cutover_runbook = include_str!(
+        "../../../docs/superpowers/runbooks/2026-07-29-macos-starring-integrated-staging-cutover.md"
+    );
+    assert_eq!(
+        main.matches("\"--provision-interaction-token-keyring\"")
+            .count(),
+        1
+    );
+    assert!(main.contains("\"outcome={} active_key_id={}\""));
+    for forbidden in [
+        "sqlx",
+        "StagingPostgresSessionV1",
+        "PgConnection",
+        "apply_verifiers",
+        "DatabaseMutation",
+    ] {
+        assert!(!incremental.contains(forbidden), "{forbidden}");
+    }
+    assert!(incremental.contains("begin_create_interaction_token_keyring"));
+    assert!(incremental.contains("validate_keyring_set"));
+    assert!(readme.contains("outcome=created|exact_replay"));
+    assert!(runtime_runbook.contains("performs no database connection or mutation"));
+    assert!(cutover_runbook.contains("interaction-keyring-created.txt"));
+    assert!(cutover_runbook.contains("interaction-keyring-replay.txt"));
+}
+
+#[test]
 fn interaction_token_keyring_identity_output_and_inventory_are_exact() {
     let identity = include_str!("../src/identity.rs");
     let main = include_str!("../src/main.rs");

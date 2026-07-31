@@ -36,6 +36,11 @@ pub struct ValidatedInteractionTokenEnvelopeKeyringV1 {
     keys: Vec<ValidatedInteractionTokenEnvelopeKeyV1>,
 }
 
+pub(crate) struct ValidatedApiKeyringPairV1 {
+    product_action: ValidatedKeyringV1,
+    snapshot_envelope: ValidatedKeyringV1,
+}
+
 struct ValidatedInteractionTokenEnvelopeKeyV1 {
     key_id: String,
     material: Zeroizing<[u8; 32]>,
@@ -58,10 +63,38 @@ pub fn validate_keyring_set(
     snapshot_envelope: &[u8],
     interaction_token_envelope: &[u8],
 ) -> Result<(String, String, String), ProvisionerErrorV1> {
-    let product_action = validate_keyring(product_action)?;
-    let snapshot_envelope = validate_keyring(snapshot_envelope)?;
+    let api_keyrings = validate_api_keyring_pair(product_action, snapshot_envelope)?;
     let interaction_token_envelope =
         validate_interaction_token_envelope_keyring(interaction_token_envelope)?;
+    if interaction_token_envelope.keys.iter().any(|key| {
+        key.key_id == api_keyrings.product_action.active_key_id
+            || key.key_id == api_keyrings.snapshot_envelope.active_key_id
+            || bool::from(
+                key.material
+                    .as_slice()
+                    .ct_eq(api_keyrings.product_action.material.as_slice()),
+            )
+            || bool::from(
+                key.material
+                    .as_slice()
+                    .ct_eq(api_keyrings.snapshot_envelope.material.as_slice()),
+            )
+    }) {
+        return Err(ProvisionerErrorV1::KeyringContract);
+    }
+    Ok((
+        api_keyrings.product_action.active_key_id,
+        api_keyrings.snapshot_envelope.active_key_id,
+        interaction_token_envelope.active_key_id,
+    ))
+}
+
+pub(crate) fn validate_api_keyring_pair(
+    product_action: &[u8],
+    snapshot_envelope: &[u8],
+) -> Result<ValidatedApiKeyringPairV1, ProvisionerErrorV1> {
+    let product_action = validate_keyring(product_action)?;
+    let snapshot_envelope = validate_keyring(snapshot_envelope)?;
     if product_action.active_key_id == snapshot_envelope.active_key_id
         || bool::from(
             product_action
@@ -69,28 +102,23 @@ pub fn validate_keyring_set(
                 .as_slice()
                 .ct_eq(snapshot_envelope.material.as_slice()),
         )
-        || interaction_token_envelope.keys.iter().any(|key| {
-            key.key_id == product_action.active_key_id
-                || key.key_id == snapshot_envelope.active_key_id
-                || bool::from(
-                    key.material
-                        .as_slice()
-                        .ct_eq(product_action.material.as_slice()),
-                )
-                || bool::from(
-                    key.material
-                        .as_slice()
-                        .ct_eq(snapshot_envelope.material.as_slice()),
-                )
-        })
     {
         return Err(ProvisionerErrorV1::KeyringContract);
     }
-    Ok((
-        product_action.active_key_id,
-        snapshot_envelope.active_key_id,
-        interaction_token_envelope.active_key_id,
-    ))
+    Ok(ValidatedApiKeyringPairV1 {
+        product_action,
+        snapshot_envelope,
+    })
+}
+
+impl ValidatedApiKeyringPairV1 {
+    pub(crate) fn product_action_material(&self) -> &[u8; 32] {
+        &self.product_action.material
+    }
+
+    pub(crate) fn snapshot_envelope_material(&self) -> &[u8; 32] {
+        &self.snapshot_envelope.material
+    }
 }
 
 pub fn validate_interaction_token_envelope_keyring(
