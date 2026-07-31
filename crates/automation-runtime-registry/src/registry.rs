@@ -156,6 +156,10 @@ impl SlotMutationTokenV1 {
     pub fn fencing_token(&self) -> FencingToken {
         self.fencing_token
     }
+
+    pub fn route_incarnation(&self) -> NonZeroU64 {
+        self.incarnation
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

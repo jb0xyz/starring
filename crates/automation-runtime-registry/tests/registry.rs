@@ -422,6 +422,18 @@ fn exact_route_preserves_the_explicit_deployment_identity() {
 }
 
 #[test]
+fn mutation_token_exposes_the_exact_admitted_route_fence() {
+    let registry = registry(8);
+    let route = route(10, "study", 3, 4, "receipt-route", None);
+    let receipt = registry
+        .install(route.slot_key(), route, fence(17))
+        .unwrap();
+
+    assert_eq!(receipt.token.fencing_token(), fence(17));
+    assert_eq!(receipt.token.route_incarnation().get(), 1);
+}
+
+#[test]
 fn serving_slot_key_is_typed_by_guild_and_ruleset() {
     let key = ServingSlotKeyV1::new(GuildId(9), RuleSetKey::parse("welcome").unwrap());
     assert_eq!(key.guild_id(), GuildId(9));
