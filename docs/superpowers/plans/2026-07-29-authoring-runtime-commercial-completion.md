@@ -310,7 +310,7 @@ removing security, restart, failure, or release gates.
 - [x] B4. Finalize V2 certification and serving monitor
 - [x] B5. Dispatch interactions on the canonical shard
 - [x] B6. Pass the staging end-to-end gate
-- [ ] C1. Add durable interaction receipts
+- [x] C1. Add durable interaction receipts
 - [ ] C2. Add complete deterministic action-plan preflight
 - [ ] C3. Add effect journal, reconciliation, and bounded compensation
 - [ ] D1. Complete restart and failure cohorts
@@ -1052,6 +1052,37 @@ Commit:
 ```text
 feat(runtime): suppress duplicate Discord interactions durably
 ```
+
+Completion evidence recorded on 2026-07-31:
+
+- the exact 115-migration ledger, 184 owned user-schema relations, and 124
+  capability functions passed both isolated PostgreSQL 16 and staging
+  verification;
+- the incremental receipt ACL backfill converged twice to 17 exact functions,
+  with 11 exported interaction capabilities and six owner-only helpers, while
+  preserving the interaction SCRAM verifier, role attributes, and role
+  settings;
+- the dedicated interaction-token envelope keyring was created through the
+  fixed Keychain-only provisioner and immediately returned exact replay on a
+  second invocation;
+- immutable runtime revision
+  `6fc9a16b09f2a6179886ccb4f4697e40d4ecfc3d` started from the reviewed launchd
+  manifest, reported live and ready, exposed 33 numeric interaction-health
+  counters without receipt identifiers or secret fields, and listened only on
+  `127.0.0.1:19091`;
+- SIGTERM completed cleanly in 333 milliseconds, launchd did not restart it
+  during the complete 30-second throttle window, and the explicit successor
+  start returned to ready;
+- the local API returned ready, the external API remained behind Cloudflare
+  Access, and the external health route remained intentionally unpublished;
+- `cargo test --locked --workspace`, workspace Clippy for every target with
+  warnings denied, formatting, and diff checks all passed. The focused runtime
+  package reported 570 passed and one existing ignored test; its dependency
+  guard reported 49 passed.
+
+C1 deliberately does not replay an ambiguous Discord mutation. C2 remains the
+complete deterministic preflight boundary and C3 remains the per-effect
+journal, observation, and compensation boundary.
 
 ### Task C2: Add complete deterministic action-plan preflight
 
