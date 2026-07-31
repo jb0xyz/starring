@@ -20,10 +20,10 @@ use sha2::{Digest, Sha256};
 use crate::action_plan_digest::build_interaction_action_plan_digest_v1;
 use crate::convert::interaction_to_event;
 use crate::receipt_fenced_effects::{
-    InteractionEffectPermitV1, InteractionInitialResponseIntentV1,
-    InteractionInitialResponseKindV1, InteractionInitialResponseResultKindV1,
-    InteractionInitialResponseResultV1, ReceiptFencedDiscordMutationAdapterV1,
-    ReceiptFencedInteractionResponderV1,
+    InteractionEffectPermitV1, InteractionInitialResponseIntentDispositionV1,
+    InteractionInitialResponseIntentV1, InteractionInitialResponseKindV1,
+    InteractionInitialResponseResultKindV1, InteractionInitialResponseResultV1,
+    ReceiptFencedDiscordMutationAdapterV1, ReceiptFencedInteractionResponderV1,
 };
 use crate::shared_gateway_admission::SharedGatewayAdmittedInteractionV3;
 use crate::shared_gateway_dispatcher::SharedGatewayInteractionEnvelopeV3;
@@ -769,18 +769,21 @@ impl<P: InteractionEffectPermitV1> InteractionEffectPermitV1
     async fn commit_initial_response_intent_v1(
         &self,
         intent: &InteractionInitialResponseIntentV1,
-    ) -> Result<(), Self::Error> {
-        if let Err(error) = self.permit.commit_initial_response_intent_v1(intent).await {
-            self.persistence_failure_stage.store(1, Ordering::SeqCst);
-            return Err(error);
-        }
+    ) -> Result<InteractionInitialResponseIntentDispositionV1, Self::Error> {
+        let disposition = match self.permit.commit_initial_response_intent_v1(intent).await {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                self.persistence_failure_stage.store(1, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
         self.initial_response_attempted
             .store(true, Ordering::SeqCst);
         if intent.kind() != InteractionInitialResponseKindV1::DeferEphemeral {
             self.non_defer_response_attempted
                 .store(true, Ordering::SeqCst);
         }
-        Ok(())
+        Ok(disposition)
     }
 
     async fn commit_initial_response_result_v1(

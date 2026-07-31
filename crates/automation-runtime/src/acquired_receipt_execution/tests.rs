@@ -59,6 +59,7 @@ const RULESET_KEY: &str = "receipt_flow";
 #[derive(Clone, Copy, Default)]
 struct PermitFailuresV1 {
     initial_intent: bool,
+    suppress_initial_intent: bool,
     initial_result: bool,
     bind: bool,
     execution_intent: bool,
@@ -89,7 +90,7 @@ impl InteractionEffectPermitV1 for FakeLifecyclePermitV1 {
     async fn commit_initial_response_intent_v1(
         &self,
         intent: &InteractionInitialResponseIntentV1,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<InteractionInitialResponseIntentDispositionV1, Self::Error> {
         self.state
             .trace
             .lock()
@@ -99,7 +100,11 @@ impl InteractionEffectPermitV1 for FakeLifecyclePermitV1 {
             return Err(PermitErrorV1);
         }
         self.state.intents.lock().unwrap().push(intent.clone());
-        Ok(())
+        if self.failures.suppress_initial_intent {
+            Ok(InteractionInitialResponseIntentDispositionV1::ExactReplaySuppressed)
+        } else {
+            Ok(InteractionInitialResponseIntentDispositionV1::ExternalCallAuthorized)
+        }
     }
 
     async fn commit_initial_response_result_v1(
@@ -685,6 +690,65 @@ async fn static_response_binds_before_http_and_terminalizes() {
             "permit.finish:interaction_static_completed",
         ]
     );
+}
+
+#[tokio::test]
+async fn exact_replay_disposition_crosses_tracking_without_discord_or_result_commit() {
+    let definition = static_ruleset(vec![ActionSpec::RespondEphemeral {
+        content: "already-succeeded".to_string(),
+    }]);
+    let admitted = admitted_v1(
+        artifact(definition),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), 51_021);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(
+        root,
+        PermitFailuresV1 {
+            suppress_initial_intent: true,
+            ..PermitFailuresV1::default()
+        },
+    );
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = MockInstanceTeardownService::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: false,
+    };
+
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        services_v1(
+            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+
+    assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::StaticCompleted,
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.bind",
+            "permit.intent:respond_ephemeral",
+            "permit.finish:interaction_static_completed",
+        ]
+    );
+    assert!(state.results.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

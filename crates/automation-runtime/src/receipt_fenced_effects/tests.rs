@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use automation_core::{
@@ -17,6 +18,7 @@ struct FakePermitV1 {
     fail_intent: bool,
     fail_result: bool,
     fail_execution: bool,
+    intent_dispositions: Mutex<VecDeque<InteractionInitialResponseIntentDispositionV1>>,
     intents: Mutex<Vec<InteractionInitialResponseIntentV1>>,
     results: Mutex<Vec<InteractionInitialResponseResultV1>>,
 }
@@ -28,6 +30,7 @@ impl FakePermitV1 {
             fail_intent: false,
             fail_result: false,
             fail_execution: false,
+            intent_dispositions: Mutex::new(VecDeque::new()),
             intents: Mutex::new(Vec::new()),
             results: Mutex::new(Vec::new()),
         }
@@ -44,6 +47,22 @@ impl FakePermitV1 {
             fail_intent,
             fail_result,
             fail_execution,
+            intent_dispositions: Mutex::new(VecDeque::new()),
+            intents: Mutex::new(Vec::new()),
+            results: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_intent_dispositions(
+        trace: Arc<Mutex<Vec<&'static str>>>,
+        dispositions: impl IntoIterator<Item = InteractionInitialResponseIntentDispositionV1>,
+    ) -> Self {
+        Self {
+            trace,
+            fail_intent: false,
+            fail_result: false,
+            fail_execution: false,
+            intent_dispositions: Mutex::new(dispositions.into_iter().collect()),
             intents: Mutex::new(Vec::new()),
             results: Mutex::new(Vec::new()),
         }
@@ -56,13 +75,18 @@ impl InteractionEffectPermitV1 for FakePermitV1 {
     async fn commit_initial_response_intent_v1(
         &self,
         intent: &InteractionInitialResponseIntentV1,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<InteractionInitialResponseIntentDispositionV1, Self::Error> {
         self.trace.lock().unwrap().push("permit.initial_intent");
         if self.fail_intent {
             return Err(SecretPermitError("permit-intent-secret"));
         }
         self.intents.lock().unwrap().push(intent.clone());
-        Ok(())
+        Ok(self
+            .intent_dispositions
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(InteractionInitialResponseIntentDispositionV1::ExternalCallAuthorized))
     }
 
     async fn commit_initial_response_result_v1(
@@ -265,6 +289,70 @@ async fn initial_intent_outage_produces_zero_external_calls() {
     assert_eq!(error.kind, AdapterErrorKind::Unknown);
     assert_eq!(error.message, RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1);
     assert!(!format!("{error:?}").contains("permit-intent-secret"));
+}
+
+#[tokio::test]
+async fn identical_response_action_executes_one_discord_call_and_one_result_commit() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let permit = FakePermitV1::with_intent_dispositions(
+        Arc::clone(&trace),
+        [
+            InteractionInitialResponseIntentDispositionV1::ExternalCallAuthorized,
+            InteractionInitialResponseIntentDispositionV1::ExactReplaySuppressed,
+        ],
+    );
+    let responder = FakeResponderV1::successful(Arc::clone(&trace));
+    let fenced = ReceiptFencedInteractionResponderV1::new(&responder, &permit);
+
+    fenced.respond_ephemeral("same".to_string()).await.unwrap();
+    fenced.respond_ephemeral("same".to_string()).await.unwrap();
+
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            "permit.initial_intent",
+            "external.respond",
+            "permit.initial_result",
+            "permit.initial_intent",
+        ]
+    );
+    assert_eq!(permit.intents.lock().unwrap().len(), 2);
+    assert_eq!(permit.results.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn succeeded_response_exact_replay_suppresses_discord_and_result_recommit() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let permit = FakePermitV1::with_intent_dispositions(
+        Arc::clone(&trace),
+        [InteractionInitialResponseIntentDispositionV1::ExactReplaySuppressed],
+    );
+    let operation = encode_initial_response_operation_v1(InitialResponsePayloadV1::Respond(
+        "already-succeeded",
+    ));
+    let intent = build_initial_response_intent_v1(
+        InteractionInitialResponseKindV1::RespondEphemeral,
+        &operation,
+    );
+    permit
+        .results
+        .lock()
+        .unwrap()
+        .push(build_initial_response_result_v1(
+            intent.digest.clone(),
+            InteractionInitialResponseResultKindV1::Succeeded,
+            &operation,
+        ));
+    let responder = FakeResponderV1::successful(Arc::clone(&trace));
+    let fenced = ReceiptFencedInteractionResponderV1::new(&responder, &permit);
+
+    fenced
+        .respond_ephemeral("already-succeeded".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(*trace.lock().unwrap(), ["permit.initial_intent"]);
+    assert_eq!(permit.results.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

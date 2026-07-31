@@ -59,10 +59,10 @@ pub use readiness::{
 };
 pub use receipt_fenced_effects::{
     InteractionEffectPermitV1, InteractionInitialResponseIntentDigestV1,
-    InteractionInitialResponseIntentV1, InteractionInitialResponseKindV1,
-    InteractionInitialResponseResultDigestV1, InteractionInitialResponseResultKindV1,
-    InteractionInitialResponseResultV1, ReceiptFencedDiscordMutationAdapterV1,
-    ReceiptFencedInteractionResponderV1,
+    InteractionInitialResponseIntentDispositionV1, InteractionInitialResponseIntentV1,
+    InteractionInitialResponseKindV1, InteractionInitialResponseResultDigestV1,
+    InteractionInitialResponseResultKindV1, InteractionInitialResponseResultV1,
+    ReceiptFencedDiscordMutationAdapterV1, ReceiptFencedInteractionResponderV1,
 };
 pub use responder::TwilightInteractionResponder;
 pub use resume::{resume_deleting_instances, ResumeConfig, ResumeEntry, ResumeReport};

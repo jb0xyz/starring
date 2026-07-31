@@ -46,6 +46,18 @@ pub enum InteractionInitialResponseResultKindV1 {
     Indeterminate,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InteractionInitialResponseIntentDispositionV1 {
+    ExternalCallAuthorized,
+    ExactReplaySuppressed,
+}
+
+impl InteractionInitialResponseIntentDispositionV1 {
+    pub const fn external_call_authorized(self) -> bool {
+        matches!(self, Self::ExternalCallAuthorized)
+    }
+}
+
 impl InteractionInitialResponseResultKindV1 {
     pub const fn code(self) -> &'static str {
         match self {
@@ -138,7 +150,7 @@ pub trait InteractionEffectPermitV1 {
     async fn commit_initial_response_intent_v1(
         &self,
         intent: &InteractionInitialResponseIntentV1,
-    ) -> Result<(), Self::Error>;
+    ) -> Result<InteractionInitialResponseIntentDispositionV1, Self::Error>;
 
     async fn commit_initial_response_result_v1(
         &self,
@@ -178,7 +190,12 @@ where
             InteractionInitialResponseKindV1::RespondEphemeral,
             &operation,
         );
-        persist_initial_response_intent_v1(self.permit, &intent).await?;
+        if !persist_initial_response_intent_v1(self.permit, &intent)
+            .await?
+            .external_call_authorized()
+        {
+            return Ok(());
+        }
         let external = self.responder.respond_ephemeral(content).await;
         finish_initial_response_v1(self.permit, intent, &operation, external).await
     }
@@ -190,7 +207,12 @@ where
             InteractionInitialResponseKindV1::OpenModal,
             &operation,
         );
-        persist_initial_response_intent_v1(self.permit, &intent).await?;
+        if !persist_initial_response_intent_v1(self.permit, &intent)
+            .await?
+            .external_call_authorized()
+        {
+            return Ok(());
+        }
         let external = self.responder.open_modal(modal).await;
         finish_initial_response_v1(self.permit, intent, &operation, external).await
     }
@@ -202,7 +224,12 @@ where
             InteractionInitialResponseKindV1::DeferEphemeral,
             &operation,
         );
-        persist_initial_response_intent_v1(self.permit, &intent).await?;
+        if !persist_initial_response_intent_v1(self.permit, &intent)
+            .await?
+            .external_call_authorized()
+        {
+            return Ok(());
+        }
         let external = self.responder.defer_ephemeral().await;
         finish_initial_response_v1(self.permit, intent, &operation, external).await
     }
@@ -307,7 +334,7 @@ where
 async fn persist_initial_response_intent_v1<P: InteractionEffectPermitV1 + ?Sized>(
     permit: &P,
     intent: &InteractionInitialResponseIntentV1,
-) -> Result<(), AdapterError> {
+) -> Result<InteractionInitialResponseIntentDispositionV1, AdapterError> {
     permit
         .commit_initial_response_intent_v1(intent)
         .await
