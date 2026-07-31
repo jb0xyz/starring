@@ -487,6 +487,10 @@ CREATE TABLE public.runtime_interaction_receipt_heads_v1 (
             )
         )
         AND (
+            state <> 'failed'
+            OR execution_intended_at IS NULL
+        )
+        AND (
             acknowledgement_result IS NOT NULL
             OR acknowledgement_state IN ('unacknowledged', 'attempting')
         )
@@ -1360,6 +1364,10 @@ BEGIN
             AND NEW.execution_intended_at
                 IS DISTINCT FROM OLD.execution_intended_at
         )
+        OR (
+            NEW.state = 'failed'
+            AND NEW.execution_intended_at IS NOT NULL
+        )
         OR NOT (
             NEW.acknowledgement_state = OLD.acknowledgement_state
             OR (
@@ -1468,7 +1476,6 @@ BEGIN
                 OLD.state = 'executing'
                 AND NEW.state IN (
                     'completed',
-                    'failed',
                     'recovery_required'
                 )
             )
@@ -1851,6 +1858,8 @@ DECLARE
     database_now TIMESTAMPTZ;
     token_issued TIMESTAMPTZ;
     token_expiry TIMESTAMPTZ;
+    next_acknowledgement_state TEXT;
+    recovery_observation_digest BYTEA;
     authority_available BOOLEAN := FALSE;
 BEGIN
     IF expected_application_id !~ '^[1-9][0-9]{0,19}$'
@@ -2297,11 +2306,48 @@ BEGIN
                     MESSAGE = 'runtime_interaction_receipt_recovery_authority_invalid';
             END IF;
 
+            next_acknowledgement_state := CASE
+                WHEN head_row.acknowledgement_state = 'attempting'
+                    THEN 'response_recovery_terminal'
+                ELSE head_row.acknowledgement_state
+            END;
+            recovery_observation_digest := pg_catalog.sha256(
+                pg_catalog.convert_to(
+                    pg_catalog.concat_ws(
+                        '|',
+                        'starring-runtime-interaction-receipt-duplicate-expiry-v1',
+                        expected_application_id,
+                        expected_interaction_id,
+                        head_row.head_revision::TEXT,
+                        head_row.claim_revision::TEXT,
+                        head_row.state,
+                        head_row.acknowledgement_state
+                    ),
+                    'UTF8'
+                )
+            );
+
             UPDATE public.runtime_interaction_receipt_heads_v1 AS head
             SET state = 'recovery_required',
+                acknowledgement_state = next_acknowledgement_state,
                 head_revision = head.head_revision + 1,
+                acknowledgement_result = CASE
+                    WHEN head_row.acknowledgement_state = 'attempting'
+                        THEN 'indeterminate'
+                    ELSE head.acknowledgement_result
+                END,
+                acknowledgement_result_digest = CASE
+                    WHEN head_row.acknowledgement_state = 'attempting'
+                        THEN recovery_observation_digest
+                    ELSE head.acknowledgement_result_digest
+                END,
+                acknowledged_at = CASE
+                    WHEN head_row.acknowledgement_state = 'attempting'
+                        THEN database_now
+                    ELSE head.acknowledged_at
+                END,
                 terminal_outcome_code = 'expired_claim_recovery_required',
-                terminal_result_digest = proposed_request_digest,
+                terminal_result_digest = recovery_observation_digest,
                 terminal_at = database_now,
                 updated_at = database_now
             WHERE head.application_id = expected_application_id
@@ -2334,7 +2380,7 @@ BEGIN
                 head_row.state,
                 'recovery_required',
                 head_row.acknowledgement_state,
-                head_row.acknowledgement_state,
+                next_acknowledgement_state,
                 head_row.claim_revision,
                 head_row.claim_process_instance_id,
                 head_row.claim_gateway_shard_id,
@@ -2354,7 +2400,7 @@ BEGIN
                         head_row.state,
                         'recovery_required',
                         head_row.acknowledgement_state,
-                        head_row.acknowledgement_state,
+                        next_acknowledgement_state,
                         head_row.claim_revision::TEXT,
                         head_row.claim_process_instance_id,
                         head_row.claim_gateway_shard_id,
@@ -3827,6 +3873,10 @@ BEGIN
                 'executing'
             )
         )
+        OR (
+            proposed_terminal_state = 'failed'
+            AND head_row.execution_intended_at IS NOT NULL
+        )
     THEN
         RAISE EXCEPTION USING
             ERRCODE = 'RI001',
@@ -4862,6 +4912,7 @@ ROWS 1
 AS $function$
 DECLARE
     authority_row RECORD;
+    execution_row RECORD;
     root_row public.runtime_interaction_receipt_roots_v1%ROWTYPE;
     head_row public.runtime_interaction_receipt_heads_v1%ROWTYPE;
     database_now TIMESTAMPTZ;
@@ -4983,34 +5034,140 @@ BEGIN
         RETURN;
     END IF;
 
-    BEGIN
-        SELECT observed.*
-        INTO authority_row
-        FROM public.starring_runtime_interaction_receipt_authority_observe_v1(
-            root_row.application_id,
-            root_row.tenant_id,
-            root_row.installation_id,
-            root_row.deployment_id,
-            root_row.guild_id,
-            root_row.ruleset_key,
-            root_row.target_version,
-            root_row.target_content_hash,
-            root_row.binding_revision,
-            root_row.binding_fingerprint,
-            root_row.runtime_generation,
-            root_row.route_controller_fencing_token,
-            root_row.route_incarnation,
-            expected_process_instance_id,
-            root_row.origin_gateway_shard_id,
-            expected_runtime_build_revision,
-            root_row.route_kind,
-            COALESCE(root_row.instance_id, '')
-        ) AS observed;
+    SELECT
+        attestation.attestation_id,
+        attestation.attestation_digest,
+        attestation.controller_fencing_token,
+        attestation.v2_route_incarnation,
+        attestation.runtime_build_revision,
+        serving.lease_epoch AS serving_lease_epoch,
+        serving.revision AS serving_revision,
+        serving.expires_at AS serving_expires_at,
+        owner.lease_epoch AS gateway_owner_lease_epoch,
+        owner.owner_revision AS gateway_owner_revision,
+        owner.expires_at AS gateway_owner_expires_at
+    INTO authority_row
+    FROM public.automation_installations AS installation
+    INNER JOIN public.runtime_serving_leases AS serving
+        ON serving.tenant_id = installation.tenant_id
+        AND serving.installation_id = installation.installation_id
+        AND serving.guild_id = installation.discord_guild_id
+        AND serving.ruleset_key = installation.ruleset_key
+    INNER JOIN public.runtime_deployments AS deployment
+        ON deployment.tenant_id = serving.tenant_id
+        AND deployment.installation_id = serving.installation_id
+        AND deployment.deployment_id = serving.deployment_id
+    INNER JOIN public.runtime_attestations AS attestation
+        ON attestation.tenant_id = serving.tenant_id
+        AND attestation.installation_id = serving.installation_id
+        AND attestation.deployment_id = serving.deployment_id
+        AND attestation.attestation_id = serving.attestation_id
+    INNER JOIN public.runtime_gateway_owners AS owner
+        ON owner.gateway_shard_id = root_row.origin_gateway_shard_id
+    WHERE installation.discord_application_id = root_row.application_id
+        AND installation.discord_guild_id = root_row.guild_id
+        AND installation.ruleset_key = root_row.ruleset_key
+        AND installation.tenant_id = root_row.tenant_id
+        AND installation.installation_id = root_row.installation_id
+        AND installation.lifecycle_state = 'active'
+        AND serving.deployment_id = root_row.deployment_id
+        AND serving.process_instance_id = expected_process_instance_id
+        AND serving.runtime_generation = root_row.runtime_generation
+        AND serving.target_version = root_row.target_version
+        AND serving.target_content_hash = root_row.target_content_hash
+        AND serving.binding_revision = root_row.binding_revision
+        AND serving.binding_fingerprint = root_row.binding_fingerprint
+        AND serving.connected
+        AND serving.serving
+        AND serving.expires_at > database_now
+        AND deployment.phase = 'live'
+        AND deployment.live_attestation_id = serving.attestation_id
+        AND deployment.guild_id = root_row.guild_id
+        AND deployment.ruleset_key = root_row.ruleset_key
+        AND deployment.target_version = root_row.target_version
+        AND deployment.target_content_hash = root_row.target_content_hash
+        AND deployment.binding_revision = root_row.binding_revision
+        AND deployment.binding_fingerprint = root_row.binding_fingerprint
+        AND deployment.runtime_generation = root_row.runtime_generation
+        AND attestation.guild_id = root_row.guild_id
+        AND attestation.ruleset_key = root_row.ruleset_key
+        AND attestation.target_version = root_row.target_version
+        AND attestation.target_content_hash = root_row.target_content_hash
+        AND attestation.binding_revision = root_row.binding_revision
+        AND attestation.binding_fingerprint = root_row.binding_fingerprint
+        AND attestation.runtime_generation = root_row.runtime_generation
+        AND attestation.record_format_version = 2
+        AND attestation.process_instance_id = expected_process_instance_id
+        AND attestation.runtime_build_revision = expected_runtime_build_revision
+        AND expected_runtime_build_revision = root_row.runtime_build_revision
+        AND attestation.gateway_shard_id = root_row.origin_gateway_shard_id
+        AND owner.process_instance_id = expected_process_instance_id
+        AND owner.expected_build_revision = expected_runtime_build_revision
+        AND owner.expires_at > database_now
+        AND owner.lease_epoch::TEXT = (
+            attestation.v2_route_admission
+                #>> '{gateway_owner_lease_id,lease_epoch}'
+        )
+        AND (
+            (
+                expected_process_instance_id
+                    = root_row.origin_process_instance_id
+                AND serving.attestation_id = root_row.attestation_id
+                AND attestation.attestation_digest
+                    = root_row.attestation_digest
+                AND attestation.controller_fencing_token
+                    = root_row.route_controller_fencing_token
+                AND attestation.v2_route_incarnation
+                    = root_row.route_incarnation
+            )
+            OR (
+                expected_process_instance_id
+                    <> root_row.origin_process_instance_id
+                AND attestation.controller_fencing_token
+                    > root_row.route_controller_fencing_token
+            )
+        )
+    FOR SHARE OF installation, serving, deployment, attestation, owner;
+
+    authority_available := FOUND;
+
+    IF authority_available THEN
+        IF root_row.route_kind = 'static' THEN
+            SELECT artifact.version, artifact.content_hash,
+                NULL::TEXT AS manifest_digest
+            INTO execution_row
+            FROM public.automation_ruleset_versions AS artifact
+            WHERE artifact.guild_id = root_row.guild_id
+                AND artifact.ruleset_key = root_row.ruleset_key
+                AND artifact.version = root_row.execution_ruleset_version
+                AND artifact.content_hash
+                    = root_row.execution_ruleset_content_hash
+            FOR SHARE;
+        ELSE
+            SELECT
+                instance.ruleset_version AS version,
+                artifact.content_hash,
+                pg_catalog.encode(
+                    pg_catalog.sha256(pg_catalog.convert_to(
+                        public.starring_canonical_json_v1(instance.resources),
+                        'UTF8'
+                    )),
+                    'hex'
+                ) AS manifest_digest
+            INTO execution_row
+            FROM public.automation_instances AS instance
+            INNER JOIN public.automation_ruleset_versions AS artifact
+                ON artifact.guild_id = instance.guild_id
+                AND artifact.ruleset_key = instance.ruleset_key
+                AND artifact.version = instance.ruleset_version
+            WHERE instance.guild_id = root_row.guild_id
+                AND instance.instance_id = root_row.instance_id
+                AND instance.ruleset_key = root_row.ruleset_key
+                AND instance.status = 'active'
+            FOR SHARE OF instance, artifact;
+        END IF;
         authority_available := FOUND;
-    EXCEPTION
-        WHEN SQLSTATE 'RI004' THEN
-            authority_available := FALSE;
-    END;
+    END IF;
 
     database_now := pg_catalog.clock_timestamp();
 
@@ -5026,21 +5183,15 @@ BEGIN
     END IF;
 
     IF NOT authority_available
-        OR authority_row.attestation_id
-            IS DISTINCT FROM root_row.attestation_id
-        OR authority_row.attestation_digest
-            IS DISTINCT FROM root_row.attestation_digest
-        OR authority_row.route_controller_fencing_token
-            IS DISTINCT FROM root_row.route_controller_fencing_token
-        OR authority_row.route_incarnation
-            IS DISTINCT FROM root_row.route_incarnation
         OR authority_row.runtime_build_revision
             IS DISTINCT FROM expected_runtime_build_revision
-        OR authority_row.execution_ruleset_version
+        OR authority_row.serving_expires_at <= database_now
+        OR authority_row.gateway_owner_expires_at <= database_now
+        OR execution_row.version
             IS DISTINCT FROM root_row.execution_ruleset_version
-        OR authority_row.execution_ruleset_content_hash
+        OR execution_row.content_hash
             IS DISTINCT FROM root_row.execution_ruleset_content_hash
-        OR authority_row.instance_manifest_digest
+        OR execution_row.manifest_digest
             IS DISTINCT FROM root_row.instance_manifest_digest
     THEN
         outcome_name := 'route_authority_stale';
@@ -5091,6 +5242,18 @@ BEGIN
         AND head.interaction_id = expected_interaction_id
         AND head.head_revision = expected_head_revision
         AND head.claim_revision = expected_claim_revision
+        AND head.claim_process_instance_id
+            = head_row.claim_process_instance_id
+        AND head.claim_gateway_shard_id
+            = head_row.claim_gateway_shard_id
+        AND head.claim_gateway_owner_lease_epoch
+            = head_row.claim_gateway_owner_lease_epoch
+        AND head.claim_gateway_owner_revision
+            = head_row.claim_gateway_owner_revision
+        AND head.claim_serving_lease_epoch
+            = head_row.claim_serving_lease_epoch
+        AND head.claim_serving_revision
+            = head_row.claim_serving_revision
         AND head.claim_expires_at <= database_now
         AND head.state IN (
             'claimed',
@@ -5643,7 +5806,7 @@ BEGIN
 
     RETURN observed_count = 156
         AND observed_digest =
-            'a2ea200c577ae33a9289803fc380f86cf886a7f4e4f5cc7f7fbc0b66f5ef128a';
+            'bcbf6ee257defdb6c690a1f0d9752f0c84389093c6fc1ae3d9946b7aaecef302';
 END;
 $function$;
 

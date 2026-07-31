@@ -546,6 +546,138 @@ async fn seed_receipt_authority(pool: &PgPool) -> String {
     content_hash
 }
 
+async fn advance_receipt_authority_to_successor(
+    pool: &PgPool,
+    process_instance_id: &str,
+) -> String {
+    let request_bytes = br#"{"fixture":"durable-receipt-successor"}"#.to_vec();
+    let (request_digest, live_bytes, attestation_id): (String, Vec<u8>, String) = sqlx::query_as(
+        "WITH request AS ( \
+             SELECT $1::BYTEA AS bytes, \
+                    starring_runtime_private_v2.starring_runtime_framed_digest_v2( \
+                        pg_catalog.convert_to( \
+                            'starring.runtime.certification_request.v2', 'UTF8' \
+                        ) || pg_catalog.decode('00', 'hex'), \
+                        $1::BYTEA \
+                    ) AS digest \
+         ), live AS ( \
+             SELECT request.digest, \
+                    pg_catalog.convert_to( \
+                        '{\"format_version\":2,\"request_digest\":\"' \
+                            || request.digest || '\",\"request\":', \
+                        'UTF8' \
+                    ) || request.bytes || pg_catalog.convert_to('}', 'UTF8') AS bytes \
+             FROM request \
+         ) \
+         SELECT live.digest, live.bytes, \
+                starring_runtime_private_v2.starring_runtime_framed_digest_v2( \
+                    pg_catalog.convert_to( \
+                        'starring.runtime.live_attestation.v2', 'UTF8' \
+                    ) || pg_catalog.decode('00', 'hex'), \
+                    live.bytes \
+                ) \
+         FROM live",
+    )
+    .bind(request_bytes.clone())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    for table in [
+        "runtime_deployments",
+        "runtime_attestations",
+        "runtime_serving_leases",
+        "runtime_gateway_owners",
+    ] {
+        sqlx::query(&format!("ALTER TABLE public.{table} DISABLE TRIGGER ALL"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_attestations \
+         SELECT (pg_catalog.jsonb_populate_record( \
+             NULL::public.runtime_attestations, \
+             pg_catalog.to_jsonb(attestation) || pg_catalog.jsonb_build_object( \
+                 'attestation_id', $1::TEXT, \
+                 'attestation_digest', $1::TEXT, \
+                 'deployment_revision', 2, \
+                 'process_instance_id', $2::TEXT, \
+                 'convergence_attempt_no', 2, \
+                 'controller_fencing_token', 2, \
+                 'v2_route_incarnation', 7, \
+                 'v2_operation_id', 'fedcba0987654321fedcba0987654321', \
+                 'v2_request_digest', $3::TEXT, \
+                 'v2_request_bytes', pg_catalog.to_jsonb($4::BYTEA), \
+                 'v2_live_attestation_bytes', pg_catalog.to_jsonb($5::BYTEA), \
+                 'v2_route_admission', \
+                     '{\"gateway_owner_lease_id\":{\"lease_epoch\":2},\"fixture\":\"successor\"}'::JSONB \
+             ) \
+         )).* \
+         FROM public.runtime_attestations AS attestation \
+         WHERE attestation.deployment_id = $6 AND attestation.deployment_revision = 1",
+    )
+    .bind(&attestation_id)
+    .bind(process_instance_id)
+    .bind(&request_digest)
+    .bind(request_bytes)
+    .bind(live_bytes)
+    .bind(RECEIPT_DEPLOYMENT_ID)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_deployments \
+         SET revision = 2, convergence_attempt_no = 2, live_attestation_id = $1, \
+             updated_at = pg_catalog.clock_timestamp() \
+         WHERE deployment_id = $2",
+    )
+    .bind(&attestation_id)
+    .bind(RECEIPT_DEPLOYMENT_ID)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_serving_leases \
+         SET attestation_id = $1, process_instance_id = $2, lease_epoch = 2, \
+             revision = revision + 1, acquired_at = pg_catalog.clock_timestamp(), \
+             last_heartbeat_at = pg_catalog.clock_timestamp(), \
+             expires_at = pg_catalog.clock_timestamp() + INTERVAL '5 minutes' \
+         WHERE guild_id = $3 AND ruleset_key = $4",
+    )
+    .bind(&attestation_id)
+    .bind(process_instance_id)
+    .bind(RECEIPT_GUILD_ID.to_string())
+    .bind(RECEIPT_RULESET_KEY)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_gateway_owners \
+         SET process_instance_id = $1, lease_epoch = 2, owner_revision = owner_revision + 1, \
+             expires_at = pg_catalog.clock_timestamp() + INTERVAL '5 minutes' \
+         WHERE gateway_shard_id = $2",
+    )
+    .bind(process_instance_id)
+    .bind(RECEIPT_GATEWAY_SHARD)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    for table in [
+        "runtime_deployments",
+        "runtime_attestations",
+        "runtime_serving_leases",
+        "runtime_gateway_owners",
+    ] {
+        sqlx::query(&format!("ALTER TABLE public.{table} ENABLE TRIGGER ALL"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+    attestation_id
+}
+
 fn receipt_expected_route(content_hash: &str) -> InteractionExpectedRouteV1 {
     receipt_expected_route_for(content_hash, RECEIPT_PROCESS_ID, RECEIPT_BUILD_REVISION)
 }
@@ -554,6 +686,22 @@ fn receipt_expected_route_for(
     content_hash: &str,
     process_instance_id: &str,
     runtime_build_revision: &str,
+) -> InteractionExpectedRouteV1 {
+    receipt_expected_route_for_authority(
+        content_hash,
+        process_instance_id,
+        runtime_build_revision,
+        1,
+        1,
+    )
+}
+
+fn receipt_expected_route_for_authority(
+    content_hash: &str,
+    process_instance_id: &str,
+    runtime_build_revision: &str,
+    controller_fencing_token: u64,
+    route_incarnation: u64,
 ) -> InteractionExpectedRouteV1 {
     let target = RuntimeDeploymentTargetV1 {
         guild_id: GuildId(RECEIPT_GUILD_ID),
@@ -577,8 +725,8 @@ fn receipt_expected_route_for(
         },
         InteractionGatewayShardIdentityV1::parse(RECEIPT_GATEWAY_SHARD).unwrap(),
         InteractionRuntimeBuildRevisionV1::parse(runtime_build_revision).unwrap(),
-        FencingToken::new(1).unwrap(),
-        InteractionRouteIncarnationV1::new(1).unwrap(),
+        FencingToken::new(controller_fencing_token).unwrap(),
+        InteractionRouteIncarnationV1::new(route_incarnation).unwrap(),
     )
     .unwrap()
 }
@@ -778,9 +926,23 @@ fn durable_receipt_migration_preserves_expiry_and_recovery_contracts() {
     assert!(terminalize.contains("root_row.origin_gateway_shard_id"));
     assert!(terminalize.contains("head.head_revision = expected_head_revision"));
     assert!(terminalize.contains("head.claim_revision = expected_claim_revision"));
-    assert!(terminalize.contains("WHEN SQLSTATE 'RI004'"));
+    assert!(terminalize.contains(
+        "attestation.controller_fencing_token\n                    > root_row.route_controller_fencing_token"
+    ));
+    assert!(terminalize.contains("serving.expires_at AS serving_expires_at"));
+    assert!(terminalize.contains("owner.expires_at AS gateway_owner_expires_at"));
+    assert!(terminalize.contains("execution_row.content_hash"));
     assert!(!terminalize.contains("token_ciphertext"));
     assert!(!terminalize.contains("root_route_key"));
+    let claim = migration
+        .split("CREATE FUNCTION public.starring_runtime_interaction_receipt_claim_v1(")
+        .nth(1)
+        .unwrap()
+        .split("$function$;")
+        .next()
+        .unwrap();
+    assert!(claim.contains("THEN 'response_recovery_terminal'"));
+    assert!(claim.contains("THEN 'indeterminate'"));
     for line in migration.lines() {
         let trimmed = line.trim_start();
         assert!(!trimmed.starts_with("--"));
@@ -1111,6 +1273,77 @@ async fn durable_receipt_restricted_role_runs_lifecycle_recovery_and_token_expir
         1
     );
 
+    let known_failed_id = 9_200_014;
+    let mut known_failed = acquire_test_receipt(
+        &store,
+        &content_hash,
+        known_failed_id,
+        "button:known-failed",
+        Duration::from_secs(30),
+    )
+    .await;
+    let known_failure = RuntimeInteractionReceiptTerminalOutcomeV1::new(
+        RuntimeInteractionReceiptTerminalStateV1::Failed,
+        "known_no_effect_failure",
+        RuntimeInteractionReceiptOpaqueDigestV1::new([0x31; 32]),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .finish_interaction_receipt_v1(&mut known_failed, known_failure.clone())
+            .await
+            .unwrap(),
+        RuntimeInteractionReceiptMutationDispositionV1::Applied
+    );
+    assert_eq!(
+        store
+            .finish_interaction_receipt_v1(&mut known_failed, known_failure)
+            .await
+            .unwrap(),
+        RuntimeInteractionReceiptMutationDispositionV1::ExactReplay
+    );
+
+    let ambiguous_id = 9_200_015;
+    let mut ambiguous = acquire_test_receipt(
+        &store,
+        &content_hash,
+        ambiguous_id,
+        "button:ambiguous",
+        Duration::from_secs(30),
+    )
+    .await;
+    store
+        .bind_interaction_receipt_action_plan_v1(
+            &mut ambiguous,
+            InteractionActionPlanDigestV1::parse("3".repeat(64)).unwrap(),
+        )
+        .await
+        .unwrap();
+    store
+        .intend_interaction_receipt_execution_v1(&mut ambiguous)
+        .await
+        .unwrap();
+    let recovery_required = RuntimeInteractionReceiptTerminalOutcomeV1::new(
+        RuntimeInteractionReceiptTerminalStateV1::RecoveryRequired,
+        "ambiguous_external_effect",
+        RuntimeInteractionReceiptOpaqueDigestV1::new([0x32; 32]),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .finish_interaction_receipt_v1(&mut ambiguous, recovery_required.clone())
+            .await
+            .unwrap(),
+        RuntimeInteractionReceiptMutationDispositionV1::Applied
+    );
+    assert_eq!(
+        store
+            .finish_interaction_receipt_v1(&mut ambiguous, recovery_required)
+            .await
+            .unwrap(),
+        RuntimeInteractionReceiptMutationDispositionV1::ExactReplay
+    );
+
     let renewal_id = 9_200_012;
     acquire_test_receipt(
         &store,
@@ -1322,6 +1555,39 @@ async fn durable_receipt_restricted_role_runs_lifecycle_recovery_and_token_expir
             .unwrap(),
         RuntimeInteractionReceiptMutationDispositionV1::ExactReplay
     );
+    let unsafe_failed = sqlx::query(
+        "SELECT * FROM public.starring_runtime_interaction_receipt_finish_v1(\
+            $1::TEXT, $2::TEXT, $3::BIGINT, $4::BIGINT, $5::TEXT, $6::BYTEA, \
+            'failed'::TEXT, 'unsafe_failed'::TEXT, $7::BYTEA\
+         )",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(lifecycle_id.to_string())
+    .bind(i64::try_from(lifecycle.head_revision()).unwrap())
+    .bind(i64::try_from(lifecycle.claim_revision()).unwrap())
+    .bind(lifecycle.claim_process_instance_id().as_str())
+    .bind(vec![0x11_u8; 32])
+    .bind(vec![0x22_u8; 32])
+    .fetch_all(&database.executor_pool)
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&unsafe_failed).as_deref(), Some("RI001"));
+    let (unsafe_failed_state, unsafe_failed_token_count): (String, i64) = sqlx::query_as(
+        "SELECT head.state, pg_catalog.count(secret.application_id) \
+         FROM public.runtime_interaction_receipt_heads_v1 AS head \
+         LEFT JOIN public.runtime_interaction_receipt_token_secrets_v1 AS secret \
+           ON secret.application_id = head.application_id \
+          AND secret.interaction_id = head.interaction_id \
+         WHERE head.application_id = $1 AND head.interaction_id = $2 \
+         GROUP BY head.state",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(lifecycle_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(unsafe_failed_state, "executing");
+    assert_eq!(unsafe_failed_token_count, 1);
     let early_expiry = RuntimeInteractionReceiptTokenExpiryRequestV1::new(
         lifecycle.claim_root().identity(),
         lifecycle.head_revision(),
@@ -1503,6 +1769,40 @@ async fn durable_receipt_restricted_role_runs_lifecycle_recovery_and_token_expir
         )
         .await
         .unwrap();
+    let redelivery_id = 9_200_016;
+    let mut redelivery_claim = acquire_test_receipt(
+        &store,
+        &content_hash,
+        redelivery_id,
+        "button:redelivery",
+        Duration::from_secs(1),
+    )
+    .await;
+    store
+        .bind_interaction_receipt_action_plan_v1(
+            &mut redelivery_claim,
+            InteractionActionPlanDigestV1::parse("a".repeat(64)).unwrap(),
+        )
+        .await
+        .unwrap();
+    store
+        .intend_interaction_receipt_initial_response_v1(
+            &mut redelivery_claim,
+            RuntimeInteractionReceiptInitialResponseIntentV1::new(
+                RuntimeInteractionReceiptInitialResponseKindV1::RespondEphemeral,
+                RuntimeInteractionReceiptOpaqueDigestV1::new([22; 32]),
+            ),
+        )
+        .await
+        .unwrap();
+    let redelivery_request = test_receipt_request(
+        &store,
+        &content_hash,
+        redelivery_id,
+        "button:redelivery",
+        Duration::from_secs(1),
+    )
+    .await;
     let pristine_id = 9_200_009;
     acquire_test_receipt(
         &store,
@@ -1552,12 +1852,74 @@ async fn durable_receipt_restricted_role_runs_lifecycle_recovery_and_token_expir
             .cloned()
             .unwrap()
     };
+    let redelivery_candidate = candidate(redelivery_id);
+    let redelivery_terminalize =
+        RuntimeInteractionReceiptTerminalizeExpiredRequestV1::from_recovery_candidate(
+            &redelivery_candidate,
+            &receipt_expected_route(&content_hash),
+            RuntimeInteractionReceiptOpaqueDigestV1::new([23; 32]),
+        )
+        .unwrap();
+    let (redelivery, redelivery_supervisor) = tokio::join!(
+        store.claim_interaction_receipt_v1(redelivery_request),
+        store.terminalize_expired_interaction_receipt_v1(redelivery_terminalize),
+    );
+    assert!(matches!(
+        redelivery.unwrap(),
+        RuntimeInteractionReceiptClaimOutcomeV1::RecoveryRequired(_)
+    ));
+    assert!(matches!(
+        redelivery_supervisor.unwrap().disposition(),
+        RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::RecoveryRequired
+            | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::TerminalReceipt
+    ));
+    let (
+        redelivery_state,
+        redelivery_acknowledgement_state,
+        redelivery_acknowledgement_result,
+        redelivery_token_count,
+        redelivery_terminal_event_count,
+    ): (String, String, Option<String>, i64, i64) = sqlx::query_as(
+        "SELECT head.state, head.acknowledgement_state, head.acknowledgement_result, \
+                pg_catalog.count(DISTINCT secret.interaction_id), \
+                pg_catalog.count(DISTINCT event.event_revision) \
+         FROM public.runtime_interaction_receipt_heads_v1 AS head \
+         LEFT JOIN public.runtime_interaction_receipt_token_secrets_v1 AS secret \
+           ON secret.application_id = head.application_id \
+          AND secret.interaction_id = head.interaction_id \
+         LEFT JOIN public.runtime_interaction_receipt_events_v1 AS event \
+           ON event.application_id = head.application_id \
+          AND event.interaction_id = head.interaction_id \
+          AND event.event_kind = 'recovery_required' \
+         WHERE head.application_id = $1 AND head.interaction_id = $2 \
+         GROUP BY head.state, head.acknowledgement_state, head.acknowledgement_result",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(redelivery_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(redelivery_state, "recovery_required");
+    assert_eq!(
+        redelivery_acknowledgement_state,
+        "response_recovery_terminal"
+    );
+    assert_eq!(
+        redelivery_acknowledgement_result.as_deref(),
+        Some("indeterminate")
+    );
+    assert_eq!(redelivery_token_count, 0);
+    assert_eq!(redelivery_terminal_event_count, 1);
     let successor_candidate = candidate(successor_id);
     let successor_recovery = store
         .recover_interaction_receipt_v1(
             RuntimeInteractionReceiptRecoveryRequestV1::new(
                 successor_candidate.clone(),
-                receipt_expected_route_for(&content_hash, "process-successor", "build-successor"),
+                receipt_expected_route_for(
+                    &content_hash,
+                    "process-successor",
+                    RECEIPT_BUILD_REVISION,
+                ),
                 RuntimeInteractionReceiptRecoveryObservationKindV1::Unacknowledged,
                 RuntimeInteractionReceiptOpaqueDigestV1::new([20; 32]),
                 RuntimeInteractionReceiptClaimLeaseV1::default(),
@@ -1573,21 +1935,6 @@ async fn durable_receipt_restricted_role_runs_lifecycle_recovery_and_token_expir
             ..
         }
     ));
-    let successor_terminalized = store
-        .terminalize_expired_interaction_receipt_v1(
-            RuntimeInteractionReceiptTerminalizeExpiredRequestV1::from_recovery_candidate(
-                &successor_candidate,
-                &receipt_expected_route(&content_hash),
-                RuntimeInteractionReceiptOpaqueDigestV1::new([21; 32]),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        successor_terminalized.disposition(),
-        RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::PristineClaimAbandoned
-    );
     let terminalize_candidate = candidate(terminalize_id);
     let revision_race = RuntimeInteractionReceiptTerminalizeExpiredRequestV1::new(
         terminalize_candidate.key().identity(),
@@ -1703,6 +2050,81 @@ async fn durable_receipt_restricted_role_runs_lifecycle_recovery_and_token_expir
             ..
         }
     ));
+
+    let successor_attestation_id =
+        advance_receipt_authority_to_successor(&database.owner_pool, "process-successor").await;
+    let successor_route = receipt_expected_route_for_authority(
+        &content_hash,
+        "process-successor",
+        RECEIPT_BUILD_REVISION,
+        2,
+        7,
+    );
+    let successor_left =
+        RuntimeInteractionReceiptTerminalizeExpiredRequestV1::from_recovery_candidate(
+            &successor_candidate,
+            &successor_route,
+            RuntimeInteractionReceiptOpaqueDigestV1::new([21; 32]),
+        )
+        .unwrap();
+    let successor_right =
+        RuntimeInteractionReceiptTerminalizeExpiredRequestV1::from_recovery_candidate(
+            &successor_candidate,
+            &successor_route,
+            RuntimeInteractionReceiptOpaqueDigestV1::new([21; 32]),
+        )
+        .unwrap();
+    let (successor_left, successor_right) = tokio::join!(
+        store.terminalize_expired_interaction_receipt_v1(successor_left),
+        store.terminalize_expired_interaction_receipt_v1(successor_right),
+    );
+    let successor_dispositions = [
+        successor_left.unwrap().disposition(),
+        successor_right.unwrap().disposition(),
+    ];
+    assert_eq!(
+        successor_dispositions
+            .iter()
+            .filter(|disposition| {
+                **disposition
+                    == RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::PristineClaimAbandoned
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        successor_dispositions
+            .iter()
+            .filter(|disposition| {
+                **disposition
+                    == RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::TerminalReceipt
+            })
+            .count(),
+        1
+    );
+    let (root_attestation_id, origin_process_instance_id, successor_event_count): (
+        String,
+        String,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT root.attestation_id, root.origin_process_instance_id, \
+                pg_catalog.count(event.event_revision) \
+         FROM public.runtime_interaction_receipt_roots_v1 AS root \
+         LEFT JOIN public.runtime_interaction_receipt_events_v1 AS event \
+           ON event.application_id = root.application_id \
+          AND event.interaction_id = root.interaction_id \
+          AND event.outcome_code = 'expired_pristine_claim_abandoned' \
+         WHERE root.application_id = $1 AND root.interaction_id = $2 \
+         GROUP BY root.attestation_id, root.origin_process_instance_id",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(successor_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_ne!(root_attestation_id, successor_attestation_id);
+    assert_eq!(origin_process_instance_id, RECEIPT_PROCESS_ID);
+    assert_eq!(successor_event_count, 1);
 
     replace_with_expired_token(&database.owner_pool, lifecycle_id).await;
     replace_with_expired_token(&database.owner_pool, expired_id).await;

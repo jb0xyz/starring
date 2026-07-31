@@ -907,6 +907,8 @@ fn decode_recovery_root(
         || binding.process_identity().target != expected_route.process_identity().target
         || binding.process_identity().runtime_generation
             != expected_route.process_identity().runtime_generation
+        || binding.process_identity().process_instance_id
+            != expected_route.process_identity().process_instance_id
         || binding.serving_identity().gateway_shard_identity()
             != expected_route.gateway_shard_identity()
         || binding.serving_identity().runtime_build_revision()

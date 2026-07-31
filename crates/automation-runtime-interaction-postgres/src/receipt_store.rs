@@ -409,6 +409,11 @@ impl PostgresRuntimeInteractionV1 {
         {
             return Err(RuntimeInteractionPersistenceErrorV1::Conflict);
         }
+        if terminal.state() == RuntimeInteractionReceiptTerminalStateV1::Failed
+            && claim.state() == InteractionReceiptStateV1::Executing
+        {
+            return Err(RuntimeInteractionPersistenceErrorV1::Conflict);
+        }
         if claim.state().is_terminal() && claim.state() != terminal.state().state() {
             return Err(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt);
         }
