@@ -1,3 +1,4 @@
+pub mod action_plan_digest;
 pub mod convert;
 pub mod custom_id;
 pub mod error;
@@ -20,6 +21,7 @@ pub mod snapshot;
 pub mod strict_panel_installer;
 mod teardown_retry_supervisor;
 
+pub use action_plan_digest::build_interaction_action_plan_digest_v1;
 pub use convert::interaction_to_event;
 pub use custom_id::{
     decode, encode_button, encode_modal, ComponentKind, CustomIdError, ParsedCustomId,

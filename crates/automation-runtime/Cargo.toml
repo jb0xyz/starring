@@ -12,6 +12,7 @@ automation-core = { path = "../automation-core" }
 automation-ruleset = { path = "../automation-ruleset" }
 automation-ruleset-dispatch = { path = "../automation-ruleset-dispatch" }
 automation-ruleset-readiness = { path = "../automation-ruleset-readiness" }
+automation-runtime-interaction = { path = "../automation-runtime-interaction" }
 automation-runtime-registry = { path = "../automation-runtime-registry" }
 desired-state = { path = "../desired-state" }
 discord-model = { path = "../discord-model" }

@@ -421,6 +421,7 @@ dependencies = [
  "automation-ruleset-dispatch",
  "automation-ruleset-readiness",
  "automation-runtime-convergence",
+ "automation-runtime-interaction",
  "automation-runtime-registry",
  "automation-state",
  "desired-state",
@@ -501,6 +502,25 @@ dependencies = [
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "automation-runtime-interaction"
+version = "0.1.0"
+dependencies = [
+ "automation-instance",
+ "automation-ruleset",
+ "automation-runtime-convergence",
+ "chacha20poly1305",
+ "discord-model",
+ "getrandom 0.4.3",
+ "resource-resolution",
+ "serde",
+ "sha2",
+ "static_assertions",
+ "subtle",
+ "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]
