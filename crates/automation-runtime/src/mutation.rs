@@ -96,6 +96,7 @@ impl DiscordMutationAdapter for TwilightMutationAdapter<'_> {
             .http
             .create_role(Id::new(guild.0))
             .name(&spec.name)
+            .permissions(TwilightPermissions::empty())
             .await
             .map_err(|error| classify_error(&error))?
             .model()
