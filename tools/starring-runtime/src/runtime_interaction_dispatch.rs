@@ -9,7 +9,6 @@ use automation_runtime::{
     GatewayConnectionObserverV3, GatewayReadyLeaseV3, InteractionExecutionOutcomeV3,
     SharedGatewayAdmissionErrorV3, SharedGatewayInteractionDispatchOutcomeV3,
     SharedGatewayInteractionEnvelopeV3, SharedGatewayInteractionRejectionV3,
-    SharedGatewayRejectionAcknowledgementOutcomeV3,
 };
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -30,8 +29,6 @@ use crate::GatewayResourceConfigV1;
 
 pub(crate) type RuntimeInteractionDispatchFutureV1 =
     Pin<Box<dyn Future<Output = SharedGatewayInteractionDispatchOutcomeV3> + Send + 'static>>;
-pub(crate) type RuntimeInteractionRejectionFutureV1 =
-    Pin<Box<dyn Future<Output = SharedGatewayRejectionAcknowledgementOutcomeV3> + Send + 'static>>;
 
 pub(crate) enum RuntimeInteractionDispatchReservationOutcomeV1<R> {
     Reserved(R),
@@ -60,16 +57,10 @@ pub(crate) trait RuntimeInteractionDispatchPortV1: Send + Sync + 'static {
         self: Arc<Self>,
         reservation: Self::Reservation,
     ) -> RuntimeInteractionDispatchFutureV1;
-
-    fn acknowledge_rejection_v1(
-        self: Arc<Self>,
-        envelope: Box<SharedGatewayInteractionEnvelopeV3>,
-    ) -> RuntimeInteractionRejectionFutureV1;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeInteractionRejectionSchedulingV1 {
-    Enqueued,
     Dropped,
 }
 
@@ -85,7 +76,6 @@ pub(crate) enum RuntimeInteractionEnqueueOutcomeV1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimeInteractionCompletionV1 {
     Dispatch,
-    RejectionAcknowledgement,
     Idle,
 }
 
@@ -144,9 +134,7 @@ where
 {
     port: Arc<P>,
     dispatch_capacity: NonZeroUsize,
-    rejection_capacity: NonZeroUsize,
     dispatches: FuturesUnordered<RuntimeInteractionDispatchFutureV1>,
-    rejections: FuturesUnordered<RuntimeInteractionRejectionFutureV1>,
     state: RuntimeInteractionLaneStateV1,
     report: RuntimeInteractionDispatchReportV1,
 }
@@ -468,25 +456,23 @@ impl<P> RuntimeDiscordInteractionDispatchLaneV1<P>
 where
     P: RuntimeInteractionDispatchPortV1,
 {
-    pub(crate) fn new_v1(port: P, rejection_capacity: NonZeroUsize) -> Self {
+    pub(crate) fn new_v1(port: P, _rejection_capacity: NonZeroUsize) -> Self {
         let dispatch_capacity = port.dispatch_capacity_v1();
         Self {
             port: Arc::new(port),
             dispatch_capacity,
-            rejection_capacity,
             dispatches: FuturesUnordered::new(),
-            rejections: FuturesUnordered::new(),
             state: RuntimeInteractionLaneStateV1::Paused,
             report: RuntimeInteractionDispatchReportV1::default(),
         }
     }
 
     pub(crate) fn has_in_flight_v1(&self) -> bool {
-        !self.dispatches.is_empty() || !self.rejections.is_empty()
+        !self.dispatches.is_empty()
     }
 
     fn in_flight_count_v1(&self) -> u64 {
-        (self.dispatches.len() as u64).saturating_add(self.rejections.len() as u64)
+        self.dispatches.len() as u64
     }
 
     pub(crate) fn report_v1(&self) -> RuntimeInteractionDispatchReportV1 {
@@ -562,20 +548,10 @@ where
         if !self.has_in_flight_v1() {
             return RuntimeInteractionCompletionV1::Idle;
         }
-        tokio::select! {
-            outcome = self.dispatches.next(), if !self.dispatches.is_empty() => {
-                if let Some(outcome) = outcome {
-                    self.record_dispatch_v1(outcome);
-                }
-                RuntimeInteractionCompletionV1::Dispatch
-            }
-            outcome = self.rejections.next(), if !self.rejections.is_empty() => {
-                if let Some(outcome) = outcome {
-                    self.record_rejection_acknowledgement_v1(outcome);
-                }
-                RuntimeInteractionCompletionV1::RejectionAcknowledgement
-            }
+        if let Some(outcome) = self.dispatches.next().await {
+            self.record_dispatch_v1(outcome);
         }
+        RuntimeInteractionCompletionV1::Dispatch
     }
 
     pub(crate) async fn pause_and_drain_until_v1(
@@ -661,26 +637,16 @@ where
             .report
             .dispatch_cancelled
             .saturating_add(self.dispatches.len() as u64);
-        self.report.rejection_acknowledgement_cancelled = self
-            .report
-            .rejection_acknowledgement_cancelled
-            .saturating_add(self.rejections.len() as u64);
         self.dispatches = FuturesUnordered::new();
-        self.rejections = FuturesUnordered::new();
     }
 
     fn reject_v1(
         &mut self,
         envelope: Box<SharedGatewayInteractionEnvelopeV3>,
     ) -> RuntimeInteractionEnqueueOutcomeV1 {
-        let acknowledgement = if self.rejections.len() >= self.rejection_capacity.get() {
-            increment_v1(&mut self.report.rejection_acknowledgement_dropped);
-            RuntimeInteractionRejectionSchedulingV1::Dropped
-        } else {
-            self.rejections
-                .push(Arc::clone(&self.port).acknowledge_rejection_v1(envelope));
-            RuntimeInteractionRejectionSchedulingV1::Enqueued
-        };
+        drop(envelope);
+        increment_v1(&mut self.report.rejection_acknowledgement_dropped);
+        let acknowledgement = RuntimeInteractionRejectionSchedulingV1::Dropped;
         RuntimeInteractionEnqueueOutcomeV1::Rejected { acknowledgement }
     }
 
@@ -728,23 +694,6 @@ where
             SharedGatewayAdmissionErrorV3::Overloaded => increment_v1(&mut self.report.overloaded),
             SharedGatewayAdmissionErrorV3::Router(_) => {
                 increment_v1(&mut self.report.admission_rejected)
-            }
-        }
-    }
-
-    fn record_rejection_acknowledgement_v1(
-        &mut self,
-        outcome: SharedGatewayRejectionAcknowledgementOutcomeV3,
-    ) {
-        match outcome {
-            SharedGatewayRejectionAcknowledgementOutcomeV3::Sent => {
-                increment_v1(&mut self.report.rejection_acknowledged)
-            }
-            SharedGatewayRejectionAcknowledgementOutcomeV3::Failed => {
-                increment_v1(&mut self.report.rejection_acknowledgement_failed)
-            }
-            SharedGatewayRejectionAcknowledgementOutcomeV3::TimedOut => {
-                increment_v1(&mut self.report.rejection_acknowledgement_timed_out)
             }
         }
     }
@@ -802,7 +751,6 @@ mod tests {
     struct TestPortV1 {
         dispatch_capacity: NonZeroUsize,
         dispatch_behavior: TestDispatchBehaviorV1,
-        acknowledgement_pending: bool,
         reserve_calls: Arc<AtomicUsize>,
     }
 
@@ -841,17 +789,6 @@ mod tests {
                     )
                 }),
                 TestDispatchBehaviorV1::Pending => Box::pin(std::future::pending()),
-            }
-        }
-
-        fn acknowledge_rejection_v1(
-            self: Arc<Self>,
-            _envelope: Box<SharedGatewayInteractionEnvelopeV3>,
-        ) -> RuntimeInteractionRejectionFutureV1 {
-            if self.acknowledgement_pending {
-                Box::pin(std::future::pending())
-            } else {
-                Box::pin(async { SharedGatewayRejectionAcknowledgementOutcomeV3::Sent })
             }
         }
     }
@@ -988,7 +925,6 @@ mod tests {
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Complete,
-                acknowledgement_pending: false,
                 reserve_calls: Arc::clone(&reserve_calls),
             },
             NonZeroUsize::new(1).unwrap(),
@@ -1032,7 +968,6 @@ mod tests {
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Complete,
-                acknowledgement_pending: false,
                 reserve_calls: Arc::clone(&reserve_calls),
             },
             NonZeroUsize::new(1).unwrap(),
@@ -1044,14 +979,14 @@ mod tests {
             actor.handle_raw_interaction_v1(pinned_button_v1(Some(42))),
             RuntimeDiscordInteractionActorHandlingOutcomeV1::Enqueue(
                 RuntimeInteractionEnqueueOutcomeV1::Rejected {
-                    acknowledgement: RuntimeInteractionRejectionSchedulingV1::Enqueued
+                    acknowledgement: RuntimeInteractionRejectionSchedulingV1::Dropped
                 }
             )
         ));
         assert_eq!(reserve_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             actor.poll_next_completion_v1().await,
-            RuntimeInteractionCompletionV1::RejectionAcknowledgement
+            RuntimeInteractionCompletionV1::Idle
         );
         assert!(publisher.publish_ready_v2());
         assert!(matches!(
@@ -1085,7 +1020,6 @@ mod tests {
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Complete,
-                acknowledgement_pending: false,
                 reserve_calls: Arc::clone(&reserve_calls),
             },
             NonZeroUsize::new(1).unwrap(),
@@ -1122,7 +1056,6 @@ mod tests {
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Complete,
-                acknowledgement_pending: false,
                 reserve_calls: Arc::clone(&reserve_calls),
             },
             NonZeroUsize::new(1).unwrap(),
@@ -1172,7 +1105,6 @@ mod tests {
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Complete,
-                acknowledgement_pending: false,
                 reserve_calls: Arc::clone(&reserve_calls),
             },
             NonZeroUsize::new(1).unwrap(),
@@ -1182,7 +1114,7 @@ mod tests {
         assert_eq!(
             lane.try_enqueue_v1(envelope_v1(), &ready.observer, Some(ready.lease), || true,),
             RuntimeInteractionEnqueueOutcomeV1::Rejected {
-                acknowledgement: RuntimeInteractionRejectionSchedulingV1::Enqueued
+                acknowledgement: RuntimeInteractionRejectionSchedulingV1::Dropped
             }
         );
         assert_eq!(reserve_calls.load(Ordering::SeqCst), 0);
@@ -1190,7 +1122,7 @@ mod tests {
         assert_eq!(lane.report_v1().product_not_ready, 0);
         assert_eq!(
             lane.poll_next_completion_v1().await,
-            RuntimeInteractionCompletionV1::RejectionAcknowledgement
+            RuntimeInteractionCompletionV1::Idle
         );
         lane.reopen_v1(&ready.observer, Some(ready.lease), || true)
             .unwrap();
@@ -1208,7 +1140,6 @@ mod tests {
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Complete,
-                acknowledgement_pending: false,
                 reserve_calls: Arc::clone(&reserve_calls),
             },
             NonZeroUsize::new(1).unwrap(),
@@ -1217,7 +1148,7 @@ mod tests {
         assert_eq!(
             lane.try_enqueue_v1(envelope_v1(), &ready.observer, Some(ready.lease), || false,),
             RuntimeInteractionEnqueueOutcomeV1::Rejected {
-                acknowledgement: RuntimeInteractionRejectionSchedulingV1::Enqueued
+                acknowledgement: RuntimeInteractionRejectionSchedulingV1::Dropped
             }
         );
         assert_eq!(reserve_calls.load(Ordering::SeqCst), 0);
@@ -1231,7 +1162,6 @@ mod tests {
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Complete,
-                acknowledgement_pending: false,
                 reserve_calls: Arc::new(AtomicUsize::new(0)),
             },
             NonZeroUsize::new(1).unwrap(),
@@ -1246,25 +1176,25 @@ mod tests {
         assert_eq!(
             outcome,
             RuntimeInteractionEnqueueOutcomeV1::Rejected {
-                acknowledgement: RuntimeInteractionRejectionSchedulingV1::Enqueued
+                acknowledgement: RuntimeInteractionRejectionSchedulingV1::Dropped
             }
         );
         assert_eq!(lane.report_v1().product_not_ready, 1);
         assert_eq!(lane.report_v1().enqueued, 0);
         assert_eq!(
             lane.poll_next_completion_v1().await,
-            RuntimeInteractionCompletionV1::RejectionAcknowledgement
+            RuntimeInteractionCompletionV1::Idle
         );
-        assert_eq!(lane.report_v1().rejection_acknowledged, 1);
+        assert_eq!(lane.report_v1().rejection_acknowledged, 0);
+        assert_eq!(lane.report_v1().rejection_acknowledgement_dropped, 1);
     }
 
     #[tokio::test]
-    async fn dispatch_and_rejection_work_are_independently_bounded() {
+    async fn dispatch_is_bounded_and_preclaim_rejections_never_call_discord() {
         let (mut lane, ready) = ready_lane_v1(
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Pending,
-                acknowledgement_pending: true,
                 reserve_calls: Arc::new(AtomicUsize::new(0)),
             },
             NonZeroUsize::new(1).unwrap(),
@@ -1277,7 +1207,7 @@ mod tests {
         assert_eq!(
             lane.try_enqueue_v1(envelope_v1(), &ready.observer, Some(ready.lease), || true,),
             RuntimeInteractionEnqueueOutcomeV1::Rejected {
-                acknowledgement: RuntimeInteractionRejectionSchedulingV1::Enqueued
+                acknowledgement: RuntimeInteractionRejectionSchedulingV1::Dropped
             }
         );
         assert_eq!(
@@ -1288,7 +1218,7 @@ mod tests {
         );
         assert_eq!(lane.report_v1().enqueued, 1);
         assert_eq!(lane.report_v1().overloaded, 2);
-        assert_eq!(lane.report_v1().rejection_acknowledgement_dropped, 1);
+        assert_eq!(lane.report_v1().rejection_acknowledgement_dropped, 2);
     }
 
     #[tokio::test]
@@ -1297,7 +1227,6 @@ mod tests {
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Pending,
-                acknowledgement_pending: true,
                 reserve_calls: Arc::new(AtomicUsize::new(0)),
             },
             NonZeroUsize::new(1).unwrap(),
@@ -1330,7 +1259,6 @@ mod tests {
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Pending,
-                acknowledgement_pending: true,
                 reserve_calls: Arc::new(AtomicUsize::new(0)),
             },
             NonZeroUsize::new(1).unwrap(),
@@ -1361,7 +1289,6 @@ mod tests {
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Complete,
-                acknowledgement_pending: false,
                 reserve_calls: Arc::new(AtomicUsize::new(0)),
             },
             NonZeroUsize::new(1).unwrap(),
@@ -1381,13 +1308,13 @@ mod tests {
         assert_eq!(
             lane.try_enqueue_v1(envelope_v1(), &ready.observer, Some(ready.lease), || true,),
             RuntimeInteractionEnqueueOutcomeV1::Rejected {
-                acknowledgement: RuntimeInteractionRejectionSchedulingV1::Enqueued
+                acknowledgement: RuntimeInteractionRejectionSchedulingV1::Dropped
             }
         );
         assert_eq!(lane.report_v1().not_accepting, 1);
         assert_eq!(
             lane.poll_next_completion_v1().await,
-            RuntimeInteractionCompletionV1::RejectionAcknowledgement
+            RuntimeInteractionCompletionV1::Idle
         );
         lane.reopen_v1(&ready.observer, Some(ready.lease), || true)
             .unwrap();
@@ -1403,7 +1330,6 @@ mod tests {
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Complete,
-                acknowledgement_pending: false,
                 reserve_calls: Arc::new(AtomicUsize::new(0)),
             },
             NonZeroUsize::new(1).unwrap(),
@@ -1432,7 +1358,6 @@ mod tests {
             TestPortV1 {
                 dispatch_capacity: NonZeroUsize::new(1).unwrap(),
                 dispatch_behavior: TestDispatchBehaviorV1::Complete,
-                acknowledgement_pending: false,
                 reserve_calls: Arc::new(AtomicUsize::new(0)),
             },
             NonZeroUsize::new(1).unwrap(),

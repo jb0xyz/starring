@@ -59,7 +59,7 @@ use zeroize::Zeroizing;
 use crate::registry::RuntimeInteractionDispatchRegistryV1;
 use crate::runtime_interaction_dispatch::{
     RuntimeInteractionDispatchFutureV1, RuntimeInteractionDispatchPortV1,
-    RuntimeInteractionDispatchReservationOutcomeV1, RuntimeInteractionRejectionFutureV1,
+    RuntimeInteractionDispatchReservationOutcomeV1,
 };
 use crate::startup::RuntimeStartupBudgetV1;
 use crate::{
@@ -437,13 +437,6 @@ impl RuntimeInteractionDispatchPortV1 for RuntimeInteractionDispatchDatabasePort
         reservation: Self::Reservation,
     ) -> RuntimeInteractionDispatchFutureV1 {
         Box::pin(async move { self.inner.dispatch_v3(reservation).await })
-    }
-
-    fn acknowledge_rejection_v1(
-        self: Arc<Self>,
-        envelope: Box<SharedGatewayInteractionEnvelopeV3>,
-    ) -> RuntimeInteractionRejectionFutureV1 {
-        Box::pin(async move { self.inner.acknowledge_rejection_v3(envelope).await })
     }
 }
 
