@@ -17,8 +17,17 @@ fn assert_forbidden_calls_absent(source: &str) {
     }
 }
 
+fn assert_test_only(source: &str, declaration: &str) {
+    let declaration = source.find(declaration).unwrap();
+    let attributes = source[..declaration].rsplit("\n\n").next().unwrap();
+    assert!(
+        attributes.contains("#[cfg(any(test, doctest))]"),
+        "{declaration}"
+    );
+}
+
 #[test]
-fn shared_gateway_v3_has_only_narrow_instance_and_pin_capabilities() {
+fn test_only_shared_gateway_v3_has_only_narrow_instance_and_pin_capabilities() {
     let runtime = production_prefix(include_str!("../src/shared_gateway_runtime.rs"));
     let executor = production_prefix(include_str!("../src/shared_gateway_executor.rs"));
     let admission = production_prefix(include_str!("../src/shared_gateway_admission.rs"));
@@ -38,7 +47,7 @@ fn shared_gateway_v3_has_only_narrow_instance_and_pin_capabilities() {
 }
 
 #[test]
-fn shard_runtime_delegates_to_the_source_neutral_dispatcher() {
+fn test_only_shard_runtime_delegates_to_the_source_neutral_dispatcher() {
     let runtime = production_prefix(include_str!("../src/shared_gateway_runtime.rs"));
     let dispatcher = production_prefix(include_str!("../src/shared_gateway_dispatcher.rs"));
     assert!(runtime.contains("SharedGatewayInteractionEnvelopeV3::from_twilight_interaction_v3"));
@@ -61,6 +70,38 @@ fn shard_runtime_delegates_to_the_source_neutral_dispatcher() {
     assert!(dispatcher.contains(
         "pub fn reserve_shared_gateway_interaction_v3(\n    envelope: SharedGatewayInteractionEnvelopeV3,"
     ));
+}
+
+#[test]
+fn legacy_http_execution_surfaces_are_absent_from_production_compilation() {
+    let library = include_str!("../src/lib.rs");
+    let dispatcher = include_str!("../src/shared_gateway_dispatcher.rs");
+    let executor = include_str!("../src/shared_gateway_executor.rs");
+    assert!(library.contains("mod shared_gateway_executor;"));
+    assert!(!library.contains("pub mod shared_gateway_executor;"));
+    assert!(library.contains("#[cfg(any(test, doctest))]\npub mod shared_gateway_runtime;"));
+    assert!(library.contains(
+        "#[cfg(any(test, doctest))]\npub use shared_gateway_dispatcher::{\n    acknowledge_shared_gateway_interaction_rejection_v3,"
+    ));
+    assert!(library.contains(
+        "#[cfg(any(test, doctest))]\npub use shared_gateway_executor::execute_admitted_interaction_v3;"
+    ));
+    assert!(library.contains("#[cfg(any(test, doctest))]\npub use shared_gateway_runtime::{"));
+    for declaration in [
+        "pub enum SharedGatewayInteractionDispatchOutcomeV3",
+        "pub enum SharedGatewayRejectionAcknowledgementOutcomeV3",
+        "pub async fn acknowledge_shared_gateway_interaction_rejection_v3(",
+        "pub async fn dispatch_reserved_shared_gateway_interaction_v3<",
+        "pub async fn dispatch_v3(",
+        "pub async fn acknowledge_rejection_v3(",
+    ] {
+        assert_test_only(dispatcher, declaration);
+    }
+    assert_test_only(executor, "pub async fn execute_admitted_interaction_v3(");
+    assert!(dispatcher.contains("pub fn reserve_shared_gateway_interaction_v3("));
+    assert!(dispatcher.contains("pub async fn admit_reserved_shared_gateway_interaction_v1<I>("));
+    assert!(dispatcher.contains("pub async fn execute_acquired_v1<P>("));
+    assert!(executor.contains("pub(crate) fn execution_inputs("));
 }
 
 #[test]

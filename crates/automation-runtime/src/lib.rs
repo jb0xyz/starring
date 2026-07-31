@@ -16,9 +16,10 @@ pub mod runner;
 pub mod shared_gateway_admission;
 pub mod shared_gateway_control;
 pub mod shared_gateway_dispatcher;
-pub mod shared_gateway_executor;
+mod shared_gateway_executor;
 pub mod shared_gateway_receipt_claim;
 pub mod shared_gateway_router;
+#[cfg(any(test, doctest))]
 pub mod shared_gateway_runtime;
 pub mod snapshot;
 pub mod strict_panel_installer;
@@ -87,23 +88,28 @@ pub use shared_gateway_control::{
     GatewayReservedResumeCommandV3, GatewayRuntimeCommandOutcomeV3,
     GatewaySynchronousInvalidatorV3, SharedGatewayControlV3, SharedGatewayRuntimeControlV3,
 };
+#[cfg(any(test, doctest))]
 pub use shared_gateway_dispatcher::{
     acknowledge_shared_gateway_interaction_rejection_v3,
+    dispatch_reserved_shared_gateway_interaction_v3, SharedGatewayInteractionDispatchOutcomeV3,
+    SharedGatewayRejectionAcknowledgementOutcomeV3,
+};
+pub use shared_gateway_dispatcher::{
     admit_reserved_shared_gateway_interaction_v1, cancel_reserved_shared_gateway_interaction_v3,
-    dispatch_reserved_shared_gateway_interaction_v3, reserve_shared_gateway_interaction_v3,
-    OwnedSharedGatewayDispatchServicesCompositionErrorV3, OwnedSharedGatewayDispatchServicesV3,
-    SharedGatewayAdmissionDispatchOutcomeV1, SharedGatewayAdmittedEnvelopeV1,
-    SharedGatewayInteractionApplicationIdV3, SharedGatewayInteractionDispatchOutcomeV3,
+    reserve_shared_gateway_interaction_v3, OwnedSharedGatewayDispatchServicesCompositionErrorV3,
+    OwnedSharedGatewayDispatchServicesV3, SharedGatewayAdmissionDispatchOutcomeV1,
+    SharedGatewayAdmittedEnvelopeV1, SharedGatewayInteractionApplicationIdV3,
     SharedGatewayInteractionEnvelopeErrorV3, SharedGatewayInteractionEnvelopeV3,
     SharedGatewayInteractionIdV3, SharedGatewayInteractionIdentityV3,
     SharedGatewayInteractionKindV3, SharedGatewayInteractionRejectionV3,
     SharedGatewayInteractionReservationOutcomeV3, SharedGatewayInteractionTokenV3,
-    SharedGatewayModalInputV3, SharedGatewayRejectionAcknowledgementOutcomeV3,
-    SharedGatewayReservedInteractionV3, MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3,
-    MAX_SHARED_GATEWAY_INTERACTION_LOCALE_BYTES_V3, MAX_SHARED_GATEWAY_INTERACTION_TOKEN_BYTES_V3,
-    MAX_SHARED_GATEWAY_MODAL_INPUTS_V3, MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3,
-    MAX_SHARED_GATEWAY_MODAL_PAYLOAD_BYTES_V3, SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3,
+    SharedGatewayModalInputV3, SharedGatewayReservedInteractionV3,
+    MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3, MAX_SHARED_GATEWAY_INTERACTION_LOCALE_BYTES_V3,
+    MAX_SHARED_GATEWAY_INTERACTION_TOKEN_BYTES_V3, MAX_SHARED_GATEWAY_MODAL_INPUTS_V3,
+    MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3, MAX_SHARED_GATEWAY_MODAL_PAYLOAD_BYTES_V3,
+    SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3,
 };
+#[cfg(any(test, doctest))]
 pub use shared_gateway_executor::execute_admitted_interaction_v3;
 pub use shared_gateway_receipt_claim::{
     build_shared_gateway_durable_receipt_claim_input_v1,
@@ -115,6 +121,7 @@ pub use shared_gateway_router::{
     parse_shared_gateway_route_v1, SharedGatewayRouteConfigV1,
     SharedGatewayRouteConfigurationErrorV1, SharedGatewayRouteErrorV1, SharedGatewayRouteHintV1,
 };
+#[cfg(any(test, doctest))]
 pub use shared_gateway_runtime::{
     run_shared_gateway_v3, SharedGatewayDrainOutcomeV3, SharedGatewayExitReasonV3,
     SharedGatewayExitV3, SharedGatewayRuntimeConfigV3, SharedGatewayRuntimeConfigurationErrorV3,

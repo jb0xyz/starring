@@ -5,16 +5,21 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+#[cfg(any(test, doctest))]
 use automation_core::InteractionResponder;
+#[cfg(any(test, doctest))]
+use automation_instance::InstanceIdGenerator;
 use automation_instance::{
-    InstanceIdGenerator, InstanceRegistrarV1, InstanceRouteReaderV1, InstanceStoreError,
+    InstanceRegistrarV1, InstanceRouteReaderV1, InstanceStoreError,
     InstanceTeardownRetryScanCursorV2, InstanceTeardownRetryScanPageV2,
     InstanceTeardownRetryScannerV2, InstanceTeardownStoreV1, SecureRandomInstanceIdGenerator,
 };
 use automation_instance_teardown::{
     InstanceTeardownService, Teardown, TeardownError, TeardownOutcome,
 };
-use automation_ruleset_dispatch::{GuildRoleSnapshotProvider, PinnedInstanceResolverV1};
+#[cfg(any(test, doctest))]
+use automation_ruleset_dispatch::GuildRoleSnapshotProvider;
+use automation_ruleset_dispatch::PinnedInstanceResolverV1;
 use automation_runtime_interaction::{
     build_interaction_request_digest_v1, InteractionReceiptIdentityV1,
     InteractionRequestDigestErrorV1, InteractionRequestDigestInputV1, InteractionRequestDigestV1,
@@ -44,13 +49,16 @@ use crate::acquired_receipt_execution::{
 use crate::instance_deleter::OwnedTwilightInstanceDeleter;
 use crate::mutation::TwilightMutationAdapter;
 use crate::responder::TwilightInteractionResponder;
+#[cfg(any(test, doctest))]
 use crate::runner::InteractionExecutionOutcomeV3;
 use crate::shared_gateway_admission::{
     SharedGatewayAdmissionBudgetV3, SharedGatewayAdmissionConfigV3, SharedGatewayAdmissionErrorV3,
     SharedGatewayAdmissionReservationV3, SharedGatewayAdmittedInteractionV3,
 };
 use crate::shared_gateway_control::{GatewayConnectionObserverV3, GatewayReadyLeaseV3};
-use crate::shared_gateway_executor::{execute_admitted_interaction_v3, execution_inputs};
+#[cfg(any(test, doctest))]
+use crate::shared_gateway_executor::execute_admitted_interaction_v3;
+use crate::shared_gateway_executor::execution_inputs;
 use crate::shared_gateway_router::{parse_shared_gateway_route_v1, SharedGatewayRouteErrorV1};
 use crate::snapshot::OwnedTwilightGuildRoleSnapshotProvider;
 
@@ -418,6 +426,7 @@ impl SharedGatewayInteractionEnvelopeV3 {
         ZeroizingTwilightInteractionV3(interaction)
     }
 
+    #[cfg(any(test, doctest))]
     pub(crate) fn from_twilight_interaction_v3(
         interaction: Interaction,
     ) -> Result<Option<Self>, SharedGatewayInteractionEnvelopeErrorV3> {
@@ -591,6 +600,7 @@ impl Debug for SharedGatewayAdmissionDispatchOutcomeV1 {
     }
 }
 
+#[cfg(any(test, doctest))]
 pub enum SharedGatewayInteractionDispatchOutcomeV3 {
     Executed(InteractionExecutionOutcomeV3),
     Ignored,
@@ -600,12 +610,14 @@ pub enum SharedGatewayInteractionDispatchOutcomeV3 {
     },
 }
 
+#[cfg(any(test, doctest))]
 impl Debug for SharedGatewayInteractionDispatchOutcomeV3 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("SharedGatewayInteractionDispatchOutcomeV3(<redacted>)")
     }
 }
 
+#[cfg(any(test, doctest))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SharedGatewayRejectionAcknowledgementOutcomeV3 {
     Sent,
@@ -613,6 +625,7 @@ pub enum SharedGatewayRejectionAcknowledgementOutcomeV3 {
     TimedOut,
 }
 
+#[cfg(any(test, doctest))]
 pub async fn acknowledge_shared_gateway_interaction_rejection_v3(
     interaction_http: &Client,
     envelope: Box<SharedGatewayInteractionEnvelopeV3>,
@@ -675,6 +688,7 @@ pub fn reserve_shared_gateway_interaction_v3(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(test, doctest))]
 pub async fn dispatch_reserved_shared_gateway_interaction_v3<I, G, T, PR, S>(
     reserved: SharedGatewayReservedInteractionV3,
     registry: &ServingSlotRegistryV1,
@@ -886,6 +900,7 @@ where
         cancel_reserved_shared_gateway_interaction_v3(reserved)
     }
 
+    #[cfg(any(test, doctest))]
     pub async fn dispatch_v3(
         &self,
         reserved: SharedGatewayReservedInteractionV3,
@@ -949,6 +964,7 @@ where
         .await
     }
 
+    #[cfg(any(test, doctest))]
     pub async fn acknowledge_rejection_v3(
         &self,
         envelope: Box<SharedGatewayInteractionEnvelopeV3>,
@@ -1016,6 +1032,7 @@ fn validate_locale_v3(locale: Option<&str>) -> Result<(), SharedGatewayInteracti
 }
 
 #[allow(deprecated)]
+#[cfg(any(test, doctest))]
 fn twilight_channel_id_v3(interaction: &Interaction) -> Option<Id<ChannelMarker>> {
     interaction
         .channel
@@ -1024,6 +1041,7 @@ fn twilight_channel_id_v3(interaction: &Interaction) -> Option<Id<ChannelMarker>
         .or(interaction.channel_id)
 }
 
+#[cfg(any(test, doctest))]
 fn collect_twilight_modal_inputs_v3(
     components: &[ModalInteractionComponent],
     inputs: &mut Vec<SharedGatewayModalInputV3>,

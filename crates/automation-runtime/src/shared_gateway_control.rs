@@ -989,6 +989,7 @@ impl SharedGatewayRuntimeControlV3 {
         self.state
     }
 
+    #[cfg(any(test, doctest))]
     pub(crate) fn connection_observer(&self) -> GatewayConnectionObserverV3 {
         GatewayConnectionObserverV3 {
             admission: self.admission.subscribe(),
@@ -997,6 +998,7 @@ impl SharedGatewayRuntimeControlV3 {
         }
     }
 
+    #[cfg(any(test, doctest))]
     pub(crate) fn begin_runtime_failure_drain(&mut self) {
         if !matches!(
             self.state,

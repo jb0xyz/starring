@@ -91,11 +91,11 @@ fn scan_cursor_survives_errors_and_resets_only_after_a_terminal_page() {
 }
 
 #[test]
-fn dispatch_and_retry_share_one_owned_teardown_and_http_authority() {
+fn acquired_execution_and_retry_share_one_owned_teardown_and_http_authority() {
     let source = production_prefix(include_str!("../src/shared_gateway_dispatcher.rs"));
     let dispatch = declaration(
         source,
-        "pub async fn dispatch_v3(",
+        "pub async fn execute_acquired_v1<P>(",
         "pub async fn acknowledge_rejection_v3(",
     );
     let retry = declaration(source, "pub async fn retry_teardown_v1(", "impl<I> Debug");

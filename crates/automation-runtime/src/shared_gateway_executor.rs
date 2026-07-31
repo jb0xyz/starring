@@ -1,20 +1,32 @@
+#[cfg(any(test, doctest))]
 use std::future::Future;
 use std::sync::Arc;
 
 use automation_core::RunningRuleSetIdentity;
+#[cfg(not(any(test, doctest)))]
+use automation_instance::InstanceRuleSetVersion;
+#[cfg(any(test, doctest))]
 use automation_instance::{InstanceIdGenerator, InstanceRegistrarV1, InstanceRuleSetVersion};
+#[cfg(any(test, doctest))]
 use automation_instance_teardown::InstanceTeardownService;
 use automation_ruleset::RuleSetVersion;
+#[cfg(any(test, doctest))]
 use automation_ruleset_dispatch::{GuildRoleSnapshotProvider, PinnedInstanceResolverV1};
 use automation_runtime_registry::ExactServingRouteV1;
 use resource_resolution::ResourceBindingMap;
+#[cfg(any(test, doctest))]
 use twilight_http::Client;
+#[cfg(any(test, doctest))]
 use twilight_model::application::interaction::Interaction;
 
+#[cfg(any(test, doctest))]
 use crate::mutation::TwilightMutationAdapter;
+#[cfg(any(test, doctest))]
 use crate::runner::{handle_interaction_with_resolver_v1, InteractionExecutionOutcomeV3};
+#[cfg(any(test, doctest))]
 use crate::shared_gateway_admission::SharedGatewayAdmittedInteractionV3;
 
+#[cfg(any(test, doctest))]
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_admitted_interaction_v3(
     mutation_http: &Client,
@@ -64,6 +76,7 @@ pub(crate) fn execution_inputs(
     (identity, artifact, Arc::clone(route.bindings()))
 }
 
+#[cfg(any(test, doctest))]
 async fn hold_admission_while<F>(
     admitted: SharedGatewayAdmittedInteractionV3,
     future: F,
