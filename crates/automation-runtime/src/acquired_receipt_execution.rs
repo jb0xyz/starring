@@ -23,7 +23,8 @@ use crate::receipt_fenced_effects::{
     InteractionEffectPermitV1, InteractionInitialResponseIntentDispositionV1,
     InteractionInitialResponseIntentV1, InteractionInitialResponseKindV1,
     InteractionInitialResponseResultKindV1, InteractionInitialResponseResultV1,
-    ReceiptFencedDiscordMutationAdapterV1, ReceiptFencedInteractionResponderV1,
+    ReceiptFencedDiscordMutationAdapterV1, ReceiptFencedInstanceTeardownServiceV1,
+    ReceiptFencedInteractionResponderV1,
 };
 use crate::shared_gateway_admission::SharedGatewayAdmittedInteractionV3;
 use crate::shared_gateway_dispatcher::SharedGatewayInteractionEnvelopeV3;
@@ -300,12 +301,13 @@ where
     let tracking = TrackingInteractionEffectPermitV1::new(permit);
     let responder = ReceiptFencedInteractionResponderV1::new(services.responder, &tracking);
     let mutation = ReceiptFencedDiscordMutationAdapterV1::new(services.mutation, &tracking);
+    let teardown = ReceiptFencedInstanceTeardownServiceV1::new(services.teardown, &tracking);
     let execution_services = AutomationServices {
         mutation: &mutation,
         responder: &responder,
         instances: services.instances,
         instance_ids: services.instance_ids,
-        teardown: services.teardown,
+        teardown: &teardown,
     };
     match &event.kind {
         EventKind::ButtonClick { .. } | EventKind::ModalSubmit { .. } => {

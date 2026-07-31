@@ -4,6 +4,8 @@ use automation_core::{
     AdapterError, AdapterErrorKind, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter,
     InteractionResponder, ModalPresentation, PostPanelSpec,
 };
+use automation_instance::{InstanceId, InstanceStoreError};
+use automation_instance_teardown::{InstanceTeardownService, TeardownError, TeardownOutcome};
 use automation_state::{ModalFieldSpec, ModalFieldStyle, ModalInputPolicy};
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
 use sha2::{Digest, Sha256};
@@ -21,6 +23,8 @@ const RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1: &str =
     "interaction effect receipt persistence failed";
 const INITIAL_RESPONSE_FAILURE_MESSAGE_V1: &str = "Discord initial response failed";
 const EXECUTION_FAILURE_MESSAGE_V1: &str = "Discord execution failed";
+const TEARDOWN_RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1: &str =
+    "interaction teardown receipt persistence failed";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteractionInitialResponseKindV1 {
@@ -331,6 +335,41 @@ where
     }
 }
 
+pub(crate) struct ReceiptFencedInstanceTeardownServiceV1<'a, T: ?Sized, P: ?Sized> {
+    teardown: &'a T,
+    permit: &'a P,
+}
+
+impl<'a, T: ?Sized, P: ?Sized> ReceiptFencedInstanceTeardownServiceV1<'a, T, P> {
+    pub(crate) const fn new(teardown: &'a T, permit: &'a P) -> Self {
+        Self { teardown, permit }
+    }
+}
+
+impl<T: ?Sized, P: ?Sized> Debug for ReceiptFencedInstanceTeardownServiceV1<'_, T, P> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReceiptFencedInstanceTeardownServiceV1(<redacted>)")
+    }
+}
+
+impl<T, P> InstanceTeardownService for ReceiptFencedInstanceTeardownServiceV1<'_, T, P>
+where
+    T: InstanceTeardownService + ?Sized,
+    P: InteractionEffectPermitV1 + ?Sized,
+{
+    async fn teardown(
+        &self,
+        guild_id: GuildId,
+        instance_id: InstanceId,
+    ) -> Result<TeardownOutcome, TeardownError> {
+        self.permit
+            .commit_idempotent_execution_intent_v1()
+            .await
+            .map_err(|_| teardown_receipt_persistence_error_v1())?;
+        self.teardown.teardown(guild_id, instance_id).await
+    }
+}
+
 async fn persist_initial_response_intent_v1<P: InteractionEffectPermitV1 + ?Sized>(
     permit: &P,
     intent: &InteractionInitialResponseIntentV1,
@@ -391,6 +430,12 @@ fn receipt_persistence_error_v1() -> AdapterError {
         AdapterErrorKind::Unknown,
         RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1,
     )
+}
+
+fn teardown_receipt_persistence_error_v1() -> TeardownError {
+    TeardownError::Store(InstanceStoreError::Backend(
+        TEARDOWN_RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1.to_string(),
+    ))
 }
 
 fn sanitize_initial_response_error_v1(error: AdapterError) -> AdapterError {

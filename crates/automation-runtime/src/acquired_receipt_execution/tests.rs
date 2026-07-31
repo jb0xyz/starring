@@ -9,6 +9,7 @@ use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceResources,
     InstanceRuleSetVersion, InstanceStore, SequenceInstanceIdGenerator,
 };
+use automation_instance_teardown::{InstanceTeardownService, TeardownError, TeardownOutcome};
 use automation_ruleset::{
     content_hash, RuleSetKey, RuleSetVersion, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
 };
@@ -33,7 +34,7 @@ use automation_runtime_registry::{
     ExactServingRouteV1, ServingSlotRegistryConfigV1, ServingSlotRegistryV1,
 };
 use automation_state::{
-    ActionSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
+    ActionSpec, InstanceRef, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
     ModalInputPolicy, ModalSpec, TriggerSpec,
 };
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
@@ -233,6 +234,21 @@ struct FakeMutationV1 {
     error: Option<AdapterError>,
 }
 
+struct FakeTeardownV1 {
+    state: Arc<PermitStateV1>,
+}
+
+impl InstanceTeardownService for FakeTeardownV1 {
+    async fn teardown(&self, _: GuildId, _: InstanceId) -> Result<TeardownOutcome, TeardownError> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("external.teardown".to_string());
+        Ok(TeardownOutcome::Completed)
+    }
+}
+
 impl FakeMutationV1 {
     fn successful(state: Arc<PermitStateV1>) -> Self {
         Self { state, error: None }
@@ -335,6 +351,28 @@ impl GuildRoleSnapshotProvider for FakeSnapshotProviderV1 {
         Ok(GuildRoleSnapshot {
             roles: BTreeMap::from([(RoleId(GUILD_ID.0), Permissions::ADMINISTRATOR)]),
             bot_role_ids: BTreeSet::new(),
+        })
+    }
+}
+
+struct FakeTeardownSnapshotProviderV1 {
+    state: Arc<PermitStateV1>,
+}
+
+impl GuildRoleSnapshotProvider for FakeTeardownSnapshotProviderV1 {
+    async fn snapshot(&self, _: GuildId) -> Result<GuildRoleSnapshot, SnapshotError> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("prepare.snapshot".to_string());
+        let bot_role = RoleId(41_006);
+        Ok(GuildRoleSnapshot {
+            roles: BTreeMap::from([
+                (RoleId(GUILD_ID.0), Permissions::empty()),
+                (bot_role, Permissions::ADMINISTRATOR),
+            ]),
+            bot_role_ids: BTreeSet::from([bot_role]),
         })
     }
 }
@@ -611,6 +649,29 @@ fn instance_definition() -> InteractionRuleSet {
     }
 }
 
+fn instance_teardown_definition() -> InteractionRuleSet {
+    InteractionRuleSet {
+        version: 1,
+        panels: Vec::new(),
+        modals: Vec::new(),
+        rules: vec![InteractionRule {
+            key: "close".to_string(),
+            trigger: TriggerSpec::InstanceAction {
+                action: "close".to_string(),
+            },
+            actions: vec![
+                ActionSpec::DeferEphemeral,
+                ActionSpec::TeardownInstance {
+                    instance: InstanceRef::Event,
+                },
+                ActionSpec::EditResponse {
+                    content: "closed".to_string(),
+                },
+            ],
+        }],
+    }
+}
+
 fn active_instance_v1() -> AutomationInstance {
     AutomationInstance {
         id: InstanceId::parse("room_001").unwrap(),
@@ -857,6 +918,131 @@ async fn defer_first_instance_defers_before_resolve_snapshot_and_bind() {
             "permit.execution_intent",
             "external.edit",
             "permit.finish:interaction_instance_completed",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn instance_teardown_crosses_execution_fence_before_the_service() {
+    let definition = instance_teardown_definition();
+    let pinned_artifact = artifact(definition.clone());
+    let instance = active_instance_v1();
+    let custom_id = encode_instance_action(instance.id.as_str(), "close").unwrap();
+    let admitted = admitted_v1(artifact(definition), &custom_id, Some(instance.clone())).await;
+    let envelope = envelope_v1(custom_id, 51_022);
+    let root = claim_root_v1(&admitted, &envelope, Some(&instance.id));
+    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = FakeTeardownV1 {
+        state: Arc::clone(&state),
+    };
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: Some(ResolvedPinnedInstanceV1 {
+            instance,
+            artifact: pinned_artifact,
+        }),
+    };
+    let snapshot = FakeTeardownSnapshotProviderV1 {
+        state: Arc::clone(&state),
+    };
+
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        AcquiredInteractionExecutionServicesV1::new(
+            &mutation, &responder, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+
+    assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::InstanceCompleted,
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "prepare.resolve",
+            "prepare.snapshot",
+            "permit.bind",
+            "permit.execution_intent",
+            "external.teardown",
+            "permit.execution_intent",
+            "external.edit",
+            "permit.finish:interaction_instance_completed",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn new_permit_execution_replay_denial_has_zero_teardown_effects() {
+    let definition = instance_teardown_definition();
+    let pinned_artifact = artifact(definition.clone());
+    let instance = active_instance_v1();
+    let custom_id = encode_instance_action(instance.id.as_str(), "close").unwrap();
+    let admitted = admitted_v1(artifact(definition), &custom_id, Some(instance.clone())).await;
+    let envelope = envelope_v1(custom_id, 51_023);
+    let root = claim_root_v1(&admitted, &envelope, Some(&instance.id));
+    let (permit, state) = permit_v1(
+        root,
+        PermitFailuresV1 {
+            execution_intent: true,
+            ..PermitFailuresV1::default()
+        },
+    );
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = FakeTeardownV1 {
+        state: Arc::clone(&state),
+    };
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: Some(ResolvedPinnedInstanceV1 {
+            instance,
+            artifact: pinned_artifact,
+        }),
+    };
+    let snapshot = FakeTeardownSnapshotProviderV1 {
+        state: Arc::clone(&state),
+    };
+
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        AcquiredInteractionExecutionServicesV1::new(
+            &mutation, &responder, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
+            stage: AcquiredInteractionPersistenceStageV1::ExecutionIntent,
+            external_effect_may_have_occurred: true,
+        }
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "prepare.resolve",
+            "prepare.snapshot",
+            "permit.bind",
+            "permit.execution_intent",
         ]
     );
 }

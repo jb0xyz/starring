@@ -5,6 +5,7 @@ use automation_core::{
     AdapterError, AdapterErrorKind, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter,
     InteractionResponder, ModalPresentation, PostPanelSpec,
 };
+use automation_instance_teardown::{InstanceTeardownService, TeardownError, TeardownOutcome};
 use automation_state::{ModalFieldSpec, ModalFieldStyle, ModalInputPolicy};
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
 
@@ -162,6 +163,17 @@ impl InteractionResponder for FakeResponderV1 {
 
 struct FakeMutationV1 {
     trace: Arc<Mutex<Vec<&'static str>>>,
+}
+
+struct FakeTeardownV1 {
+    trace: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl InstanceTeardownService for FakeTeardownV1 {
+    async fn teardown(&self, _: GuildId, _: InstanceId) -> Result<TeardownOutcome, TeardownError> {
+        self.trace.lock().unwrap().push("external.teardown");
+        Ok(TeardownOutcome::Completed)
+    }
 }
 
 impl DiscordMutationAdapter for FakeMutationV1 {
@@ -572,6 +584,51 @@ async fn execution_intent_outage_prevents_edit_and_mutation_calls() {
 }
 
 #[tokio::test]
+async fn teardown_is_execution_intent_fenced_before_the_service_can_delete() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let permit = FakePermitV1::new(Arc::clone(&trace));
+    let teardown = FakeTeardownV1 {
+        trace: Arc::clone(&trace),
+    };
+    let fenced = ReceiptFencedInstanceTeardownServiceV1::new(&teardown, &permit);
+
+    let outcome = fenced
+        .teardown(GuildId(1), InstanceId::parse("room_001").unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, TeardownOutcome::Completed);
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["permit.execution_intent", "external.teardown"]
+    );
+}
+
+#[tokio::test]
+async fn denied_execution_replay_prevents_every_teardown_effect() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let permit = FakePermitV1::with_failures(Arc::clone(&trace), false, false, true);
+    let teardown = FakeTeardownV1 {
+        trace: Arc::clone(&trace),
+    };
+    let fenced = ReceiptFencedInstanceTeardownServiceV1::new(&teardown, &permit);
+
+    let error = fenced
+        .teardown(GuildId(1), InstanceId::parse("room_001").unwrap())
+        .await
+        .unwrap_err();
+
+    assert_eq!(*trace.lock().unwrap(), ["permit.execution_intent"]);
+    assert_eq!(
+        error,
+        TeardownError::Store(InstanceStoreError::Backend(
+            TEARDOWN_RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1.to_string()
+        ))
+    );
+    assert!(!format!("{error:?}").contains("permit-execution-secret"));
+}
+
+#[tokio::test]
 async fn execution_errors_preserve_kind_without_backend_text() {
     let trace = Arc::new(Mutex::new(Vec::new()));
     let permit = FakePermitV1::new(Arc::clone(&trace));
@@ -607,6 +664,10 @@ fn public_debug_surfaces_are_redacted() {
     let mutation = FakeMutationV1 { trace };
     let fenced_responder = ReceiptFencedInteractionResponderV1::new(&responder, &permit);
     let fenced_mutation = ReceiptFencedDiscordMutationAdapterV1::new(&mutation, &permit);
+    let teardown = FakeTeardownV1 {
+        trace: Arc::new(Mutex::new(Vec::new())),
+    };
+    let fenced_teardown = ReceiptFencedInstanceTeardownServiceV1::new(&teardown, &permit);
     let operation = encode_initial_response_operation_v1(InitialResponsePayloadV1::Respond(
         "private-response-payload",
     ));
@@ -623,6 +684,7 @@ fn public_debug_surfaces_are_redacted() {
     for rendered in [
         format!("{fenced_responder:?}"),
         format!("{fenced_mutation:?}"),
+        format!("{fenced_teardown:?}"),
         format!("{intent:?}"),
         format!("{:?}", intent.digest()),
         format!("{result:?}"),
