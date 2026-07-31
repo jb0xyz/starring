@@ -18,6 +18,7 @@ pub mod shared_gateway_router;
 pub mod shared_gateway_runtime;
 pub mod snapshot;
 pub mod strict_panel_installer;
+mod teardown_retry_supervisor;
 
 pub use convert::interaction_to_event;
 pub use custom_id::{
@@ -97,3 +98,11 @@ pub use shared_gateway_runtime::{
 };
 pub use snapshot::{OwnedTwilightGuildRoleSnapshotProvider, TwilightGuildRoleSnapshotProvider};
 pub use strict_panel_installer::{render_strict_declared_panel_v1, TwilightStrictPanelInstaller};
+pub use teardown_retry_supervisor::{
+    InstanceTeardownRetryExecutionFutureV1, InstanceTeardownRetryExecutionRequestV1,
+    InstanceTeardownRetryScanFutureV1, InstanceTeardownRetryScanRequestV1,
+    InstanceTeardownRetrySupervisorConfigV1, InstanceTeardownRetrySupervisorConfigurationErrorV1,
+    InstanceTeardownRetrySupervisorExitV1, InstanceTeardownRetrySupervisorPortV1,
+    InstanceTeardownRetrySupervisorProgressV1, InstanceTeardownRetrySupervisorReportV1,
+    InstanceTeardownRetrySupervisorV1,
+};

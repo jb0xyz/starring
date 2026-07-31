@@ -880,7 +880,7 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
         "registry: ServingSlotRegistryV1",
         "instances: I",
         "instance_ids: SecureRandomInstanceIdGenerator",
-        "teardown: Teardown<I, OwnedTwilightInstanceDeleter>",
+        "teardown: Arc<Teardown<I, OwnedTwilightInstanceDeleter>>",
         "snapshot_provider: OwnedTwilightGuildRoleSnapshotProvider",
         "mutation_http: Arc<Client>",
         "interaction_http: Arc<Client>",
@@ -894,6 +894,113 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
         assert!(facade.contains(required), "{required}");
     }
     assert!(!facade.contains("SequenceInstanceIdGenerator"));
+}
+
+#[test]
+fn teardown_retry_reuses_dispatch_authority_and_stops_before_database_close() {
+    let database = source_before_test_module(include_str!("../src/database.rs"));
+    let process = source_before_test_module(include_str!("../src/process.rs"));
+    let owner = source_before_test_module(include_str!("../src/process/owner.rs"));
+    let connected = source_before_test_module(include_str!("../src/process/connected.rs"));
+    let facade = source_before_test_module(include_str!(
+        "../../../crates/automation-runtime/src/shared_gateway_dispatcher.rs"
+    ));
+    let dispatch = braced_declaration(facade, "pub async fn dispatch_v3(");
+    let retry = braced_declaration(facade, "pub async fn retry_teardown_v1(");
+    assert!(facade.contains("teardown: Arc<Teardown<I, OwnedTwilightInstanceDeleter>>"));
+    assert!(facade.contains("let teardown = Arc::new(Teardown::new("));
+    assert!(dispatch.contains("self.teardown.as_ref()"));
+    assert!(retry.contains("self.teardown.teardown(guild_id, instance_id).await"));
+    assert!(!retry.contains("Client::builder"));
+    assert!(!retry.contains("Teardown::new"));
+
+    assert!(database.contains(
+        "struct RuntimeInteractionTeardownRetryDatabasePortV1 {\n    inner: Arc<OwnedSharedGatewayDispatchServicesV3<PostgresRuntimeInteractionV1>>,"
+    ));
+    let start = braced_declaration(
+        database,
+        "pub(crate) fn start_teardown_retry_supervisor_v1(",
+    );
+    assert!(start.contains("inner: Arc::clone(&self.inner)"));
+    assert!(start.contains("production_teardown_retry_config_v1()"));
+    for required in [
+        "const INSTANCE_TEARDOWN_RETRY_CADENCE: Duration = Duration::from_secs(30);",
+        "const INSTANCE_TEARDOWN_RETRY_PAGE_LIMIT: usize = 32;",
+        "const INSTANCE_TEARDOWN_RETRY_CONCURRENCY: usize = 4;",
+        "const INSTANCE_TEARDOWN_RETRY_SCAN_TIMEOUT: Duration = Duration::from_secs(5);",
+        "const INSTANCE_TEARDOWN_RETRY_TIMEOUT: Duration = Duration::from_secs(60);",
+    ] {
+        assert!(database.contains(required), "{required}");
+    }
+
+    let composition = braced_declaration(
+        process,
+        "pub(crate) async fn compose_runtime_process_foundation_v1(",
+    );
+    assert!(composition.contains("teardown_retry_supervisor: None"));
+    assert!(!composition.contains("start_teardown_retry_supervisor_v1"));
+    let activation = braced_declaration(
+        process,
+        "pub(super) fn activate_teardown_retry_supervisor_v1(",
+    );
+    assert_eq!(
+        activation
+            .matches("start_teardown_retry_supervisor_v1()")
+            .count(),
+        1
+    );
+    assert_eq!(
+        process
+            .matches("start_teardown_retry_supervisor_v1()")
+            .count(),
+        1
+    );
+    let owner_transition = braced_declaration(owner, "pub(crate) async fn into_owner_held_v1(");
+    assert_eq!(
+        owner_transition
+            .matches(".activate_teardown_retry_supervisor_v1()")
+            .count(),
+        1
+    );
+    let final_operation_check = owner_transition
+        .rfind("if !self.startup_budget.operation_is_open()")
+        .unwrap();
+    let activation = owner_transition
+        .find("self.activate_teardown_retry_supervisor_v1()")
+        .unwrap();
+    let owner_held = owner_transition
+        .rfind("Ok(RuntimeOwnerHeldProcessV1 {")
+        .unwrap();
+    assert!(final_operation_check < activation);
+    assert!(activation < owner_held);
+
+    let begin = braced_declaration(process, "pub(super) async fn begin_shutdown_v1(");
+    assert!(begin.contains("self.teardown_retry_supervisor.take()"));
+    assert!(begin.contains("teardown_retry.shutdown_until(deadline).await"));
+    let owner_shutdown = braced_declaration(owner, "pub(crate) async fn shutdown(self)");
+    let begin_shutdown = owner_shutdown.find(".begin_shutdown_v1(").unwrap();
+    let release_owner = owner_shutdown.find("owner.shutdown_until(").unwrap();
+    assert!(begin_shutdown < release_owner);
+    let paused_shutdown = braced_declaration(
+        connected,
+        "pub(super) async fn shutdown_paused_foundation_owner_v1<",
+    );
+    let begin_shutdown = paused_shutdown.find(".begin_shutdown_v1(").unwrap();
+    let release_owner = paused_shutdown
+        .find("shutdown_owner(owner_cleanup_deadline)")
+        .unwrap();
+    assert!(begin_shutdown < release_owner);
+
+    let finish = braced_declaration(process, "pub(super) async fn finish_shutdown_v1(");
+    let retry_shutdown = finish
+        .find("teardown_retry.shutdown_until(cleanup_deadline).await")
+        .unwrap();
+    let pool_close = finish
+        .find("shutdown.close_until(cleanup_deadline).await")
+        .unwrap();
+    assert!(retry_shutdown < pool_close);
+    assert!(process
+        .contains("Self::TeardownRetry => \"runtime_process_teardown_retry_supervisor_shutdown\""));
 }
 
 #[test]

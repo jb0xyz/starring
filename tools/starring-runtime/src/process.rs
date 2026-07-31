@@ -14,7 +14,8 @@ use crate::capability_readiness_supervisor::{
 use crate::controller_identity::generate_runtime_controller_id_v1;
 use crate::database::{
     compose_runtime_database_dependencies_v1, RuntimeInteractionDispatchCompositionErrorV1,
-    RuntimeInteractionDispatchDatabasePortV1,
+    RuntimeInteractionDispatchDatabasePortV1, RuntimeInteractionTeardownRetrySupervisorExitV1,
+    RuntimeInteractionTeardownRetrySupervisorV1,
 };
 use crate::health::{
     RuntimeHealthInteractionDispatchPublisherV1, RuntimeHealthReadinessObserverV1,
@@ -236,6 +237,7 @@ pub enum RuntimeProcessFoundationShutdownFailureV1 {
     HealthListener,
     IngressAcknowledgement,
     CapabilityReadiness,
+    TeardownRetry,
     RuntimeController,
 }
 
@@ -253,6 +255,7 @@ impl RuntimeProcessFoundationShutdownFailureV1 {
                 "runtime_process_ingress_acknowledgement_supervisor_shutdown"
             }
             Self::CapabilityReadiness => "runtime_process_capability_readiness_supervisor_shutdown",
+            Self::TeardownRetry => "runtime_process_teardown_retry_supervisor_shutdown",
             Self::RuntimeController => "runtime_process_serving_controller_shutdown",
         }
     }
@@ -358,6 +361,7 @@ pub(crate) struct RuntimeProcessFoundationV1 {
     gateway: RuntimeGatewayBootstrapV1,
     registry: RuntimeRegistryBootstrapV1,
     interaction_dispatch_port: RuntimeInteractionDispatchDatabasePortV1,
+    teardown_retry_supervisor: Option<RuntimeInteractionTeardownRetrySupervisorV1>,
     databases: RuntimeDatabaseDependenciesV1,
     secrets: ResolvedRuntimeSecretsV1,
     config: RuntimeConfigV1,
@@ -433,6 +437,17 @@ impl RuntimeProcessFoundationV1 {
         &self,
     ) -> RuntimeHealthInteractionDispatchPublisherV1 {
         self.root_supervisor.interaction_dispatch_publisher_v1()
+    }
+
+    pub(super) fn activate_teardown_retry_supervisor_v1(&mut self) {
+        assert!(
+            self.teardown_retry_supervisor.is_none(),
+            "runtime teardown retry supervisor already active"
+        );
+        self.teardown_retry_supervisor = Some(
+            self.interaction_dispatch_port
+                .start_teardown_retry_supervisor_v1(),
+        );
     }
 
     pub(super) fn trip_shutdown_v1(
@@ -628,6 +643,13 @@ impl RuntimeProcessFoundationV1 {
             .expect("runtime lifecycle terminal reporter");
         let observation = self.trip_shutdown_v1(cause);
         let deadline = self.effective_shutdown_deadline_v1(observation);
+        if let Some(teardown_retry) = self.teardown_retry_supervisor.take() {
+            let report = teardown_retry.shutdown_until(deadline).await;
+            if report.exit() != RuntimeInteractionTeardownRetrySupervisorExitV1::Commanded {
+                self.shutdown_failures
+                    .record(RuntimeProcessFoundationShutdownFailureV1::TeardownRetry);
+            }
+        }
         let finalizer_present =
             self.mutation_finalizer.is_some() || self.process_mutation_finalizer.is_some();
         let finalizer_timing = finalizer_present.then(|| {
@@ -787,6 +809,7 @@ impl RuntimeProcessFoundationV1 {
             gateway,
             registry,
             interaction_dispatch_port,
+            teardown_retry_supervisor,
             databases,
             secrets,
             config,
@@ -806,6 +829,12 @@ impl RuntimeProcessFoundationV1 {
             mut root_supervisor,
             mut shutdown_failures,
         } = self;
+        if let Some(teardown_retry) = teardown_retry_supervisor {
+            let report = teardown_retry.shutdown_until(cleanup_deadline).await;
+            if report.exit() != RuntimeInteractionTeardownRetrySupervisorExitV1::Commanded {
+                shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::TeardownRetry);
+            }
+        }
         let finalizer_present =
             mutation_finalizer.is_some() || process_mutation_finalizer.is_some();
         let finalizer_timing = finalizer_present.then(|| {
@@ -1221,6 +1250,7 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         gateway: closed_components.gateway,
         registry: closed_components.registry,
         interaction_dispatch_port,
+        teardown_retry_supervisor: None,
         databases,
         secrets,
         config,

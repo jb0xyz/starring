@@ -1,16 +1,19 @@
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use automation_core::InteractionResponder;
 use automation_instance::{
-    InstanceIdGenerator, InstanceRegistrarV1, InstanceRouteReaderV1, InstanceTeardownStoreV1,
-    SecureRandomInstanceIdGenerator,
+    InstanceIdGenerator, InstanceRegistrarV1, InstanceRouteReaderV1, InstanceStoreError,
+    InstanceTeardownRetryScanCursorV2, InstanceTeardownRetryScanPageV2,
+    InstanceTeardownRetryScannerV2, InstanceTeardownStoreV1, SecureRandomInstanceIdGenerator,
 };
-use automation_instance_teardown::{InstanceTeardownService, Teardown};
+use automation_instance_teardown::{
+    InstanceTeardownService, Teardown, TeardownError, TeardownOutcome,
+};
 use automation_ruleset_dispatch::{GuildRoleSnapshotProvider, PinnedInstanceResolverV1};
 use automation_runtime_registry::ServingSlotRegistryV1;
 use discord_model::{ChannelId, GuildId, UserId};
@@ -655,7 +658,7 @@ pub struct OwnedSharedGatewayDispatchServicesV3<I> {
     registry: ServingSlotRegistryV1,
     instances: I,
     instance_ids: SecureRandomInstanceIdGenerator,
-    teardown: Teardown<I, OwnedTwilightInstanceDeleter>,
+    teardown: Arc<Teardown<I, OwnedTwilightInstanceDeleter>>,
     snapshot_provider: OwnedTwilightGuildRoleSnapshotProvider,
     mutation_http: Arc<Client>,
     interaction_http: Arc<Client>,
@@ -703,10 +706,10 @@ where
         .await
         .map_err(|_| OwnedSharedGatewayDispatchServicesCompositionErrorV3::TimedOut)?
         .map_err(|_| OwnedSharedGatewayDispatchServicesCompositionErrorV3::SnapshotUnavailable)?;
-        let teardown = Teardown::new(
+        let teardown = Arc::new(Teardown::new(
             instances.clone(),
             OwnedTwilightInstanceDeleter::new(Arc::clone(&mutation_http)),
-        );
+        ));
         Ok(Self {
             registry,
             instances,
@@ -753,7 +756,7 @@ where
             &self.registry,
             &self.instances,
             &self.instance_ids,
-            &self.teardown,
+            self.teardown.as_ref(),
             &self.instances,
             &self.snapshot_provider,
             &self.mutation_http,
@@ -773,6 +776,35 @@ where
             SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3,
         )
         .await
+    }
+}
+
+impl<I> OwnedSharedGatewayDispatchServicesV3<I>
+where
+    I: Clone
+        + Send
+        + Sync
+        + 'static
+        + InstanceRouteReaderV1
+        + InstanceRegistrarV1
+        + InstanceTeardownRetryScannerV2
+        + InstanceTeardownStoreV1
+        + PinnedInstanceResolverV1,
+{
+    pub async fn scan_teardown_retries_v1(
+        &self,
+        cursor: &InstanceTeardownRetryScanCursorV2,
+        limit: NonZeroUsize,
+    ) -> Result<InstanceTeardownRetryScanPageV2, InstanceStoreError> {
+        self.instances.scan_retryable_v2(cursor, limit).await
+    }
+
+    pub async fn retry_teardown_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: automation_instance::InstanceId,
+    ) -> Result<TeardownOutcome, TeardownError> {
+        self.teardown.teardown(guild_id, instance_id).await
     }
 }
 

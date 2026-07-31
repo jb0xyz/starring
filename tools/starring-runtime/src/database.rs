@@ -2,14 +2,19 @@ use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
 use automation_runtime::{
-    GatewayConnectionObserverV3, GatewayReadyLeaseV3,
-    OwnedSharedGatewayDispatchServicesCompositionErrorV3, OwnedSharedGatewayDispatchServicesV3,
-    SharedGatewayAdmissionConfigV3, SharedGatewayInteractionEnvelopeV3,
-    SharedGatewayInteractionReservationOutcomeV3, SharedGatewayReservedInteractionV3,
+    GatewayConnectionObserverV3, GatewayReadyLeaseV3, InstanceTeardownRetryExecutionFutureV1,
+    InstanceTeardownRetryExecutionRequestV1, InstanceTeardownRetryScanFutureV1,
+    InstanceTeardownRetryScanRequestV1, InstanceTeardownRetrySupervisorConfigV1,
+    InstanceTeardownRetrySupervisorExitV1, InstanceTeardownRetrySupervisorPortV1,
+    InstanceTeardownRetrySupervisorV1, OwnedSharedGatewayDispatchServicesCompositionErrorV3,
+    OwnedSharedGatewayDispatchServicesV3, SharedGatewayAdmissionConfigV3,
+    SharedGatewayInteractionEnvelopeV3, SharedGatewayInteractionReservationOutcomeV3,
+    SharedGatewayReservedInteractionV3,
 };
 use automation_runtime_convergence_postgres::{
     PostgresRuntimeExactTargetReader, RuntimeConvergenceStoreError,
@@ -65,6 +70,15 @@ use crate::{
 
 const PERIODIC_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const DATABASE_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+const INSTANCE_TEARDOWN_RETRY_CADENCE: Duration = Duration::from_secs(30);
+const INSTANCE_TEARDOWN_RETRY_PAGE_LIMIT: usize = 32;
+const INSTANCE_TEARDOWN_RETRY_CONCURRENCY: usize = 4;
+const INSTANCE_TEARDOWN_RETRY_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+const INSTANCE_TEARDOWN_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub(crate) type RuntimeInteractionTeardownRetrySupervisorV1 = InstanceTeardownRetrySupervisorV1;
+pub(crate) type RuntimeInteractionTeardownRetrySupervisorExitV1 =
+    InstanceTeardownRetrySupervisorExitV1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeDatabaseCompositionErrorV1 {
@@ -431,6 +445,60 @@ impl RuntimeInteractionDispatchPortV1 for RuntimeInteractionDispatchDatabasePort
     ) -> RuntimeInteractionRejectionFutureV1 {
         Box::pin(async move { self.inner.acknowledge_rejection_v3(envelope).await })
     }
+}
+
+struct RuntimeInteractionTeardownRetryDatabasePortV1 {
+    inner: Arc<OwnedSharedGatewayDispatchServicesV3<PostgresRuntimeInteractionV1>>,
+}
+
+impl InstanceTeardownRetrySupervisorPortV1 for RuntimeInteractionTeardownRetryDatabasePortV1 {
+    fn scan_retryable_v1(
+        self: Arc<Self>,
+        request: InstanceTeardownRetryScanRequestV1,
+    ) -> InstanceTeardownRetryScanFutureV1 {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let (cursor, limit) = request.into_parts();
+            inner.scan_teardown_retries_v1(&cursor, limit).await
+        })
+    }
+
+    fn retry_teardown_v1(
+        self: Arc<Self>,
+        request: InstanceTeardownRetryExecutionRequestV1,
+    ) -> InstanceTeardownRetryExecutionFutureV1 {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let (guild_id, instance_id) = request.into_parts();
+            inner.retry_teardown_v1(guild_id, instance_id).await
+        })
+    }
+}
+
+impl RuntimeInteractionDispatchDatabasePortV1 {
+    pub(crate) fn start_teardown_retry_supervisor_v1(
+        &self,
+    ) -> RuntimeInteractionTeardownRetrySupervisorV1 {
+        InstanceTeardownRetrySupervisorV1::start(
+            RuntimeInteractionTeardownRetryDatabasePortV1 {
+                inner: Arc::clone(&self.inner),
+            },
+            production_teardown_retry_config_v1(),
+        )
+    }
+}
+
+fn production_teardown_retry_config_v1() -> InstanceTeardownRetrySupervisorConfigV1 {
+    InstanceTeardownRetrySupervisorConfigV1::new(
+        INSTANCE_TEARDOWN_RETRY_CADENCE,
+        NonZeroUsize::new(INSTANCE_TEARDOWN_RETRY_PAGE_LIMIT)
+            .expect("instance teardown retry page limit is non-zero"),
+        NonZeroUsize::new(INSTANCE_TEARDOWN_RETRY_CONCURRENCY)
+            .expect("instance teardown retry concurrency is non-zero"),
+        INSTANCE_TEARDOWN_RETRY_SCAN_TIMEOUT,
+        INSTANCE_TEARDOWN_RETRY_TIMEOUT,
+    )
+    .expect("production instance teardown retry configuration is bounded")
 }
 
 impl RuntimePendingDrainMutationDatabaseV3 {
@@ -1558,6 +1626,16 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn teardown_retry_production_limits_are_exact_and_bounded() {
+        let config = production_teardown_retry_config_v1();
+        assert_eq!(config.cadence(), Duration::from_secs(30));
+        assert_eq!(config.page_limit().get(), 32);
+        assert_eq!(config.max_concurrency().get(), 4);
+        assert_eq!(config.scan_timeout(), Duration::from_secs(5));
+        assert_eq!(config.per_instance_timeout(), Duration::from_secs(60));
+    }
 
     #[test]
     fn expected_authority_is_checked_before_connecting() {
