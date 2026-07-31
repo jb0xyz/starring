@@ -6,8 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use automation_runtime::{
-    GatewayConnectionObserverV3, GatewayReadyLeaseV3, InteractionExecutionOutcomeV3,
-    SharedGatewayAdmissionErrorV3, SharedGatewayInteractionDispatchOutcomeV3,
+    GatewayConnectionObserverV3, GatewayReadyLeaseV3, SharedGatewayAdmissionErrorV3,
     SharedGatewayInteractionEnvelopeV3, SharedGatewayInteractionRejectionV3,
 };
 use futures::stream::FuturesUnordered;
@@ -25,10 +24,33 @@ use crate::health::{
     RuntimeHealthInteractionDispatchPublisherV1, RuntimeHealthInteractionDispatchStatusV1,
     RuntimeHealthReadinessObserverV1,
 };
+use crate::interaction_receipt::{
+    RuntimeInteractionReceiptClosedReasonV1, RuntimeInteractionReceiptDuplicateClassV1,
+};
 use crate::GatewayResourceConfigV1;
 
 pub(crate) type RuntimeInteractionDispatchFutureV1 =
-    Pin<Box<dyn Future<Output = SharedGatewayInteractionDispatchOutcomeV3> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = RuntimeInteractionDispatchOutcomeV1> + Send + 'static>>;
+
+pub(crate) enum RuntimeInteractionDispatchOutcomeV1 {
+    Completed,
+    Failed,
+    RecoveryRequired,
+    AuthorityRejected,
+    PersistenceFailed {
+        external_effect_may_have_occurred: bool,
+    },
+    Ignored,
+    AdmissionRejected(SharedGatewayAdmissionErrorV3),
+    ReceiptDuplicate(RuntimeInteractionReceiptDuplicateClassV1),
+    ReceiptClosed(RuntimeInteractionReceiptClosedReasonV1),
+}
+
+impl Debug for RuntimeInteractionDispatchOutcomeV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeInteractionDispatchOutcomeV1(<redacted>)")
+    }
+}
 
 pub(crate) enum RuntimeInteractionDispatchReservationOutcomeV1<R> {
     Reserved(R),
@@ -126,6 +148,20 @@ pub(crate) struct RuntimeInteractionDispatchReportV1 {
     pub(crate) rejection_acknowledgement_dropped: u64,
     pub(crate) dispatch_cancelled: u64,
     pub(crate) rejection_acknowledgement_cancelled: u64,
+    pub(crate) receipt_acquired: u64,
+    pub(crate) receipt_completed_duplicate: u64,
+    pub(crate) receipt_in_flight_duplicate: u64,
+    pub(crate) receipt_terminal_duplicate: u64,
+    pub(crate) receipt_recovery_required_duplicate: u64,
+    pub(crate) receipt_claim_closed: u64,
+    pub(crate) receipt_claim_timeout: u64,
+    pub(crate) receipt_claim_unavailable: u64,
+    pub(crate) receipt_claim_rejected: u64,
+    pub(crate) receipt_claim_corrupt: u64,
+    pub(crate) receipt_authority_rejected: u64,
+    pub(crate) receipt_persistence_failed_before_effect: u64,
+    pub(crate) receipt_persistence_failed_after_effect: u64,
+    pub(crate) receipt_terminal_recovery_required: u64,
 }
 
 pub(crate) struct RuntimeDiscordInteractionDispatchLaneV1<P>
@@ -383,6 +419,21 @@ where
             rejection_acknowledgement_dropped: report.rejection_acknowledgement_dropped,
             dispatch_cancelled: report.dispatch_cancelled,
             rejection_acknowledgement_cancelled: report.rejection_acknowledgement_cancelled,
+            receipt_acquired: report.receipt_acquired,
+            receipt_completed_duplicate: report.receipt_completed_duplicate,
+            receipt_in_flight_duplicate: report.receipt_in_flight_duplicate,
+            receipt_terminal_duplicate: report.receipt_terminal_duplicate,
+            receipt_recovery_required_duplicate: report.receipt_recovery_required_duplicate,
+            receipt_claim_closed: report.receipt_claim_closed,
+            receipt_claim_timeout: report.receipt_claim_timeout,
+            receipt_claim_unavailable: report.receipt_claim_unavailable,
+            receipt_claim_rejected: report.receipt_claim_rejected,
+            receipt_claim_corrupt: report.receipt_claim_corrupt,
+            receipt_authority_rejected: report.receipt_authority_rejected,
+            receipt_persistence_failed_before_effect: report
+                .receipt_persistence_failed_before_effect,
+            receipt_persistence_failed_after_effect: report.receipt_persistence_failed_after_effect,
+            receipt_terminal_recovery_required: report.receipt_terminal_recovery_required,
             in_flight: self.lane.in_flight_count_v1(),
         });
     }
@@ -650,27 +701,79 @@ where
         RuntimeInteractionEnqueueOutcomeV1::Rejected { acknowledgement }
     }
 
-    fn record_dispatch_v1(&mut self, outcome: SharedGatewayInteractionDispatchOutcomeV3) {
+    fn record_dispatch_v1(&mut self, outcome: RuntimeInteractionDispatchOutcomeV1) {
         match outcome {
-            SharedGatewayInteractionDispatchOutcomeV3::Executed(outcome) => match outcome {
-                InteractionExecutionOutcomeV3::Ignored => increment_v1(&mut self.report.ignored),
-                InteractionExecutionOutcomeV3::StaticFailed
-                | InteractionExecutionOutcomeV3::InstanceFailed => {
-                    increment_v1(&mut self.report.execution_failed)
-                }
-                InteractionExecutionOutcomeV3::StaticExecuted
-                | InteractionExecutionOutcomeV3::StaticNoOp
-                | InteractionExecutionOutcomeV3::InstanceExecuted
-                | InteractionExecutionOutcomeV3::InstanceNoOp => {
-                    increment_v1(&mut self.report.completed)
-                }
-            },
-            SharedGatewayInteractionDispatchOutcomeV3::Ignored => {
-                increment_v1(&mut self.report.ignored)
+            RuntimeInteractionDispatchOutcomeV1::Completed => {
+                increment_v1(&mut self.report.receipt_acquired);
+                increment_v1(&mut self.report.completed);
             }
-            SharedGatewayInteractionDispatchOutcomeV3::Rejected { error, envelope } => {
+            RuntimeInteractionDispatchOutcomeV1::Failed => {
+                increment_v1(&mut self.report.receipt_acquired);
+                increment_v1(&mut self.report.execution_failed);
+            }
+            RuntimeInteractionDispatchOutcomeV1::RecoveryRequired => {
+                increment_v1(&mut self.report.receipt_acquired);
+                increment_v1(&mut self.report.execution_failed);
+                increment_v1(&mut self.report.receipt_terminal_recovery_required);
+            }
+            RuntimeInteractionDispatchOutcomeV1::AuthorityRejected => {
+                increment_v1(&mut self.report.receipt_acquired);
+                increment_v1(&mut self.report.execution_failed);
+                increment_v1(&mut self.report.receipt_authority_rejected);
+            }
+            RuntimeInteractionDispatchOutcomeV1::PersistenceFailed {
+                external_effect_may_have_occurred,
+            } => {
+                increment_v1(&mut self.report.receipt_acquired);
+                increment_v1(&mut self.report.execution_failed);
+                if external_effect_may_have_occurred {
+                    increment_v1(&mut self.report.receipt_persistence_failed_after_effect);
+                } else {
+                    increment_v1(&mut self.report.receipt_persistence_failed_before_effect);
+                }
+            }
+            RuntimeInteractionDispatchOutcomeV1::Ignored => increment_v1(&mut self.report.ignored),
+            RuntimeInteractionDispatchOutcomeV1::AdmissionRejected(error) => {
                 self.record_admission_error_v1(&error);
-                let _ = self.reject_v1(envelope);
+            }
+            RuntimeInteractionDispatchOutcomeV1::ReceiptDuplicate(class) => {
+                increment_v1(&mut self.report.ignored);
+                match class {
+                    RuntimeInteractionReceiptDuplicateClassV1::Completed => {
+                        increment_v1(&mut self.report.receipt_completed_duplicate)
+                    }
+                    RuntimeInteractionReceiptDuplicateClassV1::InFlight => {
+                        increment_v1(&mut self.report.receipt_in_flight_duplicate)
+                    }
+                    RuntimeInteractionReceiptDuplicateClassV1::Terminal => {
+                        increment_v1(&mut self.report.receipt_terminal_duplicate)
+                    }
+                    RuntimeInteractionReceiptDuplicateClassV1::RecoveryRequired => {
+                        increment_v1(&mut self.report.receipt_recovery_required_duplicate)
+                    }
+                }
+            }
+            RuntimeInteractionDispatchOutcomeV1::ReceiptClosed(reason) => {
+                increment_v1(&mut self.report.execution_failed);
+                increment_v1(&mut self.report.receipt_claim_closed);
+                match reason {
+                    RuntimeInteractionReceiptClosedReasonV1::Timeout => {
+                        increment_v1(&mut self.report.receipt_claim_timeout)
+                    }
+                    RuntimeInteractionReceiptClosedReasonV1::Unavailable
+                    | RuntimeInteractionReceiptClosedReasonV1::Indeterminate => {
+                        increment_v1(&mut self.report.receipt_claim_unavailable)
+                    }
+                    RuntimeInteractionReceiptClosedReasonV1::PersistenceCorrupt => {
+                        increment_v1(&mut self.report.receipt_claim_corrupt)
+                    }
+                    RuntimeInteractionReceiptClosedReasonV1::InvalidInput
+                    | RuntimeInteractionReceiptClosedReasonV1::InvalidAuthority
+                    | RuntimeInteractionReceiptClosedReasonV1::Conflict
+                    | RuntimeInteractionReceiptClosedReasonV1::TokenEnvelope => {
+                        increment_v1(&mut self.report.receipt_claim_rejected)
+                    }
+                }
             }
         }
     }
@@ -783,11 +886,9 @@ mod tests {
             _reservation: Self::Reservation,
         ) -> RuntimeInteractionDispatchFutureV1 {
             match self.dispatch_behavior {
-                TestDispatchBehaviorV1::Complete => Box::pin(async {
-                    SharedGatewayInteractionDispatchOutcomeV3::Executed(
-                        InteractionExecutionOutcomeV3::StaticExecuted,
-                    )
-                }),
+                TestDispatchBehaviorV1::Complete => {
+                    Box::pin(async { RuntimeInteractionDispatchOutcomeV1::Completed })
+                }
                 TestDispatchBehaviorV1::Pending => Box::pin(std::future::pending()),
             }
         }
@@ -913,6 +1014,44 @@ mod tests {
         lane.reopen_v1(&ready.observer, Some(ready.lease), || true)
             .unwrap();
         (lane, ready)
+    }
+
+    #[test]
+    fn receipt_outcomes_are_classified_without_exposing_receipt_identity() {
+        let mut lane = RuntimeDiscordInteractionDispatchLaneV1::new_v1(
+            TestPortV1 {
+                dispatch_capacity: NonZeroUsize::new(1).unwrap(),
+                dispatch_behavior: TestDispatchBehaviorV1::Complete,
+                reserve_calls: Arc::new(AtomicUsize::new(0)),
+            },
+            NonZeroUsize::new(1).unwrap(),
+        );
+        lane.record_dispatch_v1(RuntimeInteractionDispatchOutcomeV1::Completed);
+        lane.record_dispatch_v1(RuntimeInteractionDispatchOutcomeV1::ReceiptDuplicate(
+            RuntimeInteractionReceiptDuplicateClassV1::Completed,
+        ));
+        lane.record_dispatch_v1(RuntimeInteractionDispatchOutcomeV1::ReceiptDuplicate(
+            RuntimeInteractionReceiptDuplicateClassV1::InFlight,
+        ));
+        lane.record_dispatch_v1(RuntimeInteractionDispatchOutcomeV1::ReceiptClosed(
+            RuntimeInteractionReceiptClosedReasonV1::Timeout,
+        ));
+        lane.record_dispatch_v1(RuntimeInteractionDispatchOutcomeV1::PersistenceFailed {
+            external_effect_may_have_occurred: true,
+        });
+        lane.record_dispatch_v1(RuntimeInteractionDispatchOutcomeV1::RecoveryRequired);
+
+        let report = lane.report_v1();
+        assert_eq!(report.receipt_acquired, 3);
+        assert_eq!(report.completed, 1);
+        assert_eq!(report.execution_failed, 3);
+        assert_eq!(report.ignored, 2);
+        assert_eq!(report.receipt_completed_duplicate, 1);
+        assert_eq!(report.receipt_in_flight_duplicate, 1);
+        assert_eq!(report.receipt_claim_closed, 1);
+        assert_eq!(report.receipt_claim_timeout, 1);
+        assert_eq!(report.receipt_persistence_failed_after_effect, 1);
+        assert_eq!(report.receipt_terminal_recovery_required, 1);
     }
 
     #[tokio::test]

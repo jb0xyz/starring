@@ -603,6 +603,8 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/identity_encoding.rs",
             "src/ingress_acknowledgement_safety.rs",
             "src/ingress_acknowledgement_supervisor.rs",
+            "src/interaction_receipt.rs",
+            "src/interaction_receipt_recovery_supervisor.rs",
             "src/lib.rs",
             "src/lifecycle_timing.rs",
             "src/main.rs",
@@ -770,7 +772,7 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
     ));
     for required in [
         "FuturesUnordered<RuntimeInteractionDispatchFutureV1>",
-        "dyn Future<Output = SharedGatewayInteractionDispatchOutcomeV3> + Send + 'static",
+        "dyn Future<Output = RuntimeInteractionDispatchOutcomeV1> + Send + 'static",
         "dispatch_capacity: NonZeroUsize",
         "RuntimeProductionDiscordInteractionDispatchLaneV1",
         "compose_runtime_discord_interaction_dispatch_lane_v1(",
@@ -899,6 +901,22 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
 }
 
 #[test]
+fn production_interaction_dispatch_claims_a_receipt_before_any_acquired_execution() {
+    let database = source_before_test_module(include_str!("../src/database.rs"));
+    let dispatch = braced_declaration(database, "async fn dispatch_admitted_v1(");
+    let claim = dispatch
+        .find("claim_runtime_interaction_receipt_v1(")
+        .unwrap();
+    let execute = dispatch.find("self.inner.execute_acquired_v1(").unwrap();
+    assert!(dispatch.contains("build_shared_gateway_durable_receipt_claim_input_v1("));
+    assert!(dispatch.contains("RuntimeInteractionReceiptClaimDispositionV1::Acquired(permit)"));
+    assert!(dispatch.contains("RuntimeInteractionReceiptClaimDispositionV1::Duplicate(class)"));
+    assert!(dispatch.contains("RuntimeInteractionReceiptClaimDispositionV1::Closed(reason)"));
+    assert!(claim < execute);
+    assert!(!database.contains("self.inner.dispatch_v3("));
+}
+
+#[test]
 fn teardown_retry_reuses_dispatch_authority_and_stops_before_database_close() {
     let database = source_before_test_module(include_str!("../src/database.rs"));
     let process = source_before_test_module(include_str!("../src/process.rs"));
@@ -1004,6 +1022,68 @@ fn teardown_retry_reuses_dispatch_authority_and_stops_before_database_close() {
 }
 
 #[test]
+fn receipt_recovery_is_database_only_owner_bound_and_joined_before_release() {
+    let database = source_before_test_module(include_str!("../src/database.rs"));
+    let supervisor = source_before_test_module(include_str!(
+        "../src/interaction_receipt_recovery_supervisor.rs"
+    ));
+    let process = source_before_test_module(include_str!("../src/process.rs"));
+    let owner = source_before_test_module(include_str!("../src/process/owner.rs"));
+
+    let owner_transition = braced_declaration(owner, "pub(crate) async fn into_owner_held_v1(");
+    let owner_acquired = owner_transition
+        .find("let owner = match transition")
+        .unwrap();
+    let recovery_started = owner_transition
+        .find("self.start_receipt_recovery_supervisor_v1()")
+        .unwrap();
+    assert!(owner_acquired < recovery_started);
+
+    let begin = braced_declaration(process, "pub(super) async fn begin_shutdown_v1(");
+    assert!(begin.contains("receipt_recovery.shutdown_until(deadline).await"));
+    let finish = braced_declaration(process, "pub(super) async fn finish_shutdown_v1(");
+    let recovery_join = finish
+        .find("receipt_recovery.shutdown_until(cleanup_deadline).await")
+        .unwrap();
+    let pool_close = finish
+        .find("shutdown.close_until(cleanup_deadline).await")
+        .unwrap();
+    assert!(recovery_join < pool_close);
+
+    for required in [
+        "scan_recoverable_interaction_receipts_v1(&cursor, limit)",
+        "expire_interaction_receipt_token_v1(request)",
+        "terminalize_expired_interaction_receipt_v1(request)",
+        "RuntimeInteractionReceiptRecoverySupervisorConfigV1::production_v1()",
+    ] {
+        assert!(database.contains(required), "{required}");
+    }
+    for forbidden in [
+        "TwilightInteractionResponder",
+        "TwilightMutationAdapter",
+        "decrypt(",
+        "execute_acquired_v1",
+    ] {
+        let recovery_port = braced_declaration(
+            database,
+            "impl RuntimeInteractionReceiptRecoverySupervisorPortV1",
+        );
+        assert!(!recovery_port.contains(forbidden), "{forbidden}");
+    }
+    for required in [
+        "Duration::from_secs(15)",
+        "RUNTIME_INTERACTION_RECEIPT_RECOVERY_PAGE_LIMIT_V1: usize = 64",
+        "Duration::from_secs(5)",
+        "RuntimeInteractionReceiptRecoverySupervisorV1(<redacted>)",
+    ] {
+        assert!(supervisor.contains(required), "{required}");
+    }
+    assert!(process.contains(
+        "Self::InteractionReceiptRecovery => {\n                \"runtime_process_interaction_receipt_recovery_supervisor_shutdown\""
+    ));
+}
+
+#[test]
 fn source_is_comment_free_and_external_composition_is_bounded() {
     for (path, source) in source_files() {
         assert!(!has_rust_comment(&source), "{}", path.display());
@@ -1102,6 +1182,8 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/discord_actor_serving_tests.rs")
             && path != Path::new("src/ingress_acknowledgement_safety.rs")
             && path != Path::new("src/ingress_acknowledgement_supervisor.rs")
+            && path != Path::new("src/interaction_receipt.rs")
+            && path != Path::new("src/interaction_receipt_recovery_supervisor.rs")
             && path != Path::new("src/maintenance_ingress_gate.rs")
             && path != Path::new("src/process/closed.rs")
             && path != Path::new("src/process/connected.rs")
@@ -1619,6 +1701,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             let allowed_interaction_dispatch_lane = path
                 == Path::new("src/runtime_interaction_dispatch.rs")
                 && identifier == "automation_runtime";
+            let allowed_interaction_receipt = path == Path::new("src/interaction_receipt.rs")
+                && identifier == "automation_runtime";
             let allowed_discord_actor_serving_tests = path
                 == Path::new("src/discord_actor_serving_tests.rs")
                 && matches!(
@@ -1631,8 +1715,11 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     identifier,
                     "GatewayAdmissionPolicyV3" | "GatewayControlConfigV3"
                 );
-            let allowed_interaction_dispatch_database =
-                path == Path::new("src/database.rs") && identifier == "automation_runtime";
+            let allowed_interaction_dispatch_database = path == Path::new("src/database.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime" | "automation_runtime_convergence"
+                );
             let allowed_interaction_dispatch_v3 = matches!(
                 identifier,
                 "GatewayConnectionObserverV3"
@@ -1660,6 +1747,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         | "OwnedSharedGatewayDispatchServicesV3"
                         | "SharedGatewayAdmissionConfigV3"
                         | "SharedGatewayInteractionEnvelopeV3"
+                        | "SharedGatewayInteractionIdentityV3"
+                        | "SharedGatewayInteractionKindV3"
                         | "SharedGatewayInteractionReservationOutcomeV3"
                         | "SharedGatewayReservedInteractionV3"
                 ) && path == Path::new("src/database.rs");
@@ -1869,9 +1958,15 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     || allowed_ordinary_barrier_v3
                     || allowed_discord_actor_serving_v3
                     || allowed_discord_interaction_normalizer
+                    || (path == Path::new("src/interaction_receipt.rs")
+                        && matches!(
+                            identifier,
+                            "SharedGatewayInteractionIdentityV3" | "SharedGatewayInteractionKindV3"
+                        ))
                     || allowed_interaction_dispatch_v3)
                     && (allowed_readiness_worker
                         || allowed_interaction_dispatch_lane
+                        || allowed_interaction_receipt
                         || allowed_discord_actor_serving_tests
                         || allowed_interaction_dispatch_database
                         || allowed_registry_adapter

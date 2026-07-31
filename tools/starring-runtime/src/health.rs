@@ -80,6 +80,20 @@ pub(crate) struct RuntimeHealthInteractionDispatchStatusV1 {
     pub(crate) rejection_acknowledgement_dropped: u64,
     pub(crate) dispatch_cancelled: u64,
     pub(crate) rejection_acknowledgement_cancelled: u64,
+    pub(crate) receipt_acquired: u64,
+    pub(crate) receipt_completed_duplicate: u64,
+    pub(crate) receipt_in_flight_duplicate: u64,
+    pub(crate) receipt_terminal_duplicate: u64,
+    pub(crate) receipt_recovery_required_duplicate: u64,
+    pub(crate) receipt_claim_closed: u64,
+    pub(crate) receipt_claim_timeout: u64,
+    pub(crate) receipt_claim_unavailable: u64,
+    pub(crate) receipt_claim_rejected: u64,
+    pub(crate) receipt_claim_corrupt: u64,
+    pub(crate) receipt_authority_rejected: u64,
+    pub(crate) receipt_persistence_failed_before_effect: u64,
+    pub(crate) receipt_persistence_failed_after_effect: u64,
+    pub(crate) receipt_terminal_recovery_required: u64,
     pub(crate) in_flight: u64,
 }
 
@@ -467,7 +481,16 @@ fn runtime_health_response_v1(request: &[u8], state: &RuntimeHealthStateV1) -> V
                 "\"rejection_acknowledged\":{},\"rejection_acknowledgement_failed\":{},",
                 "\"rejection_acknowledgement_timed_out\":{},",
                 "\"rejection_acknowledgement_dropped\":{},\"dispatch_cancelled\":{},",
-                "\"rejection_acknowledgement_cancelled\":{},\"in_flight\":{}}}"
+                "\"rejection_acknowledgement_cancelled\":{},\"receipt_acquired\":{},",
+                "\"receipt_completed_duplicate\":{},\"receipt_in_flight_duplicate\":{},",
+                "\"receipt_terminal_duplicate\":{},",
+                "\"receipt_recovery_required_duplicate\":{},\"receipt_claim_closed\":{},",
+                "\"receipt_claim_timeout\":{},\"receipt_claim_unavailable\":{},",
+                "\"receipt_claim_rejected\":{},\"receipt_claim_corrupt\":{},",
+                "\"receipt_authority_rejected\":{},",
+                "\"receipt_persistence_failed_before_effect\":{},",
+                "\"receipt_persistence_failed_after_effect\":{},",
+                "\"receipt_terminal_recovery_required\":{},\"in_flight\":{}}}"
             ),
             status.normalization_ignored,
             status.normalization_rejected,
@@ -487,6 +510,20 @@ fn runtime_health_response_v1(request: &[u8], state: &RuntimeHealthStateV1) -> V
             status.rejection_acknowledgement_dropped,
             status.dispatch_cancelled,
             status.rejection_acknowledgement_cancelled,
+            status.receipt_acquired,
+            status.receipt_completed_duplicate,
+            status.receipt_in_flight_duplicate,
+            status.receipt_terminal_duplicate,
+            status.receipt_recovery_required_duplicate,
+            status.receipt_claim_closed,
+            status.receipt_claim_timeout,
+            status.receipt_claim_unavailable,
+            status.receipt_claim_rejected,
+            status.receipt_claim_corrupt,
+            status.receipt_authority_rejected,
+            status.receipt_persistence_failed_before_effect,
+            status.receipt_persistence_failed_after_effect,
+            status.receipt_terminal_recovery_required,
             status.in_flight,
         );
         return format!(
@@ -542,6 +579,20 @@ mod tests {
             normalization_rejected: 2,
             execution_failed: 3,
             rejection_acknowledgement_failed: 5,
+            receipt_acquired: 11,
+            receipt_completed_duplicate: 13,
+            receipt_in_flight_duplicate: 17,
+            receipt_terminal_duplicate: 19,
+            receipt_recovery_required_duplicate: 23,
+            receipt_claim_closed: 29,
+            receipt_claim_timeout: 31,
+            receipt_claim_unavailable: 37,
+            receipt_claim_rejected: 41,
+            receipt_claim_corrupt: 43,
+            receipt_authority_rejected: 47,
+            receipt_persistence_failed_before_effect: 53,
+            receipt_persistence_failed_after_effect: 59,
+            receipt_terminal_recovery_required: 61,
             in_flight: 7,
             ..RuntimeHealthInteractionDispatchStatusV1::default()
         });
@@ -550,7 +601,25 @@ mod tests {
         assert!(interactions.contains("\"normalization_rejected\":2"));
         assert!(interactions.contains("\"execution_failed\":3"));
         assert!(interactions.contains("\"rejection_acknowledgement_failed\":5"));
+        assert!(interactions.contains("\"receipt_acquired\":11"));
+        assert!(interactions.contains("\"receipt_completed_duplicate\":13"));
+        assert!(interactions.contains("\"receipt_in_flight_duplicate\":17"));
+        assert!(interactions.contains("\"receipt_terminal_duplicate\":19"));
+        assert!(interactions.contains("\"receipt_recovery_required_duplicate\":23"));
+        assert!(interactions.contains("\"receipt_claim_closed\":29"));
+        assert!(interactions.contains("\"receipt_claim_timeout\":31"));
+        assert!(interactions.contains("\"receipt_claim_unavailable\":37"));
+        assert!(interactions.contains("\"receipt_claim_rejected\":41"));
+        assert!(interactions.contains("\"receipt_claim_corrupt\":43"));
+        assert!(interactions.contains("\"receipt_authority_rejected\":47"));
+        assert!(interactions.contains("\"receipt_persistence_failed_before_effect\":53"));
+        assert!(interactions.contains("\"receipt_persistence_failed_after_effect\":59"));
+        assert!(interactions.contains("\"receipt_terminal_recovery_required\":61"));
         assert!(interactions.contains("\"in_flight\":7"));
+        assert!(!interactions.contains("interaction_id"));
+        assert!(!interactions.contains("token"));
+        assert!(!interactions.contains("digest"));
+        assert!(!interactions.contains("key_name"));
         assert!(request(addr, "/unknown").await.starts_with("HTTP/1.1 404"));
         assert_eq!(
             format!("{supervisor:?}"),

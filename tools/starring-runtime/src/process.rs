@@ -14,8 +14,9 @@ use crate::capability_readiness_supervisor::{
 use crate::controller_identity::generate_runtime_controller_id_v1;
 use crate::database::{
     compose_runtime_database_dependencies_v1, RuntimeInteractionDispatchCompositionErrorV1,
-    RuntimeInteractionDispatchDatabasePortV1, RuntimeInteractionTeardownRetrySupervisorExitV1,
-    RuntimeInteractionTeardownRetrySupervisorV1,
+    RuntimeInteractionDispatchCompositionInputV1, RuntimeInteractionDispatchDatabasePortV1,
+    RuntimeInteractionReceiptRecoverySupervisorExitV1,
+    RuntimeInteractionTeardownRetrySupervisorExitV1, RuntimeInteractionTeardownRetrySupervisorV1,
 };
 use crate::health::{
     RuntimeHealthInteractionDispatchPublisherV1, RuntimeHealthReadinessObserverV1,
@@ -25,6 +26,7 @@ use crate::ingress_acknowledgement_supervisor::{
     RuntimeIngressAcknowledgementSupervisorConfigV2, RuntimeIngressAcknowledgementSupervisorExitV2,
     RuntimeIngressAcknowledgementSupervisorV2, RuntimeWorkerIngressAcknowledgementJobV2,
 };
+use crate::interaction_receipt_recovery_supervisor::RuntimeInteractionReceiptRecoverySupervisorV1;
 use crate::lifecycle_timing::{
     RuntimeLifecycleTimingMetricV2, RuntimeLifecycleTimingOutcomeV2,
     RuntimeLifecycleTimingRecorderV2, RuntimeLifecycleTimingTerminalReporterV2,
@@ -237,6 +239,7 @@ pub enum RuntimeProcessFoundationShutdownFailureV1 {
     HealthListener,
     IngressAcknowledgement,
     CapabilityReadiness,
+    InteractionReceiptRecovery,
     TeardownRetry,
     RuntimeController,
 }
@@ -255,6 +258,9 @@ impl RuntimeProcessFoundationShutdownFailureV1 {
                 "runtime_process_ingress_acknowledgement_supervisor_shutdown"
             }
             Self::CapabilityReadiness => "runtime_process_capability_readiness_supervisor_shutdown",
+            Self::InteractionReceiptRecovery => {
+                "runtime_process_interaction_receipt_recovery_supervisor_shutdown"
+            }
             Self::TeardownRetry => "runtime_process_teardown_retry_supervisor_shutdown",
             Self::RuntimeController => "runtime_process_serving_controller_shutdown",
         }
@@ -361,6 +367,7 @@ pub(crate) struct RuntimeProcessFoundationV1 {
     gateway: RuntimeGatewayBootstrapV1,
     registry: RuntimeRegistryBootstrapV1,
     interaction_dispatch_port: RuntimeInteractionDispatchDatabasePortV1,
+    receipt_recovery_supervisor: Option<RuntimeInteractionReceiptRecoverySupervisorV1>,
     teardown_retry_supervisor: Option<RuntimeInteractionTeardownRetrySupervisorV1>,
     databases: RuntimeDatabaseDependenciesV1,
     secrets: ResolvedRuntimeSecretsV1,
@@ -447,6 +454,17 @@ impl RuntimeProcessFoundationV1 {
         self.teardown_retry_supervisor = Some(
             self.interaction_dispatch_port
                 .start_teardown_retry_supervisor_v1(),
+        );
+    }
+
+    pub(super) fn start_receipt_recovery_supervisor_v1(&mut self) {
+        assert!(
+            self.receipt_recovery_supervisor.is_none(),
+            "runtime interaction receipt recovery supervisor already active"
+        );
+        self.receipt_recovery_supervisor = Some(
+            self.interaction_dispatch_port
+                .start_receipt_recovery_supervisor_v1(),
         );
     }
 
@@ -643,6 +661,13 @@ impl RuntimeProcessFoundationV1 {
             .expect("runtime lifecycle terminal reporter");
         let observation = self.trip_shutdown_v1(cause);
         let deadline = self.effective_shutdown_deadline_v1(observation);
+        if let Some(receipt_recovery) = self.receipt_recovery_supervisor.take() {
+            let report = receipt_recovery.shutdown_until(deadline).await;
+            if report.exit() != RuntimeInteractionReceiptRecoverySupervisorExitV1::Commanded {
+                self.shutdown_failures
+                    .record(RuntimeProcessFoundationShutdownFailureV1::InteractionReceiptRecovery);
+            }
+        }
         if let Some(teardown_retry) = self.teardown_retry_supervisor.take() {
             let report = teardown_retry.shutdown_until(deadline).await;
             if report.exit() != RuntimeInteractionTeardownRetrySupervisorExitV1::Commanded {
@@ -809,6 +834,7 @@ impl RuntimeProcessFoundationV1 {
             gateway,
             registry,
             interaction_dispatch_port,
+            receipt_recovery_supervisor,
             teardown_retry_supervisor,
             databases,
             secrets,
@@ -829,6 +855,13 @@ impl RuntimeProcessFoundationV1 {
             mut root_supervisor,
             mut shutdown_failures,
         } = self;
+        if let Some(receipt_recovery) = receipt_recovery_supervisor {
+            let report = receipt_recovery.shutdown_until(cleanup_deadline).await;
+            if report.exit() != RuntimeInteractionReceiptRecoverySupervisorExitV1::Commanded {
+                shutdown_failures
+                    .record(RuntimeProcessFoundationShutdownFailureV1::InteractionReceiptRecovery);
+            }
+        }
         if let Some(teardown_retry) = teardown_retry_supervisor {
             let report = teardown_retry.shutdown_until(cleanup_deadline).await;
             if report.exit() != RuntimeInteractionTeardownRetrySupervisorExitV1::Commanded {
@@ -1131,14 +1164,17 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         return Err(cleanup_after_operation_deadline_v1(databases, &startup_budget).await);
     }
     let interaction_dispatch_port = databases
-        .compose_interaction_dispatch_port_v1(
-            closed_components
+        .compose_interaction_dispatch_port_v1(RuntimeInteractionDispatchCompositionInputV1 {
+            registry: closed_components
                 .registry
                 .interaction_dispatch_registry_v1(),
-            secrets.discord_bot_token(),
-            config.gateway(),
-            startup_budget.operation_cutoff(),
-        )
+            token: secrets.discord_bot_token(),
+            token_envelope_keyring: secrets.interaction_token_envelope_keyring(),
+            build_revision: build_revision.as_str(),
+            process_instance_id: &process_instance_id,
+            gateway: config.gateway(),
+            operation_deadline: startup_budget.operation_cutoff(),
+        })
         .await;
     let interaction_dispatch_port = match interaction_dispatch_port {
         Ok(port) => port,
@@ -1250,6 +1286,7 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         gateway: closed_components.gateway,
         registry: closed_components.registry,
         interaction_dispatch_port,
+        receipt_recovery_supervisor: None,
         teardown_retry_supervisor: None,
         databases,
         secrets,
