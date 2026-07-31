@@ -3,8 +3,9 @@
 This runbook installs and operates `starring-runtime` as the logged-in Mac
 mini user's LaunchAgent. The staging service is
 `local.starring.runtime.staging`, its health listener is loopback-only at
-`127.0.0.1:19091`, and every database URL and the Discord bot token are
-resolved indirectly from macOS Keychain.
+`127.0.0.1:19091`, and every database URL, the Discord bot token, and the
+interaction-token envelope keyring are resolved indirectly from macOS
+Keychain.
 
 This is an empty-open runtime substrate. A successful startup can acquire and
 renew the production owner, connect Discord in the paused state, publish the
@@ -27,6 +28,7 @@ serving until a separately reviewed route-admission release exists.
 | process shutdown bound | 30 seconds |
 | launchd exit timeout | 35 seconds |
 | PostgreSQL pools | 5 roles × 2 connections, ceiling 10 |
+| runtime Keychain inventory | exactly 7 service/account items |
 | role bootstrap | `ops/postgres/staging-runtime-role-bootstrap.sql` |
 
 The runtime requires exactly five distinct PostgreSQL login identities:
@@ -760,9 +762,26 @@ for the full URL without putting it in the command line:
   /usr/bin/security add-generic-password -U \
     -s starring.runtime.staging -a database.interaction -w
   /usr/bin/security add-generic-password -U \
+    -s starring.runtime.staging -a interaction.token-envelope-keyring -w
+  /usr/bin/security add-generic-password -U \
     -s starring.runtime.staging -a discord.bot-token -w
 )
 ```
+
+The interaction-token prompt accepts only this payload shape:
+
+```text
+v1;active=KEY_ID=64_LOWERCASE_HEX;retired=KEY_ID=64_LOWERCASE_HEX,...
+```
+
+The active key plus retired keys must total at most eight. IDs must be bounded
+and unique, and every 64-character lowercase hexadecimal material value must
+decode to a distinct non-repetitive 32-byte key. Fresh integrated staging uses
+the one-shot provisioner to generate and write this item in the same rollback
+boundary as the other managed items. The interactive command is only for a
+separately reviewed standalone provision or rotation payload prepared without
+shell variables, arguments, history, clipboard evidence, or terminal logging.
+Record only its key ID.
 
 The last prompt receives the Discord bot token, not a URL. Never use `-A`,
 never place a value after `-w`, and never export these values.
@@ -785,6 +804,7 @@ include `-w`, because `find-generic-password -w` prints the secret:
     database.panel \
     database.serving \
     database.interaction \
+    interaction.token-envelope-keyring \
     discord.bot-token
   do
     /usr/bin/security find-generic-password \
@@ -792,6 +812,38 @@ include `-w`, because `find-generic-password -w` prints the secret:
   done
 )
 ```
+
+## Rotate runtime secrets
+
+Every runtime secret-rotation inventory contains exactly seven accounts:
+
+```text
+database.execution
+database.exact-target
+database.panel
+database.serving
+database.interaction
+interaction.token-envelope-keyring
+discord.bot-token
+```
+
+Keep the runtime and API stopped for database or shared Discord-token
+rotation. The interaction-token envelope keyring has its own staged rotation
+contract. Create a new independent active key, move the previous active key to
+the retired list, retain every still-required retired key, and keep the total
+at eight or fewer. Apply the complete payload as one Keychain item through a
+separately reviewed rollback-capable operation. Do not rerun the one-shot fresh
+provisioner and do not update active and retired material in separate writes.
+
+After the update, run the final provisioner verifier while applications remain
+stopped, then start the runtime and repeat liveness, readiness, and SIGTERM
+acceptance. The verifier and runtime may report only key IDs or stable error
+codes. Keep the former active key retired for at least the 15-minute maximum
+Discord interaction-token lifetime and until receipt cleanup has independently
+proved that no recoverable token uses it. Removing a retired key is a second
+reviewed rotation with the same stop, semantic verification, startup, and
+rollback gates. Never exceed seven retired keys and never copy key material or
+its hash into a change record.
 
 ## Build and install an immutable revision
 
@@ -1198,7 +1250,29 @@ schema, leave the empty-open service stopped and restore a separately verified
 database snapshot instead of improvising reverse SQL.
 
 To revoke the staging runtime completely, stop the LaunchAgent, disable its
-label, delete all six `starring.runtime.staging` Keychain items by exact
+label, delete all seven `starring.runtime.staging` Keychain items by exact
 service/account, and ask a database administrator to return the five login
 roles to `NOLOGIN`. Never delete Keychain items while a rollback decision is
-still pending.
+still pending. The exact removal inventory is:
+
+```zsh
+(
+  set -euo pipefail
+  DOMAIN="gui/$(id -u)"
+  SERVICE="$DOMAIN/local.starring.runtime.staging"
+  ! launchctl print "$SERVICE" >/dev/null 2>&1
+  launchctl disable "$SERVICE"
+  for ACCOUNT in \
+    database.execution \
+    database.exact-target \
+    database.panel \
+    database.serving \
+    database.interaction \
+    interaction.token-envelope-keyring \
+    discord.bot-token
+  do
+    /usr/bin/security delete-generic-password \
+      -s starring.runtime.staging -a "$ACCOUNT" >/dev/null
+  done
+)
+```

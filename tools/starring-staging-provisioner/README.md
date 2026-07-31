@@ -13,7 +13,8 @@ application roles. It requires the three existing Discord Keychain items to be
 readable and leaves them unchanged.
 
 It generates twenty-one distinct 32-byte passwords, two independent 32-byte API
-keyrings, and independent PostgreSQL SCRAM-SHA-256 verifiers. Plaintext
+keyrings, one dedicated 32-byte runtime interaction-token envelope keyring, and
+independent PostgreSQL SCRAM-SHA-256 verifiers. Plaintext
 passwords are hex-encoded in memory and passed only to the interactive macOS
 `security` process over stdin, never through an argument or environment
 variable, and stored as fixed Keychain database URLs. Only verifier strings
@@ -41,10 +42,11 @@ env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin \
 ```
 
 The final verifier reads the fixed administrator and twenty application
-database URLs plus both API keyrings from Keychain without printing them. It
+database URLs plus all three keyrings from Keychain without printing them. It
 requires strict version-1 keyring payloads with distinct active IDs and
-materials, direct non-TLS IPv4 loopback connections, exact database, schema,
-and role identities, and the fifteen-line final HBA contract. Physical
+materials, validates the runtime keyring's active key and at most seven retired
+keys, and proves direct non-TLS IPv4 loopback connections, exact database,
+schema, role identities, and the fifteen-line final HBA contract. Physical
 replication rejection remains a separate external negative probe because this
 tool does not claim to model a replication-protocol startup.
 

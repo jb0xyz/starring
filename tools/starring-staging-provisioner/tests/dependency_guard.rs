@@ -211,3 +211,27 @@ fn incremental_writer_mode_is_explicit_and_runbooked_once() {
     assert!(runbook.contains("authoring-writer-replay.txt"));
     assert!(runbook.contains("Do not rerun the\none-shot provisioner"));
 }
+
+#[test]
+fn interaction_token_keyring_identity_output_and_inventory_are_exact() {
+    let identity = include_str!("../src/identity.rs");
+    let main = include_str!("../src/main.rs");
+    let runtime_runbook = include_str!(
+        "../../../docs/superpowers/runbooks/2026-07-29-macos-starring-runtime-staging-operations.md"
+    );
+    let cutover_runbook = include_str!(
+        "../../../docs/superpowers/runbooks/2026-07-29-macos-starring-integrated-staging-cutover.md"
+    );
+    assert_eq!(
+        identity
+            .matches("interaction.token-envelope-keyring")
+            .count(),
+        2
+    );
+    assert!(main.contains("application_database_credentials=20 keyrings=3"));
+    assert!(main.contains("interaction_token_envelope_key_id={}"));
+    assert!(runtime_runbook.contains("exactly seven accounts"));
+    assert!(runtime_runbook.contains("delete all seven"));
+    assert!(cutover_runbook.contains("test \"$COUNT\" = 28"));
+    assert!(cutover_runbook.contains("twenty-one-connection/three-keyring"));
+}

@@ -77,9 +77,10 @@ async fn main() -> ExitCode {
         match provision_staging(acknowledgement).await {
             Ok(report) => {
                 println!(
-                    "provisioned database=starring_runtime_staging application_database_credentials=20 keyrings=2 product_action_key_id={} snapshot_envelope_key_id={}",
+                    "provisioned database=starring_runtime_staging application_database_credentials=20 keyrings=3 product_action_key_id={} snapshot_envelope_key_id={} interaction_token_envelope_key_id={}",
                     report.product_action_key_id(),
-                    report.snapshot_envelope_key_id()
+                    report.snapshot_envelope_key_id(),
+                    report.interaction_token_envelope_key_id()
                 );
                 ExitCode::SUCCESS
             }

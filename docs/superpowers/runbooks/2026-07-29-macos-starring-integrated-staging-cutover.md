@@ -153,6 +153,21 @@ exactly 32 random bytes. Key IDs are immutable and unique inside a keyring, and
 material must differ across the two purposes. Record key IDs only. Never record
 material or a material hash.
 
+There is exactly one runtime interaction-token envelope keyring entry:
+
+| Keychain service/account | Purpose |
+| --- | --- |
+| `starring.runtime.staging/interaction.token-envelope-keyring` | restart-recoverable Discord interaction-token encryption |
+
+Its payload is exactly
+`v1;active=KEY_ID=64_LOWERCASE_HEX;retired=KEY_ID=64_LOWERCASE_HEX,...`.
+It contains one active key and zero through seven retired keys, for at most
+eight keys total. Each material value is exactly 32 independently generated
+random bytes encoded as 64 lowercase hexadecimal characters. IDs are bounded,
+unique, and immutable within the keyring. Materials are unique within the
+keyring and across both API keyring purposes. Record only the active key ID.
+Never record material or a material hash.
+
 The provisioner also creates one operational administrator URL:
 
 | Keychain service/account | Exact database role and database |
@@ -160,10 +175,12 @@ The provisioner also creates one operational administrator URL:
 | `starring.postgres.staging/database.cluster-admin` | `starring_cluster_admin` on `postgres` |
 
 The complete inventory after provisioning is twenty-one database URLs, three
-unchanged Discord provider items, one unchanged authoring-worker item, and two
-keyrings: twenty-seven Keychain items. The application plists reference only
-their own twenty URLs, the three Discord provider items, the authoring-worker
-item, and the two API keyrings. They never reference the administrator URL.
+unchanged Discord provider items, one unchanged authoring-worker item, two API
+keyrings, and one runtime interaction-token keyring: twenty-eight Keychain
+items. The application plists reference only their own twenty URLs, the three
+Discord provider items, the authoring-worker item, the two API keyrings, and
+the runtime interaction-token keyring. They never reference the administrator
+URL.
 
 The cluster-administrator password is generated only by the one-shot
 provisioner and is never typed or exported. `starring_owner` has no password.
@@ -1154,7 +1171,7 @@ A failure in either manifest leaves staging offline. Rerun both quarantine
 blocks in the same order after correcting the reported drift. Never continue
 from a partial role manifest.
 
-## Gate 10: provision twenty-one credentials and two keyrings
+## Gate 10: provision twenty-one credentials and three keyrings
 
 Keep all services stopped. The immutable one-shot provisioner checks the peer
 boundary, independently approved system identifier and acknowledgement,
@@ -1164,12 +1181,15 @@ provider items to be readable and verifies that the API and runtime bot-token
 items are identical without printing either value. The separately preflighted
 authoring-worker item is not part of provisioner mutation or semantic reads.
 
-It generates twenty-one distinct 32-byte random passwords, two independent
-32-byte keyrings, and independent PostgreSQL SCRAM-SHA-256 verifiers with
-4,096 PBKDF2-HMAC-SHA-256 iterations. It writes twenty fixed application
-URLs, one fixed administrator URL, and two keyring objects to Keychain, then
-applies only verifier strings in one database transaction. It restores prior
-managed Keychain values on a pre-commit failure. A
+It generates twenty-one distinct 32-byte random passwords, two independent API
+keyrings, one dedicated runtime interaction-token envelope keyring, and
+independent PostgreSQL SCRAM-SHA-256 verifiers with 4,096
+PBKDF2-HMAC-SHA-256 iterations. It writes twenty fixed application URLs, one
+fixed administrator URL, and three keyring objects to Keychain, then applies
+only verifier strings in one database transaction. All twenty-four managed
+Keychain writes share one rollback boundary. It restores every prior managed
+Keychain value, including removal of a newly created runtime keyring item, on
+a pre-commit failure. A
 `database_commit_indeterminate` result is an incident: preserve the new
 values, keep all clients stopped, and reconcile database and Keychain state
 without rerunning.
@@ -1186,7 +1206,7 @@ without rerunning.
     "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
     >"$STARRING_CUTOVER_EVIDENCE/starring-staging-provisioner.txt"
   grep -E \
-    '^provisioned database=starring_runtime_staging application_database_credentials=20 keyrings=2 product_action_key_id=[A-Za-z0-9_-]+ snapshot_envelope_key_id=[A-Za-z0-9_-]+$' \
+    '^provisioned database=starring_runtime_staging application_database_credentials=20 keyrings=3 product_action_key_id=[A-Za-z0-9_-]+ snapshot_envelope_key_id=[A-Za-z0-9_-]+ interaction_token_envelope_key_id=[A-Za-z0-9_-]+$' \
     "$STARRING_CUTOVER_EVIDENCE/starring-staging-provisioner.txt" >/dev/null
 )
 ```
@@ -1955,6 +1975,12 @@ HBA:
 )
 ```
 
+An historical staging installation created before C1 has no runtime
+interaction-token envelope keyring. It cannot rejoin this path until a
+separately reviewed rollback-capable standalone provision has created the
+exact runtime item and the current final verifier has accepted its semantic
+payload. Do not rerun the one-shot fresh provisioner to backfill it.
+
 Run the incremental mode twice. The first call must create exactly one
 credential and the second must prove exact replay:
 
@@ -1990,7 +2016,7 @@ credential and the second must prove exact replay:
     "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
     >"$STARRING_CUTOVER_EVIDENCE/authoring-writer-final-verifier.txt"
   grep -Fx \
-    'verified database=starring_runtime_staging application_database_credentials=20 keyrings=2 hba_rules=15' \
+    'verified database=starring_runtime_staging application_database_credentials=20 keyrings=3 hba_rules=15' \
     "$STARRING_CUTOVER_EVIDENCE/authoring-writer-final-verifier.txt" >/dev/null
 )
 ```
@@ -2017,8 +2043,8 @@ only.
 
 Fresh Gate 10, or the historical incremental path after its required final
 verification, has created twenty application database URLs, one administrator
-URL, and two keyrings while leaving the three Discord provider items and the
-authoring-worker item unchanged.
+URL, two API keyrings, and one runtime interaction-token keyring while leaving
+the three Discord provider items and the authoring-worker item unchanged.
 Inventory only their existence. Never add `-w`, never export a Keychain value,
 and never copy an access-control list or secret payload into evidence:
 
@@ -2052,6 +2078,7 @@ and never copy an access-control list or secret payload into evidence:
     "starring.runtime.staging:database.panel" \
     "starring.runtime.staging:database.serving" \
     "starring.runtime.staging:database.interaction" \
+    "starring.runtime.staging:interaction.token-envelope-keyring" \
     "starring.runtime.staging:discord.bot-token" \
     "com.starring.llm-api-key:llm-api" \
     "starring.postgres.staging:database.cluster-admin"
@@ -2062,13 +2089,17 @@ and never copy an access-control list or secret payload into evidence:
       -s "$SERVICE" -a "$ACCOUNT" >/dev/null
     COUNT=$(( COUNT + 1 ))
   done
-  test "$COUNT" = 27
+  test "$COUNT" = 28
 )
 ```
 
-The provisioner has already semantically validated every generated URL and
-keyring and both equal bot-token values. Application startup and the final
-verifier perform independent semantic reads without printing them.
+The provisioner has already semantically validated every generated URL, all
+three keyrings, and both equal bot-token values. Application startup and the
+final verifier perform independent semantic reads without printing them.
+The runtime service now owns exactly seven Keychain accounts. Any later
+rotation or complete removal must use the seven-account inventory and bounded
+interaction-token keyring procedure in the runtime staging operations runbook;
+never reuse the six-account pre-C1 checklist.
 
 ## Gate 12: build and install both services without starting them
 
@@ -2205,7 +2236,8 @@ Run the independent final verifier. It
 reads the administrator and all twenty application URLs directly from
 Keychain, proves exact TCP role and database identity for all twenty-one
 connections, proves all application roles are direct `LOGIN` roles without
-membership, strictly revalidates both keyrings, and re-proves the
+membership, strictly revalidates all three keyrings without emitting material,
+and re-proves the
 fifteen-rule HBA contract:
 
 ```zsh
@@ -2220,7 +2252,7 @@ fifteen-rule HBA contract:
     "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
     >"$STARRING_CUTOVER_EVIDENCE/starring-staging-final-verifier.txt"
   grep -Fx \
-    'verified database=starring_runtime_staging application_database_credentials=20 keyrings=2 hba_rules=15' \
+    'verified database=starring_runtime_staging application_database_credentials=20 keyrings=3 hba_rules=15' \
     "$STARRING_CUTOVER_EVIDENCE/starring-staging-final-verifier.txt" >/dev/null
 )
 ```
@@ -2654,10 +2686,10 @@ The cutover is accepted only when a change record contains all of these facts:
   pre-incremental nineteen-role receipt and instead record the legacy HBA
   archive, atomic replacement and reload proof, writer-created receipt,
   exact-replay receipt, and twenty-application-credential final verifier;
-- Keychain existence count `27`, Discord provider credential versions,
+- Keychain existence count `28`, Discord provider credential versions,
   authoring-worker item existence, and generated key IDs only;
 - runtime enable, API enable, and final
-  twenty-one-connection/two-keyring verifier exit status;
+  twenty-one-connection/three-keyring verifier exit status;
 - aggregate application-role proof `20|20|0|0|0` and combined negative-probe
   exit status;
 - installed API plist proof for the unchanged approved origin and Discord IDs,

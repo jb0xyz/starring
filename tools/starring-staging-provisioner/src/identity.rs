@@ -20,6 +20,7 @@ pub const ADMIN_KEYCHAIN_SERVICE: &str = "starring.postgres.staging";
 pub const ADMIN_KEYCHAIN_ACCOUNT: &str = "database.cluster-admin";
 pub const PRODUCT_ACTION_KEYRING_ACCOUNT: &str = "keyring.product-action";
 pub const SNAPSHOT_ENVELOPE_KEYRING_ACCOUNT: &str = "keyring.snapshot-envelope";
+pub const INTERACTION_TOKEN_ENVELOPE_KEYRING_ACCOUNT: &str = "interaction.token-envelope-keyring";
 pub const AUTHORING_WRITER_IDENTITY: DatabaseIdentityV1 = DatabaseIdentityV1 {
     service: API_KEYCHAIN_SERVICE,
     account: "database.authoring-session-writer",
@@ -163,6 +164,11 @@ pub const SNAPSHOT_ENVELOPE_KEYRING_IDENTITY: KeychainIdentityV1 = KeychainIdent
     account: SNAPSHOT_ENVELOPE_KEYRING_ACCOUNT,
 };
 
+pub const INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY: KeychainIdentityV1 = KeychainIdentityV1 {
+    service: RUNTIME_KEYCHAIN_SERVICE,
+    account: INTERACTION_TOKEN_ENVELOPE_KEYRING_ACCOUNT,
+};
+
 pub const ADMIN_KEYCHAIN_IDENTITY: KeychainIdentityV1 = KeychainIdentityV1 {
     service: ADMIN_KEYCHAIN_SERVICE,
     account: ADMIN_KEYCHAIN_ACCOUNT,
@@ -300,6 +306,13 @@ mod tests {
                 service: RUNTIME_KEYCHAIN_SERVICE,
                 account: "database.interaction",
                 role: "starring_runtime_interaction",
+            }
+        );
+        assert_eq!(
+            INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY,
+            KeychainIdentityV1 {
+                service: "starring.runtime.staging",
+                account: "interaction.token-envelope-keyring",
             }
         );
     }

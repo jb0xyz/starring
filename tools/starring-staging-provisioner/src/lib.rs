@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crypto::GeneratedSecretsV1;
 use keychain::KeychainClientV1;
-use keyring::validate_keyring_pair;
+use keyring::validate_keyring_set;
 use postgres::StagingPostgresSessionV1;
 
 pub use final_verify::{verify_final, FinalVerificationReportV1};
@@ -165,6 +165,7 @@ impl StagingAcknowledgementV1 {
 pub struct ProvisioningReportV1 {
     product_action_key_id: String,
     snapshot_envelope_key_id: String,
+    interaction_token_envelope_key_id: String,
 }
 
 impl ProvisioningReportV1 {
@@ -175,6 +176,10 @@ impl ProvisioningReportV1 {
     pub fn snapshot_envelope_key_id(&self) -> &str {
         &self.snapshot_envelope_key_id
     }
+
+    pub fn interaction_token_envelope_key_id(&self) -> &str {
+        &self.interaction_token_envelope_key_id
+    }
 }
 
 pub async fn provision_staging(
@@ -184,9 +189,10 @@ pub async fn provision_staging(
     keychain.preflight_discord()?;
     let database = StagingPostgresSessionV1::connect_and_preflight(&acknowledgement).await?;
     let secrets = GeneratedSecretsV1::generate()?;
-    validate_keyring_pair(
+    validate_keyring_set(
         secrets.product_action_keyring_payload(),
         secrets.snapshot_envelope_keyring_payload(),
+        secrets.interaction_token_envelope_keyring_payload(),
     )?;
     let keychain_items = secrets.keychain_items();
     let keychain_update = keychain.begin_update(&keychain_items)?;
@@ -204,6 +210,7 @@ pub async fn provision_staging(
     Ok(ProvisioningReportV1 {
         product_action_key_id: secrets.product_action_key_id().to_owned(),
         snapshot_envelope_key_id: secrets.snapshot_envelope_key_id().to_owned(),
+        interaction_token_envelope_key_id: secrets.interaction_token_envelope_key_id().to_owned(),
     })
 }
 
