@@ -1256,6 +1256,10 @@ impl RuntimeDiscordCertificationBarrierBAcknowledgementPendingV2 {
         &self.barrier_id
     }
 
+    pub(crate) fn resume_evidence_v3(&self) -> &RuntimeDiscordOrdinaryBarrierResumeEvidenceV3 {
+        &self.resume_evidence
+    }
+
     pub(crate) fn gateway_v2(&self) -> &RuntimeResumedGatewayObservationV2 {
         &self.gateway
     }
@@ -6588,6 +6592,26 @@ mod tests {
                 ..
             }) if coordinator_generation == generation
         ));
+    }
+
+    #[tokio::test]
+    async fn open_state_ready_observer_rejects_a_held_resumed_ordinary_barrier() {
+        let resumed = ordinary_barrier_resumed_fixture_v3().await;
+        let generation = coordinator_generation(3);
+        let ready = resumed
+            .fixture
+            .production
+            .observe_exact_resumed_ordinary_barrier_ready_v3(&resumed.evidence)
+            .unwrap();
+        let observer = resumed
+            .fixture
+            .production
+            .bind_current_ready_invalidation_observer_v2(generation, &ready);
+
+        assert_eq!(
+            observer.current_invalidation_v2(),
+            Some(RuntimeGatewayReadyInvalidationV2::CoordinatorInvalidated)
+        );
     }
 
     #[tokio::test]

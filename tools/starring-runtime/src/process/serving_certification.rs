@@ -42,6 +42,7 @@ use crate::gateway::{
 use crate::maintenance_ingress_gate::{
     RuntimeMaintenanceIngressGateOpeningAuthorityV2, RuntimeMaintenanceIngressGateStageV2,
 };
+use crate::registry::RuntimeRegistryBarrierBServingMonitorAuthorityV2;
 use crate::runtime_controller::{
     RuntimeControllerCertificationHandoffRejectionV2, RuntimeControllerCertificationHandoffReplyV2,
     RuntimeControllerCertificationHandoffV2, RuntimeServingControllerSupervisorV2,
@@ -152,6 +153,7 @@ struct RuntimeServingCertificationProcessCoreV2 {
     acknowledgement_safety:
         crate::ingress_acknowledgement_safety::RuntimeIngressAcknowledgementSafetyMonitorV2,
     certification_monitors: RuntimeServingCertificationMonitorSetV2,
+    pending_registry_monitor: Option<RuntimeRegistryBarrierBServingMonitorAuthorityV2>,
     process_generation: NonZeroU64,
 }
 
@@ -166,7 +168,6 @@ struct RuntimeServingCertificationFrozenProcessV2<G> {
     core: RuntimeServingCertificationProcessCoreV2,
     lifecycle: RuntimeClosedRecoveryCertificationFrozenServingOpenProcessV2,
     maintenance_ingress: G,
-    heartbeat: Option<RuntimeServingHeartbeatMonitorV2>,
 }
 
 impl RuntimeServingCertificationProcessCoreV2 {
@@ -200,12 +201,26 @@ impl RuntimeServingCertificationProcessCoreV2 {
                 ingress_acknowledgement,
                 acknowledgement_safety,
                 certification_monitors,
+                pending_registry_monitor: None,
                 process_generation,
             },
             lifecycle,
             maintenance_ingress,
             acknowledgement_schedule,
         )
+    }
+
+    fn remove_pending_registry_monitor_v2(
+        &mut self,
+        transition: RuntimeProcessProductionHandoffFailureV2,
+    ) -> RuntimeProcessProductionHandoffFailureV2 {
+        match self.pending_registry_monitor.take() {
+            Some(monitor) => match monitor.remove_exact_serving_v2() {
+                Ok(_) => transition,
+                Err(_) => RuntimeServingCertificationFailureV2::Registry.transition_v2(),
+            },
+            None => transition,
+        }
     }
 
     async fn stop_monitors_for_cleanup_v2(
@@ -233,6 +248,7 @@ impl RuntimeServingCertificationProcessCoreV2 {
         heartbeat: Option<RuntimeServingHeartbeatMonitorV2>,
         transition: RuntimeProcessProductionHandoffFailureV2,
     ) -> RuntimeProcessProductionHandoffErrorV2 {
+        let transition = self.remove_pending_registry_monitor_v2(transition);
         self.readiness.remove_readiness_v2();
         drop(maintenance_ingress);
         stop_runtime_controller_before_cleanup_v2(&mut self.controller, &mut self.foundation).await;
@@ -245,6 +261,7 @@ impl RuntimeServingCertificationProcessCoreV2 {
             ingress_acknowledgement,
             acknowledgement_safety,
             certification_monitors,
+            pending_registry_monitor: _,
             process_generation,
         } = self;
         drop((controller, readiness, certification_monitors));
@@ -269,6 +286,7 @@ impl RuntimeServingCertificationProcessCoreV2 {
         heartbeat: Option<RuntimeServingHeartbeatMonitorV2>,
         transition: RuntimeProcessProductionHandoffFailureV2,
     ) -> RuntimeProcessProductionHandoffErrorV2 {
+        let transition = self.remove_pending_registry_monitor_v2(transition);
         self.readiness.remove_readiness_v2();
         stop_runtime_controller_before_cleanup_v2(&mut self.controller, &mut self.foundation).await;
         self.stop_monitors_for_cleanup_v2(heartbeat).await;
@@ -280,6 +298,7 @@ impl RuntimeServingCertificationProcessCoreV2 {
             ingress_acknowledgement,
             acknowledgement_safety,
             certification_monitors,
+            pending_registry_monitor: _,
             process_generation,
         } = self;
         drop((controller, certification_monitors));
@@ -306,6 +325,7 @@ impl RuntimeServingCertificationProcessCoreV2 {
         heartbeat: Option<RuntimeServingHeartbeatMonitorV2>,
         transition: RuntimeProcessProductionHandoffFailureV2,
     ) -> RuntimeProcessProductionHandoffErrorV2 {
+        let transition = self.remove_pending_registry_monitor_v2(transition);
         self.readiness.remove_readiness_v2();
         stop_runtime_controller_before_cleanup_v2(&mut self.controller, &mut self.foundation).await;
         self.stop_monitors_for_cleanup_v2(heartbeat).await;
@@ -317,6 +337,7 @@ impl RuntimeServingCertificationProcessCoreV2 {
             ingress_acknowledgement,
             acknowledgement_safety,
             certification_monitors,
+            pending_registry_monitor: _,
             process_generation,
         } = self;
         drop((controller, certification_monitors));
@@ -343,6 +364,7 @@ impl RuntimeServingCertificationProcessCoreV2 {
         heartbeat: Option<RuntimeServingHeartbeatMonitorV2>,
         transition: RuntimeProcessProductionHandoffFailureV2,
     ) -> RuntimeProcessProductionHandoffErrorV2 {
+        let transition = self.remove_pending_registry_monitor_v2(transition);
         self.readiness.remove_readiness_v2();
         stop_runtime_controller_before_cleanup_v2(&mut self.controller, &mut self.foundation).await;
         self.stop_monitors_for_cleanup_v2(heartbeat).await;
@@ -354,6 +376,7 @@ impl RuntimeServingCertificationProcessCoreV2 {
             ingress_acknowledgement,
             acknowledgement_safety,
             certification_monitors,
+            pending_registry_monitor: _,
             process_generation,
         } = self;
         drop((controller, certification_monitors));
@@ -380,6 +403,7 @@ impl RuntimeServingCertificationProcessCoreV2 {
         heartbeat: Option<RuntimeServingHeartbeatMonitorV2>,
         transition: RuntimeProcessProductionHandoffFailureV2,
     ) -> RuntimeProcessProductionHandoffErrorV2 {
+        let transition = self.remove_pending_registry_monitor_v2(transition);
         self.readiness.remove_readiness_v2();
         stop_runtime_controller_before_cleanup_v2(&mut self.controller, &mut self.foundation).await;
         self.stop_monitors_for_cleanup_v2(heartbeat).await;
@@ -391,6 +415,7 @@ impl RuntimeServingCertificationProcessCoreV2 {
             ingress_acknowledgement,
             acknowledgement_safety,
             certification_monitors,
+            pending_registry_monitor: _,
             process_generation,
         } = self;
         drop((controller, certification_monitors));
@@ -417,6 +442,7 @@ impl<G> RuntimeServingCertificationNormalProcessV2<G> {
         heartbeat: Option<RuntimeServingHeartbeatMonitorV2>,
         transition: RuntimeProcessProductionHandoffFailureV2,
     ) -> RuntimeProcessProductionHandoffErrorV2 {
+        let transition = self.core.remove_pending_registry_monitor_v2(transition);
         self.core.readiness.remove_readiness_v2();
         if let Some(gateway_monitor) = self.gateway_monitor.take() {
             gateway_monitor.stop_v2().await;
@@ -437,6 +463,7 @@ impl<G> RuntimeServingCertificationNormalProcessV2<G> {
                     ingress_acknowledgement,
                     acknowledgement_safety,
                     certification_monitors,
+                    pending_registry_monitor: _,
                     process_generation,
                 },
             lifecycle,
@@ -466,15 +493,14 @@ impl<G> RuntimeServingCertificationFrozenProcessV2<G> {
         mut self,
         transition: RuntimeProcessProductionHandoffFailureV2,
     ) -> RuntimeProcessProductionHandoffErrorV2 {
+        let transition = self.core.remove_pending_registry_monitor_v2(transition);
         self.core.readiness.remove_readiness_v2();
         stop_runtime_controller_before_cleanup_v2(
             &mut self.core.controller,
             &mut self.core.foundation,
         )
         .await;
-        self.core
-            .stop_monitors_for_cleanup_v2(self.heartbeat.take())
-            .await;
+        self.core.stop_monitors_for_cleanup_v2(None).await;
         let RuntimeServingCertificationFrozenProcessV2 {
             core:
                 RuntimeServingCertificationProcessCoreV2 {
@@ -485,11 +511,11 @@ impl<G> RuntimeServingCertificationFrozenProcessV2<G> {
                     ingress_acknowledgement,
                     acknowledgement_safety,
                     certification_monitors,
+                    pending_registry_monitor: _,
                     process_generation,
                 },
             lifecycle,
             maintenance_ingress,
-            heartbeat: _,
         } = self;
         drop((controller, certification_monitors));
         let cleanup = shutdown_certification_frozen_serving_open_process_v2(
@@ -774,7 +800,6 @@ async fn execute_certification_v2(
         core,
         lifecycle,
         maintenance_ingress: gate,
-        heartbeat: None,
     };
     let input = match build_certification_reservation_input_v2(
         &session,
@@ -908,6 +933,7 @@ async fn execute_certification_v2(
             return Err(frozen.cleanup_v2(transition).await);
         }
     };
+    frozen.core.pending_registry_monitor = Some(registry_monitor);
     let registration = completed.authorize_finalization();
     let registered = match finalizer_slot.submit_certification_finalizer_v2(registration) {
         Ok(registered) => registered,
@@ -943,47 +969,10 @@ async fn execute_certification_v2(
                 .await);
         }
     };
-    let gateway_loss = frozen
-        .lifecycle
-        .bind_gateway_ready_invalidation_observer_v2(&gateway_ready);
-    let owner_loss = frozen.lifecycle.owner_terminal_observation_v2();
-    let observers = match RuntimeServingHeartbeatExternalObserversV2::with_exact_gateway_v2(
-        async move {
-            let _ = owner_loss.await;
-        },
-        gateway_loss,
-    ) {
-        Ok(observers) => observers,
-        Err(_) => {
-            return Err(frozen
-                .cleanup_v2(RuntimeServingCertificationFailureV2::Gateway.transition_v2())
-                .await);
-        }
-    };
-    let heartbeat = match start_runtime_process_serving_heartbeat_monitor_v2(
-        serving.clone(),
-        frozen.core.foundation.databases.serving().clone(),
-        registry_monitor,
-        frozen.core.foundation.shutdown_trigger_v1(),
-        frozen.core.foundation.shutdown_observer_v1(),
-        observers,
-        RuntimeServingHeartbeatMonitorConfigV2::production_v2(),
-    )
-    .await
-    {
-        Ok(heartbeat) => heartbeat.into_monitor_v2(),
-        Err(_) => {
-            return Err(frozen
-                .cleanup_v2(RuntimeServingCertificationFailureV2::Database.transition_v2())
-                .await);
-        }
-    };
-    frozen.heartbeat = Some(heartbeat);
     let RuntimeServingCertificationFrozenProcessV2 {
         mut core,
         lifecycle,
         maintenance_ingress,
-        heartbeat,
     } = frozen;
     let (lifecycle, successor_owner) =
         match lifecycle.thaw_v2(frozen_owner, acceptance_deadline).await {
@@ -992,7 +981,7 @@ async fn execute_certification_v2(
                 return Err(core
                     .cleanup_without_lifecycle_v2(
                         maintenance_ingress,
-                        heartbeat,
+                        None,
                         RuntimeServingCertificationFailureV2::Owner.transition_v2(),
                     )
                     .await);
@@ -1008,7 +997,7 @@ async fn execute_certification_v2(
                 gateway_monitor: None,
             }
             .cleanup_v2(
-                heartbeat,
+                None,
                 RuntimeServingCertificationFailureV2::Gate.transition_v2(),
             )
             .await);
@@ -1042,7 +1031,7 @@ async fn execute_certification_v2(
                     maintenance_ingress: opening,
                     gateway_monitor: None,
                 }
-                .cleanup_v2(heartbeat, transition)
+                .cleanup_v2(None, transition)
                 .await);
             }
             Err(RuntimeServingCertificationAcknowledgementFailureV2::Refreshing {
@@ -1051,7 +1040,7 @@ async fn execute_certification_v2(
                 transition,
             }) => {
                 return Err(core
-                    .cleanup_refreshing_v2(*lifecycle, opening, heartbeat, transition)
+                    .cleanup_refreshing_v2(*lifecycle, opening, None, transition)
                     .await);
             }
             Err(RuntimeServingCertificationAcknowledgementFailureV2::Admission {
@@ -1060,7 +1049,7 @@ async fn execute_certification_v2(
                 transition,
             }) => {
                 return Err(core
-                    .cleanup_admission_v2(*lifecycle, opening, heartbeat, transition)
+                    .cleanup_admission_v2(*lifecycle, opening, None, transition)
                     .await);
             }
             Err(RuntimeServingCertificationAcknowledgementFailureV2::Empty {
@@ -1069,7 +1058,7 @@ async fn execute_certification_v2(
                 transition,
             }) => {
                 return Err(core
-                    .cleanup_empty_v2(*lifecycle, opening, heartbeat, transition)
+                    .cleanup_empty_v2(*lifecycle, opening, None, transition)
                     .await);
             }
             Err(RuntimeServingCertificationAcknowledgementFailureV2::RefreshingEmpty {
@@ -1078,7 +1067,7 @@ async fn execute_certification_v2(
                 transition,
             }) => {
                 return Err(core
-                    .cleanup_refreshing_empty_v2(*lifecycle, opening, heartbeat, transition)
+                    .cleanup_refreshing_empty_v2(*lifecycle, opening, None, transition)
                     .await);
             }
             Err(RuntimeServingCertificationAcknowledgementFailureV2::Lost {
@@ -1086,10 +1075,24 @@ async fn execute_certification_v2(
                 transition,
             }) => {
                 return Err(core
-                    .cleanup_without_lifecycle_v2(opening, heartbeat, transition)
+                    .cleanup_without_lifecycle_v2(opening, None, transition)
                     .await);
             }
         };
+    let completion_deadline = acceptance_deadline.min(schedule.safety_deadline);
+    if Instant::now() >= completion_deadline {
+        return Err(RuntimeServingCertificationNormalProcessV2 {
+            core,
+            lifecycle,
+            maintenance_ingress: opening,
+            gateway_monitor: None,
+        }
+        .cleanup_v2(
+            None,
+            RuntimeServingCertificationFailureV2::Deadline.transition_v2(),
+        )
+        .await);
+    }
     let maintenance_ingress = match opening.commit_open_v2() {
         Ok(open) => open,
         Err(failure) => {
@@ -1100,7 +1103,7 @@ async fn execute_certification_v2(
                 gateway_monitor: None,
             }
             .cleanup_v2(
-                heartbeat,
+                None,
                 RuntimeServingCertificationFailureV2::Gate.transition_v2(),
             )
             .await);
@@ -1119,13 +1122,27 @@ async fn execute_certification_v2(
                 gateway_monitor: None,
             }
             .cleanup_v2(
-                heartbeat,
+                None,
                 RuntimeServingCertificationFailureV2::Gateway.transition_v2(),
             )
             .await);
         }
     };
-    let _completed_barrier = match lifecycle.complete_certification_barrier_b_v2(completion) {
+    if Instant::now() >= completion_deadline {
+        drop(completion);
+        return Err(RuntimeServingCertificationNormalProcessV2 {
+            core,
+            lifecycle,
+            maintenance_ingress,
+            gateway_monitor: None,
+        }
+        .cleanup_v2(
+            None,
+            RuntimeServingCertificationFailureV2::Deadline.transition_v2(),
+        )
+        .await);
+    }
+    let completed_barrier = match lifecycle.complete_certification_barrier_b_v2(completion) {
         Ok(completed) => completed,
         Err(_) => {
             return Err(RuntimeServingCertificationNormalProcessV2 {
@@ -1135,14 +1152,30 @@ async fn execute_certification_v2(
                 gateway_monitor: None,
             }
             .cleanup_v2(
-                heartbeat,
+                None,
                 RuntimeServingCertificationFailureV2::Gateway.transition_v2(),
             )
             .await);
         }
     };
-    let mut lifecycle = lifecycle;
-    if lifecycle.complete_slot_work_v2(permit).is_err() {
+    let expected_gateway_ready = completed_barrier.gateway_v2().ready_v2().clone();
+    let current_gateway_ready = match lifecycle.observe_exact_current_ready_attestation_v2() {
+        Ok(ready) => ready,
+        Err(_) => {
+            return Err(RuntimeServingCertificationNormalProcessV2 {
+                core,
+                lifecycle,
+                maintenance_ingress,
+                gateway_monitor: None,
+            }
+            .cleanup_v2(
+                None,
+                RuntimeServingCertificationFailureV2::Gateway.transition_v2(),
+            )
+            .await);
+        }
+    };
+    if current_gateway_ready != expected_gateway_ready {
         return Err(RuntimeServingCertificationNormalProcessV2 {
             core,
             lifecycle,
@@ -1150,14 +1183,37 @@ async fn execute_certification_v2(
             gateway_monitor: None,
         }
         .cleanup_v2(
-            heartbeat,
-            RuntimeServingCertificationFailureV2::Protocol.transition_v2(),
+            None,
+            RuntimeServingCertificationFailureV2::Gateway.transition_v2(),
         )
         .await);
     }
-    let slot = RuntimeServingSlotV2::from_target(&serving.identity.process_identity.target);
-    let heartbeat = match heartbeat {
-        Some(heartbeat) => heartbeat,
+    let gateway_loss =
+        lifecycle.bind_gateway_ready_invalidation_observer_v2(&expected_gateway_ready);
+    let owner_loss = lifecycle.owner_terminal_observation_v2();
+    let observers = match RuntimeServingHeartbeatExternalObserversV2::with_exact_gateway_v2(
+        async move {
+            let _ = owner_loss.await;
+        },
+        gateway_loss,
+    ) {
+        Ok(observers) => observers,
+        Err(_) => {
+            return Err(RuntimeServingCertificationNormalProcessV2 {
+                core,
+                lifecycle,
+                maintenance_ingress,
+                gateway_monitor: None,
+            }
+            .cleanup_v2(
+                None,
+                RuntimeServingCertificationFailureV2::Gateway.transition_v2(),
+            )
+            .await);
+        }
+    };
+    let registry_monitor = match core.pending_registry_monitor.take() {
+        Some(monitor) => monitor,
         None => {
             return Err(RuntimeServingCertificationNormalProcessV2 {
                 core,
@@ -1172,6 +1228,60 @@ async fn execute_certification_v2(
             .await);
         }
     };
+    let heartbeat = match start_runtime_process_serving_heartbeat_monitor_v2(
+        serving.clone(),
+        core.foundation.databases.serving().clone(),
+        registry_monitor,
+        core.foundation.shutdown_trigger_v1(),
+        core.foundation.shutdown_observer_v1(),
+        observers,
+        RuntimeServingHeartbeatMonitorConfigV2::production_v2(),
+    )
+    .await
+    {
+        Ok(heartbeat) => heartbeat.into_monitor_v2(),
+        Err(_) => {
+            return Err(RuntimeServingCertificationNormalProcessV2 {
+                core,
+                lifecycle,
+                maintenance_ingress,
+                gateway_monitor: None,
+            }
+            .cleanup_v2(
+                None,
+                RuntimeServingCertificationFailureV2::Database.transition_v2(),
+            )
+            .await);
+        }
+    };
+    if Instant::now() >= completion_deadline {
+        return Err(RuntimeServingCertificationNormalProcessV2 {
+            core,
+            lifecycle,
+            maintenance_ingress,
+            gateway_monitor: None,
+        }
+        .cleanup_v2(
+            Some(heartbeat),
+            RuntimeServingCertificationFailureV2::Deadline.transition_v2(),
+        )
+        .await);
+    }
+    let mut lifecycle = lifecycle;
+    if lifecycle.complete_slot_work_v2(permit).is_err() {
+        return Err(RuntimeServingCertificationNormalProcessV2 {
+            core,
+            lifecycle,
+            maintenance_ingress,
+            gateway_monitor: None,
+        }
+        .cleanup_v2(
+            Some(heartbeat),
+            RuntimeServingCertificationFailureV2::Protocol.transition_v2(),
+        )
+        .await);
+    }
+    let slot = RuntimeServingSlotV2::from_target(&serving.identity.process_identity.target);
     if let Err(failure) = core.certification_monitors.insert_v2(slot, heartbeat) {
         let transition = match failure.source_v2() {
             RuntimeServingCertificationMonitorAdmissionErrorV2::DuplicateSlot
@@ -1197,6 +1307,7 @@ async fn execute_certification_v2(
         ingress_acknowledgement,
         acknowledgement_safety,
         certification_monitors,
+        pending_registry_monitor: _,
         process_generation,
     } = core;
     let process = RuntimeServingOpenProcessV2 {
@@ -1217,7 +1328,7 @@ async fn execute_certification_v2(
             .cleanup_transition_v2(RuntimeServingCertificationFailureV2::Protocol.transition_v2())
             .await);
     }
-    let gateway_ready = match process
+    let final_gateway_ready = match process
         .lifecycle
         .observe_exact_current_ready_attestation_v2()
     {
@@ -1230,7 +1341,17 @@ async fn execute_certification_v2(
                 .await);
         }
     };
-    let gateway_monitor = match process.start_gateway_monitor_v2(&gateway_ready) {
+    if final_gateway_ready != expected_gateway_ready {
+        return Err(process
+            .cleanup_transition_v2(RuntimeServingCertificationFailureV2::Gateway.transition_v2())
+            .await);
+    }
+    if Instant::now() >= completion_deadline {
+        return Err(process
+            .cleanup_transition_v2(RuntimeServingCertificationFailureV2::Deadline.transition_v2())
+            .await);
+    }
+    let gateway_monitor = match process.start_gateway_monitor_v2(&expected_gateway_ready) {
         Ok(monitor) => monitor,
         Err(failure) => {
             return Err(process.cleanup_transition_v2(failure).await);

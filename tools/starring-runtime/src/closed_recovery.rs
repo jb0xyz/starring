@@ -2796,7 +2796,7 @@ impl RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
         }
         let expected_ready = pending.gateway_v2().ready_v2();
         let current_ready = self
-            .observe_exact_current_ready_attestation_v2()
+            .observe_exact_resumed_ordinary_barrier_ready_v3(pending.resume_evidence_v3())
             .map_err(|_| RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway)?;
         if &current_ready != expected_ready {
             return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);
@@ -2813,7 +2813,7 @@ impl RuntimeClosedRecoverySupervisedServingOpenProcessV2 {
         }
         self.revalidate_owner_and_registry_v2().await?;
         if self
-            .observe_exact_current_ready_attestation_v2()
+            .observe_exact_resumed_ordinary_barrier_ready_v3(pending.resume_evidence_v3())
             .map_or(true, |ready| ready != current_ready)
         {
             return Err(RuntimeClosedRecoveryProductionHandoffErrorV2::Gateway);

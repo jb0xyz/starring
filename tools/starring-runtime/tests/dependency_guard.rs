@@ -3588,13 +3588,15 @@ fn serving_certification_is_linear_supervised_bounded_and_fail_closed() {
         "submit_certification_finalizer_v2",
         "await_committed_certification_v2",
         "apply_certification_v2",
-        "start_runtime_process_serving_heartbeat_monitor_v2",
         "thaw_v2",
         "begin_open_v2",
         "publish_preopen_acknowledgement_v2",
         "commit_open_v2",
         "authorize_certification_barrier_b_completion_v2",
         "complete_certification_barrier_b_v2",
+        "observe_exact_current_ready_attestation_v2",
+        "bind_gateway_ready_invalidation_observer_v2",
+        "start_runtime_process_serving_heartbeat_monitor_v2",
         "complete_slot_work_v2",
         "insert_v2",
         "revalidate_v2",
@@ -3607,6 +3609,120 @@ fn serving_certification_is_linear_supervised_bounded_and_fail_closed() {
         assert!(position >= previous, "{required}");
         previous = position;
     }
+    let prepared_registry_monitor = orchestration
+        .find("let (pending, registry_monitor) = match")
+        .unwrap();
+    let retained_registry_monitor = orchestration
+        .find("frozen.core.pending_registry_monitor = Some(registry_monitor);")
+        .unwrap();
+    let finalizer_submission = orchestration
+        .find("submit_certification_finalizer_v2")
+        .unwrap();
+    let completion_deadline = orchestration
+        .find("let completion_deadline = acceptance_deadline.min(schedule.safety_deadline);")
+        .unwrap();
+    let ingress_commit = orchestration
+        .find("let maintenance_ingress = match opening.commit_open_v2()")
+        .unwrap();
+    let completion_authorization = orchestration
+        .find("let completion = match lifecycle")
+        .unwrap();
+    let post_authorization_deadline = completion_authorization
+        + orchestration[completion_authorization..]
+            .find("if Instant::now() >= completion_deadline")
+            .unwrap();
+    let dropped_completion = orchestration.find("drop(completion);").unwrap();
+    let completed_barrier = orchestration.find("let completed_barrier = match").unwrap();
+    let taken_registry_monitor = orchestration
+        .find("let registry_monitor = match core.pending_registry_monitor.take()")
+        .unwrap();
+    let heartbeat = orchestration
+        .find("start_runtime_process_serving_heartbeat_monitor_v2")
+        .unwrap();
+    assert!(
+        prepared_registry_monitor < retained_registry_monitor
+            && retained_registry_monitor < finalizer_submission
+            && completion_deadline < ingress_commit
+            && ingress_commit < completion_authorization
+            && completion_authorization < post_authorization_deadline
+            && post_authorization_deadline < dropped_completion
+            && dropped_completion < completed_barrier
+            && completed_barrier < taken_registry_monitor
+            && taken_registry_monitor < heartbeat
+    );
+    let registry_cleanup =
+        braced_declaration(certification, "fn remove_pending_registry_monitor_v2(");
+    for required in [
+        "self.pending_registry_monitor.take()",
+        "monitor.remove_exact_serving_v2()",
+        "RuntimeServingCertificationFailureV2::Registry.transition_v2()",
+    ] {
+        assert!(registry_cleanup.contains(required), "{required}");
+    }
+    assert_eq!(
+        certification
+            .matches("let transition = self.remove_pending_registry_monitor_v2(transition);")
+            .count(),
+        5
+    );
+    assert_eq!(
+        certification
+            .matches("let transition = self.core.remove_pending_registry_monitor_v2(transition);")
+            .count(),
+        2
+    );
+    let expected_gateway_ready = orchestration
+        .find("let expected_gateway_ready = completed_barrier.gateway_v2().ready_v2().clone()")
+        .unwrap();
+    let current_gateway_ready = orchestration
+        .find("let current_gateway_ready = match lifecycle.observe_exact_current_ready_attestation_v2()")
+        .unwrap();
+    let exact_gateway_ready = orchestration
+        .find("if current_gateway_ready != expected_gateway_ready")
+        .unwrap();
+    let gateway_observer = orchestration
+        .find("bind_gateway_ready_invalidation_observer_v2(&expected_gateway_ready)")
+        .unwrap();
+    assert!(
+        completed_barrier < expected_gateway_ready
+            && expected_gateway_ready < current_gateway_ready
+            && current_gateway_ready < exact_gateway_ready
+            && exact_gateway_ready < gateway_observer
+            && gateway_observer < heartbeat
+    );
+    let post_start_deadline = heartbeat
+        + orchestration[heartbeat..]
+            .find("if Instant::now() >= completion_deadline")
+            .unwrap();
+    let slot_completion = orchestration.find("complete_slot_work_v2").unwrap();
+    assert!(heartbeat < post_start_deadline && post_start_deadline < slot_completion);
+    let final_revalidation = orchestration
+        .find("if process.revalidate_v2().await.is_err()")
+        .unwrap();
+    let final_gateway_ready = orchestration
+        .find("let final_gateway_ready = match process")
+        .unwrap();
+    let final_exact_gateway_ready = orchestration
+        .find("if final_gateway_ready != expected_gateway_ready")
+        .unwrap();
+    let final_deadline = final_exact_gateway_ready
+        + orchestration[final_exact_gateway_ready..]
+            .find("if Instant::now() >= completion_deadline")
+            .unwrap();
+    let normal_gateway_monitor = orchestration
+        .find("process.start_gateway_monitor_v2(&expected_gateway_ready)")
+        .unwrap();
+    let publish_ready = orchestration
+        .find("process.readiness.publish_ready_v2()")
+        .unwrap();
+    assert!(
+        heartbeat < final_revalidation
+            && final_revalidation < final_gateway_ready
+            && final_gateway_ready < final_exact_gateway_ready
+            && final_exact_gateway_ready < final_deadline
+            && final_deadline < normal_gateway_monitor
+            && normal_gateway_monitor < publish_ready
+    );
     for required in [
         "shutdown_serving_open_process_v2",
         "shutdown_certification_frozen_serving_open_process_v2",
@@ -7838,6 +7954,32 @@ fn ordinary_discord_barrier_consumes_actor_and_lifecycle_bound_authority() {
             && exact_receipt < owner_registry
             && owner_registry < stable_ready
     );
+    let certification_authorize = braced_declaration(
+        closed,
+        "pub(crate) async fn authorize_certification_barrier_b_completion_v2(",
+    );
+    let certification_exact_ready = certification_authorize
+        .find("observe_exact_resumed_ordinary_barrier_ready_v3(pending.resume_evidence_v3())")
+        .unwrap();
+    let certification_worker_authority = certification_authorize
+        .find("authorize_ordinary_barrier_completion_v3(final_observation.receipt_v3())")
+        .unwrap();
+    let certification_exact_receipt = certification_authorize
+        .find("worker.accepts_final_reobservation_v3(final_observation.receipt_v3())")
+        .unwrap();
+    let certification_owner_registry = certification_authorize
+        .find("self.revalidate_owner_and_registry_v2().await")
+        .unwrap();
+    let certification_stable_ready = certification_authorize
+        .rfind("observe_exact_resumed_ordinary_barrier_ready_v3(pending.resume_evidence_v3())")
+        .unwrap();
+    assert!(
+        certification_exact_ready < certification_worker_authority
+            && certification_worker_authority < certification_exact_receipt
+            && certification_exact_receipt < certification_owner_registry
+            && certification_owner_registry < certification_stable_ready
+    );
+    assert!(!certification_authorize.contains("observe_exact_current_ready_attestation_v2"));
     let serving_resume = braced_declaration(serving, "pub(crate) async fn run_until_shutdown_v2(");
     let durable_refresh = serving_resume
         .find("refresh_acknowledgement_with_ready_v3(gateway_ready, false)")
