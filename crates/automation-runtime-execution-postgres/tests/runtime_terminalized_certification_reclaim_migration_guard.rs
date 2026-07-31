@@ -98,6 +98,6 @@ fn terminalized_reclaim_refreshes_execution_manifest_and_all_current_pins() {
     assert!(PREVIOUS_MIGRATION
         .contains("16ac5e4726c5ab72da45c1ab67490a50e737197d79a435133fcbd27b56f79a15"));
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
-        assert!(source.contains("779d97c088a29027589ebdffa9753eb1333a1d9b511cd714211cde6ae8146c4e"));
+        assert!(source.contains("0e69552f26e09949d44b87c7ae7680432ff2c36a0027230efcf541cc4324cd9f"));
     }
 }

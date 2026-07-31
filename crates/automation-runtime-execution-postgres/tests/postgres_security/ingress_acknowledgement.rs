@@ -39,9 +39,9 @@ async fn ingress_acknowledgement_migration_is_timezone_invariant() {
         utc,
         (
             true,
-            "f6bd51c0de1eff13175d07f8861f71e4f08b2e7395cfc3eaf516cf4b644a4e63"
+            "2ee6db433ac8976c754c1566b39eb17950d8c9e1a9e5e56d6d96e45a39342dc7"
                 .to_owned(),
-            "779d97c088a29027589ebdffa9753eb1333a1d9b511cd714211cde6ae8146c4e"
+            "0e69552f26e09949d44b87c7ae7680432ff2c36a0027230efcf541cc4324cd9f"
                 .to_owned(),
         )
     );
