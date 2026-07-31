@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1581,7 +1582,12 @@ impl RuntimeGatewayOwnerProductionSupervisorV2 {
         &self,
     ) -> Result<RuntimeGatewayOwnerCurrentObservationV1, RuntimeGatewayOwnerCurrentObservationErrorV1>
     {
-        self.inner().observe_current_gateway_owner_v1().await
+        match self.inner().observe_current_gateway_owner_v1().await {
+            Err(RuntimeGatewayOwnerCurrentObservationErrorV1::Retryable) => {
+                self.inner().observe_current_gateway_owner_v1().await
+            }
+            result => result,
+        }
     }
 
     pub(crate) async fn wait_for_strict_successor_v2(
@@ -2507,6 +2513,11 @@ where
             })
             .await;
         let _result = terminal_sender.send(Some(exit));
+        let _write_result = writeln!(
+            std::io::stderr().lock(),
+            "starring_runtime_component_status component=gateway_owner status={}",
+            exit.code()
+        );
     });
     Ok(RuntimeGatewayOwnerStartupWatchdogHandleV1 {
         inner: Some(RuntimeGatewayOwnerSupervisorHandleV1 {

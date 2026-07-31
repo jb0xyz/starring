@@ -7065,6 +7065,139 @@ async fn exact_certification_thaw_resumes_with_a_strict_successor() {
 }
 
 #[tokio::test]
+async fn production_observation_crossing_renewal_boundary_retries_after_successor() {
+    let process_generation = NonZeroU64::new(72).unwrap();
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_millis(700),
+        Duration::from_millis(450),
+        Duration::from_millis(100),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let mut process = frozen.try_into_process_frozen_v2().unwrap();
+    process
+        .start_production_renewal_in_place_v2()
+        .await
+        .unwrap();
+    let production = process.try_into_production_v2().unwrap();
+    let first = production
+        .wait_for_strict_successor_v2(
+            receipt.owner_revision,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    let authority = production
+        .prepare_certification_freeze_v2(Instant::now() + Duration::from_millis(500))
+        .unwrap();
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let (production, thawed) = frozen
+        .thaw_v2(observation, Instant::now() + Duration::from_millis(450))
+        .await
+        .unwrap();
+    assert!(thawed.receipt().owner_revision > first.receipt().owner_revision);
+
+    port.block_next_observation(Arc::new(Notify::new()));
+    let renew_calls = port.renew_calls();
+    let observe_calls = port.observe_calls();
+    let observed = timeout(Duration::from_secs(1), production.observe_current_v2())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        observed.receipt().owner_revision.get(),
+        thawed.receipt().owner_revision.get() + 1
+    );
+    assert_eq!(port.renew_calls(), renew_calls + 1);
+    assert_eq!(port.observe_calls(), observe_calls + 2);
+    assert_eq!(production.terminal_status_v2(), None);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        production
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn production_observation_recovery_is_bounded_to_one_retry() {
+    let process_generation = NonZeroU64::new(77).unwrap();
+    let (production, port, invalidated, receipt) =
+        certification_production_fixture([], process_generation).await;
+    production
+        .wait_for_strict_successor_v2(
+            receipt.owner_revision,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    port.push_observation_step(FakeObservationStepV1::Error(FakeErrorV1::Retryable));
+    port.push_observation_step(FakeObservationStepV1::Error(FakeErrorV1::Retryable));
+    let observe_calls = port.observe_calls();
+
+    assert_eq!(
+        production.observe_current_v2().await,
+        Err(RuntimeGatewayOwnerCurrentObservationErrorV1::Retryable)
+    );
+    assert_eq!(port.observe_calls(), observe_calls + 2);
+    assert_eq!(production.terminal_status_v2(), None);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        production
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn production_observation_terminal_failures_are_never_retried() {
+    let cases = [
+        (
+            FakeErrorV1::OwnershipLost,
+            RuntimeGatewayOwnerCurrentObservationErrorV1::OwnershipLost,
+            RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
+        ),
+        (
+            FakeErrorV1::ProtocolViolation,
+            RuntimeGatewayOwnerCurrentObservationErrorV1::ProtocolViolation,
+            RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+        ),
+    ];
+    for (injected, expected_error, expected_exit) in cases {
+        let process_generation = NonZeroU64::new(78).unwrap();
+        let (production, port, invalidated, receipt) =
+            certification_production_fixture([], process_generation).await;
+        production
+            .wait_for_strict_successor_v2(
+                receipt.owner_revision,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        port.push_observation_step(FakeObservationStepV1::Error(injected));
+        let observe_calls = port.observe_calls();
+
+        assert_eq!(production.observe_current_v2().await, Err(expected_error));
+        assert_eq!(port.observe_calls(), observe_calls + 1);
+        assert_eq!(production.terminal_observation_v2().await, expected_exit);
+        assert!(invalidated.load(Ordering::Acquire));
+        assert_eq!(port.release_calls(), 1);
+    }
+}
+
+#[tokio::test]
 async fn certification_thaw_send_queue_stall_is_bounded_by_the_authority_cutoff() {
     let process_generation = NonZeroU64::new(72).unwrap();
     let (production, port, invalidated, _) =

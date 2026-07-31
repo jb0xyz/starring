@@ -755,6 +755,48 @@ fn production_handoff_final_revalidation_rejects_latched_root_shutdown() {
 }
 
 #[test]
+fn production_open_shutdown_preserves_latched_cause_class() {
+    for (cause, expected) in [
+        (
+            crate::RuntimeShutdownCauseV1::Interrupt,
+            RuntimeProcessProductionHandoffFailureV2::ProcessShutdown,
+        ),
+        (
+            crate::RuntimeShutdownCauseV1::Terminate,
+            RuntimeProcessProductionHandoffFailureV2::ProcessShutdown,
+        ),
+        (
+            crate::RuntimeShutdownCauseV1::GatewayOwnerTerminal,
+            RuntimeProcessProductionHandoffFailureV2::Owner,
+        ),
+        (
+            crate::RuntimeShutdownCauseV1::DiscordTerminal,
+            RuntimeProcessProductionHandoffFailureV2::DiscordIndeterminate,
+        ),
+        (
+            crate::RuntimeShutdownCauseV1::ReadinessLost,
+            RuntimeProcessProductionHandoffFailureV2::Database,
+        ),
+        (
+            crate::RuntimeShutdownCauseV1::FinalizerTerminal,
+            RuntimeProcessProductionHandoffFailureV2::FinalizerTerminal,
+        ),
+        (
+            crate::RuntimeShutdownCauseV1::HealthTerminal,
+            RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+        ),
+    ] {
+        let latch = crate::process_supervisor::create_runtime_process_shutdown_latch_v1();
+        let shutdown = latch.observer();
+        latch.trigger().trip(cause);
+        assert_eq!(
+            production_open_shutdown_failure_v2(&shutdown),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
 fn observation_failures_map_to_finite_public_classes() {
     let operation_cutoff = Instant::now() + Duration::from_secs(2);
     let owner_safety_deadline = Instant::now() + Duration::from_secs(1);

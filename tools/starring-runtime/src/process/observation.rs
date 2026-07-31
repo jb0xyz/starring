@@ -2211,30 +2211,47 @@ pub(super) fn maintenance_gate_is_open_v2(
 
 impl RuntimeEmptyOpenProcessV2 {
     pub(crate) fn revalidate_v2(&self) -> Result<(), RuntimeProcessProductionHandoffFailureV2> {
+        if let Some(transition) =
+            production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+        {
+            return Err(transition);
+        }
         if self.discord.terminal_status_v2().is_some() || self.discord.is_finished_v2() {
-            return Err(RuntimeProcessProductionHandoffFailureV2::DiscordIndeterminate);
+            return Err(production_open_shutdown_failure_v2(
+                &self.foundation.shutdown_observer_v1(),
+            )
+            .unwrap_or(RuntimeProcessProductionHandoffFailureV2::DiscordIndeterminate));
         }
         if self.lifecycle.process_generation_v2() != self.process_generation {
-            return Err(RuntimeProcessProductionHandoffFailureV2::Owner);
+            return Err(production_open_shutdown_failure_v2(
+                &self.foundation.shutdown_observer_v1(),
+            )
+            .unwrap_or(RuntimeProcessProductionHandoffFailureV2::Owner));
         }
         if !self
             .foundation
             .process_finalizer_health_v2()
             .is_some_and(|health| health.is_ready())
         {
-            return Err(RuntimeProcessProductionHandoffFailureV2::FinalizerTerminal);
+            return Err(production_open_shutdown_failure_v2(
+                &self.foundation.shutdown_observer_v1(),
+            )
+            .unwrap_or(RuntimeProcessProductionHandoffFailureV2::FinalizerTerminal));
         }
         let gate = self
             .foundation
             .maintenance_ingress_observer_v2()
             .snapshot_v2();
         if !maintenance_gate_is_open_v2(gate, self.maintenance_ingress.generation()) {
-            return Err(RuntimeProcessProductionHandoffFailureV2::MaintenanceGate);
+            return Err(production_open_shutdown_failure_v2(
+                &self.foundation.shutdown_observer_v1(),
+            )
+            .unwrap_or(RuntimeProcessProductionHandoffFailureV2::MaintenanceGate));
         }
         self.lifecycle
             .revalidate_v2()
             .map_err(map_worker_production_handoff_failure_v2)?;
-        production_handoff_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+        production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
             .map_or(Ok(()), Err)
     }
 
@@ -2252,7 +2269,13 @@ impl RuntimeEmptyOpenProcessV2 {
         if let Err(transition) = self.revalidate_v2() {
             return Err(self.cleanup_transition_v2(transition).await);
         }
-        let database = match collect_recovery_resume_database_evidence_v2(&self.foundation).await {
+        let database = collect_recovery_resume_database_evidence_v2(&self.foundation).await;
+        if let Some(transition) =
+            production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+        {
+            return Err(self.cleanup_transition_v2(transition).await);
+        }
+        let database = match database {
             Ok(database) => database,
             Err(transition) => return Err(self.cleanup_transition_v2(transition).await),
         };
@@ -2280,18 +2303,22 @@ impl RuntimeEmptyOpenProcessV2 {
             .foundation
             .process_finalizer_health_v2()
             .is_some_and(|health| health.is_ready());
+        if let Some(transition) =
+            production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+        {
+            return Err(self.cleanup_transition_v2(transition).await);
+        }
         let supervisors_running = finalizer_accepting
             && self.lifecycle.owner_terminal_status_v2().is_none()
             && self.discord.terminal_status_v2().is_none()
-            && !self.discord.is_finished_v2()
-            && production_handoff_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
-                .is_none();
+            && !self.discord.is_finished_v2();
         if !maintenance_gate_is_open_v2(gate, self.maintenance_ingress.generation())
             || !supervisors_running
         {
-            return Err(self
-                .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation)
-                .await);
+            let transition =
+                production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
+                    .unwrap_or(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation);
+            return Err(self.cleanup_transition_v2(transition).await);
         }
         let predecessor_authorization = self
             .lifecycle
@@ -2299,13 +2326,18 @@ impl RuntimeEmptyOpenProcessV2 {
         let final_authorization = self
             .lifecycle
             .authorize_ingress_acknowledgement_predecessor_observation_v2();
-        let predecessor_observation = match self
+        let predecessor_observation = self
             .foundation
             .databases
             .execution()
             .observe_ingress_open_acknowledgement_predecessor(&predecessor_authorization)
-            .await
+            .await;
+        if let Some(transition) =
+            production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
         {
+            return Err(self.cleanup_transition_v2(transition).await);
+        }
+        let predecessor_observation = match predecessor_observation {
             Ok(observation) => observation,
             Err(_) => {
                 return Err(self
@@ -2356,7 +2388,9 @@ impl RuntimeEmptyOpenProcessV2 {
         let refresh = match lifecycle.authorize_acknowledgement_refresh_v2(input) {
             Ok(refresh) => refresh,
             Err(failure) => {
-                let transition = map_production_lifecycle_failure_v2(failure.error_v2());
+                let transition =
+                    production_open_shutdown_failure_v2(&foundation.shutdown_observer_v1())
+                        .unwrap_or_else(|| map_production_lifecycle_failure_v2(failure.error_v2()));
                 let process = Self {
                     discord,
                     foundation,
@@ -2379,6 +2413,8 @@ impl RuntimeEmptyOpenProcessV2 {
             foundation.lifecycle_timing_v2(),
         )
         .await;
+        let shutdown_transition =
+            production_open_shutdown_failure_v2(&foundation.shutdown_observer_v1());
         let (lifecycle, accepted_receipt) = match acknowledgement {
             Ok(RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2::EmptyOpenRefresh {
                 lifecycle,
@@ -2388,6 +2424,8 @@ impl RuntimeEmptyOpenProcessV2 {
                 lifecycle,
                 ..
             }) => {
+                let transition = shutdown_transition
+                    .unwrap_or(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation);
                 let cleanup = shutdown_orphaned_admission_process_v2(
                     foundation,
                     discord,
@@ -2401,15 +2439,14 @@ impl RuntimeEmptyOpenProcessV2 {
                     process_generation,
                 )
                 .await;
-                return Err(finish_production_handoff_transition_v2(
-                    RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
-                    cleanup,
-                ));
+                return Err(finish_production_handoff_transition_v2(transition, cleanup));
             }
             Ok(RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2::ServingOpenRefresh {
                 lifecycle,
                 ..
             }) => {
+                let transition = shutdown_transition
+                    .unwrap_or(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation);
                 let cleanup = shutdown_serving_open_process_v2(
                     foundation,
                     discord,
@@ -2423,16 +2460,14 @@ impl RuntimeEmptyOpenProcessV2 {
                     process_generation,
                 )
                 .await;
-                return Err(finish_production_handoff_transition_v2(
-                    RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
-                    cleanup,
-                ));
+                return Err(finish_production_handoff_transition_v2(transition, cleanup));
             }
             Err(RuntimeProcessIngressAcknowledgementExecutionFailureV2::Retained {
                 authority,
                 transition,
             }) => {
                 let retained = (*authority).into_retained_state_v2();
+                let transition = shutdown_transition.unwrap_or(transition);
                 let RuntimeClosedRecoveryIngressAcknowledgementRetainedStateV2::EmptyOpenRefresh(
                     refresh,
                 ) = retained
@@ -2470,6 +2505,7 @@ impl RuntimeEmptyOpenProcessV2 {
             Err(RuntimeProcessIngressAcknowledgementExecutionFailureV2::AuthorityLost(
                 transition,
             )) => {
+                let transition = shutdown_transition.unwrap_or(transition);
                 let cleanup = shutdown_process_without_lifecycle_v2(
                     foundation,
                     discord,
@@ -2484,6 +2520,20 @@ impl RuntimeEmptyOpenProcessV2 {
                 return Err(finish_production_handoff_transition_v2(transition, cleanup));
             }
         };
+        if let Some(transition) = shutdown_transition {
+            let process = Self {
+                discord,
+                foundation,
+                lifecycle,
+                maintenance_ingress,
+                readiness,
+                ingress_acknowledgement,
+                acknowledgement_schedule,
+                acknowledgement_safety,
+                process_generation,
+            };
+            return Err(process.cleanup_transition_v2(transition).await);
+        }
         let final_observation_started_at = Instant::now();
         let final_observation = exact_reobserve_ingress_acknowledgement_v2(
             foundation.databases.execution(),
@@ -2508,6 +2558,11 @@ impl RuntimeEmptyOpenProcessV2 {
             acknowledgement_safety,
             process_generation,
         };
+        if let Some(transition) =
+            production_open_shutdown_failure_v2(&process.foundation.shutdown_observer_v1())
+        {
+            return Err(process.cleanup_transition_v2(transition).await);
+        }
         match (final_observation, schedule) {
             (Ok(_), Some(schedule)) => {
                 if !process
@@ -2644,6 +2699,14 @@ pub(super) fn production_handoff_shutdown_failure_v2(
     shutdown
         .observed()
         .map(|_| RuntimeProcessProductionHandoffFailureV2::ProcessShutdown)
+}
+
+pub(super) fn production_open_shutdown_failure_v2(
+    shutdown: &crate::shutdown::RuntimeShutdownObserverV1,
+) -> Option<RuntimeProcessProductionHandoffFailureV2> {
+    shutdown
+        .observed()
+        .map(|observation| map_empty_open_shutdown_cause_v2(observation.cause()))
 }
 
 async fn time_shutdown_result_v2<T, E, F, Outcome>(
