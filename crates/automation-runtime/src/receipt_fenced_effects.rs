@@ -4,7 +4,9 @@ use automation_core::{
     AdapterError, AdapterErrorKind, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter,
     InteractionResponder, ModalPresentation, PostPanelSpec,
 };
-use automation_instance::{InstanceId, InstanceStoreError};
+use automation_instance::{
+    AutomationInstance, InstanceId, InstanceRegistrarV1, InstanceStoreError,
+};
 use automation_instance_teardown::{InstanceTeardownService, TeardownError, TeardownOutcome};
 use automation_state::{ModalFieldSpec, ModalFieldStyle, ModalInputPolicy};
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
@@ -25,6 +27,8 @@ const INITIAL_RESPONSE_FAILURE_MESSAGE_V1: &str = "Discord initial response fail
 const EXECUTION_FAILURE_MESSAGE_V1: &str = "Discord execution failed";
 const TEARDOWN_RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1: &str =
     "interaction teardown receipt persistence failed";
+const INSTANCE_REGISTRATION_RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1: &str =
+    "interaction instance registration receipt persistence failed";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InteractionInitialResponseKindV1 {
@@ -335,6 +339,40 @@ where
     }
 }
 
+pub struct ReceiptFencedInstanceRegistrarV1<'a, S: ?Sized, P: ?Sized> {
+    registrar: &'a S,
+    permit: &'a P,
+}
+
+impl<'a, S: ?Sized, P: ?Sized> ReceiptFencedInstanceRegistrarV1<'a, S, P> {
+    pub const fn new(registrar: &'a S, permit: &'a P) -> Self {
+        Self { registrar, permit }
+    }
+}
+
+impl<S: ?Sized, P: ?Sized> Debug for ReceiptFencedInstanceRegistrarV1<'_, S, P> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReceiptFencedInstanceRegistrarV1(<redacted>)")
+    }
+}
+
+impl<S, P> InstanceRegistrarV1 for ReceiptFencedInstanceRegistrarV1<'_, S, P>
+where
+    S: InstanceRegistrarV1 + ?Sized,
+    P: InteractionEffectPermitV1 + ?Sized,
+{
+    async fn register_instance_v1(
+        &self,
+        instance: AutomationInstance,
+    ) -> Result<(), InstanceStoreError> {
+        self.permit
+            .commit_idempotent_execution_intent_v1()
+            .await
+            .map_err(|_| instance_registration_receipt_persistence_error_v1())?;
+        self.registrar.register_instance_v1(instance).await
+    }
+}
+
 pub(crate) struct ReceiptFencedInstanceTeardownServiceV1<'a, T: ?Sized, P: ?Sized> {
     teardown: &'a T,
     permit: &'a P,
@@ -436,6 +474,12 @@ fn teardown_receipt_persistence_error_v1() -> TeardownError {
     TeardownError::Store(InstanceStoreError::Backend(
         TEARDOWN_RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1.to_string(),
     ))
+}
+
+fn instance_registration_receipt_persistence_error_v1() -> InstanceStoreError {
+    InstanceStoreError::Backend(
+        INSTANCE_REGISTRATION_RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1.to_string(),
+    )
 }
 
 fn sanitize_initial_response_error_v1(error: AdapterError) -> AdapterError {

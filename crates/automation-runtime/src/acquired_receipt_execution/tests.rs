@@ -6,8 +6,9 @@ use automation_core::{
     AdapterErrorKind, CreateRoleSpec, MockInstanceTeardownService, PostPanelSpec,
 };
 use automation_instance::{
-    AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceResources,
-    InstanceRuleSetVersion, InstanceStore, SequenceInstanceIdGenerator,
+    AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceRegistrarV1,
+    InstanceResources, InstanceRuleSetVersion, InstanceStore, InstanceStoreError,
+    SequenceInstanceIdGenerator,
 };
 use automation_instance_teardown::{InstanceTeardownService, TeardownError, TeardownOutcome};
 use automation_ruleset::{
@@ -34,8 +35,8 @@ use automation_runtime_registry::{
     ExactServingRouteV1, ServingSlotRegistryConfigV1, ServingSlotRegistryV1,
 };
 use automation_state::{
-    ActionSpec, InstanceRef, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle,
-    ModalInputPolicy, ModalSpec, TriggerSpec,
+    ActionSpec, InstanceRef, InstanceResourceRefs, InteractionRule, InteractionRuleSet,
+    ModalFieldSpec, ModalFieldStyle, ModalInputPolicy, ModalSpec, TriggerSpec,
 };
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
 use resource_resolution::{resource_binding_fingerprint_v2, ResourceBindingMap};
@@ -236,6 +237,22 @@ struct FakeMutationV1 {
 
 struct FakeTeardownV1 {
     state: Arc<PermitStateV1>,
+}
+
+struct FakeRegistrarV1 {
+    state: Arc<PermitStateV1>,
+    error: Option<InstanceStoreError>,
+}
+
+impl InstanceRegistrarV1 for FakeRegistrarV1 {
+    async fn register_instance_v1(&self, _: AutomationInstance) -> Result<(), InstanceStoreError> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("external.register".to_string());
+        self.error.clone().map_or(Ok(()), Err)
+    }
 }
 
 impl InstanceTeardownService for FakeTeardownV1 {
@@ -602,6 +619,14 @@ fn static_ruleset(actions: Vec<ActionSpec>) -> InteractionRuleSet {
     }
 }
 
+fn register_only_ruleset() -> InteractionRuleSet {
+    static_ruleset(vec![ActionSpec::RegisterInstance {
+        key: "study_room_instance".to_string(),
+        kind: InstanceKind("study_room".to_string()),
+        resources: InstanceResourceRefs::default(),
+    }])
+}
+
 fn modal_definition(actions: Vec<ActionSpec>) -> InteractionRuleSet {
     InteractionRuleSet {
         version: 1,
@@ -697,6 +722,116 @@ fn assert_terminalized_v1(
         }
         other => panic!("unexpected outcome {other:?}"),
     }
+}
+
+async fn run_register_only_v1(
+    failures: PermitFailuresV1,
+    registrar_error: Option<InstanceStoreError>,
+    interaction_id: u64,
+) -> (AcquiredInteractionExecutionOutcomeV1, Arc<PermitStateV1>) {
+    let admitted = admitted_v1(
+        artifact(register_only_ruleset()),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), interaction_id);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(root, failures);
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = FakeRegistrarV1 {
+        state: Arc::clone(&state),
+        error: registrar_error,
+    };
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = MockInstanceTeardownService::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: false,
+    };
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        AcquiredInteractionExecutionServicesV1::new(
+            &mutation, &responder, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+    (outcome, state)
+}
+
+#[tokio::test]
+async fn register_only_execution_commits_intent_before_the_registrar() {
+    let (outcome, state) = run_register_only_v1(PermitFailuresV1::default(), None, 51_023).await;
+
+    assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::StaticCompleted,
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.bind",
+            "permit.execution_intent",
+            "external.register",
+            "permit.finish:interaction_static_completed",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn first_register_intent_failure_is_persistence_failure_before_effect() {
+    let (outcome, state) = run_register_only_v1(
+        PermitFailuresV1 {
+            execution_intent: true,
+            ..PermitFailuresV1::default()
+        },
+        None,
+        51_024,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
+            stage: AcquiredInteractionPersistenceStageV1::ExecutionIntent,
+            external_effect_may_have_occurred: false,
+        }
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        ["permit.bind", "permit.execution_intent"]
+    );
+}
+
+#[tokio::test]
+async fn registrar_timeout_after_intent_is_recovery_required_not_before_effect() {
+    let (outcome, state) = run_register_only_v1(
+        PermitFailuresV1::default(),
+        Some(InstanceStoreError::TimedOut),
+        51_025,
+    )
+    .await;
+
+    assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::ExecutionRecoveryRequired,
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.bind",
+            "permit.execution_intent",
+            "external.register",
+            "permit.finish:interaction_execution_recovery_required",
+        ]
+    );
 }
 
 #[tokio::test]

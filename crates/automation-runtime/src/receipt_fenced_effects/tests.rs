@@ -5,6 +5,10 @@ use automation_core::{
     AdapterError, AdapterErrorKind, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter,
     InteractionResponder, ModalPresentation, PostPanelSpec,
 };
+use automation_instance::{
+    AutomationInstance, InstanceKind, InstanceRegistrarV1, InstanceResources,
+    InstanceRuleSetVersion, InstanceStoreError,
+};
 use automation_instance_teardown::{InstanceTeardownService, TeardownError, TeardownOutcome};
 use automation_state::{ModalFieldSpec, ModalFieldStyle, ModalInputPolicy};
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
@@ -169,6 +173,18 @@ struct FakeTeardownV1 {
     trace: Arc<Mutex<Vec<&'static str>>>,
 }
 
+struct FakeRegistrarV1 {
+    trace: Arc<Mutex<Vec<&'static str>>>,
+    error: Option<InstanceStoreError>,
+}
+
+impl InstanceRegistrarV1 for FakeRegistrarV1 {
+    async fn register_instance_v1(&self, _: AutomationInstance) -> Result<(), InstanceStoreError> {
+        self.trace.lock().unwrap().push("external.register");
+        self.error.clone().map_or(Ok(()), Err)
+    }
+}
+
 impl InstanceTeardownService for FakeTeardownV1 {
     async fn teardown(&self, _: GuildId, _: InstanceId) -> Result<TeardownOutcome, TeardownError> {
         self.trace.lock().unwrap().push("external.teardown");
@@ -232,6 +248,19 @@ fn modal(title: &str, label: &str) -> ModalPresentation {
             max_length: Some(40),
             input_policy: ModalInputPolicy::TrimUnicodeWhitespace,
         }],
+    }
+}
+
+fn instance() -> AutomationInstance {
+    AutomationInstance {
+        id: InstanceId::parse("room_001").unwrap(),
+        guild_id: GuildId(1),
+        ruleset_key: "study_room".to_string(),
+        ruleset_version: InstanceRuleSetVersion::new(1).unwrap(),
+        kind: InstanceKind("study_room".to_string()),
+        created_by: UserId(2),
+        resources: InstanceResources::default(),
+        status: automation_instance::InstanceStatus::Active,
     }
 }
 
@@ -584,6 +613,89 @@ async fn execution_intent_outage_prevents_edit_and_mutation_calls() {
 }
 
 #[tokio::test]
+async fn registration_is_execution_intent_fenced_before_the_store() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let permit = FakePermitV1::new(Arc::clone(&trace));
+    let registrar = FakeRegistrarV1 {
+        trace: Arc::clone(&trace),
+        error: None,
+    };
+    let fenced = ReceiptFencedInstanceRegistrarV1::new(&registrar, &permit);
+
+    fenced.register_instance_v1(instance()).await.unwrap();
+
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["permit.execution_intent", "external.register"]
+    );
+}
+
+#[tokio::test]
+async fn every_registration_rechecks_the_live_permit() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let permit = FakePermitV1::new(Arc::clone(&trace));
+    let registrar = FakeRegistrarV1 {
+        trace: Arc::clone(&trace),
+        error: None,
+    };
+    let fenced = ReceiptFencedInstanceRegistrarV1::new(&registrar, &permit);
+
+    fenced.register_instance_v1(instance()).await.unwrap();
+    fenced.register_instance_v1(instance()).await.unwrap();
+
+    assert_eq!(
+        *trace.lock().unwrap(),
+        [
+            "permit.execution_intent",
+            "external.register",
+            "permit.execution_intent",
+            "external.register",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn denied_registration_intent_prevents_the_store() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let permit = FakePermitV1::with_failures(Arc::clone(&trace), false, false, true);
+    let registrar = FakeRegistrarV1 {
+        trace: Arc::clone(&trace),
+        error: None,
+    };
+    let fenced = ReceiptFencedInstanceRegistrarV1::new(&registrar, &permit);
+
+    let error = fenced.register_instance_v1(instance()).await.unwrap_err();
+
+    assert_eq!(*trace.lock().unwrap(), ["permit.execution_intent"]);
+    assert_eq!(
+        error,
+        InstanceStoreError::Backend(
+            INSTANCE_REGISTRATION_RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1.to_string()
+        )
+    );
+    assert!(!format!("{error:?}").contains("permit-execution-secret"));
+}
+
+#[tokio::test]
+async fn registrar_timeout_is_returned_only_after_the_intent_commit() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let permit = FakePermitV1::new(Arc::clone(&trace));
+    let registrar = FakeRegistrarV1 {
+        trace: Arc::clone(&trace),
+        error: Some(InstanceStoreError::TimedOut),
+    };
+    let fenced = ReceiptFencedInstanceRegistrarV1::new(&registrar, &permit);
+
+    let error = fenced.register_instance_v1(instance()).await.unwrap_err();
+
+    assert_eq!(error, InstanceStoreError::TimedOut);
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["permit.execution_intent", "external.register"]
+    );
+}
+
+#[tokio::test]
 async fn teardown_is_execution_intent_fenced_before_the_service_can_delete() {
     let trace = Arc::new(Mutex::new(Vec::new()));
     let permit = FakePermitV1::new(Arc::clone(&trace));
@@ -664,6 +776,11 @@ fn public_debug_surfaces_are_redacted() {
     let mutation = FakeMutationV1 { trace };
     let fenced_responder = ReceiptFencedInteractionResponderV1::new(&responder, &permit);
     let fenced_mutation = ReceiptFencedDiscordMutationAdapterV1::new(&mutation, &permit);
+    let registrar = FakeRegistrarV1 {
+        trace: Arc::new(Mutex::new(Vec::new())),
+        error: None,
+    };
+    let fenced_registrar = ReceiptFencedInstanceRegistrarV1::new(&registrar, &permit);
     let teardown = FakeTeardownV1 {
         trace: Arc::new(Mutex::new(Vec::new())),
     };
@@ -684,6 +801,7 @@ fn public_debug_surfaces_are_redacted() {
     for rendered in [
         format!("{fenced_responder:?}"),
         format!("{fenced_mutation:?}"),
+        format!("{fenced_registrar:?}"),
         format!("{fenced_teardown:?}"),
         format!("{intent:?}"),
         format!("{:?}", intent.digest()),
