@@ -27,6 +27,9 @@ fn adapter_dependency_surface_is_narrow() {
         "automation-instance",
         "automation-ruleset",
         "automation-ruleset-dispatch",
+        "automation-runtime-convergence",
+        "automation-runtime-interaction",
+        "resource-resolution",
         "sqlx",
         "tokio",
     ] {
@@ -81,7 +84,7 @@ fn adapter_sources_contain_no_comments() {
 }
 
 #[test]
-fn adapter_contract_uses_only_ten_private_capabilities() {
+fn adapter_contract_uses_only_twenty_one_private_capabilities() {
     let contract = include_str!("../src/contract.rs");
     let capabilities = [
         "starring_runtime_interaction_database_identity_v1",
@@ -94,9 +97,20 @@ fn adapter_contract_uses_only_ten_private_capabilities() {
         "starring_runtime_interaction_instance_mark_deleted_v1",
         "starring_runtime_interaction_instance_list_retryable_v1",
         "starring_runtime_interaction_instance_scan_retryable_v2",
+        "starring_runtime_interaction_receipt_authority_observe_v1",
+        "starring_runtime_interaction_receipt_claim_v1",
+        "starring_runtime_interaction_receipt_plan_bind_v1",
+        "starring_runtime_interaction_receipt_acknowledgement_intend_v1",
+        "starring_runtime_interaction_receipt_acknowledgement_finish_v1",
+        "starring_runtime_interaction_receipt_execution_intend_v1",
+        "starring_runtime_interaction_receipt_finish_v1",
+        "starring_runtime_interaction_receipt_scan_recoverable_v1",
+        "starring_runtime_interaction_receipt_recover_v1",
+        "starring_runtime_interaction_receipt_token_expire_v1",
+        "starring_runtime_interaction_receipt_terminalize_expired_v1",
     ];
-    assert_eq!(contract.matches("pub(crate) const ").count(), 10);
-    assert_eq!(contract.matches("SELECT ").count(), 10);
+    assert_eq!(contract.matches("pub(crate) const ").count(), 21);
+    assert_eq!(contract.matches("SELECT ").count(), 21);
     for capability in capabilities {
         assert_eq!(
             contract.matches(capability).count(),
@@ -134,6 +148,17 @@ fn adapter_contract_placeholder_shapes_are_exact() {
         ("INSTANCE_TEARDOWN_MARK_QUERY", 2),
         ("INSTANCE_TEARDOWN_RETRY_QUERY", 2),
         ("INSTANCE_TEARDOWN_RETRY_SCAN_QUERY", 5),
+        ("RECEIPT_AUTHORITY_OBSERVE_QUERY", 18),
+        ("RECEIPT_CLAIM_QUERY", 41),
+        ("RECEIPT_PLAN_BIND_QUERY", 6),
+        ("RECEIPT_ACKNOWLEDGEMENT_INTEND_QUERY", 7),
+        ("RECEIPT_ACKNOWLEDGEMENT_FINISH_QUERY", 8),
+        ("RECEIPT_EXECUTION_INTEND_QUERY", 6),
+        ("RECEIPT_FINISH_QUERY", 9),
+        ("RECEIPT_RECOVERY_SCAN_QUERY", 7),
+        ("RECEIPT_RECOVER_QUERY", 13),
+        ("RECEIPT_TOKEN_EXPIRE_QUERY", 5),
+        ("RECEIPT_TERMINALIZE_EXPIRED_QUERY", 7),
     ];
     for (name, expected_maximum) in expected {
         let query = contract
@@ -246,12 +271,36 @@ fn route_read_deadline_wraps_the_complete_database_operation() {
 #[test]
 fn every_interaction_operation_rechecks_database_binding() {
     let store = include_str!("../src/store.rs");
+    let receipt_store = include_str!("../src/receipt_store.rs");
     assert_eq!(
         store
             .matches("verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)")
             .count(),
         7
     );
+    assert_eq!(
+        receipt_store
+            .matches("verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)")
+            .count(),
+        10
+    );
+    assert_eq!(
+        receipt_store
+            .matches("begin_interaction_transaction(&self.pool, self.timeouts)")
+            .count(),
+        10
+    );
+}
+
+#[test]
+fn receipt_public_values_do_not_expose_database_handles() {
+    let receipt = include_str!("../src/receipt.rs");
+    for forbidden in ["sqlx::", "PgPool", "PgConnection", "Transaction<'"] {
+        assert!(
+            !receipt.contains(forbidden),
+            "database handle leak: {forbidden}"
+        );
+    }
 }
 
 #[test]

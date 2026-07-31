@@ -226,7 +226,7 @@ fn manifests_readiness_and_roles_expose_only_six_capabilities() {
     assert!(!acl.contains("GRANT INSERT"));
     assert!(!acl.contains("GRANT UPDATE"));
     assert!(!acl.contains("GRANT DELETE"));
-    assert!(ROLE_BOOTSTRAP.contains(") <> 70 THEN"));
+    assert!(ROLE_BOOTSTRAP.contains(") <> 71 THEN"));
     assert!(EXECUTION_CONTRACT
         .contains("0e69552f26e09949d44b87c7ae7680432ff2c36a0027230efcf541cc4324cd9f"));
     assert!(EXECUTION_DATABASE

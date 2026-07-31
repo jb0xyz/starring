@@ -872,15 +872,23 @@ BEGIN
             (
                 'public.starring_runtime_interaction_receipt_recover_v1(text,text,bigint,bigint,text,bigint,bigint,bigint,text,text,text,bytea,bigint)',
                 'expected_application_id text, expected_interaction_id text, expected_head_revision bigint, expected_claim_revision bigint, expected_process_instance_id text, expected_runtime_generation bigint, expected_controller_fencing_token bigint, expected_route_incarnation bigint, expected_gateway_shard_id text, expected_runtime_build_revision text, proposed_observation_kind text, proposed_observation_digest bytea, requested_claim_lease_milliseconds bigint',
-                'TABLE(outcome_name text, receipt_state text, resulting_head_revision bigint, resulting_claim_revision bigint, resulting_claim_expires_at timestamp with time zone, resulting_gateway_owner_lease_epoch bigint, resulting_gateway_owner_revision bigint, resulting_serving_lease_epoch bigint, resulting_serving_revision bigint, root_tenant_id text, root_installation_id text, root_deployment_id text, root_attestation_digest text, root_guild_id text, root_ruleset_key text, root_target_version bigint, root_target_content_hash text, root_binding_revision bigint, root_binding_fingerprint text, root_runtime_generation bigint, root_process_instance_id text, root_serving_lease_epoch bigint, root_serving_revision bigint, root_gateway_shard_id text, root_gateway_owner_lease_epoch bigint, root_gateway_owner_revision bigint, root_route_controller_fencing_token bigint, root_route_incarnation bigint, root_runtime_build_revision text, root_route_kind text, root_instance_id text, root_execution_ruleset_version bigint, root_execution_ruleset_content_hash text, root_instance_manifest_digest text, root_request_digest bytea, token_encryption_suite text, token_suite_version smallint, token_key_id text, token_nonce bytea, token_ciphertext bytea, token_aad_digest bytea, token_issued_at timestamp with time zone, token_expires_at timestamp with time zone, observed_database_now timestamp with time zone)',
+                'TABLE(outcome_name text, receipt_state text, resulting_head_revision bigint, resulting_claim_revision bigint, resulting_claim_expires_at timestamp with time zone, resulting_gateway_owner_lease_epoch bigint, resulting_gateway_owner_revision bigint, resulting_serving_lease_epoch bigint, resulting_serving_revision bigint, root_tenant_id text, root_installation_id text, root_deployment_id text, root_attestation_digest text, root_guild_id text, root_ruleset_key text, root_target_version bigint, root_target_content_hash text, root_binding_revision bigint, root_binding_fingerprint text, root_runtime_generation bigint, root_process_instance_id text, root_serving_lease_epoch bigint, root_serving_revision bigint, root_gateway_shard_id text, root_gateway_owner_lease_epoch bigint, root_gateway_owner_revision bigint, root_route_controller_fencing_token bigint, root_route_incarnation bigint, root_runtime_build_revision text, root_route_kind text, root_route_key text, root_instance_id text, root_execution_ruleset_version bigint, root_execution_ruleset_content_hash text, root_instance_manifest_digest text, root_request_digest bytea, token_encryption_suite text, token_suite_version smallint, token_key_id text, token_nonce bytea, token_ciphertext bytea, token_aad_digest bytea, token_issued_at timestamp with time zone, token_expires_at timestamp with time zone, observed_database_now timestamp with time zone)',
                 TRUE,
                 1::REAL,
                 'plpgsql'
             ),
             (
-                'public.starring_runtime_interaction_receipt_token_expire_v1(text,text,bigint,bigint,text,bytea)',
-                'expected_application_id text, expected_interaction_id text, expected_head_revision bigint, expected_claim_revision bigint, expected_process_instance_id text, proposed_expiry_observation_digest bytea',
+                'public.starring_runtime_interaction_receipt_token_expire_v1(text,text,bigint,bigint,bytea)',
+                'expected_application_id text, expected_interaction_id text, expected_head_revision bigint, expected_claim_revision bigint, proposed_expiry_observation_digest bytea',
                 'TABLE(outcome_name text, receipt_state text, resulting_head_revision bigint, resulting_claim_revision bigint, observed_database_now timestamp with time zone)',
+                TRUE,
+                1::REAL,
+                'plpgsql'
+            ),
+            (
+                'public.starring_runtime_interaction_receipt_terminalize_expired_v1(text,text,bigint,bigint,text,text,bytea)',
+                'expected_application_id text, expected_interaction_id text, expected_head_revision bigint, expected_claim_revision bigint, expected_process_instance_id text, expected_runtime_build_revision text, proposed_observation_digest bytea',
+                'TABLE(outcome_name text, receipt_state text, resulting_head_revision bigint, resulting_claim_revision bigint, resulting_claim_expires_at timestamp with time zone, observed_database_now timestamp with time zone)',
                 TRUE,
                 1::REAL,
                 'plpgsql'
@@ -1015,7 +1023,10 @@ BEGIN
                 'public.starring_runtime_interaction_receipt_recover_v1(text,text,bigint,bigint,text,bigint,bigint,bigint,text,text,text,bytea,bigint)'
             ),
             pg_catalog.to_regprocedure(
-                'public.starring_runtime_interaction_receipt_token_expire_v1(text,text,bigint,bigint,text,bytea)'
+                'public.starring_runtime_interaction_receipt_token_expire_v1(text,text,bigint,bigint,bytea)'
+            ),
+            pg_catalog.to_regprocedure(
+                'public.starring_runtime_interaction_receipt_terminalize_expired_v1(text,text,bigint,bigint,text,text,bytea)'
             )$extension$;
 
     IF function_definition IS NULL
@@ -1690,7 +1701,7 @@ BEGIN
     END IF;
 
     IF expected_route_kind = 'static' THEN
-        SELECT artifact.version, artifact.content_hash
+        SELECT artifact.version, artifact.content_hash, NULL::TEXT AS manifest_digest
         INTO execution_row
         FROM public.automation_ruleset_versions AS artifact
         WHERE artifact.guild_id = expected_guild_id
@@ -1991,13 +2002,13 @@ BEGIN
             OR root_row.origin_serving_lease_epoch
                 IS DISTINCT FROM expected_serving_lease_epoch
             OR root_row.origin_serving_revision
-                IS DISTINCT FROM expected_serving_revision
+                > expected_serving_revision
             OR root_row.origin_gateway_shard_id
                 IS DISTINCT FROM expected_gateway_shard_id
             OR root_row.origin_gateway_owner_lease_epoch
                 IS DISTINCT FROM expected_gateway_owner_lease_epoch
             OR root_row.origin_gateway_owner_revision
-                IS DISTINCT FROM expected_gateway_owner_revision
+                > expected_gateway_owner_revision
             OR root_row.runtime_build_revision
                 IS DISTINCT FROM expected_runtime_build_revision
             OR root_row.route_kind IS DISTINCT FROM expected_route_kind
@@ -2027,6 +2038,19 @@ BEGIN
             RAISE EXCEPTION USING
                 ERRCODE = 'RI002',
                 MESSAGE = 'runtime_interaction_receipt_head_missing';
+        END IF;
+
+        IF head_row.claim_serving_lease_epoch
+                IS DISTINCT FROM expected_serving_lease_epoch
+            OR head_row.claim_serving_revision > expected_serving_revision
+            OR head_row.claim_gateway_owner_lease_epoch
+                IS DISTINCT FROM expected_gateway_owner_lease_epoch
+            OR head_row.claim_gateway_owner_revision
+                > expected_gateway_owner_revision
+        THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'RI002',
+                MESSAGE = 'runtime_interaction_receipt_claim_authority_regressed';
         END IF;
 
         SELECT secret.issued_at, secret.expires_at
@@ -2088,11 +2112,11 @@ BEGIN
                 AND authority_row.serving_lease_epoch
                     = root_row.origin_serving_lease_epoch
                 AND authority_row.serving_revision
-                    = root_row.origin_serving_revision
+                    = expected_serving_revision
                 AND authority_row.gateway_owner_lease_epoch
                     = root_row.origin_gateway_owner_lease_epoch
                 AND authority_row.gateway_owner_revision
-                    = root_row.origin_gateway_owner_revision
+                    = expected_gateway_owner_revision
                 AND authority_row.route_controller_fencing_token
                     = root_row.route_controller_fencing_token
                 AND authority_row.route_incarnation = root_row.route_incarnation
@@ -2250,11 +2274,11 @@ BEGIN
                 OR authority_row.serving_lease_epoch
                     IS DISTINCT FROM root_row.origin_serving_lease_epoch
                 OR authority_row.serving_revision
-                    IS DISTINCT FROM root_row.origin_serving_revision
+                    IS DISTINCT FROM expected_serving_revision
                 OR authority_row.gateway_owner_lease_epoch
                     IS DISTINCT FROM root_row.origin_gateway_owner_lease_epoch
                 OR authority_row.gateway_owner_revision
-                    IS DISTINCT FROM root_row.origin_gateway_owner_revision
+                    IS DISTINCT FROM expected_gateway_owner_revision
                 OR authority_row.route_controller_fencing_token
                     IS DISTINCT FROM root_row.route_controller_fencing_token
                 OR authority_row.route_incarnation
@@ -2357,12 +2381,12 @@ BEGIN
         derived_deployment_id := root_row.deployment_id;
         derived_attestation_id := root_row.attestation_id;
         derived_attestation_digest := root_row.attestation_digest;
-        derived_serving_lease_epoch := root_row.origin_serving_lease_epoch;
-        derived_serving_revision := root_row.origin_serving_revision;
+        derived_serving_lease_epoch := expected_serving_lease_epoch;
+        derived_serving_revision := expected_serving_revision;
         derived_gateway_owner_lease_epoch :=
-            root_row.origin_gateway_owner_lease_epoch;
+            expected_gateway_owner_lease_epoch;
         derived_gateway_owner_revision :=
-            root_row.origin_gateway_owner_revision;
+            expected_gateway_owner_revision;
         derived_route_controller_fencing_token :=
             root_row.route_controller_fencing_token;
         derived_route_incarnation := root_row.route_incarnation;
@@ -3726,6 +3750,7 @@ BEGIN
             'recovery_required'
         )
         OR proposed_terminal_outcome_code !~ '^[a-z0-9_]{1,64}$'
+        OR proposed_terminal_outcome_code = 'exact_replay'
         OR pg_catalog.octet_length(proposed_terminal_result_digest) <> 32
     THEN
         RAISE EXCEPTION USING
@@ -4139,6 +4164,7 @@ RETURNS TABLE(
     root_route_incarnation BIGINT,
     root_runtime_build_revision TEXT,
     root_route_kind TEXT,
+    root_route_key TEXT,
     root_instance_id TEXT,
     root_execution_ruleset_version BIGINT,
     root_execution_ruleset_content_hash TEXT,
@@ -4285,14 +4311,27 @@ BEGIN
             MESSAGE = 'runtime_interaction_receipt_recovery_observation_conflict';
     END IF;
 
+    IF root_row.origin_process_instance_id
+            IS DISTINCT FROM expected_process_instance_id
+        OR root_row.runtime_build_revision
+            IS DISTINCT FROM expected_runtime_build_revision
+    THEN
+        outcome_name := 'successor_process_recovery_deferred';
+        receipt_state := head_row.state;
+        resulting_head_revision := head_row.head_revision;
+        resulting_claim_revision := head_row.claim_revision;
+        resulting_claim_expires_at := head_row.claim_expires_at;
+        observed_database_now := database_now;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
     IF root_row.runtime_generation
             IS DISTINCT FROM expected_runtime_generation
         OR root_row.route_controller_fencing_token
             IS DISTINCT FROM expected_controller_fencing_token
         OR root_row.route_incarnation
             IS DISTINCT FROM expected_route_incarnation
-        OR root_row.runtime_build_revision
-            IS DISTINCT FROM expected_runtime_build_revision
     THEN
         RAISE EXCEPTION USING
             ERRCODE = 'RI004',
@@ -4776,6 +4815,7 @@ BEGIN
     root_route_incarnation := root_row.route_incarnation;
     root_runtime_build_revision := root_row.runtime_build_revision;
     root_route_kind := root_row.route_kind;
+    root_route_key := root_row.route_key;
     root_instance_id := root_row.instance_id;
     root_execution_ruleset_version := root_row.execution_ruleset_version;
     root_execution_ruleset_content_hash :=
@@ -4795,19 +4835,21 @@ BEGIN
 END;
 $function$;
 
-CREATE FUNCTION public.starring_runtime_interaction_receipt_token_expire_v1(
+CREATE FUNCTION public.starring_runtime_interaction_receipt_terminalize_expired_v1(
     expected_application_id TEXT,
     expected_interaction_id TEXT,
     expected_head_revision BIGINT,
     expected_claim_revision BIGINT,
     expected_process_instance_id TEXT,
-    proposed_expiry_observation_digest BYTEA
+    expected_runtime_build_revision TEXT,
+    proposed_observation_digest BYTEA
 )
 RETURNS TABLE(
     outcome_name TEXT,
     receipt_state TEXT,
     resulting_head_revision BIGINT,
     resulting_claim_revision BIGINT,
+    resulting_claim_expires_at TIMESTAMPTZ,
     observed_database_now TIMESTAMPTZ
 )
 LANGUAGE plpgsql
@@ -4822,9 +4864,11 @@ DECLARE
     authority_row RECORD;
     root_row public.runtime_interaction_receipt_roots_v1%ROWTYPE;
     head_row public.runtime_interaction_receipt_heads_v1%ROWTYPE;
-    secret_row public.runtime_interaction_receipt_token_secrets_v1%ROWTYPE;
     database_now TIMESTAMPTZ;
     next_acknowledgement_state TEXT;
+    next_terminal_outcome_code TEXT;
+    authority_available BOOLEAN := FALSE;
+    mutated_count BIGINT;
 BEGIN
     IF expected_application_id !~ '^[1-9][0-9]{0,19}$'
         OR pg_catalog.length(expected_application_id) > 20
@@ -4833,11 +4877,12 @@ BEGIN
         OR expected_head_revision NOT BETWEEN 1 AND 9223372036854775806
         OR expected_claim_revision NOT BETWEEN 1 AND 9223372036854775807
         OR expected_process_instance_id !~ '^[A-Za-z0-9_.:-]{1,128}$'
-        OR pg_catalog.octet_length(proposed_expiry_observation_digest) <> 32
+        OR expected_runtime_build_revision !~ '^[A-Za-z0-9_.:/-]{1,128}$'
+        OR pg_catalog.octet_length(proposed_observation_digest) <> 32
     THEN
         RAISE EXCEPTION USING
             ERRCODE = 'RI003',
-            MESSAGE = 'runtime_interaction_receipt_token_expire_input_invalid';
+            MESSAGE = 'runtime_interaction_receipt_terminalize_expired_input_invalid';
     END IF;
 
     PERFORM pg_catalog.pg_advisory_xact_lock(
@@ -4849,8 +4894,6 @@ BEGIN
             0
         )
     );
-
-    database_now := pg_catalog.clock_timestamp();
 
     SELECT root.*
     INTO root_row
@@ -4874,6 +4917,340 @@ BEGIN
 
     IF NOT FOUND THEN
         RAISE EXCEPTION USING
+            ERRCODE = 'RI002',
+            MESSAGE = 'runtime_interaction_receipt_head_missing';
+    END IF;
+
+    database_now := pg_catalog.clock_timestamp();
+
+    IF head_row.state IN ('completed', 'failed', 'recovery_required') THEN
+        outcome_name := 'terminal_receipt_unchanged';
+        receipt_state := head_row.state;
+        resulting_head_revision := head_row.head_revision;
+        resulting_claim_revision := head_row.claim_revision;
+        resulting_claim_expires_at := head_row.claim_expires_at;
+        observed_database_now := database_now;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    IF head_row.head_revision <> expected_head_revision
+        OR head_row.claim_revision <> expected_claim_revision
+    THEN
+        outcome_name := 'revision_race';
+        receipt_state := head_row.state;
+        resulting_head_revision := head_row.head_revision;
+        resulting_claim_revision := head_row.claim_revision;
+        resulting_claim_expires_at := head_row.claim_expires_at;
+        observed_database_now := database_now;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    IF head_row.claim_expires_at > database_now THEN
+        outcome_name := 'claim_renewed';
+        receipt_state := head_row.state;
+        resulting_head_revision := head_row.head_revision;
+        resulting_claim_revision := head_row.claim_revision;
+        resulting_claim_expires_at := head_row.claim_expires_at;
+        observed_database_now := database_now;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    IF head_row.state NOT IN (
+        'claimed',
+        'acknowledging',
+        'deferred',
+        'prepared',
+        'executing'
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RI002',
+            MESSAGE = 'runtime_interaction_receipt_terminalize_expired_state_corrupt';
+    END IF;
+
+    IF root_row.runtime_build_revision
+            IS DISTINCT FROM expected_runtime_build_revision
+    THEN
+        outcome_name := 'route_authority_stale';
+        receipt_state := head_row.state;
+        resulting_head_revision := head_row.head_revision;
+        resulting_claim_revision := head_row.claim_revision;
+        resulting_claim_expires_at := head_row.claim_expires_at;
+        observed_database_now := database_now;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    BEGIN
+        SELECT observed.*
+        INTO authority_row
+        FROM public.starring_runtime_interaction_receipt_authority_observe_v1(
+            root_row.application_id,
+            root_row.tenant_id,
+            root_row.installation_id,
+            root_row.deployment_id,
+            root_row.guild_id,
+            root_row.ruleset_key,
+            root_row.target_version,
+            root_row.target_content_hash,
+            root_row.binding_revision,
+            root_row.binding_fingerprint,
+            root_row.runtime_generation,
+            root_row.route_controller_fencing_token,
+            root_row.route_incarnation,
+            expected_process_instance_id,
+            root_row.origin_gateway_shard_id,
+            expected_runtime_build_revision,
+            root_row.route_kind,
+            COALESCE(root_row.instance_id, '')
+        ) AS observed;
+        authority_available := FOUND;
+    EXCEPTION
+        WHEN SQLSTATE 'RI004' THEN
+            authority_available := FALSE;
+    END;
+
+    database_now := pg_catalog.clock_timestamp();
+
+    IF head_row.claim_expires_at > database_now THEN
+        outcome_name := 'claim_renewed';
+        receipt_state := head_row.state;
+        resulting_head_revision := head_row.head_revision;
+        resulting_claim_revision := head_row.claim_revision;
+        resulting_claim_expires_at := head_row.claim_expires_at;
+        observed_database_now := database_now;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    IF NOT authority_available
+        OR authority_row.attestation_id
+            IS DISTINCT FROM root_row.attestation_id
+        OR authority_row.attestation_digest
+            IS DISTINCT FROM root_row.attestation_digest
+        OR authority_row.route_controller_fencing_token
+            IS DISTINCT FROM root_row.route_controller_fencing_token
+        OR authority_row.route_incarnation
+            IS DISTINCT FROM root_row.route_incarnation
+        OR authority_row.runtime_build_revision
+            IS DISTINCT FROM expected_runtime_build_revision
+        OR authority_row.execution_ruleset_version
+            IS DISTINCT FROM root_row.execution_ruleset_version
+        OR authority_row.execution_ruleset_content_hash
+            IS DISTINCT FROM root_row.execution_ruleset_content_hash
+        OR authority_row.instance_manifest_digest
+            IS DISTINCT FROM root_row.instance_manifest_digest
+    THEN
+        outcome_name := 'route_authority_stale';
+        receipt_state := head_row.state;
+        resulting_head_revision := head_row.head_revision;
+        resulting_claim_revision := head_row.claim_revision;
+        resulting_claim_expires_at := head_row.claim_expires_at;
+        observed_database_now := database_now;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    next_acknowledgement_state := CASE
+        WHEN head_row.acknowledgement_state = 'attempting'
+            THEN 'response_recovery_terminal'
+        ELSE head_row.acknowledgement_state
+    END;
+    next_terminal_outcome_code := CASE
+        WHEN head_row.state = 'claimed'
+            THEN 'expired_pristine_claim_abandoned'
+        ELSE 'expired_claim_recovery_required'
+    END;
+
+    UPDATE public.runtime_interaction_receipt_heads_v1 AS head
+    SET state = 'recovery_required',
+        acknowledgement_state = next_acknowledgement_state,
+        head_revision = head.head_revision + 1,
+        acknowledgement_result = CASE
+            WHEN head_row.acknowledgement_state = 'attempting'
+                THEN 'indeterminate'
+            ELSE head.acknowledgement_result
+        END,
+        acknowledgement_result_digest = CASE
+            WHEN head_row.acknowledgement_state = 'attempting'
+                THEN proposed_observation_digest
+            ELSE head.acknowledgement_result_digest
+        END,
+        acknowledged_at = CASE
+            WHEN head_row.acknowledgement_state = 'attempting'
+                THEN database_now
+            ELSE head.acknowledged_at
+        END,
+        terminal_outcome_code = next_terminal_outcome_code,
+        terminal_result_digest = proposed_observation_digest,
+        terminal_at = database_now,
+        updated_at = database_now
+    WHERE head.application_id = expected_application_id
+        AND head.interaction_id = expected_interaction_id
+        AND head.head_revision = expected_head_revision
+        AND head.claim_revision = expected_claim_revision
+        AND head.claim_expires_at <= database_now
+        AND head.state IN (
+            'claimed',
+            'acknowledging',
+            'deferred',
+            'prepared',
+            'executing'
+        );
+
+    GET DIAGNOSTICS mutated_count = ROW_COUNT;
+
+    IF mutated_count <> 1 THEN
+        outcome_name := 'revision_race';
+        receipt_state := head_row.state;
+        resulting_head_revision := head_row.head_revision;
+        resulting_claim_revision := head_row.claim_revision;
+        resulting_claim_expires_at := head_row.claim_expires_at;
+        observed_database_now := database_now;
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    INSERT INTO public.runtime_interaction_receipt_events_v1 (
+        application_id,
+        interaction_id,
+        event_revision,
+        event_kind,
+        from_state,
+        to_state,
+        from_acknowledgement_state,
+        to_acknowledgement_state,
+        claim_revision,
+        claim_process_instance_id,
+        claim_gateway_shard_id,
+        claim_gateway_owner_lease_epoch,
+        claim_gateway_owner_revision,
+        claim_serving_lease_epoch,
+        claim_serving_revision,
+        outcome_code,
+        event_digest,
+        observed_at
+    ) VALUES (
+        expected_application_id,
+        expected_interaction_id,
+        head_row.head_revision + 1,
+        'recovery_required',
+        head_row.state,
+        'recovery_required',
+        head_row.acknowledgement_state,
+        next_acknowledgement_state,
+        head_row.claim_revision,
+        head_row.claim_process_instance_id,
+        head_row.claim_gateway_shard_id,
+        head_row.claim_gateway_owner_lease_epoch,
+        head_row.claim_gateway_owner_revision,
+        head_row.claim_serving_lease_epoch,
+        head_row.claim_serving_revision,
+        next_terminal_outcome_code,
+        pg_catalog.sha256(pg_catalog.convert_to(
+            pg_catalog.concat_ws(
+                '|',
+                'starring-runtime-interaction-receipt-event-v1',
+                expected_application_id,
+                expected_interaction_id,
+                (head_row.head_revision + 1)::TEXT,
+                'recovery_required',
+                head_row.state,
+                'recovery_required',
+                head_row.acknowledgement_state,
+                next_acknowledgement_state,
+                head_row.claim_revision::TEXT,
+                head_row.claim_process_instance_id,
+                head_row.claim_gateway_shard_id,
+                head_row.claim_gateway_owner_lease_epoch::TEXT,
+                head_row.claim_gateway_owner_revision::TEXT,
+                head_row.claim_serving_lease_epoch::TEXT,
+                head_row.claim_serving_revision::TEXT,
+                next_terminal_outcome_code
+            ),
+            'UTF8'
+        )),
+        database_now
+    );
+
+    DELETE FROM public.runtime_interaction_receipt_token_secrets_v1
+    WHERE application_id = expected_application_id
+        AND interaction_id = expected_interaction_id;
+
+    outcome_name := next_terminal_outcome_code;
+    receipt_state := 'recovery_required';
+    resulting_head_revision := head_row.head_revision + 1;
+    resulting_claim_revision := head_row.claim_revision;
+    resulting_claim_expires_at := head_row.claim_expires_at;
+    observed_database_now := database_now;
+    RETURN NEXT;
+END;
+$function$;
+
+CREATE FUNCTION public.starring_runtime_interaction_receipt_token_expire_v1(
+    expected_application_id TEXT,
+    expected_interaction_id TEXT,
+    expected_head_revision BIGINT,
+    expected_claim_revision BIGINT,
+    proposed_expiry_observation_digest BYTEA
+)
+RETURNS TABLE(
+    outcome_name TEXT,
+    receipt_state TEXT,
+    resulting_head_revision BIGINT,
+    resulting_claim_revision BIGINT,
+    observed_database_now TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+VOLATILE
+STRICT
+PARALLEL UNSAFE
+SECURITY DEFINER
+SET search_path = pg_catalog
+ROWS 1
+AS $function$
+DECLARE
+    head_row public.runtime_interaction_receipt_heads_v1%ROWTYPE;
+    secret_row public.runtime_interaction_receipt_token_secrets_v1%ROWTYPE;
+    secret_found BOOLEAN;
+    database_now TIMESTAMPTZ;
+    next_acknowledgement_state TEXT;
+    expiry_outcome_code TEXT;
+BEGIN
+    IF expected_application_id !~ '^[1-9][0-9]{0,19}$'
+        OR pg_catalog.length(expected_application_id) > 20
+        OR expected_interaction_id !~ '^[1-9][0-9]{0,19}$'
+        OR pg_catalog.length(expected_interaction_id) > 20
+        OR expected_head_revision NOT BETWEEN 1 AND 9223372036854775806
+        OR expected_claim_revision NOT BETWEEN 1 AND 9223372036854775807
+        OR pg_catalog.octet_length(proposed_expiry_observation_digest) <> 32
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RI003',
+            MESSAGE = 'runtime_interaction_receipt_token_expire_input_invalid';
+    END IF;
+
+    PERFORM pg_catalog.pg_advisory_xact_lock(
+        pg_catalog.hashtextextended(
+            'starring-runtime-interaction-receipt-v1:'
+                || expected_application_id
+                || ':'
+                || expected_interaction_id,
+            0
+        )
+    );
+
+    SELECT head.*
+    INTO head_row
+    FROM public.runtime_interaction_receipt_heads_v1 AS head
+    WHERE head.application_id = expected_application_id
+        AND head.interaction_id = expected_interaction_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION USING
             ERRCODE = 'RI001',
             MESSAGE = 'runtime_interaction_receipt_not_found';
     END IF;
@@ -4884,8 +5261,21 @@ BEGIN
     WHERE secret.application_id = expected_application_id
         AND secret.interaction_id = expected_interaction_id
     FOR UPDATE;
+    secret_found := FOUND;
 
-    IF NOT FOUND THEN
+    database_now := pg_catalog.clock_timestamp();
+
+    IF head_row.head_revision <> expected_head_revision
+        OR head_row.claim_revision <> expected_claim_revision
+    THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'RI001',
+            MESSAGE = 'runtime_interaction_receipt_token_expire_conflict';
+    END IF;
+
+    IF NOT secret_found
+        AND head_row.state IN ('completed', 'failed', 'recovery_required')
+    THEN
         outcome_name := 'token_absent';
         receipt_state := head_row.state;
         resulting_head_revision := head_row.head_revision;
@@ -4895,7 +5285,7 @@ BEGIN
         RETURN;
     END IF;
 
-    IF secret_row.expires_at > database_now THEN
+    IF secret_found AND secret_row.expires_at > database_now THEN
         outcome_name := 'token_not_expired';
         receipt_state := head_row.state;
         resulting_head_revision := head_row.head_revision;
@@ -4903,62 +5293,6 @@ BEGIN
         observed_database_now := database_now;
         RETURN NEXT;
         RETURN;
-    END IF;
-
-    IF head_row.head_revision <> expected_head_revision
-        OR head_row.claim_revision <> expected_claim_revision
-        OR head_row.claim_process_instance_id
-            IS DISTINCT FROM expected_process_instance_id
-    THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'RI001',
-            MESSAGE = 'runtime_interaction_receipt_token_expire_conflict';
-    END IF;
-
-    SELECT observed.*
-    INTO authority_row
-    FROM public.starring_runtime_interaction_receipt_authority_observe_v1(
-        root_row.application_id,
-        root_row.tenant_id,
-        root_row.installation_id,
-        root_row.deployment_id,
-        root_row.guild_id,
-        root_row.ruleset_key,
-        root_row.target_version,
-        root_row.target_content_hash,
-        root_row.binding_revision,
-        root_row.binding_fingerprint,
-        root_row.runtime_generation,
-        root_row.route_controller_fencing_token,
-        root_row.route_incarnation,
-        expected_process_instance_id,
-        head_row.claim_gateway_shard_id,
-        root_row.runtime_build_revision,
-        root_row.route_kind,
-        COALESCE(root_row.instance_id, '')
-    ) AS observed;
-
-    IF NOT FOUND
-        OR authority_row.attestation_id
-            IS DISTINCT FROM root_row.attestation_id
-        OR authority_row.attestation_digest
-            IS DISTINCT FROM root_row.attestation_digest
-        OR authority_row.route_controller_fencing_token
-            IS DISTINCT FROM root_row.route_controller_fencing_token
-        OR authority_row.route_incarnation
-            IS DISTINCT FROM root_row.route_incarnation
-        OR authority_row.runtime_build_revision
-            IS DISTINCT FROM root_row.runtime_build_revision
-        OR authority_row.execution_ruleset_version
-            IS DISTINCT FROM root_row.execution_ruleset_version
-        OR authority_row.execution_ruleset_content_hash
-            IS DISTINCT FROM root_row.execution_ruleset_content_hash
-        OR authority_row.instance_manifest_digest
-            IS DISTINCT FROM root_row.instance_manifest_digest
-    THEN
-        RAISE EXCEPTION USING
-            ERRCODE = 'RI004',
-            MESSAGE = 'runtime_interaction_receipt_token_expire_authority_invalid';
     END IF;
 
     IF head_row.state IN ('completed', 'failed', 'recovery_required') THEN
@@ -4974,6 +5308,11 @@ BEGIN
         RETURN NEXT;
         RETURN;
     END IF;
+
+    expiry_outcome_code := CASE
+        WHEN secret_found THEN 'interaction_token_expired'
+        ELSE 'interaction_token_unavailable'
+    END;
 
     next_acknowledgement_state := CASE
         WHEN head_row.acknowledgement_state = 'attempting'
@@ -5000,7 +5339,7 @@ BEGIN
                 THEN database_now
             ELSE head.acknowledged_at
         END,
-        terminal_outcome_code = 'interaction_token_expired',
+        terminal_outcome_code = expiry_outcome_code,
         terminal_result_digest = proposed_expiry_observation_digest,
         terminal_at = database_now,
         updated_at = database_now
@@ -5042,7 +5381,7 @@ BEGIN
         head_row.claim_gateway_owner_revision,
         head_row.claim_serving_lease_epoch,
         head_row.claim_serving_revision,
-        'interaction_token_expired',
+        expiry_outcome_code,
         pg_catalog.sha256(pg_catalog.convert_to(
             pg_catalog.concat_ws(
                 '|',
@@ -5062,7 +5401,7 @@ BEGIN
                 head_row.claim_gateway_owner_revision::TEXT,
                 head_row.claim_serving_lease_epoch::TEXT,
                 head_row.claim_serving_revision::TEXT,
-                'interaction_token_expired'
+                expiry_outcome_code
             ),
             'UTF8'
         )),
@@ -5073,7 +5412,7 @@ BEGIN
     WHERE application_id = expected_application_id
         AND interaction_id = expected_interaction_id;
 
-    outcome_name := 'interaction_token_expired';
+    outcome_name := expiry_outcome_code;
     receipt_state := 'recovery_required';
     resulting_head_revision := head_row.head_revision + 1;
     resulting_claim_revision := head_row.claim_revision;
@@ -5302,9 +5641,9 @@ BEGIN
     INTO observed_count, observed_digest
     FROM manifest;
 
-    RETURN observed_count = 155
+    RETURN observed_count = 156
         AND observed_digest =
-            'f51a0a41f3384801fbf3237722de7f171732c72d707ca6d4586a8ea4b314e333';
+            'a2ea200c577ae33a9289803fc380f86cf886a7f4e4f5cc7f7fbc0b66f5ef128a';
 END;
 $function$;
 
@@ -5474,7 +5813,7 @@ BEGIN
                         OR privilege.privilege_type <> 'EXECUTE'
                         OR privilege.is_grantable
                 )
-        ) <> 16
+        ) <> 17
         OR (
             SELECT pg_catalog.count(*)
             FROM pg_catalog.pg_trigger AS trigger_row
@@ -5500,6 +5839,8 @@ BEGIN
             '%starring_runtime_interaction_receipt_claim_v1%'
         OR readiness_definition NOT LIKE
             '%starring_runtime_interaction_receipt_recover_v1%'
+        OR readiness_definition NOT LIKE
+            '%starring_runtime_interaction_receipt_terminalize_expired_v1%'
     THEN
         RAISE EXCEPTION 'runtime interaction receipt migration postflight failed'
             USING ERRCODE = '55000';

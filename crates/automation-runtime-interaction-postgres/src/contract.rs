@@ -31,3 +31,49 @@ pub(crate) const INSTANCE_TEARDOWN_RETRY_QUERY: &str =
 pub(crate) const INSTANCE_TEARDOWN_RETRY_SCAN_QUERY: &str =
     "SELECT * FROM public.starring_runtime_interaction_instance_scan_retryable_v2(\
         $1, $2, $3, $4, $5)";
+
+pub(crate) const RECEIPT_AUTHORITY_OBSERVE_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_receipt_authority_observe_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)";
+
+pub(crate) const RECEIPT_CLAIM_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_receipt_claim_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+        $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, \
+        $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)";
+
+pub(crate) const RECEIPT_PLAN_BIND_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_receipt_plan_bind_v1(\
+        $1, $2, $3, $4, $5, $6)";
+
+pub(crate) const RECEIPT_ACKNOWLEDGEMENT_INTEND_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_receipt_acknowledgement_intend_v1(\
+        $1, $2, $3, $4, $5, $6, $7)";
+
+pub(crate) const RECEIPT_ACKNOWLEDGEMENT_FINISH_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_receipt_acknowledgement_finish_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8)";
+
+pub(crate) const RECEIPT_EXECUTION_INTEND_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_receipt_execution_intend_v1(\
+        $1, $2, $3, $4, $5, $6)";
+
+pub(crate) const RECEIPT_FINISH_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_receipt_finish_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9)";
+
+pub(crate) const RECEIPT_RECOVERY_SCAN_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_receipt_scan_recoverable_v1(\
+        $1, $2, $3, $4, $5, $6, $7)";
+
+pub(crate) const RECEIPT_RECOVER_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_receipt_recover_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)";
+
+pub(crate) const RECEIPT_TOKEN_EXPIRE_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_receipt_token_expire_v1(\
+        $1, $2, $3, $4, $5)";
+
+pub(crate) const RECEIPT_TERMINALIZE_EXPIRED_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_receipt_terminalize_expired_v1(\
+        $1, $2, $3, $4, $5, $6, $7)";

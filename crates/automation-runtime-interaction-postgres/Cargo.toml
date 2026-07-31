@@ -8,9 +8,12 @@ automation-core = { path = "../automation-core" }
 automation-instance = { path = "../automation-instance" }
 automation-ruleset = { path = "../automation-ruleset" }
 automation-ruleset-dispatch = { path = "../automation-ruleset-dispatch" }
+automation-runtime-convergence = { path = "../automation-runtime-convergence" }
+automation-runtime-interaction = { path = "../automation-runtime-interaction" }
 automation-state = { path = "../automation-state" }
 chrono = "0.4"
 discord-model = { path = "../discord-model" }
+resource-resolution = { path = "../resource-resolution" }
 serde_json = { workspace = true }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "derive", "macros", "migrate"] }
 thiserror = { workspace = true }

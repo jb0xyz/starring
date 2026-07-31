@@ -39,9 +39,9 @@ use crate::{
 
 #[derive(Clone)]
 pub struct PostgresRuntimeInteractionV1 {
-    pool: PgPool,
-    expectation: RuntimeInteractionDatabaseExpectationV1,
-    timeouts: RuntimeInteractionDatabaseTimeoutsV1,
+    pub(crate) pool: PgPool,
+    pub(crate) expectation: RuntimeInteractionDatabaseExpectationV1,
+    pub(crate) timeouts: RuntimeInteractionDatabaseTimeoutsV1,
     route_database_timeouts: RuntimeInteractionDatabaseTimeoutsV1,
     route_timeout: RuntimeInteractionRouteTimeoutV1,
     initial_readiness: RuntimeInteractionDatabaseReadinessV1,
