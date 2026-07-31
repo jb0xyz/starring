@@ -646,6 +646,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "tests/mutation_finalizer.rs",
             "tests/process_contract.rs",
             "tests/serving_heartbeat_monitor_guard.rs",
+            "tests/staging_receipt_acl_backfill_contract.rs",
             "tests/staging_role_bootstrap_contract.rs"
         ]
     );
@@ -722,6 +723,7 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
             ("futures".to_string(), None),
             ("getrandom".to_string(), None),
             ("serde_json".to_string(), Some("dev".to_string())),
+            ("sha2".to_string(), Some("dev".to_string())),
             ("sqlx".to_string(), None),
             ("thiserror".to_string(), None),
             ("tokio".to_string(), None),

@@ -71,8 +71,10 @@ starring-runtime-dedicated-staging-cluster-v2:SYSTEM_IDENTIFIER:starring_runtime
 ```
 
 Every `zsh` block below is a fail-fast subshell. Run a block as one unit and
-continue only when its exit status is zero. Secrets are entered only at an
-interactive password prompt.
+continue only when its exit status is zero. Secret input follows the contract
+of each block: legacy bootstrap prompts use hidden terminal input, while
+reviewed incremental paths read only their fixed Keychain items and never
+prompt on the server.
 
 ## Local preconditions and independent inventory
 
@@ -242,6 +244,134 @@ fails the block.
   diff -u "$EXPECTED_LEDGER" "$APPLIED_LEDGER"
 )
 ```
+
+## Backfill C1 interaction receipt function ACLs
+
+Use this incremental path only when an already-provisioned staging cluster has
+applied migration `202607310022` but the five runtime role bootstrap must not
+be rerun because its existing SCRAM credentials must remain unchanged. A new
+cluster should use the full bootstrap path below instead. Keep both staging
+LaunchAgents unloaded. The script rejects any other client backend or prepared
+transaction, validates the exact 115-entry repository migration ledger, and
+holds a transaction advisory lock for the whole operation.
+
+The transaction can change only the ACLs of the 17 C1 receipt-boundary
+functions. It removes `PUBLIC` and unrelated grants, gives the 11 exported
+receipt capabilities non-grantable `EXECUTE` to
+`starring_runtime_interaction`, and leaves the six internal manifest, claim
+helper, and trigger guard functions owner-only. It snapshots every PostgreSQL
+role attribute including the SCRAM verifier for `starring_owner` and
+`starring_runtime_interaction`, proves the snapshot is unchanged before
+commit, and runs interaction database readiness under the actual interaction
+session identity. A failed check rolls back every ACL change. An exact replay
+is safe and produces the same ACL topology.
+
+```zsh
+(
+  set -euo pipefail
+  set +x
+  umask 077
+  cd /Users/jungbogeon/starring
+  STAGING_DATABASE=starring_runtime_staging
+  DOMAIN="gui/$(id -u)"
+  ADMIN_PGPASS_DIR=
+  ADMIN_PGPASS_PATH=
+  cleanup_admin_pgpass() {
+    CLEANUP_STATUS=0
+    if test -n "${ADMIN_PGPASS_PATH:-}" \
+      && test -e "$ADMIN_PGPASS_PATH"
+    then
+      if test -f "$ADMIN_PGPASS_PATH" \
+        && ! test -L "$ADMIN_PGPASS_PATH"
+      then
+        /bin/dd if=/dev/zero of="$ADMIN_PGPASS_PATH" \
+          bs=4096 count=1 conv=notrunc >/dev/null 2>&1 \
+          || CLEANUP_STATUS=1
+      else
+        CLEANUP_STATUS=1
+      fi
+      /bin/rm -f "$ADMIN_PGPASS_PATH" >/dev/null 2>&1 \
+        || CLEANUP_STATUS=1
+    fi
+    if test -n "${ADMIN_PGPASS_DIR:-}"
+    then
+      /bin/rmdir "$ADMIN_PGPASS_DIR" >/dev/null 2>&1 \
+        || CLEANUP_STATUS=1
+    fi
+    return "$CLEANUP_STATUS"
+  }
+  trap \
+    'TRAP_STATUS=$?; trap - EXIT HUP INT TERM; cleanup_admin_pgpass || CLEANUP_STATUS=$?; if test "$TRAP_STATUS" -eq 0 && test "${CLEANUP_STATUS:-0}" -ne 0; then exit "$CLEANUP_STATUS"; fi; exit "$TRAP_STATUS"' \
+    EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  : "${STARRING_STAGING_CLUSTER_ADMIN:?load the reviewed cluster administrator}"
+  : "${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER:?load the reviewed system identifier}"
+  : "${STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT:?load the reviewed dedicated-cluster acknowledgement}"
+  test "$STARRING_STAGING_CLUSTER_ADMIN" = starring_cluster_admin
+  ! launchctl print "$DOMAIN/local.starring.runtime.staging" >/dev/null 2>&1
+  ! launchctl print "$DOMAIN/local.starring.api.staging" >/dev/null 2>&1
+  unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
+  unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
+  ADMIN_PGPASS_DIR="$(
+    /usr/bin/mktemp -d /private/tmp/starring-admin-pgpass.XXXXXX
+  )"
+  test -d "$ADMIN_PGPASS_DIR"
+  test "$(
+    /usr/bin/stat -f '%u:%Lp' "$ADMIN_PGPASS_DIR"
+  )" = "$(/usr/bin/id -u):700"
+  /bin/ls -lde "$ADMIN_PGPASS_DIR" \
+    | /usr/bin/awk \
+      'NR == 1 { ok = ($1 == "drwx------" || $1 == "drwx------@") } NR > 1 { ok = 0 } END { exit(ok ? 0 : 1) }'
+  ADMIN_PGPASS_PATH="$ADMIN_PGPASS_DIR/pgpass"
+  /usr/bin/security find-generic-password -w \
+    -s starring.postgres.staging \
+    -a database.cluster-admin \
+    | /usr/bin/sed -nE \
+      's#^postgresql://starring_cluster_admin:([A-Za-z0-9_-]{43})@127\.0\.0\.1:5432/postgres\?sslmode=disable$#127.0.0.1:5432:*:starring_cluster_admin:\1#p' \
+      >"$ADMIN_PGPASS_PATH"
+  test -f "$ADMIN_PGPASS_PATH"
+  ! test -L "$ADMIN_PGPASS_PATH"
+  test "$(
+    /usr/bin/stat -f '%u:%Lp' "$ADMIN_PGPASS_PATH"
+  )" = "$(/usr/bin/id -u):600"
+  /bin/ls -le "$ADMIN_PGPASS_PATH" \
+    | /usr/bin/awk \
+      'NR == 1 { ok = ($1 == "-rw-------" || $1 == "-rw-------@") } NR > 1 { ok = 0 } END { exit(ok ? 0 : 1) }'
+  test "$(
+    /usr/bin/wc -l <"$ADMIN_PGPASS_PATH" | /usr/bin/tr -d ' '
+  )" = 1
+  /usr/bin/grep -Eq \
+    '^127\.0\.0\.1:5432:\*:starring_cluster_admin:[A-Za-z0-9_-]{43}$' \
+    "$ADMIN_PGPASS_PATH"
+  PGPASSFILE="$ADMIN_PGPASS_PATH" PGSSLMODE=disable \
+    /opt/homebrew/opt/postgresql@16/bin/psql \
+    --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
+    --host 127.0.0.1 --port 5432 \
+    --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+    --dbname "$STAGING_DATABASE" \
+    --set expected_database="$STAGING_DATABASE" \
+    --set expected_system_identifier="$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    --set runtime_dedicated_cluster_acknowledgement="$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    --file ops/postgres/staging-runtime-interaction-receipt-acl-backfill.sql
+)
+```
+
+Do not substitute a database URL, password environment variable, inline SQL
+credential, or interactive server prompt. The administrator URL flows from the
+fixed Keychain item through a mode-`0600` temporary `PGPASSFILE`; the trap
+overwrites and removes that file on success, error, or signal. Do not use this
+script if any migration later than `202607310022` exists; update and
+independently review its fixed ledger and function manifests first.
+
+For an existing credentialed cluster, a successful C1 backfill completes the
+runtime-role ACL step. Skip the following bootstrap, quarantine, password
+creation, role-enable, and credential-rotation sections; resuming any of those
+fresh-cluster sections would intentionally reset the existing runtime role
+credentials. Continue at `Store indirect secrets in Keychain` and use only its
+dedicated legacy interaction-token keyring mode before building the immutable
+revision.
 
 ## Bootstrap the five database roles
 

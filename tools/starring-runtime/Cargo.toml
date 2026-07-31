@@ -30,3 +30,4 @@ zeroize = "1"
 
 [dev-dependencies]
 serde_json.workspace = true
+sha2 = "0.10"

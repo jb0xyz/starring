@@ -3362,6 +3362,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
