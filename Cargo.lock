@@ -3346,6 +3346,7 @@ dependencies = [
  "automation-runtime-convergence",
  "automation-runtime-convergence-postgres",
  "automation-runtime-execution-postgres",
+ "automation-runtime-interaction",
  "automation-runtime-interaction-postgres",
  "automation-runtime-panel-evidence",
  "automation-runtime-panel-postgres",

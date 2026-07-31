@@ -111,6 +111,7 @@ pub enum RuntimeConfigurationFieldV1 {
     GatewayOwnerSafetyMargin,
     DatabaseUrlSecretReference(DatabaseCapabilityV1),
     DiscordBotTokenSecretReference,
+    InteractionTokenEnvelopeKeyringSecretReference,
 }
 
 impl RuntimeConfigurationFieldV1 {
@@ -148,6 +149,9 @@ impl RuntimeConfigurationFieldV1 {
             Self::DiscordBotTokenSecretReference => {
                 "STARRING_RUNTIME_DISCORD_BOT_TOKEN_SECRET_REFERENCE"
             }
+            Self::InteractionTokenEnvelopeKeyringSecretReference => {
+                "STARRING_RUNTIME_INTERACTION_TOKEN_ENVELOPE_KEYRING_SECRET_REFERENCE"
+            }
         }
     }
 
@@ -179,6 +183,9 @@ impl RuntimeConfigurationFieldV1 {
                 DatabaseCapabilityV1::Interaction => "interaction_database_url_secret_reference",
             },
             Self::DiscordBotTokenSecretReference => "discord_bot_token_secret_reference",
+            Self::InteractionTokenEnvelopeKeyringSecretReference => {
+                "interaction_token_envelope_keyring_secret_reference"
+            }
         }
     }
 }
@@ -439,16 +446,19 @@ impl GatewayOwnerTimingConfigV1 {
 pub struct RuntimeSecretReferencesV1 {
     database_urls: [RuntimeSecretReferenceV1; 5],
     discord_bot_token: RuntimeSecretReferenceV1,
+    interaction_token_envelope_keyring: RuntimeSecretReferenceV1,
 }
 
 impl RuntimeSecretReferencesV1 {
     pub(crate) fn from_parts(
         database_urls: [RuntimeSecretReferenceV1; 5],
         discord_bot_token: RuntimeSecretReferenceV1,
+        interaction_token_envelope_keyring: RuntimeSecretReferenceV1,
     ) -> Self {
         Self {
             database_urls,
             discord_bot_token,
+            interaction_token_envelope_keyring,
         }
     }
 
@@ -458,6 +468,10 @@ impl RuntimeSecretReferencesV1 {
 
     pub fn discord_bot_token(&self) -> &RuntimeSecretReferenceV1 {
         &self.discord_bot_token
+    }
+
+    pub fn interaction_token_envelope_keyring(&self) -> &RuntimeSecretReferenceV1 {
+        &self.interaction_token_envelope_keyring
     }
 }
 
@@ -752,6 +766,10 @@ fn parse_secret_references(
         source,
         RuntimeConfigurationFieldV1::DiscordBotTokenSecretReference,
     )?;
+    let interaction_token_envelope_keyring = parse_secret_reference(
+        source,
+        RuntimeConfigurationFieldV1::InteractionTokenEnvelopeKeyringSecretReference,
+    )?;
     let duplicate_database = database_urls.iter().enumerate().any(|(index, candidate)| {
         database_urls
             .iter()
@@ -762,6 +780,10 @@ fn parse_secret_references(
         || database_urls
             .iter()
             .any(|reference| reference == &discord_bot_token)
+        || database_urls
+            .iter()
+            .any(|reference| reference == &interaction_token_envelope_keyring)
+        || discord_bot_token == interaction_token_envelope_keyring
     {
         return Err(RuntimeConfigErrorV1::DuplicateSecretReference);
     }
@@ -771,6 +793,7 @@ fn parse_secret_references(
     Ok(RuntimeSecretReferencesV1::from_parts(
         database_urls,
         discord_bot_token,
+        interaction_token_envelope_keyring,
     ))
 }
 
@@ -891,6 +914,10 @@ mod tests {
             RuntimeConfigurationFieldV1::DiscordBotTokenSecretReference,
             "env:STARRING_RUNTIME_SECRET_DISCORD_BOT_TOKEN",
         );
+        source.insert(
+            RuntimeConfigurationFieldV1::InteractionTokenEnvelopeKeyringSecretReference,
+            "env:STARRING_RUNTIME_SECRET_INTERACTION_TOKEN_ENVELOPE_KEYRING",
+        );
         source
     }
 
@@ -972,6 +999,13 @@ mod tests {
                 .environment_name(),
             Some("STARRING_RUNTIME_SECRET_DISCORD_BOT_TOKEN")
         );
+        assert_eq!(
+            config
+                .secret_references()
+                .interaction_token_envelope_keyring()
+                .environment_name(),
+            Some("STARRING_RUNTIME_SECRET_INTERACTION_TOKEN_ENVELOPE_KEYRING")
+        );
         let mut missing = valid_source();
         missing.values.remove(
             RuntimeConfigurationFieldV1::DatabaseUrlSecretReference(
@@ -1030,6 +1064,35 @@ mod tests {
         assert_eq!(
             RuntimeConfigV1::from_source(&token_alias).unwrap_err(),
             RuntimeConfigErrorV1::DuplicateSecretReference
+        );
+        let mut keyring_alias = valid_source();
+        keyring_alias.insert(
+            RuntimeConfigurationFieldV1::InteractionTokenEnvelopeKeyringSecretReference,
+            "env:STARRING_RUNTIME_SECRET_DISCORD_BOT_TOKEN",
+        );
+        assert_eq!(
+            RuntimeConfigV1::from_source(&keyring_alias).unwrap_err(),
+            RuntimeConfigErrorV1::DuplicateSecretReference
+        );
+        let mut keyring_database_alias = valid_source();
+        keyring_database_alias.insert(
+            RuntimeConfigurationFieldV1::InteractionTokenEnvelopeKeyringSecretReference,
+            "env:STARRING_RUNTIME_SECRET_DATABASE_4",
+        );
+        assert_eq!(
+            RuntimeConfigV1::from_source(&keyring_database_alias).unwrap_err(),
+            RuntimeConfigErrorV1::DuplicateSecretReference
+        );
+        let mut missing_keyring = valid_source();
+        missing_keyring.values.remove(
+            RuntimeConfigurationFieldV1::InteractionTokenEnvelopeKeyringSecretReference
+                .environment_name(),
+        );
+        assert_eq!(
+            RuntimeConfigV1::from_source(&missing_keyring).unwrap_err(),
+            RuntimeConfigErrorV1::Missing(
+                RuntimeConfigurationFieldV1::InteractionTokenEnvelopeKeyringSecretReference
+            )
         );
         for rejected in [
             "env:",

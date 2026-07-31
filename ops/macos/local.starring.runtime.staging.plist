@@ -60,6 +60,8 @@
         <string>keychain:starring.runtime.staging:database.interaction</string>
         <key>STARRING_RUNTIME_DISCORD_BOT_TOKEN_SECRET_REFERENCE</key>
         <string>keychain:starring.runtime.staging:discord.bot-token</string>
+        <key>STARRING_RUNTIME_INTERACTION_TOKEN_ENVELOPE_KEYRING_SECRET_REFERENCE</key>
+        <string>keychain:starring.runtime.staging:interaction.token-envelope-keyring</string>
     </dict>
     <key>KeepAlive</key>
     <dict>

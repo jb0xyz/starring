@@ -52,6 +52,10 @@ fn referenced_command() -> Command {
             "STARRING_RUNTIME_DISCORD_BOT_TOKEN_SECRET_REFERENCE",
             "env:STARRING_RUNTIME_SECRET_DISCORD_BOT_TOKEN",
         ),
+        (
+            "STARRING_RUNTIME_INTERACTION_TOKEN_ENVELOPE_KEYRING_SECRET_REFERENCE",
+            "env:STARRING_RUNTIME_SECRET_INTERACTION_TOKEN_ENVELOPE_KEYRING",
+        ),
     ] {
         command.env(name, value);
     }
@@ -79,6 +83,10 @@ fn configured_command() -> Command {
         "STARRING_RUNTIME_SECRET_DISCORD_BOT_TOKEN",
         "opaque.discord_bot-token_1234567890abcdef",
     );
+    command.env(
+        "STARRING_RUNTIME_SECRET_INTERACTION_TOKEN_ENVELOPE_KEYRING",
+        interaction_token_envelope_keyring(),
+    );
     command
 }
 
@@ -104,6 +112,7 @@ fn valid_runtime_configuration_stays_at_an_exact_closed_boundary() {
     for forbidden in [
         database_password(),
         "opaque.discord_bot-token_1234567890abcdef".to_string(),
+        interaction_token_envelope_keyring(),
         database_socket_path(),
     ] {
         assert!(!stderr
@@ -187,4 +196,9 @@ fn database_password() -> String {
 
 fn database_socket_path() -> String {
     format!("/tmp/starring_runtime_no_postgres_{}", std::process::id())
+}
+
+fn interaction_token_envelope_keyring() -> String {
+    "v1;active=process-contract=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;retired="
+        .to_string()
 }

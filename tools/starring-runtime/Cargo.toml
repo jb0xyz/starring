@@ -10,6 +10,7 @@ automation-runtime-controller = { path = "../../crates/automation-runtime-contro
 automation-runtime-convergence = { path = "../../crates/automation-runtime-convergence" }
 automation-runtime-convergence-postgres = { path = "../../crates/automation-runtime-convergence-postgres" }
 automation-runtime-execution-postgres = { path = "../../crates/automation-runtime-execution-postgres" }
+automation-runtime-interaction = { path = "../../crates/automation-runtime-interaction" }
 automation-runtime-interaction-postgres = { path = "../../crates/automation-runtime-interaction-postgres" }
 automation-runtime-panel-evidence = { path = "../../crates/automation-runtime-panel-evidence" }
 automation-runtime-panel-postgres = { path = "../../crates/automation-runtime-panel-postgres" }

@@ -708,6 +708,7 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
             ("automation-runtime-convergence".to_string(), None),
             ("automation-runtime-convergence-postgres".to_string(), None),
             ("automation-runtime-execution-postgres".to_string(), None),
+            ("automation-runtime-interaction".to_string(), None),
             ("automation-runtime-interaction-postgres".to_string(), None),
             ("automation-runtime-panel-evidence".to_string(), None),
             ("automation-runtime-panel-postgres".to_string(), None),
@@ -7167,7 +7168,7 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
         resolver
             .matches("run_runtime_startup_sync_stage_v1(")
             .count(),
-        2
+        3
     );
     for capability in [
         "DatabaseCapabilityV1::Convergence",
