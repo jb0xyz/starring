@@ -306,10 +306,10 @@ removing security, restart, failure, or release gates.
 - [x] A6. Pass the authoring milestone gate
 - [x] B1. Extend the existing production lifecycle for route serving
 - [x] B2. Compose the convergence lane and exact hydration
-- [ ] B3. Replace prior routes and reconcile panels
-- [ ] B4. Finalize V2 certification and serving monitor
-- [ ] B5. Dispatch interactions on the canonical shard
-- [ ] B6. Pass the staging end-to-end gate
+- [x] B3. Replace prior routes and reconcile panels
+- [x] B4. Finalize V2 certification and serving monitor
+- [x] B5. Dispatch interactions on the canonical shard
+- [x] B6. Pass the staging end-to-end gate
 - [ ] C1. Add durable interaction receipts
 - [ ] C2. Add complete deterministic action-plan preflight
 - [ ] C3. Add effect journal, reconciliation, and bounded compensation
@@ -941,7 +941,8 @@ feat(runtime): dispatch interactions on the production shard
 
 Work:
 
-- Create a disposable PostgreSQL database and Discord guild namespace
+- Use the dedicated non-customer staging PostgreSQL database and an isolated,
+  disposable per-run Discord resource namespace
 - Seed only the installation and credentials required by the real product path
 - Run OAuth and fresh Author authority
 - Submit one deterministic authoring fixture through the trusted writer
@@ -953,7 +954,9 @@ Work:
 - Execute button, modal, role, channel, permission, panel, and ephemeral paths
 - Restart runtime at representative durable checkpoints
 - Confirm route and historical instance reconstruction
-- Drain and remove all test resources
+- Drain and remove every run-owned Discord and instance resource
+- Retain only the explicitly enumerated standing staging database,
+  installation, immutable deployment evidence, and certified base Create panel
 
 Milestone B acceptance:
 
@@ -961,6 +964,11 @@ Milestone B acceptance:
 - No manual activation or smoke-only authority is used
 - No customer guild or production credential is used
 - The final status is truthful before, during, and after Live
+- Every per-run role, channel, panel, and active instance resource is absent
+  after teardown
+- The retained standing fixture is enumerated in the evidence and does not
+  satisfy or weaken the stricter D2 disposable-database, failure-injection,
+  replacement, disconnect, and total-resource-disposal gate
 
 Commit:
 
@@ -969,6 +977,15 @@ test(runtime): prove requested to live staging execution
 ```
 
 Milestone B completes the accepted **3–5 focused workday** staging range.
+
+Observed closure on 2026-07-31 is recorded in
+`../measurements/2026-07-31-runtime-milestone-b6.md`. The functional product
+path, real Discord mutation path, restart reconstruction, exact instance
+cleanup, and final runtime recovery passed. The dedicated staging database,
+installation, live deployment, and certified base panel were retained as a
+reusable staging fixture because no product uninstall operation exists. This
+standing-fixture scope does not replace the stricter unique-database and
+total-resource disposal acceptance in D2.
 
 ## Phase C: commercial safety
 

@@ -285,9 +285,11 @@ privilege drift also closes admission. The checked-in LaunchAgents and exact
 capability manifests are staging-only. Authoring admission is isolated from the
 core product surface, so an absent, saturated, unhealthy, or drifted writer or
 worker closes authoring without granting fallback database authority. A6 now
-proves this runnable authoring path through exact promotion, but it is not a
-commercial Live certificate: Phase B still must compose runtime route serving
-on the canonical Discord shard.
+proves this runnable authoring path through exact promotion. Phase B now
+composes exact deployment convergence, panel reconciliation, certification,
+serving monitoring, and deterministic interaction dispatch on the canonical
+Discord shard. The B6 staging run reached real Live and executed the current
+recipe, but it is not a commercial release certificate.
 
 The active authoring provider is `codex_chatgpt`, pinned to
 `gpt-5.6-luna` with `medium` reasoning effort and ChatGPT authentication. The
@@ -645,6 +647,16 @@ Stated as capabilities (durable across the phase numbering):
 - Fenced PostgreSQL runtime convergence with exact desired-target digests,
   attestation, serving lease and heartbeat evidence, stale-Live recovery, and
   product status that never equates an Applied pointer with Live.
+- The existing `tools/starring-runtime` process now owns one canonical Discord
+  shard, stages exact requested targets, drains and replaces routes, reconciles
+  certified panels, finalizes V2 Live certification, monitors serving leases,
+  dispatches static and historical-instance interactions, and preserves
+  least-privilege instance teardown state. Its bounded periodic teardown
+  supervisor starts only after canonical owner acquisition and operation-open,
+  uses the same narrow interaction capability and shared Discord client as live
+  dispatch, and stops before owner release. The B6 staging slice proved the real
+  product path from approval and Apply through Live, Discord resource creation,
+  restart reconstruction, and automatic exact per-instance footprint cleanup.
 - Current-versus-historical authority separation: policy-only rotation preserves
   runtime eligibility, while lifecycle, target, binding revision, fingerprint,
   or binding-map mismatch fails closed.
@@ -704,15 +716,16 @@ Stated as capabilities (durable across the phase numbering):
   restrictive grants, and a 15-rule HBA; restored-cluster reconciliation,
   production secret-account isolation, rotation, and whole-process negative
   capability evidence remain release blockers.
-- Phase B route serving in the existing `tools/starring-runtime` process. It
-  safely reaches the connected paused empty-open epoch, but the serving-open
-  lifecycle successor, deployment convergence lane, exact hydration, route
-  replacement, panel reconciliation, V2 certification monitor, canonical-shard
-  dispatcher, teardown composition, and disposable-guild staging E2E are not
-  yet complete.
+- Commercial runtime safety beyond the completed Phase B staging slice:
+  durable duplicate-interaction receipts, complete deterministic action-plan
+  preflight, effect journaling, indeterminate-effect reconciliation, bounded
+  compensation, and recovery of partially observed non-teardown effects remain
+  Phase C.
 - An administrative / management API.
 - Broader multi-process lease/ownership beyond the single per-request lease.
-- A periodic teardown-retry worker (teardown resumes on boot, not on a schedule).
+- A dedicated live teardown-retry progress and degraded-health projection. The
+  bounded periodic worker exists and was exercised, but ongoing scan and item
+  failure counters are not yet exposed through a separate health endpoint.
 - Compact `RouteId` / custom-id compression (deferred until length is a real
   constraint).
 - Any non-Discord adapter.
@@ -729,10 +742,9 @@ Stated as capabilities (durable across the phase numbering):
 
 - The product-control HTTP process is runnable only as a staging control plane.
   It authenticates and authorizes conversational authoring and the implemented
-  product operations, but it cannot make Requested deployments Live until the
-  existing runtime process gains the Phase B serving loop. Public ingress
-  remains a release decision gated by the operational runbook and later
-  commercial certification.
+  product operations, and the staging runtime can make exact Requested
+  deployments Live. Public ingress remains a release decision gated by the
+  operational runbook and later commercial certification.
 - `interaction-smoke` is non-production manual tooling. It is unavailable
   without its compile feature, requires `STARRING_ALLOW_INTERACTION_SMOKE=1`,
   is marked non-publishable, and accepts only ASCII alphanumeric/underscore
@@ -744,26 +756,31 @@ Stated as capabilities (durable across the phase numbering):
 - The HTTP `/v1/me` database mismatch is resolved: `current_principal` uses the
   session-only projection, while `verify_csrf` uses the distinct mutation
   projection. The production facade and fifteen-pool API startup composition now
-  exercise this boundary, while runtime route serving remains incomplete.
-- Apply can durably reach `RuntimePending`, and tests can drive exact simulated
-  attestation to Live. Commercial operation still requires the Phase B
-  route-serving loop in the existing runtime process and real Discord lifecycle
-  certification.
+  exercise this boundary, and the B6 staging route exercised the real runtime
+  successor.
+- Apply can durably reach `RuntimePending`, and the exact staging runtime can
+  advance it to real Live with a certified panel and fresh serving lease.
+  Commercial operation still requires the Phase C safety controls and Phase D
+  failure, load, recovery, disposable-guild, CI, and merged-main certification.
 - The `automation-panel-installation-postgres` ignored tests share a guild
   constant and must run serially (`--test-threads=1`); CI does this. A cleaner
   per-test isolation is deferred.
 - `last_apply_error` keeps only the latest attempt (no history table). Legacy and
   manual `observed_active` remains informational; product-authoring requests bind
   an exact expected baseline and fail as `Superseded` when it drifts.
-- Discord and DB are not jointly atomic; the guarantees are "no durable
-  incomplete state" and idempotent convergence, not distributed transactions.
-- Layer 1's live end-to-end maturity is not certified here.
+- Discord and DB are not jointly atomic. Teardown state is durable and its
+  retries are idempotent, but ordinary action execution still lacks the Phase C
+  effect journal and reconciliation needed to recover every partial external
+  effect.
+- Layer 2's functional product/runtime staging execution is proven, but its
+  commercial failure, load, recovery, and release maturity is not certified
+  here. Layer 1's live end-to-end maturity remains uncertified.
 - The first recipe checkpoint does not certify commercial readiness. Custom
   copy, naming, and controls now have a passing repeated V4 acceptance matrix,
   and the authenticated API, identity boundary, and A6 live authoring path are
-  proven, but concurrent load, throughput, soak recovery, high availability,
-  live Discord execution, and external Discord failure recovery remain
-  uncertified.
+  proven. B6 also proves one exact live Discord execution and restart path, but
+  concurrent load, throughput, soak recovery, high availability, and external
+  Discord failure recovery remain uncertified.
 - V4 structurally removes the V3 identity defect in which three full-detail
   repetitions produced one RuleSet and one compiled-plan identity but two
   input-intent and semantic-intent hash variants. The deterministic identity
@@ -801,52 +818,53 @@ Stated as capabilities (durable across the phase numbering):
   workspace test, Clippy, and formatting gates completed locally; treat a
   recurrence as a host operational fault and continue requiring independent CI
   before merge.
-- After the final Phase A gates and removal of 56.7 GiB of Rust build
-  artifacts, the data volume is about 74% used with roughly 54 GiB free. Keep
+- After the B6 gates and removal of the final clean-worktree target, the data
+  volume has roughly 37 GiB free. Keep
   at least 30 GiB free before retaining another large build or evaluation
   cohort; this is an operational capacity floor, not a certified production
   margin.
 
 ## Next Phase: Prove Commercial Operation
 
-Phase A A1–A6 is complete. The API has fourteen core pools and one isolated
-writer pool; the integrated staging cluster has 20 application credentials, two
-keyrings, a 15-rule HBA, migration 89, and authority revision 2
+Phase A A1–A6 and Phase B B1–B6 are complete. The API has fourteen core pools
+and one isolated writer pool; the integrated staging cluster has 20 application
+credentials, two keyrings, a 15-rule HBA, 114 migration-ledger entries through
+`202607310021`, and authority revision 2
 `community_hub` binding. The live signed-in gate proved one-shot and resumed
 multi-turn authoring, three encrypted durable generations, authenticated read,
-and exact PreviewReady promotion while stopping before approval or Apply.
+and exact PreviewReady promotion. The B6 gate then proved approval, Apply,
+RuntimePending-to-Live convergence, real Discord resource effects, restart
+reconstruction, and exact per-instance footprint cleanup.
 
 The accepted next sequence is:
 
-1. **Phase B — staging runtime serving:** extend the existing OpenProduction
-   lifecycle with a serving-open successor; compose bounded deployment
-   convergence and exact hydration; drain and replace prior routes; reconcile
-   panels; finalize V2 certification and serving monitoring; dispatch on the one
-   canonical Discord shard; and prove Requested-to-Live plus current-recipe
-   interaction execution in the disposable staging guild.
-2. **Phase C — commercial runtime safety:** add durable interaction receipts,
+1. **Phase C — commercial runtime safety:** add durable interaction receipts,
    deterministic whole-action-plan preflight, per-effect journaling,
    indeterminate-effect observation and reconciliation, and bounded
    compensation. The model remains absent from event-time and deployment-time
    execution.
-3. **Phase D — commercial certification:** run restart and failure cohorts,
+2. **Phase D — commercial certification:** run restart and failure cohorts,
    final disposable-guild E2E, backup/restore and non-interactive reboot drills,
    concurrency, saturation and soak measurement, complete local gates, final PR
    and merge-candidate CI, merged-main CI, and source-of-truth/runbook closure.
-4. After the commercial certificate, add typed multi-turn preference
+3. After the commercial certificate, add typed multi-turn preference
    accumulation and typed-planner handoff, then consider broader recipes or the
    separate `StatefulSpec` runtime arc.
 
 `docs/superpowers/plans/2026-07-29-authoring-runtime-commercial-completion.md`
 is authoritative for task ordering, acceptance conditions, and estimates.
 `docs/superpowers/measurements/2026-07-30-authoring-milestone-a6.md` is the
-aggregate Phase A live certificate; it must not be relabeled as Phase B runtime
-or commercial certification.
+aggregate Phase A live certificate.
+`docs/superpowers/measurements/2026-07-31-runtime-milestone-b6.md` records the
+Phase B staging runtime evidence and its standing-fixture scope. Neither
+measurement is a commercial certification.
 
 ## Source Documents
 
 - Design specs, plans, and runbooks: `docs/superpowers/{specs,plans,runbooks}/`
   (per-phase rationale; the 16–18f arc and the CI and rollback runbooks).
+- Phase B staging runtime evidence:
+  `docs/superpowers/measurements/2026-07-31-runtime-milestone-b6.md`.
 - Current Intent V4 semantic-identity implementation handoff:
   `docs/superpowers/handoffs/2026-07-15-intent-v4-semantic-identity-handoff.md`.
 - Current Luna V4 acceptance and hardening handoff:
