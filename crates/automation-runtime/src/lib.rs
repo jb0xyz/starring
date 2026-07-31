@@ -1,3 +1,4 @@
+pub mod acquired_receipt_execution;
 pub mod action_plan_digest;
 pub mod convert;
 pub mod custom_id;
@@ -23,6 +24,12 @@ pub mod snapshot;
 pub mod strict_panel_installer;
 mod teardown_retry_supervisor;
 
+pub use acquired_receipt_execution::{
+    execute_acquired_interaction_v1, AcquiredInteractionExecutionOutcomeV1,
+    AcquiredInteractionExecutionServicesV1, AcquiredInteractionLifecyclePermitV1,
+    AcquiredInteractionPersistenceStageV1, AcquiredInteractionTerminalOutcomeV1,
+    AuthoritativeInteractionClaimV1, InteractionTerminalDigestV1, InteractionTerminalFinishV1,
+};
 pub use action_plan_digest::build_interaction_action_plan_digest_v1;
 pub use convert::interaction_to_event;
 pub use custom_id::{

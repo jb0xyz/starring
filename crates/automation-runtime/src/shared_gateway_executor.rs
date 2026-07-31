@@ -47,7 +47,7 @@ pub async fn execute_admitted_interaction_v3(
     hold_admission_while(admitted, handler).await
 }
 
-fn execution_inputs(
+pub(crate) fn execution_inputs(
     route: &ExactServingRouteV1,
 ) -> (
     RunningRuleSetIdentity,
