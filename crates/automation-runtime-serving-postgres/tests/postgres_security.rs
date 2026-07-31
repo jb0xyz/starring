@@ -49,6 +49,10 @@ const IDENTITY_FUNCTION: &str = "public.starring_runtime_serving_database_identi
 const HEARTBEAT_FUNCTION: &str = "public.starring_runtime_serving_heartbeat_v1(TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT,BIGINT)";
 const DISCONNECT_FUNCTION: &str =
     "public.starring_runtime_serving_disconnect_v1(TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT)";
+const OBSERVE_V2_FUNCTION: &str =
+    "public.starring_runtime_serving_observe_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT,BIGINT)";
+const HEARTBEAT_V2_FUNCTION: &str = "public.starring_runtime_serving_heartbeat_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT,BIGINT)";
+const DISCONNECT_V2_FUNCTION: &str = "public.starring_runtime_serving_disconnect_if_current_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT)";
 
 struct IsolatedDatabase {
     name: String,
@@ -237,6 +241,19 @@ async fn isolated_database(base: PgConnectOptions) -> IsolatedDatabase {
         .await
         .unwrap();
     MIGRATOR.run(&owner_pool).await.unwrap();
+    let readiness_definition_digest = sqlx::query_scalar::<_, String>(
+        "SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(\
+            pg_catalog.pg_get_functiondef(pg_catalog.to_regprocedure(\
+                'public.starring_runtime_serving_database_readiness_v1()'\
+            )), 'UTF8')), 'hex')",
+    )
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        readiness_definition_digest,
+        "e2e2cbbecc245e4c8d96b264d5bf89f1ce01cf4613c86f2d954bbdeeb3d2ad8a"
+    );
     let password_literal = sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_literal($1)")
         .bind(&password)
         .fetch_one(&owner_pool)
@@ -261,6 +278,9 @@ async fn isolated_database(base: PgConnectOptions) -> IsolatedDatabase {
         format!("GRANT EXECUTE ON FUNCTION {IDENTITY_FUNCTION} TO {role}"),
         format!("GRANT EXECUTE ON FUNCTION {HEARTBEAT_FUNCTION} TO {role}"),
         format!("GRANT EXECUTE ON FUNCTION {DISCONNECT_FUNCTION} TO {role}"),
+        format!("GRANT EXECUTE ON FUNCTION {OBSERVE_V2_FUNCTION} TO {role}"),
+        format!("GRANT EXECUTE ON FUNCTION {HEARTBEAT_V2_FUNCTION} TO {role}"),
+        format!("GRANT EXECUTE ON FUNCTION {DISCONNECT_V2_FUNCTION} TO {role}"),
     ] {
         owner_pool.execute(statement.as_str()).await.unwrap();
     }

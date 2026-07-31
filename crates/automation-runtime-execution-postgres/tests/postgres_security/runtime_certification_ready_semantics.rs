@@ -37,30 +37,21 @@ async fn runtime_certification_ready_semantics_scenario(
         runtime_generation: awaiting_snapshot.runtime_generation,
         process_instance_id: panel.process_instance_id.clone(),
     };
-    let (lease_epoch, owner_revision) = sqlx::query_as::<_, (i64, i64)>(
-        "SELECT lease_epoch, owner_revision \
-         FROM public.starring_runtime_gateway_owner_acquire_v1($1,$2,$3,$4)",
-    )
-    .bind(CERTIFICATION_SHARD)
-    .bind(process_identity.process_instance_id.as_str())
-    .bind(CERTIFICATION_BUILD)
-    .bind(300_000_i64)
-    .fetch_one(&database.executor_pool)
-    .await
-    .unwrap();
-    let gateway_owner_lease_id =
-        automation_runtime_controller::RuntimeGatewayOwnerLeaseIdV1 {
-            gateway_shard_id: automation_runtime_controller::GatewayShardIdV1::parse(
-                CERTIFICATION_SHARD,
-            )
-            .unwrap(),
-            process_instance_id: process_identity.process_instance_id.clone(),
-            lease_epoch: std::num::NonZeroU64::new(lease_epoch as u64).unwrap(),
-            expected_build_revision: automation_runtime_controller::RuntimeBuildRevisionV1::parse(
-                CERTIFICATION_BUILD,
-            )
-            .unwrap(),
-        };
+    let owner_request = RuntimeAcquireGatewayOwnerLeaseV1 {
+        gateway_shard_id: GatewayShardIdV1::parse(CERTIFICATION_SHARD).unwrap(),
+        process_instance_id: process_identity.process_instance_id.clone(),
+        expected_build_revision: RuntimeBuildRevisionV1::parse(CERTIFICATION_BUILD).unwrap(),
+        lease_for: RuntimeGatewayOwnerLeaseDurationV1::new(Duration::from_secs(300)).unwrap(),
+    };
+    let RuntimeAcquireGatewayOwnerLeaseOutcomeV1::Acquired(owner_receipt) =
+        RuntimeGatewayOwnerLeasePortV1::acquire_gateway_owner(&adapter, owner_request)
+            .await
+            .unwrap()
+    else {
+        panic!("certification owner acquisition must win")
+    };
+    let owner_revision = owner_receipt.owner_revision.get();
+    let gateway_owner_lease_id = owner_receipt.lease_id.clone();
     let reservation = session
         .begin_certification_reservation_v2(
             automation_runtime_controller::RuntimeCertificationReservationInputV2 {
@@ -77,7 +68,7 @@ async fn runtime_certification_ready_semantics_scenario(
                     binding_fingerprint: awaiting_snapshot.target.binding_fingerprint.clone(),
                 },
                 gateway_owner_lease_id: gateway_owner_lease_id.clone(),
-                observed_owner_revision: std::num::NonZeroU64::new(owner_revision as u64).unwrap(),
+                observed_owner_revision: owner_receipt.owner_revision,
                 runtime_build_revision:
                     automation_runtime_controller::RuntimeBuildRevisionV1::parse(
                         CERTIFICATION_BUILD,
@@ -156,7 +147,7 @@ async fn runtime_certification_ready_semantics_scenario(
             resume_sequence,
         },
         gateway_owner_lease_id,
-        attested_owner_revision: std::num::NonZeroU64::new(owner_revision as u64).unwrap(),
+        attested_owner_revision: owner_receipt.owner_revision,
         route: automation_runtime_controller::RuntimeServingRouteAttestationV2 {
             identity: process_identity,
             controller_fencing_token: execution.fencing_token,
@@ -264,6 +255,372 @@ async fn runtime_certification_ready_semantics_scenario(
         }
         other => panic!("expected committed replay observation, got {other:?}"),
     }
+
+    if matches!(
+        kind,
+        automation_runtime_controller::RuntimeGatewayReadyKindV2::Ready
+    ) {
+        runtime_serving_owner_successor_scenario(
+            database,
+            &adapter,
+            owner_receipt,
+            &receipt,
+            owner_revision,
+        )
+        .await;
+    }
+}
+
+async fn runtime_serving_owner_successor_scenario(
+    database: &IsolatedDatabase,
+    adapter: &PostgresRuntimeExecutionV1,
+    owner_receipt: automation_runtime_controller::RuntimeGatewayOwnerLeaseReceiptV1,
+    certification: &automation_runtime_controller::RuntimeCertificationReceiptV2,
+    attested_owner_revision: u64,
+) {
+    let equal_request = certification_ingress_acknowledgement_request(
+        None,
+        owner_receipt.clone(),
+        certification.route_admission.gateway.clone(),
+    );
+    let equal_acknowledgement =
+        publish_ingress_acknowledgement(&database.executor_pool, &equal_request)
+            .await
+            .unwrap();
+    assert_eq!(equal_acknowledgement.outcome_name, "applied");
+    let equal_error = raw_runtime_serving_heartbeat_v2(
+        &database.owner_pool,
+        &certification.serving.identity,
+        i64::try_from(certification.serving.identity.revision.get()).unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        equal_error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .as_deref(),
+        Some("RS001"),
+        "{equal_error:?}"
+    );
+
+    let first_successor = renew_certification_owner(adapter, &owner_receipt).await;
+    assert_eq!(
+        first_successor.owner_revision.get(),
+        attested_owner_revision + 1
+    );
+    let attested_acknowledgement_error = raw_runtime_serving_heartbeat_v2(
+        &database.owner_pool,
+        &certification.serving.identity,
+        i64::try_from(certification.serving.identity.revision.get()).unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&attested_acknowledgement_error, "RS001");
+    let first_request = certification_ingress_acknowledgement_request(
+        acknowledgement_revision(&equal_acknowledgement),
+        first_successor.clone(),
+        certification.route_admission.gateway.clone(),
+    );
+    let first_acknowledgement =
+        publish_ingress_acknowledgement(&database.executor_pool, &first_request)
+            .await
+            .unwrap();
+    assert_eq!(first_acknowledgement.outcome_name, "applied");
+    let first_serving_revision = raw_runtime_serving_heartbeat_v2(
+        &database.owner_pool,
+        &certification.serving.identity,
+        i64::try_from(certification.serving.identity.revision.get()).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let second_successor = renew_certification_owner(adapter, &first_successor).await;
+    let rollover_serving_revision = raw_runtime_serving_heartbeat_v2(
+        &database.owner_pool,
+        &certification.serving.identity,
+        first_serving_revision,
+    )
+    .await
+    .unwrap();
+    let third_successor = renew_certification_owner(adapter, &second_successor).await;
+    let stale_acknowledgement_error = raw_runtime_serving_heartbeat_v2(
+        &database.owner_pool,
+        &certification.serving.identity,
+        rollover_serving_revision,
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&stale_acknowledgement_error, "RS001");
+    let third_request = certification_ingress_acknowledgement_request(
+        acknowledgement_revision(&first_acknowledgement),
+        third_successor,
+        certification.route_admission.gateway.clone(),
+    );
+    let third_acknowledgement =
+        publish_ingress_acknowledgement(&database.executor_pool, &third_request)
+            .await
+            .unwrap();
+    assert_eq!(third_acknowledgement.outcome_name, "applied");
+    let third_serving_revision = assert_heartbeat_writer_fence_precedes_owner_lock(
+        database,
+        certification.serving.identity.clone(),
+        rollover_serving_revision,
+    )
+    .await;
+
+    let left_pool = database.owner_pool.clone();
+    let right_pool = database.owner_pool.clone();
+    let left_identity = certification.serving.identity.clone();
+    let right_identity = certification.serving.identity.clone();
+    let (left, right) = tokio::join!(
+        raw_runtime_serving_heartbeat_v2(
+            &left_pool,
+            &left_identity,
+            third_serving_revision,
+        ),
+        raw_runtime_serving_heartbeat_v2(
+            &right_pool,
+            &right_identity,
+            third_serving_revision,
+        )
+    );
+    let expected_replay_revision = third_serving_revision + 1;
+    assert_eq!(left.unwrap(), expected_replay_revision);
+    assert_eq!(right.unwrap(), expected_replay_revision);
+
+    let disconnected = raw_runtime_serving_disconnect_v2(
+        &database.owner_pool,
+        &certification.serving.identity,
+        expected_replay_revision,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        disconnected,
+        (
+            i64::from(certification.serving.identity.process_identity.target.version.get()),
+            certification
+                .serving
+                .identity
+                .process_identity
+                .target
+                .content_hash
+                .to_string(),
+            i64::try_from(
+                certification
+                    .serving
+                    .identity
+                    .process_identity
+                    .target
+                    .binding_revision
+                    .get(),
+            )
+            .unwrap(),
+            certification
+                .serving
+                .identity
+                .process_identity
+                .target
+                .binding_fingerprint
+                .as_str()
+                .to_owned(),
+            expected_replay_revision + 1,
+            false,
+            false,
+        )
+    );
+    let disconnect_replay = raw_runtime_serving_disconnect_v2(
+        &database.owner_pool,
+        &certification.serving.identity,
+        expected_replay_revision,
+    )
+    .await
+    .unwrap();
+    assert_eq!(disconnect_replay, disconnected);
+}
+
+fn certification_ingress_acknowledgement_request(
+    source_acknowledgement_revision: Option<NonZeroU64>,
+    owner_receipt: automation_runtime_controller::RuntimeGatewayOwnerLeaseReceiptV1,
+    gateway_ready: RuntimeGatewayReadyAttestationV2,
+) -> RuntimePublishIngressOpenAcknowledgementV2 {
+    RuntimePublishIngressOpenAcknowledgementV2::new(
+        RuntimePublishIngressOpenAcknowledgementInputV2 {
+            source_acknowledgement_revision,
+            fence_generation: RuntimeWriterFenceGenerationV1::new(NonZeroU64::MIN),
+            maintenance_gate_generation: NonZeroU64::MIN,
+            gateway_ready,
+            owner_receipt,
+            lease_for: RuntimeIngressOpenAcknowledgementLeaseDurationV2::from_duration(
+                Duration::from_secs(10),
+            )
+            .unwrap(),
+        },
+    )
+    .unwrap()
+}
+
+fn acknowledgement_revision(
+    acknowledgement: &IngressAcknowledgementSqlRowV2,
+) -> Option<NonZeroU64> {
+    acknowledgement
+        .acknowledgement_revision
+        .and_then(|revision| u64::try_from(revision).ok())
+        .and_then(NonZeroU64::new)
+}
+
+async fn renew_certification_owner(
+    adapter: &PostgresRuntimeExecutionV1,
+    current: &automation_runtime_controller::RuntimeGatewayOwnerLeaseReceiptV1,
+) -> automation_runtime_controller::RuntimeGatewayOwnerLeaseReceiptV1 {
+    let request = RuntimeRenewGatewayOwnerLeaseV1 {
+        lease_id: current.lease_id.clone(),
+        expected_owner_revision: current.owner_revision,
+        lease_for: RuntimeGatewayOwnerLeaseDurationV1::new(Duration::from_secs(300)).unwrap(),
+    };
+    let RuntimeRenewGatewayOwnerLeaseOutcomeV1::Renewed(receipt) =
+        RuntimeGatewayOwnerLeasePortV1::renew_gateway_owner(adapter, request)
+            .await
+            .unwrap()
+    else {
+        panic!("certification owner renewal must win")
+    };
+    receipt
+}
+
+async fn raw_runtime_serving_heartbeat_v2(
+    pool: &PgPool,
+    identity: &automation_runtime_controller::RuntimeServingIdentityV2,
+    expected_revision: i64,
+) -> Result<i64, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "SELECT pg_catalog.set_config('statement_timeout', '5000ms', TRUE), \
+            pg_catalog.set_config('lock_timeout', '1000ms', TRUE), \
+            pg_catalog.set_config(\
+                'idle_in_transaction_session_timeout', '10000ms', TRUE\
+            )",
+    )
+    .execute(&mut *transaction)
+    .await?;
+    let result = sqlx::query_scalar(
+        "SELECT serving_revision \
+         FROM public.starring_runtime_serving_heartbeat_v2(\
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+    )
+    .bind(identity.operation_id.as_str())
+    .bind(identity.scope.tenant_id.as_str())
+    .bind(identity.scope.installation_id.as_str())
+    .bind(identity.scope.deployment_id.as_str())
+    .bind(identity.attestation_digest.as_str())
+    .bind(identity.process_identity.process_instance_id.as_str())
+    .bind(i64::try_from(identity.process_identity.runtime_generation.get()).unwrap())
+    .bind(i64::try_from(identity.lease_epoch.get()).unwrap())
+    .bind(expected_revision)
+    .bind(CERTIFICATION_LEASE_MILLISECONDS)
+    .fetch_one(&mut *transaction)
+    .await;
+    match result {
+        Ok(revision) => {
+            transaction.commit().await?;
+            Ok(revision)
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+async fn raw_runtime_serving_disconnect_v2(
+    pool: &PgPool,
+    identity: &automation_runtime_controller::RuntimeServingIdentityV2,
+    expected_revision: i64,
+) -> Result<(i64, String, i64, String, i64, bool, bool), sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        "SELECT pg_catalog.set_config('statement_timeout', '5000ms', TRUE), \
+            pg_catalog.set_config('lock_timeout', '1000ms', TRUE), \
+            pg_catalog.set_config(\
+                'idle_in_transaction_session_timeout', '10000ms', TRUE\
+            )",
+    )
+    .execute(&mut *transaction)
+    .await?;
+    let result = sqlx::query_as(
+        "SELECT target_version, target_content_hash, binding_revision, \
+            binding_fingerprint, serving_revision, connected, serving \
+         FROM public.starring_runtime_serving_disconnect_if_current_v2(\
+            $1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(identity.operation_id.as_str())
+    .bind(identity.scope.tenant_id.as_str())
+    .bind(identity.scope.installation_id.as_str())
+    .bind(identity.scope.deployment_id.as_str())
+    .bind(identity.attestation_digest.as_str())
+    .bind(identity.process_identity.process_instance_id.as_str())
+    .bind(i64::try_from(identity.process_identity.runtime_generation.get()).unwrap())
+    .bind(i64::try_from(identity.lease_epoch.get()).unwrap())
+    .bind(expected_revision)
+    .fetch_one(&mut *transaction)
+    .await;
+    match result {
+        Ok(disconnected) => {
+            transaction.commit().await?;
+            Ok(disconnected)
+        }
+        Err(error) => {
+            transaction.rollback().await?;
+            Err(error)
+        }
+    }
+}
+
+async fn assert_heartbeat_writer_fence_precedes_owner_lock(
+    database: &IsolatedDatabase,
+    identity: automation_runtime_controller::RuntimeServingIdentityV2,
+    expected_revision: i64,
+) -> i64 {
+    let mut writer_blocker = database.owner_pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_catalog.pg_advisory_xact_lock(\
+            pg_catalog.hashtextextended('starring-runtime-writer-fence-v1', 0)\
+        )",
+    )
+    .execute(&mut *writer_blocker)
+    .await
+    .unwrap();
+
+    let heartbeat_pool = database.owner_pool.clone();
+    let heartbeat = tokio::spawn(async move {
+        raw_runtime_serving_heartbeat_v2(&heartbeat_pool, &identity, expected_revision).await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut owner_probe = database.owner_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '250ms'")
+        .execute(&mut *owner_probe)
+        .await
+        .unwrap();
+    sqlx::query(
+        "SELECT owner_revision \
+         FROM public.runtime_gateway_owners \
+         WHERE gateway_shard_id = $1 \
+         FOR UPDATE",
+    )
+    .bind(CERTIFICATION_SHARD)
+    .fetch_one(&mut *owner_probe)
+    .await
+    .unwrap();
+    owner_probe.rollback().await.unwrap();
+    writer_blocker.rollback().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), heartbeat)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
 }
 
 async fn raw_runtime_certification_v2_replay(
