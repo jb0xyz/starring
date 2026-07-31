@@ -430,6 +430,7 @@ dependencies = [
  "resource-resolution",
  "rustls",
  "serde",
+ "sha2",
  "static_assertions",
  "thiserror 1.0.69",
  "tokio",

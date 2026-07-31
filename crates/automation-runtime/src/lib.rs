@@ -8,6 +8,7 @@ pub mod instance_deleter;
 pub mod mutation;
 pub mod panel_installer;
 pub mod readiness;
+pub mod receipt_fenced_effects;
 pub mod responder;
 pub mod resume;
 pub mod runner;
@@ -48,6 +49,13 @@ pub use readiness::{
     RuntimeDiscordPreflightErrorV1, RuntimeObservedRoleV1, RuntimeReadinessContextV1,
     RuntimeReadinessSnapshotErrorV1, RuntimeTargetReadinessErrorV1, RuntimeTargetReadyV1,
     TwilightRuntimeReadinessProvider,
+};
+pub use receipt_fenced_effects::{
+    InteractionEffectPermitV1, InteractionInitialResponseIntentDigestV1,
+    InteractionInitialResponseIntentV1, InteractionInitialResponseKindV1,
+    InteractionInitialResponseResultDigestV1, InteractionInitialResponseResultKindV1,
+    InteractionInitialResponseResultV1, ReceiptFencedDiscordMutationAdapterV1,
+    ReceiptFencedInteractionResponderV1,
 };
 pub use responder::TwilightInteractionResponder;
 pub use resume::{resume_deleting_instances, ResumeConfig, ResumeEntry, ResumeReport};
