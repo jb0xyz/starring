@@ -246,7 +246,7 @@ async fn modal_input_order_is_canonical_and_value_drift_changes_digest() {
 #[tokio::test]
 async fn button_identity_locale_and_custom_id_drift_change_digest() {
     let baseline_id = encode_button(GUILD_ID, RULESET_KEY, "open_room");
-    let admitted = admitted(&baseline_id, false, FencingToken::new(32).unwrap()).await;
+    let baseline_admitted = admitted(&baseline_id, false, FencingToken::new(32).unwrap()).await;
     let envelope = |application_id, interaction_id, locale: Option<&str>, custom_id: String| {
         SharedGatewayInteractionEnvelopeV3::message_component_v3(
             identity(GUILD_ID, application_id, interaction_id),
@@ -265,10 +265,17 @@ async fn button_identity_locale_and_custom_id_drift_change_digest() {
         Some("ko"),
         encode_button(GUILD_ID, RULESET_KEY, "close_room"),
     );
-    let digest = |envelope: &SharedGatewayInteractionEnvelopeV3| {
+    let changed_custom_id_admitted = admitted(
+        changed_custom_id.custom_id_v3(),
+        false,
+        FencingToken::new(32).unwrap(),
+    )
+    .await;
+    let digest = |envelope: &SharedGatewayInteractionEnvelopeV3,
+                  admitted: &SharedGatewayAdmittedInteractionV3| {
         build_shared_gateway_durable_receipt_claim_input_v1(
             envelope,
-            &admitted,
+            admitted,
             gateway_shard(),
             runtime_build(),
         )
@@ -277,10 +284,13 @@ async fn button_identity_locale_and_custom_id_drift_change_digest() {
         .request_digest()
         .clone()
     };
-    let baseline = digest(&baseline);
-    assert_ne!(baseline, digest(&changed_identity));
-    assert_ne!(baseline, digest(&changed_locale));
-    assert_ne!(baseline, digest(&changed_custom_id));
+    let baseline = digest(&baseline, &baseline_admitted);
+    assert_ne!(baseline, digest(&changed_identity, &baseline_admitted));
+    assert_ne!(baseline, digest(&changed_locale, &baseline_admitted));
+    assert_ne!(
+        baseline,
+        digest(&changed_custom_id, &changed_custom_id_admitted)
+    );
 }
 
 #[tokio::test]
@@ -306,6 +316,16 @@ async fn static_and_instance_route_hints_remain_typed() {
         SharedGatewayRouteHintV1::Static(key)
             if key.guild_id() == GUILD_ID && key.ruleset_key().as_str() == RULESET_KEY
     ));
+    assert!(matches!(
+        static_input.route_v1(),
+        SharedGatewayDurableReceiptRouteV1::StaticComponent {
+            slot_key,
+            component_kind: crate::custom_id::ComponentKind::Button,
+            component_key,
+        } if slot_key.guild_id() == GUILD_ID
+            && slot_key.ruleset_key().as_str() == RULESET_KEY
+            && component_key == "open_room"
+    ));
 
     let instance_id = encode_instance_action("room_001", "join").unwrap();
     let instance_admitted = admitted(&instance_id, true, FencingToken::new(34).unwrap()).await;
@@ -328,6 +348,166 @@ async fn static_and_instance_route_hints_remain_typed() {
         SharedGatewayRouteHintV1::Instance(instance_id)
             if instance_id == &InstanceId::parse("room_001").unwrap()
     ));
+    assert!(matches!(
+        instance_input.route_v1(),
+        SharedGatewayDurableReceiptRouteV1::InstanceAction {
+            instance_id,
+            action,
+        } if instance_id == &InstanceId::parse("room_001").unwrap() && action == "join"
+    ));
+}
+
+#[tokio::test]
+async fn exact_routes_keep_button_modal_and_instance_actions_distinct() {
+    let button_id = encode_button(GUILD_ID, RULESET_KEY, "open_room");
+    let button_admitted = admitted(&button_id, false, FencingToken::new(35).unwrap()).await;
+    let button_envelope = SharedGatewayInteractionEnvelopeV3::message_component_v3(
+        identity(GUILD_ID, 7404, 7510),
+        button_id,
+        None,
+        token("button-route-token"),
+    )
+    .unwrap();
+    let button = build_shared_gateway_durable_receipt_claim_input_v1(
+        &button_envelope,
+        &button_admitted,
+        gateway_shard(),
+        runtime_build(),
+    )
+    .unwrap();
+
+    let modal_id = encode_modal(GUILD_ID, RULESET_KEY, "submit_room");
+    let modal_admitted = admitted(&modal_id, false, FencingToken::new(36).unwrap()).await;
+    let modal_envelope = SharedGatewayInteractionEnvelopeV3::modal_submit_v3(
+        identity(GUILD_ID, 7404, 7511),
+        modal_id,
+        vec![input(1, "room", "night")],
+        None,
+        token("modal-route-token"),
+    )
+    .unwrap();
+    let modal = build_shared_gateway_durable_receipt_claim_input_v1(
+        &modal_envelope,
+        &modal_admitted,
+        gateway_shard(),
+        runtime_build(),
+    )
+    .unwrap();
+
+    let join_id = encode_instance_action("room_001", "join").unwrap();
+    let join_admitted = admitted(&join_id, true, FencingToken::new(37).unwrap()).await;
+    let join_envelope = SharedGatewayInteractionEnvelopeV3::message_component_v3(
+        identity(GUILD_ID, 7404, 7512),
+        join_id,
+        None,
+        token("join-route-token"),
+    )
+    .unwrap();
+    let join = build_shared_gateway_durable_receipt_claim_input_v1(
+        &join_envelope,
+        &join_admitted,
+        gateway_shard(),
+        runtime_build(),
+    )
+    .unwrap();
+
+    let leave_id = encode_instance_action("room_001", "leave").unwrap();
+    let leave_admitted = admitted(&leave_id, true, FencingToken::new(38).unwrap()).await;
+    let leave_envelope = SharedGatewayInteractionEnvelopeV3::message_component_v3(
+        identity(GUILD_ID, 7404, 7513),
+        leave_id,
+        None,
+        token("leave-route-token"),
+    )
+    .unwrap();
+    let leave = build_shared_gateway_durable_receipt_claim_input_v1(
+        &leave_envelope,
+        &leave_admitted,
+        gateway_shard(),
+        runtime_build(),
+    )
+    .unwrap();
+
+    assert_ne!(button.route_v1(), modal.route_v1());
+    assert_ne!(join.route_v1(), leave.route_v1());
+    assert_eq!(
+        button.route_v1().static_component_v1().map(|parts| parts.2),
+        Some("open_room")
+    );
+    assert_eq!(
+        modal.route_v1().static_component_v1().map(|parts| parts.2),
+        Some("submit_room")
+    );
+    assert_eq!(
+        join.route_v1().instance_action_v1().map(|parts| parts.1),
+        Some("join")
+    );
+    assert_eq!(
+        leave.route_v1().instance_action_v1().map(|parts| parts.1),
+        Some("leave")
+    );
+}
+
+#[tokio::test]
+async fn receipt_route_must_match_the_exact_admitted_custom_id() {
+    let admitted_button_id = encode_button(GUILD_ID, RULESET_KEY, "open_room");
+    let admitted_button =
+        admitted(&admitted_button_id, false, FencingToken::new(39).unwrap()).await;
+    let changed_button = SharedGatewayInteractionEnvelopeV3::message_component_v3(
+        identity(GUILD_ID, 7404, 7514),
+        encode_button(GUILD_ID, RULESET_KEY, "close_room"),
+        None,
+        token("changed-button-token"),
+    )
+    .unwrap();
+    assert_eq!(
+        build_shared_gateway_durable_receipt_claim_input_v1(
+            &changed_button,
+            &admitted_button,
+            gateway_shard(),
+            runtime_build(),
+        )
+        .unwrap_err(),
+        SharedGatewayDurableReceiptClaimInputErrorV1::RouteMismatch
+    );
+
+    let admitted_action_id = encode_instance_action("room_001", "join").unwrap();
+    let admitted_action = admitted(&admitted_action_id, true, FencingToken::new(40).unwrap()).await;
+    let changed_action = SharedGatewayInteractionEnvelopeV3::message_component_v3(
+        identity(GUILD_ID, 7404, 7515),
+        encode_instance_action("room_001", "leave").unwrap(),
+        None,
+        token("changed-action-token"),
+    )
+    .unwrap();
+    assert_eq!(
+        build_shared_gateway_durable_receipt_claim_input_v1(
+            &changed_action,
+            &admitted_action,
+            gateway_shard(),
+            runtime_build(),
+        )
+        .unwrap_err(),
+        SharedGatewayDurableReceiptClaimInputErrorV1::RouteMismatch
+    );
+
+    let changed_instance = SharedGatewayInteractionEnvelopeV3::message_component_v3(
+        identity(GUILD_ID, 7404, 7516),
+        encode_instance_action("room_002", "join").unwrap(),
+        None,
+        token("changed-instance-token"),
+    )
+    .unwrap();
+    assert_eq!(
+        build_shared_gateway_durable_receipt_claim_input_v1(
+            &changed_instance,
+            &admitted_action,
+            gateway_shard(),
+            runtime_build(),
+        )
+        .unwrap_err(),
+        SharedGatewayDurableReceiptClaimInputErrorV1::RouteMismatch
+    );
 }
 
 #[tokio::test]

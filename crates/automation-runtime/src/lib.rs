@@ -107,6 +107,7 @@ pub use shared_gateway_executor::execute_admitted_interaction_v3;
 pub use shared_gateway_receipt_claim::{
     build_shared_gateway_durable_receipt_claim_input_v1,
     SharedGatewayDurableReceiptClaimInputErrorV1, SharedGatewayDurableReceiptClaimInputV1,
+    SharedGatewayDurableReceiptRouteV1,
 };
 pub use shared_gateway_router::{
     admit_shared_gateway_route_v1, admit_shared_gateway_route_with_config_v1,

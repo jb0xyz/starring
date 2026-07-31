@@ -209,6 +209,7 @@ impl SharedGatewayAdmissionReservationV3 {
         Ok(Some(SharedGatewayAdmittedInteractionV3 {
             admitted,
             ready_lease: self.ready_lease,
+            custom_id: custom_id.to_string(),
             _global_permit: self.global_permit,
         }))
     }
@@ -217,6 +218,7 @@ impl SharedGatewayAdmissionReservationV3 {
 pub struct SharedGatewayAdmittedInteractionV3 {
     admitted: AdmittedInteractionV1,
     ready_lease: GatewayReadyLeaseV3,
+    custom_id: String,
     _global_permit: OwnedSemaphorePermit,
 }
 
@@ -231,6 +233,10 @@ impl SharedGatewayAdmittedInteractionV3 {
 
     pub fn epoch(&self) -> GatewayConnectionEpochV3 {
         self.ready_lease.epoch()
+    }
+
+    pub(crate) fn custom_id_v3(&self) -> &str {
+        &self.custom_id
     }
 }
 
