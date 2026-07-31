@@ -6,7 +6,7 @@ use automation_core::mock::{MockInteractionResponder, MockMutationAdapter, Respo
 use automation_core::plan::{ActionPlan, PlannedAction};
 use automation_core::run::{handle_event, run, HandleOutcome};
 use automation_core::validate::{validate, ValidationError};
-use automation_core::AutomationServices;
+use automation_core::{execute_prepared_event, prepare_event_execution, AutomationServices};
 use automation_instance::{InMemoryInstanceStore, SequenceInstanceIdGenerator};
 use automation_state::{
     ActionSpec, InteractionRule, InteractionRuleSet, ModalFieldSpec, ModalFieldStyle, ModalSpec,
@@ -109,6 +109,51 @@ fn run_executes_defer_and_edit() {
             ResponderCall::DeferEphemeral,
             ResponderCall::EditResponse {
                 content: "완료".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn public_preparation_can_be_inspected_before_exact_execution() {
+    let mutation = MockMutationAdapter::new();
+    let responder = MockInteractionResponder::new();
+    let prepared = prepare_event_execution(
+        &submit("cozy"),
+        &defer_rule(),
+        &ResourceBindingMap::default(),
+        &identity("test"),
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(prepared.leading_defer_ephemeral());
+    assert_eq!(prepared.context().ruleset_key, "test");
+    assert_eq!(prepared.context().inputs["room_name"], "cozy");
+    assert_eq!(prepared.plan().steps.len(), 2);
+    assert!(mutation.calls().is_empty());
+    assert!(responder.calls().is_empty());
+
+    block_on(execute_prepared_event(
+        prepared,
+        &AutomationServices {
+            mutation: &mutation,
+            responder: &responder,
+            instances: &InMemoryInstanceStore::new(),
+            instance_ids: &SequenceInstanceIdGenerator::new("test", 1),
+            teardown: &automation_core::MockInstanceTeardownService::new(),
+        },
+        "실패",
+    ))
+    .unwrap();
+
+    assert_eq!(mutation.calls().len(), 1);
+    assert_eq!(
+        responder.calls(),
+        vec![
+            ResponderCall::DeferEphemeral,
+            ResponderCall::EditResponse {
+                content: "스터디룸 'cozy' 완료".to_string(),
             },
         ]
     );

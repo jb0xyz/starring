@@ -129,7 +129,7 @@ where
             failure_response: FailureResponseOutcome::NotAttempted,
         });
     }
-    match run_pinned(
+    let prepared = match prepare_instance_action_with_route_v1(
         event,
         instance_id,
         action,
@@ -137,10 +137,19 @@ where
         resolver,
         snapshot_provider,
         bindings,
-        services,
     )
     .await
     {
+        Ok(prepared) => prepared,
+        Err(cause) => {
+            let failure_response = emit_failure(services, failure_message).await;
+            return Err(DispatchFailure {
+                cause,
+                failure_response,
+            });
+        }
+    };
+    match execute_prepared_instance_action_v1(prepared, services).await {
         Ok(outcome) => Ok(outcome),
         Err(cause) => {
             let failure_response = emit_failure(services, failure_message).await;
@@ -152,8 +161,58 @@ where
     }
 }
 
+pub struct PreparedInstanceActionV1 {
+    context: RuntimeContext,
+    plan: ActionPlan,
+    leading_defer_ephemeral: bool,
+}
+
+impl PreparedInstanceActionV1 {
+    pub fn context(&self) -> &RuntimeContext {
+        &self.context
+    }
+
+    pub fn plan(&self) -> &ActionPlan {
+        &self.plan
+    }
+
+    pub fn leading_defer_ephemeral(&self) -> bool {
+        self.leading_defer_ephemeral
+    }
+
+    pub fn into_parts(self) -> (RuntimeContext, ActionPlan, bool) {
+        (self.context, self.plan, self.leading_defer_ephemeral)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn run_pinned<M, R, S, G, T, PR, P>(
+pub async fn prepare_instance_action_with_resolver_v1<PR, P>(
+    event: &RuntimeEvent,
+    instance_id: &InstanceId,
+    action: &str,
+    expected_ruleset_key: &str,
+    resolver: &PR,
+    snapshot_provider: &P,
+    bindings: &ResourceBindingMap,
+) -> Result<PreparedInstanceActionV1, DispatchError>
+where
+    PR: PinnedInstanceResolverV1,
+    P: GuildRoleSnapshotProvider,
+{
+    prepare_instance_action_with_route_v1(
+        event,
+        instance_id,
+        action,
+        Some(expected_ruleset_key),
+        resolver,
+        snapshot_provider,
+        bindings,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_instance_action_with_route_v1<PR, P>(
     event: &RuntimeEvent,
     instance_id: &InstanceId,
     action: &str,
@@ -161,14 +220,8 @@ async fn run_pinned<M, R, S, G, T, PR, P>(
     resolver: &PR,
     snapshot_provider: &P,
     bindings: &ResourceBindingMap,
-    services: &AutomationServices<'_, M, R, S, G, T>,
-) -> Result<HandleOutcome, DispatchError>
+) -> Result<PreparedInstanceActionV1, DispatchError>
 where
-    M: DiscordMutationAdapter,
-    R: InteractionResponder,
-    S: InstanceRegistrarV1,
-    G: InstanceIdGenerator,
-    T: InstanceTeardownService,
     PR: PinnedInstanceResolverV1,
     P: GuildRoleSnapshotProvider,
 {
@@ -235,7 +288,25 @@ where
         instance,
         action: action.to_string(),
     });
-    run(&context, &ActionPlan { steps }, services)
+    Ok(PreparedInstanceActionV1 {
+        context,
+        plan: ActionPlan { steps },
+        leading_defer_ephemeral: true,
+    })
+}
+
+pub async fn execute_prepared_instance_action_v1<M, R, S, G, T>(
+    prepared: PreparedInstanceActionV1,
+    services: &AutomationServices<'_, M, R, S, G, T>,
+) -> Result<HandleOutcome, DispatchError>
+where
+    M: DiscordMutationAdapter,
+    R: InteractionResponder,
+    S: InstanceRegistrarV1,
+    G: InstanceIdGenerator,
+    T: InstanceTeardownService,
+{
+    run(prepared.context(), prepared.plan(), services)
         .await
         .map_err(DispatchError::Execution)?;
     Ok(HandleOutcome::Executed)
