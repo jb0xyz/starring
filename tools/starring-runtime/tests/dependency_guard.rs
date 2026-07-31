@@ -769,11 +769,8 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
     ));
     for required in [
         "FuturesUnordered<RuntimeInteractionDispatchFutureV1>",
-        "FuturesUnordered<RuntimeInteractionRejectionFutureV1>",
         "dyn Future<Output = SharedGatewayInteractionDispatchOutcomeV3> + Send + 'static",
-        "dyn Future<Output = SharedGatewayRejectionAcknowledgementOutcomeV3> + Send + 'static",
         "dispatch_capacity: NonZeroUsize",
-        "rejection_capacity: NonZeroUsize",
         "RuntimeProductionDiscordInteractionDispatchLaneV1",
         "compose_runtime_discord_interaction_dispatch_lane_v1(",
         "gateway.rejection_acknowledgement_capacity()",
@@ -812,7 +809,9 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
         "RuntimeInteractionReopenErrorV1::InFlight",
         "RuntimeInteractionReopenErrorV1::Sealed",
         "self.dispatches.len() >= self.dispatch_capacity.get()",
-        "self.rejections.len() >= self.rejection_capacity.get()",
+        "drop(envelope)",
+        "RuntimeInteractionRejectionSchedulingV1::Dropped",
+        "rejection_acknowledgement_dropped",
         "TokioInstant::from_std(deadline)",
         "self.abort_v1()",
         "RuntimeDiscordInteractionDispatchLaneV1(<redacted>)",
@@ -864,6 +863,8 @@ fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
         "SequenceInstanceIdGenerator",
         "Serialize",
         "Deserialize",
+        "RuntimeInteractionRejectionFutureV1",
+        "acknowledge_rejection_v1",
     ] {
         assert!(!contains_identifier(lane, forbidden), "{forbidden}");
     }
