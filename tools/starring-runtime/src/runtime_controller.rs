@@ -14,8 +14,9 @@ use automation_runtime_controller::{
     RuntimeServingSlotV2, RuntimeServingUpdateReceiptV1,
 };
 use automation_runtime_convergence::{
-    ActivationAttestationV1, ActivationOutcomeKindV1, ControllerId, RuntimeDeploymentPhaseV1,
-    RuntimeFailureId, RuntimeFailureKindV1, RuntimePendingConditionV1, RuntimeProcessIdentityV1,
+    ActivationAttestationV1, ActivationOutcomeKindV1, ControllerId, RuntimeDeploymentIdentityV1,
+    RuntimeDeploymentPhaseV1, RuntimeDeploymentTargetV1, RuntimeFailureId, RuntimeFailureKindV1,
+    RuntimeGeneration, RuntimePendingConditionV1, RuntimeProcessIdentityV1,
 };
 use automation_runtime_convergence_postgres::{RuntimeConvergenceStoreError, RuntimeExactTargetV1};
 use automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1;
@@ -2369,8 +2370,13 @@ impl RuntimeStagedRoutePortV2<RuntimeExactTargetV1> for RuntimeControllerStagePo
         request: &RuntimeRouteStageRequestV2,
         hydrated: &RuntimeExactTargetV1,
     ) -> Result<RuntimeRouteStageObservationV2<Self::Staged>, Self::Error> {
-        if hydrated.snapshot.target != request.process_identity().target
-            || &hydrated.desired_target_digest != request.desired_target_digest()
+        if !exact_staging_route_identity_matches_v2(
+            &request.execution_guard().scope,
+            &hydrated.snapshot.identity,
+            &hydrated.snapshot.target,
+            hydrated.snapshot.runtime_generation,
+            request.process_identity(),
+        ) || &hydrated.desired_target_digest != request.desired_target_digest()
             || hydrated.installation_authority_revision
                 != request.installation_authority_revision().get()
             || hydrated.current_authority_revision != request.current_authority_revision().get()
@@ -2387,6 +2393,7 @@ impl RuntimeStagedRoutePortV2<RuntimeExactTargetV1> for RuntimeControllerStagePo
             return Err(RuntimeControllerStagePortErrorV2::EvidenceMismatch);
         }
         let route = ExactServingRouteV1::new(
+            hydrated.snapshot.identity.clone(),
             request.process_identity().clone(),
             hydrated.artifact.clone(),
             hydrated.bindings.clone(),
@@ -2427,6 +2434,18 @@ impl RuntimeStagedRoutePortV2<RuntimeExactTargetV1> for RuntimeControllerStagePo
             staged: staged.into_replacement_v2(),
         })
     }
+}
+
+fn exact_staging_route_identity_matches_v2(
+    expected_scope: &RuntimeDeploymentScopeV1,
+    deployment_identity: &RuntimeDeploymentIdentityV1,
+    target: &RuntimeDeploymentTargetV1,
+    runtime_generation: RuntimeGeneration,
+    process_identity: &RuntimeProcessIdentityV1,
+) -> bool {
+    expected_scope.matches(deployment_identity)
+        && target == &process_identity.target
+        && runtime_generation == process_identity.runtime_generation
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2601,6 +2620,83 @@ mod tests {
 
     fn at(second: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(second, 0).unwrap()
+    }
+
+    #[test]
+    fn exact_staging_route_requires_product_scope_target_and_generation() {
+        let identity: RuntimeDeploymentIdentityV1 = serde_json::from_value(serde_json::json!({
+            "deployment_id": "deployment:stage-test",
+            "tenant_id": "tenant:stage-test",
+            "installation_id": "installation:stage-test",
+            "promotion_id": "2".repeat(64),
+            "activation_request_id": "activation:stage-test"
+        }))
+        .unwrap();
+        let target: RuntimeDeploymentTargetV1 = serde_json::from_value(serde_json::json!({
+            "guild_id": "42",
+            "ruleset_key": "studyroom",
+            "version": 1,
+            "content_hash": "3".repeat(64),
+            "binding_revision": 1,
+            "binding_fingerprint": "4".repeat(64)
+        }))
+        .unwrap();
+        let runtime_generation = RuntimeGeneration::new(7).unwrap();
+        let process_identity: RuntimeProcessIdentityV1 =
+            serde_json::from_value(serde_json::json!({
+                "target": target,
+                "runtime_generation": runtime_generation,
+                "process_instance_id": "stage-test-process"
+            }))
+            .unwrap();
+        let scope = RuntimeDeploymentScopeV1::from_identity(&identity);
+
+        assert!(exact_staging_route_identity_matches_v2(
+            &scope,
+            &identity,
+            &process_identity.target,
+            runtime_generation,
+            &process_identity,
+        ));
+
+        let mut foreign_identity = identity.clone();
+        foreign_identity.tenant_id =
+            automation_runtime_convergence::TenantId::parse("tenant:foreign").unwrap();
+        assert!(!exact_staging_route_identity_matches_v2(
+            &scope,
+            &foreign_identity,
+            &process_identity.target,
+            runtime_generation,
+            &process_identity,
+        ));
+
+        let mut foreign_target = process_identity.target.clone();
+        foreign_target.guild_id = discord_model::GuildId(43);
+        assert!(!exact_staging_route_identity_matches_v2(
+            &scope,
+            &identity,
+            &foreign_target,
+            runtime_generation,
+            &process_identity,
+        ));
+
+        let mut foreign_route = process_identity.target.clone();
+        foreign_route.ruleset_key = serde_json::from_value(serde_json::json!("welcome")).unwrap();
+        assert!(!exact_staging_route_identity_matches_v2(
+            &scope,
+            &identity,
+            &foreign_route,
+            runtime_generation,
+            &process_identity,
+        ));
+
+        assert!(!exact_staging_route_identity_matches_v2(
+            &scope,
+            &identity,
+            &process_identity.target,
+            RuntimeGeneration::new(8).unwrap(),
+            &process_identity,
+        ));
     }
 
     #[test]

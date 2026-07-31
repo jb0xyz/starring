@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use automation_runtime_convergence::{FencingToken, ProcessInstanceId, RuntimeProcessIdentityV1};
+use automation_runtime_convergence::{
+    FencingToken, ProcessInstanceId, RuntimeDeploymentIdentityV1, RuntimeProcessIdentityV1,
+};
 use automation_runtime_registry::{
     ExactServingRouteV1, ServingSlotRegistryError, ServingSlotRegistryV1, SlotLifecycleV1,
 };
@@ -24,6 +26,17 @@ const BINDING_FINGERPRINT: &str =
 
 fn fence(value: u64) -> FencingToken {
     FencingToken::new(value).unwrap()
+}
+
+fn deployment_identity(process_instance_id: &str) -> RuntimeDeploymentIdentityV1 {
+    serde_json::from_value(json!({
+        "deployment_id": format!("deployment:{process_instance_id}"),
+        "tenant_id": "tenant:registry-staging-test",
+        "installation_id": "installation:registry-staging-test",
+        "promotion_id": "1".repeat(64),
+        "activation_request_id": format!("activation:{process_instance_id}")
+    }))
+    .unwrap()
 }
 
 fn route(process_instance_id: &str) -> ExactServingRouteV1 {
@@ -56,7 +69,13 @@ fn route(process_instance_id: &str) -> ExactServingRouteV1 {
     }))
     .unwrap();
 
-    ExactServingRouteV1::new(identity, ruleset, Default::default()).unwrap()
+    ExactServingRouteV1::new(
+        deployment_identity(process_instance_id),
+        identity,
+        ruleset,
+        Default::default(),
+    )
+    .unwrap()
 }
 
 fn staging_port(

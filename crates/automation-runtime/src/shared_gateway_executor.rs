@@ -85,8 +85,9 @@ mod tests {
         content_hash, RuleSetKey, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
     };
     use automation_runtime_convergence::{
-        BindingRevision, FencingToken, ProcessInstanceId, RuntimeDeploymentTargetV1,
-        RuntimeGeneration, RuntimeProcessIdentityV1,
+        ActivationRequestId, BindingRevision, DeploymentId, FencingToken, InstallationId,
+        ProcessInstanceId, PromotionId, RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1,
+        RuntimeGeneration, RuntimeProcessIdentityV1, TenantId,
     };
     use automation_runtime_registry::{
         ServingSlotKeyV1, ServingSlotRegistryConfigV1, ServingSlotRegistryV1,
@@ -105,6 +106,17 @@ mod tests {
     };
 
     use super::*;
+
+    fn deployment_identity() -> RuntimeDeploymentIdentityV1 {
+        RuntimeDeploymentIdentityV1 {
+            deployment_id: DeploymentId::parse("deployment:shared-executor-test").unwrap(),
+            tenant_id: TenantId::parse("tenant:shared-executor-test").unwrap(),
+            installation_id: InstallationId::parse("installation:shared-executor-test").unwrap(),
+            promotion_id: PromotionId::parse("a".repeat(64)).unwrap(),
+            activation_request_id: ActivationRequestId::parse("activation:shared-executor-test")
+                .unwrap(),
+        }
+    }
 
     fn exact_route(version: u32) -> ExactServingRouteV1 {
         let guild_id = GuildId(77);
@@ -131,6 +143,7 @@ mod tests {
             process_instance_id: ProcessInstanceId::parse("shared-executor-test").unwrap(),
         };
         ExactServingRouteV1::new(
+            deployment_identity(),
             identity,
             RuleSetVersion {
                 guild_id,

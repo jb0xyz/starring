@@ -2875,7 +2875,8 @@ mod tests {
 
     use automation_runtime_controller::{RuntimeDrainIntentIdV2, RuntimeServingSlotV2};
     use automation_runtime_convergence::{
-        FencingToken, ProcessInstanceId, RuntimeDeploymentTargetV1, RuntimeProcessIdentityV1,
+        FencingToken, ProcessInstanceId, RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1,
+        RuntimeProcessIdentityV1,
     };
     use automation_runtime_registry::{
         ExactServingRouteV1, ServingSlotKeyV1, ServingSlotRegistryError, ServingSlotRegistryV1,
@@ -2929,6 +2930,17 @@ mod tests {
         SlotSealKeyV2::try_from([7_u8; 16].as_slice()).unwrap()
     }
 
+    fn deployment_identity(process_instance_id: &str, version: u64) -> RuntimeDeploymentIdentityV1 {
+        serde_json::from_value(json!({
+            "deployment_id": format!("deployment:{process_instance_id}:{version}"),
+            "tenant_id": "tenant:registry-test",
+            "installation_id": "installation:registry-test",
+            "promotion_id": "f".repeat(64),
+            "activation_request_id": format!("activation:{process_instance_id}:{version}")
+        }))
+        .unwrap()
+    }
+
     fn replacement_route(
         process_instance_id: &str,
         runtime_generation: u64,
@@ -2965,7 +2977,13 @@ mod tests {
             "created_by": "9"
         }))
         .unwrap();
-        ExactServingRouteV1::new(identity, ruleset, Default::default()).unwrap()
+        ExactServingRouteV1::new(
+            deployment_identity(process_instance_id, version),
+            identity,
+            ruleset,
+            Default::default(),
+        )
+        .unwrap()
     }
 
     fn replacement_registry(

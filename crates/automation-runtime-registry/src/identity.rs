@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use automation_ruleset::{content_hash, RuleSetVersion};
-use automation_runtime_convergence::{RuntimeDeploymentTargetV1, RuntimeProcessIdentityV1};
+use automation_runtime_convergence::{
+    RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1, RuntimeProcessIdentityV1,
+};
 use discord_model::GuildId;
 use resource_resolution::{resource_binding_fingerprint_v2, ResourceBindingMap};
 
@@ -40,18 +42,20 @@ impl ServingSlotKeyV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExactServingRouteV1 {
-    identity: RuntimeProcessIdentityV1,
+    deployment_identity: RuntimeDeploymentIdentityV1,
+    process_identity: RuntimeProcessIdentityV1,
     ruleset: Arc<RuleSetVersion>,
     bindings: Arc<ResourceBindingMap>,
 }
 
 impl ExactServingRouteV1 {
     pub fn new(
-        identity: RuntimeProcessIdentityV1,
+        deployment_identity: RuntimeDeploymentIdentityV1,
+        process_identity: RuntimeProcessIdentityV1,
         ruleset: RuleSetVersion,
         bindings: ResourceBindingMap,
     ) -> Result<Self, ExactServingRouteError> {
-        let target = &identity.target;
+        let target = &process_identity.target;
         if ruleset.guild_id != target.guild_id || ruleset.ruleset_key != target.ruleset_key {
             return Err(ExactServingRouteError::RuleSetSlotMismatch);
         }
@@ -70,14 +74,23 @@ impl ExactServingRouteV1 {
             return Err(ExactServingRouteError::BindingFingerprintMismatch);
         }
         Ok(Self {
-            identity,
+            deployment_identity,
+            process_identity,
             ruleset: Arc::new(ruleset),
             bindings: Arc::new(bindings),
         })
     }
 
+    pub fn deployment_identity(&self) -> &RuntimeDeploymentIdentityV1 {
+        &self.deployment_identity
+    }
+
     pub fn identity(&self) -> &RuntimeProcessIdentityV1 {
-        &self.identity
+        &self.process_identity
+    }
+
+    pub fn process_identity(&self) -> &RuntimeProcessIdentityV1 {
+        &self.process_identity
     }
 
     pub fn ruleset(&self) -> &Arc<RuleSetVersion> {
@@ -89,6 +102,6 @@ impl ExactServingRouteV1 {
     }
 
     pub fn slot_key(&self) -> ServingSlotKeyV1 {
-        ServingSlotKeyV1::from_target(&self.identity.target)
+        ServingSlotKeyV1::from_target(&self.process_identity.target)
     }
 }
