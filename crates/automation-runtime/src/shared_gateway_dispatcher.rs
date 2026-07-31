@@ -37,15 +37,20 @@ use twilight_model::oauth::ApplicationIntegrationMap;
 use twilight_model::user::User;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::acquired_receipt_execution::{
+    execute_acquired_interaction_v1, AcquiredInteractionExecutionOutcomeV1,
+    AcquiredInteractionExecutionServicesV1, AcquiredInteractionLifecyclePermitV1,
+};
 use crate::instance_deleter::OwnedTwilightInstanceDeleter;
+use crate::mutation::TwilightMutationAdapter;
 use crate::responder::TwilightInteractionResponder;
 use crate::runner::InteractionExecutionOutcomeV3;
 use crate::shared_gateway_admission::{
     SharedGatewayAdmissionBudgetV3, SharedGatewayAdmissionConfigV3, SharedGatewayAdmissionErrorV3,
-    SharedGatewayAdmissionReservationV3,
+    SharedGatewayAdmissionReservationV3, SharedGatewayAdmittedInteractionV3,
 };
 use crate::shared_gateway_control::{GatewayConnectionObserverV3, GatewayReadyLeaseV3};
-use crate::shared_gateway_executor::execute_admitted_interaction_v3;
+use crate::shared_gateway_executor::{execute_admitted_interaction_v3, execution_inputs};
 use crate::shared_gateway_router::{parse_shared_gateway_route_v1, SharedGatewayRouteErrorV1};
 use crate::snapshot::OwnedTwilightGuildRoleSnapshotProvider;
 
@@ -541,6 +546,51 @@ impl Debug for SharedGatewayReservedInteractionV3 {
     }
 }
 
+pub struct SharedGatewayAdmittedEnvelopeV1 {
+    admitted: SharedGatewayAdmittedInteractionV3,
+    envelope: SharedGatewayInteractionEnvelopeV3,
+}
+
+impl SharedGatewayAdmittedEnvelopeV1 {
+    pub fn admitted_v1(&self) -> &SharedGatewayAdmittedInteractionV3 {
+        &self.admitted
+    }
+
+    pub fn envelope_v1(&self) -> &SharedGatewayInteractionEnvelopeV3 {
+        &self.envelope
+    }
+
+    pub fn into_parts_v1(
+        self,
+    ) -> (
+        SharedGatewayAdmittedInteractionV3,
+        SharedGatewayInteractionEnvelopeV3,
+    ) {
+        (self.admitted, self.envelope)
+    }
+}
+
+impl Debug for SharedGatewayAdmittedEnvelopeV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayAdmittedEnvelopeV1(<redacted>)")
+    }
+}
+
+pub enum SharedGatewayAdmissionDispatchOutcomeV1 {
+    Admitted(Box<SharedGatewayAdmittedEnvelopeV1>),
+    Ignored,
+    Rejected {
+        error: SharedGatewayAdmissionErrorV3,
+        envelope: Box<SharedGatewayInteractionEnvelopeV3>,
+    },
+}
+
+impl Debug for SharedGatewayAdmissionDispatchOutcomeV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayAdmissionDispatchOutcomeV1(<redacted>)")
+    }
+}
+
 pub enum SharedGatewayInteractionDispatchOutcomeV3 {
     Executed(InteractionExecutionOutcomeV3),
     Ignored,
@@ -683,6 +733,38 @@ where
     }
 }
 
+pub async fn admit_reserved_shared_gateway_interaction_v1<I>(
+    reserved: SharedGatewayReservedInteractionV3,
+    registry: &ServingSlotRegistryV1,
+    instances: &I,
+) -> SharedGatewayAdmissionDispatchOutcomeV1
+where
+    I: InstanceRouteReaderV1,
+{
+    let SharedGatewayReservedInteractionV3 {
+        reservation,
+        envelope,
+    } = reserved;
+    match reservation
+        .admit(
+            registry,
+            instances,
+            envelope.identity.guild_id,
+            envelope.custom_id_v3(),
+        )
+        .await
+    {
+        Ok(Some(admitted)) => SharedGatewayAdmissionDispatchOutcomeV1::Admitted(Box::new(
+            SharedGatewayAdmittedEnvelopeV1 { admitted, envelope },
+        )),
+        Ok(None) => SharedGatewayAdmissionDispatchOutcomeV1::Ignored,
+        Err(error) => SharedGatewayAdmissionDispatchOutcomeV1::Rejected {
+            error,
+            envelope: Box::new(envelope),
+        },
+    }
+}
+
 pub fn cancel_reserved_shared_gateway_interaction_v3(
     reserved: SharedGatewayReservedInteractionV3,
 ) -> Box<SharedGatewayInteractionEnvelopeV3> {
@@ -819,6 +901,50 @@ where
             &self.mutation_http,
             &self.interaction_http,
             SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3,
+        )
+        .await
+    }
+
+    pub async fn admit_v1(
+        &self,
+        reserved: SharedGatewayReservedInteractionV3,
+    ) -> SharedGatewayAdmissionDispatchOutcomeV1 {
+        admit_reserved_shared_gateway_interaction_v1(reserved, &self.registry, &self.instances)
+            .await
+    }
+
+    pub async fn execute_acquired_v1<P>(
+        &self,
+        admitted: SharedGatewayAdmittedEnvelopeV1,
+        permit: P,
+    ) -> AcquiredInteractionExecutionOutcomeV1
+    where
+        P: AcquiredInteractionLifecyclePermitV1,
+    {
+        let (admitted, envelope) = admitted.into_parts_v1();
+        let (identity, _, _) = execution_inputs(admitted.route());
+        let mutation = TwilightMutationAdapter::new(&self.mutation_http, identity.key.clone());
+        let responder = {
+            let interaction = envelope.twilight_interaction_v3();
+            TwilightInteractionResponder::from_interaction(
+                &self.interaction_http,
+                interaction.as_interaction_v3(),
+                identity.key.as_str(),
+            )
+        };
+        execute_acquired_interaction_v1(
+            admitted,
+            envelope,
+            permit,
+            AcquiredInteractionExecutionServicesV1::new(
+                &mutation,
+                &responder,
+                &self.instances,
+                &self.instance_ids,
+                self.teardown.as_ref(),
+                &self.instances,
+                &self.snapshot_provider,
+            ),
         )
         .await
     }

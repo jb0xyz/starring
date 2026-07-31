@@ -64,6 +64,41 @@ fn shard_runtime_delegates_to_the_source_neutral_dispatcher() {
 }
 
 #[test]
+fn durable_admission_is_separate_from_http_execution() {
+    let dispatcher = production_prefix(include_str!("../src/shared_gateway_dispatcher.rs"));
+    let admission = dispatcher
+        .split("pub async fn admit_reserved_shared_gateway_interaction_v1")
+        .nth(1)
+        .unwrap()
+        .split("pub fn cancel_reserved_shared_gateway_interaction_v3")
+        .next()
+        .unwrap();
+    assert!(admission.contains("reservation\n        .admit("));
+    for forbidden in [
+        "Client",
+        "interaction_http",
+        "mutation_http",
+        "TwilightInteractionResponder",
+        "TwilightMutationAdapter",
+        "execute_acquired_interaction_v1",
+        "execute_admitted_interaction_v3",
+    ] {
+        assert!(!admission.contains(forbidden), "{forbidden}");
+    }
+
+    let execution = dispatcher
+        .split("pub async fn execute_acquired_v1<P>")
+        .nth(1)
+        .unwrap()
+        .split("pub async fn acknowledge_rejection_v3")
+        .next()
+        .unwrap();
+    assert!(execution.contains("permit: P"));
+    assert!(execution.contains("P: AcquiredInteractionLifecyclePermitV1"));
+    assert!(execution.contains("execute_acquired_interaction_v1("));
+}
+
+#[test]
 fn narrow_runner_uses_the_pinned_resolver_boundary() {
     let runner = include_str!("../src/runner.rs");
     let narrow = runner

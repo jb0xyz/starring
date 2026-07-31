@@ -89,19 +89,20 @@ pub use shared_gateway_control::{
 };
 pub use shared_gateway_dispatcher::{
     acknowledge_shared_gateway_interaction_rejection_v3,
-    cancel_reserved_shared_gateway_interaction_v3, dispatch_reserved_shared_gateway_interaction_v3,
-    reserve_shared_gateway_interaction_v3, OwnedSharedGatewayDispatchServicesCompositionErrorV3,
-    OwnedSharedGatewayDispatchServicesV3, SharedGatewayInteractionApplicationIdV3,
-    SharedGatewayInteractionDispatchOutcomeV3, SharedGatewayInteractionEnvelopeErrorV3,
-    SharedGatewayInteractionEnvelopeV3, SharedGatewayInteractionIdV3,
-    SharedGatewayInteractionIdentityV3, SharedGatewayInteractionKindV3,
-    SharedGatewayInteractionRejectionV3, SharedGatewayInteractionReservationOutcomeV3,
-    SharedGatewayInteractionTokenV3, SharedGatewayModalInputV3,
-    SharedGatewayRejectionAcknowledgementOutcomeV3, SharedGatewayReservedInteractionV3,
-    MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3, MAX_SHARED_GATEWAY_INTERACTION_LOCALE_BYTES_V3,
-    MAX_SHARED_GATEWAY_INTERACTION_TOKEN_BYTES_V3, MAX_SHARED_GATEWAY_MODAL_INPUTS_V3,
-    MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3, MAX_SHARED_GATEWAY_MODAL_PAYLOAD_BYTES_V3,
-    SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3,
+    admit_reserved_shared_gateway_interaction_v1, cancel_reserved_shared_gateway_interaction_v3,
+    dispatch_reserved_shared_gateway_interaction_v3, reserve_shared_gateway_interaction_v3,
+    OwnedSharedGatewayDispatchServicesCompositionErrorV3, OwnedSharedGatewayDispatchServicesV3,
+    SharedGatewayAdmissionDispatchOutcomeV1, SharedGatewayAdmittedEnvelopeV1,
+    SharedGatewayInteractionApplicationIdV3, SharedGatewayInteractionDispatchOutcomeV3,
+    SharedGatewayInteractionEnvelopeErrorV3, SharedGatewayInteractionEnvelopeV3,
+    SharedGatewayInteractionIdV3, SharedGatewayInteractionIdentityV3,
+    SharedGatewayInteractionKindV3, SharedGatewayInteractionRejectionV3,
+    SharedGatewayInteractionReservationOutcomeV3, SharedGatewayInteractionTokenV3,
+    SharedGatewayModalInputV3, SharedGatewayRejectionAcknowledgementOutcomeV3,
+    SharedGatewayReservedInteractionV3, MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3,
+    MAX_SHARED_GATEWAY_INTERACTION_LOCALE_BYTES_V3, MAX_SHARED_GATEWAY_INTERACTION_TOKEN_BYTES_V3,
+    MAX_SHARED_GATEWAY_MODAL_INPUTS_V3, MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3,
+    MAX_SHARED_GATEWAY_MODAL_PAYLOAD_BYTES_V3, SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3,
 };
 pub use shared_gateway_executor::execute_admitted_interaction_v3;
 pub use shared_gateway_receipt_claim::{
