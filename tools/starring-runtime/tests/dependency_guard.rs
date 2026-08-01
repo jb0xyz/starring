@@ -637,6 +637,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/registry_staging_tests.rs",
             "src/registry_succession_tests.rs",
             "src/runtime_controller.rs",
+            "src/runtime_controller_fault_cohort_tests.rs",
             "src/runtime_interaction_dispatch.rs",
             "src/secret.rs",
             "src/serving_heartbeat_monitor.rs",

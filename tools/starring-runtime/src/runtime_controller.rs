@@ -3,6 +3,8 @@ use std::future::Future;
 use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use automation_runtime::RuntimeReadinessSnapshotErrorV1;
 use automation_runtime::{OwnedDiscordRuntimeOperationsV2, RuntimeDiscordPreflightErrorV1};
 use automation_runtime_controller::{
     plan_runtime_action_v1, RuntimeBindingPinV1, RuntimeClaimNextExecutionV1,
@@ -18,6 +20,8 @@ use automation_runtime_convergence::{
     RuntimeDeploymentPhaseV1, RuntimeDeploymentTargetV1, RuntimeFailureId, RuntimeFailureKindV1,
     RuntimeGeneration, RuntimePendingConditionV1, RuntimeProcessIdentityV1,
 };
+#[cfg(test)]
+use automation_runtime_convergence::{FencingToken, LeaseRequestV1, RuntimeDeployment};
 use automation_runtime_convergence_postgres::{RuntimeConvergenceStoreError, RuntimeExactTargetV1};
 use automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1;
 use automation_runtime_registry::{

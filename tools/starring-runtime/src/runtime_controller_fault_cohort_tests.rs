@@ -1,11 +1,5 @@
 use std::num::NonZeroU32;
 
-use automation_runtime::RuntimeReadinessSnapshotErrorV1;
-use automation_runtime_convergence::{
-    FencingToken, LeaseRequestV1, RuntimeDeployment, RuntimeDeploymentIdentityV1,
-    RuntimeDeploymentTargetV1,
-};
-
 use super::*;
 
 #[derive(Default)]
