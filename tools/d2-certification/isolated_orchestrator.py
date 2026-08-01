@@ -196,6 +196,21 @@ def candidate_health(context, platform, wait):
     }
 
 
+def require_started_dependency(context, platform, name):
+    if name == "transport":
+        status = platform.wait_for_status(
+            lambda: platform.transport_health_status(context), 200
+        )
+    elif name == "worker":
+        status = platform.wait_for_status(
+            lambda: platform.worker_health_status(context), 200
+        )
+    else:
+        return
+    if status != 200:
+        fail("candidate_health_unready")
+
+
 def rollback_candidate_services(context, platform):
     failures = []
     for name in SERVICE_STOP_ORDER:
@@ -362,6 +377,7 @@ def command_start(context, platform):
             append_journal(context, "launchd_start", "intent", label)
             platform.launchd_start(label, service_plist_path(context, name))
             append_journal(context, "launchd_start", "complete", label)
+            require_started_dependency(context, platform, name)
         statuses = candidate_health(context, platform, wait=True)
         if any(status != 200 for status in statuses.values()):
             fail("candidate_health_unready")

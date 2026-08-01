@@ -82,6 +82,7 @@ class FakePlatform:
         self.launchd_failure = None
         self.transport_state = None
         self.http_probes = []
+        self.lifecycle_events = []
 
     def run(self, arguments, input_bytes=None, timeout=30, environment=None):
         executable = pathlib.Path(arguments[0]).name
@@ -200,6 +201,7 @@ class FakePlatform:
             ORCHESTRATOR.fail("injected_launchd_failure")
         self.loaded.add(label)
         self.start_order.append(label)
+        self.lifecycle_events.append(f"start:{label}")
 
     def http_status(self, url, timeout_seconds=3, host_header=None):
         self.http_probes.append((url, host_header))
@@ -208,11 +210,13 @@ class FakePlatform:
         return 200
 
     def worker_health_status(self, context, timeout_seconds=3):
+        self.lifecycle_events.append("health:worker")
         if self.health_failure == "worker":
             return 503
         return 200
 
     def transport_health_status(self, context, timeout_seconds=3):
+        self.lifecycle_events.append("health:transport")
         if self.health_failure == "transport":
             return 503
         return 200
@@ -515,6 +519,16 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
                 "d2-api.starring.co.kr",
             ),
             self.platform.http_probes,
+        )
+        api_label = self.context.manifest["services"]["api"]["label"]
+        worker_label = self.context.manifest["services"]["worker"]["label"]
+        self.assertLess(
+            self.platform.lifecycle_events.index("health:worker"),
+            self.platform.lifecycle_events.index(f"start:{api_label}"),
+        )
+        self.assertLess(
+            self.platform.lifecycle_events.index("health:transport"),
+            self.platform.lifecycle_events.index(f"start:{worker_label}"),
         )
         stopped = ORCHESTRATOR.command_stop(self.context, self.platform)
         self.assertEqual(stopped["phase"], "stopped")
