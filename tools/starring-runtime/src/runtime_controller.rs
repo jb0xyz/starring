@@ -68,6 +68,25 @@ const RUNTIME_CONTROLLER_COMMAND_CAPACITY_V2: usize = 1;
 const RUNTIME_CONTROLLER_IDLE_BACKOFF_V2: Duration = Duration::from_secs(1);
 const RUNTIME_CONTROLLER_RETRY_BACKOFF_V2: Duration = Duration::from_secs(5);
 
+enum RuntimeControllerClaimGateV2 {
+    Claimed(Box<RuntimeExecutionReceiptV1>),
+    Wait(Duration),
+    Failed,
+}
+
+fn runtime_controller_claim_gate_v2(
+    result: Result<Option<RuntimeExecutionReceiptV1>, RuntimeExecutionPersistenceErrorV1>,
+) -> RuntimeControllerClaimGateV2 {
+    match result {
+        Ok(Some(receipt)) => RuntimeControllerClaimGateV2::Claimed(Box::new(receipt)),
+        Ok(None) => RuntimeControllerClaimGateV2::Wait(RUNTIME_CONTROLLER_IDLE_BACKOFF_V2),
+        Err(error) if retryable_execution_error_v2(error) => {
+            RuntimeControllerClaimGateV2::Wait(RUNTIME_CONTROLLER_RETRY_BACKOFF_V2)
+        }
+        Err(_) => RuntimeControllerClaimGateV2::Failed,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeServingControllerConfigV2 {
     inner: RuntimeControllerConfigV1,
@@ -379,30 +398,18 @@ impl RuntimeServingControllerActorV2 {
             .await;
             let receipt = match claim {
                 Err(()) => return RuntimeServingControllerActorExitV2::Commanded,
-                Ok(Ok(Some(receipt))) => receipt,
-                Ok(Ok(None)) => {
-                    if runtime_wait_until_stop_v2(
-                        &mut self.stop,
-                        RUNTIME_CONTROLLER_IDLE_BACKOFF_V2,
-                    )
-                    .await
-                    {
-                        return RuntimeServingControllerActorExitV2::Commanded;
+                Ok(result) => match runtime_controller_claim_gate_v2(result) {
+                    RuntimeControllerClaimGateV2::Claimed(receipt) => *receipt,
+                    RuntimeControllerClaimGateV2::Wait(backoff) => {
+                        if runtime_wait_until_stop_v2(&mut self.stop, backoff).await {
+                            return RuntimeServingControllerActorExitV2::Commanded;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                Ok(Err(error)) if retryable_execution_error_v2(error) => {
-                    if runtime_wait_until_stop_v2(
-                        &mut self.stop,
-                        RUNTIME_CONTROLLER_RETRY_BACKOFF_V2,
-                    )
-                    .await
-                    {
-                        return RuntimeServingControllerActorExitV2::Commanded;
+                    RuntimeControllerClaimGateV2::Failed => {
+                        return RuntimeServingControllerActorExitV2::Failed;
                     }
-                    continue;
-                }
-                Ok(Err(_)) => return RuntimeServingControllerActorExitV2::Failed,
+                },
             };
             let mut retained_receipt = receipt;
             loop {
@@ -631,30 +638,29 @@ impl RuntimeServingControllerActorV2 {
                 .await
             {
                 Err(()) => return RuntimeControllerAttemptV2::Commanded,
-                Ok(Ok(preflight)) => preflight,
-                Ok(Err(RuntimeDiscordPreflightErrorV2::Port(error))) => {
-                    return match error.disposition_v2() {
-                        RuntimeControllerDiscordPreflightDispositionV2::Retryable => {
-                            RuntimeControllerAttemptV2::RetryRetained(Box::new(
-                                preflight_failure_receipt,
-                            ))
-                        }
-                        RuntimeControllerDiscordPreflightDispositionV2::DeploymentBlocked => {
-                            if runtime_phase_allows_preflight_cancel_v2(
-                                &preflight_failure_receipt.snapshot.phase,
-                            ) {
-                                self.cancel_blocked_preflight_v2(preflight_failure_receipt)
-                                    .await
-                            } else {
-                                RuntimeControllerAttemptV2::Failed
-                            }
-                        }
-                        RuntimeControllerDiscordPreflightDispositionV2::ProcessFatal => {
+                Ok(result) => match runtime_controller_discord_preflight_gate_v2(
+                    result,
+                    preflight_failure_receipt,
+                ) {
+                    RuntimeControllerDiscordPreflightGateV2::Ready(preflight) => preflight,
+                    RuntimeControllerDiscordPreflightGateV2::RetryRetained(receipt) => {
+                        return RuntimeControllerAttemptV2::RetryRetained(receipt);
+                    }
+                    RuntimeControllerDiscordPreflightGateV2::DeploymentBlocked(receipt) => {
+                        let preflight_failure_receipt = *receipt;
+                        return if runtime_phase_allows_preflight_cancel_v2(
+                            &preflight_failure_receipt.snapshot.phase,
+                        ) {
+                            self.cancel_blocked_preflight_v2(preflight_failure_receipt)
+                                .await
+                        } else {
                             RuntimeControllerAttemptV2::Failed
-                        }
-                    };
-                }
-                Ok(Err(_)) => return RuntimeControllerAttemptV2::Failed,
+                        };
+                    }
+                    RuntimeControllerDiscordPreflightGateV2::Failed => {
+                        return RuntimeControllerAttemptV2::Failed;
+                    }
+                },
             };
         let stage_ready = match preflight {
             RuntimeDiscordPreflightOutcomeV2::StageReady(stage_ready) => *stage_ready,
@@ -2276,6 +2282,37 @@ enum RuntimeControllerDiscordPreflightDispositionV2 {
     ProcessFatal,
 }
 
+enum RuntimeControllerDiscordPreflightGateV2 {
+    Ready(RuntimeDiscordPreflightOutcomeV2<RuntimeExactTargetV1>),
+    RetryRetained(Box<RuntimeExecutionReceiptV1>),
+    DeploymentBlocked(Box<RuntimeExecutionReceiptV1>),
+    Failed,
+}
+
+fn runtime_controller_discord_preflight_gate_v2(
+    result: Result<
+        RuntimeDiscordPreflightOutcomeV2<RuntimeExactTargetV1>,
+        RuntimeDiscordPreflightErrorV2<RuntimeControllerDiscordPreflightPortErrorV2>,
+    >,
+    receipt: RuntimeExecutionReceiptV1,
+) -> RuntimeControllerDiscordPreflightGateV2 {
+    match result {
+        Ok(preflight) => RuntimeControllerDiscordPreflightGateV2::Ready(preflight),
+        Err(RuntimeDiscordPreflightErrorV2::Port(error)) => match error.disposition_v2() {
+            RuntimeControllerDiscordPreflightDispositionV2::Retryable => {
+                RuntimeControllerDiscordPreflightGateV2::RetryRetained(Box::new(receipt))
+            }
+            RuntimeControllerDiscordPreflightDispositionV2::DeploymentBlocked => {
+                RuntimeControllerDiscordPreflightGateV2::DeploymentBlocked(Box::new(receipt))
+            }
+            RuntimeControllerDiscordPreflightDispositionV2::ProcessFatal => {
+                RuntimeControllerDiscordPreflightGateV2::Failed
+            }
+        },
+        Err(_) => RuntimeControllerDiscordPreflightGateV2::Failed,
+    }
+}
+
 fn runtime_discord_preflight_blocking_mutation_v2() -> RuntimeConvergenceMutationV1 {
     RuntimeConvergenceMutationV1::Cancel {
         reason: "runtime_discord_preflight_blocked".to_owned(),
@@ -2607,6 +2644,10 @@ async fn runtime_wait_for_stop_v2(stop: &mut watch::Receiver<bool>) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_controller_fault_cohort_tests.rs"]
+mod runtime_controller_fault_cohort_tests;
 
 #[cfg(test)]
 mod tests {
