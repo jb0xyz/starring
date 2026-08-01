@@ -167,7 +167,18 @@ VALUES
     ('interaction', 'public.starring_runtime_interaction_receipt_scan_recoverable_v1(timestamp with time zone,text,text,timestamp with time zone,text,text,bigint)'),
     ('interaction', 'public.starring_runtime_interaction_receipt_recover_v1(text,text,bigint,bigint,text,bigint,bigint,bigint,text,text,text,bytea,bigint)'),
     ('interaction', 'public.starring_runtime_interaction_receipt_token_expire_v1(text,text,bigint,bigint,bytea)'),
-    ('interaction', 'public.starring_runtime_interaction_receipt_terminalize_expired_v1(text,text,bigint,bigint,text,text,bytea)');
+    ('interaction', 'public.starring_runtime_interaction_receipt_terminalize_expired_v1(text,text,bigint,bigint,text,text,bytea)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_plan_bind_v1(text,text,bigint,bigint,text,bytea,bytea,bytea,jsonb)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_intend_v1(text,text,bigint,bigint,text,bytea,bigint,bigint,bytea,bytea,bytea,jsonb,bytea,jsonb,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_finish_v1(text,text,bigint,bigint,text,bytea,bigint,bigint,bytea,text,text)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_scan_recoverable_v1(timestamp with time zone,text,text,bigint,timestamp with time zone,text,text,bigint,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_recovery_claim_v1(text,text,bigint,bigint,text,text,text,bigint,bigint,bigint,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_reconcile_v1(text,text,bigint,bigint,bigint,text,text,text,bigint,bigint,bigint,text,text,bytea,text,bytea,text,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_compensation_intend_v1(text,text,bigint,bigint,text,text,text,bigint,bigint,bigint,bytea,bytea,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_compensation_finish_v1(text,text,bigint,bigint,bigint,text,bytea,text,bytea,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_response_tail_scan_v1(timestamp with time zone,text,text,bigint,timestamp with time zone,text,text,bigint,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_response_tail_claim_v1(text,text,bigint,bigint,text,text,text,bigint,bigint,bigint,bytea,bytea,bytea,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_response_tail_finalize_v1(text,text,bigint,bigint,text,bigint,bigint,text,text,text,bigint,bigint,bigint,bytea,bytea,text,bytea,bytea,bigint)');
 
 SELECT pg_catalog.pg_advisory_lock(
     pg_catalog.hashtextextended(
@@ -270,7 +281,7 @@ BEGIN
     IF (
         SELECT pg_catalog.count(*)
         FROM pg_temp.starring_runtime_capability_functions
-    ) <> 71 THEN
+    ) <> 82 THEN
         RAISE EXCEPTION 'runtime capability function manifest is invalid'
             USING ERRCODE = '55000';
     END IF;

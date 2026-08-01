@@ -12,8 +12,8 @@ Detailed rationale lives in the per-topic specs, plans, and runbooks under
 ## System Summary
 
 Starring is an AI-based Discord control plane: "Terraform / Kubernetes for
-Discord with a natural-language frontend." A Rust workspace of **47 crates, 10
-Rust tools, and 57 workspace members**, PostgreSQL-backed at its durable runtime
+Discord with a natural-language frontend." A Rust workspace of **48 crates, 10
+Rust tools, and 58 workspace members**, PostgreSQL-backed at its durable runtime
 boundaries, organized into three layers. The defining safety principle is
 constant across all layers:
 
@@ -291,6 +291,20 @@ serving monitoring, and deterministic interaction dispatch on the canonical
 Discord shard. The B6 staging run reached real Live and executed the current
 recipe, but it is not a commercial release certificate.
 
+The retained staging fixture already runs the C1 durable
+duplicate-interaction receipt boundary. The source candidate adds the C2
+complete deterministic action-plan preflight and the C3 per-effect PostgreSQL
+journal, exact Discord observation, reverse-order bounded compensation,
+response-tail recovery, route-scoped unsafe-recovery admission, and bounded
+production recovery supervisor. All external Discord calls remain outside
+database transactions. An unresolved or uncorrelatable mutable non-response
+effect is recorded as `recovery_required` and blocks the affected route instead
+of being guessed or blindly replayed. An unrecoverable response tail closes
+only the exact receipt without inventing delivery. C2 and C3 are a source-level
+hardening checkpoint, not a deployment or commercial release certificate; the
+live fault, restart, load, restore, and disposable-guild cohorts remain Phase D
+work.
+
 The active authoring provider is `codex_chatgpt`, pinned to
 `gpt-5.6-luna` with `medium` reasoning effort and ChatGPT authentication. The
 CLI and trusted API conversation composition reach it only through the strict
@@ -334,7 +348,7 @@ Compiler, persistence, runtime, and server checkpoint.
 
 ## Workspace Topology
 
-47 crates and 10 Rust tools form 57 workspace members. The recurring pattern is
+48 crates and 10 Rust tools form 58 workspace members. The recurring pattern is
 **pure core + edge adapter**: pure crates hold the domain and logic and are
 forbidden `sqlx`/`twilight` dependencies (guarded by `dependency_guard` tests);
 a paired `*-postgres` adapter (or a dedicated runtime or Discord edge) provides
@@ -368,6 +382,10 @@ persistence and Discord I/O.
   authority).
 - **Layer 2 durable instances**: `automation-instance` + `-postgres`,
   `automation-instance-teardown`, `automation-panel-installation` + `-postgres`.
+- **Layer 2 durable interaction execution**:
+  `automation-runtime-interaction` (pure receipt, effect, digest, plan, and
+  recovery contracts) and `automation-runtime-interaction-postgres` (narrow
+  durable receipt and effect-journal adapter).
 - **Rust tools**: `interaction-smoke` (feature-gated, test-database-only Layer 2
   manual runner), `executor-smoke`, `starring-demo`, `ai-eval`,
   `design-harness` (Luna-medium/SQLite CLI and evaluation edge), `starring-api`
@@ -376,13 +394,14 @@ persistence and Discord I/O.
   `starring-staging-authority-operator`. `codex-worker` is a separate private
   loopback ChatGPT-login Codex service rather than a workspace member.
 
-Persistence is 89 ordered migrations under `/migrations`, ending at
-`202607300001_add_trusted_authoring_generation_writer.sql`, including the
+Persistence is 116 ordered migrations under `/migrations`, ending at
+`202608010001_add_runtime_interaction_effect_journal_v1.sql`, including the
 original instance and RuleSet stores, product-bound activation context and
 terminal states, the authoring promotion journal, atomic Product Apply and
 runtime deployment, runtime convergence, current-versus-historical binding
 separation, artifact integrity, exclusive product-slot ownership, scoped
-installation-authority reads, and scoped product-session authentication.
+installation-authority reads, scoped product-session authentication, durable
+interaction receipts, and the per-effect recovery journal.
 
 ## Durable RuleSet Lifecycle
 
@@ -482,7 +501,7 @@ in-flight legacy activation.
 - **CI** (`.github/workflows/ci.yml`, GitHub Actions, push + PR): a DB-less job
   (fmt, build, `cargo test --workspace`, clippy `-D warnings`, unsafe-dev feature
   build, and design-harness JavaScript/Promptfoo static checks) and a PostgreSQL
-  job (ten adapter or integration packages' ignored tests, serial). No live Discord
+  job (eleven adapter or integration packages' ignored tests, serial). No live Discord
   or LLM in CI.
 - **Test volume**: the complete Rust workspace suite, the design-harness
   JavaScript evaluator and acceptance self-tests, two Promptfoo configuration
@@ -716,11 +735,11 @@ Stated as capabilities (durable across the phase numbering):
   restrictive grants, and a 15-rule HBA; restored-cluster reconciliation,
   production secret-account isolation, rotation, and whole-process negative
   capability evidence remain release blockers.
-- Commercial runtime safety beyond the completed Phase B staging slice:
-  durable duplicate-interaction receipts, complete deterministic action-plan
-  preflight, effect journaling, indeterminate-effect reconciliation, bounded
-  compensation, and recovery of partially observed non-teardown effects remain
-  Phase C.
+- Commercial runtime certification beyond the completed Phase C source
+  candidate: C1 receipts are staged, while C2 preflight and the C3
+  effect-journal, reconciliation, compensation, route-admission, and
+  recovery-supervisor boundaries still need deployment plus the Phase D
+  restart, injected-failure, load, restore, and disposable-guild cohorts.
 - An administrative / management API.
 - Broader multi-process lease/ownership beyond the single per-request lease.
 - A dedicated live teardown-retry progress and degraded-health projection. The
@@ -733,10 +752,6 @@ Stated as capabilities (durable across the phase numbering):
 - Actual typed-planner handoff, structured brainstorming state, recipe editing
   and recompilation, typed multi-turn preference accumulation, and bounded
   Intent transcript compression.
-- Whole-action-plan deterministic preflight before the first Discord side
-  effect.
-- Provisioning-state persistence, compensation, reconciliation, and replay
-  idempotency for partial external failures.
 
 ## Known Limitations
 
@@ -760,18 +775,28 @@ Stated as capabilities (durable across the phase numbering):
   successor.
 - Apply can durably reach `RuntimePending`, and the exact staging runtime can
   advance it to real Live with a certified panel and fresh serving lease.
-  Commercial operation still requires the Phase C safety controls and Phase D
-  failure, load, recovery, disposable-guild, CI, and merged-main certification.
+  C1 receipts are deployed to the retained staging fixture; C2 preflight and
+  C3 recovery controls exist in the source candidate. Commercial operation
+  still requires deployment of C2/C3 and the Phase D failure, load, recovery,
+  disposable-guild, CI, and merged-main certification.
 - The `automation-panel-installation-postgres` ignored tests share a guild
   constant and must run serially (`--test-threads=1`); CI does this. A cleaner
   per-test isolation is deferred.
 - `last_apply_error` keeps only the latest attempt (no history table). Legacy and
   manual `observed_active` remains informational; product-authoring requests bind
   an exact expected baseline and fail as `Superseded` when it drifts.
-- Discord and DB are not jointly atomic. Teardown state is durable and its
-  retries are idempotent, but ordinary action execution still lacks the Phase C
-  effect journal and reconciliation needed to recover every partial external
-  effect.
+- Discord and DB are not jointly atomic. Ordinary action execution now writes
+  an exact per-effect journal, observes ambiguous results before retry, and
+  performs only bounded compensation with exact preimages. Mutable non-response
+  effects that cannot be correlated safely remain durably `recovery_required`
+  and route-blocked. An unrecoverable response tail terminalizes only its exact
+  receipt; Phase D must still prove those paths against live injected failures.
+  Observation, compensation-attempt, and compensation-observation recovery each
+  have a database-enforced 64-attempt hard cap. The production recovery
+  supervisor exposes task liveness and progress to serving readiness; task exit
+  or three consecutive failed sweeps fails closed. A present teardown target
+  without the exact persisted registration identity is treated as a conflict,
+  never adopted by instance ID or resource manifest alone.
 - Layer 2's functional product/runtime staging execution is proven, but its
   commercial failure, load, recovery, and release maturity is not certified
   here. Layer 1's live end-to-end maturity remains uncertified.
@@ -794,8 +819,14 @@ Stated as capabilities (durable across the phase numbering):
   authentication mode, not a weights or remote backend-configuration digest.
   The declared 16,384-token context remains an evaluation policy; the worker
   does not attest the remote model's active context window.
-- Runtime actions are still prepared and executed one at a time. A later
-  deterministic failure can leave an earlier Discord mutation behind.
+- Runtime actions now receive complete deterministic preflight before the first
+  mutation and commit an exact effect journal around each effect-plan external
+  call. Initial defer and direct response paths retain the C1 receipt-level
+  intent/result journal, while an unrecoverable response tail terminalizes that
+  exact receipt. A later mutation failure therefore enters bounded observation,
+  compensation, or an explicit route-blocked state instead of leaving an
+  untracked mutation. Live fault-injection certification of those paths remains
+  Phase D work.
 - V3 Intent snapshots are deliberately incompatible with V4. V6 and V7
   non-Intent snapshots can be promoted at the CLI store edge, but any V6 or V7
   snapshot containing Intent state is rejected. Future protocol, prompt,
@@ -818,36 +849,39 @@ Stated as capabilities (durable across the phase numbering):
   workspace test, Clippy, and formatting gates completed locally; treat a
   recurrence as a host operational fault and continue requiring independent CI
   before merge.
-- After the B6 gates and removal of the final clean-worktree target, the data
-  volume has roughly 37 GiB free. Keep
+- After the C3 gates and removal of the final clean-worktree target, the data
+  volume has roughly 34 GiB free. Keep
   at least 30 GiB free before retaining another large build or evaluation
   cohort; this is an operational capacity floor, not a certified production
   margin.
 
 ## Next Phase: Prove Commercial Operation
 
-Phase A A1–A6 and Phase B B1–B6 are complete. The API has fourteen core pools
-and one isolated writer pool; the integrated staging cluster has 20 application
-credentials, two keyrings, a 15-rule HBA, 114 migration-ledger entries through
-`202607310021`, and authority revision 2
+Phase A A1–A6, Phase B B1–B6, and the Phase C source implementation are
+complete. The API has fourteen core pools and one isolated writer pool; the
+retained integrated staging cluster has 20 application credentials, two
+keyrings, a 15-rule HBA, 115 migration-ledger entries through
+`202607310022`, and authority revision 2
 `community_hub` binding. The live signed-in gate proved one-shot and resumed
 multi-turn authoring, three encrypted durable generations, authenticated read,
 and exact PreviewReady promotion. The B6 gate then proved approval, Apply,
 RuntimePending-to-Live convergence, real Discord resource effects, restart
 reconstruction, and exact per-instance footprint cleanup.
 
+The source candidate adds migration 116,
+`202608010001_add_runtime_interaction_effect_journal_v1.sql`. Its isolated
+PostgreSQL evidence is recorded separately from the retained staging fixture;
+it has not yet been deployed to that fixture or certified against live Discord
+failure injection.
+
 The accepted next sequence is:
 
-1. **Phase C — commercial runtime safety:** add durable interaction receipts,
-   deterministic whole-action-plan preflight, per-effect journaling,
-   indeterminate-effect observation and reconciliation, and bounded
-   compensation. The model remains absent from event-time and deployment-time
-   execution.
-2. **Phase D — commercial certification:** run restart and failure cohorts,
+1. **Phase D — commercial certification:** deploy the Phase C candidate, run
+   restart and injected-failure cohorts,
    final disposable-guild E2E, backup/restore and non-interactive reboot drills,
    concurrency, saturation and soak measurement, complete local gates, final PR
    and merge-candidate CI, merged-main CI, and source-of-truth/runbook closure.
-3. After the commercial certificate, add typed multi-turn preference
+2. After the commercial certificate, add typed multi-turn preference
    accumulation and typed-planner handoff, then consider broader recipes or the
    separate `StatefulSpec` runtime arc.
 
@@ -858,6 +892,9 @@ aggregate Phase A live certificate.
 `docs/superpowers/measurements/2026-07-31-runtime-milestone-b6.md` records the
 Phase B staging runtime evidence and its standing-fixture scope. Neither
 measurement is a commercial certification.
+`docs/superpowers/measurements/2026-08-01-runtime-milestone-c3.md` records the
+Phase C source-level durability, recovery, and isolated PostgreSQL evidence. It
+is also not a commercial certification.
 
 ## Source Documents
 
@@ -865,6 +902,8 @@ measurement is a commercial certification.
   (per-phase rationale; the 16–18f arc and the CI and rollback runbooks).
 - Phase B staging runtime evidence:
   `docs/superpowers/measurements/2026-07-31-runtime-milestone-b6.md`.
+- Phase C source hardening evidence:
+  `docs/superpowers/measurements/2026-08-01-runtime-milestone-c3.md`.
 - Current Intent V4 semantic-identity implementation handoff:
   `docs/superpowers/handoffs/2026-07-15-intent-v4-semantic-identity-handoff.md`.
 - Current Luna V4 acceptance and hardening handoff:

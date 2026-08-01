@@ -15,6 +15,7 @@ use crate::controller_identity::generate_runtime_controller_id_v1;
 use crate::database::{
     compose_runtime_database_dependencies_v1, RuntimeInteractionDispatchCompositionErrorV1,
     RuntimeInteractionDispatchCompositionInputV1, RuntimeInteractionDispatchDatabasePortV1,
+    RuntimeInteractionEffectRecoverySupervisorExitV1,
     RuntimeInteractionReceiptRecoverySupervisorExitV1,
     RuntimeInteractionTeardownRetrySupervisorExitV1, RuntimeInteractionTeardownRetrySupervisorV1,
 };
@@ -25,6 +26,10 @@ use crate::health::{
 use crate::ingress_acknowledgement_supervisor::{
     RuntimeIngressAcknowledgementSupervisorConfigV2, RuntimeIngressAcknowledgementSupervisorExitV2,
     RuntimeIngressAcknowledgementSupervisorV2, RuntimeWorkerIngressAcknowledgementJobV2,
+};
+use crate::interaction_effect_recovery_supervisor::{
+    RuntimeInteractionEffectRecoverySupervisorHealthV1,
+    RuntimeInteractionEffectRecoverySupervisorV1,
 };
 use crate::interaction_receipt_recovery_supervisor::RuntimeInteractionReceiptRecoverySupervisorV1;
 use crate::lifecycle_timing::{
@@ -239,6 +244,9 @@ pub enum RuntimeProcessFoundationShutdownFailureV1 {
     HealthListener,
     IngressAcknowledgement,
     CapabilityReadiness,
+    InteractionEffectRecoveryControlClosed,
+    InteractionEffectRecoveryPanicked,
+    InteractionEffectRecoveryDeadlineElapsed,
     InteractionReceiptRecovery,
     TeardownRetry,
     RuntimeController,
@@ -258,6 +266,15 @@ impl RuntimeProcessFoundationShutdownFailureV1 {
                 "runtime_process_ingress_acknowledgement_supervisor_shutdown"
             }
             Self::CapabilityReadiness => "runtime_process_capability_readiness_supervisor_shutdown",
+            Self::InteractionEffectRecoveryControlClosed => {
+                "runtime_process_interaction_effect_recovery_supervisor_control_closed"
+            }
+            Self::InteractionEffectRecoveryPanicked => {
+                "runtime_process_interaction_effect_recovery_supervisor_panicked"
+            }
+            Self::InteractionEffectRecoveryDeadlineElapsed => {
+                "runtime_process_interaction_effect_recovery_supervisor_shutdown_deadline_elapsed"
+            }
             Self::InteractionReceiptRecovery => {
                 "runtime_process_interaction_receipt_recovery_supervisor_shutdown"
             }
@@ -367,6 +384,7 @@ pub(crate) struct RuntimeProcessFoundationV1 {
     gateway: RuntimeGatewayBootstrapV1,
     registry: RuntimeRegistryBootstrapV1,
     interaction_dispatch_port: RuntimeInteractionDispatchDatabasePortV1,
+    effect_recovery_supervisor: Option<RuntimeInteractionEffectRecoverySupervisorV1>,
     receipt_recovery_supervisor: Option<RuntimeInteractionReceiptRecoverySupervisorV1>,
     teardown_retry_supervisor: Option<RuntimeInteractionTeardownRetrySupervisorV1>,
     databases: RuntimeDatabaseDependenciesV1,
@@ -466,6 +484,37 @@ impl RuntimeProcessFoundationV1 {
             self.interaction_dispatch_port
                 .start_receipt_recovery_supervisor_v1(),
         );
+    }
+
+    pub(super) fn start_effect_recovery_supervisor_v1(&mut self) {
+        assert!(
+            self.effect_recovery_supervisor.is_none(),
+            "runtime interaction effect recovery supervisor already active"
+        );
+        self.effect_recovery_supervisor = Some(
+            self.interaction_dispatch_port
+                .start_effect_recovery_supervisor_v1(),
+        );
+    }
+
+    pub(super) fn effect_recovery_supervisor_health_v1(
+        &self,
+    ) -> Option<RuntimeInteractionEffectRecoverySupervisorHealthV1> {
+        self.effect_recovery_supervisor
+            .as_ref()
+            .map(RuntimeInteractionEffectRecoverySupervisorV1::health_v1)
+    }
+
+    pub(super) async fn stop_effect_recovery_supervisor_until_v1(
+        &mut self,
+        deadline: std::time::Instant,
+    ) {
+        if let Some(effect_recovery) = self.effect_recovery_supervisor.take() {
+            let report = effect_recovery.shutdown_until(deadline).await;
+            if let Some(failure) = effect_recovery_shutdown_failure_v1(report.exit()) {
+                self.shutdown_failures.record(failure);
+            }
+        }
     }
 
     pub(super) fn trip_shutdown_v1(
@@ -661,6 +710,8 @@ impl RuntimeProcessFoundationV1 {
             .expect("runtime lifecycle terminal reporter");
         let observation = self.trip_shutdown_v1(cause);
         let deadline = self.effective_shutdown_deadline_v1(observation);
+        self.stop_effect_recovery_supervisor_until_v1(deadline)
+            .await;
         if let Some(receipt_recovery) = self.receipt_recovery_supervisor.take() {
             let report = receipt_recovery.shutdown_until(deadline).await;
             if report.exit() != RuntimeInteractionReceiptRecoverySupervisorExitV1::Commanded {
@@ -834,6 +885,7 @@ impl RuntimeProcessFoundationV1 {
             gateway,
             registry,
             interaction_dispatch_port,
+            effect_recovery_supervisor,
             receipt_recovery_supervisor,
             teardown_retry_supervisor,
             databases,
@@ -855,6 +907,12 @@ impl RuntimeProcessFoundationV1 {
             mut root_supervisor,
             mut shutdown_failures,
         } = self;
+        if let Some(effect_recovery) = effect_recovery_supervisor {
+            let report = effect_recovery.shutdown_until(cleanup_deadline).await;
+            if let Some(failure) = effect_recovery_shutdown_failure_v1(report.exit()) {
+                shutdown_failures.record(failure);
+            }
+        }
         if let Some(receipt_recovery) = receipt_recovery_supervisor {
             let report = receipt_recovery.shutdown_until(cleanup_deadline).await;
             if report.exit() != RuntimeInteractionReceiptRecoverySupervisorExitV1::Commanded {
@@ -1033,6 +1091,23 @@ fn merge_lifecycle_timing_outcome_v2(
             RuntimeLifecycleTimingOutcomeV2::FailedClosed
         }
         (_, next) => next,
+    }
+}
+
+fn effect_recovery_shutdown_failure_v1(
+    exit: RuntimeInteractionEffectRecoverySupervisorExitV1,
+) -> Option<RuntimeProcessFoundationShutdownFailureV1> {
+    match exit {
+        RuntimeInteractionEffectRecoverySupervisorExitV1::Commanded => None,
+        RuntimeInteractionEffectRecoverySupervisorExitV1::ControlClosed => {
+            Some(RuntimeProcessFoundationShutdownFailureV1::InteractionEffectRecoveryControlClosed)
+        }
+        RuntimeInteractionEffectRecoverySupervisorExitV1::Panicked => {
+            Some(RuntimeProcessFoundationShutdownFailureV1::InteractionEffectRecoveryPanicked)
+        }
+        RuntimeInteractionEffectRecoverySupervisorExitV1::DeadlineElapsed => Some(
+            RuntimeProcessFoundationShutdownFailureV1::InteractionEffectRecoveryDeadlineElapsed,
+        ),
     }
 }
 
@@ -1286,6 +1361,7 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         gateway: closed_components.gateway,
         registry: closed_components.registry,
         interaction_dispatch_port,
+        effect_recovery_supervisor: None,
         receipt_recovery_supervisor: None,
         teardown_retry_supervisor: None,
         databases,
@@ -1519,6 +1595,44 @@ mod tests {
             )),
             Err(RuntimeRegistryRecoveryObservationErrorV1::RegistryUnavailable)
         );
+    }
+
+    #[test]
+    fn effect_recovery_shutdown_exits_are_typed_and_redacted() {
+        assert_eq!(
+            effect_recovery_shutdown_failure_v1(
+                RuntimeInteractionEffectRecoverySupervisorExitV1::Commanded,
+            ),
+            None
+        );
+        let cases = [
+            (
+                RuntimeInteractionEffectRecoverySupervisorExitV1::ControlClosed,
+                RuntimeProcessFoundationShutdownFailureV1::InteractionEffectRecoveryControlClosed,
+                "runtime_process_interaction_effect_recovery_supervisor_control_closed",
+            ),
+            (
+                RuntimeInteractionEffectRecoverySupervisorExitV1::Panicked,
+                RuntimeProcessFoundationShutdownFailureV1::InteractionEffectRecoveryPanicked,
+                "runtime_process_interaction_effect_recovery_supervisor_panicked",
+            ),
+            (
+                RuntimeInteractionEffectRecoverySupervisorExitV1::DeadlineElapsed,
+                RuntimeProcessFoundationShutdownFailureV1::InteractionEffectRecoveryDeadlineElapsed,
+                "runtime_process_interaction_effect_recovery_supervisor_shutdown_deadline_elapsed",
+            ),
+        ];
+        for (exit, failure, code) in cases {
+            assert_eq!(effect_recovery_shutdown_failure_v1(exit), Some(failure));
+            let error = RuntimeProcessFoundationShutdownErrorV1::single(failure);
+            assert_eq!(error.code(), code);
+            assert_eq!(error.primary(), failure);
+            assert_eq!(error.database_only(), None);
+            assert_eq!(
+                format!("{error:?}"),
+                "RuntimeProcessFoundationShutdownErrorV1(<redacted>)"
+            );
+        }
     }
 
     #[test]

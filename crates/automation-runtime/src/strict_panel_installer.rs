@@ -278,7 +278,7 @@ impl StrictPanelInstaller for TwilightStrictPanelInstaller<'_> {
         {
             Ok(response) => response,
             Err(error) if observe_missing(error.kind()) => {
-                return Ok(StrictObservedMessageV1::Missing)
+                return Ok(StrictObservedMessageV1::Missing);
             }
             Err(_) => return Err(InstallerError::new("strict panel observation failed")),
         };

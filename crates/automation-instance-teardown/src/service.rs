@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use automation_instance::{InstanceId, InstanceTeardownClaimOutcomeV1, InstanceTeardownStoreV1};
 use discord_model::GuildId;
 
-use crate::domain::{InstanceDeleter, InstanceResource, TeardownError, TeardownOutcome};
+use crate::domain::{
+    ExactInstanceTeardownRequestV1, InstanceDeleter, InstanceResource,
+    InstanceTeardownRecoveryObservationV1, TeardownError, TeardownOutcome,
+};
 
 #[allow(async_fn_in_trait)]
 pub trait InstanceTeardownService {
@@ -14,6 +17,19 @@ pub trait InstanceTeardownService {
         guild_id: GuildId,
         instance_id: InstanceId,
     ) -> Result<TeardownOutcome, TeardownError>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait DurableInstanceTeardownServiceV1: InstanceTeardownService {
+    async fn teardown_exact_v1(
+        &self,
+        request: &ExactInstanceTeardownRequestV1,
+    ) -> Result<TeardownOutcome, TeardownError>;
+
+    async fn observe_teardown_exact_v1(
+        &self,
+        request: &ExactInstanceTeardownRequestV1,
+    ) -> Result<InstanceTeardownRecoveryObservationV1, TeardownError>;
 }
 
 #[derive(Default)]
@@ -95,19 +111,32 @@ where
         &self,
         guild_id: GuildId,
         instance_id: &InstanceId,
+        exact: Option<&ExactInstanceTeardownRequestV1>,
     ) -> Result<TeardownOutcome, TeardownError> {
+        let initial = self
+            .store
+            .get_for_teardown_v1(guild_id, instance_id)
+            .await
+            .map_err(TeardownError::Lookup)?
+            .ok_or(TeardownError::InstanceNotFound)?;
+        if exact.is_some_and(|request| !request.matches_instance_v1(&initial)) {
+            return Err(TeardownError::ManifestDrift);
+        }
+        let claim = self
+            .store
+            .claim_deleting_v1(guild_id, instance_id)
+            .await
+            .map_err(TeardownError::Store)?;
         let instance = self
             .store
             .get_for_teardown_v1(guild_id, instance_id)
             .await
             .map_err(TeardownError::Lookup)?
             .ok_or(TeardownError::InstanceNotFound)?;
-        let first_owner = match self
-            .store
-            .claim_deleting_v1(guild_id, instance_id)
-            .await
-            .map_err(TeardownError::Store)?
-        {
+        if exact.is_some_and(|request| !request.matches_instance_v1(&instance)) {
+            return Err(TeardownError::ManifestDrift);
+        }
+        let first_owner = match claim {
             InstanceTeardownClaimOutcomeV1::Claimed => true,
             InstanceTeardownClaimOutcomeV1::AlreadyDeleting => false,
             InstanceTeardownClaimOutcomeV1::AlreadyDeleted => {
@@ -172,7 +201,51 @@ where
         let Some(_guard) = self.try_lock(guild_id, &instance_id) else {
             return Ok(TeardownOutcome::InProgress);
         };
-        self.teardown_locked(guild_id, &instance_id).await
+        self.teardown_locked(guild_id, &instance_id, None).await
+    }
+}
+
+impl<S, D> DurableInstanceTeardownServiceV1 for Teardown<S, D>
+where
+    S: InstanceTeardownStoreV1,
+    D: InstanceDeleter,
+{
+    async fn teardown_exact_v1(
+        &self,
+        request: &ExactInstanceTeardownRequestV1,
+    ) -> Result<TeardownOutcome, TeardownError> {
+        let Some(_guard) = self.try_lock(request.guild_id(), request.instance_id()) else {
+            return Ok(TeardownOutcome::InProgress);
+        };
+        self.teardown_locked(request.guild_id(), request.instance_id(), Some(request))
+            .await
+    }
+
+    async fn observe_teardown_exact_v1(
+        &self,
+        request: &ExactInstanceTeardownRequestV1,
+    ) -> Result<InstanceTeardownRecoveryObservationV1, TeardownError> {
+        let instance = self
+            .store
+            .get_for_teardown_v1(request.guild_id(), request.instance_id())
+            .await
+            .map_err(TeardownError::Lookup)?
+            .ok_or(TeardownError::InstanceNotFound)?;
+        if !request.matches_instance_v1(&instance) {
+            return Err(TeardownError::ManifestDrift);
+        }
+        Ok(match instance.status {
+            automation_instance::InstanceStatus::Active
+            | automation_instance::InstanceStatus::Disabled => {
+                InstanceTeardownRecoveryObservationV1::ProvenNotStarted
+            }
+            automation_instance::InstanceStatus::Deleting => {
+                InstanceTeardownRecoveryObservationV1::DurableRetryPending
+            }
+            automation_instance::InstanceStatus::Deleted => {
+                InstanceTeardownRecoveryObservationV1::ProvenSucceeded
+            }
+        })
     }
 }
 

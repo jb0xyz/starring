@@ -232,8 +232,13 @@ fn interaction_database_migration_is_registered_after_convergence_identity() {
         .iter()
         .position(|version| *version == 202_607_300_005)
         .unwrap();
+    let effect_journal = versions
+        .iter()
+        .position(|version| *version == 202_608_010_001)
+        .unwrap();
     assert!(convergence_identity < persisted_controller);
     assert_eq!(interaction, persisted_controller + 1);
     assert!(interaction < teardown);
     assert_eq!(retry_scan, teardown + 1);
+    assert!(retry_scan < effect_journal);
 }

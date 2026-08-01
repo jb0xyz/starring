@@ -4,10 +4,17 @@ pub mod action_plan_preflight_certificate;
 mod action_plan_wire_preflight;
 pub mod convert;
 pub mod custom_id;
+mod discord_effect_postimage;
+pub mod discord_effects;
+mod discord_original_response;
+pub mod effect_journal;
 pub mod error;
 pub mod gateway;
 pub mod gateway_supervisor;
 pub mod instance_deleter;
+mod interaction_effect_plan;
+mod interaction_effect_recovery_executor;
+mod journaled_action_executor;
 pub mod mutation;
 pub mod panel_installer;
 pub mod readiness;
@@ -43,6 +50,21 @@ pub use custom_id::{
     decode, encode_button, encode_modal, ComponentKind, CustomIdError, ParsedCustomId,
     PANEL_RENDER_REVISION,
 };
+pub use discord_effects::{
+    DiscordEffectAttemptOutcomeV1, DiscordEffectCompensationObservationOutcomeV1,
+    DiscordEffectCompensationObserverV1, DiscordEffectObservationEvidenceV1,
+    DiscordEffectObservationOutcomeV1, DiscordEffectReadFailureV1,
+    RecoverableDiscordMutationAdapterV1,
+};
+pub use discord_original_response::{
+    DiscordOriginalResponseObservationOutcomeV1, DiscordOriginalResponseObservationRequestV1,
+    DiscordOriginalResponseObserverV1, OwnedTwilightOriginalResponseObserverV1,
+};
+pub use effect_journal::{
+    InteractionEffectIntentDispositionV1, InteractionEffectJournalIntendV1,
+    InteractionEffectJournalPlanEntryV1, InteractionEffectJournalPlanV1,
+    InteractionEffectJournalPortV1, InteractionEffectPlanBindDispositionV1,
+};
 pub use error::classify_error;
 pub use gateway::{
     control_channel, run, run_controlled, GatewayCommandV1, GatewayControlV1,
@@ -55,6 +77,28 @@ pub use gateway_supervisor::{
     GatewayExitV2, GatewayLifecycleEventV2, GatewayReadyKindV2, GatewayRuntimeControlV2,
 };
 pub use instance_deleter::{OwnedTwilightInstanceDeleter, TwilightInstanceDeleter};
+pub use interaction_effect_recovery_executor::{
+    OwnedSharedGatewayDiscordEffectsV1, OwnedSharedGatewayInternalEffectRecoveryV1,
+    RuntimeInteractionEffectDiscordCompensationRequestV1,
+    RuntimeInteractionEffectDiscordObservationRequestV1,
+    RuntimeInteractionEffectDiscordObservedOutputV1, RuntimeInteractionEffectDiscordRecoveryPortV1,
+    RuntimeInteractionEffectInstanceObservationOutcomeV1,
+    RuntimeInteractionEffectInstanceObservationRequestV1,
+    RuntimeInteractionEffectInstanceRegistrationIdentityV1,
+    RuntimeInteractionEffectInstanceRestoreOutcomeV1,
+    RuntimeInteractionEffectInstanceRestoreRequestV1,
+    RuntimeInteractionEffectInternalReadFailureV1, RuntimeInteractionEffectInternalRecoveryPortV1,
+    RuntimeInteractionEffectRecoveryCompensationDispositionV1,
+    RuntimeInteractionEffectRecoveryCompensationObservationDispositionV1,
+    RuntimeInteractionEffectRecoveryCompensationRequestErrorV1,
+    RuntimeInteractionEffectRecoveryCompensationRequestV1,
+    RuntimeInteractionEffectRecoveryDeferredV1, RuntimeInteractionEffectRecoveryDefinitionErrorV1,
+    RuntimeInteractionEffectRecoveryDefinitionV1, RuntimeInteractionEffectRecoveryExecutorV1,
+    RuntimeInteractionEffectRecoveryObservationDispositionV1,
+    RuntimeInteractionEffectRecoveryObservationRequestErrorV1,
+    RuntimeInteractionEffectRecoveryObservationRequestV1,
+    RuntimeInteractionEffectRecoveryRequiredV1, RuntimeInteractionEffectRecoveryRouteBlockV1,
+};
 pub use mutation::TwilightMutationAdapter;
 pub use panel_installer::TwilightPanelInstaller;
 pub use readiness::{

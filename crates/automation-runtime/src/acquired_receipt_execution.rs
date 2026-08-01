@@ -3,16 +3,17 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use automation_core::preflight::{
-    execute_preflighted_action_plan_v1, preflight_action_plan_v1, prepare_action_plan_v1,
-    ActionPlanSnapshotIdentityV1, ActionPlanSnapshotRequestV1, ActionPlanSnapshotV1,
-    PreflightedActionPlanV1,
+    preflight_action_plan_v1, prepare_action_plan_v1, ActionPlanSnapshotIdentityV1,
+    ActionPlanSnapshotRequestV1, ActionPlanSnapshotV1, PreflightedActionPlanV1,
 };
+#[cfg(test)]
+use automation_core::DiscordMutationAdapter;
 use automation_core::{
-    prepare_event_execution, ActionPlan, AdapterError, AutomationServices, DiscordMutationAdapter,
-    EventKind, InteractionResponder, RunningRuleSetIdentity, RuntimeContext, RuntimeEvent,
+    prepare_event_execution, ActionPlan, AdapterError, AutomationServices, EventKind,
+    InteractionResponder, RunningRuleSetIdentity, RuntimeContext, RuntimeEvent,
 };
 use automation_instance::{InstanceIdGenerator, InstanceRegistrarV1};
-use automation_instance_teardown::InstanceTeardownService;
+use automation_instance_teardown::DurableInstanceTeardownServiceV1;
 use automation_ruleset_dispatch::{
     prepare_instance_action_with_resolver_and_snapshot_v1, GuildRoleSnapshot,
     GuildRoleSnapshotProvider, PinnedInstanceResolverV1,
@@ -30,12 +31,23 @@ use crate::action_plan_digest::build_interaction_action_plan_digest_v1;
 use crate::action_plan_preflight_certificate::InteractionActionPreflightCertificateV1;
 use crate::action_plan_wire_preflight::{preflight_action_plan_wire_v1, ActionPlanWirePreflightV1};
 use crate::convert::interaction_to_event;
+use crate::discord_effects::RecoverableDiscordMutationAdapterV1;
+use crate::effect_journal::{
+    InteractionEffectIntentDispositionV1, InteractionEffectJournalIntendV1,
+    InteractionEffectJournalPlanEntryV1, InteractionEffectJournalPlanV1,
+    InteractionEffectJournalPortV1, InteractionEffectPlanBindDispositionV1,
+};
+use crate::interaction_effect_plan::build_interaction_effect_execution_plan_v1;
+use crate::journaled_action_executor::{
+    execute_journaled_action_plan_v1, ExactInteractionTeardownSetV1,
+    JournaledActionExecutionOutcomeV1, JournaledActionExecutionServicesV1,
+    JournaledActionExecutionStageV1, JournaledActionExecutionStopReasonV1,
+};
 use crate::receipt_fenced_effects::{
     InteractionEffectPermitV1, InteractionInitialResponseIntentDispositionV1,
     InteractionInitialResponseIntentV1, InteractionInitialResponseKindV1,
     InteractionInitialResponseResultKindV1, InteractionInitialResponseResultV1,
-    ReceiptFencedDiscordMutationAdapterV1, ReceiptFencedInstanceRegistrarV1,
-    ReceiptFencedInstanceTeardownServiceV1, ReceiptFencedInteractionResponderV1,
+    ReceiptFencedInteractionResponderV1,
 };
 use crate::shared_gateway_admission::SharedGatewayAdmittedInteractionV3;
 use crate::shared_gateway_dispatcher::SharedGatewayInteractionEnvelopeV3;
@@ -91,11 +103,13 @@ impl Debug for AuthoritativeInteractionClaimV1<'_> {
 pub enum AcquiredInteractionTerminalOutcomeV1 {
     StaticCompleted,
     InstanceCompleted,
+    ProvisioningCompletedResponseUnconfirmed,
     EventConversionFailed,
     NoMatchingRule,
     StaticPreparationFailed,
     InstancePreparationFailed,
     ExecutionFailedBeforeEffect,
+    ExecutionKnownFailed,
     ExecutionRecoveryRequired,
 }
 
@@ -104,23 +118,32 @@ impl AcquiredInteractionTerminalOutcomeV1 {
         match self {
             Self::StaticCompleted => "interaction_static_completed",
             Self::InstanceCompleted => "interaction_instance_completed",
+            Self::ProvisioningCompletedResponseUnconfirmed => {
+                "interaction_provisioning_completed_response_unconfirmed"
+            }
             Self::EventConversionFailed => "interaction_event_conversion_failed",
             Self::NoMatchingRule => "interaction_no_matching_rule",
             Self::StaticPreparationFailed => "interaction_static_preparation_failed",
             Self::InstancePreparationFailed => "interaction_instance_preparation_failed",
             Self::ExecutionFailedBeforeEffect => "interaction_execution_failed_before_effect",
+            Self::ExecutionKnownFailed => "interaction_execution_known_failed",
             Self::ExecutionRecoveryRequired => "interaction_execution_recovery_required",
         }
     }
 
     pub const fn state(self) -> InteractionReceiptStateV1 {
         match self {
-            Self::StaticCompleted | Self::InstanceCompleted => InteractionReceiptStateV1::Completed,
+            Self::StaticCompleted
+            | Self::InstanceCompleted
+            | Self::ProvisioningCompletedResponseUnconfirmed => {
+                InteractionReceiptStateV1::Completed
+            }
             Self::EventConversionFailed
             | Self::NoMatchingRule
             | Self::StaticPreparationFailed
             | Self::InstancePreparationFailed
-            | Self::ExecutionFailedBeforeEffect => InteractionReceiptStateV1::Failed,
+            | Self::ExecutionFailedBeforeEffect
+            | Self::ExecutionKnownFailed => InteractionReceiptStateV1::Failed,
             Self::ExecutionRecoveryRequired => InteractionReceiptStateV1::RecoveryRequired,
         }
     }
@@ -198,6 +221,9 @@ pub enum AcquiredInteractionPersistenceStageV1 {
     InitialResponseResult,
     ActionPlanBind,
     ExecutionIntent,
+    EffectPlanBind,
+    EffectIntent,
+    EffectResult,
     TerminalFinish,
 }
 
@@ -210,6 +236,7 @@ pub enum AcquiredInteractionExecutionOutcomeV1 {
     },
     AuthorityRejected,
     ExecutionDeadlineElapsed,
+    EffectRecoveryPending,
     PersistenceFailed {
         stage: AcquiredInteractionPersistenceStageV1,
         external_effect_may_have_occurred: bool,
@@ -273,12 +300,13 @@ pub async fn execute_acquired_interaction_v1<P, M, R, S, G, T, PR, SP>(
     services: AcquiredInteractionExecutionServicesV1<'_, M, R, S, G, T, PR, SP>,
 ) -> AcquiredInteractionExecutionOutcomeV1
 where
-    P: AcquiredInteractionLifecyclePermitV1,
-    M: DiscordMutationAdapter + ?Sized,
+    P: AcquiredInteractionLifecyclePermitV1
+        + InteractionEffectJournalPortV1<Error = <P as InteractionEffectPermitV1>::Error>,
+    M: RecoverableDiscordMutationAdapterV1,
     R: InteractionResponder + ?Sized,
     S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
-    T: InstanceTeardownService,
+    T: DurableInstanceTeardownServiceV1,
     PR: PinnedInstanceResolverV1,
     SP: GuildRoleSnapshotProvider,
 {
@@ -301,12 +329,13 @@ async fn execute_acquired_interaction_until_v1<P, M, R, S, G, T, PR, SP>(
     execution_deadline: Instant,
 ) -> AcquiredInteractionExecutionOutcomeV1
 where
-    P: AcquiredInteractionLifecyclePermitV1,
-    M: DiscordMutationAdapter + ?Sized,
+    P: AcquiredInteractionLifecyclePermitV1
+        + InteractionEffectJournalPortV1<Error = <P as InteractionEffectPermitV1>::Error>,
+    M: RecoverableDiscordMutationAdapterV1,
     R: InteractionResponder + ?Sized,
     S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
-    T: InstanceTeardownService,
+    T: DurableInstanceTeardownServiceV1,
     PR: PinnedInstanceResolverV1,
     SP: GuildRoleSnapshotProvider,
 {
@@ -341,12 +370,13 @@ async fn execute_acquired_interaction_inner_v1<P, M, R, S, G, T, PR, SP>(
     services: &AcquiredInteractionExecutionServicesV1<'_, M, R, S, G, T, PR, SP>,
 ) -> AcquiredInteractionExecutionOutcomeV1
 where
-    P: AcquiredInteractionLifecyclePermitV1,
-    M: DiscordMutationAdapter + ?Sized,
+    P: AcquiredInteractionLifecyclePermitV1
+        + InteractionEffectJournalPortV1<Error = <P as InteractionEffectPermitV1>::Error>,
+    M: RecoverableDiscordMutationAdapterV1,
     R: InteractionResponder + ?Sized,
     S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
-    T: InstanceTeardownService,
+    T: DurableInstanceTeardownServiceV1,
     PR: PinnedInstanceResolverV1,
     SP: GuildRoleSnapshotProvider,
 {
@@ -370,16 +400,14 @@ where
         return AcquiredInteractionExecutionOutcomeV1::AuthorityRejected;
     }
     let tracking = TrackingInteractionEffectPermitV1::new(permit);
-    let responder = ReceiptFencedInteractionResponderV1::new(services.responder, &tracking);
-    let mutation = ReceiptFencedDiscordMutationAdapterV1::new(services.mutation, &tracking);
-    let instances = ReceiptFencedInstanceRegistrarV1::new(services.instances, &tracking);
-    let teardown = ReceiptFencedInstanceTeardownServiceV1::new(services.teardown, &tracking);
+    let responder =
+        ReceiptFencedInteractionResponderV1::initial_response_only(services.responder, &tracking);
     let execution_services = AutomationServices {
-        mutation: &mutation,
+        mutation: services.mutation,
         responder: &responder,
-        instances: &instances,
+        instances: services.instances,
         instance_ids: services.instance_ids,
-        teardown: &teardown,
+        teardown: services.teardown,
     };
     match &event.kind {
         EventKind::ButtonClick { .. } | EventKind::ModalSubmit { .. } => {
@@ -428,12 +456,13 @@ async fn execute_static_v1<P, M, R, S, G, T>(
     services: &AutomationServices<'_, M, R, S, G, T>,
 ) -> AcquiredInteractionExecutionOutcomeV1
 where
-    P: AcquiredInteractionLifecyclePermitV1,
-    M: DiscordMutationAdapter,
+    P: AcquiredInteractionLifecyclePermitV1
+        + InteractionEffectJournalPortV1<Error = <P as InteractionEffectPermitV1>::Error>,
+    M: RecoverableDiscordMutationAdapterV1,
     R: InteractionResponder,
     S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
-    T: InstanceTeardownService,
+    T: DurableInstanceTeardownServiceV1,
 {
     let prepared = match prepare_event_execution(event, ruleset, bindings, identity) {
         Ok(Some(prepared)) => prepared,
@@ -444,7 +473,7 @@ where
                 AcquiredInteractionTerminalOutcomeV1::NoMatchingRule,
                 false,
             )
-            .await
+            .await;
         }
         Err(_) => {
             return finish_terminal_v1(
@@ -453,7 +482,7 @@ where
                 AcquiredInteractionTerminalOutcomeV1::StaticPreparationFailed,
                 false,
             )
-            .await
+            .await;
         }
     };
     let (context, plan, leading_defer_ephemeral) = prepared.into_parts();
@@ -507,6 +536,7 @@ where
         tracking,
         preflight,
         &action_plan_digest,
+        leading_defer_ephemeral,
         AcquiredInteractionTerminalOutcomeV1::StaticCompleted,
         services,
     )
@@ -527,12 +557,13 @@ async fn execute_instance_v1<P, M, R, S, G, T, PR, SP>(
     services: &AutomationServices<'_, M, R, S, G, T>,
 ) -> AcquiredInteractionExecutionOutcomeV1
 where
-    P: AcquiredInteractionLifecyclePermitV1,
-    M: DiscordMutationAdapter,
+    P: AcquiredInteractionLifecyclePermitV1
+        + InteractionEffectJournalPortV1<Error = <P as InteractionEffectPermitV1>::Error>,
+    M: RecoverableDiscordMutationAdapterV1,
     R: InteractionResponder,
     S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
-    T: InstanceTeardownService,
+    T: DurableInstanceTeardownServiceV1,
     PR: PinnedInstanceResolverV1,
     SP: GuildRoleSnapshotProvider,
 {
@@ -550,7 +581,7 @@ where
                 AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
                 false,
             )
-            .await
+            .await;
         }
     };
     let readiness_snapshot = match GuildRoleSnapshot::from_action_plan_snapshot_v1(&action_snapshot)
@@ -563,7 +594,7 @@ where
                 AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
                 false,
             )
-            .await
+            .await;
         }
     };
     let prepared = match prepare_instance_action_with_resolver_and_snapshot_v1(
@@ -585,7 +616,7 @@ where
                 AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
                 false,
             )
-            .await
+            .await;
         }
     };
     let (context, plan, leading_defer_ephemeral) = prepared.into_parts();
@@ -636,6 +667,7 @@ where
         tracking,
         preflight,
         &action_plan_digest,
+        leading_defer_ephemeral,
         AcquiredInteractionTerminalOutcomeV1::InstanceCompleted,
         services,
     )
@@ -644,6 +676,7 @@ where
 
 struct PreflightExecutionEnvelopeV1 {
     plan: PreflightedActionPlanV1,
+    snapshot: ActionPlanSnapshotV1,
     wire: ActionPlanWirePreflightV1,
     expected_snapshot_identity: ActionPlanSnapshotIdentityV1,
     certificate: InteractionActionPreflightCertificateV1,
@@ -686,6 +719,7 @@ where
             .ok()?,
     };
     let expected_snapshot_identity = snapshot.identity.clone();
+    let retained_snapshot = snapshot.clone();
     let snapshot_digest = InteractionPreflightSnapshotDigestV1::from_canonical_bytes(
         expected_snapshot_identity.as_str().as_bytes(),
     );
@@ -713,6 +747,7 @@ where
         .ok()?;
     Some(PreflightExecutionEnvelopeV1 {
         plan,
+        snapshot: retained_snapshot,
         wire,
         expected_snapshot_identity,
         certificate,
@@ -792,16 +827,18 @@ async fn execute_bound_preflighted_plan_v1<P, M, R, S, G, T>(
     tracking: &TrackingInteractionEffectPermitV1<'_, P>,
     preflight: PreflightExecutionEnvelopeV1,
     action_plan_digest: &InteractionActionPlanDigestV1,
+    leading_defer_ephemeral: bool,
     success: AcquiredInteractionTerminalOutcomeV1,
     services: &AutomationServices<'_, M, R, S, G, T>,
 ) -> AcquiredInteractionExecutionOutcomeV1
 where
-    P: AcquiredInteractionLifecyclePermitV1,
-    M: DiscordMutationAdapter,
+    P: AcquiredInteractionLifecyclePermitV1
+        + InteractionEffectJournalPortV1<Error = <P as InteractionEffectPermitV1>::Error>,
+    M: RecoverableDiscordMutationAdapterV1,
     R: InteractionResponder,
     S: InstanceRegistrarV1,
     G: InstanceIdGenerator,
-    T: InstanceTeardownService,
+    T: DurableInstanceTeardownServiceV1,
 {
     let Some(combined_preflight_material) = combined_preflight_digest_material_v1(
         preflight.plan.digest_material_v1(),
@@ -840,24 +877,200 @@ where
         )
         .await;
     }
-    match execute_preflighted_action_plan_v1(
-        preflight.plan,
-        &preflight.expected_snapshot_identity,
-        services,
+    let effect_plan = match build_interaction_effect_execution_plan_v1(
+        &preflight.plan,
+        &preflight.snapshot,
+        &preflight.wire,
+        &preflight.certificate,
+        action_plan_digest,
+        claim.identity(),
+    ) {
+        Ok(plan) => plan,
+        Err(_) => {
+            return finish_terminal_v1(
+                permit,
+                Some(action_plan_digest),
+                AcquiredInteractionTerminalOutcomeV1::ExecutionFailedBeforeEffect,
+                tracking.any_external_attempt_v1(),
+            )
+            .await;
+        }
+    };
+    let exact_teardown_requests = preflight
+        .wire
+        .exact_teardown_requests_v1(preflight.plan.context().guild_id)
+        .collect::<Vec<_>>();
+    if exact_teardown_requests.len() > 1
+        || effect_plan.snapshot_digest() != preflight.certificate.snapshot_digest()
+        || effect_plan
+            .entries()
+            .iter()
+            .enumerate()
+            .any(|(index, entry)| {
+                entry.action_entry() != entry.action().entry()
+                    || usize::from(entry.definition().action().action_index().get()) != index
+                    || entry.expected_postimage_digest().as_str().len() != 64
+            })
+    {
+        return finish_terminal_v1(
+            permit,
+            Some(action_plan_digest),
+            AcquiredInteractionTerminalOutcomeV1::ExecutionFailedBeforeEffect,
+            tracking.any_external_attempt_v1(),
+        )
+        .await;
+    }
+    let exact_teardowns = match ExactInteractionTeardownSetV1::new(exact_teardown_requests) {
+        Ok(exact) => exact,
+        Err(_) => {
+            return finish_terminal_v1(
+                permit,
+                Some(action_plan_digest),
+                AcquiredInteractionTerminalOutcomeV1::ExecutionFailedBeforeEffect,
+                tracking.any_external_attempt_v1(),
+            )
+            .await;
+        }
+    };
+    let journal_plan = InteractionEffectJournalPlanV1::new(
+        preflight.certificate.digest().clone(),
+        effect_plan.snapshot_digest().clone(),
+        effect_plan
+            .entries()
+            .iter()
+            .map(|entry| {
+                InteractionEffectJournalPlanEntryV1::new(
+                    entry.definition().clone(),
+                    entry.expected_postimage_digest().clone(),
+                )
+            })
+            .collect(),
+    );
+    let journaled_services = JournaledActionExecutionServicesV1 {
+        journal: tracking,
+        mutation: services.mutation,
+        responder: services.responder,
+        instances: services.instances,
+        teardown: services.teardown,
+        exact_teardowns: &exact_teardowns,
+    };
+    match execute_journaled_action_plan_v1(
+        &preflight.plan,
+        &effect_plan,
+        &journal_plan,
+        leading_defer_ephemeral,
+        &journaled_services,
     )
     .await
     {
-        Ok(_) => {
+        JournaledActionExecutionOutcomeV1::Completed(_) => {
             finish_terminal_v1(
                 permit,
                 Some(action_plan_digest),
                 success,
-                tracking.any_external_attempt_v1(),
+                !journal_plan.entries().is_empty() || tracking.any_external_attempt_v1(),
             )
             .await
         }
-        Err(error) => {
-            handle_execution_error_v1(permit, tracking, error, Some(action_plan_digest)).await
+        JournaledActionExecutionOutcomeV1::Stopped { stop, .. } => {
+            let effect_stage = matches!(
+                stop.stage(),
+                JournaledActionExecutionStageV1::Materialization
+                    | JournaledActionExecutionStageV1::EffectIntent
+                    | JournaledActionExecutionStageV1::EffectCall
+                    | JournaledActionExecutionStageV1::EffectFinish
+            );
+            if effect_stage && (stop.action_entry().is_none() || stop.effect_index().is_none()) {
+                return finish_terminal_v1(
+                    permit,
+                    Some(action_plan_digest),
+                    AcquiredInteractionTerminalOutcomeV1::ExecutionRecoveryRequired,
+                    tracking.any_external_attempt_v1(),
+                )
+                .await;
+            }
+            if stop.reason() == JournaledActionExecutionStopReasonV1::JournalUnavailable {
+                let stage = tracking
+                    .persistence_failure_stage_v1()
+                    .unwrap_or(match stop.stage() {
+                        JournaledActionExecutionStageV1::PlanBind => {
+                            AcquiredInteractionPersistenceStageV1::EffectPlanBind
+                        }
+                        JournaledActionExecutionStageV1::EffectIntent => {
+                            AcquiredInteractionPersistenceStageV1::EffectIntent
+                        }
+                        JournaledActionExecutionStageV1::EffectFinish => {
+                            AcquiredInteractionPersistenceStageV1::EffectResult
+                        }
+                        JournaledActionExecutionStageV1::Projection
+                        | JournaledActionExecutionStageV1::Materialization
+                        | JournaledActionExecutionStageV1::EffectCall
+                        | JournaledActionExecutionStageV1::InitialResponse => {
+                            AcquiredInteractionPersistenceStageV1::EffectResult
+                        }
+                    });
+                return persistence_failed_v1(
+                    stage,
+                    stop.stage() == JournaledActionExecutionStageV1::EffectFinish
+                        || tracking.any_external_attempt_v1(),
+                );
+            }
+            if stop.reason() == JournaledActionExecutionStopReasonV1::ResponseFailure {
+                return handle_execution_error_v1(
+                    permit,
+                    tracking,
+                    AdapterError::new(
+                        automation_core::AdapterErrorKind::Unknown,
+                        "Discord initial response failed",
+                    ),
+                    Some(action_plan_digest),
+                )
+                .await;
+            }
+            if stop.recovery_scope()
+                == Some(
+                    automation_runtime_interaction::InteractionEffectRecoveryScopeV1::ResponseTail,
+                )
+                && matches!(
+                    stop.reason(),
+                    JournaledActionExecutionStopReasonV1::Indeterminate
+                        | JournaledActionExecutionStopReasonV1::ExactReplaySuppressed
+                )
+            {
+                return AcquiredInteractionExecutionOutcomeV1::EffectRecoveryPending;
+            }
+            let outcome = if stop.recovery_scope()
+                == Some(
+                    automation_runtime_interaction::InteractionEffectRecoveryScopeV1::ResponseTail,
+                ) {
+                AcquiredInteractionTerminalOutcomeV1::ProvisioningCompletedResponseUnconfirmed
+            } else if stop.reason() == JournaledActionExecutionStopReasonV1::KnownFailure
+                && !stop.rollback_requested()
+            {
+                AcquiredInteractionTerminalOutcomeV1::ExecutionKnownFailed
+            } else if stop.reason() == JournaledActionExecutionStopReasonV1::ProtocolViolation
+                && !stop.rollback_requested()
+                && stop.stage() != JournaledActionExecutionStageV1::EffectCall
+            {
+                AcquiredInteractionTerminalOutcomeV1::ExecutionFailedBeforeEffect
+            } else {
+                AcquiredInteractionTerminalOutcomeV1::ExecutionRecoveryRequired
+            };
+            let external_effect_may_have_occurred = tracking.any_external_attempt_v1()
+                || matches!(
+                    stop.stage(),
+                    JournaledActionExecutionStageV1::EffectCall
+                        | JournaledActionExecutionStageV1::EffectFinish
+                )
+                || stop.rollback_requested()
+                || stop.reason() == JournaledActionExecutionStopReasonV1::ExactReplaySuppressed;
+            finish_terminal_v1(
+                permit,
+                Some(action_plan_digest),
+                outcome,
+                external_effect_may_have_occurred,
+            )
+            .await
         }
     }
 }
@@ -1088,7 +1301,6 @@ impl<'a, P> TrackingInteractionEffectPermitV1<'a, P> {
 
     fn any_external_attempt_v1(&self) -> bool {
         self.initial_response_attempted.load(Ordering::SeqCst)
-            || self.execution_intended.load(Ordering::SeqCst)
     }
 }
 
@@ -1147,6 +1359,41 @@ impl<P: InteractionEffectPermitV1> InteractionEffectPermitV1
         }
         self.execution_intended.store(true, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+impl<P> InteractionEffectJournalPortV1 for TrackingInteractionEffectPermitV1<'_, P>
+where
+    P: InteractionEffectPermitV1
+        + InteractionEffectJournalPortV1<Error = <P as InteractionEffectPermitV1>::Error>,
+{
+    type Error = <P as InteractionEffectPermitV1>::Error;
+    type IntentPermit = <P as InteractionEffectJournalPortV1>::IntentPermit;
+
+    async fn bind_effect_plan_v1(
+        &self,
+        plan: &InteractionEffectJournalPlanV1,
+    ) -> Result<InteractionEffectPlanBindDispositionV1, Self::Error> {
+        self.permit.bind_effect_plan_v1(plan).await
+    }
+
+    async fn intend_effect_v1(
+        &self,
+        intent: InteractionEffectJournalIntendV1<'_>,
+    ) -> Result<InteractionEffectIntentDispositionV1<Self::IntentPermit>, Self::Error> {
+        self.commit_idempotent_execution_intent_v1().await?;
+        self.permit.intend_effect_v1(intent).await
+    }
+
+    async fn finish_effect_v1(
+        &self,
+        permit: &Self::IntentPermit,
+        materialized: &automation_runtime_interaction::InteractionEffectMaterializedPlanV1,
+        outcome: &automation_runtime_interaction::InteractionEffectAttemptOutcomeV1,
+    ) -> Result<(), Self::Error> {
+        self.permit
+            .finish_effect_v1(permit, materialized, outcome)
+            .await
     }
 }
 

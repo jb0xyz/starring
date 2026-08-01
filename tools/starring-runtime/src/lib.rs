@@ -17,6 +17,8 @@ mod health;
 mod identity_encoding;
 mod ingress_acknowledgement_safety;
 mod ingress_acknowledgement_supervisor;
+#[cfg_attr(not(test), allow(dead_code))]
+mod interaction_effect_recovery_supervisor;
 mod interaction_receipt;
 mod interaction_receipt_recovery_supervisor;
 mod lifecycle_timing;

@@ -94,6 +94,28 @@ const RECEIPT_TOKEN_EXPIRE_FUNCTION: &str =
     "public.starring_runtime_interaction_receipt_token_expire_v1(TEXT,TEXT,BIGINT,BIGINT,BYTEA)";
 const RECEIPT_TERMINALIZE_EXPIRED_FUNCTION: &str =
     "public.starring_runtime_interaction_receipt_terminalize_expired_v1(TEXT,TEXT,BIGINT,BIGINT,TEXT,TEXT,BYTEA)";
+const EFFECT_PLAN_BIND_FUNCTION: &str =
+    "public.starring_runtime_interaction_effect_plan_bind_v1(TEXT,TEXT,BIGINT,BIGINT,TEXT,BYTEA,BYTEA,BYTEA,JSONB)";
+const EFFECT_INTEND_FUNCTION: &str =
+    "public.starring_runtime_interaction_effect_intend_v1(TEXT,TEXT,BIGINT,BIGINT,TEXT,BYTEA,BIGINT,BIGINT,BYTEA,BYTEA,BYTEA,JSONB,BYTEA,JSONB,BIGINT)";
+const EFFECT_FINISH_FUNCTION: &str =
+    "public.starring_runtime_interaction_effect_finish_v1(TEXT,TEXT,BIGINT,BIGINT,TEXT,BYTEA,BIGINT,BIGINT,BYTEA,TEXT,TEXT)";
+const EFFECT_RECOVERY_SCAN_FUNCTION: &str =
+    "public.starring_runtime_interaction_effect_scan_recoverable_v1(TIMESTAMPTZ,TEXT,TEXT,BIGINT,TIMESTAMPTZ,TEXT,TEXT,BIGINT,BIGINT)";
+const EFFECT_RECOVERY_CLAIM_FUNCTION: &str =
+    "public.starring_runtime_interaction_effect_recovery_claim_v1(TEXT,TEXT,BIGINT,BIGINT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT,BIGINT)";
+const EFFECT_RECONCILE_FUNCTION: &str =
+    "public.starring_runtime_interaction_effect_reconcile_v1(TEXT,TEXT,BIGINT,BIGINT,BIGINT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT,TEXT,TEXT,BYTEA,TEXT,BYTEA,TEXT,BIGINT)";
+const EFFECT_COMPENSATION_INTEND_FUNCTION: &str =
+    "public.starring_runtime_interaction_effect_compensation_intend_v1(TEXT,TEXT,BIGINT,BIGINT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT,BYTEA,BYTEA,BIGINT)";
+const EFFECT_COMPENSATION_FINISH_FUNCTION: &str =
+    "public.starring_runtime_interaction_effect_compensation_finish_v1(TEXT,TEXT,BIGINT,BIGINT,BIGINT,TEXT,BYTEA,TEXT,BYTEA,BIGINT)";
+const EFFECT_RESPONSE_TAIL_SCAN_FUNCTION: &str =
+    "public.starring_runtime_interaction_effect_response_tail_scan_v1(TIMESTAMPTZ,TEXT,TEXT,BIGINT,TIMESTAMPTZ,TEXT,TEXT,BIGINT,BIGINT)";
+const EFFECT_RESPONSE_TAIL_CLAIM_FUNCTION: &str =
+    "public.starring_runtime_interaction_effect_response_tail_claim_v1(TEXT,TEXT,BIGINT,BIGINT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT,BYTEA,BYTEA,BYTEA,BIGINT)";
+const EFFECT_RESPONSE_TAIL_FINALIZE_FUNCTION: &str =
+    "public.starring_runtime_interaction_effect_response_tail_finalize_v1(TEXT,TEXT,BIGINT,BIGINT,TEXT,BIGINT,BIGINT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT,BYTEA,BYTEA,TEXT,BYTEA,BYTEA,BIGINT)";
 
 static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -215,15 +237,17 @@ async fn isolated_database_with_upgrade_boundary(
             no_tx: false,
         };
         partial.run(&owner_pool).await.unwrap();
+        let boundary_identity = if boundary <= 202_607_300_004 {
+            "public.starring_runtime_interaction_instance_scan_retryable_v2(text,text,text,text,bigint)"
+        } else {
+            "public.starring_runtime_interaction_effect_schema_manifest_v1()"
+        };
         assert!(
-            sqlx::query_scalar::<_, bool>(
-                "SELECT pg_catalog.to_regprocedure(\
-                    'public.starring_runtime_interaction_instance_scan_retryable_v2(text,text,text,text,bigint)'\
-                 ) IS NULL",
-            )
-            .fetch_one(&owner_pool)
-            .await
-            .unwrap()
+            sqlx::query_scalar::<_, bool>("SELECT pg_catalog.to_regprocedure($1) IS NULL")
+                .bind(boundary_identity)
+                .fetch_one(&owner_pool)
+                .await
+                .unwrap()
         );
         MIGRATOR.run(&owner_pool).await.unwrap();
     } else {
@@ -255,6 +279,17 @@ async fn isolated_database_with_upgrade_boundary(
         function_grant(RECEIPT_RECOVER_FUNCTION, &role),
         function_grant(RECEIPT_TOKEN_EXPIRE_FUNCTION, &role),
         function_grant(RECEIPT_TERMINALIZE_EXPIRED_FUNCTION, &role),
+        function_grant(EFFECT_PLAN_BIND_FUNCTION, &role),
+        function_grant(EFFECT_INTEND_FUNCTION, &role),
+        function_grant(EFFECT_FINISH_FUNCTION, &role),
+        function_grant(EFFECT_RECOVERY_SCAN_FUNCTION, &role),
+        function_grant(EFFECT_RECOVERY_CLAIM_FUNCTION, &role),
+        function_grant(EFFECT_RECONCILE_FUNCTION, &role),
+        function_grant(EFFECT_COMPENSATION_INTEND_FUNCTION, &role),
+        function_grant(EFFECT_COMPENSATION_FINISH_FUNCTION, &role),
+        function_grant(EFFECT_RESPONSE_TAIL_SCAN_FUNCTION, &role),
+        function_grant(EFFECT_RESPONSE_TAIL_CLAIM_FUNCTION, &role),
+        function_grant(EFFECT_RESPONSE_TAIL_FINALIZE_FUNCTION, &role),
         format!("GRANT CONNECT ON DATABASE {name} TO {cross_role}"),
         format!("GRANT USAGE ON SCHEMA public TO {cross_role}"),
     ] {
@@ -343,6 +378,25 @@ fn sqlstate(error: &sqlx::Error) -> Option<String> {
         .as_database_error()
         .and_then(|database| database.code())
         .map(|code| code.into_owned())
+}
+
+fn explain_has_seq_scan(plan: &serde_json::Value, relation: &str) -> bool {
+    match plan {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| explain_has_seq_scan(value, relation)),
+        serde_json::Value::Object(values) => {
+            values.get("Node Type").and_then(serde_json::Value::as_str) == Some("Seq Scan")
+                && values
+                    .get("Relation Name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(relation)
+                || values
+                    .values()
+                    .any(|value| explain_has_seq_scan(value, relation))
+        }
+        _ => false,
+    }
 }
 
 async fn seed_receipt_authority(pool: &PgPool) -> String {
@@ -771,6 +825,25 @@ async fn test_receipt_request_with_digest(
     lease: Duration,
     request_digest: String,
 ) -> RuntimeInteractionReceiptClaimRequestV1 {
+    test_receipt_request_with_route(
+        store,
+        content_hash,
+        interaction_id,
+        RuntimeInteractionReceiptRouteV1::static_route(route_key).unwrap(),
+        lease,
+        request_digest,
+    )
+    .await
+}
+
+async fn test_receipt_request_with_route(
+    store: &PostgresRuntimeInteractionV1,
+    content_hash: &str,
+    interaction_id: u64,
+    route: RuntimeInteractionReceiptRouteV1,
+    lease: Duration,
+    request_digest: String,
+) -> RuntimeInteractionReceiptClaimRequestV1 {
     let identity = InteractionReceiptIdentityV1::new(
         DiscordApplicationIdV1::new(RECEIPT_APPLICATION_ID).unwrap(),
         DiscordInteractionIdV1::new(interaction_id).unwrap(),
@@ -781,10 +854,7 @@ async fn test_receipt_request_with_digest(
         InteractionRequestDigestV1::parse(request_digest).unwrap(),
     );
     let authority = store
-        .observe_interaction_receipt_authority_v1(
-            candidate,
-            RuntimeInteractionReceiptRouteV1::static_route(route_key).unwrap(),
-        )
+        .observe_interaction_receipt_authority_v1(candidate, route)
         .await
         .unwrap();
     let now = u64::try_from(Utc::now().timestamp_millis()).unwrap();
@@ -857,6 +927,643 @@ async fn remove_interaction_token(pool: &PgPool, interaction_id: u64) {
     .execute(pool)
     .await
     .unwrap();
+}
+
+fn create_role_effect_action(action_index: u8) -> serde_json::Value {
+    let dependency_indices = action_index
+        .checked_sub(1)
+        .map_or_else(Vec::new, |dependency| vec![dependency]);
+    serde_json::json!({
+        "action_index": action_index,
+        "action_kind": "create_role",
+        "dependency_indices": dependency_indices,
+        "planned_identity_digest": "1".repeat(64),
+        "input_digest": "2".repeat(64),
+        "expected_postimage_digest": "3".repeat(64),
+        "planned_recovery_input": {
+            "references": [{
+                "slot": "guild_id",
+                "source": "existing",
+                "id": RECEIPT_GUILD_ID.to_string()
+            }]
+        },
+        "planned_preimage_digest": "4".repeat(64),
+        "planned_preimage": {"kind": "none"},
+        "output_kind": "created_role",
+        "correlation_class": "audit_log_reason",
+        "correlation_digest": "5".repeat(64),
+        "correlation_marker": "6".repeat(64)
+    })
+}
+
+fn edit_response_effect_action(action_index: u8) -> serde_json::Value {
+    let dependency_indices = action_index
+        .checked_sub(1)
+        .map_or_else(Vec::new, |dependency| vec![dependency]);
+    serde_json::json!({
+        "action_index": action_index,
+        "action_kind": "edit_response",
+        "dependency_indices": dependency_indices,
+        "planned_identity_digest": "7".repeat(64),
+        "input_digest": "8".repeat(64),
+        "expected_postimage_digest": "9".repeat(64),
+        "planned_recovery_input": {
+            "references": [],
+            "payload_digest": "a".repeat(64)
+        },
+        "planned_preimage_digest": "b".repeat(64),
+        "planned_preimage": {"kind": "none"},
+        "output_kind": "original_response",
+        "correlation_class": "interaction_receipt",
+        "correlation_digest": "c".repeat(64),
+        "correlation_marker": null
+    })
+}
+
+async fn bind_effect_plan_document(
+    pool: &PgPool,
+    claim: &automation_runtime_interaction_postgres::RuntimeInteractionReceiptExclusiveClaimV1,
+    plan_digest: &InteractionActionPlanDigestV1,
+    actions: serde_json::Value,
+) -> Result<(String, i16), sqlx::Error> {
+    sqlx::query_as(
+        "SELECT outcome_name, resulting_action_count \
+         FROM public.starring_runtime_interaction_effect_plan_bind_v1(\
+             $1, $2, $3, $4, $5, pg_catalog.decode($6, 'hex'), \
+             pg_catalog.decode(pg_catalog.repeat('d', 64), 'hex'), \
+             pg_catalog.decode(pg_catalog.repeat('e', 64), 'hex'), $7::JSONB\
+         )",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(
+        claim
+            .claim_root()
+            .identity()
+            .interaction_id()
+            .get()
+            .to_string(),
+    )
+    .bind(i64::try_from(claim.head_revision()).unwrap())
+    .bind(i64::try_from(claim.claim_revision()).unwrap())
+    .bind(claim.claim_process_instance_id().as_str())
+    .bind(plan_digest.as_str())
+    .bind(actions)
+    .fetch_one(pool)
+    .await
+}
+
+async fn prepare_deferred_receipt(
+    store: &PostgresRuntimeInteractionV1,
+    content_hash: &str,
+    interaction_id: u64,
+    plan_digest: InteractionActionPlanDigestV1,
+) -> automation_runtime_interaction_postgres::RuntimeInteractionReceiptExclusiveClaimV1 {
+    prepare_deferred_receipt_for_route(
+        store,
+        content_hash,
+        interaction_id,
+        &format!("button:deferred-{interaction_id}"),
+        plan_digest,
+    )
+    .await
+}
+
+async fn prepare_deferred_receipt_for_route(
+    store: &PostgresRuntimeInteractionV1,
+    content_hash: &str,
+    interaction_id: u64,
+    route_key: &str,
+    plan_digest: InteractionActionPlanDigestV1,
+) -> automation_runtime_interaction_postgres::RuntimeInteractionReceiptExclusiveClaimV1 {
+    let mut claim = acquire_test_receipt(
+        store,
+        content_hash,
+        interaction_id,
+        route_key,
+        Duration::from_secs(30),
+    )
+    .await;
+    store
+        .bind_interaction_receipt_action_plan_v1(&mut claim, plan_digest)
+        .await
+        .unwrap();
+    let intent_digest = RuntimeInteractionReceiptOpaqueDigestV1::new([31; 32]);
+    store
+        .intend_interaction_receipt_initial_response_v1(
+            &mut claim,
+            RuntimeInteractionReceiptInitialResponseIntentV1::new(
+                RuntimeInteractionReceiptInitialResponseKindV1::DeferEphemeral,
+                intent_digest.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .finish_interaction_receipt_initial_response_v1(
+            &mut claim,
+            RuntimeInteractionReceiptInitialResponseResultV1::new(
+                intent_digest,
+                RuntimeInteractionReceiptInitialResponseResultKindV1::Succeeded,
+                RuntimeInteractionReceiptOpaqueDigestV1::new([32; 32]),
+            ),
+        )
+        .await
+        .unwrap();
+    claim
+}
+
+async fn intend_create_role_effect(
+    pool: &PgPool,
+    claim: &automation_runtime_interaction_postgres::RuntimeInteractionReceiptExclusiveClaimV1,
+) -> Result<(String, String, i64), sqlx::Error> {
+    sqlx::query_as(
+        "SELECT outcome_name, effect_state, resulting_effect_head_revision \
+         FROM public.starring_runtime_interaction_effect_intend_v1(\
+             $1, $2, $3, $4, $5, pg_catalog.decode(pg_catalog.repeat('d', 64), 'hex'), \
+             0, 1, $6, $7, $8, $9::JSONB, $10, $11::JSONB, 1000\
+         )",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(
+        claim
+            .claim_root()
+            .identity()
+            .interaction_id()
+            .get()
+            .to_string(),
+    )
+    .bind(i64::try_from(claim.head_revision()).unwrap())
+    .bind(i64::try_from(claim.claim_revision()).unwrap())
+    .bind(claim.claim_process_instance_id().as_str())
+    .bind(vec![17_u8; 32])
+    .bind(vec![18_u8; 32])
+    .bind(Vec::<u8>::new())
+    .bind(serde_json::json!({
+        "references": [{
+            "slot": "guild_id",
+            "id": RECEIPT_GUILD_ID.to_string()
+        }]
+    }))
+    .bind(vec![19_u8; 32])
+    .bind(serde_json::json!({"kind": "none"}))
+    .fetch_one(pool)
+    .await
+}
+
+async fn finish_create_role_effect(
+    pool: &PgPool,
+    claim: &automation_runtime_interaction_postgres::RuntimeInteractionReceiptExclusiveClaimV1,
+    outcome: &str,
+) -> (String, String, i64) {
+    try_finish_create_role_effect(
+        pool,
+        claim,
+        claim.claim_process_instance_id().as_str(),
+        outcome,
+    )
+    .await
+    .unwrap()
+}
+
+async fn try_finish_create_role_effect(
+    pool: &PgPool,
+    claim: &automation_runtime_interaction_postgres::RuntimeInteractionReceiptExclusiveClaimV1,
+    process_instance_id: &str,
+    outcome: &str,
+) -> Result<(String, String, i64), sqlx::Error> {
+    let output_id = if outcome == "succeeded" {
+        "9400999"
+    } else {
+        ""
+    };
+    sqlx::query_as(
+        "SELECT outcome_name, effect_state, resulting_effect_head_revision \
+         FROM public.starring_runtime_interaction_effect_finish_v1(\
+             $1, $2, $3, $4, $5, pg_catalog.decode(pg_catalog.repeat('d', 64), 'hex'), \
+             0, 2, $6, $7, $8\
+         )",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(
+        claim
+            .claim_root()
+            .identity()
+            .interaction_id()
+            .get()
+            .to_string(),
+    )
+    .bind(i64::try_from(claim.head_revision()).unwrap())
+    .bind(i64::try_from(claim.claim_revision()).unwrap())
+    .bind(process_instance_id)
+    .bind(vec![20_u8; 32])
+    .bind(outcome)
+    .bind(output_id)
+    .fetch_one(pool)
+    .await
+}
+
+async fn intend_edit_response_effect(
+    pool: &PgPool,
+    claim: &automation_runtime_interaction_postgres::RuntimeInteractionReceiptExclusiveClaimV1,
+) -> (String, String, i64) {
+    sqlx::query_as(
+        "SELECT outcome_name, effect_state, resulting_effect_head_revision \
+         FROM public.starring_runtime_interaction_effect_intend_v1(\
+             $1, $2, $3, $4, $5, pg_catalog.decode(pg_catalog.repeat('d', 64), 'hex'), \
+             0, 1, $6, $7, $8, $9::JSONB, $10, $11::JSONB, 1000\
+         )",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(
+        claim
+            .claim_root()
+            .identity()
+            .interaction_id()
+            .get()
+            .to_string(),
+    )
+    .bind(i64::try_from(claim.head_revision()).unwrap())
+    .bind(i64::try_from(claim.claim_revision()).unwrap())
+    .bind(claim.claim_process_instance_id().as_str())
+    .bind(vec![21_u8; 32])
+    .bind(vec![22_u8; 32])
+    .bind(Vec::<u8>::new())
+    .bind(serde_json::json!({
+        "references": [],
+        "payload_digest": "a".repeat(64)
+    }))
+    .bind(vec![23_u8; 32])
+    .bind(serde_json::json!({"kind": "none"}))
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn make_effect_recovery_due(pool: &PgPool, interaction_id: u64) {
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_interaction_effect_heads_v1 \
+         SET next_recovery_at = pg_catalog.clock_timestamp() - INTERVAL '1 second' \
+         WHERE application_id = $1 AND interaction_id = $2 \
+           AND next_recovery_at IS NOT NULL",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+}
+
+async fn force_receipt_claim_expired(pool: &PgPool, interaction_id: u64) {
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_interaction_receipt_heads_v1 \
+         SET claim_acquired_at = pg_catalog.clock_timestamp() - INTERVAL '2 seconds', \
+             claim_expires_at = pg_catalog.clock_timestamp() - INTERVAL '1 second', \
+             updated_at = pg_catalog.clock_timestamp() \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+}
+
+async fn effect_recovery_scan_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT pg_catalog.count(*) FROM \
+         public.starring_runtime_interaction_effect_scan_recoverable_v1(\
+             '1970-01-01 00:00:00+00'::TIMESTAMPTZ, '', '', -1, \
+             '1970-01-01 00:00:00+00'::TIMESTAMPTZ, '', '', -1, 256\
+         )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn claim_effect_recovery(
+    owner_pool: &PgPool,
+    pool: &PgPool,
+    interaction_id: u64,
+    action_index: i64,
+    effect_head_revision: i64,
+) -> Result<(String, String, i64, i64), sqlx::Error> {
+    let authority: (i64, i64, i64) = sqlx::query_as(
+        "SELECT runtime_generation, route_controller_fencing_token, route_incarnation \
+         FROM public.runtime_interaction_receipt_roots_v1 \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .fetch_one(owner_pool)
+    .await
+    .unwrap();
+    sqlx::query_as(
+        "SELECT outcome_name, effect_state, resulting_effect_head_revision, \
+                resulting_recovery_claim_revision \
+         FROM public.starring_runtime_interaction_effect_recovery_claim_v1(\
+             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,1000\
+         )",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .bind(action_index)
+    .bind(effect_head_revision)
+    .bind(RECEIPT_PROCESS_ID)
+    .bind(RECEIPT_GATEWAY_SHARD)
+    .bind(RECEIPT_BUILD_REVISION)
+    .bind(authority.0)
+    .bind(authority.1)
+    .bind(authority.2)
+    .fetch_one(pool)
+    .await
+}
+
+async fn intend_effect_compensation(
+    owner_pool: &PgPool,
+    pool: &PgPool,
+    interaction_id: u64,
+    action_index: i64,
+    effect_head_revision: i64,
+) -> Result<(String, String, i64, i64), sqlx::Error> {
+    let authority: (Vec<u8>, i64, i64, i64) = sqlx::query_as(
+        "SELECT effect.preflight_certificate_digest, receipt.runtime_generation, \
+                receipt.route_controller_fencing_token, receipt.route_incarnation \
+         FROM public.runtime_interaction_effect_roots_v1 AS effect \
+         INNER JOIN public.runtime_interaction_receipt_roots_v1 AS receipt \
+           ON receipt.application_id = effect.application_id \
+          AND receipt.interaction_id = effect.interaction_id \
+         WHERE effect.application_id = $1 AND effect.interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .fetch_one(owner_pool)
+    .await
+    .unwrap();
+    sqlx::query_as(
+        "SELECT outcome_name, effect_state, resulting_effect_head_revision, \
+                resulting_recovery_claim_revision \
+         FROM public.starring_runtime_interaction_effect_compensation_intend_v1(\
+             $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1000\
+         )",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .bind(action_index)
+    .bind(effect_head_revision)
+    .bind(RECEIPT_PROCESS_ID)
+    .bind(RECEIPT_GATEWAY_SHARD)
+    .bind(RECEIPT_BUILD_REVISION)
+    .bind(authority.1)
+    .bind(authority.2)
+    .bind(authority.3)
+    .bind(authority.0)
+    .bind(vec![0xca_u8; 32])
+    .fetch_one(pool)
+    .await
+}
+
+async fn reconcile_observed_effect(
+    owner_pool: &PgPool,
+    pool: &PgPool,
+    interaction_id: u64,
+    revisions: (i64, i64),
+    observation: (&str, &[u8]),
+    runtime_generation_delta: i64,
+) -> Result<(String, String, i64), sqlx::Error> {
+    let authority: (Vec<u8>, i64, i64, i64) = sqlx::query_as(
+        "SELECT effect.preflight_certificate_digest, receipt.runtime_generation, \
+                receipt.route_controller_fencing_token, receipt.route_incarnation \
+         FROM public.runtime_interaction_effect_roots_v1 AS effect \
+         INNER JOIN public.runtime_interaction_receipt_roots_v1 AS receipt \
+           ON receipt.application_id = effect.application_id \
+          AND receipt.interaction_id = effect.interaction_id \
+         WHERE effect.application_id = $1 AND effect.interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .fetch_one(owner_pool)
+    .await
+    .unwrap();
+    sqlx::query_as(
+        "SELECT outcome_name, effect_state, resulting_effect_head_revision \
+         FROM public.starring_runtime_interaction_effect_reconcile_v1(\
+             $1,$2,0,$3,$4,$5,$6,$7,$8,$9,$10,'observing','observation',\
+             $11,$12,$13,'',1000\
+         )",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .bind(revisions.0)
+    .bind(revisions.1)
+    .bind(RECEIPT_PROCESS_ID)
+    .bind(RECEIPT_GATEWAY_SHARD)
+    .bind(RECEIPT_BUILD_REVISION)
+    .bind(authority.1 + runtime_generation_delta)
+    .bind(authority.2)
+    .bind(authority.3)
+    .bind(authority.0)
+    .bind(observation.0)
+    .bind(observation.1)
+    .fetch_one(pool)
+    .await
+}
+
+async fn finish_effect_compensation(
+    owner_pool: &PgPool,
+    pool: &PgPool,
+    interaction_id: u64,
+    revisions: (i64, i64),
+    process_instance_id: &str,
+    result: (&str, &[u8]),
+) -> Result<(String, String, i64), sqlx::Error> {
+    let preflight_certificate_digest: Vec<u8> = sqlx::query_scalar(
+        "SELECT preflight_certificate_digest \
+         FROM public.runtime_interaction_effect_roots_v1 \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .fetch_one(owner_pool)
+    .await
+    .unwrap();
+    sqlx::query_as(
+        "SELECT outcome_name, effect_state, resulting_effect_head_revision \
+         FROM public.starring_runtime_interaction_effect_compensation_finish_v1(\
+             $1,$2,0,$3,$4,$5,$6,$7,$8,1000\
+         )",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .bind(revisions.0)
+    .bind(revisions.1)
+    .bind(process_instance_id)
+    .bind(preflight_certificate_digest)
+    .bind(result.0)
+    .bind(result.1)
+    .fetch_one(pool)
+    .await
+}
+
+async fn claim_response_tail(
+    owner_pool: &PgPool,
+    pool: &PgPool,
+    interaction_id: u64,
+    effect_head_revision: i64,
+) -> Result<(String, String, i64, i64, i32, String, i64), sqlx::Error> {
+    let authority: (i64, i64, i64) = sqlx::query_as(
+        "SELECT runtime_generation, route_controller_fencing_token, route_incarnation \
+         FROM public.runtime_interaction_receipt_roots_v1 \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .fetch_one(owner_pool)
+    .await
+    .unwrap();
+    sqlx::query_as(
+        "SELECT outcome_name, effect_state, resulting_effect_head_revision, \
+                resulting_recovery_claim_revision, resulting_observation_attempt_count, \
+                receipt_state, resulting_receipt_head_revision \
+         FROM public.starring_runtime_interaction_effect_response_tail_claim_v1(\
+             $1,$2,0,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1000\
+         )",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .bind(effect_head_revision)
+    .bind(RECEIPT_PROCESS_ID)
+    .bind(RECEIPT_GATEWAY_SHARD)
+    .bind(RECEIPT_BUILD_REVISION)
+    .bind(authority.0)
+    .bind(authority.1)
+    .bind(authority.2)
+    .bind(vec![0xdd_u8; 32])
+    .bind(vec![0x99_u8; 32])
+    .bind(vec![0xee_u8; 32])
+    .fetch_one(pool)
+    .await
+}
+
+async fn finalize_response_tail(
+    owner_pool: &PgPool,
+    pool: &PgPool,
+    interaction_id: u64,
+    revisions: (i64, i64, i64),
+    process_instance_id: &str,
+    outcome: (&str, &[u8], &[u8]),
+) -> Result<(String, String, i64, String, i64), sqlx::Error> {
+    let authority: (Vec<u8>, i64, i64, i64) = sqlx::query_as(
+        "SELECT effect.preflight_certificate_digest, receipt.runtime_generation, \
+                receipt.route_controller_fencing_token, receipt.route_incarnation \
+         FROM public.runtime_interaction_effect_roots_v1 AS effect \
+         INNER JOIN public.runtime_interaction_receipt_roots_v1 AS receipt \
+           ON receipt.application_id = effect.application_id \
+          AND receipt.interaction_id = effect.interaction_id \
+         WHERE effect.application_id = $1 AND effect.interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .fetch_one(owner_pool)
+    .await
+    .unwrap();
+    sqlx::query_as(
+        "SELECT outcome_name, effect_state, resulting_effect_head_revision, \
+                receipt_state, resulting_receipt_head_revision \
+         FROM public.starring_runtime_interaction_effect_response_tail_finalize_v1(\
+             $1,$2,0,$3,'executing',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,1000\
+         )",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(interaction_id.to_string())
+    .bind(revisions.0)
+    .bind(revisions.1)
+    .bind(revisions.2)
+    .bind(process_instance_id)
+    .bind(RECEIPT_GATEWAY_SHARD)
+    .bind(RECEIPT_BUILD_REVISION)
+    .bind(authority.1)
+    .bind(authority.2)
+    .bind(authority.3)
+    .bind(authority.0)
+    .bind(vec![0x99_u8; 32])
+    .bind(outcome.0)
+    .bind(outcome.1)
+    .bind(outcome.2)
+    .fetch_one(pool)
+    .await
+}
+
+async fn complete_actionless_receipt(
+    store: &PostgresRuntimeInteractionV1,
+    pool: &PgPool,
+    content_hash: &str,
+    interaction_id: u64,
+    route_key: &str,
+) {
+    let plan_digest =
+        InteractionActionPlanDigestV1::parse(format!("{interaction_id:064x}")).unwrap();
+    let mut claim = acquire_test_receipt(
+        store,
+        content_hash,
+        interaction_id,
+        route_key,
+        Duration::from_secs(30),
+    )
+    .await;
+    store
+        .bind_interaction_receipt_action_plan_v1(&mut claim, plan_digest.clone())
+        .await
+        .unwrap();
+    bind_effect_plan_document(pool, &claim, &plan_digest, serde_json::json!([]))
+        .await
+        .unwrap();
+    let intent_digest = RuntimeInteractionReceiptOpaqueDigestV1::new([41; 32]);
+    store
+        .intend_interaction_receipt_initial_response_v1(
+            &mut claim,
+            RuntimeInteractionReceiptInitialResponseIntentV1::new(
+                RuntimeInteractionReceiptInitialResponseKindV1::RespondEphemeral,
+                intent_digest.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .finish_interaction_receipt_initial_response_v1(
+            &mut claim,
+            RuntimeInteractionReceiptInitialResponseResultV1::new(
+                intent_digest,
+                RuntimeInteractionReceiptInitialResponseResultKindV1::Succeeded,
+                RuntimeInteractionReceiptOpaqueDigestV1::new([42; 32]),
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .finish_interaction_receipt_v1(
+            &mut claim,
+            RuntimeInteractionReceiptTerminalOutcomeV1::new(
+                RuntimeInteractionReceiptTerminalStateV1::Completed,
+                "actionless_completed",
+                RuntimeInteractionReceiptOpaqueDigestV1::new([43; 32]),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 }
 
 #[test]
@@ -1157,6 +1864,69 @@ async fn teardown_retry_scan_upgrades_cleanly_from_teardown_v1() {
 
 #[tokio::test]
 #[ignore]
+async fn effect_journal_upgrades_from_durable_receipts_with_exact_catalog_and_acl() {
+    let database = isolated_database_with_upgrade_boundary(Some(202_607_310_022)).await;
+    let applied: i64 = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*) FROM public._sqlx_migrations \
+         WHERE version = 202608010001 AND success",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(applied, 1);
+    let manifests: (bool, bool, bool) = sqlx::query_as(
+        "SELECT public.starring_runtime_interaction_effect_schema_manifest_v1(), \
+                public.starring_runtime_interaction_receipt_schema_manifest_v1(), \
+                public.starring_runtime_interaction_schema_manifest_v1()",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(manifests, (true, true, true));
+    let catalog: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class AS relation \
+              INNER JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+              WHERE namespace.nspname = 'public' AND relation.relkind = 'r' \
+                AND relation.relname LIKE 'runtime_interaction_effect_%'), \
+             (SELECT pg_catalog.count(*) FROM pg_catalog.pg_indexes \
+              WHERE schemaname = 'public' AND indexname LIKE 'runtime_interaction_effect_%'), \
+             (SELECT pg_catalog.count(*) FROM pg_catalog.pg_proc AS function_row \
+              INNER JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = function_row.pronamespace \
+              WHERE namespace.nspname = 'public' AND (function_row.proname LIKE 'starring_runtime_interaction_effect_%' \
+                OR function_row.proname LIKE 'guard_runtime_interaction_effect_%')), \
+             (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class AS relation \
+              INNER JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace \
+              WHERE namespace.nspname = 'public')",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(catalog, (4, 8, 22, 198));
+    let executable: i64 = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*) FROM pg_catalog.pg_proc AS function_row \
+         INNER JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = function_row.pronamespace \
+         WHERE namespace.nspname = 'public' \
+           AND function_row.proname LIKE 'starring_runtime_interaction_effect_%' \
+           AND pg_catalog.has_function_privilege($1, function_row.oid, 'EXECUTE')",
+    )
+    .bind(&database.role)
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(executable, 11);
+    let direct_write = sqlx::query(
+        "INSERT INTO public.runtime_interaction_effect_roots_v1 (application_id) VALUES ('1')",
+    )
+    .execute(&database.executor_pool)
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&direct_write).as_deref(), Some("42501"));
+    cleanup(database).await;
+}
+
+#[tokio::test]
+#[ignore]
 async fn durable_receipt_recovery_scan_is_empty_and_private() {
     let database = isolated_database().await;
     let database_identity: String = sqlx::query_scalar(
@@ -1198,6 +1968,1797 @@ async fn durable_receipt_recovery_scan_is_empty_and_private() {
     .await
     .unwrap_err();
     assert_eq!(sqlstate(&cross_error).as_deref(), Some("42501"));
+    cleanup(database).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn effect_plan_bind_enforces_defer_tail_policy_and_serializes_replay() {
+    let database = isolated_database().await;
+    let content_hash = seed_receipt_authority(&database.owner_pool).await;
+    let database_identity: String = sqlx::query_scalar(
+        "SELECT database_identity::TEXT \
+         FROM public.product_control_plane_identity WHERE singleton",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let expectation = RuntimeInteractionDatabaseExpectationV1::new(
+        database_identity,
+        database.name.clone(),
+        database.role.clone(),
+    )
+    .unwrap();
+    let store = PostgresRuntimeInteractionV1::connect_verified_default(
+        database.executor_pool.clone(),
+        expectation,
+    )
+    .await
+    .unwrap();
+
+    let direct_plan = InteractionActionPlanDigestV1::parse("1".repeat(64)).unwrap();
+    let mut direct = acquire_test_receipt(
+        &store,
+        &content_hash,
+        9_300_001,
+        "button:direct-zero",
+        Duration::from_secs(30),
+    )
+    .await;
+    store
+        .bind_interaction_receipt_action_plan_v1(&mut direct, direct_plan.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        bind_effect_plan_document(
+            &database.executor_pool,
+            &direct,
+            &direct_plan,
+            serde_json::json!([]),
+        )
+        .await
+        .unwrap(),
+        ("plan_bound".to_string(), 0)
+    );
+    let direct_intent_digest = RuntimeInteractionReceiptOpaqueDigestV1::new([33; 32]);
+    store
+        .intend_interaction_receipt_initial_response_v1(
+            &mut direct,
+            RuntimeInteractionReceiptInitialResponseIntentV1::new(
+                RuntimeInteractionReceiptInitialResponseKindV1::RespondEphemeral,
+                direct_intent_digest.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .finish_interaction_receipt_initial_response_v1(
+            &mut direct,
+            RuntimeInteractionReceiptInitialResponseResultV1::new(
+                direct_intent_digest,
+                RuntimeInteractionReceiptInitialResponseResultKindV1::Succeeded,
+                RuntimeInteractionReceiptOpaqueDigestV1::new([34; 32]),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .finish_interaction_receipt_v1(
+                &mut direct,
+                RuntimeInteractionReceiptTerminalOutcomeV1::new(
+                    RuntimeInteractionReceiptTerminalStateV1::Completed,
+                    "direct_zero_completed",
+                    RuntimeInteractionReceiptOpaqueDigestV1::new([35; 32]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        RuntimeInteractionReceiptMutationDispositionV1::Applied
+    );
+
+    let unacknowledged_plan = InteractionActionPlanDigestV1::parse("2".repeat(64)).unwrap();
+    let mut unacknowledged = acquire_test_receipt(
+        &store,
+        &content_hash,
+        9_300_002,
+        "button:unacknowledged-mutation",
+        Duration::from_secs(30),
+    )
+    .await;
+    store
+        .bind_interaction_receipt_action_plan_v1(&mut unacknowledged, unacknowledged_plan.clone())
+        .await
+        .unwrap();
+    let unacknowledged_error = bind_effect_plan_document(
+        &database.executor_pool,
+        &unacknowledged,
+        &unacknowledged_plan,
+        serde_json::json!([create_role_effect_action(0), edit_response_effect_action(1)]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&unacknowledged_error).as_deref(), Some("RI001"));
+    let unacknowledged_rows: i64 = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*) \
+         FROM public.runtime_interaction_effect_roots_v1 \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind("9300002")
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(unacknowledged_rows, 0);
+
+    let deferred_plan = InteractionActionPlanDigestV1::parse("3".repeat(64)).unwrap();
+    let mut deferred =
+        prepare_deferred_receipt(&store, &content_hash, 9_300_003, deferred_plan.clone()).await;
+    let mut null_dependency = create_role_effect_action(0);
+    null_dependency["dependency_indices"] = serde_json::json!([null]);
+    let mut predecessor_with_null = create_role_effect_action(1);
+    predecessor_with_null["dependency_indices"] = serde_json::json!([0, null]);
+    predecessor_with_null["correlation_marker"] = serde_json::json!("7".repeat(64));
+    for invalid in [
+        serde_json::json!([null_dependency]),
+        serde_json::json!([create_role_effect_action(0), predecessor_with_null]),
+        serde_json::json!([create_role_effect_action(0)]),
+        serde_json::json!([
+            edit_response_effect_action(0),
+            edit_response_effect_action(1)
+        ]),
+        serde_json::json!([edit_response_effect_action(0), create_role_effect_action(1)]),
+    ] {
+        let error =
+            bind_effect_plan_document(&database.executor_pool, &deferred, &deferred_plan, invalid)
+                .await
+                .unwrap_err();
+        assert_eq!(sqlstate(&error).as_deref(), Some("RI003"));
+    }
+    let valid = serde_json::json!([create_role_effect_action(0), edit_response_effect_action(1)]);
+    let (left, right) = tokio::join!(
+        bind_effect_plan_document(
+            &database.executor_pool,
+            &deferred,
+            &deferred_plan,
+            valid.clone(),
+        ),
+        bind_effect_plan_document(&database.executor_pool, &deferred, &deferred_plan, valid,)
+    );
+    let mut outcomes = [left.unwrap().0, right.unwrap().0];
+    outcomes.sort();
+    assert_eq!(outcomes, ["exact_replay", "plan_bound"]);
+    assert_eq!(
+        store
+            .intend_interaction_receipt_execution_v1(&mut deferred)
+            .await
+            .unwrap(),
+        RuntimeInteractionReceiptMutationDispositionV1::Applied
+    );
+
+    let response_only_plan = InteractionActionPlanDigestV1::parse("4".repeat(64)).unwrap();
+    let response_only =
+        prepare_deferred_receipt(&store, &content_hash, 9_300_004, response_only_plan.clone())
+            .await;
+    assert_eq!(
+        bind_effect_plan_document(
+            &database.executor_pool,
+            &response_only,
+            &response_only_plan,
+            serde_json::json!([edit_response_effect_action(0)]),
+        )
+        .await
+        .unwrap(),
+        ("plan_bound".to_string(), 1)
+    );
+    cleanup(database).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn effect_same_route_admission_is_serialized_and_completed_history_is_index_bounded() {
+    let database = isolated_database().await;
+    let content_hash = seed_receipt_authority(&database.owner_pool).await;
+    let database_identity: String = sqlx::query_scalar(
+        "SELECT database_identity::TEXT FROM public.product_control_plane_identity WHERE singleton",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let expectation = RuntimeInteractionDatabaseExpectationV1::new(
+        database_identity,
+        database.name.clone(),
+        database.role.clone(),
+    )
+    .unwrap();
+    let store = PostgresRuntimeInteractionV1::connect_verified_default(
+        database.executor_pool.clone(),
+        expectation,
+    )
+    .await
+    .unwrap();
+    let route_key = "button:shared-static";
+    complete_actionless_receipt(
+        &store,
+        &database.executor_pool,
+        &content_hash,
+        9_400_001,
+        route_key,
+    )
+    .await;
+
+    let terminal_plan = InteractionActionPlanDigestV1::parse("6".repeat(64)).unwrap();
+    let mut terminal_source = prepare_deferred_receipt_for_route(
+        &store,
+        &content_hash,
+        9_400_100,
+        "button:terminal-source",
+        terminal_plan.clone(),
+    )
+    .await;
+    let mut terminal_action = create_role_effect_action(0);
+    terminal_action["correlation_marker"] = serde_json::json!("6".repeat(64));
+    bind_effect_plan_document(
+        &database.executor_pool,
+        &terminal_source,
+        &terminal_plan,
+        serde_json::json!([terminal_action, edit_response_effect_action(1)]),
+    )
+    .await
+    .unwrap();
+    store
+        .intend_interaction_receipt_execution_v1(&mut terminal_source)
+        .await
+        .unwrap();
+    assert_eq!(
+        intend_create_role_effect(&database.executor_pool, &terminal_source)
+            .await
+            .unwrap(),
+        ("intended".to_string(), "intended".to_string(), 2)
+    );
+    assert_eq!(
+        finish_create_role_effect(
+            &database.executor_pool,
+            &terminal_source,
+            "definitive_failure",
+        )
+        .await,
+        (
+            "definitive_failure".to_string(),
+            "known_failed".to_string(),
+            3
+        )
+    );
+    assert_eq!(
+        finish_create_role_effect(
+            &database.executor_pool,
+            &terminal_source,
+            "definitive_failure",
+        )
+        .await,
+        ("exact_replay".to_string(), "known_failed".to_string(), 3)
+    );
+    let finish_replay_before: (String, i64, i64) = sqlx::query_as(
+        "SELECT state, head_revision, \
+                (SELECT pg_catalog.count(*) \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind("9400100")
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let stale_finish_process = try_finish_create_role_effect(
+        &database.executor_pool,
+        &terminal_source,
+        "process-receipt-stale",
+        "definitive_failure",
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&stale_finish_process).as_deref(), Some("RI001"));
+    let finish_replay_after: (String, i64, i64) = sqlx::query_as(
+        "SELECT state, head_revision, \
+                (SELECT pg_catalog.count(*) \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind("9400100")
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(finish_replay_after, finish_replay_before);
+
+    let mut transaction = database.owner_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_interaction_receipt_roots_v1 \
+         SELECT (pg_catalog.jsonb_populate_record(\
+             NULL::public.runtime_interaction_receipt_roots_v1, \
+             pg_catalog.to_jsonb(source) || pg_catalog.jsonb_build_object(\
+                 'interaction_id', (950000000 + ordinal)::TEXT\
+             )\
+         )).* \
+         FROM public.runtime_interaction_receipt_roots_v1 AS source \
+         CROSS JOIN pg_catalog.generate_series(1, 5000) AS ordinal \
+         WHERE source.application_id = $1 AND source.interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind("9400001")
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_interaction_receipt_heads_v1 \
+         SELECT (pg_catalog.jsonb_populate_record(\
+             NULL::public.runtime_interaction_receipt_heads_v1, \
+             pg_catalog.to_jsonb(source) || pg_catalog.jsonb_build_object(\
+                 'interaction_id', (950000000 + ordinal)::TEXT\
+             )\
+         )).* \
+         FROM public.runtime_interaction_receipt_heads_v1 AS source \
+         CROSS JOIN pg_catalog.generate_series(1, 5000) AS ordinal \
+         WHERE source.application_id = $1 AND source.interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind("9400001")
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_interaction_effect_roots_v1 \
+         SELECT (pg_catalog.jsonb_populate_record(\
+             NULL::public.runtime_interaction_effect_roots_v1, \
+             pg_catalog.to_jsonb(source) || pg_catalog.jsonb_build_object(\
+                 'interaction_id', (950000000 + ordinal)::TEXT\
+             )\
+         )).* \
+         FROM public.runtime_interaction_effect_roots_v1 AS source \
+         CROSS JOIN pg_catalog.generate_series(1, 5000) AS ordinal \
+         WHERE source.application_id = $1 AND source.interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind("9400100")
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_interaction_effect_heads_v1 \
+         SELECT (pg_catalog.jsonb_populate_record(\
+             NULL::public.runtime_interaction_effect_heads_v1, \
+             pg_catalog.to_jsonb(source) || pg_catalog.jsonb_build_object(\
+                 'interaction_id', (950000000 + ordinal)::TEXT, \
+                 'correlation_marker', CASE \
+                     WHEN source.correlation_marker IS NULL THEN NULL \
+                     ELSE pg_catalog.lpad(pg_catalog.to_hex(ordinal), 64, '0') \
+                 END\
+             )\
+         )).* \
+         FROM public.runtime_interaction_effect_heads_v1 AS source \
+         CROSS JOIN pg_catalog.generate_series(1, 5000) AS ordinal \
+         WHERE source.application_id = $1 AND source.interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind("9400100")
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_interaction_effect_rollbacks_v1 \
+         SELECT (pg_catalog.jsonb_populate_record(\
+             NULL::public.runtime_interaction_effect_rollbacks_v1, \
+             pg_catalog.to_jsonb(source) || pg_catalog.jsonb_build_object(\
+                 'interaction_id', (950000000 + ordinal)::TEXT, \
+                 'state', 'completed', 'revision', 2, \
+                 'completed_at', source.required_at\
+             )\
+         )).* \
+         FROM public.runtime_interaction_effect_rollbacks_v1 AS source \
+         CROSS JOIN pg_catalog.generate_series(1, 5000) AS ordinal \
+         WHERE source.application_id = $1 AND source.interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind("9400100")
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+
+    let mut left = prepare_deferred_receipt_for_route(
+        &store,
+        &content_hash,
+        9_400_002,
+        route_key,
+        InteractionActionPlanDigestV1::parse("4".repeat(64)).unwrap(),
+    )
+    .await;
+    let mut right = prepare_deferred_receipt_for_route(
+        &store,
+        &content_hash,
+        9_400_003,
+        route_key,
+        InteractionActionPlanDigestV1::parse("5".repeat(64)).unwrap(),
+    )
+    .await;
+    let mut left_action = create_role_effect_action(0);
+    left_action["correlation_marker"] = serde_json::json!("4".repeat(64));
+    let mut right_action = create_role_effect_action(0);
+    right_action["correlation_marker"] = serde_json::json!("5".repeat(64));
+    bind_effect_plan_document(
+        &database.executor_pool,
+        &left,
+        &InteractionActionPlanDigestV1::parse("4".repeat(64)).unwrap(),
+        serde_json::json!([left_action, edit_response_effect_action(1)]),
+    )
+    .await
+    .unwrap();
+    bind_effect_plan_document(
+        &database.executor_pool,
+        &right,
+        &InteractionActionPlanDigestV1::parse("5".repeat(64)).unwrap(),
+        serde_json::json!([right_action, edit_response_effect_action(1)]),
+    )
+    .await
+    .unwrap();
+    store
+        .intend_interaction_receipt_execution_v1(&mut left)
+        .await
+        .unwrap();
+    store
+        .intend_interaction_receipt_execution_v1(&mut right)
+        .await
+        .unwrap();
+
+    let (left_outcome, right_outcome) = tokio::join!(
+        intend_create_role_effect(&database.executor_pool, &left),
+        intend_create_role_effect(&database.executor_pool, &right)
+    );
+    assert!(
+        matches!(
+            (&left_outcome, &right_outcome),
+            (Ok((outcome, state, 2)), Err(error))
+                if outcome == "intended" && state == "intended"
+                    && sqlstate(error).as_deref() == Some("RI004")
+        ) || matches!(
+            (&left_outcome, &right_outcome),
+            (Err(error), Ok((outcome, state, 2)))
+                if outcome == "intended" && state == "intended"
+                    && sqlstate(error).as_deref() == Some("RI004")
+        ),
+        "left={left_outcome:?}, right={right_outcome:?}"
+    );
+    let winner = if left_outcome.is_ok() { &left } else { &right };
+    assert_eq!(
+        intend_create_role_effect(&database.executor_pool, winner)
+            .await
+            .unwrap(),
+        ("exact_replay".to_string(), "intended".to_string(), 2)
+    );
+
+    let fresh_request = test_receipt_request(
+        &store,
+        &content_hash,
+        9_400_004,
+        route_key,
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(matches!(
+        store.claim_interaction_receipt_v1(fresh_request).await,
+        Err(RuntimeInteractionPersistenceErrorV1::InvalidAuthority)
+    ));
+
+    sqlx::query(
+        "ANALYZE public.runtime_interaction_receipt_roots_v1, \
+         public.runtime_interaction_effect_heads_v1, \
+         public.runtime_interaction_effect_rollbacks_v1",
+    )
+    .execute(&database.owner_pool)
+    .await
+    .unwrap();
+    let plan: serde_json::Value = sqlx::query_scalar(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) \
+         SELECT 1 FROM (\
+             SELECT effect.application_id, effect.interaction_id \
+             FROM public.runtime_interaction_effect_heads_v1 AS effect \
+             INNER JOIN public.runtime_interaction_receipt_roots_v1 AS root \
+                 ON root.application_id = effect.application_id \
+                 AND root.interaction_id = effect.interaction_id \
+             WHERE effect.application_id = $1 \
+                 AND effect.action_kind <> 'edit_response' \
+                 AND effect.state IN (\
+                     'intended','indeterminate','observing','observation_pending',\
+                     'compensation_intended','compensation_indeterminate',\
+                     'compensation_observing','compensation_observation_pending',\
+                     'recovery_required'\
+                 ) \
+                 AND root.guild_id = $2 AND root.ruleset_key = $3 \
+                 AND root.route_kind = 'static' AND root.route_key = $4 \
+             UNION ALL \
+             SELECT effect.application_id, effect.interaction_id \
+             FROM public.runtime_interaction_effect_rollbacks_v1 AS rollback \
+             INNER JOIN public.runtime_interaction_effect_heads_v1 AS effect \
+                 ON effect.application_id = rollback.application_id \
+                 AND effect.interaction_id = rollback.interaction_id \
+                 AND effect.action_index <= rollback.abort_action_index \
+             INNER JOIN public.runtime_interaction_receipt_roots_v1 AS root \
+                 ON root.application_id = effect.application_id \
+                 AND root.interaction_id = effect.interaction_id \
+             WHERE rollback.state = 'required' AND effect.application_id = $1 \
+                 AND effect.action_kind <> 'edit_response' \
+                 AND effect.state IN ('known_succeeded','reconciled_succeeded') \
+                 AND root.guild_id = $2 AND root.ruleset_key = $3 \
+                 AND root.route_kind = 'static' AND root.route_key = $4\
+         ) AS blocked LIMIT 1",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(RECEIPT_GUILD_ID.to_string())
+    .bind(RECEIPT_RULESET_KEY)
+    .bind(route_key)
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let plan_text = plan.to_string();
+    assert!(plan_text.contains("runtime_interaction_effect_heads_route_unsafe_v1_idx"));
+    assert!(plan_text.contains("runtime_interaction_effect_rollbacks_required_v1_idx"));
+    assert!(!explain_has_seq_scan(
+        &plan,
+        "runtime_interaction_effect_heads_v1"
+    ));
+    assert!(!explain_has_seq_scan(
+        &plan,
+        "runtime_interaction_effect_rollbacks_v1"
+    ));
+    cleanup(database).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn effect_recovery_fences_active_receipts_and_persists_budget_and_response_replays() {
+    let database = isolated_database().await;
+    let content_hash = seed_receipt_authority(&database.owner_pool).await;
+    let database_identity: String = sqlx::query_scalar(
+        "SELECT database_identity::TEXT FROM public.product_control_plane_identity WHERE singleton",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let expectation = RuntimeInteractionDatabaseExpectationV1::new(
+        database_identity,
+        database.name.clone(),
+        database.role.clone(),
+    )
+    .unwrap();
+    let store = PostgresRuntimeInteractionV1::connect_verified_default(
+        database.executor_pool.clone(),
+        expectation,
+    )
+    .await
+    .unwrap();
+
+    let observation_id = 9_600_001;
+    let observation_plan = InteractionActionPlanDigestV1::parse("f".repeat(64)).unwrap();
+    let mut observation = prepare_deferred_receipt(
+        &store,
+        &content_hash,
+        observation_id,
+        observation_plan.clone(),
+    )
+    .await;
+    bind_effect_plan_document(
+        &database.executor_pool,
+        &observation,
+        &observation_plan,
+        serde_json::json!([create_role_effect_action(0), edit_response_effect_action(1)]),
+    )
+    .await
+    .unwrap();
+    store
+        .intend_interaction_receipt_execution_v1(&mut observation)
+        .await
+        .unwrap();
+    assert_eq!(
+        intend_create_role_effect(&database.executor_pool, &observation)
+            .await
+            .unwrap(),
+        ("intended".to_string(), "intended".to_string(), 2)
+    );
+    make_effect_recovery_due(&database.owner_pool, observation_id).await;
+    assert_eq!(effect_recovery_scan_count(&database.executor_pool).await, 0);
+    let before: (String, i64, i64) = sqlx::query_as(
+        "SELECT state, head_revision, \
+                (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(observation_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let active_error = claim_effect_recovery(
+        &database.owner_pool,
+        &database.executor_pool,
+        observation_id,
+        0,
+        2,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&active_error).as_deref(), Some("RI004"));
+    let active_compensation_error = intend_effect_compensation(
+        &database.owner_pool,
+        &database.executor_pool,
+        observation_id,
+        0,
+        2,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        sqlstate(&active_compensation_error).as_deref(),
+        Some("RI004")
+    );
+    let after_active: (String, i64, i64) = sqlx::query_as(
+        "SELECT state, head_revision, \
+                (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(observation_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(after_active, before);
+
+    force_receipt_claim_expired(&database.owner_pool, observation_id).await;
+    assert_eq!(effect_recovery_scan_count(&database.executor_pool).await, 1);
+    assert_eq!(
+        claim_effect_recovery(
+            &database.owner_pool,
+            &database.executor_pool,
+            observation_id,
+            0,
+            2,
+        )
+        .await
+        .unwrap(),
+        (
+            "recovery_claimed".to_string(),
+            "observing".to_string(),
+            3,
+            1
+        )
+    );
+    let preserved_result = vec![0x70_u8; 32];
+    let mut transaction = database.owner_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_interaction_effect_heads_v1 \
+         SET state = 'observation_pending', head_revision = 4, \
+             observation_attempt_count = 64, result_digest = $3, \
+             result_at = pg_catalog.clock_timestamp(), \
+             recovery_process_instance_id = NULL, recovery_gateway_shard_id = NULL, \
+             recovery_runtime_build_revision = NULL, recovery_acquired_at = NULL, \
+             recovery_expires_at = NULL, \
+             next_recovery_at = pg_catalog.clock_timestamp() - INTERVAL '1 second', \
+             updated_at = pg_catalog.clock_timestamp() \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(observation_id.to_string())
+    .bind(&preserved_result)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(
+        claim_effect_recovery(
+            &database.owner_pool,
+            &database.executor_pool,
+            observation_id,
+            0,
+            4,
+        )
+        .await
+        .unwrap(),
+        (
+            "recovery_blocked_attempt_budget_exhausted".to_string(),
+            "recovery_required".to_string(),
+            5,
+            1
+        )
+    );
+    let blocked_event_count: i64 = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(observation_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        claim_effect_recovery(
+            &database.owner_pool,
+            &database.executor_pool,
+            observation_id,
+            0,
+            4,
+        )
+        .await
+        .unwrap(),
+        (
+            "exact_replay".to_string(),
+            "recovery_required".to_string(),
+            5,
+            1
+        )
+    );
+    let blocked_head: (Vec<u8>, i64) = sqlx::query_as(
+        "SELECT result_digest, \
+                (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(observation_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(blocked_head, (preserved_result, blocked_event_count));
+    assert_eq!(effect_recovery_scan_count(&database.executor_pool).await, 0);
+    let mut transaction = database.owner_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_interaction_effect_events_v1 \
+         SET from_state = 'compensation_observation_pending' \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0 \
+           AND event_revision = 5",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(observation_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let tampered_before: (String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(observation_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let tampered_replay = claim_effect_recovery(
+        &database.owner_pool,
+        &database.executor_pool,
+        observation_id,
+        0,
+        4,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&tampered_replay).as_deref(), Some("RI001"));
+    let tampered_after: (String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(observation_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(tampered_after, tampered_before);
+
+    let compensation_id = 9_600_004;
+    let compensation_plan = InteractionActionPlanDigestV1::parse("c".repeat(64)).unwrap();
+    let mut compensation = prepare_deferred_receipt(
+        &store,
+        &content_hash,
+        compensation_id,
+        compensation_plan.clone(),
+    )
+    .await;
+    let mut compensation_action = create_role_effect_action(0);
+    compensation_action["correlation_marker"] = serde_json::json!("7".repeat(64));
+    bind_effect_plan_document(
+        &database.executor_pool,
+        &compensation,
+        &compensation_plan,
+        serde_json::json!([compensation_action, edit_response_effect_action(1)]),
+    )
+    .await
+    .unwrap();
+    store
+        .intend_interaction_receipt_execution_v1(&mut compensation)
+        .await
+        .unwrap();
+    assert_eq!(
+        intend_create_role_effect(&database.executor_pool, &compensation)
+            .await
+            .unwrap(),
+        ("intended".to_string(), "intended".to_string(), 2)
+    );
+    force_receipt_claim_expired(&database.owner_pool, compensation_id).await;
+    let compensation_observation_result = vec![0x73_u8; 32];
+    let mut transaction = database.owner_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_interaction_effect_heads_v1 \
+         SET state = 'compensation_observation_pending', head_revision = 3, \
+             compensation_observation_attempt_count = 64, result_digest = $3, \
+             result_at = pg_catalog.clock_timestamp(), \
+             success_binding_kind = 'attempt_result', success_binding_digest = $3, \
+             output_id = '123456789', compensation_intent_digest = $4, \
+             compensation_intent_at = pg_catalog.clock_timestamp(), \
+             compensation_result_digest = $5, \
+             compensation_result_at = pg_catalog.clock_timestamp(), \
+             recovery_process_instance_id = NULL, recovery_gateway_shard_id = NULL, \
+             recovery_runtime_build_revision = NULL, recovery_acquired_at = NULL, \
+             recovery_expires_at = NULL, \
+             next_recovery_at = pg_catalog.clock_timestamp() - INTERVAL '1 second', \
+             updated_at = pg_catalog.clock_timestamp() \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(compensation_id.to_string())
+    .bind(vec![0x74_u8; 32])
+    .bind(vec![0x75_u8; 32])
+    .bind(&compensation_observation_result)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_interaction_effect_rollbacks_v1 (\
+             application_id, interaction_id, abort_action_index, abort_reason, \
+             state, revision, required_at, completed_at\
+         ) VALUES ($1,$2,0,'recovery_required','required',1,\
+                   pg_catalog.clock_timestamp(),NULL)",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(compensation_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(
+        claim_effect_recovery(
+            &database.owner_pool,
+            &database.executor_pool,
+            compensation_id,
+            0,
+            3,
+        )
+        .await
+        .unwrap(),
+        (
+            "recovery_blocked_attempt_budget_exhausted".to_string(),
+            "recovery_required".to_string(),
+            4,
+            0
+        )
+    );
+    let compensation_events: i64 = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(compensation_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        claim_effect_recovery(
+            &database.owner_pool,
+            &database.executor_pool,
+            compensation_id,
+            0,
+            3,
+        )
+        .await
+        .unwrap(),
+        (
+            "exact_replay".to_string(),
+            "recovery_required".to_string(),
+            4,
+            0
+        )
+    );
+    let compensation_evidence: (Vec<u8>, i64) = sqlx::query_as(
+        "SELECT compensation_result_digest, \
+                (SELECT pg_catalog.count(*) \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(compensation_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        compensation_evidence,
+        (compensation_observation_result, compensation_events)
+    );
+    assert_eq!(effect_recovery_scan_count(&database.executor_pool).await, 0);
+
+    let compensation_finish_id = 9_600_006;
+    let compensation_finish_plan = InteractionActionPlanDigestV1::parse("a".repeat(64)).unwrap();
+    let mut compensation_finish = prepare_deferred_receipt(
+        &store,
+        &content_hash,
+        compensation_finish_id,
+        compensation_finish_plan.clone(),
+    )
+    .await;
+    let mut compensation_finish_action = create_role_effect_action(0);
+    compensation_finish_action["correlation_marker"] = serde_json::json!("9".repeat(64));
+    bind_effect_plan_document(
+        &database.executor_pool,
+        &compensation_finish,
+        &compensation_finish_plan,
+        serde_json::json!([compensation_finish_action, edit_response_effect_action(1)]),
+    )
+    .await
+    .unwrap();
+    store
+        .intend_interaction_receipt_execution_v1(&mut compensation_finish)
+        .await
+        .unwrap();
+    assert_eq!(
+        intend_create_role_effect(&database.executor_pool, &compensation_finish)
+            .await
+            .unwrap(),
+        ("intended".to_string(), "intended".to_string(), 2)
+    );
+    force_receipt_claim_expired(&database.owner_pool, compensation_finish_id).await;
+    let mut transaction = database.owner_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_interaction_effect_heads_v1 \
+         SET state = 'compensation_intended', head_revision = 3, \
+             compensation_attempt_count = 1, result_digest = $3, \
+             result_at = pg_catalog.statement_timestamp(), \
+             success_binding_kind = 'attempt_result', success_binding_digest = $3, \
+             output_id = '223456789', recovery_claim_revision = 1, \
+             recovery_process_instance_id = $4, \
+             recovery_gateway_shard_id = $5, \
+             recovery_runtime_build_revision = $6, \
+             recovery_acquired_at = pg_catalog.statement_timestamp(), \
+             recovery_expires_at = pg_catalog.statement_timestamp() + INTERVAL '1 minute', \
+             next_recovery_at = pg_catalog.statement_timestamp() + INTERVAL '1 minute', \
+             compensation_intent_digest = $7, \
+             compensation_intent_at = pg_catalog.statement_timestamp(), \
+             updated_at = pg_catalog.statement_timestamp() \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(compensation_finish_id.to_string())
+    .bind(vec![0x77_u8; 32])
+    .bind(RECEIPT_PROCESS_ID)
+    .bind(RECEIPT_GATEWAY_SHARD)
+    .bind(RECEIPT_BUILD_REVISION)
+    .bind(vec![0x78_u8; 32])
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_interaction_effect_rollbacks_v1 (\
+             application_id, interaction_id, abort_action_index, abort_reason, \
+             state, revision, required_at, completed_at\
+         ) VALUES ($1,$2,0,'recovery_required','required',1,\
+                   pg_catalog.clock_timestamp(),NULL)",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(compensation_finish_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let compensation_finish_digest = vec![0x79_u8; 32];
+    assert_eq!(
+        finish_effect_compensation(
+            &database.owner_pool,
+            &database.executor_pool,
+            compensation_finish_id,
+            (3, 1),
+            RECEIPT_PROCESS_ID,
+            ("compensated", &compensation_finish_digest),
+        )
+        .await
+        .unwrap(),
+        ("compensated".to_string(), "compensated".to_string(), 4)
+    );
+    assert_eq!(
+        finish_effect_compensation(
+            &database.owner_pool,
+            &database.executor_pool,
+            compensation_finish_id,
+            (3, 1),
+            RECEIPT_PROCESS_ID,
+            ("compensated", &compensation_finish_digest),
+        )
+        .await
+        .unwrap(),
+        ("exact_replay".to_string(), "compensated".to_string(), 4)
+    );
+    let compensation_finish_before: (String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(compensation_finish_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let stale_compensation_process = finish_effect_compensation(
+        &database.owner_pool,
+        &database.executor_pool,
+        compensation_finish_id,
+        (3, 1),
+        "process-receipt-stale",
+        ("compensated", &compensation_finish_digest),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        sqlstate(&stale_compensation_process).as_deref(),
+        Some("RI001")
+    );
+    let compensation_finish_after: (String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(compensation_finish_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(compensation_finish_after, compensation_finish_before);
+    let mut transaction = database.owner_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_interaction_effect_events_v1 \
+         SET outcome_code = 'indeterminate' \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0 \
+           AND event_revision = 4",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(compensation_finish_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let tampered_compensation_before: (String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(compensation_finish_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let tampered_compensation = finish_effect_compensation(
+        &database.owner_pool,
+        &database.executor_pool,
+        compensation_finish_id,
+        (3, 1),
+        RECEIPT_PROCESS_ID,
+        ("compensated", &compensation_finish_digest),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&tampered_compensation).as_deref(), Some("RI001"));
+    let tampered_compensation_after: (String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(compensation_finish_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(tampered_compensation_after, tampered_compensation_before);
+
+    let replay_id = 9_600_005;
+    let replay_plan = InteractionActionPlanDigestV1::parse("b".repeat(64)).unwrap();
+    let mut replay =
+        prepare_deferred_receipt(&store, &content_hash, replay_id, replay_plan.clone()).await;
+    let mut replay_action = create_role_effect_action(0);
+    replay_action["correlation_marker"] = serde_json::json!("8".repeat(64));
+    bind_effect_plan_document(
+        &database.executor_pool,
+        &replay,
+        &replay_plan,
+        serde_json::json!([replay_action, edit_response_effect_action(1)]),
+    )
+    .await
+    .unwrap();
+    store
+        .intend_interaction_receipt_execution_v1(&mut replay)
+        .await
+        .unwrap();
+    assert_eq!(
+        intend_create_role_effect(&database.executor_pool, &replay)
+            .await
+            .unwrap(),
+        ("intended".to_string(), "intended".to_string(), 2)
+    );
+    make_effect_recovery_due(&database.owner_pool, replay_id).await;
+    force_receipt_claim_expired(&database.owner_pool, replay_id).await;
+    assert_eq!(
+        claim_effect_recovery(
+            &database.owner_pool,
+            &database.executor_pool,
+            replay_id,
+            0,
+            2,
+        )
+        .await
+        .unwrap(),
+        (
+            "recovery_claimed".to_string(),
+            "observing".to_string(),
+            3,
+            1
+        )
+    );
+    let replay_digest = vec![0x76_u8; 32];
+    assert_eq!(
+        reconcile_observed_effect(
+            &database.owner_pool,
+            &database.executor_pool,
+            replay_id,
+            (3, 1),
+            ("conflict", &replay_digest),
+            0,
+        )
+        .await
+        .unwrap(),
+        ("conflict".to_string(), "recovery_required".to_string(), 4)
+    );
+    assert_eq!(
+        reconcile_observed_effect(
+            &database.owner_pool,
+            &database.executor_pool,
+            replay_id,
+            (3, 1),
+            ("conflict", &replay_digest),
+            0,
+        )
+        .await
+        .unwrap(),
+        (
+            "exact_replay".to_string(),
+            "recovery_required".to_string(),
+            4
+        )
+    );
+    let wrong_outcome_before: (String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(replay_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let stale_authority = reconcile_observed_effect(
+        &database.owner_pool,
+        &database.executor_pool,
+        replay_id,
+        (3, 1),
+        ("conflict", &replay_digest),
+        1,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&stale_authority).as_deref(), Some("RI001"));
+    let wrong_outcome = reconcile_observed_effect(
+        &database.owner_pool,
+        &database.executor_pool,
+        replay_id,
+        (3, 1),
+        ("unsupported", &replay_digest),
+        0,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&wrong_outcome).as_deref(), Some("RI001"));
+    let wrong_outcome_after: (String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(replay_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(wrong_outcome_after, wrong_outcome_before);
+
+    let response_finalize_id = 9_600_007;
+    let response_finalize_plan = InteractionActionPlanDigestV1::parse("1".repeat(64)).unwrap();
+    let mut response_finalize = prepare_deferred_receipt(
+        &store,
+        &content_hash,
+        response_finalize_id,
+        response_finalize_plan.clone(),
+    )
+    .await;
+    bind_effect_plan_document(
+        &database.executor_pool,
+        &response_finalize,
+        &response_finalize_plan,
+        serde_json::json!([edit_response_effect_action(0)]),
+    )
+    .await
+    .unwrap();
+    store
+        .intend_interaction_receipt_execution_v1(&mut response_finalize)
+        .await
+        .unwrap();
+    assert_eq!(
+        intend_edit_response_effect(&database.executor_pool, &response_finalize).await,
+        ("intended".to_string(), "intended".to_string(), 2)
+    );
+    make_effect_recovery_due(&database.owner_pool, response_finalize_id).await;
+    force_receipt_claim_expired(&database.owner_pool, response_finalize_id).await;
+    let response_finalize_claim = claim_response_tail(
+        &database.owner_pool,
+        &database.executor_pool,
+        response_finalize_id,
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response_finalize_claim.0, "response_tail_claimed");
+    assert_eq!(response_finalize_claim.1, "observing");
+    assert_eq!(response_finalize_claim.2, 3);
+    assert_eq!(response_finalize_claim.3, 1);
+    assert_eq!(response_finalize_claim.4, 1);
+    assert_eq!(response_finalize_claim.5, "executing");
+    let response_finalize_observation = vec![0x7a_u8; 32];
+    let response_finalize_terminal = vec![0x99_u8; 32];
+    let response_finalize_result = finalize_response_tail(
+        &database.owner_pool,
+        &database.executor_pool,
+        response_finalize_id,
+        (response_finalize_claim.6, 3, 1),
+        RECEIPT_PROCESS_ID,
+        (
+            "exact_success",
+            &response_finalize_observation,
+            &response_finalize_terminal,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response_finalize_result.0, "effects_recovered_completed");
+    assert_eq!(response_finalize_result.1, "reconciled_succeeded");
+    assert_eq!(response_finalize_result.2, 4);
+    assert_eq!(response_finalize_result.3, "completed");
+    assert_eq!(response_finalize_result.4, response_finalize_claim.6 + 1);
+    let response_finalize_replay = finalize_response_tail(
+        &database.owner_pool,
+        &database.executor_pool,
+        response_finalize_id,
+        (response_finalize_claim.6, 3, 1),
+        RECEIPT_PROCESS_ID,
+        (
+            "exact_success",
+            &response_finalize_observation,
+            &response_finalize_terminal,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response_finalize_replay.0, "exact_replay");
+    assert_eq!(response_finalize_replay.1, "reconciled_succeeded");
+    assert_eq!(response_finalize_replay.2, 4);
+    assert_eq!(response_finalize_replay.3, "completed");
+    assert_eq!(response_finalize_replay.4, response_finalize_claim.6 + 1);
+    let response_finalize_before: (String, String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id), \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_receipt_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id) \
+         FROM public.runtime_interaction_receipt_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(response_finalize_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let stale_response_process = finalize_response_tail(
+        &database.owner_pool,
+        &database.executor_pool,
+        response_finalize_id,
+        (response_finalize_claim.6, 3, 1),
+        "process-receipt-stale",
+        (
+            "exact_success",
+            &response_finalize_observation,
+            &response_finalize_terminal,
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        sqlstate(&stale_response_process).as_deref(),
+        Some("RI001" | "RI004")
+    ));
+    let response_finalize_after: (String, String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id), \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_receipt_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id) \
+         FROM public.runtime_interaction_receipt_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(response_finalize_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(response_finalize_after, response_finalize_before);
+    let mut transaction = database.owner_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_interaction_receipt_events_v1 \
+         SET outcome_code = 'interaction_response_unrecoverable' \
+         WHERE application_id = $1 AND interaction_id = $2 AND event_revision = $3",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(response_finalize_id.to_string())
+    .bind(response_finalize_result.4)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let tampered_receipt_before: (String, String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id), \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_receipt_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id) \
+         FROM public.runtime_interaction_receipt_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(response_finalize_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let tampered_receipt = finalize_response_tail(
+        &database.owner_pool,
+        &database.executor_pool,
+        response_finalize_id,
+        (response_finalize_claim.6, 3, 1),
+        RECEIPT_PROCESS_ID,
+        (
+            "exact_success",
+            &response_finalize_observation,
+            &response_finalize_terminal,
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&tampered_receipt).as_deref(), Some("RI001"));
+    let tampered_receipt_after: (String, String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id), \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_receipt_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id) \
+         FROM public.runtime_interaction_receipt_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(response_finalize_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(tampered_receipt_after, tampered_receipt_before);
+    let mut transaction = database.owner_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_interaction_receipt_events_v1 \
+         SET outcome_code = 'effects_recovered_completed' \
+         WHERE application_id = $1 AND interaction_id = $2 AND event_revision = $3",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(response_finalize_id.to_string())
+    .bind(response_finalize_result.4)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(
+        finalize_response_tail(
+            &database.owner_pool,
+            &database.executor_pool,
+            response_finalize_id,
+            (response_finalize_claim.6, 3, 1),
+            RECEIPT_PROCESS_ID,
+            (
+                "exact_success",
+                &response_finalize_observation,
+                &response_finalize_terminal,
+            ),
+        )
+        .await
+        .unwrap()
+        .0,
+        "exact_replay"
+    );
+    let mut transaction = database.owner_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_interaction_effect_events_v1 \
+         SET outcome_code = 'observed_failure' \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0 \
+           AND event_revision = 4",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(response_finalize_id.to_string())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let tampered_response_before: (String, String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id), \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_receipt_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id) \
+         FROM public.runtime_interaction_receipt_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(response_finalize_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let tampered_response = finalize_response_tail(
+        &database.owner_pool,
+        &database.executor_pool,
+        response_finalize_id,
+        (response_finalize_claim.6, 3, 1),
+        RECEIPT_PROCESS_ID,
+        (
+            "exact_success",
+            &response_finalize_observation,
+            &response_finalize_terminal,
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate(&tampered_response).as_deref(), Some("RI001"));
+    let tampered_response_after: (String, String, String) = sqlx::query_as(
+        "SELECT pg_catalog.to_jsonb(head)::TEXT, \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id), \
+                (SELECT pg_catalog.jsonb_agg(pg_catalog.to_jsonb(event) \
+                    ORDER BY event.event_revision)::TEXT \
+                 FROM public.runtime_interaction_receipt_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id) \
+         FROM public.runtime_interaction_receipt_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(response_finalize_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(tampered_response_after, tampered_response_before);
+
+    let response_id = 9_600_002;
+    let response_plan = InteractionActionPlanDigestV1::parse("e".repeat(64)).unwrap();
+    let mut response =
+        prepare_deferred_receipt(&store, &content_hash, response_id, response_plan.clone()).await;
+    bind_effect_plan_document(
+        &database.executor_pool,
+        &response,
+        &response_plan,
+        serde_json::json!([edit_response_effect_action(0)]),
+    )
+    .await
+    .unwrap();
+    store
+        .intend_interaction_receipt_execution_v1(&mut response)
+        .await
+        .unwrap();
+    assert_eq!(
+        intend_edit_response_effect(&database.executor_pool, &response).await,
+        ("intended".to_string(), "intended".to_string(), 2)
+    );
+    force_receipt_claim_expired(&database.owner_pool, response_id).await;
+    let response_result = vec![0x71_u8; 32];
+    let mut transaction = database.owner_pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_interaction_effect_heads_v1 \
+         SET state = 'observation_pending', head_revision = 3, \
+             observation_attempt_count = 64, result_digest = $3, \
+             result_at = pg_catalog.clock_timestamp(), \
+             next_recovery_at = pg_catalog.clock_timestamp() - INTERVAL '1 second', \
+             updated_at = pg_catalog.clock_timestamp() \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(response_id.to_string())
+    .bind(&response_result)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let response_blocked = claim_response_tail(
+        &database.owner_pool,
+        &database.executor_pool,
+        response_id,
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response_blocked.0, "interaction_response_unrecoverable");
+    assert_eq!(response_blocked.1, "recovery_required");
+    assert_eq!(response_blocked.2, 4);
+    assert_eq!(response_blocked.3, 0);
+    assert_eq!(response_blocked.4, 64);
+    assert_eq!(response_blocked.5, "completed");
+    let response_events: i64 = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(response_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        claim_response_tail(
+            &database.owner_pool,
+            &database.executor_pool,
+            response_id,
+            3,
+        )
+        .await
+        .unwrap(),
+        response_blocked
+    );
+    let response_evidence: (Vec<u8>, i64, i64) = sqlx::query_as(
+        "SELECT result_digest, \
+                (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS event \
+                 WHERE event.application_id = head.application_id \
+                   AND event.interaction_id = head.interaction_id \
+                   AND event.action_index = head.action_index), \
+                (SELECT pg_catalog.count(*) FROM public.runtime_interaction_receipt_token_secrets_v1 AS token \
+                 WHERE token.application_id = head.application_id \
+                   AND token.interaction_id = head.interaction_id) \
+         FROM public.runtime_interaction_effect_heads_v1 AS head \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(response_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(response_evidence, (response_result, response_events, 0));
+
+    let lost_reply_id = 9_600_003;
+    let lost_reply_plan = InteractionActionPlanDigestV1::parse("d".repeat(64)).unwrap();
+    let mut lost_reply = prepare_deferred_receipt(
+        &store,
+        &content_hash,
+        lost_reply_id,
+        lost_reply_plan.clone(),
+    )
+    .await;
+    bind_effect_plan_document(
+        &database.executor_pool,
+        &lost_reply,
+        &lost_reply_plan,
+        serde_json::json!([edit_response_effect_action(0)]),
+    )
+    .await
+    .unwrap();
+    store
+        .intend_interaction_receipt_execution_v1(&mut lost_reply)
+        .await
+        .unwrap();
+    intend_edit_response_effect(&database.executor_pool, &lost_reply).await;
+    make_effect_recovery_due(&database.owner_pool, lost_reply_id).await;
+    force_receipt_claim_expired(&database.owner_pool, lost_reply_id).await;
+    remove_interaction_token(&database.owner_pool, lost_reply_id).await;
+    let lost_reply_first = claim_response_tail(
+        &database.owner_pool,
+        &database.executor_pool,
+        lost_reply_id,
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(lost_reply_first.0, "interaction_response_unrecoverable");
+    assert_eq!(lost_reply_first.2, 4);
+    let lost_reply_events: i64 = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(lost_reply_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        claim_response_tail(
+            &database.owner_pool,
+            &database.executor_pool,
+            lost_reply_id,
+            2,
+        )
+        .await
+        .unwrap(),
+        lost_reply_first
+    );
+    let lost_reply_replay_events: i64 = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 \
+         WHERE application_id = $1 AND interaction_id = $2 AND action_index = 0",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(lost_reply_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(lost_reply_replay_events, lost_reply_events);
     cleanup(database).await;
 }
 
@@ -1623,6 +4184,18 @@ async fn durable_receipt_restricted_role_runs_lifecycle_recovery_and_token_expir
             .unwrap(),
         RuntimeInteractionReceiptMutationDispositionV1::ExactReplay
     );
+    let persisted_terminal: (String, Vec<u8>) = sqlx::query_as(
+        "SELECT terminal_outcome_code, terminal_result_digest \
+         FROM public.runtime_interaction_receipt_heads_v1 \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(lifecycle_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted_terminal.0, "completed_test");
+    assert_eq!(persisted_terminal.1, vec![4; 32]);
     let absent_expiry = RuntimeInteractionReceiptTokenExpiryRequestV1::new(
         lifecycle.claim_root().identity(),
         lifecycle.head_revision(),

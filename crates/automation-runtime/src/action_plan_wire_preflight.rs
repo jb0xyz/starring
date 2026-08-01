@@ -5,9 +5,14 @@ use automation_core::preflight::{
     ActionEntryIdV1, PreflightButtonRouteV1, PreflightInstanceRefV1, PreparedActionPlanV1,
     PreparedPlanActionV1,
 };
-use automation_instance::{AutomationInstance, InstanceId, InstanceResources, InstanceStatus};
+use automation_instance::{
+    AutomationInstance, InstanceId, InstanceMessageRef, InstanceResources, InstanceStatus,
+};
+use automation_instance_teardown::{
+    ExactInstanceRegistrationIdentityV1, ExactInstanceTeardownRequestV1,
+};
 use automation_runtime_interaction::InteractionInstanceManifestDigestV1;
-use discord_model::{ChannelId, MessageId, RoleId};
+use discord_model::{ChannelId, GuildId, MessageId, RoleId};
 use sha2::{Digest, Sha256};
 
 use crate::custom_id::{
@@ -72,6 +77,7 @@ pub(crate) enum ExactTeardownDeleteV1 {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ExactPinnedInstanceManifestV1 {
     instance_id: InstanceId,
+    registration_identity: ExactInstanceRegistrationIdentityV1,
     digest: InteractionInstanceManifestDigestV1,
     roles: Vec<ExactManifestRoleV1>,
     channels: Vec<ExactManifestChannelV1>,
@@ -89,12 +95,44 @@ impl ExactPinnedInstanceManifestV1 {
         &self.digest
     }
 
+    pub(crate) fn registration_identity(&self) -> &ExactInstanceRegistrationIdentityV1 {
+        &self.registration_identity
+    }
+
     pub(crate) fn reverse_delete_order(&self) -> &[ExactTeardownDeleteV1] {
         &self.reverse_delete_order
     }
 
     pub(crate) fn canonical_manifest_bytes_v1(&self) -> &[u8] {
         &self.canonical_manifest
+    }
+
+    fn resources_v1(&self) -> InstanceResources {
+        InstanceResources {
+            roles: self
+                .roles
+                .iter()
+                .map(|role| (role.alias.clone(), role.id))
+                .collect(),
+            channels: self
+                .channels
+                .iter()
+                .map(|channel| (channel.alias.clone(), channel.id))
+                .collect(),
+            messages: self
+                .messages
+                .iter()
+                .map(|message| {
+                    (
+                        message.alias.clone(),
+                        InstanceMessageRef {
+                            channel: message.channel,
+                            id: message.id,
+                        },
+                    )
+                })
+                .collect(),
+        }
     }
 }
 
@@ -123,7 +161,7 @@ pub(crate) enum ActionPlanWireBindingV1 {
     },
     TeardownInstance {
         entry: ActionEntryIdV1,
-        manifest: ExactPinnedInstanceManifestV1,
+        manifest: Box<ExactPinnedInstanceManifestV1>,
     },
 }
 
@@ -152,10 +190,61 @@ impl ActionPlanWirePreflightV1 {
         &self,
     ) -> impl Iterator<Item = &ExactPinnedInstanceManifestV1> {
         self.bindings.iter().filter_map(|binding| match binding {
-            ActionPlanWireBindingV1::TeardownInstance { manifest, .. } => Some(manifest),
+            ActionPlanWireBindingV1::TeardownInstance { manifest, .. } => Some(manifest.as_ref()),
             ActionPlanWireBindingV1::OpenModal { .. }
             | ActionPlanWireBindingV1::PostPanel { .. } => None,
         })
+    }
+
+    pub(crate) fn teardown_manifest_for_entry_v1(
+        &self,
+        entry: ActionEntryIdV1,
+    ) -> Option<&ExactPinnedInstanceManifestV1> {
+        self.bindings.iter().find_map(|binding| match binding {
+            ActionPlanWireBindingV1::TeardownInstance {
+                entry: candidate,
+                manifest,
+            } if *candidate == entry => Some(manifest.as_ref()),
+            ActionPlanWireBindingV1::OpenModal { .. }
+            | ActionPlanWireBindingV1::PostPanel { .. }
+            | ActionPlanWireBindingV1::TeardownInstance { .. } => None,
+        })
+    }
+
+    pub(crate) fn panel_buttons_for_entry_v1(
+        &self,
+        entry: ActionEntryIdV1,
+    ) -> Option<&[ExactPostPanelButtonV1]> {
+        self.bindings.iter().find_map(|binding| match binding {
+            ActionPlanWireBindingV1::PostPanel {
+                entry: candidate,
+                buttons,
+            } if *candidate == entry => Some(buttons.as_slice()),
+            ActionPlanWireBindingV1::OpenModal { .. }
+            | ActionPlanWireBindingV1::PostPanel { .. }
+            | ActionPlanWireBindingV1::TeardownInstance { .. } => None,
+        })
+    }
+
+    pub(crate) fn exact_teardown_requests_v1(
+        &self,
+        guild_id: GuildId,
+    ) -> impl Iterator<Item = (ActionEntryIdV1, ExactInstanceTeardownRequestV1)> + '_ {
+        self.bindings
+            .iter()
+            .filter_map(move |binding| match binding {
+                ActionPlanWireBindingV1::TeardownInstance { entry, manifest } => Some((
+                    *entry,
+                    ExactInstanceTeardownRequestV1::new_exact_v1(
+                        guild_id,
+                        manifest.instance_id.clone(),
+                        manifest.resources_v1(),
+                        manifest.registration_identity.clone(),
+                    ),
+                )),
+                ActionPlanWireBindingV1::OpenModal { .. }
+                | ActionPlanWireBindingV1::PostPanel { .. } => None,
+            })
     }
 }
 
@@ -286,7 +375,7 @@ pub(crate) fn preflight_action_plan_wire_v1(
                 }
                 bindings.push(ActionPlanWireBindingV1::TeardownInstance {
                     entry: *entry,
-                    manifest: exact_manifest(&pinned.instance)?,
+                    manifest: Box::new(exact_manifest(&pinned.instance)?),
                 });
             }
             PreparedPlanActionV1::GrantRole { .. }
@@ -322,7 +411,7 @@ fn exact_custom_id(
 fn exact_manifest(
     instance: &AutomationInstance,
 ) -> Result<ExactPinnedInstanceManifestV1, ActionPlanWirePreflightErrorV1> {
-    validate_manifest(instance.guild_id, &instance.resources)?;
+    validate_manifest(instance.guild_id, &instance.resources, false)?;
     let roles = instance
         .resources
         .roles
@@ -359,11 +448,12 @@ fn exact_manifest(
         .chain(roles.iter().cloned().map(ExactTeardownDeleteV1::Role))
         .collect();
     let canonical_manifest = canonical_manifest_json(&instance.resources)?;
-    let digest =
-        InteractionInstanceManifestDigestV1::parse(lower_hex(Sha256::digest(&canonical_manifest)))
-            .map_err(|_| ActionPlanWirePreflightErrorV1::InvalidTeardownManifest)?;
+    let digest = exact_instance_manifest_digest_v1(instance.guild_id, &instance.resources)?;
     Ok(ExactPinnedInstanceManifestV1 {
         instance_id: instance.id.clone(),
+        registration_identity: ExactInstanceRegistrationIdentityV1::from_exact_instance_v1(
+            instance,
+        ),
         digest,
         roles,
         channels,
@@ -373,14 +463,26 @@ fn exact_manifest(
     })
 }
 
+pub(crate) fn exact_instance_manifest_digest_v1(
+    guild_id: GuildId,
+    resources: &InstanceResources,
+) -> Result<InteractionInstanceManifestDigestV1, ActionPlanWirePreflightErrorV1> {
+    validate_manifest(guild_id, resources, true)?;
+    let canonical_manifest = canonical_manifest_json(resources)?;
+    InteractionInstanceManifestDigestV1::parse(lower_hex(Sha256::digest(&canonical_manifest)))
+        .map_err(|_| ActionPlanWirePreflightErrorV1::InvalidTeardownManifest)
+}
+
 fn validate_manifest(
     guild_id: discord_model::GuildId,
     resources: &InstanceResources,
+    allow_empty: bool,
 ) -> Result<(), ActionPlanWirePreflightErrorV1> {
     if resources.roles.len() > MAX_MANIFEST_ROLES
         || resources.channels.len() > MAX_MANIFEST_CHANNELS
         || resources.messages.len() > MAX_MANIFEST_MESSAGES
-        || resources.roles.is_empty()
+        || !allow_empty
+            && resources.roles.is_empty()
             && resources.channels.is_empty()
             && resources.messages.is_empty()
         || resources
@@ -520,6 +622,24 @@ fn canonical_wire_material(
                 for deletion in manifest.reverse_delete_order() {
                     action.field(8, &canonical_delete(deletion));
                 }
+                action.field(9, manifest.registration_identity().ruleset_key().as_bytes());
+                action.field(
+                    10,
+                    &manifest
+                        .registration_identity()
+                        .ruleset_version()
+                        .get()
+                        .to_be_bytes(),
+                );
+                action.field(11, manifest.registration_identity().kind().0.as_bytes());
+                action.field(
+                    12,
+                    &manifest
+                        .registration_identity()
+                        .created_by()
+                        .0
+                        .to_be_bytes(),
+                );
             }
         }
         outer.field(1, &action.finish());
@@ -817,6 +937,48 @@ mod tests {
         assert_eq!(manifest.roles.len(), 2);
         assert_eq!(manifest.channels.len(), 2);
         assert_eq!(manifest.messages.len(), 2);
+        let (_, request) = wire.exact_teardown_requests_v1(GuildId(7)).next().unwrap();
+        let identity = request.expected_registration_identity().unwrap();
+        assert_eq!(identity.ruleset_key(), "studyroom");
+        assert_eq!(identity.ruleset_version().get(), 1);
+        assert_eq!(identity.kind(), &InstanceKind("study_room".to_string()));
+        assert_eq!(identity.created_by(), UserId(42));
+    }
+
+    #[test]
+    fn teardown_wire_digest_binds_full_registration_identity() {
+        let plan = ActionPlan {
+            steps: vec![PlannedAction::TeardownInstance {
+                instance: InstanceRef::Event,
+            }],
+        };
+        let first = prepare_action_plan_v1(
+            &pinned_context(),
+            &plan,
+            &SequenceInstanceIdGenerator::new("unused", 1),
+        )
+        .unwrap();
+        let mut replacement_context = pinned_context();
+        replacement_context
+            .instance
+            .as_mut()
+            .unwrap()
+            .instance
+            .created_by = UserId(99);
+        let replacement = prepare_action_plan_v1(
+            &replacement_context,
+            &plan,
+            &SequenceInstanceIdGenerator::new("unused", 1),
+        )
+        .unwrap();
+
+        let first = preflight_action_plan_wire_v1(&first).unwrap();
+        let replacement = preflight_action_plan_wire_v1(&replacement).unwrap();
+
+        assert_ne!(
+            first.wire_digest_material_v1(),
+            replacement.wire_digest_material_v1()
+        );
     }
 
     #[test]

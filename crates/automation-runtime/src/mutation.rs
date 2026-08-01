@@ -13,8 +13,8 @@ use crate::custom_id::{encode_button, encode_instance_action};
 use crate::error::{classify_body_error, classify_error};
 
 pub struct TwilightMutationAdapter<'a> {
-    http: &'a Client,
-    ruleset_key: String,
+    pub(crate) http: &'a Client,
+    pub(crate) ruleset_key: String,
 }
 
 impl<'a> TwilightMutationAdapter<'a> {
@@ -24,10 +24,10 @@ impl<'a> TwilightMutationAdapter<'a> {
 }
 
 fn to_twilight_permissions(permissions: Permissions) -> TwilightPermissions {
-    TwilightPermissions::from_bits_truncate(permissions.bits())
+    TwilightPermissions::from_bits_retain(permissions.bits())
 }
 
-fn to_permission_overwrite(
+pub(crate) fn to_permission_overwrite(
     target: OverwriteTarget,
     allow: Permissions,
     deny: Permissions,
@@ -44,7 +44,7 @@ fn to_permission_overwrite(
     }
 }
 
-fn to_button_component(
+pub(crate) fn to_button_component(
     guild: GuildId,
     ruleset_key: &str,
     button: &PostPanelButtonSpec,

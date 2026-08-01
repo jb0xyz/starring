@@ -5,9 +5,10 @@ use automation_core::{
     AdapterError, AdapterErrorKind, CreateChannelSpec, CreateRoleSpec, DiscordMutationAdapter,
     InteractionResponder, ModalPresentation, PostPanelSpec,
 };
-use automation_instance::{
-    AutomationInstance, InstanceId, InstanceRegistrarV1, InstanceStoreError,
-};
+#[cfg(any(test, doctest))]
+use automation_instance::InstanceId;
+use automation_instance::{AutomationInstance, InstanceRegistrarV1, InstanceStoreError};
+#[cfg(any(test, doctest))]
 use automation_instance_teardown::{InstanceTeardownService, TeardownError, TeardownOutcome};
 use automation_state::{ModalFieldSpec, ModalFieldStyle, ModalInputPolicy};
 use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
@@ -27,6 +28,7 @@ const RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1: &str =
     "interaction effect receipt persistence failed";
 const INITIAL_RESPONSE_FAILURE_MESSAGE_V1: &str = "Discord initial response failed";
 const EXECUTION_FAILURE_MESSAGE_V1: &str = "Discord execution failed";
+#[cfg(any(test, doctest))]
 const TEARDOWN_RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1: &str =
     "interaction teardown receipt persistence failed";
 const INSTANCE_REGISTRATION_RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1: &str =
@@ -175,11 +177,24 @@ pub trait InteractionEffectPermitV1 {
 pub struct ReceiptFencedInteractionResponderV1<'a, R: ?Sized, P: ?Sized> {
     responder: &'a R,
     permit: &'a P,
+    fence_edit_response: bool,
 }
 
 impl<'a, R: ?Sized, P: ?Sized> ReceiptFencedInteractionResponderV1<'a, R, P> {
     pub const fn new(responder: &'a R, permit: &'a P) -> Self {
-        Self { responder, permit }
+        Self {
+            responder,
+            permit,
+            fence_edit_response: true,
+        }
+    }
+
+    pub(crate) const fn initial_response_only(responder: &'a R, permit: &'a P) -> Self {
+        Self {
+            responder,
+            permit,
+            fence_edit_response: false,
+        }
     }
 }
 
@@ -244,7 +259,9 @@ where
     }
 
     async fn edit_response(&self, content: String) -> Result<(), AdapterError> {
-        persist_execution_intent_v1(self.permit).await?;
+        if self.fence_edit_response {
+            persist_execution_intent_v1(self.permit).await?;
+        }
         self.responder
             .edit_response(content)
             .await
@@ -374,23 +391,27 @@ where
     }
 }
 
+#[cfg(any(test, doctest))]
 pub(crate) struct ReceiptFencedInstanceTeardownServiceV1<'a, T: ?Sized, P: ?Sized> {
     teardown: &'a T,
     permit: &'a P,
 }
 
+#[cfg(any(test, doctest))]
 impl<'a, T: ?Sized, P: ?Sized> ReceiptFencedInstanceTeardownServiceV1<'a, T, P> {
     pub(crate) const fn new(teardown: &'a T, permit: &'a P) -> Self {
         Self { teardown, permit }
     }
 }
 
+#[cfg(any(test, doctest))]
 impl<T: ?Sized, P: ?Sized> Debug for ReceiptFencedInstanceTeardownServiceV1<'_, T, P> {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ReceiptFencedInstanceTeardownServiceV1(<redacted>)")
     }
 }
 
+#[cfg(any(test, doctest))]
 impl<T, P> InstanceTeardownService for ReceiptFencedInstanceTeardownServiceV1<'_, T, P>
 where
     T: InstanceTeardownService + ?Sized,
@@ -530,6 +551,7 @@ fn initial_response_deadline_error_v1() -> AdapterError {
     )
 }
 
+#[cfg(any(test, doctest))]
 fn teardown_receipt_persistence_error_v1() -> TeardownError {
     TeardownError::Store(InstanceStoreError::Backend(
         TEARDOWN_RECEIPT_PERSISTENCE_FAILURE_MESSAGE_V1.to_string(),

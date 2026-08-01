@@ -233,7 +233,7 @@ impl RuntimeEmptyOpenProcessV2 {
             foundation.shutdown_trigger_v1(),
             foundation.config.runtime_controller(),
         );
-        let process = RuntimeServingOpenProcessV2 {
+        let mut process = RuntimeServingOpenProcessV2 {
             controller,
             discord,
             foundation,
@@ -252,7 +252,20 @@ impl RuntimeEmptyOpenProcessV2 {
         if let Err(transition) = process.revalidate_v2().await {
             Err(process.cleanup_transition_v2(transition).await)
         } else {
-            Ok(process)
+            process.foundation.start_effect_recovery_supervisor_v1();
+            if process
+                .foundation
+                .effect_recovery_supervisor_health_v1()
+                .is_some_and(|health| health.is_ready_v1())
+            {
+                Ok(process)
+            } else {
+                Err(process
+                    .cleanup_transition_v2(
+                        RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+                    )
+                    .await)
+            }
         }
     }
 }
@@ -287,6 +300,16 @@ impl RuntimeServingOpenProcessV2 {
                 &self.foundation.shutdown_observer_v1(),
             )
             .unwrap_or(RuntimeProcessProductionHandoffFailureV2::FinalizerTerminal));
+        }
+        if self
+            .foundation
+            .effect_recovery_supervisor_health_v1()
+            .is_some_and(|health| !health.is_ready_v1())
+        {
+            return Err(production_open_shutdown_failure_v2(
+                &self.foundation.shutdown_observer_v1(),
+            )
+            .unwrap_or(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation));
         }
         let gate = self
             .foundation
@@ -374,12 +397,17 @@ impl RuntimeServingOpenProcessV2 {
             .foundation
             .process_finalizer_health_v2()
             .is_some_and(|health| health.is_ready());
+        let effect_recovery_ready = self
+            .foundation
+            .effect_recovery_supervisor_health_v1()
+            .is_some_and(|health| health.is_ready_v1());
         if let Some(transition) =
             production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
         {
             return Err(self.cleanup_transition_v2(transition).await);
         }
         let supervisors_running = finalizer_accepting
+            && effect_recovery_ready
             && self.lifecycle.owner_terminal_status_v2().is_none()
             && self.discord.terminal_status_v2().is_none()
             && !self.discord.is_finished_v2();
@@ -1268,6 +1296,9 @@ pub(super) async fn stop_runtime_controller_before_cleanup_v2(
 ) {
     let observation = foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::Explicit);
     let deadline = foundation.effective_shutdown_deadline_v1(observation);
+    foundation
+        .stop_effect_recovery_supervisor_until_v1(deadline)
+        .await;
     if controller.shutdown_until_v2(deadline).await.is_err() {
         foundation.record_runtime_controller_shutdown_failure_v2();
         foundation.trip_shutdown_v1(crate::RuntimeShutdownCauseV1::SupervisorFailure);

@@ -224,13 +224,7 @@ impl PostgresRuntimeInteractionV1 {
         RuntimeInteractionReceiptInitialResponseIntentDispositionV1,
         RuntimeInteractionPersistenceErrorV1,
     > {
-        if intent.kind() == RuntimeInteractionReceiptInitialResponseKindV1::DeferEphemeral {
-            if claim.action_plan_digest().is_some() {
-                return Err(RuntimeInteractionPersistenceErrorV1::InvalidInput);
-            }
-        } else if claim.action_plan_digest().is_none() {
-            return Err(RuntimeInteractionPersistenceErrorV1::Conflict);
-        }
+        validate_initial_response_plan_binding_v1(intent.kind(), claim.action_plan_digest())?;
         if claim
             .acknowledgement_intent()
             .is_some_and(|existing| existing != &intent)
@@ -374,7 +368,9 @@ impl PostgresRuntimeInteractionV1 {
             .ok_or(RuntimeInteractionPersistenceErrorV1::Conflict)?;
         if !matches!(
             claim.state(),
-            InteractionReceiptStateV1::Prepared | InteractionReceiptStateV1::Executing
+            InteractionReceiptStateV1::Prepared
+                | InteractionReceiptStateV1::Deferred
+                | InteractionReceiptStateV1::Executing
         ) {
             return Err(RuntimeInteractionPersistenceErrorV1::Conflict);
         }
@@ -740,6 +736,15 @@ fn to_i64(value: u64) -> Result<i64, RuntimeInteractionPersistenceErrorV1> {
     i64::try_from(value).map_err(|_| RuntimeInteractionPersistenceErrorV1::InvalidInput)
 }
 
+fn validate_initial_response_plan_binding_v1(
+    _kind: RuntimeInteractionReceiptInitialResponseKindV1,
+    action_plan_digest: Option<&InteractionActionPlanDigestV1>,
+) -> Result<(), RuntimeInteractionPersistenceErrorV1> {
+    action_plan_digest
+        .map(|_| ())
+        .ok_or(RuntimeInteractionPersistenceErrorV1::Conflict)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,5 +819,24 @@ mod tests {
             ),
             Err(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt)
         );
+    }
+
+    #[test]
+    fn every_initial_response_kind_requires_a_bound_action_plan() {
+        let digest = InteractionActionPlanDigestV1::parse("a".repeat(64)).unwrap();
+        for kind in [
+            RuntimeInteractionReceiptInitialResponseKindV1::DeferEphemeral,
+            RuntimeInteractionReceiptInitialResponseKindV1::RespondEphemeral,
+            RuntimeInteractionReceiptInitialResponseKindV1::OpenModal,
+        ] {
+            assert_eq!(
+                validate_initial_response_plan_binding_v1(kind, Some(&digest)),
+                Ok(())
+            );
+            assert_eq!(
+                validate_initial_response_plan_binding_v1(kind, None),
+                Err(RuntimeInteractionPersistenceErrorV1::Conflict)
+            );
+        }
     }
 }

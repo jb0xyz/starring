@@ -6,14 +6,17 @@ use automation_core::preflight::{
     ActionPlanSnapshotIdentityV1, ActionPlanSnapshotRequestV1, ActionPlanSnapshotV1,
 };
 use automation_core::{
-    AdapterErrorKind, CreateRoleSpec, MockInstanceTeardownService, PostPanelSpec,
+    AdapterErrorKind, CreateChannelSpec, CreateRoleSpec, MockInstanceTeardownService, PostPanelSpec,
 };
 use automation_instance::{
     AutomationInstance, InMemoryInstanceStore, InstanceId, InstanceKind, InstanceRegistrarV1,
     InstanceResources, InstanceRuleSetVersion, InstanceStore, InstanceStoreError,
     SequenceInstanceIdGenerator,
 };
-use automation_instance_teardown::{InstanceTeardownService, TeardownError, TeardownOutcome};
+use automation_instance_teardown::{
+    DurableInstanceTeardownServiceV1, ExactInstanceTeardownRequestV1,
+    InstanceTeardownRecoveryObservationV1, InstanceTeardownService, TeardownError, TeardownOutcome,
+};
 use automation_ruleset::{
     content_hash, RuleSetKey, RuleSetVersion, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
 };
@@ -26,10 +29,14 @@ use automation_runtime_convergence::{
     RuntimeGeneration, RuntimeProcessIdentityV1, TenantId,
 };
 use automation_runtime_interaction::{
-    InteractionExpectedRouteV1, InteractionGatewayOwnerIdentityV1,
-    InteractionGatewayOwnerLeaseEpochV1, InteractionGatewayOwnerRevisionV1,
-    InteractionGatewayShardIdentityV1, InteractionInstanceManifestDigestV1,
-    InteractionProductScopeV1, InteractionReceiptClaimCandidateV1, InteractionReceiptIdentityV1,
+    InteractionEffectAttemptOutcomeV1, InteractionEffectExpectedPostimageDigestV1,
+    InteractionEffectIndeterminateClassV1, InteractionEffectKnownFailureClassV1,
+    InteractionEffectKnownFailureV1, InteractionEffectMaterializedPlanV1,
+    InteractionEffectPermissionStateV1, InteractionExpectedRouteV1,
+    InteractionGatewayOwnerIdentityV1, InteractionGatewayOwnerLeaseEpochV1,
+    InteractionGatewayOwnerRevisionV1, InteractionGatewayShardIdentityV1,
+    InteractionInstanceManifestDigestV1, InteractionProductScopeV1,
+    InteractionReceiptClaimCandidateV1, InteractionReceiptIdentityV1,
     InteractionRouteAttestationDigestV1, InteractionRouteBindingV1, InteractionRouteIncarnationV1,
     InteractionRuntimeBuildRevisionV1, InteractionServingLeaseEpochV1,
     InteractionServingLeaseRevisionV1, InteractionServingRouteIdentityV1,
@@ -48,6 +55,15 @@ use discord_model::{
 use resource_resolution::{resource_binding_fingerprint_v2, ResourceBindingMap};
 
 use crate::custom_id::{encode_button, encode_instance_action, encode_modal};
+use crate::discord_effects::{
+    DiscordEffectAttemptOutcomeV1, DiscordEffectObservationOutcomeV1, DiscordEffectReadFailureV1,
+    RecoverableDiscordMutationAdapterV1,
+};
+use crate::effect_journal::{
+    InteractionEffectIntentDispositionV1, InteractionEffectJournalIntendV1,
+    InteractionEffectJournalPlanV1, InteractionEffectJournalPortV1,
+    InteractionEffectPlanBindDispositionV1,
+};
 use crate::shared_gateway_admission::{
     SharedGatewayAdmissionBudgetV3, SharedGatewayAdmissionConfigV3,
 };
@@ -73,6 +89,9 @@ struct PermitFailuresV1 {
     initial_result: bool,
     bind: bool,
     execution_intent: bool,
+    effect_plan_bind: bool,
+    effect_intent: bool,
+    effect_result: bool,
     finish: bool,
 }
 
@@ -85,6 +104,9 @@ struct PermitStateV1 {
     intents: Mutex<Vec<InteractionInitialResponseIntentV1>>,
     results: Mutex<Vec<InteractionInitialResponseResultV1>>,
     binds: Mutex<Vec<InteractionActionPlanDigestV1>>,
+    effect_plans: Mutex<Vec<InteractionEffectJournalPlanV1>>,
+    effect_intents: Mutex<Vec<InteractionEffectMaterializedPlanV1>>,
+    effect_results: Mutex<Vec<InteractionEffectAttemptOutcomeV1>>,
     finishes: Mutex<Vec<InteractionTerminalFinishV1>>,
 }
 
@@ -188,6 +210,80 @@ impl AcquiredInteractionLifecyclePermitV1 for FakeLifecyclePermitV1 {
     }
 }
 
+impl InteractionEffectJournalPortV1 for FakeLifecyclePermitV1 {
+    type Error = PermitErrorV1;
+    type IntentPermit = u16;
+
+    async fn bind_effect_plan_v1(
+        &self,
+        plan: &InteractionEffectJournalPlanV1,
+    ) -> Result<InteractionEffectPlanBindDispositionV1, Self::Error> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push(format!("journal.bind:{}", plan.entries().len()));
+        if self.failures.effect_plan_bind {
+            return Err(PermitErrorV1);
+        }
+        self.state.effect_plans.lock().unwrap().push(plan.clone());
+        Ok(InteractionEffectPlanBindDispositionV1::Fresh)
+    }
+
+    async fn intend_effect_v1(
+        &self,
+        intent: InteractionEffectJournalIntendV1<'_>,
+    ) -> Result<InteractionEffectIntentDispositionV1<Self::IntentPermit>, Self::Error> {
+        let index = intent
+            .materialized()
+            .definition()
+            .action()
+            .action_index()
+            .get();
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push(format!("journal.intent:{index}"));
+        if self.failures.effect_intent {
+            return Err(PermitErrorV1);
+        }
+        self.state
+            .effect_intents
+            .lock()
+            .unwrap()
+            .push(intent.materialized().clone());
+        Ok(InteractionEffectIntentDispositionV1::ExternalCallAuthorized(index))
+    }
+
+    async fn finish_effect_v1(
+        &self,
+        permit: &Self::IntentPermit,
+        _: &InteractionEffectMaterializedPlanV1,
+        outcome: &InteractionEffectAttemptOutcomeV1,
+    ) -> Result<(), Self::Error> {
+        let result = match outcome {
+            InteractionEffectAttemptOutcomeV1::KnownSucceeded(_) => "succeeded",
+            InteractionEffectAttemptOutcomeV1::KnownFailed(_) => "failed",
+            InteractionEffectAttemptOutcomeV1::Indeterminate(_) => "indeterminate",
+        };
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push(format!("journal.result:{permit}:{result}"));
+        if self.failures.effect_result {
+            return Err(PermitErrorV1);
+        }
+        self.state
+            .effect_results
+            .lock()
+            .unwrap()
+            .push(outcome.clone());
+        Ok(())
+    }
+}
+
 struct FakeResponderV1 {
     state: Arc<PermitStateV1>,
     initial_error: Option<AdapterError>,
@@ -271,6 +367,18 @@ struct FakeTeardownV1 {
     state: Arc<PermitStateV1>,
 }
 
+struct FakeDurableTeardownV1 {
+    inner: MockInstanceTeardownService,
+}
+
+impl FakeDurableTeardownV1 {
+    fn new() -> Self {
+        Self {
+            inner: MockInstanceTeardownService::new(),
+        }
+    }
+}
+
 struct FakeRegistrarV1 {
     state: Arc<PermitStateV1>,
     error: Option<InstanceStoreError>,
@@ -295,6 +403,55 @@ impl InstanceTeardownService for FakeTeardownV1 {
             .unwrap()
             .push("external.teardown".to_string());
         Ok(TeardownOutcome::Completed)
+    }
+}
+
+impl DurableInstanceTeardownServiceV1 for FakeTeardownV1 {
+    async fn teardown_exact_v1(
+        &self,
+        _: &ExactInstanceTeardownRequestV1,
+    ) -> Result<TeardownOutcome, TeardownError> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("external.teardown".to_string());
+        Ok(TeardownOutcome::Completed)
+    }
+
+    async fn observe_teardown_exact_v1(
+        &self,
+        _: &ExactInstanceTeardownRequestV1,
+    ) -> Result<InstanceTeardownRecoveryObservationV1, TeardownError> {
+        Ok(InstanceTeardownRecoveryObservationV1::ProvenNotStarted)
+    }
+}
+
+impl InstanceTeardownService for FakeDurableTeardownV1 {
+    async fn teardown(
+        &self,
+        guild_id: GuildId,
+        instance_id: InstanceId,
+    ) -> Result<TeardownOutcome, TeardownError> {
+        self.inner.teardown(guild_id, instance_id).await
+    }
+}
+
+impl DurableInstanceTeardownServiceV1 for FakeDurableTeardownV1 {
+    async fn teardown_exact_v1(
+        &self,
+        request: &ExactInstanceTeardownRequestV1,
+    ) -> Result<TeardownOutcome, TeardownError> {
+        self.inner
+            .teardown(request.guild_id(), request.instance_id().clone())
+            .await
+    }
+
+    async fn observe_teardown_exact_v1(
+        &self,
+        _: &ExactInstanceTeardownRequestV1,
+    ) -> Result<InstanceTeardownRecoveryObservationV1, TeardownError> {
+        Ok(InstanceTeardownRecoveryObservationV1::ProvenNotStarted)
     }
 }
 
@@ -323,6 +480,22 @@ impl DiscordMutationAdapter for FakeMutationV1 {
         match &self.error {
             Some(error) => Err(error.clone()),
             None => Ok(RoleId(55_001)),
+        }
+    }
+
+    async fn create_channel(
+        &self,
+        _: GuildId,
+        _: CreateChannelSpec,
+    ) -> Result<ChannelId, AdapterError> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("external.create_channel".to_string());
+        match &self.error {
+            Some(error) => Err(error.clone()),
+            None => Ok(ChannelId(55_003)),
         }
     }
 
@@ -357,6 +530,251 @@ impl DiscordMutationAdapter for FakeMutationV1 {
             .unwrap()
             .push("external.upsert_overwrite".to_string());
         self.error.clone().map_or(Ok(()), Err)
+    }
+}
+
+impl FakeMutationV1 {
+    fn effect_outcome_v1<T>(&self, value: T) -> DiscordEffectAttemptOutcomeV1<T> {
+        let Some(error) = &self.error else {
+            return DiscordEffectAttemptOutcomeV1::KnownSucceeded(value);
+        };
+        match error.kind {
+            AdapterErrorKind::Forbidden => DiscordEffectAttemptOutcomeV1::KnownFailed(
+                InteractionEffectKnownFailureV1::new(
+                    InteractionEffectKnownFailureClassV1::Forbidden,
+                    Some(403),
+                )
+                .unwrap(),
+            ),
+            AdapterErrorKind::NotFound => DiscordEffectAttemptOutcomeV1::KnownFailed(
+                InteractionEffectKnownFailureV1::new(
+                    InteractionEffectKnownFailureClassV1::NotFound,
+                    Some(404),
+                )
+                .unwrap(),
+            ),
+            AdapterErrorKind::RateLimited => DiscordEffectAttemptOutcomeV1::KnownFailed(
+                InteractionEffectKnownFailureV1::new(
+                    InteractionEffectKnownFailureClassV1::RateLimitedBeforeDispatch,
+                    Some(429),
+                )
+                .unwrap(),
+            ),
+            AdapterErrorKind::BadRequest
+            | AdapterErrorKind::InvalidEventRoute
+            | AdapterErrorKind::Unsupported => DiscordEffectAttemptOutcomeV1::KnownFailed(
+                InteractionEffectKnownFailureV1::new(
+                    InteractionEffectKnownFailureClassV1::InvalidRequest,
+                    Some(400),
+                )
+                .unwrap(),
+            ),
+            AdapterErrorKind::Network => DiscordEffectAttemptOutcomeV1::Indeterminate(
+                InteractionEffectIndeterminateClassV1::ConnectionLost,
+            ),
+            AdapterErrorKind::Unknown => DiscordEffectAttemptOutcomeV1::Indeterminate(
+                InteractionEffectIndeterminateClassV1::Unknown,
+            ),
+        }
+    }
+}
+
+fn unavailable_effect_observation_v1<T>() -> DiscordEffectObservationOutcomeV1<T> {
+    DiscordEffectObservationOutcomeV1::Unavailable(DiscordEffectReadFailureV1::KnownFailed(
+        InteractionEffectKnownFailureV1::new(
+            InteractionEffectKnownFailureClassV1::InvalidRequest,
+            None,
+        )
+        .unwrap(),
+    ))
+}
+
+impl RecoverableDiscordMutationAdapterV1 for FakeMutationV1 {
+    async fn create_role_effect_v1(
+        &self,
+        _: GuildId,
+        _: CreateRoleSpec,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectAttemptOutcomeV1<RoleId> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("external.create_role".to_string());
+        self.effect_outcome_v1(RoleId(55_001))
+    }
+
+    async fn create_channel_effect_v1(
+        &self,
+        _: GuildId,
+        _: CreateChannelSpec,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectAttemptOutcomeV1<ChannelId> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("external.create_channel".to_string());
+        self.effect_outcome_v1(ChannelId(55_003))
+    }
+
+    async fn grant_role_effect_v1(
+        &self,
+        _: GuildId,
+        _: UserId,
+        _: RoleId,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectAttemptOutcomeV1<()> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("external.grant_role".to_string());
+        self.effect_outcome_v1(())
+    }
+
+    async fn upsert_overwrite_effect_v1(
+        &self,
+        _: GuildId,
+        _: ChannelId,
+        _: OverwriteTarget,
+        _: Permissions,
+        _: Permissions,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectAttemptOutcomeV1<()> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("external.upsert_overwrite".to_string());
+        self.effect_outcome_v1(())
+    }
+
+    async fn post_panel_effect_v1(
+        &self,
+        _: GuildId,
+        _: ChannelId,
+        _: PostPanelSpec,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectAttemptOutcomeV1<MessageId> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("external.post_panel".to_string());
+        self.effect_outcome_v1(MessageId(55_002))
+    }
+
+    async fn observe_created_role_effect_v1(
+        &self,
+        _: GuildId,
+        _: UserId,
+        _: &InteractionEffectExpectedPostimageDigestV1,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectObservationOutcomeV1<RoleId> {
+        unavailable_effect_observation_v1()
+    }
+
+    async fn observe_created_channel_effect_v1(
+        &self,
+        _: GuildId,
+        _: UserId,
+        _: &InteractionEffectExpectedPostimageDigestV1,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectObservationOutcomeV1<ChannelId> {
+        unavailable_effect_observation_v1()
+    }
+
+    async fn observe_role_membership_effect_v1(
+        &self,
+        _: GuildId,
+        _: UserId,
+        _: UserId,
+        _: RoleId,
+        _: &InteractionEffectExpectedPostimageDigestV1,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectObservationOutcomeV1<bool> {
+        unavailable_effect_observation_v1()
+    }
+
+    async fn observe_overwrite_effect_v1(
+        &self,
+        _: GuildId,
+        _: UserId,
+        _: ChannelId,
+        _: OverwriteTarget,
+        _: &InteractionEffectExpectedPostimageDigestV1,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectObservationOutcomeV1<InteractionEffectPermissionStateV1> {
+        unavailable_effect_observation_v1()
+    }
+
+    async fn observe_post_panel_effect_v1(
+        &self,
+        _: &InteractionEffectExpectedPostimageDigestV1,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectObservationOutcomeV1<MessageId> {
+        unavailable_effect_observation_v1()
+    }
+
+    async fn compensate_created_role_effect_v1(
+        &self,
+        _: GuildId,
+        _: UserId,
+        _: RoleId,
+        _: &InteractionEffectExpectedPostimageDigestV1,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectAttemptOutcomeV1<()> {
+        self.effect_outcome_v1(())
+    }
+
+    async fn compensate_created_channel_effect_v1(
+        &self,
+        _: GuildId,
+        _: UserId,
+        _: ChannelId,
+        _: &InteractionEffectExpectedPostimageDigestV1,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectAttemptOutcomeV1<()> {
+        self.effect_outcome_v1(())
+    }
+
+    async fn compensate_role_membership_effect_v1(
+        &self,
+        _: GuildId,
+        _: UserId,
+        _: UserId,
+        _: RoleId,
+        _: bool,
+        _: &InteractionEffectExpectedPostimageDigestV1,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectAttemptOutcomeV1<()> {
+        self.effect_outcome_v1(())
+    }
+
+    async fn compensate_overwrite_effect_v1(
+        &self,
+        _: GuildId,
+        _: UserId,
+        _: ChannelId,
+        _: OverwriteTarget,
+        _: &InteractionEffectExpectedPostimageDigestV1,
+        _: InteractionEffectPermissionStateV1,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectAttemptOutcomeV1<()> {
+        self.effect_outcome_v1(())
+    }
+
+    async fn compensate_posted_panel_effect_v1(
+        &self,
+        _: GuildId,
+        _: ChannelId,
+        _: MessageId,
+        _: UserId,
+        _: &InteractionEffectExpectedPostimageDigestV1,
+        _: &automation_runtime_interaction::InteractionEffectCorrelationV1,
+    ) -> DiscordEffectAttemptOutcomeV1<()> {
+        self.effect_outcome_v1(())
     }
 }
 
@@ -726,7 +1144,7 @@ fn services_v1<'a>(
     mutation: &'a FakeMutationV1,
     instances: &'a InMemoryInstanceStore,
     instance_ids: &'a SequenceInstanceIdGenerator,
-    teardown: &'a MockInstanceTeardownService,
+    teardown: &'a FakeDurableTeardownV1,
     resolver: &'a FakePinnedResolverV1,
     snapshot: &'a FakeSnapshotProviderV1,
 ) -> AcquiredInteractionExecutionServicesV1<
@@ -735,7 +1153,7 @@ fn services_v1<'a>(
     FakeResponderV1,
     InMemoryInstanceStore,
     SequenceInstanceIdGenerator,
-    MockInstanceTeardownService,
+    FakeDurableTeardownV1,
     FakePinnedResolverV1,
     FakeSnapshotProviderV1,
 > {
@@ -766,11 +1184,30 @@ fn static_ruleset(actions: Vec<ActionSpec>) -> InteractionRuleSet {
 }
 
 fn register_only_ruleset() -> InteractionRuleSet {
-    static_ruleset(vec![ActionSpec::RegisterInstance {
-        key: "study_room_instance".to_string(),
-        kind: InstanceKind("study_room".to_string()),
-        resources: InstanceResourceRefs::default(),
-    }])
+    static_ruleset(vec![
+        ActionSpec::DeferEphemeral,
+        ActionSpec::RegisterInstance {
+            key: "study_room_instance".to_string(),
+            kind: InstanceKind("study_room".to_string()),
+            resources: InstanceResourceRefs::default(),
+        },
+        ActionSpec::EditResponse {
+            content: "created".to_string(),
+        },
+    ])
+}
+
+fn deferred_create_role_ruleset() -> InteractionRuleSet {
+    static_ruleset(vec![
+        ActionSpec::DeferEphemeral,
+        ActionSpec::CreateRole {
+            key: "member".to_string(),
+            name: "Member".to_string(),
+        },
+        ActionSpec::EditResponse {
+            content: "created".to_string(),
+        },
+    ])
 }
 
 fn modal_definition(actions: Vec<ActionSpec>) -> InteractionRuleSet {
@@ -913,7 +1350,7 @@ async fn run_register_only_v1(
         error: registrar_error,
     };
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -934,6 +1371,510 @@ async fn run_register_only_v1(
     (outcome, state)
 }
 
+async fn run_create_role_v1(
+    failures: PermitFailuresV1,
+    mutation_error: Option<AdapterError>,
+    interaction_id: u64,
+) -> (AcquiredInteractionExecutionOutcomeV1, Arc<PermitStateV1>) {
+    let definition = deferred_create_role_ruleset();
+    let admitted = admitted_v1(
+        artifact(definition),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), interaction_id);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(root, failures);
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1 {
+        state: Arc::clone(&state),
+        error: mutation_error,
+    };
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = FakeDurableTeardownV1::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: false,
+    };
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        services_v1(
+            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+    (outcome, state)
+}
+
+async fn run_create_role_then_direct_response_v1(
+    response: ActionSpec,
+    interaction_id: u64,
+) -> (AcquiredInteractionExecutionOutcomeV1, Arc<PermitStateV1>) {
+    let needs_modal = matches!(&response, ActionSpec::OpenModal { .. });
+    let mut definition = static_ruleset(vec![
+        ActionSpec::CreateRole {
+            key: "member".to_string(),
+            name: "Member".to_string(),
+        },
+        response,
+    ]);
+    if needs_modal {
+        definition.modals = modal_definition(Vec::new()).modals;
+    }
+    let admitted = admitted_v1(
+        artifact(definition),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), interaction_id);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = FakeDurableTeardownV1::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: false,
+    };
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        services_v1(
+            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+    (outcome, state)
+}
+
+fn assert_mutation_direct_response_rejected_v1(
+    outcome: AcquiredInteractionExecutionOutcomeV1,
+    state: &PermitStateV1,
+) {
+    assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::ExecutionFailedBeforeEffect,
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "prepare.snapshot",
+            "permit.bind",
+            "permit.finish:interaction_execution_failed_before_effect",
+        ]
+    );
+    assert!(state.effect_plans.lock().unwrap().is_empty());
+    assert!(state.effect_intents.lock().unwrap().is_empty());
+    assert!(state.effect_results.lock().unwrap().is_empty());
+    assert!(state.intents.lock().unwrap().is_empty());
+    assert!(state.results.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn mutation_before_direct_modal_is_rejected_without_external_effects() {
+    let (outcome, state) = run_create_role_then_direct_response_v1(
+        ActionSpec::OpenModal {
+            modal: "room".to_string(),
+        },
+        51_035,
+    )
+    .await;
+
+    assert_mutation_direct_response_rejected_v1(outcome, &state);
+}
+
+#[tokio::test]
+async fn deferred_mutation_with_final_edit_executes_and_completes() {
+    let (outcome, state) = run_create_role_v1(PermitFailuresV1::default(), None, 51_036).await;
+
+    assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::StaticCompleted,
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "prepare.snapshot",
+            "permit.bind",
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "journal.bind:2",
+            "permit.execution_intent",
+            "journal.intent:0",
+            "external.create_role",
+            "journal.result:0:succeeded",
+            "permit.execution_intent",
+            "journal.intent:1",
+            "external.edit",
+            "journal.result:1:succeeded",
+            "permit.finish:interaction_static_completed",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn effect_plan_bind_failure_has_zero_mutation_calls() {
+    let (outcome, state) = run_create_role_v1(
+        PermitFailuresV1 {
+            effect_plan_bind: true,
+            ..PermitFailuresV1::default()
+        },
+        None,
+        51_028,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
+            stage: AcquiredInteractionPersistenceStageV1::EffectPlanBind,
+            external_effect_may_have_occurred: true,
+        }
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "prepare.snapshot",
+            "permit.bind",
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "journal.bind:2",
+        ]
+    );
+    assert!(state.effect_intents.lock().unwrap().is_empty());
+    assert!(state.effect_results.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn effect_intent_failure_has_zero_mutation_calls() {
+    let (outcome, state) = run_create_role_v1(
+        PermitFailuresV1 {
+            effect_intent: true,
+            ..PermitFailuresV1::default()
+        },
+        None,
+        51_029,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
+            stage: AcquiredInteractionPersistenceStageV1::EffectIntent,
+            external_effect_may_have_occurred: true,
+        }
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "prepare.snapshot",
+            "permit.bind",
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "journal.bind:2",
+            "permit.execution_intent",
+            "journal.intent:0",
+        ]
+    );
+    assert!(state.effect_intents.lock().unwrap().is_empty());
+    assert!(state.effect_results.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn indeterminate_effect_requires_recovery_without_replay() {
+    let (outcome, state) = run_create_role_v1(
+        PermitFailuresV1::default(),
+        Some(AdapterError::new(
+            AdapterErrorKind::Network,
+            "indeterminate-secret",
+        )),
+        51_030,
+    )
+    .await;
+
+    assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::ExecutionRecoveryRequired,
+    );
+    let trace = state.trace.lock().unwrap();
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| event.as_str() == "external.create_role")
+            .count(),
+        1
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| event.as_str() == "journal.intent:0")
+            .count(),
+        1
+    );
+    drop(trace);
+    assert!(matches!(
+        state.effect_results.lock().unwrap().as_slice(),
+        [InteractionEffectAttemptOutcomeV1::Indeterminate(
+            InteractionEffectIndeterminateClassV1::ConnectionLost
+        )]
+    ));
+}
+
+#[tokio::test]
+async fn effect_result_persistence_failure_reports_possible_external_effect() {
+    let (outcome, state) = run_create_role_v1(
+        PermitFailuresV1 {
+            effect_result: true,
+            ..PermitFailuresV1::default()
+        },
+        None,
+        51_031,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
+            stage: AcquiredInteractionPersistenceStageV1::EffectResult,
+            external_effect_may_have_occurred: true,
+        }
+    );
+    assert_eq!(
+        state
+            .trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "external.create_role")
+            .count(),
+        1
+    );
+    assert!(state.effect_results.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn known_first_effect_failure_terminalizes_failed_without_recovery() {
+    let (outcome, state) = run_create_role_v1(
+        PermitFailuresV1::default(),
+        Some(AdapterError::new(
+            AdapterErrorKind::BadRequest,
+            "known-failure-secret",
+        )),
+        51_032,
+    )
+    .await;
+
+    let finish = assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::ExecutionKnownFailed,
+    );
+    assert_eq!(finish.state(), InteractionReceiptStateV1::Failed);
+    assert!(matches!(
+        state.effect_results.lock().unwrap().as_slice(),
+        [InteractionEffectAttemptOutcomeV1::KnownFailed(failure)]
+            if failure.class() == InteractionEffectKnownFailureClassV1::InvalidRequest
+    ));
+}
+
+#[tokio::test]
+async fn response_tail_failure_completes_provisioning_without_rollback() {
+    let definition = static_ruleset(vec![
+        ActionSpec::DeferEphemeral,
+        ActionSpec::EditResponse {
+            content: "done".to_string(),
+        },
+    ]);
+    let admitted = admitted_v1(
+        artifact(definition),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), 51_033);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
+    let responder = FakeResponderV1 {
+        state: Arc::clone(&state),
+        initial_error: None,
+        edit_error: Some(AdapterError::new(
+            AdapterErrorKind::BadRequest,
+            "response-tail-secret",
+        )),
+        pending_initial: false,
+    };
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = FakeDurableTeardownV1::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: false,
+    };
+
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        services_v1(
+            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+
+    let finish = assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::ProvisioningCompletedResponseUnconfirmed,
+    );
+    assert_eq!(finish.state(), InteractionReceiptStateV1::Completed);
+    assert!(state
+        .trace
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|event| event != "external.teardown"));
+}
+
+#[tokio::test]
+async fn indeterminate_response_tail_retains_durable_recovery_authority() {
+    let definition = static_ruleset(vec![
+        ActionSpec::DeferEphemeral,
+        ActionSpec::EditResponse {
+            content: "done".to_string(),
+        },
+    ]);
+    let admitted = admitted_v1(
+        artifact(definition),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), 51_034);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
+    let responder = FakeResponderV1 {
+        state: Arc::clone(&state),
+        initial_error: None,
+        edit_error: Some(AdapterError::new(
+            AdapterErrorKind::Network,
+            "response-tail-indeterminate-secret",
+        )),
+        pending_initial: false,
+    };
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = FakeDurableTeardownV1::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: false,
+    };
+
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        services_v1(
+            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        AcquiredInteractionExecutionOutcomeV1::EffectRecoveryPending
+    );
+    assert!(state.finishes.lock().unwrap().is_empty());
+    assert!(matches!(
+        state.effect_results.lock().unwrap().as_slice(),
+        [InteractionEffectAttemptOutcomeV1::Indeterminate(
+            InteractionEffectIndeterminateClassV1::ConnectionLost
+        )]
+    ));
+}
+
+#[tokio::test]
+async fn edit_response_without_defer_is_rejected_before_effect_plan_bind() {
+    let definition = static_ruleset(vec![ActionSpec::EditResponse {
+        content: "invalid".to_string(),
+    }]);
+    let admitted = admitted_v1(
+        artifact(definition),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), 51_037);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = FakeDurableTeardownV1::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: false,
+    };
+
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        services_v1(
+            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+
+    assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::ExecutionFailedBeforeEffect,
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.bind",
+            "permit.finish:interaction_execution_failed_before_effect",
+        ]
+    );
+    assert!(state.effect_plans.lock().unwrap().is_empty());
+    assert!(state.effect_intents.lock().unwrap().is_empty());
+    assert!(state.effect_results.lock().unwrap().is_empty());
+    assert!(state.intents.lock().unwrap().is_empty());
+    assert!(state.results.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn register_only_execution_commits_intent_before_the_registrar() {
     let (outcome, state) = run_register_only_v1(PermitFailuresV1::default(), None, 51_023).await;
@@ -946,8 +1887,18 @@ async fn register_only_execution_commits_intent_before_the_registrar() {
         *state.trace.lock().unwrap(),
         [
             "permit.bind",
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "journal.bind:2",
             "permit.execution_intent",
+            "journal.intent:0",
             "external.register",
+            "journal.result:0:succeeded",
+            "permit.execution_intent",
+            "journal.intent:1",
+            "external.edit",
+            "journal.result:1:succeeded",
             "permit.finish:interaction_static_completed",
         ]
     );
@@ -987,7 +1938,7 @@ async fn execution_deadline_cancels_without_a_false_terminal_finish() {
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -1018,6 +1969,7 @@ async fn execution_deadline_cancels_without_a_false_terminal_finish() {
         *state.trace.lock().unwrap(),
         [
             "permit.bind",
+            "journal.bind:0",
             "permit.intent:respond_ephemeral",
             "external.respond",
         ]
@@ -1042,7 +1994,7 @@ async fn elapsed_execution_deadline_wins_before_an_immediately_ready_effect() {
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -1088,12 +2040,19 @@ async fn first_register_intent_failure_is_persistence_failure_before_effect() {
         outcome,
         AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
             stage: AcquiredInteractionPersistenceStageV1::ExecutionIntent,
-            external_effect_may_have_occurred: false,
+            external_effect_may_have_occurred: true,
         }
     );
     assert_eq!(
         *state.trace.lock().unwrap(),
-        ["permit.bind", "permit.execution_intent"]
+        [
+            "permit.bind",
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "journal.bind:2",
+            "permit.execution_intent",
+        ]
     );
 }
 
@@ -1114,8 +2073,14 @@ async fn registrar_timeout_after_intent_is_recovery_required_not_before_effect()
         *state.trace.lock().unwrap(),
         [
             "permit.bind",
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "journal.bind:2",
             "permit.execution_intent",
+            "journal.intent:0",
             "external.register",
+            "journal.result:0:indeterminate",
             "permit.finish:interaction_execution_recovery_required",
         ]
     );
@@ -1139,7 +2104,7 @@ async fn static_response_binds_before_http_and_terminalizes() {
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -1163,10 +2128,22 @@ async fn static_response_binds_before_http_and_terminalizes() {
         AcquiredInteractionTerminalOutcomeV1::StaticCompleted,
     );
     assert!(finish.action_plan_digest().is_some());
+    let effect_plans = state.effect_plans.lock().unwrap();
+    assert_eq!(effect_plans.len(), 1);
+    assert!(effect_plans[0].entries().is_empty());
+    assert_eq!(
+        effect_plans[0]
+            .preflight_certificate_digest()
+            .as_str()
+            .len(),
+        64
+    );
+    drop(effect_plans);
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
             "permit.bind",
+            "journal.bind:0",
             "permit.intent:respond_ephemeral",
             "external.respond",
             "permit.result:succeeded",
@@ -1199,7 +2176,7 @@ async fn exact_replay_disposition_crosses_tracking_without_discord_or_result_com
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -1227,6 +2204,7 @@ async fn exact_replay_disposition_crosses_tracking_without_discord_or_result_com
         *state.trace.lock().unwrap(),
         [
             "permit.bind",
+            "journal.bind:0",
             "permit.intent:respond_ephemeral",
             "permit.finish:interaction_static_completed",
         ]
@@ -1253,7 +2231,7 @@ async fn modal_response_uses_the_same_bound_fence() {
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -1280,6 +2258,7 @@ async fn modal_response_uses_the_same_bound_fence() {
         *state.trace.lock().unwrap(),
         [
             "permit.bind",
+            "journal.bind:0",
             "permit.intent:open_modal",
             "external.modal",
             "permit.result:succeeded",
@@ -1310,7 +2289,7 @@ async fn overlong_exact_modal_custom_id_has_zero_external_effects() {
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -1361,7 +2340,7 @@ async fn instance_preflight_and_plan_bind_complete_before_defer() {
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: Some(ResolvedPinnedInstanceV1 {
@@ -1396,8 +2375,11 @@ async fn instance_preflight_and_plan_bind_complete_before_defer() {
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "journal.bind:1",
             "permit.execution_intent",
+            "journal.intent:0",
             "external.edit",
+            "journal.result:0:succeeded",
             "permit.finish:interaction_instance_completed",
         ]
     );
@@ -1464,10 +2446,15 @@ async fn instance_teardown_crosses_execution_fence_before_the_service() {
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "journal.bind:2",
             "permit.execution_intent",
+            "journal.intent:0",
             "external.teardown",
+            "journal.result:0:succeeded",
             "permit.execution_intent",
+            "journal.intent:1",
             "external.edit",
+            "journal.result:1:succeeded",
             "permit.finish:interaction_instance_completed",
         ]
     );
@@ -1602,75 +2589,27 @@ async fn new_permit_execution_replay_denial_has_zero_teardown_effects() {
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "journal.bind:2",
             "permit.execution_intent",
         ]
     );
 }
 
 #[tokio::test]
-async fn mutation_before_response_is_fenced_in_plan_order() {
-    let definition = static_ruleset(vec![
-        ActionSpec::CreateRole {
-            key: "member".to_string(),
-            name: "Member".to_string(),
-        },
+async fn mutation_before_direct_ephemeral_is_rejected_without_external_effects() {
+    let (outcome, state) = run_create_role_then_direct_response_v1(
         ActionSpec::RespondEphemeral {
             content: "created".to_string(),
         },
-    ]);
-    let admitted = admitted_v1(
-        artifact(definition),
-        &encode_button(GUILD_ID, RULESET_KEY, "go"),
-        None,
+        51_004,
     )
     .await;
-    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), 51_004);
-    let root = claim_root_v1(&admitted, &envelope, None);
-    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
-    let responder = FakeResponderV1::successful(Arc::clone(&state));
-    let mutation = FakeMutationV1::successful(Arc::clone(&state));
-    let instances = InMemoryInstanceStore::new();
-    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
-    let resolver = FakePinnedResolverV1 {
-        state: Arc::clone(&state),
-        resolved: None,
-    };
-    let snapshot = FakeSnapshotProviderV1 {
-        state: Arc::clone(&state),
-        fail: false,
-    };
 
-    let outcome = execute_acquired_interaction_v1(
-        admitted,
-        envelope,
-        permit,
-        services_v1(
-            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
-        ),
-    )
-    .await;
-    assert_terminalized_v1(
-        outcome,
-        AcquiredInteractionTerminalOutcomeV1::StaticCompleted,
-    );
-    assert_eq!(
-        *state.trace.lock().unwrap(),
-        [
-            "prepare.snapshot",
-            "permit.bind",
-            "permit.execution_intent",
-            "external.create_role",
-            "permit.intent:respond_ephemeral",
-            "external.respond",
-            "permit.result:succeeded",
-            "permit.finish:interaction_static_completed",
-        ]
-    );
+    assert_mutation_direct_response_rejected_v1(outcome, &state);
 }
 
 #[tokio::test]
-async fn mutation_only_plan_finishes_without_inventing_acknowledgement() {
+async fn mutation_only_plan_is_rejected_without_external_effects() {
     let definition = static_ruleset(vec![ActionSpec::CreateRole {
         key: "member".to_string(),
         name: "Member".to_string(),
@@ -1688,7 +2627,7 @@ async fn mutation_only_plan_finishes_without_inventing_acknowledgement() {
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -1709,19 +2648,21 @@ async fn mutation_only_plan_finishes_without_inventing_acknowledgement() {
     .await;
     assert_terminalized_v1(
         outcome,
-        AcquiredInteractionTerminalOutcomeV1::StaticCompleted,
+        AcquiredInteractionTerminalOutcomeV1::ExecutionFailedBeforeEffect,
     );
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
             "prepare.snapshot",
             "permit.bind",
-            "permit.execution_intent",
-            "external.create_role",
-            "permit.finish:interaction_static_completed",
+            "permit.finish:interaction_execution_failed_before_effect",
         ]
     );
+    assert!(state.effect_plans.lock().unwrap().is_empty());
+    assert!(state.effect_intents.lock().unwrap().is_empty());
+    assert!(state.effect_results.lock().unwrap().is_empty());
     assert!(state.intents.lock().unwrap().is_empty());
+    assert!(state.results.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1745,7 +2686,7 @@ async fn no_match_and_preparation_failure_are_known_pre_effect_failures() {
     let no_match_mutation = FakeMutationV1::successful(Arc::clone(&no_match_state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&no_match_state),
         resolved: None,
@@ -1797,7 +2738,7 @@ async fn no_match_and_preparation_failure_are_known_pre_effect_failures() {
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -1849,7 +2790,7 @@ async fn bind_outage_has_zero_external_calls() {
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -1898,7 +2839,7 @@ async fn fenced_persistence_outages_stop_before_the_external_call() {
         let mutation = FakeMutationV1::successful(Arc::clone(&state));
         let instances = InMemoryInstanceStore::new();
         let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-        let teardown = MockInstanceTeardownService::new();
+        let teardown = FakeDurableTeardownV1::new();
         let resolver = FakePinnedResolverV1 {
             state: Arc::clone(&state),
             resolved: None,
@@ -1918,6 +2859,30 @@ async fn fenced_persistence_outages_stop_before_the_external_call() {
         .await;
         (outcome, state)
     }
+
+    let (root_outcome, root_state) = run_case(
+        static_ruleset(vec![ActionSpec::RespondEphemeral {
+            content: "never".to_string(),
+        }]),
+        PermitFailuresV1 {
+            effect_plan_bind: true,
+            ..PermitFailuresV1::default()
+        },
+        51_029,
+    )
+    .await;
+    assert_eq!(
+        root_outcome,
+        AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
+            stage: AcquiredInteractionPersistenceStageV1::EffectPlanBind,
+            external_effect_may_have_occurred: false,
+        }
+    );
+    assert_eq!(
+        *root_state.trace.lock().unwrap(),
+        ["permit.bind", "journal.bind:0"]
+    );
+    assert!(root_state.effect_plans.lock().unwrap().is_empty());
 
     let (initial_outcome, initial_state) = run_case(
         static_ruleset(vec![ActionSpec::RespondEphemeral {
@@ -1939,14 +2904,15 @@ async fn fenced_persistence_outages_stop_before_the_external_call() {
     );
     assert_eq!(
         *initial_state.trace.lock().unwrap(),
-        ["permit.bind", "permit.intent:respond_ephemeral"]
+        [
+            "permit.bind",
+            "journal.bind:0",
+            "permit.intent:respond_ephemeral",
+        ]
     );
 
     let (execution_outcome, execution_state) = run_case(
-        static_ruleset(vec![ActionSpec::CreateRole {
-            key: "member".to_string(),
-            name: "Member".to_string(),
-        }]),
+        deferred_create_role_ruleset(),
         PermitFailuresV1 {
             execution_intent: true,
             ..PermitFailuresV1::default()
@@ -1958,12 +2924,20 @@ async fn fenced_persistence_outages_stop_before_the_external_call() {
         execution_outcome,
         AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
             stage: AcquiredInteractionPersistenceStageV1::ExecutionIntent,
-            external_effect_may_have_occurred: false,
+            external_effect_may_have_occurred: true,
         }
     );
     assert_eq!(
         *execution_state.trace.lock().unwrap(),
-        ["prepare.snapshot", "permit.bind", "permit.execution_intent"]
+        [
+            "prepare.snapshot",
+            "permit.bind",
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "journal.bind:2",
+            "permit.execution_intent"
+        ]
     );
 }
 
@@ -1986,7 +2960,7 @@ async fn stale_authoritative_permit_has_zero_external_calls() {
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -2036,7 +3010,7 @@ async fn terminal_persistence_failure_after_response_reports_possible_effect() {
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -2094,7 +3068,7 @@ async fn definitive_acknowledgement_failure_returns_the_committed_terminal_state
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,
@@ -2125,6 +3099,7 @@ async fn definitive_acknowledgement_failure_returns_the_committed_terminal_state
         *state.trace.lock().unwrap(),
         [
             "permit.bind",
+            "journal.bind:0",
             "permit.intent:respond_ephemeral",
             "external.respond",
             "permit.result:definitive_failure",
@@ -2154,7 +3129,7 @@ async fn canonical_plan_and_terminal_digests_are_deterministic_and_payload_sensi
         let mutation = FakeMutationV1::successful(Arc::clone(&state));
         let instances = InMemoryInstanceStore::new();
         let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-        let teardown = MockInstanceTeardownService::new();
+        let teardown = FakeDurableTeardownV1::new();
         let resolver = FakePinnedResolverV1 {
             state: Arc::clone(&state),
             resolved: None,
@@ -2190,11 +3165,8 @@ async fn canonical_plan_and_terminal_digests_are_deterministic_and_payload_sensi
 }
 
 #[tokio::test]
-async fn mutation_failure_after_execution_intent_terminalizes_recovery_required() {
-    let definition = static_ruleset(vec![ActionSpec::CreateRole {
-        key: "member".to_string(),
-        name: "Member".to_string(),
-    }]);
+async fn indeterminate_mutation_after_execution_intent_terminalizes_recovery_required() {
+    let definition = deferred_create_role_ruleset();
     let admitted = admitted_v1(
         artifact(definition),
         &encode_button(GUILD_ID, RULESET_KEY, "go"),
@@ -2208,13 +3180,13 @@ async fn mutation_failure_after_execution_intent_terminalizes_recovery_required(
     let mutation = FakeMutationV1 {
         state: Arc::clone(&state),
         error: Some(AdapterError::new(
-            AdapterErrorKind::BadRequest,
+            AdapterErrorKind::Network,
             "backend-mutation-secret",
         )),
     };
     let instances = InMemoryInstanceStore::new();
     let ids = SequenceInstanceIdGenerator::new("receipt", 1);
-    let teardown = MockInstanceTeardownService::new();
+    let teardown = FakeDurableTeardownV1::new();
     let resolver = FakePinnedResolverV1 {
         state: Arc::clone(&state),
         resolved: None,

@@ -1258,10 +1258,10 @@ impl SharedGatewayRuntimeControlV3 {
             }
             GatewayConnectionStateV3::Paused { connection } => connection,
             GatewayConnectionStateV3::Draining { .. } => {
-                return Err(GatewayControlTransitionErrorV3::Draining)
+                return Err(GatewayControlTransitionErrorV3::Draining);
             }
             GatewayConnectionStateV3::Stopped { .. } => {
-                return Err(GatewayControlTransitionErrorV3::Stopped)
+                return Err(GatewayControlTransitionErrorV3::Stopped);
             }
         };
         Ok((

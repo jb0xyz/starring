@@ -84,7 +84,7 @@ fn adapter_sources_contain_no_comments() {
 }
 
 #[test]
-fn adapter_contract_uses_only_twenty_one_private_capabilities() {
+fn adapter_contract_uses_only_thirty_two_private_capabilities() {
     let contract = include_str!("../src/contract.rs");
     let capabilities = [
         "starring_runtime_interaction_database_identity_v1",
@@ -108,9 +108,20 @@ fn adapter_contract_uses_only_twenty_one_private_capabilities() {
         "starring_runtime_interaction_receipt_recover_v1",
         "starring_runtime_interaction_receipt_token_expire_v1",
         "starring_runtime_interaction_receipt_terminalize_expired_v1",
+        "starring_runtime_interaction_effect_plan_bind_v1",
+        "starring_runtime_interaction_effect_intend_v1",
+        "starring_runtime_interaction_effect_finish_v1",
+        "starring_runtime_interaction_effect_scan_recoverable_v1",
+        "starring_runtime_interaction_effect_recovery_claim_v1",
+        "starring_runtime_interaction_effect_response_tail_scan_v1",
+        "starring_runtime_interaction_effect_response_tail_claim_v1",
+        "starring_runtime_interaction_effect_response_tail_finalize_v1",
+        "starring_runtime_interaction_effect_reconcile_v1",
+        "starring_runtime_interaction_effect_compensation_intend_v1",
+        "starring_runtime_interaction_effect_compensation_finish_v1",
     ];
-    assert_eq!(contract.matches("pub(crate) const ").count(), 21);
-    assert_eq!(contract.matches("SELECT ").count(), 21);
+    assert_eq!(contract.matches("pub(crate) const ").count(), 32);
+    assert_eq!(contract.matches("SELECT ").count(), 32);
     for capability in capabilities {
         assert_eq!(
             contract.matches(capability).count(),
@@ -159,6 +170,17 @@ fn adapter_contract_placeholder_shapes_are_exact() {
         ("RECEIPT_RECOVER_QUERY", 13),
         ("RECEIPT_TOKEN_EXPIRE_QUERY", 5),
         ("RECEIPT_TERMINALIZE_EXPIRED_QUERY", 7),
+        ("EFFECT_PLAN_BIND_QUERY", 9),
+        ("EFFECT_INTEND_QUERY", 15),
+        ("EFFECT_FINISH_QUERY", 11),
+        ("EFFECT_RECOVERY_SCAN_QUERY", 9),
+        ("EFFECT_RECOVERY_CLAIM_QUERY", 11),
+        ("EFFECT_RESPONSE_TAIL_SCAN_QUERY", 9),
+        ("EFFECT_RESPONSE_TAIL_CLAIM_QUERY", 14),
+        ("EFFECT_RESPONSE_TAIL_FINALIZE_QUERY", 19),
+        ("EFFECT_RECONCILE_QUERY", 18),
+        ("EFFECT_COMPENSATION_INTEND_QUERY", 13),
+        ("EFFECT_COMPENSATION_FINISH_QUERY", 10),
     ];
     for (name, expected_maximum) in expected {
         let query = contract
@@ -272,6 +294,8 @@ fn route_read_deadline_wraps_the_complete_database_operation() {
 fn every_interaction_operation_rechecks_database_binding() {
     let store = include_str!("../src/store.rs");
     let receipt_store = include_str!("../src/receipt_store.rs");
+    let effect_store = include_str!("../src/effect_store.rs");
+    let response_tail_store = include_str!("../src/response_tail_store.rs");
     assert_eq!(
         store
             .matches("verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)")
@@ -289,6 +313,30 @@ fn every_interaction_operation_rechecks_database_binding() {
             .matches("begin_interaction_transaction(&self.pool, self.timeouts)")
             .count(),
         10
+    );
+    assert_eq!(
+        effect_store
+            .matches("verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)")
+            .count(),
+        8
+    );
+    assert_eq!(
+        effect_store
+            .matches("begin_interaction_transaction(&self.pool, self.timeouts)")
+            .count(),
+        8
+    );
+    assert_eq!(
+        response_tail_store
+            .matches("verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)")
+            .count(),
+        3
+    );
+    assert_eq!(
+        response_tail_store
+            .matches("begin_interaction_transaction(&self.pool, self.timeouts)")
+            .count(),
+        3
     );
 }
 

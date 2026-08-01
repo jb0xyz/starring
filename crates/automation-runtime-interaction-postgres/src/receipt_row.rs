@@ -668,6 +668,34 @@ impl ReceiptTokenExpiryRowV1 {
             {
                 RuntimeInteractionReceiptTokenExpiryDispositionV1::RecoveryRequired
             }
+            "effects_recovered_completed"
+                if state == InteractionReceiptStateV1::Completed
+                    && head_revision == expected_head_revision + 1
+                    && claim_revision == expected_claim_revision =>
+            {
+                RuntimeInteractionReceiptTokenExpiryDispositionV1::EffectsCompleted
+            }
+            "provisioning_completed_response_unconfirmed"
+                if state == InteractionReceiptStateV1::Completed
+                    && head_revision == expected_head_revision + 1
+                    && claim_revision == expected_claim_revision =>
+            {
+                RuntimeInteractionReceiptTokenExpiryDispositionV1::ResponseUnconfirmed
+            }
+            "interaction_response_unrecoverable"
+                if state == InteractionReceiptStateV1::Completed
+                    && head_revision == expected_head_revision + 1
+                    && claim_revision == expected_claim_revision =>
+            {
+                RuntimeInteractionReceiptTokenExpiryDispositionV1::ResponseUnrecoverable
+            }
+            "effect_recovery_pending"
+                if state == InteractionReceiptStateV1::Executing
+                    && head_revision == expected_head_revision
+                    && claim_revision == expected_claim_revision =>
+            {
+                RuntimeInteractionReceiptTokenExpiryDispositionV1::EffectRecoveryPending
+            }
             _ => return Err(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt),
         };
         Ok(RuntimeInteractionReceiptTokenExpiryOutcomeV1::new(
@@ -739,6 +767,35 @@ impl ReceiptTerminalizeExpiredRowV1 {
             {
                 RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::RouteAuthorityStale
             }
+            "effects_recovered_completed"
+                if state == InteractionReceiptStateV1::Completed
+                    && head_revision == expected_head_revision + 1
+                    && claim_revision == expected_claim_revision
+                    && expired =>
+            {
+                RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::EffectsCompleted
+            }
+            "provisioning_completed_response_unconfirmed"
+                if state == InteractionReceiptStateV1::Completed
+                    && head_revision == expected_head_revision + 1
+                    && claim_revision == expected_claim_revision
+                    && expired =>
+            {
+                RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::ResponseUnconfirmed
+            }
+            "interaction_response_unrecoverable"
+                if state == InteractionReceiptStateV1::Completed
+                    && head_revision == expected_head_revision + 1
+                    && claim_revision == expected_claim_revision
+                    && expired =>
+            {
+                RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::ResponseUnrecoverable
+            }
+            "effect_recovery_pending"
+                if state == InteractionReceiptStateV1::Executing && revisions_match && expired =>
+            {
+                RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::EffectRecoveryPending
+            }
             _ => return Err(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt),
         };
         Ok(RuntimeInteractionReceiptTerminalizeExpiredOutcomeV1::new(
@@ -753,7 +810,7 @@ impl ReceiptTerminalizeExpiredRowV1 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_binding(
+pub(crate) fn decode_binding(
     scope: InteractionProductScopeV1,
     process_identity: RuntimeProcessIdentityV1,
     gateway_shard: InteractionGatewayShardIdentityV1,
@@ -1029,7 +1086,7 @@ fn recovery_root_or_token_payload_present(row: &ReceiptRecoverRowV1) -> bool {
         || row.token_expires_at.is_some()
 }
 
-fn decode_scope(
+pub(crate) fn decode_scope(
     tenant_id: String,
     installation_id: String,
     deployment_id: String,
@@ -1044,7 +1101,7 @@ fn decode_scope(
     ))
 }
 
-fn decode_receipt_identity(
+pub(crate) fn decode_receipt_identity(
     application_id: String,
     interaction_id: String,
 ) -> Result<InteractionReceiptIdentityV1, RuntimeInteractionPersistenceErrorV1> {
@@ -1063,7 +1120,9 @@ fn decode_receipt_identity(
     Ok(InteractionReceiptIdentityV1::new(application, interaction))
 }
 
-fn decode_guild_id(value: &str) -> Result<GuildId, RuntimeInteractionPersistenceErrorV1> {
+pub(crate) fn decode_guild_id(
+    value: &str,
+) -> Result<GuildId, RuntimeInteractionPersistenceErrorV1> {
     let guild_id = value
         .parse::<u64>()
         .ok()
@@ -1103,7 +1162,7 @@ pub(crate) fn digest_bytes(value: &str) -> Result<Vec<u8>, RuntimeInteractionPer
         .collect()
 }
 
-fn bytes_to_lower_hex(value: &[u8]) -> String {
+pub(crate) fn bytes_to_lower_hex(value: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(value.len() * 2);
     for byte in value {
@@ -1132,7 +1191,7 @@ fn validate_lower_hex(value: &str) -> Result<(), RuntimeInteractionPersistenceEr
     Ok(())
 }
 
-fn decode_ruleset_version(
+pub(crate) fn decode_ruleset_version(
     value: i64,
 ) -> Result<RuleSetVersionId, RuntimeInteractionPersistenceErrorV1> {
     u32::try_from(value)
@@ -1141,7 +1200,7 @@ fn decode_ruleset_version(
         .ok_or(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt)
 }
 
-fn positive_u64(value: i64) -> Result<u64, RuntimeInteractionPersistenceErrorV1> {
+pub(crate) fn positive_u64(value: i64) -> Result<u64, RuntimeInteractionPersistenceErrorV1> {
     u64::try_from(value)
         .ok()
         .filter(|value| *value > 0 && *value <= i64::MAX as u64)

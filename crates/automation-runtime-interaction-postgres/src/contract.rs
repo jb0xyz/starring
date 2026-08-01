@@ -77,3 +77,49 @@ pub(crate) const RECEIPT_TOKEN_EXPIRE_QUERY: &str =
 pub(crate) const RECEIPT_TERMINALIZE_EXPIRED_QUERY: &str =
     "SELECT * FROM public.starring_runtime_interaction_receipt_terminalize_expired_v1(\
         $1, $2, $3, $4, $5, $6, $7)";
+
+pub(crate) const EFFECT_PLAN_BIND_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_effect_plan_bind_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9)";
+
+pub(crate) const EFFECT_INTEND_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_effect_intend_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)";
+
+pub(crate) const EFFECT_FINISH_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_effect_finish_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
+
+pub(crate) const EFFECT_RECOVERY_SCAN_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_effect_scan_recoverable_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9)";
+
+pub(crate) const EFFECT_RECOVERY_CLAIM_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_effect_recovery_claim_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
+
+pub(crate) const EFFECT_RESPONSE_TAIL_SCAN_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_effect_response_tail_scan_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9)";
+
+pub(crate) const EFFECT_RESPONSE_TAIL_CLAIM_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_effect_response_tail_claim_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)";
+
+pub(crate) const EFFECT_RESPONSE_TAIL_FINALIZE_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_effect_response_tail_finalize_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+        $16, $17, $18, $19)";
+
+pub(crate) const EFFECT_RECONCILE_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_effect_reconcile_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
+        $17, $18)";
+
+pub(crate) const EFFECT_COMPENSATION_INTEND_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_effect_compensation_intend_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)";
+
+pub(crate) const EFFECT_COMPENSATION_FINISH_QUERY: &str =
+    "SELECT * FROM public.starring_runtime_interaction_effect_compensation_finish_v1(\
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";

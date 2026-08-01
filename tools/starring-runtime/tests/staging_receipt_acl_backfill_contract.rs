@@ -19,6 +19,7 @@ const RUNBOOK: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../docs/superpowers/runbooks/2026-07-29-macos-starring-runtime-staging-operations.md"
 ));
+const RECEIPT_BACKFILL_MIGRATION_VERSION: i64 = 202_607_310_022;
 
 fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start = source.find(start).unwrap();
@@ -92,6 +93,7 @@ fn checksum_hex(bytes: &[u8]) -> String {
 fn migration_ledger_digest() -> String {
     let projection = MIGRATOR
         .iter()
+        .filter(|migration| migration.version <= RECEIPT_BACKFILL_MIGRATION_VERSION)
         .map(|migration| {
             format!(
                 "{}:true:{}",
@@ -140,7 +142,10 @@ fn receipt_acl_backfill_manifest_matches_the_runtime_capability_boundary() {
 
 #[test]
 fn receipt_acl_backfill_pins_target_ledger_identity_and_quiescence() {
-    let migrations = MIGRATOR.iter().collect::<Vec<_>>();
+    let migrations = MIGRATOR
+        .iter()
+        .filter(|migration| migration.version <= RECEIPT_BACKFILL_MIGRATION_VERSION)
+        .collect::<Vec<_>>();
     assert_eq!(migrations.len(), 115);
     let latest = migrations.last().unwrap();
     assert_eq!(latest.version, 202_607_310_022);

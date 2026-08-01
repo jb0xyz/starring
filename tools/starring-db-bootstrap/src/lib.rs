@@ -15,8 +15,8 @@ pub use keychain::{
 
 pub const DATABASE_NAME: &str = "starring_runtime_staging";
 pub const OWNER_ROLE: &str = "starring_owner";
-pub const RELATION_COUNT: i64 = 184;
-pub const CAPABILITY_FUNCTION_COUNT: usize = 124;
+pub const RELATION_COUNT: i64 = 198;
+pub const CAPABILITY_FUNCTION_COUNT: usize = 135;
 pub const CLUSTER_ADMIN_ROLE: &str = "starring_cluster_admin";
 pub const PEER_MAP_NAME: &str = "starring_bootstrap";
 pub const PEER_SOCKET_DIRECTORY: &str = "/private/tmp/starring-bootstrap";
@@ -1000,9 +1000,9 @@ fn extract_manifest(sql: &'static str) -> Vec<&'static str> {
 mod tests {
     use super::*;
 
-    const EXPECTED_MIGRATION_COUNT: usize = 115;
-    const EXPECTED_MIGRATION_HEAD: i64 = 202607310022;
-    const RELATION_COUNT_BEFORE_MIGRATION_HEAD: i64 = 174;
+    const EXPECTED_MIGRATION_COUNT: usize = 116;
+    const EXPECTED_MIGRATION_HEAD: i64 = 202608010001;
+    const RELATION_COUNT_BEFORE_MIGRATION_HEAD: i64 = 184;
 
     fn count_sql_lines_with_prefix(sql: &str, prefix: &str) -> i64 {
         sql.lines()
@@ -1017,13 +1017,13 @@ mod tests {
     #[test]
     fn manifest_is_exact_and_unique() {
         let identities = capability_function_identities().unwrap();
-        assert_eq!(identities.len(), 124);
+        assert_eq!(identities.len(), 135);
         assert_eq!(
             identities.iter().copied().collect::<BTreeSet<_>>().len(),
-            124
+            135
         );
         assert_eq!(extract_manifest(API_ROLE_BOOTSTRAP).len(), 53);
-        assert_eq!(extract_manifest(RUNTIME_ROLE_BOOTSTRAP).len(), 71);
+        assert_eq!(extract_manifest(RUNTIME_ROLE_BOOTSTRAP).len(), 82);
     }
 
     #[test]
@@ -1044,12 +1044,16 @@ mod tests {
         assert_eq!(migrations.len(), EXPECTED_MIGRATION_COUNT);
         let head = migrations.last().unwrap();
         assert_eq!(head.version, EXPECTED_MIGRATION_HEAD);
-        assert_eq!(head.description, "add runtime interaction receipts v1");
+        assert_eq!(
+            head.description,
+            "add runtime interaction effect journal v1"
+        );
         let table_count = count_sql_lines_with_prefix(&head.sql, "CREATE TABLE public.");
-        let explicit_index_count = count_sql_lines_with_prefix(&head.sql, "CREATE INDEX ");
+        let explicit_index_count = count_sql_lines_with_prefix(&head.sql, "CREATE INDEX ")
+            + count_sql_lines_with_prefix(&head.sql, "CREATE UNIQUE INDEX ");
         let primary_key_index_count = count_sql_lines_containing(&head.sql, " PRIMARY KEY (");
         assert_eq!(table_count, 4);
-        assert_eq!(explicit_index_count, 2);
+        assert_eq!(explicit_index_count, 6);
         assert_eq!(primary_key_index_count, table_count);
         assert_eq!(
             RELATION_COUNT,
@@ -1118,8 +1122,8 @@ mod tests {
     fn fixed_identities_are_not_configurable() {
         assert_eq!(DATABASE_NAME, "starring_runtime_staging");
         assert_eq!(OWNER_ROLE, "starring_owner");
-        assert_eq!(RELATION_COUNT, 184);
-        assert_eq!(CAPABILITY_FUNCTION_COUNT, 124);
+        assert_eq!(RELATION_COUNT, 198);
+        assert_eq!(CAPABILITY_FUNCTION_COUNT, 135);
         assert_eq!(CLUSTER_ADMIN_ROLE, "starring_cluster_admin");
         assert_eq!(PEER_MAP_NAME, "starring_bootstrap");
         assert_eq!(PEER_SOCKET_DIRECTORY, "/private/tmp/starring-bootstrap");
@@ -1235,6 +1239,6 @@ mod tests {
             );
         }
         assert!(!VERIFY_RELATION_OWNERSHIP_SQL.contains("relation.relkind"));
-        assert_eq!(RELATION_COUNT, 184);
+        assert_eq!(RELATION_COUNT, 198);
     }
 }

@@ -464,6 +464,7 @@ mod tests {
 
     #[tokio::test]
     async fn owned_runtime_operations_reuse_one_private_http_capability() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let operations = OwnedDiscordRuntimeOperationsV2::new("unused-token".to_owned());
         let _installer = operations.strict_panel_installer();
     }

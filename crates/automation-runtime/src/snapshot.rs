@@ -43,6 +43,10 @@ impl OwnedTwilightGuildRoleSnapshotProvider {
         let bot_user_id = fetch_bot_user_id(&http).await?;
         Ok(Self { http, bot_user_id })
     }
+
+    pub(crate) fn bot_user_id_v1(&self) -> UserId {
+        UserId(self.bot_user_id.get())
+    }
 }
 
 async fn fetch_bot_user_id(http: &Client) -> Result<Id<UserMarker>, SnapshotError> {

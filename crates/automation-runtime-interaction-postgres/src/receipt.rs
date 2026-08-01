@@ -1114,6 +1114,10 @@ pub enum RuntimeInteractionReceiptTokenExpiryDispositionV1 {
     TokenNotExpired,
     TerminalTokenDeleted,
     RecoveryRequired,
+    EffectsCompleted,
+    ResponseUnconfirmed,
+    ResponseUnrecoverable,
+    EffectRecoveryPending,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1219,6 +1223,10 @@ pub enum RuntimeInteractionReceiptTerminalizeExpiredDispositionV1 {
     ClaimRenewed,
     RevisionRace,
     RouteAuthorityStale,
+    EffectsCompleted,
+    ResponseUnconfirmed,
+    ResponseUnrecoverable,
+    EffectRecoveryPending,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

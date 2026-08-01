@@ -12,7 +12,9 @@ use automation_runtime::{
     InstanceTeardownRetryExecutionRequestV1, InstanceTeardownRetryScanFutureV1,
     InstanceTeardownRetryScanRequestV1, InstanceTeardownRetrySupervisorConfigV1,
     InstanceTeardownRetrySupervisorExitV1, InstanceTeardownRetrySupervisorPortV1,
-    InstanceTeardownRetrySupervisorV1, InteractionInitialResponseIntentDispositionV1,
+    InstanceTeardownRetrySupervisorV1, InteractionEffectIntentDispositionV1,
+    InteractionEffectJournalIntendV1, InteractionEffectJournalPlanV1,
+    InteractionEffectPlanBindDispositionV1, InteractionInitialResponseIntentDispositionV1,
     InteractionInitialResponseIntentV1, InteractionInitialResponseKindV1,
     InteractionInitialResponseResultKindV1, InteractionInitialResponseResultV1,
     InteractionTerminalFinishV1, OwnedSharedGatewayDispatchServicesCompositionErrorV3,
@@ -35,17 +37,22 @@ use automation_runtime_execution_postgres::{
     RuntimeExecutionDatabaseTimeoutsV1, RuntimeExecutionPersistenceErrorV1,
 };
 use automation_runtime_interaction::{
-    InteractionActionPlanDigestV1, InteractionGatewayShardIdentityV1,
-    InteractionReceiptClaimRootV1, InteractionReceiptStateV1, InteractionRuntimeBuildRevisionV1,
-    InteractionTokenEnvelopeKeyringV1, InteractionTokenEnvelopeTimeV1, InteractionTokenV1,
-    XChaCha20Poly1305InteractionTokenCipherV1, MAX_INTERACTION_TOKEN_LIFETIME_MILLISECONDS_V1,
+    InteractionActionPlanDigestV1, InteractionEffectActionIndexV1,
+    InteractionEffectAttemptOutcomeV1, InteractionEffectMaterializedPlanV1,
+    InteractionGatewayShardIdentityV1, InteractionReceiptClaimRootV1, InteractionReceiptStateV1,
+    InteractionRuntimeBuildRevisionV1, InteractionTokenEnvelopeKeyringV1,
+    InteractionTokenEnvelopeTimeV1, InteractionTokenV1, XChaCha20Poly1305InteractionTokenCipherV1,
+    MAX_INTERACTION_TOKEN_LIFETIME_MILLISECONDS_V1,
 };
 use automation_runtime_interaction_postgres::{
     PostgresRuntimeInteractionV1, RuntimeInteractionDatabaseExpectationV1,
     RuntimeInteractionDatabaseReadinessV1, RuntimeInteractionDatabaseTimeoutsV1,
-    RuntimeInteractionErrorClassV1, RuntimeInteractionPersistenceErrorV1,
-    RuntimeInteractionReceiptClaimLeaseV1, RuntimeInteractionReceiptClaimOutcomeV1,
-    RuntimeInteractionReceiptClaimRequestV1, RuntimeInteractionReceiptExclusiveClaimV1,
+    RuntimeInteractionEffectFinishRequestV1, RuntimeInteractionEffectIntendRequestV1,
+    RuntimeInteractionEffectMutationDispositionV1, RuntimeInteractionEffectPlanActionV1,
+    RuntimeInteractionEffectPlanBindRequestV1, RuntimeInteractionErrorClassV1,
+    RuntimeInteractionPersistenceErrorV1, RuntimeInteractionReceiptClaimLeaseV1,
+    RuntimeInteractionReceiptClaimOutcomeV1, RuntimeInteractionReceiptClaimRequestV1,
+    RuntimeInteractionReceiptExclusiveClaimV1,
     RuntimeInteractionReceiptInitialResponseIntentDispositionV1 as PostgresInitialResponseIntentDispositionV1,
     RuntimeInteractionReceiptInitialResponseIntentV1 as PostgresInitialResponseIntentV1,
     RuntimeInteractionReceiptInitialResponseKindV1 as PostgresInitialResponseKindV1,
@@ -59,6 +66,7 @@ use automation_runtime_interaction_postgres::{
     RuntimeInteractionReceiptTerminalizeExpiredRequestV1,
     RuntimeInteractionReceiptTokenExpiryDispositionV1,
     RuntimeInteractionReceiptTokenExpiryRequestV1, RuntimeInteractionRouteTimeoutV1,
+    MIN_RUNTIME_INTERACTION_EFFECT_RETRY_DELAY,
 };
 use automation_runtime_panel_postgres::{
     PostgresRuntimePanelV1, RuntimePanelDatabaseExpectationV1, RuntimePanelDatabaseReadinessV1,
@@ -115,6 +123,10 @@ use crate::{
     RuntimeDiscordBotTokenV1,
 };
 
+mod effect_recovery;
+
+use effect_recovery::RuntimeInteractionEffectRecoveryDatabasePortV1;
+
 const PERIODIC_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const DATABASE_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const INSTANCE_TEARDOWN_RETRY_CADENCE: Duration = Duration::from_secs(30);
@@ -136,6 +148,8 @@ pub(crate) type RuntimeInteractionTeardownRetrySupervisorExitV1 =
     InstanceTeardownRetrySupervisorExitV1;
 pub(crate) type RuntimeInteractionReceiptRecoverySupervisorExitV1 =
     crate::interaction_receipt_recovery_supervisor::RuntimeInteractionReceiptRecoverySupervisorExitV1;
+pub(crate) type RuntimeInteractionEffectRecoverySupervisorExitV1 =
+    crate::interaction_effect_recovery_supervisor::RuntimeInteractionEffectRecoverySupervisorExitV1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeDatabaseCompositionErrorV1 {
@@ -473,6 +487,11 @@ struct RuntimeInteractionReceiptDatabaseV1 {
     cipher: XChaCha20Poly1305InteractionTokenCipherV1,
 }
 
+struct RuntimeInteractionEffectDatabaseIntentPermitV1 {
+    action_index: InteractionEffectActionIndexV1,
+    effect_head_revision: u64,
+}
+
 impl Debug for RuntimeInteractionDispatchDatabasePortV1 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeInteractionDispatchDatabasePortV1(<redacted>)")
@@ -609,6 +628,9 @@ fn map_acquired_interaction_outcome_v1(
         AcquiredInteractionExecutionOutcomeV1::ExecutionDeadlineElapsed => {
             RuntimeInteractionDispatchOutcomeV1::RecoveryRequired
         }
+        AcquiredInteractionExecutionOutcomeV1::EffectRecoveryPending => {
+            RuntimeInteractionDispatchOutcomeV1::RecoveryRequired
+        }
         AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
             external_effect_may_have_occurred,
             ..
@@ -639,6 +661,7 @@ fn map_terminal_receipt_state_v1(
 
 impl RuntimeInteractionReceiptPersistencePortV1 for RuntimeInteractionReceiptDatabaseV1 {
     type Claim = RuntimeInteractionReceiptExclusiveClaimV1;
+    type EffectIntentPermit = RuntimeInteractionEffectDatabaseIntentPermitV1;
 
     fn claim_root_v1(claim: &Self::Claim) -> &InteractionReceiptClaimRootV1 {
         claim.claim_root()
@@ -797,6 +820,106 @@ impl RuntimeInteractionReceiptPersistencePortV1 for RuntimeInteractionReceiptDat
                 RuntimeInteractionReceiptPersistenceMutationDispositionV1::ExactReplay
             }
         })
+    }
+
+    async fn bind_effect_plan_v1(
+        &self,
+        claim: &mut Self::Claim,
+        plan: &InteractionEffectJournalPlanV1,
+    ) -> Result<InteractionEffectPlanBindDispositionV1, RuntimeInteractionReceiptPermitErrorV1>
+    {
+        let actions = plan
+            .entries()
+            .iter()
+            .map(|entry| {
+                RuntimeInteractionEffectPlanActionV1::new(
+                    entry.definition().clone(),
+                    entry.expected_postimage_digest().clone(),
+                )
+                .map_err(map_receipt_permit_error_v1)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let request = RuntimeInteractionEffectPlanBindRequestV1::new(
+            claim,
+            plan.preflight_certificate_digest().clone(),
+            plan.snapshot_digest().clone(),
+            actions,
+        )
+        .map_err(map_receipt_permit_error_v1)?;
+        let outcome = self
+            .store
+            .bind_interaction_effect_plan_v1(request)
+            .await
+            .map_err(map_receipt_permit_error_v1)?;
+        Ok(match outcome.disposition() {
+            RuntimeInteractionEffectMutationDispositionV1::Applied => {
+                InteractionEffectPlanBindDispositionV1::Fresh
+            }
+            RuntimeInteractionEffectMutationDispositionV1::ExactReplay => {
+                InteractionEffectPlanBindDispositionV1::ExactReplay
+            }
+        })
+    }
+
+    async fn intend_effect_v1(
+        &self,
+        claim: &mut Self::Claim,
+        intent: InteractionEffectJournalIntendV1<'_>,
+    ) -> Result<
+        InteractionEffectIntentDispositionV1<Self::EffectIntentPermit>,
+        RuntimeInteractionReceiptPermitErrorV1,
+    > {
+        let request = RuntimeInteractionEffectIntendRequestV1::new(
+            claim,
+            intent.materialized(),
+            1,
+            intent.resolved_instance_manifest_digest().cloned(),
+            MIN_RUNTIME_INTERACTION_EFFECT_RETRY_DELAY,
+        )
+        .map_err(map_receipt_permit_error_v1)?;
+        let action_index = intent.materialized().definition().action().action_index();
+        let checkpoint = self
+            .store
+            .intend_interaction_effect_v1(request)
+            .await
+            .map_err(map_receipt_permit_error_v1)?;
+        Ok(match checkpoint.disposition() {
+            RuntimeInteractionEffectMutationDispositionV1::Applied => {
+                InteractionEffectIntentDispositionV1::ExternalCallAuthorized(
+                    RuntimeInteractionEffectDatabaseIntentPermitV1 {
+                        action_index,
+                        effect_head_revision: checkpoint.effect_head_revision(),
+                    },
+                )
+            }
+            RuntimeInteractionEffectMutationDispositionV1::ExactReplay => {
+                InteractionEffectIntentDispositionV1::ExactReplay
+            }
+        })
+    }
+
+    async fn finish_effect_v1(
+        &self,
+        claim: &mut Self::Claim,
+        permit: &Self::EffectIntentPermit,
+        materialized: &InteractionEffectMaterializedPlanV1,
+        outcome: &InteractionEffectAttemptOutcomeV1,
+    ) -> Result<(), RuntimeInteractionReceiptPermitErrorV1> {
+        if permit.action_index != materialized.definition().action().action_index() {
+            return Err(RuntimeInteractionReceiptPermitErrorV1::Contract);
+        }
+        let request = RuntimeInteractionEffectFinishRequestV1::new(
+            claim,
+            materialized,
+            permit.effect_head_revision,
+            outcome.clone(),
+        )
+        .map_err(map_receipt_permit_error_v1)?;
+        self.store
+            .finish_interaction_effect_v1(request)
+            .await
+            .map_err(map_receipt_permit_error_v1)?;
+        Ok(())
     }
 
     async fn commit_terminal_v1(
@@ -994,10 +1117,14 @@ impl RuntimeInteractionReceiptRecoverySupervisorPortV1
                     RuntimeInteractionReceiptRecoveryMutationDispositionV1::RecoveryRequired
                 }
                 RuntimeInteractionReceiptTokenExpiryDispositionV1::TokenAbsent
-                | RuntimeInteractionReceiptTokenExpiryDispositionV1::TerminalTokenDeleted => {
+                | RuntimeInteractionReceiptTokenExpiryDispositionV1::TerminalTokenDeleted
+                | RuntimeInteractionReceiptTokenExpiryDispositionV1::EffectsCompleted
+                | RuntimeInteractionReceiptTokenExpiryDispositionV1::ResponseUnconfirmed
+                | RuntimeInteractionReceiptTokenExpiryDispositionV1::ResponseUnrecoverable => {
                     RuntimeInteractionReceiptRecoveryMutationDispositionV1::Converged
                 }
-                RuntimeInteractionReceiptTokenExpiryDispositionV1::TokenNotExpired => {
+                RuntimeInteractionReceiptTokenExpiryDispositionV1::TokenNotExpired
+                | RuntimeInteractionReceiptTokenExpiryDispositionV1::EffectRecoveryPending => {
                     RuntimeInteractionReceiptRecoveryMutationDispositionV1::Deferred
                 }
             })
@@ -1029,12 +1156,16 @@ impl RuntimeInteractionReceiptRecoverySupervisorPortV1
                 | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::PristineClaimAbandoned => {
                     RuntimeInteractionReceiptRecoveryMutationDispositionV1::RecoveryRequired
                 }
-                RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::TerminalReceipt => {
+                RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::TerminalReceipt
+                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::EffectsCompleted
+                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::ResponseUnconfirmed
+                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::ResponseUnrecoverable => {
                     RuntimeInteractionReceiptRecoveryMutationDispositionV1::Converged
                 }
                 RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::ClaimRenewed
                 | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::RevisionRace
-                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::RouteAuthorityStale => {
+                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::RouteAuthorityStale
+                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::EffectRecoveryPending => {
                     RuntimeInteractionReceiptRecoveryMutationDispositionV1::Deferred
                 }
             })
@@ -1067,6 +1198,16 @@ impl InstanceTeardownRetrySupervisorPortV1 for RuntimeInteractionTeardownRetryDa
 }
 
 impl RuntimeInteractionDispatchDatabasePortV1 {
+    pub(crate) fn start_effect_recovery_supervisor_v1(
+        &self,
+    ) -> crate::interaction_effect_recovery_supervisor::RuntimeInteractionEffectRecoverySupervisorV1
+    {
+        crate::interaction_effect_recovery_supervisor::RuntimeInteractionEffectRecoverySupervisorV1::start(
+            RuntimeInteractionEffectRecoveryDatabasePortV1::from_dispatch_port_v1(self),
+            crate::interaction_effect_recovery_supervisor::RuntimeInteractionEffectRecoverySupervisorConfigV1::production_v1(),
+        )
+    }
+
     pub(crate) fn start_receipt_recovery_supervisor_v1(
         &self,
     ) -> RuntimeInteractionReceiptRecoverySupervisorV1 {

@@ -11,8 +11,10 @@ use automation_instance::{
     InstanceTeardownClaimOutcomeV1, InstanceTeardownMarkOutcomeV1, InstanceTeardownStoreV1,
 };
 use automation_instance_teardown::{
-    DeleteOutcome, DeleterError, DeleterErrorKind, InstanceDeleter, InstanceResource,
-    InstanceTeardownService, Teardown, TeardownError, TeardownOutcome,
+    DeleteOutcome, DeleterError, DeleterErrorKind, DurableInstanceTeardownServiceV1,
+    ExactInstanceRegistrationIdentityV1, ExactInstanceTeardownRequestV1, InstanceDeleter,
+    InstanceResource, InstanceTeardownRecoveryObservationV1, InstanceTeardownService, Teardown,
+    TeardownError, TeardownOutcome,
 };
 use discord_model::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use futures::executor::block_on;
@@ -310,6 +312,10 @@ fn expected_order() -> Vec<DeleteCall> {
         DeleteCall::Role(RoleId(600)),
         DeleteCall::Role(RoleId(601)),
     ]
+}
+
+fn exact_request() -> ExactInstanceTeardownRequestV1 {
+    ExactInstanceTeardownRequestV1::new(GUILD, instance_id(), resources())
 }
 
 #[test]
@@ -632,4 +638,175 @@ fn uncertain_delete_error_is_not_already_gone() {
         InstanceStatus::Deleting
     );
     assert_eq!(store.mark_calls(), 0);
+}
+
+#[test]
+fn exact_teardown_rejects_manifest_drift_before_claim_or_delete() {
+    let store = SharedStore::default();
+    let deleter = ScriptedDeleter::default();
+    register(&store, InstanceStatus::Active);
+    let mut drifted = resources();
+    drifted.roles.insert("a_role".to_string(), RoleId(999));
+    let request = ExactInstanceTeardownRequestV1::new(GUILD, instance_id(), drifted);
+    let service = Teardown::new(store.clone(), deleter.clone());
+
+    assert_eq!(
+        block_on(service.teardown_exact_v1(&request)),
+        Err(TeardownError::ManifestDrift)
+    );
+    assert!(deleter.calls().is_empty());
+    assert_eq!(store.transition_calls(), 0);
+    assert_eq!(store.mark_calls(), 0);
+    assert_eq!(
+        block_on(store.get(GUILD, &instance_id()))
+            .unwrap()
+            .unwrap()
+            .status,
+        InstanceStatus::Active
+    );
+}
+
+#[test]
+fn exact_teardown_observation_distinguishes_durable_states() {
+    let active_store = SharedStore::default();
+    register(&active_store, InstanceStatus::Active);
+    let active = Teardown::new(active_store, ScriptedDeleter::default());
+    assert_eq!(
+        block_on(active.observe_teardown_exact_v1(&exact_request())).unwrap(),
+        InstanceTeardownRecoveryObservationV1::ProvenNotStarted
+    );
+
+    let deleting_store = SharedStore::default();
+    register(&deleting_store, InstanceStatus::Deleting);
+    let deleting = Teardown::new(deleting_store, ScriptedDeleter::default());
+    assert_eq!(
+        block_on(deleting.observe_teardown_exact_v1(&exact_request())).unwrap(),
+        InstanceTeardownRecoveryObservationV1::DurableRetryPending
+    );
+
+    let deleted_store = SharedStore::default();
+    register(&deleted_store, InstanceStatus::Deleted);
+    let deleted = Teardown::new(deleted_store, ScriptedDeleter::default());
+    assert_eq!(
+        block_on(deleted.observe_teardown_exact_v1(&exact_request())).unwrap(),
+        InstanceTeardownRecoveryObservationV1::ProvenSucceeded
+    );
+}
+
+#[test]
+fn indeterminate_delete_retries_only_the_exact_manifest_and_converges() {
+    let store = SharedStore::default();
+    let network = DeleterError {
+        kind: DeleterErrorKind::Network,
+        message: "timeout".to_string(),
+    };
+    let deleter =
+        ScriptedDeleter::with_outcomes(vec![Ok(DeleteOutcome::Deleted), Err(network.clone())]);
+    register(&store, InstanceStatus::Active);
+    let service = Teardown::new(store.clone(), deleter.clone());
+    let request = exact_request();
+
+    assert_eq!(
+        block_on(service.teardown_exact_v1(&request)),
+        Err(TeardownError::DeleteFailed {
+            resource: InstanceResource::Message {
+                alias: "z_message".to_string(),
+                channel: ChannelId(99),
+                id: MessageId(401),
+            },
+            source: network,
+        })
+    );
+    assert_eq!(
+        block_on(service.observe_teardown_exact_v1(&request)).unwrap(),
+        InstanceTeardownRecoveryObservationV1::DurableRetryPending
+    );
+    deleter.replace_outcomes(vec![Ok(DeleteOutcome::AlreadyGone); 6]);
+    assert_eq!(
+        block_on(service.teardown_exact_v1(&request)).unwrap(),
+        TeardownOutcome::ResumedAndCompleted
+    );
+    assert_eq!(
+        deleter.calls(),
+        [
+            DeleteCall::Message(ChannelId(500), MessageId(400)),
+            DeleteCall::Message(ChannelId(99), MessageId(401)),
+        ]
+        .into_iter()
+        .chain(expected_order())
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        block_on(service.observe_teardown_exact_v1(&request)).unwrap(),
+        InstanceTeardownRecoveryObservationV1::ProvenSucceeded
+    );
+}
+
+#[derive(Clone)]
+struct ClaimDriftStore(Arc<Mutex<AutomationInstance>>);
+
+impl InstanceTeardownStoreV1 for ClaimDriftStore {
+    async fn get_for_teardown_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<Option<AutomationInstance>, InstanceStoreError> {
+        let instance = self.0.lock().unwrap().clone();
+        Ok((instance.guild_id == guild_id && &instance.id == instance_id).then_some(instance))
+    }
+
+    async fn claim_deleting_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<InstanceTeardownClaimOutcomeV1, InstanceStoreError> {
+        let mut instance = self.0.lock().unwrap();
+        if instance.guild_id != guild_id || &instance.id != instance_id {
+            return Err(InstanceStoreError::NotFound);
+        }
+        instance.status = InstanceStatus::Deleting;
+        instance.kind = InstanceKind("drifted".to_string());
+        Ok(InstanceTeardownClaimOutcomeV1::Claimed)
+    }
+
+    async fn mark_deleted_v1(
+        &self,
+        _guild_id: GuildId,
+        _instance_id: &InstanceId,
+    ) -> Result<InstanceTeardownMarkOutcomeV1, InstanceStoreError> {
+        Ok(InstanceTeardownMarkOutcomeV1::MarkedDeleted)
+    }
+
+    async fn list_retryable_v1(
+        &self,
+        _guild_id: GuildId,
+        _limit: NonZeroUsize,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn identity_complete_teardown_rejects_same_manifest_replacement_after_claim_before_first_delete() {
+    let instance = instance_for_guild(GUILD, InstanceStatus::Active);
+    let request = ExactInstanceTeardownRequestV1::new_exact_v1(
+        instance.guild_id,
+        instance.id.clone(),
+        instance.resources.clone(),
+        ExactInstanceRegistrationIdentityV1::new(
+            instance.ruleset_key.clone(),
+            instance.ruleset_version,
+            instance.kind.clone(),
+            instance.created_by,
+        ),
+    );
+    let store = ClaimDriftStore(Arc::new(Mutex::new(instance)));
+    let deleter = ScriptedDeleter::default();
+    let service = Teardown::new(store, deleter.clone());
+
+    assert_eq!(
+        block_on(service.teardown_exact_v1(&request)),
+        Err(TeardownError::ManifestDrift)
+    );
+    assert!(deleter.calls().is_empty());
 }

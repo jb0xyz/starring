@@ -3,14 +3,17 @@ use std::time::Duration;
 
 use automation_runtime::{
     AcquiredInteractionLifecyclePermitV1, AuthoritativeInteractionClaimV1,
-    InteractionEffectPermitV1, InteractionInitialResponseIntentDispositionV1,
+    InteractionEffectIntentDispositionV1, InteractionEffectJournalIntendV1,
+    InteractionEffectJournalPlanV1, InteractionEffectJournalPortV1, InteractionEffectPermitV1,
+    InteractionEffectPlanBindDispositionV1, InteractionInitialResponseIntentDispositionV1,
     InteractionInitialResponseIntentV1, InteractionInitialResponseResultV1,
     InteractionTerminalFinishV1, SharedGatewayDurableReceiptClaimInputV1,
     SharedGatewayInteractionIdentityV3, SharedGatewayInteractionKindV3,
     ACQUIRED_INTERACTION_CLAIM_LEASE_V1,
 };
 use automation_runtime_interaction::{
-    InteractionActionPlanDigestV1, InteractionReceiptClaimRootV1,
+    InteractionActionPlanDigestV1, InteractionEffectAttemptOutcomeV1,
+    InteractionEffectMaterializedPlanV1, InteractionReceiptClaimRootV1,
 };
 use tokio::sync::Mutex;
 use tokio::time::{timeout_at, Instant};
@@ -90,6 +93,7 @@ pub(crate) trait RuntimeInteractionReceiptPersistencePortV1:
     Clone + Send + Sync + 'static
 {
     type Claim: Send;
+    type EffectIntentPermit: Send;
 
     fn claim_root_v1(claim: &Self::Claim) -> &InteractionReceiptClaimRootV1;
 
@@ -128,6 +132,29 @@ pub(crate) trait RuntimeInteractionReceiptPersistencePortV1:
         RuntimeInteractionReceiptPersistenceMutationDispositionV1,
         RuntimeInteractionReceiptPermitErrorV1,
     >;
+
+    async fn bind_effect_plan_v1(
+        &self,
+        claim: &mut Self::Claim,
+        plan: &InteractionEffectJournalPlanV1,
+    ) -> Result<InteractionEffectPlanBindDispositionV1, RuntimeInteractionReceiptPermitErrorV1>;
+
+    async fn intend_effect_v1(
+        &self,
+        claim: &mut Self::Claim,
+        intent: InteractionEffectJournalIntendV1<'_>,
+    ) -> Result<
+        InteractionEffectIntentDispositionV1<Self::EffectIntentPermit>,
+        RuntimeInteractionReceiptPermitErrorV1,
+    >;
+
+    async fn finish_effect_v1(
+        &self,
+        claim: &mut Self::Claim,
+        permit: &Self::EffectIntentPermit,
+        materialized: &InteractionEffectMaterializedPlanV1,
+        outcome: &InteractionEffectAttemptOutcomeV1,
+    ) -> Result<(), RuntimeInteractionReceiptPermitErrorV1>;
 
     async fn commit_terminal_v1(
         &self,
@@ -331,6 +358,46 @@ where
         let mut checkpoint = self.checkpoint.lock().await;
         self.persistence
             .commit_terminal_v1(&mut checkpoint.claim, finish)
+            .await
+    }
+}
+
+impl<P> InteractionEffectJournalPortV1 for RuntimeAcquiredInteractionPermitV1<P>
+where
+    P: RuntimeInteractionReceiptPersistencePortV1,
+{
+    type Error = RuntimeInteractionReceiptPermitErrorV1;
+    type IntentPermit = P::EffectIntentPermit;
+
+    async fn bind_effect_plan_v1(
+        &self,
+        plan: &InteractionEffectJournalPlanV1,
+    ) -> Result<InteractionEffectPlanBindDispositionV1, Self::Error> {
+        let mut checkpoint = self.checkpoint.lock().await;
+        self.persistence
+            .bind_effect_plan_v1(&mut checkpoint.claim, plan)
+            .await
+    }
+
+    async fn intend_effect_v1(
+        &self,
+        intent: InteractionEffectJournalIntendV1<'_>,
+    ) -> Result<InteractionEffectIntentDispositionV1<Self::IntentPermit>, Self::Error> {
+        let mut checkpoint = self.checkpoint.lock().await;
+        self.persistence
+            .intend_effect_v1(&mut checkpoint.claim, intent)
+            .await
+    }
+
+    async fn finish_effect_v1(
+        &self,
+        permit: &Self::IntentPermit,
+        materialized: &InteractionEffectMaterializedPlanV1,
+        outcome: &InteractionEffectAttemptOutcomeV1,
+    ) -> Result<(), Self::Error> {
+        let mut checkpoint = self.checkpoint.lock().await;
+        self.persistence
+            .finish_effect_v1(&mut checkpoint.claim, permit, materialized, outcome)
             .await
     }
 }

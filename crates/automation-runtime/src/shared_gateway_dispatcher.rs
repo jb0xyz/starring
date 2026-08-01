@@ -46,8 +46,14 @@ use crate::acquired_receipt_execution::{
     execute_acquired_interaction_v1, AcquiredInteractionExecutionOutcomeV1,
     AcquiredInteractionExecutionServicesV1, AcquiredInteractionLifecyclePermitV1,
 };
+use crate::discord_original_response::OwnedTwilightOriginalResponseObserverV1;
+use crate::effect_journal::InteractionEffectJournalPortV1;
 use crate::instance_deleter::OwnedTwilightInstanceDeleter;
+use crate::interaction_effect_recovery_executor::{
+    OwnedSharedGatewayDiscordEffectsV1, OwnedSharedGatewayInternalEffectRecoveryV1,
+};
 use crate::mutation::TwilightMutationAdapter;
+use crate::receipt_fenced_effects::InteractionEffectPermitV1;
 use crate::responder::TwilightInteractionResponder;
 #[cfg(any(test, doctest))]
 use crate::runner::InteractionExecutionOutcomeV3;
@@ -723,7 +729,7 @@ pub fn reserve_shared_gateway_interaction_v3(
             return SharedGatewayInteractionReservationOutcomeV3::Rejected {
                 reason: SharedGatewayInteractionRejectionV3::Route(error),
                 envelope: Box::new(envelope),
-            }
+            };
         }
     }
     let Some(ready_lease) = ready_lease else {
@@ -940,6 +946,24 @@ where
         self.admission_budget.capacity()
     }
 
+    pub fn original_response_observer_v1(&self) -> OwnedTwilightOriginalResponseObserverV1 {
+        OwnedTwilightOriginalResponseObserverV1::new(Arc::clone(&self.interaction_http))
+    }
+
+    pub fn discord_effects_v1(&self) -> OwnedSharedGatewayDiscordEffectsV1 {
+        OwnedSharedGatewayDiscordEffectsV1::new(
+            Arc::clone(&self.mutation_http),
+            self.snapshot_provider.bot_user_id_v1(),
+        )
+    }
+
+    pub fn internal_effect_recovery_v1(&self) -> OwnedSharedGatewayInternalEffectRecoveryV1<I> {
+        OwnedSharedGatewayInternalEffectRecoveryV1::new(
+            self.instances.clone(),
+            Arc::clone(&self.teardown),
+        )
+    }
+
     pub fn reserve_v3(
         &self,
         envelope: SharedGatewayInteractionEnvelopeV3,
@@ -995,7 +1019,8 @@ where
         permit: P,
     ) -> AcquiredInteractionExecutionOutcomeV1
     where
-        P: AcquiredInteractionLifecyclePermitV1,
+        P: AcquiredInteractionLifecyclePermitV1
+            + InteractionEffectJournalPortV1<Error = <P as InteractionEffectPermitV1>::Error>,
     {
         let (admitted, envelope) = admitted.into_parts_v1();
         let (identity, _, _) = execution_inputs(admitted.route());

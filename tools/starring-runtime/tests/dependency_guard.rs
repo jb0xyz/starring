@@ -590,6 +590,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/closed_recovery.rs",
             "src/config.rs",
             "src/controller_identity.rs",
+            "src/database/effect_recovery.rs",
             "src/database.rs",
             "src/discord.rs",
             "src/discord_actor_serving_tests.rs",
@@ -603,6 +604,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/identity_encoding.rs",
             "src/ingress_acknowledgement_safety.rs",
             "src/ingress_acknowledgement_supervisor.rs",
+            "src/interaction_effect_recovery_supervisor.rs",
             "src/interaction_receipt.rs",
             "src/interaction_receipt_recovery_supervisor.rs",
             "src/lib.rs",
@@ -646,6 +648,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "tests/mutation_finalizer.rs",
             "tests/process_contract.rs",
             "tests/serving_heartbeat_monitor_guard.rs",
+            "tests/staging_effect_acl_backfill_contract.rs",
             "tests/staging_receipt_acl_backfill_contract.rs",
             "tests/staging_role_bootstrap_contract.rs"
         ]
@@ -1087,6 +1090,192 @@ fn receipt_recovery_is_database_only_owner_bound_and_joined_before_release() {
 }
 
 #[test]
+fn effect_recovery_is_serving_open_bound_and_stops_first() {
+    let database = source_before_test_module(include_str!("../src/database.rs"));
+    let supervisor = source_before_test_module(include_str!(
+        "../src/interaction_effect_recovery_supervisor.rs"
+    ));
+    let process = source_before_test_module(include_str!("../src/process.rs"));
+    let process_startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let owner = source_before_test_module(include_str!("../src/process/owner.rs"));
+    let serving = source_before_test_module(include_str!("../src/process/serving.rs"));
+
+    let composition = braced_declaration(
+        process,
+        "pub(crate) async fn compose_runtime_process_foundation_v1(",
+    );
+    assert!(composition.contains("effect_recovery_supervisor: None"));
+    assert!(!composition.contains("start_effect_recovery_supervisor_v1"));
+    let activation = braced_declaration(
+        process,
+        "pub(super) fn start_effect_recovery_supervisor_v1(",
+    );
+    assert_eq!(
+        activation
+            .matches("start_effect_recovery_supervisor_v1()")
+            .count(),
+        1
+    );
+
+    let owner_transition = braced_declaration(owner, "pub(crate) async fn into_owner_held_v1(");
+    assert!(!owner_transition.contains("start_effect_recovery_supervisor_v1"));
+    let serving_transition =
+        braced_declaration(serving, "pub(crate) async fn enter_serving_open_v2(");
+    assert!(serving_transition.starts_with(
+        "pub(crate) async fn enter_serving_open_v2(\n        self,\n    ) -> Result<RuntimeServingOpenProcessV2"
+    ));
+    assert_eq!(
+        process_startup.matches(".enter_serving_open_v2()").count(),
+        1
+    );
+    assert_eq!(
+        serving_transition
+            .matches("start_effect_recovery_supervisor_v1()")
+            .count(),
+        1
+    );
+    let final_revalidation = serving_transition
+        .rfind("if let Err(transition) = process.revalidate_v2().await")
+        .unwrap();
+    let recovery_started = serving_transition
+        .find("process.foundation.start_effect_recovery_supervisor_v1()")
+        .unwrap();
+    let success = serving_transition.rfind("Ok(process)").unwrap();
+    assert!(final_revalidation < recovery_started);
+    assert!(recovery_started < success);
+
+    let stop_effect = braced_declaration(
+        process,
+        "pub(super) async fn stop_effect_recovery_supervisor_until_v1(",
+    );
+    assert!(stop_effect.contains("effect_recovery.shutdown_until(deadline).await"));
+    let begin = braced_declaration(process, "pub(super) async fn begin_shutdown_v1(");
+    let effect_shutdown = begin
+        .find("self.stop_effect_recovery_supervisor_until_v1(deadline)")
+        .unwrap();
+    let receipt_shutdown = begin
+        .find("receipt_recovery.shutdown_until(deadline).await")
+        .unwrap();
+    assert!(effect_shutdown < receipt_shutdown);
+    let serving_shutdown = braced_declaration(
+        serving,
+        "pub(super) async fn stop_runtime_controller_before_cleanup_v2(",
+    );
+    let effect_shutdown = serving_shutdown
+        .find("stop_effect_recovery_supervisor_until_v1(deadline)")
+        .unwrap();
+    let controller_shutdown = serving_shutdown
+        .find("controller.shutdown_until_v2(deadline)")
+        .unwrap();
+    assert!(effect_shutdown < controller_shutdown);
+    let finish = braced_declaration(process, "pub(super) async fn finish_shutdown_v1(");
+    let effect_shutdown = finish
+        .find("effect_recovery.shutdown_until(cleanup_deadline).await")
+        .unwrap();
+    let receipt_shutdown = finish
+        .find("receipt_recovery.shutdown_until(cleanup_deadline).await")
+        .unwrap();
+    let pool_close = finish
+        .find("shutdown.close_until(cleanup_deadline).await")
+        .unwrap();
+    assert!(effect_shutdown < receipt_shutdown);
+    assert!(effect_shutdown < pool_close);
+
+    assert!(database.contains("pub(crate) fn start_effect_recovery_supervisor_v1("));
+    assert!(
+        database.contains("RuntimeInteractionEffectRecoverySupervisorConfigV1::production_v1()")
+    );
+    assert!(supervisor.contains("RuntimeInteractionEffectRecoverySupervisorV1(<redacted>)"));
+    for code in [
+        "runtime_process_interaction_effect_recovery_supervisor_control_closed",
+        "runtime_process_interaction_effect_recovery_supervisor_panicked",
+        "runtime_process_interaction_effect_recovery_supervisor_shutdown_deadline_elapsed",
+    ] {
+        assert!(process.contains(code), "{code}");
+    }
+}
+
+#[test]
+fn effect_recovery_commits_claims_before_external_work_and_finalizes_separately() {
+    let recovery = include_str!("../src/database/effect_recovery.rs");
+    let observation = braced_declaration(recovery, "async fn recover_observation_v1(");
+    let claim = observation
+        .find("claim_interaction_effect_recovery_v1(")
+        .unwrap();
+    let external = observation
+        .find("executor.observe_v1(request).await")
+        .unwrap();
+    let reconcile = observation
+        .find("reconcile_interaction_effect_v1(request).await")
+        .unwrap();
+    assert!(claim < external && external < reconcile);
+
+    let compensation = braced_declaration(recovery, "async fn begin_compensation_v1(");
+    let intend = compensation
+        .find("intend_interaction_effect_compensation_v1(")
+        .unwrap();
+    let external = compensation
+        .find("executor.compensate_v1(request).await")
+        .unwrap();
+    let finish = compensation
+        .find("finish_interaction_effect_compensation_v1(request)")
+        .unwrap();
+    assert!(intend < external && external < finish);
+
+    let observation = braced_declaration(recovery, "async fn observe_compensation_v1(");
+    let claim = observation
+        .find("claim_interaction_effect_recovery_v1(")
+        .unwrap();
+    let external = observation
+        .find("executor.observe_compensation_v1(request).await")
+        .unwrap();
+    let reconcile = observation
+        .find("reconcile_interaction_effect_v1(request).await")
+        .unwrap();
+    assert!(claim < external && external < reconcile);
+
+    let response = braced_declaration(recovery, "async fn observe_response_tail_v1(");
+    let claim = response
+        .find("claim_interaction_response_tail_v1(request)")
+        .unwrap();
+    let token_budget = response
+        .find("response_token_has_minimum_budget_v1(")
+        .unwrap();
+    let decrypt = response.find("self.cipher.decrypt(").unwrap();
+    let external = response.find("executor.observe_v1(request).await").unwrap();
+    let finalize = response
+        .find("finalize_interaction_response_tail_v1(request)")
+        .unwrap();
+    assert!(claim < token_budget && token_budget < decrypt && decrypt < external);
+    assert!(external < finalize);
+    assert!(response.contains("finalize_response_token_unrecoverable_v1(&claim)"));
+    assert!(!response.contains("RuntimeInteractionEffectRecoveryDispositionV1::RouteBlocked"));
+
+    assert!(
+        recovery.contains("scan_recoverable_interaction_response_tails_v1(&source_cursor, limit)")
+    );
+    assert!(recovery.contains("scan_recoverable_interaction_effects_v1("));
+    assert!(recovery.contains("persist_recovery_block_v1(&claim"));
+    assert!(recovery.contains("persist_compensation_block_v1("));
+    assert!(recovery.contains("persist_response_tail_recovery_block_v1("));
+    assert!(recovery.contains("RuntimeInteractionEffectRecoveryDispositionV1::RouteBlocked"));
+    assert!(
+        recovery.contains("const RESPONSE_TAIL_MINIMUM_TOKEN_BUDGET_MILLISECONDS_V1: u64 = 12_000")
+    );
+    let definition = braced_declaration(recovery, "fn recovery_definition_v1(");
+    for required in [
+        "RuntimeInteractionEffectInstanceRegistrationIdentityV1::from_ruleset_version_v1(",
+        "ruleset_key.clone()",
+        "process.target.version",
+        "kind.clone()",
+        "candidate.origin().actor_user_id()",
+        ".resolved_instance_manifest_digest()",
+    ] {
+        assert!(definition.contains(required), "{required}");
+    }
+}
+
+#[test]
 fn source_is_comment_free_and_external_composition_is_bounded() {
     for (path, source) in source_files() {
         assert!(!has_rust_comment(&source), "{}", path.display());
@@ -1116,7 +1305,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
                 path.display()
             );
         }
-        if path != Path::new("src/database.rs") {
+        if path != Path::new("src/database.rs") && !path.starts_with("src/database") {
             for forbidden in [
                 "sqlx",
                 "PgPool",
@@ -1186,6 +1375,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/ingress_acknowledgement_safety.rs")
             && path != Path::new("src/ingress_acknowledgement_supervisor.rs")
             && path != Path::new("src/interaction_receipt.rs")
+            && path != Path::new("src/interaction_effect_recovery_supervisor.rs")
             && path != Path::new("src/interaction_receipt_recovery_supervisor.rs")
             && path != Path::new("src/maintenance_ingress_gate.rs")
             && path != Path::new("src/process/closed.rs")
@@ -1718,7 +1908,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     identifier,
                     "GatewayAdmissionPolicyV3" | "GatewayControlConfigV3"
                 );
-            let allowed_interaction_dispatch_database = path == Path::new("src/database.rs")
+            let allowed_interaction_dispatch_database = (path == Path::new("src/database.rs")
+                || path.starts_with("src/database"))
                 && matches!(
                     identifier,
                     "automation_runtime" | "automation_runtime_convergence"
@@ -1754,7 +1945,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         | "SharedGatewayInteractionKindV3"
                         | "SharedGatewayInteractionReservationOutcomeV3"
                         | "SharedGatewayReservedInteractionV3"
-                ) && path == Path::new("src/database.rs");
+                ) && (path == Path::new("src/database.rs") || path.starts_with("src/database"));
             let allowed_registry_adapter = path == Path::new("src/registry.rs")
                 && matches!(
                     identifier,

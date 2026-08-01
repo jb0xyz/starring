@@ -311,8 +311,8 @@ removing security, restart, failure, or release gates.
 - [x] B5. Dispatch interactions on the canonical shard
 - [x] B6. Pass the staging end-to-end gate
 - [x] C1. Add durable interaction receipts
-- [ ] C2. Add complete deterministic action-plan preflight
-- [ ] C3. Add effect journal, reconciliation, and bounded compensation
+- [x] C2. Add complete deterministic action-plan preflight
+- [x] C3. Add effect journal, reconciliation, and bounded compensation
 - [ ] D1. Complete restart and failure cohorts
 - [ ] D2. Pass the final disposable-guild product E2E
 - [ ] D3. Pass the final complete gate
