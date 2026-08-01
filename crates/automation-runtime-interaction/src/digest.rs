@@ -13,6 +13,8 @@ use crate::{
 
 const REQUEST_DIGEST_DOMAIN_V1: &[u8] = b"starring.runtime.interaction.request.v1\0";
 const ACTION_PLAN_DIGEST_DOMAIN_V1: &[u8] = b"starring.runtime.interaction.action_plan.v1\0";
+const PREFLIGHT_CERTIFICATE_DIGEST_DOMAIN_V1: &[u8] =
+    b"starring.runtime.interaction.preflight_certificate.v1\0";
 const MAX_CUSTOM_ID_BYTES: usize = 100;
 const MAX_LOCALE_BYTES: usize = 64;
 const MAX_MODAL_INPUTS: usize = 5;
@@ -58,6 +60,9 @@ macro_rules! define_digest {
 
 define_digest!(InteractionRequestDigestV1);
 define_digest!(InteractionActionPlanDigestV1);
+define_digest!(InteractionPreflightPlanDigestV1);
+define_digest!(InteractionPreflightSnapshotDigestV1);
+define_digest!(InteractionPreflightCertificateDigestV1);
 define_digest!(InteractionInstanceManifestDigestV1);
 define_digest!(InteractionRouteAttestationDigestV1);
 define_digest!(InteractionTokenAuthenticatedDataDigestV1);
@@ -72,6 +77,55 @@ impl InteractionActionPlanDigestV1 {
     fn from_sha256(bytes: &[u8]) -> Self {
         Self(lower_hex(Sha256::digest(bytes).as_slice()))
     }
+}
+
+impl InteractionPreflightPlanDigestV1 {
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Self {
+        Self(lower_hex(Sha256::digest(bytes).as_slice()))
+    }
+}
+
+impl InteractionPreflightSnapshotDigestV1 {
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Self {
+        Self(lower_hex(Sha256::digest(bytes).as_slice()))
+    }
+}
+
+impl InteractionPreflightCertificateDigestV1 {
+    fn from_sha256(bytes: &[u8]) -> Self {
+        Self(lower_hex(Sha256::digest(bytes).as_slice()))
+    }
+}
+
+pub struct InteractionPreflightCertificateDigestInputV1<'a> {
+    pub claim_root: &'a InteractionReceiptClaimRootV1,
+    pub action_plan_digest: &'a InteractionActionPlanDigestV1,
+    pub preflight_plan_digest: &'a InteractionPreflightPlanDigestV1,
+    pub snapshot_digest: &'a InteractionPreflightSnapshotDigestV1,
+}
+
+pub fn build_interaction_preflight_certificate_digest_v1(
+    input: InteractionPreflightCertificateDigestInputV1<'_>,
+) -> InteractionPreflightCertificateDigestV1 {
+    let mut bytes = Vec::with_capacity(2_048);
+    append_frame(&mut bytes, PREFLIGHT_CERTIFICATE_DIGEST_DOMAIN_V1);
+    append_claim_root_v1(&mut bytes, input.claim_root);
+    append_field(
+        &mut bytes,
+        b"action_plan_digest",
+        input.action_plan_digest.as_str().as_bytes(),
+    );
+    append_field(
+        &mut bytes,
+        b"preflight_plan_digest",
+        input.preflight_plan_digest.as_str().as_bytes(),
+    );
+    append_field(
+        &mut bytes,
+        b"snapshot_digest",
+        input.snapshot_digest.as_str().as_bytes(),
+    );
+    InteractionPreflightCertificateDigestV1::from_sha256(&bytes)
 }
 
 impl InteractionTokenAuthenticatedDataDigestV1 {
@@ -656,6 +710,72 @@ mod tests {
         changed.push_action("grant_role", b"role=member").unwrap();
 
         assert_ne!(first.finish().unwrap(), changed.finish().unwrap());
+    }
+
+    #[test]
+    fn preflight_certificate_is_deterministic_and_binds_every_authoritative_input() {
+        let route = static_route(1);
+        let request = button_request("join");
+        let candidate = crate::InteractionReceiptClaimCandidateV1::new(
+            receipt(),
+            crate::InteractionExpectedRouteV1::from_authoritative(&route),
+            request.clone(),
+        );
+        let claim = candidate.bind_authoritative(route).unwrap();
+        let mut builder = InteractionActionPlanDigestBuilderV1::new(claim.route(), &request, false);
+        builder.push_action("grant_role", b"role=member").unwrap();
+        let action_plan = builder.finish().unwrap();
+        let preflight_plan = InteractionPreflightPlanDigestV1::from_canonical_bytes(b"plan");
+        let snapshot = InteractionPreflightSnapshotDigestV1::from_canonical_bytes(b"snapshot");
+        let build = |claim: &InteractionReceiptClaimRootV1,
+                     action_plan: &InteractionActionPlanDigestV1,
+                     preflight_plan: &InteractionPreflightPlanDigestV1,
+                     snapshot: &InteractionPreflightSnapshotDigestV1| {
+            build_interaction_preflight_certificate_digest_v1(
+                InteractionPreflightCertificateDigestInputV1 {
+                    claim_root: claim,
+                    action_plan_digest: action_plan,
+                    preflight_plan_digest: preflight_plan,
+                    snapshot_digest: snapshot,
+                },
+            )
+        };
+        let first = build(&claim, &action_plan, &preflight_plan, &snapshot);
+        assert_eq!(
+            first,
+            build(&claim, &action_plan, &preflight_plan, &snapshot)
+        );
+        assert_ne!(
+            first,
+            build(
+                &claim,
+                &action_plan,
+                &InteractionPreflightPlanDigestV1::from_canonical_bytes(b"changed"),
+                &snapshot,
+            )
+        );
+        assert_ne!(
+            first,
+            build(
+                &claim,
+                &action_plan,
+                &preflight_plan,
+                &InteractionPreflightSnapshotDigestV1::from_canonical_bytes(b"changed"),
+            )
+        );
+
+        let changed_route = static_route(2);
+        let changed_claim = crate::InteractionReceiptClaimCandidateV1::new(
+            receipt(),
+            crate::InteractionExpectedRouteV1::from_authoritative(&changed_route),
+            request,
+        )
+        .bind_authoritative(changed_route)
+        .unwrap();
+        assert_ne!(
+            first,
+            build(&changed_claim, &action_plan, &preflight_plan, &snapshot)
+        );
     }
 
     #[test]

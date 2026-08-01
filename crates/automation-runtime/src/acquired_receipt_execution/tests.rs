@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, Mutex};
 
+use automation_core::preflight::{
+    ActionPlanSnapshotIdentityV1, ActionPlanSnapshotRequestV1, ActionPlanSnapshotV1,
+};
 use automation_core::{
     AdapterErrorKind, CreateRoleSpec, MockInstanceTeardownService, PostPanelSpec,
 };
@@ -38,7 +41,10 @@ use automation_state::{
     ActionSpec, InstanceRef, InstanceResourceRefs, InteractionRule, InteractionRuleSet,
     ModalFieldSpec, ModalFieldStyle, ModalInputPolicy, ModalSpec, TriggerSpec,
 };
-use discord_model::{ChannelId, GuildId, MessageId, OverwriteTarget, Permissions, RoleId, UserId};
+use discord_model::{
+    Channel, ChannelId, ChannelType, GuildId, Member, MessageId, OverwriteTarget, Permissions,
+    Role, RoleId, UserId,
+};
 use resource_resolution::{resource_binding_fingerprint_v2, ResourceBindingMap};
 
 use crate::custom_id::{encode_button, encode_instance_action, encode_modal};
@@ -57,6 +63,8 @@ use super::*;
 
 const GUILD_ID: GuildId = GuildId(41_001);
 const RULESET_KEY: &str = "receipt_flow";
+const ACTIVE_INSTANCE_MANIFEST_DIGEST_V1: &str =
+    "85b0c4ae170d458fd4088b0dc4c89021cab4379d55376bef91dd005c59b42821";
 
 #[derive(Clone, Copy, Default)]
 struct PermitFailuresV1 {
@@ -394,6 +402,21 @@ impl GuildRoleSnapshotProvider for FakeSnapshotProviderV1 {
             bot_role_ids: BTreeSet::new(),
         })
     }
+
+    async fn action_plan_snapshot_v1(
+        &self,
+        request: &ActionPlanSnapshotRequestV1,
+    ) -> Result<ActionPlanSnapshotV1, SnapshotError> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("prepare.snapshot".to_string());
+        if self.fail {
+            return Err(SnapshotError::new("snapshot-secret"));
+        }
+        fake_action_snapshot_v1(request, Some(RoleId(41_098)))
+    }
 }
 
 struct FakeTeardownSnapshotProviderV1 {
@@ -416,6 +439,91 @@ impl GuildRoleSnapshotProvider for FakeTeardownSnapshotProviderV1 {
             bot_role_ids: BTreeSet::from([bot_role]),
         })
     }
+
+    async fn action_plan_snapshot_v1(
+        &self,
+        request: &ActionPlanSnapshotRequestV1,
+    ) -> Result<ActionPlanSnapshotV1, SnapshotError> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("prepare.snapshot".to_string());
+        let mut snapshot = fake_action_snapshot_v1(request, Some(RoleId(41_006)))?;
+        snapshot
+            .channels
+            .as_mut()
+            .expect("fake teardown snapshot has channels")
+            .push(Channel {
+                id: ChannelId(41_008),
+                name: "room".to_string(),
+                channel_type: ChannelType::Text,
+                parent_id: None,
+                position: 0,
+                overwrites: Vec::new(),
+            });
+        Ok(snapshot)
+    }
+}
+
+fn fake_action_snapshot_v1(
+    request: &ActionPlanSnapshotRequestV1,
+    bot_role: Option<RoleId>,
+) -> Result<ActionPlanSnapshotV1, SnapshotError> {
+    let mut roles = vec![Role {
+        id: RoleId(request.guild_id().0),
+        name: "everyone".to_string(),
+        permissions: Permissions::empty(),
+        position: 0,
+        managed: false,
+    }];
+    if let Some(bot_role) = bot_role {
+        roles.push(Role {
+            id: bot_role,
+            name: "bot".to_string(),
+            permissions: Permissions::ADMINISTRATOR,
+            position: 10,
+            managed: false,
+        });
+    }
+    for role_id in request.existing_roles() {
+        if roles.iter().all(|role| role.id != *role_id) {
+            roles.push(Role {
+                id: *role_id,
+                name: "existing".to_string(),
+                permissions: Permissions::empty(),
+                position: 1,
+                managed: false,
+            });
+        }
+    }
+    let channels = request
+        .existing_channels()
+        .iter()
+        .map(|channel_id| Channel {
+            id: *channel_id,
+            name: "existing".to_string(),
+            channel_type: ChannelType::Text,
+            parent_id: None,
+            position: 0,
+            overwrites: Vec::new(),
+        })
+        .collect();
+    Ok(ActionPlanSnapshotV1 {
+        guild_id: request.guild_id(),
+        identity: ActionPlanSnapshotIdentityV1::new("fake-action-snapshot-v1".to_string())
+            .map_err(|error| SnapshotError::new(error.to_string()))?,
+        roles: Some(roles),
+        channels: Some(channels),
+        bot_member: Some(Member {
+            user_id: UserId(41_099),
+            roles: bot_role.into_iter().collect(),
+        }),
+        actor_member: Some(Member {
+            user_id: request.actor(),
+            roles: Vec::new(),
+        }),
+    })
 }
 
 fn deployment_identity() -> RuntimeDeploymentIdentityV1 {
@@ -532,6 +640,20 @@ fn claim_root_v1(
     envelope: &SharedGatewayInteractionEnvelopeV3,
     instance_id: Option<&InstanceId>,
 ) -> InteractionReceiptClaimRootV1 {
+    let instance = instance_id.map(|instance_id| {
+        (
+            instance_id,
+            InteractionInstanceManifestDigestV1::parse("c".repeat(64)).unwrap(),
+        )
+    });
+    claim_root_with_instance_manifest_v1(admitted, envelope, instance)
+}
+
+fn claim_root_with_instance_manifest_v1(
+    admitted: &SharedGatewayAdmittedInteractionV3,
+    envelope: &SharedGatewayInteractionEnvelopeV3,
+    instance: Option<(&InstanceId, InteractionInstanceManifestDigestV1)>,
+) -> InteractionReceiptClaimRootV1 {
     let route = admitted.route();
     let serving = InteractionServingRouteIdentityV1::new(
         InteractionRouteAttestationDigestV1::parse("b".repeat(64)).unwrap(),
@@ -547,15 +669,15 @@ fn claim_root_v1(
         InteractionRouteIncarnationV1::new(admitted.token().route_incarnation().get()).unwrap(),
     );
     let scope = InteractionProductScopeV1::from_deployment_identity(route.deployment_identity());
-    let authoritative = match instance_id {
-        Some(instance_id) => InteractionRouteBindingV1::new_instance(
+    let authoritative = match instance {
+        Some((instance_id, resource_manifest_digest)) => InteractionRouteBindingV1::new_instance(
             scope,
             route.process_identity().clone(),
             serving,
             instance_id.clone(),
             route.process_identity().target.version,
             route.process_identity().target.content_hash,
-            InteractionInstanceManifestDigestV1::parse("c".repeat(64)).unwrap(),
+            resource_manifest_digest,
         )
         .unwrap(),
         None => {
@@ -729,7 +851,17 @@ fn active_instance_v1() -> AutomationInstance {
         ruleset_version: InstanceRuleSetVersion::new(1).unwrap(),
         kind: InstanceKind("study_room".to_string()),
         created_by: UserId(41_004),
-        resources: InstanceResources::default(),
+        resources: InstanceResources {
+            roles: BTreeMap::new(),
+            channels: BTreeMap::from([("room".to_string(), ChannelId(41_008))]),
+            messages: BTreeMap::from([(
+                "panel".to_string(),
+                automation_instance::InstanceMessageRef {
+                    channel: ChannelId(41_008),
+                    id: MessageId(41_009),
+                },
+            )]),
+        },
         status: automation_instance::InstanceStatus::Active,
     }
 }
@@ -746,6 +878,18 @@ fn assert_terminalized_v1(
         }
         other => panic!("unexpected outcome {other:?}"),
     }
+}
+
+#[test]
+fn combined_preflight_digest_material_is_unambiguous() {
+    let left = combined_preflight_digest_material_v1(b"ab", b"c").unwrap();
+    let right = combined_preflight_digest_material_v1(b"a", b"bc").unwrap();
+
+    assert_ne!(left, right);
+    assert_eq!(
+        combined_preflight_digest_material_v1(b"ab", b"c").unwrap(),
+        left
+    );
 }
 
 async fn run_register_only_v1(
@@ -1145,7 +1289,66 @@ async fn modal_response_uses_the_same_bound_fence() {
 }
 
 #[tokio::test]
-async fn defer_first_instance_defers_before_resolve_snapshot_and_bind() {
+async fn overlong_exact_modal_custom_id_has_zero_external_effects() {
+    let modal_key = "m".repeat(90);
+    let mut definition = static_ruleset(vec![ActionSpec::OpenModal {
+        modal: modal_key.clone(),
+    }]);
+    let mut modal = modal_definition(Vec::new()).modals.remove(0);
+    modal.key = modal_key;
+    definition.modals = vec![modal];
+    let admitted = admitted_v1(
+        artifact(definition),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), 51_024);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = MockInstanceTeardownService::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: false,
+    };
+
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        services_v1(
+            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+
+    assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::StaticPreparationFailed,
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        ["permit.finish:interaction_static_preparation_failed"]
+    );
+    assert!(state.binds.lock().unwrap().is_empty());
+    assert!(state
+        .trace
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|event| !event.starts_with("external.")));
+}
+
+#[tokio::test]
+async fn instance_preflight_and_plan_bind_complete_before_defer() {
     let definition = instance_definition();
     let pinned_artifact = artifact(definition.clone());
     let instance = active_instance_v1();
@@ -1187,12 +1390,12 @@ async fn defer_first_instance_defers_before_resolve_snapshot_and_bind() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
+            "prepare.snapshot",
+            "prepare.resolve",
+            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
-            "prepare.resolve",
-            "prepare.snapshot",
-            "permit.bind",
             "permit.execution_intent",
             "external.edit",
             "permit.finish:interaction_instance_completed",
@@ -1208,7 +1411,17 @@ async fn instance_teardown_crosses_execution_fence_before_the_service() {
     let custom_id = encode_instance_action(instance.id.as_str(), "close").unwrap();
     let admitted = admitted_v1(artifact(definition), &custom_id, Some(instance.clone())).await;
     let envelope = envelope_v1(custom_id, 51_022);
-    let root = claim_root_v1(&admitted, &envelope, Some(&instance.id));
+    let root = claim_root_with_instance_manifest_v1(
+        &admitted,
+        &envelope,
+        Some((
+            &instance.id,
+            InteractionInstanceManifestDigestV1::parse(
+                ACTIVE_INSTANCE_MANIFEST_DIGEST_V1.to_string(),
+            )
+            .unwrap(),
+        )),
+    );
     let (permit, state) = permit_v1(root, PermitFailuresV1::default());
     let responder = FakeResponderV1::successful(Arc::clone(&state));
     let mutation = FakeMutationV1::successful(Arc::clone(&state));
@@ -1245,12 +1458,12 @@ async fn instance_teardown_crosses_execution_fence_before_the_service() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
+            "prepare.snapshot",
+            "prepare.resolve",
+            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
-            "prepare.resolve",
-            "prepare.snapshot",
-            "permit.bind",
             "permit.execution_intent",
             "external.teardown",
             "permit.execution_intent",
@@ -1261,6 +1474,65 @@ async fn instance_teardown_crosses_execution_fence_before_the_service() {
 }
 
 #[tokio::test]
+async fn authoritative_instance_manifest_mismatch_has_zero_external_effects() {
+    let definition = instance_teardown_definition();
+    let pinned_artifact = artifact(definition.clone());
+    let instance = active_instance_v1();
+    let custom_id = encode_instance_action(instance.id.as_str(), "close").unwrap();
+    let admitted = admitted_v1(artifact(definition), &custom_id, Some(instance.clone())).await;
+    let envelope = envelope_v1(custom_id, 51_025);
+    let root = claim_root_v1(&admitted, &envelope, Some(&instance.id));
+    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = FakeTeardownV1 {
+        state: Arc::clone(&state),
+    };
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: Some(ResolvedPinnedInstanceV1 {
+            instance,
+            artifact: pinned_artifact,
+        }),
+    };
+    let snapshot = FakeTeardownSnapshotProviderV1 {
+        state: Arc::clone(&state),
+    };
+
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        AcquiredInteractionExecutionServicesV1::new(
+            &mutation, &responder, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+
+    assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "prepare.snapshot",
+            "prepare.resolve",
+            "permit.finish:interaction_instance_preparation_failed",
+        ]
+    );
+    assert!(state.binds.lock().unwrap().is_empty());
+    assert!(state
+        .trace
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|event| !event.starts_with("external.")));
+}
+
+#[tokio::test]
 async fn new_permit_execution_replay_denial_has_zero_teardown_effects() {
     let definition = instance_teardown_definition();
     let pinned_artifact = artifact(definition.clone());
@@ -1268,7 +1540,17 @@ async fn new_permit_execution_replay_denial_has_zero_teardown_effects() {
     let custom_id = encode_instance_action(instance.id.as_str(), "close").unwrap();
     let admitted = admitted_v1(artifact(definition), &custom_id, Some(instance.clone())).await;
     let envelope = envelope_v1(custom_id, 51_023);
-    let root = claim_root_v1(&admitted, &envelope, Some(&instance.id));
+    let root = claim_root_with_instance_manifest_v1(
+        &admitted,
+        &envelope,
+        Some((
+            &instance.id,
+            InteractionInstanceManifestDigestV1::parse(
+                ACTIVE_INSTANCE_MANIFEST_DIGEST_V1.to_string(),
+            )
+            .unwrap(),
+        )),
+    );
     let (permit, state) = permit_v1(
         root,
         PermitFailuresV1 {
@@ -1314,12 +1596,12 @@ async fn new_permit_execution_replay_denial_has_zero_teardown_effects() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
+            "prepare.snapshot",
+            "prepare.resolve",
+            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
-            "prepare.resolve",
-            "prepare.snapshot",
-            "permit.bind",
             "permit.execution_intent",
         ]
     );
@@ -1375,6 +1657,7 @@ async fn mutation_before_response_is_fenced_in_plan_order() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
+            "prepare.snapshot",
             "permit.bind",
             "permit.execution_intent",
             "external.create_role",
@@ -1431,6 +1714,7 @@ async fn mutation_only_plan_finishes_without_inventing_acknowledgement() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
+            "prepare.snapshot",
             "permit.bind",
             "permit.execution_intent",
             "external.create_role",
@@ -1679,7 +1963,7 @@ async fn fenced_persistence_outages_stop_before_the_external_call() {
     );
     assert_eq!(
         *execution_state.trace.lock().unwrap(),
-        ["permit.bind", "permit.execution_intent"]
+        ["prepare.snapshot", "permit.bind", "permit.execution_intent"]
     );
 }
 

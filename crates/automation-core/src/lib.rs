@@ -6,6 +6,7 @@ pub mod mock;
 pub mod modal_input;
 pub mod plan;
 pub mod policy;
+pub mod preflight;
 mod prepare;
 pub mod run;
 pub mod template;

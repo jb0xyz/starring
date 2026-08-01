@@ -7,11 +7,14 @@ mod token;
 mod test_support;
 
 pub use digest::{
-    build_interaction_request_digest_v1, InteractionActionPlanDigestBuilderErrorV1,
-    InteractionActionPlanDigestBuilderV1, InteractionActionPlanDigestV1, InteractionDigestErrorV1,
-    InteractionInstanceManifestDigestV1, InteractionRequestDigestErrorV1,
-    InteractionRequestDigestInputV1, InteractionRequestDigestV1, InteractionRequestPayloadV1,
-    InteractionRouteAttestationDigestV1, InteractionTokenAuthenticatedDataDigestV1,
+    build_interaction_preflight_certificate_digest_v1, build_interaction_request_digest_v1,
+    InteractionActionPlanDigestBuilderErrorV1, InteractionActionPlanDigestBuilderV1,
+    InteractionActionPlanDigestV1, InteractionDigestErrorV1, InteractionInstanceManifestDigestV1,
+    InteractionPreflightCertificateDigestInputV1, InteractionPreflightCertificateDigestV1,
+    InteractionPreflightPlanDigestV1, InteractionPreflightSnapshotDigestV1,
+    InteractionRequestDigestErrorV1, InteractionRequestDigestInputV1, InteractionRequestDigestV1,
+    InteractionRequestPayloadV1, InteractionRouteAttestationDigestV1,
+    InteractionTokenAuthenticatedDataDigestV1,
 };
 pub use identity::{
     DiscordApplicationIdV1, DiscordInteractionIdV1, DiscordInteractionIdentityErrorV1,

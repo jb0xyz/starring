@@ -2,24 +2,33 @@ use std::fmt::{Debug, Formatter};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
+use automation_core::preflight::{
+    execute_preflighted_action_plan_v1, preflight_action_plan_v1, prepare_action_plan_v1,
+    ActionPlanSnapshotIdentityV1, ActionPlanSnapshotRequestV1, ActionPlanSnapshotV1,
+    PreflightedActionPlanV1,
+};
 use automation_core::{
-    prepare_event_execution, run, ActionPlan, AdapterError, AutomationServices,
-    DiscordMutationAdapter, EventKind, InteractionResponder, RunningRuleSetIdentity,
-    RuntimeContext, RuntimeEvent,
+    prepare_event_execution, ActionPlan, AdapterError, AutomationServices, DiscordMutationAdapter,
+    EventKind, InteractionResponder, RunningRuleSetIdentity, RuntimeContext, RuntimeEvent,
 };
 use automation_instance::{InstanceIdGenerator, InstanceRegistrarV1};
 use automation_instance_teardown::InstanceTeardownService;
 use automation_ruleset_dispatch::{
-    prepare_instance_action_with_resolver_v1, GuildRoleSnapshotProvider, PinnedInstanceResolverV1,
+    prepare_instance_action_with_resolver_and_snapshot_v1, GuildRoleSnapshot,
+    GuildRoleSnapshotProvider, PinnedInstanceResolverV1,
 };
 use automation_runtime_interaction::{
-    InteractionActionPlanDigestV1, InteractionReceiptClaimRootV1, InteractionReceiptIdentityV1,
-    InteractionReceiptStateV1, InteractionRequestDigestV1, InteractionRouteBindingV1,
+    InteractionActionPlanDigestV1, InteractionExecutionRouteV1, InteractionPreflightPlanDigestV1,
+    InteractionPreflightSnapshotDigestV1, InteractionReceiptClaimRootV1,
+    InteractionReceiptIdentityV1, InteractionReceiptStateV1, InteractionRequestDigestV1,
+    InteractionRouteBindingV1,
 };
 use sha2::{Digest, Sha256};
 use tokio::time::{sleep_until, Instant};
 
 use crate::action_plan_digest::build_interaction_action_plan_digest_v1;
+use crate::action_plan_preflight_certificate::InteractionActionPreflightCertificateV1;
+use crate::action_plan_wire_preflight::{preflight_action_plan_wire_v1, ActionPlanWirePreflightV1};
 use crate::convert::interaction_to_event;
 use crate::receipt_fenced_effects::{
     InteractionEffectPermitV1, InteractionInitialResponseIntentDispositionV1,
@@ -34,6 +43,9 @@ use crate::shared_gateway_executor::execution_inputs;
 
 const TERMINAL_DIGEST_DOMAIN_V1: &[u8] = b"starring.runtime.acquired_receipt.terminal.v1\0";
 const TERMINAL_DIGEST_VERSION_V1: u16 = 1;
+const COMBINED_PREFLIGHT_DIGEST_DOMAIN_V1: &[u8] =
+    b"starring.runtime.interaction.combined_preflight_plan.v1\0";
+const MAX_COMBINED_PREFLIGHT_DIGEST_MATERIAL_BYTES_V1: usize = 2_098_176;
 const ACQUIRED_INTERACTION_CLAIM_LEASE_SECONDS_V1: u64 = 5 * 60;
 const ACQUIRED_INTERACTION_EXECUTION_DEADLINE_SECONDS_V1: u64 = 4 * 60;
 const ACQUIRED_INTERACTION_RECOVERY_MARGIN_SECONDS_V1: u64 = 60;
@@ -378,6 +390,7 @@ where
                 &identity,
                 &artifact.definition,
                 &bindings,
+                services.snapshot_provider,
                 &execution_services,
             )
             .await
@@ -411,6 +424,7 @@ async fn execute_static_v1<P, M, R, S, G, T>(
     identity: &RunningRuleSetIdentity,
     ruleset: &automation_state::InteractionRuleSet,
     bindings: &resource_resolution::ResourceBindingMap,
+    snapshot_provider: &impl GuildRoleSnapshotProvider,
     services: &AutomationServices<'_, M, R, S, G, T>,
 ) -> AcquiredInteractionExecutionOutcomeV1
 where
@@ -454,11 +468,25 @@ where
         )
         .await;
     };
-    if leading_defer_ephemeral {
-        if let Err(error) = services.responder.defer_ephemeral().await {
-            return handle_execution_error_v1(permit, tracking, error, None).await;
-        }
-    }
+    let Some(preflight) = build_preflight_execution_v1(
+        permit,
+        &context,
+        &plan,
+        &action_plan_digest,
+        services.instance_ids,
+        snapshot_provider,
+        None,
+    )
+    .await
+    else {
+        return finish_terminal_v1(
+            permit,
+            Some(&action_plan_digest),
+            AcquiredInteractionTerminalOutcomeV1::StaticPreparationFailed,
+            false,
+        )
+        .await;
+    };
     if permit
         .bind_action_plan_digest_v1(&action_plan_digest)
         .await
@@ -469,11 +497,15 @@ where
             tracking.any_external_attempt_v1(),
         );
     }
-    execute_bound_plan_v1(
+    if leading_defer_ephemeral {
+        if let Err(error) = services.responder.defer_ephemeral().await {
+            return handle_execution_error_v1(permit, tracking, error, None).await;
+        }
+    }
+    execute_bound_preflighted_plan_v1(
         permit,
         tracking,
-        &context,
-        &plan,
+        preflight,
         &action_plan_digest,
         AcquiredInteractionTerminalOutcomeV1::StaticCompleted,
         services,
@@ -504,16 +536,43 @@ where
     PR: PinnedInstanceResolverV1,
     SP: GuildRoleSnapshotProvider,
 {
-    if let Err(error) = services.responder.defer_ephemeral().await {
-        return handle_execution_error_v1(permit, tracking, error, None).await;
-    }
-    let prepared = match prepare_instance_action_with_resolver_v1(
+    let complete_snapshot_request =
+        ActionPlanSnapshotRequestV1::complete(event.guild_id, event.actor);
+    let action_snapshot = match snapshot_provider
+        .action_plan_snapshot_v1(&complete_snapshot_request)
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return finish_terminal_v1(
+                permit,
+                None,
+                AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
+                false,
+            )
+            .await
+        }
+    };
+    let readiness_snapshot = match GuildRoleSnapshot::from_action_plan_snapshot_v1(&action_snapshot)
+    {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return finish_terminal_v1(
+                permit,
+                None,
+                AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
+                false,
+            )
+            .await
+        }
+    };
+    let prepared = match prepare_instance_action_with_resolver_and_snapshot_v1(
         event,
         instance_id,
         action,
         &identity.key,
         pinned_resolver,
-        snapshot_provider,
+        &readiness_snapshot,
         bindings,
     )
     .await
@@ -524,7 +583,7 @@ where
                 permit,
                 None,
                 AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
-                tracking.any_external_attempt_v1(),
+                false,
             )
             .await
         }
@@ -541,18 +600,41 @@ where
         )
         .await;
     };
+    let Some(preflight) = build_preflight_execution_v1(
+        permit,
+        &context,
+        &plan,
+        &action_plan_digest,
+        services.instance_ids,
+        snapshot_provider,
+        Some(action_snapshot),
+    )
+    .await
+    else {
+        return finish_terminal_v1(
+            permit,
+            Some(&action_plan_digest),
+            AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
+            false,
+        )
+        .await;
+    };
     if permit
         .bind_action_plan_digest_v1(&action_plan_digest)
         .await
         .is_err()
     {
-        return persistence_failed_v1(AcquiredInteractionPersistenceStageV1::ActionPlanBind, true);
+        return persistence_failed_v1(AcquiredInteractionPersistenceStageV1::ActionPlanBind, false);
     }
-    execute_bound_plan_v1(
+    if leading_defer_ephemeral {
+        if let Err(error) = services.responder.defer_ephemeral().await {
+            return handle_execution_error_v1(permit, tracking, error, None).await;
+        }
+    }
+    execute_bound_preflighted_plan_v1(
         permit,
         tracking,
-        &context,
-        &plan,
+        preflight,
         &action_plan_digest,
         AcquiredInteractionTerminalOutcomeV1::InstanceCompleted,
         services,
@@ -560,11 +642,155 @@ where
     .await
 }
 
-async fn execute_bound_plan_v1<P, M, R, S, G, T>(
+struct PreflightExecutionEnvelopeV1 {
+    plan: PreflightedActionPlanV1,
+    wire: ActionPlanWirePreflightV1,
+    expected_snapshot_identity: ActionPlanSnapshotIdentityV1,
+    certificate: InteractionActionPreflightCertificateV1,
+}
+
+async fn build_preflight_execution_v1<P, G, SP>(
     permit: &P,
-    tracking: &TrackingInteractionEffectPermitV1<'_, P>,
     context: &RuntimeContext,
     plan: &ActionPlan,
+    action_plan_digest: &InteractionActionPlanDigestV1,
+    instance_ids: &G,
+    snapshot_provider: &SP,
+    captured_snapshot: Option<ActionPlanSnapshotV1>,
+) -> Option<PreflightExecutionEnvelopeV1>
+where
+    P: AcquiredInteractionLifecyclePermitV1,
+    G: InstanceIdGenerator,
+    SP: GuildRoleSnapshotProvider,
+{
+    let prepared = prepare_action_plan_v1(context, plan, instance_ids).ok()?;
+    let wire = preflight_action_plan_wire_v1(&prepared).ok()?;
+    let claim = permit.authoritative_claim_v1();
+    if !authoritative_teardown_manifest_matches_v1(claim.route(), &wire) {
+        return None;
+    }
+    let combined_preflight_material = combined_preflight_digest_material_v1(
+        prepared.digest_material_v1(),
+        wire.wire_digest_material_v1(),
+    )?;
+    let preflight_plan_digest =
+        InteractionPreflightPlanDigestV1::from_canonical_bytes(&combined_preflight_material);
+    let snapshot = match captured_snapshot {
+        Some(snapshot) => snapshot,
+        None if prepared.snapshot_request().observations().is_empty() => {
+            no_observation_snapshot_v1(prepared.snapshot_request()).ok()?
+        }
+        None => snapshot_provider
+            .action_plan_snapshot_v1(prepared.snapshot_request())
+            .await
+            .ok()?,
+    };
+    let expected_snapshot_identity = snapshot.identity.clone();
+    let snapshot_digest = InteractionPreflightSnapshotDigestV1::from_canonical_bytes(
+        expected_snapshot_identity.as_str().as_bytes(),
+    );
+    let plan = preflight_action_plan_v1(prepared, snapshot).ok()?;
+    if plan.snapshot_identity() != &expected_snapshot_identity {
+        return None;
+    }
+    let claim = permit.authoritative_claim_v1();
+    if !authoritative_teardown_manifest_matches_v1(claim.route(), &wire) {
+        return None;
+    }
+    let certificate = InteractionActionPreflightCertificateV1::issue(
+        claim.claim_root,
+        action_plan_digest.clone(),
+        preflight_plan_digest.clone(),
+        snapshot_digest.clone(),
+    );
+    certificate
+        .verify(
+            claim.claim_root,
+            action_plan_digest,
+            &preflight_plan_digest,
+            &snapshot_digest,
+        )
+        .ok()?;
+    Some(PreflightExecutionEnvelopeV1 {
+        plan,
+        wire,
+        expected_snapshot_identity,
+        certificate,
+    })
+}
+
+fn combined_preflight_digest_material_v1(semantic: &[u8], wire: &[u8]) -> Option<Vec<u8>> {
+    let domain_len = u32::try_from(COMBINED_PREFLIGHT_DIGEST_DOMAIN_V1.len()).ok()?;
+    let semantic_len = u32::try_from(semantic.len()).ok()?;
+    let wire_len = u32::try_from(wire.len()).ok()?;
+    let capacity = 18usize
+        .checked_add(COMBINED_PREFLIGHT_DIGEST_DOMAIN_V1.len())?
+        .checked_add(semantic.len())?
+        .checked_add(wire.len())?;
+    if capacity > MAX_COMBINED_PREFLIGHT_DIGEST_MATERIAL_BYTES_V1 {
+        return None;
+    }
+    let mut material = Vec::with_capacity(capacity);
+    material.extend_from_slice(&0u16.to_be_bytes());
+    material.extend_from_slice(&domain_len.to_be_bytes());
+    material.extend_from_slice(COMBINED_PREFLIGHT_DIGEST_DOMAIN_V1);
+    material.extend_from_slice(&1u16.to_be_bytes());
+    material.extend_from_slice(&semantic_len.to_be_bytes());
+    material.extend_from_slice(semantic);
+    material.extend_from_slice(&2u16.to_be_bytes());
+    material.extend_from_slice(&wire_len.to_be_bytes());
+    material.extend_from_slice(wire);
+    Some(material)
+}
+
+fn authoritative_teardown_manifest_matches_v1(
+    route: &InteractionRouteBindingV1,
+    wire: &ActionPlanWirePreflightV1,
+) -> bool {
+    let mut manifests = wire.teardown_manifests();
+    let Some(manifest) = manifests.next() else {
+        return true;
+    };
+    if manifests.next().is_some() {
+        return false;
+    }
+    match route.execution_route() {
+        InteractionExecutionRouteV1::Instance {
+            instance_id,
+            resource_manifest_digest,
+            ..
+        } => manifest.instance_id() == instance_id && manifest.digest() == resource_manifest_digest,
+        InteractionExecutionRouteV1::Static { .. } => false,
+    }
+}
+
+fn no_observation_snapshot_v1(
+    request: &ActionPlanSnapshotRequestV1,
+) -> Result<ActionPlanSnapshotV1, automation_core::preflight::ActionPlanPreflightErrorV1> {
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(b"starring.runtime.no_observation_snapshot.v1\0");
+    bytes.extend_from_slice(&request.guild_id().0.to_be_bytes());
+    bytes.extend_from_slice(&request.actor().0.to_be_bytes());
+    let digest = Sha256::digest(bytes);
+    let mut identity = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write;
+        write!(&mut identity, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(ActionPlanSnapshotV1 {
+        guild_id: request.guild_id(),
+        identity: ActionPlanSnapshotIdentityV1::new(identity)?,
+        roles: None,
+        channels: None,
+        bot_member: None,
+        actor_member: None,
+    })
+}
+
+async fn execute_bound_preflighted_plan_v1<P, M, R, S, G, T>(
+    permit: &P,
+    tracking: &TrackingInteractionEffectPermitV1<'_, P>,
+    preflight: PreflightExecutionEnvelopeV1,
     action_plan_digest: &InteractionActionPlanDigestV1,
     success: AcquiredInteractionTerminalOutcomeV1,
     services: &AutomationServices<'_, M, R, S, G, T>,
@@ -577,7 +803,50 @@ where
     G: InstanceIdGenerator,
     T: InstanceTeardownService,
 {
-    match run(context, plan, services).await {
+    let Some(combined_preflight_material) = combined_preflight_digest_material_v1(
+        preflight.plan.digest_material_v1(),
+        preflight.wire.wire_digest_material_v1(),
+    ) else {
+        return finish_terminal_v1(
+            permit,
+            Some(action_plan_digest),
+            AcquiredInteractionTerminalOutcomeV1::ExecutionFailedBeforeEffect,
+            tracking.any_external_attempt_v1(),
+        )
+        .await;
+    };
+    let preflight_plan_digest =
+        InteractionPreflightPlanDigestV1::from_canonical_bytes(&combined_preflight_material);
+    let snapshot_digest = InteractionPreflightSnapshotDigestV1::from_canonical_bytes(
+        preflight.expected_snapshot_identity.as_str().as_bytes(),
+    );
+    let claim = permit.authoritative_claim_v1();
+    if !authoritative_teardown_manifest_matches_v1(claim.route(), &preflight.wire)
+        || preflight
+            .certificate
+            .verify(
+                claim.claim_root,
+                action_plan_digest,
+                &preflight_plan_digest,
+                &snapshot_digest,
+            )
+            .is_err()
+    {
+        return finish_terminal_v1(
+            permit,
+            Some(action_plan_digest),
+            AcquiredInteractionTerminalOutcomeV1::ExecutionFailedBeforeEffect,
+            tracking.any_external_attempt_v1(),
+        )
+        .await;
+    }
+    match execute_preflighted_action_plan_v1(
+        preflight.plan,
+        &preflight.expected_snapshot_identity,
+        services,
+    )
+    .await
+    {
         Ok(_) => {
             finish_terminal_v1(
                 permit,

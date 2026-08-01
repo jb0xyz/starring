@@ -20,9 +20,9 @@ use resource_resolution::ResourceBindingMap;
 use crate::error::{DispatchError, DispatchFailure, FailureResponseOutcome};
 use crate::resolver::{
     LegacyStoreBackedPinnedInstanceResolverV1, PinnedInstanceResolverErrorV1,
-    PinnedInstanceResolverV1,
+    PinnedInstanceResolverV1, ResolvedPinnedInstanceV1,
 };
-use crate::snapshot::GuildRoleSnapshotProvider;
+use crate::snapshot::{GuildRoleSnapshot, GuildRoleSnapshotProvider};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_instance_action<M, R, S, G, T, RS, P>(
@@ -212,6 +212,36 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn prepare_instance_action_with_resolver_and_snapshot_v1<PR>(
+    event: &RuntimeEvent,
+    instance_id: &InstanceId,
+    action: &str,
+    expected_ruleset_key: &str,
+    resolver: &PR,
+    snapshot: &GuildRoleSnapshot,
+    bindings: &ResourceBindingMap,
+) -> Result<PreparedInstanceActionV1, DispatchError>
+where
+    PR: PinnedInstanceResolverV1,
+{
+    let expected_ruleset_key =
+        RuleSetKey::parse(expected_ruleset_key).map_err(|_| DispatchError::PinnedKeyInvalid)?;
+    let resolved = resolver
+        .resolve_pinned_instance_v1(event.guild_id, instance_id)
+        .await
+        .map_err(map_resolver_error)?;
+    prepare_resolved_instance_action_v1(
+        event,
+        instance_id,
+        action,
+        Some(&expected_ruleset_key),
+        resolved,
+        snapshot,
+        bindings,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn prepare_instance_action_with_route_v1<PR, P>(
     event: &RuntimeEvent,
     instance_id: &InstanceId,
@@ -233,33 +263,44 @@ where
         .resolve_pinned_instance_v1(event.guild_id, instance_id)
         .await
         .map_err(map_resolver_error)?;
+    validate_resolved_instance_action_v1(
+        event,
+        instance_id,
+        expected_ruleset_key.as_ref(),
+        &resolved,
+    )?;
+    let snapshot = snapshot_provider
+        .snapshot(event.guild_id)
+        .await
+        .map_err(DispatchError::SnapshotFailed)?;
+    prepare_resolved_instance_action_v1(
+        event,
+        instance_id,
+        action,
+        expected_ruleset_key.as_ref(),
+        resolved,
+        &snapshot,
+        bindings,
+    )
+}
+
+fn prepare_resolved_instance_action_v1(
+    event: &RuntimeEvent,
+    instance_id: &InstanceId,
+    action: &str,
+    expected_ruleset_key: Option<&RuleSetKey>,
+    resolved: ResolvedPinnedInstanceV1,
+    snapshot: &GuildRoleSnapshot,
+    bindings: &ResourceBindingMap,
+) -> Result<PreparedInstanceActionV1, DispatchError> {
+    validate_resolved_instance_action_v1(event, instance_id, expected_ruleset_key, &resolved)?;
     let instance = resolved.instance;
-    ensure_active(&instance)?;
-    let key =
-        RuleSetKey::parse(&instance.ruleset_key).map_err(|_| DispatchError::PinnedKeyInvalid)?;
-    let version = RuleSetVersionId::new(instance.ruleset_version.get())
-        .map_err(|_| DispatchError::PinnedKeyInvalid)?;
-    if instance.guild_id != event.guild_id
-        || instance.id != *instance_id
-        || expected_ruleset_key
-            .as_ref()
-            .is_some_and(|expected| expected != &key)
-        || resolved.artifact.guild_id != event.guild_id
-        || resolved.artifact.ruleset_key != key
-        || resolved.artifact.version != version
-    {
-        return Err(DispatchError::PinnedVersionMissing);
-    }
     let identity = RunningRuleSetIdentity {
         key: instance.ruleset_key.clone(),
         version: instance.ruleset_version,
     };
     let artifact = resolved.artifact;
 
-    let snapshot = snapshot_provider
-        .snapshot(event.guild_id)
-        .await
-        .map_err(DispatchError::SnapshotFailed)?;
     let bot_roles: Vec<RoleId> = snapshot.bot_role_ids.iter().copied().collect();
     let (guild_capabilities, role_permissions) =
         build_readiness_context(event.guild_id, bindings, &snapshot.roles, &bot_roles)
@@ -293,6 +334,29 @@ where
         plan: ActionPlan { steps },
         leading_defer_ephemeral: true,
     })
+}
+
+fn validate_resolved_instance_action_v1(
+    event: &RuntimeEvent,
+    instance_id: &InstanceId,
+    expected_ruleset_key: Option<&RuleSetKey>,
+    resolved: &ResolvedPinnedInstanceV1,
+) -> Result<(), DispatchError> {
+    ensure_active(&resolved.instance)?;
+    let key = RuleSetKey::parse(&resolved.instance.ruleset_key)
+        .map_err(|_| DispatchError::PinnedKeyInvalid)?;
+    let version = RuleSetVersionId::new(resolved.instance.ruleset_version.get())
+        .map_err(|_| DispatchError::PinnedKeyInvalid)?;
+    if resolved.instance.guild_id != event.guild_id
+        || resolved.instance.id != *instance_id
+        || expected_ruleset_key.is_some_and(|expected| expected != &key)
+        || resolved.artifact.guild_id != event.guild_id
+        || resolved.artifact.ruleset_key != key
+        || resolved.artifact.version != version
+    {
+        return Err(DispatchError::PinnedVersionMissing);
+    }
+    Ok(())
 }
 
 pub async fn execute_prepared_instance_action_v1<M, R, S, G, T>(

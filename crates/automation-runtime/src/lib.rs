@@ -1,5 +1,7 @@
 pub mod acquired_receipt_execution;
 pub mod action_plan_digest;
+pub mod action_plan_preflight_certificate;
+mod action_plan_wire_preflight;
 pub mod convert;
 pub mod custom_id;
 pub mod error;
@@ -33,6 +35,9 @@ pub use acquired_receipt_execution::{
     ACQUIRED_INTERACTION_CLAIM_LEASE_V1,
 };
 pub use action_plan_digest::build_interaction_action_plan_digest_v1;
+pub use action_plan_preflight_certificate::{
+    InteractionActionPreflightCertificateErrorV1, InteractionActionPreflightCertificateV1,
+};
 pub use convert::interaction_to_event;
 pub use custom_id::{
     decode, encode_button, encode_modal, ComponentKind, CustomIdError, ParsedCustomId,
