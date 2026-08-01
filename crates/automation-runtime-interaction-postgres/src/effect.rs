@@ -3861,6 +3861,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recovery_block_codes_are_exact_unique_and_stable() {
+        let mappings = [
+            (
+                RuntimeInteractionEffectRecoveryBlockReasonV1::DiscordReadRejected,
+                "recovery_blocked_discord_read_rejected",
+            ),
+            (
+                RuntimeInteractionEffectRecoveryBlockReasonV1::ResponseTokenUnavailable,
+                "recovery_blocked_response_token_unavailable",
+            ),
+            (
+                RuntimeInteractionEffectRecoveryBlockReasonV1::ObservationProtocol,
+                "recovery_blocked_observation_protocol",
+            ),
+            (
+                RuntimeInteractionEffectRecoveryBlockReasonV1::CompensationConflict,
+                "recovery_blocked_compensation_conflict",
+            ),
+            (
+                RuntimeInteractionEffectRecoveryBlockReasonV1::CompensationUnsupported,
+                "recovery_blocked_compensation_unsupported",
+            ),
+            (
+                RuntimeInteractionEffectRecoveryBlockReasonV1::NonCompensable,
+                "recovery_blocked_non_compensable",
+            ),
+            (
+                RuntimeInteractionEffectRecoveryBlockReasonV1::InternalConflict,
+                "recovery_blocked_internal_conflict",
+            ),
+            (
+                RuntimeInteractionEffectRecoveryBlockReasonV1::DiscordForbidden,
+                "recovery_blocked_discord_forbidden",
+            ),
+            (
+                RuntimeInteractionEffectRecoveryBlockReasonV1::InternalAuthority,
+                "recovery_blocked_internal_authority",
+            ),
+            (
+                RuntimeInteractionEffectRecoveryBlockReasonV1::AttemptBudgetExhausted,
+                "recovery_blocked_attempt_budget_exhausted",
+            ),
+        ];
+        let mut observed = std::collections::BTreeSet::new();
+
+        for (reason, expected) in mappings {
+            assert_eq!(reason.code(), expected);
+            assert!(observed.insert(expected));
+        }
+
+        assert_eq!(observed.len(), 10);
+    }
+
+    #[test]
     fn strict_resolved_references_require_exact_canonical_documents() {
         let exact = json!([
             {"slot": "channel_id", "id": "42"},

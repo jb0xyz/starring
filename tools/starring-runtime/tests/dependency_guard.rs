@@ -650,6 +650,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "tests/process_contract.rs",
             "tests/serving_heartbeat_monitor_guard.rs",
             "tests/staging_effect_acl_backfill_contract.rs",
+            "tests/staging_effect_inspection_contract.rs",
             "tests/staging_receipt_acl_backfill_contract.rs",
             "tests/staging_role_bootstrap_contract.rs"
         ]

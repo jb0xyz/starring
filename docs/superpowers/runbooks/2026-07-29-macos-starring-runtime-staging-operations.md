@@ -373,6 +373,132 @@ credentials. Continue at `Store indirect secrets in Keychain` and use only its
 dedicated legacy interaction-token keyring mode before building the immutable
 revision.
 
+## Inspect durable interaction effect recovery blocks
+
+Run this read-only inspection after migration `202608010001` is present when
+an interaction route remains blocked or before deciding whether manual
+recovery is appropriate. The inspection uses one repeatable-read transaction,
+validates PostgreSQL 16, the fixed staging database and dedicated cluster, the
+exact 116-entry migration ledger, and the interaction-effect schema manifest.
+It then emits only recovery block code, action kind, aggregate count, and the
+oldest and newest block times. It never emits application, interaction,
+action, or Discord output identifiers, nor digest, correlation,
+response-token, input, preimage, or payload values. An unknown code or a
+recovery-required head without its exact terminal event makes the command fail
+before any projection is printed.
+
+The runtime and API may remain loaded because this operation neither locks the
+service boundary nor changes database state. A zero-row result means there are
+no current recovery-required effects in the transaction snapshot.
+
+```zsh
+(
+  set -euo pipefail
+  set +x
+  umask 077
+  cd /Users/jungbogeon/starring
+  STAGING_DATABASE=starring_runtime_staging
+  ADMIN_PGPASS_DIR=
+  ADMIN_PGPASS_PATH=
+  cleanup_admin_pgpass() {
+    CLEANUP_STATUS=0
+    if test -n "${ADMIN_PGPASS_PATH:-}" \
+      && test -e "$ADMIN_PGPASS_PATH"
+    then
+      if test -f "$ADMIN_PGPASS_PATH" \
+        && ! test -L "$ADMIN_PGPASS_PATH"
+      then
+        /bin/dd if=/dev/zero of="$ADMIN_PGPASS_PATH" \
+          bs=4096 count=1 conv=notrunc >/dev/null 2>&1 \
+          || CLEANUP_STATUS=1
+      else
+        CLEANUP_STATUS=1
+      fi
+      /bin/rm -f "$ADMIN_PGPASS_PATH" >/dev/null 2>&1 \
+        || CLEANUP_STATUS=1
+    fi
+    if test -n "${ADMIN_PGPASS_DIR:-}"
+    then
+      /bin/rmdir "$ADMIN_PGPASS_DIR" >/dev/null 2>&1 \
+        || CLEANUP_STATUS=1
+    fi
+    return "$CLEANUP_STATUS"
+  }
+  trap \
+    'TRAP_STATUS=$?; trap - EXIT HUP INT TERM; cleanup_admin_pgpass || CLEANUP_STATUS=$?; if test "$TRAP_STATUS" -eq 0 && test "${CLEANUP_STATUS:-0}" -ne 0; then exit "$CLEANUP_STATUS"; fi; exit "$TRAP_STATUS"' \
+    EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  : "${STARRING_STAGING_CLUSTER_ADMIN:?load the reviewed cluster administrator}"
+  : "${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER:?load the reviewed system identifier}"
+  : "${STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT:?load the reviewed dedicated-cluster acknowledgement}"
+  test "$STARRING_STAGING_CLUSTER_ADMIN" = starring_cluster_admin
+  unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
+  unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
+  ADMIN_PGPASS_DIR="$(
+    /usr/bin/mktemp -d /private/tmp/starring-admin-pgpass.XXXXXX
+  )"
+  test -d "$ADMIN_PGPASS_DIR"
+  test "$(
+    /usr/bin/stat -f '%u:%Lp' "$ADMIN_PGPASS_DIR"
+  )" = "$(/usr/bin/id -u):700"
+  /bin/ls -lde "$ADMIN_PGPASS_DIR" \
+    | /usr/bin/awk \
+      'NR == 1 { ok = ($1 == "drwx------" || $1 == "drwx------@") } NR > 1 { ok = 0 } END { exit(ok ? 0 : 1) }'
+  ADMIN_PGPASS_PATH="$ADMIN_PGPASS_DIR/pgpass"
+  /usr/bin/security find-generic-password -w \
+    -s starring.postgres.staging \
+    -a database.cluster-admin \
+    | /usr/bin/sed -nE \
+      's#^postgresql://starring_cluster_admin:([A-Za-z0-9_-]{43})@127\.0\.0\.1:5432/postgres\?sslmode=disable$#127.0.0.1:5432:*:starring_cluster_admin:\1#p' \
+      >"$ADMIN_PGPASS_PATH"
+  test -f "$ADMIN_PGPASS_PATH"
+  ! test -L "$ADMIN_PGPASS_PATH"
+  test "$(
+    /usr/bin/stat -f '%u:%Lp' "$ADMIN_PGPASS_PATH"
+  )" = "$(/usr/bin/id -u):600"
+  /bin/ls -le "$ADMIN_PGPASS_PATH" \
+    | /usr/bin/awk \
+      'NR == 1 { ok = ($1 == "-rw-------" || $1 == "-rw-------@") } NR > 1 { ok = 0 } END { exit(ok ? 0 : 1) }'
+  test "$(
+    /usr/bin/wc -l <"$ADMIN_PGPASS_PATH" | /usr/bin/tr -d ' '
+  )" = 1
+  /usr/bin/grep -Eq \
+    '^127\.0\.0\.1:5432:\*:starring_cluster_admin:[A-Za-z0-9_-]{43}$' \
+    "$ADMIN_PGPASS_PATH"
+  PGPASSFILE="$ADMIN_PGPASS_PATH" PGSSLMODE=disable \
+    /opt/homebrew/opt/postgresql@16/bin/psql \
+    --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
+    --host 127.0.0.1 --port 5432 \
+    --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+    --dbname "$STAGING_DATABASE" \
+    --set expected_database="$STAGING_DATABASE" \
+    --set expected_system_identifier="$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    --set runtime_dedicated_cluster_acknowledgement="$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    --file ops/postgres/staging-runtime-interaction-effect-inspection.sql
+)
+```
+
+Do not replace the fixed Keychain-to-`PGPASSFILE` path with a database URL,
+password environment variable, command-line password, inline credential, or
+interactive prompt. Do not replay an interaction, delete an effect row, or
+edit a journal row in response to this projection. Preserve the durable
+journal and use the action below for the exact reported code.
+
+| Recovery block code | Required operator action |
+| --- | --- |
+| `recovery_blocked_discord_read_rejected` | Keep the route blocked, inspect Discord connectivity and audit-read permission, repair the external read path, then rerun this inspection before considering recovery. |
+| `recovery_blocked_response_token_unavailable` | Preserve the receipt and effect history, do not fabricate a response, and treat response delivery as unrecoverable while verifying the product-visible state. |
+| `recovery_blocked_observation_protocol` | Stop automatic recovery for the route, preserve the journal, compare the observed Discord state with the expected protocol shape, and escalate as a code defect. |
+| `recovery_blocked_compensation_conflict` | Do not delete external state; compare the target with the preserved preimage and perform only a documented manual reconciliation. |
+| `recovery_blocked_compensation_unsupported` | Leave the route blocked and choose a documented manual remediation; neither retry nor delete the external resource. |
+| `recovery_blocked_non_compensable` | Preserve the external state and journal, avoid automatic deletion, and resolve the product state through a documented manual procedure. |
+| `recovery_blocked_internal_conflict` | Keep the route blocked, verify installation, instance, and route authority through supported product reads, and never override durable records. |
+| `recovery_blocked_discord_forbidden` | Restore the intended bot permission through Discord administration and do not retry the mutation until exact authority has been re-established. |
+| `recovery_blocked_internal_authority` | Keep the route blocked and restore or rotate authority through the reviewed product or operator path; never repair it with direct table edits. |
+| `recovery_blocked_attempt_budget_exhausted` | Leave automatic retries stopped, inspect exact current external state, and choose a documented manual remediation before any new attempt. |
+
 ## Bootstrap the five database roles
 
 Run the script in quarantine mode. A session advisory lock serializes valid
