@@ -355,7 +355,6 @@ class Platform:
                 [
                     REQUIRED_PROGRAMS["launchctl"],
                     "kickstart",
-                    "-k",
                     f"{domain}/{label}",
                 ],
                 timeout=20,

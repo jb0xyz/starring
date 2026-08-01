@@ -29,6 +29,30 @@ ORCHESTRATOR_SPEC = importlib.util.spec_from_file_location(
 ORCHESTRATOR = importlib.util.module_from_spec(ORCHESTRATOR_SPEC)
 ORCHESTRATOR_SPEC.loader.exec_module(ORCHESTRATOR)
 CONTRACT = sys.modules["d2_orchestrator_contract"]
+PLATFORM = sys.modules["d2_orchestrator_platform"]
+
+
+class RecordingLaunchdPlatform(PLATFORM.Platform):
+    def __init__(self):
+        self.loaded = False
+        self.commands = []
+        self.fail_action = None
+        self.bootouts = []
+
+    def launchd_loaded(self, label):
+        return self.loaded
+
+    def run(self, arguments, input_bytes=None, timeout=30, environment=None):
+        command = [str(argument) for argument in arguments]
+        self.commands.append(command)
+        if len(command) > 1 and command[1] == "bootstrap":
+            self.loaded = True
+        returncode = 1 if len(command) > 1 and command[1] == self.fail_action else 0
+        return subprocess.CompletedProcess(command, returncode, b"", b"")
+
+    def launchd_bootout(self, label):
+        self.bootouts.append(label)
+        self.loaded = False
 
 
 class FakePlatform:
@@ -935,6 +959,32 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
             ORCHESTRATOR.os.close(descriptor)
+
+
+class LaunchdPlatformTests(unittest.TestCase):
+    def test_start_does_not_terminate_a_freshly_bootstrapped_keepalive_job(self):
+        platform = RecordingLaunchdPlatform()
+        platform.launchd_start("local.starring.d2.test", pathlib.Path("/tmp/test.plist"))
+        actions = [command[1:] for command in platform.commands]
+        self.assertEqual(
+            actions,
+            [
+                ["bootstrap", f"gui/{ORCHESTRATOR.os.getuid()}", "/tmp/test.plist"],
+                ["enable", f"gui/{ORCHESTRATOR.os.getuid()}/local.starring.d2.test"],
+                ["kickstart", f"gui/{ORCHESTRATOR.os.getuid()}/local.starring.d2.test"],
+            ],
+        )
+
+    def test_kickstart_failure_boots_out_the_loaded_job_once(self):
+        platform = RecordingLaunchdPlatform()
+        platform.fail_action = "kickstart"
+        with self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "launchd_kickstart_failed"
+        ):
+            platform.launchd_start(
+                "local.starring.d2.test", pathlib.Path("/tmp/test.plist")
+            )
+        self.assertEqual(platform.bootouts, ["local.starring.d2.test"])
 
 
 if __name__ == "__main__":
