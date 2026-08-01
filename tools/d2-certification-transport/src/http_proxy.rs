@@ -6,8 +6,8 @@ use futures_util::StreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{
-    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST,
-    TRANSFER_ENCODING, UPGRADE,
+    HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_LENGTH,
+    HOST, TRANSFER_ENCODING, UPGRADE,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -190,12 +190,14 @@ async fn proxy_request(
         Ok(upstream) => upstream,
         Err(_) => {
             restore_claim(&state, claim.take());
+            eprintln!("d2_transport_http_failure=upstream_request");
             return Err(ProxyServiceError::Upstream);
         }
     };
     let status = upstream.status();
     if validate_response_headers(upstream.headers()).is_err() {
         restore_claim(&state, claim.take());
+        eprintln!("d2_transport_http_failure=response_headers");
         return Err(ProxyServiceError::Upstream);
     }
     if upstream
@@ -203,6 +205,7 @@ async fn proxy_request(
         .is_some_and(|length| length > MAX_RESPONSE_BODY_BYTES as u64)
     {
         restore_claim(&state, claim.take());
+        eprintln!("d2_transport_http_failure=response_content_length");
         return Err(ProxyServiceError::Upstream);
     }
     let headers = upstream.headers().clone();
@@ -213,11 +216,13 @@ async fn proxy_request(
             Ok(chunk) => chunk,
             Err(_) => {
                 restore_claim(&state, claim.take());
+                eprintln!("d2_transport_http_failure=response_stream");
                 return Err(ProxyServiceError::Upstream);
             }
         };
         if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BODY_BYTES {
             restore_claim(&state, claim.take());
+            eprintln!("d2_transport_http_failure=response_body_limit");
             return Err(ProxyServiceError::Upstream);
         }
         body.extend_from_slice(&chunk);
@@ -225,18 +230,24 @@ async fn proxy_request(
     if status.is_success() && reservation.is_some() {
         let Some(id) = extract_response_id(&body) else {
             restore_claim(&state, claim.take());
+            eprintln!("d2_transport_http_failure=resource_identity");
             return Err(ProxyServiceError::Upstream);
         };
         if !reservation.take().expect("resource reservation").commit(id) {
             restore_claim(&state, claim.take());
+            eprintln!("d2_transport_http_failure=resource_commit");
             return Err(ProxyServiceError::Upstream);
         }
     }
-    if validated.current_user
-        && (!status.is_success()
-            || extract_response_id(&body).as_deref() != Some(config.bot_user_id()))
-    {
+    let current_user_identity_matches =
+        extract_response_id(&body).as_deref() == Some(config.bot_user_id());
+    if validated.current_user && (!status.is_success() || !current_user_identity_matches) {
         restore_claim(&state, claim.take());
+        eprintln!(
+            "d2_transport_http_failure=current_user_identity status={} identity_matches={}",
+            status.as_u16(),
+            current_user_identity_matches
+        );
         return Err(ProxyServiceError::Upstream);
     }
     if status.is_success() {
@@ -492,12 +503,14 @@ fn forward_request_headers(source: &HeaderMap) -> HeaderMap {
         if !hop_by_hop(name)
             && *name != HOST
             && *name != CONTENT_LENGTH
+            && *name != ACCEPT_ENCODING
             && !connection_headers.contains(name.as_str())
             && !name.as_str().starts_with("x-forwarded-")
         {
             destination.append(name.clone(), value.clone());
         }
     }
+    destination.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     destination
 }
 
@@ -872,5 +885,28 @@ mod tests {
             ),
             Err(StatusCode::FORBIDDEN)
         );
+    }
+
+    #[test]
+    fn forwarded_requests_negotiate_identity_encoding() {
+        let mut source = HeaderMap::new();
+        source.insert(HOST, HeaderValue::from_static("127.0.0.1:21002"));
+        source.insert(AUTHORIZATION, HeaderValue::from_static("Bot value"));
+        source.insert(ACCEPT_ENCODING, HeaderValue::from_static("br"));
+        source.insert("user-agent", HeaderValue::from_static("twilight-http"));
+        let forwarded = forward_request_headers(&source);
+        assert_eq!(
+            forwarded.get(ACCEPT_ENCODING),
+            Some(&HeaderValue::from_static("identity"))
+        );
+        assert_eq!(
+            forwarded.get(AUTHORIZATION),
+            Some(&HeaderValue::from_static("Bot value"))
+        );
+        assert_eq!(
+            forwarded.get("user-agent"),
+            Some(&HeaderValue::from_static("twilight-http"))
+        );
+        assert!(!forwarded.contains_key(HOST));
     }
 }
