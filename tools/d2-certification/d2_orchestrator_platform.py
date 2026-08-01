@@ -9,6 +9,9 @@ import time
 from d2_orchestrator_contract import OWNER_ACCOUNT, REQUIRED_PROGRAMS, fail
 
 
+MAX_TRANSPORT_CONTROL_BYTES = 64 * 1024
+
+
 class Platform:
     def run(self, arguments, input_bytes=None, timeout=30, environment=None):
         options = {
@@ -486,6 +489,267 @@ class Platform:
         ):
             fail("worker_health_identity_invalid")
         return status
+
+    def transport_health_status(self, context, timeout_seconds=3):
+        value = self._transport_control_exchange(
+            context, "snapshot", {}, timeout_seconds, allow_unavailable=True
+        )
+        if value is None:
+            return 0
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"ok", "snapshot"}
+            or value["ok"] is not True
+            or not self._transport_snapshot_valid(
+                context, value["snapshot"], require_ready=False
+            )
+        ):
+            fail("transport_control_response_invalid")
+        return 200 if value["snapshot"]["ready"] else 503
+
+    def transport_control(self, context, command, fields=None, timeout_seconds=3):
+        value = self._transport_control_exchange(
+            context, command, fields or {}, timeout_seconds, allow_unavailable=False
+        )
+        if command == "snapshot":
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"ok", "snapshot"}
+                or value["ok"] is not True
+                or not self._transport_snapshot_valid(context, value["snapshot"])
+            ):
+                fail("transport_control_response_invalid")
+            return value["snapshot"]
+        if command in {
+            "arm_next_duplicate",
+            "arm_next_create_role_indeterminate",
+        }:
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"ok", "changed", "disposition"}
+                or value["ok"] is not True
+                or type(value["changed"]) is not bool
+                or value["disposition"] not in {"armed", "replayed", "busy"}
+                or (value["disposition"] == "armed") != value["changed"]
+            ):
+                fail("transport_control_response_invalid")
+            return {
+                "changed": value["changed"],
+                "disposition": value["disposition"],
+            }
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"ok", "changed"}
+            or value["ok"] is not True
+            or type(value["changed"]) is not bool
+        ):
+            fail("transport_control_response_invalid")
+        return {"changed": value["changed"]}
+
+    def _transport_control_exchange(
+        self, context, command, fields, timeout_seconds, allow_unavailable
+    ):
+        path = context.root / "transport-control.sock"
+        try:
+            metadata = path.lstat()
+        except OSError:
+            if allow_unavailable:
+                return None
+            fail("transport_control_unavailable")
+        if (
+            not stat.S_ISSOCK(metadata.st_mode)
+            or path.is_symlink()
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            fail("transport_control_socket_invalid")
+        request = {
+            "version": 1,
+            "command": command,
+            "run_id": context.manifest["run_id"],
+            "guild_id": context.manifest["discord"]["guild_id"],
+            "actor_id": context.manifest["discord"]["actor_id"],
+            "bot_user_id": context.manifest["discord"]["bot_user_id"],
+        }
+        if not isinstance(fields, dict) or set(fields).intersection(request):
+            fail("transport_control_request_invalid")
+        request.update(fields)
+        encoded = (
+            json.dumps(request, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("ascii")
+        control = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            control.settimeout(timeout_seconds)
+            control.connect(str(path))
+            control.sendall(encoded)
+            control.shutdown(socket.SHUT_WR)
+            response = bytearray()
+            while True:
+                chunk = control.recv(4096)
+                if not chunk:
+                    break
+                response.extend(chunk)
+                if len(response) > MAX_TRANSPORT_CONTROL_BYTES:
+                    fail("transport_control_response_too_large")
+        except (OSError, TimeoutError):
+            if allow_unavailable:
+                return None
+            fail("transport_control_unavailable")
+        finally:
+            control.close()
+        if response.count(b"\n") != 1 or not response.endswith(b"\n"):
+            fail("transport_control_response_invalid")
+        try:
+            value = json.loads(response)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            fail("transport_control_response_invalid")
+        return value
+
+    def _transport_snapshot_valid(self, context, snapshot, require_ready=True):
+        if not isinstance(snapshot, dict) or set(snapshot) != {
+            "version",
+            "ready",
+            "run_id",
+            "guild_id",
+            "actor_id",
+            "bot_user_id",
+            "instance_id",
+            "gateway",
+            "effect_http",
+        }:
+            return False
+        if (
+            snapshot["version"] != 1
+            or type(snapshot["ready"]) is not bool
+            or require_ready
+            and snapshot["ready"] is not True
+            or snapshot["run_id"] != context.manifest["run_id"]
+            or snapshot["guild_id"] != context.manifest["discord"]["guild_id"]
+            or snapshot["actor_id"] != context.manifest["discord"]["actor_id"]
+            or snapshot["bot_user_id"]
+            != context.manifest["discord"]["bot_user_id"]
+            or not isinstance(snapshot["instance_id"], str)
+            or not re.fullmatch(r"d2ti-[0-9a-f]{32}", snapshot["instance_id"])
+        ):
+            return False
+        gateway = snapshot["gateway"]
+        if not isinstance(gateway, dict) or set(gateway) != {
+            "partitioned",
+            "connections",
+            "ready_rewrites",
+            "partition_events",
+            "identity_rejections",
+            "duplicate_armed",
+            "armed_duplicate_operation_id",
+            "duplicate_claimed",
+            "claimed_duplicate_operation_id",
+            "duplicate_injections",
+            "duplicate_failed_attempts",
+            "last_failed_duplicate_operation_id",
+            "duplicate_delivery_count",
+            "last_duplicate_interaction_id",
+            "last_duplicate_operation_id",
+        }:
+            return False
+        if any(
+            type(gateway[field]) is not bool
+            for field in ("partitioned", "duplicate_armed", "duplicate_claimed")
+        ):
+            return False
+        if any(
+            type(gateway[field]) is not int or gateway[field] < 0
+            for field in (
+                "connections",
+                "ready_rewrites",
+                "partition_events",
+                "identity_rejections",
+                "duplicate_injections",
+                "duplicate_failed_attempts",
+                "duplicate_delivery_count",
+            )
+        ):
+            return False
+        interaction_id = gateway["last_duplicate_interaction_id"]
+        if interaction_id is not None and (
+            not isinstance(interaction_id, str)
+            or not re.fullmatch(r"[1-9][0-9]{0,19}", interaction_id)
+        ):
+            return False
+        for field in (
+            "armed_duplicate_operation_id",
+            "claimed_duplicate_operation_id",
+            "last_failed_duplicate_operation_id",
+            "last_duplicate_operation_id",
+        ):
+            operation_id = gateway[field]
+            if operation_id is not None and (
+                not isinstance(operation_id, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_.:-]{7,95}", operation_id)
+            ):
+                return False
+        if gateway["duplicate_armed"] != (
+            gateway["armed_duplicate_operation_id"] is not None
+        ) or gateway["duplicate_claimed"] != (
+            gateway["claimed_duplicate_operation_id"] is not None
+        ):
+            return False
+        effect = snapshot["effect_http"]
+        if not isinstance(effect, dict) or set(effect) != {
+            "forwarded_requests",
+            "rejected_requests",
+            "indeterminate_armed",
+            "armed_indeterminate_operation_id",
+            "indeterminate_claimed",
+            "claimed_indeterminate_operation_id",
+            "indeterminate_injections",
+            "last_indeterminate_audit_reason_sha256",
+            "last_indeterminate_operation_id",
+            "last_indeterminate_upstream_status",
+            "owned_role_count",
+            "owned_channel_count",
+            "owned_message_count",
+        }:
+            return False
+        if any(
+            type(effect[field]) is not bool
+            for field in ("indeterminate_armed", "indeterminate_claimed")
+        ) or any(
+            type(effect[field]) is not int or effect[field] < 0
+            for field in (
+                "forwarded_requests",
+                "rejected_requests",
+                "indeterminate_injections",
+                "owned_role_count",
+                "owned_channel_count",
+                "owned_message_count",
+            )
+        ):
+            return False
+        digest = effect["last_indeterminate_audit_reason_sha256"]
+        if digest is not None and (
+            not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            return False
+        for field in (
+            "armed_indeterminate_operation_id",
+            "claimed_indeterminate_operation_id",
+            "last_indeterminate_operation_id",
+        ):
+            operation_id = effect[field]
+            if operation_id is not None and (
+                not isinstance(operation_id, str)
+                or not re.fullmatch(r"[a-z][a-z0-9_.:-]{7,95}", operation_id)
+            ):
+                return False
+        if effect["indeterminate_armed"] != (
+            effect["armed_indeterminate_operation_id"] is not None
+        ) or effect["indeterminate_claimed"] != (
+            effect["claimed_indeterminate_operation_id"] is not None
+        ):
+            return False
+        status = effect["last_indeterminate_upstream_status"]
+        return status is None or type(status) is int and 100 <= status <= 599
 
     def wait_for_status(self, probe, expected, timeout_seconds=60):
         deadline = time.monotonic() + timeout_seconds

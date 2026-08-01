@@ -24,7 +24,7 @@ after all 17 receipts satisfy the exact contracts.
 `isolated_orchestrator.py` implements the disposable substrate lifecycle. Its
 dry run rejects standing ports, labels, Keychain services, public origin, and
 Discord application identity reuse. Preparation creates only the exact
-manifest-derived PostgreSQL root, four unloaded launchd plists, a tunnel runner,
+manifest-derived PostgreSQL root, five unloaded launchd plists, a tunnel runner,
 and per-run Keychain ownership markers. Start launches PostgreSQL and invokes
 the immutable `starring-d2-db-bootstrap` candidate, which reuses the production
 SQLx bootstrap library and records the exact migration ledger. It then invokes
@@ -32,8 +32,17 @@ the immutable sealed provisioner, creates or exactly replays 20 application
 database credentials, three application keyrings, one worker bearer credential,
 activates the 20 application roles, changes PostgreSQL from socket-only
 bootstrap access to role-specific loopback SCRAM access, verifies replay after
-the sealed restart, and starts worker, API, runtime, and tunnel in that order.
-Step 3 evidence binds the exact candidates and Cloudflare route tuple. Stop and
+the sealed restart, and starts the certification transport, worker, API,
+runtime, and tunnel in that order. The transport owns two loopback listeners
+and a manifest-owned `0600` Unix control socket. Runtime uses its explicit
+`loopback_proxy_v1` mode, so Discord gateway and interaction-effect traffic
+cannot silently fall back to the direct production transport. Controller
+preflight and strict panel reconciliation remain direct and are isolated by the
+dedicated D2 application and guild. Step 3 evidence binds the exact
+candidates, transport source tree, control snapshot readiness, and Cloudflare
+route tuple. It also pins the transport process instance identity. Any transport
+restart changes that identity and invalidates the certification run instead of
+silently resetting the in-memory fault counters. Stop and
 cleanup are idempotent, operate only on manifest-derived identities, and require
 the standing launchd, plist, and port snapshot to remain unchanged.
 
@@ -42,8 +51,20 @@ ordered by version, hash the signed 64-bit version in big-endian form, one
 success byte, the checksum length as an unsigned 64-bit big-endian value, and
 the raw SQLx checksum bytes.
 
+Every executable candidate and the Codex worker entrypoint must be a canonical,
+same-owner regular file with all write bits removed. Its immediate artifact
+directory must have the same owner and all write bits removed, preventing path
+replacement after manifest verification. Build into a writable directory,
+copy the reviewed artifacts into a dedicated release directory, then remove
+write permission from both files and that directory before `prepare`. The
+Python and Rust source trees are a different boundary: they may remain
+owner-writable for development, but their exact inventory and SHA-256 are
+revalidated at the start of every certification command; group/world-writable
+source files or roots are rejected. They are verified per invocation and are
+not described as immutable artifacts.
+
 The current execution boundary is deliberate. `start` reports
-`candidate_services_loaded=true` only after all four candidates are loaded and
+`candidate_services_loaded=true` only after all five services are loaded and
 their local and public health probes pass. A dedicated D2 Discord application,
 guild, and credential pair remain mandatory because sharing the standing
 gateway session would violate the no-staging-mutation contract. The fixed D2
@@ -80,6 +101,7 @@ python3 tools/d2-certification/d2_certification.py prepare \
   --discord-guild-id "$DISPOSABLE_GUILD_ID" \
   --discord-application-id "$DISCORD_APPLICATION_ID" \
   --discord-bot-user-id "$DISCORD_BOT_USER_ID" \
+  --discord-actor-id "$DISCORD_ACTOR_ID" \
   --discord-oauth-keychain starring.d2.credentials:discord.oauth-client-secret \
   --discord-bot-keychain starring.d2.credentials:discord.bot-token \
   --tunnel-token-keychain starring.d2.credentials:cloudflare.tunnel-token \
@@ -87,19 +109,22 @@ python3 tools/d2-certification/d2_certification.py prepare \
   --public-origin https://d2-api.starring.co.kr \
   --candidate api=/absolute/immutable/starring-api \
   --candidate runtime=/absolute/immutable/starring-runtime \
-  --candidate codex_worker=/absolute/repo/tools/codex-worker/worker.mjs \
-  --candidate codex=/absolute/codex \
+  --candidate codex_worker=/absolute/immutable/codex-worker/worker.mjs \
+  --candidate codex=/absolute/immutable/codex \
   --candidate db_bootstrap=/absolute/immutable/starring-d2-db-bootstrap \
   --candidate sealed_provisioner=/absolute/immutable/starring-d2-sealed-provisioner \
-  --candidate node=/absolute/node \
-  --candidate cloudflared=/absolute/cloudflared \
+  --candidate certification_transport=/absolute/immutable/d2-certification-transport \
+  --candidate node=/absolute/immutable/node \
+  --candidate cloudflared=/absolute/immutable/cloudflared \
   --port postgres=55433 \
   --port api=28080 \
   --port runtime=29091 \
-  --port worker=28181
+  --port worker=28181 \
+  --port transport_gateway=29101 \
+  --port transport_http=29102
 ```
 
-Build both exact provisioning candidates from the candidate commit, then run
+Build the exact local candidates from the candidate commit, then run
 the substrate lifecycle with the immutable manifest:
 
 ```text
@@ -107,7 +132,40 @@ cargo build --locked --release -p starring-db-bootstrap \
   --bin starring-d2-db-bootstrap
 cargo build --locked --release -p starring-staging-provisioner \
   --bin starring-d2-sealed-provisioner
+cargo build --locked --release \
+  --manifest-path tools/d2-certification-transport/Cargo.toml
+```
 
+Materialize the reviewed binaries and exact seven-file Codex worker tree in one
+dedicated artifact directory. The source variables below identify reviewed
+build outputs or installed executables:
+
+```text
+install -d -m 0700 /absolute/immutable
+install -d -m 0700 /absolute/immutable/codex-worker
+install -m 0555 "$API_BINARY" /absolute/immutable/starring-api
+install -m 0555 "$RUNTIME_BINARY" /absolute/immutable/starring-runtime
+install -m 0555 "$DB_BOOTSTRAP_BINARY" /absolute/immutable/starring-d2-db-bootstrap
+install -m 0555 "$SEALED_PROVISIONER_BINARY" /absolute/immutable/starring-d2-sealed-provisioner
+install -m 0555 "$CERTIFICATION_TRANSPORT_BINARY" /absolute/immutable/d2-certification-transport
+install -m 0555 "$CODEX_BINARY" /absolute/immutable/codex
+install -m 0555 "$NODE_BINARY" /absolute/immutable/node
+install -m 0555 "$CLOUDFLARED_BINARY" /absolute/immutable/cloudflared
+install -m 0444 tools/codex-worker/admission-registry.mjs /absolute/immutable/codex-worker/
+install -m 0444 tools/codex-worker/codex-runner.mjs /absolute/immutable/codex-worker/
+install -m 0444 tools/codex-worker/metrics-log.mjs /absolute/immutable/codex-worker/
+install -m 0444 tools/codex-worker/protocol.mjs /absolute/immutable/codex-worker/
+install -m 0444 tools/codex-worker/request-timeline.mjs /absolute/immutable/codex-worker/
+install -m 0444 tools/codex-worker/scheduler.mjs /absolute/immutable/codex-worker/
+install -m 0444 tools/codex-worker/worker.mjs /absolute/immutable/codex-worker/
+chmod 0555 /absolute/immutable/codex-worker
+chmod 0555 /absolute/immutable
+```
+
+Use only paths under that sealed directory for every `--candidate` argument.
+Then run the substrate lifecycle with the immutable manifest:
+
+```text
 python3 tools/d2-certification/isolated_orchestrator.py dry-run \
   --manifest /absolute/run/manifest.json
 python3 tools/d2-certification/isolated_orchestrator.py prepare \
@@ -118,14 +176,57 @@ python3 tools/d2-certification/isolated_orchestrator.py onboard \
   --manifest /absolute/run/manifest.json \
   --principal-id discord:<authenticated-user-id> \
   --display-name <authenticated-display-name>
+python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+  --manifest /absolute/run/manifest.json \
+  --operation snapshot
 python3 tools/d2-certification/isolated_orchestrator.py stop \
   --manifest /absolute/run/manifest.json
 python3 tools/d2-certification/isolated_orchestrator.py cleanup \
   --manifest /absolute/run/manifest.json
 ```
 
+Fault injection uses only the manifest-bound orchestrator commands below. Each
+command verifies the pinned transport instance, writes and fsyncs a durable
+operation intent, performs one exact control request over the private Unix
+socket, verifies the postcondition, and writes a secret-free completion
+snapshot. If the response is lost, retry the same command. The pending intent
+reuses the operation ID, so an already armed fault is recognized as an exact
+replay. A different pending operation, a busy arm, a widened response schema,
+or a changed transport instance fails closed.
+
+```text
+python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+  --manifest /absolute/run/manifest.json \
+  --operation arm-next-duplicate
+python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+  --manifest /absolute/run/manifest.json \
+  --operation disarm-duplicate
+python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+  --manifest /absolute/run/manifest.json \
+  --operation arm-next-indeterminate
+python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+  --manifest /absolute/run/manifest.json \
+  --operation disarm-indeterminate
+python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+  --manifest /absolute/run/manifest.json \
+  --operation partition-gateway
+python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+  --manifest /absolute/run/manifest.json \
+  --operation heal-gateway
+```
+
+`arm-next-duplicate` applies only to the next eligible manifest-owned Discord
+interaction. `arm-next-indeterminate` applies only to the next manifest-owned
+`create_role` effect. Run each arm immediately before its reviewed product
+action, then use a `snapshot` completion evidence object to populate the exact
+step 10 or step 13 receipt fields. For step 15, partition the gateway, record
+the failed-closed observation and partition counters, then heal it. Raw socket
+clients and unbound network fault tools are outside the certification contract.
+
 Every lifecycle operation takes a machine-wide nonblocking D2 lock. Mutation
-intent and completion receipts are append-only and fsynced. Cleanup reconstructs
+intent and completion receipts are append-only and fsynced, including the
+parent-directory entries created by atomic rename or first journal creation.
+Cleanup reconstructs
 the owned root, labels, and Keychain accounts from the immutable manifest rather
 than trusting the last state write, so it also recovers a prior interrupted run.
 

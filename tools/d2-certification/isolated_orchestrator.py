@@ -3,6 +3,7 @@
 import argparse
 import os
 import pathlib
+import re
 import shutil
 import signal
 import stat
@@ -50,8 +51,9 @@ from d2_orchestrator_contract import (
 from d2_orchestrator_platform import Platform
 
 
-SERVICE_START_ORDER = ("worker", "api", "runtime", "tunnel")
+SERVICE_START_ORDER = ("transport", "worker", "api", "runtime", "tunnel")
 SERVICE_STOP_ORDER = tuple(reversed(SERVICE_START_ORDER))
+TRANSPORT_INSTANCE_PATTERN = re.compile(r"^d2ti-[0-9a-f]{32}$")
 
 
 def command_dry_run(context, platform):
@@ -170,6 +172,7 @@ def candidate_health(context, platform, wait):
         return platform.wait_for_status(probe, 200) if wait else probe()
 
     worker_status = observe(lambda: platform.worker_health_status(context))
+    transport_status = observe(lambda: platform.transport_health_status(context))
     api_status = observe(
         lambda: platform.http_status(
             f"http://127.0.0.1:{manifest['services']['api']['port']}/health/ready"
@@ -185,6 +188,7 @@ def candidate_health(context, platform, wait):
     )
     return {
         "worker": worker_status,
+        "transport": transport_status,
         "api": api_status,
         "runtime": runtime_status,
         "tunnel": tunnel_status,
@@ -233,13 +237,20 @@ def write_database_evidence(context, database_evidence):
     )
 
 
-def write_candidate_evidence(context, statuses):
+def write_candidate_evidence(context, statuses, platform):
     manifest = context.manifest
+    transport_snapshot = platform.transport_control(context, "snapshot")
     evidence = {
         "api_sha256": manifest["candidates"]["api"]["sha256"],
         "runtime_sha256": manifest["candidates"]["runtime"]["sha256"],
         "codex_worker_sha256": manifest["source_trees"]["codex_worker"]["sha256"],
         "d2_toolchain_sha256": manifest["source_trees"]["d2_toolchain"]["sha256"],
+        "certification_transport_sha256": manifest["candidates"][
+            "certification_transport"
+        ]["sha256"],
+        "certification_transport_source_sha256": manifest["source_trees"][
+            "certification_transport"
+        ]["sha256"],
         "api_build_revision": manifest["commit_sha"],
         "runtime_build_revision": manifest["commit_sha"],
         "api_ready_status": statuses["api"],
@@ -248,12 +259,41 @@ def write_candidate_evidence(context, statuses):
         "cloudflare_tunnel_id": manifest["cloudflare"]["tunnel_id"],
         "public_origin": manifest["cloudflare"]["public_origin"],
         "origin_service": manifest["cloudflare"]["origin_service"],
+        "transport_instance_id": transport_snapshot["instance_id"],
+        "transport_ready": statuses["transport"] == 200,
         "tunnel_ready": statuses["tunnel"] == 200,
     }
     write_atomic(
         context.artifact_directory / "step-03-evidence.json",
         canonical_json(evidence) + "\n",
     )
+
+
+def pinned_transport_instance_id(context):
+    path = context.artifact_directory / "step-03-evidence.json"
+    try:
+        metadata = path.lstat()
+    except OSError:
+        fail("transport_instance_evidence_absent")
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or path.is_symlink()
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        fail("transport_instance_evidence_invalid")
+    evidence = load_json(path, "transport_instance_evidence_invalid")
+    instance_id = evidence.get("transport_instance_id") if isinstance(evidence, dict) else None
+    if not isinstance(instance_id, str) or not TRANSPORT_INSTANCE_PATTERN.fullmatch(
+        instance_id
+    ):
+        fail("transport_instance_evidence_invalid")
+    return instance_id
+
+
+def require_pinned_transport_snapshot(context, snapshot):
+    if snapshot["instance_id"] != pinned_transport_instance_id(context):
+        fail("transport_instance_changed")
 
 
 def command_start(context, platform):
@@ -267,6 +307,9 @@ def command_start(context, platform):
         statuses = candidate_health(context, platform, wait=True)
         if any(status != 200 for status in statuses.values()):
             fail("candidate_health_unready")
+        require_pinned_transport_snapshot(
+            context, platform.transport_control(context, "snapshot")
+        )
         return {"status": "already_started", "phase": "candidate_started"}
     if state["phase"] in {
         "substrate_starting",
@@ -323,7 +366,7 @@ def command_start(context, platform):
             fail("candidate_health_unready")
         if standing_snapshot(context, platform) != state["standing_snapshot"]:
             fail("protected_staging_state_changed")
-        write_candidate_evidence(context, statuses)
+        write_candidate_evidence(context, statuses, platform)
         append_journal(context, "postgres_start", "complete", "cluster")
         save_state(context, "candidate_started", state["standing_snapshot"])
         return {
@@ -389,6 +432,8 @@ def command_onboard(context, platform, principal_id, display_name):
     if not principal_id.startswith("discord:"):
         fail("onboarding_principal_invalid")
     validate_snowflake(principal_id.removeprefix("discord:"), "onboarding_principal")
+    if principal_id != f"discord:{context.manifest['discord']['actor_id']}":
+        fail("onboarding_principal_invalid")
     if (
         not display_name
         or len(display_name.encode("utf-8")) > 512
@@ -431,6 +476,304 @@ def command_onboard(context, platform, principal_id, display_name):
         save_state(context, "candidate_started", state["standing_snapshot"])
         append_journal(context, "installation_onboard", "failed", "installation")
         raise
+
+
+TRANSPORT_OPERATIONS = {
+    "snapshot": "snapshot",
+    "arm-next-duplicate": "arm_next_duplicate",
+    "disarm-duplicate": "disarm_duplicate",
+    "arm-next-indeterminate": "arm_next_create_role_indeterminate",
+    "disarm-indeterminate": "disarm_indeterminate",
+    "partition-gateway": "partition_gateway",
+    "heal-gateway": "heal_gateway",
+}
+TRANSPORT_CONTROL_FILE_PATTERN = re.compile(
+    r"^([0-9]{4})-([a-z-]+)-(intent|complete)\.json$"
+)
+TRANSPORT_OPERATION_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.:-]{7,95}$")
+TRANSPORT_RECORDED_AT_PATTERN = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
+
+
+def transport_control_directory(context):
+    return context.artifact_directory / "transport-controls"
+
+
+def transport_control_inventory(context):
+    directory = transport_control_directory(context)
+    if not directory.exists():
+        return [], None
+    metadata = directory.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or directory.is_symlink()
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        fail("transport_evidence_directory_invalid")
+    records = {}
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        fail("transport_evidence_inventory_invalid")
+    for entry in entries:
+        match = TRANSPORT_CONTROL_FILE_PATTERN.fullmatch(entry.name)
+        try:
+            entry_metadata = entry.lstat()
+        except OSError:
+            fail("transport_evidence_inventory_invalid")
+        if (
+            match is None
+            or not stat.S_ISREG(entry_metadata.st_mode)
+            or entry.is_symlink()
+            or entry_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(entry_metadata.st_mode) != 0o600
+        ):
+            fail("transport_evidence_inventory_invalid")
+        sequence = int(match.group(1))
+        operation = match.group(2)
+        kind = match.group(3)
+        if sequence == 0 or operation not in TRANSPORT_OPERATIONS:
+            fail("transport_evidence_inventory_invalid")
+        record = records.setdefault(sequence, {"operation": operation})
+        if record["operation"] != operation or kind in record:
+            fail("transport_evidence_inventory_invalid")
+        record[kind] = load_json(entry, "transport_evidence_invalid")
+    ordered = []
+    for expected_sequence, sequence in enumerate(sorted(records), 1):
+        if sequence != expected_sequence:
+            fail("transport_evidence_inventory_invalid")
+        record = records[sequence]
+        if "intent" not in record:
+            fail("transport_evidence_inventory_invalid")
+        intent = record["intent"]
+        expected_intent = {
+            "schema_version",
+            "manifest_sha256",
+            "recorded_at",
+            "sequence",
+            "operation",
+            "command",
+            "operation_id",
+        }
+        if (
+            not isinstance(intent, dict)
+            or set(intent) != expected_intent
+            or intent["schema_version"] != 1
+            or intent["manifest_sha256"] != context.digest
+            or intent["sequence"] != sequence
+            or intent["operation"] != record["operation"]
+            or intent["command"] != TRANSPORT_OPERATIONS[record["operation"]]
+            or not isinstance(intent["recorded_at"], str)
+            or not TRANSPORT_RECORDED_AT_PATTERN.fullmatch(intent["recorded_at"])
+            or not isinstance(intent["operation_id"], str)
+            or not TRANSPORT_OPERATION_ID_PATTERN.fullmatch(intent["operation_id"])
+        ):
+            fail("transport_evidence_invalid")
+        complete = record.get("complete")
+        if complete is not None:
+            if (
+                not isinstance(complete, dict)
+                or set(complete)
+                != {
+                    "schema_version",
+                    "manifest_sha256",
+                    "recorded_at",
+                    "sequence",
+                    "operation",
+                    "command",
+                    "operation_id",
+                    "response",
+                    "snapshot",
+                }
+                or complete["schema_version"] != 1
+                or complete["manifest_sha256"] != context.digest
+                or complete["sequence"] != sequence
+                or complete["operation"] != intent["operation"]
+                or complete["command"] != intent["command"]
+                or complete["operation_id"] != intent["operation_id"]
+                or not isinstance(complete["recorded_at"], str)
+                or not TRANSPORT_RECORDED_AT_PATTERN.fullmatch(
+                    complete["recorded_at"]
+                )
+                or complete["response"] is not None
+                and not isinstance(complete["response"], dict)
+                or not isinstance(complete["snapshot"], dict)
+            ):
+                fail("transport_evidence_invalid")
+        ordered.append({"sequence": sequence, **record})
+    pending = [record for record in ordered if "complete" not in record]
+    if len(pending) > 1 or pending and pending[0] is not ordered[-1]:
+        fail("transport_evidence_inventory_invalid")
+    return ordered, pending[0] if pending else None
+
+
+def transport_operation_postcondition(operation, operation_id, response, snapshot):
+    gateway = snapshot["gateway"]
+    effect = snapshot["effect_http"]
+    if operation == "snapshot":
+        return
+    if operation == "arm-next-duplicate":
+        if response["disposition"] == "busy":
+            fail("transport_operation_busy")
+        if not (
+            gateway["armed_duplicate_operation_id"] == operation_id
+            or gateway["claimed_duplicate_operation_id"] == operation_id
+            or gateway["last_duplicate_operation_id"] == operation_id
+        ):
+            fail("transport_operation_not_applied")
+        return
+    if operation == "arm-next-indeterminate":
+        if response["disposition"] == "busy":
+            fail("transport_operation_busy")
+        if not (
+            effect["armed_indeterminate_operation_id"] == operation_id
+            or effect["claimed_indeterminate_operation_id"] == operation_id
+            or effect["last_indeterminate_operation_id"] == operation_id
+        ):
+            fail("transport_operation_not_applied")
+        return
+    expected = {
+        "disarm-duplicate": not gateway["duplicate_armed"]
+        and not gateway["duplicate_claimed"],
+        "disarm-indeterminate": not effect["indeterminate_armed"]
+        and not effect["indeterminate_claimed"],
+        "partition-gateway": gateway["partitioned"],
+        "heal-gateway": not gateway["partitioned"],
+    }[operation]
+    if not expected:
+        fail("transport_operation_not_applied")
+
+
+def validate_transport_control_history(context, records):
+    validator = Platform()
+    pinned_instance_id = pinned_transport_instance_id(context)
+    for record in records:
+        complete = record.get("complete")
+        if complete is None:
+            continue
+        response = complete["response"]
+        operation = complete["operation"]
+        if operation == "snapshot":
+            if response is not None:
+                fail("transport_evidence_invalid")
+        elif operation in {"arm-next-duplicate", "arm-next-indeterminate"}:
+            if (
+                not isinstance(response, dict)
+                or set(response) != {"changed", "disposition"}
+                or type(response["changed"]) is not bool
+                or response["disposition"] not in {"armed", "replayed"}
+                or (response["disposition"] == "armed") != response["changed"]
+            ):
+                fail("transport_evidence_invalid")
+        elif (
+            not isinstance(response, dict)
+            or set(response) != {"changed"}
+            or type(response["changed"]) is not bool
+        ):
+            fail("transport_evidence_invalid")
+        snapshot = complete["snapshot"]
+        if (
+            not validator._transport_snapshot_valid(context, snapshot)
+            or snapshot["instance_id"] != pinned_instance_id
+        ):
+            fail("transport_evidence_invalid")
+        transport_operation_postcondition(
+            operation, complete["operation_id"], response, snapshot
+        )
+
+
+def command_transport_control(context, platform, operation):
+    state = load_state(context, {"candidate_started"})
+    if not platform.postgres_running(context.cluster_root) or any(
+        not platform.launchd_loaded(context.manifest["services"][name]["label"])
+        for name in SERVICE_START_ORDER
+    ):
+        fail("candidate_state_drift")
+    if standing_snapshot(context, platform) != state["standing_snapshot"]:
+        fail("protected_staging_state_changed")
+    command = TRANSPORT_OPERATIONS.get(operation)
+    if command is None:
+        fail("transport_operation_invalid")
+    pre_snapshot = platform.transport_control(context, "snapshot")
+    require_pinned_transport_snapshot(context, pre_snapshot)
+    records, pending = transport_control_inventory(context)
+    validate_transport_control_history(context, records)
+    if pending is not None:
+        intent = pending["intent"]
+        if intent["operation"] != operation:
+            fail("transport_operation_pending")
+        sequence = intent["sequence"]
+        operation_id = intent["operation_id"]
+    else:
+        if operation == "arm-next-duplicate" and (
+            pre_snapshot["gateway"]["duplicate_armed"]
+            or pre_snapshot["gateway"]["duplicate_claimed"]
+        ):
+            fail("transport_operation_busy")
+        if operation == "arm-next-indeterminate" and (
+            pre_snapshot["effect_http"]["indeterminate_armed"]
+            or pre_snapshot["effect_http"]["indeterminate_claimed"]
+        ):
+            fail("transport_operation_busy")
+        sequence = len(records) + 1
+        if sequence > 9999:
+            fail("transport_evidence_capacity_exhausted")
+        operation_id = f"d2:{context.digest[:16]}:{sequence:04d}:{operation}"
+        intent = {
+            "schema_version": 1,
+            "manifest_sha256": context.digest,
+            "recorded_at": utc_now(),
+            "sequence": sequence,
+            "operation": operation,
+            "command": command,
+            "operation_id": operation_id,
+        }
+        intent_path = transport_control_directory(context) / (
+            f"{sequence:04d}-{operation}-intent.json"
+        )
+        write_atomic(intent_path, canonical_json(intent) + "\n")
+        append_journal(
+            context, "transport_control", "intent", operation_id.replace(":", "_")
+        )
+    response = None
+    if operation != "snapshot":
+        fields = (
+            {"operation_id": operation_id}
+            if operation in {"arm-next-duplicate", "arm-next-indeterminate"}
+            else {}
+        )
+        response = platform.transport_control(context, command, fields)
+    snapshot = platform.transport_control(context, "snapshot")
+    require_pinned_transport_snapshot(context, snapshot)
+    transport_operation_postcondition(operation, operation_id, response, snapshot)
+    evidence = {
+        "schema_version": 1,
+        "manifest_sha256": context.digest,
+        "recorded_at": utc_now(),
+        "sequence": sequence,
+        "operation": operation,
+        "command": command,
+        "operation_id": operation_id,
+        "response": response,
+        "snapshot": snapshot,
+    }
+    evidence_path = transport_control_directory(context) / (
+        f"{sequence:04d}-{operation}-complete.json"
+    )
+    write_atomic(evidence_path, canonical_json(evidence) + "\n")
+    append_journal(
+        context, "transport_control", "complete", operation_id.replace(":", "_")
+    )
+    return {
+        "status": "controlled",
+        "operation": operation,
+        "operation_id": operation_id,
+        "response": response,
+        "evidence": str(evidence_path),
+        "snapshot": snapshot,
+    }
 
 
 def guarded_remove_root(context):
@@ -572,6 +915,21 @@ def build_parser():
     onboard.add_argument("--manifest", required=True)
     onboard.add_argument("--principal-id", required=True)
     onboard.add_argument("--display-name", required=True)
+    transport = subparsers.add_parser("transport-control")
+    transport.add_argument("--manifest", required=True)
+    transport.add_argument(
+        "--operation",
+        required=True,
+        choices=(
+            "snapshot",
+            "arm-next-duplicate",
+            "disarm-duplicate",
+            "arm-next-indeterminate",
+            "disarm-indeterminate",
+            "partition-gateway",
+            "heal-gateway",
+        ),
+    )
     return parser
 
 
@@ -592,6 +950,12 @@ def main():
             if arguments.command == "onboard":
                 result = command_onboard(
                     context, platform, arguments.principal_id, arguments.display_name
+                )
+            elif arguments.command == "transport-control":
+                result = command_transport_control(
+                    context,
+                    platform,
+                    arguments.operation,
                 )
             else:
                 result = handlers[arguments.command](context, platform)

@@ -20,6 +20,7 @@ SPEC.loader.exec_module(MODULE)
 COMMIT = "a" * 40
 DIGEST = "b" * 64
 RUN_ID = "d2-20260801t120000z-0123456789ab"
+TRANSPORT_INSTANCE_ID = "d2ti-0123456789abcdef0123456789abcdef"
 
 
 def complete_evidence(manifest):
@@ -38,6 +39,12 @@ def complete_evidence(manifest):
             "runtime_sha256": manifest["candidates"]["runtime"]["sha256"],
             "codex_worker_sha256": manifest["source_trees"]["codex_worker"]["sha256"],
             "d2_toolchain_sha256": manifest["source_trees"]["d2_toolchain"]["sha256"],
+            "certification_transport_sha256": manifest["candidates"][
+                "certification_transport"
+            ]["sha256"],
+            "certification_transport_source_sha256": manifest["source_trees"][
+                "certification_transport"
+            ]["sha256"],
             "api_build_revision": COMMIT,
             "runtime_build_revision": COMMIT,
             "api_ready_status": 200,
@@ -46,6 +53,8 @@ def complete_evidence(manifest):
             "cloudflare_tunnel_id": manifest["cloudflare"]["tunnel_id"],
             "public_origin": manifest["cloudflare"]["public_origin"],
             "origin_service": manifest["cloudflare"]["origin_service"],
+            "transport_instance_id": TRANSPORT_INSTANCE_ID,
+            "transport_ready": True,
             "tunnel_ready": True,
         },
         4: {
@@ -108,6 +117,10 @@ def complete_evidence(manifest):
             "delivery_count": 2,
             "external_effect_count": 1,
             "receipt_state": "completed",
+            "transport_duplicate_injections": 1,
+            "transport_duplicate_delivery_count": 2,
+            "transport_last_duplicate_interaction_id": "1532677575736819846",
+            "transport_instance_id": TRANSPORT_INSTANCE_ID,
         },
         11: {
             "old_pid": 100,
@@ -135,6 +148,10 @@ def complete_evidence(manifest):
             "reconciliation_state": "known_success",
             "duplicate_external_effect_count": 0,
             "unsafe_deletion_count": 0,
+            "transport_indeterminate_injections": 1,
+            "transport_last_audit_reason_sha256": DIGEST,
+            "transport_last_upstream_status": 201,
+            "transport_instance_id": TRANSPORT_INSTANCE_ID,
         },
         14: {
             "replacement_target_id": "deployment-2",
@@ -153,6 +170,9 @@ def complete_evidence(manifest):
             "runtime_ready_status": 503,
             "public_code": "runtime_gateway_disconnected",
             "route_id": "route-2",
+            "transport_gateway_partitioned": True,
+            "transport_gateway_partition_events": 1,
+            "transport_instance_id": TRANSPORT_INSTANCE_ID,
         },
         16: {
             "teardown_started": True,
@@ -186,13 +206,15 @@ def complete_evidence(manifest):
 class D2CertificationTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = pathlib.Path(self.temporary.name)
+        self.root = pathlib.Path(self.temporary.name).resolve()
+        self.artifact_root = self.root / "immutable-candidates"
+        self.artifact_root.mkdir()
         self.candidates = {}
         for name in MODULE.REQUIRED_CANDIDATES:
             path = (
-                self.root / "worker-tree" / "worker.mjs"
+                self.artifact_root / "worker-tree" / "worker.mjs"
                 if name == "codex_worker"
-                else self.root / name
+                else self.artifact_root / name
             )
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(f"candidate:{name}".encode())
@@ -201,8 +223,21 @@ class D2CertificationTest(unittest.TestCase):
             path = self.candidates["codex_worker"].parent / name
             if not path.exists():
                 path.write_bytes(f"worker-source:{name}".encode())
+        for path in self.artifact_root.rglob("*"):
+            if path.is_file():
+                path.chmod(0o555)
+        for path in sorted(
+            (path for path in self.artifact_root.rglob("*") if path.is_dir()),
+            reverse=True,
+        ):
+            path.chmod(0o555)
+        self.artifact_root.chmod(0o555)
 
     def tearDown(self):
+        for path in self.artifact_root.rglob("*"):
+            if path.is_dir():
+                path.chmod(0o700)
+        self.artifact_root.chmod(0o700)
         self.temporary.cleanup()
 
     def prepare(self):
@@ -218,6 +253,8 @@ class D2CertificationTest(unittest.TestCase):
             "1524810437118525552",
             "--discord-bot-user-id",
             "1524810437118525553",
+            "--discord-actor-id",
+            "1056857223529250906",
             "--discord-oauth-keychain",
             "starring.d2.credentials:discord.oauth-client-secret",
             "--discord-bot-keychain",
@@ -238,6 +275,8 @@ class D2CertificationTest(unittest.TestCase):
             "api": 28080,
             "runtime": 29091,
             "worker": 28181,
+            "transport_gateway": 29101,
+            "transport_http": 29102,
         }.items():
             arguments.extend(("--port", f"{name}={port}"))
         output = io.StringIO()
@@ -282,13 +321,39 @@ class D2CertificationTest(unittest.TestCase):
             },
         )
         self.assertTrue(manifest["database"]["cluster_root"].startswith("/private/tmp/starring-d2-"))
-        self.assertEqual(len(set(value["port"] for value in manifest["services"].values() if "port" in value)), 3)
+        self.assertEqual(
+            {
+                manifest["services"]["transport"]["gateway_port"],
+                manifest["services"]["transport"]["http_port"],
+            },
+            {29101, 29102},
+        )
         self.assertEqual(
             manifest["candidates"]["runtime"]["sha256"],
             MODULE.sha256_file(self.candidates["runtime"]),
         )
+        self.assertEqual(manifest["discord"]["actor_id"], "1056857223529250906")
+        self.assertEqual(
+            manifest["source_trees"]["certification_transport"]["files"],
+            list(MODULE.CERTIFICATION_TRANSPORT_SOURCE_FILES),
+        )
         self.assertEqual(oct(manifest_path.stat().st_mode & 0o777), "0o600")
         self.assertEqual(oct(manifest_path.parent.stat().st_mode & 0o777), "0o700")
+
+    def test_transport_inventory_prunes_the_build_target(self):
+        root = self.root / "transport-inventory"
+        for name in MODULE.CERTIFICATION_TRANSPORT_SOURCE_FILES:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(name, encoding="utf-8")
+        (root / "target").symlink_to(root / "missing-build-output")
+        MODULE.validate_certification_transport_inventory(root)
+        extra = root / "src" / "unexpected.rs"
+        extra.write_text("unexpected", encoding="utf-8")
+        with self.assertRaisesRegex(
+            MODULE.CertificationError, "certification_transport_inventory_invalid"
+        ):
+            MODULE.validate_certification_transport_inventory(root)
 
     def test_prepare_fsyncs_parent_then_complete_run_directory(self):
         observed = []
@@ -369,6 +434,34 @@ class D2CertificationTest(unittest.TestCase):
         self.assertEqual(summary["steps"], 17)
         self.assertRegex(summary["receipt_chain_head_sha256"], r"^[0-9a-f]{64}$")
 
+    def test_oauth_principal_must_match_the_pinned_transport_actor(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence_by_step = complete_evidence(manifest)
+        for step in range(1, 4):
+            self.assertEqual(self.record(manifest_path, step, evidence_by_step[step]), 0)
+        evidence_by_step[4]["principal_id"] = "discord:1056857223529250907"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            status = self.record(manifest_path, 4, evidence_by_step[4])
+        self.assertEqual(status, 1)
+        self.assertIn("step_contract_failed:principal_id", stderr.getvalue())
+
+    def test_fault_receipt_requires_the_pinned_transport_instance(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence_by_step = complete_evidence(manifest)
+        for step in range(1, 10):
+            self.assertEqual(self.record(manifest_path, step, evidence_by_step[step]), 0)
+        evidence_by_step[10]["transport_instance_id"] = (
+            "d2ti-fedcba9876543210fedcba9876543210"
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            status = self.record(manifest_path, 10, evidence_by_step[10])
+        self.assertEqual(status, 1)
+        self.assertIn("step_contract_failed:transport_instance_id", stderr.getvalue())
+
     def test_record_rejects_out_of_order_step(self):
         manifest_path = self.prepare()
         manifest = json.loads(manifest_path.read_text())
@@ -426,12 +519,20 @@ class D2CertificationTest(unittest.TestCase):
 
     def test_candidate_permissions_and_worker_inventory_are_revalidated(self):
         manifest_path = self.prepare()
+        self.artifact_root.chmod(0o755)
+        with self.assertRaisesRegex(
+            MODULE.CertificationError, "candidate_api_directory_mutable"
+        ):
+            MODULE.load_verified_manifest(manifest_path)
+        self.artifact_root.chmod(0o555)
         self.candidates["api"].chmod(0o666)
         with self.assertRaisesRegex(MODULE.CertificationError, "candidate_api_writable"):
             MODULE.load_verified_manifest(manifest_path)
-        self.candidates["api"].chmod(0o644)
+        self.candidates["api"].chmod(0o555)
         extra = self.candidates["codex_worker"].parent / "unpinned-runtime.mjs"
+        self.candidates["codex_worker"].parent.chmod(0o755)
         extra.write_text("export const unpinned = true;\n", encoding="utf-8")
+        self.candidates["codex_worker"].parent.chmod(0o555)
         with self.assertRaisesRegex(
             MODULE.CertificationError, "codex_worker_inventory_invalid"
         ):

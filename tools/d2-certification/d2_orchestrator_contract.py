@@ -13,6 +13,7 @@ from d2_certification import (
     D2_CLOUDFLARE_TUNNEL_ID,
     D2_ORIGIN_SERVICE,
     D2_PUBLIC_ORIGIN,
+    fsync_directory,
     load_verified_manifest,
     sha256_file,
 )
@@ -108,7 +109,10 @@ def utc_now():
 
 
 def write_atomic(path, payload, mode=0o600):
+    parent_created = not path.parent.exists()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if parent_created:
+        fsync_directory(path.parent.parent, "atomic_parent_parent")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     descriptor = os.open(
         temporary,
@@ -116,6 +120,7 @@ def write_atomic(path, payload, mode=0o600):
         mode,
     )
     try:
+        os.fchmod(descriptor, mode)
         data = payload if isinstance(payload, bytes) else payload.encode("utf-8")
         written = 0
         while written < len(data):
@@ -127,7 +132,7 @@ def write_atomic(path, payload, mode=0o600):
     finally:
         os.close(descriptor)
     os.replace(temporary, path)
-    os.chmod(path, mode)
+    fsync_directory(path.parent, "atomic_parent")
 
 
 def load_json(path, code):
@@ -211,6 +216,7 @@ def load_context(raw_manifest):
         fail("manifest_discord_shape_invalid")
     validate_identity(discord.get("application_id"), "manifest_discord_application_invalid")
     validate_identity(discord.get("bot_user_id"), "manifest_discord_bot_invalid")
+    validate_identity(discord.get("actor_id"), "manifest_discord_actor_invalid")
     if manifest.get("public_origin") == STANDING_PUBLIC_ORIGIN:
         fail("dedicated_public_origin_required")
     if manifest.get("cloudflare") != {
@@ -224,6 +230,7 @@ def load_context(raw_manifest):
         "api": f"local.starring.d2.{suffix}.api",
         "runtime": f"local.starring.d2.{suffix}.runtime",
         "worker": f"local.starring.d2.{suffix}.worker",
+        "transport": f"local.starring.d2.{suffix}.transport",
         "tunnel": f"local.starring.d2.{suffix}.tunnel",
     }
     if set(services) != set(expected_labels):
@@ -391,6 +398,7 @@ def validate_candidate_programs(context, platform):
         "cloudflared",
         "db_bootstrap",
         "sealed_provisioner",
+        "certification_transport",
     ):
         candidate = pathlib.Path(context.manifest["candidates"][name]["path"])
         if not platform.executable(candidate):
@@ -403,8 +411,10 @@ def validate_ports(context, platform, require_available=True):
         context.manifest["services"]["api"]["port"],
         context.manifest["services"]["runtime"]["port"],
         context.manifest["services"]["worker"]["port"],
+        context.manifest["services"]["transport"]["gateway_port"],
+        context.manifest["services"]["transport"]["http_port"],
     }
-    if len(ports) != 4 or ports.intersection(PROTECTED_PORTS):
+    if len(ports) != 6 or ports.intersection(PROTECTED_PORTS):
         fail("isolated_port_contract_invalid")
     if require_available:
         for port in ports:
@@ -413,13 +423,20 @@ def validate_ports(context, platform, require_available=True):
 
 
 def append_journal(context, action, status, target):
+    artifact_created = not context.artifact_directory.exists()
     context.artifact_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if artifact_created:
+        fsync_directory(context.artifact_directory.parent, "journal_artifact_parent")
+    lock_created = not context.lock_path.exists()
     descriptor = os.open(
         context.lock_path,
         os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
         0o600,
     )
     try:
+        os.fchmod(descriptor, 0o600)
+        if lock_created:
+            fsync_directory(context.artifact_directory, "journal_lock_parent")
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         sequence = 1
         if context.journal_path.exists():
@@ -438,8 +455,10 @@ def append_journal(context, action, status, target):
             "target": validate_identity(target, "journal_target_invalid"),
         }
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        journal_created = not context.journal_path.exists()
         output = os.open(context.journal_path, flags, 0o600)
         try:
+            os.fchmod(output, 0o600)
             payload = (json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
             written = 0
             while written < len(payload):
@@ -450,6 +469,8 @@ def append_journal(context, action, status, target):
             os.fsync(output)
         finally:
             os.close(output)
+        if journal_created:
+            fsync_directory(context.artifact_directory, "journal_entry_parent")
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)

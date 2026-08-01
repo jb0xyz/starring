@@ -28,6 +28,7 @@ SNOWFLAKE_PATTERN = re.compile(r"^[1-9][0-9]{5,24}$")
 RUN_ID_PATTERN = re.compile(r"^d2-[0-9]{8}t[0-9]{6}z-[0-9a-f]{12}$")
 MIGRATION_PATTERN = re.compile(r"^[0-9]{12}$")
 UTC_TIMESTAMP_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+TRANSPORT_INSTANCE_PATTERN = re.compile(r"^d2ti-[0-9a-f]{32}$")
 ZERO_DIGEST = "0" * 64
 FORBIDDEN_EVIDENCE_KEYS = {
     "access_token",
@@ -64,10 +65,18 @@ REQUIRED_CANDIDATES = {
     "codex",
     "db_bootstrap",
     "sealed_provisioner",
+    "certification_transport",
     "node",
     "cloudflared",
 }
-REQUIRED_PORTS = {"postgres", "api", "runtime", "worker"}
+REQUIRED_PORTS = {
+    "postgres",
+    "api",
+    "runtime",
+    "worker",
+    "transport_gateway",
+    "transport_http",
+}
 CODEX_WORKER_SOURCE_FILES = (
     "admission-registry.mjs",
     "codex-runner.mjs",
@@ -84,6 +93,18 @@ D2_TOOLCHAIN_SOURCE_FILES = (
     "d2_orchestrator_platform.py",
     "isolated_orchestrator.py",
     "product_driver.js",
+)
+CERTIFICATION_TRANSPORT_SOURCE_FILES = (
+    ".gitignore",
+    "Cargo.lock",
+    "Cargo.toml",
+    "src/config.rs",
+    "src/control.rs",
+    "src/gateway.rs",
+    "src/http_proxy.rs",
+    "src/lib.rs",
+    "src/main.rs",
+    "src/state.rs",
 )
 AUTHORING_CONFIG = {
     "provider": "codex_chatgpt",
@@ -129,6 +150,8 @@ STEP_SPECS = {
             "runtime_sha256",
             "codex_worker_sha256",
             "d2_toolchain_sha256",
+            "certification_transport_sha256",
+            "certification_transport_source_sha256",
             "api_build_revision",
             "runtime_build_revision",
             "api_ready_status",
@@ -137,6 +160,8 @@ STEP_SPECS = {
             "cloudflare_tunnel_id",
             "public_origin",
             "origin_service",
+            "transport_instance_id",
+            "transport_ready",
             "tunnel_ready",
         ),
     ),
@@ -215,7 +240,16 @@ STEP_SPECS = {
     ),
     10: StepSpec(
         "duplicate_interaction_suppressed",
-        ("interaction_id", "delivery_count", "external_effect_count", "receipt_state"),
+        (
+            "interaction_id",
+            "delivery_count",
+            "external_effect_count",
+            "receipt_state",
+            "transport_duplicate_injections",
+            "transport_duplicate_delivery_count",
+            "transport_last_duplicate_interaction_id",
+            "transport_instance_id",
+        ),
     ),
     11: StepSpec(
         "runtime_restarted",
@@ -251,6 +285,10 @@ STEP_SPECS = {
             "reconciliation_state",
             "duplicate_external_effect_count",
             "unsafe_deletion_count",
+            "transport_indeterminate_injections",
+            "transport_last_audit_reason_sha256",
+            "transport_last_upstream_status",
+            "transport_instance_id",
         ),
     ),
     14: StepSpec(
@@ -275,6 +313,9 @@ STEP_SPECS = {
             "runtime_ready_status",
             "public_code",
             "route_id",
+            "transport_gateway_partitioned",
+            "transport_gateway_partition_events",
+            "transport_instance_id",
         ),
     ),
     16: StepSpec(
@@ -339,11 +380,13 @@ def source_tree_digest(root, files, label):
         fail(f"{label}_root_unavailable:{error.__class__.__name__}")
     if not stat.S_ISDIR(metadata.st_mode) or root.is_symlink():
         fail(f"{label}_root_invalid")
+    if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
+        fail(f"{label}_root_ownership_invalid")
     digest = hashlib.sha256()
     for name in files:
         path = root / name
         file_metadata = require_regular_file(path, f"{label}_{name}")
-        if stat.S_IMODE(file_metadata.st_mode) & 0o022:
+        if file_metadata.st_uid != os.getuid() or stat.S_IMODE(file_metadata.st_mode) & 0o022:
             fail(f"{label}_{name}_writable")
         content = path.read_bytes()
         encoded_name = name.encode("utf-8")
@@ -368,6 +411,26 @@ def validate_codex_worker_inventory(root):
         fail(f"codex_worker_inventory_unavailable:{error.__class__.__name__}")
     if observed != set(CODEX_WORKER_SOURCE_FILES):
         fail("codex_worker_inventory_invalid")
+
+
+def validate_certification_transport_inventory(root):
+    try:
+        observed = set()
+        for path in root.iterdir():
+            if path.name == "target":
+                continue
+            if path.name == "src" and path.is_dir() and not path.is_symlink():
+                observed.update(
+                    child.relative_to(root).as_posix() for child in path.iterdir()
+                )
+            else:
+                observed.add(path.relative_to(root).as_posix())
+    except OSError as error:
+        fail(
+            f"certification_transport_inventory_unavailable:{error.__class__.__name__}"
+        )
+    if observed != set(CERTIFICATION_TRANSPORT_SOURCE_FILES):
+        fail("certification_transport_inventory_invalid")
 
 
 def source_tree_manifest(root, files, label):
@@ -429,10 +492,31 @@ def parse_named_values(raw_values, required, label, value_parser):
 
 def parse_candidate(raw, name):
     path = require_absolute_path(raw, f"candidate_{name}")
-    metadata = require_regular_file(path, f"candidate_{name}")
-    if stat.S_IMODE(metadata.st_mode) & 0o022:
-        fail(f"candidate_{name}_writable")
+    require_immutable_candidate(path, name)
     return path
+
+
+def require_immutable_candidate(path, name):
+    metadata = require_regular_file(path, f"candidate_{name}")
+    if metadata.st_uid != os.getuid():
+        fail(f"candidate_{name}_owner_invalid")
+    if stat.S_IMODE(metadata.st_mode) & 0o222:
+        fail(f"candidate_{name}_writable")
+    try:
+        parent = path.parent.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        fail(f"candidate_{name}_unavailable:{error.__class__.__name__}")
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or path.parent.is_symlink()
+        or parent.st_uid != metadata.st_uid
+        or stat.S_IMODE(parent.st_mode) & 0o222
+    ):
+        fail(f"candidate_{name}_directory_mutable")
+    if resolved != path:
+        fail(f"candidate_{name}_path_not_canonical")
+    return metadata
 
 
 def parse_port(raw, name):
@@ -617,6 +701,7 @@ def build_manifest(arguments):
     bot_user_id = validate_snowflake(
         arguments.discord_bot_user_id, "discord_bot_user_id"
     )
+    actor_id = validate_snowflake(arguments.discord_actor_id, "discord_actor_id")
     candidates = parse_named_values(
         arguments.candidate, REQUIRED_CANDIDATES, "candidates", parse_candidate
     )
@@ -647,6 +732,8 @@ def build_manifest(arguments):
         fail("candidate_codex_worker_entrypoint_invalid")
     validate_codex_worker_inventory(worker_root)
     toolchain_root = pathlib.Path(__file__).resolve().parent
+    transport_root = toolchain_root.parent / "d2-certification-transport"
+    validate_certification_transport_inventory(transport_root)
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
@@ -666,6 +753,11 @@ def build_manifest(arguments):
             "d2_toolchain": source_tree_manifest(
                 toolchain_root, D2_TOOLCHAIN_SOURCE_FILES, "d2_toolchain_tree"
             ),
+            "certification_transport": source_tree_manifest(
+                transport_root,
+                CERTIFICATION_TRANSPORT_SOURCE_FILES,
+                "certification_transport_tree",
+            ),
         },
         "database": {
             "name": "starring_runtime_staging",
@@ -677,6 +769,7 @@ def build_manifest(arguments):
             "guild_id": guild_id,
             "application_id": application_id,
             "bot_user_id": bot_user_id,
+            "actor_id": actor_id,
             "resource_prefix": prefix,
             "disposable_guild_required": True,
         },
@@ -692,6 +785,11 @@ def build_manifest(arguments):
             "worker": {
                 "label": f"local.starring.d2.{suffix}.worker",
                 "port": ports["worker"],
+            },
+            "transport": {
+                "label": f"local.starring.d2.{suffix}.transport",
+                "gateway_port": ports["transport_gateway"],
+                "http_port": ports["transport_http"],
             },
             "tunnel": {"label": f"local.starring.d2.{suffix}.tunnel"},
         },
@@ -812,6 +910,7 @@ def validate_manifest(manifest):
     expected_files = {
         "codex_worker": CODEX_WORKER_SOURCE_FILES,
         "d2_toolchain": D2_TOOLCHAIN_SOURCE_FILES,
+        "certification_transport": CERTIFICATION_TRANSPORT_SOURCE_FILES,
     }
     if not isinstance(source_trees, dict) or set(source_trees) != set(expected_files):
         fail("manifest_source_trees_invalid")
@@ -835,6 +934,7 @@ def validate_manifest(manifest):
             "guild_id",
             "application_id",
             "bot_user_id",
+            "actor_id",
             "resource_prefix",
             "disposable_guild_required",
         }
@@ -846,6 +946,7 @@ def validate_manifest(manifest):
         discord.get("application_id", ""), "manifest_discord_application"
     )
     validate_snowflake(discord.get("bot_user_id", ""), "manifest_discord_bot")
+    validate_snowflake(discord.get("actor_id", ""), "manifest_discord_actor")
     if not isinstance(discord.get("resource_prefix"), str) or not ID_PATTERN.fullmatch(
         discord["resource_prefix"]
     ):
@@ -867,6 +968,7 @@ def validate_manifest(manifest):
         "api": f"local.starring.d2.{suffix}.api",
         "runtime": f"local.starring.d2.{suffix}.runtime",
         "worker": f"local.starring.d2.{suffix}.worker",
+        "transport": f"local.starring.d2.{suffix}.transport",
         "tunnel": f"local.starring.d2.{suffix}.tunnel",
     }
     if not isinstance(services, dict) or set(services) != set(expected_labels):
@@ -874,7 +976,17 @@ def validate_manifest(manifest):
     observed_ports = [database["port"]]
     for name, label in expected_labels.items():
         expected = {"label": label}
-        if name != "tunnel":
+        if name == "transport":
+            if (
+                not isinstance(services[name], dict)
+                or set(services[name]) != {"label", "gateway_port", "http_port"}
+            ):
+                fail("manifest_services_invalid")
+            for port_name in ("gateway_port", "http_port"):
+                parse_port(str(services[name][port_name]), f"transport_{port_name}")
+                expected[port_name] = services[name][port_name]
+                observed_ports.append(services[name][port_name])
+        elif name != "tunnel":
             if not isinstance(services[name], dict) or "port" not in services[name]:
                 fail("manifest_services_invalid")
             parse_port(str(services[name]["port"]), name)
@@ -882,7 +994,7 @@ def validate_manifest(manifest):
             observed_ports.append(services[name]["port"])
         if services[name] != expected:
             fail("manifest_services_invalid")
-    if len(set(observed_ports)) != 4:
+    if len(set(observed_ports)) != 6:
         fail("manifest_ports_invalid")
     expected_cloudflare = validate_cloudflare_route_binding(
         tunnel_id, manifest["public_origin"], services["api"]["port"]
@@ -936,9 +1048,7 @@ def validate_manifest(manifest):
 def validate_candidate_files(manifest):
     for name, candidate in manifest["candidates"].items():
         path = require_absolute_path(candidate["path"], f"candidate_{name}")
-        metadata = require_regular_file(path, f"candidate_{name}")
-        if stat.S_IMODE(metadata.st_mode) & 0o022:
-            fail(f"candidate_{name}_writable")
+        require_immutable_candidate(path, name)
         if sha256_file(path) != candidate["sha256"]:
             fail(f"candidate_{name}_digest_mismatch")
     worker_path = pathlib.Path(manifest["candidates"]["codex_worker"]["path"])
@@ -946,11 +1056,17 @@ def validate_candidate_files(manifest):
     expected_roots = {
         "codex_worker": worker_path.parent,
         "d2_toolchain": pathlib.Path(__file__).resolve().parent,
+        "certification_transport": pathlib.Path(__file__).resolve().parent.parent
+        / "d2-certification-transport",
     }
     expected_files = {
         "codex_worker": CODEX_WORKER_SOURCE_FILES,
         "d2_toolchain": D2_TOOLCHAIN_SOURCE_FILES,
+        "certification_transport": CERTIFICATION_TRANSPORT_SOURCE_FILES,
     }
+    validate_certification_transport_inventory(
+        expected_roots["certification_transport"]
+    )
     for name in sorted(expected_roots):
         tree = manifest["source_trees"][name]
         if pathlib.Path(tree["root"]) != expected_roots[name]:
@@ -1084,13 +1200,31 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             != manifest["source_trees"]["d2_toolchain"]["sha256"]
         ):
             fail("step_contract_failed:source_tree_sha256")
+        require_digest(
+            evidence,
+            "certification_transport_sha256",
+            "certification_transport_source_sha256",
+        )
+        if (
+            evidence["certification_transport_sha256"]
+            != manifest["candidates"]["certification_transport"]["sha256"]
+            or evidence["certification_transport_source_sha256"]
+            != manifest["source_trees"]["certification_transport"]["sha256"]
+        ):
+            fail("step_contract_failed:certification_transport_sha256")
         for field in ("api_build_revision", "runtime_build_revision"):
             if evidence[field] != manifest["commit_sha"]:
                 fail(f"step_contract_failed:{field}")
         for field in ("api_ready_status", "runtime_ready_status", "worker_ready_status"):
             if evidence[field] != 200:
                 fail(f"step_contract_failed:{field}")
-        require_true(evidence, "tunnel_ready")
+        require_true(evidence, "transport_ready", "tunnel_ready")
+        if not isinstance(
+            evidence["transport_instance_id"], str
+        ) or not TRANSPORT_INSTANCE_PATTERN.fullmatch(
+            evidence["transport_instance_id"]
+        ):
+            fail("step_contract_failed:transport_instance_id")
         if (
             evidence["cloudflare_tunnel_id"]
             != manifest["cloudflare"]["tunnel_id"]
@@ -1107,6 +1241,8 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         require_identifier(evidence, "principal_id", "installation_id", "guild_id")
         if evidence["guild_id"] != manifest["discord"]["guild_id"]:
             fail("step_contract_failed:guild_id")
+        if evidence["principal_id"] != f"discord:{manifest['discord']['actor_id']}":
+            fail("step_contract_failed:principal_id")
     elif step == 5:
         if evidence["authoring_http_status"] not in (200, 201):
             fail("step_contract_failed:authoring_http_status")
@@ -1200,6 +1336,18 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             fail("step_contract_failed:receipt_state")
         if evidence["interaction_id"] != prior_receipts[8]["evidence"]["join_interaction_id"]:
             fail("step_contract_failed:duplicate_interaction_id")
+        if (
+            evidence["transport_duplicate_injections"] != 1
+            or evidence["transport_duplicate_delivery_count"] != 2
+            or evidence["transport_last_duplicate_interaction_id"]
+            != evidence["interaction_id"]
+        ):
+            fail("step_contract_failed:transport_duplicate_evidence")
+        if (
+            evidence["transport_instance_id"]
+            != prior_receipts[2]["evidence"]["transport_instance_id"]
+        ):
+            fail("step_contract_failed:transport_instance_id")
     elif step == 11:
         require_positive_integer(evidence, "old_pid", "new_pid")
         if evidence["old_pid"] == evidence["new_pid"]:
@@ -1242,6 +1390,19 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         ):
             fail("step_contract_failed:reconciliation_state")
         require_zero(evidence, "duplicate_external_effect_count", "unsafe_deletion_count")
+        if evidence["transport_indeterminate_injections"] != 1:
+            fail("step_contract_failed:transport_indeterminate_injections")
+        require_digest(evidence, "transport_last_audit_reason_sha256")
+        if (
+            type(evidence["transport_last_upstream_status"]) is not int
+            or not 200 <= evidence["transport_last_upstream_status"] < 300
+        ):
+            fail("step_contract_failed:transport_last_upstream_status")
+        if (
+            evidence["transport_instance_id"]
+            != prior_receipts[2]["evidence"]["transport_instance_id"]
+        ):
+            fail("step_contract_failed:transport_instance_id")
     elif step == 14:
         require_identifier(
             evidence,
@@ -1275,6 +1436,13 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         require_identifier(evidence, "public_code", "route_id")
         if evidence["route_id"] != prior_receipts[13]["evidence"]["replacement_route_id"]:
             fail("step_contract_failed:route_id")
+        require_true(evidence, "transport_gateway_partitioned")
+        require_positive_integer(evidence, "transport_gateway_partition_events")
+        if (
+            evidence["transport_instance_id"]
+            != prior_receipts[2]["evidence"]["transport_instance_id"]
+        ):
+            fail("step_contract_failed:transport_instance_id")
     elif step == 16:
         require_true(
             evidence,
@@ -1458,6 +1626,7 @@ def parser():
     prepare.add_argument("--discord-guild-id", required=True)
     prepare.add_argument("--discord-application-id", required=True)
     prepare.add_argument("--discord-bot-user-id", required=True)
+    prepare.add_argument("--discord-actor-id", required=True)
     prepare.add_argument("--discord-oauth-keychain", required=True)
     prepare.add_argument("--discord-bot-keychain", required=True)
     prepare.add_argument("--tunnel-token-keychain", required=True)

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 DIRECTORY = pathlib.Path(__file__).parent
@@ -27,6 +28,7 @@ ORCHESTRATOR_SPEC = importlib.util.spec_from_file_location(
 )
 ORCHESTRATOR = importlib.util.module_from_spec(ORCHESTRATOR_SPEC)
 ORCHESTRATOR_SPEC.loader.exec_module(ORCHESTRATOR)
+CONTRACT = sys.modules["d2_orchestrator_contract"]
 
 
 class FakePlatform:
@@ -54,6 +56,7 @@ class FakePlatform:
         self.start_order = []
         self.health_failure = None
         self.launchd_failure = None
+        self.transport_state = None
 
     def run(self, arguments, input_bytes=None, timeout=30, environment=None):
         executable = pathlib.Path(arguments[0]).name
@@ -183,6 +186,105 @@ class FakePlatform:
             return 503
         return 200
 
+    def transport_health_status(self, context, timeout_seconds=3):
+        if self.health_failure == "transport":
+            return 503
+        return 200
+
+    def transport_control(self, context, command, fields=None, timeout_seconds=3):
+        if self.transport_state is None:
+            self.transport_state = {
+                "version": 1,
+                "ready": True,
+                "run_id": context.manifest["run_id"],
+                "guild_id": context.manifest["discord"]["guild_id"],
+                "actor_id": context.manifest["discord"]["actor_id"],
+                "bot_user_id": context.manifest["discord"]["bot_user_id"],
+                "instance_id": "d2ti-0123456789abcdef0123456789abcdef",
+                "gateway": {
+                    "partitioned": False,
+                    "connections": 1,
+                    "ready_rewrites": 1,
+                    "partition_events": 0,
+                    "identity_rejections": 0,
+                    "duplicate_armed": False,
+                    "armed_duplicate_operation_id": None,
+                    "duplicate_claimed": False,
+                    "claimed_duplicate_operation_id": None,
+                    "duplicate_injections": 0,
+                    "duplicate_failed_attempts": 0,
+                    "last_failed_duplicate_operation_id": None,
+                    "duplicate_delivery_count": 0,
+                    "last_duplicate_interaction_id": None,
+                    "last_duplicate_operation_id": None,
+                },
+                "effect_http": {
+                    "forwarded_requests": 0,
+                    "rejected_requests": 0,
+                    "indeterminate_armed": False,
+                    "armed_indeterminate_operation_id": None,
+                    "indeterminate_claimed": False,
+                    "claimed_indeterminate_operation_id": None,
+                    "indeterminate_injections": 0,
+                    "last_indeterminate_audit_reason_sha256": None,
+                    "last_indeterminate_operation_id": None,
+                    "last_indeterminate_upstream_status": None,
+                    "owned_role_count": 0,
+                    "owned_channel_count": 0,
+                    "owned_message_count": 0,
+                },
+            }
+        fields = fields or {}
+        if command == "snapshot":
+            return json.loads(json.dumps(self.transport_state))
+        gateway = self.transport_state["gateway"]
+        effect = self.transport_state["effect_http"]
+        if command == "arm_next_duplicate":
+            operation_id = fields["operation_id"]
+            if gateway["duplicate_armed"]:
+                return {
+                    "changed": False,
+                    "disposition": "replayed"
+                    if gateway["armed_duplicate_operation_id"] == operation_id
+                    else "busy",
+                }
+            gateway["duplicate_armed"] = True
+            gateway["armed_duplicate_operation_id"] = operation_id
+            return {"changed": True, "disposition": "armed"}
+        if command == "disarm_duplicate":
+            changed = gateway["duplicate_armed"]
+            gateway["duplicate_armed"] = False
+            gateway["armed_duplicate_operation_id"] = None
+            return {"changed": changed}
+        if command == "arm_next_create_role_indeterminate":
+            operation_id = fields["operation_id"]
+            if effect["indeterminate_armed"] or effect["indeterminate_claimed"]:
+                return {
+                    "changed": False,
+                    "disposition": "replayed"
+                    if effect["armed_indeterminate_operation_id"] == operation_id
+                    else "busy",
+                }
+            effect["indeterminate_armed"] = True
+            effect["armed_indeterminate_operation_id"] = operation_id
+            return {"changed": True, "disposition": "armed"}
+        if command == "disarm_indeterminate":
+            changed = effect["indeterminate_armed"]
+            effect["indeterminate_armed"] = False
+            effect["armed_indeterminate_operation_id"] = None
+            return {"changed": changed}
+        if command == "partition_gateway":
+            if gateway["partitioned"]:
+                return {"changed": False}
+            gateway["partitioned"] = True
+            gateway["partition_events"] += 1
+            return {"changed": True}
+        if command == "heal_gateway":
+            changed = gateway["partitioned"]
+            gateway["partitioned"] = False
+            return {"changed": changed}
+        raise AssertionError(command)
+
     def wait_for_status(self, probe, expected, timeout_seconds=60):
         return probe()
 
@@ -194,15 +296,17 @@ class FakePlatform:
 class D2IsolatedOrchestratorTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = pathlib.Path(self.temporary.name)
+        self.root = pathlib.Path(self.temporary.name).resolve()
+        self.artifact_root = self.root / "immutable-candidates"
+        self.artifact_root.mkdir()
         self.run_id = f"d2-20260801t120000z-{secrets.token_hex(6)}"
         self.isolated_root = pathlib.Path(f"/private/tmp/starring-d2-{self.run_id}")
         self.candidates = {}
         for name in CERTIFICATION.REQUIRED_CANDIDATES:
             path = (
-                self.root / "worker-tree" / "worker.mjs"
+                self.artifact_root / "worker-tree" / "worker.mjs"
                 if name == "codex_worker"
-                else self.root / name
+                else self.artifact_root / name
             )
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(f"candidate:{name}".encode())
@@ -211,6 +315,15 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             path = self.candidates["codex_worker"].parent / name
             if not path.exists():
                 path.write_bytes(f"worker-source:{name}".encode())
+        for path in self.artifact_root.rglob("*"):
+            if path.is_file():
+                path.chmod(0o555)
+        for path in sorted(
+            (path for path in self.artifact_root.rglob("*") if path.is_dir()),
+            reverse=True,
+        ):
+            path.chmod(0o555)
+        self.artifact_root.chmod(0o555)
         self.manifest_path = self.prepare_manifest()
         self.context = ORCHESTRATOR.load_context(self.manifest_path)
         self.platform = FakePlatform()
@@ -218,6 +331,10 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
     def tearDown(self):
         if self.isolated_root.exists():
             ORCHESTRATOR.guarded_remove_root(self.context)
+        for path in self.artifact_root.rglob("*"):
+            if path.is_dir():
+                path.chmod(0o700)
+        self.artifact_root.chmod(0o700)
         self.temporary.cleanup()
 
     def prepare_manifest(self):
@@ -233,6 +350,8 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             "1524810437118525552",
             "--discord-bot-user-id",
             "1524810437118525553",
+            "--discord-actor-id",
+            "1056857223529250906",
             "--discord-oauth-keychain",
             "starring.d2.credentials:discord.oauth-client-secret",
             "--discord-bot-keychain",
@@ -253,6 +372,8 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             "api": 28080,
             "runtime": 29091,
             "worker": 28181,
+            "transport_gateway": 29101,
+            "transport_http": 29102,
         }.items():
             arguments.extend(("--port", f"{name}={port}"))
         output = io.StringIO()
@@ -268,12 +389,54 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertEqual(self.platform.bootouts, [])
         self.assertFalse(self.isolated_root.exists())
 
+    def test_atomic_write_fsyncs_created_parent_and_renamed_entry(self):
+        path = self.root / "atomic" / "state.json"
+        observed = []
+        real_fsync_directory = CONTRACT.fsync_directory
+
+        def record(directory, label):
+            observed.append((pathlib.Path(directory), label))
+            real_fsync_directory(directory, label)
+
+        with mock.patch.object(CONTRACT, "fsync_directory", side_effect=record):
+            CONTRACT.write_atomic(path, "{}\n")
+        self.assertEqual(
+            observed,
+            [
+                (self.root, "atomic_parent_parent"),
+                (path.parent, "atomic_parent"),
+            ],
+        )
+        self.assertEqual(path.read_text(encoding="utf-8"), "{}\n")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_first_journal_append_fsyncs_artifact_lock_and_entry_directories(self):
+        observed = []
+        real_fsync_directory = CONTRACT.fsync_directory
+
+        def record(directory, label):
+            observed.append((pathlib.Path(directory), label))
+            real_fsync_directory(directory, label)
+
+        with mock.patch.object(CONTRACT, "fsync_directory", side_effect=record):
+            CONTRACT.append_journal(self.context, "test_action", "complete", "test")
+        self.assertEqual(
+            observed,
+            [
+                (self.context.run_directory, "journal_artifact_parent"),
+                (self.context.artifact_directory, "journal_lock_parent"),
+                (self.context.artifact_directory, "journal_entry_parent"),
+            ],
+        )
+        self.assertEqual(self.context.lock_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.context.journal_path.stat().st_mode & 0o777, 0o600)
+
     def test_prepare_start_stop_cleanup_is_idempotent_and_preserves_staging(self):
         prepared = ORCHESTRATOR.command_prepare(self.context, self.platform)
         self.assertEqual(prepared["phase"], "prepared")
         self.assertTrue((self.isolated_root / "postgres" / "PG_VERSION").is_file())
         self.assertEqual(len(self.platform.keychain_writes), 4)
-        for name in ("api", "runtime", "worker", "tunnel"):
+        for name in ("api", "runtime", "worker", "transport", "tunnel"):
             label = self.context.manifest["services"][name]["label"]
             plist_path = self.context.plist_directory / f"{label}.plist"
             self.assertTrue(plist_path.is_file())
@@ -298,6 +461,20 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         )
         self.assertTrue(
             (self.context.artifact_directory / "step-03-evidence.json").is_file()
+        )
+        step_three = json.loads(
+            (self.context.artifact_directory / "step-03-evidence.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertTrue(step_three["transport_ready"])
+        self.assertEqual(
+            step_three["transport_instance_id"],
+            "d2ti-0123456789abcdef0123456789abcdef",
+        )
+        self.assertEqual(
+            step_three["certification_transport_sha256"],
+            self.context.manifest["candidates"]["certification_transport"]["sha256"],
         )
         self.assertEqual(
             self.platform.start_order,
@@ -340,7 +517,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             "starring_bootstrap jungbogeon starring_cluster_admin\n",
         )
         values = {}
-        for name in ("api", "runtime", "worker", "tunnel"):
+        for name in ("api", "runtime", "worker", "transport", "tunnel"):
             label = self.context.manifest["services"][name]["label"]
             values[name] = plistlib.loads(
                 (self.context.plist_directory / f"{label}.plist").read_bytes()
@@ -357,6 +534,41 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
                 "STARRING_RUNTIME_DISCORD_BOT_TOKEN_SECRET_REFERENCE"
             ],
             "keychain:starring.d2.credentials:discord.bot-token",
+        )
+        runtime_environment = values["runtime"]["EnvironmentVariables"]
+        self.assertEqual(
+            runtime_environment["STARRING_RUNTIME_DISCORD_TRANSPORT_MODE"],
+            "loopback_proxy_v1",
+        )
+        self.assertEqual(
+            runtime_environment["STARRING_RUNTIME_DISCORD_GATEWAY_PROXY_URL"],
+            "ws://127.0.0.1:29101",
+        )
+        self.assertEqual(
+            runtime_environment[
+                "STARRING_RUNTIME_DISCORD_EFFECT_HTTP_PROXY_AUTHORITY"
+            ],
+            "127.0.0.1:29102",
+        )
+        self.assertEqual(
+            values["transport"]["ProgramArguments"],
+            [
+                str(self.candidates["certification_transport"]),
+                "--root",
+                str(self.context.root),
+                "--run-id",
+                self.context.manifest["run_id"],
+                "--guild-id",
+                self.context.manifest["discord"]["guild_id"],
+                "--actor-id",
+                self.context.manifest["discord"]["actor_id"],
+                "--bot-user-id",
+                self.context.manifest["discord"]["bot_user_id"],
+                "--gateway-listen",
+                "127.0.0.1:29101",
+                "--http-listen",
+                "127.0.0.1:29102",
+            ],
         )
         self.assertEqual(
             values["worker"]["EnvironmentVariables"]["STARRING_CODEX_PATH"],
@@ -378,6 +590,144 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             tunnel_environment["STARRING_D2_CLOUDFLARE_ORIGIN_SERVICE"],
             CERTIFICATION.D2_ORIGIN_SERVICE,
         )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_transport_snapshot_health_is_exact_and_identity_bound(self):
+        snapshot = {
+            "version": 1,
+            "ready": True,
+            "run_id": self.context.manifest["run_id"],
+            "guild_id": self.context.manifest["discord"]["guild_id"],
+            "actor_id": self.context.manifest["discord"]["actor_id"],
+            "bot_user_id": self.context.manifest["discord"]["bot_user_id"],
+            "instance_id": "d2ti-0123456789abcdef0123456789abcdef",
+            "gateway": {
+                "partitioned": False,
+                "connections": 1,
+                "ready_rewrites": 1,
+                "partition_events": 0,
+                "identity_rejections": 0,
+                "duplicate_armed": False,
+                "armed_duplicate_operation_id": None,
+                "duplicate_claimed": False,
+                "claimed_duplicate_operation_id": None,
+                "duplicate_injections": 0,
+                "duplicate_failed_attempts": 0,
+                "last_failed_duplicate_operation_id": None,
+                "duplicate_delivery_count": 0,
+                "last_duplicate_interaction_id": None,
+                "last_duplicate_operation_id": None,
+            },
+            "effect_http": {
+                "forwarded_requests": 0,
+                "rejected_requests": 0,
+                "indeterminate_armed": False,
+                "armed_indeterminate_operation_id": None,
+                "indeterminate_claimed": False,
+                "claimed_indeterminate_operation_id": None,
+                "indeterminate_injections": 0,
+                "last_indeterminate_audit_reason_sha256": None,
+                "last_indeterminate_operation_id": None,
+                "last_indeterminate_upstream_status": None,
+                "owned_role_count": 0,
+                "owned_channel_count": 0,
+                "owned_message_count": 0,
+            },
+        }
+        platform = ORCHESTRATOR.Platform()
+        self.assertTrue(platform._transport_snapshot_valid(self.context, snapshot))
+        not_ready = json.loads(json.dumps(snapshot))
+        not_ready["ready"] = False
+        self.assertFalse(platform._transport_snapshot_valid(self.context, not_ready))
+        self.assertTrue(
+            platform._transport_snapshot_valid(
+                self.context, not_ready, require_ready=False
+            )
+        )
+        identity_drift = json.loads(json.dumps(snapshot))
+        identity_drift["actor_id"] = "1056857223529250907"
+        self.assertFalse(platform._transport_snapshot_valid(self.context, identity_drift))
+        widened = json.loads(json.dumps(snapshot))
+        widened["gateway"]["unpinned"] = 0
+        self.assertFalse(platform._transport_snapshot_valid(self.context, widened))
+
+    def test_transport_control_lost_response_reuses_durable_operation(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        original = self.platform.transport_control
+        injected = False
+
+        def lose_first_response(context, command, fields=None, timeout_seconds=3):
+            nonlocal injected
+            result = original(context, command, fields, timeout_seconds)
+            if command == "partition_gateway" and not injected:
+                injected = True
+                raise ORCHESTRATOR.OrchestratorError("injected_lost_response")
+            return result
+
+        self.platform.transport_control = lose_first_response
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_lost_response"
+        ):
+            ORCHESTRATOR.command_transport_control(
+                self.context, self.platform, "partition-gateway"
+            )
+        directory = ORCHESTRATOR.transport_control_directory(self.context)
+        intent_path = directory / "0001-partition-gateway-intent.json"
+        complete_path = directory / "0001-partition-gateway-complete.json"
+        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        self.assertFalse(complete_path.exists())
+        self.platform.transport_control = original
+        result = ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "partition-gateway"
+        )
+        complete = json.loads(complete_path.read_text(encoding="utf-8"))
+        self.assertEqual(result["operation_id"], intent["operation_id"])
+        self.assertEqual(complete["operation_id"], intent["operation_id"])
+        self.assertEqual(result["response"], {"changed": False})
+        self.assertTrue(result["snapshot"]["gateway"]["partitioned"])
+        self.assertEqual(intent_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(complete_path.stat().st_mode & 0o777, 0o600)
+        ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "heal-gateway"
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_transport_arm_next_is_operation_bound_and_busy_fails_closed(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        armed = ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "arm-next-duplicate"
+        )
+        self.assertEqual(armed["response"]["disposition"], "armed")
+        self.assertEqual(
+            armed["snapshot"]["gateway"]["armed_duplicate_operation_id"],
+            armed["operation_id"],
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "transport_operation_busy"
+        ):
+            ORCHESTRATOR.command_transport_control(
+                self.context, self.platform, "arm-next-duplicate"
+            )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_transport_instance_rotation_invalidates_candidate_run(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        self.platform.transport_state["instance_id"] = (
+            "d2ti-fedcba9876543210fedcba9876543210"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "transport_instance_changed"
+        ):
+            ORCHESTRATOR.command_transport_control(
+                self.context, self.platform, "snapshot"
+            )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "transport_instance_changed"
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_prepare_failure_runs_manifest_reconstructed_cleanup(self):
@@ -482,6 +832,15 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
     def test_onboarding_is_manifest_scoped_and_exactly_replayable(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         ORCHESTRATOR.command_start(self.context, self.platform)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "onboarding_principal_invalid"
+        ):
+            ORCHESTRATOR.command_onboard(
+                self.context,
+                self.platform,
+                "discord:1056857223529250907",
+                "보건",
+            )
         result = ORCHESTRATOR.command_onboard(
             self.context,
             self.platform,
