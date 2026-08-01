@@ -313,7 +313,7 @@ removing security, restart, failure, or release gates.
 - [x] C1. Add durable interaction receipts
 - [x] C2. Add complete deterministic action-plan preflight
 - [x] C3. Add effect journal, reconciliation, and bounded compensation
-- [ ] D1. Complete restart and failure cohorts
+- [x] D1. Complete restart and failure cohorts
 - [ ] D2. Pass the final disposable-guild product E2E
 - [ ] D3. Pass the final complete gate
 - [ ] D4. Update source-of-truth and operations
