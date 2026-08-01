@@ -366,24 +366,24 @@ class Platform:
                 self.launchd_bootout(label)
             raise
 
-    def http_status(self, url, timeout_seconds=3):
-        result = self.run(
-            [
-                REQUIRED_PROGRAMS["curl"],
-                "--silent",
-                "--show-error",
-                "--output",
-                "/dev/null",
-                "--write-out",
-                "%{http_code}",
-                "--connect-timeout",
-                str(timeout_seconds),
-                "--max-time",
-                str(timeout_seconds),
-                url,
-            ],
-            timeout=timeout_seconds + 2,
-        )
+    def http_status(self, url, timeout_seconds=3, host_header=None):
+        arguments = [
+            REQUIRED_PROGRAMS["curl"],
+            "--silent",
+            "--show-error",
+            "--output",
+            "/dev/null",
+            "--write-out",
+            "%{http_code}",
+            "--connect-timeout",
+            str(timeout_seconds),
+            "--max-time",
+            str(timeout_seconds),
+        ]
+        if host_header is not None:
+            arguments.extend(("--header", f"Host: {host_header}"))
+        arguments.append(url)
+        result = self.run(arguments, timeout=timeout_seconds + 2)
         if result.returncode != 0:
             return 0
         try:

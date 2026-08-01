@@ -175,7 +175,8 @@ def candidate_health(context, platform, wait):
     transport_status = observe(lambda: platform.transport_health_status(context))
     api_status = observe(
         lambda: platform.http_status(
-            f"http://127.0.0.1:{manifest['services']['api']['port']}/health/ready"
+            f"http://127.0.0.1:{manifest['services']['api']['port']}/health/ready",
+            host_header=manifest["public_origin"].removeprefix("https://"),
         )
     )
     runtime_status = observe(

@@ -81,6 +81,7 @@ class FakePlatform:
         self.health_failure = None
         self.launchd_failure = None
         self.transport_state = None
+        self.http_probes = []
 
     def run(self, arguments, input_bytes=None, timeout=30, environment=None):
         executable = pathlib.Path(arguments[0]).name
@@ -200,7 +201,8 @@ class FakePlatform:
         self.loaded.add(label)
         self.start_order.append(label)
 
-    def http_status(self, url, timeout_seconds=3):
+    def http_status(self, url, timeout_seconds=3, host_header=None):
+        self.http_probes.append((url, host_header))
         if self.health_failure and self.health_failure in url:
             return 503
         return 200
@@ -506,6 +508,13 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
                 self.context.manifest["services"][name]["label"]
                 for name in ORCHESTRATOR.SERVICE_START_ORDER
             ],
+        )
+        self.assertIn(
+            (
+                f"http://127.0.0.1:{self.context.manifest['services']['api']['port']}/health/ready",
+                "d2-api.starring.co.kr",
+            ),
+            self.platform.http_probes,
         )
         stopped = ORCHESTRATOR.command_stop(self.context, self.platform)
         self.assertEqual(stopped["phase"], "stopped")
@@ -962,6 +971,18 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
 
 
 class LaunchdPlatformTests(unittest.TestCase):
+    def test_http_probe_preserves_loopback_and_supplies_public_host(self):
+        platform = PLATFORM.Platform()
+        completed = subprocess.CompletedProcess([], 0, b"200", b"")
+        with mock.patch.object(platform, "run", return_value=completed) as run:
+            status = platform.http_status(
+                "http://127.0.0.1:28080/health/ready",
+                host_header="d2-api.starring.co.kr",
+            )
+        self.assertEqual(status, 200)
+        arguments = run.call_args.args[0]
+        self.assertEqual(arguments[-3:], ["--header", "Host: d2-api.starring.co.kr", "http://127.0.0.1:28080/health/ready"])
+
     def test_start_does_not_terminate_a_freshly_bootstrapped_keepalive_job(self):
         platform = RecordingLaunchdPlatform()
         platform.launchd_start("local.starring.d2.test", pathlib.Path("/tmp/test.plist"))
