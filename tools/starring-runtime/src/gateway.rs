@@ -2551,8 +2551,10 @@ impl RuntimeGatewayBootstrapV1 {
             operation_cutoff,
             shutdown_deadline,
         } = start;
-        let driver =
-            prepare_twilight_runtime_discord_gateway_driver_v1(token.expose_secret().to_owned());
+        let driver = prepare_twilight_runtime_discord_gateway_driver_v1(
+            token.expose_secret().to_owned(),
+            gateway_config.discord_transport(),
+        );
         let prepared = self
             .prepare_discord_gateway_start_v1(operation_cutoff, Some(shutdown))
             .await?;

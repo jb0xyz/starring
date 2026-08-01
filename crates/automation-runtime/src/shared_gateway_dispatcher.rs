@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Formatter};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,8 +78,37 @@ pub const MAX_SHARED_GATEWAY_MODAL_PAYLOAD_BYTES_V3: usize = 20_000;
 const SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3: Duration = Duration::from_secs(2);
 const SHARED_GATEWAY_MUTATION_HTTP_TIMEOUT_V3: Duration = Duration::from_secs(15);
 const SHARED_GATEWAY_INITIAL_RESPONSE_BUDGET_V3: Duration = Duration::from_secs(3);
+const MIN_SHARED_GATEWAY_LOOPBACK_PROXY_PORT_V1: u16 = 1_024;
 pub const SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3: &str =
     "Starring is temporarily unable to process this request. Please try again.";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SharedGatewayLoopbackHttpProxyV1(SocketAddrV4);
+
+impl SharedGatewayLoopbackHttpProxyV1 {
+    pub fn new(address: SocketAddrV4) -> Option<Self> {
+        (*address.ip() == Ipv4Addr::LOCALHOST
+            && address.port() >= MIN_SHARED_GATEWAY_LOOPBACK_PROXY_PORT_V1)
+            .then_some(Self(address))
+    }
+
+    fn authority(self) -> String {
+        self.0.to_string()
+    }
+}
+
+impl Debug for SharedGatewayLoopbackHttpProxyV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayLoopbackHttpProxyV1(<loopback>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SharedGatewayMutationHttpTransportV1 {
+    #[default]
+    Direct,
+    LoopbackProxy(SharedGatewayLoopbackHttpProxyV1),
+}
 
 #[derive(Clone, Copy)]
 pub struct SharedGatewayInteractionReceivedAtV3(Instant);
@@ -903,22 +933,33 @@ where
         admission_config: SharedGatewayAdmissionConfigV3,
         operation_deadline: Instant,
     ) -> Result<Self, OwnedSharedGatewayDispatchServicesCompositionErrorV3> {
+        Self::compose_with_mutation_http_transport_v1(
+            token,
+            registry,
+            instances,
+            admission_config,
+            SharedGatewayMutationHttpTransportV1::Direct,
+            operation_deadline,
+        )
+        .await
+    }
+
+    pub async fn compose_with_mutation_http_transport_v1(
+        token: Zeroizing<String>,
+        registry: ServingSlotRegistryV1,
+        instances: I,
+        admission_config: SharedGatewayAdmissionConfigV3,
+        mutation_http_transport: SharedGatewayMutationHttpTransportV1,
+        operation_deadline: Instant,
+    ) -> Result<Self, OwnedSharedGatewayDispatchServicesCompositionErrorV3> {
         if Instant::now() >= operation_deadline {
             return Err(OwnedSharedGatewayDispatchServicesCompositionErrorV3::TimedOut);
         }
-        let mutation_http = Arc::new(
-            Client::builder()
-                .token(token.to_string())
-                .timeout(SHARED_GATEWAY_MUTATION_HTTP_TIMEOUT_V3)
-                .build(),
-        );
-        let interaction_http = Arc::new(
-            Client::builder()
-                .token(token.to_string())
-                .ratelimiter(None)
-                .timeout(SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3)
-                .build(),
-        );
+        let mutation_http = Arc::new(mutation_http_client_v1(
+            token.as_str(),
+            mutation_http_transport,
+        ));
+        let interaction_http = Arc::new(interaction_callback_http_client_v1(token.as_str()));
         let snapshot_provider = tokio::time::timeout_at(
             tokio::time::Instant::from_std(operation_deadline),
             OwnedTwilightGuildRoleSnapshotProvider::new(Arc::clone(&mutation_http)),
@@ -1062,6 +1103,26 @@ where
         )
         .await
     }
+}
+
+fn mutation_http_client_v1(token: &str, transport: SharedGatewayMutationHttpTransportV1) -> Client {
+    let builder = Client::builder()
+        .token(token.to_owned())
+        .timeout(SHARED_GATEWAY_MUTATION_HTTP_TIMEOUT_V3);
+    match transport {
+        SharedGatewayMutationHttpTransportV1::Direct => builder.build(),
+        SharedGatewayMutationHttpTransportV1::LoopbackProxy(proxy) => {
+            builder.proxy(proxy.authority(), true).build()
+        }
+    }
+}
+
+fn interaction_callback_http_client_v1(token: &str) -> Client {
+    Client::builder()
+        .token(token.to_owned())
+        .ratelimiter(None)
+        .timeout(SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3)
+        .build()
 }
 
 impl<I> OwnedSharedGatewayDispatchServicesV3<I>
@@ -1218,7 +1279,11 @@ fn zeroize_twilight_modal_inputs_v3(components: &mut [ModalInteractionComponent]
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
     use std::num::NonZeroUsize;
+    use std::thread;
+    use std::time::Duration;
 
     use crate::custom_id::encode_button;
     use crate::interaction_to_event;
@@ -1233,6 +1298,62 @@ mod tests {
     assert_not_impl_any!(SharedGatewayInteractionEnvelopeV3: Clone, serde::Serialize);
     assert_not_impl_any!(SharedGatewayInteractionTokenV3: Clone, serde::Serialize);
     assert_not_impl_any!(SharedGatewayModalInputV3: Clone, serde::Serialize);
+
+    #[test]
+    fn loopback_http_proxy_type_rejects_privileged_and_non_loopback_addresses() {
+        assert!(SharedGatewayLoopbackHttpProxyV1::new(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            1024,
+        ))
+        .is_some());
+        for address in [
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1023),
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 21002),
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 21002),
+        ] {
+            assert!(SharedGatewayLoopbackHttpProxyV1::new(address).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_http_uses_the_opt_in_proxy_and_callback_client_stays_direct() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else {
+            panic!("test listener must be IPv4")
+        };
+        let request = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                assert!(request.len() <= 8 * 1024);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let proxy = SharedGatewayLoopbackHttpProxyV1::new(address).unwrap();
+        let mutation = mutation_http_client_v1(
+            "test-token",
+            SharedGatewayMutationHttpTransportV1::LoopbackProxy(proxy),
+        );
+        assert!(mutation.current_user().await.unwrap().status().is_success());
+        let request = request.join().unwrap();
+        assert!(request.starts_with("GET /api/v10/users/@me HTTP/1.1\r\n"));
+        assert!(mutation.ratelimiter().is_some());
+        let callback = interaction_callback_http_client_v1("test-token");
+        assert!(callback.ratelimiter().is_none());
+    }
 
     fn identity() -> SharedGatewayInteractionIdentityV3 {
         SharedGatewayInteractionIdentityV3::new(

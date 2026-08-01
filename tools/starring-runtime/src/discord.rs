@@ -12,12 +12,13 @@ use automation_runtime::{
 use automation_runtime_worker::RuntimeGatewayCoordinatorGenerationV2;
 use paused_discord_gateway::error::ReceiveMessageErrorType;
 use paused_discord_gateway::{
-    CloseFrame, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt,
+    CloseFrame, ConfigBuilder, Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{sleep_until, timeout_at, Instant as TokioInstant};
 
+use crate::config::RuntimeDiscordTransportConfigV1;
 use crate::discord_interaction_normalizer::{
     pin_runtime_discord_interaction_v1, ZeroizingPinnedDiscordInteractionV1,
 };
@@ -329,9 +330,18 @@ struct TwilightRuntimeDiscordGatewayDriverV1 {
 }
 
 impl TwilightRuntimeDiscordGatewayDriverV1 {
-    fn new(token: String) -> Self {
+    fn new(token: String, transport: RuntimeDiscordTransportConfigV1) -> Self {
+        let shard = match transport.gateway_proxy_url() {
+            None => Shard::new(ShardId::ONE, token, Intents::empty()),
+            Some(proxy_url) => {
+                let config = ConfigBuilder::new(token, Intents::empty())
+                    .proxy_url(proxy_url)
+                    .build();
+                Shard::with_config(ShardId::ONE, config)
+            }
+        };
         Self {
-            shard: Shard::new(ShardId::ONE, token, Intents::empty()),
+            shard,
             transport_state: RuntimeDiscordGatewayTransportStateV1::Unstarted,
         }
     }
@@ -1633,8 +1643,9 @@ impl Debug for RuntimeDiscordGatewaySupervisorV1 {
 
 pub(crate) fn prepare_twilight_runtime_discord_gateway_driver_v1(
     token: String,
+    transport: RuntimeDiscordTransportConfigV1,
 ) -> impl RuntimeDiscordGatewayDriverV1 {
-    TwilightRuntimeDiscordGatewayDriverV1::new(token)
+    TwilightRuntimeDiscordGatewayDriverV1::new(token, transport)
 }
 
 pub(crate) fn start_runtime_discord_gateway_v1<D>(
@@ -2803,6 +2814,7 @@ mod actor_serving_tests;
 #[cfg(test)]
 mod tests {
     use std::future::{poll_fn, Future};
+    use std::net::{Ipv4Addr, SocketAddrV4};
     use std::num::{NonZeroU64, NonZeroUsize};
     use std::sync::atomic::Ordering;
     use std::task::Poll;
@@ -2817,6 +2829,7 @@ mod tests {
     use automation_runtime_worker::RuntimeGatewayCoordinatorGenerationV2;
     use tokio::sync::watch;
 
+    use crate::config::RuntimeDiscordTransportConfigV1;
     use crate::gateway::{
         compose_runtime_gateway_section_test_bootstrap_v2,
         compose_runtime_gateway_section_test_bootstrap_with_capacity_v2,
@@ -2830,8 +2843,28 @@ mod tests {
         RuntimeDiscordGatewayExitV1, RuntimeDiscordGatewayShutdownErrorV1,
         RuntimeDiscordGatewaySignalV1, RuntimeDiscordProcessHandoffFailureV2,
         RuntimeDiscordProcessHandoffV2, RuntimeDiscordRecoveryResumeOwnershipV2,
-        RuntimeDiscordRecoveryResumeV2,
+        RuntimeDiscordRecoveryResumeV2, TwilightRuntimeDiscordGatewayDriverV1,
     };
+
+    #[tokio::test]
+    async fn twilight_gateway_proxy_is_opt_in_and_direct_is_the_default() {
+        let direct = TwilightRuntimeDiscordGatewayDriverV1::new(
+            "token".to_string(),
+            RuntimeDiscordTransportConfigV1::Direct,
+        );
+        assert_eq!(direct.shard.config().proxy_url(), None);
+        let proxied = TwilightRuntimeDiscordGatewayDriverV1::new(
+            "token".to_string(),
+            RuntimeDiscordTransportConfigV1::LoopbackProxy {
+                gateway_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 21001),
+                effect_http_proxy_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 21002),
+            },
+        );
+        assert_eq!(
+            proxied.shard.config().proxy_url(),
+            Some("ws://127.0.0.1:21001")
+        );
+    }
 
     struct PendingDispatchDrainLaneV1;
 

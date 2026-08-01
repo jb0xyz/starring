@@ -6,6 +6,20 @@ use std::process::Command;
 const WORKSPACE: &str = include_str!("../../../Cargo.toml");
 const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
 const TRACKED_SECRET_SCAN: &str = include_str!("../../ci/scan_tracked_secrets.py");
+const STANDING_RUNTIME_LAUNCHD: &str =
+    include_str!("../../../ops/macos/local.starring.runtime.staging.plist");
+
+#[test]
+fn standing_runtime_launchd_cannot_enable_the_disposable_discord_proxy() {
+    for forbidden in [
+        "STARRING_RUNTIME_DISCORD_TRANSPORT_MODE",
+        "STARRING_RUNTIME_DISCORD_GATEWAY_PROXY_URL",
+        "STARRING_RUNTIME_DISCORD_EFFECT_HTTP_PROXY_AUTHORITY",
+        "loopback_proxy_v1",
+    ] {
+        assert!(!STANDING_RUNTIME_LAUNCHD.contains(forbidden), "{forbidden}");
+    }
+}
 
 fn collect_source_files(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, String)>) {
     let mut entries = fs::read_dir(directory)

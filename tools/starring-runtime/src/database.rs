@@ -23,6 +23,7 @@ use automation_runtime::{
     SharedGatewayDurableReceiptClaimInputV1, SharedGatewayDurableReceiptRouteV1,
     SharedGatewayInteractionEnvelopeV3, SharedGatewayInteractionIdentityV3,
     SharedGatewayInteractionKindV3, SharedGatewayInteractionReservationOutcomeV3,
+    SharedGatewayLoopbackHttpProxyV1, SharedGatewayMutationHttpTransportV1,
     SharedGatewayReservedInteractionV3,
 };
 use automation_runtime_convergence::ProcessInstanceId;
@@ -1340,11 +1341,19 @@ impl RuntimeDatabaseDependenciesV1 {
                 .map_err(|_| RuntimeInteractionDispatchCompositionErrorV1::AdmissionConfiguration)?
                 .with_instance_lookup_timeout(gateway.instance_lookup_timeout())
                 .map_err(|_| RuntimeInteractionDispatchCompositionErrorV1::RouteConfiguration)?;
-        let inner = OwnedSharedGatewayDispatchServicesV3::compose_v3(
+        let mutation_http_transport = match gateway.discord_transport().effect_http_proxy_address()
+        {
+            Some(address) => SharedGatewayLoopbackHttpProxyV1::new(address)
+                .map(SharedGatewayMutationHttpTransportV1::LoopbackProxy)
+                .ok_or(RuntimeInteractionDispatchCompositionErrorV1::RouteConfiguration)?,
+            None => SharedGatewayMutationHttpTransportV1::Direct,
+        };
+        let inner = OwnedSharedGatewayDispatchServicesV3::compose_with_mutation_http_transport_v1(
             Zeroizing::new(token.expose_secret().to_owned()),
             registry.into_registry_v1(),
             self.interaction.clone(),
             admission_config,
+            mutation_http_transport,
             operation_deadline,
         )
         .await
