@@ -893,14 +893,20 @@ fn validate_serving_refresh(
     let Some(predecessor_receipt) = input.predecessor.present_receipt() else {
         return Err(RuntimeProductionLifecycleErrorV2::IngressAcknowledgementMismatch);
     };
+    let predecessor_observed_at = input.predecessor.observed_database_now();
+    let predecessor_expired = predecessor_observed_at >= current_acknowledgement.expires_at();
     if predecessor_receipt.acknowledgement() != current_acknowledgement
         || predecessor_receipt.request_digest()
             != epoch
                 .ingress_acknowledgement
                 .accepted_request()
                 .request_digest()
-        || input.predecessor.observed_database_now() < input.owner_receipt.database_now
-        || input.predecessor.observed_database_now() >= current_acknowledgement.expires_at()
+        || predecessor_observed_at < input.owner_receipt.database_now
+        || predecessor_observed_at >= input.owner_receipt.expires_at
+        || matches!(
+            gateway_transition,
+            RuntimeServingGatewayReadyRefreshV3::Current
+        ) && predecessor_expired
     {
         return Err(RuntimeProductionLifecycleErrorV2::IngressAcknowledgementNotCurrent);
     }

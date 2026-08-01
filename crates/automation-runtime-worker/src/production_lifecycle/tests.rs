@@ -2052,13 +2052,20 @@ fn route_refresh_invalidates_not_yet_started_slot_work_requests() {
 fn serving_refresh_predecessor(
     serving: &RuntimeServingOpenProcessV2,
 ) -> crate::RuntimeIngressOpenAcknowledgementPredecessorV2 {
+    serving_refresh_predecessor_at(serving, at(255))
+}
+
+fn serving_refresh_predecessor_at(
+    serving: &RuntimeServingOpenProcessV2,
+    observed_database_now: DateTime<Utc>,
+) -> crate::RuntimeIngressOpenAcknowledgementPredecessorV2 {
     let current = serving.epoch().ingress_acknowledgement().accepted_receipt();
     let receipt = RuntimeIngressOpenAcknowledgementReceiptV2::new(
         RuntimeIngressOpenAcknowledgementReceiptInputV2 {
             source_acknowledgement_revision: current.source_acknowledgement_revision(),
             request_digest: current.request_digest(),
             acknowledgement: current.acknowledgement().clone(),
-            observed_database_now: at(255),
+            observed_database_now,
         },
     )
     .unwrap();
@@ -2131,6 +2138,48 @@ fn serving_ready_successor(
     ready.admission_revision = non_zero(ready.admission_revision.get() + 1);
     ready.resume_sequence = sequence(ready.resume_sequence.get() + 2);
     ready
+}
+
+#[test]
+fn resumed_serving_refresh_accepts_exact_expired_predecessor_while_current_refresh_rejects_it() {
+    let serving = serving_open_with_capacity(1);
+    let sequence = serving.epoch().route_set().observation_sequence().get();
+    let expired_at = serving
+        .epoch()
+        .ingress_acknowledgement()
+        .acknowledgement()
+        .expires_at();
+    let mut current_input = serving_refresh_input(&serving, sequence, false);
+    current_input.predecessor = serving_refresh_predecessor_at(&serving, expired_at);
+    let failure = serving
+        .authorize_ingress_open_acknowledgement_refresh(current_input)
+        .unwrap_err();
+    assert_eq!(
+        failure.error(),
+        RuntimeProductionLifecycleErrorV2::IngressAcknowledgementNotCurrent
+    );
+
+    let serving = serving_open_with_capacity(1);
+    let sequence = serving.epoch().route_set().observation_sequence().get();
+    let expired_at = serving
+        .epoch()
+        .ingress_acknowledgement()
+        .acknowledgement()
+        .expires_at();
+    let current_revision = serving
+        .epoch()
+        .ingress_acknowledgement()
+        .acknowledgement_revision();
+    let mut resumed_input = serving_refresh_input(&serving, sequence, false);
+    resumed_input.gateway_ready = serving_ready_successor(&serving);
+    resumed_input.predecessor = serving_refresh_predecessor_at(&serving, expired_at);
+    let refresh = serving
+        .authorize_resumed_ingress_open_acknowledgement_refresh_v3(resumed_input)
+        .unwrap();
+    assert_eq!(
+        refresh.request().source_acknowledgement_revision(),
+        Some(current_revision)
+    );
 }
 
 #[test]
