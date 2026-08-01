@@ -274,8 +274,9 @@ environment and Keychain configuration, fourteen independently credentialed
 core PostgreSQL pools plus one isolated authoring-writer pool, aggregate and
 post-bind deep readiness, and a bounded loopback-only HTTP process. The
 integrated staging inventory has 20 pairwise-distinct application database
-credentials across the 15 API and 5 runtime capabilities, two purpose-separated
-keyrings, and an exact 15-rule final HBA manifest. Database connection material
+credentials across the 15 API and 5 runtime capabilities, three
+purpose-separated keyrings, 28 total Keychain items, and an exact 15-rule final
+HBA manifest. Database connection material
 is complete and explicit; ambient PostgreSQL variables and `.pgpass` cannot fill
 missing authority or transport fields. Runtime readiness is supervised outside
 the request path; its first error, timeout, or panic closes business admission
@@ -291,19 +292,18 @@ serving monitoring, and deterministic interaction dispatch on the canonical
 Discord shard. The B6 staging run reached real Live and executed the current
 recipe, but it is not a commercial release certificate.
 
-The retained staging fixture already runs the C1 durable
-duplicate-interaction receipt boundary. The source candidate adds the C2
-complete deterministic action-plan preflight and the C3 per-effect PostgreSQL
+The Phase C source implements the durable duplicate-interaction receipt
+boundary, complete deterministic action-plan preflight, per-effect PostgreSQL
 journal, exact Discord observation, reverse-order bounded compensation,
 response-tail recovery, route-scoped unsafe-recovery admission, and bounded
 production recovery supervisor. All external Discord calls remain outside
 database transactions. An unresolved or uncorrelatable mutable non-response
 effect is recorded as `recovery_required` and blocks the affected route instead
 of being guessed or blindly replayed. An unrecoverable response tail closes
-only the exact receipt without inventing delivery. C2 and C3 are a source-level
-hardening checkpoint, not a deployment or commercial release certificate; the
-live fault, restart, load, restore, and disposable-guild cohorts remain Phase D
-work.
+only the exact receipt without inventing delivery. Phase C remains a
+source-level hardening checkpoint, not a commercial release certificate; the
+complete restart, live fault, load, restore, and disposable-guild cohorts remain
+Phase D work.
 
 The active authoring provider is `codex_chatgpt`, pinned to
 `gpt-5.6-luna` with `medium` reasoning effort and ChatGPT authentication. The
@@ -394,14 +394,18 @@ persistence and Discord I/O.
   `starring-staging-authority-operator`. `codex-worker` is a separate private
   loopback ChatGPT-login Codex service rather than a workspace member.
 
-Persistence is 116 ordered migrations under `/migrations`, ending at
-`202608010001_add_runtime_interaction_effect_journal_v1.sql`, including the
+Persistence is 117 ordered migrations under `/migrations`, ending at
+`202608010002_fix_runtime_interaction_effect_response_tail_scan_v1.sql`,
+including the
 original instance and RuleSet stores, product-bound activation context and
 terminal states, the authoring promotion journal, atomic Product Apply and
 runtime deployment, runtime convergence, current-versus-historical binding
 separation, artifact integrity, exclusive product-slot ownership, scoped
 installation-authority reads, scoped product-session authentication, durable
-interaction receipts, and the per-effect recovery journal.
+interaction receipts, the per-effect recovery journal, and the additive
+response-tail recovery-scan correction. Migration 117 changes no table or
+capability count; it preserves the function signature, owner, ACL, and security
+attributes while replacing the invalid qualified `greatest` expression.
 
 ## Durable RuleSet Lifecycle
 
@@ -501,17 +505,19 @@ in-flight legacy activation.
 - **CI** (`.github/workflows/ci.yml`, GitHub Actions, push + PR): a DB-less job
   (fmt, build, `cargo test --workspace`, clippy `-D warnings`, unsafe-dev feature
   build, and design-harness JavaScript/Promptfoo static checks) and a PostgreSQL
-  job (eleven adapter or integration packages' ignored tests, serial). No live Discord
-  or LLM in CI.
+  job (thirteen explicit adapter or integration commands, serial). The DB-less
+  job also scans tracked repository content for secret patterns before build.
+  No live Discord or LLM runs in CI.
 - **Test volume**: the complete Rust workspace suite, the design-harness
   JavaScript evaluator and acceptance self-tests, two Promptfoo configuration
   validations, and the ignored PostgreSQL integration suites for contention,
   CAS, lease, partial-unique, and reconnect behavior. At the final Luna V4
-  checkpoint, the focused `design-harness` library target passed 742 tests, the
-  CLI gate passed 82 tests plus its dependency guard, and the JavaScript gate
-  passed 106 tests. Relevant clippy `-D warnings` and formatting gates also
-  passed. The exact resumable repeated Luna matrix is implemented, statically
-  verified, and passed live at 232/232 samples and 298/298 planned model calls.
+  checkpoint, the independently audited `design-harness` library target passed
+  878 tests, the CLI gate passed 82 tests plus its dependency guard, and the
+  JavaScript gate passed 106 tests. Relevant clippy `-D warnings` and formatting
+  gates also passed. The exact resumable repeated Luna matrix is implemented,
+  statically verified, and passed live at 232/232 samples and 298/298 planned
+  model calls.
   The clean evidence source also passed GitHub Actions CI run 31: the complete
   workspace checks and PostgreSQL integration job were both green. CI remains
   separate from the local live-model certificate.
@@ -731,15 +737,17 @@ Stated as capabilities (durable across the phase numbering):
   concurrency, saturation, soak, and public-ingress drills remain release work.
 - Production credential and operational certification beyond the integrated
   staging cluster. Staging has 20 pairwise-distinct application database
-  credentials, two purpose-separated keyrings, fixed function allowlists,
-  restrictive grants, and a 15-rule HBA; restored-cluster reconciliation,
+  credentials, three purpose-separated keyrings, 28 total Keychain items,
+  fixed function allowlists, restrictive grants, and a 15-rule HBA;
+  restored-cluster reconciliation,
   production secret-account isolation, rotation, and whole-process negative
   capability evidence remain release blockers.
 - Commercial runtime certification beyond the completed Phase C source
-  candidate: C1 receipts are staged, while C2 preflight and the C3
-  effect-journal, reconciliation, compensation, route-admission, and
-  recovery-supervisor boundaries still need deployment plus the Phase D
-  restart, injected-failure, load, restore, and disposable-guild cohorts.
+  candidate. The receipt, preflight, effect-journal, reconciliation,
+  compensation, route-admission, and recovery-supervisor boundaries exist, but
+  D1 restart and injected-failure cohorts are complete while the exact release
+  tree still needs the disposable-guild, load, restore, merge-candidate, and
+  merged-main cohorts.
 - An administrative / management API.
 - Broader multi-process lease/ownership beyond the single per-request lease.
 - A dedicated live teardown-retry progress and degraded-health projection. The
@@ -775,10 +783,9 @@ Stated as capabilities (durable across the phase numbering):
   successor.
 - Apply can durably reach `RuntimePending`, and the exact staging runtime can
   advance it to real Live with a certified panel and fresh serving lease.
-  C1 receipts are deployed to the retained staging fixture; C2 preflight and
-  C3 recovery controls exist in the source candidate. Commercial operation
-  still requires deployment of C2/C3 and the Phase D failure, load, recovery,
-  disposable-guild, CI, and merged-main certification.
+  Commercial operation still requires the exact candidate to pass the Phase D
+  disposable-guild, load, restore, merge-candidate, CI, and merged-main
+  certification gates.
 - The `automation-panel-installation-postgres` ignored tests share a guild
   constant and must run serially (`--test-threads=1`); CI does this. A cleaner
   per-test isolation is deferred.
@@ -790,7 +797,9 @@ Stated as capabilities (durable across the phase numbering):
   performs only bounded compensation with exact preimages. Mutable non-response
   effects that cannot be correlated safely remain durably `recovery_required`
   and route-blocked. An unrecoverable response tail terminalizes only its exact
-  receipt; Phase D must still prove those paths against live injected failures.
+  receipt. D1 proves the bounded restart and failure boundaries; D2 must still
+  prove the exact indeterminate-effect scenario against a disposable Discord
+  guild.
   Observation, compensation-attempt, and compensation-observation recovery each
   have a database-enforced 64-attempt hard cap. The production recovery
   supervisor exposes task liveness and progress to serving readiness; task exit
@@ -825,8 +834,8 @@ Stated as capabilities (durable across the phase numbering):
   intent/result journal, while an unrecoverable response tail terminalizes that
   exact receipt. A later mutation failure therefore enters bounded observation,
   compensation, or an explicit route-blocked state instead of leaving an
-  untracked mutation. Live fault-injection certification of those paths remains
-  Phase D work.
+  untracked mutation. The disposable-guild indeterminate-effect and cleanup
+  certificate remains D2 work.
 - V3 Intent snapshots are deliberately incompatible with V4. V6 and V7
   non-Intent snapshots can be promoted at the CLI store edge, but any V6 or V7
   snapshot containing Intent state is rejected. Future protocol, prompt,
@@ -849,38 +858,40 @@ Stated as capabilities (durable across the phase numbering):
   workspace test, Clippy, and formatting gates completed locally; treat a
   recurrence as a host operational fault and continue requiring independent CI
   before merge.
-- After the C3 gates and removal of the final clean-worktree target, the data
-  volume has roughly 34 GiB free. Keep
-  at least 30 GiB free before retaining another large build or evaluation
-  cohort; this is an operational capacity floor, not a certified production
-  margin.
+- Keep at least 30 GiB free before retaining another large build or evaluation
+  cohort. Recheck the current filesystem immediately before each release build;
+  a previously recorded free-space value is not a capacity guarantee. This is
+  an operational floor, not a certified production margin.
 
 ## Next Phase: Prove Commercial Operation
 
 Phase A A1–A6, Phase B B1–B6, and the Phase C source implementation are
 complete. The API has fourteen core pools and one isolated writer pool; the
-retained integrated staging cluster has 20 application credentials, two
-keyrings, a 15-rule HBA, 115 migration-ledger entries through
-`202607310022`, and authority revision 2
+retained integrated staging cluster has 20 application credentials, three
+keyrings, 28 total Keychain items, a 15-rule HBA, 117 migration-ledger entries
+through `202608010002`, and authority revision 2
 `community_hub` binding. The live signed-in gate proved one-shot and resumed
 multi-turn authoring, three encrypted durable generations, authenticated read,
 and exact PreviewReady promotion. The B6 gate then proved approval, Apply,
 RuntimePending-to-Live convergence, real Discord resource effects, restart
 reconstruction, and exact per-instance footprint cleanup.
 
-The source candidate adds migration 116,
-`202608010001_add_runtime_interaction_effect_journal_v1.sql`. Its isolated
-PostgreSQL evidence is recorded separately from the retained staging fixture;
-it has not yet been deployed to that fixture or certified against live Discord
-failure injection.
+Migration 117,
+`202608010002_fix_runtime_interaction_effect_response_tail_scan_v1.sql`, repairs
+the invalid qualified PostgreSQL expression exposed by the first D1 restart
+drill. The corrected immutable candidate at
+`b4f2bb09f4997c2fda33ddef6a1175e642ca19ba` is deployed. Its forced-restart
+successor reacquired exact authority in 66 seconds and then held process,
+liveness, readiness, and fresh acknowledgement evidence for 40/40 samples over
+83 seconds. The complete deterministic and PostgreSQL D1 failure matrix is
+green. D2 and D3 remain required.
 
 The accepted next sequence is:
 
-1. **Phase D — commercial certification:** deploy the Phase C candidate, run
-   restart and injected-failure cohorts,
-   final disposable-guild E2E, backup/restore and non-interactive reboot drills,
-   concurrency, saturation and soak measurement, complete local gates, final PR
-   and merge-candidate CI, merged-main CI, and source-of-truth/runbook closure.
+1. **Phase D — commercial certification:** run the final disposable-guild E2E,
+   backup/restore and non-interactive reboot drills, concurrency, saturation and
+   soak measurement, complete local gates, final PR and merge-candidate CI,
+   merged-main CI, and source-of-truth/runbook closure.
 2. After the commercial certificate, add typed multi-turn preference
    accumulation and typed-planner handoff, then consider broader recipes or the
    separate `StatefulSpec` runtime arc.
@@ -895,15 +906,22 @@ measurement is a commercial certification.
 `docs/superpowers/measurements/2026-08-01-runtime-milestone-c3.md` records the
 Phase C source-level durability, recovery, and isolated PostgreSQL evidence. It
 is also not a commercial certification.
+`docs/superpowers/measurements/2026-08-01-runtime-phase-d1.md` records the
+completed restart and failure cohorts. D1 alone is not a commercial
+certification.
 
 ## Source Documents
 
+- Active Phase D continuation and operational handoff:
+  `docs/superpowers/handoffs/2026-08-01-commercial-certification-phase-d-handoff.md`.
 - Design specs, plans, and runbooks: `docs/superpowers/{specs,plans,runbooks}/`
   (per-phase rationale; the 16–18f arc and the CI and rollback runbooks).
 - Phase B staging runtime evidence:
   `docs/superpowers/measurements/2026-07-31-runtime-milestone-b6.md`.
 - Phase C source hardening evidence:
   `docs/superpowers/measurements/2026-08-01-runtime-milestone-c3.md`.
+- Phase D1 restart and failure evidence:
+  `docs/superpowers/measurements/2026-08-01-runtime-phase-d1.md`.
 - Current Intent V4 semantic-identity implementation handoff:
   `docs/superpowers/handoffs/2026-07-15-intent-v4-semantic-identity-handoff.md`.
 - Current Luna V4 acceptance and hardening handoff:

@@ -1,19 +1,21 @@
 # macOS Starring Integrated Staging Cutover
 
-## Status: not executed
+## Status: staging foundation executed; Phase D certification incomplete
 
-This runbook is an executable staging plan. No command in this document was run
-as part of authoring it. No old cluster was stopped or moved, no new cluster was
-initialized, no role or Keychain item was changed, and no LaunchAgent or tunnel
-was loaded or unloaded. Every acceptance result and receipt remains absent
-until an operator runs the applicable block and records its exit status.
+The dedicated PostgreSQL 16 cluster, twenty application credentials, three
+keyrings, final HBA, API, runtime, and product-path staging foundation described
+by this runbook now exist. The B6 measurement records the bounded staging Live
+exercise. This document remains the fresh-cutover and recovery procedure; it is
+not itself evidence that a later source tree, migration, binary, backup, or
+disposable-guild cohort passed. Re-run the applicable blocks and retain a new
+acceptance record for every replacement environment.
 
 This cutover creates a disposable, dedicated PostgreSQL 16 staging cluster for
-the Starring API and the empty-open runtime on one Mac mini. It does not
-authorize customer traffic, a customer Discord guild, or production Live
-automation. Runtime readiness in this release means paused Discord connection,
-owner and ingress-acknowledgement convergence, and an empty in-process registry.
-It does not mean that a customer interaction route is installed.
+the Starring API and serving runtime on one Mac mini. The runtime can converge
+an exact Requested deployment and serve an admitted route, but process
+readiness alone never means a customer route is Live. Production authorization
+requires the exact product deployment projection plus the complete Phase D
+release certificate.
 
 The host still uses one macOS GUI login as the Keychain and LaunchAgent
 boundary. Codex and other processes under that login are inside the same secret
@@ -27,6 +29,7 @@ blocks in:
 
 - [Production Control Plane Cutover Runbook](./2026-07-19-production-control-plane-cutover.md)
 - [macOS Starring Runtime Staging Operations](./2026-07-29-macos-starring-runtime-staging-operations.md)
+- [Commercial certification Phase D handoff](../handoffs/2026-08-01-commercial-certification-phase-d-handoff.md)
 - `ops/postgres/staging-api-role-bootstrap.sql`
 - `ops/postgres/staging-api-role-enable.sql`
 - `ops/postgres/staging-runtime-role-bootstrap.sql`
@@ -885,7 +888,7 @@ major, independently reviewed system identifier, acknowledgement, peer rule,
 and ident map before mutation. It creates or normalizes the non-login owner and
 fixed database, runs the compile-time SQLx migration set under
 `SET ROLE starring_owner`, verifies its own exact ledger, verifies every
-user-schema relation and all 124 capability functions, resets role, and removes
+user-schema relation and all 135 capability functions, resets role, and removes
 all inbound and outbound owner memberships. In peer mode it is the sole owner
 of cluster-administrator normalization. It creates no migrator login.
 
@@ -902,7 +905,7 @@ of cluster-administrator normalization. It creates no migrator login.
     "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
     >"$STARRING_CUTOVER_EVIDENCE/starring-db-bootstrap.txt"
   grep -E \
-    '^database=starring_runtime_staging owner=starring_owner migrations=[1-9][0-9]* relations=184 capability_functions=124$' \
+    '^database=starring_runtime_staging owner=starring_owner migrations=117 relations=198 capability_functions=135$' \
     "$STARRING_CUTOVER_EVIDENCE/starring-db-bootstrap.txt" >/dev/null
 )
 ```
@@ -1872,6 +1875,12 @@ in the component runbooks.
 
 ### Existing nineteen-role staging cluster: incremental authoring writer
 
+This subsection is an archived migration-89 receipt procedure. It is retained
+only to interpret the original nineteen-role cutover evidence and must not be
+run against the current 117-migration source or staging database. Current
+environments use the complete twenty-role verifier and the additive receipt and
+effect ACL procedures in the runtime operations runbook.
+
 This subsection applies only to the already provisioned staging cluster that
 has fourteen API roles, five runtime roles, the final TCP administrator
 credential, and no authoring-writer role or Keychain item. Do not rerun the
@@ -2692,8 +2701,9 @@ API startup evidence must combine aggregate fourteen-core-pool readiness with
 the separately successful fifteenth authoring-writer and loopback-worker
 preflights described in
 [Startup and deep-readiness proof](./2026-07-19-production-control-plane-cutover.md#startup-and-deep-readiness-proof).
-Runtime readiness must remain the empty-open contract described in the runtime
-runbook. Review only finite redacted status lines from both logs. Never copy a
+Runtime readiness must satisfy the serving-process contract described in the
+runtime runbook; an exact route is accepted only through its separate product
+deployment projection. Review only finite redacted status lines from both logs. Never copy a
 database URL, OAuth code, Discord token, Keychain value, or key material into
 evidence.
 
@@ -2715,7 +2725,8 @@ The cutover is accepted only when a change record contains all of these facts:
 - exact seven-rule bootstrap HBA and ident proof, final fifteen-rule HBA
   proof, peer-removal proof, and physical replication rejection;
 - immutable bootstrap and provisioner binary SHA-256 values;
-- embedded bootstrap receipt with 184 relations and 124 capability functions;
+- embedded bootstrap receipt with 117 migrations, 198 relations, and 135
+  capability functions;
 - exact migration ledger diff with no difference;
 - exact database, `public` schema, ledger, relation, routine, and type ownership
   proof plus owner zero-membership postflight and migrator absence;
@@ -2936,12 +2947,20 @@ deletion and archive retention are separate reviewed follow-up operations.
 
 ## End state
 
-Authoring this document does not change the host. Before execution, the only
-truthful status is:
+The retained integrated staging foundation has been executed and B6 reached one
+exact staging Live route. That historical result does not transfer to another
+tree or restored environment. For every new execution, record the result using
+this closed form:
 
 ```text
-integrated staging cutover: not executed
-database cutover evidence: absent
-application activation evidence: absent
+integrated staging cutover: accepted | rolled_back | incomplete
+database cutover evidence: retained | absent
+application readiness evidence: retained | absent
+exact route Live evidence: retained | absent
+Phase D disposable-guild certificate: retained | absent
 public ingress: not authorized by this runbook
 ```
+
+Only `accepted` with retained database and application readiness evidence is a
+successful infrastructure cutover. It still does not authorize production
+traffic or substitute for the exact Phase D release certificate.

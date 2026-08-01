@@ -7,12 +7,15 @@ mini user's LaunchAgent. The staging service is
 interaction-token envelope keyring are resolved indirectly from macOS
 Keychain.
 
-This is an empty-open runtime substrate. A successful startup can acquire and
-renew the production owner, connect Discord in the paused state, publish the
-durable ingress acknowledgement, and report ready. It does not install a
-customer interaction route, populate the in-process registry, or execute a
-customer Discord interaction. Do not describe `ready` as customer traffic
-serving until a separately reviewed route-admission release exists.
+This runtime can acquire and renew the production owner, connect the canonical
+Discord shard, reconstruct durable routes, converge Requested deployments,
+serve admitted interactions, and recover bounded receipt and effect work. The
+B6 staging milestone proved one exact route through Live and real interactions.
+That proof is not the Phase D commercial certificate. Process `ready` means the
+runtime's process-wide authorities and supervisors are current; it never proves
+that a particular installation or route is Live. Use the product deployment
+status for the exact installation and promotion before describing customer
+traffic as serving.
 
 ## Fixed operating contract
 
@@ -373,13 +376,111 @@ credentials. Continue at `Store indirect secrets in Keychain` and use only its
 dedicated legacy interaction-token keyring mode before building the immutable
 revision.
 
+## Backfill C3 interaction effect function ACLs
+
+Use this additive path after migration `202608010002` when an existing
+credentialed cluster must receive the exact effect-journal capability ACLs
+without rotating its runtime credentials or rerunning either role bootstrap.
+Keep API and runtime unloaded. The script requires cluster-wide zero client
+backends and zero prepared transactions, verifies the exact 117-entry ledger
+and migration checksum, preserves both role attribute and SCRAM-verifier
+snapshots, and rechecks quiescence before commit.
+
+The fixed manifest contains 22 functions. Eleven external capabilities receive
+non-grantable `EXECUTE` for `starring_runtime_interaction`; eleven guards,
+manifest helpers, and cross-record functions remain owner-only. `PUBLIC`,
+unrelated roles, grant options, direct relations, role membership, role
+settings, and owner drift fail closed. Exact replay produces the same ACL.
+
+Use the complete Keychain-to-mode-`0600` temporary `PGPASSFILE` setup and trap
+from the C1 section, but execute only this current-head script at the final
+`psql` step:
+
+```zsh
+PGPASSFILE="$ADMIN_PGPASS_PATH" PGSSLMODE=disable \
+  /opt/homebrew/opt/postgresql@16/bin/psql \
+  --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
+  --host 127.0.0.1 --port 5432 \
+  --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+  --dbname "$STAGING_DATABASE" \
+  --set expected_database="$STAGING_DATABASE" \
+  --set expected_system_identifier="$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+  --set runtime_dedicated_cluster_acknowledgement="$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+  --file ops/postgres/staging-runtime-interaction-effect-acl-backfill.sql
+```
+
+Do not run the older C1 SQL file in the same transaction or leave either
+LaunchAgent loaded. On failure, retain only the stable error, prove the
+transaction rolled back, and keep both services stopped.
+
+## Inspect duplicate receipts without exposing identities
+
+The loopback-only interaction health projection is a process-local, redacted
+counter view. It contains no application, guild, installation, interaction,
+route, user, token, payload, or effect identity. Capture it before and after a
+reviewed duplicate-delivery drill to classify the receipt result without
+querying receipt tables or copying Discord interaction data into evidence:
+
+```zsh
+(
+  set -euo pipefail
+  SNAPSHOT="$(
+    curl --fail --silent --show-error --max-time 1 \
+      http://127.0.0.1:19091/health/interactions
+  )"
+  print -r -- "$SNAPSHOT" | jq -e '
+    [
+      .receipt_acquired,
+      .receipt_completed_duplicate,
+      .receipt_in_flight_duplicate,
+      .receipt_terminal_duplicate,
+      .receipt_recovery_required_duplicate,
+      .receipt_claim_closed,
+      .receipt_claim_timeout,
+      .receipt_claim_unavailable,
+      .receipt_claim_rejected,
+      .receipt_claim_corrupt,
+      .receipt_authority_rejected,
+      .receipt_persistence_failed_before_effect,
+      .receipt_persistence_failed_after_effect,
+      .receipt_terminal_recovery_required,
+      .in_flight
+    ] | all(type == "number" and . >= 0)
+  ' >/dev/null
+  print -r -- "$SNAPSHOT" | jq '{
+    receipt_acquired,
+    receipt_completed_duplicate,
+    receipt_in_flight_duplicate,
+    receipt_terminal_duplicate,
+    receipt_recovery_required_duplicate,
+    receipt_claim_closed,
+    receipt_claim_timeout,
+    receipt_claim_unavailable,
+    receipt_claim_rejected,
+    receipt_claim_corrupt,
+    receipt_authority_rejected,
+    receipt_persistence_failed_before_effect,
+    receipt_persistence_failed_after_effect,
+    receipt_terminal_recovery_required,
+    in_flight
+  }'
+)
+```
+
+The counters are monotonic only for the current runtime process and reset after
+a restart. A duplicate counter increase proves the runtime classified a replay;
+it does not alone prove that Discord observed one mutable effect. Pair it with
+the disposable-guild resource count and the durable final receipt/effect state
+required by the Phase D E2E. Never use direct table reads, raw interaction IDs,
+or token ciphertext as routine operational evidence.
+
 ## Inspect durable interaction effect recovery blocks
 
-Run this read-only inspection after migration `202608010001` is present when
+Run this read-only inspection after migration `202608010002` is present when
 an interaction route remains blocked or before deciding whether manual
 recovery is appropriate. The inspection uses one repeatable-read transaction,
 validates PostgreSQL 16, the fixed staging database and dedicated cluster, the
-exact 116-entry migration ledger, and the interaction-effect schema manifest.
+exact 117-entry migration ledger, and the interaction-effect schema manifest.
 It then emits only recovery block code, action kind, aggregate count, and the
 oldest and newest block times. It never emits application, interaction,
 action, or Discord output identifiers, nor digest, correlation,
@@ -498,6 +599,17 @@ journal and use the action below for the exact reported code.
 | `recovery_blocked_discord_forbidden` | Restore the intended bot permission through Discord administration and do not retry the mutation until exact authority has been re-established. |
 | `recovery_blocked_internal_authority` | Keep the route blocked and restore or rotate authority through the reviewed product or operator path; never repair it with direct table edits. |
 | `recovery_blocked_attempt_budget_exhausted` | Leave automatic retries stopped, inspect exact current external state, and choose a documented manual remediation before any new attempt. |
+
+`recovery_required` is a durable safety state, not a transient HTTP retry hint.
+The exact unsafe route remains blocked while unrelated routes may continue. Do
+not clear it by deleting a receipt, effect head, event, or resource. The
+15-second recovery supervisor may observe or compensate only within its
+database-enforced bounded protocol. Three consecutive failed sweeps make the
+supervisor unhealthy and the serving-process revalidation fails closed; a
+supervisor exit is also not ready. Preserve the redacted inspection result,
+repair only the classified dependency or authority, and let the reviewed
+recovery path advance durable state. Escalate any code without a documented
+operator action as a release-blocking protocol defect.
 
 ## Bootstrap the five database roles
 
@@ -1177,7 +1289,7 @@ tight crash loop. `RunAtLoad=true` starts the process during `bootstrap`; do
 not follow bootstrap with `kickstart -k`, because `-k` would terminate a newly
 started process without its shutdown protocol.
 
-## Health and empty-open verification
+## Health and serving-process verification
 
 First prove the listener is loopback-only and liveness is available:
 
@@ -1219,8 +1331,10 @@ acknowledgement converge. Allow one bounded startup window:
 ```
 
 The log must contain only finite status codes and contexts, never a database
-URL, password, Discord token, or Keychain value. `ready` at this release still
-means empty-open only. There is no customer-route smoke request to send.
+URL, password, Discord token, or Keychain value. Process readiness is not a
+route projection. For a route-bearing acceptance, independently require the
+exact product deployment status to report Live with fresh serving evidence and
+exercise only the reviewed disposable-guild interaction path.
 
 ## SIGTERM acceptance
 
@@ -1429,6 +1543,56 @@ API owner corrects the failure and the complete password, enable, runtime, and
 API readiness sequence is repeated. When `api_was_loaded=false`, do not run the
 restore block; record that the API intentionally remained stopped.
 
+## Backup, restore, and failure-drill contract
+
+Take a database backup before every migration or capability-ACL change. Close
+public ingress first, then stop API and runtime, apply the cluster-quiescence
+proof above, and require zero other client backends and zero prepared
+transactions. Create a PostgreSQL 16 custom-format dump as the reviewed cluster
+administrator through the same Keychain-to-mode-`0600` `PGPASSFILE` boundary
+used by the effect inspection. The backup file and its directory must be mode
+`0600` and `0700`, respectively. Record only:
+
+- UTC backup identifier
+- source Git revision and binary SHA-256
+- migration head and successful ledger count
+- dump byte count and SHA-256
+- `pg_restore --list` success
+
+Do not record the administrator URL, `PGPASSFILE`, Keychain output, relation
+rows, receipt or effect identities, encrypted payloads, or Discord identifiers.
+A dump that has not passed a restore drill is not a verified backup.
+
+Restore only into an isolated PostgreSQL 16 cluster or a unique disposable
+database with all staging clients and public ingress unable to reach it. Never
+restore over `starring_runtime_staging`. Require `pg_restore --exit-on-error` to
+finish, diff the restored `_sqlx_migrations` versions and checksums against the
+repository, verify the common owner and function manifests, and run the exact
+capability readiness suites before deleting the disposable restore target. A
+different database name may intentionally fail application database-identity
+readiness; that is not permission to weaken the identity contract. A production
+recovery uses a reviewed replacement cluster with the original logical database
+identity, then reruns HBA, role, Keychain-reference, API, runtime, route, and
+serving checks before ingress reopens.
+
+For a full-cluster cutover backup and restoration, use Gate 2 and the rollback
+sequence in
+[macOS Starring Integrated Staging Cutover](./2026-07-29-macos-starring-integrated-staging-cutover.md).
+Those steps archive the prior data directory without deleting it. Do not mix a
+logical dump rollback with an unreviewed reverse migration.
+
+Run failure drills only on the reviewed staging or disposable-guild target. For
+each drill, capture the pre-state, inject exactly one failure, observe the
+closed state, remove the injection, and prove bounded convergence before moving
+to the next case. The release cohort must cover database loss before claim and
+before effect, Discord loss before effect, indeterminate Discord outcome,
+gateway disconnect, owner and controller lease loss, writer-fence and authority
+changes, binding-map drift, process kill/restart, and duplicate HTTP and Discord
+delivery. Stop a drill immediately on false Live, a stale writer, a second
+mutable effect, missing durable recovery state, or an automatic deletion not
+authorized by an exact preimage. Keep the exact checkpoint and stable redacted
+code; never retain injected secrets or full interaction payloads.
+
 ## Routine operation
 
 ```zsh
@@ -1510,8 +1674,9 @@ it:
 Then repeat the listener, liveness, readiness, and SIGTERM checks. Database
 migrations are forward-only and this role bootstrap has no automatic database
 rollback. If the previous executable is not compatible with the current
-schema, leave the empty-open service stopped and restore a separately verified
-database snapshot instead of improvising reverse SQL.
+schema, leave the serving process stopped and restore a separately verified
+database snapshot instead of improvising reverse SQL. Binary rollback never
+rewinds a durable route, receipt, effect journal, or deployment by itself.
 
 To revoke the staging runtime completely, stop the LaunchAgent, disable its
 label, delete all seven `starring.runtime.staging` Keychain items by exact

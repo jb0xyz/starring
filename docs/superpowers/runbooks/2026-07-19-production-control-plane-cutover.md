@@ -4,16 +4,20 @@
 
 This runbook describes the fail-closed migration and maintenance contract for
 the production control plane. It does not authorize production cutover until
-the database-role, RLS, capability-probe, HTTP composition, and
-runtime Live gates in the accepted design are implemented and green.
+the database-role, RLS, capability-probe, HTTP composition, runtime Live,
+failure-cohort, backup/restore, merge-candidate, and merged-main gates in the
+accepted design are implemented and green.
 
-The current `starring-api` slice is a staging control plane. It can authenticate
-product users and carry promotion, approval, rejection, Apply, and status
-requests through the verified control boundary. The production runtime worker,
-gateway convergence, serving heartbeat, and Live recovery drills are not yet a
-deployable production unit. Apply may therefore reach `runtime_pending`; it
-must never be represented as Live. Do not connect this slice to a customer
-guild or advertise production Live automation.
+The current `starring-api` is a staging control plane. It can authenticate
+product users and carry authoring, promotion, approval, rejection, Apply, and
+status requests through the verified control boundary. The staging runtime can
+converge an exact deployment to Live and serve the supported recipe; B6 proved
+one bounded standing-fixture path. Phase D restart, injected-failure,
+disposable-guild, exact merge-candidate, and merged-main certification remain
+incomplete. Do not connect this slice to a customer guild or advertise
+commercial production automation. The current continuation state is recorded
+in the
+[Commercial certification Phase D handoff](../handoffs/2026-08-01-commercial-certification-phase-d-handoff.md).
 
 ## Required operators and credentials
 
@@ -681,6 +685,47 @@ permission to substitute a core pool. Recomposition after a failed startup
 authoring preflight requires a controlled process restart; the running facade
 does not hot-add authoring dependencies.
 
+### Authoring degraded operation
+
+General `GET /health/ready` can remain `200` while authoring is unavailable.
+The authoritative startup distinction is the current process's single redacted
+line:
+
+```text
+starring_api_authoring_status=ready
+starring_api_authoring_status=unavailable
+```
+
+When the line is `unavailable`, authentication, status, approval, Apply, and
+other independently composed core routes may remain available, but authoring
+turns fail closed with `503 dependency_unavailable`. An in-process authoring
+capacity rejection returns `503 authoring_saturated` with the bounded
+`Retry-After` configured by the HTTP boundary. A bounded dependency timeout is
+`504 dependency_timeout`; a structurally invalid worker response is `502
+upstream_invalid_response`. These public codes are redacted and retryability is
+closed by code. Never surface a worker response, model transcript, database
+error, Keychain result, or bearer credential to diagnose them.
+
+For degradation:
+
+1. Keep the core API running only while general readiness remains green.
+2. Stop new authoring turns; preserve each caller's original idempotency key
+   and expected generation.
+3. Check the writer and worker by their independent least-privilege and
+   loopback health procedures. Do not borrow a core database pool or bypass the
+   worker contract.
+4. Wait for active authoring work to settle, then perform a controlled API
+   restart. Authoring dependencies are composed only at process startup.
+5. Require general readiness and the new process's exact
+   `starring_api_authoring_status=ready` line before reopening authoring.
+6. On a lost turn response, retry the same idempotency key. Never create a new
+   key until the exact session generation proves whether the prior commit won.
+
+Repeated saturation is a capacity/SLO incident, not permission to increase
+worker concurrency, queue depth, HTTP admission, database pool size, or timeout
+without a measured cohort. If core readiness also fails, close public ingress
+and follow the complete shutdown path instead of operating in degraded mode.
+
 Before promoting a release candidate, rehearse the 14-role core probe and the
 isolated fifteenth authoring pool under the expected concurrent request load and
 database latency with the intended pool limit. Record core probe duration,
@@ -754,14 +799,16 @@ Failure handling is intentionally closed:
   credential to make readiness green.
 
 Do not enable the public tunnel until local readiness, a staging OAuth flow, and
-a disposable-guild authority check are green. Current staging evidence is not
-production Live evidence because the production runtime worker and serving
-lease path remain unavailable.
+a disposable-guild authority check are green. B6 proved one staging Live route,
+serving lease, and interaction path, but that evidence is not the final
+disposable-guild Phase D certificate. Keep production ingress prohibited until
+the exact merge candidate passes the release cohorts and merged-main CI.
 
 ## Preflight
 
 1. Record the running application revision and migration version.
-2. Take and verify a restorable PostgreSQL backup.
+2. Take and verify a restorable PostgreSQL backup using the
+   [backup, restore, and failure-drill contract](./2026-07-29-macos-starring-runtime-staging-operations.md#backup-restore-and-failure-drill-contract).
 3. Stop new promotion, approval, rejection, and apply requests.
 4. Drain legacy writers, including every old `interaction-smoke` process, and
    confirm no activation is `applying`.
@@ -2213,9 +2260,12 @@ recovery procedure.
   it does not recognize. When migrations are forward-only or receipt retention
   has run, use a forward fix or verified database restore rather than forcing
   an old binary through red capability probes.
-- No rollback in the current slice can produce production Live. RuntimePending
-  remains the terminal honest product state until the production runtime
-  worker, attestation, serving-lease, fencing, and recovery release gates pass.
+- API rollback does not rewind a deployment, route, receipt, effect journal, or
+  Discord resource. A compatible runtime may keep an exact deployment Live
+  while the API is stopped. After any API rollback, keep public ingress closed
+  until the API reports deep readiness and the exact product deployment status
+  independently proves its current runtime state. Never infer Live from an
+  Applied pointer or an API process restart.
 
 ## Evidence to retain
 
