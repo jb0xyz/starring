@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+      - name: Scan tracked repository secrets
+        run: python3 tools/ci/scan_tracked_secrets.py
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -106,5 +108,9 @@ jobs:
         run: cargo test --locked -p automation-runtime-convergence-postgres -- --ignored --test-threads=1
       - name: Test runtime execution PostgreSQL store
         run: cargo test --locked -p automation-runtime-execution-postgres --test postgres_security -- --ignored --test-threads=1
+      - name: Test runtime serving PostgreSQL store
+        run: cargo test --locked -p automation-runtime-serving-postgres -- --ignored --test-threads=1
       - name: Test runtime interaction PostgreSQL store
-        run: cargo test --locked -p automation-runtime-interaction-postgres --test postgres_security -- --ignored --test-threads=1
+        run: cargo test --locked -p automation-runtime-interaction-postgres -- --ignored --test-threads=1
+      - name: Test runtime panel PostgreSQL store
+        run: cargo test --locked -p automation-runtime-panel-postgres -- --ignored --test-threads=1

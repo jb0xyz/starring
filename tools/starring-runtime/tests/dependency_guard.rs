@@ -5,6 +5,7 @@ use std::process::Command;
 
 const WORKSPACE: &str = include_str!("../../../Cargo.toml");
 const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
+const TRACKED_SECRET_SCAN: &str = include_str!("../../ci/scan_tracked_secrets.py");
 
 fn collect_source_files(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, String)>) {
     let mut entries = fs::read_dir(directory)
@@ -1668,6 +1669,47 @@ fn startup_provenance_is_compile_time_canonical_and_nonforgeable() {
     )));
     assert!(!CI_WORKFLOW.contains("STARRING_APPROVED_RELEASE_REVISION"));
     assert!(CI_WORKFLOW.contains("STARRING_RUNTIME_TEST_REQUIRE_COMPILED_REVISION: \"1\""));
+}
+
+#[test]
+fn ci_requires_the_complete_serial_postgres_manifest_and_tracked_secret_scan() {
+    let commands = [
+        "cargo test --locked -p automation-ruleset-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-instance-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-panel-installation-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-ruleset-activation-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p authoring-promotion-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p authoring-application-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-ruleset-dispatch -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-ruleset-readiness -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-runtime-convergence-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-runtime-execution-postgres --test postgres_security -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-runtime-serving-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-runtime-interaction-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-runtime-panel-postgres -- --ignored --test-threads=1",
+    ];
+    let mut previous = 0;
+    for command in commands {
+        assert_eq!(CI_WORKFLOW.matches(command).count(), 1, "{command}");
+        let position = CI_WORKFLOW.find(command).unwrap();
+        assert!(position >= previous, "{command}");
+        previous = position;
+    }
+    assert!(!CI_WORKFLOW
+        .contains("automation-runtime-interaction-postgres --test postgres_security -- --ignored"));
+    assert!(CI_WORKFLOW.contains("- name: Scan tracked repository secrets\n        run: python3 tools/ci/scan_tracked_secrets.py"));
+    for required in [
+        "git\", \"ls-files\", \"-z",
+        "cloudflare_api_token",
+        "private_key_or_age_handoff",
+        "database_url_password",
+        "sensitive_assignment",
+        "tracked repository secret scan failed",
+    ] {
+        assert!(TRACKED_SECRET_SCAN.contains(required), "{required}");
+    }
+    assert!(!TRACKED_SECRET_SCAN.contains("print(content"));
+    assert!(!TRACKED_SECRET_SCAN.contains("print(match"));
 }
 
 #[test]
