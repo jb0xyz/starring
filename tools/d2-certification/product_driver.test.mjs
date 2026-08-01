@@ -1,0 +1,276 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+import vm from "node:vm";
+
+
+const SOURCE = await readFile(new URL("./product_driver.js", import.meta.url), "utf8");
+const DIGEST = "a".repeat(64);
+
+
+function response(status, body) {
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    text: async () => (body === null ? "" : JSON.stringify(body)),
+  };
+}
+
+
+function driver(fetchImpl, cookie = "__Host-starring_csrf=csrf-value", options = {}) {
+  const context = {
+    URL,
+    Error,
+    Object,
+    Promise,
+    AbortController,
+    console,
+    globalThis: null,
+    location: { origin: "https://d2-api.starring.co.kr" },
+    setTimeout,
+    clearTimeout,
+  };
+  context.globalThis = context;
+  vm.runInNewContext(SOURCE, context, { filename: "product_driver.js" });
+  return context.StarringD2ProductDriver.create({
+    fetchImpl,
+    cookieSource: () => cookie,
+    randomUUID: () => "00000000-0000-4000-8000-000000000001",
+    sleep: async () => {},
+    ...options,
+  });
+}
+
+
+test("one-shot flow uses product boundaries and returns no prompt or full preview ruleset", async () => {
+  const calls = [];
+  const responses = [
+    response(201, {
+      session_id: "session-1",
+      generation: 1,
+      disposition: "created",
+      projection: {
+        state: "preview_ready",
+        assistant_message: "not retained",
+        preview: {
+          revision: 1,
+          ruleset: { rules: [{ hidden: true }] },
+          receipt: { candidate_ruleset_hash: DIGEST },
+        },
+      },
+    }),
+    response(201, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: DIGEST,
+      replayed: false,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: DIGEST,
+      summary: {
+        panels: 1,
+        modals: 1,
+        rules: 4,
+        actions: 15,
+        target_version: 1,
+        required_approvals: 1,
+        target_content_hash: DIGEST,
+        binding_fingerprint: DIGEST,
+        expires_at: "2026-08-01T12:00:00Z",
+      },
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 2,
+      state: "approved",
+      replayed: false,
+    }),
+    response(202, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "runtime_pending",
+      replayed: false,
+    }),
+  ];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options });
+    return responses.shift();
+  };
+  const evidence = await driver(fetchImpl).runOneShotProductFlow({
+    installationId: "installation-1",
+    sessionId: "session-1",
+    message: "Create the private study room automation",
+    confirmPreview: async (preview) => {
+      assert.equal(preview.promotion_id, DIGEST);
+      assert.deepEqual(
+        { ...preview.summary },
+        {
+          panels: 1,
+          modals: 1,
+          rules: 4,
+          actions: 15,
+          target_version: 1,
+          required_approvals: 1,
+        }
+      );
+      return true;
+    },
+  });
+  assert.equal(calls.length, 5);
+  assert.equal(calls[0].options.headers["x-csrf-token"], "csrf-value");
+  assert.equal(calls[0].options.credentials, "same-origin");
+  assert.equal(calls[4].options.method, "POST");
+  assert.equal(evidence.authoring.projection_state, "preview_ready");
+  assert.equal(evidence.applied.state, "runtime_pending");
+  const serialized = JSON.stringify(evidence);
+  assert.equal(serialized.includes("Create the private study room automation"), false);
+  assert.equal(serialized.includes("assistant_message"), false);
+  assert.equal(serialized.includes("ruleset"), true);
+  assert.equal(serialized.includes('"hidden"'), false);
+  assert.equal(Object.hasOwn(evidence.preview, "ruleset"), false);
+  assert.equal(Object.hasOwn(evidence.preview.summary, "target_content_hash"), false);
+  assert.equal(Object.hasOwn(evidence.preview.summary, "binding_fingerprint"), false);
+  assert.equal(Object.hasOwn(evidence.preview.summary, "expires_at"), false);
+});
+
+
+test("one-shot flow requires an explicit preview confirmation boundary", async () => {
+  let calls = 0;
+  const product = driver(async () => {
+    calls += 1;
+    return response(500, null);
+  });
+  await assert.rejects(
+    product.runOneShotProductFlow({
+      installationId: "installation-1",
+      sessionId: "session-1",
+      message: "Create a study room",
+    }),
+    /preview_confirmation_required/
+  );
+  assert.equal(calls, 0);
+});
+
+
+test("mutation stops before fetch when the CSRF cookie is absent", async () => {
+  let calls = 0;
+  const product = driver(async () => {
+    calls += 1;
+    return response(500, null);
+  }, "unrelated=value");
+  await assert.rejects(
+    product.authoringTurn({
+      installationId: "installation-1",
+      sessionId: "session-1",
+      expectedGeneration: 0,
+      message: "Create a study room",
+    }),
+    /csrf_cookie_missing/
+  );
+  assert.equal(calls, 0);
+});
+
+
+test("live polling requires product and operational live with a fresh lease", async () => {
+  const responses = [
+    response(200, { installation_id: "installation-1", promotion_id: DIGEST, state: "pending" }),
+    response(200, { installation_id: "installation-1", promotion_id: DIGEST, state: "pending", runtime: { phase: "requested", serving: { state: "not_expected" } } }),
+    response(200, { installation_id: "installation-1", promotion_id: DIGEST, state: "live" }),
+    response(200, { installation_id: "installation-1", promotion_id: DIGEST, state: "live", runtime: { phase: "live", serving: { state: "fresh" } } }),
+  ];
+  const result = await driver(async () => responses.shift()).waitForLive({
+    installationId: "installation-1",
+    promotionId: DIGEST,
+    attempts: 2,
+    intervalMilliseconds: 100,
+  });
+  assert.equal(result.pending_observed, true);
+  assert.equal(result.live_observed, true);
+  assert.equal(result.attempts, 2);
+  assert.equal(result.product_state, "live");
+  assert.equal(result.runtime_phase, "live");
+  assert.equal(Object.hasOwn(result, "product"), false);
+  assert.equal(Object.hasOwn(result, "operational"), false);
+});
+
+
+test("one-shot flow rejects identity drift before the next mutation", async () => {
+  const responses = [
+    response(201, {
+      session_id: "session-1",
+      generation: 1,
+      disposition: "created",
+      projection: {
+        state: "preview_ready",
+        preview: { revision: 1, receipt: { candidate_ruleset_hash: DIGEST } },
+      },
+    }),
+    response(201, {
+      installation_id: "installation-other",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: DIGEST,
+      replayed: false,
+    }),
+  ];
+  let calls = 0;
+  await assert.rejects(
+    driver(async () => {
+      calls += 1;
+      return responses.shift();
+    }).runOneShotProductFlow({
+      installationId: "installation-1",
+      sessionId: "session-1",
+      message: "Create a study room",
+      confirmPreview: async () => true,
+    }),
+    /promotion_identity_mismatch/
+  );
+  assert.equal(calls, 2);
+});
+
+
+test("problem responses expose only the closed status and public code", async () => {
+  const product = driver(async () => response(503, {
+    error: {
+      code: "request_failed",
+      message: "not retained",
+      request_id: "request-1",
+      retryable: true,
+    },
+  }));
+  await assert.rejects(product.me(), (error) => {
+    assert.equal(error.name, "StarringD2ProductRequestError");
+    assert.equal(error.status, 503);
+    assert.equal(error.code, "request_failed");
+    assert.equal(error.retryable, true);
+    assert.equal(error.message, "product_request_failed");
+    return true;
+  });
+});
+
+
+test("every fetch is aborted by the fixed request deadline", async () => {
+  const started = Date.now();
+  const product = driver(
+    async (_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener(
+        "abort",
+        () => reject(options.signal.reason),
+        { once: true }
+      );
+    }),
+    "__Host-starring_csrf=csrf-value",
+    { requestTimeoutMilliseconds: 10 }
+  );
+  await assert.rejects(product.me(), /product_request_timeout/);
+  assert.ok(Date.now() - started < 1000);
+});

@@ -18,6 +18,53 @@ const COMMAND_POLL: Duration = Duration::from_millis(10);
 const MAX_CAPTURE_BYTES: usize = 16 * 1024;
 const KEYCHAIN_ITEM_NOT_FOUND_EXIT: i32 = 44;
 
+#[derive(Clone, Copy)]
+pub(crate) struct DynamicSecretItemRefV1<'a> {
+    pub service: &'a str,
+    pub account: &'a str,
+    pub value: &'a [u8],
+}
+
+#[derive(Clone, Copy)]
+struct KeychainTargetV1<'a> {
+    service: &'a str,
+    account: &'a str,
+}
+
+impl KeychainTargetV1<'_> {
+    fn validate(self) -> Result<(), ProvisionerErrorV1> {
+        if valid_keychain_component(self.service) && valid_keychain_component(self.account) {
+            Ok(())
+        } else {
+            Err(ProvisionerErrorV1::IdentityManifest)
+        }
+    }
+}
+
+impl From<KeychainIdentityV1> for KeychainTargetV1<'_> {
+    fn from(identity: KeychainIdentityV1) -> Self {
+        Self {
+            service: identity.service,
+            account: identity.account,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OwnedKeychainTargetV1 {
+    service: String,
+    account: String,
+}
+
+impl OwnedKeychainTargetV1 {
+    fn as_target(&self) -> KeychainTargetV1<'_> {
+        KeychainTargetV1 {
+            service: &self.service,
+            account: &self.account,
+        }
+    }
+}
+
 pub struct KeychainClientV1;
 
 impl KeychainClientV1 {
@@ -52,7 +99,22 @@ impl KeychainClientV1 {
         &self,
         identity: KeychainIdentityV1,
     ) -> Result<Zeroizing<Vec<u8>>, ProvisionerErrorV1> {
-        match self.read_optional(identity)? {
+        self.read_required_target(identity.into())
+    }
+
+    pub(crate) fn read_required_dynamic(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<Zeroizing<Vec<u8>>, ProvisionerErrorV1> {
+        self.read_required_target(KeychainTargetV1 { service, account })
+    }
+
+    fn read_required_target(
+        &self,
+        target: KeychainTargetV1<'_>,
+    ) -> Result<Zeroizing<Vec<u8>>, ProvisionerErrorV1> {
+        match self.read_optional_target(target)? {
             Some(value) if !value.is_empty() => Ok(value),
             _ => Err(ProvisionerErrorV1::KeychainRead),
         }
@@ -65,13 +127,16 @@ impl KeychainClientV1 {
         let mut backups = Vec::with_capacity(items.len());
         for item in items {
             backups.push(KeychainBackupEntryV1 {
-                identity: item.identity,
+                target: owned_target(item.identity.into()),
                 previous: self.read_optional(item.identity)?,
                 created: None,
             });
         }
         for (written, item) in items.iter().enumerate() {
-            if self.write_and_verify(item.identity, item.value).is_err() {
+            if self
+                .write_and_verify_target(item.identity.into(), item.value)
+                .is_err()
+            {
                 if self.restore_prefix(&backups, written + 1).is_err() {
                     return Err(ProvisionerErrorV1::KeychainRollback);
                 }
@@ -119,7 +184,7 @@ impl KeychainClientV1 {
         self.write_new_and_verify(item.identity, item.value)?;
         Ok(KeychainUpdateV1 {
             backups: vec![KeychainBackupEntryV1 {
-                identity: item.identity,
+                target: owned_target(item.identity.into()),
                 previous: None,
                 created: Some(Zeroizing::new(item.value.to_vec())),
             }],
@@ -132,15 +197,31 @@ impl KeychainClientV1 {
         &self,
         identity: KeychainIdentityV1,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, ProvisionerErrorV1> {
+        self.read_optional_target(identity.into())
+    }
+
+    pub(crate) fn read_optional_dynamic(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, ProvisionerErrorV1> {
+        self.read_optional_target(KeychainTargetV1 { service, account })
+    }
+
+    fn read_optional_target(
+        &self,
+        target: KeychainTargetV1<'_>,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, ProvisionerErrorV1> {
+        target.validate()?;
         let mut command = Command::new(SECURITY_PATH);
         command
             .args([
                 "find-generic-password",
                 "-w",
                 "-s",
-                identity.service,
+                target.service,
                 "-a",
-                identity.account,
+                target.account,
             ])
             .env_clear()
             .stdin(Stdio::null())
@@ -165,12 +246,12 @@ impl KeychainClientV1 {
         Err(ProvisionerErrorV1::KeychainRead)
     }
 
-    fn write_and_verify(
+    fn write_and_verify_target(
         &self,
-        identity: KeychainIdentityV1,
+        target: KeychainTargetV1<'_>,
         value: &[u8],
     ) -> Result<(), ProvisionerErrorV1> {
-        self.write_with_mode_and_verify(identity, value, true)
+        self.write_with_mode_and_verify(target, value, true)
     }
 
     fn write_new_and_verify(
@@ -178,15 +259,24 @@ impl KeychainClientV1 {
         identity: KeychainIdentityV1,
         value: &[u8],
     ) -> Result<(), ProvisionerErrorV1> {
-        self.write_with_mode_and_verify(identity, value, false)
+        self.write_new_and_verify_target(identity.into(), value)
+    }
+
+    fn write_new_and_verify_target(
+        &self,
+        target: KeychainTargetV1<'_>,
+        value: &[u8],
+    ) -> Result<(), ProvisionerErrorV1> {
+        self.write_with_mode_and_verify(target, value, false)
     }
 
     fn write_with_mode_and_verify(
         &self,
-        identity: KeychainIdentityV1,
+        target: KeychainTargetV1<'_>,
         value: &[u8],
         update: bool,
     ) -> Result<(), ProvisionerErrorV1> {
+        target.validate()?;
         if value.is_empty()
             || value.len() > MAX_CAPTURE_BYTES
             || value.iter().any(|byte| byte.is_ascii_control())
@@ -203,23 +293,7 @@ impl KeychainClientV1 {
         let mut child = command
             .spawn()
             .map_err(|_| ProvisionerErrorV1::KeychainWrite)?;
-        let mut input = Zeroizing::new(Vec::with_capacity(
-            48 + identity.service.len() + identity.account.len() + value.len() * 2,
-        ));
-        input.extend_from_slice(b"add-generic-password ");
-        if update {
-            input.extend_from_slice(b"-U ");
-        }
-        input.extend_from_slice(b"-s ");
-        input.extend_from_slice(identity.service.as_bytes());
-        input.extend_from_slice(b" -a ");
-        input.extend_from_slice(identity.account.as_bytes());
-        input.extend_from_slice(b" -X ");
-        for byte in value {
-            input.push(b"0123456789abcdef"[(byte >> 4) as usize]);
-            input.push(b"0123456789abcdef"[(byte & 0x0f) as usize]);
-        }
-        input.push(b'\n');
+        let input = build_write_input(target, value, update);
         let write_result = child
             .stdin
             .take()
@@ -234,7 +308,7 @@ impl KeychainClientV1 {
         if !status.success() {
             return Err(ProvisionerErrorV1::KeychainWrite);
         }
-        let readback = match self.read_required(identity) {
+        let readback = match self.read_required_target(target) {
             Ok(readback) => readback,
             Err(_) if !update => return Err(ProvisionerErrorV1::KeychainWrite),
             Err(error) => return Err(error),
@@ -245,15 +319,24 @@ impl KeychainClientV1 {
         Ok(())
     }
 
-    fn delete(&self, identity: KeychainIdentityV1) -> Result<(), ProvisionerErrorV1> {
+    pub(crate) fn delete_dynamic(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<(), ProvisionerErrorV1> {
+        self.delete_target(KeychainTargetV1 { service, account })
+    }
+
+    fn delete_target(&self, target: KeychainTargetV1<'_>) -> Result<(), ProvisionerErrorV1> {
+        target.validate()?;
         let mut command = Command::new(SECURITY_PATH);
         command
             .args([
                 "delete-generic-password",
                 "-s",
-                identity.service,
+                target.service,
                 "-a",
-                identity.account,
+                target.account,
             ])
             .env_clear()
             .stdin(Stdio::null())
@@ -278,7 +361,7 @@ impl KeychainClientV1 {
         let mut failed = false;
         for backup in backups[..written].iter().rev() {
             let result = match &backup.previous {
-                Some(value) => self.write_and_verify(backup.identity, value),
+                Some(value) => self.write_and_verify_target(backup.target.as_target(), value),
                 None => self.delete_created(backup),
             };
             failed |= result.is_err();
@@ -292,25 +375,115 @@ impl KeychainClientV1 {
 
     fn delete_created(&self, backup: &KeychainBackupEntryV1) -> Result<(), ProvisionerErrorV1> {
         let Some(expected) = &backup.created else {
-            return self.delete(backup.identity);
+            return self.delete_target(backup.target.as_target());
         };
-        match self.read_optional(backup.identity)? {
+        match self.read_optional_target(backup.target.as_target())? {
             None => Ok(()),
             Some(current)
                 if current.len() == expected.len()
                     && bool::from(current.as_slice().ct_eq(expected.as_slice())) =>
             {
-                self.delete(backup.identity)
+                self.delete_target(backup.target.as_target())
             }
             Some(_) => Err(ProvisionerErrorV1::KeychainRollback),
         }
     }
+
+    pub(crate) fn begin_create_dynamic(
+        &self,
+        items: &[DynamicSecretItemRefV1<'_>],
+    ) -> Result<KeychainUpdateV1, ProvisionerErrorV1> {
+        let mut targets = items
+            .iter()
+            .map(|item| (item.service, item.account))
+            .collect::<Vec<_>>();
+        targets.sort_unstable();
+        if targets.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(ProvisionerErrorV1::IdentityManifest);
+        }
+        let mut backups = Vec::with_capacity(items.len());
+        for item in items {
+            let target = KeychainTargetV1 {
+                service: item.service,
+                account: item.account,
+            };
+            target.validate()?;
+            if self.read_optional_target(target)?.is_some() {
+                return Err(ProvisionerErrorV1::KeychainWrite);
+            }
+            backups.push(KeychainBackupEntryV1 {
+                target: owned_target(target),
+                previous: None,
+                created: Some(Zeroizing::new(item.value.to_vec())),
+            });
+        }
+        for (written, item) in items.iter().enumerate() {
+            let target = KeychainTargetV1 {
+                service: item.service,
+                account: item.account,
+            };
+            if self
+                .write_new_and_verify_target(target, item.value)
+                .is_err()
+            {
+                if self.restore_prefix(&backups, written + 1).is_err() {
+                    return Err(ProvisionerErrorV1::KeychainRollback);
+                }
+                return Err(ProvisionerErrorV1::KeychainWrite);
+            }
+        }
+        Ok(KeychainUpdateV1 {
+            backups,
+            client: Self,
+            completed: false,
+        })
+    }
 }
 
 struct KeychainBackupEntryV1 {
-    identity: KeychainIdentityV1,
+    target: OwnedKeychainTargetV1,
     previous: Option<Zeroizing<Vec<u8>>>,
     created: Option<Zeroizing<Vec<u8>>>,
+}
+
+fn owned_target(target: KeychainTargetV1<'_>) -> OwnedKeychainTargetV1 {
+    OwnedKeychainTargetV1 {
+        service: target.service.to_owned(),
+        account: target.account.to_owned(),
+    }
+}
+
+fn valid_keychain_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 192
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+        })
+}
+
+fn build_write_input(
+    target: KeychainTargetV1<'_>,
+    value: &[u8],
+    update: bool,
+) -> Zeroizing<Vec<u8>> {
+    let mut input = Zeroizing::new(Vec::with_capacity(
+        48 + target.service.len() + target.account.len() + value.len() * 2,
+    ));
+    input.extend_from_slice(b"add-generic-password ");
+    if update {
+        input.extend_from_slice(b"-U ");
+    }
+    input.extend_from_slice(b"-s ");
+    input.extend_from_slice(target.service.as_bytes());
+    input.extend_from_slice(b" -a ");
+    input.extend_from_slice(target.account.as_bytes());
+    input.extend_from_slice(b" -X ");
+    for byte in value {
+        input.push(b"0123456789abcdef"[(byte >> 4) as usize]);
+        input.push(b"0123456789abcdef"[(byte & 0x0f) as usize]);
+    }
+    input.push(b'\n');
+    input
 }
 
 pub struct KeychainUpdateV1 {
@@ -429,13 +602,15 @@ mod tests {
             account: "temporary.test-only",
         };
         let client = KeychainClientV1::new().unwrap();
-        let _ = client.delete(identity);
+        let _ = client.delete_target(identity.into());
         let secret = b"postgresql://starring_identity_oauth:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@127.0.0.1:5432/starring_runtime_staging?sslmode=disable";
         assert!(secret.len() > 128);
-        client.write_and_verify(identity, secret).unwrap();
+        client
+            .write_and_verify_target(identity.into(), secret)
+            .unwrap();
         let readback = client.read_required(identity).unwrap();
         assert_eq!(readback.as_slice(), secret);
-        client.delete(identity).unwrap();
+        client.delete_target(identity.into()).unwrap();
         assert!(client.read_optional(identity).unwrap().is_none());
         let update = client
             .begin_create(SecretItemRefV1 {
@@ -461,12 +636,31 @@ mod tests {
                 value: secret,
             })
             .unwrap();
-        client.write_and_verify(identity, b"different").unwrap();
+        client
+            .write_and_verify_target(identity.into(), b"different")
+            .unwrap();
         assert_eq!(update.rollback(), Err(ProvisionerErrorV1::KeychainRollback));
         assert_eq!(
             client.read_required(identity).unwrap().as_slice(),
             b"different"
         );
-        client.delete(identity).unwrap();
+        client.delete_target(identity.into()).unwrap();
+    }
+
+    #[test]
+    fn dynamic_write_uses_only_interactive_stdin_hex() {
+        let target = KeychainTargetV1 {
+            service: "starring.d2.0123456789ab.api",
+            account: "database.session-api",
+        };
+        let secret = b"not-on-argv";
+        let input = build_write_input(target, secret, false);
+        let rendered = std::str::from_utf8(&input).unwrap();
+        assert_eq!(
+            rendered,
+            "add-generic-password -s starring.d2.0123456789ab.api -a database.session-api -X 6e6f742d6f6e2d61726776\n"
+        );
+        assert!(!rendered.contains("not-on-argv"));
+        assert!(!rendered.contains("-U"));
     }
 }

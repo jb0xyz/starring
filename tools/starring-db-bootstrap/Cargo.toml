@@ -7,6 +7,7 @@ edition.workspace = true
 automation-instance-postgres = { path = "../../crates/automation-instance-postgres" }
 libc = "0.2"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres", "migrate"] }
+sha2 = "0.10"
 thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }
 zeroize = "1"

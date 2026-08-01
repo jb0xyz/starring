@@ -86,11 +86,16 @@ impl Debug for DatabaseSecretV1 {
 }
 
 pub struct AdminSecretV1 {
+    password: Zeroizing<String>,
     verifier: Zeroizing<String>,
     url: Zeroizing<String>,
 }
 
 impl AdminSecretV1 {
+    pub fn password(&self) -> &str {
+        self.password.as_str()
+    }
+
     pub fn verifier(&self) -> &str {
         self.verifier.as_str()
     }
@@ -169,6 +174,7 @@ impl GeneratedSecretsV1 {
             ADMIN_DATABASE_NAME,
         );
         let admin = AdminSecretV1 {
+            password: admin_password,
             verifier: admin_verifier,
             url: admin_url,
         };

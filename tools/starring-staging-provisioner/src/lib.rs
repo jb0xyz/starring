@@ -1,4 +1,5 @@
 mod crypto;
+mod d2;
 mod final_verify;
 mod identity;
 mod incremental_keyring;
@@ -13,6 +14,12 @@ use crypto::GeneratedSecretsV1;
 use keychain::KeychainClientV1;
 use keyring::validate_keyring_set;
 use postgres::StagingPostgresSessionV1;
+
+pub use d2::{
+    onboard_d2_from_manifest, provision_d2_from_manifest, quarantine_d2_from_manifest,
+    D2OnboardingOutcomeV1, D2OnboardingReportV1, D2ProvisionerErrorV1, D2ProvisioningOutcomeV1,
+    D2ProvisioningReportV1, D2QuarantineReportV1,
+};
 
 pub use final_verify::{verify_final, FinalVerificationReportV1};
 pub use identity::{
