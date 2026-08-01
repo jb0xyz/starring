@@ -1000,9 +1000,10 @@ fn extract_manifest(sql: &'static str) -> Vec<&'static str> {
 mod tests {
     use super::*;
 
-    const EXPECTED_MIGRATION_COUNT: usize = 116;
-    const EXPECTED_MIGRATION_HEAD: i64 = 202608010001;
-    const RELATION_COUNT_BEFORE_MIGRATION_HEAD: i64 = 184;
+    const EXPECTED_MIGRATION_COUNT: usize = 117;
+    const EXPECTED_MIGRATION_HEAD: i64 = 202608010002;
+    const EFFECT_JOURNAL_MIGRATION: i64 = 202608010001;
+    const RELATION_COUNT_BEFORE_EFFECT_JOURNAL: i64 = 184;
 
     fn count_sql_lines_with_prefix(sql: &str, prefix: &str) -> i64 {
         sql.lines()
@@ -1046,18 +1047,29 @@ mod tests {
         assert_eq!(head.version, EXPECTED_MIGRATION_HEAD);
         assert_eq!(
             head.description,
-            "add runtime interaction effect journal v1"
+            "fix runtime interaction effect response tail scan v1"
         );
-        let table_count = count_sql_lines_with_prefix(&head.sql, "CREATE TABLE public.");
-        let explicit_index_count = count_sql_lines_with_prefix(&head.sql, "CREATE INDEX ")
-            + count_sql_lines_with_prefix(&head.sql, "CREATE UNIQUE INDEX ");
-        let primary_key_index_count = count_sql_lines_containing(&head.sql, " PRIMARY KEY (");
+        assert_eq!(
+            count_sql_lines_with_prefix(&head.sql, "CREATE TABLE public."),
+            0
+        );
+        assert_eq!(count_sql_lines_with_prefix(&head.sql, "CREATE INDEX "), 0);
+        let effect_journal = migrations
+            .iter()
+            .find(|migration| migration.version == EFFECT_JOURNAL_MIGRATION)
+            .unwrap();
+        let table_count = count_sql_lines_with_prefix(&effect_journal.sql, "CREATE TABLE public.");
+        let explicit_index_count =
+            count_sql_lines_with_prefix(&effect_journal.sql, "CREATE INDEX ")
+                + count_sql_lines_with_prefix(&effect_journal.sql, "CREATE UNIQUE INDEX ");
+        let primary_key_index_count =
+            count_sql_lines_containing(&effect_journal.sql, " PRIMARY KEY (");
         assert_eq!(table_count, 4);
         assert_eq!(explicit_index_count, 6);
         assert_eq!(primary_key_index_count, table_count);
         assert_eq!(
             RELATION_COUNT,
-            RELATION_COUNT_BEFORE_MIGRATION_HEAD
+            RELATION_COUNT_BEFORE_EFFECT_JOURNAL
                 + table_count
                 + explicit_index_count
                 + primary_key_index_count

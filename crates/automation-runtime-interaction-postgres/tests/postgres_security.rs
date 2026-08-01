@@ -29,9 +29,9 @@ use automation_runtime_interaction::{
 };
 use automation_runtime_interaction_postgres::{
     PostgresRuntimeInteractionV1, RuntimeInteractionDatabaseExpectationV1,
-    RuntimeInteractionDatabaseTimeoutsV1, RuntimeInteractionPersistenceErrorV1,
-    RuntimeInteractionReceiptClaimLeaseV1, RuntimeInteractionReceiptClaimOutcomeV1,
-    RuntimeInteractionReceiptClaimRequestV1,
+    RuntimeInteractionDatabaseTimeoutsV1, RuntimeInteractionEffectResponseTailScanCursorV1,
+    RuntimeInteractionPersistenceErrorV1, RuntimeInteractionReceiptClaimLeaseV1,
+    RuntimeInteractionReceiptClaimOutcomeV1, RuntimeInteractionReceiptClaimRequestV1,
     RuntimeInteractionReceiptInitialResponseIntentDispositionV1,
     RuntimeInteractionReceiptInitialResponseIntentV1,
     RuntimeInteractionReceiptInitialResponseKindV1,
@@ -148,6 +148,24 @@ fn function_grant(function: &str, role: &str) -> String {
     format!("GRANT EXECUTE ON FUNCTION {function} TO {role}")
 }
 
+async fn assert_response_tail_scan_fix_checksum(pool: &PgPool) {
+    let expected = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 202_608_010_002)
+        .unwrap()
+        .checksum
+        .as_ref()
+        .to_vec();
+    let applied: Vec<u8> = sqlx::query_scalar(
+        "SELECT checksum FROM public._sqlx_migrations \
+         WHERE version = 202608010002 AND success",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(applied, expected);
+}
+
 async fn isolated_database() -> IsolatedDatabase {
     isolated_database_with_upgrade_boundary(None).await
 }
@@ -237,18 +255,46 @@ async fn isolated_database_with_upgrade_boundary(
             no_tx: false,
         };
         partial.run(&owner_pool).await.unwrap();
+        let later_migration_count: i64 = sqlx::query_scalar(
+            "SELECT pg_catalog.count(*) FROM public._sqlx_migrations \
+             WHERE version > $1 AND success",
+        )
+        .bind(boundary)
+        .fetch_one(&owner_pool)
+        .await
+        .unwrap();
+        assert_eq!(later_migration_count, 0);
         let boundary_identity = if boundary <= 202_607_300_004 {
-            "public.starring_runtime_interaction_instance_scan_retryable_v2(text,text,text,text,bigint)"
+            Some(
+                "public.starring_runtime_interaction_instance_scan_retryable_v2(text,text,text,text,bigint)",
+            )
+        } else if boundary < 202_608_010_001 {
+            Some("public.starring_runtime_interaction_effect_schema_manifest_v1()")
         } else {
-            "public.starring_runtime_interaction_effect_schema_manifest_v1()"
+            None
         };
-        assert!(
-            sqlx::query_scalar::<_, bool>("SELECT pg_catalog.to_regprocedure($1) IS NULL")
-                .bind(boundary_identity)
-                .fetch_one(&owner_pool)
-                .await
-                .unwrap()
-        );
+        if let Some(boundary_identity) = boundary_identity {
+            assert!(
+                sqlx::query_scalar::<_, bool>("SELECT pg_catalog.to_regprocedure($1) IS NULL")
+                    .bind(boundary_identity)
+                    .fetch_one(&owner_pool)
+                    .await
+                    .unwrap()
+            );
+        }
+        if boundary == 202_608_010_001 {
+            let error = sqlx::query(
+                "SELECT * FROM \
+                 public.starring_runtime_interaction_effect_response_tail_scan_v1(\
+                     '1970-01-01 00:00:00+00'::TIMESTAMPTZ, '', '', -1, \
+                     '1970-01-01 00:00:00+00'::TIMESTAMPTZ, '', '', -1, 1\
+                 )",
+            )
+            .fetch_all(&owner_pool)
+            .await
+            .unwrap_err();
+            assert_eq!(sqlstate(&error).as_deref(), Some("42883"));
+        }
         MIGRATOR.run(&owner_pool).await.unwrap();
     } else {
         MIGRATOR.run(&owner_pool).await.unwrap();
@@ -1658,6 +1704,67 @@ fn durable_receipt_migration_preserves_expiry_and_recovery_contracts() {
 }
 
 #[test]
+fn response_tail_scan_fix_is_adjacent_exact_and_metadata_preserving() {
+    let versions = MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    let journal = versions
+        .iter()
+        .position(|version| *version == 202_608_010_001)
+        .unwrap();
+    let fix = versions
+        .iter()
+        .position(|version| *version == 202_608_010_002)
+        .unwrap();
+    assert_eq!(fix, journal + 1);
+
+    let migration = include_str!(
+        "../../../migrations/202608010002_fix_runtime_interaction_effect_response_tail_scan_v1.sql"
+    );
+    for required in [
+        "public.starring_runtime_interaction_effect_response_tail_scan_v1(timestamp with time zone,text,text,bigint,timestamp with time zone,text,text,bigint,bigint)",
+        "applied_count <> 116",
+        "applied_head <> 202608010001",
+        "69bc36f83f1e6b575205ca67703639124e41abd9d19b1b701d845ca150dcc4d6202608176b0583c864b4663937bd89e7",
+        "c4841de684e511174bb2c3186a7ed94e6a826d127c85e9b73b531c75bf726917",
+        "83f98c884ef9bed3706ace2a9430c401760277fb3cc83ea16646d147c819550b",
+        "948198e83dfad27778d0d9b1e254a3c1319e405d8fb147f5eea37cbb9077f00e",
+        "old_fragment TEXT := 'pg_catalog.greatest('",
+        "new_fragment TEXT := 'GREATEST('",
+        "/ pg_catalog.char_length(old_fragment) <> 2",
+        "/ pg_catalog.char_length(new_fragment) <> 2",
+        "metadata_after IS DISTINCT FROM metadata_before",
+        "f293f524ef97b491b6781a795888bf879aa0a82f790be699f31e4cee8c054152",
+        "8db2428cc05e5f973639d6f8af244722c40ae9183f3b32202ec45af5e22d5215",
+        "2e4143ab4b3feb364f1dd83d9c085ff7e719f85cd7e2b4f4073840393fcdfdd2",
+        "4cb3618c886f231ab75cd9224422131aadba925e9abac870416244a596be2e17",
+        "public.starring_runtime_interaction_effect_schema_manifest_v1()",
+        "public.starring_runtime_interaction_schema_manifest_v1()",
+    ] {
+        assert!(migration.contains(required), "missing contract: {required}");
+    }
+    for forbidden in [
+        "\nCREATE ROLE ",
+        "\nCREATE TABLE ",
+        "\nALTER TABLE ",
+        "\nINSERT ",
+        "\nUPDATE ",
+        "\nDELETE ",
+        "\nTRUNCATE ",
+        "\nGRANT ",
+        "COMMENT ON",
+    ] {
+        assert!(!migration.contains(forbidden), "forbidden SQL: {forbidden}");
+    }
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
+}
+
+#[test]
 fn teardown_migration_is_ordered_idempotent_bounded_and_private() {
     let versions = MIGRATOR
         .iter()
@@ -1922,6 +2029,101 @@ async fn effect_journal_upgrades_from_durable_receipts_with_exact_catalog_and_ac
     .await
     .unwrap_err();
     assert_eq!(sqlstate(&direct_write).as_deref(), Some("42501"));
+    cleanup(database).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn response_tail_scan_fix_upgrades_from_effect_journal_and_serves_empty_scan() {
+    let database = isolated_database_with_upgrade_boundary(Some(202_608_010_001)).await;
+    assert_response_tail_scan_fix_checksum(&database.owner_pool).await;
+    let ledger: (i64, i64, i32) = sqlx::query_as(
+        "SELECT pg_catalog.count(*), pg_catalog.max(version), \
+                pg_catalog.octet_length((\
+                    SELECT migration.checksum \
+                    FROM public._sqlx_migrations AS migration \
+                    WHERE migration.version = 202608010002 \
+                        AND migration.success\
+                )) \
+         FROM public._sqlx_migrations WHERE success",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(ledger, (117, 202_608_010_002, 48));
+    let definitions: (String, String, i32, i32) = sqlx::query_as(
+        "SELECT \
+             pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(\
+                 pg_catalog.pg_get_functiondef(pg_catalog.to_regprocedure($1)), 'UTF8'\
+             )), 'hex'), \
+             pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(\
+                 pg_catalog.pg_get_functiondef(pg_catalog.to_regprocedure($2)), 'UTF8'\
+             )), 'hex'), \
+             (pg_catalog.char_length(pg_catalog.pg_get_functiondef(\
+                  pg_catalog.to_regprocedure($1)\
+              )) - pg_catalog.char_length(pg_catalog.replace(\
+                  pg_catalog.pg_get_functiondef(pg_catalog.to_regprocedure($1)), \
+                  'pg_catalog.greatest(', ''\
+              ))) / pg_catalog.char_length('pg_catalog.greatest('), \
+             (pg_catalog.char_length(pg_catalog.pg_get_functiondef(\
+                  pg_catalog.to_regprocedure($1)\
+              )) - pg_catalog.char_length(pg_catalog.replace(\
+                  pg_catalog.pg_get_functiondef(pg_catalog.to_regprocedure($1)), \
+                  'GREATEST(', ''\
+              ))) / pg_catalog.char_length('GREATEST(')",
+    )
+    .bind(EFFECT_RESPONSE_TAIL_SCAN_FUNCTION)
+    .bind("public.starring_runtime_interaction_effect_schema_manifest_v1()")
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        definitions,
+        (
+            "83f98c884ef9bed3706ace2a9430c401760277fb3cc83ea16646d147c819550b".to_string(),
+            "4cb3618c886f231ab75cd9224422131aadba925e9abac870416244a596be2e17".to_string(),
+            0,
+            2,
+        )
+    );
+    let manifests: (bool, bool, bool) = sqlx::query_as(
+        "SELECT public.starring_runtime_interaction_effect_schema_manifest_v1(), \
+                public.starring_runtime_interaction_receipt_schema_manifest_v1(), \
+                public.starring_runtime_interaction_schema_manifest_v1()",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(manifests, (true, true, true));
+
+    let database_identity: String = sqlx::query_scalar(
+        "SELECT database_identity::TEXT \
+         FROM public.product_control_plane_identity WHERE singleton",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let expectation = RuntimeInteractionDatabaseExpectationV1::new(
+        database_identity,
+        database.name.clone(),
+        database.role.clone(),
+    )
+    .unwrap();
+    let store = PostgresRuntimeInteractionV1::connect_verified_default(
+        database.executor_pool.clone(),
+        expectation,
+    )
+    .await
+    .unwrap();
+    let page = store
+        .scan_recoverable_interaction_response_tails_v1(
+            &RuntimeInteractionEffectResponseTailScanCursorV1::default(),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(page.candidates().is_empty());
+    assert!(page.exhausted());
     cleanup(database).await;
 }
 
@@ -2523,6 +2725,71 @@ async fn effect_same_route_admission_is_serialized_and_completed_history_is_inde
         &plan,
         "runtime_interaction_effect_rollbacks_v1"
     ));
+    cleanup(database).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn response_tail_scan_returns_an_eligible_expired_edit_response() {
+    let database = isolated_database().await;
+    assert_response_tail_scan_fix_checksum(&database.owner_pool).await;
+    let content_hash = seed_receipt_authority(&database.owner_pool).await;
+    let database_identity: String = sqlx::query_scalar(
+        "SELECT database_identity::TEXT \
+         FROM public.product_control_plane_identity WHERE singleton",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let expectation = RuntimeInteractionDatabaseExpectationV1::new(
+        database_identity,
+        database.name.clone(),
+        database.role.clone(),
+    )
+    .unwrap();
+    let store = PostgresRuntimeInteractionV1::connect_verified_default(
+        database.executor_pool.clone(),
+        expectation,
+    )
+    .await
+    .unwrap();
+    let interaction_id = 9_600_099;
+    let action_plan = InteractionActionPlanDigestV1::parse("9".repeat(64)).unwrap();
+    let mut receipt =
+        prepare_deferred_receipt(&store, &content_hash, interaction_id, action_plan.clone()).await;
+    bind_effect_plan_document(
+        &database.executor_pool,
+        &receipt,
+        &action_plan,
+        serde_json::json!([edit_response_effect_action(0)]),
+    )
+    .await
+    .unwrap();
+    store
+        .intend_interaction_receipt_execution_v1(&mut receipt)
+        .await
+        .unwrap();
+    assert_eq!(
+        intend_edit_response_effect(&database.executor_pool, &receipt).await,
+        ("intended".to_string(), "intended".to_string(), 2)
+    );
+    make_effect_recovery_due(&database.owner_pool, interaction_id).await;
+    force_receipt_claim_expired(&database.owner_pool, interaction_id).await;
+
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT interaction_id, effect_state, effect_head_revision \
+         FROM public.starring_runtime_interaction_effect_response_tail_scan_v1(\
+             '1970-01-01 00:00:00+00'::TIMESTAMPTZ, '', '', -1, \
+             '1970-01-01 00:00:00+00'::TIMESTAMPTZ, '', '', -1, 256\
+         )",
+    )
+    .fetch_all(&database.executor_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![(interaction_id.to_string(), "intended".to_string(), 2)]
+    );
     cleanup(database).await;
 }
 

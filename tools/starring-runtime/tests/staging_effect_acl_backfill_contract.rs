@@ -142,17 +142,17 @@ fn effect_acl_backfill_manifest_matches_the_runtime_capability_boundary() {
 #[test]
 fn effect_acl_backfill_pins_target_ledger_identity_and_quiescence() {
     let migrations = MIGRATOR.iter().collect::<Vec<_>>();
-    assert_eq!(migrations.len(), 116);
+    assert_eq!(migrations.len(), 117);
     let latest = migrations.last().unwrap();
-    assert_eq!(latest.version, 202_608_010_001);
+    assert_eq!(latest.version, 202_608_010_002);
     let latest_checksum = checksum_hex(latest.checksum.as_ref());
     assert_eq!(
         latest_checksum,
-        "69bc36f83f1e6b575205ca67703639124e41abd9d19b1b701d845ca150dcc4d6202608176b0583c864b4663937bd89e7"
+        "7d2d45e7aa1cce1458686b5a3e1b85a00ffb723ba0929a9cf11ab8a8f195ddd8d3627806b0459f15be653482370490c9"
     );
     assert_eq!(
         migration_ledger_digest(),
-        "33ac781065168bb63b3ac4646f3590cbcb54ee0466654a5112d799c86a30bf44"
+        "b5de80fe64edfc25d51538b29dc52cd13a6863c8340a0af722660ad163c84e68"
     );
 
     for required in [
@@ -167,10 +167,10 @@ fn effect_acl_backfill_pins_target_ledger_identity_and_quiescence() {
         "pg_catalog.pg_advisory_xact_lock",
         "activity.backend_type = 'client backend'",
         "pg_catalog.pg_prepared_xacts",
-        "ledger_count <> 116",
-        "33ac781065168bb63b3ac4646f3590cbcb54ee0466654a5112d799c86a30bf44",
-        "migration.version = 202608010001",
-        "69bc36f83f1e6b575205ca67703639124e41abd9d19b1b701d845ca150dcc4d6202608176b0583c864b4663937bd89e7",
+        "ledger_count <> 117",
+        "b5de80fe64edfc25d51538b29dc52cd13a6863c8340a0af722660ad163c84e68",
+        "migration.version = 202608010002",
+        "7d2d45e7aa1cce1458686b5a3e1b85a00ffb723ba0929a9cf11ab8a8f195ddd8d3627806b0459f15be653482370490c9",
     ] {
         assert!(BACKFILL.contains(required), "missing contract: {required}");
     }
