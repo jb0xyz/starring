@@ -5,9 +5,8 @@ use crate::model::{
     DeploymentAvailabilityV1, RuntimeDeploymentScopeV1, RuntimeDeploymentStatusV1,
     StrictLiveProjectionV1,
 };
-use crate::row::{
-    metadata, runtime_i64, PersistedAttestation, PersistedDeployment, ServingLeaseRow,
-};
+use crate::row::{runtime_i64, PersistedDeployment, ServingLeaseRow};
+use crate::status_attestation::StatusAttestationEvidence;
 use crate::RuntimeConvergenceStoreError;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -23,7 +22,7 @@ pub(crate) enum CurrentAuthorityOutcome {
 pub(crate) struct StatusProjectionEvidence {
     pub persisted: PersistedDeployment,
     pub authority: CurrentAuthorityOutcome,
-    pub attestation: Option<PersistedAttestation>,
+    pub attestation: Option<StatusAttestationEvidence>,
     pub serving: Option<ServingLeaseRow>,
 }
 
@@ -115,21 +114,22 @@ pub(crate) fn project_status(
         ));
     };
     let identity = &snapshot.identity;
-    if convergence_attempt != attestation.convergence_attempt.map(Into::into)
+    if convergence_attempt
+        .is_some_and(|attempt| attempt.started() != attestation.convergence_attempt)
         || attestation.id != expected_attestation_id
         || attestation.deployment_id != identity.deployment_id.as_str()
         || attestation.tenant_id != identity.tenant_id.as_str()
         || attestation.installation_id != identity.installation_id.as_str()
         || attestation.promotion_id != identity.promotion_id.as_str()
         || attestation.activation_request_id != identity.activation_request_id.as_str()
-        || snapshot.live.as_ref() != Some(&attestation.record.live)
-        || attestation.record.deployment_revision != snapshot.revision
+        || snapshot.live.as_ref() != Some(&attestation.live)
+        || attestation.deployment_revision != snapshot.revision
     {
         return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
             "Live deployment and attestation differ",
         ));
     }
-    if attestation.record.live.certified_at > observed_at {
+    if attestation.live.certified_at > observed_at {
         return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
             "attestation observation time",
         ));
@@ -160,13 +160,13 @@ pub(crate) fn project_status(
         .map(|serving| {
             Ok::<StrictLiveProjectionV1, RuntimeConvergenceStoreError>(StrictLiveProjectionV1 {
                 attestation_id: attestation.id.clone(),
-                process_instance_id: attestation.record.live.process_instance_id.clone(),
-                runtime_generation: attestation.record.live.runtime_generation,
+                process_instance_id: attestation.live.process_instance_id.clone(),
+                runtime_generation: attestation.live.runtime_generation,
                 lease_epoch: serving.checked_epoch()?,
                 serving_revision: serving.checked_revision()?,
                 last_heartbeat_at: serving.last_heartbeat_at,
                 expires_at: serving.expires_at,
-                metadata: metadata(&attestation.record)?,
+                metadata: attestation.metadata.clone(),
             })
         })
         .transpose()?;
@@ -218,7 +218,7 @@ pub(crate) fn project_status(
 fn serving_identity_matches(
     scope: &RuntimeDeploymentScopeV1,
     snapshot: &automation_runtime_convergence::RuntimeDeploymentSnapshotV1,
-    attestation: &PersistedAttestation,
+    attestation: &StatusAttestationEvidence,
     serving: &ServingLeaseRow,
 ) -> Result<bool, RuntimeConvergenceStoreError> {
     Ok(serving.guild_id == snapshot.target.guild_id.to_string()
@@ -227,7 +227,7 @@ fn serving_identity_matches(
         && serving.installation_id == scope.installation_id.as_str()
         && serving.deployment_id == scope.deployment_id.as_str()
         && serving.attestation_id == attestation.id.as_str()
-        && serving.process_instance_id == attestation.record.live.process_instance_id.as_str()
+        && serving.process_instance_id == attestation.live.process_instance_id.as_str()
         && serving.runtime_generation == runtime_i64(snapshot.runtime_generation.get())?
         && serving.target_version == i64::from(snapshot.target.version.get())
         && serving.target_content_hash == snapshot.target.content_hash.to_hex()

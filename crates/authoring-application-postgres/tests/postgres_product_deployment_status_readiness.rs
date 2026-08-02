@@ -13,15 +13,15 @@ use sqlx::Connection;
 
 const STATUS_IDENTITY_FUNCTION: &str =
     "public.starring_product_deployment_status_reader_database_identity_v1()";
-const STATUS_READ_FUNCTION: &str = "public.starring_product_deployment_status_read_v1(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)";
+const STATUS_READ_FUNCTION: &str = "public.starring_product_deployment_status_read_v3(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)";
 const OPERATIONAL_STATUS_IDENTITY_FUNCTION: &str =
     "public.starring_product_deployment_status_reader_database_identity_v2()";
-const OPERATIONAL_STATUS_CORE_FUNCTION: &str = "public.starring_product_deployment_status_read_core_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)";
-const OPERATIONAL_STATUS_READ_FUNCTION: &str = "public.starring_product_deployment_status_read_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)";
+const OPERATIONAL_STATUS_CORE_FUNCTION: &str = "public.starring_product_deployment_status_read_core_v3(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)";
+const OPERATIONAL_STATUS_READ_FUNCTION: &str = "public.starring_product_operational_deployment_status_read_v3(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)";
 const UNEXPECTED_FUNCTION: &str = "public.validate_runtime_deployment_projection()";
 const CANONICAL_HELPER: &str = "public.starring_canonical_json_v1(JSONB)";
 
-const RELATIONS: [&str; 13] = [
+const RELATIONS: [&str; 14] = [
     "product_control_plane_identity",
     "product_principals",
     "product_auth_sessions",
@@ -33,16 +33,20 @@ const RELATIONS: [&str; 13] = [
     "automation_installation_authority_versions",
     "automation_ruleset_activations",
     "automation_ruleset_versions",
+    "runtime_certification_operations_v2",
     "runtime_attestations",
     "runtime_serving_leases",
 ];
 
-const OWNED_FUNCTIONS: [&str; 18] = [
+const OWNED_FUNCTIONS: [&str; 22] = [
     STATUS_IDENTITY_FUNCTION,
+    "public.starring_product_deployment_status_read_v1(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
     STATUS_READ_FUNCTION,
     OPERATIONAL_STATUS_IDENTITY_FUNCTION,
-    OPERATIONAL_STATUS_CORE_FUNCTION,
+    "public.starring_product_deployment_status_read_core_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
+    "public.starring_product_deployment_status_read_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
     OPERATIONAL_STATUS_READ_FUNCTION,
+    OPERATIONAL_STATUS_CORE_FUNCTION,
     "public.validate_runtime_deployment_projection()",
     "public.validate_runtime_convergence_attempt_projection()",
     "public.enforce_runtime_deployment_policy_shadow()",
@@ -51,6 +55,7 @@ const OWNED_FUNCTIONS: [&str; 18] = [
     "public.validate_runtime_attestation_projection()",
     "public.validate_runtime_attestation_attempt_projection()",
     "public.reject_immutable_product_row()",
+    "public.reject_runtime_certification_reservation_mutation_v2()",
     "public.validate_runtime_serving_lease_transition()",
     "public.reject_runtime_serving_lease_delete()",
     "public.reject_ruleset_artifact_mutation()",
@@ -869,7 +874,7 @@ async fn operational_status_readiness_enforces_a_separate_exact_capability() {
         fixture.statuses().verify_readiness().await.unwrap();
 
         let core_error = sqlx::query(
-            "SELECT * FROM public.starring_product_deployment_status_read_core_v2(\
+            "SELECT * FROM public.starring_product_deployment_status_read_core_v3(\
                 '', '', '', '', '', '', '', '', ''::bytea)",
         )
         .execute(&fixture.operational_reader_pool)

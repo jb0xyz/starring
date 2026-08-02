@@ -1396,9 +1396,14 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
 fn deployment_status_uses_one_scoped_reader_and_the_shared_runtime_projector() {
     let adapter = include_str!("../src/deployment_status/mod.rs");
     let contract = include_str!("../src/deployment_status/contract.rs");
+    let operational_contract = include_str!("../src/deployment_status/operational/contract.rs");
     let query = include_str!("../src/deployment_status/query.rs");
+    let operational_query = include_str!("../src/deployment_status/operational/query.rs");
     let row = include_str!("../src/deployment_status/row.rs");
     let readiness = include_str!("../src/deployment_status/readiness.rs");
+    let migration = include_str!(
+        "../../../migrations/202608020001_project_runtime_certification_v2_status_evidence.sql"
+    );
     assert!(adapter.contains("pool: PgPool"));
     assert!(!adapter.contains("PostgresRuntimeConvergence"));
     for required in [
@@ -1415,7 +1420,7 @@ fn deployment_status_uses_one_scoped_reader_and_the_shared_runtime_projector() {
     }
     for required in [
         "starring_product_deployment_status_reader_database_identity_v1()",
-        "starring_product_deployment_status_read_v1(text,text,text,text,text,text,text,text,bytea)",
+        "starring_product_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)",
         "expected_product_session_digest bytea",
         "LIMIT 2",
     ] {
@@ -1424,10 +1429,40 @@ fn deployment_status_uses_one_scoped_reader_and_the_shared_runtime_projector() {
             "missing status contract: {required}"
         );
     }
+    for required in [
+        "starring_product_deployment_status_reader_database_identity_v2()",
+        "starring_product_operational_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)",
+        "expected_product_session_digest bytea",
+        "LIMIT 2",
+    ] {
+        assert!(
+            operational_contract.contains(required),
+            "missing operational status contract: {required}"
+        );
+    }
+    for required in [
+        "CREATE FUNCTION public.starring_product_deployment_status_read_core_v3(",
+        "CREATE FUNCTION public.starring_product_deployment_status_read_v3(",
+        "CREATE FUNCTION public.starring_product_operational_deployment_status_read_v3(",
+        "public.starring_product_deployment_status_read_core_v3(text,text,text,text,text,text,text,text,bytea)",
+        "public.starring_product_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)",
+        "public.starring_product_operational_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)",
+    ] {
+        assert!(
+            migration.contains(required),
+            "missing status migration contract: {required}"
+        );
+    }
+    assert!(!contract.contains("starring_product_deployment_status_read_core_v3"));
+    assert!(!operational_contract.contains("starring_product_deployment_status_read_core_v3"));
     assert!(query.contains("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"));
     assert!(query.contains("sqlx::query_as::<_, ProductDeploymentStatusRow>(STATUS_QUERY)"));
     assert!(query.contains(".bind(actor.session_fingerprint().as_bytes().as_slice())"));
     assert!(query.contains(".fetch_all(&mut *transaction)"));
+    assert!(operational_query
+        .contains("sqlx::query_as::<_, ProductDeploymentOperationalStatusRow>(STATUS_QUERY)"));
+    assert!(operational_query.contains(".bind(actor.session_fingerprint().as_bytes().as_slice())"));
+    assert!(operational_query.contains(".fetch_all(&mut *transaction)"));
     for forbidden in [
         "runtime_deployments",
         "runtime_attestations",
@@ -1442,13 +1477,17 @@ fn deployment_status_uses_one_scoped_reader_and_the_shared_runtime_projector() {
             !query.contains(forbidden),
             "raw status SQL edge: {forbidden}"
         );
+        assert!(
+            !operational_query.contains(forbidden),
+            "raw operational status SQL edge: {forbidden}"
+        );
     }
     assert!(row.contains("request_mismatch"));
     assert!(row.contains("sensitive_evidence_is_empty"));
     assert!(!row.contains("derive(Debug"));
     for required in [
         "FUNCTIONS: [ScopedFunctionContractV1<'static>; 2]",
-        "RELATIONS: [ScopedRelationContractV1<'static>; 13]",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 14]",
         "verify_scoped_executable_allowlist",
         "verify_scoped_schema_trust",
         "SUPPORT_CONTRACT_QUERY",

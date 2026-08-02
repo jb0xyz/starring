@@ -32,9 +32,22 @@ async fn read_raw_operational_deployment_status(
                 AND serving_projection IS NULL \
                 AND deployment_convergence_attempt_no IS NULL \
                 AND deployment_last_failure_attempt_no IS NULL \
-                AND attestation_convergence_attempt_no IS NULL AS payload_is_empty, \
+                AND attestation_convergence_attempt_no IS NULL \
+                AND attestation_record_format_version IS NULL \
+                AND attestation_serving_lease_duration_nanos IS NULL \
+                AND deployment_last_controller_id IS NULL \
+                AND v2_evidence_state IS NULL \
+                AND v2_operation_id IS NULL \
+                AND v2_intent_fingerprint IS NULL \
+                AND v2_certification_intent_bytes IS NULL \
+                AND v2_request_digest IS NULL \
+                AND v2_request_bytes IS NULL \
+                AND v2_live_attestation_bytes IS NULL \
+                AND v2_must_commit_before IS NULL \
+                AND v2_route_admission IS NULL \
+                AND v2_certified_snapshot IS NULL AS payload_is_empty, \
             database_now IS NOT NULL AS database_now_is_present \
-         FROM public.starring_product_deployment_status_read_v2(\
+         FROM public.starring_product_operational_deployment_status_read_v3(\
             $1, $2, $3, $4, $5, $6, $7, $8, $9) \
          LIMIT 2",
     )

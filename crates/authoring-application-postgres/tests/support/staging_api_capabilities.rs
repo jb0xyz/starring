@@ -74,11 +74,11 @@ const CANCELLATION_EXECUTOR_FUNCTIONS: &[&str] = &[
 ];
 const DEPLOYMENT_STATUS_FUNCTIONS: &[&str] = &[
     "public.starring_product_deployment_status_reader_database_identity_v1()",
-    "public.starring_product_deployment_status_read_v1(text,text,text,text,text,text,text,text,bytea)",
+    "public.starring_product_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)",
 ];
 pub const OPERATIONAL_DEPLOYMENT_STATUS_FUNCTIONS: &[&str] = &[
     "public.starring_product_deployment_status_reader_database_identity_v2()",
-    "public.starring_product_deployment_status_read_v2(text,text,text,text,text,text,text,text,bytea)",
+    "public.starring_product_operational_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)",
 ];
 const AUTHORING_SESSION_WRITER_FUNCTIONS: &[&str] = &[
     "public.starring_authoring_session_writer_database_identity_v1()",

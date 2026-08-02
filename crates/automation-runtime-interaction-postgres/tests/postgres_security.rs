@@ -2050,7 +2050,7 @@ async fn response_tail_scan_fix_upgrades_from_effect_journal_and_serves_empty_sc
     .fetch_one(&database.owner_pool)
     .await
     .unwrap();
-    assert_eq!(ledger, (117, 202_608_010_002, 48));
+    assert_eq!(ledger, (118, 202_608_020_001, 48));
     let definitions: (String, String, i32, i32) = sqlx::query_as(
         "SELECT \
              pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(\

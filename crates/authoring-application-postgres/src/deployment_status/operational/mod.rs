@@ -73,6 +73,7 @@ impl DeploymentOperationalStatusPortV2<FreshDiscordAuthorityEvidenceV1>
                     artifact_projection: evidence.base.artifact_projection,
                     attestation_projection: evidence.base.attestation_projection,
                     serving_projection: evidence.base.serving_projection,
+                    attestation_evidence_v2: evidence.base.attestation_evidence_v2.into_runtime(),
                 },
                 deployment_convergence_attempt_no: evidence.deployment_convergence_attempt_no,
                 deployment_last_failure_attempt_no: evidence.deployment_last_failure_attempt_no,

@@ -98,6 +98,7 @@ impl PostgresProductDeploymentStatuses {
                 artifact_projection: evidence.artifact_projection,
                 attestation_projection: evidence.attestation_projection,
                 serving_projection: evidence.serving_projection,
+                attestation_evidence_v2: evidence.attestation_evidence_v2.into_runtime(),
             },
         )
         .map_err(map_projector_error)?;

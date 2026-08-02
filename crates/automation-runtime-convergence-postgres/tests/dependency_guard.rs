@@ -51,6 +51,7 @@ fn adapter_sources_contain_no_comments() {
         include_str!("../src/store/previous_serving/row.rs"),
         include_str!("../src/store/serving.rs"),
         include_str!("../src/store/status.rs"),
+        include_str!("../src/status_attestation.rs"),
         include_str!("product_drain_prepare.rs"),
     ];
     for source in sources {

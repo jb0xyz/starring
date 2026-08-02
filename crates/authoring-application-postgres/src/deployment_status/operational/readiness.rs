@@ -17,7 +17,7 @@ const FUNCTIONS: [ScopedFunctionContractV1<'static>; 2] = [
     ScopedFunctionContractV1::scalar(DATABASE_IDENTITY_FUNCTION, "text"),
     ScopedFunctionContractV1::set_named(STATUS_FUNCTION, STATUS_RESULT, 1.0, STATUS_ARGUMENTS),
 ];
-const RELATIONS: [ScopedRelationContractV1<'static>; 13] = [
+const RELATIONS: [ScopedRelationContractV1<'static>; 14] = [
     ScopedRelationContractV1::ordinary_without_rls("public.product_control_plane_identity"),
     ScopedRelationContractV1::ordinary_without_rls("public.product_principals"),
     ScopedRelationContractV1::ordinary_without_rls("public.product_auth_sessions"),
@@ -31,6 +31,7 @@ const RELATIONS: [ScopedRelationContractV1<'static>; 13] = [
     ),
     ScopedRelationContractV1::ordinary_without_rls("public.automation_ruleset_activations"),
     ScopedRelationContractV1::ordinary_without_rls("public.automation_ruleset_versions"),
+    ScopedRelationContractV1::ordinary_without_rls("public.runtime_certification_operations_v2"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_attestations"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_serving_leases"),
 ];
@@ -56,7 +57,7 @@ WITH common_owner AS (
         ('public.starring_product_deployment_status_read_v1(text,text,text,text,text,text,text,text,bytea)',
             'expected_deployment_id text, expected_promotion_id text, expected_desired_target_digest text, expected_tenant_id text, expected_installation_id text, expected_guild_id text, expected_principal_id text, expected_acting_discord_user_id text, expected_product_session_digest bytea',
             'TABLE(request_outcome text, deployment_projection jsonb, activation_projection jsonb, promotion_projection jsonb, tenant_lifecycle_state text, installation_projection jsonb, historical_authority_projection jsonb, current_authority_projection jsonb, active_target_version bigint, artifact_projection jsonb, attestation_projection jsonb, serving_projection jsonb, database_now timestamp with time zone)',
-            TRUE, TRUE, 1::REAL, FALSE),
+            TRUE, TRUE, 1::REAL, TRUE),
         ('public.starring_product_deployment_status_reader_database_identity_v2()',
             '', 'text', TRUE, FALSE, 0::REAL, FALSE),
         ('public.starring_product_deployment_status_read_core_v2(text,text,text,text,text,text,text,text,bytea)',
@@ -66,9 +67,21 @@ WITH common_owner AS (
         ('public.starring_product_deployment_status_read_v2(text,text,text,text,text,text,text,text,bytea)',
             'expected_deployment_id text, expected_promotion_id text, expected_desired_target_digest text, expected_tenant_id text, expected_installation_id text, expected_guild_id text, expected_principal_id text, expected_acting_discord_user_id text, expected_product_session_digest bytea',
             'TABLE(request_outcome text, deployment_projection jsonb, activation_projection jsonb, promotion_projection jsonb, tenant_lifecycle_state text, installation_projection jsonb, historical_authority_projection jsonb, current_authority_projection jsonb, active_target_version bigint, artifact_projection jsonb, attestation_projection jsonb, serving_projection jsonb, database_now timestamp with time zone, deployment_convergence_attempt_no bigint, deployment_last_failure_attempt_no bigint, attestation_convergence_attempt_no bigint)',
+            TRUE, TRUE, 1::REAL, TRUE),
+        ('public.starring_product_deployment_status_read_core_v3(text,text,text,text,text,text,text,text,bytea)',
+            'expected_deployment_id text, expected_promotion_id text, expected_desired_target_digest text, expected_tenant_id text, expected_installation_id text, expected_guild_id text, expected_principal_id text, expected_acting_discord_user_id text, expected_product_session_digest bytea',
+            'TABLE(request_outcome text, deployment_projection jsonb, activation_projection jsonb, promotion_projection jsonb, tenant_lifecycle_state text, installation_projection jsonb, historical_authority_projection jsonb, current_authority_projection jsonb, active_target_version bigint, artifact_projection jsonb, attestation_projection jsonb, serving_projection jsonb, database_now timestamp with time zone, deployment_convergence_attempt_no bigint, deployment_last_failure_attempt_no bigint, attestation_convergence_attempt_no bigint, attestation_record_format_version smallint, attestation_serving_lease_duration_nanos bigint, deployment_last_controller_id text, v2_evidence_state text, v2_operation_id text, v2_intent_fingerprint text, v2_certification_intent_bytes bytea, v2_request_digest text, v2_request_bytes bytea, v2_live_attestation_bytes bytea, v2_must_commit_before timestamp with time zone, v2_route_admission jsonb, v2_certified_snapshot jsonb)',
+            TRUE, TRUE, 1::REAL, TRUE),
+        ('public.starring_product_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)',
+            'expected_deployment_id text, expected_promotion_id text, expected_desired_target_digest text, expected_tenant_id text, expected_installation_id text, expected_guild_id text, expected_principal_id text, expected_acting_discord_user_id text, expected_product_session_digest bytea',
+            'TABLE(request_outcome text, deployment_projection jsonb, activation_projection jsonb, promotion_projection jsonb, tenant_lifecycle_state text, installation_projection jsonb, historical_authority_projection jsonb, current_authority_projection jsonb, active_target_version bigint, artifact_projection jsonb, attestation_projection jsonb, serving_projection jsonb, database_now timestamp with time zone, attestation_record_format_version smallint, attestation_serving_lease_duration_nanos bigint, attestation_convergence_attempt_no bigint, deployment_last_controller_id text, v2_evidence_state text, v2_operation_id text, v2_intent_fingerprint text, v2_certification_intent_bytes bytea, v2_request_digest text, v2_request_bytes bytea, v2_live_attestation_bytes bytea, v2_must_commit_before timestamp with time zone, v2_route_admission jsonb, v2_certified_snapshot jsonb)',
+            TRUE, TRUE, 1::REAL, FALSE),
+        ('public.starring_product_operational_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)',
+            'expected_deployment_id text, expected_promotion_id text, expected_desired_target_digest text, expected_tenant_id text, expected_installation_id text, expected_guild_id text, expected_principal_id text, expected_acting_discord_user_id text, expected_product_session_digest bytea',
+            'TABLE(request_outcome text, deployment_projection jsonb, activation_projection jsonb, promotion_projection jsonb, tenant_lifecycle_state text, installation_projection jsonb, historical_authority_projection jsonb, current_authority_projection jsonb, active_target_version bigint, artifact_projection jsonb, attestation_projection jsonb, serving_projection jsonb, database_now timestamp with time zone, deployment_convergence_attempt_no bigint, deployment_last_failure_attempt_no bigint, attestation_convergence_attempt_no bigint, attestation_record_format_version smallint, attestation_serving_lease_duration_nanos bigint, deployment_last_controller_id text, v2_evidence_state text, v2_operation_id text, v2_intent_fingerprint text, v2_certification_intent_bytes bytea, v2_request_digest text, v2_request_bytes bytea, v2_live_attestation_bytes bytea, v2_must_commit_before timestamp with time zone, v2_route_admission jsonb, v2_certified_snapshot jsonb)',
             TRUE, TRUE, 1::REAL, FALSE)
 ), function_contract AS (
-    SELECT pg_catalog.count(*) = 5
+    SELECT pg_catalog.count(*) = 8
         AND pg_catalog.bool_and(COALESCE(
             function_row.oid IS NOT NULL
             AND function_row.proowner = common_owner.owner_oid
@@ -106,7 +119,7 @@ WITH common_owner AS (
     LEFT JOIN pg_catalog.pg_language AS language_row
         ON language_row.oid = function_row.prolang
 ), function_identity_contract AS (
-    SELECT pg_catalog.count(*) = 5 AS valid
+    SELECT pg_catalog.count(*) = 8 AS valid
     FROM pg_catalog.pg_proc AS function_row
     INNER JOIN pg_catalog.pg_namespace AS namespace
         ON namespace.oid = function_row.pronamespace
@@ -116,7 +129,10 @@ WITH common_owner AS (
             'starring_product_deployment_status_read_v1',
             'starring_product_deployment_status_reader_database_identity_v2',
             'starring_product_deployment_status_read_core_v2',
-            'starring_product_deployment_status_read_v2'
+            'starring_product_deployment_status_read_v2',
+            'starring_product_deployment_status_read_core_v3',
+            'starring_product_deployment_status_read_v3',
+            'starring_product_operational_deployment_status_read_v3'
         )
 ), expected_triggers(relation_identity, function_identity, definition) AS (
     VALUES
@@ -128,12 +144,14 @@ WITH common_owner AS (
         ('public.runtime_attestations', 'public.validate_runtime_attestation_projection()', 'CREATE TRIGGER runtime_attestations_validate_projection BEFORE INSERT ON public.runtime_attestations FOR EACH ROW EXECUTE FUNCTION public.validate_runtime_attestation_projection()'),
         ('public.runtime_attestations', 'public.validate_runtime_attestation_attempt_projection()', 'CREATE TRIGGER runtime_attestations_validate_convergence_attempt BEFORE INSERT ON public.runtime_attestations FOR EACH ROW EXECUTE FUNCTION public.validate_runtime_attestation_attempt_projection()'),
         ('public.runtime_attestations', 'public.reject_immutable_product_row()', 'CREATE TRIGGER runtime_attestations_reject_mutation BEFORE DELETE OR UPDATE ON public.runtime_attestations FOR EACH ROW EXECUTE FUNCTION public.reject_immutable_product_row()'),
+        ('public.runtime_certification_operations_v2', 'public.reject_runtime_certification_reservation_mutation_v2()', 'CREATE TRIGGER runtime_certification_operations_v2_reject_row_mutation BEFORE INSERT OR DELETE OR UPDATE ON public.runtime_certification_operations_v2 FOR EACH ROW EXECUTE FUNCTION public.reject_runtime_certification_reservation_mutation_v2()'),
+        ('public.runtime_certification_operations_v2', 'public.reject_runtime_certification_reservation_mutation_v2()', 'CREATE TRIGGER runtime_certification_operations_v2_reject_truncate BEFORE TRUNCATE ON public.runtime_certification_operations_v2 FOR EACH STATEMENT EXECUTE FUNCTION public.reject_runtime_certification_reservation_mutation_v2()'),
         ('public.runtime_serving_leases', 'public.validate_runtime_serving_lease_transition()', 'CREATE TRIGGER runtime_serving_leases_validate_transition BEFORE INSERT OR UPDATE ON public.runtime_serving_leases FOR EACH ROW EXECUTE FUNCTION public.validate_runtime_serving_lease_transition()'),
         ('public.runtime_serving_leases', 'public.reject_runtime_serving_lease_delete()', 'CREATE TRIGGER runtime_serving_leases_reject_delete BEFORE DELETE ON public.runtime_serving_leases FOR EACH ROW EXECUTE FUNCTION public.reject_runtime_serving_lease_delete()'),
         ('public.automation_ruleset_versions', 'public.reject_ruleset_artifact_mutation()', 'CREATE TRIGGER automation_ruleset_versions_reject_mutation BEFORE DELETE OR UPDATE ON public.automation_ruleset_versions FOR EACH STATEMENT EXECUTE FUNCTION public.reject_ruleset_artifact_mutation()'),
         ('public.automation_ruleset_versions', 'public.reject_ruleset_artifact_mutation()', 'CREATE TRIGGER automation_ruleset_versions_reject_truncate BEFORE TRUNCATE ON public.automation_ruleset_versions FOR EACH STATEMENT EXECUTE FUNCTION public.reject_ruleset_artifact_mutation()')
 ), trigger_contract AS (
-    SELECT pg_catalog.count(*) = 12 AS valid
+    SELECT pg_catalog.count(*) = 14 AS valid
     FROM expected_triggers AS expected
     INNER JOIN pg_catalog.pg_trigger AS trigger_row
         ON trigger_row.tgrelid = pg_catalog.to_regclass(expected.relation_identity)
@@ -153,11 +171,12 @@ WITH common_owner AS (
         AND trigger_row.tgoldtable IS NULL
         AND trigger_row.tgnewtable IS NULL
 ), actual_trigger_contract AS (
-    SELECT pg_catalog.count(*) = 12 AS valid
+    SELECT pg_catalog.count(*) = 14 AS valid
     FROM pg_catalog.pg_trigger AS trigger_row
     WHERE NOT trigger_row.tgisinternal
         AND trigger_row.tgrelid IN (
             pg_catalog.to_regclass('public.runtime_deployments'),
+            pg_catalog.to_regclass('public.runtime_certification_operations_v2'),
             pg_catalog.to_regclass('public.runtime_attestations'),
             pg_catalog.to_regclass('public.runtime_serving_leases'),
             pg_catalog.to_regclass('public.automation_ruleset_versions')
@@ -257,7 +276,7 @@ impl PostgresProductDeploymentOperationalStatusesV2 {
             .map_err(map_readiness)?;
         let probe_count = sqlx::query_scalar::<_, i64>(
             "SELECT pg_catalog.count(*) \
-             FROM public.starring_product_deployment_status_read_v2(\
+             FROM public.starring_product_operational_deployment_status_read_v3(\
                 $1, $1, $1, $1, $1, $1, $1, $1, $2)",
         )
         .bind(PROBE_IDENTITY)
@@ -302,12 +321,12 @@ mod tests {
     #[test]
     fn operational_readiness_is_a_separate_exact_capability() {
         assert_eq!(FUNCTIONS.len(), 2);
-        assert_eq!(RELATIONS.len(), 13);
+        assert_eq!(RELATIONS.len(), 14);
         assert_eq!(PROBE_SESSION_DIGEST.len(), 31);
         assert!(SUPPORT_CONTRACT_QUERY.contains(
-            "starring_product_deployment_status_read_core_v2(text,text,text,text,text,text,text,text,bytea)"
+            "starring_product_deployment_status_read_core_v3(text,text,text,text,text,text,text,text,bytea)"
         ));
-        assert!(SUPPORT_CONTRACT_QUERY.contains("pg_catalog.count(*) = 12"));
+        assert!(SUPPORT_CONTRACT_QUERY.contains("pg_catalog.count(*) = 14"));
         assert!(LEGACY_SUPPORT_CONTRACT_QUERY.contains("expected_support_functions"));
         assert!(LEGACY_SUPPORT_CONTRACT_QUERY.contains("digest_helper_contract"));
     }
