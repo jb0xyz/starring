@@ -21,8 +21,8 @@ use automation_runtime_interaction::{
     build_interaction_token_authenticated_data_v1, DiscordApplicationIdV1, DiscordInteractionIdV1,
     EncryptedInteractionTokenV1, InteractionActionPlanDigestV1, InteractionExpectedRouteV1,
     InteractionGatewayShardIdentityV1, InteractionProductScopeV1,
-    InteractionReceiptClaimCandidateV1, InteractionReceiptIdentityV1, InteractionRequestDigestV1,
-    InteractionRouteIncarnationV1, InteractionRuntimeBuildRevisionV1,
+    InteractionReceiptClaimCandidateV1, InteractionReceiptIdentityV1, InteractionReceiptStateV1,
+    InteractionRequestDigestV1, InteractionRouteIncarnationV1, InteractionRuntimeBuildRevisionV1,
     InteractionTokenAuthenticatedDataInputV1, InteractionTokenEnvelopeTimeV1,
     XCHACHA20_POLY1305_INTERACTION_TOKEN_SUITE_V1,
     XCHACHA20_POLY1305_INTERACTION_TOKEN_SUITE_VERSION_V1,
@@ -2170,6 +2170,144 @@ async fn durable_receipt_recovery_scan_is_empty_and_private() {
     .await
     .unwrap_err();
     assert_eq!(sqlstate(&cross_error).as_deref(), Some("42501"));
+    cleanup(database).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn durable_defer_can_precede_plan_binding_and_terminalize_preparation_failure() {
+    let database = isolated_database().await;
+    let content_hash = seed_receipt_authority(&database.owner_pool).await;
+    let database_identity: String = sqlx::query_scalar(
+        "SELECT database_identity::TEXT FROM public.product_control_plane_identity WHERE singleton",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let expectation = RuntimeInteractionDatabaseExpectationV1::new(
+        database_identity,
+        database.name.clone(),
+        database.role.clone(),
+    )
+    .unwrap();
+    let store = PostgresRuntimeInteractionV1::connect_verified_default(
+        database.executor_pool.clone(),
+        expectation,
+    )
+    .await
+    .unwrap();
+
+    let mut prepared = acquire_test_receipt(
+        &store,
+        &content_hash,
+        9_300_005,
+        "button:defer-before-plan",
+        Duration::from_secs(30),
+    )
+    .await;
+    let prepared_intent_digest = RuntimeInteractionReceiptOpaqueDigestV1::new([51; 32]);
+    assert_eq!(
+        store
+            .intend_interaction_receipt_initial_response_v1(
+                &mut prepared,
+                RuntimeInteractionReceiptInitialResponseIntentV1::new(
+                    RuntimeInteractionReceiptInitialResponseKindV1::DeferEphemeral,
+                    prepared_intent_digest.clone(),
+                ),
+            )
+            .await
+            .unwrap(),
+        RuntimeInteractionReceiptInitialResponseIntentDispositionV1::ExternalCallAuthorized
+    );
+    assert_eq!(prepared.state(), InteractionReceiptStateV1::Acknowledging);
+    assert!(prepared.action_plan_digest().is_none());
+    assert_eq!(
+        store
+            .finish_interaction_receipt_initial_response_v1(
+                &mut prepared,
+                RuntimeInteractionReceiptInitialResponseResultV1::new(
+                    prepared_intent_digest,
+                    RuntimeInteractionReceiptInitialResponseResultKindV1::Succeeded,
+                    RuntimeInteractionReceiptOpaqueDigestV1::new([52; 32]),
+                ),
+            )
+            .await
+            .unwrap(),
+        RuntimeInteractionReceiptMutationDispositionV1::Applied
+    );
+    assert_eq!(prepared.state(), InteractionReceiptStateV1::Deferred);
+    assert!(prepared.action_plan_digest().is_none());
+    let plan_digest = InteractionActionPlanDigestV1::parse("5".repeat(64)).unwrap();
+    assert_eq!(
+        store
+            .bind_interaction_receipt_action_plan_v1(&mut prepared, plan_digest.clone())
+            .await
+            .unwrap(),
+        RuntimeInteractionReceiptMutationDispositionV1::Applied
+    );
+    assert_eq!(prepared.state(), InteractionReceiptStateV1::Prepared);
+    assert_eq!(prepared.action_plan_digest(), Some(&plan_digest));
+
+    let failed_interaction_id = 9_300_006;
+    let mut failed = acquire_test_receipt(
+        &store,
+        &content_hash,
+        failed_interaction_id,
+        "button:defer-before-failure",
+        Duration::from_secs(30),
+    )
+    .await;
+    let failed_intent_digest = RuntimeInteractionReceiptOpaqueDigestV1::new([53; 32]);
+    store
+        .intend_interaction_receipt_initial_response_v1(
+            &mut failed,
+            RuntimeInteractionReceiptInitialResponseIntentV1::new(
+                RuntimeInteractionReceiptInitialResponseKindV1::DeferEphemeral,
+                failed_intent_digest.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .finish_interaction_receipt_initial_response_v1(
+            &mut failed,
+            RuntimeInteractionReceiptInitialResponseResultV1::new(
+                failed_intent_digest,
+                RuntimeInteractionReceiptInitialResponseResultKindV1::Succeeded,
+                RuntimeInteractionReceiptOpaqueDigestV1::new([54; 32]),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.state(), InteractionReceiptStateV1::Deferred);
+    assert!(failed.action_plan_digest().is_none());
+    assert_eq!(
+        store
+            .finish_interaction_receipt_v1(
+                &mut failed,
+                RuntimeInteractionReceiptTerminalOutcomeV1::new(
+                    RuntimeInteractionReceiptTerminalStateV1::Failed,
+                    "preparation_failed_after_defer",
+                    RuntimeInteractionReceiptOpaqueDigestV1::new([55; 32]),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+        RuntimeInteractionReceiptMutationDispositionV1::Applied
+    );
+    assert_eq!(failed.state(), InteractionReceiptStateV1::Failed);
+    assert!(failed.action_plan_digest().is_none());
+    let failed_secret_count: i64 = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*) FROM public.runtime_interaction_receipt_token_secrets_v1 \
+         WHERE application_id = $1 AND interaction_id = $2",
+    )
+    .bind(RECEIPT_APPLICATION_ID.to_string())
+    .bind(failed_interaction_id.to_string())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(failed_secret_count, 0);
     cleanup(database).await;
 }
 

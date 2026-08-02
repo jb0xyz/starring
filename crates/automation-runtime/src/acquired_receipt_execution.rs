@@ -5,6 +5,7 @@ use std::time::Duration;
 use automation_core::preflight::{
     preflight_action_plan_v1, prepare_action_plan_v1, ActionPlanSnapshotIdentityV1,
     ActionPlanSnapshotRequestV1, ActionPlanSnapshotV1, PreflightedActionPlanV1,
+    PreparedActionPlanV1,
 };
 #[cfg(test)]
 use automation_core::DiscordMutationAdapter;
@@ -497,40 +498,79 @@ where
         )
         .await;
     };
-    let Some(preflight) = build_preflight_execution_v1(
-        permit,
-        &context,
-        &plan,
-        &action_plan_digest,
-        services.instance_ids,
-        snapshot_provider,
-        None,
-    )
-    .await
+    let Some(prepared_preflight) =
+        prepare_preflight_execution_v1(permit, &context, &plan, services.instance_ids)
     else {
         return finish_terminal_v1(
             permit,
-            Some(&action_plan_digest),
+            None,
             AcquiredInteractionTerminalOutcomeV1::StaticPreparationFailed,
             false,
         )
         .await;
     };
-    if permit
-        .bind_action_plan_digest_v1(&action_plan_digest)
-        .await
-        .is_err()
-    {
-        return persistence_failed_v1(
-            AcquiredInteractionPersistenceStageV1::ActionPlanBind,
-            tracking.any_external_attempt_v1(),
-        );
-    }
-    if leading_defer_ephemeral {
+    let preflight = if leading_defer_ephemeral {
         if let Err(error) = services.responder.defer_ephemeral().await {
             return handle_execution_error_v1(permit, tracking, error, None).await;
         }
-    }
+        let Some(preflight) = finalize_preflight_execution_v1(
+            permit,
+            prepared_preflight,
+            &action_plan_digest,
+            snapshot_provider,
+            None,
+        )
+        .await
+        else {
+            return finish_terminal_v1(
+                permit,
+                None,
+                AcquiredInteractionTerminalOutcomeV1::StaticPreparationFailed,
+                tracking.any_external_attempt_v1(),
+            )
+            .await;
+        };
+        if permit
+            .bind_action_plan_digest_v1(&action_plan_digest)
+            .await
+            .is_err()
+        {
+            return persistence_failed_v1(
+                AcquiredInteractionPersistenceStageV1::ActionPlanBind,
+                tracking.any_external_attempt_v1(),
+            );
+        }
+        preflight
+    } else {
+        let Some(preflight) = finalize_preflight_execution_v1(
+            permit,
+            prepared_preflight,
+            &action_plan_digest,
+            snapshot_provider,
+            None,
+        )
+        .await
+        else {
+            return finish_terminal_v1(
+                permit,
+                None,
+                AcquiredInteractionTerminalOutcomeV1::StaticPreparationFailed,
+                tracking.any_external_attempt_v1(),
+            )
+            .await;
+        };
+        if permit
+            .bind_action_plan_digest_v1(&action_plan_digest)
+            .await
+            .is_err()
+        {
+            return persistence_failed_v1(
+                AcquiredInteractionPersistenceStageV1::ActionPlanBind,
+                tracking.any_external_attempt_v1(),
+            );
+        }
+        preflight
+    };
     execute_bound_preflighted_plan_v1(
         permit,
         tracking,
@@ -567,6 +607,9 @@ where
     PR: PinnedInstanceResolverV1,
     SP: GuildRoleSnapshotProvider,
 {
+    if let Err(error) = services.responder.defer_ephemeral().await {
+        return handle_execution_error_v1(permit, tracking, error, None).await;
+    }
     let complete_snapshot_request =
         ActionPlanSnapshotRequestV1::complete(event.guild_id, event.actor);
     let action_snapshot = match snapshot_provider
@@ -579,7 +622,7 @@ where
                 permit,
                 None,
                 AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
-                false,
+                tracking.any_external_attempt_v1(),
             )
             .await;
         }
@@ -592,7 +635,7 @@ where
                 permit,
                 None,
                 AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
-                false,
+                tracking.any_external_attempt_v1(),
             )
             .await;
         }
@@ -614,7 +657,7 @@ where
                 permit,
                 None,
                 AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
-                false,
+                tracking.any_external_attempt_v1(),
             )
             .await;
         }
@@ -631,12 +674,21 @@ where
         )
         .await;
     };
-    let Some(preflight) = build_preflight_execution_v1(
+    let Some(prepared_preflight) =
+        prepare_preflight_execution_v1(permit, &context, &plan, services.instance_ids)
+    else {
+        return finish_terminal_v1(
+            permit,
+            None,
+            AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
+            tracking.any_external_attempt_v1(),
+        )
+        .await;
+    };
+    let Some(preflight) = finalize_preflight_execution_v1(
         permit,
-        &context,
-        &plan,
+        prepared_preflight,
         &action_plan_digest,
-        services.instance_ids,
         snapshot_provider,
         Some(action_snapshot),
     )
@@ -644,9 +696,9 @@ where
     else {
         return finish_terminal_v1(
             permit,
-            Some(&action_plan_digest),
+            None,
             AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
-            false,
+            tracking.any_external_attempt_v1(),
         )
         .await;
     };
@@ -655,12 +707,10 @@ where
         .await
         .is_err()
     {
-        return persistence_failed_v1(AcquiredInteractionPersistenceStageV1::ActionPlanBind, false);
-    }
-    if leading_defer_ephemeral {
-        if let Err(error) = services.responder.defer_ephemeral().await {
-            return handle_execution_error_v1(permit, tracking, error, None).await;
-        }
+        return persistence_failed_v1(
+            AcquiredInteractionPersistenceStageV1::ActionPlanBind,
+            tracking.any_external_attempt_v1(),
+        );
     }
     execute_bound_preflighted_plan_v1(
         permit,
@@ -682,39 +732,64 @@ struct PreflightExecutionEnvelopeV1 {
     certificate: InteractionActionPreflightCertificateV1,
 }
 
-async fn build_preflight_execution_v1<P, G, SP>(
+struct PreparedPreflightExecutionV1 {
+    plan: PreparedActionPlanV1,
+    wire: ActionPlanWirePreflightV1,
+    preflight_plan_digest: InteractionPreflightPlanDigestV1,
+}
+
+fn prepare_preflight_execution_v1<P, G>(
     permit: &P,
     context: &RuntimeContext,
     plan: &ActionPlan,
-    action_plan_digest: &InteractionActionPlanDigestV1,
     instance_ids: &G,
-    snapshot_provider: &SP,
-    captured_snapshot: Option<ActionPlanSnapshotV1>,
-) -> Option<PreflightExecutionEnvelopeV1>
+) -> Option<PreparedPreflightExecutionV1>
 where
     P: AcquiredInteractionLifecyclePermitV1,
     G: InstanceIdGenerator,
-    SP: GuildRoleSnapshotProvider,
 {
-    let prepared = prepare_action_plan_v1(context, plan, instance_ids).ok()?;
-    let wire = preflight_action_plan_wire_v1(&prepared).ok()?;
+    let plan = prepare_action_plan_v1(context, plan, instance_ids).ok()?;
+    let wire = preflight_action_plan_wire_v1(&plan).ok()?;
     let claim = permit.authoritative_claim_v1();
     if !authoritative_teardown_manifest_matches_v1(claim.route(), &wire) {
         return None;
     }
     let combined_preflight_material = combined_preflight_digest_material_v1(
-        prepared.digest_material_v1(),
+        plan.digest_material_v1(),
         wire.wire_digest_material_v1(),
     )?;
     let preflight_plan_digest =
         InteractionPreflightPlanDigestV1::from_canonical_bytes(&combined_preflight_material);
+    Some(PreparedPreflightExecutionV1 {
+        plan,
+        wire,
+        preflight_plan_digest,
+    })
+}
+
+async fn finalize_preflight_execution_v1<P, SP>(
+    permit: &P,
+    prepared: PreparedPreflightExecutionV1,
+    action_plan_digest: &InteractionActionPlanDigestV1,
+    snapshot_provider: &SP,
+    captured_snapshot: Option<ActionPlanSnapshotV1>,
+) -> Option<PreflightExecutionEnvelopeV1>
+where
+    P: AcquiredInteractionLifecyclePermitV1,
+    SP: GuildRoleSnapshotProvider,
+{
+    let PreparedPreflightExecutionV1 {
+        plan: prepared_plan,
+        wire,
+        preflight_plan_digest,
+    } = prepared;
     let snapshot = match captured_snapshot {
         Some(snapshot) => snapshot,
-        None if prepared.snapshot_request().observations().is_empty() => {
-            no_observation_snapshot_v1(prepared.snapshot_request()).ok()?
+        None if prepared_plan.snapshot_request().observations().is_empty() => {
+            no_observation_snapshot_v1(prepared_plan.snapshot_request()).ok()?
         }
         None => snapshot_provider
-            .action_plan_snapshot_v1(prepared.snapshot_request())
+            .action_plan_snapshot_v1(prepared_plan.snapshot_request())
             .await
             .ok()?,
     };
@@ -723,7 +798,7 @@ where
     let snapshot_digest = InteractionPreflightSnapshotDigestV1::from_canonical_bytes(
         expected_snapshot_identity.as_str().as_bytes(),
     );
-    let plan = preflight_action_plan_v1(prepared, snapshot).ok()?;
+    let plan = preflight_action_plan_v1(prepared_plan, snapshot).ok()?;
     if plan.snapshot_identity() != &expected_snapshot_identity {
         return None;
     }

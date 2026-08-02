@@ -737,12 +737,18 @@ fn to_i64(value: u64) -> Result<i64, RuntimeInteractionPersistenceErrorV1> {
 }
 
 fn validate_initial_response_plan_binding_v1(
-    _kind: RuntimeInteractionReceiptInitialResponseKindV1,
+    kind: RuntimeInteractionReceiptInitialResponseKindV1,
     action_plan_digest: Option<&InteractionActionPlanDigestV1>,
 ) -> Result<(), RuntimeInteractionPersistenceErrorV1> {
-    action_plan_digest
-        .map(|_| ())
-        .ok_or(RuntimeInteractionPersistenceErrorV1::Conflict)
+    match kind {
+        RuntimeInteractionReceiptInitialResponseKindV1::DeferEphemeral => Ok(()),
+        RuntimeInteractionReceiptInitialResponseKindV1::RespondEphemeral
+        | RuntimeInteractionReceiptInitialResponseKindV1::RespondMessage
+        | RuntimeInteractionReceiptInitialResponseKindV1::OpenModal
+        | RuntimeInteractionReceiptInitialResponseKindV1::UpdateMessage => action_plan_digest
+            .map(|_| ())
+            .ok_or(RuntimeInteractionPersistenceErrorV1::Conflict),
+    }
 }
 
 #[cfg(test)]
@@ -822,20 +828,36 @@ mod tests {
     }
 
     #[test]
-    fn every_initial_response_kind_requires_a_bound_action_plan() {
+    fn defer_can_precede_plan_but_direct_responses_require_a_bound_plan() {
         let digest = InteractionActionPlanDigestV1::parse("a".repeat(64)).unwrap();
+        assert_eq!(
+            validate_initial_response_plan_binding_v1(
+                RuntimeInteractionReceiptInitialResponseKindV1::DeferEphemeral,
+                None,
+            ),
+            Ok(())
+        );
+        for kind in [
+            RuntimeInteractionReceiptInitialResponseKindV1::RespondEphemeral,
+            RuntimeInteractionReceiptInitialResponseKindV1::RespondMessage,
+            RuntimeInteractionReceiptInitialResponseKindV1::OpenModal,
+            RuntimeInteractionReceiptInitialResponseKindV1::UpdateMessage,
+        ] {
+            assert_eq!(
+                validate_initial_response_plan_binding_v1(kind, None),
+                Err(RuntimeInteractionPersistenceErrorV1::Conflict)
+            );
+        }
         for kind in [
             RuntimeInteractionReceiptInitialResponseKindV1::DeferEphemeral,
             RuntimeInteractionReceiptInitialResponseKindV1::RespondEphemeral,
+            RuntimeInteractionReceiptInitialResponseKindV1::RespondMessage,
             RuntimeInteractionReceiptInitialResponseKindV1::OpenModal,
+            RuntimeInteractionReceiptInitialResponseKindV1::UpdateMessage,
         ] {
             assert_eq!(
                 validate_initial_response_plan_binding_v1(kind, Some(&digest)),
                 Ok(())
-            );
-            assert_eq!(
-                validate_initial_response_plan_binding_v1(kind, None),
-                Err(RuntimeInteractionPersistenceErrorV1::Conflict)
             );
         }
     }

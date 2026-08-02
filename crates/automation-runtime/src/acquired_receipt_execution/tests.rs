@@ -197,6 +197,8 @@ impl AcquiredInteractionLifecyclePermitV1 for FakeLifecyclePermitV1 {
         &self,
         finish: &InteractionTerminalFinishV1,
     ) -> Result<(), Self::Error> {
+        let bound_digest = self.state.binds.lock().unwrap().last().cloned();
+        assert_eq!(finish.action_plan_digest(), bound_digest.as_ref());
         self.state
             .trace
             .lock()
@@ -805,6 +807,11 @@ struct FakeSnapshotProviderV1 {
     fail: bool,
 }
 
+struct BlockingSnapshotProviderV1 {
+    state: Arc<PermitStateV1>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 impl GuildRoleSnapshotProvider for FakeSnapshotProviderV1 {
     async fn snapshot(&self, _: GuildId) -> Result<GuildRoleSnapshot, SnapshotError> {
         self.state
@@ -833,6 +840,44 @@ impl GuildRoleSnapshotProvider for FakeSnapshotProviderV1 {
         if self.fail {
             return Err(SnapshotError::new("snapshot-secret"));
         }
+        fake_action_snapshot_v1(request, Some(RoleId(41_098)))
+    }
+}
+
+impl GuildRoleSnapshotProvider for BlockingSnapshotProviderV1 {
+    async fn snapshot(&self, _: GuildId) -> Result<GuildRoleSnapshot, SnapshotError> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("prepare.snapshot.started".to_string());
+        self.release.notified().await;
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("prepare.snapshot.completed".to_string());
+        Ok(GuildRoleSnapshot {
+            roles: BTreeMap::from([(RoleId(GUILD_ID.0), Permissions::ADMINISTRATOR)]),
+            bot_role_ids: BTreeSet::new(),
+        })
+    }
+
+    async fn action_plan_snapshot_v1(
+        &self,
+        request: &ActionPlanSnapshotRequestV1,
+    ) -> Result<ActionPlanSnapshotV1, SnapshotError> {
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("prepare.snapshot.started".to_string());
+        self.release.notified().await;
+        self.state
+            .trace
+            .lock()
+            .unwrap()
+            .push("prepare.snapshot.completed".to_string());
         fake_action_snapshot_v1(request, Some(RoleId(41_098)))
     }
 }
@@ -1414,6 +1459,86 @@ async fn run_create_role_v1(
     (outcome, state)
 }
 
+async fn run_static_snapshot_failure_v1(
+    definition: InteractionRuleSet,
+    failures: PermitFailuresV1,
+    interaction_id: u64,
+) -> (AcquiredInteractionExecutionOutcomeV1, Arc<PermitStateV1>) {
+    let admitted = admitted_v1(
+        artifact(definition),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), interaction_id);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(root, failures);
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = FakeDurableTeardownV1::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: true,
+    };
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        services_v1(
+            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+    (outcome, state)
+}
+
+async fn run_instance_preparation_failure_v1(
+    snapshot_failure: bool,
+    resolver_succeeds: bool,
+    interaction_id: u64,
+) -> (AcquiredInteractionExecutionOutcomeV1, Arc<PermitStateV1>) {
+    let definition = instance_definition();
+    let pinned_artifact = artifact(definition.clone());
+    let instance = active_instance_v1();
+    let custom_id = encode_instance_action(instance.id.as_str(), "join").unwrap();
+    let admitted = admitted_v1(artifact(definition), &custom_id, Some(instance.clone())).await;
+    let envelope = envelope_v1(custom_id, interaction_id);
+    let root = claim_root_v1(&admitted, &envelope, Some(&instance.id));
+    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = FakeDurableTeardownV1::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: resolver_succeeds.then_some(ResolvedPinnedInstanceV1 {
+            instance,
+            artifact: pinned_artifact,
+        }),
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: snapshot_failure,
+    };
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        services_v1(
+            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+    (outcome, state)
+}
+
 async fn run_create_role_then_direct_response_v1(
     response: ActionSpec,
     interaction_id: u64,
@@ -1500,6 +1625,300 @@ async fn mutation_before_direct_modal_is_rejected_without_external_effects() {
 }
 
 #[tokio::test]
+async fn leading_defer_completes_before_a_slow_static_snapshot() {
+    let definition = deferred_create_role_ruleset();
+    let admitted = admitted_v1(
+        artifact(definition),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), 51_038);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
+    let responder = FakeResponderV1::successful(Arc::clone(&state));
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = FakeDurableTeardownV1::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let release = Arc::new(tokio::sync::Notify::new());
+    let snapshot = BlockingSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        release: Arc::clone(&release),
+    };
+    let execution = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        AcquiredInteractionExecutionServicesV1::new(
+            &mutation, &responder, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    );
+    tokio::pin!(execution);
+    let snapshot_started = async {
+        loop {
+            if state
+                .trace
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "prepare.snapshot.started")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::pin!(snapshot_started);
+    tokio::select! {
+        outcome = &mut execution => panic!("execution completed before snapshot release: {outcome:?}"),
+        _ = &mut snapshot_started => {}
+        _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("snapshot did not start"),
+    }
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "prepare.snapshot.started",
+        ]
+    );
+    assert!(state.binds.lock().unwrap().is_empty());
+    release.notify_one();
+    let outcome = execution.await;
+    assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::StaticCompleted,
+    );
+    let trace = state.trace.lock().unwrap();
+    let defer_index = trace
+        .iter()
+        .position(|event| event == "external.defer")
+        .unwrap();
+    let snapshot_completion_index = trace
+        .iter()
+        .position(|event| event == "prepare.snapshot.completed")
+        .unwrap();
+    let bind_index = trace
+        .iter()
+        .position(|event| event == "permit.bind")
+        .unwrap();
+    assert!(defer_index < snapshot_completion_index);
+    assert!(snapshot_completion_index < bind_index);
+}
+
+#[tokio::test]
+async fn leading_defer_action_plan_bind_failure_after_ack_has_no_mutation_effects() {
+    let (outcome, state) = run_create_role_v1(
+        PermitFailuresV1 {
+            bind: true,
+            ..PermitFailuresV1::default()
+        },
+        None,
+        51_039,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
+            stage: AcquiredInteractionPersistenceStageV1::ActionPlanBind,
+            external_effect_may_have_occurred: true,
+        }
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "prepare.snapshot",
+            "permit.bind",
+        ]
+    );
+    assert_eq!(state.intents.lock().unwrap().len(), 1);
+    assert_eq!(state.results.lock().unwrap().len(), 1);
+    assert!(state.binds.lock().unwrap().is_empty());
+    assert!(state.effect_plans.lock().unwrap().is_empty());
+    assert!(state.effect_intents.lock().unwrap().is_empty());
+    assert!(state.effect_results.lock().unwrap().is_empty());
+    assert!(state
+        .trace
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|event| event != "external.create_role"));
+}
+
+#[tokio::test]
+async fn indeterminate_leading_defer_stops_before_snapshot_and_effects() {
+    let definition = deferred_create_role_ruleset();
+    let admitted = admitted_v1(
+        artifact(definition),
+        &encode_button(GUILD_ID, RULESET_KEY, "go"),
+        None,
+    )
+    .await;
+    let envelope = envelope_v1(encode_button(GUILD_ID, RULESET_KEY, "go"), 51_040);
+    let root = claim_root_v1(&admitted, &envelope, None);
+    let (permit, state) = permit_v1(root, PermitFailuresV1::default());
+    let responder = FakeResponderV1 {
+        state: Arc::clone(&state),
+        initial_error: Some(AdapterError::new(
+            AdapterErrorKind::Network,
+            "indeterminate-ack-secret",
+        )),
+        edit_error: None,
+        pending_initial: false,
+    };
+    let mutation = FakeMutationV1::successful(Arc::clone(&state));
+    let instances = InMemoryInstanceStore::new();
+    let ids = SequenceInstanceIdGenerator::new("receipt", 1);
+    let teardown = FakeDurableTeardownV1::new();
+    let resolver = FakePinnedResolverV1 {
+        state: Arc::clone(&state),
+        resolved: None,
+    };
+    let snapshot = FakeSnapshotProviderV1 {
+        state: Arc::clone(&state),
+        fail: false,
+    };
+
+    let outcome = execute_acquired_interaction_v1(
+        admitted,
+        envelope,
+        permit,
+        services_v1(
+            &responder, &mutation, &instances, &ids, &teardown, &resolver, &snapshot,
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        AcquiredInteractionExecutionOutcomeV1::AcknowledgementTerminalized {
+            state: InteractionReceiptStateV1::RecoveryRequired,
+            result: InteractionInitialResponseResultKindV1::Indeterminate,
+        }
+    );
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:indeterminate",
+        ]
+    );
+    assert!(state.binds.lock().unwrap().is_empty());
+    assert!(state.effect_plans.lock().unwrap().is_empty());
+    assert!(state.effect_intents.lock().unwrap().is_empty());
+    assert!(state.effect_results.lock().unwrap().is_empty());
+    assert!(state.finishes.lock().unwrap().is_empty());
+    assert!(!format!("{outcome:?}").contains("indeterminate-ack-secret"));
+}
+
+#[tokio::test]
+async fn post_ack_snapshot_failure_terminalizes_without_effects() {
+    let (outcome, state) = run_static_snapshot_failure_v1(
+        deferred_create_role_ruleset(),
+        PermitFailuresV1::default(),
+        51_041,
+    )
+    .await;
+
+    let finish = assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::StaticPreparationFailed,
+    );
+    assert!(finish.action_plan_digest().is_none());
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "prepare.snapshot",
+            "permit.finish:interaction_static_preparation_failed",
+        ]
+    );
+    assert!(state.binds.lock().unwrap().is_empty());
+    assert!(state.effect_plans.lock().unwrap().is_empty());
+    assert!(state.effect_intents.lock().unwrap().is_empty());
+    assert!(state.effect_results.lock().unwrap().is_empty());
+    assert!(state
+        .trace
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|event| event != "external.create_role"));
+}
+
+#[tokio::test]
+async fn post_ack_snapshot_terminal_persistence_failure_reports_external_ack() {
+    let (outcome, state) = run_static_snapshot_failure_v1(
+        deferred_create_role_ruleset(),
+        PermitFailuresV1 {
+            finish: true,
+            ..PermitFailuresV1::default()
+        },
+        51_042,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
+            stage: AcquiredInteractionPersistenceStageV1::TerminalFinish,
+            external_effect_may_have_occurred: true,
+        }
+    );
+    assert_eq!(
+        state.trace.lock().unwrap().last().map(String::as_str),
+        Some("permit.finish:interaction_static_preparation_failed")
+    );
+    assert!(state.binds.lock().unwrap().is_empty());
+    assert!(state.effect_plans.lock().unwrap().is_empty());
+    assert!(state.effect_intents.lock().unwrap().is_empty());
+    assert!(state.effect_results.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn non_deferred_snapshot_failure_terminalizes_without_a_bound_digest() {
+    let definition = static_ruleset(vec![
+        ActionSpec::CreateRole {
+            key: "member".to_string(),
+            name: "Member".to_string(),
+        },
+        ActionSpec::RespondEphemeral {
+            content: "never".to_string(),
+        },
+    ]);
+    let (outcome, state) =
+        run_static_snapshot_failure_v1(definition, PermitFailuresV1::default(), 51_043).await;
+
+    let finish = assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::StaticPreparationFailed,
+    );
+    assert!(finish.action_plan_digest().is_none());
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "prepare.snapshot",
+            "permit.finish:interaction_static_preparation_failed",
+        ]
+    );
+    assert!(state.binds.lock().unwrap().is_empty());
+    assert!(state.intents.lock().unwrap().is_empty());
+    assert!(state.effect_plans.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn deferred_mutation_with_final_edit_executes_and_completes() {
     let (outcome, state) = run_create_role_v1(PermitFailuresV1::default(), None, 51_036).await;
 
@@ -1510,11 +1929,11 @@ async fn deferred_mutation_with_final_edit_executes_and_completes() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
-            "prepare.snapshot",
-            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "prepare.snapshot",
+            "permit.bind",
             "journal.bind:2",
             "permit.execution_intent",
             "journal.intent:0",
@@ -1551,11 +1970,11 @@ async fn effect_plan_bind_failure_has_zero_mutation_calls() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
-            "prepare.snapshot",
-            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "prepare.snapshot",
+            "permit.bind",
             "journal.bind:2",
         ]
     );
@@ -1585,11 +2004,11 @@ async fn effect_intent_failure_has_zero_mutation_calls() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
-            "prepare.snapshot",
-            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "prepare.snapshot",
+            "permit.bind",
             "journal.bind:2",
             "permit.execution_intent",
             "journal.intent:0",
@@ -1886,10 +2305,10 @@ async fn register_only_execution_commits_intent_before_the_registrar() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
-            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "permit.bind",
             "journal.bind:2",
             "permit.execution_intent",
             "journal.intent:0",
@@ -2046,10 +2465,10 @@ async fn first_register_intent_failure_is_persistence_failure_before_effect() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
-            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "permit.bind",
             "journal.bind:2",
             "permit.execution_intent",
         ]
@@ -2072,10 +2491,10 @@ async fn registrar_timeout_after_intent_is_recovery_required_not_before_effect()
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
-            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "permit.bind",
             "journal.bind:2",
             "permit.execution_intent",
             "journal.intent:0",
@@ -2327,7 +2746,58 @@ async fn overlong_exact_modal_custom_id_has_zero_external_effects() {
 }
 
 #[tokio::test]
-async fn instance_preflight_and_plan_bind_complete_before_defer() {
+async fn instance_snapshot_failure_after_defer_has_no_unbound_digest_or_effects() {
+    let (outcome, state) = run_instance_preparation_failure_v1(true, true, 51_044).await;
+
+    let finish = assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
+    );
+    assert!(finish.action_plan_digest().is_none());
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "prepare.snapshot",
+            "permit.finish:interaction_instance_preparation_failed",
+        ]
+    );
+    assert!(state.binds.lock().unwrap().is_empty());
+    assert!(state.effect_plans.lock().unwrap().is_empty());
+    assert!(state.effect_intents.lock().unwrap().is_empty());
+    assert!(state.effect_results.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn instance_resolver_failure_after_defer_has_no_unbound_digest_or_effects() {
+    let (outcome, state) = run_instance_preparation_failure_v1(false, false, 51_045).await;
+
+    let finish = assert_terminalized_v1(
+        outcome,
+        AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
+    );
+    assert!(finish.action_plan_digest().is_none());
+    assert_eq!(
+        *state.trace.lock().unwrap(),
+        [
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
+            "prepare.snapshot",
+            "prepare.resolve",
+            "permit.finish:interaction_instance_preparation_failed",
+        ]
+    );
+    assert!(state.binds.lock().unwrap().is_empty());
+    assert!(state.effect_plans.lock().unwrap().is_empty());
+    assert!(state.effect_intents.lock().unwrap().is_empty());
+    assert!(state.effect_results.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn instance_leading_defer_completes_before_snapshot_and_resolver() {
     let definition = instance_definition();
     let pinned_artifact = artifact(definition.clone());
     let instance = active_instance_v1();
@@ -2369,12 +2839,12 @@ async fn instance_preflight_and_plan_bind_complete_before_defer() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
-            "prepare.snapshot",
-            "prepare.resolve",
-            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "prepare.snapshot",
+            "prepare.resolve",
+            "permit.bind",
             "journal.bind:1",
             "permit.execution_intent",
             "journal.intent:0",
@@ -2440,12 +2910,12 @@ async fn instance_teardown_crosses_execution_fence_before_the_service() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
-            "prepare.snapshot",
-            "prepare.resolve",
-            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "prepare.snapshot",
+            "prepare.resolve",
+            "permit.bind",
             "journal.bind:2",
             "permit.execution_intent",
             "journal.intent:0",
@@ -2461,7 +2931,7 @@ async fn instance_teardown_crosses_execution_fence_before_the_service() {
 }
 
 #[tokio::test]
-async fn authoritative_instance_manifest_mismatch_has_zero_external_effects() {
+async fn authoritative_instance_manifest_mismatch_has_zero_mutation_effects() {
     let definition = instance_teardown_definition();
     let pinned_artifact = artifact(definition.clone());
     let instance = active_instance_v1();
@@ -2498,13 +2968,17 @@ async fn authoritative_instance_manifest_mismatch_has_zero_external_effects() {
     )
     .await;
 
-    assert_terminalized_v1(
+    let finish = assert_terminalized_v1(
         outcome,
         AcquiredInteractionTerminalOutcomeV1::InstancePreparationFailed,
     );
+    assert!(finish.action_plan_digest().is_none());
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
+            "permit.intent:defer_ephemeral",
+            "external.defer",
+            "permit.result:succeeded",
             "prepare.snapshot",
             "prepare.resolve",
             "permit.finish:interaction_instance_preparation_failed",
@@ -2516,7 +2990,7 @@ async fn authoritative_instance_manifest_mismatch_has_zero_external_effects() {
         .lock()
         .unwrap()
         .iter()
-        .all(|event| !event.starts_with("external.")));
+        .all(|event| event != "external.teardown"));
 }
 
 #[tokio::test]
@@ -2583,12 +3057,12 @@ async fn new_permit_execution_replay_denial_has_zero_teardown_effects() {
     assert_eq!(
         *state.trace.lock().unwrap(),
         [
-            "prepare.snapshot",
-            "prepare.resolve",
-            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "prepare.snapshot",
+            "prepare.resolve",
+            "permit.bind",
             "journal.bind:2",
             "permit.execution_intent",
         ]
@@ -2930,11 +3404,11 @@ async fn fenced_persistence_outages_stop_before_the_external_call() {
     assert_eq!(
         *execution_state.trace.lock().unwrap(),
         [
-            "prepare.snapshot",
-            "permit.bind",
             "permit.intent:defer_ephemeral",
             "external.defer",
             "permit.result:succeeded",
+            "prepare.snapshot",
+            "permit.bind",
             "journal.bind:2",
             "permit.execution_intent"
         ]
