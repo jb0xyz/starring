@@ -742,6 +742,7 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
             ("discord-model".to_string(), None),
             ("futures".to_string(), None),
             ("getrandom".to_string(), None),
+            ("rustls".to_string(), Some("dev".to_string())),
             ("serde_json".to_string(), Some("dev".to_string())),
             ("sha2".to_string(), Some("dev".to_string())),
             ("sqlx".to_string(), None),

@@ -2848,6 +2848,7 @@ mod tests {
 
     #[tokio::test]
     async fn twilight_gateway_proxy_is_opt_in_and_direct_is_the_default() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let direct = TwilightRuntimeDiscordGatewayDriverV1::new(
             "token".to_string(),
             RuntimeDiscordTransportConfigV1::Direct,
