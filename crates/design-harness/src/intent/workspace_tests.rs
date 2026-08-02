@@ -2,7 +2,10 @@ use serde_json::json;
 
 use super::model::{FeatureConfigurationV1, IntentValueSource, IntentWorkspaceV2};
 use super::normalize::PreparedIntentWorkspaceV2;
-use super::proposal::{apply_existing_channel_decision, prepare_private_study_room};
+use super::proposal::{
+    apply_existing_channel_decision, prepare_private_study_room,
+    upgrade_working_draft_to_validated_preview,
+};
 use super::{
     ExistingChannelKey, IntentLocaleV1, IntentProposalOutcomeV2, IntentRequestedOutcome,
     IntentResolutionContext, PrivateStudyRoomControlsProposalV1, PrivateStudyRoomCopyProposalV1,
@@ -207,5 +210,59 @@ fn missing_channel_decision_uses_the_proposal_locale() {
     assert_eq!(
         decisions[0].reason,
         "레시피가 실행 패널과 탐색 패널을 배치할 기존 채널 하나를 지정해야 합니다"
+    );
+}
+
+#[test]
+fn working_draft_outcome_upgrade_is_checked_and_feature_preserving() {
+    let mut input = proposal(IntentLocaleV1::En);
+    input.requested_outcome = IntentRequestedOutcome::WorkingDraft;
+    input.hub_channel = Some(ExistingChannelKey("study_hub".to_string()));
+    let PreparedIntentWorkspaceV2::Resolved { workspace, .. } =
+        prepare_private_study_room(input, &context()).expect("working draft should resolve")
+    else {
+        panic!("expected resolved working draft");
+    };
+    let original_features = workspace.features.clone();
+    let PreparedIntentWorkspaceV2::Resolved {
+        workspace: upgraded,
+        intent,
+    } = upgrade_working_draft_to_validated_preview(&workspace, workspace.revision, &context())
+        .expect("outcome upgrade should resolve")
+    else {
+        panic!("expected resolved preview intent");
+    };
+
+    assert_eq!(upgraded.revision, workspace.revision + 1);
+    assert_eq!(
+        upgraded.requested_outcome,
+        IntentRequestedOutcome::ValidatedPreview
+    );
+    assert_eq!(upgraded.features, original_features);
+    assert_eq!(
+        intent.requested_outcome(),
+        IntentRequestedOutcome::ValidatedPreview
+    );
+    assert_eq!(intent.revision(), upgraded.revision);
+    assert_eq!(
+        upgrade_working_draft_to_validated_preview(&workspace, 0, &context())
+            .unwrap_err()
+            .code,
+        "STALE_INTENT_WORKSPACE_REVISION"
+    );
+    assert_eq!(
+        upgrade_working_draft_to_validated_preview(&upgraded, upgraded.revision, &context())
+            .unwrap_err()
+            .code,
+        "INTENT_OUTCOME_UPGRADE_NOT_ALLOWED"
+    );
+
+    let mut exhausted = workspace;
+    exhausted.revision = u64::MAX;
+    assert_eq!(
+        upgrade_working_draft_to_validated_preview(&exhausted, u64::MAX, &context())
+            .unwrap_err()
+            .code,
+        "INTENT_WORKSPACE_REVISION_OVERFLOW"
     );
 }

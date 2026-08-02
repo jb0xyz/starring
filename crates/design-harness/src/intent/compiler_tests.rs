@@ -7,11 +7,12 @@ use crate::turn::{
 use super::normalize::PreparedIntentWorkspaceV2;
 use super::proposal::{apply_existing_channel_decision, prepare_private_study_room};
 use super::{
-    compile_intent, propose_private_study_room, recipe_descriptor_digest_v1,
-    recipe_registry_digest_v1, ClosePolicyV1, ExistingChannelKey, IntentLocaleV1,
-    IntentProposalOutcomeV2, IntentRequestedOutcome, IntentResolutionContext,
-    PrivateStudyRoomControlsProposalV1, PrivateStudyRoomCopyProposalV1,
-    PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV2, RecipeKindV1, ValidatedIntentV2,
+    compile_intent, compiled_intents_behaviorally_equivalent, propose_private_study_room,
+    recipe_descriptor_digest_v1, recipe_registry_digest_v1, verify_outcome_only_finalization,
+    ClosePolicyV1, ExistingChannelKey, IntentLocaleV1, IntentProposalOutcomeV2,
+    IntentRequestedOutcome, IntentResolutionContext, PrivateStudyRoomControlsProposalV1,
+    PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV2,
+    RecipeKindV1, ValidatedIntentV2,
 };
 
 fn context() -> IntentResolutionContext {
@@ -363,6 +364,32 @@ fn requested_outcome_is_semantic_even_when_the_plan_is_identical() {
         preview.manifest.compiled_plan_hash
     );
     assert_eq!(working.requirements, preview.requirements);
+    assert!(compiled_intents_behaviorally_equivalent(&working, &preview));
+    assert!(verify_outcome_only_finalization(&working, &preview, &preview).is_ok());
+
+    let mut changed_manifest = preview.clone();
+    changed_manifest.manifest.compiler_revision += 1;
+    assert!(!compiled_intents_behaviorally_equivalent(
+        &working,
+        &changed_manifest
+    ));
+
+    let changed_behavior = compile_intent(&intent(
+        IntentRequestedOutcome::ValidatedPreview,
+        None,
+        Some("Different launcher"),
+    ))
+    .expect("changed intent should compile");
+    assert!(!compiled_intents_behaviorally_equivalent(
+        &working,
+        &changed_behavior
+    ));
+    assert_eq!(
+        verify_outcome_only_finalization(&working, &changed_behavior, &preview)
+            .unwrap_err()
+            .code,
+        "INTENT_OUTCOME_FINALIZATION_BEHAVIOR_CHANGED"
+    );
 }
 
 #[test]

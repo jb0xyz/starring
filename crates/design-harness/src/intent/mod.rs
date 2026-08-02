@@ -24,6 +24,7 @@ mod workspace_tests;
 
 pub(crate) use candidate::{
     candidate_ruleset_hash, draft_state_hash, replay_intent_candidate_preparation,
+    verify_existing_intent_candidate,
 };
 pub use candidate::{
     prepare_intent_candidate, verify_preview_ruleset_v1, CommittedIntentCandidateV1,
@@ -42,6 +43,9 @@ pub use catalog::{
     recipe_descriptor_digest_v1, recipe_descriptor_v1, recipe_registry_digest_v1,
     recipe_registry_v1, RecipeDescriptorV1, RecipeKindV1,
 };
+#[cfg(test)]
+pub(crate) use compile::compiled_intents_behaviorally_equivalent;
+pub(crate) use compile::verify_outcome_only_finalization;
 pub use compile::{
     compile_intent, CompilationManifestV2, CompilationVerificationV1, CompiledIntentV2,
     INTENT_IDENTITY_REVISION,
@@ -54,7 +58,10 @@ pub use model::{
 pub(crate) use model::{PRIVATE_STUDY_ROOM_RECIPE_ID, PRIVATE_STUDY_ROOM_RECIPE_VERSION};
 pub use normalize::ValidatedIntentV2;
 pub(crate) use normalize::{prepare_intent_workspace, PreparedIntentWorkspaceV2};
-pub(crate) use proposal::{apply_existing_channel_decision, prepare_private_study_room};
+pub(crate) use proposal::{
+    apply_existing_channel_decision, prepare_private_study_room,
+    upgrade_working_draft_to_validated_preview,
+};
 pub use proposal::{
     propose_private_study_room, IntentProposalOutcomeV2, PrivateStudyRoomControlsProposalV1,
     PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1, PrivateStudyRoomProposalV2,

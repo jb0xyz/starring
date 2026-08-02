@@ -12,6 +12,8 @@ use super::state::intent_error;
 
 const DETAIL_REQUEST_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.detail_request.v2\0";
 const DETAIL_COVERAGE_DIGEST_DOMAIN_V2: &[u8] = b"starring.intent.detail_coverage.v2\0";
+const RECIPE_EVIDENCE_BINDING_DIGEST_DOMAIN_V4: &[u8] =
+    b"starring.intent.recipe_evidence_binding.v4\0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,6 +89,19 @@ impl IntentRecipeEvidenceV4 {
 
     pub(super) fn selected_descriptor_digest(&self) -> &str {
         &self.selected_descriptor_digest
+    }
+
+    pub(super) fn binding_digest(&self) -> Result<String, StructuredError> {
+        self.validate()?;
+        canonical_json_digest(
+            RECIPE_EVIDENCE_BINDING_DIGEST_DOMAIN_V4,
+            self,
+            IdentityErrorSpec::new(
+                "INTENT_RECIPE_EVIDENCE_BINDING_SERIALIZATION_FAILED",
+                "intent.recipe_evidence",
+                "The recipe evidence binding could not be serialized deterministically",
+            ),
+        )
     }
 
     pub(super) fn validate(&self) -> Result<(), StructuredError> {

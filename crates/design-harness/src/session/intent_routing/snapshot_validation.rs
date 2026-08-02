@@ -2,7 +2,8 @@ use crate::draft::Draft;
 use crate::errors::StructuredError;
 use crate::intent::{
     candidate_ruleset_hash, compile_intent, draft_state_hash, prepare_intent_workspace,
-    ExistingChannelKey, IntentResolutionContext, IntentWorkspaceV2, PreparedIntentWorkspaceV2,
+    verify_outcome_only_finalization, ExistingChannelKey, IntentRequestedOutcome,
+    IntentResolutionContext, IntentWorkspaceV2, PreparedIntentWorkspaceV2,
     INTENT_IDENTITY_REVISION,
 };
 use crate::llm::Message;
@@ -16,7 +17,10 @@ use super::super::{SessionSnapshot, SessionSnapshotError};
 use super::adjudicate::validate_persisted_private_study_room_decision_v4;
 use super::decision::IntentRouteDecisionV2;
 use super::evidence::IntentRecipeEvidenceV4;
-use super::request_evidence::{IntentRequestEvidenceChainV1, IntentRequestEvidenceEntryV1};
+use super::request_evidence::{
+    IntentRequestEvidenceChainV1, IntentRequestEvidenceEntryV1,
+    TerminalOutcomeFinalizationEvidenceRefV1,
+};
 use super::state::{
     context_fingerprint, snapshot_error, validate_intent_recipe_component_identity,
     IntentRecipeRuntime, IntentRecipeStageSnapshotV2, INTENT_RECIPE_PROTOCOL_VERSION,
@@ -216,6 +220,12 @@ pub(in crate::session) fn validate_intent_recipe_snapshot(
             "intent recipe resource bindings changed after the snapshot was created",
         ));
     }
+    let context = IntentResolutionContext::from_channel_bindings(
+        bindings
+            .channel_bindings
+            .keys()
+            .map(|key| ExistingChannelKey(key.0.clone())),
+    );
     if !valid_hash(&intent.transcript_integrity_digest) {
         return Err(snapshot_error(
             "intent recipe transcript integrity digest is malformed",
@@ -243,6 +253,7 @@ pub(in crate::session) fn validate_intent_recipe_snapshot(
         &transcript,
         &snapshot.draft,
         bindings,
+        &intent.stage,
     )?;
     validate_terminal_private_stage(&intent.stage, &transcript, &core_transcript)?;
     match &intent.stage {
@@ -270,15 +281,18 @@ pub(in crate::session) fn validate_intent_recipe_snapshot(
                     "awaiting intent decision state is inconsistent",
                 ));
             }
-            validate_persisted_evidence_chain(
+            validate_persisted_evidence_chain(PersistedEvidenceValidationV4 {
                 request_evidence,
-                &snapshot.messages,
-                &transcript,
+                messages: &snapshot.messages,
+                transcript: &transcript,
                 workspace,
-                route_decision,
-                recipe_evidence,
-                &core_transcript,
-            )?;
+                decision: route_decision,
+                evidence: recipe_evidence,
+                core_transcript: &core_transcript,
+                context: &context,
+                terminal_finalization_allowed: false,
+                stage_draft_revision: *root_draft_revision,
+            })?;
             validate_final_awaiting_tool_result(
                 request_evidence,
                 &transcript,
@@ -359,15 +373,18 @@ pub(in crate::session) fn validate_intent_recipe_snapshot(
                     "preview-ready intent recipe state is inconsistent",
                 ));
             }
-            validate_persisted_evidence_chain(
+            validate_persisted_evidence_chain(PersistedEvidenceValidationV4 {
                 request_evidence,
-                &snapshot.messages,
-                &transcript,
+                messages: &snapshot.messages,
+                transcript: &transcript,
                 workspace,
-                route_decision,
-                recipe_evidence,
-                &core_transcript,
-            )?;
+                decision: route_decision,
+                evidence: recipe_evidence,
+                core_transcript: &core_transcript,
+                context: &context,
+                terminal_finalization_allowed: true,
+                stage_draft_revision: *candidate_revision,
+            })?;
             validate_final_preview_tool_result(
                 request_evidence,
                 &transcript,
@@ -444,6 +461,10 @@ fn validate_request_evidence_frontiers(
                 transcript_message_index,
                 ..
             } => (*transcript_message_index, RESOLVE_INTENT_DECISION),
+            IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization {
+                transcript_message_index,
+                ..
+            } => (*transcript_message_index, INTERPRET_INTENT_CORE),
         };
         let matching = transcript
             .turns
@@ -460,15 +481,34 @@ fn validate_request_evidence_frontiers(
     Ok(())
 }
 
+struct PersistedEvidenceValidationV4<'a> {
+    request_evidence: &'a IntentRequestEvidenceChainV1,
+    messages: &'a [Message],
+    transcript: &'a IntentTranscriptV4,
+    workspace: &'a IntentWorkspaceV2,
+    decision: &'a IntentRouteDecisionV2,
+    evidence: &'a IntentRecipeEvidenceV4,
+    core_transcript: &'a ValidatedCoreTranscriptV4,
+    context: &'a IntentResolutionContext,
+    terminal_finalization_allowed: bool,
+    stage_draft_revision: u64,
+}
+
 fn validate_persisted_evidence_chain(
-    request_evidence: &IntentRequestEvidenceChainV1,
-    messages: &[crate::llm::Message],
-    transcript: &IntentTranscriptV4,
-    workspace: &IntentWorkspaceV2,
-    decision: &IntentRouteDecisionV2,
-    evidence: &IntentRecipeEvidenceV4,
-    core_transcript: &ValidatedCoreTranscriptV4,
+    input: PersistedEvidenceValidationV4<'_>,
 ) -> Result<(), SessionSnapshotError> {
+    let PersistedEvidenceValidationV4 {
+        request_evidence,
+        messages,
+        transcript,
+        workspace,
+        decision,
+        evidence,
+        core_transcript,
+        context,
+        terminal_finalization_allowed,
+        stage_draft_revision,
+    } = input;
     request_evidence
         .validate_against_transcript(messages)
         .map_err(|error| {
@@ -526,6 +566,217 @@ fn validate_persisted_evidence_chain(
         &initial_head,
         core_transcript,
     )?;
+    match request_evidence.terminal_outcome_finalization() {
+        Some(finalization) if terminal_finalization_allowed => {
+            validate_terminal_outcome_finalization_replay(
+                messages,
+                transcript,
+                workspace,
+                context,
+                core_transcript,
+                finalization,
+                stage_draft_revision,
+            )?;
+        }
+        Some(_) => {
+            return Err(snapshot_error(
+                "terminal outcome finalization evidence is only valid in preview-ready state",
+            ));
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn validate_terminal_outcome_finalization_replay(
+    messages: &[Message],
+    transcript: &IntentTranscriptV4,
+    workspace: &IntentWorkspaceV2,
+    context: &IntentResolutionContext,
+    core_transcript: &ValidatedCoreTranscriptV4,
+    finalization: TerminalOutcomeFinalizationEvidenceRefV1<'_>,
+    stage_draft_revision: u64,
+) -> Result<(), SessionSnapshotError> {
+    if !valid_hash(finalization.previous_chain_head())
+        || finalization.expected_draft_revision() != stage_draft_revision
+        || finalization.next_workspace_revision() != workspace.revision
+        || finalization.prior_workspace_revision().checked_add(1)
+            != Some(finalization.next_workspace_revision())
+        || workspace.requested_outcome != IntentRequestedOutcome::ValidatedPreview
+    {
+        return Err(snapshot_error(
+            "terminal outcome finalization does not match the persisted Draft and workspace frontier",
+        ));
+    }
+    let replayed = core_transcript
+        .private_turn(finalization.transcript_message_index())
+        .ok_or_else(|| {
+            snapshot_error(
+                "terminal outcome finalization no longer replays as a private study-room intent",
+            )
+        })?;
+    if replayed.expected_revision != finalization.expected_draft_revision()
+        || replayed.initial_head != finalization.standalone_request_evidence_digest()
+        || replayed.selection.decision().request_evidence_hash()
+            != Some(finalization.standalone_request_evidence_digest())
+        || replayed.selection.decision().adjudication_digest()
+            != finalization.standalone_adjudication_digest()
+    {
+        return Err(snapshot_error(
+            "terminal outcome finalization does not match its standalone Core adjudication",
+        ));
+    }
+    let turn = transcript
+        .turns
+        .iter()
+        .find(|turn| turn.human_message_index == finalization.transcript_message_index())
+        .ok_or_else(|| {
+            snapshot_error("terminal outcome finalization transcript turn is missing")
+        })?;
+    if !turn.succeeded || turn.primary_tool.as_deref() != Some(INTERPRET_INTENT_CORE) {
+        return Err(snapshot_error(
+            "terminal outcome finalization transcript frontier did not succeed",
+        ));
+    }
+    let primary_result = turn
+        .primary_result
+        .as_ref()
+        .ok_or_else(|| snapshot_error("terminal outcome finalization Core result is missing"))?;
+    let selection = &replayed.selection;
+    let source_human_turn_digest = finalization.human_turn_digest();
+    let (recipe_evidence, permit) = if selection.detail_facets().is_empty() {
+        if turn.detail_arguments.is_some()
+            || turn.detail_result.is_some()
+            || !turn.detail_facets.is_empty()
+            || !turn.detail_fields.is_empty()
+            || replayed.detail_parameters.is_some()
+        {
+            return Err(snapshot_error(
+                "terminal outcome finalization contains an unexpected detail frontier",
+            ));
+        }
+        let evidence = IntentRecipeEvidenceV4::deterministic_default(
+            selection.semantic_ir_digest(),
+            source_human_turn_digest,
+        )
+        .map_err(restored_semantics_error)?;
+        let permit = selection
+            .clone()
+            .finalize(None)
+            .map_err(restored_semantics_error)?;
+        (evidence, permit)
+    } else {
+        validate_details_required_tool_result(primary_result, selection.detail_facets())?;
+        if turn.detail_facets.as_slice() != selection.detail_facets()
+            || turn.detail_fields.as_slice() != replayed.detail_ticket.fields()
+        {
+            return Err(snapshot_error(
+                "terminal outcome finalization detail frontier does not replay exactly",
+            ));
+        }
+        let detail_arguments = turn.detail_arguments.as_deref().ok_or_else(|| {
+            snapshot_error("terminal outcome finalization detail arguments are missing")
+        })?;
+        let detail_parameters = replayed.detail_parameters.as_ref().ok_or_else(|| {
+            snapshot_error("terminal outcome finalization detail parameters are missing")
+        })?;
+        let details = parse_private_study_room_details_for_active_serving_with_parameters(
+            detail_arguments,
+            selection.detail_facets(),
+            replayed.detail_ticket.expectations(),
+            detail_parameters,
+            selection.expected_revision(),
+            selection.semantic_ir_digest(),
+            &replayed.human,
+        )
+        .map_err(restored_semantics_error)?;
+        let detail_result_digest = selection
+            .details_digest(source_human_turn_digest, &details)
+            .map_err(restored_semantics_error)?;
+        let evidence = IntentRecipeEvidenceV4::model_detail(
+            selection.semantic_ir_digest(),
+            source_human_turn_digest,
+            selection.detail_facets(),
+            detail_result_digest,
+        )
+        .map_err(restored_semantics_error)?;
+        let permit = selection
+            .clone()
+            .finalize(Some(details))
+            .map_err(restored_semantics_error)?;
+        (evidence, permit)
+    };
+    if recipe_evidence
+        .binding_digest()
+        .map_err(restored_semantics_error)?
+        != finalization.standalone_recipe_evidence_digest()
+    {
+        return Err(snapshot_error(
+            "terminal outcome finalization does not match its standalone recipe evidence",
+        ));
+    }
+    let expected_channel_keys = context
+        .channel_bindings
+        .iter()
+        .map(|key| key.0.clone())
+        .collect::<Vec<_>>();
+    if replayed.available_channel_keys != expected_channel_keys {
+        return Err(snapshot_error(
+            "terminal outcome finalization resource frontier changed after commit",
+        ));
+    }
+    let (route_decision, prepared) = permit.prepare(context).map_err(restored_semantics_error)?;
+    if route_decision.adjudication_digest() != finalization.standalone_adjudication_digest() {
+        return Err(snapshot_error(
+            "terminal outcome finalization prepared route decision changed during replay",
+        ));
+    }
+    let PreparedIntentWorkspaceV2::Resolved {
+        workspace: standalone_workspace,
+        intent: standalone_intent,
+    } = prepared
+    else {
+        return Err(snapshot_error(
+            "terminal outcome finalization no longer resolves without another decision",
+        ));
+    };
+    if standalone_workspace.requested_outcome != IntentRequestedOutcome::ValidatedPreview
+        || standalone_intent.requested_outcome() != IntentRequestedOutcome::ValidatedPreview
+    {
+        return Err(snapshot_error(
+            "terminal outcome finalization no longer requests validated_preview",
+        ));
+    }
+    let PreparedIntentWorkspaceV2::Resolved {
+        intent: persisted_intent,
+        ..
+    } = prepare_intent_workspace(workspace.clone(), context).map_err(restored_semantics_error)?
+    else {
+        return Err(snapshot_error(
+            "terminal outcome finalization persisted workspace no longer resolves",
+        ));
+    };
+    let standalone_compilation =
+        compile_intent(&standalone_intent).map_err(restored_state_error)?;
+    let persisted_compilation = compile_intent(&persisted_intent).map_err(restored_state_error)?;
+    verify_outcome_only_finalization(
+        &persisted_compilation,
+        &standalone_compilation,
+        &persisted_compilation,
+    )
+    .map_err(restored_semantics_error)?;
+    if messages
+        .get(
+            usize::try_from(finalization.transcript_message_index()).map_err(|_| {
+                snapshot_error("terminal outcome finalization transcript index overflowed")
+            })?,
+        )
+        .is_none()
+    {
+        return Err(snapshot_error(
+            "terminal outcome finalization human message is missing",
+        ));
+    }
     Ok(())
 }
 

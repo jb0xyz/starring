@@ -4,8 +4,10 @@ use crate::draft::Draft;
 use crate::errors::StructuredError;
 use crate::intent::identity::{domain_separated_length_framed_digest, is_lowercase_sha256_hex};
 use crate::intent::{
-    replay_intent_candidate_preparation, ExistingChannelKey, IntentResolutionContext,
-    PreparedIntentWorkspaceV2,
+    compile_intent, prepare_intent_workspace, replay_intent_candidate_preparation,
+    upgrade_working_draft_to_validated_preview, verify_outcome_only_finalization,
+    ExistingChannelKey, IntentRequestedOutcome, IntentResolutionContext, IntentWorkspaceV2,
+    PreparedIntentWorkspaceV2, ValidatedIntentV2,
 };
 use crate::llm::Message;
 use crate::turn::{
@@ -106,6 +108,26 @@ impl ValidatedCoreTranscriptV4 {
 struct TerminalPrivateOutcomeV4<'a> {
     human_message_index: u64,
     status: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct FinalizationTranscriptExpectationV1 {
+    human_message_index: u64,
+    intent_revision: u64,
+    draft_revision: u64,
+}
+
+struct WorkingDraftFinalizationReplayV1 {
+    workspace: IntentWorkspaceV2,
+    candidate_revision: u64,
+}
+
+struct PrivateCoreValidationContextV4<'a> {
+    draft: &'a Draft,
+    bindings: &'a ResourceBindingMap,
+    candidate_replay_outcomes: &'a mut BTreeMap<String, Result<(), StructuredError>>,
+    finalization: Option<FinalizationTranscriptExpectationV1>,
+    working_finalization: Option<&'a WorkingDraftFinalizationReplayV1>,
 }
 
 pub(super) fn routed_presentation_digest(response: &str) -> String {
@@ -248,10 +270,13 @@ pub(super) fn validate_core_transcript_results(
     transcript: &IntentTranscriptV4,
     draft: &Draft,
     bindings: &ResourceBindingMap,
+    stage: &IntentRecipeStageSnapshotV2,
 ) -> Result<ValidatedCoreTranscriptV4, SessionSnapshotError> {
     let mut private_turns = Vec::new();
     let mut deferred_candidate_failures = Vec::new();
     let mut candidate_replay_outcomes = BTreeMap::new();
+    let finalization = finalization_transcript_expectation(stage);
+    let working_finalization = working_draft_finalization_replay(stage);
     for turn in &transcript.turns {
         if turn.primary_tool.as_deref() != Some(INTERPRET_INTENT_CORE) {
             continue;
@@ -269,14 +294,16 @@ pub(super) fn validate_core_transcript_results(
                 validate_persisted_routed_result(result, &replayed)?
             }
             Ok(ReplayedCoreSemanticsV4::Private(replayed)) => {
-                if validate_private_core_result(
-                    turn,
-                    result,
-                    &replayed,
+                let mut validation = PrivateCoreValidationContextV4 {
                     draft,
                     bindings,
-                    &mut candidate_replay_outcomes,
-                )? {
+                    candidate_replay_outcomes: &mut candidate_replay_outcomes,
+                    finalization: finalization.filter(|expected| {
+                        expected.human_message_index == turn.human_message_index
+                    }),
+                    working_finalization: working_finalization.as_ref(),
+                };
+                if validate_private_core_result(turn, result, &replayed, &mut validation)? {
                     deferred_candidate_failures.push(turn.human_message_index);
                 }
                 private_turns.push((turn.human_message_index, replayed));
@@ -360,8 +387,101 @@ fn final_evidence_message_index(
         | IntentRequestEvidenceEntryV1::AcceptedResolution {
             transcript_message_index,
             ..
+        }
+        | IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization {
+            transcript_message_index,
+            ..
         } => Ok(*transcript_message_index),
     }
+}
+
+fn finalization_transcript_expectation(
+    stage: &IntentRecipeStageSnapshotV2,
+) -> Option<FinalizationTranscriptExpectationV1> {
+    let IntentRecipeStageSnapshotV2::PreviewReady {
+        request_evidence, ..
+    } = stage
+    else {
+        return None;
+    };
+    request_evidence
+        .terminal_outcome_finalization()
+        .map(|finalization| FinalizationTranscriptExpectationV1 {
+            human_message_index: finalization.transcript_message_index(),
+            intent_revision: finalization.next_workspace_revision(),
+            draft_revision: finalization.expected_draft_revision(),
+        })
+}
+
+fn working_draft_finalization_replay(
+    stage: &IntentRecipeStageSnapshotV2,
+) -> Option<WorkingDraftFinalizationReplayV1> {
+    let IntentRecipeStageSnapshotV2::PreviewReady {
+        workspace,
+        candidate_revision,
+        request_evidence,
+        ..
+    } = stage
+    else {
+        return None;
+    };
+    let mut working = workspace.clone();
+    match working.requested_outcome {
+        IntentRequestedOutcome::WorkingDraft => {}
+        IntentRequestedOutcome::ValidatedPreview => {
+            let finalization = request_evidence.terminal_outcome_finalization()?;
+            working.revision = finalization.prior_workspace_revision();
+            working.requested_outcome = IntentRequestedOutcome::WorkingDraft;
+        }
+        IntentRequestedOutcome::Discussion => return None,
+    }
+    Some(WorkingDraftFinalizationReplayV1 {
+        workspace: working,
+        candidate_revision: *candidate_revision,
+    })
+}
+
+fn replay_outcome_finalization_attempt(
+    working_workspace: &IntentWorkspaceV2,
+    standalone_intent: &ValidatedIntentV2,
+    context: &IntentResolutionContext,
+) -> Result<(), StructuredError> {
+    let PreparedIntentWorkspaceV2::Resolved {
+        intent: working_intent,
+        ..
+    } = prepare_intent_workspace(working_workspace.clone(), context)?
+    else {
+        return Err(StructuredError::new(
+            "INTENT_OUTCOME_FINALIZATION_SOURCE_UNRESOLVED",
+            "intent.workspace",
+            "The committed working Draft workspace no longer resolves",
+            "Start a new intent from the current canonical Draft",
+        ));
+    };
+    let PreparedIntentWorkspaceV2::Resolved {
+        intent: finalized_intent,
+        ..
+    } = upgrade_working_draft_to_validated_preview(
+        working_workspace,
+        working_workspace.revision,
+        context,
+    )?
+    else {
+        return Err(StructuredError::new(
+            "INTENT_OUTCOME_FINALIZATION_UNRESOLVED",
+            "intent.workspace",
+            "The outcome-only workspace transition no longer resolves",
+            "Start a new intent from the current canonical Draft",
+        ));
+    };
+    let working_compilation = compile_intent(&working_intent)?;
+    let standalone_compilation = compile_intent(standalone_intent)?;
+    let finalized_compilation = compile_intent(&finalized_intent)?;
+    verify_outcome_only_finalization(
+        &working_compilation,
+        &standalone_compilation,
+        &finalized_compilation,
+    )
 }
 
 fn terminal_private_outcome(
@@ -474,9 +594,7 @@ fn validate_private_core_result(
     turn: &IntentTranscriptTurnV4,
     primary_result: &serde_json::Value,
     replayed: &ReplayedPrivateSemanticsV4,
-    draft: &Draft,
-    bindings: &ResourceBindingMap,
-    candidate_replay_outcomes: &mut BTreeMap<String, Result<(), StructuredError>>,
+    validation: &mut PrivateCoreValidationContextV4<'_>,
 ) -> Result<bool, SessionSnapshotError> {
     if has_routed_binding(primary_result) {
         return Err(snapshot_error(
@@ -512,9 +630,7 @@ fn validate_private_core_result(
             available_channel_keys,
             primary_result,
             expected_revision,
-            draft,
-            bindings,
-            candidate_replay_outcomes,
+            validation,
         );
     }
     validate_details_required_tool_result(primary_result, &facets)?;
@@ -567,9 +683,7 @@ fn validate_private_core_result(
         available_channel_keys,
         detail_result,
         expected_revision,
-        draft,
-        bindings,
-        candidate_replay_outcomes,
+        validation,
     )
 }
 
@@ -578,9 +692,7 @@ fn validate_prepared_private_result(
     available_channel_keys: &[String],
     result: &serde_json::Value,
     expected_revision: u64,
-    draft: &Draft,
-    bindings: &ResourceBindingMap,
-    candidate_replay_outcomes: &mut BTreeMap<String, Result<(), StructuredError>>,
+    validation: &mut PrivateCoreValidationContextV4<'_>,
 ) -> Result<bool, SessionSnapshotError> {
     let context = IntentResolutionContext::from_channel_bindings(
         available_channel_keys
@@ -627,22 +739,46 @@ fn validate_prepared_private_result(
         }
         PreparedIntentWorkspaceV2::Resolved { workspace, intent } => {
             if result.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
-                if expected_revision > draft.draft_revision {
+                if let Some(finalization) = validation.working_finalization.filter(|finalization| {
+                    expected_revision == finalization.candidate_revision
+                        && intent.requested_outcome() == IntentRequestedOutcome::ValidatedPreview
+                }) {
+                    let replay = replay_outcome_finalization_attempt(
+                        &finalization.workspace,
+                        &intent,
+                        &context,
+                    );
+                    return match replay {
+                        Ok(()) => Err(snapshot_error(
+                            "private failure result does not match deterministic transcript replay",
+                        )),
+                        Err(error) => {
+                            validate_persisted_private_failure(result, &error, expected_revision)?;
+                            Ok(false)
+                        }
+                    };
+                }
+                if expected_revision > validation.draft.draft_revision {
                     return Err(snapshot_error(
                         "private candidate failure references a future Draft revision",
                     ));
                 }
-                if expected_revision < draft.draft_revision {
+                if expected_revision < validation.draft.draft_revision {
                     validate_persisted_private_failure_shape(result, expected_revision)?;
                     return Ok(true);
                 }
                 let replay_key = serde_json::to_string(&intent).map_err(|_| {
                     snapshot_error("private candidate replay identity could not be serialized")
                 })?;
-                let replay = candidate_replay_outcomes
+                let replay = validation
+                    .candidate_replay_outcomes
                     .entry(replay_key)
                     .or_insert_with(|| {
-                        replay_intent_candidate_preparation(draft, &intent, bindings)
+                        replay_intent_candidate_preparation(
+                            validation.draft,
+                            &intent,
+                            validation.bindings,
+                        )
                     })
                     .clone();
                 return match replay {
@@ -657,9 +793,18 @@ fn validate_prepared_private_result(
             }
             let persisted: PersistedPreviewToolResultV4 = serde_json::from_value(result.clone())
                 .map_err(|_| snapshot_error("replayed preview result has an invalid shape"))?;
+            let expected_intent_revision = validation
+                .finalization
+                .map(|expected| expected.intent_revision)
+                .unwrap_or(workspace.revision);
             if !persisted.ok
                 || persisted.status != "preview_ready"
-                || persisted.intent_revision != workspace.revision
+                || persisted.intent_revision != expected_intent_revision
+                || validation.finalization.is_some_and(|expected| {
+                    workspace.requested_outcome != IntentRequestedOutcome::ValidatedPreview
+                        || intent.requested_outcome() != IntentRequestedOutcome::ValidatedPreview
+                        || persisted.draft_revision != expected.draft_revision
+                })
                 || !valid_hash(&persisted.semantic_intent_hash)
                 || !valid_hash(&persisted.compiled_plan_hash)
                 || !valid_hash(&persisted.candidate_ruleset_hash)

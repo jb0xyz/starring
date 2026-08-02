@@ -4,7 +4,7 @@ use crate::errors::StructuredError;
 use crate::intent::identity::{canonical_json_digest, is_lowercase_sha256_hex, IdentityErrorSpec};
 use crate::intent::{
     apply_existing_channel_decision, prepare_intent_workspace, ExistingChannelKey,
-    IntentResolutionContext, IntentWorkspaceV2, PreparedIntentWorkspaceV2,
+    IntentRequestedOutcome, IntentResolutionContext, IntentWorkspaceV2, PreparedIntentWorkspaceV2,
 };
 use crate::llm::{Message, MessageRole};
 
@@ -15,6 +15,8 @@ const HUMAN_TURN_DIGEST_DOMAIN_V1: &[u8] = b"starring.intent.human_turn.v1\0";
 const INITIAL_EVIDENCE_DIGEST_DOMAIN_V1: &[u8] = b"starring.intent.request_evidence.initial.v1\0";
 const RESOLUTION_EVIDENCE_DIGEST_DOMAIN_V1: &[u8] =
     b"starring.intent.request_evidence.resolution.v1\0";
+const TERMINAL_FINALIZATION_EVIDENCE_DIGEST_DOMAIN_V1: &[u8] =
+    b"starring.intent.request_evidence.terminal_finalization.v1\0";
 const ACTIVE_OPTIONS_DIGEST_DOMAIN_V1: &[u8] = b"starring.intent.request_evidence.options.v1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +57,19 @@ pub(super) enum IntentRequestEvidenceEntryV1 {
         human_turn_digest: String,
         accepted_typed_value: AcceptedIntentResolutionV1,
     },
+    TerminalOutcomeFinalization {
+        previous_chain_head: String,
+        transcript_message_index: u64,
+        expected_draft_revision: u64,
+        prior_workspace_revision: u64,
+        next_workspace_revision: u64,
+        prior_requested_outcome: IntentRequestedOutcome,
+        next_requested_outcome: IntentRequestedOutcome,
+        human_turn_digest: String,
+        standalone_request_evidence_digest: String,
+        standalone_adjudication_digest: String,
+        standalone_recipe_evidence_digest: String,
+    },
 }
 
 impl IntentRequestEvidenceEntryV1 {
@@ -67,18 +82,23 @@ impl IntentRequestEvidenceEntryV1 {
             | Self::AcceptedResolution {
                 transcript_message_index,
                 ..
+            }
+            | Self::TerminalOutcomeFinalization {
+                transcript_message_index,
+                ..
             } => *transcript_message_index,
         }
     }
 
-    pub(super) fn expected_revision(&self) -> u64 {
+    fn resolution_expected_revision(&self) -> Option<u64> {
         match self {
             Self::InitialHuman {
                 expected_revision, ..
             }
             | Self::AcceptedResolution {
                 expected_revision, ..
-            } => *expected_revision,
+            } => Some(*expected_revision),
+            Self::TerminalOutcomeFinalization { .. } => None,
         }
     }
 
@@ -88,6 +108,9 @@ impl IntentRequestEvidenceEntryV1 {
                 human_turn_digest, ..
             }
             | Self::AcceptedResolution {
+                human_turn_digest, ..
+            }
+            | Self::TerminalOutcomeFinalization {
                 human_turn_digest, ..
             } => human_turn_digest,
         }
@@ -109,6 +132,67 @@ pub(super) struct AcceptedResolutionEvidenceInputV1<'a> {
     pub(super) decision_path: &'a str,
     pub(super) active_options: &'a [String],
     pub(super) accepted_typed_value: AcceptedIntentResolutionV1,
+}
+
+pub(super) struct TerminalOutcomeFinalizationEvidenceInputV1<'a> {
+    pub(super) transcript_message_index: u64,
+    pub(super) expected_draft_revision: u64,
+    pub(super) prior_workspace_revision: u64,
+    pub(super) next_workspace_revision: u64,
+    pub(super) standalone_request_evidence_digest: &'a str,
+    pub(super) standalone_adjudication_digest: &'a str,
+    pub(super) standalone_recipe_evidence_digest: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TerminalOutcomeFinalizationEvidenceRefV1<'a> {
+    previous_chain_head: &'a str,
+    transcript_message_index: u64,
+    expected_draft_revision: u64,
+    prior_workspace_revision: u64,
+    next_workspace_revision: u64,
+    human_turn_digest: &'a str,
+    standalone_request_evidence_digest: &'a str,
+    standalone_adjudication_digest: &'a str,
+    standalone_recipe_evidence_digest: &'a str,
+}
+
+impl<'a> TerminalOutcomeFinalizationEvidenceRefV1<'a> {
+    pub(super) fn previous_chain_head(self) -> &'a str {
+        self.previous_chain_head
+    }
+
+    pub(super) fn transcript_message_index(self) -> u64 {
+        self.transcript_message_index
+    }
+
+    pub(super) fn expected_draft_revision(self) -> u64 {
+        self.expected_draft_revision
+    }
+
+    pub(super) fn prior_workspace_revision(self) -> u64 {
+        self.prior_workspace_revision
+    }
+
+    pub(super) fn next_workspace_revision(self) -> u64 {
+        self.next_workspace_revision
+    }
+
+    pub(super) fn human_turn_digest(self) -> &'a str {
+        self.human_turn_digest
+    }
+
+    pub(super) fn standalone_request_evidence_digest(self) -> &'a str {
+        self.standalone_request_evidence_digest
+    }
+
+    pub(super) fn standalone_adjudication_digest(self) -> &'a str {
+        self.standalone_adjudication_digest
+    }
+
+    pub(super) fn standalone_recipe_evidence_digest(self) -> &'a str {
+        self.standalone_recipe_evidence_digest
+    }
 }
 
 #[derive(Serialize)]
@@ -197,6 +281,61 @@ impl IntentRequestEvidenceChainV1 {
         Ok(())
     }
 
+    pub(super) fn append_terminal_outcome_finalization(
+        &mut self,
+        transcript: &[Message],
+        input: TerminalOutcomeFinalizationEvidenceInputV1<'_>,
+    ) -> Result<(), StructuredError> {
+        self.append_terminal_outcome_finalization_with_prefix(
+            transcript,
+            input,
+            INTENT_HUMAN_PREFIX,
+        )
+    }
+
+    pub(super) fn append_terminal_outcome_finalization_with_prefix(
+        &mut self,
+        transcript: &[Message],
+        input: TerminalOutcomeFinalizationEvidenceInputV1<'_>,
+        prefix: &str,
+    ) -> Result<(), StructuredError> {
+        self.validate_against_transcript_with_prefix(transcript, prefix)?;
+        validate_terminal_finalization_input(&input)?;
+        let human_turn = transcript_human_turn(transcript, input.transcript_message_index, prefix)?;
+        let human_turn_digest = human_turn_digest(&human_turn)?;
+        let standalone_request_evidence_digest = standalone_initial_evidence_digest(
+            input.transcript_message_index,
+            input.expected_draft_revision,
+            &human_turn_digest,
+        )?;
+        if input.standalone_request_evidence_digest != standalone_request_evidence_digest {
+            return Err(evidence_error(
+                "INTENT_REQUEST_EVIDENCE_FINALIZATION_STANDALONE_REQUEST_MISMATCH",
+                "intent.request_evidence.entries.standalone_request_evidence_digest",
+                "Terminal finalization standalone request evidence does not match the current human turn and Draft revision",
+                "Use the exact standalone request evidence head from the finalization turn",
+            ));
+        }
+        let entry = IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization {
+            previous_chain_head: self.head.clone(),
+            transcript_message_index: input.transcript_message_index,
+            expected_draft_revision: input.expected_draft_revision,
+            prior_workspace_revision: input.prior_workspace_revision,
+            next_workspace_revision: input.next_workspace_revision,
+            prior_requested_outcome: IntentRequestedOutcome::WorkingDraft,
+            next_requested_outcome: IntentRequestedOutcome::ValidatedPreview,
+            human_turn_digest,
+            standalone_request_evidence_digest,
+            standalone_adjudication_digest: input.standalone_adjudication_digest.to_string(),
+            standalone_recipe_evidence_digest: input.standalone_recipe_evidence_digest.to_string(),
+        };
+        validate_append_shape(&self.entries, &entry)?;
+        let head = entry_digest(&entry)?;
+        self.entries.push(entry);
+        self.head = head;
+        Ok(())
+    }
+
     pub(super) fn validate(&self) -> Result<(), StructuredError> {
         let Some(first) = self.entries.first() else {
             return Err(evidence_error(
@@ -210,17 +349,23 @@ impl IntentRequestEvidenceChainV1 {
         let mut computed_head = entry_digest(first)?;
         for (index, entry) in self.entries.iter().enumerate().skip(1) {
             validate_entry_shape(entry, false)?;
-            let IntentRequestEvidenceEntryV1::AcceptedResolution {
-                previous_chain_head,
-                ..
-            } = entry
-            else {
-                return Err(evidence_error(
-                    "INTENT_REQUEST_EVIDENCE_ORDER_INVALID",
-                    "intent.request_evidence.entries",
-                    "Only the first request evidence entry may be initial_human",
-                    "Preserve the original ordered evidence chain",
-                ));
+            let previous_chain_head = match entry {
+                IntentRequestEvidenceEntryV1::AcceptedResolution {
+                    previous_chain_head,
+                    ..
+                }
+                | IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization {
+                    previous_chain_head,
+                    ..
+                } => previous_chain_head,
+                IntentRequestEvidenceEntryV1::InitialHuman { .. } => {
+                    return Err(evidence_error(
+                        "INTENT_REQUEST_EVIDENCE_ORDER_INVALID",
+                        "intent.request_evidence.entries",
+                        "Only the first request evidence entry may be initial_human",
+                        "Preserve the original ordered evidence chain",
+                    ));
+                }
             };
             if previous_chain_head != &computed_head {
                 return Err(evidence_error(
@@ -268,6 +413,27 @@ impl IntentRequestEvidenceChainV1 {
                     "Request evidence does not match its referenced human transcript message",
                     "Restore the original append-only intent transcript",
                 ));
+            }
+            if let IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization {
+                transcript_message_index,
+                expected_draft_revision,
+                standalone_request_evidence_digest,
+                ..
+            } = entry
+            {
+                let expected = standalone_initial_evidence_digest(
+                    *transcript_message_index,
+                    *expected_draft_revision,
+                    &actual,
+                )?;
+                if standalone_request_evidence_digest != &expected {
+                    return Err(evidence_error(
+                        "INTENT_REQUEST_EVIDENCE_FINALIZATION_STANDALONE_REQUEST_MISMATCH",
+                        "intent.request_evidence.entries.standalone_request_evidence_digest",
+                        "Terminal finalization standalone request evidence does not match the current human turn and Draft revision",
+                        "Restore the exact standalone request evidence head from the finalization turn",
+                    ));
+                }
             }
         }
         Ok(())
@@ -324,6 +490,49 @@ impl IntentRequestEvidenceChainV1 {
         }
     }
 
+    pub(super) fn terminal_outcome_finalization(
+        &self,
+    ) -> Option<TerminalOutcomeFinalizationEvidenceRefV1<'_>> {
+        self.entries.iter().find_map(|entry| match entry {
+            IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization {
+                previous_chain_head,
+                transcript_message_index,
+                expected_draft_revision,
+                prior_workspace_revision,
+                next_workspace_revision,
+                human_turn_digest,
+                standalone_request_evidence_digest,
+                standalone_adjudication_digest,
+                standalone_recipe_evidence_digest,
+                ..
+            } => Some(TerminalOutcomeFinalizationEvidenceRefV1 {
+                previous_chain_head,
+                transcript_message_index: *transcript_message_index,
+                expected_draft_revision: *expected_draft_revision,
+                prior_workspace_revision: *prior_workspace_revision,
+                next_workspace_revision: *next_workspace_revision,
+                human_turn_digest,
+                standalone_request_evidence_digest,
+                standalone_adjudication_digest,
+                standalone_recipe_evidence_digest,
+            }),
+            IntentRequestEvidenceEntryV1::InitialHuman { .. }
+            | IntentRequestEvidenceEntryV1::AcceptedResolution { .. } => None,
+        })
+    }
+
+    pub(super) fn terminal_outcome_finalization_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization { .. }
+                )
+            })
+            .count()
+    }
+
     pub(super) fn validate_resolutions_against_workspace(
         &self,
         transcript: &[Message],
@@ -333,7 +542,16 @@ impl IntentRequestEvidenceChainV1 {
         self.validate_against_transcript(transcript)?;
         let mut reproduced = self.initial_workspace(workspace)?;
         validate_initial_channel_grounding(self, transcript, &reproduced, context)?;
-        let accepted = self.entries.iter().skip(1).collect::<Vec<_>>();
+        let accepted = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    IntentRequestEvidenceEntryV1::AcceptedResolution { .. }
+                )
+            })
+            .collect::<Vec<_>>();
         for (offset, entry) in accepted.iter().enumerate() {
             let IntentRequestEvidenceEntryV1::AcceptedResolution {
                 turn_index,
@@ -427,6 +645,9 @@ impl IntentRequestEvidenceChainV1 {
                 | PreparedIntentWorkspaceV2::Resolved { workspace, .. } => workspace,
             };
         }
+        if let Some(finalization) = self.terminal_outcome_finalization() {
+            apply_terminal_outcome_finalization_to_workspace(&mut reproduced, finalization)?;
+        }
         if reproduced != *workspace {
             return Err(evidence_error(
                 "INTENT_REQUEST_EVIDENCE_WORKSPACE_MISMATCH",
@@ -442,7 +663,16 @@ impl IntentRequestEvidenceChainV1 {
         &self,
         workspace: &IntentWorkspaceV2,
     ) -> Result<IntentWorkspaceV2, StructuredError> {
-        let accepted = self.entries.iter().skip(1).collect::<Vec<_>>();
+        let accepted = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    IntentRequestEvidenceEntryV1::AcceptedResolution { .. }
+                )
+            })
+            .collect::<Vec<_>>();
         if accepted.len() > 1 {
             return Err(evidence_error(
                 "INTENT_REQUEST_EVIDENCE_RESOLUTION_COUNT_INVALID",
@@ -459,7 +689,11 @@ impl IntentRequestEvidenceChainV1 {
                 "Start a new intent session",
             )
         })?;
-        if workspace.revision != accepted_count.saturating_add(1) {
+        let mut base = workspace.clone();
+        if let Some(finalization) = self.terminal_outcome_finalization() {
+            reverse_terminal_outcome_finalization_from_workspace(&mut base, finalization)?;
+        }
+        if base.revision != accepted_count.saturating_add(1) {
             return Err(evidence_error(
                 "INTENT_REQUEST_EVIDENCE_WORKSPACE_REVISION_MISMATCH",
                 "intent.request_evidence.entries.expected_revision",
@@ -467,7 +701,6 @@ impl IntentRequestEvidenceChainV1 {
                 "Restore the exact typed workspace and accepted decision history",
             ));
         }
-        let mut base = workspace.clone();
         for entry in accepted.iter().rev() {
             let IntentRequestEvidenceEntryV1::AcceptedResolution {
                 accepted_typed_value,
@@ -496,8 +729,54 @@ impl IntentRequestEvidenceChainV1 {
 
     #[cfg(test)]
     pub(super) fn accepted_resolution_count(&self) -> usize {
-        self.entries.len().saturating_sub(1)
+        self.entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    IntentRequestEvidenceEntryV1::AcceptedResolution { .. }
+                )
+            })
+            .count()
     }
+}
+
+fn reverse_terminal_outcome_finalization_from_workspace(
+    workspace: &mut IntentWorkspaceV2,
+    finalization: TerminalOutcomeFinalizationEvidenceRefV1<'_>,
+) -> Result<(), StructuredError> {
+    if workspace.revision != finalization.next_workspace_revision()
+        || workspace.requested_outcome != IntentRequestedOutcome::ValidatedPreview
+    {
+        return Err(evidence_error(
+            "INTENT_REQUEST_EVIDENCE_FINALIZATION_WORKSPACE_MISMATCH",
+            "intent.workspace.requested_outcome",
+            "Terminal finalization evidence does not match the final workspace revision and outcome",
+            "Restore the exact validated-preview workspace produced by finalization",
+        ));
+    }
+    workspace.revision = finalization.prior_workspace_revision();
+    workspace.requested_outcome = IntentRequestedOutcome::WorkingDraft;
+    Ok(())
+}
+
+fn apply_terminal_outcome_finalization_to_workspace(
+    workspace: &mut IntentWorkspaceV2,
+    finalization: TerminalOutcomeFinalizationEvidenceRefV1<'_>,
+) -> Result<(), StructuredError> {
+    if workspace.revision != finalization.prior_workspace_revision()
+        || workspace.requested_outcome != IntentRequestedOutcome::WorkingDraft
+    {
+        return Err(evidence_error(
+            "INTENT_REQUEST_EVIDENCE_FINALIZATION_WORKSPACE_MISMATCH",
+            "intent.workspace.requested_outcome",
+            "Terminal finalization evidence does not match the prior workspace revision and outcome",
+            "Restore the exact working-draft workspace before finalization",
+        ));
+    }
+    workspace.revision = finalization.next_workspace_revision();
+    workspace.requested_outcome = IntentRequestedOutcome::ValidatedPreview;
+    Ok(())
 }
 
 fn validate_initial_channel_grounding(
@@ -654,6 +933,18 @@ pub(super) fn active_options_digest(active_options: &[String]) -> Result<String,
     )
 }
 
+fn standalone_initial_evidence_digest(
+    transcript_message_index: u64,
+    expected_revision: u64,
+    human_turn_digest: &str,
+) -> Result<String, StructuredError> {
+    entry_digest(&IntentRequestEvidenceEntryV1::InitialHuman {
+        transcript_message_index,
+        expected_revision,
+        human_turn_digest: human_turn_digest.to_string(),
+    })
+}
+
 fn canonical_active_options(active_options: &[String]) -> Result<Vec<String>, StructuredError> {
     if active_options.is_empty() {
         return Err(evidence_error(
@@ -720,6 +1011,55 @@ fn validate_resolution_input(
     Ok(())
 }
 
+fn validate_terminal_finalization_input(
+    input: &TerminalOutcomeFinalizationEvidenceInputV1<'_>,
+) -> Result<(), StructuredError> {
+    validate_workspace_revision_transition(
+        input.prior_workspace_revision,
+        input.next_workspace_revision,
+    )?;
+    for (digest, field) in [
+        (
+            input.standalone_request_evidence_digest,
+            "standalone_request_evidence_digest",
+        ),
+        (
+            input.standalone_adjudication_digest,
+            "standalone_adjudication_digest",
+        ),
+        (
+            input.standalone_recipe_evidence_digest,
+            "standalone_recipe_evidence_digest",
+        ),
+    ] {
+        validate_digest_shape(digest, field)?;
+    }
+    Ok(())
+}
+
+fn validate_workspace_revision_transition(
+    prior_workspace_revision: u64,
+    next_workspace_revision: u64,
+) -> Result<(), StructuredError> {
+    let expected_next = prior_workspace_revision.checked_add(1).ok_or_else(|| {
+        evidence_error(
+            "INTENT_REQUEST_EVIDENCE_WORKSPACE_REVISION_OVERFLOW",
+            "intent.request_evidence.entries.next_workspace_revision",
+            "Terminal finalization workspace revision exceeds the supported range",
+            "Start a new intent session before finalizing the working draft",
+        )
+    })?;
+    if next_workspace_revision != expected_next {
+        return Err(evidence_error(
+            "INTENT_REQUEST_EVIDENCE_FINALIZATION_REVISION_INVALID",
+            "intent.request_evidence.entries.next_workspace_revision",
+            "Terminal finalization must advance the workspace revision exactly once",
+            "Bind the exact working-draft and validated-preview workspace revisions",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_entry_shape(
     entry: &IntentRequestEvidenceEntryV1,
     must_be_initial: bool,
@@ -778,6 +1118,56 @@ fn validate_entry_shape(
             }
             Ok(())
         }
+        IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization {
+            previous_chain_head,
+            prior_workspace_revision,
+            next_workspace_revision,
+            prior_requested_outcome,
+            next_requested_outcome,
+            human_turn_digest,
+            standalone_request_evidence_digest,
+            standalone_adjudication_digest,
+            standalone_recipe_evidence_digest,
+            ..
+        } => {
+            if must_be_initial {
+                return Err(evidence_error(
+                    "INTENT_REQUEST_EVIDENCE_ORDER_INVALID",
+                    "intent.request_evidence.entries",
+                    "Request evidence must begin with initial_human",
+                    "Preserve the original ordered evidence chain",
+                ));
+            }
+            validate_digest_shape(previous_chain_head, "previous_chain_head")?;
+            validate_digest_shape(human_turn_digest, "human_turn_digest")?;
+            validate_digest_shape(
+                standalone_request_evidence_digest,
+                "standalone_request_evidence_digest",
+            )?;
+            validate_digest_shape(
+                standalone_adjudication_digest,
+                "standalone_adjudication_digest",
+            )?;
+            validate_digest_shape(
+                standalone_recipe_evidence_digest,
+                "standalone_recipe_evidence_digest",
+            )?;
+            validate_workspace_revision_transition(
+                *prior_workspace_revision,
+                *next_workspace_revision,
+            )?;
+            if *prior_requested_outcome != IntentRequestedOutcome::WorkingDraft
+                || *next_requested_outcome != IntentRequestedOutcome::ValidatedPreview
+            {
+                return Err(evidence_error(
+                    "INTENT_REQUEST_EVIDENCE_FINALIZATION_OUTCOME_INVALID",
+                    "intent.request_evidence.entries.next_requested_outcome",
+                    "Terminal finalization must be the fixed working-draft to validated-preview transition",
+                    "Restore the exact terminal outcome transition",
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -785,76 +1175,146 @@ fn validate_append_shape(
     previous_entries: &[IntentRequestEvidenceEntryV1],
     entry: &IntentRequestEvidenceEntryV1,
 ) -> Result<(), StructuredError> {
-    let IntentRequestEvidenceEntryV1::AcceptedResolution {
-        turn_index,
-        transcript_message_index,
-        expected_revision,
-        decision_id,
-        decision_path,
-        ..
-    } = entry
-    else {
-        return Err(evidence_error(
-            "INTENT_REQUEST_EVIDENCE_ORDER_INVALID",
-            "intent.request_evidence.entries",
-            "Only accepted_resolution may follow initial_human",
-            "Append only a deterministically accepted decision",
-        ));
-    };
     let Some(previous) = previous_entries.last() else {
         return Err(evidence_error(
             "INTENT_REQUEST_EVIDENCE_EMPTY",
             "intent.request_evidence.entries",
-            "Accepted resolution cannot precede initial human evidence",
+            "Appended evidence cannot precede initial human evidence",
             "Create initial human evidence first",
         ));
     };
-    if *transcript_message_index <= previous.transcript_message_index() {
+    if matches!(
+        previous,
+        IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization { .. }
+    ) {
+        return Err(evidence_error(
+            "INTENT_REQUEST_EVIDENCE_FINALIZATION_NOT_TERMINAL",
+            "intent.request_evidence.entries",
+            "Terminal outcome finalization must be the final request evidence entry",
+            "Remove all evidence appended after terminal finalization",
+        ));
+    }
+    let transcript_message_index = entry.transcript_message_index();
+    if transcript_message_index <= previous.transcript_message_index() {
         return Err(evidence_error(
             "INTENT_REQUEST_EVIDENCE_TRANSCRIPT_ORDER_INVALID",
             "intent.request_evidence.entries.transcript_message_index",
-            "Accepted resolution transcript indices must increase",
+            "Request evidence transcript indices must increase",
             "Preserve append-only transcript ordering",
         ));
     }
-    if *expected_revision < previous.expected_revision() {
-        return Err(evidence_error(
-            "INTENT_REQUEST_EVIDENCE_REVISION_INVALID",
-            "intent.request_evidence.entries.expected_revision",
-            "Accepted resolution revision cannot precede prior evidence",
-            "Use the active decision expected revision",
-        ));
+    match entry {
+        IntentRequestEvidenceEntryV1::AcceptedResolution {
+            turn_index,
+            expected_revision,
+            decision_id,
+            decision_path,
+            ..
+        } => {
+            let Some(previous_expected_revision) = previous.resolution_expected_revision() else {
+                return Err(evidence_error(
+                    "INTENT_REQUEST_EVIDENCE_FINALIZATION_NOT_TERMINAL",
+                    "intent.request_evidence.entries",
+                    "Accepted resolution cannot follow terminal outcome finalization",
+                    "Preserve terminal finalization as the final evidence entry",
+                ));
+            };
+            if *expected_revision < previous_expected_revision {
+                return Err(evidence_error(
+                    "INTENT_REQUEST_EVIDENCE_REVISION_INVALID",
+                    "intent.request_evidence.entries.expected_revision",
+                    "Accepted resolution revision cannot precede prior evidence",
+                    "Use the active decision expected revision",
+                ));
+            }
+            let previous_turn = previous_entries.iter().rev().find_map(|value| match value {
+                IntentRequestEvidenceEntryV1::AcceptedResolution { turn_index, .. } => {
+                    Some(*turn_index)
+                }
+                IntentRequestEvidenceEntryV1::InitialHuman { .. }
+                | IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization { .. } => None,
+            });
+            if previous_turn.is_some_and(|value| *turn_index <= value) {
+                return Err(evidence_error(
+                    "INTENT_REQUEST_EVIDENCE_TURN_ORDER_INVALID",
+                    "intent.request_evidence.entries.turn_index",
+                    "Accepted resolution turn indices must increase",
+                    "Preserve append-only human turn ordering",
+                ));
+            }
+            if previous_entries.iter().any(|value| {
+                matches!(
+                    value,
+                    IntentRequestEvidenceEntryV1::AcceptedResolution {
+                        decision_id: existing_id,
+                        decision_path: existing_path,
+                        ..
+                    } if existing_id == decision_id || existing_path == decision_path
+                )
+            }) {
+                return Err(evidence_error(
+                    "INTENT_REQUEST_EVIDENCE_DECISION_DUPLICATE",
+                    "intent.request_evidence.entries.decision_id",
+                    "A deterministic decision may be accepted only once",
+                    "Preserve only the first accepted value for each decision",
+                ));
+            }
+            Ok(())
+        }
+        IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization {
+            prior_workspace_revision,
+            ..
+        } => {
+            if previous_entries.iter().any(|value| {
+                matches!(
+                    value,
+                    IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization { .. }
+                )
+            }) {
+                return Err(evidence_error(
+                    "INTENT_REQUEST_EVIDENCE_FINALIZATION_DUPLICATE",
+                    "intent.request_evidence.entries",
+                    "Terminal outcome finalization may appear only once",
+                    "Preserve only the first terminal finalization entry",
+                ));
+            }
+            let accepted_count = previous_entries
+                .iter()
+                .filter(|value| {
+                    matches!(
+                        value,
+                        IntentRequestEvidenceEntryV1::AcceptedResolution { .. }
+                    )
+                })
+                .count();
+            let expected_prior_revision = u64::try_from(accepted_count)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| {
+                    evidence_error(
+                        "INTENT_REQUEST_EVIDENCE_OVERFLOW",
+                        "intent.request_evidence.entries.prior_workspace_revision",
+                        "Request evidence workspace revision exceeds the supported range",
+                        "Start a new intent session",
+                    )
+                })?;
+            if *prior_workspace_revision != expected_prior_revision {
+                return Err(evidence_error(
+                    "INTENT_REQUEST_EVIDENCE_FINALIZATION_REVISION_INVALID",
+                    "intent.request_evidence.entries.prior_workspace_revision",
+                    "Terminal finalization prior revision does not match the accepted resolution history",
+                    "Bind finalization to the exact current working-draft workspace revision",
+                ));
+            }
+            Ok(())
+        }
+        IntentRequestEvidenceEntryV1::InitialHuman { .. } => Err(evidence_error(
+            "INTENT_REQUEST_EVIDENCE_ORDER_INVALID",
+            "intent.request_evidence.entries",
+            "Only the first request evidence entry may be initial_human",
+            "Preserve the original ordered evidence chain",
+        )),
     }
-    let previous_turn = previous_entries.iter().rev().find_map(|value| match value {
-        IntentRequestEvidenceEntryV1::AcceptedResolution { turn_index, .. } => Some(*turn_index),
-        IntentRequestEvidenceEntryV1::InitialHuman { .. } => None,
-    });
-    if previous_turn.is_some_and(|value| *turn_index <= value) {
-        return Err(evidence_error(
-            "INTENT_REQUEST_EVIDENCE_TURN_ORDER_INVALID",
-            "intent.request_evidence.entries.turn_index",
-            "Accepted resolution turn indices must increase",
-            "Preserve append-only human turn ordering",
-        ));
-    }
-    if previous_entries.iter().any(|value| {
-        matches!(
-            value,
-            IntentRequestEvidenceEntryV1::AcceptedResolution {
-                decision_id: existing_id,
-                decision_path: existing_path,
-                ..
-            } if existing_id == decision_id || existing_path == decision_path
-        )
-    }) {
-        return Err(evidence_error(
-            "INTENT_REQUEST_EVIDENCE_DECISION_DUPLICATE",
-            "intent.request_evidence.entries.decision_id",
-            "A deterministic decision may be accepted only once",
-            "Preserve only the first accepted value for each decision",
-        ));
-    }
-    Ok(())
 }
 
 fn transcript_human_turn(
@@ -923,6 +1383,9 @@ fn entry_digest(entry: &IntentRequestEvidenceEntryV1) -> Result<String, Structur
         IntentRequestEvidenceEntryV1::AcceptedResolution { .. } => {
             RESOLUTION_EVIDENCE_DIGEST_DOMAIN_V1
         }
+        IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization { .. } => {
+            TERMINAL_FINALIZATION_EVIDENCE_DIGEST_DOMAIN_V1
+        }
     };
     digest_serializable(domain, entry, "intent.request_evidence.entries")
 }
@@ -987,6 +1450,50 @@ mod tests {
             Message::assistant_tool_calls(Vec::new()),
             envelope("study_hub로 해줘"),
         ]
+    }
+
+    fn finalization_transcript() -> Vec<Message> {
+        vec![
+            Message::system("system"),
+            envelope("study_hub에 개인 스터디룸 작업 초안을 만들어줘"),
+            Message::user("INTENT_STATE:{}"),
+            Message::assistant_tool_calls(Vec::new()),
+            envelope("이 작업 초안을 검증된 미리보기로 확정해줘"),
+            Message::user("INTENT_STATE:{}"),
+            envelope("다시 확정해줘"),
+        ]
+    }
+
+    fn finalization_input(
+        standalone_request_evidence_digest: &str,
+    ) -> TerminalOutcomeFinalizationEvidenceInputV1<'_> {
+        TerminalOutcomeFinalizationEvidenceInputV1 {
+            transcript_message_index: 4,
+            expected_draft_revision: 22,
+            prior_workspace_revision: 1,
+            next_workspace_revision: 2,
+            standalone_request_evidence_digest,
+            standalone_adjudication_digest:
+                "2222222222222222222222222222222222222222222222222222222222222222",
+            standalone_recipe_evidence_digest:
+                "3333333333333333333333333333333333333333333333333333333333333333",
+        }
+    }
+
+    fn finalization_request_digest(
+        transcript: &[Message],
+        transcript_message_index: u64,
+        expected_draft_revision: u64,
+    ) -> String {
+        let human_turn =
+            transcript_human_turn(transcript, transcript_message_index, INTENT_HUMAN_PREFIX)
+                .unwrap();
+        standalone_initial_evidence_digest(
+            transcript_message_index,
+            expected_draft_revision,
+            &human_turn_digest(&human_turn).unwrap(),
+        )
+        .unwrap()
     }
 
     fn resolution_input<'a>(options: &'a [String]) -> AcceptedResolutionEvidenceInputV1<'a> {
@@ -1075,6 +1582,20 @@ mod tests {
         chain.head = entry_digest(&chain.entries[1]).unwrap();
     }
 
+    fn rehash_terminal_chain(chain: &mut IntentRequestEvidenceChainV1) {
+        let final_index = chain.entries.len() - 1;
+        let previous_head = entry_digest(&chain.entries[final_index - 1]).unwrap();
+        let IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization {
+            previous_chain_head,
+            ..
+        } = &mut chain.entries[final_index]
+        else {
+            panic!("expected terminal finalization")
+        };
+        *previous_chain_head = previous_head;
+        chain.head = entry_digest(&chain.entries[final_index]).unwrap();
+    }
+
     #[test]
     fn human_turn_digest_normalizes_only_crlf() {
         assert_eq!(
@@ -1127,6 +1648,228 @@ mod tests {
         assert_eq!(chain.head().len(), 64);
         assert!(chain.validate().is_ok());
         assert!(chain.validate_against_transcript(&transcript).is_ok());
+    }
+
+    #[test]
+    fn terminal_finalization_binds_transition_and_standalone_evidence() {
+        let transcript = finalization_transcript();
+        let mut chain =
+            IntentRequestEvidenceChainV1::from_initial_human(&transcript, 1, 21).unwrap();
+        let previous_head = chain.head().to_string();
+        let standalone_request_digest = finalization_request_digest(&transcript, 4, 22);
+        chain
+            .append_terminal_outcome_finalization(
+                &transcript,
+                finalization_input(&standalone_request_digest),
+            )
+            .unwrap();
+        assert_eq!(chain.entries().len(), 2);
+        assert_eq!(chain.accepted_resolution_count(), 0);
+        assert_eq!(chain.terminal_outcome_finalization_count(), 1);
+        assert_ne!(chain.head(), previous_head);
+        let finalization = chain.terminal_outcome_finalization().unwrap();
+        assert_eq!(finalization.previous_chain_head(), previous_head);
+        assert_eq!(finalization.transcript_message_index(), 4);
+        assert_eq!(finalization.expected_draft_revision(), 22);
+        assert_eq!(finalization.prior_workspace_revision(), 1);
+        assert_eq!(finalization.next_workspace_revision(), 2);
+        assert_eq!(
+            finalization.human_turn_digest(),
+            human_turn_digest("이 작업 초안을 검증된 미리보기로 확정해줘").unwrap()
+        );
+        assert_eq!(
+            finalization.standalone_request_evidence_digest(),
+            standalone_request_digest
+        );
+        assert_eq!(
+            finalization.standalone_adjudication_digest(),
+            finalization_input(&standalone_request_digest).standalone_adjudication_digest
+        );
+        assert_eq!(
+            finalization.standalone_recipe_evidence_digest(),
+            finalization_input(&standalone_request_digest).standalone_recipe_evidence_digest
+        );
+        assert!(chain.validate().is_ok());
+        assert!(chain.validate_against_transcript(&transcript).is_ok());
+        let serialized = serde_json::to_value(&chain).unwrap();
+        assert_eq!(
+            serialized["entries"][1]["previous_chain_head"],
+            previous_head
+        );
+        assert_eq!(
+            serialized["entries"][1]["prior_requested_outcome"],
+            "working_draft"
+        );
+        assert_eq!(
+            serialized["entries"][1]["next_requested_outcome"],
+            "validated_preview"
+        );
+    }
+
+    #[test]
+    fn terminal_finalization_reverses_and_replays_workspace_transition() {
+        let transcript = finalization_transcript();
+        let mut chain =
+            IntentRequestEvidenceChainV1::from_initial_human(&transcript, 1, 21).unwrap();
+        let standalone_request_digest = finalization_request_digest(&transcript, 4, 22);
+        chain
+            .append_terminal_outcome_finalization(
+                &transcript,
+                finalization_input(&standalone_request_digest),
+            )
+            .unwrap();
+        let (context, mut final_workspace) = one_shot_workspace();
+        final_workspace.revision = 2;
+        let initial_workspace = chain.initial_workspace(&final_workspace).unwrap();
+        assert_eq!(initial_workspace.revision, 1);
+        assert_eq!(
+            initial_workspace.requested_outcome,
+            IntentRequestedOutcome::WorkingDraft
+        );
+        chain
+            .validate_resolutions_against_workspace(&transcript, &final_workspace, &context)
+            .unwrap();
+    }
+
+    #[test]
+    fn terminal_finalization_reverses_before_accepted_resolution_history() {
+        let mut transcript = transcript();
+        transcript.push(Message::user("INTENT_STATE:{}"));
+        transcript.push(envelope("이 작업 초안을 검증된 미리보기로 확정해줘"));
+        let options = vec!["community".to_string(), "study_hub".to_string()];
+        let mut chain =
+            IntentRequestEvidenceChainV1::from_initial_human(&transcript, 1, 0).unwrap();
+        let mut resolution = resolution_input(&options);
+        resolution.expected_revision = 1;
+        resolution.decision_path = "intent.features.0.configuration.parameters.hub_channel";
+        chain
+            .append_accepted_resolution(&transcript, resolution)
+            .unwrap();
+        let standalone_request_digest = finalization_request_digest(&transcript, 6, 22);
+        let mut finalization = finalization_input(&standalone_request_digest);
+        finalization.transcript_message_index = 6;
+        finalization.prior_workspace_revision = 2;
+        finalization.next_workspace_revision = 3;
+        chain
+            .append_terminal_outcome_finalization(&transcript, finalization)
+            .unwrap();
+        let (context, mut final_workspace) = resolved_workspace();
+        final_workspace.revision = 3;
+        let initial_workspace = chain.initial_workspace(&final_workspace).unwrap();
+        assert_eq!(initial_workspace.revision, 1);
+        assert_eq!(
+            initial_workspace.requested_outcome,
+            IntentRequestedOutcome::WorkingDraft
+        );
+        chain
+            .validate_resolutions_against_workspace(&transcript, &final_workspace, &context)
+            .unwrap();
+    }
+
+    #[test]
+    fn terminal_finalization_is_unique_and_terminal() {
+        let transcript = finalization_transcript();
+        let mut chain =
+            IntentRequestEvidenceChainV1::from_initial_human(&transcript, 1, 21).unwrap();
+        let standalone_request_digest = finalization_request_digest(&transcript, 4, 22);
+        chain
+            .append_terminal_outcome_finalization(
+                &transcript,
+                finalization_input(&standalone_request_digest),
+            )
+            .unwrap();
+        let second_request_digest = finalization_request_digest(&transcript, 6, 22);
+        let mut second = finalization_input(&second_request_digest);
+        second.transcript_message_index = 6;
+        second.prior_workspace_revision = 2;
+        second.next_workspace_revision = 3;
+        assert_eq!(
+            chain
+                .append_terminal_outcome_finalization(&transcript, second)
+                .unwrap_err()
+                .code,
+            "INTENT_REQUEST_EVIDENCE_FINALIZATION_NOT_TERMINAL"
+        );
+
+        let options = vec!["study_hub".to_string()];
+        let mut resolution = resolution_input(&options);
+        resolution.transcript_message_index = 6;
+        resolution.expected_revision = 22;
+        assert_eq!(
+            chain
+                .append_accepted_resolution(&transcript, resolution)
+                .unwrap_err()
+                .code,
+            "INTENT_REQUEST_EVIDENCE_FINALIZATION_NOT_TERMINAL"
+        );
+    }
+
+    #[test]
+    fn terminal_finalization_semantic_and_digest_tampering_rejects() {
+        let transcript = finalization_transcript();
+        let mut baseline =
+            IntentRequestEvidenceChainV1::from_initial_human(&transcript, 1, 21).unwrap();
+        let standalone_request_digest = finalization_request_digest(&transcript, 4, 22);
+        baseline
+            .append_terminal_outcome_finalization(
+                &transcript,
+                finalization_input(&standalone_request_digest),
+            )
+            .unwrap();
+        for pointer in [
+            "/entries/1/previous_chain_head",
+            "/entries/1/transcript_message_index",
+            "/entries/1/expected_draft_revision",
+            "/entries/1/prior_workspace_revision",
+            "/entries/1/next_workspace_revision",
+            "/entries/1/prior_requested_outcome",
+            "/entries/1/next_requested_outcome",
+            "/entries/1/human_turn_digest",
+            "/entries/1/standalone_request_evidence_digest",
+            "/entries/1/standalone_adjudication_digest",
+            "/entries/1/standalone_recipe_evidence_digest",
+            "/head",
+        ] {
+            let mut value = serde_json::to_value(&baseline).unwrap();
+            let target = value.pointer_mut(pointer).unwrap();
+            *target = match target {
+                serde_json::Value::Number(_) => json!(99),
+                _ => json!("tampered"),
+            };
+            if let Ok(tampered) = serde_json::from_value::<IntentRequestEvidenceChainV1>(value) {
+                assert!(tampered.validate().is_err(), "tamper accepted at {pointer}");
+            }
+        }
+
+        let mut changed_outcome = baseline.clone();
+        let IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization {
+            next_requested_outcome,
+            ..
+        } = &mut changed_outcome.entries[1]
+        else {
+            panic!("expected terminal finalization")
+        };
+        *next_requested_outcome = IntentRequestedOutcome::WorkingDraft;
+        rehash_terminal_chain(&mut changed_outcome);
+        assert_eq!(
+            changed_outcome.validate().unwrap_err().code,
+            "INTENT_REQUEST_EVIDENCE_FINALIZATION_OUTCOME_INVALID"
+        );
+
+        let mut changed_revision = baseline;
+        let IntentRequestEvidenceEntryV1::TerminalOutcomeFinalization {
+            next_workspace_revision,
+            ..
+        } = &mut changed_revision.entries[1]
+        else {
+            panic!("expected terminal finalization")
+        };
+        *next_workspace_revision = 9;
+        rehash_terminal_chain(&mut changed_revision);
+        assert_eq!(
+            changed_revision.validate().unwrap_err().code,
+            "INTENT_REQUEST_EVIDENCE_FINALIZATION_REVISION_INVALID"
+        );
     }
 
     #[test]
