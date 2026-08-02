@@ -4,6 +4,7 @@
   const RESOURCE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
   const DIGEST = /^[0-9a-f]{64}$/;
   const COOKIE_NAME = "__Host-starring_csrf";
+  const FINALIZE_EXISTING_PREVIEW_MESSAGE = "Do not change the current Draft. Keep every existing feature and the current community_hub channel binding exactly unchanged. The only allowed semantic transition is requested_outcome from working_draft to validated_preview. Revalidate the exact current candidate, run the required simulation, and finish with a promotable preview. Do not ask another question.";
 
   function requireResourceId(value, label) {
     if (typeof value !== "string" || !RESOURCE_ID.test(value)) {
@@ -375,7 +376,7 @@
       if (typeof input.confirmPreview !== "function") {
         throw new Error("preview_confirmation_required");
       }
-      const turn = await authoringTurn({
+      let turn = await authoringTurn({
         installationId: input.installationId,
         sessionId: input.sessionId,
         expectedGeneration: input.expectedGeneration || 0,
@@ -391,12 +392,52 @@
       ) {
         throw new Error("authoring_not_preview_ready");
       }
-      const promoted = await promote({
-        installationId: input.installationId,
-        sessionId: input.sessionId,
-        expectedGeneration: turn.body.generation,
-        idempotencyKey: input.promotionIdempotencyKey,
-      });
+      let promoted;
+      try {
+        promoted = await promote({
+          installationId: input.installationId,
+          sessionId: input.sessionId,
+          expectedGeneration: turn.body.generation,
+          idempotencyKey: input.promotionIdempotencyKey,
+        });
+      } catch (error) {
+        if (
+          !error ||
+          error.name !== "StarringD2ProductRequestError" ||
+          error.status !== 422 ||
+          error.code !== "invalid_server_candidate"
+        ) {
+          throw error;
+        }
+        const priorGeneration = turn.body.generation;
+        if (priorGeneration >= Number.MAX_SAFE_INTEGER) {
+          throw new Error("authoring_generation_exhausted");
+        }
+        const expectedFinalizedGeneration = priorGeneration + 1;
+        const finalized = await authoringTurn({
+          installationId: input.installationId,
+          sessionId: input.sessionId,
+          expectedGeneration: priorGeneration,
+          message: FINALIZE_EXISTING_PREVIEW_MESSAGE,
+          idempotencyKey: input.finalizationIdempotencyKey || idempotencyKey("authoring_finalize"),
+          signal: input.signal,
+        });
+        if (
+          !finalized.body ||
+          !finalized.body.projection ||
+          finalized.body.projection.state !== "preview_ready" ||
+          finalized.body.generation !== expectedFinalizedGeneration
+        ) {
+          throw new Error("authoring_finalization_not_preview_ready");
+        }
+        turn = finalized;
+        promoted = await promote({
+          installationId: input.installationId,
+          sessionId: input.sessionId,
+          expectedGeneration: turn.body.generation,
+          idempotencyKey: input.finalizedPromotionIdempotencyKey || idempotencyKey("promote_finalized"),
+        });
+      }
       if (!promoted.body || promoted.body.state !== "pending_approval") {
         throw new Error("promotion_not_pending_approval");
       }

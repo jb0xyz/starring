@@ -141,6 +141,134 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
 });
 
 
+test("one-shot flow repairs only an invalid working draft candidate once", async () => {
+  const calls = [];
+  const responses = [
+    response(201, {
+      session_id: "session-1",
+      generation: 1,
+      disposition: "created",
+      projection: {
+        state: "preview_ready",
+        preview: { revision: 22, receipt: { candidate_ruleset_hash: DIGEST } },
+      },
+    }),
+    response(422, {
+      error: {
+        code: "invalid_server_candidate",
+        request_id: "request-1",
+        retryable: false,
+      },
+    }),
+    response(201, {
+      session_id: "session-1",
+      generation: 2,
+      disposition: "created",
+      projection: {
+        state: "preview_ready",
+        preview: { revision: 22, receipt: { candidate_ruleset_hash: DIGEST } },
+      },
+    }),
+    response(201, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: DIGEST,
+      replayed: false,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: DIGEST,
+      summary: {
+        panels: 1,
+        modals: 1,
+        rules: 4,
+        actions: 15,
+        target_version: 1,
+        required_approvals: 1,
+      },
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 2,
+      state: "approved",
+      replayed: false,
+    }),
+    response(202, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "runtime_pending",
+      replayed: false,
+    }),
+  ];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options, body: options.body && JSON.parse(options.body) });
+    return responses.shift();
+  };
+  const evidence = await driver(fetchImpl).runOneShotProductFlow({
+    installationId: "installation-1",
+    sessionId: "session-1",
+    message: "Create the private study room automation",
+    confirmPreview: async () => true,
+  });
+  assert.equal(calls.length, 7);
+  assert.deepEqual(calls[2].body.expected_generation, 1);
+  assert.match(calls[2].body.message, /working_draft to validated_preview/);
+  assert.deepEqual(calls[3].body, { expected_generation: 2 });
+  assert.notEqual(
+    calls[1].options.headers["idempotency-key"],
+    calls[3].options.headers["idempotency-key"]
+  );
+  assert.equal(evidence.authoring.generation, 2);
+  assert.equal(evidence.authoring.preview_revision, 22);
+  assert.equal(evidence.applied.state, "runtime_pending");
+  const serialized = JSON.stringify(evidence);
+  assert.equal(serialized.includes("working_draft"), false);
+  assert.equal(serialized.includes("Create the private study room automation"), false);
+});
+
+
+test("one-shot flow does not repair other promotion failures", async () => {
+  const responses = [
+    response(201, {
+      session_id: "session-1",
+      generation: 1,
+      disposition: "created",
+      projection: {
+        state: "preview_ready",
+        preview: { revision: 22, receipt: { candidate_ruleset_hash: DIGEST } },
+      },
+    }),
+    response(422, {
+      error: {
+        code: "candidate_generation_stale",
+        request_id: "request-1",
+        retryable: false,
+      },
+    }),
+  ];
+  let calls = 0;
+  await assert.rejects(
+    driver(async () => {
+      calls += 1;
+      return responses.shift();
+    }).runOneShotProductFlow({
+      installationId: "installation-1",
+      sessionId: "session-1",
+      message: "Create the private study room automation",
+      confirmPreview: async () => true,
+    }),
+    (error) => error.code === "candidate_generation_stale"
+  );
+  assert.equal(calls, 2);
+});
+
+
 test("one-shot flow requires an explicit preview confirmation boundary", async () => {
   let calls = 0;
   const product = driver(async () => {
