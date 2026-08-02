@@ -292,6 +292,7 @@ mod tests {
         let config = Config::for_test(
             root.path().to_path_buf(),
             "7",
+            "5",
             "8",
             "6",
             "127.0.0.1:21001".parse().unwrap(),
@@ -357,6 +358,7 @@ mod tests {
         let config = Config::for_test(
             root.path().to_path_buf(),
             "7",
+            "5",
             "8",
             "6",
             "127.0.0.1:21001".parse().unwrap(),
@@ -394,6 +396,8 @@ mod tests {
         let response: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["ok"], true);
         assert_eq!(response["snapshot"]["ready"], false);
+        assert_eq!(response["snapshot"]["version"], 2);
+        assert_eq!(response["snapshot"]["hub_channel_id"], "5");
         let mut stream = UnixStream::connect(&socket).await.unwrap();
         let shutdown = json!({
             "version": 1,

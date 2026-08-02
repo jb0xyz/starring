@@ -401,15 +401,18 @@ fn validate_method_and_path(
     let segments = uri.path().split('/').collect::<Vec<_>>();
     let allowed = match segments.as_slice() {
         ["", "api", "v10", "guilds", guild, "roles"] => {
-            *guild == config.guild_id() && matches!(*method, Method::GET | Method::POST)
+            *guild == config.guild_id()
+                && (*method == Method::GET || (*method == Method::POST && uri.query().is_none()))
         }
         ["", "api", "v10", "guilds", guild, "roles", role] => {
             *guild == config.guild_id()
                 && state.owns_role(role)
-                && matches!(*method, Method::GET | Method::PATCH | Method::DELETE)
+                && (*method == Method::GET
+                    || (matches!(*method, Method::PATCH | Method::DELETE) && uri.query().is_none()))
         }
         ["", "api", "v10", "guilds", guild, "channels"] => {
-            *guild == config.guild_id() && matches!(*method, Method::GET | Method::POST)
+            *guild == config.guild_id()
+                && (*method == Method::GET || (*method == Method::POST && uri.query().is_none()))
         }
         ["", "api", "v10", "guilds", guild, "audit-logs"] => {
             *guild == config.guild_id() && *method == Method::GET
@@ -424,10 +427,12 @@ fn validate_method_and_path(
                 && *actor == config.actor_id()
                 && state.owns_role(role)
                 && matches!(*method, Method::PUT | Method::DELETE)
+                && uri.query().is_none()
         }
         ["", "api", "v10", "channels", channel] => {
             state.owns_channel(channel)
-                && matches!(*method, Method::GET | Method::PATCH | Method::DELETE)
+                && (*method == Method::GET
+                    || (matches!(*method, Method::PATCH | Method::DELETE) && uri.query().is_none()))
         }
         ["", "api", "v10", "channels", channel, "permissions", target] => {
             state.owns_channel(channel)
@@ -435,14 +440,20 @@ fn validate_method_and_path(
                     || *target == config.guild_id()
                     || *target == config.actor_id())
                 && matches!(*method, Method::PUT | Method::DELETE)
+                && uri.query().is_none()
         }
         ["", "api", "v10", "channels", channel, "messages"] => {
-            state.owns_channel(channel) && matches!(*method, Method::GET | Method::POST)
+            uri.query().is_none()
+                && ((*method == Method::POST && state.admits_message_creation(channel))
+                    || (*method == Method::GET && state.owns_channel(channel)))
         }
         ["", "api", "v10", "channels", channel, "messages", message] => {
-            state.owns_channel(channel)
+            uri.query().is_none()
                 && state.owns_message(channel, message)
-                && matches!(*method, Method::GET | Method::PATCH | Method::DELETE)
+                && ((state.owns_channel(channel)
+                    && matches!(*method, Method::GET | Method::PATCH | Method::DELETE))
+                    || (*channel == config.hub_channel_id()
+                        && matches!(*method, Method::GET | Method::DELETE)))
         }
         ["", "api", "v10", "users", "@me"] => *method == Method::GET && uri.query().is_none(),
         _ => false,
@@ -661,6 +672,21 @@ mod tests {
                                     .body(Full::new(Bytes::from(body)))
                                     .unwrap()
                             }
+                            "/api/v10/channels/5/messages" => {
+                                assert_eq!(request.method(), Method::POST);
+                                Response::builder()
+                                    .status(StatusCode::CREATED)
+                                    .header("content-type", "application/json")
+                                    .body(Full::new(Bytes::from_static(br#"{"id":"15"}"#)))
+                                    .unwrap()
+                            }
+                            "/api/v10/channels/5/messages/15" => {
+                                assert_eq!(request.method(), Method::DELETE);
+                                Response::builder()
+                                    .status(StatusCode::NO_CONTENT)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap()
+                            }
                             _ => panic!("unexpected fake upstream path"),
                         };
                         Ok::<_, Infallible>(response)
@@ -687,6 +713,20 @@ mod tests {
         .into_bytes()
     }
 
+    fn raw_create_hub_message_request(proxy: SocketAddrV4) -> Vec<u8> {
+        format!(
+            "POST /api/v10/channels/5/messages HTTP/1.1\r\nHost: {proxy}\r\nAuthorization: Bot secret-test-value\r\nContent-Type: application/json\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{{\"content\":\"room\"}}"
+        )
+        .into_bytes()
+    }
+
+    fn raw_delete_hub_message_request(proxy: SocketAddrV4) -> Vec<u8> {
+        format!(
+            "DELETE /api/v10/channels/5/messages/15 HTTP/1.1\r\nHost: {proxy}\r\nAuthorization: Bot secret-test-value\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
     #[tokio::test]
     async fn fake_upstream_success_is_consumed_then_downstream_gets_zero_bytes_once() {
         let root = TempDir::new().unwrap();
@@ -698,6 +738,7 @@ mod tests {
         let config = Config::for_test(
             root.path().to_path_buf(),
             "7",
+            "5",
             "8",
             "6",
             gateway_address,
@@ -789,12 +830,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinned_hub_message_is_tracked_and_can_be_deleted_without_channel_ownership() {
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let upstream_address = reserve_address().await;
+        let proxy_address = reserve_address().await;
+        let gateway_address = reserve_address().await;
+        let upstream = tokio::spawn(fake_upstream(upstream_address));
+        let config = Config::for_test(
+            root.path().to_path_buf(),
+            "7",
+            "5",
+            "8",
+            "6",
+            gateway_address,
+            proxy_address,
+            format!("ws://{gateway_address}"),
+            format!("http://{upstream_address}"),
+        );
+        let state = Arc::new(SharedState::new(&config).unwrap());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_config = config.clone();
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            serve(server_config, server_state, shutdown_rx)
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut create = TcpStream::connect(proxy_address).await.unwrap();
+        create
+            .write_all(&raw_create_hub_message_request(proxy_address))
+            .await
+            .unwrap();
+        let mut create_response = Vec::new();
+        create.read_to_end(&mut create_response).await.unwrap();
+        assert!(String::from_utf8(create_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 201 Created\r\n"));
+        assert!(!state.owns_channel("5"));
+        assert!(state.owns_message("5", "15"));
+        let mut delete = TcpStream::connect(proxy_address).await.unwrap();
+        delete
+            .write_all(&raw_delete_hub_message_request(proxy_address))
+            .await
+            .unwrap();
+        let mut delete_response = Vec::new();
+        delete.read_to_end(&mut delete_response).await.unwrap();
+        assert!(String::from_utf8(delete_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(!state.owns_message("5", "15"));
+        let snapshot = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(snapshot["effect_http"]["forwarded_requests"], 2);
+        assert_eq!(snapshot["effect_http"]["rejected_requests"], 0);
+        assert_eq!(snapshot["effect_http"]["owned_channel_count"], 0);
+        assert_eq!(snapshot["effect_http"]["owned_message_count"], 0);
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap();
+        upstream.abort();
+    }
+
+    #[tokio::test]
     async fn mismatched_guild_and_host_fail_before_fake_upstream() {
         let root = TempDir::new().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let config = Config::for_test(
             root.path().to_path_buf(),
             "7",
+            "5",
             "8",
             "6",
             "127.0.0.1:21001".parse().unwrap(),
@@ -844,6 +948,88 @@ mod tests {
             ),
             Err(StatusCode::FORBIDDEN)
         );
+        for method in [Method::GET, Method::PATCH, Method::DELETE] {
+            assert_eq!(
+                validate_method_and_path(
+                    &method,
+                    &"/api/v10/channels/5".parse().unwrap(),
+                    &config,
+                    &state
+                ),
+                Err(StatusCode::FORBIDDEN)
+            );
+        }
+        assert_eq!(
+            validate_method_and_path(
+                &Method::PUT,
+                &"/api/v10/channels/5/permissions/7".parse().unwrap(),
+                &config,
+                &state
+            ),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            validate_method_and_path(
+                &Method::POST,
+                &"/api/v10/channels/5/messages".parse().unwrap(),
+                &config,
+                &state
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_method_and_path(
+                &Method::GET,
+                &"/api/v10/channels/5/messages".parse().unwrap(),
+                &config,
+                &state
+            ),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            validate_method_and_path(
+                &Method::POST,
+                &"/api/v10/channels/5/messages?limit=1".parse().unwrap(),
+                &config,
+                &state
+            ),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert!(state
+            .reserve_resource(ResourceKind::Message {
+                channel_id: "5".to_owned()
+            })
+            .unwrap()
+            .commit("15".to_owned()));
+        for method in [Method::GET, Method::DELETE] {
+            assert_eq!(
+                validate_method_and_path(
+                    &method,
+                    &"/api/v10/channels/5/messages/15".parse().unwrap(),
+                    &config,
+                    &state
+                ),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            validate_method_and_path(
+                &Method::PATCH,
+                &"/api/v10/channels/5/messages/15".parse().unwrap(),
+                &config,
+                &state
+            ),
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert_eq!(
+            validate_method_and_path(
+                &Method::DELETE,
+                &"/api/v10/channels/5/messages/16".parse().unwrap(),
+                &config,
+                &state
+            ),
+            Err(StatusCode::FORBIDDEN)
+        );
         assert!(state
             .reserve_resource(ResourceKind::Channel)
             .unwrap()
@@ -885,6 +1071,79 @@ mod tests {
             ),
             Err(StatusCode::FORBIDDEN)
         );
+    }
+
+    #[test]
+    fn tracked_mutations_reject_query_suffixes() {
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let config = Config::for_test(
+            root.path().to_path_buf(),
+            "7",
+            "5",
+            "8",
+            "6",
+            "127.0.0.1:21001".parse().unwrap(),
+            "127.0.0.1:21002".parse().unwrap(),
+            "ws://127.0.0.1:22001".to_owned(),
+            "http://127.0.0.1:22002".to_owned(),
+        );
+        let state = Arc::new(SharedState::new(&config).unwrap());
+        for path in [
+            "/api/v10/guilds/7/roles?unexpected=1",
+            "/api/v10/guilds/7/channels?unexpected=1",
+        ] {
+            assert_eq!(
+                validate_method_and_path(&Method::POST, &path.parse().unwrap(), &config, &state),
+                Err(StatusCode::FORBIDDEN)
+            );
+        }
+        assert!(state
+            .reserve_resource(ResourceKind::Role)
+            .unwrap()
+            .commit("12".to_owned()));
+        assert!(state
+            .reserve_resource(ResourceKind::Channel)
+            .unwrap()
+            .commit("11".to_owned()));
+        assert!(state
+            .reserve_resource(ResourceKind::Message {
+                channel_id: "11".to_owned()
+            })
+            .unwrap()
+            .commit("13".to_owned()));
+        for (method, path) in [
+            (Method::PATCH, "/api/v10/guilds/7/roles/12?unexpected=1"),
+            (Method::DELETE, "/api/v10/guilds/7/roles/12?unexpected=1"),
+            (Method::PATCH, "/api/v10/channels/11?unexpected=1"),
+            (Method::DELETE, "/api/v10/channels/11?unexpected=1"),
+            (
+                Method::PUT,
+                "/api/v10/guilds/7/members/8/roles/12?unexpected=1",
+            ),
+            (
+                Method::DELETE,
+                "/api/v10/guilds/7/members/8/roles/12?unexpected=1",
+            ),
+            (
+                Method::PUT,
+                "/api/v10/channels/11/permissions/12?unexpected=1",
+            ),
+            (
+                Method::DELETE,
+                "/api/v10/channels/11/permissions/12?unexpected=1",
+            ),
+            (Method::POST, "/api/v10/channels/11/messages?unexpected=1"),
+            (
+                Method::DELETE,
+                "/api/v10/channels/11/messages/13?unexpected=1",
+            ),
+        ] {
+            assert_eq!(
+                validate_method_and_path(&method, &path.parse().unwrap(), &config, &state),
+                Err(StatusCode::FORBIDDEN)
+            );
+        }
     }
 
     #[test]

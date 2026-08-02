@@ -279,6 +279,8 @@ def compose_plists(context):
                 manifest["run_id"],
                 "--guild-id",
                 manifest["discord"]["guild_id"],
+                "--hub-channel-id",
+                manifest["discord"]["hub_channel_id"],
                 "--actor-id",
                 manifest["discord"]["actor_id"],
                 "--bot-user-id",

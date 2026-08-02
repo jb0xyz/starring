@@ -226,10 +226,11 @@ class FakePlatform:
     def transport_control(self, context, command, fields=None, timeout_seconds=3):
         if self.transport_state is None:
             self.transport_state = {
-                "version": 1,
+                "version": 2,
                 "ready": True,
                 "run_id": context.manifest["run_id"],
                 "guild_id": context.manifest["discord"]["guild_id"],
+                "hub_channel_id": context.manifest["discord"]["hub_channel_id"],
                 "actor_id": context.manifest["discord"]["actor_id"],
                 "bot_user_id": context.manifest["discord"]["bot_user_id"],
                 "instance_id": "d2ti-0123456789abcdef0123456789abcdef",
@@ -611,6 +612,8 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
                 self.context.manifest["run_id"],
                 "--guild-id",
                 self.context.manifest["discord"]["guild_id"],
+                "--hub-channel-id",
+                self.context.manifest["discord"]["hub_channel_id"],
                 "--actor-id",
                 self.context.manifest["discord"]["actor_id"],
                 "--bot-user-id",
@@ -645,10 +648,11 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
 
     def test_transport_snapshot_health_is_exact_and_identity_bound(self):
         snapshot = {
-            "version": 1,
+            "version": 2,
             "ready": True,
             "run_id": self.context.manifest["run_id"],
             "guild_id": self.context.manifest["discord"]["guild_id"],
+            "hub_channel_id": self.context.manifest["discord"]["hub_channel_id"],
             "actor_id": self.context.manifest["discord"]["actor_id"],
             "bot_user_id": self.context.manifest["discord"]["bot_user_id"],
             "instance_id": "d2ti-0123456789abcdef0123456789abcdef",
@@ -698,6 +702,9 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         identity_drift = json.loads(json.dumps(snapshot))
         identity_drift["actor_id"] = "1056857223529250907"
         self.assertFalse(platform._transport_snapshot_valid(self.context, identity_drift))
+        hub_drift = json.loads(json.dumps(snapshot))
+        hub_drift["hub_channel_id"] = "1524810437118525555"
+        self.assertFalse(platform._transport_snapshot_valid(self.context, hub_drift))
         widened = json.loads(json.dumps(snapshot))
         widened["gateway"]["unpinned"] = 0
         self.assertFalse(platform._transport_snapshot_valid(self.context, widened))

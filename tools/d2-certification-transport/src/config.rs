@@ -15,6 +15,7 @@ pub struct Config {
     root: PathBuf,
     run_id: String,
     guild_id: String,
+    hub_channel_id: String,
     actor_id: String,
     bot_user_id: String,
     gateway_listen: SocketAddrV4,
@@ -60,6 +61,7 @@ impl Config {
                 "--root"
                     | "--run-id"
                     | "--guild-id"
+                    | "--hub-channel-id"
                     | "--actor-id"
                     | "--bot-user-id"
                     | "--gateway-listen"
@@ -72,7 +74,7 @@ impl Config {
                 return Err(ConfigError::ArgumentContract);
             }
         }
-        if values.len() != 7 {
+        if values.len() != 8 {
             return Err(ConfigError::ArgumentContract);
         }
         let root = PathBuf::from(
@@ -85,6 +87,9 @@ impl Config {
             .ok_or(ConfigError::ArgumentContract)?;
         let guild_id = values
             .remove("--guild-id")
+            .ok_or(ConfigError::ArgumentContract)?;
+        let hub_channel_id = values
+            .remove("--hub-channel-id")
             .ok_or(ConfigError::ArgumentContract)?;
         let actor_id = values
             .remove("--actor-id")
@@ -106,6 +111,7 @@ impl Config {
             root,
             run_id,
             guild_id,
+            hub_channel_id,
             actor_id,
             bot_user_id,
             gateway_listen,
@@ -120,6 +126,7 @@ impl Config {
         root: PathBuf,
         run_id: String,
         guild_id: String,
+        hub_channel_id: String,
         actor_id: String,
         bot_user_id: String,
         gateway_listen: SocketAddrV4,
@@ -133,9 +140,13 @@ impl Config {
         }
         if !valid_run_id(&run_id)
             || !valid_snowflake(&guild_id)
+            || !valid_snowflake(&hub_channel_id)
             || !valid_snowflake(&actor_id)
             || !valid_snowflake(&bot_user_id)
             || actor_id == bot_user_id
+            || hub_channel_id == guild_id
+            || hub_channel_id == actor_id
+            || hub_channel_id == bot_user_id
         {
             return Err(ConfigError::Identity);
         }
@@ -146,6 +157,7 @@ impl Config {
             root: canonical_root,
             run_id,
             guild_id,
+            hub_channel_id,
             actor_id,
             bot_user_id,
             gateway_listen,
@@ -165,6 +177,10 @@ impl Config {
 
     pub fn guild_id(&self) -> &str {
         &self.guild_id
+    }
+
+    pub fn hub_channel_id(&self) -> &str {
+        &self.hub_channel_id
     }
 
     pub fn actor_id(&self) -> &str {
@@ -204,6 +220,7 @@ impl Config {
     pub fn for_test(
         root: PathBuf,
         guild_id: &str,
+        hub_channel_id: &str,
         actor_id: &str,
         bot_user_id: &str,
         gateway_listen: SocketAddrV4,
@@ -216,6 +233,7 @@ impl Config {
             root,
             "d2-test-run".to_owned(),
             guild_id.to_owned(),
+            hub_channel_id.to_owned(),
             actor_id.to_owned(),
             bot_user_id.to_owned(),
             gateway_listen,
@@ -284,6 +302,8 @@ mod tests {
             "d2-release-1",
             "--guild-id",
             "123456789",
+            "--hub-channel-id",
+            "444444444",
             "--actor-id",
             "987654321",
             "--bot-user-id",
@@ -294,8 +314,9 @@ mod tests {
             "127.0.0.1:21002",
         ]
         .into_iter()
-        .map(str::to_owned);
-        let config = Config::from_arguments(arguments).unwrap();
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        let config = Config::from_arguments(arguments.clone()).unwrap();
         assert_eq!(
             config.control_socket(),
             canonical_root.join(CONTROL_SOCKET_NAME)
@@ -305,6 +326,25 @@ mod tests {
             "wss://gateway.discord.gg/?v=10&encoding=json"
         );
         assert_eq!(config.http_upstream(), "https://discord.com");
+        assert_eq!(config.hub_channel_id(), "444444444");
+        let mut missing = arguments.clone();
+        missing.drain(6..8);
+        assert_eq!(
+            Config::from_arguments(missing).err(),
+            Some(ConfigError::ArgumentContract)
+        );
+        let mut duplicate = arguments.clone();
+        duplicate.extend(["--hub-channel-id".to_owned(), "444444445".to_owned()]);
+        assert_eq!(
+            Config::from_arguments(duplicate).err(),
+            Some(ConfigError::ArgumentContract)
+        );
+        let mut unknown = arguments;
+        unknown.extend(["--channel-id".to_owned(), "444444444".to_owned()]);
+        assert_eq!(
+            Config::from_arguments(unknown).err(),
+            Some(ConfigError::ArgumentContract)
+        );
     }
 
     #[test]
@@ -315,6 +355,7 @@ mod tests {
             root.path().to_path_buf(),
             "d2-release-1".to_owned(),
             "7".to_owned(),
+            "5".to_owned(),
             "8".to_owned(),
             "9".to_owned(),
             "127.0.0.1:21001".parse().unwrap(),
@@ -328,5 +369,24 @@ mod tests {
         assert!(parse_loopback("0.0.0.0:21001").is_err());
         assert!(parse_loopback("127.0.0.1:80").is_err());
         assert!(parse_loopback("[::1]:21001").is_err());
+
+        let private_root = TempDir::new().unwrap();
+        fs::set_permissions(private_root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let canonical_root = fs::canonicalize(private_root.path()).unwrap();
+        for hub_channel_id in ["0", "7", "8", "9"] {
+            let result = Config::validated(
+                canonical_root.clone(),
+                "d2-release-1".to_owned(),
+                "7".to_owned(),
+                hub_channel_id.to_owned(),
+                "8".to_owned(),
+                "9".to_owned(),
+                "127.0.0.1:21001".parse().unwrap(),
+                "127.0.0.1:21002".parse().unwrap(),
+                String::new(),
+                String::new(),
+            );
+            assert_eq!(result.err(), Some(ConfigError::Identity));
+        }
     }
 }

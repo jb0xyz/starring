@@ -278,6 +278,7 @@ mod tests {
         let config = Config::for_test(
             root.path().to_path_buf(),
             "7",
+            "5",
             "8",
             "6",
             gateway_address,
@@ -350,6 +351,7 @@ mod tests {
         let config = Config::for_test(
             root.path().to_path_buf(),
             "7",
+            "5",
             "8",
             "6",
             "127.0.0.1:21001".parse().unwrap(),

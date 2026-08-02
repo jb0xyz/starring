@@ -678,6 +678,7 @@ class Platform:
             "ready",
             "run_id",
             "guild_id",
+            "hub_channel_id",
             "actor_id",
             "bot_user_id",
             "instance_id",
@@ -686,12 +687,14 @@ class Platform:
         }:
             return False
         if (
-            snapshot["version"] != 1
+            snapshot["version"] != 2
             or type(snapshot["ready"]) is not bool
             or require_ready
             and snapshot["ready"] is not True
             or snapshot["run_id"] != context.manifest["run_id"]
             or snapshot["guild_id"] != context.manifest["discord"]["guild_id"]
+            or snapshot["hub_channel_id"]
+            != context.manifest["discord"]["hub_channel_id"]
             or snapshot["actor_id"] != context.manifest["discord"]["actor_id"]
             or snapshot["bot_user_id"]
             != context.manifest["discord"]["bot_user_id"]

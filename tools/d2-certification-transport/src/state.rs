@@ -16,6 +16,7 @@ const ARM_LIFETIME: Duration = Duration::from_secs(60);
 pub struct SharedState {
     run_id: String,
     guild_id: String,
+    hub_channel_id: String,
     actor_id: String,
     bot_user_id: String,
     instance_id: String,
@@ -111,6 +112,7 @@ pub struct Snapshot {
     instance_id: String,
     run_id: String,
     guild_id: String,
+    hub_channel_id: String,
     actor_id: String,
     bot_user_id: String,
     gateway: GatewaySnapshot,
@@ -160,6 +162,7 @@ impl SharedState {
         Ok(Self {
             run_id: config.run_id().to_owned(),
             guild_id: config.guild_id().to_owned(),
+            hub_channel_id: config.hub_channel_id().to_owned(),
             actor_id: config.actor_id().to_owned(),
             bot_user_id: config.bot_user_id().to_owned(),
             instance_id,
@@ -519,7 +522,7 @@ impl SharedState {
                 inner.owned_channel_ids.len() + inner.pending_channel_slots < MAX_OWNED_IDENTITIES
             }
             ResourceKind::Message { channel_id } => {
-                inner.owned_channel_ids.contains(channel_id)
+                (inner.owned_channel_ids.contains(channel_id) || *channel_id == self.hub_channel_id)
                     && inner.owned_message_ids.len() + inner.pending_message_slots
                         < MAX_OWNED_IDENTITIES
             }
@@ -555,6 +558,10 @@ impl SharedState {
             .contains(id)
     }
 
+    pub fn admits_message_creation(&self, channel_id: &str) -> bool {
+        channel_id == self.hub_channel_id || self.owns_channel(channel_id)
+    }
+
     pub fn owns_message(&self, channel_id: &str, id: &str) -> bool {
         self.inner
             .lock()
@@ -574,9 +581,11 @@ impl SharedState {
     pub fn remove_channel(&self, id: &str) -> bool {
         let mut inner = self.inner.lock().expect("state mutex poisoned");
         let removed = inner.owned_channel_ids.remove(id);
-        inner
-            .owned_message_ids
-            .retain(|(channel_id, _)| channel_id != id);
+        if removed {
+            inner
+                .owned_message_ids
+                .retain(|(channel_id, _)| channel_id != id);
+        }
         removed
     }
 
@@ -610,12 +619,13 @@ impl SharedState {
         let inner = self.inner.lock().expect("state mutex poisoned");
         let now = Instant::now();
         Snapshot {
-            version: 1,
+            version: 2,
             ready: self.gateway_listener_ready.load(Ordering::Acquire)
                 && self.effect_http_listener_ready.load(Ordering::Acquire),
             instance_id: self.instance_id.clone(),
             run_id: self.run_id.clone(),
             guild_id: self.guild_id.clone(),
+            hub_channel_id: self.hub_channel_id.clone(),
             actor_id: self.actor_id.clone(),
             bot_user_id: self.bot_user_id.clone(),
             gateway: GatewaySnapshot {
@@ -763,6 +773,7 @@ mod tests {
         let config = Config::for_test(
             root.path().to_path_buf(),
             "7",
+            "5",
             "8",
             "6",
             "127.0.0.1:21001".parse().unwrap(),
@@ -884,5 +895,32 @@ mod tests {
             serde_json::to_value(state.snapshot()).unwrap()["effect_http"]["owned_role_count"],
             MAX_OWNED_IDENTITIES
         );
+    }
+
+    #[test]
+    fn pinned_hub_admits_only_owned_messages_without_becoming_an_owned_channel() {
+        let (_root, state) = state();
+        let state = std::sync::Arc::new(state);
+        assert!(state.admits_message_creation("5"));
+        assert!(!state.owns_channel("5"));
+        assert!(state
+            .reserve_resource(ResourceKind::Message {
+                channel_id: "5".to_owned()
+            })
+            .unwrap()
+            .commit("13".to_owned()));
+        assert!(state.owns_message("5", "13"));
+        assert!(state
+            .reserve_resource(ResourceKind::Message {
+                channel_id: "10".to_owned()
+            })
+            .is_none());
+        assert!(!state.remove_channel("5"));
+        assert!(state.owns_message("5", "13"));
+        let snapshot = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(snapshot["version"], 2);
+        assert_eq!(snapshot["hub_channel_id"], "5");
+        assert_eq!(snapshot["effect_http"]["owned_channel_count"], 0);
+        assert_eq!(snapshot["effect_http"]["owned_message_count"], 1);
     }
 }
