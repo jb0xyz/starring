@@ -8,7 +8,8 @@ standing staging database, or claim that an incomplete run passed.
 The preparation command binds one run to an exact Git commit, immutable API
 and runtime binaries, the Codex worker and its executables, a unique resource
 prefix, unique loopback ports, unique launchd labels, unique Keychain service
-names, and an isolated PostgreSQL root. It also binds the fixed D2 Cloudflare
+names, an isolated PostgreSQL root, and one exact disposable-guild text channel
+as the `community_hub` resource binding. It also binds the fixed D2 Cloudflare
 route as one indivisible tuple: tunnel
 `57c22e8a-0ec2-4f67-a882-2c355b0348df`, public origin
 `https://d2-api.starring.co.kr`, and loopback API origin
@@ -77,7 +78,8 @@ The remaining certification work is:
    manifest-pinned external Keychain identities. The fixed Cloudflare tunnel
    token must already exist in its third external identity.
 2. Create the disposable Discord guild and dedicated D2 Discord application,
-   then prepare and start the immutable candidate run.
+   select one text channel as `community_hub`, then prepare and start the
+   immutable candidate run.
 3. Complete OAuth and invoke `onboard` with the authenticated Discord principal.
 4. Load `product_driver.js` into the authenticated same-origin browser and use
    its bounded product driver for authoring, promotion, approval, Apply, and
@@ -99,6 +101,7 @@ python3 tools/d2-certification/d2_certification.py prepare \
   --output-root "$HOME/Library/Application Support/Starring/release-certifications" \
   --commit "$CANDIDATE_COMMIT" \
   --discord-guild-id "$DISPOSABLE_GUILD_ID" \
+  --discord-hub-channel-id "$DISPOSABLE_HUB_CHANNEL_ID" \
   --discord-application-id "$DISCORD_APPLICATION_ID" \
   --discord-bot-user-id "$DISCORD_BOT_USER_ID" \
   --discord-actor-id "$DISCORD_ACTOR_ID" \
@@ -184,6 +187,15 @@ python3 tools/d2-certification/isolated_orchestrator.py stop \
 python3 tools/d2-certification/isolated_orchestrator.py cleanup \
   --manifest /absolute/run/manifest.json
 ```
+
+`onboard` creates or exactly replays revision 1 with the single external
+channel binding `community_hub -> discord.hub_channel_id`. Its redacted output
+and `onboarding-evidence.json` both retain `binding_key: community_hub` and the
+manifest-pinned `hub_channel_id`; a missing, different, or extra manifest field
+fails closed before candidate execution. Before database mutation, the bot
+must also resolve that ID as a type-0 text channel in the manifest guild. The
+persisted authority payload digest uses the same canonical revision, binding,
+policy, and TTL identity contract enforced by runtime hydration.
 
 Fault injection uses only the manifest-bound orchestrator commands below. Each
 command verifies the pinned transport instance, writes and fsyncs a durable

@@ -24,7 +24,7 @@ MAX_NESTING_DEPTH = 8
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$")
-SNOWFLAKE_PATTERN = re.compile(r"^[1-9][0-9]{5,24}$")
+SNOWFLAKE_PATTERN = re.compile(r"^[1-9][0-9]{0,19}$")
 RUN_ID_PATTERN = re.compile(r"^d2-[0-9]{8}t[0-9]{6}z-[0-9a-f]{12}$")
 MIGRATION_PATTERN = re.compile(r"^[0-9]{12}$")
 UTC_TIMESTAMP_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
@@ -591,7 +591,11 @@ def validate_commit(raw):
 
 
 def validate_snowflake(raw, label):
-    if not isinstance(raw, str) or not SNOWFLAKE_PATTERN.fullmatch(raw):
+    if (
+        not isinstance(raw, str)
+        or not SNOWFLAKE_PATTERN.fullmatch(raw)
+        or int(raw) > 18446744073709551615
+    ):
         fail(f"{label}_invalid")
     return raw
 
@@ -695,6 +699,9 @@ def build_manifest(arguments):
     commit = validate_commit(arguments.commit)
     run_id = validate_run_id(arguments.run_id or generate_run_id())
     guild_id = validate_snowflake(arguments.discord_guild_id, "discord_guild_id")
+    hub_channel_id = validate_snowflake(
+        arguments.discord_hub_channel_id, "discord_hub_channel_id"
+    )
     application_id = validate_snowflake(
         arguments.discord_application_id, "discord_application_id"
     )
@@ -702,6 +709,8 @@ def build_manifest(arguments):
         arguments.discord_bot_user_id, "discord_bot_user_id"
     )
     actor_id = validate_snowflake(arguments.discord_actor_id, "discord_actor_id")
+    if hub_channel_id in {guild_id, application_id, bot_user_id, actor_id}:
+        fail("discord_hub_channel_identity_invalid")
     candidates = parse_named_values(
         arguments.candidate, REQUIRED_CANDIDATES, "candidates", parse_candidate
     )
@@ -767,6 +776,7 @@ def build_manifest(arguments):
         },
         "discord": {
             "guild_id": guild_id,
+            "hub_channel_id": hub_channel_id,
             "application_id": application_id,
             "bot_user_id": bot_user_id,
             "actor_id": actor_id,
@@ -932,6 +942,7 @@ def validate_manifest(manifest):
         or set(discord)
         != {
             "guild_id",
+            "hub_channel_id",
             "application_id",
             "bot_user_id",
             "actor_id",
@@ -943,10 +954,20 @@ def validate_manifest(manifest):
         fail("manifest_discord_invalid")
     validate_snowflake(discord.get("guild_id", ""), "manifest_discord_guild")
     validate_snowflake(
+        discord.get("hub_channel_id", ""), "manifest_discord_hub_channel"
+    )
+    validate_snowflake(
         discord.get("application_id", ""), "manifest_discord_application"
     )
     validate_snowflake(discord.get("bot_user_id", ""), "manifest_discord_bot")
     validate_snowflake(discord.get("actor_id", ""), "manifest_discord_actor")
+    if discord["hub_channel_id"] in {
+        discord["guild_id"],
+        discord["application_id"],
+        discord["bot_user_id"],
+        discord["actor_id"],
+    }:
+        fail("manifest_discord_hub_channel_invalid")
     if not isinstance(discord.get("resource_prefix"), str) or not ID_PATTERN.fullmatch(
         discord["resource_prefix"]
     ):
@@ -1624,6 +1645,7 @@ def parser():
     prepare.add_argument("--output-root", required=True)
     prepare.add_argument("--commit", required=True)
     prepare.add_argument("--discord-guild-id", required=True)
+    prepare.add_argument("--discord-hub-channel-id", required=True)
     prepare.add_argument("--discord-application-id", required=True)
     prepare.add_argument("--discord-bot-user-id", required=True)
     prepare.add_argument("--discord-actor-id", required=True)

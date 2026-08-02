@@ -283,7 +283,64 @@ class Platform:
             fail("sealed_provisioning_output_invalid")
         return evidence
 
+    def preflight_discord_hub_channel(self, context, timeout_seconds=10):
+        identity = context.manifest["external_keychain"]["discord_bot_token"]
+        channel_id = context.manifest["discord"]["hub_channel_id"]
+        script = "\n".join(
+            (
+                'service="$1"',
+                'account="$2"',
+                'url="$3"',
+                'value="$(/usr/bin/security find-generic-password -s "$service" -a "$account" -w)" || exit 71',
+                'case "$value" in (""|*[!A-Za-z0-9._~-]*) unset value; exit 72;; esac',
+                'response="$({ printf \'header = "Authorization: Bot %s"\\n\' "$value"; } | /usr/bin/curl --silent --show-error --request GET --proto \'=https\' --header \'Accept: application/json\' --max-filesize 16384 --write-out \'\\n%{http_code}\' --connect-timeout "$4" --max-time "$4" --config - "$url")"',
+                'result="$?"',
+                'unset value',
+                'test "$result" -eq 0 || exit "$result"',
+                'printf \'%s\' "$response"',
+            )
+        )
+        result = self.run(
+            [
+                "/bin/zsh",
+                "-c",
+                script,
+                "d2-discord-hub-preflight",
+                identity["service"],
+                identity["account"],
+                f"https://discord.com/api/v10/channels/{channel_id}",
+                str(timeout_seconds),
+            ],
+            timeout=timeout_seconds + 3,
+        )
+        if result.returncode != 0:
+            fail("discord_hub_channel_preflight_unavailable")
+        if len(result.stdout) > 20 * 1024:
+            fail("discord_hub_channel_preflight_output_invalid")
+        try:
+            body, raw_status = result.stdout.rsplit(b"\n", 1)
+            status = int(raw_status)
+        except (ValueError, TypeError):
+            fail("discord_hub_channel_preflight_output_invalid")
+        if status < 100 or status > 599:
+            fail("discord_hub_channel_preflight_output_invalid")
+        if status != 200:
+            fail("discord_hub_channel_preflight_status_invalid")
+        try:
+            channel = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            fail("discord_hub_channel_preflight_response_invalid")
+        if (
+            not isinstance(channel, dict)
+            or channel.get("id") != channel_id
+            or channel.get("guild_id") != context.manifest["discord"]["guild_id"]
+            or type(channel.get("type")) is not int
+            or channel["type"] != 0
+        ):
+            fail("discord_hub_channel_preflight_response_invalid")
+
     def onboard_installation(self, context, principal_id, display_name, installation_id):
+        self.preflight_discord_hub_channel(context)
         candidate = context.manifest["candidates"]["sealed_provisioner"]["path"]
         result = self.run(
             [
@@ -309,10 +366,20 @@ class Platform:
             fail("installation_onboarding_output_invalid")
         if (
             not isinstance(evidence, dict)
-            or set(evidence) != {"outcome", "installation_id", "principal_id"}
+            or set(evidence)
+            != {
+                "outcome",
+                "installation_id",
+                "principal_id",
+                "binding_key",
+                "hub_channel_id",
+            }
             or evidence["outcome"] not in {"fresh", "exact_replay"}
             or evidence["installation_id"] != installation_id
             or evidence["principal_id"] != principal_id
+            or evidence["binding_key"] != "community_hub"
+            or evidence["hub_channel_id"]
+            != context.manifest["discord"]["hub_channel_id"]
         ):
             fail("installation_onboarding_output_invalid")
         return evidence

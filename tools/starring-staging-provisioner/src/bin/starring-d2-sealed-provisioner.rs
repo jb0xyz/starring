@@ -63,10 +63,12 @@ async fn main() -> ExitCode {
             {
                 Ok(report) => {
                     println!(
-                        "{{\"outcome\":\"{}\",\"installation_id\":\"{}\",\"principal_id\":\"{}\"}}",
+                        "{{\"outcome\":\"{}\",\"installation_id\":\"{}\",\"principal_id\":\"{}\",\"binding_key\":\"{}\",\"hub_channel_id\":\"{}\"}}",
                         report.outcome().as_str(),
                         report.installation_id(),
                         report.principal_id(),
+                        report.binding_key(),
+                        report.hub_channel_id(),
                     );
                     ExitCode::SUCCESS
                 }
@@ -129,6 +131,8 @@ mod tests {
         assert!(source.contains("provision"));
         assert!(source.contains("quarantine"));
         assert!(source.contains("--manifest"));
+        assert!(source.contains("binding_key"));
+        assert!(source.contains("hub_channel_id"));
         assert!(!source.contains(&["--", "password"].concat()));
         assert!(!source.contains(&["--", "token"].concat()));
         assert!(!source.contains(&["key", "_id"].concat()));

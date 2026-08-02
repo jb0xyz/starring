@@ -194,6 +194,8 @@ class FakePlatform:
             "outcome": "fresh",
             "installation_id": installation_id,
             "principal_id": principal_id,
+            "binding_key": "community_hub",
+            "hub_channel_id": context.manifest["discord"]["hub_channel_id"],
         }
 
     def launchd_start(self, label, plist_path):
@@ -376,6 +378,8 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             "a" * 40,
             "--discord-guild-id",
             "1524810437118525551",
+            "--discord-hub-channel-id",
+            "1524810437118525554",
             "--discord-application-id",
             "1524810437118525552",
             "--discord-bot-user-id",
@@ -904,8 +908,157 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             )
         )
         self.assertEqual(evidence["guild_id"], self.context.manifest["discord"]["guild_id"])
+        self.assertEqual(evidence["binding_key"], "community_hub")
+        self.assertEqual(
+            evidence["hub_channel_id"],
+            self.context.manifest["discord"]["hub_channel_id"],
+        )
+        self.assertEqual(result["binding_key"], "community_hub")
+        self.assertEqual(
+            result["hub_channel_id"],
+            self.context.manifest["discord"]["hub_channel_id"],
+        )
         self.assertNotIn("display_name", evidence)
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_platform_onboarding_output_is_bound_to_the_manifest_hub(self):
+        installation_id = (
+            f"installation:{self.context.manifest['discord']['resource_prefix']}"
+        )
+        principal_id = "discord:1056857223529250906"
+        evidence = {
+            "outcome": "fresh",
+            "installation_id": installation_id,
+            "principal_id": principal_id,
+            "binding_key": "community_hub",
+            "hub_channel_id": self.context.manifest["discord"]["hub_channel_id"],
+        }
+        platform = PLATFORM.Platform()
+
+        def onboarding_completed(value):
+            return subprocess.CompletedProcess(
+                [], 0, json.dumps(value).encode("utf-8"), b""
+            )
+
+        hub = {
+            "id": self.context.manifest["discord"]["hub_channel_id"],
+            "guild_id": self.context.manifest["discord"]["guild_id"],
+            "type": 0,
+        }
+        hub_completed = subprocess.CompletedProcess(
+            [], 0, json.dumps(hub).encode("utf-8") + b"\n200", b""
+        )
+        with mock.patch.object(
+            platform,
+            "run",
+            side_effect=[hub_completed, onboarding_completed(evidence)],
+        ) as run:
+            self.assertEqual(
+                platform.onboard_installation(
+                    self.context, principal_id, "보건", installation_id
+                ),
+                evidence,
+            )
+        preflight = run.call_args_list[0]
+        command = preflight.args[0]
+        self.assertEqual(command[:2], ["/bin/zsh", "-c"])
+        self.assertIn('header = "Authorization: Bot %s"', command[2])
+        self.assertIn("--config -", command[2])
+        self.assertEqual(
+            command[4:7],
+            [
+                self.context.manifest["external_keychain"]["discord_bot_token"][
+                    "service"
+                ],
+                self.context.manifest["external_keychain"]["discord_bot_token"][
+                    "account"
+                ],
+                "https://discord.com/api/v10/channels/"
+                + self.context.manifest["discord"]["hub_channel_id"],
+            ],
+        )
+        self.assertNotIn("environment", preflight.kwargs)
+        self.assertEqual(
+            run.call_args_list[1].args[0][0],
+            str(self.candidates["sealed_provisioner"]),
+        )
+        for field, value in (
+            ("binding_key", "another_hub"),
+            ("hub_channel_id", "1524810437118525555"),
+        ):
+            invalid = {**evidence, field: value}
+            with self.subTest(field=field):
+                with mock.patch.object(
+                    platform,
+                    "run",
+                    side_effect=[hub_completed, onboarding_completed(invalid)],
+                ), self.assertRaisesRegex(
+                    ORCHESTRATOR.OrchestratorError,
+                    "installation_onboarding_output_invalid",
+                ):
+                    platform.onboard_installation(
+                        self.context, principal_id, "보건", installation_id
+                    )
+
+    def test_discord_hub_preflight_rejects_wrong_scope_type_status_and_shape(self):
+        installation_id = (
+            f"installation:{self.context.manifest['discord']['resource_prefix']}"
+        )
+        principal_id = "discord:1056857223529250906"
+        expected = {
+            "id": self.context.manifest["discord"]["hub_channel_id"],
+            "guild_id": self.context.manifest["discord"]["guild_id"],
+            "type": 0,
+        }
+        cases = (
+            (
+                "wrong_id",
+                {**expected, "id": "1524810437118525555"},
+                200,
+                "discord_hub_channel_preflight_response_invalid",
+            ),
+            (
+                "wrong_guild",
+                {**expected, "guild_id": "1524810437118525555"},
+                200,
+                "discord_hub_channel_preflight_response_invalid",
+            ),
+            (
+                "wrong_type",
+                {**expected, "type": 2},
+                200,
+                "discord_hub_channel_preflight_response_invalid",
+            ),
+            (
+                "wrong_status",
+                expected,
+                404,
+                "discord_hub_channel_preflight_status_invalid",
+            ),
+            (
+                "wrong_shape",
+                [expected],
+                200,
+                "discord_hub_channel_preflight_response_invalid",
+            ),
+        )
+        platform = PLATFORM.Platform()
+        for name, body, status, code in cases:
+            response = subprocess.CompletedProcess(
+                [],
+                0,
+                json.dumps(body).encode("utf-8") + f"\n{status}".encode("ascii"),
+                b"",
+            )
+            with self.subTest(name=name), mock.patch.object(
+                platform, "run", return_value=response
+            ) as run, self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, code
+            ):
+                platform.onboard_installation(
+                    self.context, principal_id, "보건", installation_id
+                )
+            self.assertEqual(run.call_count, 1)
 
     def test_cleanup_refuses_symlinked_root_and_recovers_after_operator_restore(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)

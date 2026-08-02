@@ -481,6 +481,8 @@ def command_onboard(context, platform, principal_id, display_name):
             "principal_id": evidence["principal_id"],
             "guild_id": context.manifest["discord"]["guild_id"],
             "discord_application_id": context.manifest["discord"]["application_id"],
+            "binding_key": evidence["binding_key"],
+            "hub_channel_id": evidence["hub_channel_id"],
         }
         write_atomic(
             context.artifact_directory / "onboarding-evidence.json",

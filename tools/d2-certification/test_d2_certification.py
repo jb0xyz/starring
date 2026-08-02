@@ -249,6 +249,8 @@ class D2CertificationTest(unittest.TestCase):
             COMMIT,
             "--discord-guild-id",
             "1524810437118525551",
+            "--discord-hub-channel-id",
+            "1524810437118525554",
             "--discord-application-id",
             "1524810437118525552",
             "--discord-bot-user-id",
@@ -333,6 +335,9 @@ class D2CertificationTest(unittest.TestCase):
             MODULE.sha256_file(self.candidates["runtime"]),
         )
         self.assertEqual(manifest["discord"]["actor_id"], "1056857223529250906")
+        self.assertEqual(
+            manifest["discord"]["hub_channel_id"], "1524810437118525554"
+        )
         self.assertEqual(
             manifest["source_trees"]["certification_transport"]["files"],
             list(MODULE.CERTIFICATION_TRANSPORT_SOURCE_FILES),
@@ -516,6 +521,50 @@ class D2CertificationTest(unittest.TestCase):
             MODULE.CertificationError, "manifest_candidate_api_invalid"
         ):
             MODULE.validate_manifest(manifest)
+
+    def test_manifest_requires_the_exact_pinned_hub_channel_shape(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["discord"].pop("hub_channel_id")
+        with self.assertRaisesRegex(
+            MODULE.CertificationError, "manifest_discord_invalid"
+        ):
+            MODULE.validate_manifest(manifest)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["discord"]["hub_channel_id"] = "not-a-snowflake"
+        with self.assertRaisesRegex(
+            MODULE.CertificationError, "manifest_discord_hub_channel_invalid"
+        ):
+            MODULE.validate_manifest(manifest)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["discord"]["hub_channel_id"] = manifest["discord"]["guild_id"]
+        with self.assertRaisesRegex(
+            MODULE.CertificationError, "manifest_discord_hub_channel_invalid"
+        ):
+            MODULE.validate_manifest(manifest)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["discord"]["unexpected_binding"] = "1524810437118525554"
+        with self.assertRaisesRegex(
+            MODULE.CertificationError, "manifest_discord_invalid"
+        ):
+            MODULE.validate_manifest(manifest)
+
+    def test_snowflake_validation_matches_the_unsigned_64_bit_contract(self):
+        self.assertEqual(MODULE.validate_snowflake("1", "snowflake"), "1")
+        self.assertEqual(
+            MODULE.validate_snowflake("18446744073709551615", "snowflake"),
+            "18446744073709551615",
+        )
+        for value in (
+            "0",
+            "01",
+            "18446744073709551616",
+            "9999999999999999999999999",
+        ):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                MODULE.CertificationError, "snowflake_invalid"
+            ):
+                MODULE.validate_snowflake(value, "snowflake")
 
     def test_candidate_permissions_and_worker_inventory_are_revalidated(self):
         manifest_path = self.prepare()

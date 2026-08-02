@@ -40,6 +40,10 @@ const ADMIN_ACCOUNT: &str = "database.cluster-admin";
 const WORKER_TOKEN_ACCOUNT: &str = "authoring.bearer-token";
 const EMPTY_BINDINGS_FINGERPRINT: &str =
     "a44fd4f629a1183147a25a8afb93b026de7e3f92efe737637da222617df0c655";
+const EMPTY_RESOURCE_BINDINGS_JSON: &str = "{\"channel_bindings\":{},\"role_bindings\":{}}";
+const RESOURCE_CONTEXT_DOMAIN_V2: &str = "starring.intent.resource_context.v2\0";
+const AUTHORITY_PAYLOAD_DOMAIN_V1: &[u8] = b"starring.installation-authority.payload.v1\0";
+const D2_HUB_BINDING_KEY: &str = "community_hub";
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const PROTECTED_KEYCHAIN_SERVICES: [&str; 5] = [
     "starring-api.staging",
@@ -195,6 +199,8 @@ pub struct D2OnboardingReportV1 {
     outcome: D2OnboardingOutcomeV1,
     installation_id: String,
     principal_id: String,
+    binding_key: &'static str,
+    hub_channel_id: String,
 }
 
 impl D2OnboardingReportV1 {
@@ -208,6 +214,14 @@ impl D2OnboardingReportV1 {
 
     pub fn principal_id(&self) -> &str {
         &self.principal_id
+    }
+
+    pub const fn binding_key(&self) -> &'static str {
+        self.binding_key
+    }
+
+    pub fn hub_channel_id(&self) -> &str {
+        &self.hub_channel_id
     }
 }
 
@@ -236,6 +250,9 @@ struct ManifestV1 {
 struct DiscordManifestV1 {
     guild_id: String,
     application_id: String,
+    bot_user_id: String,
+    actor_id: String,
+    hub_channel_id: String,
     resource_prefix: String,
 }
 
@@ -284,6 +301,7 @@ struct D2ConfigV1 {
     worker_service: String,
     discord_guild_id: String,
     discord_application_id: String,
+    discord_hub_channel_id: String,
     resource_prefix: String,
     external: [KeychainIdentityV1; 3],
 }
@@ -402,27 +420,17 @@ pub async fn onboard_d2_from_manifest(
         .map_err(|_| D2ProvisionerErrorV1::Onboarding)?;
     let tenant_id = format!("tenant:{}", config.resource_prefix);
     let ruleset_key = "studyroom";
-    let authority_payload_digest = digest_fields(
-        "starring-d2-authority-v1",
-        &[
-            &tenant_id,
-            installation_id,
-            &config.discord_application_id,
-            &config.discord_guild_id,
-            ruleset_key,
-            principal_id,
-            EMPTY_BINDINGS_FINGERPRINT,
-        ],
-    );
-    let created_by_request_digest = digest_fields(
-        "starring-d2-onboarding-request-v1",
-        &[
-            &config.run_id,
-            &tenant_id,
-            installation_id,
-            principal_id,
-            display_name,
-        ],
+    let resource_bindings = d2_resource_bindings_json(&config.discord_hub_channel_id)?;
+    let binding_fingerprint = d2_resource_binding_fingerprint_v2(&config.discord_hub_channel_id)?;
+    let authority_payload_digest =
+        d2_authority_payload_digest_v1(&tenant_id, installation_id, &binding_fingerprint)?;
+    let created_by_request_digest = d2_onboarding_request_digest(
+        &config.run_id,
+        &tenant_id,
+        installation_id,
+        principal_id,
+        display_name,
+        &authority_payload_digest,
     );
     let existed: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM public.automation_installations WHERE installation_id = $1)",
@@ -444,9 +452,12 @@ pub async fn onboard_d2_from_manifest(
         installation_id,
         discord_application_id: &config.discord_application_id,
         discord_guild_id: &config.discord_guild_id,
+        discord_hub_channel_id: &config.discord_hub_channel_id,
         ruleset_key,
         principal_id,
         discord_user_id,
+        resource_bindings: &resource_bindings,
+        binding_fingerprint: &binding_fingerprint,
         authority_payload_digest: &authority_payload_digest,
         created_by_request_digest: &created_by_request_digest,
         port: config.port,
@@ -465,6 +476,8 @@ pub async fn onboard_d2_from_manifest(
         },
         installation_id: installation_id.to_owned(),
         principal_id: principal_id.to_owned(),
+        binding_key: D2_HUB_BINDING_KEY,
+        hub_channel_id: config.discord_hub_channel_id,
     })
 }
 
@@ -654,10 +667,7 @@ fn validate_manifest(manifest: ManifestV1) -> Result<D2ConfigV1, D2ProvisionerEr
     {
         return Err(D2ProvisionerErrorV1::Manifest);
     }
-    if !valid_snowflake(&manifest.discord.guild_id)
-        || !valid_snowflake(&manifest.discord.application_id)
-        || !valid_product_identifier(&manifest.discord.resource_prefix, 128)
-    {
+    if !valid_discord_manifest(&manifest.discord) {
         return Err(D2ProvisionerErrorV1::Manifest);
     }
     validate_target_directory(&root, 0o700)?;
@@ -717,9 +727,23 @@ fn validate_manifest(manifest: ManifestV1) -> Result<D2ConfigV1, D2ProvisionerEr
         worker_service: expected.worker,
         discord_guild_id: manifest.discord.guild_id,
         discord_application_id: manifest.discord.application_id,
+        discord_hub_channel_id: manifest.discord.hub_channel_id,
         resource_prefix: manifest.discord.resource_prefix,
         external,
     })
+}
+
+fn valid_discord_manifest(discord: &DiscordManifestV1) -> bool {
+    valid_snowflake(&discord.guild_id)
+        && valid_snowflake(&discord.application_id)
+        && valid_snowflake(&discord.bot_user_id)
+        && valid_snowflake(&discord.actor_id)
+        && valid_snowflake(&discord.hub_channel_id)
+        && discord.hub_channel_id != discord.guild_id
+        && discord.hub_channel_id != discord.application_id
+        && discord.hub_channel_id != discord.bot_user_id
+        && discord.hub_channel_id != discord.actor_id
+        && valid_product_identifier(&discord.resource_prefix, 128)
 }
 
 fn validate_target_directory(path: &Path, mode: u32) -> Result<(), D2ProvisionerErrorV1> {
@@ -1164,9 +1188,12 @@ struct OnboardingInputsV1<'a> {
     installation_id: &'a str,
     discord_application_id: &'a str,
     discord_guild_id: &'a str,
+    discord_hub_channel_id: &'a str,
     ruleset_key: &'a str,
     principal_id: &'a str,
     discord_user_id: &'a str,
+    resource_bindings: &'a str,
+    binding_fingerprint: &'a str,
     authority_payload_digest: &'a str,
     created_by_request_digest: &'a str,
     port: u16,
@@ -1180,7 +1207,12 @@ fn render_onboarding_script(
         || !valid_product_identifier(inputs.principal_id, 128)
         || !valid_snowflake(inputs.discord_application_id)
         || !valid_snowflake(inputs.discord_guild_id)
+        || !valid_snowflake(inputs.discord_hub_channel_id)
         || !valid_snowflake(inputs.discord_user_id)
+        || d2_resource_bindings_json(inputs.discord_hub_channel_id).as_deref()
+            != Ok(inputs.resource_bindings)
+        || d2_resource_binding_fingerprint_v2(inputs.discord_hub_channel_id).as_deref()
+            != Ok(inputs.binding_fingerprint)
         || !valid_digest(inputs.authority_payload_digest)
         || !valid_digest(inputs.created_by_request_digest)
         || inputs.system_identifier.is_empty()
@@ -1213,6 +1245,13 @@ fn render_onboarding_script(
             inputs.port
         ),
     );
+    if rendered.matches(EMPTY_RESOURCE_BINDINGS_JSON).count() != 1
+        || rendered.matches(EMPTY_BINDINGS_FINGERPRINT).count() != 1
+    {
+        return Err(D2ProvisionerErrorV1::Onboarding);
+    }
+    rendered = rendered.replace(EMPTY_RESOURCE_BINDINGS_JSON, inputs.resource_bindings);
+    rendered = rendered.replace(EMPTY_BINDINGS_FINGERPRINT, inputs.binding_fingerprint);
     for (name, value) in [
         ("expected_database", DATABASE_NAME),
         ("expected_system_identifier", inputs.system_identifier),
@@ -1224,7 +1263,7 @@ fn render_onboarding_script(
         ("ruleset_key", inputs.ruleset_key),
         ("created_by_principal_id", inputs.principal_id),
         ("created_by_discord_user_id", inputs.discord_user_id),
-        ("binding_fingerprint", EMPTY_BINDINGS_FINGERPRINT),
+        ("binding_fingerprint", inputs.binding_fingerprint),
         ("authority_payload_digest", inputs.authority_payload_digest),
         (
             "created_by_request_digest",
@@ -1248,15 +1287,96 @@ fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn digest_fields(domain: &str, fields: &[&str]) -> String {
+fn d2_resource_bindings_json(hub_channel_id: &str) -> Result<String, D2ProvisionerErrorV1> {
+    if !valid_snowflake(hub_channel_id) {
+        return Err(D2ProvisionerErrorV1::OnboardingInput);
+    }
+    Ok(format!(
+        "{{\"role_bindings\":{{}},\"channel_bindings\":{{\"{D2_HUB_BINDING_KEY}\":\"{hub_channel_id}\"}}}}"
+    ))
+}
+
+fn d2_resource_binding_fingerprint_v2(
+    hub_channel_id: &str,
+) -> Result<String, D2ProvisionerErrorV1> {
+    if !valid_snowflake(hub_channel_id) {
+        return Err(D2ProvisionerErrorV1::OnboardingInput);
+    }
+    Ok(digest_fields(
+        RESOURCE_CONTEXT_DOMAIN_V2,
+        &["channel", D2_HUB_BINDING_KEY, hub_channel_id],
+    ))
+}
+
+fn d2_onboarding_request_digest(
+    run_id: &str,
+    tenant_id: &str,
+    installation_id: &str,
+    principal_id: &str,
+    display_name: &str,
+    authority_payload_digest: &str,
+) -> String {
+    digest_fields(
+        "starring-d2-onboarding-request-v1",
+        &[
+            run_id,
+            tenant_id,
+            installation_id,
+            principal_id,
+            display_name,
+            authority_payload_digest,
+        ],
+    )
+}
+
+fn d2_authority_payload_digest_v1(
+    tenant_id: &str,
+    installation_id: &str,
+    binding_fingerprint: &str,
+) -> Result<String, D2ProvisionerErrorV1> {
+    if !valid_product_identifier(tenant_id, 128)
+        || !valid_product_identifier(installation_id, 128)
+        || !valid_digest(binding_fingerprint)
+    {
+        return Err(D2ProvisionerErrorV1::OnboardingInput);
+    }
+    let revision = 1_u64.to_be_bytes();
+    let binding_revision = 1_u64.to_be_bytes();
+    let policy_revision = 1_u64.to_be_bytes();
+    let required_approvals = 1_u32.to_be_bytes();
+    let activation_ttl_seconds = 86_400_u64.to_be_bytes();
+    Ok(digest_byte_fields(
+        AUTHORITY_PAYLOAD_DOMAIN_V1,
+        &[
+            tenant_id.as_bytes(),
+            installation_id.as_bytes(),
+            &revision,
+            &binding_revision,
+            binding_fingerprint.as_bytes(),
+            &policy_revision,
+            &required_approvals,
+            &activation_ttl_seconds,
+        ],
+    ))
+}
+
+fn digest_byte_fields(domain: &[u8], fields: &[&[u8]]) -> String {
     let mut digest = Sha256::new();
     digest.update((domain.len() as u64).to_be_bytes());
-    digest.update(domain.as_bytes());
+    digest.update(domain);
     for field in fields {
         digest.update((field.len() as u64).to_be_bytes());
-        digest.update(field.as_bytes());
+        digest.update(field);
     }
     format!("{:x}", digest.finalize())
+}
+
+fn digest_fields(domain: &str, fields: &[&str]) -> String {
+    let fields = fields
+        .iter()
+        .map(|field| field.as_bytes())
+        .collect::<Vec<_>>();
+    digest_byte_fields(domain.as_bytes(), &fields)
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -1271,7 +1391,7 @@ async fn verify_onboarding(
     inputs: &OnboardingInputsV1<'_>,
 ) -> Result<(), D2ProvisionerErrorV1> {
     let exact: bool = sqlx::query_scalar(
-        "SELECT (SELECT COUNT(*) = 1 FROM public.product_tenants AS tenant WHERE tenant.tenant_id = $1 AND tenant.lifecycle_state = 'active' AND tenant.display_name = $2 AND tenant.display_metadata = '{\"environment\":\"staging\",\"onboarding\":\"operator_v1\"}'::JSONB) AND (SELECT COUNT(*) = 1 FROM public.automation_installations AS installation WHERE installation.installation_id = $3 AND installation.tenant_id = $1 AND installation.discord_application_id = $4 AND installation.discord_guild_id = $5 AND installation.ruleset_key = $6 AND installation.lifecycle_state = 'active' AND installation.current_authority_revision = 1) AND (SELECT COUNT(*) = 1 FROM public.automation_installation_authority_versions AS authority WHERE authority.installation_id = $3 AND authority.revision = 1 AND authority.tenant_id = $1 AND authority.binding_revision = 1 AND authority.resource_bindings = '{\"channel_bindings\":{},\"role_bindings\":{}}'::JSONB AND authority.binding_fingerprint = $7 AND authority.policy_revision = 1 AND authority.required_approvals = 1 AND authority.activation_ttl_seconds = 86400 AND authority.authority_payload_digest = $8 AND authority.created_by_principal_id = $9 AND authority.created_by_request_digest = $10) AND (SELECT COUNT(*) = 1 FROM public.runtime_slot_writer_fences_v2 AS fence WHERE fence.slot_guild_id = $5 AND fence.slot_ruleset_key = $6 AND fence.writer_epoch BETWEEN 1 AND 9223372036854775807 AND pg_catalog.isfinite(fence.updated_at))",
+        "SELECT (SELECT COUNT(*) = 1 FROM public.product_tenants AS tenant WHERE tenant.tenant_id = $1 AND tenant.lifecycle_state = 'active' AND tenant.display_name = $2 AND tenant.display_metadata = '{\"environment\":\"staging\",\"onboarding\":\"operator_v1\"}'::JSONB) AND (SELECT COUNT(*) = 1 FROM public.automation_installations AS installation WHERE installation.installation_id = $3 AND installation.tenant_id = $1 AND installation.discord_application_id = $4 AND installation.discord_guild_id = $5 AND installation.ruleset_key = $6 AND installation.lifecycle_state = 'active' AND installation.current_authority_revision = 1) AND (SELECT COUNT(*) = 1 FROM public.automation_installation_authority_versions AS authority WHERE authority.installation_id = $3 AND authority.revision = 1 AND authority.tenant_id = $1 AND authority.binding_revision = 1 AND authority.resource_bindings = $7::JSONB AND authority.binding_fingerprint = $8 AND authority.policy_revision = 1 AND authority.required_approvals = 1 AND authority.activation_ttl_seconds = 86400 AND authority.authority_payload_digest = $9 AND authority.created_by_principal_id = $10 AND authority.created_by_request_digest = $11) AND (SELECT COUNT(*) = 1 FROM public.runtime_slot_writer_fences_v2 AS fence WHERE fence.slot_guild_id = $5 AND fence.slot_ruleset_key = $6 AND fence.writer_epoch BETWEEN 1 AND 9223372036854775807 AND pg_catalog.isfinite(fence.updated_at))",
     )
     .bind(inputs.tenant_id)
     .bind(inputs.tenant_display_name)
@@ -1279,7 +1399,8 @@ async fn verify_onboarding(
     .bind(inputs.discord_application_id)
     .bind(inputs.discord_guild_id)
     .bind(inputs.ruleset_key)
-    .bind(EMPTY_BINDINGS_FINGERPRINT)
+    .bind(inputs.resource_bindings)
+    .bind(inputs.binding_fingerprint)
     .bind(inputs.authority_payload_digest)
     .bind(inputs.principal_id)
     .bind(inputs.created_by_request_digest)
@@ -1758,6 +1879,7 @@ mod tests {
             worker_service: "starring.d2.0123456789ab.worker".to_owned(),
             discord_guild_id: "123456789012345678".to_owned(),
             discord_application_id: "223456789012345678".to_owned(),
+            discord_hub_channel_id: "323456789012345678".to_owned(),
             resource_prefix: "starring-d2-20260801-0123456789ab".to_owned(),
             external: [
                 KeychainIdentityV1 {
@@ -1895,8 +2017,23 @@ mod tests {
 
     #[test]
     fn onboarding_renderer_generalizes_only_the_bound_target_and_inputs() {
-        let authority = digest_fields("authority", &["one", "two"]);
-        let request = digest_fields("request", &["three"]);
+        let hub_channel_id = "423456789012345678";
+        let resource_bindings = d2_resource_bindings_json(hub_channel_id).unwrap();
+        let binding_fingerprint = d2_resource_binding_fingerprint_v2(hub_channel_id).unwrap();
+        let authority = d2_authority_payload_digest_v1(
+            "tenant:starring-d2-test",
+            "installation:starring-d2-test",
+            &binding_fingerprint,
+        )
+        .unwrap();
+        let request = d2_onboarding_request_digest(
+            "d2-20260801t120000z-0123456789ab",
+            "tenant:starring-d2-test",
+            "installation:starring-d2-test",
+            "discord:323456789012345678",
+            "보건 O'Hara",
+            &authority,
+        );
         let inputs = OnboardingInputsV1 {
             system_identifier: "7663763942264209752",
             tenant_id: "tenant:starring-d2-test",
@@ -1904,9 +2041,12 @@ mod tests {
             installation_id: "installation:starring-d2-test",
             discord_application_id: "123456789012345678",
             discord_guild_id: "223456789012345678",
+            discord_hub_channel_id: hub_channel_id,
             ruleset_key: "studyroom",
             principal_id: "discord:323456789012345678",
             discord_user_id: "323456789012345678",
+            resource_bindings: &resource_bindings,
+            binding_fingerprint: &binding_fingerprint,
             authority_payload_digest: &authority,
             created_by_request_digest: &request,
             port: 25432,
@@ -1915,10 +2055,92 @@ mod tests {
         assert!(rendered.contains("pg_catalog.inet_server_port() IS DISTINCT FROM 25432"));
         assert!(!rendered.contains("pg_catalog.inet_server_port() IS DISTINCT FROM 5432"));
         assert!(rendered.contains("SET starring.onboarding_tenant_display_name = '보건 O''Hara';"));
+        assert!(rendered.contains(&format!(
+            "resource_bindings PG_CATALOG.JSONB :=\n        '{resource_bindings}'::PG_CATALOG.JSONB;"
+        )));
+        assert!(rendered.contains(&format!(
+            "SET starring.onboarding_binding_fingerprint = '{binding_fingerprint}';"
+        )));
+        assert!(!rendered.contains(EMPTY_RESOURCE_BINDINGS_JSON));
+        assert!(!rendered.contains(EMPTY_BINDINGS_FINGERPRINT));
         assert!(rendered.trim_end().ends_with("COMMIT;"));
         assert!(!rendered.contains(":'"));
         assert!(!rendered.lines().any(|line| line.starts_with('\\')));
         assert_eq!(authority.len(), 64);
         assert_eq!(request.len(), 64);
+    }
+
+    #[test]
+    fn d2_hub_binding_matches_the_resource_context_v2_golden_vector() {
+        let fingerprint = d2_resource_binding_fingerprint_v2("700").unwrap();
+        assert_eq!(
+            d2_resource_bindings_json("700").unwrap(),
+            "{\"role_bindings\":{},\"channel_bindings\":{\"community_hub\":\"700\"}}"
+        );
+        assert_eq!(
+            fingerprint,
+            "27c51a7b90c32b1fd4095deefe2f48cfdda9f41416f5208cc683e8adf42418d4"
+        );
+        let authority_payload_digest = d2_authority_payload_digest_v1(
+            "tenant:starring-d2-test",
+            "installation:starring-d2-test",
+            &fingerprint,
+        )
+        .unwrap();
+        assert_eq!(
+            authority_payload_digest,
+            "c16a709b84262f3854b18ceba1a34b94f927de7693dfe411d3a4154c7a9a2dad"
+        );
+        let changed_fingerprint = d2_resource_binding_fingerprint_v2("701").unwrap();
+        let changed_authority_payload_digest = d2_authority_payload_digest_v1(
+            "tenant:starring-d2-test",
+            "installation:starring-d2-test",
+            &changed_fingerprint,
+        )
+        .unwrap();
+        assert_ne!(
+            d2_onboarding_request_digest(
+                "d2-20260801t120000z-0123456789ab",
+                "tenant:starring-d2-test",
+                "installation:starring-d2-test",
+                "discord:323456789012345678",
+                "Operator",
+                &authority_payload_digest,
+            ),
+            d2_onboarding_request_digest(
+                "d2-20260801t120000z-0123456789ab",
+                "tenant:starring-d2-test",
+                "installation:starring-d2-test",
+                "discord:323456789012345678",
+                "Operator",
+                &changed_authority_payload_digest,
+            )
+        );
+        assert_ne!(authority_payload_digest, changed_authority_payload_digest);
+        assert!(d2_resource_bindings_json("0").is_err());
+        assert!(d2_resource_binding_fingerprint_v2("18446744073709551616").is_err());
+        assert!(INSTALLATION_ONBOARDING.contains(EMPTY_RESOURCE_BINDINGS_JSON));
+        assert!(INSTALLATION_ONBOARDING.contains(EMPTY_BINDINGS_FINGERPRINT));
+    }
+
+    #[test]
+    fn d2_hub_channel_identity_is_distinct_from_guild_and_application() {
+        let mut discord = DiscordManifestV1 {
+            guild_id: "123456789012345678".to_owned(),
+            application_id: "223456789012345678".to_owned(),
+            bot_user_id: "223456789012345678".to_owned(),
+            actor_id: "423456789012345678".to_owned(),
+            hub_channel_id: "323456789012345678".to_owned(),
+            resource_prefix: "starring-d2-20260801-0123456789ab".to_owned(),
+        };
+        assert!(valid_discord_manifest(&discord));
+        discord.hub_channel_id.clone_from(&discord.guild_id);
+        assert!(!valid_discord_manifest(&discord));
+        discord.hub_channel_id.clone_from(&discord.application_id);
+        assert!(!valid_discord_manifest(&discord));
+        discord.hub_channel_id.clone_from(&discord.bot_user_id);
+        assert!(!valid_discord_manifest(&discord));
+        discord.hub_channel_id.clone_from(&discord.actor_id);
+        assert!(!valid_discord_manifest(&discord));
     }
 }
