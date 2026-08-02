@@ -267,6 +267,13 @@ pub(crate) fn decode_canonical_status_attestation_v2(
         .map(positive_attempt)
         .transpose()?;
     let serving_nanos = i64::try_from(intent.serving_lease_for.as_nanos()).ok();
+    let (expected_gateway_ready_kind, expected_live_gateway_ready_kind) =
+        match request.route_admission.gateway.kind {
+            RuntimeGatewayReadyKindV2::Ready => ("discord_ready", GatewayReadyKindV1::DiscordReady),
+            RuntimeGatewayReadyKindV2::Resumed => {
+                ("discord_resumed", GatewayReadyKindV1::DiscordResumed)
+            }
+        };
     let valid = row.attestation_id == row.attestation_digest
         && row.attestation_id == canonical.live_attestation_digest().as_str()
         && operation_id == intent.operation_id.as_str()
@@ -313,11 +320,7 @@ pub(crate) fn decode_canonical_status_attestation_v2(
         && row.panel_certificate_id == intent.panel.certificate_id.as_str()
         && row.panel_report_digest == intent.panel.report_digest.as_str()
         && row.gateway_shard_id == intent.gateway_owner_lease_id.gateway_shard_id.as_str()
-        && row.gateway_ready_kind == "discord_resumed"
-        && matches!(
-            request.route_admission.gateway.kind,
-            RuntimeGatewayReadyKindV2::Resumed
-        )
+        && row.gateway_ready_kind == expected_gateway_ready_kind
         && row.gateway_ready_at == row.certified_at
         && row.created_at == row.certified_at
         && live.target == intent.target
@@ -333,7 +336,7 @@ pub(crate) fn decode_canonical_status_attestation_v2(
         && live.panel_certificate.runtime_generation == intent.guard.runtime_generation
         && live.panel_certificate.process_instance_id
             == intent.process_identity.process_instance_id
-        && matches!(live.gateway_ready.kind, GatewayReadyKindV1::DiscordResumed)
+        && live.gateway_ready.kind == expected_live_gateway_ready_kind
         && live.gateway_ready.target == intent.target
         && live.gateway_ready.runtime_generation == intent.guard.runtime_generation
         && live.gateway_ready.process_instance_id == intent.process_identity.process_instance_id
@@ -514,6 +517,16 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_for_gateway_kind(RuntimeGatewayReadyKindV2::Resumed)
+    }
+
+    fn fixture_for_gateway_kind(gateway_kind: RuntimeGatewayReadyKindV2) -> Fixture {
+        let (persisted_gateway_kind, projected_gateway_kind) = match gateway_kind {
+            RuntimeGatewayReadyKindV2::Ready => ("discord_ready", GatewayReadyKindV1::DiscordReady),
+            RuntimeGatewayReadyKindV2::Resumed => {
+                ("discord_resumed", GatewayReadyKindV1::DiscordResumed)
+            }
+        };
         let target = target();
         let identity = identity();
         let process_instance_id = ProcessInstanceId::parse("process:1").unwrap();
@@ -678,7 +691,7 @@ mod tests {
                 gateway: RuntimeGatewayReadyAttestationV2 {
                     process_instance_id: process_instance_id.clone(),
                     connection_epoch: non_zero(9),
-                    kind: RuntimeGatewayReadyKindV2::Resumed,
+                    kind: gateway_kind,
                     admission_revision: non_zero(10),
                     connected_event_sequence: RuntimeGatewayAdmissionSequenceV2::new(non_zero(11)),
                     resume_sequence: RuntimeGatewayAdmissionSequenceV2::new(non_zero(13)),
@@ -702,7 +715,7 @@ mod tests {
                     target: target.clone(),
                     runtime_generation,
                     process_instance_id: process_instance_id.clone(),
-                    kind: GatewayReadyKindV1::DiscordResumed,
+                    kind: projected_gateway_kind,
                     ready_at: at(50),
                 },
                 at(51),
@@ -737,7 +750,7 @@ mod tests {
             panel_certificate_id: "panel:1".to_string(),
             panel_report_digest: "4".repeat(64),
             gateway_shard_id: "shard:0".to_string(),
-            gateway_ready_kind: "discord_resumed".to_string(),
+            gateway_ready_kind: persisted_gateway_kind.to_string(),
             gateway_ready_at: at(51),
             certified_at: at(51),
             record_format_version: 2,
@@ -891,25 +904,49 @@ mod tests {
     }
 
     #[test]
-    fn canonical_v2_product_evidence_decodes_to_format_neutral_status() {
-        let fixture = fixture();
-        let attestation = decode_canonical_status_attestation_v2(
-            fixture.row,
-            fixture.sidecar,
-            &fixture.deployment,
-        )
-        .unwrap();
+    fn canonical_v2_product_evidence_decodes_both_gateway_ready_kinds() {
+        for gateway_kind in [
+            RuntimeGatewayReadyKindV2::Ready,
+            RuntimeGatewayReadyKindV2::Resumed,
+        ] {
+            let fixture = fixture_for_gateway_kind(gateway_kind);
+            let expected_id = fixture.deployment.live_attestation_id.clone().unwrap();
+            let attestation = decode_canonical_status_attestation_v2(
+                fixture.row,
+                fixture.sidecar,
+                &fixture.deployment,
+            )
+            .unwrap();
 
-        assert_eq!(
-            attestation.id,
-            fixture.deployment.live_attestation_id.unwrap()
-        );
-        assert_eq!(attestation.convergence_attempt, NonZeroU32::new(5));
-        assert_eq!(
-            attestation.metadata.runtime_build_revision.as_str(),
-            "build:1"
-        );
-        assert_eq!(attestation.metadata.gateway_shard_id.as_str(), "shard:0");
+            assert_eq!(attestation.id, expected_id);
+            assert_eq!(attestation.convergence_attempt, NonZeroU32::new(5));
+            assert_eq!(
+                attestation.metadata.runtime_build_revision.as_str(),
+                "build:1"
+            );
+            assert_eq!(attestation.metadata.gateway_shard_id.as_str(), "shard:0");
+        }
+    }
+
+    #[test]
+    fn canonical_v2_product_evidence_rejects_cross_kind_gateway_projection() {
+        for (gateway_kind, persisted_gateway_kind) in [
+            (RuntimeGatewayReadyKindV2::Ready, "discord_resumed"),
+            (RuntimeGatewayReadyKindV2::Resumed, "discord_ready"),
+        ] {
+            let mut fixture = fixture_for_gateway_kind(gateway_kind);
+            fixture.row.gateway_ready_kind = persisted_gateway_kind.to_string();
+            assert!(matches!(
+                decode_canonical_status_attestation_v2(
+                    fixture.row,
+                    fixture.sidecar,
+                    &fixture.deployment,
+                ),
+                Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                    "runtime attestation V2 projections"
+                ))
+            ));
+        }
     }
 
     #[test]
