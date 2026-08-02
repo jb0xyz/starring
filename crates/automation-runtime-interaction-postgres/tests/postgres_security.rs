@@ -1089,10 +1089,6 @@ async fn prepare_deferred_receipt_for_route(
         Duration::from_secs(30),
     )
     .await;
-    store
-        .bind_interaction_receipt_action_plan_v1(&mut claim, plan_digest)
-        .await
-        .unwrap();
     let intent_digest = RuntimeInteractionReceiptOpaqueDigestV1::new([31; 32]);
     store
         .intend_interaction_receipt_initial_response_v1(
@@ -1115,6 +1111,14 @@ async fn prepare_deferred_receipt_for_route(
         )
         .await
         .unwrap();
+    assert_eq!(claim.state(), InteractionReceiptStateV1::Deferred);
+    assert!(claim.action_plan_digest().is_none());
+    store
+        .bind_interaction_receipt_action_plan_v1(&mut claim, plan_digest.clone())
+        .await
+        .unwrap();
+    assert_eq!(claim.state(), InteractionReceiptStateV1::Prepared);
+    assert_eq!(claim.action_plan_digest(), Some(&plan_digest));
     claim
 }
 
@@ -1765,6 +1769,68 @@ fn response_tail_scan_fix_is_adjacent_exact_and_metadata_preserving() {
 }
 
 #[test]
+fn ack_first_effect_plan_bind_fix_is_head_exact_and_metadata_preserving() {
+    let versions = MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    let status_projection = versions
+        .iter()
+        .position(|version| *version == 202_608_020_001)
+        .unwrap();
+    let fix = versions
+        .iter()
+        .position(|version| *version == 202_608_020_002)
+        .unwrap();
+    assert_eq!(fix, status_projection + 1);
+    assert_eq!(fix, versions.len() - 1);
+
+    let migration = include_str!(
+        "../../../migrations/202608020002_fix_runtime_interaction_effect_ack_first_plan_bind_v1.sql"
+    );
+    for required in [
+        "public.starring_runtime_interaction_effect_plan_bind_v1(text,text,bigint,bigint,text,bytea,bytea,bytea,jsonb)",
+        "applied_count <> 118",
+        "applied_head <> 202608020001",
+        "f00b245ee986adaa9358b30f56756d11642a2c6610c0a03778d09efc630fd379225cfd08c8ec85121a6a38f854955c0f",
+        "986be456dee9d29fc2be05cc67291c733195dda219cfd9a68581bcd013893951",
+        "4dcdf8c5abdd4a11dd91c60a0722a84f3dba0321f94ce718e767a5992d6e334e",
+        "74569a6e5d8d7b6e53ef502b2ff95805927c41473b3e64b2edab9b2d621377eb",
+        "receipt_head.state <> ''deferred''",
+        "receipt_head.state NOT IN (''prepared'', ''deferred'')",
+        "/ pg_catalog.char_length(old_fragment) <> 1",
+        "/ pg_catalog.char_length(new_fragment) <> 1",
+        "metadata_after IS DISTINCT FROM metadata_before",
+        "8db2428cc05e5f973639d6f8af244722c40ae9183f3b32202ec45af5e22d5215",
+        "2c26f1d73f15e926dc4dd2af76f698462082490ae298b0b7ce3b366a341378f1",
+        "4cb3618c886f231ab75cd9224422131aadba925e9abac870416244a596be2e17",
+        "5eb6e46d8d2bfe6f4654d222bb9abe2a8193c31725b36f4485b96fa5b2cd8834",
+        "public.starring_runtime_interaction_effect_schema_manifest_v1()",
+        "public.starring_runtime_interaction_schema_manifest_v1()",
+    ] {
+        assert!(migration.contains(required), "missing contract: {required}");
+    }
+    for forbidden in [
+        "\nCREATE ROLE ",
+        "\nCREATE TABLE ",
+        "\nALTER TABLE ",
+        "\nINSERT ",
+        "\nUPDATE ",
+        "\nDELETE ",
+        "\nTRUNCATE ",
+        "\nGRANT ",
+        "COMMENT ON",
+    ] {
+        assert!(!migration.contains(forbidden), "forbidden SQL: {forbidden}");
+    }
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
+}
+
+#[test]
 fn teardown_migration_is_ordered_idempotent_bounded_and_private() {
     let versions = MIGRATOR
         .iter()
@@ -2050,7 +2116,7 @@ async fn response_tail_scan_fix_upgrades_from_effect_journal_and_serves_empty_sc
     .fetch_one(&database.owner_pool)
     .await
     .unwrap();
-    assert_eq!(ledger, (118, 202_608_020_001, 48));
+    assert_eq!(ledger, (119, 202_608_020_002, 48));
     let definitions: (String, String, i32, i32) = sqlx::query_as(
         "SELECT \
              pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(\
@@ -2081,7 +2147,7 @@ async fn response_tail_scan_fix_upgrades_from_effect_journal_and_serves_empty_sc
         definitions,
         (
             "83f98c884ef9bed3706ace2a9430c401760277fb3cc83ea16646d147c819550b".to_string(),
-            "4cb3618c886f231ab75cd9224422131aadba925e9abac870416244a596be2e17".to_string(),
+            "5eb6e46d8d2bfe6f4654d222bb9abe2a8193c31725b36f4485b96fa5b2cd8834".to_string(),
             0,
             2,
         )
@@ -2472,6 +2538,75 @@ async fn effect_plan_bind_enforces_defer_tail_policy_and_serializes_replay() {
     assert_eq!(
         store
             .intend_interaction_receipt_execution_v1(&mut deferred)
+            .await
+            .unwrap(),
+        RuntimeInteractionReceiptMutationDispositionV1::Applied
+    );
+
+    let legacy_plan = InteractionActionPlanDigestV1::parse("6".repeat(64)).unwrap();
+    let mut legacy = acquire_test_receipt(
+        &store,
+        &content_hash,
+        9_300_007,
+        "button:legacy-plan-before-defer",
+        Duration::from_secs(30),
+    )
+    .await;
+    store
+        .bind_interaction_receipt_action_plan_v1(&mut legacy, legacy_plan.clone())
+        .await
+        .unwrap();
+    let legacy_intent_digest = RuntimeInteractionReceiptOpaqueDigestV1::new([36; 32]);
+    store
+        .intend_interaction_receipt_initial_response_v1(
+            &mut legacy,
+            RuntimeInteractionReceiptInitialResponseIntentV1::new(
+                RuntimeInteractionReceiptInitialResponseKindV1::DeferEphemeral,
+                legacy_intent_digest.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .finish_interaction_receipt_initial_response_v1(
+            &mut legacy,
+            RuntimeInteractionReceiptInitialResponseResultV1::new(
+                legacy_intent_digest,
+                RuntimeInteractionReceiptInitialResponseResultKindV1::Succeeded,
+                RuntimeInteractionReceiptOpaqueDigestV1::new([37; 32]),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy.state(), InteractionReceiptStateV1::Deferred);
+    let mut legacy_create_role = create_role_effect_action(0);
+    legacy_create_role["correlation_marker"] = serde_json::json!("d".repeat(64));
+    let legacy_actions = serde_json::json!([legacy_create_role, edit_response_effect_action(1)]);
+    assert_eq!(
+        bind_effect_plan_document(
+            &database.executor_pool,
+            &legacy,
+            &legacy_plan,
+            legacy_actions.clone(),
+        )
+        .await
+        .unwrap(),
+        ("plan_bound".to_string(), 2)
+    );
+    assert_eq!(
+        bind_effect_plan_document(
+            &database.executor_pool,
+            &legacy,
+            &legacy_plan,
+            legacy_actions,
+        )
+        .await
+        .unwrap(),
+        ("exact_replay".to_string(), 2)
+    );
+    assert_eq!(
+        store
+            .intend_interaction_receipt_execution_v1(&mut legacy)
             .await
             .unwrap(),
         RuntimeInteractionReceiptMutationDispositionV1::Applied
