@@ -102,7 +102,7 @@ fn committed_certification_execution_digest_chain_is_exact_and_current() {
     assert!(PREVIOUS_MIGRATION
         .contains("779d97c088a29027589ebdffa9753eb1333a1d9b511cd714211cde6ae8146c4e"));
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
-        assert!(source.contains("0e69552f26e09949d44b87c7ae7680432ff2c36a0027230efcf541cc4324cd9f"));
+        assert!(source.contains("98ed1251e3339ffb452ed12334699e93f43e2ea3cd7d327bc3d2a11fe12b9fb2"));
         assert!(
             !source.contains("779d97c088a29027589ebdffa9753eb1333a1d9b511cd714211cde6ae8146c4e")
         );

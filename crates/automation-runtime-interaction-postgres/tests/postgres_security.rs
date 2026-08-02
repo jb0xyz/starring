@@ -1783,7 +1783,8 @@ fn ack_first_effect_plan_bind_fix_is_head_exact_and_metadata_preserving() {
         .position(|version| *version == 202_608_020_002)
         .unwrap();
     assert_eq!(fix, status_projection + 1);
-    assert_eq!(fix, versions.len() - 1);
+    assert_eq!(versions.get(fix + 1), Some(&202_608_030_001));
+    assert_eq!(fix + 1, versions.len() - 1);
 
     let migration = include_str!(
         "../../../migrations/202608020002_fix_runtime_interaction_effect_ack_first_plan_bind_v1.sql"
@@ -2116,7 +2117,7 @@ async fn response_tail_scan_fix_upgrades_from_effect_journal_and_serves_empty_sc
     .fetch_one(&database.owner_pool)
     .await
     .unwrap();
-    assert_eq!(ledger, (119, 202_608_020_002, 48));
+    assert_eq!(ledger, (120, 202_608_030_001, 48));
     let definitions: (String, String, i32, i32) = sqlx::query_as(
         "SELECT \
              pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(\

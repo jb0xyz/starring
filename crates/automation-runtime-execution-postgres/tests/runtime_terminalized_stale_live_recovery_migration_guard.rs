@@ -116,7 +116,7 @@ fn terminalized_stale_live_recovery_digest_chain_is_exact_and_current() {
     assert!(PREVIOUS_MIGRATION
         .contains("7bd23bbaa7cef9cfcb88ac6a273dc6ac82af3e55e5ab71fff5a54b98cd90f81e"));
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
-        assert!(source.contains("0e69552f26e09949d44b87c7ae7680432ff2c36a0027230efcf541cc4324cd9f"));
+        assert!(source.contains("98ed1251e3339ffb452ed12334699e93f43e2ea3cd7d327bc3d2a11fe12b9fb2"));
     }
 }
 

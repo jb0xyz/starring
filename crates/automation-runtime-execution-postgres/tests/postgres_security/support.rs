@@ -111,7 +111,7 @@ const PRE_INGRESS_ACK_EXECUTOR_FUNCTIONS: [&str; 15] = [
     "public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "0e69552f26e09949d44b87c7ae7680432ff2c36a0027230efcf541cc4324cd9f";
+    "98ed1251e3339ffb452ed12334699e93f43e2ea3cd7d327bc3d2a11fe12b9fb2";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";

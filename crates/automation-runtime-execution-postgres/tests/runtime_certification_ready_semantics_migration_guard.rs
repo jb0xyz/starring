@@ -146,7 +146,7 @@ fn execution_readiness_refresh_is_exact_and_pinned_everywhere() {
     let previous_readiness_definition =
         "fc2b7bceeb3e9b9fc98335c3c358652e76b3f13edf87bbbb2506b62de3577e0a";
     let current_readiness_definition =
-        "0e69552f26e09949d44b87c7ae7680432ff2c36a0027230efcf541cc4324cd9f";
+        "98ed1251e3339ffb452ed12334699e93f43e2ea3cd7d327bc3d2a11fe12b9fb2";
     for required in [
         "public.starring_runtime_execution_database_readiness_v1()",
         previous_manifest_definition,
