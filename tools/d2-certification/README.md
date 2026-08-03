@@ -182,6 +182,11 @@ python3 tools/d2-certification/isolated_orchestrator.py onboard \
 python3 tools/d2-certification/isolated_orchestrator.py transport-control \
   --manifest /absolute/run/manifest.json \
   --operation snapshot
+python3 tools/d2-certification/isolated_orchestrator.py certify-live-runtime-restart \
+  --manifest /absolute/run/manifest.json
+python3 tools/d2-certification/isolated_orchestrator.py certify-live-runtime-restart \
+  --manifest /absolute/run/manifest.json \
+  --confirmation-file /absolute/live-runtime-restart-confirmation.json
 python3 tools/d2-certification/isolated_orchestrator.py restart-drained-runtime \
   --manifest /absolute/run/manifest.json
 python3 tools/d2-certification/isolated_orchestrator.py stop \
@@ -198,6 +203,66 @@ fails closed before candidate execution. Before database mutation, the bot
 must also resolve that ID as a type-0 text channel in the manifest guild. The
 persisted authority payload digest uses the same canonical revision, binding,
 policy, and TTL identity contract enforced by runtime hydration.
+
+`certify-live-runtime-restart` is the step 11 process boundary and is separate
+from replacement drain recovery. It requires exactly the first ten verified D2
+receipts, binds their prior live witness and the deployment, route, and instance
+from steps 8 and 9, and accepts only the fixed `live_fresh_lease` checkpoint.
+Before signaling, it fsyncs the exact old PID, launchd run count, runtime
+candidate and plist identity, dependency processes, transport instance,
+standing snapshot, and receipt-chain head. It sends only `SIGTERM` to the
+manifest runtime label, requires a clean exit within 30 seconds, and then
+observes a complete 30-second launchd throttle window with no PID, the same run
+count, exit code `0`, and closed readiness. It uses `restart-drained-runtime`
+for the exact inactive start and verifies a stable new PID.
+
+The first invocation stops at `awaiting_canonical_confirmation` and does not
+write completion or step 11 evidence. In the authenticated browser, call
+`liveRuntimeRestartConfirmation` on the loaded `StarringD2ProductDriver` with
+the returned `operation_id`, `installation_id`, `promotion_id`, and
+`shutdown_boundary`. The helper reads both canonical deployment endpoints,
+requires product and operational `live`, runtime `live`, serving `fresh`, exact
+heartbeat and lease agreement, the same positive attestation revision, and a
+heartbeat later than the durable shutdown boundary. It also seals the driver's
+normalized public origin. Its returned object is the complete redacted JSON
+contract; save only that JSON to an absolute, owner-controlled mode-`0600`
+file. Rerun the command with `--confirmation-file` before the fixed 45-second
+serving lease expires. If it expires, run only the browser helper again and
+replace the confirmation file. A confirmation supplied before the durable
+awaiting record is rejected before any signal or restart.
+
+```js
+const product = StarringD2ProductDriver.create();
+const confirmation = await product.liveRuntimeRestartConfirmation({
+  operationId: "<operation_id from phase 1>",
+  installationId: "<installation_id from phase 1>",
+  promotionId: "<promotion_id from phase 1>",
+  shutdownBoundary: "<shutdown_boundary from phase 1>",
+});
+copy(JSON.stringify(confirmation));
+```
+
+The second invocation accepts only the exact schema and binds its operation,
+installation, promotion, public origin, and shutdown boundary to the durable
+local restart. Only then does it publish completion and mode-`0600` step 11
+evidence. The receipt step is named
+`local_runtime_restarted_with_canonical_serving_continuity` and binds the full
+confirmation digest, operation, scope, boundary, origin, and attestation
+revision. It certifies two separate facts: the exact local launchd candidate
+cleanly rotated PID and became ready, and the canonical scoped deployment had
+a fresh serving heartbeat after the shutdown boundary. It explicitly records
+`process_identity_joined: false`; it does not claim that the canonical lease is
+cryptographically joined to the new local PID.
+
+This human boundary is required because the authenticated canonical product
+status does not expose a process identifier that can be safely joined to the
+local launchd PID, and the certification tool has no product session credential
+or least-privilege direct runtime reader. The flow performs no direct database
+observation and stores no cookie, token, or session fingerprint. Interrupted
+operations resume from their durable phase, and completed operations replay
+without another signal or a current-lease requirement. The command does not
+append the certification receipt; record the reviewed evidence with
+`d2_certification.py record --step 11`.
 
 `restart-drained-runtime` is available only while the manifest is in
 `candidate_started`. It requires the prior runtime PID and readiness to be

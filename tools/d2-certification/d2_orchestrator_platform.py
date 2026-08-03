@@ -518,6 +518,21 @@ class Platform:
                 self.launchd_bootout(label)
             raise
 
+    def launchd_signal(self, label, signal_name):
+        if signal_name != "SIGTERM":
+            fail("launchd_signal_invalid")
+        result = self.run(
+            [
+                REQUIRED_PROGRAMS["launchctl"],
+                "kill",
+                signal_name,
+                f"gui/{os.getuid()}/{label}",
+            ],
+            timeout=10,
+        )
+        if result.returncode != 0:
+            fail("launchd_signal_failed")
+
     def http_status(self, url, timeout_seconds=3, host_header=None):
         arguments = [
             REQUIRED_PROGRAMS["curl"],

@@ -127,10 +127,21 @@ def complete_evidence(manifest):
             "new_pid": 101,
             "runtime_sha256": manifest["candidates"]["runtime"]["sha256"],
             "ready_after_restart": True,
+            "process_identity_joined": False,
             "checkpoint": "live_fresh_lease",
             "deployment_id": "deployment-1",
             "route_id": "route-1",
             "instance_id": "instance-1",
+            "canonical_confirmation_sha256": DIGEST,
+            "operation_id": (
+                f"d2:{MODULE.manifest_digest(manifest)[:16]}:"
+                "certify-live-runtime-restart"
+            ),
+            "shutdown_boundary": "2026-08-03T01:00:00Z",
+            "installation_id": "installation-1",
+            "promotion_id": DIGEST,
+            "attestation_revision": 11,
+            "public_origin": manifest["cloudflare"]["public_origin"],
         },
         12: {
             "route_reconstructed": True,
@@ -438,6 +449,47 @@ class D2CertificationTest(unittest.TestCase):
         self.assertEqual(summary["status"], "passed")
         self.assertEqual(summary["steps"], 17)
         self.assertRegex(summary["receipt_chain_head_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_step_eleven_requires_the_fixed_live_fresh_lease_checkpoint(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence_by_step = complete_evidence(manifest)
+        for step in range(1, 11):
+            self.assertEqual(
+                self.record(manifest_path, step, evidence_by_step[step]), 0
+            )
+        evidence_by_step[11]["checkpoint"] = "runtime_ready"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            status = self.record(manifest_path, 11, evidence_by_step[11])
+        self.assertEqual(status, 1)
+        self.assertIn("step_contract_failed:checkpoint", stderr.getvalue())
+
+    def test_step_eleven_binds_the_canonical_confirmation_scope(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence_by_step = complete_evidence(manifest)
+        for step in range(1, 11):
+            self.assertEqual(
+                self.record(manifest_path, step, evidence_by_step[step]), 0
+            )
+        evidence = evidence_by_step[11]
+        mutations = (
+            ("process_identity_joined", True),
+            ("public_origin", "https://api.starring.co.kr"),
+            ("installation_id", "installation-other"),
+            (
+                "operation_id",
+                "d2:ffffffffffffffff:certify-live-runtime-restart",
+            ),
+        )
+        for field, replacement in mutations:
+            original = evidence[field]
+            evidence[field] = replacement
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.record(manifest_path, 11, evidence), 1)
+            evidence[field] = original
+        self.assertEqual(self.record(manifest_path, 11, evidence), 0)
 
     def test_oauth_principal_must_match_the_pinned_transport_actor(self):
         manifest_path = self.prepare()

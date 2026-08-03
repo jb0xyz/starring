@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import contextlib
+import datetime
 import fcntl
 import importlib.util
 import io
@@ -31,6 +32,8 @@ ORCHESTRATOR_SPEC.loader.exec_module(ORCHESTRATOR)
 CONTRACT = sys.modules["d2_orchestrator_contract"]
 PLATFORM = sys.modules["d2_orchestrator_platform"]
 DRAINED_RUNTIME_RESTART = sys.modules["d2_drained_runtime_restart"]
+LIVE_RUNTIME_RESTART = sys.modules["d2_live_runtime_restart"]
+from test_d2_certification import complete_evidence as complete_certification_evidence
 
 
 class RecordingLaunchdPlatform(PLATFORM.Platform):
@@ -92,6 +95,9 @@ class FakePlatform:
         self.launchd_runs = {}
         self.launchd_states = {}
         self.last_exit_codes = {}
+        self.signals = []
+        self.signal_exit_code = 0
+        self.signal_failure = False
         self.next_pid = 41000
 
     def run(self, arguments, input_bytes=None, timeout=30, environment=None):
@@ -370,6 +376,12 @@ class FakePlatform:
     def wait_for_status(self, probe, expected, timeout_seconds=60):
         return probe()
 
+    def launchd_signal(self, label, signal_name):
+        if self.signal_failure:
+            ORCHESTRATOR.fail("injected_launchd_signal_failure")
+        self.signals.append((label, signal_name))
+        self.exit_launchd(label, self.signal_exit_code)
+
     def launchd_bootout(self, label):
         self.bootouts.append(label)
         self.loaded.discard(label)
@@ -416,8 +428,23 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.manifest_path = self.prepare_manifest()
         self.context = ORCHESTRATOR.load_context(self.manifest_path)
         self.platform = FakePlatform()
+        self.live_clock = 0.0
+        self.live_monotonic = mock.patch.object(
+            LIVE_RUNTIME_RESTART,
+            "monotonic_time",
+            side_effect=lambda: self.live_clock,
+        )
+        self.live_sleep = mock.patch.object(
+            LIVE_RUNTIME_RESTART,
+            "wait_interval",
+            side_effect=self.advance_live_clock,
+        )
+        self.live_monotonic.start()
+        self.live_sleep.start()
 
     def tearDown(self):
+        self.live_sleep.stop()
+        self.live_monotonic.stop()
         if self.isolated_root.exists():
             ORCHESTRATOR.guarded_remove_root(self.context)
         for path in self.artifact_root.rglob("*"):
@@ -425,6 +452,9 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
                 path.chmod(0o700)
         self.artifact_root.chmod(0o700)
         self.temporary.cleanup()
+
+    def advance_live_clock(self, seconds):
+        self.live_clock += seconds
 
     def prepare_manifest(self):
         arguments = [
@@ -472,6 +502,65 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             self.assertEqual(CERTIFICATION.main(arguments), 0)
         return pathlib.Path(json.loads(output.getvalue())["manifest"])
 
+    def record_prerequisite_receipts(self):
+        evidence_by_step = complete_certification_evidence(self.context.manifest)
+        for step in range(1, 11):
+            path = self.root / f"live-restart-step-{step}.json"
+            path.write_text(
+                json.dumps(evidence_by_step[step]), encoding="utf-8"
+            )
+            path.chmod(0o600)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    CERTIFICATION.main(
+                        [
+                            "record",
+                            "--manifest",
+                            str(self.manifest_path),
+                            "--step",
+                            str(step),
+                            "--evidence",
+                            str(path),
+                        ]
+                    ),
+                    0,
+                )
+
+    def write_live_restart_confirmation(self, awaiting, overrides=None):
+        boundary = datetime.datetime.fromisoformat(
+            awaiting["shutdown_boundary"].replace("Z", "+00:00")
+        )
+        heartbeat = boundary + datetime.timedelta(microseconds=1)
+        observed = boundary + datetime.timedelta(microseconds=2)
+        expires = heartbeat + datetime.timedelta(seconds=45)
+        confirmation = {
+            "schema_version": 1,
+            "kind": LIVE_RUNTIME_RESTART.CONFIRMATION_KIND,
+            "checkpoint": "live_fresh_lease",
+            "operation_id": awaiting["operation_id"],
+            "installation_id": awaiting["installation_id"],
+            "promotion_id": awaiting["promotion_id"],
+            "public_origin": awaiting["public_origin"],
+            "shutdown_boundary": awaiting["shutdown_boundary"],
+            "observed_at": observed.isoformat().replace("+00:00", "Z"),
+            "product_state": "live",
+            "operational_state": "live",
+            "runtime_phase": "live",
+            "serving_state": "fresh",
+            "attestation_revision": 11,
+            "last_heartbeat_at": heartbeat.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "lease_expires_at": expires.isoformat().replace(
+                "+00:00", "Z"
+            ),
+        }
+        confirmation.update(overrides or {})
+        path = self.root / "live-runtime-restart-confirmation.json"
+        path.write_text(json.dumps(confirmation), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
     def test_dry_run_is_read_only_and_binds_dedicated_namespaces(self):
         result = ORCHESTRATOR.command_dry_run(self.context, self.platform)
         self.assertEqual(result["status"], "ready")
@@ -486,6 +575,29 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         )
         self.assertEqual(arguments.command, "restart-drained-runtime")
         self.assertEqual(arguments.manifest, str(self.manifest_path))
+
+    def test_certify_live_runtime_restart_parser_requires_manifest(self):
+        arguments = ORCHESTRATOR.build_parser().parse_args(
+            [
+                "certify-live-runtime-restart",
+                "--manifest",
+                str(self.manifest_path),
+            ]
+        )
+        self.assertEqual(arguments.command, "certify-live-runtime-restart")
+        self.assertEqual(arguments.manifest, str(self.manifest_path))
+        self.assertIsNone(arguments.confirmation_file)
+        confirmation = self.root / "confirmation.json"
+        arguments = ORCHESTRATOR.build_parser().parse_args(
+            [
+                "certify-live-runtime-restart",
+                "--manifest",
+                str(self.manifest_path),
+                "--confirmation-file",
+                str(confirmation),
+            ]
+        )
+        self.assertEqual(arguments.confirmation_file, str(confirmation))
 
     def test_atomic_write_fsyncs_created_parent_and_renamed_entry(self):
         path = self.root / "atomic" / "state.json"
@@ -772,6 +884,14 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         widened["gateway"]["unpinned"] = 0
         self.assertFalse(platform._transport_snapshot_valid(self.context, widened))
 
+    def test_live_restart_has_no_direct_database_observation_path(self):
+        self.assertFalse(hasattr(PLATFORM.Platform(), "runtime_live_observation"))
+        source = (DIRECTORY / "d2_orchestrator_platform.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("runtime_serving_leases", source)
+        self.assertNotIn("PGPASSFILE", source)
+
     def test_transport_control_lost_response_reuses_durable_operation(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         ORCHESTRATOR.command_start(self.context, self.platform)
@@ -921,6 +1041,650 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.platform.health_failure = None
         result = ORCHESTRATOR.command_start(self.context, self.platform)
         self.assertEqual(result["phase"], "candidate_started")
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_certifies_step_11_and_exactly_replays(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        old_pid = self.platform.pids[runtime_label]
+        start_count = len(self.platform.start_order)
+        awaiting = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        self.assertEqual(awaiting["status"], "awaiting_canonical_confirmation")
+        self.assertEqual(awaiting["old_pid"], old_pid)
+        self.assertNotEqual(awaiting["new_pid"], old_pid)
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+                self.context
+            ).exists()
+        )
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_evidence_path(
+                self.context
+            ).exists()
+        )
+        confirmation_path = self.write_live_restart_confirmation(awaiting)
+        result = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform, confirmation_path
+        )
+        self.assertEqual(result["status"], "live_runtime_restart_certified")
+        self.assertEqual(result["old_pid"], old_pid)
+        self.assertNotEqual(result["new_pid"], old_pid)
+        self.assertEqual(result["checkpoint"], "live_fresh_lease")
+        self.assertEqual(result["deployment_id"], "deployment-1")
+        self.assertEqual(result["route_id"], "route-1")
+        self.assertEqual(result["instance_id"], "instance-1")
+        self.assertEqual(
+            self.platform.signals,
+            [(runtime_label, "SIGTERM")],
+        )
+        self.assertEqual(
+            self.platform.start_order[start_count:],
+            [runtime_label],
+        )
+        evidence_path = pathlib.Path(result["evidence_path"])
+        self.assertEqual(evidence_path.stat().st_mode & 0o777, 0o600)
+        shutdown_path = (
+            LIVE_RUNTIME_RESTART.live_runtime_restart_shutdown_path(
+                self.context
+            )
+        )
+        self.assertEqual(shutdown_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            json.loads(shutdown_path.read_text(encoding="utf-8"))[
+                "stability_seconds"
+            ],
+            30,
+        )
+        self.assertEqual(
+            set(json.loads(evidence_path.read_text(encoding="utf-8"))),
+            set(CERTIFICATION.STEP_SPECS[11].required),
+        )
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        completion = json.loads(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+                self.context
+            ).read_text(encoding="utf-8")
+        )
+        self.assertIs(evidence["process_identity_joined"], False)
+        self.assertEqual(
+            evidence["canonical_confirmation_sha256"],
+            completion["canonical_confirmation_sha256"],
+        )
+        self.assertEqual(
+            evidence["public_origin"],
+            self.context.manifest["cloudflare"]["public_origin"],
+        )
+        receipts_path = self.manifest_path.with_name("receipts.jsonl")
+        self.assertEqual(len(receipts_path.read_text().splitlines()), 10)
+        replay_start_count = len(self.platform.start_order)
+        replay = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        self.assertEqual(replay["status"], "exact_replay")
+        self.assertEqual(replay["new_pid"], result["new_pid"])
+        self.assertEqual(len(self.platform.signals), 1)
+        self.assertEqual(len(self.platform.start_order), replay_start_count)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                CERTIFICATION.main(
+                    [
+                        "record",
+                        "--manifest",
+                        str(self.manifest_path),
+                        "--step",
+                        "11",
+                        "--evidence",
+                        str(evidence_path),
+                    ]
+                ),
+                0,
+            )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_premature_confirmation_without_signal(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        confirmation_path = self.root / "premature-confirmation.json"
+        confirmation_path.write_text("{}", encoding="utf-8")
+        confirmation_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_confirmation_premature",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform, confirmation_path
+            )
+        self.assertEqual(self.platform.signals, [])
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_intent_path(
+                self.context
+            ).exists()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_tampered_completion_binding(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        awaiting = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        confirmation_path = self.write_live_restart_confirmation(awaiting)
+        ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform, confirmation_path
+        )
+        completion_path = (
+            LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+                self.context
+            )
+        )
+        completion = json.loads(completion_path.read_text(encoding="utf-8"))
+        completion["canonical_confirmation"]["operation_id"] = (
+            "d2:ffffffffffffffff:certify-live-runtime-restart"
+        )
+        completion["canonical_confirmation_sha256"] = (
+            LIVE_RUNTIME_RESTART.canonical_confirmation_digest(
+                completion["canonical_confirmation"]
+            )
+        )
+        completion_path.write_text(json.dumps(completion), encoding="utf-8")
+        completion_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_completion_invalid",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_persists_intent_before_sigterm(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        original_signal = self.platform.launchd_signal
+
+        def require_intent(label, signal_name):
+            intent_path = LIVE_RUNTIME_RESTART.live_runtime_restart_intent_path(
+                self.context
+            )
+            self.assertTrue(intent_path.is_file())
+            self.assertEqual(intent_path.stat().st_mode & 0o777, 0o600)
+            original_signal(label, signal_name)
+
+        self.platform.launchd_signal = require_intent
+        ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rechecks_readiness_before_sigterm(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        original_write = LIVE_RUNTIME_RESTART.write_live_runtime_restart_record
+
+        def close_readiness(context, name, record):
+            path = original_write(context, name, record)
+            if name == "intent":
+                self.platform.health_failure = str(
+                    self.context.manifest["services"]["runtime"]["port"]
+                )
+            return path
+
+        with mock.patch.object(
+            LIVE_RUNTIME_RESTART,
+            "write_live_runtime_restart_record",
+            side_effect=close_readiness,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_precondition_changed",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertEqual(self.platform.signals, [])
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_binds_transport_to_receipt_three(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        replacement = "d2ti-fedcba9876543210fedcba9876543210"
+        self.platform.transport_state["instance_id"] = replacement
+        evidence_path = self.context.artifact_directory / "step-03-evidence.json"
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["transport_instance_id"] = replacement
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        evidence_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_transport_changed",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertEqual(self.platform.signals, [])
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_recovers_after_sigterm_before_start(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        with mock.patch.object(
+            LIVE_RUNTIME_RESTART,
+            "command_restart_drained_runtime",
+            side_effect=ORCHESTRATOR.OrchestratorError("injected_restart_loss"),
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_restart_loss"
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertEqual(len(self.platform.signals), 1)
+        recovered = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        self.assertEqual(recovered["status"], "awaiting_canonical_confirmation")
+        self.assertEqual(len(self.platform.signals), 1)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_repeats_stability_after_interruption(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        interrupted = False
+
+        def interrupt_stability(seconds):
+            nonlocal interrupted
+            if seconds == 0.25 and not interrupted:
+                interrupted = True
+                raise ORCHESTRATOR.OrchestratorError("injected_stability_loss")
+            self.advance_live_clock(seconds)
+
+        with mock.patch.object(
+            LIVE_RUNTIME_RESTART,
+            "wait_interval",
+            side_effect=interrupt_stability,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_stability_loss"
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertEqual(len(self.platform.signals), 1)
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_shutdown_path(
+                self.context
+            ).exists()
+        )
+        self.assertFalse(
+            ORCHESTRATOR.drained_runtime_restart_directory(self.context).exists()
+        )
+        restart_clock = self.live_clock
+        recovered = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        self.assertEqual(recovered["status"], "awaiting_canonical_confirmation")
+        self.assertGreaterEqual(self.live_clock - restart_clock, 30)
+        self.assertEqual(len(self.platform.signals), 1)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_recovers_after_inner_restart(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        awaiting = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        confirmation_path = self.write_live_restart_confirmation(awaiting)
+        original_write = LIVE_RUNTIME_RESTART.write_live_runtime_restart_record
+        injected = False
+
+        def lose_completion(context, name, record):
+            nonlocal injected
+            if name == "complete" and not injected:
+                injected = True
+                raise ORCHESTRATOR.OrchestratorError("injected_completion_loss")
+            return original_write(context, name, record)
+
+        with mock.patch.object(
+            LIVE_RUNTIME_RESTART,
+            "write_live_runtime_restart_record",
+            side_effect=lose_completion,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_completion_loss"
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform, confirmation_path
+            )
+        start_count = len(self.platform.start_order)
+        recovered = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform, confirmation_path
+        )
+        self.assertEqual(recovered["status"], "live_runtime_restart_certified")
+        self.assertEqual(len(self.platform.signals), 1)
+        self.assertEqual(len(self.platform.start_order), start_count)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_requires_the_exact_fresh_live_confirmation(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        awaiting = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        invalid_path = self.write_live_restart_confirmation(
+            awaiting, {"serving_state": "stale"}
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_confirmation_invalid",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform, invalid_path
+            )
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+                self.context
+            ).exists()
+        )
+        self.assertEqual(len(self.platform.signals), 1)
+        valid_path = self.write_live_restart_confirmation(awaiting)
+        recovered = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform, valid_path
+        )
+        self.assertEqual(recovered["status"], "live_runtime_restart_certified")
+        self.assertEqual(len(self.platform.signals), 1)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_unprotected_confirmation_file(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        awaiting = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        confirmation_path = self.write_live_restart_confirmation(awaiting)
+        confirmation_path.chmod(0o644)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_confirmation_file_invalid",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform, confirmation_path
+            )
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+                self.context
+            ).exists()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_expired_confirmation(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        awaiting = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        confirmation_path = self.write_live_restart_confirmation(awaiting)
+        confirmation = json.loads(
+            confirmation_path.read_text(encoding="utf-8")
+        )
+        with mock.patch.object(
+            LIVE_RUNTIME_RESTART,
+            "current_utc_timestamp_key",
+            return_value=LIVE_RUNTIME_RESTART.utc_timestamp_key(
+                confirmation["lease_expires_at"]
+            ),
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_confirmation_expired",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform, confirmation_path
+            )
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+                self.context
+            ).exists()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_fractionally_expired_confirmation(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        awaiting = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        confirmation_path = self.write_live_restart_confirmation(awaiting)
+        confirmation = json.loads(
+            confirmation_path.read_text(encoding="utf-8")
+        )
+        expires = LIVE_RUNTIME_RESTART.utc_timestamp_key(
+            confirmation["lease_expires_at"]
+        )
+        same_second_after_expiry = (expires[0], expires[1] + 1)
+        with mock.patch.object(
+            LIVE_RUNTIME_RESTART,
+            "current_utc_timestamp_key",
+            return_value=same_second_after_expiry,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_confirmation_expired",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform, confirmation_path
+            )
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+                self.context
+            ).exists()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_wrong_origin_and_boolean_schema(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        awaiting = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        wrong_origin = self.write_live_restart_confirmation(
+            awaiting, {"public_origin": "https://api.starring.co.kr"}
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_confirmation_scope_mismatch",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform, wrong_origin
+            )
+        boolean_schema = self.write_live_restart_confirmation(
+            awaiting, {"schema_version": True}
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_confirmation_invalid",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform, boolean_schema
+            )
+        boundary = datetime.datetime.fromisoformat(
+            awaiting["shutdown_boundary"].replace("Z", "+00:00")
+        )
+        overlong_lease = self.write_live_restart_confirmation(
+            awaiting,
+            {
+                "lease_expires_at": (
+                    boundary + datetime.timedelta(seconds=47)
+                ).isoformat().replace("+00:00", "Z")
+            },
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_confirmation_invalid",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform, overlong_lease
+            )
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+                self.context
+            ).exists()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_heartbeat_before_shutdown_boundary(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        awaiting = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        confirmation_path = self.write_live_restart_confirmation(
+            awaiting,
+            {"last_heartbeat_at": awaiting["shutdown_boundary"]},
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_confirmation_invalid",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform, confirmation_path
+            )
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+                self.context
+            ).exists()
+        )
+        self.assertEqual(len(self.platform.signals), 1)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_missing_prerequisites_before_signal(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_prerequisites_invalid",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertEqual(self.platform.signals, [])
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_nonzero_sigterm_exit(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        self.platform.signal_exit_code = 70
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_shutdown_unsuccessful",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertEqual(len(self.platform.signals), 1)
+        self.assertFalse(
+            ORCHESTRATOR.drained_runtime_restart_directory(self.context).exists()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_observes_the_complete_throttle_window(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        identity = DRAINED_RUNTIME_RESTART.drained_runtime_restart_identity(
+            self.context
+        )
+        runtime_label = identity["label"]
+        old_runs = self.platform.launchd_runs[runtime_label]
+        self.platform.exit_launchd(runtime_label)
+        clock = 0.0
+        sleeps = []
+
+        def monotonic():
+            return clock
+
+        def sleep(seconds):
+            nonlocal clock
+            sleeps.append(seconds)
+            clock += seconds
+
+        with mock.patch.object(
+            LIVE_RUNTIME_RESTART, "LIVE_EXIT_STABILITY_SECONDS", 1
+        ), mock.patch.object(
+            LIVE_RUNTIME_RESTART, "monotonic_time", side_effect=monotonic
+        ), mock.patch.object(
+            LIVE_RUNTIME_RESTART, "wait_interval", side_effect=sleep
+        ):
+            LIVE_RUNTIME_RESTART.wait_for_clean_runtime_exit(
+                self.context,
+                self.platform,
+                identity,
+                {"old_pid": 41004, "old_runs": old_runs},
+            )
+        self.assertGreaterEqual(clock, 1)
+        self.assertEqual(sleeps, [0.25, 0.25, 0.25, 0.25])
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_an_exit_after_the_deadline(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        identity = DRAINED_RUNTIME_RESTART.drained_runtime_restart_identity(
+            self.context
+        )
+        runtime_label = identity["label"]
+        old_runs = self.platform.launchd_runs[runtime_label]
+        self.platform.exit_launchd(runtime_label)
+        with mock.patch.object(
+            LIVE_RUNTIME_RESTART,
+            "monotonic_time",
+            side_effect=[0.0, 30.000001],
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_shutdown_timeout",
+        ):
+            LIVE_RUNTIME_RESTART.wait_for_clean_runtime_exit(
+                self.context,
+                self.platform,
+                identity,
+                {"old_pid": 41004, "old_runs": old_runs},
+            )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_deadline_starts_before_sigterm_returns(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        original_signal = self.platform.launchd_signal
+
+        def delayed_signal(label, signal_name):
+            original_signal(label, signal_name)
+            self.advance_live_clock(30.000001)
+
+        self.platform.launchd_signal = delayed_signal
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_shutdown_timeout",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertEqual(len(self.platform.signals), 1)
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_shutdown_path(
+                self.context
+            ).exists()
+        )
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_drained_runtime_restart_is_manifest_scoped_and_exactly_replayable(self):
@@ -1546,6 +2310,25 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
 
 
 class LaunchdPlatformTests(unittest.TestCase):
+    def test_launchd_signal_is_exactly_sigterm_and_manifest_label_scoped(self):
+        platform = PLATFORM.Platform()
+        success = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch.object(platform, "run", return_value=success) as run:
+            platform.launchd_signal("local.starring.d2.test.runtime", "SIGTERM")
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                CONTRACT.REQUIRED_PROGRAMS["launchctl"],
+                "kill",
+                "SIGTERM",
+                f"gui/{ORCHESTRATOR.os.getuid()}/local.starring.d2.test.runtime",
+            ],
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "launchd_signal_invalid"
+        ):
+            platform.launchd_signal("local.starring.d2.test.runtime", "SIGKILL")
+
     def test_launchd_job_observation_binds_program_and_optional_pid(self):
         platform = PLATFORM.Platform()
         running = subprocess.CompletedProcess(

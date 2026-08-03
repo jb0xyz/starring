@@ -54,6 +54,7 @@ from d2_drained_runtime_restart import (
     drained_runtime_restart_directory,
     drained_runtime_restart_temporary_directory,
 )
+from d2_live_runtime_restart import command_certify_live_runtime_restart
 
 
 SERVICE_START_ORDER = ("transport", "worker", "api", "runtime", "tunnel")
@@ -943,6 +944,9 @@ def build_parser():
     ):
         child = subparsers.add_parser(command)
         child.add_argument("--manifest", required=True)
+    live_restart = subparsers.add_parser("certify-live-runtime-restart")
+    live_restart.add_argument("--manifest", required=True)
+    live_restart.add_argument("--confirmation-file")
     onboard = subparsers.add_parser("onboard")
     onboard.add_argument("--manifest", required=True)
     onboard.add_argument("--principal-id", required=True)
@@ -989,6 +993,17 @@ def main():
                     context,
                     platform,
                     arguments.operation,
+                )
+            elif arguments.command == "certify-live-runtime-restart":
+                confirmation_path = (
+                    None
+                    if arguments.confirmation_file is None
+                    else require_absolute_path(
+                        arguments.confirmation_file, "confirmation_file"
+                    )
+                )
+                result = command_certify_live_runtime_restart(
+                    context, platform, confirmation_path
                 )
             else:
                 result = handlers[arguments.command](context, platform)

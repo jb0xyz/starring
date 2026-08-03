@@ -29,6 +29,7 @@ RUN_ID_PATTERN = re.compile(r"^d2-[0-9]{8}t[0-9]{6}z-[0-9a-f]{12}$")
 MIGRATION_PATTERN = re.compile(r"^[0-9]{12}$")
 UTC_TIMESTAMP_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 TRANSPORT_INSTANCE_PATTERN = re.compile(r"^d2ti-[0-9a-f]{32}$")
+LIVE_FRESH_LEASE_CHECKPOINT = "live_fresh_lease"
 ZERO_DIGEST = "0" * 64
 FORBIDDEN_EVIDENCE_KEYS = {
     "access_token",
@@ -92,6 +93,7 @@ D2_TOOLCHAIN_SOURCE_FILES = (
     "d2_orchestrator_contract.py",
     "d2_orchestrator_platform.py",
     "d2_drained_runtime_restart.py",
+    "d2_live_runtime_restart.py",
     "isolated_orchestrator.py",
     "product_driver.js",
 )
@@ -253,16 +255,24 @@ STEP_SPECS = {
         ),
     ),
     11: StepSpec(
-        "runtime_restarted",
+        "local_runtime_restarted_with_canonical_serving_continuity",
         (
             "old_pid",
             "new_pid",
             "runtime_sha256",
             "ready_after_restart",
+            "process_identity_joined",
             "checkpoint",
             "deployment_id",
             "route_id",
             "instance_id",
+            "canonical_confirmation_sha256",
+            "operation_id",
+            "shutdown_boundary",
+            "installation_id",
+            "promotion_id",
+            "attestation_revision",
+            "public_origin",
         ),
     ),
     12: StepSpec(
@@ -1377,9 +1387,44 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         if evidence["runtime_sha256"] != manifest["candidates"]["runtime"]["sha256"]:
             fail("step_contract_failed:runtime_sha256")
         require_true(evidence, "ready_after_restart")
+        if evidence["process_identity_joined"] is not False:
+            fail("step_contract_failed:process_identity_joined")
         require_identifier(
-            evidence, "checkpoint", "deployment_id", "route_id", "instance_id"
+            evidence,
+            "checkpoint",
+            "deployment_id",
+            "route_id",
+            "instance_id",
+            "operation_id",
+            "installation_id",
         )
+        require_digest(
+            evidence, "promotion_id", "canonical_confirmation_sha256"
+        )
+        require_positive_integer(evidence, "attestation_revision")
+        if evidence["checkpoint"] != LIVE_FRESH_LEASE_CHECKPOINT:
+            fail("step_contract_failed:checkpoint")
+        expected_operation_id = (
+            f"d2:{manifest_digest(manifest)[:16]}:certify-live-runtime-restart"
+        )
+        if evidence["operation_id"] != expected_operation_id:
+            fail("step_contract_failed:operation_id")
+        if (
+            not isinstance(evidence["shutdown_boundary"], str)
+            or not UTC_TIMESTAMP_PATTERN.fullmatch(
+                evidence["shutdown_boundary"]
+            )
+        ):
+            fail("step_contract_failed:shutdown_boundary")
+        if (
+            evidence["installation_id"]
+            != prior_receipts[7]["evidence"]["installation_id"]
+            or evidence["promotion_id"]
+            != prior_receipts[7]["evidence"]["promotion_id"]
+        ):
+            fail("step_contract_failed:canonical_scope")
+        if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:
+            fail("step_contract_failed:public_origin")
         if any(
             evidence[field] != prior_receipts[8]["evidence"][field]
             for field in ("deployment_id", "route_id", "instance_id")

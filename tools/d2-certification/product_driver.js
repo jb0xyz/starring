@@ -3,7 +3,12 @@
 
   const RESOURCE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
   const DIGEST = /^[0-9a-f]{64}$/;
+  const UTC_TIMESTAMP = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.([0-9]{1,9}))?Z$/;
+  const LIVE_RESTART_OPERATION = /^d2:[0-9a-f]{16}:certify-live-runtime-restart$/;
   const COOKIE_NAME = "__Host-starring_csrf";
+  const LIVE_RESTART_CONFIRMATION_KIND = "starring.d2.live-runtime-restart-confirmation.v1";
+  const LIVE_FRESH_LEASE_CHECKPOINT = "live_fresh_lease";
+  const SERVING_LEASE_MAXIMUM_NANOSECONDS = 45 * 1000000000;
   const FINALIZE_EXISTING_PREVIEW_MESSAGE = "Do not change the current Draft. Keep every existing feature and the current community_hub channel binding exactly unchanged. The only allowed semantic transition is requested_outcome from working_draft to validated_preview. Revalidate the exact current candidate, run the required simulation, and finish with a promotable preview. Do not ask another question.";
 
   function requireResourceId(value, label) {
@@ -26,6 +31,44 @@
       throw new Error(`${label}_invalid`);
     }
     return value;
+  }
+
+  function requireUtcTimestamp(value, label) {
+    const match = typeof value === "string" ? UTC_TIMESTAMP.exec(value) : null;
+    if (!match) {
+      throw new Error(`${label}_invalid`);
+    }
+    const whole = value.replace(/\.[0-9]{1,9}Z$/, "Z");
+    const milliseconds = Date.parse(whole);
+    if (
+      !Number.isFinite(milliseconds) ||
+      new Date(milliseconds).toISOString().slice(0, 19) + "Z" !== whole
+    ) {
+      throw new Error(`${label}_invalid`);
+    }
+    return {
+      value,
+      seconds: milliseconds / 1000,
+      nanoseconds: Number((match[1] || "").padEnd(9, "0")),
+    };
+  }
+
+  function compareUtcTimestamps(left, right) {
+    if (left.seconds !== right.seconds) {
+      return left.seconds < right.seconds ? -1 : 1;
+    }
+    if (left.nanoseconds === right.nanoseconds) {
+      return 0;
+    }
+    return left.nanoseconds < right.nanoseconds ? -1 : 1;
+  }
+
+  function utcDifferenceNanoseconds(later, earlier) {
+    return (
+      (later.seconds - earlier.seconds) * 1000000000 +
+      later.nanoseconds -
+      earlier.nanoseconds
+    );
   }
 
   function normalizeOrigin(value) {
@@ -484,6 +527,63 @@
       return result;
     }
 
+    async function liveRuntimeRestartConfirmation(input) {
+      const installationId = requireResourceId(input.installationId, "installation_id");
+      const promotionId = requireDigest(input.promotionId, "promotion_id");
+      if (typeof input.operationId !== "string" || !LIVE_RESTART_OPERATION.test(input.operationId)) {
+        throw new Error("operation_id_invalid");
+      }
+      const shutdownBoundary = requireUtcTimestamp(input.shutdownBoundary, "shutdown_boundary");
+      const product = await deployment(installationId, promotionId);
+      const operational = await operationalDeployment(installationId, promotionId);
+      const runtime = requireBody(operational.body.runtime, "operational_runtime");
+      const attestation = requireBody(runtime.attestation, "operational_attestation");
+      const serving = requireBody(runtime.serving, "operational_serving");
+      const observedAt = requireUtcTimestamp(runtime.observed_at, "runtime_observed_at");
+      const lastHeartbeatAt = requireUtcTimestamp(serving.last_heartbeat_at, "last_heartbeat_at");
+      const leaseExpiresAt = requireUtcTimestamp(serving.lease_expires_at, "lease_expires_at");
+      if (
+        product.body.state !== "live" ||
+        operational.body.state !== "live" ||
+        runtime.phase !== "live" ||
+        serving.state !== "fresh" ||
+        !Number.isSafeInteger(product.body.attestation_revision) ||
+        product.body.attestation_revision < 1 ||
+        !Number.isSafeInteger(attestation.deployment_revision) ||
+        attestation.deployment_revision < 1 ||
+        product.body.attestation_revision !== attestation.deployment_revision ||
+        product.body.last_serving_heartbeat !== serving.last_heartbeat_at ||
+        product.body.serving_lease_expires_at !== serving.lease_expires_at ||
+        compareUtcTimestamps(lastHeartbeatAt, shutdownBoundary) <= 0 ||
+        compareUtcTimestamps(lastHeartbeatAt, observedAt) > 0 ||
+        compareUtcTimestamps(observedAt, leaseExpiresAt) >= 0 ||
+        utcDifferenceNanoseconds(leaseExpiresAt, lastHeartbeatAt) >
+          SERVING_LEASE_MAXIMUM_NANOSECONDS ||
+        utcDifferenceNanoseconds(observedAt, lastHeartbeatAt) >
+          SERVING_LEASE_MAXIMUM_NANOSECONDS
+      ) {
+        throw new Error("live_restart_confirmation_invalid");
+      }
+      return Object.freeze({
+        schema_version: 1,
+        kind: LIVE_RESTART_CONFIRMATION_KIND,
+        checkpoint: LIVE_FRESH_LEASE_CHECKPOINT,
+        operation_id: input.operationId,
+        installation_id: installationId,
+        promotion_id: promotionId,
+        public_origin: origin,
+        shutdown_boundary: shutdownBoundary.value,
+        observed_at: observedAt.value,
+        product_state: product.body.state,
+        operational_state: operational.body.state,
+        runtime_phase: runtime.phase,
+        serving_state: serving.state,
+        attestation_revision: product.body.attestation_revision,
+        last_heartbeat_at: lastHeartbeatAt.value,
+        lease_expires_at: leaseExpiresAt.value,
+      });
+    }
+
     async function runOneShotProductFlow(input) {
       if (typeof input.confirmPreview !== "function") {
         throw new Error("preview_confirmation_required");
@@ -677,6 +777,7 @@
       applyWithDrainHandshake,
       deployment,
       operationalDeployment,
+      liveRuntimeRestartConfirmation,
       runOneShotProductFlow,
       waitForLive,
     });
