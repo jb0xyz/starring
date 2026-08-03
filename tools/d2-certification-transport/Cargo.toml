@@ -22,4 +22,5 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 
 [dev-dependencies]
+paused-discord-gateway = { package = "twilight-gateway", git = "https://github.com/twilight-rs/twilight.git", rev = "b4ce13b727e7731b917576ad977300ab6926bb6b", default-features = false, features = ["rustls-platform-verifier"] }
 tempfile = "3"

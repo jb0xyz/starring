@@ -861,7 +861,7 @@ class Platform:
         }:
             return False
         if (
-            snapshot["version"] != 2
+            snapshot["version"] != 3
             or type(snapshot["ready"]) is not bool
             or require_ready
             and snapshot["ready"] is not True
@@ -880,6 +880,11 @@ class Platform:
         if not isinstance(gateway, dict) or set(gateway) != {
             "partitioned",
             "connections",
+            "active_connections",
+            "completed_connections",
+            "clean_close_relays",
+            "relay_failures",
+            "connection_aborts",
             "ready_rewrites",
             "partition_events",
             "identity_rejections",
@@ -904,6 +909,11 @@ class Platform:
             type(gateway[field]) is not int or gateway[field] < 0
             for field in (
                 "connections",
+                "active_connections",
+                "completed_connections",
+                "clean_close_relays",
+                "relay_failures",
+                "connection_aborts",
                 "ready_rewrites",
                 "partition_events",
                 "identity_rejections",
@@ -911,6 +921,25 @@ class Platform:
                 "duplicate_failed_attempts",
                 "duplicate_delivery_count",
             )
+        ):
+            return False
+        if (
+            gateway["active_connections"] > gateway["connections"]
+            or gateway["completed_connections"] > gateway["connections"]
+            or gateway["active_connections"] + gateway["completed_connections"]
+            != gateway["connections"]
+            or gateway["clean_close_relays"] > gateway["completed_connections"]
+            or gateway["relay_failures"] > gateway["completed_connections"]
+            or gateway["connection_aborts"] > gateway["completed_connections"]
+            or gateway["clean_close_relays"]
+            + gateway["relay_failures"]
+            + gateway["connection_aborts"]
+            > gateway["completed_connections"]
+            or (
+                gateway["relay_failures"] > 0
+                or gateway["connection_aborts"] > 0
+            )
+            and snapshot["ready"] is not False
         ):
             return False
         interaction_id = gateway["last_duplicate_interaction_id"]

@@ -29,6 +29,11 @@ pub struct SharedState {
 
 struct StateInner {
     gateway_connections: u64,
+    gateway_active_connections: u64,
+    gateway_completed_connections: u64,
+    gateway_clean_close_relays: u64,
+    gateway_relay_failures: u64,
+    gateway_connection_aborts: u64,
     gateway_ready_rewrites: u64,
     gateway_partition_events: u64,
     gateway_identity_rejections: u64,
@@ -123,6 +128,11 @@ pub struct Snapshot {
 struct GatewaySnapshot {
     partitioned: bool,
     connections: u64,
+    active_connections: u64,
+    completed_connections: u64,
+    clean_close_relays: u64,
+    relay_failures: u64,
+    connection_aborts: u64,
     ready_rewrites: u64,
     partition_events: u64,
     identity_rejections: u64,
@@ -171,6 +181,11 @@ impl SharedState {
             effect_http_listener_ready: AtomicBool::new(false),
             inner: Mutex::new(StateInner {
                 gateway_connections: 0,
+                gateway_active_connections: 0,
+                gateway_completed_connections: 0,
+                gateway_clean_close_relays: 0,
+                gateway_relay_failures: 0,
+                gateway_connection_aborts: 0,
                 gateway_ready_rewrites: 0,
                 gateway_partition_events: 0,
                 gateway_identity_rejections: 0,
@@ -238,13 +253,24 @@ impl SharedState {
         self.partitioned.swap(false, Ordering::AcqRel)
     }
 
-    pub fn record_gateway_connection(&self) {
+    pub fn begin_gateway_connection(self: &std::sync::Arc<Self>) -> GatewayConnectionLease {
         let mut inner = self.inner.lock().expect("state mutex poisoned");
         inner.gateway_connections = inner.gateway_connections.saturating_add(1);
+        inner.gateway_active_connections = inner.gateway_active_connections.saturating_add(1);
+        drop(inner);
+        GatewayConnectionLease {
+            state: std::sync::Arc::clone(self),
+            finished: false,
+        }
     }
 
     pub fn mark_gateway_listener_ready(&self) {
         self.gateway_listener_ready.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub fn gateway_listener_ready(&self) -> bool {
+        self.gateway_listener_ready.load(Ordering::Acquire)
     }
 
     pub fn mark_effect_http_listener_ready(&self) {
@@ -619,9 +645,11 @@ impl SharedState {
         let inner = self.inner.lock().expect("state mutex poisoned");
         let now = Instant::now();
         Snapshot {
-            version: 2,
+            version: 3,
             ready: self.gateway_listener_ready.load(Ordering::Acquire)
-                && self.effect_http_listener_ready.load(Ordering::Acquire),
+                && self.effect_http_listener_ready.load(Ordering::Acquire)
+                && inner.gateway_relay_failures == 0
+                && inner.gateway_connection_aborts == 0,
             instance_id: self.instance_id.clone(),
             run_id: self.run_id.clone(),
             guild_id: self.guild_id.clone(),
@@ -631,6 +659,11 @@ impl SharedState {
             gateway: GatewaySnapshot {
                 partitioned: self.is_partitioned(),
                 connections: inner.gateway_connections,
+                active_connections: inner.gateway_active_connections,
+                completed_connections: inner.gateway_completed_connections,
+                clean_close_relays: inner.gateway_clean_close_relays,
+                relay_failures: inner.gateway_relay_failures,
+                connection_aborts: inner.gateway_connection_aborts,
                 ready_rewrites: inner.gateway_ready_rewrites,
                 partition_events: inner.gateway_partition_events,
                 identity_rejections: inner.gateway_identity_rejections,
@@ -685,6 +718,54 @@ impl SharedState {
                 owned_message_count: inner.owned_message_ids.len(),
             },
         }
+    }
+}
+
+pub struct GatewayConnectionLease {
+    state: ArcState,
+    finished: bool,
+}
+
+impl GatewayConnectionLease {
+    pub fn complete_clean_close(mut self) {
+        self.finish(true, false, false);
+    }
+
+    pub fn complete(mut self) {
+        self.finish(false, false, false);
+    }
+
+    pub fn fail(mut self) {
+        self.finish(false, true, false);
+    }
+
+    fn finish(&mut self, clean_close: bool, failed: bool, aborted: bool) {
+        if self.finished {
+            return;
+        }
+        let mut inner = self.state.inner.lock().expect("state mutex poisoned");
+        if inner.gateway_active_connections == 0 {
+            inner.gateway_relay_failures = inner.gateway_relay_failures.saturating_add(1);
+        } else {
+            inner.gateway_active_connections -= 1;
+        }
+        inner.gateway_completed_connections = inner.gateway_completed_connections.saturating_add(1);
+        if clean_close {
+            inner.gateway_clean_close_relays = inner.gateway_clean_close_relays.saturating_add(1);
+        }
+        if failed {
+            inner.gateway_relay_failures = inner.gateway_relay_failures.saturating_add(1);
+        }
+        if aborted {
+            inner.gateway_connection_aborts = inner.gateway_connection_aborts.saturating_add(1);
+        }
+        self.finished = true;
+    }
+}
+
+impl Drop for GatewayConnectionLease {
+    fn drop(&mut self) {
+        self.finish(false, false, true);
     }
 }
 
@@ -898,6 +979,35 @@ mod tests {
     }
 
     #[test]
+    fn gateway_connection_failures_are_counted_and_remove_readiness() {
+        let (_root, state) = state();
+        let state = std::sync::Arc::new(state);
+        state.mark_gateway_listener_ready();
+        state.mark_effect_http_listener_ready();
+        assert!(serde_json::to_value(state.snapshot()).unwrap()["ready"]
+            .as_bool()
+            .unwrap());
+        let failed = state.begin_gateway_connection();
+        assert_eq!(
+            serde_json::to_value(state.snapshot()).unwrap()["gateway"]["active_connections"],
+            1
+        );
+        failed.fail();
+        let snapshot = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(snapshot["ready"], false);
+        assert_eq!(snapshot["gateway"]["active_connections"], 0);
+        assert_eq!(snapshot["gateway"]["completed_connections"], 1);
+        assert_eq!(snapshot["gateway"]["relay_failures"], 1);
+        assert_eq!(snapshot["gateway"]["connection_aborts"], 0);
+        let aborted = state.begin_gateway_connection();
+        drop(aborted);
+        let snapshot = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(snapshot["gateway"]["completed_connections"], 2);
+        assert_eq!(snapshot["gateway"]["relay_failures"], 1);
+        assert_eq!(snapshot["gateway"]["connection_aborts"], 1);
+    }
+
+    #[test]
     fn pinned_hub_admits_only_owned_messages_without_becoming_an_owned_channel() {
         let (_root, state) = state();
         let state = std::sync::Arc::new(state);
@@ -918,7 +1028,7 @@ mod tests {
         assert!(!state.remove_channel("5"));
         assert!(state.owns_message("5", "13"));
         let snapshot = serde_json::to_value(state.snapshot()).unwrap();
-        assert_eq!(snapshot["version"], 2);
+        assert_eq!(snapshot["version"], 3);
         assert_eq!(snapshot["hub_channel_id"], "5");
         assert_eq!(snapshot["effect_http"]["owned_channel_count"], 0);
         assert_eq!(snapshot["effect_http"]["owned_message_count"], 1);

@@ -18,6 +18,7 @@ use reqwest::redirect::Policy;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
 
 use crate::state::{IndeterminateClaim, ResourceKind, ResourceReservation, SharedState};
 use crate::Config;
@@ -34,6 +35,7 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(15);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DOWNSTREAM_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const DOWNSTREAM_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub enum HttpError {
@@ -43,6 +45,10 @@ pub enum HttpError {
     Accept,
     #[error("http_client_failed")]
     Client,
+    #[error("http_connection_failed")]
+    Connection,
+    #[error("http_connection_drain_failed")]
+    ConnectionDrain,
 }
 
 #[derive(Debug, Error)]
@@ -92,11 +98,17 @@ pub async fn serve(
         .map_err(|_| HttpError::Bind)?;
     state.mark_effect_http_listener_ready();
     let permits = Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS));
+    let mut connections = JoinSet::new();
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
-                    return Ok(());
+                    break;
+                }
+            }
+            joined = connections.join_next(), if !connections.is_empty() => {
+                if joined.is_some_and(|result| result.is_err()) {
+                    return Err(HttpError::Connection);
                 }
             }
             accepted = listener.accept() => {
@@ -110,7 +122,7 @@ pub async fn serve(
                 let config = config.clone();
                 let state = Arc::clone(&state);
                 let client = client.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _permit = permit;
                     let service = service_fn(move |request| {
                         proxy_request(request, config.clone(), Arc::clone(&state), client.clone())
@@ -125,6 +137,23 @@ pub async fn serve(
                     let _ = tokio::time::timeout(DOWNSTREAM_CONNECTION_TIMEOUT, connection).await;
                 });
             }
+        }
+    }
+    let drained = tokio::time::timeout(HTTP_CONNECTION_DRAIN_TIMEOUT, async {
+        let mut failed = false;
+        while let Some(joined) = connections.join_next().await {
+            failed |= joined.is_err();
+        }
+        failed
+    })
+    .await;
+    match drained {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(HttpError::Connection),
+        Err(_) => {
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+            Err(HttpError::ConnectionDrain)
         }
     }
 }

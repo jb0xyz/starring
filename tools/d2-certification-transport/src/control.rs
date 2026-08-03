@@ -12,6 +12,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use crate::state::{valid_operation_id, ArmOutcome, SharedState};
 use crate::Config;
@@ -19,6 +20,7 @@ use crate::Config;
 const MAX_CONTROL_REQUEST_BYTES: usize = 4096;
 const MAX_CONTROL_CONNECTIONS: usize = 4;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTROL_CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Error)]
 pub enum ControlError {
@@ -26,6 +28,10 @@ pub enum ControlError {
     Bind,
     #[error("control_accept_failed")]
     Accept,
+    #[error("control_connection_failed")]
+    Connection,
+    #[error("control_connection_drain_failed")]
+    ConnectionDrain,
 }
 
 struct SocketGuard(PathBuf);
@@ -60,11 +66,17 @@ pub async fn serve(
         .map_err(|_| ControlError::Bind)?;
     let _guard = SocketGuard(path);
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_CONNECTIONS));
+    let mut connections = JoinSet::new();
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
-                    return Ok(());
+                    break;
+                }
+            }
+            joined = connections.join_next(), if !connections.is_empty() => {
+                if joined.is_some_and(|result| result.is_err()) {
+                    return Err(ControlError::Connection);
                 }
             }
             accepted = listener.accept() => {
@@ -74,7 +86,7 @@ pub async fn serve(
                 };
                 let state = Arc::clone(&state);
                 let shutdown_tx = shutdown_tx.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _permit = permit;
                     let _ = tokio::time::timeout(
                         CONTROL_TIMEOUT,
@@ -83,6 +95,23 @@ pub async fn serve(
                     .await;
                 });
             }
+        }
+    }
+    let drained = tokio::time::timeout(CONTROL_CONNECTION_DRAIN_TIMEOUT, async {
+        let mut failed = false;
+        while let Some(joined) = connections.join_next().await {
+            failed |= joined.is_err();
+        }
+        failed
+    })
+    .await;
+    match drained {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(ControlError::Connection),
+        Err(_) => {
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+            Err(ControlError::ConnectionDrain)
         }
     }
 }
@@ -396,7 +425,7 @@ mod tests {
         let response: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["ok"], true);
         assert_eq!(response["snapshot"]["ready"], false);
-        assert_eq!(response["snapshot"]["version"], 2);
+        assert_eq!(response["snapshot"]["version"], 3);
         assert_eq!(response["snapshot"]["hub_channel_id"], "5");
         let mut stream = UnixStream::connect(&socket).await.unwrap();
         let shutdown = json!({

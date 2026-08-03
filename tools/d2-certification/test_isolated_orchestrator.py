@@ -300,7 +300,7 @@ class FakePlatform:
     def transport_control(self, context, command, fields=None, timeout_seconds=3):
         if self.transport_state is None:
             self.transport_state = {
-                "version": 2,
+                "version": 3,
                 "ready": True,
                 "run_id": context.manifest["run_id"],
                 "guild_id": context.manifest["discord"]["guild_id"],
@@ -311,6 +311,11 @@ class FakePlatform:
                 "gateway": {
                     "partitioned": False,
                     "connections": 1,
+                    "active_connections": 1,
+                    "completed_connections": 0,
+                    "clean_close_relays": 0,
+                    "relay_failures": 0,
+                    "connection_aborts": 0,
                     "ready_rewrites": 1,
                     "partition_events": 0,
                     "identity_rejections": 0,
@@ -844,7 +849,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
 
     def test_transport_snapshot_health_is_exact_and_identity_bound(self):
         snapshot = {
-            "version": 2,
+            "version": 3,
             "ready": True,
             "run_id": self.context.manifest["run_id"],
             "guild_id": self.context.manifest["discord"]["guild_id"],
@@ -855,6 +860,11 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             "gateway": {
                 "partitioned": False,
                 "connections": 1,
+                "active_connections": 1,
+                "completed_connections": 0,
+                "clean_close_relays": 0,
+                "relay_failures": 0,
+                "connection_aborts": 0,
                 "ready_rewrites": 1,
                 "partition_events": 0,
                 "identity_rejections": 0,
@@ -904,6 +914,38 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         widened = json.loads(json.dumps(snapshot))
         widened["gateway"]["unpinned"] = 0
         self.assertFalse(platform._transport_snapshot_valid(self.context, widened))
+        failed = json.loads(json.dumps(snapshot))
+        failed["ready"] = False
+        failed["gateway"]["active_connections"] = 0
+        failed["gateway"]["completed_connections"] = 1
+        failed["gateway"]["relay_failures"] = 1
+        self.assertTrue(
+            platform._transport_snapshot_valid(
+                self.context, failed, require_ready=False
+            )
+        )
+        self.assertFalse(platform._transport_snapshot_valid(self.context, failed))
+        dishonest = json.loads(json.dumps(failed))
+        dishonest["ready"] = True
+        self.assertFalse(
+            platform._transport_snapshot_valid(
+                self.context, dishonest, require_ready=False
+            )
+        )
+        overlapping = json.loads(json.dumps(failed))
+        overlapping["gateway"]["clean_close_relays"] = 1
+        self.assertFalse(
+            platform._transport_snapshot_valid(
+                self.context, overlapping, require_ready=False
+            )
+        )
+        impossible = json.loads(json.dumps(snapshot))
+        impossible["gateway"]["completed_connections"] = 1
+        self.assertFalse(
+            platform._transport_snapshot_valid(
+                self.context, impossible, require_ready=False
+            )
+        )
 
     def test_live_restart_has_no_direct_database_observation_path(self):
         self.assertFalse(hasattr(PLATFORM.Platform(), "runtime_live_observation"))
