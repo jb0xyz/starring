@@ -1,5 +1,6 @@
 import json
 import os
+import pathlib
 import re
 import socket
 import stat
@@ -56,6 +57,90 @@ class Platform:
             timeout=5,
         )
         return result.returncode == 0
+
+    def launchd_job(self, label):
+        result = self.run(
+            [REQUIRED_PROGRAMS["launchctl"], "print", f"gui/{os.getuid()}/{label}"],
+            timeout=5,
+        )
+        if result.returncode == 113:
+            return None
+        if result.returncode != 0:
+            fail("launchd_observation_failed")
+        if len(result.stdout) > 256 * 1024:
+            fail("launchd_observation_invalid")
+        try:
+            output = result.stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            fail("launchd_observation_invalid")
+        pid_matches = re.findall(r"(?m)^\tpid = ([1-9][0-9]*)\s*$", output)
+        program_matches = re.findall(r"(?m)^\tprogram = (\S(?:.*\S)?)\s*$", output)
+        path_matches = re.findall(r"(?m)^\tpath = (\S(?:.*\S)?)\s*$", output)
+        state_matches = re.findall(r"(?m)^\tstate = ([a-z][a-z0-9_-]*)\s*$", output)
+        runs_matches = re.findall(r"(?m)^\truns = ([1-9][0-9]*)\s*$", output)
+        exit_matches = re.findall(r"(?m)^\tlast exit code = (\S(?:.*\S)?)\s*$", output)
+        argument_blocks = []
+        lines = output.splitlines()
+        for index, line in enumerate(lines):
+            if line != "\targuments = {":
+                continue
+            arguments = []
+            for nested in lines[index + 1 :]:
+                if nested == "\t}":
+                    break
+                if not nested.startswith("\t\t"):
+                    fail("launchd_observation_invalid")
+                arguments.append(nested[2:])
+            else:
+                fail("launchd_observation_invalid")
+            argument_blocks.append(arguments)
+        if (
+            len(pid_matches) > 1
+            or len(program_matches) != 1
+            or len(path_matches) != 1
+            or len(state_matches) != 1
+            or len(runs_matches) != 1
+            or len(exit_matches) > 1
+            or len(argument_blocks) > 1
+        ):
+            fail("launchd_observation_invalid")
+        last_exit_code = None
+        if exit_matches:
+            if exit_matches[0] != "(never exited)":
+                if not re.fullmatch(r"-?[0-9]+", exit_matches[0]):
+                    fail("launchd_observation_invalid")
+                last_exit_code = int(exit_matches[0])
+        return {
+            "pid": int(pid_matches[0]) if pid_matches else None,
+            "program": program_matches[0],
+            "plist_path": path_matches[0],
+            "arguments": argument_blocks[0] if argument_blocks else None,
+            "runs": int(runs_matches[0]),
+            "state": state_matches[0],
+            "last_exit_code": last_exit_code,
+        }
+
+    def postgres_pid(self, cluster_root):
+        path = pathlib.Path(cluster_root) / "postmaster.pid"
+        try:
+            metadata = path.lstat()
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or path.is_symlink()
+            or metadata.st_uid != os.getuid()
+            or len(raw) > 64 * 1024
+        ):
+            fail("postgres_pid_invalid")
+        try:
+            first_line = raw.splitlines()[0].decode("ascii")
+        except (IndexError, UnicodeDecodeError):
+            fail("postgres_pid_invalid")
+        if not re.fullmatch(r"[1-9][0-9]*", first_line):
+            fail("postgres_pid_invalid")
+        return int(first_line)
 
     def keychain_present(self, service, account):
         result = self.run(

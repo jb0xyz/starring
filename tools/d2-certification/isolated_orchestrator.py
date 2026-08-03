@@ -49,6 +49,11 @@ from d2_orchestrator_contract import (
     write_atomic,
 )
 from d2_orchestrator_platform import Platform
+from d2_drained_runtime_restart import (
+    command_restart_drained_runtime,
+    drained_runtime_restart_directory,
+    drained_runtime_restart_temporary_directory,
+)
 
 
 SERVICE_START_ORDER = ("transport", "worker", "api", "runtime", "tunnel")
@@ -927,7 +932,15 @@ def command_status(context, platform):
 def build_parser():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("dry-run", "prepare", "start", "stop", "cleanup", "status"):
+    for command in (
+        "dry-run",
+        "prepare",
+        "start",
+        "restart-drained-runtime",
+        "stop",
+        "cleanup",
+        "status",
+    ):
         child = subparsers.add_parser(command)
         child.add_argument("--manifest", required=True)
     onboard = subparsers.add_parser("onboard")
@@ -961,6 +974,7 @@ def main():
             "dry-run": command_dry_run,
             "prepare": command_prepare,
             "start": command_start,
+            "restart-drained-runtime": command_restart_drained_runtime,
             "stop": command_stop,
             "cleanup": command_cleanup,
             "status": command_status,

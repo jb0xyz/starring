@@ -91,6 +91,7 @@ D2_TOOLCHAIN_SOURCE_FILES = (
     "d2_orchestrator_composition.py",
     "d2_orchestrator_contract.py",
     "d2_orchestrator_platform.py",
+    "d2_drained_runtime_restart.py",
     "isolated_orchestrator.py",
     "product_driver.js",
 )

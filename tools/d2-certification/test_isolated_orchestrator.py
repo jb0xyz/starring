@@ -30,6 +30,7 @@ ORCHESTRATOR = importlib.util.module_from_spec(ORCHESTRATOR_SPEC)
 ORCHESTRATOR_SPEC.loader.exec_module(ORCHESTRATOR)
 CONTRACT = sys.modules["d2_orchestrator_contract"]
 PLATFORM = sys.modules["d2_orchestrator_platform"]
+DRAINED_RUNTIME_RESTART = sys.modules["d2_drained_runtime_restart"]
 
 
 class RecordingLaunchdPlatform(PLATFORM.Platform):
@@ -71,6 +72,7 @@ class FakePlatform:
         self.postgres = False
         self.postgres_tcp = False
         self.postgres_port = None
+        self.postgres_process_pid = None
         self.keychain_writes = []
         self.keychain_deletes = []
         self.owner_values = {}
@@ -83,6 +85,14 @@ class FakePlatform:
         self.transport_state = None
         self.http_probes = []
         self.lifecycle_events = []
+        self.pids = {}
+        self.programs = {}
+        self.plist_paths = {}
+        self.program_arguments = {}
+        self.launchd_runs = {}
+        self.launchd_states = {}
+        self.last_exit_codes = {}
+        self.next_pid = 41000
 
     def run(self, arguments, input_bytes=None, timeout=30, environment=None):
         executable = pathlib.Path(arguments[0]).name
@@ -100,6 +110,24 @@ class FakePlatform:
 
     def launchd_loaded(self, label):
         return label in self.loaded
+
+    def launchd_job(self, label):
+        if label not in self.loaded:
+            return None
+        return {
+            "pid": self.pids.get(label),
+            "program": self.programs.get(label),
+            "plist_path": self.plist_paths.get(label),
+            "arguments": self.program_arguments.get(label),
+            "runs": self.launchd_runs.get(label),
+            "state": self.launchd_states.get(label),
+            "last_exit_code": self.last_exit_codes.get(label),
+        }
+
+    def exit_launchd(self, label, exit_code=0):
+        self.pids.pop(label, None)
+        self.launchd_states[label] = "exited"
+        self.last_exit_codes[label] = exit_code
 
     def keychain_present(self, service, account):
         return (service, account) in self.keychain
@@ -124,6 +152,9 @@ class FakePlatform:
     def postgres_running(self, cluster_root):
         return self.postgres
 
+    def postgres_pid(self, cluster_root):
+        return self.postgres_process_pid if self.postgres else None
+
     def initdb(self, cluster_root):
         cluster_root.mkdir(mode=0o700)
         (cluster_root / "PG_VERSION").write_text("16\n", encoding="utf-8")
@@ -134,6 +165,8 @@ class FakePlatform:
 
     def postgres_start(self, cluster_root, log_path):
         self.postgres = True
+        if self.postgres_process_pid is None:
+            self.postgres_process_pid = 40001
         configuration = (cluster_root / "postgresql.conf").read_text(encoding="utf-8")
         self.postgres_port = int(
             next(
@@ -150,6 +183,7 @@ class FakePlatform:
     def postgres_stop(self, cluster_root):
         self.postgres = False
         self.postgres_tcp = False
+        self.postgres_process_pid = None
 
     def bootstrap_database(self, context):
         if self.bootstrap_failure:
@@ -201,7 +235,16 @@ class FakePlatform:
     def launchd_start(self, label, plist_path):
         if self.launchd_failure == label:
             ORCHESTRATOR.fail("injected_launchd_failure")
+        value = plistlib.loads(pathlib.Path(plist_path).read_bytes())
         self.loaded.add(label)
+        self.next_pid += 1
+        self.pids[label] = self.next_pid
+        self.programs[label] = value["ProgramArguments"][0]
+        self.plist_paths[label] = str(plist_path)
+        self.program_arguments[label] = value["ProgramArguments"]
+        self.launchd_runs[label] = 1
+        self.launchd_states[label] = "running"
+        self.last_exit_codes[label] = None
         self.start_order.append(label)
         self.lifecycle_events.append(f"start:{label}")
 
@@ -209,6 +252,12 @@ class FakePlatform:
         self.http_probes.append((url, host_header))
         if self.health_failure and self.health_failure in url:
             return 503
+        if "127.0.0.1:29091/health/ready" in url:
+            runtime_label = next(
+                (label for label in self.loaded if label.endswith(".runtime")), None
+            )
+            if runtime_label is None or self.pids.get(runtime_label) is None:
+                return 0
         return 200
 
     def worker_health_status(self, context, timeout_seconds=3):
@@ -324,6 +373,13 @@ class FakePlatform:
     def launchd_bootout(self, label):
         self.bootouts.append(label)
         self.loaded.discard(label)
+        self.pids.pop(label, None)
+        self.programs.pop(label, None)
+        self.plist_paths.pop(label, None)
+        self.program_arguments.pop(label, None)
+        self.launchd_runs.pop(label, None)
+        self.launchd_states.pop(label, None)
+        self.last_exit_codes.pop(label, None)
 
 
 class D2IsolatedOrchestratorTest(unittest.TestCase):
@@ -423,6 +479,13 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertEqual(self.platform.keychain_writes, [])
         self.assertEqual(self.platform.bootouts, [])
         self.assertFalse(self.isolated_root.exists())
+
+    def test_restart_drained_runtime_parser_requires_manifest(self):
+        arguments = ORCHESTRATOR.build_parser().parse_args(
+            ["restart-drained-runtime", "--manifest", str(self.manifest_path)]
+        )
+        self.assertEqual(arguments.command, "restart-drained-runtime")
+        self.assertEqual(arguments.manifest, str(self.manifest_path))
 
     def test_atomic_write_fsyncs_created_parent_and_renamed_entry(self):
         path = self.root / "atomic" / "state.json"
@@ -860,6 +923,344 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertEqual(result["phase"], "candidate_started")
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
+    def test_drained_runtime_restart_is_manifest_scoped_and_exactly_replayable(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        drained_pid = self.platform.pids[runtime_label]
+        self.platform.exit_launchd(runtime_label)
+        dependency_pids = {
+            name: self.platform.pids[
+                self.context.manifest["services"][name]["label"]
+            ]
+            for name in ("api", "worker", "transport", "tunnel")
+        }
+        start_count = len(self.platform.start_order)
+        bootout_count = len(self.platform.bootouts)
+        result = ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        self.assertEqual(result["status"], "drained_runtime_restarted")
+        self.assertIsNone(result["old_pid"])
+        self.assertNotEqual(result["new_pid"], drained_pid)
+        self.assertEqual(self.platform.start_order[start_count:], [runtime_label])
+        self.assertEqual(self.platform.bootouts[bootout_count:], [runtime_label])
+        self.assertEqual(
+            dependency_pids,
+            {
+                name: self.platform.pids[
+                    self.context.manifest["services"][name]["label"]
+                ]
+                for name in ("api", "worker", "transport", "tunnel")
+            },
+        )
+        self.assertEqual(self.platform.postgres_process_pid, 40001)
+        intent_path = (
+            ORCHESTRATOR.drained_runtime_restart_directory(self.context)
+            / "0001-intent.json"
+        )
+        complete_path = (
+            ORCHESTRATOR.drained_runtime_restart_directory(self.context)
+            / "0001-complete.json"
+        )
+        self.assertEqual(
+            ORCHESTRATOR.drained_runtime_restart_directory(self.context).stat().st_mode
+            & 0o777,
+            0o700,
+        )
+        self.assertEqual(intent_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(complete_path.stat().st_mode & 0o777, 0o600)
+        completion = json.loads(complete_path.read_text(encoding="utf-8"))
+        self.assertEqual(completion["new_pid"], result["new_pid"])
+        self.assertEqual(completion["dependencies"]["postgres"]["pid"], 40001)
+        self.assertEqual(
+            completion["dependencies"]["api"]["program"],
+            str(self.candidates["api"]),
+        )
+        self.assertEqual(
+            completion["dependencies"]["api"]["program_arguments"],
+            [str(self.candidates["api"])],
+        )
+        self.assertEqual(completion["dependencies"]["api"]["runs"], 1)
+        self.assertEqual(
+            completion["dependencies"]["api"]["plist_path"],
+            str(ORCHESTRATOR.service_plist_path(self.context, "api")),
+        )
+        self.assertRegex(
+            completion["dependencies"]["api"]["plist_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            completion["transport_instance_id"],
+            "d2ti-0123456789abcdef0123456789abcdef",
+        )
+        self.assertEqual(
+            completion["runtime_identity"]["runtime_sha256"],
+            self.context.manifest["candidates"]["runtime"]["sha256"],
+        )
+        receipts = [
+            json.loads(line)
+            for line in self.context.journal_path.read_text(encoding="utf-8").splitlines()
+        ]
+        restart_receipts = [
+            receipt for receipt in receipts if receipt["action"] == "drained_runtime_restart"
+        ]
+        self.assertEqual(
+            [receipt["status"] for receipt in restart_receipts],
+            ["intent", "complete"],
+        )
+        replay_start_count = len(self.platform.start_order)
+        replay_bootout_count = len(self.platform.bootouts)
+        replay = ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        self.assertEqual(replay["status"], "exact_replay")
+        self.assertEqual(replay["new_pid"], result["new_pid"])
+        self.assertEqual(len(self.platform.start_order), replay_start_count)
+        self.assertEqual(len(self.platform.bootouts), replay_bootout_count)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_drained_runtime_restart_rejects_fresh_absent_runtime_evidence(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.exit_launchd(runtime_label)
+        self.platform.programs.pop(runtime_label)
+        self.platform.plist_paths.pop(runtime_label)
+        self.platform.program_arguments.pop(runtime_label)
+        self.platform.launchd_runs.pop(runtime_label)
+        self.platform.launchd_states.pop(runtime_label)
+        self.platform.last_exit_codes.pop(runtime_label)
+        self.platform.loaded.remove(runtime_label)
+        start_count = len(self.platform.start_order)
+        bootout_count = len(self.platform.bootouts)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "runtime_drain_evidence_absent"
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        self.assertEqual(len(self.platform.start_order), start_count)
+        self.assertEqual(len(self.platform.bootouts), bootout_count)
+        self.assertFalse(
+            ORCHESTRATOR.drained_runtime_restart_directory(self.context).exists()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_drained_runtime_restart_never_stops_a_live_runtime(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        runtime_pid = self.platform.pids[runtime_label]
+        start_count = len(self.platform.start_order)
+        bootout_count = len(self.platform.bootouts)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "runtime_drain_incomplete"
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        self.assertEqual(self.platform.pids[runtime_label], runtime_pid)
+        self.assertEqual(len(self.platform.start_order), start_count)
+        self.assertEqual(len(self.platform.bootouts), bootout_count)
+        self.assertFalse(ORCHESTRATOR.drained_runtime_restart_directory(self.context).exists())
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_drained_runtime_restart_requires_a_successful_drain_exit(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.exit_launchd(runtime_label, exit_code=70)
+        bootout_count = len(self.platform.bootouts)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "runtime_drain_unsuccessful"
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        self.assertEqual(len(self.platform.bootouts), bootout_count)
+        self.assertFalse(ORCHESTRATOR.drained_runtime_restart_directory(self.context).exists())
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_drained_runtime_restart_reobserves_drain_immediately_before_bootout(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.exit_launchd(runtime_label)
+        original_write = DRAINED_RUNTIME_RESTART.write_drained_runtime_restart_record
+
+        def restart_after_intent(context, sequence, kind, record):
+            original_write(context, sequence, kind, record)
+            if kind == "intent":
+                self.platform.next_pid += 1
+                self.platform.pids[runtime_label] = self.platform.next_pid
+                self.platform.launchd_states[runtime_label] = "running"
+                self.platform.last_exit_codes[runtime_label] = None
+
+        bootout_count = len(self.platform.bootouts)
+        with mock.patch.object(
+            DRAINED_RUNTIME_RESTART,
+            "write_drained_runtime_restart_record",
+            side_effect=restart_after_intent,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "runtime_drain_incomplete"
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        self.assertEqual(len(self.platform.bootouts), bootout_count)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_drained_runtime_restart_recovers_started_process_without_second_launch(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.exit_launchd(runtime_label)
+        original_write = DRAINED_RUNTIME_RESTART.write_atomic
+        injected = False
+
+        def lose_completion(path, payload, mode=0o600):
+            nonlocal injected
+            if path.name == "0001-complete.pending" and not injected:
+                injected = True
+                raise ORCHESTRATOR.OrchestratorError("injected_completion_loss")
+            return original_write(path, payload, mode)
+
+        with mock.patch.object(
+            DRAINED_RUNTIME_RESTART, "write_atomic", side_effect=lose_completion
+        ):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "injected_completion_loss"
+            ):
+                ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        restarted_pid = self.platform.pids[runtime_label]
+        start_count = len(self.platform.start_order)
+        recovered = ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        self.assertEqual(recovered["status"], "drained_runtime_restarted")
+        self.assertEqual(recovered["new_pid"], restarted_pid)
+        self.assertEqual(len(self.platform.start_order), start_count)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_drained_runtime_restart_allows_absent_only_after_pending_bootout(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.exit_launchd(runtime_label)
+        self.platform.launchd_failure = runtime_label
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_launchd_failure"
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(
+                self.context, self.platform
+            )
+        self.assertNotIn(runtime_label, self.platform.loaded)
+        self.platform.launchd_failure = None
+        recovered = ORCHESTRATOR.command_restart_drained_runtime(
+            self.context, self.platform
+        )
+        self.assertEqual(recovered["status"], "drained_runtime_restarted")
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_drained_runtime_restart_recovers_strict_sigkill_temporary_files(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.exit_launchd(runtime_label)
+        directory = ORCHESTRATOR.drained_runtime_restart_temporary_directory(self.context)
+        directory.mkdir(mode=0o700)
+        for name in (
+            ".0001-intent.pending.49152.tmp",
+            "0001-intent.pending",
+        ):
+            path = directory / name
+            path.write_bytes(b"partial")
+            path.chmod(0o600)
+        result = ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        self.assertEqual(result["status"], "drained_runtime_restarted")
+        self.assertEqual(list(directory.iterdir()), [])
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_drained_runtime_restart_rejects_an_unrecognized_temporary_entry(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.exit_launchd(runtime_label)
+        directory = ORCHESTRATOR.drained_runtime_restart_temporary_directory(self.context)
+        directory.mkdir(mode=0o700)
+        unexpected = directory / "unexpected"
+        unexpected.write_bytes(b"partial")
+        unexpected.chmod(0o600)
+        bootout_count = len(self.platform.bootouts)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "drained_runtime_restart_temporary_inventory_invalid",
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        self.assertEqual(len(self.platform.bootouts), bootout_count)
+        unexpected.unlink()
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_drained_runtime_restart_fails_closed_if_a_dependency_pid_changes(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        api_label = self.context.manifest["services"]["api"]["label"]
+        self.platform.exit_launchd(runtime_label)
+        original_start = self.platform.launchd_start
+
+        def start_with_dependency_drift(label, plist_path):
+            original_start(label, plist_path)
+            if label == runtime_label:
+                self.platform.pids[api_label] += 1
+
+        self.platform.launchd_start = start_with_dependency_drift
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "drained_runtime_restart_dependency_changed"
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        self.assertNotIn(api_label, self.platform.bootouts[-1:])
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_drained_runtime_restart_rechecks_expected_pid_after_ready_wait(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.exit_launchd(runtime_label)
+        original_wait = self.platform.wait_for_status
+
+        def rotate_after_wait(probe, expected, timeout_seconds=60):
+            status = original_wait(probe, expected, timeout_seconds)
+            self.platform.next_pid += 1
+            self.platform.pids[runtime_label] = self.platform.next_pid
+            return status
+
+        self.platform.wait_for_status = rotate_after_wait
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "drained_runtime_restart_final_observation_changed",
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_drained_runtime_restart_fails_closed_on_phase_plist_and_transport_drift(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "orchestrator_phase_invalid"
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        plist_path = ORCHESTRATOR.service_plist_path(self.context, "runtime")
+        original_plist = plist_path.read_bytes()
+        value = plistlib.loads(original_plist)
+        value["Label"] = f"{runtime_label}.drift"
+        plist_path.write_bytes(plistlib.dumps(value))
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "candidate_plist_changed"
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        plist_path.write_bytes(original_plist)
+        self.platform.transport_state["instance_id"] = (
+            "d2ti-fedcba9876543210fedcba9876543210"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "transport_instance_changed"
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
+        self.assertNotIn(runtime_label, self.platform.bootouts[-1:])
+        self.platform.transport_state["instance_id"] = (
+            "d2ti-0123456789abcdef0123456789abcdef"
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
     def test_preparing_state_allows_manifest_reconstructed_sigkill_cleanup(self):
         preflight = ORCHESTRATOR.command_dry_run(self.context, self.platform)
         self.context.artifact_directory.mkdir(mode=0o700, parents=True)
@@ -1145,6 +1546,65 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
 
 
 class LaunchdPlatformTests(unittest.TestCase):
+    def test_launchd_job_observation_binds_program_and_optional_pid(self):
+        platform = PLATFORM.Platform()
+        running = subprocess.CompletedProcess(
+            [],
+            0,
+            b"\tpath = /Users/test/Application Support/Starring/runtime.plist\n\tprogram = /Users/test/Application Support/Starring/starring-runtime\n\targuments = {\n\t\t/Users/test/Application Support/Starring/starring-runtime\n\t\t--config\n\t\t/Users/test/Application Support/Starring/runtime config.json\n\t}\n\tstate = running\n\truns = 3\n\tpid = 49152\n\tlast exit code = (never exited)\n\t\tstate = active\n\t\tpath = nested-noise\n",
+            b"",
+        )
+        with mock.patch.object(platform, "run", return_value=running):
+            self.assertEqual(
+                platform.launchd_job("local.starring.d2.test.runtime"),
+                {
+                    "pid": 49152,
+                    "program": "/Users/test/Application Support/Starring/starring-runtime",
+                    "plist_path": "/Users/test/Application Support/Starring/runtime.plist",
+                    "arguments": [
+                        "/Users/test/Application Support/Starring/starring-runtime",
+                        "--config",
+                        "/Users/test/Application Support/Starring/runtime config.json",
+                    ],
+                    "runs": 3,
+                    "state": "running",
+                    "last_exit_code": None,
+                },
+            )
+        exited = subprocess.CompletedProcess(
+            [],
+            0,
+            b"\tpath = /Users/test/Application Support/Starring/runtime.plist\n\tprogram = /Users/test/Application Support/Starring/starring-runtime\n\targuments = {\n\t\t/Users/test/Application Support/Starring/starring-runtime\n\t}\n\tstate = exited\n\truns = 1\n\tlast exit code = 0\n",
+            b"",
+        )
+        with mock.patch.object(platform, "run", return_value=exited):
+            self.assertEqual(
+                platform.launchd_job("local.starring.d2.test.runtime"),
+                {
+                    "pid": None,
+                    "program": "/Users/test/Application Support/Starring/starring-runtime",
+                    "plist_path": "/Users/test/Application Support/Starring/runtime.plist",
+                    "arguments": [
+                        "/Users/test/Application Support/Starring/starring-runtime"
+                    ],
+                    "runs": 1,
+                    "state": "exited",
+                    "last_exit_code": 0,
+                },
+            )
+
+    def test_launchd_job_only_treats_known_absence_as_absent(self):
+        platform = PLATFORM.Platform()
+        absent = subprocess.CompletedProcess([], 113, b"", b"")
+        with mock.patch.object(platform, "run", return_value=absent):
+            self.assertIsNone(platform.launchd_job("local.starring.d2.absent"))
+        failed = subprocess.CompletedProcess([], 1, b"", b"")
+        with mock.patch.object(platform, "run", return_value=failed):
+            with self.assertRaisesRegex(
+                CONTRACT.OrchestratorError, "launchd_observation_failed"
+            ):
+                platform.launchd_job("local.starring.d2.unknown")
+
     def test_http_probe_preserves_loopback_and_supplies_public_host(self):
         platform = PLATFORM.Platform()
         completed = subprocess.CompletedProcess([], 0, b"200", b"")

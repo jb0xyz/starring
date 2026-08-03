@@ -182,6 +182,8 @@ python3 tools/d2-certification/isolated_orchestrator.py onboard \
 python3 tools/d2-certification/isolated_orchestrator.py transport-control \
   --manifest /absolute/run/manifest.json \
   --operation snapshot
+python3 tools/d2-certification/isolated_orchestrator.py restart-drained-runtime \
+  --manifest /absolute/run/manifest.json
 python3 tools/d2-certification/isolated_orchestrator.py stop \
   --manifest /absolute/run/manifest.json
 python3 tools/d2-certification/isolated_orchestrator.py cleanup \
@@ -196,6 +198,25 @@ fails closed before candidate execution. Before database mutation, the bot
 must also resolve that ID as a type-0 text channel in the manifest guild. The
 persisted authority payload digest uses the same canonical revision, binding,
 policy, and TTL identity contract enforced by runtime hydration.
+
+`restart-drained-runtime` is available only while the manifest is in
+`candidate_started`. It requires the prior runtime PID and readiness to be
+absent after drain, unloads only that inactive manifest job, and launches the
+same label from the exact generated runtime plist. It never terminates a live
+runtime, and an inactive loaded job is accepted only with launchd state
+`exited` and last exit code `0`. A fresh command rejects an absent launchd job;
+absence is accepted only while replaying a durable pending intent after its
+recorded inactive job was booted out. Before and after the operation it binds the
+immutable runtime candidate and plist digests, the exact API, worker,
+transport, and tunnel programs, complete argument vectors, loaded plist paths,
+run counters, plist digests, and process identities, the PostgreSQL
+process identity, the pinned transport instance, and the standing staging
+snapshot. Retrying an interrupted intent resumes the observed new runtime,
+while retrying a completed operation returns an exact replay without starting
+another process. Intent and completion publication uses a separate
+same-filesystem temporary directory; only strict owned `0600` interrupted
+files are recoverable. Any unjournaled PID, failed drain, unexpected temporary
+entry, or identity drift fails closed.
 
 Fault injection uses only the manifest-bound orchestrator commands below. Each
 command verifies the pinned transport instance, writes and fsyncs a durable
