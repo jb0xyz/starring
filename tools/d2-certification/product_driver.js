@@ -83,6 +83,16 @@
     );
   }
 
+  function isInvalidStateConflict(error) {
+    return Boolean(
+      error &&
+      error.name === "StarringD2ProductRequestError" &&
+      error.status === 409 &&
+      error.retryable === false &&
+      error.code === "invalid_state"
+    );
+  }
+
   function projectionEvidence(turn) {
     const projection = turn.projection;
     const preview = projection && projection.preview;
@@ -320,10 +330,10 @@
       return result;
     }
 
-    async function promotion(installationId, promotionId) {
+    async function promotion(installationId, promotionId, signal) {
       const expectedInstallationId = requireResourceId(installationId, "installation_id");
       const expectedPromotionId = requireDigest(promotionId, "promotion_id");
-      const result = await request(`/v1/installations/${installationPath(installationId)}/promotions/${promotionPath(promotionId)}`);
+      const result = await request(`/v1/installations/${installationPath(installationId)}/promotions/${promotionPath(promotionId)}`, { signal });
       requireScopedIdentity(result.body, expectedInstallationId, expectedPromotionId, "promotion");
       return result;
     }
@@ -387,25 +397,59 @@
         signal: input.signal,
       });
       let runtimeDrainObserved = false;
-      for (let attempt = 1; attempt <= attempts; attempt += 1) {
-        try {
-          const result = await apply(command);
-          return Object.freeze({
-            status: result.status,
-            body: result.body,
-            attempts: attempt,
-            runtime_drain_observed: runtimeDrainObserved,
-          });
-        } catch (error) {
-          if (!isRuntimeDrainConflict(error) || attempt === attempts) {
-            throw error;
+      let applyAttempts = 0;
+      let statusObservations = 0;
+      let invalidStateConflict = null;
+      for (let round = 1; round <= attempts; round += 1) {
+        if (!invalidStateConflict) {
+          applyAttempts += 1;
+          try {
+            const result = await apply(command);
+            return Object.freeze({
+              status: result.status,
+              body: result.body,
+              attempts: applyAttempts,
+              runtime_drain_observed: runtimeDrainObserved,
+              resumed_after_conflict: false,
+              status_observations: statusObservations,
+            });
+          } catch (error) {
+            if (isInvalidStateConflict(error)) {
+              invalidStateConflict = error;
+            } else if (!isRuntimeDrainConflict(error)) {
+              throw error;
+            } else {
+              runtimeDrainObserved = true;
+              if (round === attempts) {
+                throw error;
+              }
+            }
           }
-          runtimeDrainObserved = true;
-          if (input.signal && input.signal.aborted) {
-            throw input.signal.reason || new Error("runtime_drain_retry_aborted");
-          }
-          await sleep(intervalMilliseconds);
         }
+        if (invalidStateConflict) {
+          const observed = await promotion(command.installationId, command.promotionId, command.signal);
+          statusObservations += 1;
+          if (["runtime_pending", "live"].includes(observed.body.state)) {
+            return Object.freeze({
+              status: observed.status,
+              body: observed.body,
+              attempts: applyAttempts,
+              runtime_drain_observed: runtimeDrainObserved,
+              resumed_after_conflict: true,
+              status_observations: statusObservations,
+            });
+          }
+          if (observed.body.state !== "applying") {
+            throw invalidStateConflict;
+          }
+          if (round === attempts) {
+            throw new Error("apply_resolution_timeout");
+          }
+        }
+        if (input.signal && input.signal.aborted) {
+          throw input.signal.reason || new Error(invalidStateConflict ? "apply_resume_aborted" : "runtime_drain_retry_aborted");
+        }
+        await sleep(intervalMilliseconds);
       }
       throw new Error("runtime_drain_attempts_exhausted");
     }
@@ -552,6 +596,8 @@
         apply_http_status: applied.status,
         apply_attempts: applied.attempts,
         runtime_drain_observed: applied.runtime_drain_observed,
+        apply_resumed_after_conflict: applied.resumed_after_conflict,
+        apply_status_observations: applied.status_observations,
         applied: {
           installation_id: applied.body.installation_id,
           promotion_id: applied.body.promotion_id,

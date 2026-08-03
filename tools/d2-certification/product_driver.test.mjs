@@ -247,7 +247,7 @@ test("one-shot flow retries only the exact apply command during a runtime drain"
 });
 
 
-test("runtime drain handshake is bounded and does not retry generic conflicts", async () => {
+test("runtime drain handshake is bounded and does not retry unrelated conflicts", async () => {
   const drainCalls = [];
   const drainSleeps = [];
   const drainResponses = [
@@ -298,7 +298,7 @@ test("runtime drain handshake is bounded and does not retry generic conflicts", 
     genericCalls += 1;
     return response(409, {
       error: {
-        code: "invalid_state",
+        code: "revision_conflict",
         request_id: "request-3",
         retryable: false,
       },
@@ -317,10 +317,219 @@ test("runtime drain handshake is bounded and does not retry generic conflicts", 
       runtimeDrainAttempts: 3,
       runtimeDrainIntervalMilliseconds: 100,
     }),
-    (error) => error.code === "invalid_state"
+    (error) => error.code === "revision_conflict"
   );
   assert.equal(genericCalls, 1);
   assert.equal(genericSleeps, 0);
+});
+
+
+test("invalid apply state resumes from the exact runtime pending promotion", async () => {
+  const calls = [];
+  const responses = [
+    response(409, {
+      error: {
+        code: "invalid_state",
+        request_id: "request-1",
+        retryable: false,
+      },
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 3,
+      state: "runtime_pending",
+      replayed: false,
+    }),
+  ];
+  const product = driver(async (url, options) => {
+    calls.push({ url, options });
+    return responses.shift();
+  });
+  const applied = await product.applyWithDrainHandshake({
+    installationId: "installation-1",
+    promotionId: DIGEST,
+    expectedPayloadDigest: DIGEST,
+    expectedRevision: 2,
+    runtimeDrainAttempts: 3,
+    runtimeDrainIntervalMilliseconds: 100,
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].options.method, "POST");
+  assert.equal(calls[1].options.method, "GET");
+  assert.equal(applied.status, 200);
+  assert.equal(applied.body.state, "runtime_pending");
+  assert.equal(applied.attempts, 1);
+  assert.equal(applied.resumed_after_conflict, true);
+  assert.equal(applied.status_observations, 1);
+});
+
+
+test("invalid apply state observes applying until the exact promotion is live", async () => {
+  const calls = [];
+  const sleeps = [];
+  const responses = [
+    response(409, {
+      error: {
+        code: "invalid_state",
+        request_id: "request-1",
+        retryable: false,
+      },
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 3,
+      state: "applying",
+      replayed: false,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 3,
+      state: "applying",
+      replayed: false,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 4,
+      state: "live",
+      replayed: false,
+    }),
+  ];
+  const product = driver(async (url, options) => {
+    calls.push({ url, options });
+    return responses.shift();
+  }, undefined, {
+    sleep: async (milliseconds) => sleeps.push(milliseconds),
+  });
+  const applied = await product.applyWithDrainHandshake({
+    installationId: "installation-1",
+    promotionId: DIGEST,
+    expectedPayloadDigest: DIGEST,
+    expectedRevision: 2,
+    runtimeDrainAttempts: 3,
+    runtimeDrainIntervalMilliseconds: 100,
+  });
+  assert.equal(calls.filter((call) => call.options.method === "POST").length, 1);
+  assert.equal(calls.filter((call) => call.options.method === "GET").length, 3);
+  assert.deepEqual(sleeps, [100, 100]);
+  assert.equal(applied.body.state, "live");
+  assert.equal(applied.attempts, 1);
+  assert.equal(applied.resumed_after_conflict, true);
+  assert.equal(applied.status_observations, 3);
+});
+
+
+test("invalid apply state remains terminal when the exact promotion is not applying or applied", async () => {
+  const calls = [];
+  const responses = [
+    response(409, {
+      error: {
+        code: "invalid_state",
+        request_id: "request-1",
+        retryable: false,
+      },
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 2,
+      state: "approved",
+      replayed: false,
+    }),
+  ];
+  const product = driver(async (url, options) => {
+    calls.push({ url, options });
+    return responses.shift();
+  });
+  await assert.rejects(
+    product.applyWithDrainHandshake({
+      installationId: "installation-1",
+      promotionId: DIGEST,
+      expectedPayloadDigest: DIGEST,
+      expectedRevision: 2,
+      runtimeDrainAttempts: 3,
+      runtimeDrainIntervalMilliseconds: 100,
+    }),
+    (error) => error.code === "invalid_state" && error.requestId === "request-1"
+  );
+  assert.equal(calls.length, 2);
+});
+
+
+test("invalid apply state fails closed on a foreign promotion observation", async () => {
+  const responses = [
+    response(409, {
+      error: {
+        code: "invalid_state",
+        request_id: "request-1",
+        retryable: false,
+      },
+    }),
+    response(200, {
+      installation_id: "installation-2",
+      promotion_id: DIGEST,
+      revision: 3,
+      state: "live",
+      replayed: false,
+    }),
+  ];
+  const product = driver(async () => responses.shift());
+  await assert.rejects(
+    product.applyWithDrainHandshake({
+      installationId: "installation-1",
+      promotionId: DIGEST,
+      expectedPayloadDigest: DIGEST,
+      expectedRevision: 2,
+      runtimeDrainAttempts: 3,
+      runtimeDrainIntervalMilliseconds: 100,
+    }),
+    /promotion_identity_mismatch/
+  );
+});
+
+
+test("invalid apply state observation is bounded while applying remains unresolved", async () => {
+  let calls = 0;
+  let sleeps = 0;
+  const product = driver(async () => {
+    calls += 1;
+    if (calls === 1) {
+      return response(409, {
+        error: {
+          code: "invalid_state",
+          request_id: "request-1",
+          retryable: false,
+        },
+      });
+    }
+    return response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 3,
+      state: "applying",
+      replayed: false,
+    });
+  }, undefined, {
+    sleep: async () => {
+      sleeps += 1;
+    },
+  });
+  await assert.rejects(
+    product.applyWithDrainHandshake({
+      installationId: "installation-1",
+      promotionId: DIGEST,
+      expectedPayloadDigest: DIGEST,
+      expectedRevision: 2,
+      runtimeDrainAttempts: 3,
+      runtimeDrainIntervalMilliseconds: 100,
+    }),
+    /apply_resolution_timeout/
+  );
+  assert.equal(calls, 4);
+  assert.equal(sleeps, 2);
 });
 
 
