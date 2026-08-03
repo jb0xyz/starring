@@ -179,6 +179,48 @@ pub(super) struct ApplyConsumeRuntimeDrainRow {
     pub terminal_database_time: Option<DateTime<Utc>>,
 }
 
+impl ApplyConsumeRuntimeDrainRow {
+    pub(super) fn failure_is_closed(&self) -> bool {
+        !self.preparation_ready
+            && !self.exact_replay
+            && !self.requires_commit
+            && self.preparation_token.is_none()
+            && self.locked_product_projection.is_none()
+            && self.source_deployment_snapshot.is_none()
+            && self.source_acknowledged_at.is_none()
+            && self.product_operation_id.is_none()
+            && self.product_mutation_digest.is_none()
+            && self.drain_intent_digest.is_none()
+            && self.source_deployment_id.is_none()
+            && self.source_deployment_revision.is_none()
+            && self.source_result_deployment_revision.is_none()
+            && self.source_result_deployment_snapshot.is_none()
+            && self.source_result_deployment_snapshot_digest.is_none()
+            && self.result_deployment_id.is_none()
+            && self.result_deployment_revision.is_none()
+            && self.result_deployment_snapshot.is_none()
+            && self.result_deployment_snapshot_digest.is_none()
+            && self.product_resulting_revision.is_none()
+            && self.product_resulting_state.is_none()
+            && self.product_receipt_id.is_none()
+            && self.product_audit_event_id.is_none()
+            && self.drain_intent_id.is_none()
+            && self.source_intent_revision.is_none()
+            && self.source_state_bytes.is_none()
+            && self.source_state_digest.is_none()
+            && self.result_intent_revision.is_none()
+            && self.result_intent_state.is_none()
+            && self.result_state_bytes.is_none()
+            && self.result_state_digest.is_none()
+            && self.source_slot_epoch.is_none()
+            && self.successor_slot_epoch.is_none()
+            && self.terminal_action_id.is_none()
+            && self.terminal_projection_bytes.is_none()
+            && self.terminal_projection_digest.is_none()
+            && self.terminal_database_time.is_none()
+    }
+}
+
 pub(super) struct PreparedRuntimeDrainConsumptionV2 {
     preparation_token: String,
     source: PreparedProductDrainSourceSupersessionV1,

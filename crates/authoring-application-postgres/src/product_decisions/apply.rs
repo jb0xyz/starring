@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 
 use super::apply_consume::{
     call_consume_runtime_drain, prepare_runtime_drain_consumption,
-    validate_runtime_drain_consumption_result, RuntimeDrainConsumptionCallV2,
-    ValidatedRuntimeDrainConsumptionV2,
+    validate_runtime_drain_consumption_result, ApplyConsumeRuntimeDrainRow,
+    RuntimeDrainConsumptionCallV2, ValidatedRuntimeDrainConsumptionV2,
 };
 use super::apply_projection::prepare_product_apply_v1;
 use super::apply_sql::{
@@ -291,6 +291,7 @@ async fn consume_acknowledged_runtime_drain(
         .await
         .map_err(classify_precommit_failure)?;
     if prepared_row.outcome_name == "cancelled" {
+        require_closed_consume_failure(&prepared_row).map_err(ApplyAttemptFailure::Control)?;
         return Err(ApplyAttemptFailure::Control(
             ProductControlPortError::LifecycleCancelled(
                 source.selector().map_err(ApplyAttemptFailure::Control)?,
@@ -298,8 +299,8 @@ async fn consume_acknowledged_runtime_drain(
         ));
     }
     if prepared_row.outcome_name != "drain_pending" {
-        return Err(ApplyAttemptFailure::Control(map_consume_outcome(
-            &prepared_row.outcome_name,
+        return Err(ApplyAttemptFailure::Control(map_consume_failure(
+            &prepared_row,
         )));
     }
     let prepared = prepare_runtime_drain_consumption(request, digests, source, &prepared_row)
@@ -307,6 +308,7 @@ async fn consume_acknowledged_runtime_drain(
     let committed = call_consume_runtime_drain(transaction, "commit", &call, Some(&prepared))
         .await
         .map_err(classify_precommit_failure)?;
+    require_applied_consume_outcome(&committed).map_err(ApplyAttemptFailure::Control)?;
     let result = validate_runtime_drain_consumption_result(digests, source, &prepared, &committed)
         .map_err(ApplyAttemptFailure::Control)?;
     let revision = ProductRevisionV1::new(result.product_revision)
@@ -347,6 +349,33 @@ fn map_consume_outcome(outcome: &str) -> ProductControlPortError {
             "runtime drain consumption outcome is unavailable".to_string(),
         ),
         _ => invalid_apply_result(),
+    }
+}
+
+fn map_consume_failure(row: &ApplyConsumeRuntimeDrainRow) -> ProductControlPortError {
+    if !row.failure_is_closed() {
+        return invalid_apply_result();
+    }
+    map_consume_outcome(&row.outcome_name)
+}
+
+fn require_closed_consume_failure(
+    row: &ApplyConsumeRuntimeDrainRow,
+) -> Result<(), ProductControlPortError> {
+    if row.failure_is_closed() {
+        Ok(())
+    } else {
+        Err(invalid_apply_result())
+    }
+}
+
+fn require_applied_consume_outcome(
+    row: &ApplyConsumeRuntimeDrainRow,
+) -> Result<(), ProductControlPortError> {
+    if row.outcome_name == "applied" {
+        Ok(())
+    } else {
+        Err(map_consume_failure(row))
     }
 }
 
@@ -1111,12 +1140,15 @@ enum ApplyAttemptFailure {
 mod tests {
     use automation_ruleset::{content_hash, RuleSetSchemaVersion, CURRENT_RULESET_SCHEMA_VERSION};
     use automation_state::InteractionRuleSet;
+    use chrono::{DateTime, Utc};
     use sqlx::types::Json;
 
     use super::{
-        is_terminal_supersession, map_lock_failure, map_lock_outcome, map_runtime_drain_finalize,
-        runtime_drain_start_projection_is_empty, state_digest_matches, target_artifact_is_valid,
-        ApplyBeginRuntimeDrainRow, ApplyFinalizeRow, ApplyLockRow, ApplyTargetArtifactRow,
+        is_terminal_supersession, map_consume_failure, map_lock_failure, map_lock_outcome,
+        map_runtime_drain_finalize, require_applied_consume_outcome,
+        require_closed_consume_failure, runtime_drain_start_projection_is_empty,
+        state_digest_matches, target_artifact_is_valid, ApplyBeginRuntimeDrainRow,
+        ApplyConsumeRuntimeDrainRow, ApplyFinalizeRow, ApplyLockRow, ApplyTargetArtifactRow,
         ProductControlPortError,
     };
 
@@ -1196,6 +1228,49 @@ mod tests {
             pending_deployment_id: None,
             pending_expected_revision: None,
             pending_marked_at: None,
+        }
+    }
+
+    fn closed_consume_failure(outcome: &str) -> ApplyConsumeRuntimeDrainRow {
+        ApplyConsumeRuntimeDrainRow {
+            outcome_name: outcome.to_string(),
+            preparation_ready: false,
+            exact_replay: false,
+            requires_commit: false,
+            preparation_token: None,
+            locked_product_projection: None,
+            source_deployment_snapshot: None,
+            source_acknowledged_at: None,
+            product_operation_id: None,
+            product_mutation_digest: None,
+            drain_intent_digest: None,
+            source_deployment_id: None,
+            source_deployment_revision: None,
+            source_result_deployment_revision: None,
+            source_result_deployment_snapshot: None,
+            source_result_deployment_snapshot_digest: None,
+            result_deployment_id: None,
+            result_deployment_revision: None,
+            result_deployment_snapshot: None,
+            result_deployment_snapshot_digest: None,
+            product_resulting_revision: None,
+            product_resulting_state: None,
+            product_receipt_id: None,
+            product_audit_event_id: None,
+            drain_intent_id: None,
+            source_intent_revision: None,
+            source_state_bytes: None,
+            source_state_digest: None,
+            result_intent_revision: None,
+            result_intent_state: None,
+            result_state_bytes: None,
+            result_state_digest: None,
+            source_slot_epoch: None,
+            successor_slot_epoch: None,
+            terminal_action_id: None,
+            terminal_projection_bytes: None,
+            terminal_projection_digest: None,
+            terminal_database_time: None,
         }
     }
 
@@ -1344,5 +1419,122 @@ mod tests {
             ..failed_runtime_drain("slot_conflict")
         };
         assert!(!runtime_drain_start_projection_is_empty(&malformed));
+    }
+
+    #[test]
+    fn runtime_drain_commit_maps_non_applied_outcomes_before_projection_validation() {
+        assert_eq!(
+            require_applied_consume_outcome(&closed_consume_failure("applied")),
+            Ok(())
+        );
+        assert_eq!(
+            require_applied_consume_outcome(&closed_consume_failure("authorization_stale")),
+            Err(ProductControlPortError::InvalidState)
+        );
+        assert_eq!(
+            require_applied_consume_outcome(&closed_consume_failure("indeterminate")),
+            Err(ProductControlPortError::Indeterminate(
+                "runtime drain consumption outcome is unavailable".to_string()
+            ))
+        );
+        assert_eq!(
+            require_applied_consume_outcome(&closed_consume_failure("persistence_corrupt")),
+            Err(ProductControlPortError::Backend(
+                "product apply function returned an invalid result".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn runtime_drain_failures_require_the_exact_closed_projection() {
+        let closed = closed_consume_failure("authorization_stale");
+        assert_eq!(
+            map_consume_failure(&closed),
+            ProductControlPortError::InvalidState
+        );
+        assert_eq!(
+            require_closed_consume_failure(&closed_consume_failure("cancelled")),
+            Ok(())
+        );
+
+        macro_rules! assert_malformed {
+            ($field:ident, $value:expr) => {{
+                let mut row = closed_consume_failure("authorization_stale");
+                row.$field = $value;
+                assert_eq!(
+                    map_consume_failure(&row),
+                    ProductControlPortError::Backend(
+                        "product apply function returned an invalid result".to_string()
+                    )
+                );
+            }};
+        }
+
+        assert_malformed!(preparation_ready, true);
+        assert_malformed!(exact_replay, true);
+        assert_malformed!(requires_commit, true);
+        assert_malformed!(preparation_token, Some("token".to_string()));
+        assert_malformed!(locked_product_projection, Some(Json(serde_json::json!({}))));
+        assert_malformed!(
+            source_deployment_snapshot,
+            Some(Json(serde_json::json!({})))
+        );
+        assert_malformed!(
+            source_acknowledged_at,
+            Some(
+                DateTime::parse_from_rfc3339("2026-08-03T17:37:26Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
+        assert_malformed!(product_operation_id, Some("operation".to_string()));
+        assert_malformed!(product_mutation_digest, Some("digest".to_string()));
+        assert_malformed!(drain_intent_digest, Some("digest".to_string()));
+        assert_malformed!(source_deployment_id, Some("deployment".to_string()));
+        assert_malformed!(source_deployment_revision, Some(1));
+        assert_malformed!(source_result_deployment_revision, Some(2));
+        assert_malformed!(
+            source_result_deployment_snapshot,
+            Some(Json(serde_json::json!({})))
+        );
+        assert_malformed!(
+            source_result_deployment_snapshot_digest,
+            Some("digest".to_string())
+        );
+        assert_malformed!(result_deployment_id, Some("deployment".to_string()));
+        assert_malformed!(result_deployment_revision, Some(2));
+        assert_malformed!(
+            result_deployment_snapshot,
+            Some(Json(serde_json::json!({})))
+        );
+        assert_malformed!(
+            result_deployment_snapshot_digest,
+            Some("digest".to_string())
+        );
+        assert_malformed!(product_resulting_revision, Some(2));
+        assert_malformed!(product_resulting_state, Some("applied".to_string()));
+        assert_malformed!(product_receipt_id, Some("receipt".to_string()));
+        assert_malformed!(product_audit_event_id, Some("audit".to_string()));
+        assert_malformed!(drain_intent_id, Some("drain".to_string()));
+        assert_malformed!(source_intent_revision, Some(1));
+        assert_malformed!(source_state_bytes, Some(vec![1]));
+        assert_malformed!(source_state_digest, Some("digest".to_string()));
+        assert_malformed!(result_intent_revision, Some(2));
+        assert_malformed!(result_intent_state, Some("consumed".to_string()));
+        assert_malformed!(result_state_bytes, Some(vec![1]));
+        assert_malformed!(result_state_digest, Some("digest".to_string()));
+        assert_malformed!(source_slot_epoch, Some(1));
+        assert_malformed!(successor_slot_epoch, Some(2));
+        assert_malformed!(terminal_action_id, Some("action".to_string()));
+        assert_malformed!(terminal_projection_bytes, Some(vec![1]));
+        assert_malformed!(terminal_projection_digest, Some("digest".to_string()));
+        assert_malformed!(
+            terminal_database_time,
+            Some(
+                DateTime::parse_from_rfc3339("2026-08-03T17:37:26Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
     }
 }
