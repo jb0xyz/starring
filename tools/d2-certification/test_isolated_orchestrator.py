@@ -2642,6 +2642,98 @@ class LaunchdPlatformTests(unittest.TestCase):
             ):
                 platform.launchd_job("local.starring.d2.test.runtime")
 
+    def test_launchd_job_normalizes_real_not_running_state(self):
+        platform = PLATFORM.Platform()
+        observed = subprocess.CompletedProcess(
+            [],
+            0,
+            b"\tpath = /Users/test/runtime.plist\n\tprogram = /Users/test/starring-runtime\n\targuments = {\n\t\t/Users/test/starring-runtime\n\t}\n\tstate = not running\n\truns = 1\n\tlast exit code = 0\n\t\tstate = active\n",
+            b"",
+        )
+        with mock.patch.object(platform, "run", return_value=observed):
+            self.assertEqual(
+                platform.launchd_job("local.starring.d2.test.runtime"),
+                {
+                    "pid": None,
+                    "program": "/Users/test/starring-runtime",
+                    "plist_path": "/Users/test/runtime.plist",
+                    "arguments": ["/Users/test/starring-runtime"],
+                    "runs": 1,
+                    "state": "exited",
+                    "last_exit_code": 0,
+                },
+            )
+        decorated = subprocess.CompletedProcess(
+            [],
+            0,
+            observed.stdout.replace(
+                b"last exit code = 0", b"last exit code = 70: EX_SOFTWARE"
+            ),
+            b"",
+        )
+        with mock.patch.object(platform, "run", return_value=decorated):
+            result = platform.launchd_job("local.starring.d2.test.runtime")
+        self.assertEqual(result["state"], "exited")
+        self.assertEqual(result["last_exit_code"], 70)
+
+    def test_launchd_job_rejects_inconsistent_or_unknown_states(self):
+        platform = PLATFORM.Platform()
+        invalid = [
+            (
+                "\tstate = not running\n",
+                "\tpid = 49152\n",
+                "\tlast exit code = 0\n",
+            ),
+            ("\tstate = not running\n", "", ""),
+            (
+                "\tstate = not running\n",
+                "",
+                "\tlast exit code = (never exited)\n",
+            ),
+            (
+                "\tstate = running\n",
+                "",
+                "\tlast exit code = (never exited)\n",
+            ),
+            (
+                "\tstate = waiting for debugger\n",
+                "",
+                "\tlast exit code = 0\n",
+            ),
+            ("\tstate = not-running\n", "", "\tlast exit code = 0\n"),
+            (
+                "\tstate = running\n\tstate = not running\n",
+                "\tpid = 49152\n",
+                "\tlast exit code = 0\n",
+            ),
+        ]
+        for state, pid, exit_value in invalid:
+            output = (
+                "\tpath = /Users/test/runtime.plist\n"
+                "\tprogram = /Users/test/starring-runtime\n"
+                "\targuments = {\n"
+                "\t\t/Users/test/starring-runtime\n"
+                "\t}\n"
+                f"{state}"
+                "\truns = 1\n"
+                f"{pid}"
+                f"{exit_value}"
+            ).encode("utf-8")
+            observed = subprocess.CompletedProcess([], 0, output, b"")
+            with (
+                self.subTest(
+                    state=state,
+                    pid=pid,
+                    exit_value=exit_value,
+                ),
+                mock.patch.object(platform, "run", return_value=observed),
+                self.assertRaisesRegex(
+                    CONTRACT.OrchestratorError,
+                    "launchd_observation_invalid",
+                ),
+            ):
+                platform.launchd_job("local.starring.d2.test.runtime")
+
     def test_launchd_job_rejects_duplicate_exit_fields(self):
         platform = PLATFORM.Platform()
         observed = subprocess.CompletedProcess(

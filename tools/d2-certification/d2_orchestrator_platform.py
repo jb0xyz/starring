@@ -15,6 +15,11 @@ RUNTIME_PROCESS_INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 LAUNCHD_DECORATED_EXIT_PATTERN = re.compile(
     r"^(-?[0-9]+): ([A-Z][A-Z0-9_]{0,63})$"
 )
+LAUNCHD_STATE_NORMALIZATION = {
+    "running": "running",
+    "exited": "exited",
+    "not running": "exited",
+}
 
 
 def strict_json_object(pairs):
@@ -89,7 +94,7 @@ class Platform:
         pid_matches = re.findall(r"(?m)^\tpid = ([1-9][0-9]*)\s*$", output)
         program_matches = re.findall(r"(?m)^\tprogram = (\S(?:.*\S)?)\s*$", output)
         path_matches = re.findall(r"(?m)^\tpath = (\S(?:.*\S)?)\s*$", output)
-        state_matches = re.findall(r"(?m)^\tstate = ([a-z][a-z0-9_-]*)\s*$", output)
+        state_matches = re.findall(r"(?m)^\tstate = (\S(?:.*\S)?)\s*$", output)
         runs_matches = re.findall(r"(?m)^\truns = ([1-9][0-9]*)\s*$", output)
         exit_matches = re.findall(r"(?m)^\tlast exit code = (\S(?:.*\S)?)\s*$", output)
         argument_blocks = []
@@ -130,13 +135,24 @@ class Platform:
                     last_exit_code = int(decorated_exit.group(1))
                 else:
                     fail("launchd_observation_invalid")
+        state = LAUNCHD_STATE_NORMALIZATION.get(state_matches[0])
+        pid = int(pid_matches[0]) if pid_matches else None
+        if (
+            state is None
+            or (state == "running" and pid is None)
+            or (
+                state == "exited"
+                and (pid is not None or last_exit_code is None)
+            )
+        ):
+            fail("launchd_observation_invalid")
         return {
-            "pid": int(pid_matches[0]) if pid_matches else None,
+            "pid": pid,
             "program": program_matches[0],
             "plist_path": path_matches[0],
             "arguments": argument_blocks[0] if argument_blocks else None,
             "runs": int(runs_matches[0]),
-            "state": state_matches[0],
+            "state": state,
             "last_exit_code": last_exit_code,
         }
 
