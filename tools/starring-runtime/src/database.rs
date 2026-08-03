@@ -26,6 +26,7 @@ use automation_runtime::{
     SharedGatewayLoopbackHttpProxyV1, SharedGatewayMutationHttpTransportV1,
     SharedGatewayReservedInteractionV3,
 };
+use automation_runtime_controller::{RuntimeServingIdentityV2, RuntimeServingReceiptV2};
 use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_convergence_postgres::{
     PostgresRuntimeExactTargetReader, RuntimeConvergenceStoreError,
@@ -74,7 +75,8 @@ use automation_runtime_panel_postgres::{
     RuntimePanelDatabaseTimeoutsV1, RuntimePanelPersistenceErrorV1,
 };
 use automation_runtime_serving_postgres::{
-    PostgresRuntimeServingLeaseV1, RuntimeServingDatabaseExpectationV1,
+    PostgresRuntimeServingLeaseV1, RuntimePendingDrainServingLookupV1,
+    RuntimePendingDrainServingObservationV1, RuntimeServingDatabaseExpectationV1,
     RuntimeServingDatabaseReadinessV1, RuntimeServingDatabaseTimeoutsV1,
     RuntimeServingPersistenceErrorV1,
 };
@@ -406,6 +408,7 @@ impl Debug for RuntimeDatabaseReadinessProbeV2 {
 #[derive(Clone)]
 pub(crate) struct RuntimePendingDrainMutationDatabaseV3 {
     execution: PostgresRuntimeExecutionV1,
+    serving: PostgresRuntimeServingLeaseV1,
 }
 
 #[derive(Clone)]
@@ -1248,6 +1251,25 @@ fn production_teardown_retry_config_v1() -> InstanceTeardownRetrySupervisorConfi
 }
 
 impl RuntimePendingDrainMutationDatabaseV3 {
+    pub(crate) async fn observe_source_serving_v3(
+        &self,
+        lookup: &RuntimePendingDrainServingLookupV1,
+    ) -> Result<RuntimePendingDrainServingObservationV1, RuntimeServingPersistenceErrorV1> {
+        self.serving
+            .observe_pending_drain_source_serving_v1(lookup)
+            .await
+    }
+
+    pub(crate) async fn disconnect_source_serving_v3(
+        &self,
+        lookup: &RuntimePendingDrainServingLookupV1,
+        identity: &RuntimeServingIdentityV2,
+    ) -> Result<RuntimeServingReceiptV2, RuntimeServingPersistenceErrorV1> {
+        self.serving
+            .disconnect_pending_drain_source_serving_if_expired_v1(lookup, identity)
+            .await
+    }
+
     pub(crate) async fn record_no_candidate_v3(
         &self,
         selection: &RuntimeSelectedPendingDrainNoCandidateV2,
@@ -1307,6 +1329,7 @@ impl RuntimeDatabaseDependenciesV1 {
     pub(crate) fn pending_drain_mutation_v3(&self) -> RuntimePendingDrainMutationDatabaseV3 {
         RuntimePendingDrainMutationDatabaseV3 {
             execution: self.execution.clone(),
+            serving: self.serving.clone(),
         }
     }
 

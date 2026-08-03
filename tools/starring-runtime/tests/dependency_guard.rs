@@ -636,6 +636,7 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/process/observation_tests.rs",
             "src/process/owner.rs",
             "src/process/pending_drain_finalizer.rs",
+            "src/process/pending_drain_serving.rs",
             "src/process/readiness.rs",
             "src/process/recovery.rs",
             "src/process/serving.rs",
@@ -2038,7 +2039,18 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 && identifier == "automation_runtime_worker";
             let allowed_pending_drain_finalizer_dependency = path
                 == Path::new("src/process/pending_drain_finalizer.rs")
-                && identifier == "automation_runtime_worker";
+                && matches!(
+                    identifier,
+                    "automation_runtime_controller" | "automation_runtime_worker"
+                );
+            let allowed_pending_drain_serving_dependency = path
+                == Path::new("src/process/pending_drain_serving.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime_controller" | "automation_runtime_worker"
+                );
+            let allowed_pending_drain_serving_database = path == Path::new("src/database.rs")
+                && identifier == "automation_runtime_controller";
             let allowed_certification_finalizer_dependency = path
                 == Path::new("src/process/certification_finalizer.rs")
                 && identifier == "automation_runtime_worker";
@@ -2176,6 +2188,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         "RuntimeAcceptedPendingDrainSelectionV3"
                             | "RuntimeAuthorizedPendingDrainSelectionV3"
                             | "RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3"
+                            | "RuntimePendingDrainServingSourceCorrelationV3"
                             | "RuntimePendingDrainSelectionPortV3"
                             | "RuntimePendingDrainSelectionReceiptV3"
                             | "RuntimePendingDrainSuccessionAcknowledgementExecutionPortV3"
@@ -2183,6 +2196,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     ) if path == Path::new("src/database.rs")
                         || path == Path::new("src/process/execution.rs")
                         || path == Path::new("src/process/pending_drain_finalizer.rs")
+                        || path == Path::new("src/process/pending_drain_serving.rs")
                 );
             let allowed_ordinary_barrier_v3 = matches!(
                 identifier,
@@ -2232,6 +2246,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_recovery_process
                         || allowed_execution_process
                         || allowed_pending_drain_finalizer_dependency
+                        || allowed_pending_drain_serving_dependency
+                        || allowed_pending_drain_serving_database
                         || allowed_certification_finalizer_dependency
                         || allowed_serving_certification_dependency
                         || allowed_certification_identity_dependency
@@ -5992,7 +6008,7 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
         .find("execute_owned_pending_drain_stage_v3(")
         .unwrap();
     let pending_gateway_completion = pending_execution
-        .rfind(".complete_startup_recovery_execution_v2(completed)")
+        .rfind("complete_pending_drain_recovery_owned_v3(")
         .unwrap();
     assert!(
         pending_begin < pending_select
@@ -6010,8 +6026,11 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
         pending_execution
             .matches("execute_owned_pending_drain_stage_v3(")
             .count(),
-        4
+        5
     );
+    let completion_helper =
+        braced_declaration(execution, "fn complete_pending_drain_recovery_owned_v3(");
+    assert!(completion_helper.contains(".complete_startup_recovery_execution_v2(completed)"));
     let registration =
         braced_declaration(finalizer, "pub(crate) fn register_pending_drain_job_v3<");
     let register = registration.find(".try_register(").unwrap();

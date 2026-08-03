@@ -7,17 +7,26 @@ use std::time::{Duration, Instant};
 
 use automation_runtime_controller::{
     GatewayShardIdV1, RuntimeAcquireGatewayOwnerLeaseOutcomeV1, RuntimeAcquireGatewayOwnerLeaseV1,
-    RuntimeBuildRevisionV1, RuntimeDrainIntentIdV2, RuntimeGatewayAdmissionSequenceV2,
-    RuntimeGatewayOwnerLeaseIdV1, RuntimeGatewayOwnerLeaseObservationV1,
-    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyKindV2,
-    RuntimeObserveGatewayOwnerLeaseV1, RuntimeObservedGatewayOwnerLeaseV1, RuntimeRecoveryIdV2,
+    RuntimeBuildRevisionV1, RuntimeCertificationOperationIdV2, RuntimeDeploymentScopeV1,
+    RuntimeDrainIntentIdV2, RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayOwnerLeaseIdV1,
+    RuntimeGatewayOwnerLeaseObservationV1, RuntimeGatewayOwnerLeaseReceiptV1,
+    RuntimeGatewayReadyKindV2, RuntimeLiveAttestationDigestV2, RuntimeObserveGatewayOwnerLeaseV1,
+    RuntimeObservedGatewayOwnerLeaseV1, RuntimeRecoveryIdV2,
     RuntimeReleaseGatewayOwnerLeaseOutcomeV1, RuntimeReleaseGatewayOwnerLeaseV1,
-    RuntimeRenewGatewayOwnerLeaseOutcomeV1, RuntimeRenewGatewayOwnerLeaseV1, RuntimeServingSlotV2,
+    RuntimeRenewGatewayOwnerLeaseOutcomeV1, RuntimeRenewGatewayOwnerLeaseV1,
+    RuntimeServingIdentityV2, RuntimeServingReceiptV2, RuntimeServingSlotV2,
     RuntimeStartupRecoveryObservationReceiptV2, RuntimeStartupRecoveryStateV2,
     RuntimeStartupServingStateV2,
 };
-use automation_runtime_convergence::{ProcessInstanceId, RuntimeDeploymentTargetV1};
+use automation_runtime_convergence::{
+    DeploymentId, InstallationId, ProcessInstanceId, RuntimeDeploymentTargetV1, RuntimeGeneration,
+    RuntimeProcessIdentityV1, TenantId,
+};
 use automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1 as PendingDrainPersistenceErrorV1;
+use automation_runtime_serving_postgres::{
+    RuntimePendingDrainServingLookupV1, RuntimePendingDrainServingObservationV1,
+    RuntimePendingDrainServingSourceEvidenceV1, RuntimeServingPersistenceErrorV1,
+};
 use automation_runtime_worker::{
     accept_gateway_owner_acquire_v1, accept_runtime_registry_recovery_empty_observation_v2,
     RuntimeAcceptedGatewayOwnerAcquireV1, RuntimeAcceptedGatewayOwnerReceiptV1,
@@ -647,6 +656,60 @@ fn pending_drain_candidate_v2() -> RuntimePendingDrainCandidateV2 {
     .unwrap()
 }
 
+fn pending_drain_serving_source_evidence_v1(
+    candidate: &RuntimePendingDrainCandidateV2,
+) -> RuntimePendingDrainServingSourceEvidenceV1 {
+    RuntimePendingDrainServingSourceEvidenceV1::from(
+        &RuntimePendingDrainServingLookupV1::new(
+            candidate.intent_id().clone(),
+            candidate.source_intent_revision(),
+            *candidate.source_state_digest().as_bytes(),
+        )
+        .unwrap(),
+    )
+}
+
+fn pending_drain_test_serving_receipt_v1(
+    target: RuntimeDeploymentTargetV1,
+    revision: u64,
+    observed_at: DateTime<Utc>,
+    connected: bool,
+) -> RuntimeServingReceiptV2 {
+    let expires_at = observed_at - TimeDelta::milliseconds(1);
+    let last_heartbeat_at = if connected {
+        expires_at - TimeDelta::milliseconds(1)
+    } else {
+        expires_at
+    };
+    RuntimeServingReceiptV2 {
+        identity: RuntimeServingIdentityV2 {
+            scope: RuntimeDeploymentScopeV1 {
+                tenant_id: TenantId::parse("tenant:pending-drain").unwrap(),
+                installation_id: InstallationId::parse("installation:pending-drain").unwrap(),
+                deployment_id: DeploymentId::parse("deployment:pending-drain").unwrap(),
+            },
+            operation_id: RuntimeCertificationOperationIdV2::parse(
+                "00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+            attestation_digest: RuntimeLiveAttestationDigestV2::parse("a".repeat(64)).unwrap(),
+            process_identity: RuntimeProcessIdentityV1 {
+                target,
+                runtime_generation: RuntimeGeneration::new(4).unwrap(),
+                process_instance_id: ProcessInstanceId::parse("process:pending-drain-source")
+                    .unwrap(),
+            },
+            lease_epoch: NonZeroU64::new(5).unwrap(),
+            revision: NonZeroU64::new(revision).unwrap(),
+        },
+        acquired_at: last_heartbeat_at - TimeDelta::milliseconds(1),
+        last_heartbeat_at,
+        expires_at,
+        connected,
+        serving: connected,
+    }
+}
+
 fn pending_drain_owner_receipt_v2(
     request: &automation_runtime_worker::RuntimeStartupRecoveryExecutionRequestV2,
     database_now: DateTime<Utc>,
@@ -742,6 +805,14 @@ struct FakePendingDrainRecoveryEnvironmentV2 {
     succession_revision_delta: u64,
     events: Vec<PendingDrainTestStageV2>,
     mutation_fingerprints: Vec<PendingDrainTestMutationFingerprintV2>,
+    serving_observations:
+        VecDeque<Result<RuntimePendingDrainServingObservationV1, RuntimeServingPersistenceErrorV1>>,
+    serving_disconnects:
+        VecDeque<Result<RuntimeServingReceiptV2, RuntimeServingPersistenceErrorV1>>,
+    current_serving: Option<RuntimeServingReceiptV2>,
+    serving_observation_calls: usize,
+    serving_disconnect_calls: usize,
+    selection_database_now: Option<DateTime<Utc>>,
 }
 
 impl FakePendingDrainRecoveryEnvironmentV2 {
@@ -754,6 +825,12 @@ impl FakePendingDrainRecoveryEnvironmentV2 {
             succession_revision_delta: 1,
             events: Vec::new(),
             mutation_fingerprints: Vec::new(),
+            serving_observations: VecDeque::new(),
+            serving_disconnects: VecDeque::new(),
+            current_serving: None,
+            serving_observation_calls: 0,
+            serving_disconnect_calls: 0,
+            selection_database_now: None,
         }
     }
 
@@ -820,6 +897,29 @@ impl FakePendingDrainRecoveryEnvironmentV2 {
 
     fn with_succession_revision_delta(mut self, delta: u64) -> Self {
         self.succession_revision_delta = delta;
+        self
+    }
+
+    fn with_serving_observations(
+        mut self,
+        observations: impl IntoIterator<
+            Item = Result<
+                RuntimePendingDrainServingObservationV1,
+                RuntimeServingPersistenceErrorV1,
+            >,
+        >,
+    ) -> Self {
+        self.serving_observations = observations.into_iter().collect();
+        self
+    }
+
+    fn with_serving_disconnects(
+        mut self,
+        disconnects: impl IntoIterator<
+            Item = Result<RuntimeServingReceiptV2, RuntimeServingPersistenceErrorV1>,
+        >,
+    ) -> Self {
+        self.serving_disconnects = disconnects.into_iter().collect();
         self
     }
 
@@ -915,15 +1015,100 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
                 )
             }
         };
+        let database_now = pending_drain_test_database_now_v2(authorization.request(), 1);
+        self.selection_database_now = Some(database_now);
         let receipt = RuntimePendingDrainSelectionReceiptV3::new(
             authorization.request().correlation().clone(),
-            pending_drain_owner_receipt_v2(
-                authorization.request(),
-                pending_drain_test_database_now_v2(authorization.request(), 1),
-            ),
+            pending_drain_owner_receipt_v2(authorization.request(), database_now),
             outcome,
         );
         self.finish_stage_v2(PendingDrainTestStageV2::Selection, receipt)
+    }
+
+    async fn observe_pending_drain_source_serving_v1(
+        &mut self,
+        _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        candidate: &RuntimePendingDrainCandidateV2,
+    ) -> Result<
+        RuntimePendingDrainServingObservationV1,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            RuntimeServingPersistenceErrorV1,
+        >,
+    > {
+        self.serving_observation_calls += 1;
+        let result = self.serving_observations.pop_front().unwrap_or_else(|| {
+            let observed_at = self.selection_database_now.unwrap() + TimeDelta::milliseconds(1);
+            let serving = pending_drain_test_serving_receipt_v1(
+                candidate.expected_target().clone(),
+                7,
+                observed_at,
+                false,
+            );
+            Ok(RuntimePendingDrainServingObservationV1::Disconnected {
+                source: pending_drain_serving_source_evidence_v1(candidate),
+                serving: Box::new(serving),
+                observed_at,
+            })
+        });
+        match result {
+            Ok(observation) => {
+                self.current_serving = match &observation {
+                    RuntimePendingDrainServingObservationV1::Fresh { serving, .. }
+                    | RuntimePendingDrainServingObservationV1::Expired { serving, .. }
+                    | RuntimePendingDrainServingObservationV1::Disconnected { serving, .. } => {
+                        Some((**serving).clone())
+                    }
+                    RuntimePendingDrainServingObservationV1::Absent { .. }
+                    | RuntimePendingDrainServingObservationV1::Diverged { .. } => None,
+                };
+                Ok(observation)
+            }
+            Err(error) => {
+                Err(crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(error))
+            }
+        }
+    }
+
+    async fn disconnect_pending_drain_source_serving_v1(
+        &mut self,
+        _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        candidate: &RuntimePendingDrainCandidateV2,
+        identity: &RuntimeServingIdentityV2,
+    ) -> Result<
+        RuntimeServingReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            RuntimeServingPersistenceErrorV1,
+        >,
+    > {
+        self.serving_disconnect_calls += 1;
+        assert_eq!(
+            candidate.expected_target(),
+            &identity.process_identity.target
+        );
+        assert_eq!(
+            candidate.slot(),
+            &automation_runtime_controller::RuntimeServingSlotV2::from_target(
+                &identity.process_identity.target,
+            )
+        );
+        let result = self.serving_disconnects.pop_front().unwrap_or_else(|| {
+            let mut serving = self.current_serving.clone().unwrap();
+            assert_eq!(&serving.identity, identity);
+            serving.identity.revision = NonZeroU64::new(identity.revision.get() + 1).unwrap();
+            serving.connected = false;
+            serving.serving = false;
+            serving.last_heartbeat_at = serving.expires_at;
+            Ok(serving)
+        });
+        match result {
+            Ok(serving) => {
+                self.current_serving = Some(serving.clone());
+                Ok(serving)
+            }
+            Err(error) => {
+                Err(crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(error))
+            }
+        }
     }
 
     async fn record_pending_drain_no_candidate_v2(
@@ -1148,6 +1333,44 @@ impl crate::process::RuntimePendingDrainMutationEnvironmentV3
             self,
             session,
             authorization,
+        )
+        .await
+    }
+
+    async fn observe_pending_drain_source_serving_v3(
+        &mut self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        candidate: &RuntimePendingDrainCandidateV2,
+    ) -> Result<
+        RuntimePendingDrainServingObservationV1,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            RuntimeServingPersistenceErrorV1,
+        >,
+    > {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::observe_pending_drain_source_serving_v1(
+            self,
+            session,
+            candidate,
+        )
+        .await
+    }
+
+    async fn disconnect_pending_drain_source_serving_v3(
+        &mut self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        candidate: &RuntimePendingDrainCandidateV2,
+        identity: &RuntimeServingIdentityV2,
+    ) -> Result<
+        RuntimeServingReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            RuntimeServingPersistenceErrorV1,
+        >,
+    > {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::disconnect_pending_drain_source_serving_v1(
+            self,
+            session,
+            candidate,
+            identity,
         )
         .await
     }
@@ -2358,6 +2581,81 @@ async fn root_finalizer_owns_each_pending_drain_mutation_and_exactly_finalizes_o
 }
 
 #[tokio::test]
+async fn root_finalizer_owns_expired_serving_disconnect_and_one_indeterminate_reobservation() {
+    for (recovery_id, indeterminate) in [
+        ("d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4", false),
+        ("d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5", true),
+    ] {
+        let (gateway, registry, mut session, port) =
+            initial_pending_drain_continue_fresh_registry_fixture_v2(recovery_id).await;
+        let mut environment = FakePendingDrainRecoveryEnvironmentV2::candidate();
+        let selected = select_pending_drain_for_finalizer_v3(&mut session, &mut environment).await;
+        let automation_runtime_worker::RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selected) =
+            selected
+        else {
+            panic!("unclaimed selection")
+        };
+        let observed_at = environment.selection_database_now.unwrap() + TimeDelta::milliseconds(1);
+        let source = pending_drain_test_serving_receipt_v1(
+            selected.candidate().expected_target().clone(),
+            7,
+            observed_at,
+            true,
+        );
+        environment.current_serving = Some(source.clone());
+        if indeterminate {
+            let mut disconnected = source.clone();
+            disconnected.identity.revision = NonZeroU64::new(8).unwrap();
+            disconnected.connected = false;
+            disconnected.serving = false;
+            disconnected.last_heartbeat_at = disconnected.expires_at;
+            environment = environment
+                .with_serving_disconnects([Err(RuntimeServingPersistenceErrorV1::Indeterminate)])
+                .with_serving_observations([Ok(
+                    RuntimePendingDrainServingObservationV1::Disconnected {
+                        source: pending_drain_serving_source_evidence_v1(selected.candidate()),
+                        serving: Box::new(disconnected),
+                        observed_at: observed_at + TimeDelta::milliseconds(1),
+                    },
+                )]);
+        }
+        let source_evidence = pending_drain_serving_source_evidence_v1(selected.candidate());
+        let stage = crate::process::pending_drain_serving_disconnect_stage_for_test_v1(
+            selected,
+            RuntimePendingDrainServingObservationV1::Expired {
+                source: source_evidence,
+                serving: Box::new(source),
+                observed_at,
+            },
+        )
+        .unwrap();
+        let job =
+            crate::process::RuntimePendingDrainFinalizerJobV3::new(session, environment, stage);
+        let mut supervisor = pending_drain_finalizer_supervisor_v3();
+        let settled =
+            crate::process::register_and_complete_pending_drain_job_v3(&mut supervisor, job)
+                .await
+                .unwrap();
+        let (session, environment, output) = settled.into_parts();
+        assert!(matches!(
+            output,
+            crate::process::RuntimePendingDrainMutationOutputV3::ServingResolved(_)
+        ));
+        assert_eq!(environment.serving_disconnect_calls, 1);
+        assert_eq!(
+            environment.serving_observation_calls,
+            usize::from(indeterminate)
+        );
+        assert!(registry.observe_recovery_empty_projection_v2().is_ok());
+        drop(session);
+        drop(gateway);
+        let report = supervisor.join().await;
+        assert_eq!(report.exit(), crate::RuntimeSupervisorExitV1::Commanded);
+        wait_for(|| port.release_calls() == 1).await;
+    }
+}
+
+#[tokio::test]
 async fn root_finalizer_keeps_seal_on_second_uncertainty_and_returns_session_to_mailbox() {
     let (gateway, registry, mut session, port) =
         initial_pending_drain_continue_fresh_registry_fixture_v2(
@@ -2588,6 +2886,223 @@ async fn production_pending_drain_driver_defers_fresh_previous_owner_without_sea
     run.assert_events(&[PendingDrainTestStageV2::Selection]);
     assert!(run.environment.mutation_fingerprints.is_empty());
     assert_eq!(run.successor.as_ref().unwrap(), &run.source);
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_defers_fresh_unclaimed_source_without_mutation() {
+    let candidate = pending_drain_candidate_v2();
+    let observed_at = at_millis(1_000_102);
+    let mut serving = pending_drain_test_serving_receipt_v1(
+        candidate.expected_target().clone(),
+        7,
+        observed_at,
+        true,
+    );
+    serving.expires_at = observed_at + TimeDelta::milliseconds(500);
+    let run = run_pending_drain_test_v2(
+        "cececececececececececececececece",
+        FakePendingDrainRecoveryEnvironmentV2::candidate().with_serving_observations([Ok(
+            RuntimePendingDrainServingObservationV1::Fresh {
+                source: pending_drain_serving_source_evidence_v1(&candidate),
+                serving: Box::new(serving),
+                observed_at,
+            },
+        )]),
+    )
+    .await;
+    run.assert_success();
+    run.assert_events(&[PendingDrainTestStageV2::Selection]);
+    assert_eq!(run.environment.serving_observation_calls, 1);
+    assert_eq!(run.environment.serving_disconnect_calls, 0);
+    assert!(run.environment.mutation_fingerprints.is_empty());
+    assert_eq!(run.successor.as_ref().unwrap(), &run.source);
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_disconnects_expired_source_before_s1() {
+    let candidate = pending_drain_candidate_v2();
+    let observed_at = at_millis(1_000_102);
+    let serving = pending_drain_test_serving_receipt_v1(
+        candidate.expected_target().clone(),
+        7,
+        observed_at,
+        true,
+    );
+    let run = run_pending_drain_test_v2(
+        "cfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcf",
+        FakePendingDrainRecoveryEnvironmentV2::candidate().with_serving_observations([Ok(
+            RuntimePendingDrainServingObservationV1::Expired {
+                source: pending_drain_serving_source_evidence_v1(&candidate),
+                serving: Box::new(serving),
+                observed_at,
+            },
+        )]),
+    )
+    .await;
+    run.assert_success();
+    run.assert_events(&[
+        PendingDrainTestStageV2::Selection,
+        PendingDrainTestStageV2::Claim,
+        PendingDrainTestStageV2::Acknowledgement,
+    ]);
+    assert_eq!(run.environment.serving_observation_calls, 1);
+    assert_eq!(run.environment.serving_disconnect_calls, 1);
+    run.assert_candidate_completed();
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_rejects_mismatched_determinate_disconnect_before_s1() {
+    let candidate = pending_drain_candidate_v2();
+    let observed_at = at_millis(1_000_102);
+    let source = pending_drain_test_serving_receipt_v1(
+        candidate.expected_target().clone(),
+        7,
+        observed_at,
+        true,
+    );
+    let mut scope_mismatch = source.clone();
+    scope_mismatch.identity.revision = NonZeroU64::new(8).unwrap();
+    scope_mismatch.identity.scope.tenant_id = TenantId::parse("tenant:detached").unwrap();
+    scope_mismatch.connected = false;
+    scope_mismatch.serving = false;
+    scope_mismatch.last_heartbeat_at = scope_mismatch.expires_at;
+    let mut clock_regression = source.clone();
+    clock_regression.identity.revision = NonZeroU64::new(8).unwrap();
+    clock_regression.connected = false;
+    clock_regression.serving = false;
+    clock_regression.expires_at = source.expires_at - TimeDelta::milliseconds(1);
+    clock_regression.last_heartbeat_at = clock_regression.expires_at;
+    for (recovery_id, mismatched) in [
+        ("c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7", scope_mismatch),
+        ("c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6", clock_regression),
+    ] {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::candidate()
+                .with_serving_observations([Ok(RuntimePendingDrainServingObservationV1::Expired {
+                    source: pending_drain_serving_source_evidence_v1(&candidate),
+                    serving: Box::new(source.clone()),
+                    observed_at,
+                })])
+                .with_serving_disconnects([Ok(mismatched)]),
+        )
+        .await;
+        run.assert_error(
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainCompound,
+        );
+        run.assert_events(&[PendingDrainTestStageV2::Selection]);
+        assert_eq!(run.environment.serving_observation_calls, 1);
+        assert_eq!(run.environment.serving_disconnect_calls, 1);
+        assert!(run.environment.mutation_fingerprints.is_empty());
+        run.assert_registry_sealed(false);
+    }
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_reobserves_once_after_indeterminate_disconnect() {
+    let candidate = pending_drain_candidate_v2();
+    let observed_at = at_millis(1_000_102);
+    let source = pending_drain_test_serving_receipt_v1(
+        candidate.expected_target().clone(),
+        7,
+        observed_at,
+        true,
+    );
+    let mut disconnected = source.clone();
+    disconnected.identity.revision = NonZeroU64::new(8).unwrap();
+    disconnected.connected = false;
+    disconnected.serving = false;
+    disconnected.last_heartbeat_at = disconnected.expires_at;
+    let run = run_pending_drain_test_v2(
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        FakePendingDrainRecoveryEnvironmentV2::candidate()
+            .with_serving_observations([
+                Ok(RuntimePendingDrainServingObservationV1::Expired {
+                    source: pending_drain_serving_source_evidence_v1(&candidate),
+                    serving: Box::new(source),
+                    observed_at,
+                }),
+                Ok(RuntimePendingDrainServingObservationV1::Disconnected {
+                    source: pending_drain_serving_source_evidence_v1(&candidate),
+                    serving: Box::new(disconnected),
+                    observed_at: observed_at + TimeDelta::milliseconds(1),
+                }),
+            ])
+            .with_serving_disconnects([Err(RuntimeServingPersistenceErrorV1::Indeterminate)]),
+    )
+    .await;
+    run.assert_success();
+    assert_eq!(run.environment.serving_observation_calls, 2);
+    assert_eq!(run.environment.serving_disconnect_calls, 1);
+    run.assert_exact_mutation_fingerprints(PendingDrainTestStageV2::Claim, 1);
+    run.assert_candidate_completed();
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_fails_closed_on_noncurrent_source_evidence() {
+    for (recovery_id, observation) in [
+        (
+            "cacacacacacacacacacacacacacacaca",
+            RuntimePendingDrainServingObservationV1::Absent {
+                source: pending_drain_serving_source_evidence_v1(&pending_drain_candidate_v2()),
+                observed_at: at_millis(1_000_102),
+            },
+        ),
+        (
+            "c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9",
+            RuntimePendingDrainServingObservationV1::Diverged {
+                observed_at: at_millis(1_000_102),
+            },
+        ),
+    ] {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::candidate()
+                .with_serving_observations([Ok(observation)]),
+        )
+        .await;
+        run.assert_error(
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainCompound,
+        );
+        assert_eq!(run.environment.serving_disconnect_calls, 0);
+        assert!(run.environment.mutation_fingerprints.is_empty());
+        run.assert_registry_sealed(false);
+    }
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_fails_closed_after_indeterminate_identity_drift() {
+    let candidate = pending_drain_candidate_v2();
+    let observed_at = at_millis(1_000_102);
+    let source = pending_drain_test_serving_receipt_v1(
+        candidate.expected_target().clone(),
+        7,
+        observed_at,
+        true,
+    );
+    let run = run_pending_drain_test_v2(
+        "c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8",
+        FakePendingDrainRecoveryEnvironmentV2::candidate()
+            .with_serving_observations([
+                Ok(RuntimePendingDrainServingObservationV1::Expired {
+                    source: pending_drain_serving_source_evidence_v1(&candidate),
+                    serving: Box::new(source),
+                    observed_at,
+                }),
+                Ok(RuntimePendingDrainServingObservationV1::Diverged {
+                    observed_at: observed_at + TimeDelta::milliseconds(1),
+                }),
+            ])
+            .with_serving_disconnects([Err(RuntimeServingPersistenceErrorV1::Indeterminate)]),
+    )
+    .await;
+    run.assert_error(
+        crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainCompound,
+    );
+    assert_eq!(run.environment.serving_observation_calls, 2);
+    assert_eq!(run.environment.serving_disconnect_calls, 1);
+    assert!(run.environment.mutation_fingerprints.is_empty());
+    run.assert_registry_sealed(false);
 }
 
 #[tokio::test]

@@ -64,6 +64,7 @@ mod execution;
 mod observation;
 mod owner;
 mod pending_drain_finalizer;
+mod pending_drain_serving;
 mod readiness;
 mod recovery;
 mod serving;
@@ -84,7 +85,8 @@ pub use closed::{
 };
 #[cfg(test)]
 pub(crate) use execution::{
-    execute_pending_drain_recovery_with_environment_v2, RuntimePendingDrainRecoveryEnvironmentV2,
+    execute_pending_drain_recovery_with_environment_v2,
+    pending_drain_serving_disconnect_stage_for_test_v1, RuntimePendingDrainRecoveryEnvironmentV2,
     RuntimeStartupRecoveryExecutionAwaitFailureV2,
 };
 #[cfg(test)]

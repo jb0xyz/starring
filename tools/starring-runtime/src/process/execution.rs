@@ -1,6 +1,12 @@
 use std::future::Future;
 use std::time::{Duration, Instant};
 
+use automation_runtime_serving_postgres::{
+    RuntimePendingDrainServingLookupV1, RuntimePendingDrainServingObservationV1,
+    RuntimeServingPersistenceErrorV1,
+};
+#[cfg(test)]
+use automation_runtime_worker::RuntimeSelectedPendingDrainCandidateV2;
 use automation_runtime_worker::{
     RuntimeAcceptedPendingDrainSelectionV3, RuntimeAuthorizedPendingDrainAcknowledgementV2,
     RuntimeAuthorizedPendingDrainClaimV2, RuntimeAuthorizedPendingDrainSelectionV3,
@@ -28,6 +34,15 @@ use super::pending_drain_finalizer::{
     RuntimePendingDrainFinalizerDispatchFailureV3, RuntimePendingDrainFinalizerJobV3,
     RuntimePendingDrainMutationEnvironmentV3, RuntimePendingDrainMutationOutputV3,
     RuntimePendingDrainMutationStageV3,
+};
+use super::pending_drain_serving::{
+    classify_unclaimed_pending_drain_serving_v1, RuntimeServingIdentityV2, RuntimeServingReceiptV2,
+    RuntimeUnclaimedPendingDrainServingClassificationV1,
+};
+#[cfg(test)]
+use super::pending_drain_serving::{
+    validate_pending_drain_disconnected_reobservation_v1,
+    validate_pending_drain_serving_disconnect_v1,
 };
 use super::startup_loop::RuntimeProcessStartupRecoveryLoopFailureV2;
 use super::RuntimeProcessFoundationV1;
@@ -87,6 +102,32 @@ pub(crate) trait RuntimePendingDrainRecoveryEnvironmentV2 {
             RuntimeStartupRecoveryExecutionAwaitFailureV2<
                 automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
             >,
+        >,
+    > + Send
+           + 'a;
+
+    fn observe_pending_drain_source_serving_v1<'a>(
+        &'a mut self,
+        session: &'a RuntimeClosedRecoverySessionV2,
+        candidate: &'a automation_runtime_worker::RuntimePendingDrainCandidateV2,
+    ) -> impl Future<
+        Output = Result<
+            RuntimePendingDrainServingObservationV1,
+            RuntimeStartupRecoveryExecutionAwaitFailureV2<RuntimeServingPersistenceErrorV1>,
+        >,
+    > + Send
+           + 'a;
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn disconnect_pending_drain_source_serving_v1<'a>(
+        &'a mut self,
+        session: &'a RuntimeClosedRecoverySessionV2,
+        candidate: &'a automation_runtime_worker::RuntimePendingDrainCandidateV2,
+        identity: &'a RuntimeServingIdentityV2,
+    ) -> impl Future<
+        Output = Result<
+            RuntimeServingReceiptV2,
+            RuntimeStartupRecoveryExecutionAwaitFailureV2<RuntimeServingPersistenceErrorV1>,
         >,
     > + Send
            + 'a;
@@ -331,6 +372,22 @@ enum RuntimePendingDrainOwnedStageFailureV3 {
     Lost,
 }
 
+#[cfg(test)]
+pub(crate) fn pending_drain_serving_disconnect_stage_for_test_v1(
+    selection: Box<RuntimeSelectedPendingDrainCandidateV2>,
+    observation: RuntimePendingDrainServingObservationV1,
+) -> Result<RuntimePendingDrainMutationStageV3, RuntimePendingDrainCompoundErrorV2> {
+    match classify_unclaimed_pending_drain_serving_v1(selection, observation)? {
+        RuntimeUnclaimedPendingDrainServingClassificationV1::Disconnect(evidence) => Ok(
+            RuntimePendingDrainMutationStageV3::ServingDisconnect(evidence),
+        ),
+        RuntimeUnclaimedPendingDrainServingClassificationV1::Deferred(_)
+        | RuntimeUnclaimedPendingDrainServingClassificationV1::Ready(_) => {
+            Err(RuntimePendingDrainCompoundErrorV2::ServingClassificationMismatch)
+        }
+    }
+}
+
 async fn execute_pending_drain_recovery_owned_v3(
     process: RuntimeStartupRecoveryContinueProcessV2,
 ) -> RuntimeOwnedStartupRecoveryExecutionOutcomeV3 {
@@ -452,7 +509,8 @@ async fn execute_pending_drain_recovery_owned_v3(
             session = output.0;
             match output.1 {
                 RuntimePendingDrainMutationOutputV3::Completed(completed) => completed,
-                RuntimePendingDrainMutationOutputV3::ClaimAccepted(_) => {
+                RuntimePendingDrainMutationOutputV3::ClaimAccepted(_)
+                | RuntimePendingDrainMutationOutputV3::ServingResolved(_) => {
                     return pending_drain_owned_failure_v3(
                         discord,
                         foundation,
@@ -464,6 +522,108 @@ async fn execute_pending_drain_recovery_owned_v3(
             }
         }
         RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selection) => {
+            let classification = {
+                let mut environment = RuntimeProductionPendingDrainRecoveryEnvironmentV2 {
+                    discord: &mut discord,
+                    foundation: &foundation,
+                };
+                let observation = match environment
+                    .observe_pending_drain_source_serving_v1(&session, selection.candidate())
+                    .await
+                {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        let failure = map_pending_drain_serving_await_failure_v1(
+                            &environment,
+                            &session,
+                            error,
+                        );
+                        return pending_drain_owned_failure_v3(
+                            discord,
+                            foundation,
+                            session,
+                            continuation,
+                            failure,
+                        );
+                    }
+                };
+                if let Err(failure) = revalidate_pending_drain_stage_v2(&environment, &session) {
+                    return pending_drain_owned_failure_v3(
+                        discord,
+                        foundation,
+                        session,
+                        continuation,
+                        failure,
+                    );
+                }
+                match classify_unclaimed_pending_drain_serving_v1(selection, observation) {
+                    Ok(classification) => classification,
+                    Err(error) => {
+                        return pending_drain_owned_failure_v3(
+                            discord,
+                            foundation,
+                            session,
+                            continuation,
+                            pending_drain_compound_failure_v2(error),
+                        );
+                    }
+                }
+            };
+            let selection = match classification {
+                RuntimeUnclaimedPendingDrainServingClassificationV1::Deferred(completed) => {
+                    return complete_pending_drain_recovery_owned_v3(
+                        discord,
+                        foundation,
+                        session,
+                        continuation,
+                        *completed,
+                    );
+                }
+                RuntimeUnclaimedPendingDrainServingClassificationV1::Ready(selection) => selection,
+                RuntimeUnclaimedPendingDrainServingClassificationV1::Disconnect(evidence) => {
+                    let output = match execute_owned_pending_drain_stage_v3(
+                        &discord,
+                        &mut foundation,
+                        session,
+                        RuntimePendingDrainMutationStageV3::ServingDisconnect(evidence),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(RuntimePendingDrainOwnedStageFailureV3::Retained {
+                            session: returned,
+                            failure,
+                        }) => {
+                            return pending_drain_owned_failure_v3(
+                                discord,
+                                foundation,
+                                *returned,
+                                continuation,
+                                failure,
+                            );
+                        }
+                        Err(RuntimePendingDrainOwnedStageFailureV3::Lost) => {
+                            return pending_drain_owned_terminal_v3(discord, foundation).await;
+                        }
+                    };
+                    session = output.0;
+                    match output.1 {
+                        RuntimePendingDrainMutationOutputV3::ServingResolved(selection) => {
+                            selection
+                        }
+                        RuntimePendingDrainMutationOutputV3::Completed(_)
+                        | RuntimePendingDrainMutationOutputV3::ClaimAccepted(_) => {
+                            return pending_drain_owned_failure_v3(
+                                discord,
+                                foundation,
+                                session,
+                                continuation,
+                                RuntimeProcessStartupRecoveryLoopFailureV2::ProtocolViolation,
+                            );
+                        }
+                    }
+                }
+            };
             let seal = match session.seal_pending_drain_candidate_v2(selection.candidate()) {
                 Ok(seal) => seal,
                 Err(error) => {
@@ -531,7 +691,8 @@ async fn execute_pending_drain_recovery_owned_v3(
                 RuntimePendingDrainMutationOutputV3::ClaimAccepted(acknowledgement) => {
                     acknowledgement
                 }
-                RuntimePendingDrainMutationOutputV3::Completed(_) => {
+                RuntimePendingDrainMutationOutputV3::Completed(_)
+                | RuntimePendingDrainMutationOutputV3::ServingResolved(_) => {
                     return pending_drain_owned_failure_v3(
                         discord,
                         foundation,
@@ -569,7 +730,8 @@ async fn execute_pending_drain_recovery_owned_v3(
             session = acknowledgement_output.0;
             match acknowledgement_output.1 {
                 RuntimePendingDrainMutationOutputV3::Completed(completed) => completed,
-                RuntimePendingDrainMutationOutputV3::ClaimAccepted(_) => {
+                RuntimePendingDrainMutationOutputV3::ClaimAccepted(_)
+                | RuntimePendingDrainMutationOutputV3::ServingResolved(_) => {
                     return pending_drain_owned_failure_v3(
                         discord,
                         foundation,
@@ -650,7 +812,8 @@ async fn execute_pending_drain_recovery_owned_v3(
             session = output.0;
             match output.1 {
                 RuntimePendingDrainMutationOutputV3::Completed(completed) => completed,
-                RuntimePendingDrainMutationOutputV3::ClaimAccepted(_) => {
+                RuntimePendingDrainMutationOutputV3::ClaimAccepted(_)
+                | RuntimePendingDrainMutationOutputV3::ServingResolved(_) => {
                     return pending_drain_owned_failure_v3(
                         discord,
                         foundation,
@@ -662,6 +825,17 @@ async fn execute_pending_drain_recovery_owned_v3(
             }
         }
     };
+    complete_pending_drain_recovery_owned_v3(discord, foundation, session, continuation, completed)
+}
+
+fn complete_pending_drain_recovery_owned_v3(
+    discord: RuntimeDiscordGatewaySupervisorV1,
+    foundation: RuntimeProcessFoundationV1,
+    mut session: RuntimeClosedRecoverySessionV2,
+    continuation: RuntimeStartupRecoveryContinuationV2,
+    completed: automation_runtime_worker::RuntimeCompletedStartupRecoveryExecutionV2,
+) -> RuntimeOwnedStartupRecoveryExecutionOutcomeV3 {
+    let class = RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent;
     if let Some(transition) =
         current_startup_recovery_execution_transition_from_parts_v2(&foundation, &discord, &session)
     {
@@ -978,6 +1152,25 @@ where
                 .map_err(pending_drain_compound_failure_v2)?
         }
         RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selection) => {
+            let selection = match resolve_unclaimed_pending_drain_serving_with_environment_v1(
+                session,
+                environment,
+                selection,
+            )
+            .await?
+            {
+                RuntimeUnclaimedPendingDrainServingClassificationV1::Deferred(completed) => {
+                    return complete_pending_drain_recovery_with_environment_v2(
+                        session,
+                        environment,
+                        *completed,
+                    );
+                }
+                RuntimeUnclaimedPendingDrainServingClassificationV1::Ready(selection) => selection,
+                RuntimeUnclaimedPendingDrainServingClassificationV1::Disconnect(_) => {
+                    return Err(RuntimeProcessStartupRecoveryLoopFailureV2::ProtocolViolation);
+                }
+            };
             let seal = session
                 .seal_pending_drain_candidate_v2(selection.candidate())
                 .map_err(|error| startup_recovery_execution_rejected_v2(class, error.into()))?;
@@ -1073,6 +1266,19 @@ where
                 .map_err(pending_drain_compound_failure_v2)?
         }
     };
+    complete_pending_drain_recovery_with_environment_v2(session, environment, completed)
+}
+
+#[cfg(test)]
+fn complete_pending_drain_recovery_with_environment_v2<Environment>(
+    session: &mut RuntimeClosedRecoverySessionV2,
+    environment: &Environment,
+    completed: automation_runtime_worker::RuntimeCompletedStartupRecoveryExecutionV2,
+) -> Result<RuntimeStartupRecoveryExecutionCompletionV2, RuntimeProcessStartupRecoveryLoopFailureV2>
+where
+    Environment: RuntimePendingDrainRecoveryEnvironmentV2,
+{
+    let class = RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent;
     if let Some(transition) = environment.current_transition_v2(session) {
         return Err(transition);
     }
@@ -1108,6 +1314,78 @@ fn pending_drain_requires_exact_finalization_v2(
             automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1::Indeterminate
         )
     )
+}
+
+#[cfg(test)]
+async fn resolve_unclaimed_pending_drain_serving_with_environment_v1<Environment>(
+    session: &RuntimeClosedRecoverySessionV2,
+    environment: &mut Environment,
+    selection: Box<RuntimeSelectedPendingDrainCandidateV2>,
+) -> Result<
+    RuntimeUnclaimedPendingDrainServingClassificationV1,
+    RuntimeProcessStartupRecoveryLoopFailureV2,
+>
+where
+    Environment: RuntimePendingDrainRecoveryEnvironmentV2,
+{
+    let observation = environment
+        .observe_pending_drain_source_serving_v1(session, selection.candidate())
+        .await
+        .map_err(|error| map_pending_drain_serving_await_failure_v1(environment, session, error))?;
+    revalidate_pending_drain_stage_v2(environment, session)?;
+    match classify_unclaimed_pending_drain_serving_v1(selection, observation)
+        .map_err(pending_drain_compound_failure_v2)?
+    {
+        RuntimeUnclaimedPendingDrainServingClassificationV1::Disconnect(evidence) => {
+            let (selection, serving) = (*evidence).into_parts();
+            match environment
+                .disconnect_pending_drain_source_serving_v1(
+                    session,
+                    selection.candidate(),
+                    &serving.identity,
+                )
+                .await
+            {
+                Ok(disconnected) => {
+                    validate_pending_drain_serving_disconnect_v1(&serving, &disconnected)
+                        .map_err(pending_drain_compound_failure_v2)?;
+                    revalidate_pending_drain_stage_v2(environment, session)?;
+                    return Ok(RuntimeUnclaimedPendingDrainServingClassificationV1::Ready(
+                        selection,
+                    ));
+                }
+                Err(RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(
+                    RuntimeServingPersistenceErrorV1::Indeterminate,
+                )) => {}
+                Err(error) => {
+                    return Err(map_pending_drain_serving_await_failure_v1(
+                        environment,
+                        session,
+                        error,
+                    ));
+                }
+            }
+            revalidate_pending_drain_stage_v2(environment, session)?;
+            let observation = environment
+                .observe_pending_drain_source_serving_v1(session, selection.candidate())
+                .await
+                .map_err(|error| {
+                    map_pending_drain_serving_await_failure_v1(environment, session, error)
+                })?;
+            revalidate_pending_drain_stage_v2(environment, session)?;
+            validate_pending_drain_disconnected_reobservation_v1(
+                &selection,
+                &serving,
+                None,
+                observation,
+            )
+            .map_err(pending_drain_compound_failure_v2)?;
+            Ok(RuntimeUnclaimedPendingDrainServingClassificationV1::Ready(
+                selection,
+            ))
+        }
+        outcome => Ok(outcome),
+    }
 }
 
 fn revalidate_pending_drain_stage_v2<Environment>(
@@ -1154,6 +1432,24 @@ where
     }
 }
 
+fn map_pending_drain_serving_await_failure_v1<Environment>(
+    environment: &Environment,
+    session: &RuntimeClosedRecoverySessionV2,
+    error: RuntimeStartupRecoveryExecutionAwaitFailureV2<RuntimeServingPersistenceErrorV1>,
+) -> RuntimeProcessStartupRecoveryLoopFailureV2
+where
+    Environment: RuntimePendingDrainRecoveryEnvironmentV2,
+{
+    match error {
+        RuntimeStartupRecoveryExecutionAwaitFailureV2::Transition(transition) => transition,
+        RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(error) => {
+            environment.current_transition_v2(session).unwrap_or(
+                RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainServing(error),
+            )
+        }
+    }
+}
+
 impl RuntimePendingDrainRecoveryEnvironmentV2
     for RuntimeProductionPendingDrainRecoveryEnvironmentV2<'_>
 {
@@ -1185,6 +1481,47 @@ impl RuntimePendingDrainRecoveryEnvironmentV2
             self.discord,
             session,
             database.select_pending_drain_v3(authorization, execution_cutoff),
+        )
+        .await
+    }
+
+    async fn observe_pending_drain_source_serving_v1(
+        &mut self,
+        session: &RuntimeClosedRecoverySessionV2,
+        candidate: &automation_runtime_worker::RuntimePendingDrainCandidateV2,
+    ) -> Result<
+        RuntimePendingDrainServingObservationV1,
+        RuntimeStartupRecoveryExecutionAwaitFailureV2<RuntimeServingPersistenceErrorV1>,
+    > {
+        let lookup = pending_drain_serving_lookup_v1(candidate)
+            .map_err(RuntimeStartupRecoveryExecutionAwaitFailureV2::Database)?;
+        let database = self.foundation.databases.serving().clone();
+        await_pending_drain_database_v2(
+            self.foundation,
+            self.discord,
+            session,
+            database.observe_pending_drain_source_serving_v1(&lookup),
+        )
+        .await
+    }
+
+    async fn disconnect_pending_drain_source_serving_v1(
+        &mut self,
+        session: &RuntimeClosedRecoverySessionV2,
+        candidate: &automation_runtime_worker::RuntimePendingDrainCandidateV2,
+        identity: &RuntimeServingIdentityV2,
+    ) -> Result<
+        RuntimeServingReceiptV2,
+        RuntimeStartupRecoveryExecutionAwaitFailureV2<RuntimeServingPersistenceErrorV1>,
+    > {
+        let lookup = pending_drain_serving_lookup_v1(candidate)
+            .map_err(RuntimeStartupRecoveryExecutionAwaitFailureV2::Database)?;
+        let database = self.foundation.databases.serving().clone();
+        await_pending_drain_database_v2(
+            self.foundation,
+            self.discord,
+            session,
+            database.disconnect_pending_drain_source_serving_if_expired_v1(&lookup, identity),
         )
         .await
     }
@@ -1396,6 +1733,55 @@ impl RuntimePendingDrainMutationEnvironmentV3
         )
         .await
     }
+
+    async fn observe_pending_drain_source_serving_v3(
+        &mut self,
+        session: &RuntimeClosedRecoverySessionV2,
+        candidate: &automation_runtime_worker::RuntimePendingDrainCandidateV2,
+    ) -> Result<
+        RuntimePendingDrainServingObservationV1,
+        RuntimeStartupRecoveryExecutionAwaitFailureV2<RuntimeServingPersistenceErrorV1>,
+    > {
+        let lookup = pending_drain_serving_lookup_v1(candidate)
+            .map_err(RuntimeStartupRecoveryExecutionAwaitFailureV2::Database)?;
+        let database = self.database.clone();
+        await_owned_pending_drain_database_v3(
+            self,
+            session,
+            database.observe_source_serving_v3(&lookup),
+        )
+        .await
+    }
+
+    async fn disconnect_pending_drain_source_serving_v3(
+        &mut self,
+        session: &RuntimeClosedRecoverySessionV2,
+        candidate: &automation_runtime_worker::RuntimePendingDrainCandidateV2,
+        identity: &RuntimeServingIdentityV2,
+    ) -> Result<
+        RuntimeServingReceiptV2,
+        RuntimeStartupRecoveryExecutionAwaitFailureV2<RuntimeServingPersistenceErrorV1>,
+    > {
+        let lookup = pending_drain_serving_lookup_v1(candidate)
+            .map_err(RuntimeStartupRecoveryExecutionAwaitFailureV2::Database)?;
+        let database = self.database.clone();
+        await_owned_pending_drain_database_v3(
+            self,
+            session,
+            database.disconnect_source_serving_v3(&lookup, identity),
+        )
+        .await
+    }
+}
+
+fn pending_drain_serving_lookup_v1(
+    candidate: &automation_runtime_worker::RuntimePendingDrainCandidateV2,
+) -> Result<RuntimePendingDrainServingLookupV1, RuntimeServingPersistenceErrorV1> {
+    RuntimePendingDrainServingLookupV1::new(
+        candidate.intent_id().clone(),
+        candidate.source_intent_revision(),
+        *candidate.source_state_digest().as_bytes(),
+    )
 }
 
 fn classify_current_pending_drain_finalizer_transition_v3(
@@ -1421,23 +1807,13 @@ fn classify_current_pending_drain_finalizer_transition_v3(
     )
 }
 
-async fn await_owned_pending_drain_database_v3<Execution, Completed>(
+async fn await_owned_pending_drain_database_v3<Execution, Completed, Error>(
     environment: &mut RuntimeProductionPendingDrainFinalizerEnvironmentV3,
     session: &RuntimeClosedRecoverySessionV2,
     execution: Execution,
-) -> Result<
-    Completed,
-    RuntimeStartupRecoveryExecutionAwaitFailureV2<
-        automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
-    >,
->
+) -> Result<Completed, RuntimeStartupRecoveryExecutionAwaitFailureV2<Error>>
 where
-    Execution: Future<
-            Output = Result<
-                Completed,
-                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
-            >,
-        > + Send,
+    Execution: Future<Output = Result<Completed, Error>> + Send,
 {
     let owner_safety_deadline = session.owner_safety_deadline_v2();
     let execution_cutoff = environment.operation_cutoff.min(owner_safety_deadline);
@@ -1482,24 +1858,14 @@ fn pending_drain_execution_cutoff_v2(
         .min(session.owner_safety_deadline_v2())
 }
 
-async fn await_pending_drain_database_v2<Execution, Completed>(
+async fn await_pending_drain_database_v2<Execution, Completed, Error>(
     foundation: &RuntimeProcessFoundationV1,
     discord: &mut RuntimeDiscordGatewaySupervisorV1,
     session: &RuntimeClosedRecoverySessionV2,
     execution: Execution,
-) -> Result<
-    Completed,
-    RuntimeStartupRecoveryExecutionAwaitFailureV2<
-        automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
-    >,
->
+) -> Result<Completed, RuntimeStartupRecoveryExecutionAwaitFailureV2<Error>>
 where
-    Execution: Future<
-            Output = Result<
-                Completed,
-                automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1,
-            >,
-        > + Send,
+    Execution: Future<Output = Result<Completed, Error>> + Send,
 {
     let operation_cutoff = foundation.startup_budget.operation_cutoff();
     let owner_safety_deadline = session.owner_safety_deadline_v2();
