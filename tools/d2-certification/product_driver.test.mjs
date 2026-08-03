@@ -6,6 +6,7 @@ import vm from "node:vm";
 
 const SOURCE = await readFile(new URL("./product_driver.js", import.meta.url), "utf8");
 const DIGEST = "a".repeat(64);
+const PROCESS_INSTANCE_ID = "0123456789abcdef0123456789abcdef";
 
 
 function response(status, body) {
@@ -790,7 +791,11 @@ test("live restart confirmation cross-binds both canonical status projections", 
       runtime: {
         observed_at: "2026-08-03T01:00:02.000001Z",
         phase: "live",
-        attestation: { deployment_revision: 11, convergence_attempt: 1 },
+        attestation: {
+          deployment_revision: 11,
+          convergence_attempt: 1,
+          process_instance_id: PROCESS_INSTANCE_ID,
+        },
         serving: {
           state: "fresh",
           last_heartbeat_at: heartbeat,
@@ -803,6 +808,7 @@ test("live restart confirmation cross-binds both canonical status projections", 
     operationId: "d2:0123456789abcdef:certify-live-runtime-restart",
     installationId: "installation-1",
     promotionId: DIGEST,
+    processInstanceId: PROCESS_INSTANCE_ID,
     shutdownBoundary: "2026-08-03T01:00:00Z",
   });
   assert.deepEqual(Object.keys(confirmation), [
@@ -820,10 +826,12 @@ test("live restart confirmation cross-binds both canonical status projections", 
     "runtime_phase",
     "serving_state",
     "attestation_revision",
+    "process_instance_id",
     "last_heartbeat_at",
     "lease_expires_at",
   ]);
   assert.equal(confirmation.attestation_revision, 11);
+  assert.equal(confirmation.process_instance_id, PROCESS_INSTANCE_ID);
   assert.equal(confirmation.public_origin, "https://d2-api.starring.co.kr");
   assert.equal(confirmation.last_heartbeat_at, heartbeat);
   assert.equal(confirmation.lease_expires_at, expires);
@@ -847,7 +855,10 @@ test("live restart confirmation rejects projection witness drift", async () => {
       runtime: {
         observed_at: "2026-08-03T01:00:02Z",
         phase: "live",
-        attestation: { deployment_revision: 12 },
+        attestation: {
+          deployment_revision: 12,
+          process_instance_id: PROCESS_INSTANCE_ID,
+        },
         serving: {
           state: "fresh",
           last_heartbeat_at: "2026-08-03T01:00:01Z",
@@ -861,6 +872,51 @@ test("live restart confirmation rejects projection witness drift", async () => {
       operationId: "d2:0123456789abcdef:certify-live-runtime-restart",
       installationId: "installation-1",
       promotionId: DIGEST,
+      processInstanceId: PROCESS_INSTANCE_ID,
+      shutdownBoundary: "2026-08-03T01:00:00Z",
+    }),
+    /live_restart_confirmation_invalid/
+  );
+});
+
+
+test("live restart confirmation rejects a foreign canonical process identity", async () => {
+  const heartbeat = "2026-08-03T01:00:01Z";
+  const expires = "2026-08-03T01:00:46Z";
+  const responses = [
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "live",
+      attestation_revision: 11,
+      last_serving_heartbeat: heartbeat,
+      serving_lease_expires_at: expires,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "live",
+      runtime: {
+        observed_at: "2026-08-03T01:00:02Z",
+        phase: "live",
+        attestation: {
+          deployment_revision: 11,
+          process_instance_id: "f".repeat(32),
+        },
+        serving: {
+          state: "fresh",
+          last_heartbeat_at: heartbeat,
+          lease_expires_at: expires,
+        },
+      },
+    }),
+  ];
+  await assert.rejects(
+    driver(async () => responses.shift()).liveRuntimeRestartConfirmation({
+      operationId: "d2:0123456789abcdef:certify-live-runtime-restart",
+      installationId: "installation-1",
+      promotionId: DIGEST,
+      processInstanceId: PROCESS_INSTANCE_ID,
       shutdownBoundary: "2026-08-03T01:00:00Z",
     }),
     /live_restart_confirmation_invalid/
@@ -887,7 +943,10 @@ test("live restart confirmation rejects a lease beyond the runtime contract", as
       runtime: {
         observed_at: "2026-08-03T01:00:02Z",
         phase: "live",
-        attestation: { deployment_revision: 11 },
+        attestation: {
+          deployment_revision: 11,
+          process_instance_id: PROCESS_INSTANCE_ID,
+        },
         serving: {
           state: "fresh",
           last_heartbeat_at: heartbeat,
@@ -901,6 +960,7 @@ test("live restart confirmation rejects a lease beyond the runtime contract", as
       operationId: "d2:0123456789abcdef:certify-live-runtime-restart",
       installationId: "installation-1",
       promotionId: DIGEST,
+      processInstanceId: PROCESS_INSTANCE_ID,
       shutdownBoundary: "2026-08-03T01:00:00Z",
     }),
     /live_restart_confirmation_invalid/

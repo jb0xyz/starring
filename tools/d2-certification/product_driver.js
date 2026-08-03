@@ -3,6 +3,7 @@
 
   const RESOURCE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
   const DIGEST = /^[0-9a-f]{64}$/;
+  const PROCESS_INSTANCE_ID = /^[0-9a-f]{32}$/;
   const UTC_TIMESTAMP = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.([0-9]{1,9}))?Z$/;
   const LIVE_RESTART_OPERATION = /^d2:[0-9a-f]{16}:certify-live-runtime-restart$/;
   const COOKIE_NAME = "__Host-starring_csrf";
@@ -530,6 +531,9 @@
     async function liveRuntimeRestartConfirmation(input) {
       const installationId = requireResourceId(input.installationId, "installation_id");
       const promotionId = requireDigest(input.promotionId, "promotion_id");
+      if (typeof input.processInstanceId !== "string" || !PROCESS_INSTANCE_ID.test(input.processInstanceId)) {
+        throw new Error("process_instance_id_invalid");
+      }
       if (typeof input.operationId !== "string" || !LIVE_RESTART_OPERATION.test(input.operationId)) {
         throw new Error("operation_id_invalid");
       }
@@ -551,6 +555,7 @@
         product.body.attestation_revision < 1 ||
         !Number.isSafeInteger(attestation.deployment_revision) ||
         attestation.deployment_revision < 1 ||
+        attestation.process_instance_id !== input.processInstanceId ||
         product.body.attestation_revision !== attestation.deployment_revision ||
         product.body.last_serving_heartbeat !== serving.last_heartbeat_at ||
         product.body.serving_lease_expires_at !== serving.lease_expires_at ||
@@ -579,6 +584,7 @@
         runtime_phase: runtime.phase,
         serving_state: serving.state,
         attestation_revision: product.body.attestation_revision,
+        process_instance_id: input.processInstanceId,
         last_heartbeat_at: lastHeartbeatAt.value,
         lease_expires_at: leaseExpiresAt.value,
       });

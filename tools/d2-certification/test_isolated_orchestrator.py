@@ -95,6 +95,8 @@ class FakePlatform:
         self.launchd_runs = {}
         self.launchd_states = {}
         self.last_exit_codes = {}
+        self.runtime_process_instance_ids = {}
+        self.runtime_identity_override = None
         self.signals = []
         self.signal_exit_code = 0
         self.signal_failure = False
@@ -253,6 +255,8 @@ class FakePlatform:
         self.last_exit_codes[label] = None
         self.start_order.append(label)
         self.lifecycle_events.append(f"start:{label}")
+        if label.endswith(".runtime"):
+            self.runtime_process_instance_ids[label] = f"{self.next_pid:032x}"
 
     def http_status(self, url, timeout_seconds=3, host_header=None):
         self.http_probes.append((url, host_header))
@@ -265,6 +269,21 @@ class FakePlatform:
             if runtime_label is None or self.pids.get(runtime_label) is None:
                 return 0
         return 200
+
+    def runtime_process_identity(self, context, timeout_seconds=3):
+        runtime_label = context.manifest["services"]["runtime"]["label"]
+        pid = self.pids.get(runtime_label)
+        if pid is None or self.health_failure == "runtime_identity":
+            return None
+        if self.runtime_identity_override is not None:
+            return dict(self.runtime_identity_override)
+        return {
+            "schema_version": 1,
+            "os_pid": pid,
+            "process_instance_id": self.runtime_process_instance_ids[
+                runtime_label
+            ],
+        }
 
     def worker_health_status(self, context, timeout_seconds=3):
         self.lifecycle_events.append("health:worker")
@@ -392,6 +411,7 @@ class FakePlatform:
         self.launchd_runs.pop(label, None)
         self.launchd_states.pop(label, None)
         self.last_exit_codes.pop(label, None)
+        self.runtime_process_instance_ids.pop(label, None)
 
 
 class D2IsolatedOrchestratorTest(unittest.TestCase):
@@ -548,6 +568,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             "runtime_phase": "live",
             "serving_state": "fresh",
             "attestation_revision": 11,
+            "process_instance_id": awaiting["process_instance_id"],
             "last_heartbeat_at": heartbeat.isoformat().replace(
                 "+00:00", "Z"
             ),
@@ -892,6 +913,36 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertNotIn("runtime_serving_leases", source)
         self.assertNotIn("PGPASSFILE", source)
 
+    def test_runtime_identity_probe_accepts_only_the_exact_bounded_shape(self):
+        platform = PLATFORM.Platform()
+
+        def response(body, status=200):
+            platform.run = lambda *args, **kwargs: subprocess.CompletedProcess(
+                args, 0, body + f"\n{status}".encode("ascii"), b""
+            )
+
+        response(
+            b'{"schema_version":1,"os_pid":1234,'
+            b'"process_instance_id":"0123456789abcdef0123456789abcdef"}'
+        )
+        self.assertEqual(
+            platform.runtime_process_identity(self.context),
+            {
+                "schema_version": 1,
+                "os_pid": 1234,
+                "process_instance_id": "0123456789abcdef0123456789abcdef",
+            },
+        )
+        response(b'{"schema_version":1,"schema_version":1,"os_pid":1234,'
+                 b'"process_instance_id":"0123456789abcdef0123456789abcdef"}')
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "runtime_identity_probe_output_invalid",
+        ):
+            platform.runtime_process_identity(self.context)
+        response(b"unavailable", 503)
+        self.assertIsNone(platform.runtime_process_identity(self.context))
+
     def test_transport_control_lost_response_reuses_durable_operation(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         ORCHESTRATOR.command_start(self.context, self.platform)
@@ -1056,6 +1107,15 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertEqual(awaiting["status"], "awaiting_canonical_confirmation")
         self.assertEqual(awaiting["old_pid"], old_pid)
         self.assertNotEqual(awaiting["new_pid"], old_pid)
+        intent = json.loads(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_intent_path(
+                self.context
+            ).read_text(encoding="utf-8")
+        )
+        self.assertNotEqual(
+            awaiting["process_instance_id"],
+            intent["old_process_instance_id"],
+        )
         self.assertFalse(
             LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
                 self.context
@@ -1109,7 +1169,11 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
                 self.context
             ).read_text(encoding="utf-8")
         )
-        self.assertIs(evidence["process_identity_joined"], False)
+        self.assertIs(evidence["process_identity_joined"], True)
+        self.assertEqual(
+            evidence["process_instance_id"],
+            awaiting["process_instance_id"],
+        )
         self.assertEqual(
             evidence["canonical_confirmation_sha256"],
             completion["canonical_confirmation_sha256"],
@@ -1143,6 +1207,79 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
                 ),
                 0,
             )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_local_identity_pid_mismatch_before_signal(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.runtime_identity_override = {
+            "schema_version": 1,
+            "os_pid": self.platform.pids[runtime_label] + 1,
+            "process_instance_id": self.platform.runtime_process_instance_ids[
+                runtime_label
+            ],
+        }
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_precondition_unready",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertEqual(self.platform.signals, [])
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_local_process_identity_drift(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        awaiting = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        self.platform.runtime_identity_override = {
+            "schema_version": 1,
+            "os_pid": awaiting["new_pid"],
+            "process_instance_id": "f" * 32,
+        }
+        confirmation_path = self.write_live_restart_confirmation(awaiting)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_confirmation_process_drift",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform, confirmation_path
+            )
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+                self.context
+            ).exists()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_foreign_canonical_process_identity(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        awaiting = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        confirmation_path = self.write_live_restart_confirmation(
+            awaiting, {"process_instance_id": "f" * 32}
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_confirmation_scope_mismatch",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform, confirmation_path
+            )
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+                self.context
+            ).exists()
+        )
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_live_runtime_restart_rejects_premature_confirmation_without_signal(self):

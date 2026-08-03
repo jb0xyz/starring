@@ -127,7 +127,8 @@ def complete_evidence(manifest):
             "new_pid": 101,
             "runtime_sha256": manifest["candidates"]["runtime"]["sha256"],
             "ready_after_restart": True,
-            "process_identity_joined": False,
+            "process_identity_joined": True,
+            "process_instance_id": "0123456789abcdef0123456789abcdef",
             "checkpoint": "live_fresh_lease",
             "deployment_id": "deployment-1",
             "route_id": "route-1",
@@ -475,7 +476,8 @@ class D2CertificationTest(unittest.TestCase):
             )
         evidence = evidence_by_step[11]
         mutations = (
-            ("process_identity_joined", True),
+            ("process_identity_joined", False),
+            ("process_instance_id", "not-a-process-id"),
             ("public_origin", "https://api.starring.co.kr"),
             ("installation_id", "installation-other"),
             (

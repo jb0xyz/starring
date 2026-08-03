@@ -11,6 +11,16 @@ from d2_orchestrator_contract import OWNER_ACCOUNT, REQUIRED_PROGRAMS, fail
 
 
 MAX_TRANSPORT_CONTROL_BYTES = 64 * 1024
+RUNTIME_PROCESS_INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+
+def strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_key")
+        result[key] = value
+    return result
 
 
 class Platform:
@@ -560,6 +570,60 @@ class Platform:
         if status < 100 or status > 599:
             fail("health_probe_output_invalid")
         return status
+
+    def runtime_process_identity(self, context, timeout_seconds=3):
+        port = context.manifest["services"]["runtime"]["port"]
+        result = self.run(
+            [
+                REQUIRED_PROGRAMS["curl"],
+                "--silent",
+                "--show-error",
+                "--proto",
+                "=http",
+                "--max-filesize",
+                "16384",
+                "--write-out",
+                "\n%{http_code}",
+                "--connect-timeout",
+                str(timeout_seconds),
+                "--max-time",
+                str(timeout_seconds),
+                f"http://127.0.0.1:{port}/health/identity",
+            ],
+            timeout=timeout_seconds + 2,
+        )
+        if result.returncode != 0 or len(result.stdout) > 20 * 1024:
+            return None
+        try:
+            body, raw_status = result.stdout.rsplit(b"\n", 1)
+            status = int(raw_status)
+        except (ValueError, TypeError):
+            fail("runtime_identity_probe_output_invalid")
+        if status < 100 or status > 599:
+            fail("runtime_identity_probe_output_invalid")
+        if status != 200:
+            return None
+        try:
+            identity = json.loads(
+                body, object_pairs_hook=strict_json_object
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            fail("runtime_identity_probe_output_invalid")
+        if (
+            not isinstance(identity, dict)
+            or set(identity)
+            != {"schema_version", "os_pid", "process_instance_id"}
+            or type(identity["schema_version"]) is not int
+            or identity["schema_version"] != 1
+            or type(identity["os_pid"]) is not int
+            or identity["os_pid"] <= 0
+            or not isinstance(identity["process_instance_id"], str)
+            or not RUNTIME_PROCESS_INSTANCE_PATTERN.fullmatch(
+                identity["process_instance_id"]
+            )
+        ):
+            fail("runtime_identity_probe_output_invalid")
+        return identity
 
     def worker_health_status(self, context, timeout_seconds=3):
         port = context.manifest["services"]["worker"]["port"]

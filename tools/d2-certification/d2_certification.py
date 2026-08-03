@@ -255,13 +255,14 @@ STEP_SPECS = {
         ),
     ),
     11: StepSpec(
-        "local_runtime_restarted_with_canonical_serving_continuity",
+        "runtime_restarted_with_canonical_process_identity",
         (
             "old_pid",
             "new_pid",
             "runtime_sha256",
             "ready_after_restart",
             "process_identity_joined",
+            "process_instance_id",
             "checkpoint",
             "deployment_id",
             "route_id",
@@ -1387,8 +1388,12 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         if evidence["runtime_sha256"] != manifest["candidates"]["runtime"]["sha256"]:
             fail("step_contract_failed:runtime_sha256")
         require_true(evidence, "ready_after_restart")
-        if evidence["process_identity_joined"] is not False:
-            fail("step_contract_failed:process_identity_joined")
+        require_true(evidence, "process_identity_joined")
+        if (
+            not isinstance(evidence["process_instance_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{32}", evidence["process_instance_id"])
+        ):
+            fail("step_contract_failed:process_instance_id")
         require_identifier(
             evidence,
             "checkpoint",

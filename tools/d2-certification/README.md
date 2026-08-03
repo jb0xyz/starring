@@ -208,22 +208,25 @@ policy, and TTL identity contract enforced by runtime hydration.
 from replacement drain recovery. It requires exactly the first ten verified D2
 receipts, binds their prior live witness and the deployment, route, and instance
 from steps 8 and 9, and accepts only the fixed `live_fresh_lease` checkpoint.
-Before signaling, it fsyncs the exact old PID, launchd run count, runtime
-candidate and plist identity, dependency processes, transport instance,
-standing snapshot, and receipt-chain head. It sends only `SIGTERM` to the
+Before signaling, it joins the exact old launchd PID to the loopback runtime
+health identity and fsyncs that per-boot process instance ID, launchd run
+count, runtime candidate and plist identity, dependency processes, transport
+instance, standing snapshot, and receipt-chain head. It sends only `SIGTERM` to the
 manifest runtime label, requires a clean exit within 30 seconds, and then
 observes a complete 30-second launchd throttle window with no PID, the same run
 count, exit code `0`, and closed readiness. It uses `restart-drained-runtime`
-for the exact inactive start and verifies a stable new PID.
+for the exact inactive start and verifies a stable new PID with a different
+per-boot process instance ID.
 
 The first invocation stops at `awaiting_canonical_confirmation` and does not
 write completion or step 11 evidence. In the authenticated browser, call
 `liveRuntimeRestartConfirmation` on the loaded `StarringD2ProductDriver` with
-the returned `operation_id`, `installation_id`, `promotion_id`, and
-`shutdown_boundary`. The helper reads both canonical deployment endpoints,
+the returned `operation_id`, `installation_id`, `promotion_id`,
+`process_instance_id`, and `shutdown_boundary`. The helper reads both canonical deployment endpoints,
 requires product and operational `live`, runtime `live`, serving `fresh`, exact
-heartbeat and lease agreement, the same positive attestation revision, and a
-heartbeat later than the durable shutdown boundary. It also seals the driver's
+heartbeat and lease agreement, the same positive attestation revision, the
+exact expected process instance ID, and a heartbeat later than the durable
+shutdown boundary. It also seals the driver's
 normalized public origin. Its returned object is the complete redacted JSON
 contract; save only that JSON to an absolute, owner-controlled mode-`0600`
 file. Rerun the command with `--confirmation-file` before the fixed 45-second
@@ -237,27 +240,24 @@ const confirmation = await product.liveRuntimeRestartConfirmation({
   operationId: "<operation_id from phase 1>",
   installationId: "<installation_id from phase 1>",
   promotionId: "<promotion_id from phase 1>",
+  processInstanceId: "<process_instance_id from phase 1>",
   shutdownBoundary: "<shutdown_boundary from phase 1>",
 });
 copy(JSON.stringify(confirmation));
 ```
 
 The second invocation accepts only the exact schema and binds its operation,
-installation, promotion, public origin, and shutdown boundary to the durable
-local restart. Only then does it publish completion and mode-`0600` step 11
-evidence. The receipt step is named
-`local_runtime_restarted_with_canonical_serving_continuity` and binds the full
-confirmation digest, operation, scope, boundary, origin, and attestation
-revision. It certifies two separate facts: the exact local launchd candidate
-cleanly rotated PID and became ready, and the canonical scoped deployment had
-a fresh serving heartbeat after the shutdown boundary. It explicitly records
-`process_identity_joined: false`; it does not claim that the canonical lease is
-cryptographically joined to the new local PID.
+installation, promotion, public origin, shutdown boundary, and canonical
+process instance ID to the durable local restart. Only then does it publish
+completion and mode-`0600` step 11 evidence. The receipt step is named
+`runtime_restarted_with_canonical_process_identity` and binds the full
+confirmation digest, operation, scope, boundary, origin, attestation revision,
+and process identity. It records `process_identity_joined: true` only after the
+launchd PID, loopback health identity, and authenticated canonical attestation
+form one exact three-way join.
 
-This human boundary is required because the authenticated canonical product
-status does not expose a process identifier that can be safely joined to the
-local launchd PID, and the certification tool has no product session credential
-or least-privilege direct runtime reader. The flow performs no direct database
+The browser boundary supplies the authenticated canonical product observation
+without giving the certification tool a reusable product session. The flow performs no direct database
 observation and stores no cookie, token, or session fingerprint. Interrupted
 operations resume from their durable phase, and completed operations replay
 without another signal or a current-lease requirement. The command does not

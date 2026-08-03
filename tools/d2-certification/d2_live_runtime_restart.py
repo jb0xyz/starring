@@ -49,6 +49,7 @@ OPERATION_PATTERN = re.compile(
 TRANSPORT_INSTANCE_PATTERN = re.compile(r"^d2ti-[0-9a-f]{32}$")
 RECEIPT_DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+PROCESS_INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 TEMPORARY_FILE_PATTERN = re.compile(
     r"^\.(?:intent|shutdown|awaiting-confirmation|complete|step-11-evidence)"
     r"\.json\.[1-9][0-9]*\.tmp$"
@@ -255,6 +256,7 @@ def validate_live_runtime_restart_intent(context, intent, prerequisites):
             "prior_live_witness",
             "runtime_identity",
             "old_pid",
+            "old_process_instance_id",
             "old_runs",
             "transport_instance_id",
             "dependencies",
@@ -286,6 +288,10 @@ def validate_live_runtime_restart_intent(context, intent, prerequisites):
         )
         or type(intent["old_pid"]) is not int
         or intent["old_pid"] <= 0
+        or not isinstance(intent["old_process_instance_id"], str)
+        or not PROCESS_INSTANCE_PATTERN.fullmatch(
+            intent["old_process_instance_id"]
+        )
         or type(intent["old_runs"]) is not int
         or intent["old_runs"] <= 0
         or not isinstance(intent["transport_instance_id"], str)
@@ -354,6 +360,7 @@ def validate_live_runtime_restart_awaiting(awaiting, intent, shutdown):
         != inherited
         | {
             "new_pid",
+            "process_instance_id",
             "new_runs",
             "ready_after_restart",
             "drained_restart_operation_id",
@@ -369,6 +376,12 @@ def validate_live_runtime_restart_awaiting(awaiting, intent, shutdown):
         or type(awaiting["new_pid"]) is not int
         or awaiting["new_pid"] <= 0
         or awaiting["new_pid"] == intent["old_pid"]
+        or not isinstance(awaiting["process_instance_id"], str)
+        or not PROCESS_INSTANCE_PATTERN.fullmatch(
+            awaiting["process_instance_id"]
+        )
+        or awaiting["process_instance_id"]
+        == intent["old_process_instance_id"]
         or type(awaiting["new_runs"]) is not int
         or awaiting["new_runs"] <= 0
         or awaiting["ready_after_restart"] is not True
@@ -420,6 +433,7 @@ def valid_canonical_confirmation_shape(value):
             "runtime_phase",
             "serving_state",
             "attestation_revision",
+            "process_instance_id",
             "last_heartbeat_at",
             "lease_expires_at",
         }
@@ -442,6 +456,10 @@ def valid_canonical_confirmation_shape(value):
         or value["serving_state"] != "fresh"
         or type(value["attestation_revision"]) is not int
         or value["attestation_revision"] <= 0
+        or not isinstance(value["process_instance_id"], str)
+        or not PROCESS_INSTANCE_PATTERN.fullmatch(
+            value["process_instance_id"]
+        )
     ):
         return False
     try:
@@ -501,6 +519,8 @@ def validate_live_runtime_restart_completion(completion, awaiting):
         != awaiting["canonical_scope"]["public_origin"]
         or completion["canonical_confirmation"]["shutdown_boundary"]
         != awaiting["shutdown_boundary"]
+        or completion["canonical_confirmation"]["process_instance_id"]
+        != awaiting["process_instance_id"]
     ):
         fail("live_runtime_restart_completion_invalid")
 
@@ -627,6 +647,8 @@ def require_bound_canonical_confirmation(path, awaiting):
         or confirmation["public_origin"] != scope["public_origin"]
         or confirmation["operation_id"] != awaiting["operation_id"]
         or confirmation["shutdown_boundary"] != awaiting["shutdown_boundary"]
+        or confirmation["process_instance_id"]
+        != awaiting["process_instance_id"]
     ):
         fail("live_runtime_restart_confirmation_scope_mismatch")
     try:
@@ -703,6 +725,7 @@ def ensure_live_runtime_restart_journal(context, status, operation_id):
 def require_fresh_live_runtime(context, platform, identity):
     before = runtime_job_observation(platform, identity)
     ready = runtime_ready_status(context, platform)
+    process = platform.runtime_process_identity(context)
     after = runtime_job_observation(platform, identity)
     if (
         before != after
@@ -711,9 +734,15 @@ def require_fresh_live_runtime(context, platform, identity):
         or before["pid"] <= 0
         or before["state"] != "running"
         or ready != 200
+        or not isinstance(process, dict)
+        or process.get("os_pid") != before["pid"]
+        or not isinstance(process.get("process_instance_id"), str)
+        or not PROCESS_INSTANCE_PATTERN.fullmatch(
+            process["process_instance_id"]
+        )
     ):
         fail("live_runtime_restart_precondition_unready")
-    return before
+    return before, process["process_instance_id"]
 
 
 def require_clean_runtime_exit_observation(
@@ -793,7 +822,8 @@ def step_11_evidence(completion):
         "new_pid": completion["new_pid"],
         "runtime_sha256": completion["runtime_identity"]["runtime_sha256"],
         "ready_after_restart": True,
-        "process_identity_joined": False,
+        "process_identity_joined": True,
+        "process_instance_id": completion["process_instance_id"],
         "checkpoint": LIVE_FRESH_LEASE_CHECKPOINT,
         "deployment_id": identity["deployment_id"],
         "route_id": identity["route_id"],
@@ -830,7 +860,7 @@ def require_completed_live_runtime_restart(
     identity = require_live_runtime_restart_scope(
         context, platform, state, completion, prerequisites
     )
-    final = require_stable_running_runtime(
+    final, process_instance_id = require_bound_running_runtime_identity(
         context,
         platform,
         identity,
@@ -838,6 +868,8 @@ def require_completed_live_runtime_restart(
         completion["new_runs"],
         "live_runtime_restart_replay_drift",
     )
+    if process_instance_id != completion["process_instance_id"]:
+        fail("live_runtime_restart_replay_drift")
     require_live_runtime_restart_scope(
         context, platform, state, completion, prerequisites
     )
@@ -863,6 +895,39 @@ def require_stable_running_runtime(
     return after
 
 
+def require_bound_running_runtime_identity(
+    context, platform, identity, expected_pid, expected_runs, code
+):
+    before = require_stable_running_runtime(
+        context,
+        platform,
+        identity,
+        expected_pid,
+        expected_runs,
+        code,
+    )
+    process = platform.runtime_process_identity(context)
+    after = require_stable_running_runtime(
+        context,
+        platform,
+        identity,
+        expected_pid,
+        expected_runs,
+        code,
+    )
+    if (
+        before != after
+        or not isinstance(process, dict)
+        or process.get("os_pid") != expected_pid
+        or not isinstance(process.get("process_instance_id"), str)
+        or not PROCESS_INSTANCE_PATTERN.fullmatch(
+            process["process_instance_id"]
+        )
+    ):
+        fail(code)
+    return after, process["process_instance_id"]
+
+
 def live_runtime_restart_result(status, completion, evidence, evidence_path):
     return {
         "status": status,
@@ -872,7 +937,8 @@ def live_runtime_restart_result(status, completion, evidence, evidence_path):
         "new_pid": evidence["new_pid"],
         "runtime_sha256": evidence["runtime_sha256"],
         "ready_after_restart": True,
-        "process_identity_joined": False,
+        "process_identity_joined": True,
+        "process_instance_id": evidence["process_instance_id"],
         "checkpoint": evidence["checkpoint"],
         "deployment_id": evidence["deployment_id"],
         "route_id": evidence["route_id"],
@@ -891,6 +957,7 @@ def awaiting_canonical_confirmation_result(awaiting):
         "operation_id": awaiting["operation_id"],
         "old_pid": awaiting["old_pid"],
         "new_pid": awaiting["new_pid"],
+        "process_instance_id": awaiting["process_instance_id"],
         "runtime_sha256": awaiting["runtime_identity"]["runtime_sha256"],
         "ready_after_restart": True,
         "checkpoint": awaiting["checkpoint"],
@@ -944,7 +1011,9 @@ def certify_live_runtime_restart(
         require_pinned_transport_snapshot(context, transport)
         if transport["instance_id"] != prerequisites["transport_instance_id"]:
             fail("live_runtime_restart_transport_changed")
-        old_job = require_fresh_live_runtime(context, platform, identity)
+        old_job, old_process_instance_id = require_fresh_live_runtime(
+            context, platform, identity
+        )
         if standing_snapshot(context, platform) != state["standing_snapshot"]:
             fail("protected_staging_state_changed")
         operation_id = (
@@ -964,6 +1033,7 @@ def certify_live_runtime_restart(
             "prior_live_witness": prerequisites["prior_live_witness"],
             "runtime_identity": identity,
             "old_pid": old_job["pid"],
+            "old_process_instance_id": old_process_instance_id,
             "old_runs": old_job["runs"],
             "transport_instance_id": transport["instance_id"],
             "dependencies": dependencies,
@@ -985,14 +1055,22 @@ def certify_live_runtime_restart(
                 or current["runs"] != intent["old_runs"]
             ):
                 fail("live_runtime_restart_precondition_changed")
-            require_stable_running_runtime(
-                context,
-                platform,
-                identity,
-                intent["old_pid"],
-                intent["old_runs"],
-                "live_runtime_restart_precondition_changed",
+            stable_old_job, stable_old_process_instance_id = (
+                require_bound_running_runtime_identity(
+                    context,
+                    platform,
+                    identity,
+                    intent["old_pid"],
+                    intent["old_runs"],
+                    "live_runtime_restart_precondition_changed",
+                )
             )
+            if (
+                stable_old_job != current
+                or stable_old_process_instance_id
+                != intent["old_process_instance_id"]
+            ):
+                fail("live_runtime_restart_precondition_changed")
             shutdown_deadline = monotonic_time() + LIVE_EXIT_TIMEOUT_SECONDS
             platform.launchd_signal(identity["label"], "SIGTERM")
         elif current["pid"] is not None or not current["loaded"]:
@@ -1033,7 +1111,7 @@ def certify_live_runtime_restart(
         ):
             fail("live_runtime_restart_drained_result_invalid")
         observed_job = runtime_job_observation(platform, identity)
-        final_job = require_stable_running_runtime(
+        final_job, process_instance_id = require_bound_running_runtime_identity(
             context,
             platform,
             identity,
@@ -1048,6 +1126,7 @@ def certify_live_runtime_restart(
             **intent,
             "recorded_at": utc_now(),
             "new_pid": final_job["pid"],
+            "process_instance_id": process_instance_id,
             "new_runs": final_job["runs"],
             "ready_after_restart": True,
             "drained_restart_operation_id": drained["operation_id"],
@@ -1063,7 +1142,7 @@ def certify_live_runtime_restart(
         "awaiting_canonical_confirmation",
         intent["operation_id"],
     )
-    final_job = require_stable_running_runtime(
+    final_job, process_instance_id = require_bound_running_runtime_identity(
         context,
         platform,
         identity,
@@ -1071,6 +1150,8 @@ def certify_live_runtime_restart(
         awaiting["new_runs"],
         "live_runtime_restart_confirmation_process_drift",
     )
+    if process_instance_id != awaiting["process_instance_id"]:
+        fail("live_runtime_restart_confirmation_process_drift")
     require_live_runtime_restart_scope(
         context, platform, state, awaiting, prerequisites
     )
