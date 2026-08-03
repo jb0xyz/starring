@@ -261,7 +261,7 @@ async fn isolated_database(base: PgConnectOptions) -> IsolatedDatabase {
     .unwrap();
     assert_eq!(
         readiness_definition_digest,
-        "918e4be248c37e622b1f5b22cb9e252a450b65b295157681c647855d0c0150b9"
+        "1d7bb5b18129f99ef87b5ad0dfe712b4e6beac33a0461218fedf67fa6990ac3b"
     );
     let password_literal = sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_literal($1)")
         .bind(&password)

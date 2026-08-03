@@ -210,16 +210,16 @@ BEGIN
     INTO ledger_count, ledger_digest
     FROM public._sqlx_migrations AS migration;
 
-    IF ledger_count <> 121
+    IF ledger_count <> 122
         OR ledger_digest <>
-            '380eb60df31c1628f9c2bd02961f42909c4fdc427bacd50a5a19d42da393394d'
+            'fbfb4a3fec87d3e142c467bbcefa5ccc573b2ff8ae66d71c0f49d20240dbb294'
         OR NOT EXISTS (
             SELECT 1
             FROM public._sqlx_migrations AS migration
-            WHERE migration.version = 202608030002
+            WHERE migration.version = 202608040001
                 AND migration.success
                 AND migration.checksum = pg_catalog.decode(
-                    'b3862f35f454b96e35e2ec3fa72e6b7a341f49c4a96d927cd9c7ccfbbc9fdcbbadeab96b1128210a49222f0d8fa057aa',
+                    '0176a67c84119b64791f2c3190c371802eff2726c0005a1d0636176f672be9df837d4436dcf26f49c32297f59b0fb3b0',
                     'hex'
                 )
         )
