@@ -42,9 +42,7 @@ impl ApplyInternalErrorCodeV1 {
             Self::ControlIndeterminate => "control_indeterminate",
             Self::ControlBackend => "control_backend",
             Self::ControlInvalidResult => "control_invalid_result",
-            Self::ControlRuntimeDrainConsumeInvalid => {
-                "control_runtime_drain_consume_invalid"
-            }
+            Self::ControlRuntimeDrainConsumeInvalid => "control_runtime_drain_consume_invalid",
             Self::DeploymentIndeterminate => "deployment_indeterminate",
             Self::DeploymentBackend => "deployment_backend",
             Self::InvalidProjection => "invalid_projection",
