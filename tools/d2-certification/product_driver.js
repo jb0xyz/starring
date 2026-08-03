@@ -10,6 +10,16 @@
   const LIVE_RESTART_CONFIRMATION_KIND = "starring.d2.live-runtime-restart-confirmation.v1";
   const LIVE_FRESH_LEASE_CHECKPOINT = "live_fresh_lease";
   const SERVING_LEASE_MAXIMUM_NANOSECONDS = 45 * 1000000000;
+  const APPLY_ACTIVE_STATES = new Set(["applying"]);
+  const APPLY_COMPLETE_STATES = new Set(["runtime_pending", "live"]);
+  const APPLY_TERMINAL_STATES = new Set([
+    "pending_approval",
+    "approved",
+    "rejected",
+    "expired",
+    "superseded",
+    "withdrawn",
+  ]);
   const FINALIZE_EXISTING_PREVIEW_MESSAGE = "Do not change the current Draft. Keep every existing feature and the current community_hub channel binding exactly unchanged. The only allowed semantic transition is requested_outcome from working_draft to validated_preview. Revalidate the exact current candidate, run the required simulation, and finish with a promotable preview. Do not ask another question.";
 
   function requireResourceId(value, label) {
@@ -189,6 +199,19 @@
     ) {
       throw new Error("apply_resume_binding_mismatch");
     }
+  }
+
+  function classifyApplyStatus(body) {
+    if (APPLY_ACTIVE_STATES.has(body.state)) {
+      return "active";
+    }
+    if (APPLY_COMPLETE_STATES.has(body.state)) {
+      return "complete";
+    }
+    if (APPLY_TERMINAL_STATES.has(body.state)) {
+      return "terminal";
+    }
+    throw new Error("apply_status_state_invalid");
   }
 
   function summaryEvidence(value) {
@@ -485,7 +508,8 @@
         if (invalidStateConflict) {
           const observed = await promotion(command.installationId, command.promotionId, command.signal);
           statusObservations += 1;
-          if (["runtime_pending", "live"].includes(observed.body.state)) {
+          const resolution = classifyApplyStatus(observed.body);
+          if (resolution === "complete") {
             requireApplyStatusBinding(observed.body, command);
             return Object.freeze({
               status: observed.status,
@@ -496,7 +520,7 @@
               status_observations: statusObservations,
             });
           }
-          if (observed.body.state !== "applying") {
+          if (resolution === "terminal") {
             throw invalidStateConflict;
           }
           requireApplyStatusBinding(observed.body, command);

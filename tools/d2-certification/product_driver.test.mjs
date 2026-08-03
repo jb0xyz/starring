@@ -325,6 +325,39 @@ test("runtime drain handshake is bounded and does not retry unrelated conflicts"
 });
 
 
+test("runtime drain handshake never retries a generic dependency failure", async () => {
+  let calls = 0;
+  let sleeps = 0;
+  const product = driver(async () => {
+    calls += 1;
+    return response(503, {
+      error: {
+        code: "dependency_unavailable",
+        request_id: "request-1",
+        retryable: true,
+      },
+    });
+  }, undefined, {
+    sleep: async () => {
+      sleeps += 1;
+    },
+  });
+  await assert.rejects(
+    product.applyWithDrainHandshake({
+      installationId: "installation-1",
+      promotionId: DIGEST,
+      expectedPayloadDigest: DIGEST,
+      expectedRevision: 2,
+      runtimeDrainAttempts: 3,
+      runtimeDrainIntervalMilliseconds: 100,
+    }),
+    (error) => error.status === 503 && error.code === "dependency_unavailable"
+  );
+  assert.equal(calls, 1);
+  assert.equal(sleeps, 0);
+});
+
+
 test("invalid apply state resumes from the exact runtime pending promotion", async () => {
   const calls = [];
   const responses = [
@@ -465,6 +498,132 @@ test("invalid apply state remains terminal when the exact promotion is not apply
     (error) => error.code === "invalid_state" && error.requestId === "request-1"
   );
   assert.equal(calls.length, 2);
+});
+
+
+test("invalid apply state classifies every non-applied lifecycle state as terminal", async () => {
+  for (const state of [
+    "pending_approval",
+    "approved",
+    "rejected",
+    "expired",
+    "superseded",
+    "withdrawn",
+  ]) {
+    let calls = 0;
+    const product = driver(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return response(409, {
+          error: {
+            code: "invalid_state",
+            request_id: `request-${state}`,
+            retryable: false,
+          },
+        });
+      }
+      return response(200, {
+        installation_id: "installation-1",
+        promotion_id: DIGEST,
+        revision: 2,
+        state,
+        payload_digest: DIGEST,
+        apply_source_revision: null,
+        replayed: false,
+      });
+    });
+    await assert.rejects(
+      product.applyWithDrainHandshake({
+        installationId: "installation-1",
+        promotionId: DIGEST,
+        expectedPayloadDigest: DIGEST,
+        expectedRevision: 2,
+        runtimeDrainAttempts: 3,
+        runtimeDrainIntervalMilliseconds: 100,
+      }),
+      (error) => error.code === "invalid_state" && error.requestId === `request-${state}`
+    );
+    assert.equal(calls, 2);
+  }
+});
+
+
+test("invalid apply state fails closed on an unknown lifecycle state", async () => {
+  const responses = [
+    response(409, {
+      error: {
+        code: "invalid_state",
+        request_id: "request-1",
+        retryable: false,
+      },
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 2,
+      state: "unknown",
+      payload_digest: DIGEST,
+      apply_source_revision: null,
+      replayed: false,
+    }),
+  ];
+  const product = driver(async () => responses.shift());
+  await assert.rejects(
+    product.applyWithDrainHandshake({
+      installationId: "installation-1",
+      promotionId: DIGEST,
+      expectedPayloadDigest: DIGEST,
+      expectedRevision: 2,
+      runtimeDrainAttempts: 3,
+      runtimeDrainIntervalMilliseconds: 100,
+    }),
+    /apply_status_state_invalid/
+  );
+});
+
+
+test("invalid apply state does not retry a dependency failure from status observation", async () => {
+  const calls = [];
+  let sleeps = 0;
+  const responses = [
+    response(409, {
+      error: {
+        code: "invalid_state",
+        request_id: "request-1",
+        retryable: false,
+      },
+    }),
+    response(503, {
+      error: {
+        code: "dependency_unavailable",
+        request_id: "request-2",
+        retryable: true,
+      },
+    }),
+  ];
+  const product = driver(async (url, options) => {
+    calls.push({ url, options });
+    return responses.shift();
+  }, undefined, {
+    sleep: async () => {
+      sleeps += 1;
+    },
+  });
+  await assert.rejects(
+    product.applyWithDrainHandshake({
+      installationId: "installation-1",
+      promotionId: DIGEST,
+      expectedPayloadDigest: DIGEST,
+      expectedRevision: 2,
+      runtimeDrainAttempts: 3,
+      runtimeDrainIntervalMilliseconds: 100,
+    }),
+    (error) => error.status === 503 && error.code === "dependency_unavailable"
+  );
+  assert.equal(calls.length, 2);
+  assert.equal(calls.filter((call) => call.options.method === "POST").length, 1);
+  assert.equal(calls.filter((call) => call.options.method === "GET").length, 1);
+  assert.equal(sleeps, 0);
 });
 
 
