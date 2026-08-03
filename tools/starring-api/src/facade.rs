@@ -33,6 +33,7 @@ use product_control_http::{
 
 use crate::composition::ProductionAuthoringLlmClientV1;
 use crate::input::parse_installation;
+use crate::telemetry::emit_apply_error;
 use crate::{
     map_apply_command, map_approve_command, map_authoring_application_error,
     map_authoring_conversation_error, map_authoring_session_query, map_authoring_turn_command,
@@ -576,7 +577,11 @@ impl ProductControlFacade for ProductionProductControlFacadeV1 {
                 command,
             )
             .await
-            .map_err(map_product_application_error)?;
+            .map_err(|error| {
+                let mapped = crate::error::map_apply_error(error);
+                emit_apply_error(&request_id, mapped);
+                mapped.public()
+            })?;
         Ok(project_apply(&result))
     }
 

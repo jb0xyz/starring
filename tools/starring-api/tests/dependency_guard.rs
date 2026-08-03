@@ -284,6 +284,7 @@ fn package_is_registered_once_and_source_modules_are_exactly_classified() {
                 | "config.rs"
                 | "composition.rs"
                 | "server.rs"
+                | "telemetry.rs"
                 | "authoring_admission.rs"
                 | "main.rs"
         ));

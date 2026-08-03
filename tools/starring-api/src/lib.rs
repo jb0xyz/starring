@@ -7,6 +7,7 @@ mod input;
 mod projection;
 mod secret;
 mod server;
+mod telemetry;
 
 pub use authoring_admission::{
     AuthoringAdmissionConfigErrorV1, AuthoringAdmissionConfigV1, AuthoringAdmissionV1,

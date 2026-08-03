@@ -13,6 +13,82 @@ use authoring_application_postgres::{
 use authoring_promotion::{PendingActivationPortError, PromotionError, PromotionStoreError};
 use product_control_http::{FacadeError, FacadeErrorCode};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ApplyInternalErrorCodeV1 {
+    AuthenticationBackendTimeout,
+    AuthenticationBackendRetryable,
+    AuthenticationBackendUnavailable,
+    AuthorityStale,
+    AuthorityScopeMismatch,
+    AuthorityBackend,
+    ControlIndeterminate,
+    ControlBackend,
+    ControlInvalidResult,
+    ControlRuntimeDrainConsumeInvalid,
+    DeploymentIndeterminate,
+    DeploymentBackend,
+    InvalidProjection,
+}
+
+impl ApplyInternalErrorCodeV1 {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthenticationBackendTimeout => "authentication_backend_timeout",
+            Self::AuthenticationBackendRetryable => "authentication_backend_retryable",
+            Self::AuthenticationBackendUnavailable => "authentication_backend_unavailable",
+            Self::AuthorityStale => "authority_stale",
+            Self::AuthorityScopeMismatch => "authority_scope_mismatch",
+            Self::AuthorityBackend => "authority_backend",
+            Self::ControlIndeterminate => "control_indeterminate",
+            Self::ControlBackend => "control_backend",
+            Self::ControlInvalidResult => "control_invalid_result",
+            Self::ControlRuntimeDrainConsumeInvalid => {
+                "control_runtime_drain_consume_invalid"
+            }
+            Self::DeploymentIndeterminate => "deployment_indeterminate",
+            Self::DeploymentBackend => "deployment_backend",
+            Self::InvalidProjection => "invalid_projection",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MappedApplyErrorV1 {
+    public: FacadeError,
+    internal_code: Option<ApplyInternalErrorCodeV1>,
+}
+
+impl MappedApplyErrorV1 {
+    pub(crate) fn public(self) -> FacadeError {
+        self.public
+    }
+
+    pub(crate) fn public_code(self) -> &'static str {
+        match self.public.error_code() {
+            FacadeErrorCode::AuthenticationRequired => "authentication_required",
+            FacadeErrorCode::Forbidden => "forbidden",
+            FacadeErrorCode::NotFound => "not_found",
+            FacadeErrorCode::StaleGeneration => "stale_generation",
+            FacadeErrorCode::StalePayload => "stale_payload",
+            FacadeErrorCode::IdempotencyConflict => "idempotency_conflict",
+            FacadeErrorCode::InvalidState => "invalid_state",
+            FacadeErrorCode::RuntimeDrainRequired => "runtime_drain_required",
+            FacadeErrorCode::RuntimeDrainPending => "runtime_drain_pending",
+            FacadeErrorCode::Superseded => "superseded",
+            FacadeErrorCode::InvalidServerCandidate => "invalid_server_candidate",
+            FacadeErrorCode::UpstreamInvalidResponse => "upstream_invalid_response",
+            FacadeErrorCode::AuthoringSaturated => "authoring_saturated",
+            FacadeErrorCode::DependencyUnavailable => "dependency_unavailable",
+            FacadeErrorCode::DependencyTimeout => "dependency_timeout",
+            FacadeErrorCode::Internal => "internal_error",
+        }
+    }
+
+    pub(crate) fn internal_code(self) -> Option<&'static str> {
+        self.internal_code.map(ApplyInternalErrorCodeV1::as_str)
+    }
+}
+
 pub fn map_authentication_error(error: AuthenticationError) -> FacadeError {
     let code = match error {
         AuthenticationError::InvalidCredential
@@ -66,6 +142,82 @@ pub fn map_product_application_error(error: ProductApplicationError) -> FacadeEr
         ProductApplicationError::Control(error) => map_product_control_error(error),
         ProductApplicationError::Deployment(error) => map_deployment_error(error),
         ProductApplicationError::InvalidProjection => facade(FacadeErrorCode::Internal),
+    }
+}
+
+pub(crate) fn map_apply_error(error: ProductApplicationError) -> MappedApplyErrorV1 {
+    let internal_code = match &error {
+        ProductApplicationError::Authentication(error) => match error {
+            AuthenticationError::Backend(error) => match error {
+                AuthenticationBackendFailureV1::Timeout => {
+                    Some(ApplyInternalErrorCodeV1::AuthenticationBackendTimeout)
+                }
+                AuthenticationBackendFailureV1::Retryable => {
+                    Some(ApplyInternalErrorCodeV1::AuthenticationBackendRetryable)
+                }
+                AuthenticationBackendFailureV1::Unavailable => {
+                    Some(ApplyInternalErrorCodeV1::AuthenticationBackendUnavailable)
+                }
+            },
+            AuthenticationError::InvalidCredential
+            | AuthenticationError::InvalidCsrf
+            | AuthenticationError::Expired
+            | AuthenticationError::Revoked => None,
+        },
+        ProductApplicationError::FreshAuthority(error) => match error {
+            FreshGuildAuthorityError::Stale => Some(ApplyInternalErrorCodeV1::AuthorityStale),
+            FreshGuildAuthorityError::ScopeMismatch => {
+                Some(ApplyInternalErrorCodeV1::AuthorityScopeMismatch)
+            }
+            FreshGuildAuthorityError::Backend(_) => {
+                Some(ApplyInternalErrorCodeV1::AuthorityBackend)
+            }
+            FreshGuildAuthorityError::InstallationNotFound
+            | FreshGuildAuthorityError::Forbidden => None,
+        },
+        ProductApplicationError::Control(error) => match error {
+            ProductControlPortError::Indeterminate(_) => {
+                Some(ApplyInternalErrorCodeV1::ControlIndeterminate)
+            }
+            ProductControlPortError::Backend(detail) => match detail.as_str() {
+                "product apply function returned an invalid result" => {
+                    Some(ApplyInternalErrorCodeV1::ControlInvalidResult)
+                }
+                "product apply runtime drain consume returned an invalid result" => {
+                    Some(ApplyInternalErrorCodeV1::ControlRuntimeDrainConsumeInvalid)
+                }
+                _ => Some(ApplyInternalErrorCodeV1::ControlBackend),
+            },
+            ProductControlPortError::NotFound
+            | ProductControlPortError::ScopeMismatch
+            | ProductControlPortError::RevisionConflict
+            | ProductControlPortError::PayloadMismatch
+            | ProductControlPortError::InvalidState
+            | ProductControlPortError::RuntimeDrainRequired
+            | ProductControlPortError::RuntimeDrainPending(_)
+            | ProductControlPortError::LifecycleCancelled(_)
+            | ProductControlPortError::DuplicateDecision
+            | ProductControlPortError::Expired
+            | ProductControlPortError::IdempotencyConflict
+            | ProductControlPortError::InvalidServerCandidate(_)
+            | ProductControlPortError::Superseded => None,
+        },
+        ProductApplicationError::Deployment(error) => match error {
+            DeploymentStatusPortError::Indeterminate(_) => {
+                Some(ApplyInternalErrorCodeV1::DeploymentIndeterminate)
+            }
+            DeploymentStatusPortError::Backend(_) => {
+                Some(ApplyInternalErrorCodeV1::DeploymentBackend)
+            }
+            DeploymentStatusPortError::NotFound => None,
+        },
+        ProductApplicationError::InvalidProjection => {
+            Some(ApplyInternalErrorCodeV1::InvalidProjection)
+        }
+    };
+    MappedApplyErrorV1 {
+        public: map_product_application_error(error),
+        internal_code,
     }
 }
 
@@ -649,5 +801,48 @@ mod tests {
             )),
             FacadeErrorCode::DependencyUnavailable
         );
+    }
+
+    #[test]
+    fn apply_error_mapping_has_stable_internal_codes_without_changing_public_errors() {
+        let invalid_projection = map_apply_error(ProductApplicationError::InvalidProjection);
+        assert_eq!(
+            invalid_projection.internal_code(),
+            Some("invalid_projection")
+        );
+        assert_eq!(
+            invalid_projection.public().error_code(),
+            FacadeErrorCode::Internal
+        );
+
+        let known = map_apply_error(ProductApplicationError::Control(
+            ProductControlPortError::Backend(
+                "product apply function returned an invalid result".to_string(),
+            ),
+        ));
+        assert_eq!(known.internal_code(), Some("control_invalid_result"));
+
+        let consume = map_apply_error(ProductApplicationError::Control(
+            ProductControlPortError::Backend(
+                "product apply runtime drain consume returned an invalid result".to_string(),
+            ),
+        ));
+        assert_eq!(
+            consume.internal_code(),
+            Some("control_runtime_drain_consume_invalid")
+        );
+
+        let secret = "postgres://user:secret@private-host/database";
+        let backend = map_apply_error(ProductApplicationError::Control(
+            ProductControlPortError::Backend(secret.to_string()),
+        ));
+        assert_eq!(backend.internal_code(), Some("control_backend"));
+        assert_eq!(backend.public_code(), "dependency_unavailable");
+        assert_eq!(
+            backend.public().error_code(),
+            FacadeErrorCode::DependencyUnavailable
+        );
+        assert!(backend.public().retryable());
+        assert!(!backend.internal_code().unwrap().contains(secret));
     }
 }
