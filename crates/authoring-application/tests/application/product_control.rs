@@ -34,6 +34,10 @@ fn promotion_id() -> PromotionId {
     PromotionId::parse(&"a".repeat(64)).unwrap()
 }
 
+fn approval_payload_digest() -> ApprovalPayloadDigestV1 {
+    ApprovalPayloadDigestV1::parse(&"c".repeat(64)).unwrap()
+}
+
 #[test]
 fn authority_check_authenticates_and_requires_fresh_apply_authority_only() {
     block_on(async {
@@ -358,6 +362,7 @@ fn operational_status_v2_uses_only_the_server_derived_exact_deployment() {
                 decision_projection(ProductDecisionPhaseV1::Applied {
                     exact_deployment: exact_deployment(),
                 }),
+                approval_payload_digest(),
                 decision_observed_at,
             ),
         };
@@ -496,7 +501,11 @@ fn exact_preview_and_status_observations_preserve_database_time_and_revision() {
         );
         let decisions = ObservationDecisions {
             preview: preview.clone(),
-            status: ProductDecisionObservationV1::from_server_projection(decision, observed_at),
+            status: ProductDecisionObservationV1::from_server_projection(
+                decision,
+                preview.preview().payload_digest().clone(),
+                observed_at,
+            ),
         };
         let deployments = ObservationDeployments {
             status: DeploymentStatusObservationV1::from_server_projection(
@@ -545,6 +554,10 @@ fn exact_preview_and_status_observations_preserve_database_time_and_revision() {
             .unwrap();
         assert_eq!(status.status(), ProductStatusV1::PendingApproval);
         assert_eq!(status.decision().revision().get(), 7);
+        assert_eq!(
+            status.approval_payload_digest(),
+            preview.preview().payload_digest()
+        );
         assert_eq!(status.decision_observed_at(), observed_at);
         assert!(status.deployment().is_none());
     });
@@ -562,10 +575,12 @@ fn live_observation_preserves_attestation_heartbeat_and_lease_ordering() {
             exact_deployment: exact.clone(),
         });
         let (_, preview) = exact_preview_observation(UNIX_EPOCH + Duration::from_secs(1)).await;
+        let payload_digest = preview.preview().payload_digest().clone();
         let decisions = ObservationDecisions {
             preview,
             status: ProductDecisionObservationV1::from_server_projection(
                 decision,
+                payload_digest,
                 decision_observed_at,
             ),
         };
@@ -621,12 +636,14 @@ fn runtime_observation_before_decision_observation_fails_closed() {
         let decision_observed_at = UNIX_EPOCH + Duration::from_secs(120);
         let runtime_observed_at = UNIX_EPOCH + Duration::from_secs(110);
         let (_, preview) = exact_preview_observation(UNIX_EPOCH + Duration::from_secs(1)).await;
+        let payload_digest = preview.preview().payload_digest().clone();
         let decisions = ObservationDecisions {
             preview,
             status: ProductDecisionObservationV1::from_server_projection(
                 decision_projection(ProductDecisionPhaseV1::Applied {
                     exact_deployment: exact,
                 }),
+                payload_digest,
                 decision_observed_at,
             ),
         };

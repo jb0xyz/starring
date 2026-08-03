@@ -23,8 +23,8 @@ use product_control_http::{
     LifecycleCancellationView, OAuthCallbackCommand, OAuthCallbackResult, OAuthStartCommand,
     OAuthStartResult, ProductApiReadinessGate, ProductControlAuthoringFacadeV1,
     ProductControlFacade, ProductControlLifecycleFacadeV1, ProductControlOperationalFacadeV2,
-    ProductRequestId, ProductState, PromoteCommand, PromotionView, RejectCommand,
-    RuntimeDeploymentOperationalViewV2, SafeApprovalSummary, SessionCredential,
+    ProductRequestId, ProductState, ProductStatusView, PromoteCommand, PromotionView,
+    RejectCommand, RuntimeDeploymentOperationalViewV2, SafeApprovalSummary, SessionCredential,
 };
 use tokio::sync::Notify;
 use tower::ServiceExt;
@@ -57,6 +57,7 @@ struct FakeFacade {
     identical_session_csrf: AtomicUsize,
     approval_response: AtomicUsize,
     apply_response: AtomicUsize,
+    status_response: AtomicUsize,
     block_promote: AtomicUsize,
     promote_entered: Notify,
     promote_release: Notify,
@@ -110,6 +111,23 @@ impl FakeFacade {
             promotion_id: PROMOTION.to_string(),
             revision: 4,
             state,
+            replayed: false,
+        }
+    }
+
+    fn product_status(&self, state: ProductState) -> ProductStatusView {
+        let apply_source_revision = match state {
+            ProductState::Applying => Some(3),
+            ProductState::RuntimePending | ProductState::Live => Some(2),
+            _ => None,
+        };
+        ProductStatusView {
+            installation_id: "install-1".to_string(),
+            promotion_id: PROMOTION.to_string(),
+            revision: 4,
+            state,
+            payload_digest: DIGEST.to_string(),
+            apply_source_revision,
             replayed: false,
         }
     }
@@ -277,8 +295,23 @@ impl ProductControlFacade for FakeFacade {
         _credential: &SessionCredential,
         _installation_id: &str,
         _promotion_id: &str,
-    ) -> Result<DecisionView, FacadeError> {
-        Ok(self.decision(ProductState::Approved))
+    ) -> Result<ProductStatusView, FacadeError> {
+        let mode = self.status_response.load(Ordering::SeqCst);
+        let mut view = self.product_status(if mode == 0 {
+            ProductState::Approved
+        } else {
+            ProductState::RuntimePending
+        });
+        match mode {
+            2 => {
+                view.revision = 2;
+                view.apply_source_revision = Some(0);
+            }
+            3 => view.apply_source_revision = Some(1),
+            4 => view.payload_digest = "not-a-digest".to_string(),
+            _ => {}
+        }
+        Ok(view)
     }
 
     async fn approval_preview(
@@ -2420,6 +2453,44 @@ async fn oauth_return_paths_are_an_exact_unambiguous_allowlist() {
     .unwrap();
     let response = app(facade).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn product_status_exposes_and_validates_exact_apply_source_binding() {
+    let facade = Arc::new(FakeFacade::default());
+    facade.status_response.store(1, Ordering::SeqCst);
+    let uri = format!("/v1/installations/install-1/promotions/{PROMOTION}");
+    let response = app(Arc::clone(&facade))
+        .oneshot(
+            request_builder("GET", &uri)
+                .header("cookie", format!("__Host-starring_session={SESSION}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let view: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(view["state"], "runtime_pending");
+    assert_eq!(view["revision"], 4);
+    assert_eq!(view["payload_digest"], DIGEST);
+    assert_eq!(view["apply_source_revision"], 2);
+    assert_eq!(view["replayed"], false);
+
+    for mode in [2, 3, 4] {
+        facade.status_response.store(mode, Ordering::SeqCst);
+        let response = app(Arc::clone(&facade))
+            .oneshot(
+                request_builder("GET", &uri)
+                    .header("cookie", format!("__Host-starring_session={SESSION}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
 
 #[tokio::test]

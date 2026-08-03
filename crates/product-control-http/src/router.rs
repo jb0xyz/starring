@@ -29,9 +29,9 @@ use abuse_budget::{OAuthStartAdmission, OAuthStartBudget};
 use authoring::{authoring_session, authoring_turn};
 use boundary::*;
 use response_validation::{
-    valid_apply_view, valid_approval_view, valid_current_principal, valid_decision_view,
+    valid_apply_view, valid_approval_view, valid_current_principal,
     valid_deployment_operational_view_v2, valid_deployment_view, valid_lifecycle_cancellation_view,
-    valid_preview_view, valid_promotion_view, valid_rejection_view,
+    valid_preview_view, valid_product_status_view, valid_promotion_view, valid_rejection_view,
 };
 
 pub(super) const AUTHORING_TURN_PATH_V1: &str =
@@ -720,7 +720,7 @@ where
         .status(&credential, &installation_id, &promotion_id)
         .await
     {
-        Ok(view) if valid_decision_view(&view, &installation_id, &promotion_id) => {
+        Ok(view) if valid_product_status_view(&view, &installation_id, &promotion_id) => {
             Json(view).into_response()
         }
         Ok(_) => map_facade(FacadeError::new(FacadeErrorCode::Internal), &request_id),

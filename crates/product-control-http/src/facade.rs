@@ -5,8 +5,8 @@ use uuid::Uuid;
 use crate::{
     ApplyView, ApprovalPreviewView, AuthoringSessionViewV1, AuthoringTurnViewV1, CsrfSecret,
     CurrentPrincipal, DecisionView, DeploymentOperationalViewV2, DeploymentView, FacadeError,
-    LifecycleCancellationView, OAuthCode, OAuthState, ProductState, PromotionView,
-    SessionCredential,
+    LifecycleCancellationView, OAuthCode, OAuthState, ProductState, ProductStatusView,
+    PromotionView, SessionCredential,
 };
 
 const RESOURCE_ID_MAX_BYTES: usize = 128;
@@ -318,7 +318,7 @@ pub trait ProductControlFacade: Send + Sync + 'static {
         credential: &SessionCredential,
         installation_id: &str,
         promotion_id: &str,
-    ) -> Result<DecisionView, FacadeError>;
+    ) -> Result<ProductStatusView, FacadeError>;
 
     async fn approval_preview(
         &self,

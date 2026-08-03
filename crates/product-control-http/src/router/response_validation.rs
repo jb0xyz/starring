@@ -4,7 +4,7 @@ use crate::{
     AuthoringTurnViewV1, CurrentPrincipalView, DecisionView, DeploymentOperationalStateV2,
     DeploymentOperationalViewV2, DeploymentOperatorActionV2, DeploymentRetryStateV2,
     DeploymentRuntimePhaseV2, DeploymentServingFreshnessStateV2, DeploymentState, DeploymentView,
-    LifecycleCancellationView, ProductState, PromotionView,
+    LifecycleCancellationView, ProductState, ProductStatusView, PromotionView,
 };
 
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
@@ -91,6 +91,37 @@ pub(super) fn valid_decision_view(
     view.installation_id == installation_id
         && view.promotion_id == promotion_id
         && view.revision > 0
+}
+
+pub(super) fn valid_product_status_view(
+    view: &ProductStatusView,
+    installation_id: &str,
+    promotion_id: &str,
+) -> bool {
+    let source_revision_valid = match view.state {
+        ProductState::Applying => view.apply_source_revision.is_some_and(|source| {
+            (1..=MAX_SAFE_JSON_INTEGER).contains(&source)
+                && source.checked_add(1) == Some(view.revision)
+        }),
+        ProductState::RuntimePending | ProductState::Live => {
+            view.apply_source_revision.is_some_and(|source| {
+                (1..=MAX_SAFE_JSON_INTEGER).contains(&source)
+                    && source.checked_add(2) == Some(view.revision)
+            })
+        }
+        ProductState::PendingApproval
+        | ProductState::Approved
+        | ProductState::Rejected
+        | ProductState::Expired
+        | ProductState::Superseded
+        | ProductState::Withdrawn => view.apply_source_revision.is_none(),
+    };
+    view.installation_id == installation_id
+        && view.promotion_id == promotion_id
+        && (1..=MAX_SAFE_JSON_INTEGER).contains(&view.revision)
+        && valid_digest(&view.payload_digest)
+        && source_revision_valid
+        && !view.replayed
 }
 
 pub(super) fn valid_approval_view(

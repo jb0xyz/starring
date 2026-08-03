@@ -123,6 +123,17 @@ pub struct DecisionView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProductStatusView {
+    pub installation_id: String,
+    pub promotion_id: String,
+    pub revision: u64,
+    pub state: ProductState,
+    pub payload_digest: String,
+    pub apply_source_revision: Option<u64>,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ApprovalPreviewView {
     pub installation_id: String,
     pub promotion_id: String,

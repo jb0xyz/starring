@@ -989,6 +989,21 @@ impl DeploymentStatusPort<FreshDiscordAuthorityEvidenceV1> for PendingDeployment
     }
 }
 
+impl DeploymentStatusObservationPort<FreshDiscordAuthorityEvidenceV1> for PendingDeployments {
+    async fn load_exact_deployment_observation(
+        &self,
+        _request: AuthorizedDeploymentStatusV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<DeploymentStatusObservationV1, DeploymentStatusPortError> {
+        Ok(DeploymentStatusObservationV1::from_server_projection(
+            DeploymentStatusProjectionV1::Pending,
+            UNIX_EPOCH + Duration::from_secs(4_000_000_000),
+            None,
+            None,
+        )
+        .unwrap())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum AuthorityRotation {
     Safe,

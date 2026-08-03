@@ -28,7 +28,7 @@ use product_control_http::{
     LifecycleCancellationCommand, LifecycleCancellationView, OAuthCallbackCommand,
     OAuthCallbackResult, OAuthStartCommand, OAuthStartResult, ProductControlAuthoringFacadeV1,
     ProductControlFacade, ProductControlLifecycleFacadeV1, ProductControlOperationalFacadeV2,
-    PromoteCommand, PromotionView, RejectCommand, SessionCredential,
+    ProductStatusView, PromoteCommand, PromotionView, RejectCommand, SessionCredential,
 };
 
 use crate::composition::ProductionAuthoringLlmClientV1;
@@ -484,7 +484,7 @@ impl ProductControlFacade for ProductionProductControlFacadeV1 {
         credential: &SessionCredential,
         installation_id: &str,
         promotion_id: &str,
-    ) -> Result<DecisionView, FacadeError> {
+    ) -> Result<ProductStatusView, FacadeError> {
         let target = map_product_target(installation_id, promotion_id)?;
         let observation = self
             .control_application()

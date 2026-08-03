@@ -254,6 +254,7 @@ where
             return Ok(ProductStatusObservationV1::from_verified_application(
                 status,
                 decision.projection().clone(),
+                decision.approval_payload_digest().clone(),
                 decision.observed_at(),
                 None,
             ));
@@ -280,6 +281,7 @@ where
         Ok(ProductStatusObservationV1::from_verified_application(
             status,
             decision.projection().clone(),
+            decision.approval_payload_digest().clone(),
             decision.observed_at(),
             Some(runtime),
         ))

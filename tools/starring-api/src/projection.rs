@@ -26,7 +26,8 @@ use product_control_http::{
     DeploymentRuntimePhaseV2, DeploymentServingFreshnessStateV2, DeploymentServingFreshnessViewV2,
     DeploymentState, DeploymentView, DiscordAuthorizationRequest, FacadeError, FacadeErrorCode,
     LifecycleCancellationView, OAuthCallbackResult, OAuthStartResult, OAuthState, ProductState,
-    PromotionView, RuntimeDeploymentOperationalViewV2, SafeApprovalSummary, SessionCredential,
+    ProductStatusView, PromotionView, RuntimeDeploymentOperationalViewV2, SafeApprovalSummary,
+    SessionCredential,
 };
 
 pub fn project_authoring_turn(
@@ -156,13 +157,49 @@ pub fn project_promotion(
 
 pub fn project_product_status(
     observation: &ProductStatusObservationV1,
-) -> Result<DecisionView, FacadeError> {
+) -> Result<ProductStatusView, FacadeError> {
     ensure_product_status_matches_decision(observation.status(), observation.decision().phase())?;
-    Ok(decision_view(
-        observation.decision(),
-        product_state(observation.status()),
-        false,
-    ))
+    let revision = observation.decision().revision().get();
+    let apply_source_revision = apply_source_revision(observation.status(), revision)?;
+    Ok(ProductStatusView {
+        installation_id: observation
+            .decision()
+            .installation_id()
+            .as_str()
+            .to_string(),
+        promotion_id: observation.decision().promotion_id().as_str().to_string(),
+        revision,
+        state: product_state(observation.status()),
+        payload_digest: observation.approval_payload_digest().as_str().to_string(),
+        apply_source_revision,
+        replayed: false,
+    })
+}
+
+fn apply_source_revision(
+    status: ProductStatusV1,
+    revision: u64,
+) -> Result<Option<u64>, FacadeError> {
+    Ok(match status {
+        ProductStatusV1::Applying => Some(
+            revision
+                .checked_sub(1)
+                .filter(|source| *source > 0)
+                .ok_or_else(internal)?,
+        ),
+        ProductStatusV1::RuntimePending | ProductStatusV1::Live => Some(
+            revision
+                .checked_sub(2)
+                .filter(|source| *source > 0)
+                .ok_or_else(internal)?,
+        ),
+        ProductStatusV1::PendingApproval
+        | ProductStatusV1::Approved
+        | ProductStatusV1::Rejected
+        | ProductStatusV1::Expired
+        | ProductStatusV1::Superseded
+        | ProductStatusV1::Withdrawn => None,
+    })
 }
 
 pub fn project_decision_mutation(receipt: &ProductMutationReceiptV1) -> DecisionView {
@@ -862,6 +899,38 @@ mod tests {
         assert_eq!(view.revision, 4);
         assert_eq!(view.state, ProductState::Approved);
         assert!(view.replayed);
+    }
+
+    #[test]
+    fn apply_source_revision_is_state_bound_and_fails_closed_on_underflow() {
+        assert_eq!(
+            apply_source_revision(ProductStatusV1::Applying, 2).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            apply_source_revision(ProductStatusV1::RuntimePending, 3).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            apply_source_revision(ProductStatusV1::Live, 4).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            apply_source_revision(ProductStatusV1::Approved, 1).unwrap(),
+            None
+        );
+        assert_eq!(
+            apply_source_revision(ProductStatusV1::Applying, 1)
+                .unwrap_err()
+                .error_code(),
+            FacadeErrorCode::Internal
+        );
+        assert_eq!(
+            apply_source_revision(ProductStatusV1::RuntimePending, 2)
+                .unwrap_err()
+                .error_code(),
+            FacadeErrorCode::Internal
+        );
     }
 
     #[test]

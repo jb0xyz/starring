@@ -29,7 +29,8 @@ use product_control_http::{
     AuthoringTurnViewV1, CsrfSecret, CurrentPrincipal, DecisionCommand, DecisionView,
     DeploymentView, FacadeError, FacadeErrorCode, HttpBoundaryConfig, OAuthCallbackCommand,
     OAuthCallbackResult, OAuthStartCommand, OAuthStartResult, ProductControlAuthoringFacadeV1,
-    ProductControlFacade, PromoteCommand, PromotionView, RejectCommand, SessionCredential,
+    ProductControlFacade, ProductStatusView, PromoteCommand, PromotionView, RejectCommand,
+    SessionCredential,
 };
 use serde_json::{json, Value};
 use tokio::sync::Notify;
@@ -602,7 +603,7 @@ impl ProductControlFacade for IntegratedFacade {
         _credential: &SessionCredential,
         _installation_id: &str,
         _promotion_id: &str,
-    ) -> Result<DecisionView, FacadeError> {
+    ) -> Result<ProductStatusView, FacadeError> {
         internal()
     }
 

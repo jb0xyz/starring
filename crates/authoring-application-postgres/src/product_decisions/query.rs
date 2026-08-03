@@ -77,6 +77,7 @@ impl ProductDecisionObservationPort<FreshDiscordAuthorityEvidenceV1> for Postgre
             .await?;
         Ok(ProductDecisionObservationV1::from_server_projection(
             validated.projection,
+            validated.preview.payload_digest().clone(),
             validated.observed_at,
         ))
     }

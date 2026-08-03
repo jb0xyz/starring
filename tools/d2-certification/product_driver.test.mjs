@@ -337,8 +337,10 @@ test("invalid apply state resumes from the exact runtime pending promotion", asy
     response(200, {
       installation_id: "installation-1",
       promotion_id: DIGEST,
-      revision: 3,
+      revision: 4,
       state: "runtime_pending",
+      payload_digest: DIGEST,
+      apply_source_revision: 2,
       replayed: false,
     }),
   ];
@@ -381,6 +383,8 @@ test("invalid apply state observes applying until the exact promotion is live", 
       promotion_id: DIGEST,
       revision: 3,
       state: "applying",
+      payload_digest: DIGEST,
+      apply_source_revision: 2,
       replayed: false,
     }),
     response(200, {
@@ -388,6 +392,8 @@ test("invalid apply state observes applying until the exact promotion is live", 
       promotion_id: DIGEST,
       revision: 3,
       state: "applying",
+      payload_digest: DIGEST,
+      apply_source_revision: 2,
       replayed: false,
     }),
     response(200, {
@@ -395,6 +401,8 @@ test("invalid apply state observes applying until the exact promotion is live", 
       promotion_id: DIGEST,
       revision: 4,
       state: "live",
+      payload_digest: DIGEST,
+      apply_source_revision: 2,
       replayed: false,
     }),
   ];
@@ -510,6 +518,8 @@ test("invalid apply state observation is bounded while applying remains unresolv
       promotion_id: DIGEST,
       revision: 3,
       state: "applying",
+      payload_digest: DIGEST,
+      apply_source_revision: 2,
       replayed: false,
     });
   }, undefined, {
@@ -530,6 +540,45 @@ test("invalid apply state observation is bounded while applying remains unresolv
   );
   assert.equal(calls, 4);
   assert.equal(sleeps, 2);
+});
+
+
+test("invalid apply state refuses a mismatched payload or source revision", async () => {
+  for (const mismatch of [
+    { payload_digest: "b".repeat(64), apply_source_revision: 2 },
+    { payload_digest: DIGEST, apply_source_revision: 1 },
+  ]) {
+    const responses = [
+      response(409, {
+        error: {
+          code: "invalid_state",
+          request_id: "request-1",
+          retryable: false,
+        },
+      }),
+      response(200, {
+        installation_id: "installation-1",
+        promotion_id: DIGEST,
+        revision: 4,
+        state: "runtime_pending",
+        payload_digest: mismatch.payload_digest,
+        apply_source_revision: mismatch.apply_source_revision,
+        replayed: false,
+      }),
+    ];
+    const product = driver(async () => responses.shift());
+    await assert.rejects(
+      product.applyWithDrainHandshake({
+        installationId: "installation-1",
+        promotionId: DIGEST,
+        expectedPayloadDigest: DIGEST,
+        expectedRevision: 2,
+        runtimeDrainAttempts: 3,
+        runtimeDrainIntervalMilliseconds: 100,
+      }),
+      /apply_resume_binding_mismatch/
+    );
+  }
 });
 
 

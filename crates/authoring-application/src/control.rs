@@ -347,16 +347,19 @@ pub struct ProductMutationReceiptV1 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProductDecisionObservationV1 {
     projection: ProductDecisionProjectionV1,
+    approval_payload_digest: ApprovalPayloadDigestV1,
     observed_at: SystemTime,
 }
 
 impl ProductDecisionObservationV1 {
     pub fn from_server_projection(
         projection: ProductDecisionProjectionV1,
+        approval_payload_digest: ApprovalPayloadDigestV1,
         observed_at: SystemTime,
     ) -> Self {
         Self {
             projection,
+            approval_payload_digest,
             observed_at,
         }
     }
@@ -367,6 +370,10 @@ impl ProductDecisionObservationV1 {
 
     pub fn observed_at(&self) -> SystemTime {
         self.observed_at
+    }
+
+    pub fn approval_payload_digest(&self) -> &ApprovalPayloadDigestV1 {
+        &self.approval_payload_digest
     }
 
     pub fn into_projection(self) -> ProductDecisionProjectionV1 {

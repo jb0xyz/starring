@@ -254,6 +254,7 @@ impl authoring_application::ProductDecisionObservationPort<FreshDiscordAuthority
         Ok(
             authoring_application::ProductDecisionObservationV1::from_server_projection(
                 self.projection.clone(),
+                authoring_application::ApprovalPayloadDigestV1::parse(&"c".repeat(64)).unwrap(),
                 UNIX_EPOCH,
             ),
         )

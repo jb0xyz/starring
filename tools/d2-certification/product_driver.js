@@ -135,6 +135,18 @@
     return body;
   }
 
+  function requireApplyStatusBinding(body, command) {
+    const increment = body.state === "applying" ? 1 : 2;
+    if (
+      body.payload_digest !== command.expectedPayloadDigest ||
+      body.apply_source_revision !== command.expectedRevision ||
+      !Number.isSafeInteger(body.revision) ||
+      body.revision !== command.expectedRevision + increment
+    ) {
+      throw new Error("apply_resume_binding_mismatch");
+    }
+  }
+
   function summaryEvidence(value) {
     const summary = requireBody(value, "approval_summary");
     const fields = ["panels", "modals", "rules", "actions"];
@@ -430,6 +442,7 @@
           const observed = await promotion(command.installationId, command.promotionId, command.signal);
           statusObservations += 1;
           if (["runtime_pending", "live"].includes(observed.body.state)) {
+            requireApplyStatusBinding(observed.body, command);
             return Object.freeze({
               status: observed.status,
               body: observed.body,
@@ -442,6 +455,7 @@
           if (observed.body.state !== "applying") {
             throw invalidStateConflict;
           }
+          requireApplyStatusBinding(observed.body, command);
           if (round === attempts) {
             throw new Error("apply_resolution_timeout");
           }

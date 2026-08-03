@@ -17,7 +17,8 @@ pub use dto::{
     DeploymentOperationalViewV2, DeploymentOperatorActionV2, DeploymentRetryStateV2,
     DeploymentRetryViewV2, DeploymentRuntimePhaseV2, DeploymentServingFreshnessStateV2,
     DeploymentServingFreshnessViewV2, DeploymentState, DeploymentView, LifecycleCancellationView,
-    ProductState, PromotionView, RuntimeDeploymentOperationalViewV2, SafeApprovalSummary,
+    ProductState, ProductStatusView, PromotionView, RuntimeDeploymentOperationalViewV2,
+    SafeApprovalSummary,
 };
 pub use error::{FacadeError, FacadeErrorCode};
 pub use facade::{
