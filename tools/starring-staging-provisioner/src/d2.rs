@@ -1969,6 +1969,7 @@ mod tests {
         assert!(API_ROLE_ENABLE.starts_with("BEGIN;"));
         assert!(RUNTIME_ROLE_BOOTSTRAP.starts_with("\\set ON_ERROR_STOP on"));
         assert!(API_ROLE_BOOTSTRAP.contains("starring_authoring_session_writer"));
+        assert!(RUNTIME_ROLE_BOOTSTRAP.contains(") <> 84 THEN"));
         assert!(RUNTIME_ROLE_BOOTSTRAP
             .contains("starring_runtime_interaction_effect_response_tail_finalize_v1"));
         assert!(

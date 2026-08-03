@@ -246,6 +246,11 @@ fn staging_runtime_capability_manifest_is_exact_and_unique() {
         "SELECT pg_catalog.pg_advisory_lock",
     ));
     assert_eq!(functions.len(), 84);
+    let cardinality_guard = format!(
+        "IF (\n        SELECT pg_catalog.count(*)\n        FROM pg_temp.starring_runtime_capability_functions\n    ) <> {} THEN\n        RAISE EXCEPTION 'runtime capability function manifest is invalid'",
+        functions.len()
+    );
+    assert_eq!(BOOTSTRAP.matches(&cardinality_guard).count(), 1);
     assert!(BOOTSTRAP.contains(
         "('serving', 'public.starring_runtime_serving_observe_pending_drain_source_v1(text,bigint,text)')"
     ));

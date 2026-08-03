@@ -283,7 +283,7 @@ BEGIN
     IF (
         SELECT pg_catalog.count(*)
         FROM pg_temp.starring_runtime_capability_functions
-    ) <> 82 THEN
+    ) <> 84 THEN
         RAISE EXCEPTION 'runtime capability function manifest is invalid'
             USING ERRCODE = '55000';
     END IF;

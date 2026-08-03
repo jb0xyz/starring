@@ -254,7 +254,7 @@ fn serving_manifest_and_readiness_are_refreshed_end_to_end() {
         );
     }
     assert!(SERVING_DATABASE
-        .contains("e2e2cbbecc245e4c8d96b264d5bf89f1ce01cf4613c86f2d954bbdeeb3d2ad8a"));
+        .contains("918e4be248c37e622b1f5b22cb9e252a450b65b295157681c647855d0c0150b9"));
 }
 
 #[test]
