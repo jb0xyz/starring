@@ -141,6 +141,189 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
 });
 
 
+test("one-shot flow retries only the exact apply command during a runtime drain", async () => {
+  const calls = [];
+  const sleeps = [];
+  let confirmations = 0;
+  let uuidCounter = 0;
+  const responses = [
+    response(201, {
+      session_id: "session-1",
+      generation: 1,
+      disposition: "created",
+      projection: {
+        state: "preview_ready",
+        preview: { revision: 1, receipt: { candidate_ruleset_hash: DIGEST } },
+      },
+    }),
+    response(201, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: DIGEST,
+      replayed: false,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: DIGEST,
+      summary: {
+        panels: 1,
+        modals: 1,
+        rules: 4,
+        actions: 15,
+        target_version: 2,
+        required_approvals: 1,
+      },
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 2,
+      state: "approved",
+      replayed: false,
+    }),
+    response(409, {
+      error: {
+        code: "runtime_drain_required",
+        request_id: "request-1",
+        retryable: true,
+      },
+    }),
+    response(409, {
+      error: {
+        code: "runtime_drain_pending",
+        request_id: "request-2",
+        retryable: true,
+      },
+    }),
+    response(202, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "runtime_pending",
+      replayed: false,
+    }),
+  ];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url, options, body: options.body && JSON.parse(options.body) });
+    return responses.shift();
+  };
+  const evidence = await driver(fetchImpl, undefined, {
+    sleep: async (milliseconds) => sleeps.push(milliseconds),
+    randomUUID: () => {
+      uuidCounter += 1;
+      return `00000000-0000-4000-8000-${String(uuidCounter).padStart(12, "0")}`;
+    },
+  }).runOneShotProductFlow({
+    installationId: "installation-1",
+    sessionId: "session-1",
+    message: "Update the study room automation",
+    confirmPreview: async () => {
+      confirmations += 1;
+      return true;
+    },
+    runtimeDrainAttempts: 3,
+    runtimeDrainIntervalMilliseconds: 100,
+  });
+  assert.equal(calls.length, 7);
+  assert.equal(confirmations, 1);
+  assert.deepEqual(sleeps, [100, 100]);
+  const applyCalls = calls.slice(4);
+  assert.equal(applyCalls.length, 3);
+  assert.equal(new Set(applyCalls.map((call) => call.url)).size, 1);
+  assert.equal(new Set(applyCalls.map((call) => call.options.headers["idempotency-key"])).size, 1);
+  assert.match(applyCalls[0].options.headers["idempotency-key"], /^d2\.apply\./);
+  assert.deepEqual(applyCalls.map((call) => call.body), [
+    { expected_payload_digest: DIGEST, expected_revision: 2 },
+    { expected_payload_digest: DIGEST, expected_revision: 2 },
+    { expected_payload_digest: DIGEST, expected_revision: 2 },
+  ]);
+  assert.equal(evidence.apply_attempts, 3);
+  assert.equal(evidence.runtime_drain_observed, true);
+  assert.equal(evidence.applied.state, "runtime_pending");
+});
+
+
+test("runtime drain handshake is bounded and does not retry generic conflicts", async () => {
+  const drainCalls = [];
+  const drainSleeps = [];
+  const drainResponses = [
+    response(409, {
+      error: {
+        code: "runtime_drain_required",
+        request_id: "request-1",
+        retryable: true,
+      },
+    }),
+    response(409, {
+      error: {
+        code: "runtime_drain_pending",
+        request_id: "request-2",
+        retryable: true,
+      },
+    }),
+  ];
+  const draining = driver(async (url, options) => {
+    drainCalls.push({ url, options });
+    return drainResponses.shift();
+  }, undefined, {
+    sleep: async (milliseconds) => drainSleeps.push(milliseconds),
+  });
+  await assert.rejects(
+    draining.applyWithDrainHandshake({
+      installationId: "installation-1",
+      promotionId: DIGEST,
+      expectedPayloadDigest: DIGEST,
+      expectedRevision: 2,
+      idempotencyKey: "apply-stable-2",
+      runtimeDrainAttempts: 2,
+      runtimeDrainIntervalMilliseconds: 100,
+    }),
+    (error) => error.code === "runtime_drain_pending"
+  );
+  assert.equal(drainCalls.length, 2);
+  assert.deepEqual(drainSleeps, [100]);
+  assert.equal(drainCalls[0].options.body, drainCalls[1].options.body);
+  assert.equal(
+    drainCalls[0].options.headers["idempotency-key"],
+    drainCalls[1].options.headers["idempotency-key"]
+  );
+
+  let genericCalls = 0;
+  let genericSleeps = 0;
+  const generic = driver(async () => {
+    genericCalls += 1;
+    return response(409, {
+      error: {
+        code: "invalid_state",
+        request_id: "request-3",
+        retryable: false,
+      },
+    });
+  }, undefined, {
+    sleep: async () => {
+      genericSleeps += 1;
+    },
+  });
+  await assert.rejects(
+    generic.applyWithDrainHandshake({
+      installationId: "installation-1",
+      promotionId: DIGEST,
+      expectedPayloadDigest: DIGEST,
+      expectedRevision: 2,
+      runtimeDrainAttempts: 3,
+      runtimeDrainIntervalMilliseconds: 100,
+    }),
+    (error) => error.code === "invalid_state"
+  );
+  assert.equal(genericCalls, 1);
+  assert.equal(genericSleeps, 0);
+});
+
+
 test("one-shot flow repairs only an invalid working draft candidate once", async () => {
   const calls = [];
   const responses = [

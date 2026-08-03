@@ -56,6 +56,7 @@ struct FakeFacade {
     invalid_callback_url: AtomicUsize,
     identical_session_csrf: AtomicUsize,
     approval_response: AtomicUsize,
+    apply_response: AtomicUsize,
     block_promote: AtomicUsize,
     promote_entered: Notify,
     promote_release: Notify,
@@ -343,6 +344,11 @@ impl ProductControlFacade for FakeFacade {
     ) -> Result<ApplyView, FacadeError> {
         self.verify_mutation_inputs(credential, csrf)?;
         self.record_request_id("apply", &command.decision.request_id);
+        match self.apply_response.load(Ordering::SeqCst) {
+            1 => return Err(FacadeError::new(FacadeErrorCode::RuntimeDrainRequired)),
+            2 => return Err(FacadeError::new(FacadeErrorCode::RuntimeDrainPending)),
+            _ => {}
+        }
         Ok(ApplyView {
             installation_id: "install-1".to_string(),
             promotion_id: PROMOTION.to_string(),
@@ -375,6 +381,41 @@ impl ProductControlFacade for FakeFacade {
     async fn readiness(&self) -> Result<(), FacadeError> {
         self.readiness_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+#[tokio::test]
+async fn product_apply_exposes_retryable_runtime_drain_conflicts_without_internal_selectors() {
+    for (mode, code) in [(1, "runtime_drain_required"), (2, "runtime_drain_pending")] {
+        let facade = Arc::new(FakeFacade::default());
+        facade.apply_response.store(mode, Ordering::SeqCst);
+        let uri = format!("/v1/installations/install-1/promotions/{PROMOTION}/apply");
+        let request = request_builder("POST", &uri)
+            .header("content-type", "application/json")
+            .header("origin", ORIGIN)
+            .header(
+                "cookie",
+                format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+            )
+            .header("x-csrf-token", CSRF)
+            .header("idempotency-key", format!("apply-{mode}"))
+            .body(Body::from(format!(
+                "{{\"expected_payload_digest\":\"{DIGEST}\",\"expected_revision\":3}}"
+            )))
+            .unwrap();
+        let response = app(facade).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/problem+json"
+        );
+        let body = body_text(response).await;
+        assert!(body.contains(&format!("\"code\":\"{code}\"")));
+        assert!(body.contains("\"retryable\":true"));
+        assert!(body.contains("\"request_id\":\"test-request-1\""));
+        assert!(!body.contains("drain_intent_id"));
+        assert!(!body.contains("product_operation_id"));
+        assert!(!body.contains("state_digest"));
     }
 }
 

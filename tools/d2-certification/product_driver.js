@@ -73,6 +73,16 @@
     return result;
   }
 
+  function isRuntimeDrainConflict(error) {
+    return Boolean(
+      error &&
+      error.name === "StarringD2ProductRequestError" &&
+      error.status === 409 &&
+      error.retryable === true &&
+      ["runtime_drain_required", "runtime_drain_pending"].includes(error.code)
+    );
+  }
+
   function projectionEvidence(turn) {
     const projection = turn.projection;
     const preview = projection && projection.preview;
@@ -351,9 +361,53 @@
           expected_payload_digest: requireDigest(input.expectedPayloadDigest, "payload_digest"),
           expected_revision: requireGeneration(input.expectedRevision, "expected_revision", false),
         },
+        signal: input.signal,
       });
       requireScopedIdentity(result.body, expectedInstallationId, expectedPromotionId, "apply");
       return result;
+    }
+
+    async function applyWithDrainHandshake(input) {
+      const attempts = input.runtimeDrainAttempts === undefined ? 60 : input.runtimeDrainAttempts;
+      const intervalMilliseconds = input.runtimeDrainIntervalMilliseconds === undefined
+        ? 2000
+        : input.runtimeDrainIntervalMilliseconds;
+      if (!Number.isInteger(attempts) || attempts < 1 || attempts > 180) {
+        throw new Error("runtime_drain_attempts_invalid");
+      }
+      if (!Number.isInteger(intervalMilliseconds) || intervalMilliseconds < 100 || intervalMilliseconds > 10000) {
+        throw new Error("runtime_drain_interval_invalid");
+      }
+      const command = Object.freeze({
+        installationId: requireResourceId(input.installationId, "installation_id"),
+        promotionId: requireDigest(input.promotionId, "promotion_id"),
+        expectedPayloadDigest: requireDigest(input.expectedPayloadDigest, "payload_digest"),
+        expectedRevision: requireGeneration(input.expectedRevision, "expected_revision", false),
+        idempotencyKey: input.idempotencyKey || idempotencyKey("apply"),
+        signal: input.signal,
+      });
+      let runtimeDrainObserved = false;
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+          const result = await apply(command);
+          return Object.freeze({
+            status: result.status,
+            body: result.body,
+            attempts: attempt,
+            runtime_drain_observed: runtimeDrainObserved,
+          });
+        } catch (error) {
+          if (!isRuntimeDrainConflict(error) || attempt === attempts) {
+            throw error;
+          }
+          runtimeDrainObserved = true;
+          if (input.signal && input.signal.aborted) {
+            throw input.signal.reason || new Error("runtime_drain_retry_aborted");
+          }
+          await sleep(intervalMilliseconds);
+        }
+      }
+      throw new Error("runtime_drain_attempts_exhausted");
     }
 
     async function deployment(installationId, promotionId) {
@@ -466,12 +520,15 @@
       if (!approved.body || approved.body.state !== "approved") {
         throw new Error("promotion_not_approved");
       }
-      const applied = await apply({
+      const applied = await applyWithDrainHandshake({
         installationId: input.installationId,
         promotionId: promoted.body.promotion_id,
         expectedPayloadDigest: preview.body.payload_digest,
         expectedRevision: approved.body.revision,
         idempotencyKey: input.applyIdempotencyKey,
+        runtimeDrainAttempts: input.runtimeDrainAttempts,
+        runtimeDrainIntervalMilliseconds: input.runtimeDrainIntervalMilliseconds,
+        signal: input.signal,
       });
       if (!applied.body || !["runtime_pending", "live"].includes(applied.body.state)) {
         throw new Error("promotion_not_applied");
@@ -493,6 +550,8 @@
         approval_http_status: approved.status,
         approval: decisionEvidence(approved.body),
         apply_http_status: applied.status,
+        apply_attempts: applied.attempts,
+        runtime_drain_observed: applied.runtime_drain_observed,
         applied: {
           installation_id: applied.body.installation_id,
           promotion_id: applied.body.promotion_id,
@@ -555,6 +614,7 @@
       approvalPreview,
       approve,
       apply,
+      applyWithDrainHandshake,
       deployment,
       operationalDeployment,
       runOneShotProductFlow,

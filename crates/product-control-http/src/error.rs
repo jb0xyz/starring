@@ -9,6 +9,8 @@ pub enum FacadeErrorCode {
     StalePayload,
     IdempotencyConflict,
     InvalidState,
+    RuntimeDrainRequired,
+    RuntimeDrainPending,
     Superseded,
     InvalidServerCandidate,
     UpstreamInvalidResponse,
@@ -35,7 +37,9 @@ impl FacadeError {
     pub fn retryable(self) -> bool {
         matches!(
             self.code,
-            FacadeErrorCode::AuthoringSaturated
+            FacadeErrorCode::RuntimeDrainRequired
+                | FacadeErrorCode::RuntimeDrainPending
+                | FacadeErrorCode::AuthoringSaturated
                 | FacadeErrorCode::DependencyUnavailable
                 | FacadeErrorCode::DependencyTimeout
         )
@@ -50,6 +54,8 @@ impl FacadeError {
             | FacadeErrorCode::StalePayload
             | FacadeErrorCode::IdempotencyConflict
             | FacadeErrorCode::InvalidState
+            | FacadeErrorCode::RuntimeDrainRequired
+            | FacadeErrorCode::RuntimeDrainPending
             | FacadeErrorCode::Superseded => StatusCode::CONFLICT,
             FacadeErrorCode::InvalidServerCandidate => StatusCode::UNPROCESSABLE_ENTITY,
             FacadeErrorCode::UpstreamInvalidResponse => StatusCode::BAD_GATEWAY,
@@ -70,6 +76,8 @@ impl FacadeError {
             FacadeErrorCode::StalePayload => "stale_payload",
             FacadeErrorCode::IdempotencyConflict => "idempotency_conflict",
             FacadeErrorCode::InvalidState => "invalid_state",
+            FacadeErrorCode::RuntimeDrainRequired => "runtime_drain_required",
+            FacadeErrorCode::RuntimeDrainPending => "runtime_drain_pending",
             FacadeErrorCode::Superseded => "superseded",
             FacadeErrorCode::InvalidServerCandidate => "invalid_server_candidate",
             FacadeErrorCode::UpstreamInvalidResponse => "upstream_invalid_response",
@@ -95,6 +103,12 @@ impl FacadeError {
                 "The idempotency key was already used for a different request."
             }
             FacadeErrorCode::InvalidState => "The operation is not valid in the current state.",
+            FacadeErrorCode::RuntimeDrainRequired => {
+                "The active runtime must drain before this operation can continue."
+            }
+            FacadeErrorCode::RuntimeDrainPending => {
+                "The active runtime is still draining before this operation can continue."
+            }
             FacadeErrorCode::Superseded => "The requested target has been superseded.",
             FacadeErrorCode::InvalidServerCandidate => "The server-owned candidate is not valid.",
             FacadeErrorCode::UpstreamInvalidResponse => {
@@ -120,5 +134,24 @@ mod tests {
         assert_eq!(error.status(), StatusCode::CONFLICT);
         assert_eq!(error.code(), "invalid_state");
         assert!(!error.retryable());
+    }
+
+    #[test]
+    fn runtime_drain_errors_are_retryable_conflict_wire_errors() {
+        for (code, expected) in [
+            (
+                FacadeErrorCode::RuntimeDrainRequired,
+                "runtime_drain_required",
+            ),
+            (
+                FacadeErrorCode::RuntimeDrainPending,
+                "runtime_drain_pending",
+            ),
+        ] {
+            let error = FacadeError::new(code);
+            assert_eq!(error.status(), StatusCode::CONFLICT);
+            assert_eq!(error.code(), expected);
+            assert!(error.retryable());
+        }
     }
 }

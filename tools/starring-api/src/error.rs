@@ -44,11 +44,11 @@ pub fn map_product_control_error(error: ProductControlPortError) -> FacadeError 
         ProductControlPortError::RevisionConflict => FacadeErrorCode::InvalidState,
         ProductControlPortError::PayloadMismatch => FacadeErrorCode::StalePayload,
         ProductControlPortError::InvalidState
-        | ProductControlPortError::RuntimeDrainRequired
-        | ProductControlPortError::RuntimeDrainPending(_)
         | ProductControlPortError::LifecycleCancelled(_)
         | ProductControlPortError::DuplicateDecision
         | ProductControlPortError::Expired => FacadeErrorCode::InvalidState,
+        ProductControlPortError::RuntimeDrainRequired => FacadeErrorCode::RuntimeDrainRequired,
+        ProductControlPortError::RuntimeDrainPending(_) => FacadeErrorCode::RuntimeDrainPending,
         ProductControlPortError::IdempotencyConflict => FacadeErrorCode::IdempotencyConflict,
         ProductControlPortError::InvalidServerCandidate(candidate) => map_candidate(candidate),
         ProductControlPortError::Superseded => FacadeErrorCode::Superseded,
@@ -319,6 +319,8 @@ fn facade(code: FacadeErrorCode) -> FacadeError {
 
 #[cfg(test)]
 mod tests {
+    use authoring_application::ProductDrainSelectorV1;
+
     use super::*;
 
     fn code(error: FacadeError) -> FacadeErrorCode {
@@ -419,8 +421,26 @@ mod tests {
         );
         let drain_required =
             map_product_control_error(ProductControlPortError::RuntimeDrainRequired);
-        assert_eq!(drain_required.error_code(), FacadeErrorCode::InvalidState);
-        assert!(!drain_required.retryable());
+        assert_eq!(
+            drain_required.error_code(),
+            FacadeErrorCode::RuntimeDrainRequired
+        );
+        assert!(drain_required.retryable());
+        let selector = ProductDrainSelectorV1::from_server_projection(
+            "1".repeat(32),
+            7,
+            "b".repeat(64),
+            "2".repeat(32),
+            10,
+        )
+        .unwrap();
+        let drain_pending =
+            map_product_control_error(ProductControlPortError::RuntimeDrainPending(selector));
+        assert_eq!(
+            drain_pending.error_code(),
+            FacadeErrorCode::RuntimeDrainPending
+        );
+        assert!(drain_pending.retryable());
     }
 
     #[test]
