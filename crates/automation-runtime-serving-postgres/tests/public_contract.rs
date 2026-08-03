@@ -1,11 +1,16 @@
 use std::collections::BTreeSet;
+use std::num::NonZeroU64;
 use std::time::Duration;
 
-use automation_runtime_controller::{RuntimeConvergenceErrorClassV1, RuntimeServingLeasePort};
+use automation_runtime_controller::{
+    RuntimeConvergenceErrorClassV1, RuntimeDrainIntentIdV2, RuntimeServingLeasePort,
+};
 use automation_runtime_serving_postgres::{
-    PostgresRuntimeServingLeaseV1, RuntimeServingDatabaseExpectationV1,
-    RuntimeServingDatabaseTimeoutsV1, RuntimeServingPersistenceErrorV1,
-    MAX_RUNTIME_SERVING_LEASE_DURATION, MIN_RUNTIME_SERVING_LEASE_DURATION,
+    PostgresRuntimeServingLeaseV1, RuntimePendingDrainServingLookupV1,
+    RuntimePendingDrainServingObservationV1, RuntimePendingDrainServingSourceEvidenceV1,
+    RuntimeServingDatabaseExpectationV1, RuntimeServingDatabaseTimeoutsV1,
+    RuntimeServingPersistenceErrorV1, MAX_RUNTIME_SERVING_LEASE_DURATION,
+    MIN_RUNTIME_SERVING_LEASE_DURATION,
 };
 
 fn assert_serving_port<T>()
@@ -17,6 +22,39 @@ where
 #[test]
 fn postgres_adapter_exposes_only_the_narrow_serving_port() {
     assert_serving_port::<PostgresRuntimeServingLeaseV1>();
+}
+
+#[test]
+fn pending_drain_lookup_is_exact_and_redacted() {
+    let lookup = RuntimePendingDrainServingLookupV1::new(
+        RuntimeDrainIntentIdV2::parse("00112233445566778899aabbccddeeff").unwrap(),
+        NonZeroU64::new(7).unwrap(),
+        [0xab; 32],
+    )
+    .unwrap();
+    assert_eq!(
+        lookup.intent_id().as_str(),
+        "00112233445566778899aabbccddeeff"
+    );
+    assert_eq!(lookup.source_intent_revision().get(), 7);
+    assert_eq!(lookup.source_state_digest(), &[0xab; 32]);
+    assert_eq!(
+        format!("{lookup:?}"),
+        "RuntimePendingDrainServingLookupV1(<redacted>)"
+    );
+    let source = RuntimePendingDrainServingSourceEvidenceV1::from(&lookup);
+    assert_eq!(source.intent_id(), lookup.intent_id());
+    assert_eq!(
+        source.source_intent_revision(),
+        lookup.source_intent_revision()
+    );
+    assert_eq!(source.source_state_digest(), lookup.source_state_digest());
+    assert_eq!(
+        format!("{source:?}"),
+        "RuntimePendingDrainServingSourceEvidenceV1(<redacted>)"
+    );
+    let observation: Option<RuntimePendingDrainServingObservationV1> = None;
+    assert!(observation.is_none());
 }
 
 #[test]

@@ -80,16 +80,16 @@ SELECT (
 \endif
 
 SELECT (
-    ledger.observed_count = 120
+    ledger.observed_count = 121
     AND ledger.observed_digest =
-        '190c7b1423144d7d725b86f7cd2ed43ae5b6f760f1418c77410e61b673824062'
+        '380eb60df31c1628f9c2bd02961f42909c4fdc427bacd50a5a19d42da393394d'
     AND EXISTS (
         SELECT 1
         FROM public._sqlx_migrations AS migration
-        WHERE migration.version = 202608030001
+        WHERE migration.version = 202608030002
             AND migration.success
             AND migration.checksum = pg_catalog.decode(
-                '013761ce2f46111f4d8eead74d521699037eac934b0dab7bfff60eca12451030ff95de2189404e0ddfe7f0f1e3b54fcd',
+                'b3862f35f454b96e35e2ec3fa72e6b7a341f49c4a96d927cd9c7ccfbbc9fdcbbadeab96b1128210a49222f0d8fa057aa',
                 'hex'
             )
     )

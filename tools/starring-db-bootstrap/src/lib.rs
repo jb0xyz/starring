@@ -16,7 +16,7 @@ pub use keychain::{
 pub const DATABASE_NAME: &str = "starring_runtime_staging";
 pub const OWNER_ROLE: &str = "starring_owner";
 pub const RELATION_COUNT: i64 = 198;
-pub const CAPABILITY_FUNCTION_COUNT: usize = 135;
+pub const CAPABILITY_FUNCTION_COUNT: usize = 137;
 pub const CLUSTER_ADMIN_ROLE: &str = "starring_cluster_admin";
 pub const PEER_MAP_NAME: &str = "starring_bootstrap";
 pub const PEER_SOCKET_DIRECTORY: &str = "/private/tmp/starring-bootstrap";
@@ -1000,8 +1000,8 @@ fn extract_manifest(sql: &'static str) -> Vec<&'static str> {
 mod tests {
     use super::*;
 
-    const EXPECTED_MIGRATION_COUNT: usize = 120;
-    const EXPECTED_MIGRATION_HEAD: i64 = 202608030001;
+    const EXPECTED_MIGRATION_COUNT: usize = 121;
+    const EXPECTED_MIGRATION_HEAD: i64 = 202608030002;
     const EFFECT_JOURNAL_MIGRATION: i64 = 202608010001;
     const RELATION_COUNT_BEFORE_EFFECT_JOURNAL: i64 = 184;
 
@@ -1018,13 +1018,13 @@ mod tests {
     #[test]
     fn manifest_is_exact_and_unique() {
         let identities = capability_function_identities().unwrap();
-        assert_eq!(identities.len(), 135);
+        assert_eq!(identities.len(), 137);
         assert_eq!(
             identities.iter().copied().collect::<BTreeSet<_>>().len(),
-            135
+            137
         );
         assert_eq!(extract_manifest(API_ROLE_BOOTSTRAP).len(), 53);
-        assert_eq!(extract_manifest(RUNTIME_ROLE_BOOTSTRAP).len(), 82);
+        assert_eq!(extract_manifest(RUNTIME_ROLE_BOOTSTRAP).len(), 84);
     }
 
     #[test]
@@ -1047,7 +1047,7 @@ mod tests {
         assert_eq!(head.version, EXPECTED_MIGRATION_HEAD);
         assert_eq!(
             head.description,
-            "fix pending drain live source selection v2"
+            "add pending drain source serving observation v1"
         );
         assert_eq!(
             count_sql_lines_with_prefix(&head.sql, "CREATE TABLE public."),
@@ -1135,7 +1135,7 @@ mod tests {
         assert_eq!(DATABASE_NAME, "starring_runtime_staging");
         assert_eq!(OWNER_ROLE, "starring_owner");
         assert_eq!(RELATION_COUNT, 198);
-        assert_eq!(CAPABILITY_FUNCTION_COUNT, 135);
+        assert_eq!(CAPABILITY_FUNCTION_COUNT, 137);
         assert_eq!(CLUSTER_ADMIN_ROLE, "starring_cluster_admin");
         assert_eq!(PEER_MAP_NAME, "starring_bootstrap");
         assert_eq!(PEER_SOCKET_DIRECTORY, "/private/tmp/starring-bootstrap");

@@ -23,7 +23,13 @@ fn rust_sources(directory: &Path) -> Vec<String> {
 fn adapter_dependency_surface_is_narrow() {
     let manifest = include_str!("../Cargo.toml");
     let regular = regular_dependencies(manifest);
-    for required in ["automation-runtime-controller", "sqlx", "tokio"] {
+    for required in [
+        "automation-runtime-controller",
+        "automation-runtime-convergence",
+        "serde_json",
+        "sqlx",
+        "tokio",
+    ] {
         assert!(regular.contains(required), "missing dependency: {required}");
     }
     for forbidden in [
@@ -76,6 +82,8 @@ fn adapter_contract_uses_only_private_serving_capabilities() {
         "starring_runtime_serving_observe_v2",
         "starring_runtime_serving_heartbeat_v2",
         "starring_runtime_serving_disconnect_if_current_v2",
+        "starring_runtime_serving_observe_pending_drain_source_v1",
+        "starring_runtime_serving_disconnect_pending_drain_source_if_expired_v1",
     ] {
         assert!(contract.contains(capability));
     }
@@ -106,6 +114,8 @@ fn adapter_contract_placeholder_shapes_are_exact() {
         ("OBSERVE_V2_QUERY", 8),
         ("HEARTBEAT_V2_QUERY", 10),
         ("DISCONNECT_V2_QUERY", 9),
+        ("OBSERVE_PENDING_DRAIN_SOURCE_QUERY", 3),
+        ("DISCONNECT_PENDING_DRAIN_SOURCE_IF_EXPIRED_QUERY", 18),
     ];
     for (name, expected_maximum) in expected {
         let query = contract
@@ -171,6 +181,214 @@ fn v2_serving_uses_exact_certified_identity_and_bounded_mutations() {
     assert!(adapter.contains("RuntimeServingObservationV2::Absent"));
     assert!(adapter.contains("RuntimeServingObservationV2::Current"));
     assert!(adapter.contains("RuntimeServingObservationV2::Diverged"));
+}
+
+#[test]
+fn pending_drain_observation_is_exact_read_only_and_database_clocked() {
+    let migration = include_str!(
+        "../../../migrations/202608030002_add_pending_drain_source_serving_observation_v1.sql"
+    );
+    let capability = migration
+        .split("CREATE FUNCTION public.starring_runtime_serving_observe_pending_drain_source_v1(")
+        .nth(1)
+        .and_then(|source| source.split("$function$;").next())
+        .unwrap();
+    for required in [
+        "SECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "pg_catalog.current_setting('transaction_isolation')",
+        "<> 'serializable'",
+        "pg_catalog.current_setting('transaction_read_only') <> 'off'",
+        "runtime_pending_drain_source_serving_observation_transaction_drift",
+        "expected_drain_intent_id",
+        "expected_source_intent_revision",
+        "expected_source_state_digest",
+        "starring_runtime_pending_drain_state_exact_v2",
+        "drain_row.canonical_state_digest",
+        "pg_catalog.sha256(drain_row.canonical_state_bytes)",
+        "runtime_slot_writer_fences_v2",
+        "pending_drain_intent_id",
+        "pending_product_operation_id",
+        "runtime_deployments",
+        "deployment_row.phase <> 'live'",
+        "runtime_attestations",
+        "record_format_version <> 2",
+        "runtime_serving_leases",
+        "pg_catalog.clock_timestamp()",
+        "outcome_name := 'absent'",
+        "outcome_name := 'current'",
+        "outcome_name := 'diverged'",
+    ] {
+        assert!(capability.contains(required), "{required}");
+    }
+    for forbidden in [
+        "INSERT INTO",
+        "UPDATE public.",
+        "DELETE FROM",
+        "TRUNCATE ",
+        "FOR UPDATE",
+        "FOR SHARE",
+        "FOR KEY SHARE",
+    ] {
+        assert!(!capability.contains(forbidden), "{forbidden}");
+    }
+    let adapter = include_str!("../src/pending_drain.rs");
+    let method = adapter
+        .split("pub async fn observe_pending_drain_source_serving_v1(")
+        .nth(1)
+        .unwrap();
+    let acquire = method.find("self.pool.acquire()").unwrap();
+    let begin = method.find("begin_serving_mutation_transaction").unwrap();
+    let binding = method.find("verify_runtime_serving_binding_v1").unwrap();
+    let query = method.find("OBSERVE_PENDING_DRAIN_SOURCE_QUERY").unwrap();
+    let decode = method.find("row.decode(lookup)").unwrap();
+    let commit = method.find("transaction.commit()").unwrap();
+    assert!(
+        acquire < begin && begin < binding && binding < query && query < decode && decode < commit
+    );
+}
+
+#[test]
+fn pending_drain_observation_rejects_cross_scope_serving() {
+    let migration = include_str!(
+        "../../../migrations/202608030002_add_pending_drain_source_serving_observation_v1.sql"
+    );
+    let capability = migration
+        .split("CREATE FUNCTION public.starring_runtime_serving_observe_pending_drain_source_v1(")
+        .nth(1)
+        .and_then(|source| source.split("$function$;").next())
+        .unwrap();
+    for exact_scope_guard in [
+        "fence_row.pending_tenant_id\n            IS DISTINCT FROM drain_row.tenant_id",
+        "fence_row.pending_installation_id\n            IS DISTINCT FROM drain_row.installation_id",
+        "fence_row.pending_deployment_id\n            IS DISTINCT FROM drain_row.deployment_id",
+        "serving_row.tenant_id IS DISTINCT FROM drain_row.tenant_id",
+        "serving_row.installation_id\n            IS DISTINCT FROM drain_row.installation_id",
+        "serving_row.deployment_id\n            IS DISTINCT FROM drain_row.deployment_id",
+        "serving_row.attestation_id\n            IS DISTINCT FROM attestation_row.attestation_id",
+        "serving_row.process_instance_id\n            IS DISTINCT FROM attestation_row.process_instance_id",
+        "serving_row.runtime_generation\n            IS DISTINCT FROM attestation_row.runtime_generation",
+    ] {
+        assert!(capability.contains(exact_scope_guard), "{exact_scope_guard}");
+    }
+}
+
+#[test]
+fn pending_drain_expired_disconnect_is_atomic_exact_and_writer_fenced() {
+    let migration = include_str!(
+        "../../../migrations/202608030002_add_pending_drain_source_serving_observation_v1.sql"
+    );
+    let capability = migration
+        .split(
+            "CREATE FUNCTION public.starring_runtime_serving_disconnect_pending_drain_source_if_expired_v1(",
+        )
+        .nth(1)
+        .and_then(|source| source.split("$function$;").next())
+        .unwrap();
+    for required in [
+        "SECURITY DEFINER",
+        "SET search_path = pg_catalog",
+        "pg_catalog.current_setting('transaction_isolation')",
+        "<> 'serializable'",
+        "pg_catalog.current_setting('transaction_read_only') <> 'off'",
+        "runtime_pending_drain_source_serving_disconnect_transaction_drift",
+        "pg_catalog.pg_advisory_xact_lock_shared",
+        "starring-runtime-writer-fence-v1",
+        "public.runtime_writer_fence",
+        "writer_fence_count <> 1",
+        "writer_fence_state NOT IN ('open', 'closed')",
+        "writer_fence_state = 'closed'",
+        "ERRCODE = 'RS005'",
+        "starring-runtime-serving-slot-v1:",
+        "starring_runtime_pending_drain_state_exact_v2",
+        "fence_row.pending_drain_intent_id",
+        "deployment_row.phase <> 'live'",
+        "attestation_row.record_format_version <> 2",
+        "serving_row.revision = expected_serving_revision",
+        "serving_row.expires_at > observed_at",
+        "public.starring_runtime_mutation_clock()",
+        "UPDATE public.runtime_serving_leases AS lease",
+        "SET revision = next_revision",
+        "AND lease.revision = expected_serving_revision",
+        "AND lease.expires_at <= mutation_clock",
+        "serving_row.revision = expected_serving_revision + 1",
+        "serving_row.last_heartbeat_at\n                IS DISTINCT FROM serving_row.expires_at",
+        "OR serving_row.expires_at > observed_at",
+    ] {
+        assert!(capability.contains(required), "{required}");
+    }
+    for forbidden in [
+        "FOR UPDATE",
+        "FOR SHARE",
+        "FOR KEY SHARE",
+        "starring_runtime_serving_disconnect_if_current_v2",
+        "DELETE FROM",
+        "INSERT INTO",
+    ] {
+        assert!(!capability.contains(forbidden), "{forbidden}");
+    }
+    let global_lock = capability
+        .find("pg_catalog.pg_advisory_xact_lock_shared")
+        .unwrap();
+    let writer_fence = capability.find("FROM public.runtime_writer_fence").unwrap();
+    let slot_lock = capability
+        .find("'starring-runtime-serving-slot-v1:'")
+        .unwrap();
+    let first_source_read = capability
+        .find("FROM public.runtime_drain_intents_v2")
+        .unwrap();
+    let mutation = capability
+        .find("UPDATE public.runtime_serving_leases AS lease")
+        .unwrap();
+    assert!(
+        global_lock < writer_fence
+            && writer_fence < slot_lock
+            && slot_lock < first_source_read
+            && first_source_read < mutation
+    );
+
+    let adapter = include_str!("../src/pending_drain.rs");
+    let method = adapter
+        .split("pub async fn disconnect_pending_drain_source_serving_if_expired_v1(")
+        .nth(1)
+        .unwrap();
+    let acquire = method.find("self.pool.acquire()").unwrap();
+    let begin = method.find("begin_serving_mutation_transaction").unwrap();
+    let binding = method.find("verify_runtime_serving_binding_v1").unwrap();
+    let query = method
+        .find("DISCONNECT_PENDING_DRAIN_SOURCE_IF_EXPIRED_QUERY")
+        .unwrap();
+    let first_bind = method.find(".bind(lookup.intent_id.as_str())").unwrap();
+    let final_bind = method
+        .find(".bind(runtime_i64(identity.revision.get())?)")
+        .unwrap();
+    let decode = method.find("row.decode_disconnect(identity)").unwrap();
+    let commit = method.find("map_err(map_mutation_commit_error)").unwrap();
+    assert!(
+        acquire < begin
+            && begin < binding
+            && binding < query
+            && query < first_bind
+            && first_bind < final_bind
+            && final_bind < decode
+            && decode < commit
+    );
+    assert!(method.contains("RuntimeServingPersistenceErrorV1::Indeterminate"));
+    for exact_bind in [
+        ".bind(lookup.intent_id.as_str())",
+        "runtime_i64(lookup.source_intent_revision.get())?",
+        ".bind(lowercase_hex(&lookup.source_state_digest))",
+        ".bind(identity.operation_id.as_str())",
+        ".bind(identity.scope.tenant_id.as_str())",
+        ".bind(identity.scope.installation_id.as_str())",
+        ".bind(identity.scope.deployment_id.as_str())",
+        ".bind(target.guild_id.to_string())",
+        ".bind(target.ruleset_key.as_str())",
+        ".bind(identity.attestation_digest.as_str())",
+        ".bind(identity.process_identity.process_instance_id.as_str())",
+    ] {
+        assert!(method.contains(exact_bind), "{exact_bind}");
+    }
 }
 
 #[test]
@@ -289,6 +507,7 @@ fn errors_are_redacted_at_the_adapter_boundary() {
         include_str!("../src/error.rs"),
         include_str!("../src/store.rs"),
         include_str!("../src/v2.rs"),
+        include_str!("../src/pending_drain.rs"),
     ];
     for source in sources {
         for leak in [

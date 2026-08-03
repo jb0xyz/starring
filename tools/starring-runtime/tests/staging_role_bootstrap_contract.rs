@@ -245,7 +245,13 @@ fn staging_runtime_capability_manifest_is_exact_and_unique() {
         "INSERT INTO pg_temp.starring_runtime_capability_functions",
         "SELECT pg_catalog.pg_advisory_lock",
     ));
-    assert_eq!(functions.len(), 82);
+    assert_eq!(functions.len(), 84);
+    assert!(BOOTSTRAP.contains(
+        "('serving', 'public.starring_runtime_serving_observe_pending_drain_source_v1(text,bigint,text)')"
+    ));
+    assert!(BOOTSTRAP.contains(
+        "('serving', 'public.starring_runtime_serving_disconnect_pending_drain_source_if_expired_v1(text,bigint,text,text,text,text,text,text,text,bigint,text,bigint,text,text,text,bigint,bigint,bigint)')"
+    ));
 
     let mut identities = BTreeSet::new();
     let mut counts = BTreeMap::new();
@@ -260,7 +266,7 @@ fn staging_runtime_capability_manifest_is_exact_and_unique() {
             ("execution".to_owned(), 31),
             ("interaction".to_owned(), 32),
             ("panel".to_owned(), 9),
-            ("serving".to_owned(), 7),
+            ("serving".to_owned(), 9),
         ])
     );
 }

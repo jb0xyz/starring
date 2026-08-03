@@ -328,7 +328,7 @@ impl RuntimeServingObserveRowV2 {
 }
 
 #[derive(Clone, Debug, sqlx::FromRow)]
-struct RuntimeServingMutationRowV2 {
+pub(crate) struct RuntimeServingMutationRowV2 {
     operation_id: String,
     tenant_id: String,
     installation_id: String,
@@ -383,7 +383,7 @@ impl RuntimeServingMutationRowV2 {
         self.decode(expected, self.serving_revision, true, true)
     }
 
-    fn decode_disconnect(
+    pub(crate) fn decode_disconnect(
         &self,
         expected: &RuntimeServingIdentityV2,
     ) -> Result<RuntimeServingReceiptV2, RuntimeServingPersistenceErrorV1> {

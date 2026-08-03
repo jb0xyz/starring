@@ -2,6 +2,7 @@ mod connection;
 mod contract;
 mod database;
 mod error;
+mod pending_drain;
 mod row;
 mod store;
 mod v2;
@@ -13,6 +14,10 @@ pub use database::{
     DEFAULT_RUNTIME_SERVING_STATEMENT_TIMEOUT, MAX_RUNTIME_SERVING_DATABASE_TIMEOUT,
 };
 pub use error::RuntimeServingPersistenceErrorV1;
+pub use pending_drain::{
+    RuntimePendingDrainServingLookupV1, RuntimePendingDrainServingObservationV1,
+    RuntimePendingDrainServingSourceEvidenceV1,
+};
 pub use store::{
     PostgresRuntimeServingLeaseV1, MAX_RUNTIME_SERVING_LEASE_DURATION,
     MIN_RUNTIME_SERVING_LEASE_DURATION,

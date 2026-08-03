@@ -147,6 +147,8 @@ VALUES
     ('serving', 'public.starring_runtime_serving_observe_v2(text,text,text,text,text,text,bigint,bigint)'),
     ('serving', 'public.starring_runtime_serving_heartbeat_v2(text,text,text,text,text,text,bigint,bigint,bigint,bigint)'),
     ('serving', 'public.starring_runtime_serving_disconnect_if_current_v2(text,text,text,text,text,text,bigint,bigint,bigint)'),
+    ('serving', 'public.starring_runtime_serving_observe_pending_drain_source_v1(text,bigint,text)'),
+    ('serving', 'public.starring_runtime_serving_disconnect_pending_drain_source_if_expired_v1(text,bigint,text,text,text,text,text,text,text,bigint,text,bigint,text,text,text,bigint,bigint,bigint)'),
     ('interaction', 'public.starring_runtime_interaction_database_readiness_v1()'),
     ('interaction', 'public.starring_runtime_interaction_database_identity_v1()'),
     ('interaction', 'public.starring_runtime_interaction_route_read_v1(text,text)'),
