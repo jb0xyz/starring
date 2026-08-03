@@ -688,6 +688,7 @@ fn project_attestation(
     DeploymentAttestationViewV2 {
         deployment_revision: value.deployment_revision().get(),
         convergence_attempt: value.convergence_attempt().get(),
+        process_instance_id: value.process_instance_id().as_str().to_string(),
     }
 }
 
@@ -757,11 +758,12 @@ fn internal() -> FacadeError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::num::{NonZeroU32, NonZeroU64};
     use std::time::Duration;
 
     use authoring_application::{
-        DeploymentOperationalProjectionV2, ExactDeploymentSelectorV1, ExactLiveProjectionV1,
+        DeploymentAttestationObservationV2, DeploymentOperationalProjectionV2,
+        DeploymentProcessInstanceIdV2, ExactDeploymentSelectorV1, ExactLiveProjectionV1,
         ProductDecisionProjectionV1, ProductDrainSelectorV1,
         ProductLifecycleCancellationDeploymentProjectionV1,
         ProductLifecycleCancellationDrainProjectionV1,
@@ -1101,6 +1103,51 @@ mod tests {
             DeploymentServingFreshnessStateV2::NotExpected
         );
         assert_eq!(projected.observed_at.timestamp(), 100);
+    }
+
+    #[test]
+    fn operational_runtime_projection_exposes_the_validated_process_identity() {
+        let observed_at = UNIX_EPOCH + Duration::from_secs(100);
+        let revision = NonZeroU64::new(7).unwrap();
+        let attempt = NonZeroU32::new(2).unwrap();
+        let base = DeploymentStatusObservationV1::from_server_projection(
+            DeploymentStatusProjectionV1::ExactLive(ExactLiveProjectionV1::from_exact_attestation(
+                exact_deployment(),
+                revision,
+            )),
+            observed_at,
+            Some(observed_at - Duration::from_secs(1)),
+            Some(observed_at + Duration::from_secs(10)),
+        )
+        .unwrap();
+        let runtime = DeploymentOperationalObservationV2::from_server_projection(
+            base,
+            DeploymentOperationalProjectionV2 {
+                phase: DeploymentConvergencePhaseV2::Live,
+                current_attempt: attempt.get(),
+                last_failure_attempt: None,
+                retry: None,
+                operator_action: None,
+                attestation: Some(DeploymentAttestationObservationV2::new(
+                    revision,
+                    attempt,
+                    DeploymentProcessInstanceIdV2::from_server_projection(
+                        "0123456789abcdef0123456789abcdef",
+                    )
+                    .unwrap(),
+                )),
+                serving: DeploymentServingFreshnessV2::Fresh {
+                    last_heartbeat_at: observed_at - Duration::from_secs(1),
+                    lease_expires_at: observed_at + Duration::from_secs(10),
+                },
+            },
+        )
+        .unwrap();
+        let projected = project_operational_runtime(&runtime).unwrap();
+        assert_eq!(
+            projected.attestation.unwrap().process_instance_id,
+            "0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[test]

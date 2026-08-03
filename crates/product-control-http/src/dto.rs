@@ -265,6 +265,7 @@ pub struct DeploymentRetryViewV2 {
 pub struct DeploymentAttestationViewV2 {
     pub deployment_revision: u64,
     pub convergence_attempt: u32,
+    pub process_instance_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]

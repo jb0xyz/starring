@@ -354,6 +354,10 @@ fn valid_runtime_common(
             attestation.deployment_revision > 0
                 && attestation.convergence_attempt > 0
                 && attestation.convergence_attempt == runtime.current_attempt
+                && authoring_application::DeploymentProcessInstanceIdV2::from_server_projection(
+                    attestation.process_instance_id.clone(),
+                )
+                .is_ok()
         })
 }
 

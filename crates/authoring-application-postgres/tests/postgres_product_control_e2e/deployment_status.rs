@@ -279,8 +279,8 @@ async fn certify_product_runtime_live(
 ) {
     let target = claim.snapshot.target.clone();
     let generation = claim.snapshot.runtime_generation;
-    let process_instance_id =
-        ProcessInstanceId::parse(format!("product-live-process-{}", suffix())).unwrap();
+    let process_instance_id = sha256_hex(&format!("product-live-process:{}", suffix()));
+    let process_instance_id = ProcessInstanceId::parse(&process_instance_id[..32]).unwrap();
     let panel_report_digest = sha256_hex(&format!("product-panel-report:{}", suffix()));
     let mutation_guard = ProductRuntimeMutationGuard::from_claim(scope, claim);
     let revision = mutate_product_runtime(

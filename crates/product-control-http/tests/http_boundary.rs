@@ -939,6 +939,7 @@ async fn operational_v2_preserves_retry_operator_authority_and_serving_states() 
     runtime.attestation = Some(DeploymentAttestationViewV2 {
         deployment_revision: 7,
         convergence_attempt: 2,
+        process_instance_id: "0123456789abcdef0123456789abcdef".to_string(),
     });
     runtime.serving.state = DeploymentServingFreshnessStateV2::LeaseMissing;
 
@@ -1006,6 +1007,11 @@ async fn operational_v2_preserves_retry_operator_authority_and_serving_states() 
         (fresh, "live", "live", "fresh"),
     ];
     for (view, state, phase, serving) in cases {
+        let process_instance_id = view
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.attestation.as_ref())
+            .map(|attestation| attestation.process_instance_id.clone());
         set_operational_response(&facade, view);
         let response = router
             .clone()
@@ -1018,6 +1024,13 @@ async fn operational_v2_preserves_retry_operator_authority_and_serving_states() 
         assert_eq!(json["state"], state);
         assert_eq!(json["runtime"]["phase"], phase);
         assert_eq!(json["runtime"]["serving"]["state"], serving);
+        match process_instance_id {
+            Some(process_instance_id) => assert_eq!(
+                json["runtime"]["attestation"]["process_instance_id"],
+                process_instance_id
+            ),
+            None => assert!(json["runtime"]["attestation"].is_null()),
+        }
         for forbidden in [
             SESSION,
             CSRF,
@@ -1026,7 +1039,6 @@ async fn operational_v2_preserves_retry_operator_authority_and_serving_states() 
             "failure_id",
             "failure_message",
             "attestation_id",
-            "process_instance_id",
             "runtime_build_revision",
             "sql",
         ] {
@@ -1082,6 +1094,7 @@ async fn operational_v2_rejects_impossible_or_unbounded_facade_responses() {
     runtime.attestation = Some(DeploymentAttestationViewV2 {
         deployment_revision: 7,
         convergence_attempt: 2,
+        process_instance_id: "0123456789abcdef0123456789abcdef".to_string(),
     });
     runtime.serving.state = DeploymentServingFreshnessStateV2::LeaseMissing;
 
@@ -1092,12 +1105,24 @@ async fn operational_v2_rejects_impossible_or_unbounded_facade_responses() {
     runtime.attestation = Some(DeploymentAttestationViewV2 {
         deployment_revision: 7,
         convergence_attempt: 2,
+        process_instance_id: "0123456789abcdef0123456789abcdef".to_string(),
     });
     runtime.serving = DeploymentServingFreshnessViewV2 {
         state: DeploymentServingFreshnessStateV2::Disconnected,
         last_heartbeat_at: None,
         lease_expires_at: Some(timestamp("2026-07-19T12:01:00Z")),
     };
+
+    let mut malformed_process_instance = pending_operational_view();
+    let runtime = malformed_process_instance.runtime.as_mut().unwrap();
+    runtime.phase = DeploymentRuntimePhaseV2::Live;
+    runtime.current_attempt = 2;
+    runtime.attestation = Some(DeploymentAttestationViewV2 {
+        deployment_revision: 7,
+        convergence_attempt: 2,
+        process_instance_id: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+    });
+    runtime.serving.state = DeploymentServingFreshnessStateV2::LeaseMissing;
 
     let mut wrong_retry_clock = pending_operational_view();
     wrong_retry_clock.state = DeploymentOperationalStateV2::Failed;
@@ -1121,6 +1146,7 @@ async fn operational_v2_rejects_impossible_or_unbounded_facade_responses() {
         missing_authority_action,
         false_live,
         malformed_freshness,
+        malformed_process_instance,
         wrong_retry_clock,
     ] {
         set_operational_response(&facade, view);

@@ -140,6 +140,7 @@ struct OperationalLiveSeed {
     exact: ExactDeploymentSelectorV1,
     convergence_attempt: NonZeroU32,
     deployment_revision: NonZeroU64,
+    process_instance_id: String,
     last_heartbeat_at: SystemTime,
     lease_expires_at: SystemTime,
 }
@@ -193,6 +194,14 @@ async fn seed_operational_live(
         exact,
         convergence_attempt: claim.convergence_attempt,
         deployment_revision: NonZeroU64::new(live.snapshot.revision.get()).unwrap(),
+        process_instance_id: live
+            .snapshot
+            .live
+            .as_ref()
+            .unwrap()
+            .process_instance_id
+            .as_str()
+            .to_string(),
         last_heartbeat_at: serving.last_heartbeat_at.into(),
         lease_expires_at: serving.expires_at.into(),
     }
@@ -227,12 +236,12 @@ fn assert_live_attestation(
         observation.phase(),
         authoring_application::DeploymentConvergencePhaseV2::Live
     );
+    let attestation = observation.attestation().unwrap();
+    assert_eq!(attestation.deployment_revision(), seed.deployment_revision);
+    assert_eq!(attestation.convergence_attempt(), seed.convergence_attempt);
     assert_eq!(
-        observation.attestation(),
-        Some(authoring_application::DeploymentAttestationObservationV2::new(
-            seed.deployment_revision,
-            seed.convergence_attempt,
-        ))
+        attestation.process_instance_id().as_str(),
+        seed.process_instance_id.as_str()
     );
 }
 
@@ -580,6 +589,15 @@ async fn operational_status_binds_live_attempt_and_reports_exact_disconnect() {
         live.snapshot.revision.get()
     );
     assert_eq!(attestation.convergence_attempt(), claim.convergence_attempt);
+    assert_eq!(
+        attestation.process_instance_id().as_str(),
+        live.snapshot
+            .live
+            .as_ref()
+            .unwrap()
+            .process_instance_id
+            .as_str()
+    );
     assert_eq!(
         live_runtime.serving(),
         authoring_application::DeploymentServingFreshnessV2::Fresh {

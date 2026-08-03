@@ -5,7 +5,8 @@ pub use operational::{
     DeploymentAttestationObservationV2, DeploymentConvergencePhaseV2,
     DeploymentOperationalObservationErrorV2, DeploymentOperationalObservationV2,
     DeploymentOperationalProjectionV2, DeploymentOperationalStatusPortV2,
-    DeploymentOperatorActionV2, DeploymentRetryObservationV2, DeploymentServingFreshnessV2,
+    DeploymentOperatorActionV2, DeploymentProcessInstanceIdErrorV2, DeploymentProcessInstanceIdV2,
+    DeploymentRetryObservationV2, DeploymentServingFreshnessV2,
     ProductDeploymentOperationalStatusV2,
 };
 pub(crate) use runtime::validate_exact_live;
