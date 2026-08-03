@@ -100,5 +100,5 @@ fn readiness_metadata_and_rust_pins_are_exact() {
     assert!(EXACT_TARGET_DATABASE_SOURCE
         .contains("3ada22bd8ca9b0eec6528ec9f6bff320c9bf29d816ee00d24a9cdec592aa359b"));
     assert!(SERVING_DATABASE_SOURCE
-        .contains("918e4be248c37e622b1f5b22cb9e252a450b65b295157681c647855d0c0150b9"));
+        .contains("1d7bb5b18129f99ef87b5ad0dfe712b4e6beac33a0461218fedf67fa6990ac3b"));
 }

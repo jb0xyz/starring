@@ -97,7 +97,7 @@ fn pending_drain_live_source_selection_digest_chain_is_exact_and_current() {
         assert!(MIGRATION.contains(required), "{required}");
     }
     for source in [CONTRACT_SOURCE, DATABASE_SOURCE, SECURITY_SUPPORT_SOURCE] {
-        assert!(source.contains("98ed1251e3339ffb452ed12334699e93f43e2ea3cd7d327bc3d2a11fe12b9fb2"));
+        assert!(source.contains("b632e1b778ef166f88e6ea206a30bd807b7357e210c29268bc98f39187310faf"));
     }
 }
 

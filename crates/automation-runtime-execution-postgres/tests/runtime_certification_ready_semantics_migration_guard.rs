@@ -147,6 +147,8 @@ fn execution_readiness_refresh_is_exact_and_pinned_everywhere() {
         "fc2b7bceeb3e9b9fc98335c3c358652e76b3f13edf87bbbb2506b62de3577e0a";
     let current_readiness_definition =
         "98ed1251e3339ffb452ed12334699e93f43e2ea3cd7d327bc3d2a11fe12b9fb2";
+    let latest_readiness_definition =
+        "b632e1b778ef166f88e6ea206a30bd807b7357e210c29268bc98f39187310faf";
     for required in [
         "public.starring_runtime_execution_database_readiness_v1()",
         previous_manifest_definition,
@@ -170,7 +172,8 @@ fn execution_readiness_refresh_is_exact_and_pinned_everywhere() {
         EXECUTION_DATABASE,
         POSTGRES_SECURITY_SUPPORT,
     ] {
-        assert!(current_source.contains(current_readiness_definition));
+        assert!(current_source.contains(latest_readiness_definition));
+        assert!(!current_source.contains(current_readiness_definition));
     }
 }
 

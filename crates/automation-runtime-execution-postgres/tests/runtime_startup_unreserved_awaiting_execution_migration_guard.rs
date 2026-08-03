@@ -45,7 +45,7 @@ fn migration_is_forward_only_comment_free_and_manifest_pinned() {
     assert!(CONTRACT_SOURCE
         .contains("public.starring_runtime_startup_recovery_execute_reserved_awaiting_v2"));
     assert!(CONTRACT_SOURCE
-        .contains("98ed1251e3339ffb452ed12334699e93f43e2ea3cd7d327bc3d2a11fe12b9fb2"));
+        .contains("b632e1b778ef166f88e6ea206a30bd807b7357e210c29268bc98f39187310faf"));
 }
 
 #[test]
