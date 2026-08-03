@@ -1736,6 +1736,51 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         )
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
+    def test_live_runtime_restart_rejects_auto_restart_after_nonzero_exit(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.signal_exit_code = 70
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_shutdown_unsuccessful",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertEqual(len(self.platform.signals), 1)
+        self.platform.next_pid += 1
+        self.platform.pids[runtime_label] = self.platform.next_pid
+        self.platform.launchd_runs[runtime_label] += 1
+        self.platform.launchd_states[runtime_label] = "running"
+        self.platform.last_exit_codes[runtime_label] = 70
+        self.platform.runtime_process_instance_ids[runtime_label] = (
+            f"{self.platform.next_pid:032x}"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "live_runtime_restart_shutdown_unjournaled_state",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertEqual(len(self.platform.signals), 1)
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_shutdown_path(
+                self.context
+            ).exists()
+        )
+        self.assertFalse(
+            LIVE_RUNTIME_RESTART.live_runtime_restart_awaiting_path(
+                self.context
+            ).exists()
+        )
+        self.assertFalse(
+            ORCHESTRATOR.drained_runtime_restart_directory(self.context).exists()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
     def test_live_runtime_restart_observes_the_complete_throttle_window(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         ORCHESTRATOR.command_start(self.context, self.platform)
@@ -2512,6 +2557,63 @@ class LaunchdPlatformTests(unittest.TestCase):
                     "last_exit_code": 0,
                 },
             )
+        decorated = subprocess.CompletedProcess(
+            [],
+            0,
+            b"\tpath = /Users/test/Application Support/Starring/runtime.plist\n\tprogram = /Users/test/Application Support/Starring/starring-runtime\n\targuments = {\n\t\t/Users/test/Application Support/Starring/starring-runtime\n\t}\n\tstate = exited\n\truns = 2\n\tlast exit code = 70: EX_SOFTWARE\n",
+            b"",
+        )
+        with mock.patch.object(platform, "run", return_value=decorated):
+            self.assertEqual(
+                platform.launchd_job("local.starring.d2.test.runtime")[
+                    "last_exit_code"
+                ],
+                70,
+            )
+
+    def test_launchd_job_rejects_ambiguous_exit_decorations(self):
+        platform = PLATFORM.Platform()
+        invalid = [
+            "0: EX_OK",
+            "70: ex_software",
+            "70: EX SOFTWARE",
+            "70: EX-SOFTWARE",
+            "70 garbage",
+            f"70: {'X' * 65}",
+        ]
+        for exit_value in invalid:
+            output = (
+                "\tpath = /Users/test/runtime.plist\n"
+                "\tprogram = /Users/test/starring-runtime\n"
+                "\targuments = {\n"
+                "\t\t/Users/test/starring-runtime\n"
+                "\t}\n"
+                "\tstate = exited\n"
+                "\truns = 1\n"
+                f"\tlast exit code = {exit_value}\n"
+            ).encode("utf-8")
+            observed = subprocess.CompletedProcess([], 0, output, b"")
+            with self.subTest(exit_value=exit_value), mock.patch.object(
+                platform, "run", return_value=observed
+            ), self.assertRaisesRegex(
+                CONTRACT.OrchestratorError, "launchd_observation_invalid"
+            ):
+                platform.launchd_job("local.starring.d2.test.runtime")
+
+    def test_launchd_job_rejects_duplicate_exit_fields(self):
+        platform = PLATFORM.Platform()
+        observed = subprocess.CompletedProcess(
+            [],
+            0,
+            b"\tpath = /Users/test/runtime.plist\n\tprogram = /Users/test/starring-runtime\n\targuments = {\n\t\t/Users/test/starring-runtime\n\t}\n\tstate = exited\n\truns = 1\n\tlast exit code = 70: EX_SOFTWARE\n\tlast exit code = 0\n",
+            b"",
+        )
+        with mock.patch.object(
+            platform, "run", return_value=observed
+        ), self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "launchd_observation_invalid"
+        ):
+            platform.launchd_job("local.starring.d2.test.runtime")
 
     def test_launchd_job_only_treats_known_absence_as_absent(self):
         platform = PLATFORM.Platform()

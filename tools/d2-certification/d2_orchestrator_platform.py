@@ -12,6 +12,9 @@ from d2_orchestrator_contract import OWNER_ACCOUNT, REQUIRED_PROGRAMS, fail
 
 MAX_TRANSPORT_CONTROL_BYTES = 64 * 1024
 RUNTIME_PROCESS_INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+LAUNCHD_DECORATED_EXIT_PATTERN = re.compile(
+    r"^(-?[0-9]+): ([A-Z][A-Z0-9_]{0,63})$"
+)
 
 
 def strict_json_object(pairs):
@@ -117,9 +120,16 @@ class Platform:
         last_exit_code = None
         if exit_matches:
             if exit_matches[0] != "(never exited)":
-                if not re.fullmatch(r"-?[0-9]+", exit_matches[0]):
+                plain_exit = re.fullmatch(r"-?[0-9]+", exit_matches[0])
+                decorated_exit = LAUNCHD_DECORATED_EXIT_PATTERN.fullmatch(
+                    exit_matches[0]
+                )
+                if plain_exit:
+                    last_exit_code = int(exit_matches[0])
+                elif decorated_exit and int(decorated_exit.group(1)) != 0:
+                    last_exit_code = int(decorated_exit.group(1))
+                else:
                     fail("launchd_observation_invalid")
-                last_exit_code = int(exit_matches[0])
         return {
             "pid": int(pid_matches[0]) if pid_matches else None,
             "program": program_matches[0],
