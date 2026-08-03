@@ -1196,6 +1196,7 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
     }
     let process_instance_id = process_instance_id
         .map_err(RuntimeProcessFoundationCompositionErrorV1::ProcessInstanceId)?;
+    let os_pid = std::process::id();
     let controller_id = generate_runtime_controller_id_v1();
     if !startup_budget.operation_is_open() {
         return Err(RuntimeProcessFoundationCompositionErrorV1::OperationDeadlineElapsed);
@@ -1317,6 +1318,8 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
     );
     let root_supervisor = match RuntimeProcessRootSupervisorV1::start(
         config.health_bind_addr(),
+        os_pid,
+        process_instance_id.as_str(),
         mutation_finalizer.seal_handle(),
         mutation_finalizer.terminal_observer(),
         closed_components.gateway.shutdown_handle_v1(),

@@ -975,9 +975,13 @@ mod tests {
         crate::health::RuntimeHealthReadinessPublisherV2,
         RuntimeHealthReadinessObserverV1,
     ) {
-        let mut health = RuntimeHealthSupervisorV1::start("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
+        let mut health = RuntimeHealthSupervisorV1::start(
+            "127.0.0.1:0".parse().unwrap(),
+            std::process::id(),
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
         let observer = health.readiness_observer_v1();
         let publisher = health.take_readiness_publisher_v2().unwrap();
         (health, publisher, observer)

@@ -8137,6 +8137,8 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         "pub(super) async fn begin_shutdown_v1(",
         "pub(super) async fn finish_shutdown_v1(",
         "RuntimeProcessRootSupervisorV1",
+        "let os_pid = std::process::id();",
+        "RuntimeProcessRootSupervisorV1::start(\n        config.health_bind_addr(),\n        os_pid,\n        process_instance_id.as_str(),",
         "mutation_finalizer:",
         "shutdown_health_until(cleanup_deadline)",
         "shutdown.close_until(cleanup_deadline).await",

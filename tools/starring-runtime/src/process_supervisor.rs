@@ -171,6 +171,8 @@ pub(crate) struct RuntimeProcessRootSupervisorV1 {
 impl RuntimeProcessRootSupervisorV1 {
     pub(crate) async fn start(
         health_bind_addr: SocketAddr,
+        os_pid: u32,
+        process_instance_id: &str,
         finalizer: RuntimeMutationFinalizerSealHandleV1,
         mut finalizer_terminal: RuntimeMutationFinalizerTerminalObserverV1,
         gateway: RuntimeGatewayShutdownHandleV1,
@@ -184,9 +186,10 @@ impl RuntimeProcessRootSupervisorV1 {
         } = control;
         let mut signals = RuntimeOsShutdownSignalsV1::register()
             .map_err(RuntimeProcessRootSupervisorStartErrorV1::Signal)?;
-        let mut health = RuntimeHealthSupervisorV1::start(health_bind_addr)
-            .await
-            .map_err(RuntimeProcessRootSupervisorStartErrorV1::Health)?;
+        let mut health =
+            RuntimeHealthSupervisorV1::start(health_bind_addr, os_pid, process_instance_id)
+                .await
+                .map_err(RuntimeProcessRootSupervisorStartErrorV1::Health)?;
         let readiness_publisher = health
             .take_readiness_publisher_v2()
             .expect("fresh runtime health supervisor");
@@ -374,6 +377,7 @@ mod tests {
     use automation_runtime_worker::{
         RuntimeGatewayClosedSnapshotV2, RuntimeMutationFinalizerGenerationV1,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::ingress_acknowledgement_supervisor::{
@@ -427,11 +431,22 @@ mod tests {
         }
     }
 
+    async fn health_request(addr: SocketAddr, path: &str) -> String {
+        let mut connection = tokio::net::TcpStream::connect(addr).await.unwrap();
+        connection
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        connection.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
     async fn direct_trip_projection_sample_v2() -> [Duration; 3] {
         let process_instance_id =
-            ProcessInstanceId::parse("runtime-process:direct-trip-projection").unwrap();
+            ProcessInstanceId::parse("11111111111111111111111111111111").unwrap();
         let gateway = compose_runtime_gateway_bootstrap_v1(
-            process_instance_id,
+            process_instance_id.clone(),
             GatewayResourceConfigV1::default(),
         )
         .unwrap();
@@ -457,6 +472,8 @@ mod tests {
         let (timing, timing_observer) = RuntimeLifecycleTimingRecorderV2::create_v2();
         let mut root = RuntimeProcessRootSupervisorV1::start(
             "127.0.0.1:0".parse().unwrap(),
+            std::process::id(),
+            process_instance_id.as_str(),
             finalizer.seal_handle(),
             finalizer.terminal_observer(),
             gateway.shutdown_handle_v1(),
@@ -588,9 +605,9 @@ mod tests {
     #[tokio::test]
     async fn composed_invalidation_seals_every_admission_surface_before_gateway_shutdown() {
         let process_instance_id =
-            ProcessInstanceId::parse("runtime-process:composed-invalidation").unwrap();
+            ProcessInstanceId::parse("22222222222222222222222222222222").unwrap();
         let gateway = compose_runtime_gateway_bootstrap_v1(
-            process_instance_id,
+            process_instance_id.clone(),
             GatewayResourceConfigV1::default(),
         )
         .unwrap();
@@ -620,6 +637,8 @@ mod tests {
         let (timing, timing_observer) = RuntimeLifecycleTimingRecorderV2::create_v2();
         let mut root = RuntimeProcessRootSupervisorV1::start(
             "127.0.0.1:0".parse().unwrap(),
+            std::process::id(),
+            process_instance_id.as_str(),
             finalizer.seal_handle(),
             finalizer.terminal_observer(),
             gateway.shutdown_handle_v1(),
@@ -637,6 +656,16 @@ mod tests {
         assert!(readiness.publish_ready_v2());
         assert!(readiness_state.is_ready());
         assert!(!readiness_state.is_sealed());
+        let health_addr = root.health.as_ref().unwrap().bound_addr();
+        let identity = health_request(health_addr, "/health/identity").await;
+        assert_eq!(
+            identity.split_once("\r\n\r\n").unwrap().1,
+            format!(
+                "{{\"schema_version\":1,\"os_pid\":{},\"process_instance_id\":\"{}\"}}",
+                std::process::id(),
+                process_instance_id.as_str(),
+            )
+        );
 
         let invalidation = root.invalidation_trigger();
         let trip = invalidation.trip(RuntimeShutdownCauseV1::ReadinessLost);
@@ -689,6 +718,12 @@ mod tests {
                 RuntimeLifecycleTimingOutcomeV2::Completed
             );
         }
+        let sealed_identity = health_request(health_addr, "/health/identity").await;
+        assert!(sealed_identity.starts_with("HTTP/1.1 503"));
+        assert_eq!(
+            sealed_identity.split_once("\r\n\r\n").unwrap().1,
+            "identity_unavailable"
+        );
 
         drop(maintenance);
         let deadline = Instant::now() + Duration::from_secs(2);
