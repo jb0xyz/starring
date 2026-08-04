@@ -97,6 +97,8 @@ pub enum D2ProvisionerErrorV1 {
     Onboarding,
     #[error("d2_inspection_failed")]
     Inspection,
+    #[error("d2_destruction_failed")]
+    Destruction,
 }
 
 impl D2ProvisionerErrorV1 {
@@ -121,6 +123,7 @@ impl D2ProvisionerErrorV1 {
             Self::OnboardingInput => "d2_onboarding_input_invalid",
             Self::Onboarding => "d2_onboarding_failed",
             Self::Inspection => "d2_inspection_failed",
+            Self::Destruction => "d2_destruction_failed",
         }
     }
 }
@@ -861,6 +864,14 @@ fn preflight_external_credentials(
             .map_err(|_| D2ProvisionerErrorV1::ExternalCredentials)?;
     }
     Ok(())
+}
+
+pub(crate) fn verify_d2_destruction_keychain_contract(
+    config: &D2ConfigV1,
+) -> Result<(), D2ProvisionerErrorV1> {
+    let keychain = KeychainClientV1::new().map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+    verify_keychain_owner(&keychain, config).map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+    preflight_external_credentials(&keychain, config).map_err(|_| D2ProvisionerErrorV1::Destruction)
 }
 
 fn inspect_credential_state(
@@ -2012,11 +2023,29 @@ mod tests {
             D2ProvisionerErrorV1::ReplayVerification,
             D2ProvisionerErrorV1::PartialStateQuarantined,
             D2ProvisionerErrorV1::Cleanup,
+            D2ProvisionerErrorV1::Destruction,
         ] {
             assert_eq!(error.to_string(), error.code());
             assert!(!error.to_string().contains("postgresql://"));
             assert!(!error.to_string().contains("SCRAM-SHA-256"));
         }
+    }
+
+    #[test]
+    fn destruction_keychain_contract_is_read_only_and_preserves_external_credentials() {
+        let source = include_str!("d2.rs");
+        let function = source
+            .split("pub(crate) fn verify_d2_destruction_keychain_contract")
+            .nth(1)
+            .unwrap()
+            .split("fn inspect_credential_state")
+            .next()
+            .unwrap();
+        assert!(function.contains("verify_keychain_owner"));
+        assert!(function.contains("preflight_external_credentials"));
+        assert!(!function.contains("write_"));
+        assert!(!function.contains(&["del", "ete"].concat()));
+        assert!(!function.contains("remove_"));
     }
 
     #[test]

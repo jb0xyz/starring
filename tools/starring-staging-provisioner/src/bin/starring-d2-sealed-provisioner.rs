@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use starring_staging_provisioner::{
-    inspect_d2_from_manifest, onboard_d2_from_manifest, provision_d2_from_manifest,
-    quarantine_d2_from_manifest, D2InspectionCheckpointV1, D2ProvisionerErrorV1,
+    destroy_d2_from_manifest, inspect_d2_from_manifest, onboard_d2_from_manifest,
+    provision_d2_from_manifest, quarantine_d2_from_manifest, D2InspectionCheckpointV1,
+    D2ProvisionerErrorV1,
 };
 
 #[tokio::main]
@@ -14,7 +15,7 @@ async fn main() -> ExitCode {
         return ExitCode::from(64);
     };
     match mode {
-        "provision" | "quarantine" => {
+        "provision" | "quarantine" | "destroy" => {
             let [_, manifest_flag, manifest_path] = arguments.as_slice() else {
                 eprintln!("{}", D2ProvisionerErrorV1::Arguments.code());
                 return ExitCode::from(64);
@@ -26,8 +27,10 @@ async fn main() -> ExitCode {
             let manifest_path = PathBuf::from(manifest_path);
             if mode == "provision" {
                 provision(&manifest_path).await
-            } else {
+            } else if mode == "quarantine" {
                 quarantine(&manifest_path).await
+            } else {
+                destroy(&manifest_path).await
             }
         }
         "onboard" => {
@@ -162,6 +165,25 @@ async fn quarantine(manifest_path: &std::path::Path) -> ExitCode {
     }
 }
 
+async fn destroy(manifest_path: &std::path::Path) -> ExitCode {
+    match destroy_d2_from_manifest(manifest_path).await {
+        Ok(report) => match report.to_json() {
+            Ok(payload) => {
+                println!("{payload}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{}", error.code());
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("{}", error.code());
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -170,6 +192,7 @@ mod tests {
         assert!(source.contains("provision"));
         assert!(source.contains("quarantine"));
         assert!(source.contains("inspect"));
+        assert!(source.contains("destroy"));
         assert!(source.contains("--manifest"));
         assert!(source.contains("--checkpoint"));
         assert!(source.contains("binding_key"));

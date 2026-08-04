@@ -21,7 +21,10 @@ pub use d2::{
     D2OnboardingOutcomeV1, D2OnboardingReportV1, D2ProvisionerErrorV1, D2ProvisioningOutcomeV1,
     D2ProvisioningReportV1, D2QuarantineReportV1,
 };
-pub use d2_evidence::{inspect_d2_from_manifest, D2InspectionCheckpointV1, D2InspectionReportV1};
+pub use d2_evidence::{
+    destroy_d2_from_manifest, inspect_d2_from_manifest, D2DestroyOutcomeV1, D2DestroyReportV1,
+    D2InspectionCheckpointV1, D2InspectionReportV1,
+};
 
 pub use final_verify::{verify_final, FinalVerificationReportV1};
 pub use identity::{

@@ -7,11 +7,11 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgRow, Postgres};
-use sqlx::{Decode, PgConnection, Row, Type};
+use sqlx::{Connection, Decode, PgConnection, Row, Type};
 
 use crate::d2::{
-    connect_inspection_admin_database, connect_inspection_database, load_config, D2ConfigV1,
-    D2ProvisionerErrorV1,
+    connect_inspection_admin_database, connect_inspection_database, load_config,
+    verify_d2_destruction_keychain_contract, D2ConfigV1, D2ProvisionerErrorV1,
 };
 
 const RULESET_KEY: &str = "studyroom";
@@ -19,6 +19,14 @@ const DATABASE_NAME: &str = "starring_runtime_staging";
 const ROUTE_IDENTITY_KIND: &str = "starring.d2.route-identity.v1";
 const SERVING_IDENTITY_KIND: &str = "starring.d2.serving-identity.v1";
 const EFFECT_IDENTITY_KIND: &str = "starring.d2.effect-identity.v1";
+const DESTROY_KIND: &str = "starring.d2.database-destruction.v1";
+const PROVISIONER_ADVISORY_LOCK_SQL: &str = "SELECT pg_catalog.pg_try_advisory_lock(pg_catalog.hashtextextended('starring-d2-sealed-provisioner:' || $1, 0))";
+const DESTROY_ADVISORY_LOCK_SQL: &str = "SELECT pg_catalog.pg_try_advisory_lock(pg_catalog.hashtextextended('starring-d2-sealed-destroy:' || $1, 0))";
+const DROP_DATABASE_SQL: &str = "DROP DATABASE starring_runtime_staging";
+const EXPECTED_MIGRATION_COUNT: i64 = 125;
+const EXPECTED_MIGRATION_HEAD: i64 = 202608040004;
+const EXPECTED_MIGRATION_HEAD_CHECKSUM: &str =
+    "2ac0c69bfa9bd5f99c092bdf1d8ac06510bc0c467c8a17cd62a0412f3f409a1128d4afbe5ca2136b77c34eadd91c3056";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum D2InspectionCheckpointV1 {
@@ -101,6 +109,51 @@ impl D2InspectionReportV1 {
     pub fn to_json(&self) -> Result<String, D2ProvisionerErrorV1> {
         serde_json::to_string(self).map_err(|_| D2ProvisionerErrorV1::Inspection)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum D2DestroyOutcomeV1 {
+    Destroyed,
+    ExactReplay,
+}
+
+impl D2DestroyOutcomeV1 {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Destroyed => "destroyed",
+            Self::ExactReplay => "exact_replay",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct D2DestroyReportV1 {
+    schema_version: u32,
+    kind: &'static str,
+    outcome: D2DestroyOutcomeV1,
+    installation_id: String,
+    database_absent: bool,
+}
+
+impl D2DestroyReportV1 {
+    pub const fn outcome(&self) -> D2DestroyOutcomeV1 {
+        self.outcome
+    }
+
+    pub const fn database_absent(&self) -> bool {
+        self.database_absent
+    }
+
+    pub fn to_json(&self) -> Result<String, D2ProvisionerErrorV1> {
+        serde_json::to_string(self).map_err(|_| D2ProvisionerErrorV1::Destruction)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum D2DestructionPlanV1 {
+    Drop,
+    ExactReplay,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -281,6 +334,207 @@ struct LiveObservationV1 {
     route: RouteIdentityV1,
     serving: ServingIdentityV1,
     promotion_id: String,
+}
+
+pub async fn destroy_d2_from_manifest(
+    manifest_path: &Path,
+) -> Result<D2DestroyReportV1, D2ProvisionerErrorV1> {
+    let config = load_config(manifest_path)?;
+    let scope = InspectionScopeV1::from_config(&config);
+    verify_d2_destruction_keychain_contract(&config)?;
+    let mut admin = connect_inspection_admin_database(&config)
+        .await
+        .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+    configure_destroy_admin(&mut admin).await?;
+    for statement in [PROVISIONER_ADVISORY_LOCK_SQL, DESTROY_ADVISORY_LOCK_SQL] {
+        let acquired: bool = sqlx::query_scalar(statement)
+            .bind(&scope.run_id)
+            .fetch_one(&mut admin)
+            .await
+            .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+        if !acquired {
+            return Err(D2ProvisionerErrorV1::Destruction);
+        }
+    }
+    match destruction_plan(target_database_state(&mut admin).await?)? {
+        D2DestructionPlanV1::ExactReplay => {
+            verify_d2_destruction_keychain_contract(&config)?;
+            Ok(destroy_report(&scope, D2DestroyOutcomeV1::ExactReplay))
+        }
+        D2DestructionPlanV1::Drop => {
+            validate_destroy_target(&config, &scope, &mut admin).await?;
+            if destruction_plan(target_database_state(&mut admin).await?)?
+                != D2DestructionPlanV1::Drop
+            {
+                return Err(D2ProvisionerErrorV1::Destruction);
+            }
+            sqlx::query(DROP_DATABASE_SQL)
+                .execute(&mut admin)
+                .await
+                .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+            if destruction_plan(target_database_state(&mut admin).await?)?
+                != D2DestructionPlanV1::ExactReplay
+            {
+                return Err(D2ProvisionerErrorV1::Destruction);
+            }
+            verify_d2_destruction_keychain_contract(&config)?;
+            Ok(destroy_report(&scope, D2DestroyOutcomeV1::Destroyed))
+        }
+    }
+}
+
+fn destroy_report(scope: &InspectionScopeV1, outcome: D2DestroyOutcomeV1) -> D2DestroyReportV1 {
+    D2DestroyReportV1 {
+        schema_version: 1,
+        kind: DESTROY_KIND,
+        outcome,
+        installation_id: scope.installation_id.clone(),
+        database_absent: true,
+    }
+}
+
+async fn configure_destroy_admin(
+    connection: &mut PgConnection,
+) -> Result<(), D2ProvisionerErrorV1> {
+    for setting in [
+        "SET statement_timeout = '3s'",
+        "SET lock_timeout = '500ms'",
+        "SET idle_in_transaction_session_timeout = '5s'",
+        "SET search_path = pg_catalog",
+    ] {
+        sqlx::query(setting)
+            .execute(&mut *connection)
+            .await
+            .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+    }
+    Ok(())
+}
+
+async fn target_database_state(
+    connection: &mut PgConnection,
+) -> Result<(i64, i64), D2ProvisionerErrorV1> {
+    let row = sqlx::query(
+        "SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.pg_database WHERE datname = $1) AS database_count, (SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_activity WHERE datname = $1) AS backend_count",
+    )
+    .bind(DATABASE_NAME)
+    .fetch_one(connection)
+    .await
+    .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+    Ok((
+        row.try_get("database_count")
+            .map_err(|_| D2ProvisionerErrorV1::Destruction)?,
+        row.try_get("backend_count")
+            .map_err(|_| D2ProvisionerErrorV1::Destruction)?,
+    ))
+}
+
+fn destruction_plan(
+    (database_count, backend_count): (i64, i64),
+) -> Result<D2DestructionPlanV1, D2ProvisionerErrorV1> {
+    match (database_count, backend_count) {
+        (0, 0) => Ok(D2DestructionPlanV1::ExactReplay),
+        (1, 0) => Ok(D2DestructionPlanV1::Drop),
+        _ => Err(D2ProvisionerErrorV1::Destruction),
+    }
+}
+
+async fn validate_destroy_target(
+    config: &D2ConfigV1,
+    scope: &InspectionScopeV1,
+    admin: &mut PgConnection,
+) -> Result<(), D2ProvisionerErrorV1> {
+    let mut target = connect_inspection_database(config)
+        .await
+        .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+    begin_read_snapshot(&mut target)
+        .await
+        .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+    let validation = async {
+        verify_current_d2_schema(&mut target).await?;
+        verify_exact_destroy_scope(&mut target, scope).await?;
+        inspect_precleanup(&mut target, scope)
+            .await
+            .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+        let target_pid: i32 = sqlx::query_scalar("SELECT pg_catalog.pg_backend_pid()")
+            .fetch_one(&mut target)
+            .await
+            .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+        verify_exclusive_target_backend(admin, target_pid).await
+    }
+    .await;
+    if let Err(error) = validation {
+        let _ = sqlx::query("ROLLBACK").execute(&mut target).await;
+        return Err(error);
+    }
+    sqlx::query("COMMIT")
+        .execute(&mut target)
+        .await
+        .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+    target
+        .close()
+        .await
+        .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+    Ok(())
+}
+
+async fn verify_current_d2_schema(
+    connection: &mut PgConnection,
+) -> Result<(), D2ProvisionerErrorV1> {
+    let exact: bool = sqlx::query_scalar(
+        "SELECT (SELECT pg_catalog.count(*) = $1 AND pg_catalog.max(migration.version) = $2 AND pg_catalog.count(*) FILTER (WHERE NOT migration.success) = 0 FROM public._sqlx_migrations AS migration) AND COALESCE((SELECT pg_catalog.encode(migration.checksum, 'hex') = $3 FROM public._sqlx_migrations AS migration WHERE migration.version = $2 AND migration.success), FALSE) AND public.starring_runtime_exact_target_schema_manifest_v1() AND public.starring_runtime_exact_target_schema_manifest_v2() AND public.starring_runtime_execution_schema_manifest_v1() AND public.starring_runtime_interaction_effect_schema_manifest_v1() AND public.starring_runtime_interaction_receipt_schema_manifest_v1() AND public.starring_runtime_interaction_schema_manifest_v1() AND public.starring_runtime_serving_schema_manifest_v1()",
+    )
+    .bind(EXPECTED_MIGRATION_COUNT)
+    .bind(EXPECTED_MIGRATION_HEAD)
+    .bind(EXPECTED_MIGRATION_HEAD_CHECKSUM)
+    .fetch_one(connection)
+    .await
+    .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+    if exact {
+        Ok(())
+    } else {
+        Err(D2ProvisionerErrorV1::Destruction)
+    }
+}
+
+async fn verify_exact_destroy_scope(
+    connection: &mut PgConnection,
+    scope: &InspectionScopeV1,
+) -> Result<(), D2ProvisionerErrorV1> {
+    let exact: bool = sqlx::query_scalar(
+        "SELECT (SELECT pg_catalog.count(*) = 1 FROM public.product_tenants) AND (SELECT pg_catalog.count(*) = 1 FROM public.product_tenants AS tenant WHERE tenant.tenant_id = $1 AND tenant.lifecycle_state = 'active' AND tenant.display_metadata = '{\"environment\":\"staging\",\"onboarding\":\"operator_v1\"}'::JSONB) AND (SELECT pg_catalog.count(*) = 1 FROM public.automation_installations) AND (SELECT pg_catalog.count(*) = 1 FROM public.automation_installations AS installation WHERE installation.tenant_id = $1 AND installation.installation_id = $2 AND installation.discord_guild_id = $3 AND installation.discord_application_id = $4 AND installation.ruleset_key = $5 AND installation.lifecycle_state = 'active') AND EXISTS (SELECT 1 FROM public.automation_installation_authority_versions AS authority WHERE authority.tenant_id = $1 AND authority.installation_id = $2) AND NOT EXISTS (SELECT 1 FROM public.automation_installation_authority_versions AS authority WHERE authority.tenant_id IS DISTINCT FROM $1 OR authority.installation_id IS DISTINCT FROM $2) AND EXISTS (SELECT 1 FROM public.authoring_sessions AS session WHERE session.tenant_id = $1 AND session.installation_id = $2) AND NOT EXISTS (SELECT 1 FROM public.authoring_sessions AS session WHERE session.tenant_id IS DISTINCT FROM $1 OR session.installation_id IS DISTINCT FROM $2) AND EXISTS (SELECT 1 FROM public.runtime_deployments AS deployment WHERE deployment.tenant_id = $1 AND deployment.installation_id = $2 AND deployment.guild_id = $3 AND deployment.ruleset_key = $5) AND NOT EXISTS (SELECT 1 FROM public.runtime_deployments AS deployment WHERE deployment.tenant_id IS DISTINCT FROM $1 OR deployment.installation_id IS DISTINCT FROM $2 OR deployment.guild_id IS DISTINCT FROM $3 OR deployment.ruleset_key IS DISTINCT FROM $5) AND NOT EXISTS (SELECT 1 FROM public.runtime_interaction_receipt_roots_v1 AS root WHERE root.application_id IS DISTINCT FROM $4 OR root.tenant_id IS DISTINCT FROM $1 OR root.installation_id IS DISTINCT FROM $2 OR root.guild_id IS DISTINCT FROM $3 OR root.ruleset_key IS DISTINCT FROM $5) AND NOT EXISTS (SELECT 1 FROM public.runtime_product_operations_v2 AS operation WHERE operation.tenant_id IS DISTINCT FROM $1 OR operation.installation_id IS DISTINCT FROM $2 OR operation.expected_target_guild_id IS DISTINCT FROM $3 OR operation.expected_target_ruleset_key IS DISTINCT FROM $5) AND (SELECT pg_catalog.count(*) = 1 FROM public.runtime_slot_writer_fences_v2) AND (SELECT pg_catalog.count(*) = 1 FROM public.runtime_slot_writer_fences_v2 AS fence WHERE fence.slot_guild_id = $3 AND fence.slot_ruleset_key = $5)",
+    )
+    .bind(&scope.tenant_id)
+    .bind(&scope.installation_id)
+    .bind(&scope.guild_id)
+    .bind(&scope.application_id)
+    .bind(RULESET_KEY)
+    .fetch_one(connection)
+    .await
+    .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+    if exact {
+        Ok(())
+    } else {
+        Err(D2ProvisionerErrorV1::Destruction)
+    }
+}
+
+async fn verify_exclusive_target_backend(
+    connection: &mut PgConnection,
+    target_pid: i32,
+) -> Result<(), D2ProvisionerErrorV1> {
+    let exact: bool = sqlx::query_scalar(
+        "SELECT pg_catalog.count(*) = 1 AND pg_catalog.count(*) FILTER (WHERE activity.pid = $2 AND activity.usename = 'starring_cluster_admin' AND activity.application_name = 'starring-d2-sealed-inspector' AND activity.client_addr = '127.0.0.1'::INET AND activity.backend_type = 'client backend') = 1 FROM pg_catalog.pg_stat_activity AS activity WHERE activity.datname = $1",
+    )
+    .bind(DATABASE_NAME)
+    .bind(target_pid)
+    .fetch_one(connection)
+    .await
+    .map_err(|_| D2ProvisionerErrorV1::Destruction)?;
+    if exact {
+        Ok(())
+    } else {
+        Err(D2ProvisionerErrorV1::Destruction)
+    }
 }
 
 pub async fn inspect_d2_from_manifest(
@@ -1683,5 +1937,114 @@ mod tests {
                 assert!(migration.contains(name));
             }
         }
+    }
+
+    #[test]
+    fn destruction_report_is_strict_redacted_and_replayable() {
+        let scope = InspectionScopeV1 {
+            run_id: "20260804-0123456789ab".to_owned(),
+            tenant_id: "tenant:starring-d2-20260804-0123456789ab".to_owned(),
+            installation_id: "installation:starring-d2-20260804-0123456789ab".to_owned(),
+            guild_id: "1533137713476272288".to_owned(),
+            application_id: "1533144492293754900".to_owned(),
+        };
+        for outcome in [
+            D2DestroyOutcomeV1::Destroyed,
+            D2DestroyOutcomeV1::ExactReplay,
+        ] {
+            let report = destroy_report(&scope, outcome);
+            assert!(report.database_absent());
+            assert_eq!(report.outcome(), outcome);
+            let payload = report.to_json().unwrap();
+            let value: Value = serde_json::from_str(&payload).unwrap();
+            let mut keys = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "database_absent",
+                    "installation_id",
+                    "kind",
+                    "outcome",
+                    "schema_version",
+                ]
+            );
+            assert_eq!(value["schema_version"], 1);
+            assert_eq!(value["kind"], DESTROY_KIND);
+            assert_eq!(value["outcome"], outcome.as_str());
+            assert_eq!(value["database_absent"], true);
+            for forbidden in [
+                "password",
+                "token",
+                "database_url",
+                "ciphertext",
+                "key_material",
+                "transcript",
+            ] {
+                assert!(!payload.contains(forbidden));
+            }
+        }
+    }
+
+    #[test]
+    fn destruction_plan_has_one_mutating_state_and_exact_replay() {
+        assert_eq!(destruction_plan((1, 0)).unwrap(), D2DestructionPlanV1::Drop);
+        assert_eq!(
+            destruction_plan((0, 0)).unwrap(),
+            D2DestructionPlanV1::ExactReplay
+        );
+        for state in [(0, 1), (1, 1), (2, 0), (-1, 0)] {
+            assert_eq!(
+                destruction_plan(state),
+                Err(D2ProvisionerErrorV1::Destruction)
+            );
+        }
+    }
+
+    #[test]
+    fn destruction_sql_is_fixed_nonforcing_and_current() {
+        assert_eq!(
+            DROP_DATABASE_SQL,
+            ["DROP DATABASE ", DATABASE_NAME].concat()
+        );
+        assert!(!DROP_DATABASE_SQL.contains('$'));
+        assert!(!DROP_DATABASE_SQL
+            .to_ascii_uppercase()
+            .contains(&["FOR", "CE"].concat()));
+        assert!(!DROP_DATABASE_SQL.contains(';'));
+        let migration =
+            include_bytes!("../../../migrations/202608040004_refresh_serving_pending_product_drain_readiness_v1.sql");
+        let digest = <sha2::Sha384 as sha2::Digest>::digest(migration);
+        assert_eq!(format!("{digest:x}"), EXPECTED_MIGRATION_HEAD_CHECKSUM);
+    }
+
+    #[test]
+    fn destruction_preflight_is_exclusive_exact_and_secret_free() {
+        let source = include_str!("d2_evidence.rs");
+        assert!(source.contains("pg_try_advisory_lock"));
+        assert!(source.contains("starring-d2-sealed-provisioner:"));
+        assert!(source.contains("starring-d2-sealed-destroy:"));
+        assert!(source.contains("pg_stat_activity"));
+        assert!(source.contains("activity.pid = $2"));
+        assert!(source.contains("starring_runtime_exact_target_schema_manifest_v2()"));
+        assert!(source.contains("starring_runtime_interaction_effect_schema_manifest_v1()"));
+        assert!(source.contains("discord_application_id = $4"));
+        assert!(source.contains("discord_guild_id = $3"));
+        assert!(source.contains("ruleset_key = $5"));
+        assert!(source.contains("target.close()"));
+        assert!(!source.contains(&["pg_terminate", "_backend"].concat()));
+        assert_eq!(
+            D2ProvisionerErrorV1::Destruction.code(),
+            "d2_destruction_failed"
+        );
+        assert_eq!(
+            D2ProvisionerErrorV1::Destruction.to_string(),
+            "d2_destruction_failed"
+        );
     }
 }
