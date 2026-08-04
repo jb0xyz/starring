@@ -46,6 +46,8 @@ GUILD_DELETION_KIND = "starring.d2.browser-discord-guild-deletion-evidence.v1"
 def _require_exact(value, fields, code):
     if not isinstance(value, dict) or set(value) != set(fields):
         fail(code)
+    if "schema_version" in fields and type(value["schema_version"]) is not int:
+        fail(code)
     return value
 
 

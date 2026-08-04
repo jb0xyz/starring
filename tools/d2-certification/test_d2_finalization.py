@@ -340,6 +340,20 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertEqual(self.platform.bootouts, bootouts)
         self.assertEqual(self.platform.destroy_calls, 0)
 
+    def test_freeze_rejects_boolean_schema_version(self):
+        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        path = FINALIZATION.freeze_intent_path(self.context)
+        intent = json.loads(path.read_text())
+        intent["schema_version"] = True
+        path.write_text(json.dumps(intent), encoding="utf-8")
+        path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "finalization_freeze_intent_invalid",
+        ):
+            self.finalize()
+        self.assertEqual(self.platform.destroy_calls, 0)
+
     def test_finalize_requires_healed_unarmed_transport_before_freeze(self):
         cases = (
             ("gateway", "partitioned", True),
@@ -534,6 +548,20 @@ class D2FinalizationTest(unittest.TestCase):
             )
         ):
             with self.subTest(index=index):
+                with self.assertRaises(ORCHESTRATOR.OrchestratorError):
+                    FINALIZATION.assemble_teardown_evidence(
+                        *values,
+                        FINALIZATION.local_step16_binding(self.context, teardown),
+                    )
+        for index, values in enumerate(
+            (
+                (copy.deepcopy(database), teardown, finalization),
+                (database, copy.deepcopy(teardown), finalization),
+                (database, teardown, copy.deepcopy(finalization)),
+            )
+        ):
+            values[index]["schema_version"] = True
+            with self.subTest(boolean_schema=index):
                 with self.assertRaises(ORCHESTRATOR.OrchestratorError):
                     FINALIZATION.assemble_teardown_evidence(
                         *values,
@@ -888,6 +916,18 @@ class D2FinalizationTest(unittest.TestCase):
             FINALIZATION.assemble_absence_evidence(
                 database, chronology, prefix_value, guild, binding
             )
+        for index, values in enumerate(
+            (
+                (copy.deepcopy(database), orchestration, prefix_value, guild),
+                (database, copy.deepcopy(orchestration), prefix_value, guild),
+                (database, orchestration, copy.deepcopy(prefix_value), guild),
+                (database, orchestration, prefix_value, copy.deepcopy(guild)),
+            )
+        ):
+            values[index]["schema_version"] = True
+            with self.subTest(boolean_schema=index):
+                with self.assertRaises(ORCHESTRATOR.OrchestratorError):
+                    FINALIZATION.assemble_absence_evidence(*values, binding)
 
     def test_total_absence_rejects_nonzero_prefix_scan(self):
         self.finalize()
