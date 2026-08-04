@@ -405,33 +405,117 @@ def assemble_authentication_evidence(browser):
     }
 
 
-def assemble_authoring_evidence(browser):
-    fields = {
+def assemble_authoring_evidence(browser, worker):
+    browser_fields = {
         "public_origin",
         "authoring_http_status",
         "authoring_session_id",
         "authoring_generation",
         "installation_id",
-        "model",
-        "provider",
-        "reasoning_effort",
-        "auth_mode",
         "one_shot",
     }
-    value = _require_envelope(
-        browser, "starring.d2.browser-authoring-evidence.v1", fields
+    worker_fields = {
+        "manifest_sha256",
+        "browser_evidence_sha256",
+        "browser_observed_at",
+        "provider",
+        "model",
+        "reasoning_effort",
+        "auth_mode",
+        "codex_cli_version",
+        "worker_instance_id",
+        "worker_source_sha256",
+        "accepted_requests_before",
+        "accepted_requests_after",
+        "accepted_requests_delta",
+        "settled_requests_before",
+        "settled_requests_after",
+        "settled_requests_delta",
+        "active_requests_after",
+        "queued_requests_after",
+    }
+    public = _require_envelope(
+        browser, "starring.d2.browser-authoring-evidence.v1", browser_fields
     )
-    _require_public_origin(value["public_origin"], "browser_public_origin_invalid")
+    execution = _require_envelope(
+        worker, "starring.d2.worker-authoring-evidence.v1", worker_fields
+    )
+    _require_public_origin(public["public_origin"], "browser_public_origin_invalid")
     _require_http_status(
-        value["authoring_http_status"], "authoring_http_status_invalid", {200, 201}
+        public["authoring_http_status"], "authoring_http_status_invalid", {200, 201}
     )
-    _require_identifier(value["authoring_session_id"], "authoring_session_id_invalid")
-    _require_positive_integer(value["authoring_generation"], "authoring_generation_invalid")
-    for field in ("installation_id", "model", "provider", "reasoning_effort", "auth_mode"):
-        _require_identifier(value[field], f"authoring_{field}_invalid")
-    if value["one_shot"] is not True:
+    _require_identifier(
+        public["authoring_session_id"], "authoring_session_id_invalid"
+    )
+    _require_positive_integer(
+        public["authoring_generation"], "authoring_generation_invalid"
+    )
+    _require_identifier(public["installation_id"], "authoring_installation_id_invalid")
+    if public["one_shot"] is not True:
         _fail("authoring_one_shot_invalid")
-    return {field: value[field] for field in fields}
+    for field in ("provider", "model", "reasoning_effort", "auth_mode"):
+        _require_identifier(execution[field], f"authoring_{field}_invalid")
+    _require_identifier(
+        execution["worker_instance_id"], "authoring_worker_instance_id_invalid"
+    )
+    if (
+        not isinstance(execution["codex_cli_version"], str)
+        or not execution["codex_cli_version"]
+        or len(execution["codex_cli_version"].encode("utf-8")) > 191
+    ):
+        _fail("authoring_codex_cli_version_invalid")
+    for field in (
+        "manifest_sha256",
+        "browser_evidence_sha256",
+        "worker_source_sha256",
+    ):
+        _require_digest(execution[field], f"authoring_{field}_invalid")
+    _require_timestamp(
+        execution["browser_observed_at"], "authoring_browser_observed_at_invalid"
+    )
+    if execution["browser_observed_at"] != public["observed_at"]:
+        _fail("authoring_browser_timestamp_mismatch")
+    expected_browser_digest = hashlib.sha256(
+        canonical_json(public).encode("utf-8")
+    ).hexdigest()
+    if execution["browser_evidence_sha256"] != expected_browser_digest:
+        _fail("authoring_browser_digest_mismatch")
+    for field in (
+        "accepted_requests_before",
+        "accepted_requests_after",
+        "accepted_requests_delta",
+        "settled_requests_before",
+        "settled_requests_after",
+        "settled_requests_delta",
+        "active_requests_after",
+        "queued_requests_after",
+    ):
+        _require_nonnegative_integer(
+            execution[field], f"authoring_{field}_invalid"
+        )
+    if (
+        execution["accepted_requests_delta"] != 1
+        or execution["settled_requests_delta"] != 1
+        or execution["accepted_requests_after"]
+        != execution["accepted_requests_before"] + 1
+        or execution["settled_requests_after"]
+        != execution["settled_requests_before"] + 1
+        or execution["active_requests_after"] != 0
+        or execution["queued_requests_after"] != 0
+    ):
+        _fail("authoring_worker_request_boundary_invalid")
+    return {
+        "authoring_http_status": public["authoring_http_status"],
+        "authoring_session_id": public["authoring_session_id"],
+        "authoring_generation": public["authoring_generation"],
+        "installation_id": public["installation_id"],
+        "model": execution["model"],
+        "provider": execution["provider"],
+        "reasoning_effort": execution["reasoning_effort"],
+        "auth_mode": execution["auth_mode"],
+        "one_shot": True,
+        "public_origin": public["public_origin"],
+    }
 
 
 def assemble_preview_evidence(database):
@@ -462,6 +546,7 @@ def assemble_decision_evidence(browser):
         "preview_state",
         "approval_state",
         "apply_state",
+        "runtime_pending_observed",
     }
     value = _require_envelope(
         browser, "starring.d2.browser-product-decision-evidence.v1", fields
@@ -471,8 +556,19 @@ def assemble_decision_evidence(browser):
     _require_digest(value["promotion_id"], "decision_promotion_id_invalid")
     _require_state(value["preview_state"], {"pending_approval"}, "preview_state_invalid")
     _require_state(value["approval_state"], {"approved"}, "approval_state_invalid")
-    _require_state(value["apply_state"], {"runtime_pending"}, "apply_state_invalid")
-    return {field: value[field] for field in fields}
+    _require_state(
+        value["apply_state"], {"runtime_pending", "live"}, "apply_state_invalid"
+    )
+    if value["runtime_pending_observed"] is not True:
+        _fail("runtime_pending_observation_missing")
+    return {
+        "installation_id": value["installation_id"],
+        "promotion_id": value["promotion_id"],
+        "preview_state": value["preview_state"],
+        "approval_state": value["approval_state"],
+        "apply_state": "runtime_pending",
+        "public_origin": value["public_origin"],
+    }
 
 
 def assemble_live_evidence(browser, database):

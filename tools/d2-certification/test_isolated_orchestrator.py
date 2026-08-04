@@ -107,6 +107,11 @@ class FakePlatform:
         self.proxy_deletions = []
         self.proxy_failure_resource_id = None
         self.proxy_failure_after_delete = False
+        self.worker_instance_id = "worker-0123456789abcdef"
+        self.worker_accepted_requests = 0
+        self.worker_settled_requests = 0
+        self.worker_active_requests = 0
+        self.worker_queued_requests = 0
 
     def run(self, arguments, input_bytes=None, timeout=30, environment=None):
         executable = pathlib.Path(arguments[0]).name
@@ -296,6 +301,27 @@ class FakePlatform:
         if self.health_failure == "worker":
             return 503
         return 200
+
+    def worker_health_snapshot(self, context, timeout_seconds=3):
+        if self.worker_health_status(context, timeout_seconds) != 200:
+            ORCHESTRATOR.fail("worker_health_unready")
+        return {
+            "schema_version": 1,
+            "status": "ok",
+            **context.manifest["authoring"],
+            "codex_cli_version": "codex-cli 1.2.3",
+            "instance_id": self.worker_instance_id,
+            "worker_source_sha256": context.manifest["source_trees"][
+                "codex_worker"
+            ]["sha256"],
+            "concurrency_limit": 1,
+            "queue_capacity": 4,
+            "request_timeout_ms": 55000,
+            "active_requests": self.worker_active_requests,
+            "queued_requests": self.worker_queued_requests,
+            "accepted_requests_total": self.worker_accepted_requests,
+            "settled_requests_total": self.worker_settled_requests,
+        }
 
     def transport_health_status(self, context, timeout_seconds=3):
         self.lifecycle_events.append("health:transport")
@@ -3220,6 +3246,77 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         ):
             ORCHESTRATOR.command_transport_evidence(
                 self.context, self.platform, "duplicate"
+            )
+
+    def write_browser_authoring_evidence(self, name="browser-authoring.json"):
+        path = self.root / name
+        path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "starring.d2.browser-authoring-evidence.v1",
+                    "observed_at": "2026-08-04T12:00:01.123Z",
+                    "public_origin": self.context.manifest["public_origin"],
+                    "authoring_http_status": 201,
+                    "authoring_session_id": "session-1",
+                    "authoring_generation": 1,
+                    "installation_id": "installation-1",
+                    "one_shot": True,
+                },
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return path
+
+    def test_worker_authoring_evidence_brackets_one_exact_luna_request(self):
+        self.start_candidate_with_discord_resources()
+        before = ORCHESTRATOR.command_worker_authoring_evidence(
+            self.context, self.platform, "before"
+        )
+        self.assertEqual(before["status"], "recorded")
+        self.platform.worker_accepted_requests = 1
+        self.platform.worker_settled_requests = 1
+        browser = self.write_browser_authoring_evidence()
+        after = ORCHESTRATOR.command_worker_authoring_evidence(
+            self.context, self.platform, "after", str(browser)
+        )
+        self.assertEqual(after["status"], "recorded")
+        evidence = json.loads(
+            pathlib.Path(after["evidence"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(evidence["provider"], "codex_chatgpt")
+        self.assertEqual(evidence["model"], "gpt-5.6-luna")
+        self.assertEqual(evidence["accepted_requests_delta"], 1)
+        self.assertEqual(evidence["settled_requests_delta"], 1)
+        self.assertNotIn("prompt", json.dumps(evidence).lower())
+        self.platform.worker_accepted_requests = 12
+        self.platform.worker_settled_requests = 12
+        replay = ORCHESTRATOR.command_worker_authoring_evidence(
+            self.context, self.platform, "after", str(browser)
+        )
+        self.assertEqual(replay["status"], "exact_replay")
+
+    def test_worker_authoring_evidence_rejects_non_single_or_unbound_calls(self):
+        self.start_candidate_with_discord_resources()
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "worker_browser_evidence_required"
+        ):
+            ORCHESTRATOR.command_worker_authoring_evidence(
+                self.context, self.platform, "after"
+            )
+        ORCHESTRATOR.command_worker_authoring_evidence(
+            self.context, self.platform, "before"
+        )
+        self.platform.worker_accepted_requests = 2
+        self.platform.worker_settled_requests = 2
+        browser = self.write_browser_authoring_evidence()
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "worker_authoring_evidence_invalid"
+        ):
+            ORCHESTRATOR.command_worker_authoring_evidence(
+                self.context, self.platform, "after", str(browser)
             )
 
     def test_resource_inventory_command_is_candidate_and_instance_bound(self):

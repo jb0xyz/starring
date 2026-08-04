@@ -58,6 +58,7 @@ from d2_drained_runtime_restart import (
     drained_runtime_restart_temporary_directory,
 )
 from d2_live_runtime_restart import command_certify_live_runtime_restart
+from d2_worker_evidence import capture_worker_authoring_checkpoint
 
 
 SERVICE_START_ORDER = ("transport", "worker", "api", "runtime", "tunnel")
@@ -1120,6 +1121,26 @@ def command_transport_evidence(context, platform, checkpoint):
     }
 
 
+def command_worker_authoring_evidence(
+    context, platform, checkpoint, browser_evidence_path=None
+):
+    if checkpoint == "before" and browser_evidence_path is not None:
+        fail("worker_browser_evidence_unexpected")
+    if checkpoint == "after" and browser_evidence_path is None:
+        fail("worker_browser_evidence_required")
+    require_candidate_certification_boundary(context, platform)
+    browser = None
+    if browser_evidence_path is not None:
+        path = require_absolute_path(
+            browser_evidence_path, "worker_browser_evidence"
+        )
+        browser = load_private_json(path, "worker_browser_evidence")
+    health = platform.worker_health_snapshot(context)
+    return capture_worker_authoring_checkpoint(
+        context, health, checkpoint, browser
+    )
+
+
 def discord_resource_identity_key(resource):
     return (
         resource["kind"],
@@ -1831,6 +1852,12 @@ def build_parser():
         required=True,
         choices=tuple(TRANSPORT_EVIDENCE_KINDS),
     )
+    worker_evidence = subparsers.add_parser("worker-authoring-evidence")
+    worker_evidence.add_argument("--manifest", required=True)
+    worker_evidence.add_argument(
+        "--checkpoint", required=True, choices=("before", "after")
+    )
+    worker_evidence.add_argument("--browser-evidence")
     return parser
 
 
@@ -1866,6 +1893,13 @@ def main():
                     context,
                     platform,
                     arguments.checkpoint,
+                )
+            elif arguments.command == "worker-authoring-evidence":
+                result = command_worker_authoring_evidence(
+                    context,
+                    platform,
+                    arguments.checkpoint,
+                    arguments.browser_evidence,
                 )
             elif arguments.command == "certify-live-runtime-restart":
                 confirmation_path = (

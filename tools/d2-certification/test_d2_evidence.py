@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import importlib.util
 import json
 import pathlib
@@ -205,11 +206,30 @@ class D2EvidenceTest(unittest.TestCase):
             authoring_session_id="session-1",
             authoring_generation=1,
             installation_id=INSTALLATION_ID,
+            one_shot=True,
+        )
+        worker = envelope(
+            "starring.d2.worker-authoring-evidence.v1",
+            manifest_sha256="f" * 64,
+            browser_evidence_sha256=hashlib.sha256(
+                MODULE.canonical_json(authoring).encode("utf-8")
+            ).hexdigest(),
+            browser_observed_at=authoring["observed_at"],
             model="gpt-5.6-luna",
             provider="codex_chatgpt",
             reasoning_effort="medium",
             auth_mode="chatgpt",
-            one_shot=True,
+            codex_cli_version="codex-cli 1.2.3",
+            worker_instance_id="worker-0123456789abcdef",
+            worker_source_sha256="e" * 64,
+            accepted_requests_before=7,
+            accepted_requests_after=8,
+            accepted_requests_delta=1,
+            settled_requests_before=7,
+            settled_requests_after=8,
+            settled_requests_delta=1,
+            active_requests_after=0,
+            queued_requests_after=0,
         )
         preview = envelope(
             "starring.d2.db-authoring-evidence.v1",
@@ -228,13 +248,28 @@ class D2EvidenceTest(unittest.TestCase):
             preview_state="pending_approval",
             approval_state="approved",
             apply_state="runtime_pending",
+            runtime_pending_observed=True,
         )
-        self.assertTrue(MODULE.assemble_authoring_evidence(authoring)["one_shot"])
+        self.assertTrue(
+            MODULE.assemble_authoring_evidence(authoring, worker)["one_shot"]
+        )
         self.assertTrue(MODULE.assemble_preview_evidence(preview)["generation_encrypted"])
         self.assertEqual(
             MODULE.assemble_decision_evidence(decision)["apply_state"],
             "runtime_pending",
         )
+        fast_live = copy.deepcopy(decision)
+        fast_live["apply_state"] = "live"
+        self.assertEqual(
+            MODULE.assemble_decision_evidence(fast_live)["apply_state"],
+            "runtime_pending",
+        )
+        missing_pending = copy.deepcopy(fast_live)
+        missing_pending["runtime_pending_observed"] = False
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError, "runtime_pending_observation_missing"
+        ):
+            MODULE.assemble_decision_evidence(missing_pending)
 
     def test_interaction_adapter_joins_database_and_transport_resources(self):
         database = envelope(
