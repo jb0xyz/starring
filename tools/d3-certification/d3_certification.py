@@ -921,6 +921,7 @@ def command_bind_d2(arguments):
         final_record = load_json_file(d2_final_path, "d2_final_record", 0o600)
         expected_final_fields = {
             "schema_version",
+            "kind",
             "run_id",
             "commit_sha",
             "manifest_sha256",
@@ -928,11 +929,13 @@ def command_bind_d2(arguments):
             "status",
             "resource_prefix",
             "receipt_chain_head_sha256",
+            "coordinator_evidence_sha256",
         }
         if not isinstance(final_record, dict) or set(final_record) != expected_final_fields:
             fail("d2_final_record_fields_invalid")
         expected_final = {
             "schema_version": 1,
+            "kind": "starring.d2.coordinator-final-record.v1",
             "run_id": d2_manifest.get("run_id"),
             "commit_sha": state["merge_commit"],
             "manifest_sha256": manifest_digest,
@@ -940,10 +943,17 @@ def command_bind_d2(arguments):
             "status": "passed",
             "resource_prefix": d2_manifest.get("discord", {}).get("resource_prefix"),
             "receipt_chain_head_sha256": receipts[-1]["receipt_sha256"],
+            "coordinator_evidence_sha256": final_record.get(
+                "coordinator_evidence_sha256"
+            ),
         }
+        validate_digest(
+            final_record.get("coordinator_evidence_sha256"),
+            "d2_coordinator_evidence_sha256",
+        )
         if final_record != expected_final:
             fail("d2_final_record_mismatch")
-        verifier = worktree / "tools" / "d2-certification" / "d2_certification.py"
+        verifier = worktree / "tools" / "d2-certification" / "d2_run.py"
         require_regular(verifier, "d2_verifier")
         _, raw_verified = run_process(
             [sys.executable, str(verifier), "verify", "--manifest", str(d2_manifest_path)],
@@ -963,6 +973,9 @@ def command_bind_d2(arguments):
             "manifest_sha256": manifest_digest,
             "steps": 17,
             "receipt_chain_head_sha256": final_record["receipt_chain_head_sha256"],
+            "coordinator_evidence_sha256": final_record[
+                "coordinator_evidence_sha256"
+            ],
             "final_record_sha256": sha256_bytes(canonical_json(final_record).encode("utf-8")),
         }
         if binding_path.exists():
@@ -1010,6 +1023,9 @@ def command_recheck(arguments):
             "merge_tree": state["merge_tree"],
             "gate_evidence_chain_head_sha256": gate_chain,
             "d2_receipt_chain_head_sha256": binding["receipt_chain_head_sha256"],
+            "d2_coordinator_evidence_sha256": binding[
+                "coordinator_evidence_sha256"
+            ],
         }
         if record_path.exists():
             existing = load_json_file(record_path, "recheck", 0o600)
@@ -1045,6 +1061,7 @@ def load_binding(root, state):
         "manifest_sha256",
         "steps",
         "receipt_chain_head_sha256",
+        "coordinator_evidence_sha256",
         "final_record_sha256",
         "verified_at",
         "record_sha256",
@@ -1061,6 +1078,9 @@ def load_binding(root, state):
         fail("d2_binding_identity_invalid")
     validate_digest(binding["manifest_sha256"], "d2_binding_manifest")
     validate_digest(binding["receipt_chain_head_sha256"], "d2_binding_chain")
+    validate_digest(
+        binding["coordinator_evidence_sha256"], "d2_binding_coordinator"
+    )
     validate_digest(binding["final_record_sha256"], "d2_binding_final")
     validate_timestamp(binding["verified_at"], "d2_binding_verified_at")
     verify_sealed_record(binding, "d2_binding")
@@ -1079,6 +1099,7 @@ def load_recheck(root, state):
         "merge_tree",
         "gate_evidence_chain_head_sha256",
         "d2_receipt_chain_head_sha256",
+        "d2_coordinator_evidence_sha256",
         "verified_at",
         "record_sha256",
     }
@@ -1093,6 +1114,8 @@ def load_recheck(root, state):
         or not DIGEST_PATTERN.fullmatch(record["gate_evidence_chain_head_sha256"])
         or not isinstance(record.get("d2_receipt_chain_head_sha256"), str)
         or not DIGEST_PATTERN.fullmatch(record["d2_receipt_chain_head_sha256"])
+        or not isinstance(record.get("d2_coordinator_evidence_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(record["d2_coordinator_evidence_sha256"])
     ):
         fail("recheck_identity_invalid")
     validate_timestamp(record["verified_at"], "recheck_verified_at")
@@ -1152,6 +1175,8 @@ def command_finalize(arguments):
             recheck["gate_evidence_chain_head_sha256"] != gate_chain
             or recheck["d2_receipt_chain_head_sha256"]
             != binding["receipt_chain_head_sha256"]
+            or recheck["d2_coordinator_evidence_sha256"]
+            != binding["coordinator_evidence_sha256"]
         ):
             fail("recheck_certification_binding_mismatch")
         validate_remote_url(repo, state["remote"])
@@ -1187,6 +1212,9 @@ def command_finalize(arguments):
             "d2_run_id": binding["run_id"],
             "d2_manifest_sha256": binding["manifest_sha256"],
             "d2_receipt_chain_head_sha256": binding["receipt_chain_head_sha256"],
+            "d2_coordinator_evidence_sha256": binding[
+                "coordinator_evidence_sha256"
+            ],
             "d2_binding_sha256": binding["record_sha256"],
             "rechecked_head_commit": recheck["head_commit"],
             "rechecked_base_commit": recheck["base_commit"],

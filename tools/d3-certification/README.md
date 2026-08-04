@@ -30,7 +30,7 @@ python3 tools/d3-certification/d3_certification.py run-gates \
   --gate 'cargo fmt --all -- --check'
 ```
 
-Capture the canonical output of `d2_certification.py verify` in an owned mode-`0600` JSON file, then bind it to the D2 manifest, all 17 chained receipts, and the pinned commit tree. Set `umask 077` before redirecting the verifier output so the record is never created with a permissive mode.
+Capture the canonical output of `d2_run.py verify` in an owned mode-`0600` JSON file, then bind its required 17-step coordinator ledger to the D2 manifest, all 17 chained receipts, and the pinned commit tree. Set `umask 077` before redirecting the verifier output so the record is never created with a permissive mode. The low-level receipt verifier is not release authority.
 
 ```sh
 python3 tools/d3-certification/d3_certification.py bind-d2 \

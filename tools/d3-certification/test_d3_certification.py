@@ -67,11 +67,11 @@ p = pathlib.Path(sys.argv[sys.argv.index("--manifest") + 1])
 m = json.loads(p.read_text(encoding="utf-8"))
 r = [json.loads(line) for line in p.with_name("receipts.jsonl").read_text(encoding="utf-8").splitlines()]
 d = p.with_name("manifest.sha256").read_text(encoding="ascii").strip()
-v = {"schema_version":1,"run_id":m["run_id"],"commit_sha":m["commit_sha"],"manifest_sha256":d,"steps":len(r),"status":"passed","resource_prefix":m["discord"]["resource_prefix"],"receipt_chain_head_sha256":r[-1]["receipt_sha256"]}
+v = {"schema_version":1,"kind":"starring.d2.coordinator-final-record.v1","run_id":m["run_id"],"commit_sha":m["commit_sha"],"manifest_sha256":d,"steps":len(r),"status":"passed","resource_prefix":m["discord"]["resource_prefix"],"receipt_chain_head_sha256":r[-1]["receipt_sha256"],"coordinator_evidence_sha256":"f"*64}
 print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 """
         write(
-            self.seed / "tools" / "d2-certification" / "d2_certification.py",
+            self.seed / "tools" / "d2-certification" / "d2_run.py",
             verifier,
         )
         git(self.seed, "add", ".")
@@ -381,6 +381,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         )
         final = {
             "schema_version": 1,
+            "kind": "starring.d2.coordinator-final-record.v1",
             "run_id": manifest["run_id"],
             "commit_sha": state["merge_commit"],
             "manifest_sha256": digest,
@@ -388,6 +389,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             "status": "passed",
             "resource_prefix": manifest["discord"]["resource_prefix"],
             "receipt_chain_head_sha256": previous,
+            "coordinator_evidence_sha256": "f" * 64,
         }
         final_path = root / "final.json"
         write(final_path, MODULE.canonical_json(final) + "\n", 0o600)
@@ -443,6 +445,27 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(status, 1)
         self.assertIn("d2_receipt_sequence_invalid", error)
         self.assertEqual(gates[0], "python3 -c 'raise SystemExit(0)'")
+
+    def test_d2_binding_rejects_the_legacy_receipt_only_final_record(self):
+        state_path, _, _ = self.prepare()
+        manifest_path, final_path = self.make_d2(state_path)
+        final = json.loads(final_path.read_text(encoding="utf-8"))
+        final.pop("kind")
+        final.pop("coordinator_evidence_sha256")
+        write(final_path, MODULE.canonical_json(final) + "\n", 0o600)
+        status, _, error = self.invoke(
+            [
+                "bind-d2",
+                "--state",
+                str(state_path),
+                "--d2-manifest",
+                str(manifest_path),
+                "--d2-final-record",
+                str(final_path),
+            ]
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("d2_final_record_fields_invalid", error)
 
     def complete_prerequisites(self):
         state_path, _, gates = self.prepare()
