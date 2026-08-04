@@ -13,6 +13,7 @@
   const PREVIEW_READY_EVIDENCE_KIND = "starring.d2.browser-preview-ready-evidence.v1";
   const PRODUCT_DECISION_EVIDENCE_KIND = "starring.d2.browser-product-decision-evidence.v1";
   const CHROME_PREVIEW_CONFIRMATION_KIND = "starring.d2.chrome-preview-confirmation.v1";
+  const CERTIFICATION_DECISION_COMMAND_KIND = "starring.d2.certification-decision-command.v1";
   const LIVE_EVIDENCE_KIND = "starring.d2.browser-live-evidence.v1";
   const LIVE_LOSS_EVIDENCE_KIND = "starring.d2.browser-live-loss-evidence.v1";
   const REPLACEMENT_EVIDENCE_KIND = "starring.d2.browser-replacement-evidence.v1";
@@ -499,6 +500,90 @@
       return key;
     }
 
+    function requireCertificationDecisionCommand(value) {
+      const command = requireBody(value, "certification_decision_command");
+      const fields = [
+        "schema_version",
+        "kind",
+        "installation_id",
+        "authoring_session_id",
+        "authoring_generation",
+        "candidate_ruleset_hash",
+        "preview_completion_challenge_sha256",
+        "promotion_idempotency_key",
+        "approval_idempotency_key",
+        "apply_idempotency_key",
+      ];
+      if (
+        Object.keys(command).length !== fields.length ||
+        fields.some((field) => !Object.hasOwn(command, field)) ||
+        command.schema_version !== 1 ||
+        command.kind !== CERTIFICATION_DECISION_COMMAND_KIND
+      ) {
+        throw new Error("certification_decision_command_invalid");
+      }
+      const normalized = {
+        schema_version: 1,
+        kind: CERTIFICATION_DECISION_COMMAND_KIND,
+        installation_id: requireResourceId(command.installation_id, "installation_id"),
+        authoring_session_id: requireResourceId(
+          command.authoring_session_id,
+          "authoring_session_id",
+        ),
+        authoring_generation: requireGeneration(
+          command.authoring_generation,
+          "authoring_generation",
+          false,
+        ),
+        candidate_ruleset_hash: requireDigest(
+          command.candidate_ruleset_hash,
+          "candidate_ruleset_hash",
+        ),
+        preview_completion_challenge_sha256: requireDigest(
+          command.preview_completion_challenge_sha256,
+          "preview_completion_challenge_sha256",
+        ),
+        promotion_idempotency_key: requireResourceId(
+          command.promotion_idempotency_key,
+          "promotion_idempotency_key",
+        ),
+        approval_idempotency_key: requireResourceId(
+          command.approval_idempotency_key,
+          "approval_idempotency_key",
+        ),
+        apply_idempotency_key: requireResourceId(
+          command.apply_idempotency_key,
+          "apply_idempotency_key",
+        ),
+      };
+      if (
+        new Set([
+          normalized.promotion_idempotency_key,
+          normalized.approval_idempotency_key,
+          normalized.apply_idempotency_key,
+        ]).size !== 3
+      ) {
+        throw new Error("certification_decision_command_key_reuse");
+      }
+      return Object.freeze(normalized);
+    }
+
+    function createCertificationDecisionCommand(input) {
+      return requireCertificationDecisionCommand({
+        schema_version: 1,
+        kind: CERTIFICATION_DECISION_COMMAND_KIND,
+        installation_id: input.installationId,
+        authoring_session_id: input.sessionId,
+        authoring_generation: input.authoringGeneration,
+        candidate_ruleset_hash: input.candidateRulesetHash,
+        preview_completion_challenge_sha256:
+          input.previewCompletionChallengeSha256,
+        promotion_idempotency_key: idempotencyKey("certification_promote"),
+        approval_idempotency_key: idempotencyKey("certification_approve"),
+        apply_idempotency_key: idempotencyKey("certification_apply"),
+      });
+    }
+
     async function request(path, options = {}) {
       if (typeof path !== "string" || (!path.startsWith("/v1/") && !path.startsWith("/v2/"))) {
         throw new Error("request_path_invalid");
@@ -947,21 +1032,13 @@
       if (typeof root.confirm !== "function") {
         throw new Error("native_preview_confirmation_unavailable");
       }
-      const installationId = requireResourceId(input.installationId, "installation_id");
-      const sessionId = requireResourceId(input.sessionId, "authoring_session_id");
-      const generation = requireGeneration(
-        input.authoringGeneration,
-        "authoring_generation",
-        false,
-      );
-      const candidateRulesetHash = requireDigest(
-        input.candidateRulesetHash,
-        "candidate_ruleset_hash",
-      );
-      const previewCompletionChallengeSha256 = requireDigest(
-        input.previewCompletionChallengeSha256,
-        "preview_completion_challenge_sha256",
-      );
+      const command = requireCertificationDecisionCommand(input.command);
+      const installationId = command.installation_id;
+      const sessionId = command.authoring_session_id;
+      const generation = command.authoring_generation;
+      const candidateRulesetHash = command.candidate_ruleset_hash;
+      const previewCompletionChallengeSha256 =
+        command.preview_completion_challenge_sha256;
       const current = await authoringSession(installationId, sessionId);
       const currentProjection = sessionProjectionEvidence(current.body);
       if (
@@ -980,7 +1057,7 @@
         installationId,
         sessionId,
         expectedGeneration: generation,
-        idempotencyKey: input.promotionIdempotencyKey,
+        idempotencyKey: command.promotion_idempotency_key,
       });
       if (!promoted.body || promoted.body.state !== "pending_approval") {
         throw new Error("promotion_not_pending_approval");
@@ -1034,7 +1111,7 @@
         promotionId: promoted.body.promotion_id,
         expectedPayloadDigest: preview.body.payload_digest,
         expectedRevision: preview.body.revision,
-        idempotencyKey: input.approvalIdempotencyKey,
+        idempotencyKey: command.approval_idempotency_key,
       });
       if (!approved.body || approved.body.state !== "approved") {
         throw new Error("promotion_not_approved");
@@ -1044,7 +1121,7 @@
         promotionId: promoted.body.promotion_id,
         expectedPayloadDigest: preview.body.payload_digest,
         expectedRevision: approved.body.revision,
-        idempotencyKey: input.applyIdempotencyKey,
+        idempotencyKey: command.apply_idempotency_key,
         runtimeDrainAttempts: input.runtimeDrainAttempts,
         runtimeDrainIntervalMilliseconds: input.runtimeDrainIntervalMilliseconds,
         signal: input.signal,
@@ -1517,6 +1594,7 @@
       liveRuntimeRestartConfirmation,
       beginCertificationAuthoring,
       completeCertificationDecision,
+      createCertificationDecisionCommand,
       runOneShotProductFlow,
       waitForLive,
       waitForLiveEvidence: waitForLive,

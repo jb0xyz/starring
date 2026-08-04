@@ -104,6 +104,18 @@ function driver(fetchImpl, cookie = "__Host-starring_csrf=csrf-value", options =
 }
 
 
+function certificationDecisionCommand(product, overrides = {}) {
+  return product.createCertificationDecisionCommand({
+    installationId: "installation-1",
+    sessionId: "session-1",
+    authoringGeneration: 1,
+    candidateRulesetHash: DIGEST,
+    previewCompletionChallengeSha256: PREVIEW_COMPLETION_CHALLENGE,
+    ...overrides,
+  });
+}
+
+
 test("Discord interaction observation is canonical and exact", () => {
   const evidence = driver(async () => response(500, null), undefined, {
     now: () => "2026-08-04T12:00:00Z",
@@ -444,12 +456,9 @@ test("certification authoring and decision phases are separated by a public prev
   assert.equal(authoring.authoring_evidence.authoring_disposition, "created");
   assert.equal(authoring.authoring_evidence.worker_request_id, "worker-request-1");
   assert.equal(authoring.authoring_evidence.worker_completion_sha256, "c".repeat(64));
+  const command = certificationDecisionCommand(product);
   const decision = await product.completeCertificationDecision({
-    installationId: "installation-1",
-    sessionId: "session-1",
-    authoringGeneration: 1,
-    candidateRulesetHash: DIGEST,
-    previewCompletionChallengeSha256: PREVIEW_COMPLETION_CHALLENGE,
+    command,
   });
   assert.equal(calls.length, 6);
   assert.equal(confirmations, 1);
@@ -471,6 +480,167 @@ test("certification authoring and decision phases are separated by a public prev
     true,
   );
   assert.equal(decision.applied.state, "runtime_pending");
+});
+
+
+test("certification decision command is exact, immutable, and redacted", () => {
+  const product = driver(async () => response(500, null));
+  const command = certificationDecisionCommand(product);
+  assert.equal(Object.isFrozen(command), true);
+  assert.deepEqual(
+    Object.keys(command).sort(),
+    [
+      "apply_idempotency_key",
+      "approval_idempotency_key",
+      "authoring_generation",
+      "authoring_session_id",
+      "candidate_ruleset_hash",
+      "installation_id",
+      "kind",
+      "preview_completion_challenge_sha256",
+      "promotion_idempotency_key",
+      "schema_version",
+    ],
+  );
+  assert.equal(
+    new Set([
+      command.promotion_idempotency_key,
+      command.approval_idempotency_key,
+      command.apply_idempotency_key,
+    ]).size,
+    3,
+  );
+  const serialized = JSON.stringify(command);
+  assert.equal(serialized.includes("csrf-value"), false);
+  assert.equal(serialized.includes("prompt"), false);
+  assert.equal(serialized.includes("message"), false);
+  assert.equal(serialized.includes("token"), false);
+  assert.throws(
+    () => certificationDecisionCommand(product, { authoringGeneration: true }),
+    /authoring_generation_invalid/,
+  );
+});
+
+
+test("certification decision resumes with the same command after committed responses are lost", async (t) => {
+  for (const faultStage of ["promote", "approve", "apply"]) {
+    await t.test(faultStage, async () => {
+      const approvalDigest = "b".repeat(64);
+      const committed = { promote: false, approve: false, apply: false };
+      const observedKeys = { promote: [], approve: [], apply: [] };
+      let faultInjected = false;
+      const fetchImpl = async (url, options) => {
+        const path = new URL(url).pathname;
+        const method = options.method || "GET";
+        if (method === "GET" && path.endsWith("/authoring/sessions/session-1")) {
+          return response(200, {
+            session_id: "session-1",
+            observed_generation: 1,
+            projection: {
+              state: "preview_ready",
+              preview: { revision: 1, receipt: { candidate_ruleset_hash: DIGEST } },
+            },
+          });
+        }
+        if (method === "POST" && path.endsWith("/authoring/sessions/session-1/promotions")) {
+          observedKeys.promote.push(options.headers["idempotency-key"]);
+          const replayed = committed.promote;
+          committed.promote = true;
+          if (faultStage === "promote" && !faultInjected) {
+            faultInjected = true;
+            throw new Error("response_lost_after_commit");
+          }
+          return response(replayed ? 200 : 201, {
+            installation_id: "installation-1",
+            promotion_id: DIGEST,
+            revision: 1,
+            state: "pending_approval",
+            payload_digest: approvalDigest,
+            replayed,
+          });
+        }
+        if (method === "GET" && path.endsWith(`/promotions/${DIGEST}/approval-preview`)) {
+          return response(200, {
+            installation_id: "installation-1",
+            promotion_id: DIGEST,
+            revision: 1,
+            state: "pending_approval",
+            payload_digest: approvalDigest,
+            summary: {
+              panels: 1,
+              modals: 1,
+              rules: 4,
+              actions: 15,
+              target_version: 1,
+              required_approvals: 1,
+              target_content_hash: DIGEST,
+            },
+          });
+        }
+        if (method === "POST" && path.endsWith(`/promotions/${DIGEST}/approvals`)) {
+          observedKeys.approve.push(options.headers["idempotency-key"]);
+          const replayed = committed.approve;
+          committed.approve = true;
+          if (faultStage === "approve" && !faultInjected) {
+            faultInjected = true;
+            throw new Error("response_lost_after_commit");
+          }
+          return response(200, {
+            installation_id: "installation-1",
+            promotion_id: DIGEST,
+            revision: 2,
+            state: "approved",
+            replayed,
+          });
+        }
+        if (method === "POST" && path.endsWith(`/promotions/${DIGEST}/apply`)) {
+          observedKeys.apply.push(options.headers["idempotency-key"]);
+          const replayed = committed.apply;
+          committed.apply = true;
+          if (faultStage === "apply" && !faultInjected) {
+            faultInjected = true;
+            throw new Error("response_lost_after_commit");
+          }
+          return response(replayed ? 200 : 202, {
+            installation_id: "installation-1",
+            promotion_id: DIGEST,
+            state: "runtime_pending",
+            replayed,
+          });
+        }
+        throw new Error(`unexpected_request:${method}:${path}`);
+      };
+      const firstProduct = driver(fetchImpl);
+      const command = certificationDecisionCommand(firstProduct);
+      await assert.rejects(
+        firstProduct.completeCertificationDecision({ command }),
+        /response_lost_after_commit/,
+      );
+      const restoredCommand = JSON.parse(JSON.stringify(command));
+      const resumedProduct = driver(fetchImpl, undefined, {
+        randomUUID: () => {
+          throw new Error("new_idempotency_key_forbidden");
+        },
+      });
+      const result = await resumedProduct.completeCertificationDecision({
+        command: restoredCommand,
+      });
+      assert.equal(result.applied.state, "runtime_pending");
+      assert.equal(faultInjected, true);
+      assert.deepEqual(
+        [...new Set(observedKeys.promote)],
+        [command.promotion_idempotency_key],
+      );
+      assert.deepEqual(
+        [...new Set(observedKeys.approve)],
+        [command.approval_idempotency_key],
+      );
+      assert.deepEqual(
+        [...new Set(observedKeys.apply)],
+        [command.apply_idempotency_key],
+      );
+    });
+  }
 });
 
 
@@ -511,18 +681,15 @@ test("certification decision refuses a promotion that does not target the review
     }),
   ];
   let confirmations = 0;
+  const product = driver(async () => responses.shift(), undefined, {
+    nativeConfirm: () => {
+      confirmations += 1;
+      return true;
+    },
+  });
   await assert.rejects(
-    driver(async () => responses.shift(), undefined, {
-      nativeConfirm: () => {
-        confirmations += 1;
-        return true;
-      },
-    }).completeCertificationDecision({
-      installationId: "installation-1",
-      sessionId: "session-1",
-      authoringGeneration: 1,
-      candidateRulesetHash: DIGEST,
-      previewCompletionChallengeSha256: PREVIEW_COMPLETION_CHALLENGE,
+    product.completeCertificationDecision({
+      command: certificationDecisionCommand(product),
     }),
     /promotion_candidate_identity_mismatch/,
   );
@@ -532,16 +699,13 @@ test("certification decision refuses a promotion that does not target the review
 
 test("certification decision forbids caller-supplied confirmation overrides", async () => {
   let calls = 0;
+  const product = driver(async () => {
+    calls += 1;
+    return response(500, null);
+  });
   await assert.rejects(
-    driver(async () => {
-      calls += 1;
-      return response(500, null);
-    }).completeCertificationDecision({
-      installationId: "installation-1",
-      sessionId: "session-1",
-      authoringGeneration: 1,
-      candidateRulesetHash: DIGEST,
-      previewCompletionChallengeSha256: PREVIEW_COMPLETION_CHALLENGE,
+    product.completeCertificationDecision({
+      command: certificationDecisionCommand(product),
       confirmPreview: async () => true,
     }),
     /preview_confirmation_override_forbidden/,
@@ -587,16 +751,13 @@ test("certification decision stops when native Chrome confirmation is declined",
     }),
   ];
   let calls = 0;
+  const product = driver(async () => {
+    calls += 1;
+    return responses.shift();
+  }, undefined, { nativeConfirm: () => false });
   await assert.rejects(
-    driver(async () => {
-      calls += 1;
-      return responses.shift();
-    }, undefined, { nativeConfirm: () => false }).completeCertificationDecision({
-      installationId: "installation-1",
-      sessionId: "session-1",
-      authoringGeneration: 1,
-      candidateRulesetHash: DIGEST,
-      previewCompletionChallengeSha256: PREVIEW_COMPLETION_CHALLENGE,
+    product.completeCertificationDecision({
+      command: certificationDecisionCommand(product),
     }),
     /preview_not_approved_by_operator/,
   );
@@ -616,13 +777,10 @@ test("certification decision rejects the POST turn shape at the GET session boun
       },
     }),
   ];
+  const product = driver(async () => responses.shift());
   await assert.rejects(
-    driver(async () => responses.shift()).completeCertificationDecision({
-      installationId: "installation-1",
-      sessionId: "session-1",
-      authoringGeneration: 1,
-      candidateRulesetHash: DIGEST,
-      previewCompletionChallengeSha256: PREVIEW_COMPLETION_CHALLENGE,
+    product.completeCertificationDecision({
+      command: certificationDecisionCommand(product),
     }),
     /observed_generation_invalid/,
   );
