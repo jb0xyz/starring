@@ -51,7 +51,7 @@ const EXACT_TARGET_FUNCTIONS: [&str; 3] = [
     "public.starring_runtime_exact_target_reader_database_identity_v1()",
     "public.starring_runtime_exact_target_read_v2(text,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text)",
 ];
-const SERVING_FUNCTIONS: [&str; 7] = [
+const SERVING_FUNCTIONS: [&str; 9] = [
     "public.starring_runtime_serving_database_readiness_v1()",
     "public.starring_runtime_serving_database_identity_v1()",
     "public.starring_runtime_serving_heartbeat_v1(text,text,text,text,text,bigint,bigint,bigint,bigint)",
@@ -59,6 +59,8 @@ const SERVING_FUNCTIONS: [&str; 7] = [
     "public.starring_runtime_serving_observe_v2(text,text,text,text,text,text,bigint,bigint)",
     "public.starring_runtime_serving_heartbeat_v2(text,text,text,text,text,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_serving_disconnect_if_current_v2(text,text,text,text,text,text,bigint,bigint,bigint)",
+    "public.starring_runtime_serving_observe_pending_drain_source_v1(text,bigint,text)",
+    "public.starring_runtime_serving_disconnect_pending_drain_source_if_expired_v1(text,bigint,text,text,text,text,text,text,text,bigint,text,bigint,text,text,text,bigint,bigint,bigint)",
 ];
 const EXECUTOR_FUNCTIONS: [&str; 31] = [
     "public.starring_runtime_execution_database_readiness_v1()",
