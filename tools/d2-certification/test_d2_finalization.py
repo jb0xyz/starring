@@ -109,9 +109,6 @@ class D2FinalizationTest(unittest.TestCase):
             }
         )
         self.platform.discord_existing.add(self.reconciliation_role_id)
-        ORCHESTRATOR.command_teardown_discord_resources(
-            self.context, self.platform
-        )
         self.certification_gate = mock.patch.object(
             FINALIZATION,
             "require_certification_prefix",
@@ -121,8 +118,19 @@ class D2FinalizationTest(unittest.TestCase):
             },
         )
         self.certification_mock = self.certification_gate.start()
+        self.step16_gate = mock.patch.object(
+            FINALIZATION,
+            "require_certification_step_sixteen",
+            return_value={
+                "step16_receipt_sha256": "c" * 64,
+                "step16_completion_sha256": "d" * 64,
+                "step16_completed_at": "2026-08-04T01:02:30.000001Z",
+            },
+        )
+        self.step16_mock = self.step16_gate.start()
 
     def tearDown(self):
+        self.step16_gate.stop()
         self.certification_gate.stop()
         self.fixture.tearDown()
 
@@ -132,6 +140,12 @@ class D2FinalizationTest(unittest.TestCase):
             self.platform,
             ORCHESTRATOR.command_cleanup,
             ORCHESTRATOR.command_teardown_discord_resources,
+        )
+
+    def prepare_certified_teardown(self):
+        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        return ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform, frozen=True
         )
 
     def write_browser_evidence(self, name, value):
@@ -250,6 +264,29 @@ class D2FinalizationTest(unittest.TestCase):
                 self.assertEqual(self.platform.destroy_calls, 0)
                 self.assertFalse(FINALIZATION.freeze_intent_path(self.context).exists())
                 self.platform.transport_state[section][field] = False
+
+    def test_standalone_teardown_permanently_disqualifies_certification(self):
+        result = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform
+        )
+        self.assertEqual(result["status"], "torn_down")
+        self.assertTrue(FINALIZATION.abort_teardown_tombstone_path(self.context).exists())
+        self.assertTrue(FINALIZATION.abort_teardown_evidence_path(self.context).exists())
+        self.assertFalse(
+            (
+                self.context.artifact_directory
+                / "discord-resource-teardown-evidence.json"
+            ).exists()
+        )
+        bootouts = list(self.platform.bootouts)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "standalone_teardown_certification_disqualified",
+        ):
+            self.finalize()
+        self.assertEqual(self.platform.bootouts, bootouts)
+        self.assertEqual(self.platform.destroy_calls, 0)
+        self.assertFalse(FINALIZATION.freeze_intent_path(self.context).exists())
 
     def test_finalization_directory_rejects_symlink_and_permissive_mode(self):
         finalization = FINALIZATION.finalization_directory(self.context)
@@ -423,6 +460,7 @@ class D2FinalizationTest(unittest.TestCase):
                     )
 
     def test_active_discord_resources_block_database_inspection_and_stop(self):
+        self.prepare_certified_teardown()
         path = self.context.artifact_directory / "discord-resource-teardown-evidence.json"
         value = json.loads(path.read_text())
         value["active_resources"] = [value["created_resources"][0]]
@@ -434,13 +472,7 @@ class D2FinalizationTest(unittest.TestCase):
         ):
             self.finalize()
         self.assertEqual(self.platform.inspect_calls, [])
-        self.assertEqual(
-            self.platform.bootouts[len(bootouts) :],
-            [
-                self.context.manifest["services"][name]["label"]
-                for name in FINALIZATION.FREEZE_STOP_ORDER
-            ],
-        )
+        self.assertEqual(self.platform.bootouts, bootouts)
         self.assertTrue(self.platform.database_present)
 
     def test_precleanup_blocker_prevents_service_stop_and_destroy(self):
@@ -461,6 +493,7 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertTrue(self.platform.database_present)
 
     def test_post_teardown_active_resource_drift_blocks_before_stop_or_destroy(self):
+        self.prepare_certified_teardown()
         resource_id = "1524810437118525599"
         self.platform.resource_history.append(
             {"kind": "role", "resource_id": resource_id, "state": "created"}
@@ -472,17 +505,12 @@ class D2FinalizationTest(unittest.TestCase):
             "discord_resource_teardown_evidence_invalid|discord_teardown_live_inventory_drift",
         ):
             self.finalize()
-        self.assertEqual(
-            self.platform.bootouts[len(bootouts) :],
-            [
-                self.context.manifest["services"][name]["label"]
-                for name in FINALIZATION.FREEZE_STOP_ORDER
-            ],
-        )
+        self.assertEqual(self.platform.bootouts, bootouts)
         self.assertEqual(self.platform.destroy_calls, 0)
         self.assertIn(resource_id, self.platform.discord_existing)
 
     def test_teardown_direct_observation_rejects_false_with_success_status(self):
+        self.prepare_certified_teardown()
         path = self.context.artifact_directory / "discord-resource-teardown-evidence.json"
         value = json.loads(path.read_text())
         observation = next(
@@ -516,6 +544,7 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertEqual(destroy["outcome"], "exact_replay")
 
     def test_partial_cleanup_with_stopped_postgres_resumes(self):
+        self.prepare_certified_teardown()
         FINALIZATION.command_finalize_database(self.context, self.platform)
         self.platform.postgres_stop(self.context.cluster_root)
         result = self.finalize()
@@ -557,6 +586,42 @@ class D2FinalizationTest(unittest.TestCase):
         )
         self.assertEqual(replay["status"], "exact_replay")
 
+    def test_total_absence_requires_step16_completion_before_any_write(self):
+        self.finalize()
+        prefix = self.prefix_scan()
+        guild = self.guild_deletion()
+        self.step16_mock.side_effect = ORCHESTRATOR.OrchestratorError(
+            "total_absence_step16_completion_missing"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "total_absence_step16_completion_missing",
+        ):
+            FINALIZATION.command_finalize_total_absence(
+                self.context, self.platform, str(prefix), str(guild)
+            )
+        self.assertFalse(FINALIZATION.orchestration_absence_path(self.context).exists())
+        self.assertFalse(FINALIZATION.step_seventeen_evidence_path(self.context).exists())
+
+    def test_total_absence_requires_step16_before_prefix_scan(self):
+        self.finalize()
+        prefix = self.prefix_scan()
+        guild = self.guild_deletion()
+        self.step16_mock.return_value = {
+            "step16_receipt_sha256": "c" * 64,
+            "step16_completion_sha256": "d" * 64,
+            "step16_completed_at": "2026-08-04T01:03:00.000001Z",
+        }
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "step16_absence_chronology_invalid",
+        ):
+            FINALIZATION.command_finalize_total_absence(
+                self.context, self.platform, str(prefix), str(guild)
+            )
+        self.assertFalse(FINALIZATION.orchestration_absence_path(self.context).exists())
+        self.assertFalse(FINALIZATION.step_seventeen_evidence_path(self.context).exists())
+
     def test_public_step17_assembler_rejects_partial_extra_and_identity_drift(self):
         self.finalize()
         prefix = self.prefix_scan()
@@ -586,6 +651,7 @@ class D2FinalizationTest(unittest.TestCase):
                             / "discord-resource-teardown-evidence.json"
                         ).read_text()
                     ),
+                    self.step16_mock.return_value,
                 ),
             )["discord_guild_deleted"]
         )
@@ -598,6 +664,7 @@ class D2FinalizationTest(unittest.TestCase):
                     / "discord-resource-teardown-evidence.json"
                 ).read_text()
             ),
+            self.step16_mock.return_value,
         )
         prefix_value = json.loads(prefix.read_text())
         for index, values in enumerate(

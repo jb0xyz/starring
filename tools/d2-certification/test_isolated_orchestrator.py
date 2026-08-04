@@ -2790,18 +2790,58 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
     def test_cleanup_refuses_symlinked_root_and_recovers_after_operator_restore(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         preserved = self.isolated_root.with_name(f"{self.isolated_root.name}-preserved")
+        sentinel = self.root / "cleanup-external-sentinel"
+        sentinel.write_text("preserve", encoding="utf-8")
+        bootouts = list(self.platform.bootouts)
+        deletes = list(self.platform.keychain_deletes)
+        postgres = self.platform.postgres
+        journal = self.context.journal_path.read_bytes()
         self.isolated_root.rename(preserved)
         self.isolated_root.symlink_to(self.root)
         try:
             with self.assertRaisesRegex(
-                ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+                ORCHESTRATOR.OrchestratorError, "cleanup_root_invalid"
             ):
                 ORCHESTRATOR.command_cleanup(self.context, self.platform)
+            self.assertEqual(self.platform.bootouts, bootouts)
+            self.assertEqual(self.platform.keychain_deletes, deletes)
+            self.assertEqual(self.platform.postgres, postgres)
+            self.assertEqual(self.context.journal_path.read_bytes(), journal)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
         finally:
             self.isolated_root.unlink()
             preserved.rename(self.isolated_root)
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
         self.assertFalse(self.isolated_root.exists())
+
+    def test_cleanup_refuses_symlinked_cluster_before_any_mutation(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        cluster = self.context.cluster_root
+        preserved = cluster.with_name(cluster.name + "-preserved")
+        outside = self.root / "cleanup-external-cluster"
+        outside.mkdir(mode=0o700)
+        sentinel = outside / "sentinel"
+        sentinel.write_text("preserve", encoding="utf-8")
+        bootouts = list(self.platform.bootouts)
+        deletes = list(self.platform.keychain_deletes)
+        postgres = self.platform.postgres
+        journal = self.context.journal_path.read_bytes()
+        cluster.rename(preserved)
+        cluster.symlink_to(outside, target_is_directory=True)
+        try:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "cleanup_cluster_invalid"
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+            self.assertEqual(self.platform.bootouts, bootouts)
+            self.assertEqual(self.platform.keychain_deletes, deletes)
+            self.assertEqual(self.platform.postgres, postgres)
+            self.assertEqual(self.context.journal_path.read_bytes(), journal)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
+        finally:
+            cluster.unlink()
+            preserved.rename(cluster)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_cleanup_refuses_keychain_namespace_without_matching_owner(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
@@ -3679,9 +3719,18 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         )
         evidence_path = ORCHESTRATOR.discord_teardown_evidence_path(self.context)
         progress_path = ORCHESTRATOR.discord_teardown_progress_path(self.context)
+        tombstone_path = ORCHESTRATOR.abort_teardown_tombstone_path(self.context)
         evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        tombstone = json.loads(tombstone_path.read_text(encoding="utf-8"))
         self.assertEqual(evidence_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(progress_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(tombstone_path.stat().st_mode & 0o777, 0o600)
+        self.assertTrue(tombstone["certification_permanently_disqualified"])
+        self.assertFalse(
+            ORCHESTRATOR.discord_teardown_evidence_path(
+                self.context, frozen=True
+            ).exists()
+        )
         self.assertEqual(evidence["created_resources"], evidence["deleted_resources"])
         self.assertEqual(evidence["active_resources"], [])
         self.assertEqual(evidence["resource_ids"], sorted(evidence["resource_ids"]))

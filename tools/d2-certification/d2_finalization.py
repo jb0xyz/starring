@@ -146,6 +146,30 @@ def freeze_intent_path(context):
     return finalization_directory(context) / "finalization-freeze-intent.json"
 
 
+def abort_teardown_tombstone_path(context):
+    return context.artifact_directory / "discord-resource-teardown-abort.json"
+
+
+def abort_teardown_progress_path(context):
+    return context.artifact_directory / "discord-resource-teardown-abort-progress.json"
+
+
+def abort_teardown_evidence_path(context):
+    return context.artifact_directory / "discord-resource-teardown-abort-evidence.json"
+
+
+def require_certification_eligible_teardown(context):
+    if any(
+        path.exists() or path.is_symlink()
+        for path in (
+            abort_teardown_tombstone_path(context),
+            abort_teardown_progress_path(context),
+            abort_teardown_evidence_path(context),
+        )
+    ):
+        fail("standalone_teardown_certification_disqualified")
+
+
 def precleanup_path(context):
     return finalization_directory(context) / "database-precleanup.json"
 
@@ -264,6 +288,10 @@ def validate_discord_teardown(context, value):
         "proxy_deletions",
         "direct_observations",
         "all_resources_absent",
+        "finalization_freeze_intent_sha256",
+        "certification_step15_receipt_sha256",
+        "coordinator_step15_completion_sha256",
+        "freeze_resource_inventory_digest_sha256",
     }
     _require_exact(value, fields, "discord_teardown_evidence_invalid")
     if (
@@ -283,8 +311,17 @@ def validate_discord_teardown(context, value):
         "source_inventory_digest_sha256",
         "final_inventory_digest_sha256",
         "resource_union_sha256",
+        "finalization_freeze_intent_sha256",
+        "certification_step15_receipt_sha256",
+        "coordinator_step15_completion_sha256",
+        "freeze_resource_inventory_digest_sha256",
     ):
         _require_digest(value[field], "discord_teardown_evidence_invalid")
+    binding = certified_teardown_binding(context)
+    if any(value[field] != binding[field] for field in binding) or value[
+        "source_inventory_digest_sha256"
+    ] != binding["freeze_resource_inventory_digest_sha256"]:
+        fail("discord_teardown_evidence_invalid")
     resources = [_validate_resource(resource) for resource in value["created_resources"]]
     keys = [_resource_key(resource) for resource in resources]
     if len(keys) != len(set(keys)):
@@ -668,6 +705,35 @@ def require_certification_prefix(context):
     }
 
 
+def require_certification_step_sixteen(context):
+    import d2_run
+
+    receipts = d2_run.load_receipts(
+        context.manifest_path, context.manifest, context.digest
+    )
+    if len(receipts) not in {16, 17}:
+        fail("total_absence_step16_completion_missing")
+    d2_run.coordinator_pending_step(
+        context.manifest_path, context.manifest, context.digest, receipts
+    )
+    path = d2_run.coordinator_completion_path(context.manifest_path, 16)
+    if not d2_run.path_present(path):
+        fail("total_absence_step16_completion_missing")
+    completion = d2_run.validate_completion(
+        d2_run.load_coordinator_record(path, "coordinator_completion"),
+        context.manifest,
+        context.digest,
+        16,
+    )
+    if completion["receipt_sha256"] != receipts[15]["receipt_sha256"]:
+        fail("total_absence_step16_completion_invalid")
+    return {
+        "step16_receipt_sha256": receipts[15]["receipt_sha256"],
+        "step16_completion_sha256": _digest(completion),
+        "step16_completed_at": completion["observed_at"],
+    }
+
+
 def validate_freeze_intent(context, value):
     fields = {
         "schema_version",
@@ -679,6 +745,7 @@ def validate_freeze_intent(context, value):
         "certification_step15_receipt_sha256",
         "coordinator_step15_completion_sha256",
         "transport_quiescence_sha256",
+        "resource_inventory_digest_sha256",
         "services_to_stop",
         "discord_effects_frozen",
     }
@@ -705,8 +772,31 @@ def validate_freeze_intent(context, value):
         value["transport_quiescence_sha256"],
         "finalization_freeze_intent_invalid",
     )
+    _require_digest(
+        value["resource_inventory_digest_sha256"],
+        "finalization_freeze_intent_invalid",
+    )
     _require_timestamp(value["recorded_at"], "finalization_freeze_intent_invalid")
     return value
+
+
+def certified_teardown_binding(context):
+    freeze = validate_freeze_intent(
+        context,
+        _load_private(freeze_intent_path(context), "finalization_freeze_intent"),
+    )
+    return {
+        "finalization_freeze_intent_sha256": _digest(freeze),
+        "certification_step15_receipt_sha256": freeze[
+            "certification_step15_receipt_sha256"
+        ],
+        "coordinator_step15_completion_sha256": freeze[
+            "coordinator_step15_completion_sha256"
+        ],
+        "freeze_resource_inventory_digest_sha256": freeze[
+            "resource_inventory_digest_sha256"
+        ],
+    }
 
 
 def _initial_freeze_boundary(context, platform):
@@ -723,10 +813,16 @@ def _initial_freeze_boundary(context, platform):
     instance_id = snapshot.get("instance_id") if isinstance(snapshot, dict) else None
     if instance_id != _pinned_transport_instance_id(context):
         fail("transport_instance_changed")
-    quiescence_sha256 = require_transport_quiescent(
-        context, platform, instance_id
-    )
-    return state, instance_id, quiescence_sha256
+    quiescence_sha256 = require_transport_quiescent(context, platform, instance_id)
+    inventory = platform.transport_control(context, "resource_inventory")
+    if (
+        not isinstance(inventory, dict)
+        or inventory.get("instance_id") != instance_id
+        or not isinstance(inventory.get("digest_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(inventory["digest_sha256"])
+    ):
+        fail("finalization_freeze_inventory_invalid")
+    return state, instance_id, quiescence_sha256, inventory["digest_sha256"]
 
 
 def _ensure_effect_freeze(context, platform):
@@ -742,9 +838,12 @@ def _ensure_effect_freeze(context, platform):
         ):
             validate_mutation_roots(context)
     else:
-        _state, instance_id, quiescence_sha256 = _initial_freeze_boundary(
-            context, platform
-        )
+        (
+            _state,
+            instance_id,
+            quiescence_sha256,
+            resource_inventory_digest_sha256,
+        ) = _initial_freeze_boundary(context, platform)
         certification = require_certification_prefix(context)
         intent = {
             "schema_version": 1,
@@ -760,6 +859,7 @@ def _ensure_effect_freeze(context, platform):
                 "step15_completion_sha256"
             ],
             "transport_quiescence_sha256": quiescence_sha256,
+            "resource_inventory_digest_sha256": resource_inventory_digest_sha256,
             "services_to_stop": list(FREEZE_STOP_ORDER),
             "discord_effects_frozen": True,
         }
@@ -865,6 +965,7 @@ def _load_database_artifacts(context):
 
 
 def command_finalize_database(context, platform):
+    require_certification_eligible_teardown(context)
     ensure_finalization_directory(context)
     state = load_state(context)
     if state["phase"] not in {"candidate_started", "cleaned"}:
@@ -1131,6 +1232,10 @@ def _validate_teardown_source(value):
         "proxy_deletions",
         "direct_observations",
         "all_resources_absent",
+        "finalization_freeze_intent_sha256",
+        "certification_step15_receipt_sha256",
+        "coordinator_step15_completion_sha256",
+        "freeze_resource_inventory_digest_sha256",
     }
     _require_exact(value, fields, "step16_teardown_source_invalid")
     if (
@@ -1157,9 +1262,18 @@ def _validate_teardown_source(value):
         "source_inventory_digest_sha256",
         "final_inventory_digest_sha256",
         "resource_union_sha256",
+        "finalization_freeze_intent_sha256",
+        "certification_step15_receipt_sha256",
+        "coordinator_step15_completion_sha256",
+        "freeze_resource_inventory_digest_sha256",
     ):
         _require_digest(value[field], "step16_teardown_source_invalid")
     resources = [_validate_resource(resource) for resource in value["created_resources"]]
+    if (
+        value["source_inventory_digest_sha256"]
+        != value["freeze_resource_inventory_digest_sha256"]
+    ):
+        fail("step16_teardown_source_invalid")
     resource_keys = [_resource_key(resource) for resource in resources]
     if (
         len(resource_keys) != len(set(resource_keys))
@@ -1354,11 +1468,26 @@ def _validate_step16_binding(value):
         "transport_instance_id",
         "expected_discord_resource_ids",
         "reconciliation_inventory_digest_sha256",
+        "finalization_freeze_intent_sha256",
+        "certification_step15_receipt_sha256",
+        "coordinator_step15_completion_sha256",
     }
     _require_exact(value, fields, "step16_binding_invalid")
     _require_digest(value["manifest_sha256"], "step16_binding_invalid")
     _require_digest(
         value["reconciliation_inventory_digest_sha256"],
+        "step16_binding_invalid",
+    )
+    _require_digest(
+        value["finalization_freeze_intent_sha256"],
+        "step16_binding_invalid",
+    )
+    _require_digest(
+        value["certification_step15_receipt_sha256"],
+        "step16_binding_invalid",
+    )
+    _require_digest(
+        value["coordinator_step15_completion_sha256"],
         "step16_binding_invalid",
     )
     if (
@@ -1400,6 +1529,12 @@ def assemble_teardown_evidence(database, teardown, finalization, binding):
         or teardown["resource_ids"] != binding["expected_discord_resource_ids"]
         or teardown["source_inventory_digest_sha256"]
         != binding["reconciliation_inventory_digest_sha256"]
+        or teardown["finalization_freeze_intent_sha256"]
+        != binding["finalization_freeze_intent_sha256"]
+        or teardown["certification_step15_receipt_sha256"]
+        != binding["certification_step15_receipt_sha256"]
+        or teardown["coordinator_step15_completion_sha256"]
+        != binding["coordinator_step15_completion_sha256"]
         or finalization["precleanup_sha256"] != _digest(database)
         or finalization["discord_teardown_sha256"] != _digest(teardown)
         or finalization["discord_resource_ids_deleted"] != teardown["resource_ids"]
@@ -1427,12 +1562,22 @@ def local_step16_binding(context, teardown):
         "reconciliation_inventory_digest_sha256": teardown[
             "source_inventory_digest_sha256"
         ],
+        "finalization_freeze_intent_sha256": teardown[
+            "finalization_freeze_intent_sha256"
+        ],
+        "certification_step15_receipt_sha256": teardown[
+            "certification_step15_receipt_sha256"
+        ],
+        "coordinator_step15_completion_sha256": teardown[
+            "coordinator_step15_completion_sha256"
+        ],
     }
 
 
 def command_finalize_run(
     context, platform, cleanup_boundary, teardown_boundary
 ):
+    require_certification_eligible_teardown(context)
     ensure_finalization_directory(context)
     step_path = step_sixteen_evidence_path(context)
     if step_path.exists():
@@ -1592,7 +1737,15 @@ def validate_guild_deletion(context, value):
 
 
 def validate_orchestration_absence(
-    context, value, precleanup, teardown, absence, cleanup, prefix_scan, guild
+    context,
+    value,
+    precleanup,
+    teardown,
+    absence,
+    cleanup,
+    prefix_scan,
+    guild,
+    step16_completion,
 ):
     fields = {
         "schema_version",
@@ -1609,6 +1762,9 @@ def validate_orchestration_absence(
         "discord_teardown_sha256",
         "prefix_scan_sha256",
         "guild_deletion_sha256",
+        "step16_receipt_sha256",
+        "coordinator_step16_completion_sha256",
+        "coordinator_step16_completed_at",
         "unresolved_operation_count",
         "unresolved_receipt_count",
         "unresolved_journal_count",
@@ -1661,11 +1817,36 @@ def validate_orchestration_absence(
         or value["discord_teardown_sha256"] != _digest(teardown)
         or value["prefix_scan_sha256"] != _digest(prefix_scan)
         or value["guild_deletion_sha256"] != _digest(guild)
+        or value["step16_receipt_sha256"]
+        != step16_completion["step16_receipt_sha256"]
+        or value["coordinator_step16_completion_sha256"]
+        != step16_completion["step16_completion_sha256"]
+        or value["coordinator_step16_completed_at"]
+        != step16_completion["step16_completed_at"]
         or any(type(value[field]) is not int or value[field] != 0 for field in zero_fields)
         or any(value[field] is not True for field in true_fields)
     ):
         fail("orchestrator_total_absence_evidence_invalid")
     _require_timestamp(value["observed_at"], "orchestrator_total_absence_evidence_invalid")
+    _require_digest(
+        value["step16_receipt_sha256"],
+        "orchestrator_total_absence_evidence_invalid",
+    )
+    _require_digest(
+        value["coordinator_step16_completion_sha256"],
+        "orchestrator_total_absence_evidence_invalid",
+    )
+    _require_timestamp(
+        value["coordinator_step16_completed_at"],
+        "orchestrator_total_absence_evidence_invalid",
+    )
+    if _parse_timestamp(
+        step16_completion["step16_completed_at"],
+        "orchestrator_total_absence_evidence_invalid",
+    ) >= _parse_timestamp(
+        prefix_scan["observed_at"], "orchestrator_total_absence_evidence_invalid"
+    ):
+        fail("step16_absence_chronology_invalid")
     if _parse_timestamp(
         prefix_scan["observed_at"], "orchestrator_total_absence_evidence_invalid"
     ) >= _parse_timestamp(
@@ -1676,7 +1857,14 @@ def validate_orchestration_absence(
 
 
 def new_orchestration_absence(
-    context, precleanup, teardown, absence, cleanup, prefix_scan, guild
+    context,
+    precleanup,
+    teardown,
+    absence,
+    cleanup,
+    prefix_scan,
+    guild,
+    step16_completion,
 ):
     return {
         "schema_version": 1,
@@ -1693,6 +1881,13 @@ def new_orchestration_absence(
         "discord_teardown_sha256": _digest(teardown),
         "prefix_scan_sha256": _digest(prefix_scan),
         "guild_deletion_sha256": _digest(guild),
+        "step16_receipt_sha256": step16_completion["step16_receipt_sha256"],
+        "coordinator_step16_completion_sha256": step16_completion[
+            "step16_completion_sha256"
+        ],
+        "coordinator_step16_completed_at": step16_completion[
+            "step16_completed_at"
+        ],
         "unresolved_operation_count": precleanup["unresolved_product_operation_count"],
         "unresolved_receipt_count": precleanup["unresolved_receipt_count"],
         "unresolved_journal_count": precleanup["unresolved_journal_entry_count"],
@@ -1788,6 +1983,9 @@ def _validate_orchestration_absence_source(value):
         "discord_teardown_sha256",
         "prefix_scan_sha256",
         "guild_deletion_sha256",
+        "step16_receipt_sha256",
+        "coordinator_step16_completion_sha256",
+        "coordinator_step16_completed_at",
         "unresolved_operation_count",
         "unresolved_receipt_count",
         "unresolved_journal_count",
@@ -1842,6 +2040,10 @@ def _validate_orchestration_absence_source(value):
         fail("step17_orchestration_source_invalid")
     _require_snowflake(value["guild_id"], "step17_orchestration_source_invalid")
     _require_timestamp(value["observed_at"], "step17_orchestration_source_invalid")
+    _require_timestamp(
+        value["coordinator_step16_completed_at"],
+        "step17_orchestration_source_invalid",
+    )
     for field in (
         "manifest_sha256",
         "precleanup_sha256",
@@ -1850,6 +2052,8 @@ def _validate_orchestration_absence_source(value):
         "discord_teardown_sha256",
         "prefix_scan_sha256",
         "guild_deletion_sha256",
+        "step16_receipt_sha256",
+        "coordinator_step16_completion_sha256",
     ):
         _require_digest(value[field], "step17_orchestration_source_invalid")
     return value
@@ -1890,11 +2094,18 @@ def _validate_step17_binding(value):
         "resource_prefix",
         "precleanup_sha256",
         "discord_teardown_sha256",
+        "step16_receipt_sha256",
+        "coordinator_step16_completion_sha256",
     }
     _require_exact(value, fields, "step17_binding_invalid")
     _require_digest(value["manifest_sha256"], "step17_binding_invalid")
     _require_digest(value["precleanup_sha256"], "step17_binding_invalid")
     _require_digest(value["discord_teardown_sha256"], "step17_binding_invalid")
+    _require_digest(value["step16_receipt_sha256"], "step17_binding_invalid")
+    _require_digest(
+        value["coordinator_step16_completion_sha256"],
+        "step17_binding_invalid",
+    )
     _require_snowflake(value["guild_id"], "step17_binding_invalid")
     if (
         not isinstance(value["run_id"], str)
@@ -1928,12 +2139,21 @@ def assemble_absence_evidence(database, orchestration, prefix_scan, guild, bindi
         or orchestration["precleanup_sha256"] != binding["precleanup_sha256"]
         or orchestration["discord_teardown_sha256"]
         != binding["discord_teardown_sha256"]
+        or orchestration["step16_receipt_sha256"]
+        != binding["step16_receipt_sha256"]
+        or orchestration["coordinator_step16_completion_sha256"]
+        != binding["coordinator_step16_completion_sha256"]
         or orchestration["database_absence_sha256"] != _digest(database)
         or orchestration["prefix_scan_sha256"] != _digest(prefix_scan)
         or orchestration["guild_deletion_sha256"] != _digest(guild)
     ):
         fail("step17_source_evidence_invalid")
     if _parse_timestamp(
+        orchestration["coordinator_step16_completed_at"],
+        "step17_source_evidence_invalid",
+    ) >= _parse_timestamp(
+        prefix_scan["observed_at"], "step17_source_evidence_invalid"
+    ) or _parse_timestamp(
         prefix_scan["observed_at"], "step17_source_evidence_invalid"
     ) >= _parse_timestamp(guild["observed_at"], "step17_source_evidence_invalid"):
         fail("step17_source_chronology_invalid")
@@ -1961,7 +2181,7 @@ def assemble_absence_evidence(database, orchestration, prefix_scan, guild, bindi
     }
 
 
-def local_step17_binding(context, precleanup, teardown):
+def local_step17_binding(context, precleanup, teardown, step16_completion):
     return {
         "manifest_sha256": context.digest,
         "run_id": context.manifest["run_id"],
@@ -1972,12 +2192,17 @@ def local_step17_binding(context, precleanup, teardown):
         "resource_prefix": context.manifest["discord"]["resource_prefix"],
         "precleanup_sha256": _digest(precleanup),
         "discord_teardown_sha256": _digest(teardown),
+        "step16_receipt_sha256": step16_completion["step16_receipt_sha256"],
+        "coordinator_step16_completion_sha256": step16_completion[
+            "step16_completion_sha256"
+        ],
     }
 
 
 def command_finalize_total_absence(
     context, platform, prefix_scan_evidence_path, guild_deletion_evidence_path
 ):
+    step16_completion = require_certification_step_sixteen(context)
     ensure_finalization_directory(context)
     state = load_state(context, {"cleaned"})
     precleanup, teardown, _intent, _result, absence = _load_database_artifacts(context)
@@ -2036,10 +2261,18 @@ def command_finalize_total_absence(
             cleanup,
             prefix_scan,
             guild,
+            step16_completion,
         )
     else:
         orchestration = new_orchestration_absence(
-            context, precleanup, teardown, absence, cleanup, prefix_scan, guild
+            context,
+            precleanup,
+            teardown,
+            absence,
+            cleanup,
+            prefix_scan,
+            guild,
+            step16_completion,
         )
         validate_orchestration_absence(
             context,
@@ -2050,6 +2283,7 @@ def command_finalize_total_absence(
             cleanup,
             prefix_scan,
             guild,
+            step16_completion,
         )
         write_atomic(orchestration_path, canonical_json(orchestration) + "\n")
     step = assemble_absence_evidence(
@@ -2057,7 +2291,7 @@ def command_finalize_total_absence(
         orchestration,
         prefix_scan,
         guild,
-        local_step17_binding(context, precleanup, teardown),
+        local_step17_binding(context, precleanup, teardown, step16_completion),
     )
     step_path = step_seventeen_evidence_path(context)
     if step_path.exists():

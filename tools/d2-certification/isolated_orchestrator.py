@@ -59,8 +59,13 @@ from d2_drained_runtime_restart import (
     drained_runtime_restart_temporary_directory,
 )
 from d2_finalization import (
+    abort_teardown_evidence_path,
+    abort_teardown_progress_path,
+    abort_teardown_tombstone_path,
+    certified_teardown_binding,
     command_finalize_run,
     command_finalize_total_absence,
+    require_certification_eligible_teardown,
 )
 from d2_live_runtime_restart import command_certify_live_runtime_restart
 from d2_source_contract import (
@@ -84,6 +89,7 @@ DISCORD_RESOURCE_UNKNOWN_CODES = {
 DISCORD_RESOURCE_SUCCESS_STATUS = {"role": 204, "channel": 200, "message": 204}
 DISCORD_TEARDOWN_PROGRESS_KIND = "starring.d2.discord-resource-teardown-progress.v1"
 DISCORD_TEARDOWN_EVIDENCE_KIND = "starring.d2.discord-resource-teardown.v1"
+DISCORD_TEARDOWN_ABORT_KIND = "starring.d2.discord-resource-teardown-abort.v1"
 RECONCILIATION_DISCORD_OBSERVATION_KIND = (
     "starring.d2.discord-reconciliation-role-observation.v1"
 )
@@ -1469,17 +1475,73 @@ def discord_resource_union_sha256(resources):
     return hashlib.sha256(canonical_json(resources).encode("utf-8")).hexdigest()
 
 
-def discord_teardown_progress_path(context):
-    return context.artifact_directory / "discord-resource-teardown-progress.json"
+def discord_teardown_progress_path(context, frozen=False):
+    if frozen:
+        return context.artifact_directory / "discord-resource-teardown-progress.json"
+    return abort_teardown_progress_path(context)
 
 
-def discord_teardown_evidence_path(context):
-    return context.artifact_directory / "discord-resource-teardown-evidence.json"
+def discord_teardown_evidence_path(context, frozen=False):
+    if frozen:
+        return context.artifact_directory / "discord-resource-teardown-evidence.json"
+    return abort_teardown_evidence_path(context)
 
 
 def load_private_json(path, label):
     require_owned_mode(path, 0o600, label)
     return load_json_file(path, label)
+
+
+def validate_abort_teardown_tombstone(context, value, inventory):
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "schema_version",
+            "kind",
+            "manifest_sha256",
+            "run_id",
+            "recorded_at",
+            "transport_instance_id",
+            "source_inventory_digest_sha256",
+            "certification_permanently_disqualified",
+        }
+        or value["schema_version"] != 1
+        or value["kind"] != DISCORD_TEARDOWN_ABORT_KIND
+        or value["manifest_sha256"] != context.digest
+        or value["run_id"] != context.manifest["run_id"]
+        or not isinstance(value["recorded_at"], str)
+        or not TRANSPORT_RECORDED_AT_PATTERN.fullmatch(value["recorded_at"])
+        or value["transport_instance_id"] != inventory["instance_id"]
+        or not isinstance(value["source_inventory_digest_sha256"], str)
+        or not DIGEST_PATTERN.fullmatch(value["source_inventory_digest_sha256"])
+        or value["certification_permanently_disqualified"] is not True
+    ):
+        fail("discord_resource_teardown_abort_invalid")
+    return value
+
+
+def ensure_abort_teardown_tombstone(context, inventory):
+    path = abort_teardown_tombstone_path(context)
+    if path.exists():
+        return validate_abort_teardown_tombstone(
+            context,
+            load_private_json(path, "discord_resource_teardown_abort"),
+            inventory,
+        )
+    value = {
+        "schema_version": 1,
+        "kind": DISCORD_TEARDOWN_ABORT_KIND,
+        "manifest_sha256": context.digest,
+        "run_id": context.manifest["run_id"],
+        "recorded_at": utc_now(),
+        "transport_instance_id": inventory["instance_id"],
+        "source_inventory_digest_sha256": inventory["digest_sha256"],
+        "certification_permanently_disqualified": True,
+    }
+    validate_abort_teardown_tombstone(context, value, inventory)
+    write_atomic(path, canonical_json(value) + "\n")
+    return value
 
 
 def discord_teardown_record(resource, disposition, http_status=None, discord_code=None):
@@ -1617,13 +1679,13 @@ def new_discord_teardown_progress(context, inventory):
     }
 
 
-def write_discord_teardown_progress(context, progress):
+def write_discord_teardown_progress(context, progress, frozen=False):
     write_atomic(
-        discord_teardown_progress_path(context), canonical_json(progress) + "\n"
+        discord_teardown_progress_path(context, frozen), canonical_json(progress) + "\n"
     )
 
 
-def reconcile_discord_teardown_progress(context, progress, inventory):
+def reconcile_discord_teardown_progress(context, progress, inventory, frozen=False):
     completed = {
         discord_resource_identity_key(discord_teardown_record_resource(record))
         for record in progress["deletions"]
@@ -1643,7 +1705,7 @@ def reconcile_discord_teardown_progress(context, progress, inventory):
                 discord_teardown_record_resource(record)
             )
         )
-        write_discord_teardown_progress(context, progress)
+        write_discord_teardown_progress(context, progress, frozen)
     return progress
 
 
@@ -1772,7 +1834,9 @@ def discord_resource_id_lists(resources):
     }
 
 
-def validate_discord_teardown_evidence(context, evidence, inventory):
+def validate_discord_teardown_evidence(
+    context, evidence, inventory, certification_binding=None
+):
     required = {
         "schema_version",
         "kind",
@@ -1794,6 +1858,8 @@ def validate_discord_teardown_evidence(context, evidence, inventory):
         "direct_observations",
         "all_resources_absent",
     }
+    if certification_binding is not None:
+        required.update(certification_binding)
     resources = inventory["created"]
     identifiers = discord_resource_id_lists(resources)
     if (
@@ -1823,6 +1889,11 @@ def validate_discord_teardown_evidence(context, evidence, inventory):
         or not isinstance(evidence["direct_observations"], list)
         or inventory["deleted"] != resources
         or inventory["active"] != []
+    ):
+        fail("discord_resource_teardown_evidence_invalid")
+    if certification_binding is not None and any(
+        evidence[field] != value
+        for field, value in certification_binding.items()
     ):
         fail("discord_resource_teardown_evidence_invalid")
     progress_view = {
@@ -1856,6 +1927,8 @@ def validate_discord_teardown_evidence(context, evidence, inventory):
 
 
 def command_teardown_discord_resources(context, platform, frozen=False):
+    if frozen:
+        require_certification_eligible_teardown(context)
     boundary = (
         require_frozen_discord_teardown_boundary
         if frozen
@@ -1865,12 +1938,21 @@ def command_teardown_discord_resources(context, platform, frozen=False):
     inventory = platform.transport_control(context, "resource_inventory")
     if inventory["instance_id"] != snapshot["instance_id"]:
         fail("transport_instance_changed")
-    evidence_path = discord_teardown_evidence_path(context)
+    certification_binding = certified_teardown_binding(context) if frozen else None
+    if certification_binding is not None and inventory["digest_sha256"] != (
+        certification_binding["freeze_resource_inventory_digest_sha256"]
+    ):
+        fail("discord_teardown_live_inventory_drift")
+    if not frozen:
+        ensure_abort_teardown_tombstone(context, inventory)
+    evidence_path = discord_teardown_evidence_path(context, frozen)
     if evidence_path.exists():
         evidence = load_private_json(
             evidence_path, "discord_resource_teardown_evidence"
         )
-        validate_discord_teardown_evidence(context, evidence, inventory)
+        validate_discord_teardown_evidence(
+            context, evidence, inventory, certification_binding
+        )
         observe_absent_discord_resources(context, platform, inventory)
         final_inventory = platform.transport_control(context, "resource_inventory")
         if final_inventory["digest_sha256"] != inventory["digest_sha256"]:
@@ -1885,7 +1967,7 @@ def command_teardown_discord_resources(context, platform, frozen=False):
             "all_resources_absent": True,
             "evidence": str(evidence_path),
         }
-    progress_path = discord_teardown_progress_path(context)
+    progress_path = discord_teardown_progress_path(context, frozen)
     if progress_path.exists():
         progress = load_private_json(
             progress_path, "discord_resource_teardown_progress"
@@ -1894,8 +1976,10 @@ def command_teardown_discord_resources(context, platform, frozen=False):
     else:
         progress = new_discord_teardown_progress(context, inventory)
         append_journal(context, "discord_resource_teardown", "intent", "resources")
-        write_discord_teardown_progress(context, progress)
-    progress = reconcile_discord_teardown_progress(context, progress, inventory)
+        write_discord_teardown_progress(context, progress, frozen)
+    progress = reconcile_discord_teardown_progress(
+        context, progress, inventory, frozen
+    )
     completed = {
         discord_resource_identity_key(discord_teardown_record_resource(record))
         for record in progress["deletions"]
@@ -1933,7 +2017,7 @@ def command_teardown_discord_resources(context, platform, frozen=False):
                 discord_teardown_record_resource(value)
             )
         )
-        write_discord_teardown_progress(context, progress)
+        write_discord_teardown_progress(context, progress, frozen)
         completed.add(key)
     final_inventory = platform.transport_control(context, "resource_inventory")
     if (
@@ -1976,8 +2060,11 @@ def command_teardown_discord_resources(context, platform, frozen=False):
         "proxy_deletions": progress["deletions"],
         "direct_observations": observations,
         "all_resources_absent": True,
+        **(certification_binding or {}),
     }
-    validate_discord_teardown_evidence(context, evidence, final_inventory)
+    validate_discord_teardown_evidence(
+        context, evidence, final_inventory, certification_binding
+    )
     write_atomic(evidence_path, canonical_json(evidence) + "\n")
     append_journal(context, "discord_resource_teardown", "complete", "resources")
     return {
@@ -2008,7 +2095,40 @@ def guarded_remove_root(context):
     shutil.rmtree(context.root)
 
 
+def validate_cleanup_mutation_roots(context):
+    expected = pathlib.Path(f"/private/tmp/starring-d2-{context.manifest['run_id']}")
+    if context.root != expected or context.cluster_root != expected / "postgres":
+        fail("cleanup_root_guard_failed")
+    try:
+        root_metadata = context.root.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        fail("cleanup_root_invalid")
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or context.root.is_symlink()
+        or root_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+    ):
+        fail("cleanup_root_invalid")
+    try:
+        cluster_metadata = context.cluster_root.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        fail("cleanup_cluster_invalid")
+    if (
+        not stat.S_ISDIR(cluster_metadata.st_mode)
+        or context.cluster_root.is_symlink()
+        or cluster_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(cluster_metadata.st_mode) != 0o700
+    ):
+        fail("cleanup_cluster_invalid")
+
+
 def cleanup(context, platform, expected_snapshot, from_failure=False):
+    validate_cleanup_mutation_roots(context)
     append_journal(context, "cleanup", "intent", "run")
     failures = []
     for name in SERVICE_STOP_ORDER:
