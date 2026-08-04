@@ -97,6 +97,7 @@ INDETERMINATE_EFFECT_ID = MODULE.canonical_effect_identity_sha256(
 
 def complete_evidence(manifest):
     prefix = manifest["discord"]["resource_prefix"]
+    installation_id = f"installation:{prefix}"
     return {
         1: {
             "database_system_identifier": "7667905772642692043",
@@ -132,7 +133,7 @@ def complete_evidence(manifest):
         4: {
             "me_status": 200,
             "principal_id": "discord:1056857223529250906",
-            "installation_id": "installation-1",
+            "installation_id": installation_id,
             "guild_id": "1524810437118525551",
             "authority_check_status": 204,
             "public_origin": manifest["cloudflare"]["public_origin"],
@@ -141,7 +142,7 @@ def complete_evidence(manifest):
             "authoring_http_status": 200,
             "authoring_session_id": "authoring-session-1",
             "authoring_generation": 1,
-            "installation_id": "installation-1",
+            "installation_id": installation_id,
             "model": "gpt-5.6-luna",
             "provider": "codex_chatgpt",
             "reasoning_effort": "medium",
@@ -154,11 +155,11 @@ def complete_evidence(manifest):
             "projection_state": "preview_ready",
             "generation": 1,
             "payload_digest": DIGEST,
-            "installation_id": "installation-1",
+            "installation_id": installation_id,
             "authoring_session_id": "authoring-session-1",
         },
         7: {
-            "installation_id": "installation-1",
+            "installation_id": installation_id,
             "promotion_id": DIGEST,
             "preview_state": "pending_approval",
             "approval_state": "approved",
@@ -168,7 +169,7 @@ def complete_evidence(manifest):
         8: {
             "pending_observed": True,
             "live_observed": True,
-            "installation_id": "installation-1",
+            "installation_id": installation_id,
             "promotion_id": DIGEST,
             "deployment_id": "deployment-1",
             "route_id": ROUTE_ID_INITIAL,
@@ -186,6 +187,7 @@ def complete_evidence(manifest):
             "channel_ids": ["1532677575736819848"],
             "panel_message_ids": ["1532677575736819849"],
             "ephemeral_count": 2,
+            "inventory_digest_sha256": DIGEST,
             "transport_instance_id": TRANSPORT_INSTANCE_ID,
         },
         10: {
@@ -197,6 +199,10 @@ def complete_evidence(manifest):
             "transport_duplicate_injections": 1,
             "transport_duplicate_delivery_count": 2,
             "transport_last_duplicate_interaction_id": "1532677575736819846",
+            "role_ids": ["1532677575736819847"],
+            "channel_ids": ["1532677575736819848"],
+            "panel_message_ids": ["1532677575736819849"],
+            "inventory_digest_sha256": DIGEST,
             "transport_instance_id": TRANSPORT_INSTANCE_ID,
         },
         11: {
@@ -216,7 +222,7 @@ def complete_evidence(manifest):
                 "certify-live-runtime-restart"
             ),
             "shutdown_boundary": "2026-08-03T01:00:00Z",
-            "installation_id": "installation-1",
+            "installation_id": installation_id,
             "promotion_id": DIGEST,
             "attestation_revision": 11,
             "public_origin": manifest["cloudflare"]["public_origin"],
@@ -242,12 +248,17 @@ def complete_evidence(manifest):
             "reconciliation_state": "known_success",
             "duplicate_external_effect_count": 0,
             "unsafe_deletion_count": 0,
+            "output_role_id": "1532677575736819852",
+            "reconciliation_inventory_digest_sha256": DIGEST,
             "transport_indeterminate_injections": 1,
             "transport_last_audit_reason_sha256": DIGEST,
             "transport_last_upstream_status": 201,
             "transport_instance_id": TRANSPORT_INSTANCE_ID,
         },
         14: {
+            "installation_id": installation_id,
+            "source_promotion_id": DIGEST,
+            "replacement_promotion_id": "a" * 64,
             "replacement_target_id": "deployment-2",
             "replacement_kind": "rollback",
             "source_deployment_id": "deployment-1",
@@ -260,10 +271,19 @@ def complete_evidence(manifest):
             "public_origin": manifest["cloudflare"]["public_origin"],
         },
         15: {
+            "installation_id": installation_id,
+            "promotion_id": "a" * 64,
             "gateway_disconnected": True,
             "live_lost": True,
+            "deployment_http_status": 200,
+            "operational_http_status": 200,
+            "product_state": "runtime_unavailable",
+            "operational_state": "unavailable",
+            "runtime_phase": "disconnected",
+            "serving_state": "absent",
             "runtime_ready_status": 503,
             "public_code": "runtime_gateway_disconnected",
+            "retryable": True,
             "route_id": ROUTE_ID_REPLACEMENT,
             "transport_gateway_partitioned": True,
             "transport_gateway_partition_events": 1,
@@ -276,9 +296,12 @@ def complete_evidence(manifest):
                 "1532677575736819847",
                 "1532677575736819848",
                 "1532677575736819849",
+                "1532677575736819852",
             ],
             "database_drop_requested": True,
             "services_stopped": True,
+            "precleanup_sha256": DIGEST,
+            "discord_teardown_sha256": DIGEST,
         },
         17: {
             "unresolved_operation_count": 0,

@@ -96,6 +96,7 @@ CODEX_WORKER_SOURCE_FILES = (
 D2_TOOLCHAIN_SOURCE_FILES = (
     "d2_certification.py",
     "d2_evidence.py",
+    "d2_finalization.py",
     "d2_orchestrator_composition.py",
     "d2_orchestrator_contract.py",
     "d2_orchestrator_platform.py",
@@ -252,6 +253,7 @@ STEP_SPECS = {
             "channel_ids",
             "panel_message_ids",
             "ephemeral_count",
+            "inventory_digest_sha256",
             "transport_instance_id",
         ),
     ),
@@ -266,6 +268,10 @@ STEP_SPECS = {
             "transport_duplicate_injections",
             "transport_duplicate_delivery_count",
             "transport_last_duplicate_interaction_id",
+            "role_ids",
+            "channel_ids",
+            "panel_message_ids",
+            "inventory_digest_sha256",
             "transport_instance_id",
         ),
     ),
@@ -317,6 +323,8 @@ STEP_SPECS = {
             "reconciliation_state",
             "duplicate_external_effect_count",
             "unsafe_deletion_count",
+            "output_role_id",
+            "reconciliation_inventory_digest_sha256",
             "transport_indeterminate_injections",
             "transport_last_audit_reason_sha256",
             "transport_last_upstream_status",
@@ -326,6 +334,9 @@ STEP_SPECS = {
     14: StepSpec(
         "target_replaced",
         (
+            "installation_id",
+            "source_promotion_id",
+            "replacement_promotion_id",
             "replacement_target_id",
             "replacement_kind",
             "source_deployment_id",
@@ -341,10 +352,19 @@ STEP_SPECS = {
     15: StepSpec(
         "gateway_disconnect_failed_closed",
         (
+            "installation_id",
+            "promotion_id",
             "gateway_disconnected",
             "live_lost",
+            "deployment_http_status",
+            "operational_http_status",
+            "product_state",
+            "operational_state",
+            "runtime_phase",
+            "serving_state",
             "runtime_ready_status",
             "public_code",
+            "retryable",
             "route_id",
             "transport_gateway_partitioned",
             "transport_gateway_partition_events",
@@ -359,6 +379,8 @@ STEP_SPECS = {
             "discord_resource_ids_deleted",
             "database_drop_requested",
             "services_stopped",
+            "precleanup_sha256",
+            "discord_teardown_sha256",
         ),
     ),
     17: StepSpec(
@@ -1318,6 +1340,11 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             fail("step_contract_failed:guild_id")
         if evidence["principal_id"] != f"discord:{manifest['discord']['actor_id']}":
             fail("step_contract_failed:principal_id")
+        if (
+            evidence["installation_id"]
+            != f"installation:{manifest['discord']['resource_prefix']}"
+        ):
+            fail("step_contract_failed:installation_id")
         if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:
             fail("step_contract_failed:public_origin")
     elif step == 5:
@@ -1399,6 +1426,7 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         if evidence["create_interaction_id"] == evidence["join_interaction_id"]:
             fail("step_contract_failed:interaction_identity")
         require_digest(evidence, "route_id")
+        require_digest(evidence, "inventory_digest_sha256")
         if (
             evidence["deployment_id"]
             != prior_receipts[7]["evidence"]["deployment_id"]
@@ -1450,6 +1478,14 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             != evidence["interaction_id"]
         ):
             fail("step_contract_failed:transport_duplicate_evidence")
+        require_digest(evidence, "inventory_digest_sha256")
+        if evidence["inventory_digest_sha256"] != prior_receipts[8]["evidence"][
+            "inventory_digest_sha256"
+        ]:
+            fail("step_contract_failed:duplicate_inventory_digest")
+        for field in ("role_ids", "channel_ids", "panel_message_ids"):
+            if evidence[field] != prior_receipts[8]["evidence"][field]:
+                fail(f"step_contract_failed:duplicate_{field}")
         if (
             evidence["transport_instance_id"]
             != prior_receipts[2]["evidence"]["transport_instance_id"]
@@ -1556,8 +1592,13 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         }:
             fail("step_contract_failed:reconstruction_probe_interaction")
     elif step == 13:
-        require_snowflake_fields(evidence, "interaction_id")
-        require_digest(evidence, "effect_id", "route_id")
+        require_snowflake_fields(evidence, "interaction_id", "output_role_id")
+        require_digest(
+            evidence,
+            "effect_id",
+            "route_id",
+            "reconciliation_inventory_digest_sha256",
+        )
         if (
             evidence["route_id"]
             != prior_receipts[11]["evidence"]["reconstructed_route_id"]
@@ -1566,15 +1607,19 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         if evidence["interaction_id"] in {
             prior_receipts[8]["evidence"]["create_interaction_id"],
             prior_receipts[8]["evidence"]["join_interaction_id"],
+            prior_receipts[11]["evidence"]["probe_interaction_id"],
         }:
             fail("step_contract_failed:injection_interaction_id")
+        prior_resource_ids = set(
+            prior_receipts[8]["evidence"]["role_ids"]
+            + prior_receipts[8]["evidence"]["channel_ids"]
+            + prior_receipts[8]["evidence"]["panel_message_ids"]
+        )
+        if evidence["output_role_id"] in prior_resource_ids:
+            fail("step_contract_failed:output_role_id")
         if evidence["injected_outcome"] != "indeterminate":
             fail("step_contract_failed:injected_outcome")
-        if evidence["reconciliation_state"] not in (
-            "known_success",
-            "known_failure",
-            "compensated",
-        ):
+        if evidence["reconciliation_state"] != "known_success":
             fail("step_contract_failed:reconciliation_state")
         require_zero(evidence, "duplicate_external_effect_count", "unsafe_deletion_count")
         if evidence["transport_indeterminate_injections"] != 1:
@@ -1593,11 +1638,27 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
     elif step == 14:
         require_identifier(
             evidence,
+            "installation_id",
             "replacement_target_id",
             "source_deployment_id",
             "replacement_deployment_id",
         )
-        require_digest(evidence, "source_route_id", "replacement_route_id")
+        require_digest(
+            evidence,
+            "source_promotion_id",
+            "replacement_promotion_id",
+            "source_route_id",
+            "replacement_route_id",
+        )
+        if (
+            evidence["installation_id"]
+            != prior_receipts[7]["evidence"]["installation_id"]
+            or evidence["source_promotion_id"]
+            != prior_receipts[7]["evidence"]["promotion_id"]
+            or evidence["replacement_promotion_id"]
+            == evidence["source_promotion_id"]
+        ):
+            fail("step_contract_failed:replacement_product_identity")
         source_identity_matches = (
             evidence["source_deployment_id"]
             == prior_receipts[11]["evidence"]["deployment_id"]
@@ -1621,10 +1682,30 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:
             fail("step_contract_failed:public_origin")
     elif step == 15:
+        require_identifier(evidence, "installation_id")
+        require_digest(evidence, "promotion_id")
         require_true(evidence, "gateway_disconnected", "live_lost")
+        if (
+            evidence["installation_id"]
+            != prior_receipts[13]["evidence"]["installation_id"]
+            or evidence["promotion_id"]
+            != prior_receipts[13]["evidence"]["replacement_promotion_id"]
+        ):
+            fail("step_contract_failed:live_loss_product_identity")
+        expected_public_state = {
+            "deployment_http_status": 200,
+            "operational_http_status": 200,
+            "product_state": "runtime_unavailable",
+            "operational_state": "unavailable",
+            "runtime_phase": "disconnected",
+            "serving_state": "absent",
+            "public_code": "runtime_gateway_disconnected",
+            "retryable": True,
+        }
+        if any(evidence[field] != value for field, value in expected_public_state.items()):
+            fail("step_contract_failed:live_loss_public_state")
         if evidence["runtime_ready_status"] != 503:
             fail("step_contract_failed:runtime_ready_status")
-        require_identifier(evidence, "public_code")
         require_digest(evidence, "route_id")
         if evidence["route_id"] != prior_receipts[13]["evidence"]["replacement_route_id"]:
             fail("step_contract_failed:route_id")
@@ -1644,6 +1725,7 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             "database_drop_requested",
             "services_stopped",
         )
+        require_digest(evidence, "precleanup_sha256", "discord_teardown_sha256")
         deleted = evidence["discord_resource_ids_deleted"]
         if not isinstance(deleted, list) or not deleted:
             fail("step_contract_failed:discord_resource_ids_deleted")
@@ -1658,6 +1740,7 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             prior_receipts[8]["evidence"]["role_ids"]
             + prior_receipts[8]["evidence"]["channel_ids"]
             + prior_receipts[8]["evidence"]["panel_message_ids"]
+            + [prior_receipts[12]["evidence"]["output_role_id"]]
         )
         if len(deleted) != len(set(deleted)) or set(deleted) != created:
             fail("step_contract_failed:discord_resource_ids_deleted")

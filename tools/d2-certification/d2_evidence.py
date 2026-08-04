@@ -664,6 +664,7 @@ def assemble_interaction_evidence(database, transport):
         "role_ids",
         "channel_ids",
         "panel_message_ids",
+        "inventory_digest_sha256",
         "transport_instance_id",
     }
     durable = _require_envelope(
@@ -684,10 +685,21 @@ def assemble_interaction_evidence(database, transport):
     for field in ("role_ids", "channel_ids", "panel_message_ids"):
         durable_ids = _require_snowflake_list(durable[field], f"interaction_{field}_invalid")
         inventory_ids = _require_snowflake_list(inventory[field], f"transport_{field}_invalid")
-        if set(durable_ids) != set(inventory_ids):
+        if durable_ids != inventory_ids:
             _fail(f"interaction_{field}_mismatch")
+    resource_ids = (
+        durable["role_ids"]
+        + durable["channel_ids"]
+        + durable["panel_message_ids"]
+    )
+    if len(resource_ids) != len(set(resource_ids)):
+        _fail("interaction_resource_identity_invalid")
     _require_positive_integer(durable["ephemeral_count"], "interaction_ephemeral_count_invalid")
     _require_identifier(inventory["transport_instance_id"], "transport_instance_id_invalid")
+    _require_digest(
+        inventory["inventory_digest_sha256"],
+        "interaction_inventory_digest_invalid",
+    )
     return {
         "create_interaction_id": durable["create_interaction_id"],
         "join_interaction_id": durable["join_interaction_id"],
@@ -698,6 +710,7 @@ def assemble_interaction_evidence(database, transport):
         "channel_ids": durable["channel_ids"],
         "panel_message_ids": durable["panel_message_ids"],
         "ephemeral_count": durable["ephemeral_count"],
+        "inventory_digest_sha256": inventory["inventory_digest_sha256"],
         "transport_instance_id": inventory["transport_instance_id"],
     }
 
@@ -715,6 +728,10 @@ def assemble_duplicate_evidence(database, transport):
         "transport_duplicate_injections",
         "transport_duplicate_delivery_count",
         "transport_last_duplicate_interaction_id",
+        "role_ids",
+        "channel_ids",
+        "panel_message_ids",
+        "inventory_digest_sha256",
         "transport_instance_id",
     }
     durable = _require_envelope(
@@ -744,6 +761,21 @@ def assemble_duplicate_evidence(database, transport):
     ):
         _fail("duplicate_transport_outcome_invalid")
     _require_identifier(injected["transport_instance_id"], "transport_instance_id_invalid")
+    _require_digest(
+        injected["inventory_digest_sha256"],
+        "duplicate_inventory_digest_invalid",
+    )
+    for field in ("role_ids", "channel_ids", "panel_message_ids"):
+        _require_snowflake_list(
+            injected[field], f"duplicate_{field}_invalid"
+        )
+    resource_ids = (
+        injected["role_ids"]
+        + injected["channel_ids"]
+        + injected["panel_message_ids"]
+    )
+    if len(resource_ids) != len(set(resource_ids)):
+        _fail("duplicate_resource_identity_invalid")
     return {
         "interaction_id": interaction_id,
         "effect_id": effect_id,
@@ -755,6 +787,10 @@ def assemble_duplicate_evidence(database, transport):
         "transport_last_duplicate_interaction_id": injected[
             "transport_last_duplicate_interaction_id"
         ],
+        "role_ids": injected["role_ids"],
+        "channel_ids": injected["channel_ids"],
+        "panel_message_ids": injected["panel_message_ids"],
+        "inventory_digest_sha256": injected["inventory_digest_sha256"],
         "transport_instance_id": injected["transport_instance_id"],
     }
 
@@ -828,7 +864,7 @@ def assemble_reconstruction_evidence(database):
     }
 
 
-def assemble_reconciliation_evidence(database, transport):
+def assemble_reconciliation_evidence(database, transport, discord):
     database_fields = {
         "effect_identity",
         "interaction_id",
@@ -836,6 +872,7 @@ def assemble_reconciliation_evidence(database, transport):
         "reconciliation_state",
         "duplicate_external_effect_count",
         "unsafe_deletion_count",
+        "output_role_id",
     }
     transport_fields = {
         "injected_outcome",
@@ -844,11 +881,26 @@ def assemble_reconciliation_evidence(database, transport):
         "transport_last_upstream_status",
         "transport_instance_id",
     }
+    discord_fields = {
+        "transport_instance_id",
+        "inventory_digest_sha256",
+        "resource_kind",
+        "resource_id",
+        "channel_id",
+        "http_status",
+        "discord_code",
+        "exists",
+    }
     durable = _require_envelope(
         database, "starring.d2.db-reconciliation-evidence.v1", database_fields
     )
     injected = _require_envelope(
         transport, "starring.d2.transport-indeterminate-evidence.v1", transport_fields
+    )
+    observed = _require_envelope(
+        discord,
+        "starring.d2.discord-reconciliation-role-observation.v1",
+        discord_fields,
     )
     interaction_id = durable["interaction_id"]
     _require_snowflake(interaction_id, "reconciliation_interaction_id_invalid")
@@ -856,9 +908,10 @@ def assemble_reconciliation_evidence(database, transport):
         _fail("reconciliation_effect_interaction_mismatch")
     effect_id = canonical_effect_identity_sha256(durable["effect_identity"])
     route_id = canonical_route_identity_sha256(durable["route_identity"])
+    _require_snowflake(durable["output_role_id"], "reconciliation_output_role_id_invalid")
     _require_state(
         durable["reconciliation_state"],
-        {"known_success", "known_failure", "compensated"},
+        {"known_success"},
         "reconciliation_state_invalid",
     )
     _require_nonnegative_integer(
@@ -892,6 +945,21 @@ def assemble_reconciliation_evidence(database, transport):
         set(range(200, 300)),
     )
     _require_identifier(injected["transport_instance_id"], "transport_instance_id_invalid")
+    _require_identifier(observed["transport_instance_id"], "transport_instance_id_invalid")
+    _require_digest(
+        observed["inventory_digest_sha256"],
+        "reconciliation_inventory_digest_invalid",
+    )
+    if (
+        observed["transport_instance_id"] != injected["transport_instance_id"]
+        or observed["resource_kind"] != "role"
+        or observed["resource_id"] != durable["output_role_id"]
+        or observed["channel_id"] is not None
+        or observed["http_status"] != 200
+        or observed["discord_code"] is not None
+        or observed["exists"] is not True
+    ):
+        _fail("reconciliation_discord_observation_invalid")
     return {
         "effect_id": effect_id,
         "interaction_id": interaction_id,
@@ -900,6 +968,10 @@ def assemble_reconciliation_evidence(database, transport):
         "reconciliation_state": durable["reconciliation_state"],
         "duplicate_external_effect_count": durable["duplicate_external_effect_count"],
         "unsafe_deletion_count": durable["unsafe_deletion_count"],
+        "output_role_id": durable["output_role_id"],
+        "reconciliation_inventory_digest_sha256": observed[
+            "inventory_digest_sha256"
+        ],
         "transport_indeterminate_injections": injected[
             "transport_indeterminate_injections"
         ],
@@ -990,6 +1062,9 @@ def assemble_replacement_evidence(browser, database):
     if source_route_id == replacement_route_id:
         _fail("replacement_route_not_rotated")
     return {
+        "installation_id": public["installation_id"],
+        "source_promotion_id": public["source_promotion_id"],
+        "replacement_promotion_id": public["replacement_promotion_id"],
         "replacement_target_id": durable["replacement_deployment_id"],
         "replacement_kind": public["replacement_kind"],
         "source_deployment_id": durable["source_deployment_id"],
@@ -1003,7 +1078,7 @@ def assemble_replacement_evidence(browser, database):
     }
 
 
-def assemble_live_loss_evidence(browser, transport, prior_route_id):
+def assemble_live_loss_evidence(browser, transport, prior_binding):
     browser_fields = {
         "public_origin",
         "installation_id",
@@ -1034,16 +1109,70 @@ def assemble_live_loss_evidence(browser, transport, prior_route_id):
     _require_public_origin(public["public_origin"], "browser_public_origin_invalid")
     _require_identifier(public["installation_id"], "live_loss_installation_id_invalid")
     _require_digest(public["promotion_id"], "live_loss_promotion_id_invalid")
+    binding = _require_exact_object(
+        prior_binding,
+        {
+            "installation_id",
+            "replacement_promotion_id",
+            "replacement_route_id",
+        },
+        "live_loss_prior_binding_invalid",
+    )
+    _require_identifier(
+        binding["installation_id"], "live_loss_prior_installation_id_invalid"
+    )
+    _require_digest(
+        binding["replacement_promotion_id"],
+        "live_loss_prior_promotion_id_invalid",
+    )
+    route_id = validate_canonical_identity_sha256(
+        binding["replacement_route_id"], "live_loss_prior_route_id_invalid"
+    )
+    if (
+        public["installation_id"] != binding["installation_id"]
+        or public["promotion_id"] != binding["replacement_promotion_id"]
+    ):
+        _fail("live_loss_replacement_identity_mismatch")
     if public["live_lost"] is not True or injected["gateway_disconnected"] is not True:
         _fail("live_loss_not_observed")
-    _require_http_status(public["deployment_http_status"], "live_loss_deployment_status_invalid")
-    _require_http_status(public["operational_http_status"], "live_loss_operational_status_invalid")
-    _require_identifier(public["product_state"], "live_loss_product_state_invalid")
-    _require_identifier(public["operational_state"], "live_loss_operational_state_invalid")
-    _require_identifier(public["runtime_phase"], "live_loss_runtime_phase_invalid")
-    _require_identifier(public["serving_state"], "live_loss_serving_state_invalid")
-    _require_identifier(public["public_code"], "live_loss_public_code_invalid")
+    _require_http_status(
+        public["deployment_http_status"],
+        "live_loss_deployment_status_invalid",
+        {200},
+    )
+    _require_http_status(
+        public["operational_http_status"],
+        "live_loss_operational_status_invalid",
+        {200},
+    )
+    _require_state(
+        public["product_state"],
+        {"runtime_unavailable"},
+        "live_loss_product_state_invalid",
+    )
+    _require_state(
+        public["operational_state"],
+        {"unavailable"},
+        "live_loss_operational_state_invalid",
+    )
+    _require_state(
+        public["runtime_phase"],
+        {"disconnected"},
+        "live_loss_runtime_phase_invalid",
+    )
+    _require_state(
+        public["serving_state"],
+        {"absent"},
+        "live_loss_serving_state_invalid",
+    )
+    _require_state(
+        public["public_code"],
+        {"runtime_gateway_disconnected"},
+        "live_loss_public_code_invalid",
+    )
     _require_boolean(public["retryable"], "live_loss_retryable_invalid")
+    if public["retryable"] is not True:
+        _fail("live_loss_retryable_invalid")
     if injected["runtime_ready_status"] != 503:
         _fail("live_loss_runtime_ready_status_invalid")
     if injected["transport_gateway_partitioned"] is not True:
@@ -1052,14 +1181,20 @@ def assemble_live_loss_evidence(browser, transport, prior_route_id):
         injected["transport_gateway_partition_events"], "live_loss_partition_events_invalid"
     )
     _require_identifier(injected["transport_instance_id"], "transport_instance_id_invalid")
-    route_id = validate_canonical_identity_sha256(
-        prior_route_id, "live_loss_prior_route_id_invalid"
-    )
     return {
+        "installation_id": public["installation_id"],
+        "promotion_id": public["promotion_id"],
         "gateway_disconnected": True,
         "live_lost": True,
+        "deployment_http_status": public["deployment_http_status"],
+        "operational_http_status": public["operational_http_status"],
+        "product_state": public["product_state"],
+        "operational_state": public["operational_state"],
+        "runtime_phase": public["runtime_phase"],
+        "serving_state": public["serving_state"],
         "runtime_ready_status": injected["runtime_ready_status"],
         "public_code": public["public_code"],
+        "retryable": public["retryable"],
         "route_id": route_id,
         "transport_gateway_partitioned": True,
         "transport_gateway_partition_events": injected[

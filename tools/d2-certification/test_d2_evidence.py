@@ -289,6 +289,7 @@ class D2EvidenceTest(unittest.TestCase):
             role_ids=["1532677575736819847"],
             channel_ids=["1532677575736819848"],
             panel_message_ids=["1532677575736819849"],
+            inventory_digest_sha256="b" * 64,
             transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
         )
         evidence = MODULE.assemble_interaction_evidence(database, transport)
@@ -313,6 +314,10 @@ class D2EvidenceTest(unittest.TestCase):
             transport_duplicate_injections=1,
             transport_duplicate_delivery_count=2,
             transport_last_duplicate_interaction_id="1532677575736819846",
+            role_ids=["1532677575736819847"],
+            channel_ids=["1532677575736819848"],
+            panel_message_ids=["1532677575736819849"],
+            inventory_digest_sha256="b" * 64,
             transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
         )
         evidence = MODULE.assemble_duplicate_evidence(database, transport)
@@ -365,6 +370,7 @@ class D2EvidenceTest(unittest.TestCase):
             reconciliation_state="known_success",
             duplicate_external_effect_count=0,
             unsafe_deletion_count=0,
+            output_role_id="1532677575736819852",
         )
         effect_id = MODULE.canonical_effect_identity_sha256(
             database["effect_identity"]
@@ -379,36 +385,88 @@ class D2EvidenceTest(unittest.TestCase):
             transport_last_upstream_status=201,
             transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
         )
-        evidence = MODULE.assemble_reconciliation_evidence(database, transport)
+        discord = envelope(
+            "starring.d2.discord-reconciliation-role-observation.v1",
+            transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
+            inventory_digest_sha256="b" * 64,
+            resource_kind="role",
+            resource_id="1532677575736819852",
+            channel_id=None,
+            http_status=200,
+            discord_code=None,
+            exists=True,
+        )
+        evidence = MODULE.assemble_reconciliation_evidence(
+            database, transport, discord
+        )
         self.assertEqual(evidence["reconciliation_state"], "known_success")
+        self.assertEqual(evidence["output_role_id"], "1532677575736819852")
+        self.assertEqual(evidence["reconciliation_inventory_digest_sha256"], "b" * 64)
         unsafe = copy.deepcopy(database)
         unsafe["unsafe_deletion_count"] = 1
         with self.assertRaisesRegex(MODULE.EvidenceContractError, "reconciliation_safety_invalid"):
-            MODULE.assemble_reconciliation_evidence(unsafe, transport)
+            MODULE.assemble_reconciliation_evidence(unsafe, transport, discord)
         mismatched = copy.deepcopy(transport)
         mismatched["transport_last_audit_reason_sha256"] = "f" * 64
         with self.assertRaisesRegex(
             MODULE.EvidenceContractError,
             "reconciliation_audit_correlation_mismatch",
         ):
-            MODULE.assemble_reconciliation_evidence(database, mismatched)
+            MODULE.assemble_reconciliation_evidence(database, mismatched, discord)
         raw_interaction = copy.deepcopy(transport)
         raw_interaction["interaction_id"] = interaction_id
         with self.assertRaisesRegex(MODULE.EvidenceContractError, "fields_invalid"):
-            MODULE.assemble_reconciliation_evidence(database, raw_interaction)
+            MODULE.assemble_reconciliation_evidence(
+                database, raw_interaction, discord
+            )
         boolean_counter = copy.deepcopy(transport)
         boolean_counter["transport_indeterminate_injections"] = True
         with self.assertRaisesRegex(
             MODULE.EvidenceContractError, "indeterminate_injection_count_invalid"
         ):
-            MODULE.assemble_reconciliation_evidence(database, boolean_counter)
+            MODULE.assemble_reconciliation_evidence(
+                database, boolean_counter, discord
+            )
         boolean_safety = copy.deepcopy(database)
         boolean_safety["unsafe_deletion_count"] = False
         with self.assertRaisesRegex(
             MODULE.EvidenceContractError,
             "reconciliation_unsafe_deletion_count_invalid",
         ):
-            MODULE.assemble_reconciliation_evidence(boolean_safety, transport)
+            MODULE.assemble_reconciliation_evidence(
+                boolean_safety, transport, discord
+            )
+        missing = copy.deepcopy(discord)
+        missing["exists"] = False
+        missing["http_status"] = 404
+        missing["discord_code"] = 10011
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError,
+            "reconciliation_discord_observation_invalid",
+        ):
+            MODULE.assemble_reconciliation_evidence(
+                database, transport, missing
+            )
+        wrong_role = copy.deepcopy(discord)
+        wrong_role["resource_id"] = "1532677575736819853"
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError,
+            "reconciliation_discord_observation_invalid",
+        ):
+            MODULE.assemble_reconciliation_evidence(
+                database, transport, wrong_role
+            )
+        wrong_instance = copy.deepcopy(discord)
+        wrong_instance["transport_instance_id"] = (
+            "d2ti-fedcba9876543210fedcba9876543210"
+        )
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError,
+            "reconciliation_discord_observation_invalid",
+        ):
+            MODULE.assemble_reconciliation_evidence(
+                database, transport, wrong_instance
+            )
 
     def test_replacement_and_live_loss_adapters_require_independent_sources(self):
         replacement_browser = envelope(
@@ -470,7 +528,15 @@ class D2EvidenceTest(unittest.TestCase):
             transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
         )
         loss = MODULE.assemble_live_loss_evidence(
-            loss_browser, loss_transport, replacement["replacement_route_id"]
+            loss_browser,
+            loss_transport,
+            {
+                "installation_id": replacement["installation_id"],
+                "replacement_promotion_id": replacement[
+                    "replacement_promotion_id"
+                ],
+                "replacement_route_id": replacement["replacement_route_id"],
+            },
         )
         self.assertEqual(replacement["replacement_route_id"], loss["route_id"])
         self.assertEqual(loss["runtime_ready_status"], 503)
@@ -480,12 +546,30 @@ class D2EvidenceTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(MODULE.EvidenceContractError, "fields_invalid"):
             MODULE.assemble_live_loss_evidence(
-                loss_browser, raw_route, replacement["replacement_route_id"]
+                loss_browser,
+                raw_route,
+                {
+                    "installation_id": replacement["installation_id"],
+                    "replacement_promotion_id": replacement[
+                        "replacement_promotion_id"
+                    ],
+                    "replacement_route_id": replacement["replacement_route_id"],
+                },
             )
         with self.assertRaisesRegex(
             MODULE.EvidenceContractError, "live_loss_prior_route_id_invalid"
         ):
-            MODULE.assemble_live_loss_evidence(loss_browser, loss_transport, "route-raw")
+            MODULE.assemble_live_loss_evidence(
+                loss_browser,
+                loss_transport,
+                {
+                    "installation_id": replacement["installation_id"],
+                    "replacement_promotion_id": replacement[
+                        "replacement_promotion_id"
+                    ],
+                    "replacement_route_id": "route-raw",
+                },
+            )
 
     def test_envelopes_reject_extra_and_forbidden_nested_fields(self):
         browser = envelope(

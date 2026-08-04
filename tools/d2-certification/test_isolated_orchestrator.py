@@ -3029,6 +3029,18 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             )
             self.assertEqual(arguments.command, "transport-evidence")
             self.assertEqual(arguments.checkpoint, checkpoint)
+        observation = ORCHESTRATOR.build_parser().parse_args(
+            [
+                "reconciliation-discord-observation",
+                "--manifest",
+                str(self.manifest_path),
+                "--database-evidence",
+                str(self.root / "database.json"),
+            ]
+        )
+        self.assertEqual(
+            observation.command, "reconciliation-discord-observation"
+        )
 
     def test_interaction_transport_evidence_projects_exact_active_inventory(self):
         inventory = self.start_candidate_with_discord_resources()
@@ -3048,8 +3060,12 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
                 "role_ids",
                 "channel_ids",
                 "panel_message_ids",
+                "inventory_digest_sha256",
                 "transport_instance_id",
             },
+        )
+        self.assertEqual(
+            evidence["inventory_digest_sha256"], inventory["digest_sha256"]
         )
         self.assertEqual(
             evidence["role_ids"],
@@ -3095,7 +3111,7 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             )
 
     def test_duplicate_transport_evidence_is_counter_and_interaction_bound(self):
-        self.start_candidate_with_discord_resources()
+        inventory = self.start_candidate_with_discord_resources()
         gateway = self.platform.transport_state["gateway"]
         gateway["last_duplicate_interaction_id"] = "1532677575736819846"
         gateway["duplicate_injections"] = 1
@@ -3112,6 +3128,17 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         self.assertEqual(evidence["delivery_count"], 2)
         self.assertEqual(evidence["transport_duplicate_injections"], 1)
         self.assertEqual(evidence["transport_duplicate_delivery_count"], 2)
+        self.assertEqual(
+            evidence["inventory_digest_sha256"], inventory["digest_sha256"]
+        )
+        self.assertEqual(
+            evidence["role_ids"],
+            sorted(
+                resource["resource_id"]
+                for resource in inventory["active"]
+                if resource["kind"] == "role"
+            ),
+        )
         self.assertNotIn("operation_id", evidence)
         gateway["duplicate_delivery_count"] = 3
         with self.assertRaisesRegex(
@@ -3179,6 +3206,122 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         ):
             ORCHESTRATOR.command_transport_evidence(
                 self.context, self.platform, "reconciliation"
+            )
+
+    def write_reconciliation_database_evidence(
+        self, output_role_id="1524810437118525590", **overrides
+    ):
+        interaction_id = "1532677575736819850"
+        evidence = {
+            "schema_version": 1,
+            "kind": "starring.d2.db-reconciliation-evidence.v1",
+            "observed_at": "2026-08-04T12:00:01.123Z",
+            "effect_identity": {
+                "application_id": self.context.manifest["discord"]["application_id"],
+                "interaction_id": interaction_id,
+                "action_index": 0,
+            },
+            "interaction_id": interaction_id,
+            "route_identity": {"deployment_id": "deployment-1"},
+            "reconciliation_state": "known_success",
+            "duplicate_external_effect_count": 0,
+            "unsafe_deletion_count": 0,
+            "output_role_id": output_role_id,
+        }
+        evidence.update(overrides)
+        path = self.root / "db-reconciliation.json"
+        path.write_text(json.dumps(evidence), encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def add_reconciliation_role(self):
+        resource_id = "1524810437118525590"
+        self.platform.resource_history.append(
+            {"kind": "role", "resource_id": resource_id, "state": "created"}
+        )
+        self.platform.discord_existing.add(resource_id)
+        return resource_id
+
+    def test_reconciliation_discord_observation_binds_active_role_and_inventory(self):
+        inventory = self.start_candidate_with_discord_resources()
+        output_role_id = self.add_reconciliation_role()
+        inventory = self.platform.resource_inventory(self.context)
+        database = self.write_reconciliation_database_evidence()
+        result = ORCHESTRATOR.command_reconciliation_discord_observation(
+            self.context, self.platform, str(database)
+        )
+        self.assertEqual(result["status"], "recorded")
+        path = ORCHESTRATOR.reconciliation_discord_observation_path(self.context)
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            set(evidence),
+            {
+                "schema_version",
+                "kind",
+                "observed_at",
+                "transport_instance_id",
+                "inventory_digest_sha256",
+                "resource_kind",
+                "resource_id",
+                "channel_id",
+                "http_status",
+                "discord_code",
+                "exists",
+            },
+        )
+        self.assertEqual(
+            evidence["kind"],
+            ORCHESTRATOR.RECONCILIATION_DISCORD_OBSERVATION_KIND,
+        )
+        self.assertEqual(evidence["resource_id"], output_role_id)
+        self.assertEqual(evidence["inventory_digest_sha256"], inventory["digest_sha256"])
+        self.assertEqual(evidence["http_status"], 200)
+        self.assertIsNone(evidence["discord_code"])
+        self.assertTrue(evidence["exists"])
+        replay = ORCHESTRATOR.command_reconciliation_discord_observation(
+            self.context, self.platform, str(database)
+        )
+        self.assertEqual(replay["status"], "exact_replay")
+        serialized = json.dumps(evidence).lower()
+        for forbidden in ("authorization", "bot ", "token", "response_body"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_reconciliation_discord_observation_rejects_wrong_or_absent_role(self):
+        self.start_candidate_with_discord_resources()
+        self.add_reconciliation_role()
+        wrong = self.write_reconciliation_database_evidence(
+            output_role_id="1524810437118525599"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "reconciliation_output_role_not_active",
+        ):
+            ORCHESTRATOR.command_reconciliation_discord_observation(
+                self.context, self.platform, str(wrong)
+            )
+        database = self.write_reconciliation_database_evidence()
+        self.platform.discord_existing.discard("1524810437118525590")
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "reconciliation_discord_observation_invalid",
+        ):
+            ORCHESTRATOR.command_reconciliation_discord_observation(
+                self.context, self.platform, str(database)
+            )
+
+    def test_reconciliation_discord_observation_rejects_non_success_database(self):
+        self.start_candidate_with_discord_resources()
+        self.add_reconciliation_role()
+        database = self.write_reconciliation_database_evidence(
+            reconciliation_state="known_failure"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "reconciliation_database_evidence_invalid",
+        ):
+            ORCHESTRATOR.command_reconciliation_discord_observation(
+                self.context, self.platform, str(database)
             )
 
     def test_gateway_loss_transport_evidence_uses_unready_boundary_without_route(self):

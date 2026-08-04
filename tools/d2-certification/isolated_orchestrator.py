@@ -57,6 +57,10 @@ from d2_drained_runtime_restart import (
     drained_runtime_restart_directory,
     drained_runtime_restart_temporary_directory,
 )
+from d2_finalization import (
+    command_finalize_run,
+    command_finalize_total_absence,
+)
 from d2_live_runtime_restart import command_certify_live_runtime_restart
 from d2_worker_evidence import capture_worker_authoring_checkpoint
 
@@ -74,6 +78,9 @@ DISCORD_RESOURCE_UNKNOWN_CODES = {
 DISCORD_RESOURCE_SUCCESS_STATUS = {"role": 204, "channel": 200, "message": 204}
 DISCORD_TEARDOWN_PROGRESS_KIND = "starring.d2.discord-resource-teardown-progress.v1"
 DISCORD_TEARDOWN_EVIDENCE_KIND = "starring.d2.discord-resource-teardown.v1"
+RECONCILIATION_DISCORD_OBSERVATION_KIND = (
+    "starring.d2.discord-reconciliation-role-observation.v1"
+)
 TRANSPORT_EVIDENCE_KINDS = {
     "interaction": "starring.d2.transport-resource-evidence.v1",
     "duplicate": "starring.d2.transport-duplicate-evidence.v1",
@@ -539,6 +546,9 @@ TRANSPORT_OPERATION_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.:-]{7,95}$")
 TRANSPORT_RECORDED_AT_PATTERN = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
 )
+EVIDENCE_RECORDED_AT_PATTERN = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$"
+)
 
 
 def transport_control_directory(context):
@@ -844,6 +854,27 @@ def require_candidate_certification_boundary(context, platform):
     return state, snapshot
 
 
+def require_frozen_discord_teardown_boundary(context, platform):
+    state = load_state(context, {"candidate_started"})
+    if not platform.postgres_running(context.cluster_root):
+        fail("finalization_freeze_state_drift")
+    required = ("transport", "worker", "api")
+    stopped = ("runtime", "tunnel")
+    if any(
+        not platform.launchd_loaded(context.manifest["services"][name]["label"])
+        for name in required
+    ) or any(
+        platform.launchd_loaded(context.manifest["services"][name]["label"])
+        for name in stopped
+    ):
+        fail("finalization_freeze_state_drift")
+    if standing_snapshot(context, platform) != state["standing_snapshot"]:
+        fail("protected_staging_state_changed")
+    snapshot = platform.transport_control(context, "snapshot")
+    require_pinned_transport_snapshot(context, snapshot)
+    return state, snapshot
+
+
 def command_resource_inventory(context, platform):
     _state, snapshot = require_candidate_certification_boundary(context, platform)
     inventory = platform.transport_control(context, "resource_inventory")
@@ -893,6 +924,7 @@ def validate_transport_evidence_payload(context, checkpoint, evidence):
             "role_ids",
             "channel_ids",
             "panel_message_ids",
+            "inventory_digest_sha256",
             "transport_instance_id",
         },
         "duplicate": {
@@ -901,6 +933,10 @@ def validate_transport_evidence_payload(context, checkpoint, evidence):
             "transport_duplicate_injections",
             "transport_duplicate_delivery_count",
             "transport_last_duplicate_interaction_id",
+            "role_ids",
+            "channel_ids",
+            "panel_message_ids",
+            "inventory_digest_sha256",
             "transport_instance_id",
         },
         "reconciliation": {
@@ -931,6 +967,7 @@ def validate_transport_evidence_payload(context, checkpoint, evidence):
     ):
         fail("transport_evidence_invalid")
     if checkpoint == "interaction":
+        _require_transport_inventory_projection(evidence)
         for field in ("role_ids", "channel_ids", "panel_message_ids"):
             values = evidence[field]
             if (
@@ -944,6 +981,7 @@ def validate_transport_evidence_payload(context, checkpoint, evidence):
             for value in values:
                 validate_snowflake(value, f"transport_{field}")
     elif checkpoint == "duplicate":
+        _require_transport_inventory_projection(evidence)
         validate_snowflake(evidence["interaction_id"], "transport_interaction_id")
         validate_snowflake(
             evidence["transport_last_duplicate_interaction_id"],
@@ -1017,13 +1055,45 @@ def interaction_transport_evidence(context, platform, snapshot):
         "kind": TRANSPORT_EVIDENCE_KINDS["interaction"],
         "observed_at": utc_now(),
         **values,
+        "inventory_digest_sha256": inventory["digest_sha256"],
         "transport_instance_id": inventory["instance_id"],
     }
 
 
-def duplicate_transport_evidence(snapshot):
+def _require_transport_inventory_projection(evidence):
+    digest = evidence.get("inventory_digest_sha256")
+    if not isinstance(digest, str) or not DIGEST_PATTERN.fullmatch(digest):
+        fail("transport_inventory_projection_invalid")
+    for field in ("role_ids", "channel_ids", "panel_message_ids"):
+        values = evidence.get(field)
+        if (
+            not isinstance(values, list)
+            or not values
+            or values != sorted(values)
+            or len(values) != len(set(values))
+        ):
+            fail("transport_inventory_projection_invalid")
+        for value in values:
+            validate_snowflake(value, f"transport_{field}")
+    resource_ids = (
+        evidence["role_ids"]
+        + evidence["channel_ids"]
+        + evidence["panel_message_ids"]
+    )
+    if len(resource_ids) != len(set(resource_ids)):
+        fail("transport_inventory_projection_invalid")
+
+
+def duplicate_transport_evidence(context, platform, snapshot):
     gateway = snapshot["gateway"]
     interaction_id = gateway["last_duplicate_interaction_id"]
+    inventory = platform.transport_control(context, "resource_inventory")
+    if (
+        inventory["instance_id"] != snapshot["instance_id"]
+        or inventory["deleted"] != []
+        or inventory["active"] != inventory["created"]
+    ):
+        fail("transport_duplicate_inventory_invalid")
     return {
         "schema_version": 1,
         "kind": TRANSPORT_EVIDENCE_KINDS["duplicate"],
@@ -1035,6 +1105,22 @@ def duplicate_transport_evidence(snapshot):
             "duplicate_delivery_count"
         ],
         "transport_last_duplicate_interaction_id": interaction_id,
+        "role_ids": sorted(
+            resource["resource_id"]
+            for resource in inventory["active"]
+            if resource["kind"] == "role"
+        ),
+        "channel_ids": sorted(
+            resource["resource_id"]
+            for resource in inventory["active"]
+            if resource["kind"] == "channel"
+        ),
+        "panel_message_ids": sorted(
+            resource["resource_id"]
+            for resource in inventory["active"]
+            if resource["kind"] == "message"
+        ),
+        "inventory_digest_sha256": inventory["digest_sha256"],
         "transport_instance_id": snapshot["instance_id"],
     }
 
@@ -1086,7 +1172,7 @@ def command_transport_evidence(context, platform, checkpoint):
         if checkpoint == "interaction":
             current = interaction_transport_evidence(context, platform, snapshot)
         elif checkpoint == "duplicate":
-            current = duplicate_transport_evidence(snapshot)
+            current = duplicate_transport_evidence(context, platform, snapshot)
         else:
             current = reconciliation_transport_evidence(snapshot)
     validate_transport_evidence_payload(context, checkpoint, current)
@@ -1139,6 +1225,181 @@ def command_worker_authoring_evidence(
     return capture_worker_authoring_checkpoint(
         context, health, checkpoint, browser
     )
+
+
+def reconciliation_discord_observation_path(context):
+    return (
+        context.artifact_directory
+        / "discord-evidence"
+        / "reconciliation-role.json"
+    )
+
+
+def validate_reconciliation_database_source(value):
+    fields = {
+        "schema_version",
+        "kind",
+        "observed_at",
+        "effect_identity",
+        "interaction_id",
+        "route_identity",
+        "reconciliation_state",
+        "duplicate_external_effect_count",
+        "unsafe_deletion_count",
+        "output_role_id",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or value["schema_version"] != 1
+        or value["kind"] != "starring.d2.db-reconciliation-evidence.v1"
+        or not isinstance(value["observed_at"], str)
+        or not EVIDENCE_RECORDED_AT_PATTERN.fullmatch(value["observed_at"])
+        or value["reconciliation_state"] != "known_success"
+        or value["duplicate_external_effect_count"] != 0
+        or value["unsafe_deletion_count"] != 0
+        or type(value["duplicate_external_effect_count"]) is not int
+        or type(value["unsafe_deletion_count"]) is not int
+        or not isinstance(value["effect_identity"], dict)
+        or not isinstance(value["route_identity"], dict)
+    ):
+        fail("reconciliation_database_evidence_invalid")
+    validate_snowflake(value["interaction_id"], "reconciliation_interaction_id")
+    validate_snowflake(value["output_role_id"], "reconciliation_output_role_id")
+    if value["effect_identity"].get("interaction_id") != value["interaction_id"]:
+        fail("reconciliation_database_evidence_invalid")
+    return value
+
+
+def validate_reconciliation_discord_observation(context, value, inventory, role_id):
+    fields = {
+        "schema_version",
+        "kind",
+        "observed_at",
+        "transport_instance_id",
+        "inventory_digest_sha256",
+        "resource_kind",
+        "resource_id",
+        "channel_id",
+        "http_status",
+        "discord_code",
+        "exists",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or value["schema_version"] != 1
+        or value["kind"] != RECONCILIATION_DISCORD_OBSERVATION_KIND
+        or not isinstance(value["observed_at"], str)
+        or not EVIDENCE_RECORDED_AT_PATTERN.fullmatch(value["observed_at"])
+        or value["transport_instance_id"] != inventory["instance_id"]
+        or value["inventory_digest_sha256"] != inventory["digest_sha256"]
+        or value["resource_kind"] != "role"
+        or value["resource_id"] != role_id
+        or value["channel_id"] is not None
+        or value["http_status"] != 200
+        or value["discord_code"] is not None
+        or value["exists"] is not True
+    ):
+        fail("reconciliation_discord_observation_invalid")
+    require_pinned_transport_snapshot(
+        context, {"instance_id": value["transport_instance_id"]}
+    )
+    return value
+
+
+def current_reconciliation_discord_observation(
+    context, platform, database, inventory
+):
+    role_id = database["output_role_id"]
+    resource = {"kind": "role", "resource_id": role_id}
+    if resource not in inventory["active"]:
+        fail("reconciliation_output_role_not_active")
+    observed = platform.discord_observe_resource(context, resource, inventory)
+    if (
+        not isinstance(observed, dict)
+        or set(observed)
+        != {
+            "schema_version",
+            "kind",
+            "transport_instance_id",
+            "inventory_digest_sha256",
+            "resource_kind",
+            "resource_id",
+            "channel_id",
+            "http_status",
+            "discord_code",
+            "exists",
+        }
+        or observed["schema_version"] != 1
+        or observed["kind"]
+        != "starring.d2.discord-resource-observation.v1"
+    ):
+        fail("reconciliation_discord_observation_invalid")
+    evidence = {
+        **observed,
+        "kind": RECONCILIATION_DISCORD_OBSERVATION_KIND,
+        "observed_at": utc_now(),
+    }
+    return validate_reconciliation_discord_observation(
+        context, evidence, inventory, role_id
+    )
+
+
+def command_reconciliation_discord_observation(
+    context, platform, database_evidence_path
+):
+    _state, snapshot = require_candidate_certification_boundary(context, platform)
+    database_path = require_absolute_path(
+        database_evidence_path, "reconciliation_database_evidence"
+    )
+    database = validate_reconciliation_database_source(
+        load_private_json(database_path, "reconciliation_database_evidence")
+    )
+    inventory = platform.transport_control(context, "resource_inventory")
+    if inventory["instance_id"] != snapshot["instance_id"]:
+        fail("transport_instance_changed")
+    current = current_reconciliation_discord_observation(
+        context, platform, database, inventory
+    )
+    path = reconciliation_discord_observation_path(context)
+    if path.exists():
+        recorded = validate_reconciliation_discord_observation(
+            context,
+            load_private_json(path, "reconciliation_discord_observation"),
+            inventory,
+            database["output_role_id"],
+        )
+        if {
+            key: value for key, value in current.items() if key != "observed_at"
+        } != {
+            key: value for key, value in recorded.items() if key != "observed_at"
+        }:
+            fail("reconciliation_discord_observation_replay_drift")
+        status = "exact_replay"
+    else:
+        append_journal(
+            context, "reconciliation_discord_observation", "intent", "role"
+        )
+        write_atomic(path, canonical_json(current) + "\n")
+        recorded = validate_reconciliation_discord_observation(
+            context,
+            load_private_json(path, "reconciliation_discord_observation"),
+            inventory,
+            database["output_role_id"],
+        )
+        append_journal(
+            context, "reconciliation_discord_observation", "complete", "role"
+        )
+        status = "recorded"
+    return {
+        "status": status,
+        "phase": "candidate_started",
+        "kind": recorded["kind"],
+        "transport_instance_id": recorded["transport_instance_id"],
+        "resource_id": recorded["resource_id"],
+        "evidence": str(path),
+    }
 
 
 def discord_resource_identity_key(resource):
@@ -1547,8 +1808,13 @@ def validate_discord_teardown_evidence(context, evidence, inventory):
     return evidence
 
 
-def command_teardown_discord_resources(context, platform):
-    _state, snapshot = require_candidate_certification_boundary(context, platform)
+def command_teardown_discord_resources(context, platform, frozen=False):
+    boundary = (
+        require_frozen_discord_teardown_boundary
+        if frozen
+        else require_candidate_certification_boundary
+    )
+    _state, snapshot = boundary(context, platform)
     inventory = platform.transport_control(context, "resource_inventory")
     if inventory["instance_id"] != snapshot["instance_id"]:
         fail("transport_instance_changed")
@@ -1562,7 +1828,7 @@ def command_teardown_discord_resources(context, platform):
         final_inventory = platform.transport_control(context, "resource_inventory")
         if final_inventory["digest_sha256"] != inventory["digest_sha256"]:
             fail("discord_resource_teardown_replay_drift")
-        require_candidate_certification_boundary(context, platform)
+        boundary(context, platform)
         return {
             "status": "exact_replay",
             "phase": "candidate_started",
@@ -1636,7 +1902,7 @@ def command_teardown_discord_resources(context, platform):
     observations = observe_absent_discord_resources(
         context, platform, final_inventory
     )
-    _state, final_snapshot = require_candidate_certification_boundary(context, platform)
+    _state, final_snapshot = boundary(context, platform)
     confirmed_inventory = platform.transport_control(context, "resource_inventory")
     if (
         final_snapshot["instance_id"] != final_inventory["instance_id"]
@@ -1817,6 +2083,7 @@ def build_parser():
         "restart-drained-runtime",
         "resource-inventory",
         "teardown-discord-resources",
+        "finalize-run",
         "stop",
         "cleanup",
         "status",
@@ -1858,6 +2125,17 @@ def build_parser():
         "--checkpoint", required=True, choices=("before", "after")
     )
     worker_evidence.add_argument("--browser-evidence")
+    reconciliation_observation = subparsers.add_parser(
+        "reconciliation-discord-observation"
+    )
+    reconciliation_observation.add_argument("--manifest", required=True)
+    reconciliation_observation.add_argument(
+        "--database-evidence", required=True
+    )
+    total_absence = subparsers.add_parser("finalize-total-absence")
+    total_absence.add_argument("--manifest", required=True)
+    total_absence.add_argument("--prefix-scan-evidence", required=True)
+    total_absence.add_argument("--guild-deletion-evidence", required=True)
     return parser
 
 
@@ -1900,6 +2178,26 @@ def main():
                     platform,
                     arguments.checkpoint,
                     arguments.browser_evidence,
+                )
+            elif arguments.command == "reconciliation-discord-observation":
+                result = command_reconciliation_discord_observation(
+                    context,
+                    platform,
+                    arguments.database_evidence,
+                )
+            elif arguments.command == "finalize-run":
+                result = command_finalize_run(
+                    context,
+                    platform,
+                    command_cleanup,
+                    command_teardown_discord_resources,
+                )
+            elif arguments.command == "finalize-total-absence":
+                result = command_finalize_total_absence(
+                    context,
+                    platform,
+                    arguments.prefix_scan_evidence,
+                    arguments.guild_deletion_evidence,
                 )
             elif arguments.command == "certify-live-runtime-restart":
                 confirmation_path = (
