@@ -34,6 +34,12 @@ COORDINATOR_COMPLETION_KIND = "starring.d2.coordinator-step-completion.v1"
 COORDINATOR_LEDGER_KIND = "starring.d2.coordinator-evidence-ledger.v1"
 COORDINATOR_FINAL_KIND = "starring.d2.coordinator-final-record.v1"
 COORDINATOR_LEDGER_DOMAIN = b"starring.d2.coordinator-evidence-ledger.v1\x00"
+PREVIEW_COMPLETION_CHALLENGE_KIND = (
+    "starring.d2.preview-completion-challenge.v1"
+)
+PREVIEW_COMPLETION_CHALLENGE_DOMAIN = (
+    b"starring.d2.preview-completion-challenge.v1\x00"
+)
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 HUMAN_BOUNDARIES = {
     4: "complete_discord_oauth",
@@ -799,7 +805,17 @@ def coordinator_record_digest(record):
 
 def preview_completion_challenge(manifest, digest, completion):
     validate_completion(completion, manifest, digest, 6)
-    return coordinator_record_digest(completion)
+    payload = {
+        "kind": PREVIEW_COMPLETION_CHALLENGE_KIND,
+        "manifest_sha256": digest,
+        "run_id": manifest["run_id"],
+        "step6_receipt_sha256": completion["receipt_sha256"],
+        "step6_completion_sha256": coordinator_record_digest(completion),
+    }
+    return sha256_bytes(
+        PREVIEW_COMPLETION_CHALLENGE_DOMAIN
+        + canonical_json(payload).encode("utf-8")
+    )
 
 
 def coordinator_pending_step(manifest_path, manifest, digest, receipts):

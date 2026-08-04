@@ -455,6 +455,7 @@ test("certification authoring and decision phases are separated by a public prev
   assert.equal(confirmations, 1);
   assert.match(confirmationPrompt, new RegExp(DIGEST));
   assert.match(confirmationPrompt, new RegExp(approvalDigest));
+  assert.match(confirmationPrompt, new RegExp(PREVIEW_COMPLETION_CHALLENGE));
   assert.equal(decision.product_decision_evidence.target_content_hash, DIGEST);
   assert.equal(decision.product_decision_evidence.payload_digest, approvalDigest);
   assert.equal(

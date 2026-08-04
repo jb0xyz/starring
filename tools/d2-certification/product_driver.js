@@ -1006,6 +1006,7 @@
         revision: preview.body.revision,
         payload_digest: preview.body.payload_digest,
         target_content_hash: targetContentHash,
+        preview_completion_challenge_sha256: previewCompletionChallengeSha256,
         summary: safeSummary,
       });
       const confirmed = root.confirm(

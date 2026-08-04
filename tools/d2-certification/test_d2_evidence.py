@@ -434,6 +434,21 @@ class D2EvidenceTest(unittest.TestCase):
             MODULE.EvidenceContractError, "chrome_preview_confirmation_binding_invalid"
         ):
             MODULE.assemble_decision_evidence(mismatched_confirmation)
+        for field, path in (
+            ("schema_version", None),
+            ("revision", None),
+            ("target_version", "summary"),
+            ("panels", "summary"),
+            ("required_approvals", "summary"),
+        ):
+            with self.subTest(field=field):
+                boolean_integer = copy.deepcopy(decision)
+                target = boolean_integer["chrome_confirmation"]
+                if path is not None:
+                    target = target[path]
+                target[field] = True
+                with self.assertRaises(MODULE.EvidenceContractError):
+                    MODULE.assemble_decision_evidence(boolean_integer)
 
     def test_interaction_adapter_joins_database_and_transport_resources(self):
         database = envelope(

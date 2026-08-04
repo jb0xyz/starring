@@ -729,7 +729,8 @@ def assemble_decision_evidence(browser):
         "chrome_preview_confirmation_fields_invalid",
     )
     if (
-        confirmation["schema_version"] != SCHEMA_VERSION
+        type(confirmation["schema_version"]) is not int
+        or confirmation["schema_version"] != SCHEMA_VERSION
         or confirmation["kind"]
         != "starring.d2.chrome-preview-confirmation.v1"
         or confirmation["confirmation_surface"] != "chrome_confirm"
@@ -781,7 +782,10 @@ def assemble_decision_evidence(browser):
     _require_positive_integer(
         summary["target_version"], "chrome_preview_confirmation_summary_invalid"
     )
-    if summary["required_approvals"] != 1:
+    if (
+        type(summary["required_approvals"]) is not int
+        or summary["required_approvals"] != 1
+    ):
         _fail("chrome_preview_confirmation_summary_invalid")
     if (
         confirmation["installation_id"] != value["installation_id"]
