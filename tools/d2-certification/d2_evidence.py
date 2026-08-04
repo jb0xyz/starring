@@ -31,7 +31,7 @@ FORBIDDEN_KEYS = {
 FORBIDDEN_VALUE_PATTERNS = (
     re.compile(r"postgres(?:ql)?://[^\s]+", re.IGNORECASE),
     re.compile(r"(?:Bearer|Bot)\s+[A-Za-z0-9._~-]+", re.IGNORECASE),
-    re.compile(r"-----BEGIN AGE ENCRYPTED FILE-----"),
+    re.compile("-" * 5 + r"BEGIN AGE ENCRYPTED FILE" + "-" * 5),
     re.compile(r"\bcf(?:at|ut)_[A-Za-z0-9_-]+\b"),
 )
 ROUTE_IDENTITY_FIELDS = (

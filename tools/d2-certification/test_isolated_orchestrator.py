@@ -2506,8 +2506,11 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.manifest_path.with_name("manifest.sha256").write_text(
             CERTIFICATION.manifest_digest(manifest) + "\n", encoding="utf-8"
         )
+        certification_error = CONTRACT.load_verified_manifest.__globals__[
+            "CertificationError"
+        ]
         with self.assertRaisesRegex(
-            CERTIFICATION.CertificationError, "cloudflare_route_binding_invalid"
+            certification_error, "cloudflare_route_binding_invalid"
         ):
             ORCHESTRATOR.load_context(self.manifest_path)
 
