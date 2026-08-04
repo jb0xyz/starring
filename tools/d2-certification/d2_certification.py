@@ -99,6 +99,7 @@ D2_TOOLCHAIN_SOURCE_FILES = (
     "d2_orchestrator_composition.py",
     "d2_orchestrator_contract.py",
     "d2_orchestrator_platform.py",
+    "d2_preflight_evidence.py",
     "d2_drained_runtime_restart.py",
     "d2_live_runtime_restart.py",
     "d2_run.py",
