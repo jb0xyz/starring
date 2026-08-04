@@ -65,6 +65,7 @@ GUILD_DELETION_KIND = (
 DISCORD_RECONCILIATION_OBSERVATION_KIND = (
     "starring.d2.discord-reconciliation-role-observation.v1"
 )
+GATEWAY_HEALED_KIND = "starring.d2.transport-gateway-healed-evidence.v1"
 
 
 def source_spec(kind, mode):
@@ -117,6 +118,7 @@ STEP_SOURCE_SPECS = {
     15: (
         source_spec("starring.d2.browser-live-loss-evidence.v1", "chrome"),
         source_spec("starring.d2.transport-gateway-loss-evidence.v1", "machine"),
+        source_spec(GATEWAY_HEALED_KIND, "machine"),
     ),
     16: (
         source_spec(DB_PRECLEANUP_KIND, "machine"),
@@ -561,9 +563,10 @@ def assemble_step_evidence(
         if step == 15:
             if len(prior_receipts) != 14:
                 fail("coordinator_prior_receipt_missing")
-            return d2_evidence.assemble_live_loss_evidence(
+            return d2_evidence.assemble_healed_live_loss_evidence(
                 values["starring.d2.browser-live-loss-evidence.v1"],
                 values["starring.d2.transport-gateway-loss-evidence.v1"],
+                values[GATEWAY_HEALED_KIND],
                 {
                     "installation_id": prior_receipts[13]["evidence"][
                         "installation_id"

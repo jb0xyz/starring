@@ -8,6 +8,9 @@ import urllib.parse
 SCHEMA_VERSION = 1
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+GATEWAY_OPERATION_ID_PATTERN = re.compile(
+    r"^d2:([0-9a-f]{16}):([0-9]{4}):(partition-gateway|heal-gateway)$"
+)
 PROCESS_INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SNOWFLAKE_PATTERN = re.compile(r"^[1-9][0-9]{0,19}$")
 UTC_PATTERN = re.compile(
@@ -125,6 +128,15 @@ def _require_digest(value, code):
     if not isinstance(value, str) or not DIGEST_PATTERN.fullmatch(value):
         _fail(code)
     return value
+
+
+def _require_gateway_operation_id(value, operation, code):
+    if not isinstance(value, str):
+        _fail(code)
+    matched = GATEWAY_OPERATION_ID_PATTERN.fullmatch(value)
+    if matched is None or matched.group(3) != operation:
+        _fail(code)
+    return matched.group(1), int(matched.group(2))
 
 
 def _require_process_instance(value, code):
@@ -1112,6 +1124,8 @@ def assemble_live_loss_evidence(browser, transport, prior_binding):
         "transport_gateway_partitioned",
         "transport_gateway_partition_events",
         "transport_instance_id",
+        "partition_operation_id",
+        "partition_completion_sha256",
     }
     public = _require_envelope(
         browser, "starring.d2.browser-live-loss-evidence.v1", browser_fields
@@ -1193,7 +1207,18 @@ def assemble_live_loss_evidence(browser, transport, prior_binding):
     _require_positive_integer(
         injected["transport_gateway_partition_events"], "live_loss_partition_events_invalid"
     )
+    if injected["transport_gateway_partition_events"] != 1:
+        _fail("live_loss_partition_event_count_invalid")
     _require_identifier(injected["transport_instance_id"], "transport_instance_id_invalid")
+    _require_gateway_operation_id(
+        injected["partition_operation_id"],
+        "partition-gateway",
+        "live_loss_partition_operation_id_invalid",
+    )
+    _require_digest(
+        injected["partition_completion_sha256"],
+        "live_loss_partition_completion_invalid",
+    )
     return {
         "installation_id": public["installation_id"],
         "promotion_id": public["promotion_id"],
@@ -1216,3 +1241,98 @@ def assemble_live_loss_evidence(browser, transport, prior_binding):
         "transport_instance_id": injected["transport_instance_id"],
         "public_origin": public["public_origin"],
     }
+
+
+def assemble_healed_live_loss_evidence(
+    browser, transport, healed_transport, prior_binding
+):
+    assembled = assemble_live_loss_evidence(browser, transport, prior_binding)
+    fields = {
+        "gateway_connected",
+        "runtime_ready_status",
+        "transport_gateway_partitioned",
+        "transport_gateway_partition_events",
+        "transport_duplicate_armed",
+        "transport_duplicate_claimed",
+        "transport_indeterminate_armed",
+        "transport_indeterminate_claimed",
+        "transport_instance_id",
+        "partition_operation_id",
+        "partition_completion_sha256",
+        "heal_operation_id",
+        "heal_completion_sha256",
+    }
+    healed = _require_envelope(
+        healed_transport,
+        "starring.d2.transport-gateway-healed-evidence.v1",
+        fields,
+    )
+    _require_boolean(healed["gateway_connected"], "gateway_connected_invalid")
+    _require_http_status(
+        healed["runtime_ready_status"], "gateway_healed_runtime_status_invalid", {200}
+    )
+    _require_boolean(
+        healed["transport_gateway_partitioned"],
+        "gateway_healed_partition_state_invalid",
+    )
+    _require_positive_integer(
+        healed["transport_gateway_partition_events"],
+        "gateway_healed_partition_events_invalid",
+    )
+    _require_identifier(
+        healed["transport_instance_id"], "gateway_healed_instance_id_invalid"
+    )
+    partition_operation = _require_gateway_operation_id(
+        healed["partition_operation_id"],
+        "partition-gateway",
+        "gateway_healed_partition_operation_id_invalid",
+    )
+    heal_operation = _require_gateway_operation_id(
+        healed["heal_operation_id"],
+        "heal-gateway",
+        "gateway_healed_heal_operation_id_invalid",
+    )
+    if (
+        partition_operation[0] != heal_operation[0]
+        or heal_operation[1] <= partition_operation[1]
+    ):
+        _fail("live_loss_gateway_operation_binding_invalid")
+    _require_digest(
+        healed["partition_completion_sha256"],
+        "gateway_healed_partition_completion_invalid",
+    )
+    _require_digest(
+        healed["heal_completion_sha256"],
+        "gateway_healed_heal_completion_invalid",
+    )
+    for field in (
+        "transport_duplicate_armed",
+        "transport_duplicate_claimed",
+        "transport_indeterminate_armed",
+        "transport_indeterminate_claimed",
+    ):
+        _require_boolean(healed[field], f"{field}_invalid")
+    if (
+        healed["gateway_connected"] is not True
+        or healed["runtime_ready_status"] != 200
+        or healed["transport_gateway_partitioned"] is not False
+        or healed["transport_gateway_partition_events"]
+        != assembled["transport_gateway_partition_events"]
+        or healed["transport_instance_id"] != assembled["transport_instance_id"]
+        or healed["partition_operation_id"]
+        != transport["partition_operation_id"]
+        or healed["partition_completion_sha256"]
+        != transport["partition_completion_sha256"]
+        or healed["heal_completion_sha256"]
+        == healed["partition_completion_sha256"]
+    ):
+        _fail("live_loss_gateway_heal_invalid")
+    for field in (
+        "transport_duplicate_armed",
+        "transport_duplicate_claimed",
+        "transport_indeterminate_armed",
+        "transport_indeterminate_claimed",
+    ):
+        if healed[field] is not False:
+            _fail("live_loss_transport_fault_not_quiescent")
+    return assembled

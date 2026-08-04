@@ -56,6 +56,27 @@ class D2RunCoordinatorTest(unittest.TestCase):
             )
         )
 
+    def gateway_healed_source(self, **overrides):
+        values = {
+            "gateway_connected": True,
+            "runtime_ready_status": 200,
+            "transport_gateway_partitioned": False,
+            "transport_gateway_partition_events": 1,
+            "transport_duplicate_armed": False,
+            "transport_duplicate_claimed": False,
+            "transport_indeterminate_armed": False,
+            "transport_indeterminate_claimed": False,
+            "transport_instance_id": test_d2_certification.TRANSPORT_INSTANCE_ID,
+            "partition_operation_id": (
+                "d2:0123456789abcdef:0007:partition-gateway"
+            ),
+            "partition_completion_sha256": "c" * 64,
+            "heal_operation_id": "d2:0123456789abcdef:0008:heal-gateway",
+            "heal_completion_sha256": "d" * 64,
+        }
+        values.update(overrides)
+        return self.envelope(d2_run.GATEWAY_HEALED_KIND, **values)
+
     def object_digest(self, value):
         return d2_run.sha256_bytes(
             d2_run.canonical_json(value).encode("utf-8")
@@ -376,6 +397,10 @@ class D2RunCoordinatorTest(unittest.TestCase):
         self.assertEqual(
             d2_run.STEP_SOURCE_SPECS[17][-1],
             {"kind": d2_run.GUILD_DELETION_KIND, "mode": "chrome"},
+        )
+        self.assertEqual(
+            d2_run.STEP_SOURCE_SPECS[15][-1],
+            {"kind": d2_run.GATEWAY_HEALED_KIND, "mode": "machine"},
         )
 
     def test_direct_machine_source_advances_and_replays_without_raw_evidence(self):
@@ -765,11 +790,20 @@ class D2RunCoordinatorTest(unittest.TestCase):
             transport_gateway_partitioned=True,
             transport_gateway_partition_events=1,
             transport_instance_id=test_d2_certification.TRANSPORT_INSTANCE_ID,
+            partition_operation_id=(
+                "d2:0123456789abcdef:0007:partition-gateway"
+            ),
+            partition_completion_sha256="c" * 64,
         )
+        healed = self.gateway_healed_source()
         result = d2_run.advance_certification(
             self.manifest_path,
             15,
-            [str(self.write_source(browser)), str(self.write_source(transport))],
+            [
+                str(self.write_source(browser)),
+                str(self.write_source(transport)),
+                str(self.write_source(healed)),
+            ],
         )
         self.assertEqual(result["disposition"], "created")
         evidence = self.receipts()[14]["evidence"]
@@ -810,7 +844,12 @@ class D2RunCoordinatorTest(unittest.TestCase):
             transport_gateway_partitioned=True,
             transport_gateway_partition_events=1,
             transport_instance_id=test_d2_certification.TRANSPORT_INSTANCE_ID,
+            partition_operation_id=(
+                "d2:0123456789abcdef:0007:partition-gateway"
+            ),
+            partition_completion_sha256="c" * 64,
         )
+        healed = self.gateway_healed_source()
         with self.assertRaisesRegex(
             d2_run.CertificationError,
             "coordinator_evidence_assembly_failed:live_loss_replacement_identity_mismatch",
@@ -818,8 +857,114 @@ class D2RunCoordinatorTest(unittest.TestCase):
             d2_run.advance_certification(
                 self.manifest_path,
                 15,
-                [str(self.write_source(browser)), str(self.write_source(transport))],
+                [
+                    str(self.write_source(browser)),
+                    str(self.write_source(transport)),
+                    str(self.write_source(healed)),
+                ],
             )
+        self.assertEqual(len(self.receipts()), 14)
+
+    def test_step_fifteen_requires_healed_quiescent_exact_transport(self):
+        self.append_prior(14)
+        browser = self.envelope(
+            "starring.d2.browser-live-loss-evidence.v1",
+            public_origin=self.manifest["cloudflare"]["public_origin"],
+            installation_id=self.complete[14]["installation_id"],
+            promotion_id=self.complete[14]["replacement_promotion_id"],
+            live_lost=True,
+            deployment_http_status=200,
+            operational_http_status=200,
+            product_state="runtime_unavailable",
+            operational_state="unavailable",
+            runtime_phase="disconnected",
+            serving_state="absent",
+            public_code="runtime_gateway_disconnected",
+            retryable=True,
+        )
+        transport = self.envelope(
+            "starring.d2.transport-gateway-loss-evidence.v1",
+            gateway_disconnected=True,
+            runtime_ready_status=503,
+            transport_gateway_partitioned=True,
+            transport_gateway_partition_events=1,
+            transport_instance_id=test_d2_certification.TRANSPORT_INSTANCE_ID,
+            partition_operation_id=(
+                "d2:0123456789abcdef:0007:partition-gateway"
+            ),
+            partition_completion_sha256="c" * 64,
+        )
+        invalid = (
+            {"gateway_connected": False},
+            {"runtime_ready_status": 503},
+            {"transport_gateway_partitioned": True},
+            {"transport_gateway_partition_events": 2},
+            {"transport_duplicate_claimed": True},
+            {"transport_indeterminate_armed": True},
+            {"transport_instance_id": "d2ti-fedcba9876543210fedcba9876543210"},
+            {
+                "partition_operation_id": (
+                    "d2:0123456789abcdef:0009:partition-gateway"
+                )
+            },
+            {"partition_completion_sha256": "e" * 64},
+            {
+                "heal_operation_id": (
+                    "d2:0123456789abcdef:0008:partition-gateway"
+                )
+            },
+            {"heal_completion_sha256": "invalid"},
+        )
+        for overrides in invalid:
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                d2_run.CertificationError,
+                "coordinator_evidence_assembly_failed",
+            ):
+                d2_run.advance_certification(
+                    self.manifest_path,
+                    15,
+                    [
+                        str(self.write_source(browser)),
+                        str(self.write_source(transport)),
+                        str(
+                            self.write_source(
+                                self.gateway_healed_source(**overrides)
+                            )
+                        ),
+                    ],
+                )
+        self.assertEqual(len(self.receipts()), 14)
+
+        invalid_loss = (
+            {
+                "partition_operation_id": (
+                    "d2:0123456789abcdef:0007:heal-gateway"
+                )
+            },
+            {"partition_completion_sha256": "invalid"},
+            {"transport_gateway_partition_events": 2},
+            {
+                "transport_instance_id": (
+                    "d2ti-fedcba9876543210fedcba9876543210"
+                )
+            },
+        )
+        for overrides in invalid_loss:
+            with self.subTest(loss=overrides), self.assertRaisesRegex(
+                d2_run.CertificationError,
+                "coordinator_evidence_assembly_failed",
+            ):
+                changed = dict(transport)
+                changed.update(overrides)
+                d2_run.advance_certification(
+                    self.manifest_path,
+                    15,
+                    [
+                        str(self.write_source(browser)),
+                        str(self.write_source(changed)),
+                        str(self.write_source(self.gateway_healed_source())),
+                    ],
+                )
         self.assertEqual(len(self.receipts()), 14)
 
     def test_finalization_extension_fails_closed_when_assembler_is_absent(self):

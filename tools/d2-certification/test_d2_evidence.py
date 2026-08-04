@@ -533,6 +533,10 @@ class D2EvidenceTest(unittest.TestCase):
             transport_gateway_partitioned=True,
             transport_gateway_partition_events=1,
             transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
+            partition_operation_id=(
+                "d2:0123456789abcdef:0007:partition-gateway"
+            ),
+            partition_completion_sha256="c" * 64,
         )
         loss = MODULE.assemble_live_loss_evidence(
             loss_browser,
@@ -547,6 +551,150 @@ class D2EvidenceTest(unittest.TestCase):
         )
         self.assertEqual(replacement["replacement_route_id"], loss["route_id"])
         self.assertEqual(loss["runtime_ready_status"], 503)
+        healed_transport = envelope(
+            "starring.d2.transport-gateway-healed-evidence.v1",
+            gateway_connected=True,
+            runtime_ready_status=200,
+            transport_gateway_partitioned=False,
+            transport_gateway_partition_events=1,
+            transport_duplicate_armed=False,
+            transport_duplicate_claimed=False,
+            transport_indeterminate_armed=False,
+            transport_indeterminate_claimed=False,
+            transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
+            partition_operation_id=(
+                "d2:0123456789abcdef:0007:partition-gateway"
+            ),
+            partition_completion_sha256="c" * 64,
+            heal_operation_id="d2:0123456789abcdef:0008:heal-gateway",
+            heal_completion_sha256="d" * 64,
+        )
+        healed = MODULE.assemble_healed_live_loss_evidence(
+            loss_browser,
+            loss_transport,
+            healed_transport,
+            {
+                "installation_id": replacement["installation_id"],
+                "replacement_promotion_id": replacement[
+                    "replacement_promotion_id"
+                ],
+                "replacement_route_id": replacement["replacement_route_id"],
+            },
+        )
+        self.assertEqual(healed, loss)
+        invalid_heals = {
+            "runtime_ready_status": 503,
+            "transport_gateway_partitioned": True,
+            "transport_gateway_partition_events": 2,
+            "transport_duplicate_armed": True,
+            "transport_instance_id": "d2ti-fedcba9876543210fedcba9876543210",
+            "partition_operation_id": (
+                "d2:0123456789abcdef:0009:partition-gateway"
+            ),
+            "partition_completion_sha256": "e" * 64,
+            "heal_operation_id": (
+                "d2:0123456789abcdef:0008:partition-gateway"
+            ),
+            "heal_completion_sha256": "invalid",
+        }
+        for field, value in invalid_heals.items():
+            with self.subTest(field=field):
+                changed = copy.deepcopy(healed_transport)
+                changed[field] = value
+                with self.assertRaises(MODULE.EvidenceContractError):
+                    MODULE.assemble_healed_live_loss_evidence(
+                        loss_browser,
+                        loss_transport,
+                        changed,
+                        {
+                            "installation_id": replacement["installation_id"],
+                            "replacement_promotion_id": replacement[
+                                "replacement_promotion_id"
+                            ],
+                            "replacement_route_id": replacement[
+                                "replacement_route_id"
+                            ],
+                        },
+                    )
+        for value in (
+            "d2:0123456789abcdef:0006:heal-gateway",
+            "d2:fedcba9876543210:0008:heal-gateway",
+        ):
+            changed = copy.deepcopy(healed_transport)
+            changed["heal_operation_id"] = value
+            with self.assertRaises(MODULE.EvidenceContractError):
+                MODULE.assemble_healed_live_loss_evidence(
+                    loss_browser,
+                    loss_transport,
+                    changed,
+                    {
+                        "installation_id": replacement["installation_id"],
+                        "replacement_promotion_id": replacement[
+                            "replacement_promotion_id"
+                        ],
+                        "replacement_route_id": replacement[
+                            "replacement_route_id"
+                        ],
+                    },
+                )
+        same_digest = copy.deepcopy(healed_transport)
+        same_digest["heal_completion_sha256"] = same_digest[
+            "partition_completion_sha256"
+        ]
+        with self.assertRaises(MODULE.EvidenceContractError):
+            MODULE.assemble_healed_live_loss_evidence(
+                loss_browser,
+                loss_transport,
+                same_digest,
+                {
+                    "installation_id": replacement["installation_id"],
+                    "replacement_promotion_id": replacement[
+                        "replacement_promotion_id"
+                    ],
+                    "replacement_route_id": replacement[
+                        "replacement_route_id"
+                    ],
+                },
+            )
+        unrelated_loss = copy.deepcopy(loss_transport)
+        unrelated_loss["transport_gateway_partition_events"] = 2
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError,
+            "live_loss_partition_event_count_invalid",
+        ):
+            MODULE.assemble_live_loss_evidence(
+                loss_browser,
+                unrelated_loss,
+                {
+                    "installation_id": replacement["installation_id"],
+                    "replacement_promotion_id": replacement[
+                        "replacement_promotion_id"
+                    ],
+                    "replacement_route_id": replacement["replacement_route_id"],
+                },
+            )
+        invalid_loss_bindings = {
+            "partition_operation_id": "d2:0123456789abcdef:0007:heal-gateway",
+            "partition_completion_sha256": "invalid",
+        }
+        for field, value in invalid_loss_bindings.items():
+            with self.subTest(field=field):
+                changed = copy.deepcopy(loss_transport)
+                changed[field] = value
+                with self.assertRaises(MODULE.EvidenceContractError):
+                    MODULE.assemble_live_loss_evidence(
+                        loss_browser,
+                        changed,
+                        {
+                            "installation_id": replacement["installation_id"],
+                            "replacement_promotion_id": replacement[
+                                "replacement_promotion_id"
+                            ],
+                            "replacement_route_id": replacement[
+                                "replacement_route_id"
+                            ],
+                        },
+                    )
         raw_route = copy.deepcopy(loss_transport)
         raw_route["route_identity"] = route_identity(
             "deployment-2", generation=2
