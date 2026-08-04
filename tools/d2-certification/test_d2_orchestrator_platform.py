@@ -128,6 +128,7 @@ class PlatformResourceTests(unittest.TestCase):
                         "account": "discord.bot-token",
                     }
                 },
+                "services": {"transport": {"http_port": 29102}},
             },
         )
         self.inventory = canonical_inventory(self.context)
@@ -284,6 +285,62 @@ class PlatformResourceTests(unittest.TestCase):
         self.assertIsNone(call["input_bytes"])
         self.assertIsNone(call["environment"])
         self.assertEqual(platform.responses, [])
+
+    def test_proxy_delete_is_exact_loopback_http_and_proxy_disabled(self):
+        resource = {
+            "kind": "message",
+            "resource_id": "1524810437118525561",
+            "channel_id": "1524810437118525560",
+        }
+        platform = DiscordPlatform([discord_response(204)])
+        evidence = platform.discord_delete_resource_through_transport(
+            self.context, resource, self.inventory
+        )
+        self.assertEqual(evidence["http_status"], 204)
+        self.assertTrue(evidence["deleted"])
+        arguments = platform.calls[0]["arguments"]
+        self.assertEqual(
+            arguments[7],
+            "http://127.0.0.1:29102/api/v10/channels/"
+            "1524810437118525560/messages/1524810437118525561",
+        )
+        self.assertEqual(arguments[12], "=http")
+        self.assertIn("--noproxy '*'", arguments[2])
+        self.assertIn("--proxy ''", arguments[2])
+        self.assertIn("--max-redirs 0", arguments[2])
+        self.assertIn("--config -", arguments[2])
+        self.assertNotIn("Bot secret", "\n".join(arguments))
+
+    def test_proxy_delete_requires_active_manifest_owned_resource(self):
+        deleted_role = {
+            "kind": "role",
+            "resource_id": "1524810437118525562",
+        }
+        self.assert_platform_failure(
+            "discord_resource_not_active",
+            lambda: DiscordPlatform([]).discord_delete_resource_through_transport(
+                self.context, deleted_role, self.inventory
+            ),
+        )
+        active_role_inventory = canonical_inventory(
+            self.context,
+            [
+                {
+                    "kind": "role",
+                    "resource_id": "1524810437118525562",
+                    "state": "created",
+                }
+            ],
+        )
+        wrong_port = copy.deepcopy(self.context.manifest["services"])
+        self.context.manifest["services"]["transport"]["http_port"] = 443
+        self.assert_platform_failure(
+            "discord_resource_proxy_request_invalid",
+            lambda: DiscordPlatform([]).discord_delete_resource_through_transport(
+                self.context, deleted_role, active_role_inventory
+            ),
+        )
+        self.context.manifest["services"] = wrong_port
 
     def test_role_observation_can_confirm_absence_from_successful_list(self):
         resource = {"kind": "role", "resource_id": "1524810437118525562"}

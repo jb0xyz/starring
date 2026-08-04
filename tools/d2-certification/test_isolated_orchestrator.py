@@ -3,6 +3,7 @@
 import contextlib
 import datetime
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -101,6 +102,11 @@ class FakePlatform:
         self.signal_exit_code = 0
         self.signal_failure = False
         self.next_pid = 41000
+        self.resource_history = []
+        self.discord_existing = set()
+        self.proxy_deletions = []
+        self.proxy_failure_resource_id = None
+        self.proxy_failure_after_delete = False
 
     def run(self, arguments, input_bytes=None, timeout=30, environment=None):
         executable = pathlib.Path(arguments[0]).name
@@ -349,6 +355,8 @@ class FakePlatform:
         fields = fields or {}
         if command == "snapshot":
             return json.loads(json.dumps(self.transport_state))
+        if command == "resource_inventory":
+            return self.resource_inventory(context)
         gateway = self.transport_state["gateway"]
         effect = self.transport_state["effect_http"]
         if command == "arm_next_duplicate":
@@ -396,6 +404,125 @@ class FakePlatform:
             gateway["partitioned"] = False
             return {"changed": changed}
         raise AssertionError(command)
+
+    def resource_inventory(self, context):
+        history = sorted(
+            (dict(entry) for entry in self.resource_history),
+            key=lambda entry: (
+                entry["kind"],
+                entry["resource_id"],
+                entry.get("channel_id", ""),
+            ),
+        )
+        created = []
+        deleted = []
+        active = []
+        for entry in history:
+            identity = {"kind": entry["kind"], "resource_id": entry["resource_id"]}
+            if entry["kind"] == "message":
+                identity["channel_id"] = entry["channel_id"]
+            created.append(identity)
+            if entry["state"] == "deleted":
+                deleted.append(identity)
+            else:
+                active.append(identity)
+        payload = {
+            "version": 1,
+            "kind": "starring.d2.run-owned-resource-inventory.v1",
+            "instance_id": self.transport_state["instance_id"],
+            "run_id": context.manifest["run_id"],
+            "guild_id": context.manifest["discord"]["guild_id"],
+            "hub_channel_id": context.manifest["discord"]["hub_channel_id"],
+            "actor_id": context.manifest["discord"]["actor_id"],
+            "bot_user_id": context.manifest["discord"]["bot_user_id"],
+            "history_limit": 128,
+            "history": history,
+            "created": created,
+            "deleted": deleted,
+            "active": active,
+        }
+        encoded = json.dumps(payload, separators=(",", ":")).encode("ascii")
+        return {**payload, "digest_sha256": hashlib.sha256(encoded).hexdigest()}
+
+    def discord_delete_resource_through_transport(
+        self, context, resource, inventory=None, timeout_seconds=10
+    ):
+        inventory = inventory or self.resource_inventory(context)
+        self.proxy_deletions.append(dict(resource))
+        fail_before = (
+            resource["resource_id"] == self.proxy_failure_resource_id
+            and not self.proxy_failure_after_delete
+        )
+        if fail_before:
+            ORCHESTRATOR.fail("injected_proxy_delete_failure")
+        existed = resource["resource_id"] in self.discord_existing
+        for entry in self.resource_history:
+            if (
+                entry["kind"] == resource["kind"]
+                and entry["resource_id"] == resource["resource_id"]
+                and entry.get("channel_id") == resource.get("channel_id")
+            ):
+                entry["state"] = "deleted"
+        self.discord_existing.discard(resource["resource_id"])
+        if resource["kind"] == "channel":
+            for entry in self.resource_history:
+                if entry["kind"] == "message" and entry["channel_id"] == resource[
+                    "resource_id"
+                ]:
+                    entry["state"] = "deleted"
+                    self.discord_existing.discard(entry["resource_id"])
+        if (
+            resource["resource_id"] == self.proxy_failure_resource_id
+            and self.proxy_failure_after_delete
+        ):
+            ORCHESTRATOR.fail("injected_proxy_delete_lost_response")
+        success = {"role": 204, "channel": 200, "message": 204}[
+            resource["kind"]
+        ]
+        unknown = {"role": 10011, "channel": 10003, "message": 10008}[
+            resource["kind"]
+        ]
+        return {
+            "schema_version": 1,
+            "kind": "starring.d2.discord-resource-proxy-deletion.v1",
+            "transport_instance_id": inventory["instance_id"],
+            "inventory_digest_sha256": inventory["digest_sha256"],
+            "resource_kind": resource["kind"],
+            "resource_id": resource["resource_id"],
+            "channel_id": resource.get("channel_id"),
+            "http_status": success if existed else 404,
+            "discord_code": None if existed else unknown,
+            "deleted": existed,
+        }
+
+    def discord_observe_resource(
+        self, context, resource, inventory=None, timeout_seconds=10
+    ):
+        inventory = inventory or self.resource_inventory(context)
+        exists = resource["resource_id"] in self.discord_existing
+        if exists or resource["kind"] == "role":
+            status = 200
+            code = None
+        else:
+            status = 404
+            if resource["kind"] == "message" and resource[
+                "channel_id"
+            ] not in self.discord_existing:
+                code = 10003
+            else:
+                code = {"channel": 10003, "message": 10008}[resource["kind"]]
+        return {
+            "schema_version": 1,
+            "kind": "starring.d2.discord-resource-observation.v1",
+            "transport_instance_id": inventory["instance_id"],
+            "inventory_digest_sha256": inventory["digest_sha256"],
+            "resource_kind": resource["kind"],
+            "resource_id": resource["resource_id"],
+            "channel_id": resource.get("channel_id"),
+            "http_status": status,
+            "discord_code": code,
+            "exists": exists,
+        }
 
     def wait_for_status(self, probe, expected, timeout_seconds=60):
         return probe()
@@ -480,6 +607,49 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
 
     def advance_live_clock(self, seconds):
         self.live_clock += seconds
+
+    def start_candidate_with_discord_resources(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        hub_channel_id = self.context.manifest["discord"]["hub_channel_id"]
+        self.platform.resource_history = [
+            {
+                "kind": "channel",
+                "resource_id": "1524810437118525560",
+                "state": "created",
+            },
+            {
+                "kind": "channel",
+                "resource_id": "1524810437118525561",
+                "state": "created",
+            },
+            {
+                "kind": "message",
+                "resource_id": "1524810437118525570",
+                "channel_id": "1524810437118525560",
+                "state": "created",
+            },
+            {
+                "kind": "message",
+                "resource_id": "1524810437118525571",
+                "channel_id": hub_channel_id,
+                "state": "created",
+            },
+            {
+                "kind": "role",
+                "resource_id": "1524810437118525580",
+                "state": "created",
+            },
+            {
+                "kind": "role",
+                "resource_id": "1524810437118525581",
+                "state": "created",
+            },
+        ]
+        self.platform.discord_existing = {
+            entry["resource_id"] for entry in self.platform.resource_history
+        } | {hub_channel_id}
+        return self.platform.resource_inventory(self.context)
 
     def prepare_manifest(self):
         arguments = [
@@ -2801,6 +2971,224 @@ class LaunchdPlatformTests(unittest.TestCase):
                 "local.starring.d2.test", pathlib.Path("/tmp/test.plist")
             )
         self.assertEqual(platform.bootouts, ["local.starring.d2.test"])
+
+
+class D2DiscordResourceOrchestratorTest(unittest.TestCase):
+    setUp = D2IsolatedOrchestratorTest.setUp
+    tearDown = D2IsolatedOrchestratorTest.tearDown
+    advance_live_clock = D2IsolatedOrchestratorTest.advance_live_clock
+    prepare_manifest = D2IsolatedOrchestratorTest.prepare_manifest
+    start_candidate_with_discord_resources = (
+        D2IsolatedOrchestratorTest.start_candidate_with_discord_resources
+    )
+
+    def test_discord_resource_command_parsers_require_manifest(self):
+        for command in ("resource-inventory", "teardown-discord-resources"):
+            arguments = ORCHESTRATOR.build_parser().parse_args(
+                [command, "--manifest", str(self.manifest_path)]
+            )
+            self.assertEqual(arguments.command, command)
+            self.assertEqual(arguments.manifest, str(self.manifest_path))
+
+    def test_resource_inventory_command_is_candidate_and_instance_bound(self):
+        inventory = self.start_candidate_with_discord_resources()
+        result = ORCHESTRATOR.command_resource_inventory(self.context, self.platform)
+        self.assertEqual(result["status"], "observed")
+        self.assertEqual(result["phase"], "candidate_started")
+        self.assertEqual(result["transport_instance_id"], inventory["instance_id"])
+        self.assertEqual(result["inventory_digest_sha256"], inventory["digest_sha256"])
+        self.assertEqual(result["created_count"], 6)
+        self.assertEqual(result["deleted_count"], 0)
+        self.assertEqual(result["active_count"], 6)
+        self.assertEqual(result["resource_inventory"], inventory)
+        self.platform.transport_state["instance_id"] = (
+            "d2ti-fedcba9876543210fedcba9876543210"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "transport_instance_changed"
+        ):
+            ORCHESTRATOR.command_resource_inventory(self.context, self.platform)
+
+    def test_resource_commands_fail_closed_on_phase_health_and_standing_drift(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "orchestrator_phase_invalid"
+        ):
+            ORCHESTRATOR.command_resource_inventory(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        self.platform.health_failure = "worker"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "candidate_health_unready"
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform
+            )
+        self.platform.health_failure = None
+        state = ORCHESTRATOR.load_state(self.context, {"candidate_started"})
+        label = sorted(state["standing_snapshot"]["launchd_loaded"])[0]
+        state["standing_snapshot"]["launchd_loaded"][label] = not state[
+            "standing_snapshot"
+        ]["launchd_loaded"][label]
+        ORCHESTRATOR.save_state(
+            self.context, "candidate_started", state["standing_snapshot"]
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "protected_staging_state_changed"
+        ):
+            ORCHESTRATOR.command_resource_inventory(self.context, self.platform)
+
+    def test_discord_teardown_orders_proxy_deletes_and_writes_redacted_evidence(self):
+        inventory = self.start_candidate_with_discord_resources()
+        result = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform
+        )
+        self.assertEqual(result["status"], "torn_down")
+        self.assertTrue(result["all_resources_absent"])
+        self.assertEqual(
+            [resource["kind"] for resource in self.platform.proxy_deletions],
+            ["message", "message", "channel", "channel", "role", "role"],
+        )
+        expected = sorted(
+            inventory["created"], key=ORCHESTRATOR.discord_resource_teardown_key
+        )
+        self.assertEqual(self.platform.proxy_deletions, expected)
+        protected = {
+            self.context.manifest["discord"][field]
+            for field in (
+                "guild_id",
+                "hub_channel_id",
+                "application_id",
+                "actor_id",
+                "bot_user_id",
+            )
+        }
+        self.assertTrue(
+            protected.isdisjoint(
+                resource["resource_id"]
+                for resource in self.platform.proxy_deletions
+            )
+        )
+        self.assertIn(
+            self.context.manifest["discord"]["hub_channel_id"],
+            self.platform.discord_existing,
+        )
+        evidence_path = ORCHESTRATOR.discord_teardown_evidence_path(self.context)
+        progress_path = ORCHESTRATOR.discord_teardown_progress_path(self.context)
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        self.assertEqual(evidence_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(progress_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(evidence["created_resources"], evidence["deleted_resources"])
+        self.assertEqual(evidence["active_resources"], [])
+        self.assertEqual(evidence["resource_ids"], sorted(evidence["resource_ids"]))
+        self.assertEqual(evidence["message_ids"], sorted(evidence["message_ids"]))
+        self.assertEqual(evidence["channel_ids"], sorted(evidence["channel_ids"]))
+        self.assertEqual(evidence["role_ids"], sorted(evidence["role_ids"]))
+        self.assertEqual(len(evidence["proxy_deletions"]), 6)
+        self.assertEqual(len(evidence["direct_observations"]), 6)
+        serialized = json.dumps(evidence)
+        self.assertNotIn("Bot ", serialized)
+        self.assertNotIn("discord.bot-token", serialized)
+        self.assertNotIn("Authorization", serialized)
+
+    def test_discord_teardown_partial_failure_resumes_without_redeleting_successes(self):
+        self.start_candidate_with_discord_resources()
+        self.platform.proxy_failure_resource_id = "1524810437118525560"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_proxy_delete_failure"
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform
+            )
+        progress_path = ORCHESTRATOR.discord_teardown_progress_path(self.context)
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(progress["deletions"]), 2)
+        first_attempt = list(self.platform.proxy_deletions)
+        self.assertEqual(
+            [resource["kind"] for resource in first_attempt],
+            ["message", "message", "channel"],
+        )
+        self.platform.proxy_failure_resource_id = None
+        result = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform
+        )
+        self.assertEqual(result["status"], "torn_down")
+        for resource in first_attempt[:2]:
+            self.assertEqual(self.platform.proxy_deletions.count(resource), 1)
+        final_progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(final_progress["deletions"]), 6)
+
+    def test_discord_teardown_reconciles_delete_with_lost_response(self):
+        self.start_candidate_with_discord_resources()
+        self.platform.proxy_failure_resource_id = "1524810437118525571"
+        self.platform.proxy_failure_after_delete = True
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "injected_proxy_delete_lost_response",
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform
+            )
+        self.platform.proxy_failure_resource_id = None
+        self.platform.proxy_failure_after_delete = False
+        result = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform
+        )
+        self.assertEqual(result["status"], "torn_down")
+        evidence = json.loads(
+            ORCHESTRATOR.discord_teardown_evidence_path(self.context).read_text(
+                encoding="utf-8"
+            )
+        )
+        reconciled = [
+            record
+            for record in evidence["proxy_deletions"]
+            if record["resource_id"] == "1524810437118525571"
+        ]
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(reconciled[0]["disposition"], "reconciled_deleted")
+
+    def test_discord_teardown_exact_replay_reobserves_external_absence(self):
+        self.start_candidate_with_discord_resources()
+        first = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform
+        )
+        deletions = list(self.platform.proxy_deletions)
+        replay = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform
+        )
+        self.assertEqual(first["status"], "torn_down")
+        self.assertEqual(replay["status"], "exact_replay")
+        self.assertEqual(self.platform.proxy_deletions, deletions)
+        self.platform.discord_existing.add("1524810437118525580")
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "discord_resource_absence_unconfirmed"
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform
+            )
+
+    def test_discord_teardown_rejects_progress_and_final_inventory_mismatch(self):
+        self.start_candidate_with_discord_resources()
+        self.platform.proxy_failure_resource_id = "1524810437118525560"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_proxy_delete_failure"
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform
+            )
+        progress_path = ORCHESTRATOR.discord_teardown_progress_path(self.context)
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        progress["resource_union_sha256"] = "f" * 64
+        progress_path.write_text(json.dumps(progress), encoding="utf-8")
+        progress_path.chmod(0o600)
+        self.platform.proxy_failure_resource_id = None
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "discord_resource_teardown_progress_invalid",
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform
+            )
 
 
 if __name__ == "__main__":

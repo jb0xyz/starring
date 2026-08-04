@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import os
 import pathlib
 import re
@@ -13,7 +14,9 @@ import unicodedata
 from d2_certification import (
     CertificationError,
     canonical_json,
+    load_json_file,
     require_absolute_path,
+    require_owned_mode,
     validate_snowflake,
 )
 from d2_orchestrator_composition import (
@@ -60,6 +63,16 @@ from d2_live_runtime_restart import command_certify_live_runtime_restart
 SERVICE_START_ORDER = ("transport", "worker", "api", "runtime", "tunnel")
 SERVICE_STOP_ORDER = tuple(reversed(SERVICE_START_ORDER))
 TRANSPORT_INSTANCE_PATTERN = re.compile(r"^d2ti-[0-9a-f]{32}$")
+DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+DISCORD_RESOURCE_KIND_ORDER = {"message": 0, "channel": 1, "role": 2}
+DISCORD_RESOURCE_UNKNOWN_CODES = {
+    "role": {10011},
+    "channel": {10003},
+    "message": {10003, 10008},
+}
+DISCORD_RESOURCE_SUCCESS_STATUS = {"role": 204, "channel": 200, "message": 204}
+DISCORD_TEARDOWN_PROGRESS_KIND = "starring.d2.discord-resource-teardown-progress.v1"
+DISCORD_TEARDOWN_EVIDENCE_KIND = "starring.d2.discord-resource-teardown.v1"
 
 
 def command_dry_run(context, platform):
@@ -801,6 +814,584 @@ def command_transport_control(context, platform, operation):
     }
 
 
+def require_candidate_certification_boundary(context, platform):
+    state = load_state(context, {"candidate_started"})
+    if not platform.postgres_running(context.cluster_root) or any(
+        not platform.launchd_loaded(context.manifest["services"][name]["label"])
+        for name in SERVICE_START_ORDER
+    ):
+        fail("candidate_state_drift")
+    if standing_snapshot(context, platform) != state["standing_snapshot"]:
+        fail("protected_staging_state_changed")
+    statuses = candidate_health(context, platform, wait=False)
+    if statuses != {
+        "worker": 200,
+        "transport": 200,
+        "api": 200,
+        "runtime": 200,
+        "tunnel": 200,
+    }:
+        fail("candidate_health_unready")
+    snapshot = platform.transport_control(context, "snapshot")
+    require_pinned_transport_snapshot(context, snapshot)
+    return state, snapshot
+
+
+def command_resource_inventory(context, platform):
+    _state, snapshot = require_candidate_certification_boundary(context, platform)
+    inventory = platform.transport_control(context, "resource_inventory")
+    if inventory["instance_id"] != snapshot["instance_id"]:
+        fail("transport_instance_changed")
+    return {
+        "status": "observed",
+        "phase": "candidate_started",
+        "manifest_sha256": context.digest,
+        "transport_instance_id": inventory["instance_id"],
+        "inventory_digest_sha256": inventory["digest_sha256"],
+        "created_count": len(inventory["created"]),
+        "deleted_count": len(inventory["deleted"]),
+        "active_count": len(inventory["active"]),
+        "resource_inventory": inventory,
+    }
+
+
+def discord_resource_identity_key(resource):
+    return (
+        resource["kind"],
+        resource["resource_id"],
+        resource.get("channel_id"),
+    )
+
+
+def discord_resource_teardown_key(resource):
+    return (
+        DISCORD_RESOURCE_KIND_ORDER[resource["kind"]],
+        resource.get("channel_id", ""),
+        resource["resource_id"],
+    )
+
+
+def discord_resource_union_sha256(resources):
+    return hashlib.sha256(canonical_json(resources).encode("utf-8")).hexdigest()
+
+
+def discord_teardown_progress_path(context):
+    return context.artifact_directory / "discord-resource-teardown-progress.json"
+
+
+def discord_teardown_evidence_path(context):
+    return context.artifact_directory / "discord-resource-teardown-evidence.json"
+
+
+def load_private_json(path, label):
+    require_owned_mode(path, 0o600, label)
+    return load_json_file(path, label)
+
+
+def discord_teardown_record(resource, disposition, http_status=None, discord_code=None):
+    return {
+        "resource_kind": resource["kind"],
+        "resource_id": resource["resource_id"],
+        "channel_id": resource.get("channel_id"),
+        "disposition": disposition,
+        "http_status": http_status,
+        "discord_code": discord_code,
+    }
+
+
+def discord_teardown_record_resource(record):
+    resource = {
+        "kind": record["resource_kind"],
+        "resource_id": record["resource_id"],
+    }
+    if record["resource_kind"] == "message":
+        resource["channel_id"] = record["channel_id"]
+    return resource
+
+
+def validate_discord_teardown_record(record, resources):
+    if not isinstance(record, dict) or set(record) != {
+        "resource_kind",
+        "resource_id",
+        "channel_id",
+        "disposition",
+        "http_status",
+        "discord_code",
+    }:
+        fail("discord_resource_teardown_progress_invalid")
+    kind = record["resource_kind"]
+    if kind not in DISCORD_RESOURCE_KIND_ORDER:
+        fail("discord_resource_teardown_progress_invalid")
+    resource = discord_teardown_record_resource(record)
+    if resource not in resources or (
+        kind == "message" and not isinstance(record["channel_id"], str)
+    ) or (kind != "message" and record["channel_id"] is not None):
+        fail("discord_resource_teardown_progress_invalid")
+    disposition = record["disposition"]
+    if disposition in {"preexisting_deleted", "reconciled_deleted"}:
+        if record["http_status"] is not None or record["discord_code"] is not None:
+            fail("discord_resource_teardown_progress_invalid")
+    elif disposition == "deleted":
+        if (
+            record["http_status"] != DISCORD_RESOURCE_SUCCESS_STATUS[kind]
+            or record["discord_code"] is not None
+        ):
+            fail("discord_resource_teardown_progress_invalid")
+    elif disposition == "already_absent":
+        if (
+            record["http_status"] != 404
+            or record["discord_code"] not in DISCORD_RESOURCE_UNKNOWN_CODES[kind]
+        ):
+            fail("discord_resource_teardown_progress_invalid")
+    else:
+        fail("discord_resource_teardown_progress_invalid")
+    return resource
+
+
+def validate_discord_teardown_progress(context, progress, inventory):
+    if not isinstance(progress, dict) or set(progress) != {
+        "schema_version",
+        "kind",
+        "manifest_sha256",
+        "run_id",
+        "transport_instance_id",
+        "source_inventory_digest_sha256",
+        "resource_union_sha256",
+        "created_resources",
+        "deletions",
+    }:
+        fail("discord_resource_teardown_progress_invalid")
+    resources = inventory["created"]
+    if (
+        progress["schema_version"] != 1
+        or progress["kind"] != DISCORD_TEARDOWN_PROGRESS_KIND
+        or progress["manifest_sha256"] != context.digest
+        or progress["run_id"] != context.manifest["run_id"]
+        or progress["transport_instance_id"] != inventory["instance_id"]
+        or not isinstance(progress["source_inventory_digest_sha256"], str)
+        or not DIGEST_PATTERN.fullmatch(
+            progress["source_inventory_digest_sha256"]
+        )
+        or progress["resource_union_sha256"]
+        != discord_resource_union_sha256(resources)
+        or progress["created_resources"] != resources
+        or not isinstance(progress["deletions"], list)
+    ):
+        fail("discord_resource_teardown_progress_invalid")
+    deleted = {
+        discord_resource_identity_key(resource) for resource in inventory["deleted"]
+    }
+    observed = []
+    for record in progress["deletions"]:
+        resource = validate_discord_teardown_record(record, resources)
+        key = discord_resource_identity_key(resource)
+        if key not in deleted:
+            fail("discord_resource_teardown_progress_mismatch")
+        observed.append(key)
+    expected_order = [
+        discord_resource_identity_key(resource)
+        for resource in sorted(
+            (discord_teardown_record_resource(record) for record in progress["deletions"]),
+            key=discord_resource_teardown_key,
+        )
+    ]
+    if observed != expected_order or len(observed) != len(set(observed)):
+        fail("discord_resource_teardown_progress_invalid")
+    return progress
+
+
+def new_discord_teardown_progress(context, inventory):
+    deleted = {
+        discord_resource_identity_key(resource) for resource in inventory["deleted"]
+    }
+    resources = inventory["created"]
+    deletions = [
+        discord_teardown_record(resource, "preexisting_deleted")
+        for resource in sorted(resources, key=discord_resource_teardown_key)
+        if discord_resource_identity_key(resource) in deleted
+    ]
+    return {
+        "schema_version": 1,
+        "kind": DISCORD_TEARDOWN_PROGRESS_KIND,
+        "manifest_sha256": context.digest,
+        "run_id": context.manifest["run_id"],
+        "transport_instance_id": inventory["instance_id"],
+        "source_inventory_digest_sha256": inventory["digest_sha256"],
+        "resource_union_sha256": discord_resource_union_sha256(resources),
+        "created_resources": resources,
+        "deletions": deletions,
+    }
+
+
+def write_discord_teardown_progress(context, progress):
+    write_atomic(
+        discord_teardown_progress_path(context), canonical_json(progress) + "\n"
+    )
+
+
+def reconcile_discord_teardown_progress(context, progress, inventory):
+    completed = {
+        discord_resource_identity_key(discord_teardown_record_resource(record))
+        for record in progress["deletions"]
+    }
+    added = False
+    for resource in sorted(inventory["deleted"], key=discord_resource_teardown_key):
+        key = discord_resource_identity_key(resource)
+        if key not in completed:
+            progress["deletions"].append(
+                discord_teardown_record(resource, "reconciled_deleted")
+            )
+            completed.add(key)
+            added = True
+    if added:
+        progress["deletions"].sort(
+            key=lambda record: discord_resource_teardown_key(
+                discord_teardown_record_resource(record)
+            )
+        )
+        write_discord_teardown_progress(context, progress)
+    return progress
+
+
+def normalize_proxy_deletion(inventory, resource, evidence):
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "schema_version",
+        "kind",
+        "transport_instance_id",
+        "inventory_digest_sha256",
+        "resource_kind",
+        "resource_id",
+        "channel_id",
+        "http_status",
+        "discord_code",
+        "deleted",
+    }:
+        fail("discord_resource_proxy_evidence_invalid")
+    expected_status = DISCORD_RESOURCE_SUCCESS_STATUS[resource["kind"]]
+    if (
+        evidence["schema_version"] != 1
+        or evidence["kind"]
+        != "starring.d2.discord-resource-proxy-deletion.v1"
+        or evidence["transport_instance_id"] != inventory["instance_id"]
+        or evidence["inventory_digest_sha256"] != inventory["digest_sha256"]
+        or evidence["resource_kind"] != resource["kind"]
+        or evidence["resource_id"] != resource["resource_id"]
+        or evidence["channel_id"] != resource.get("channel_id")
+        or type(evidence["deleted"]) is not bool
+    ):
+        fail("discord_resource_proxy_evidence_invalid")
+    if evidence["http_status"] == expected_status:
+        if evidence["discord_code"] is not None or evidence["deleted"] is not True:
+            fail("discord_resource_proxy_evidence_invalid")
+        disposition = "deleted"
+    elif evidence["http_status"] == 404:
+        if (
+            evidence["discord_code"]
+            not in DISCORD_RESOURCE_UNKNOWN_CODES[resource["kind"]]
+            or evidence["deleted"] is not False
+        ):
+            fail("discord_resource_proxy_evidence_invalid")
+        disposition = "already_absent"
+    else:
+        fail("discord_resource_proxy_evidence_invalid")
+    return discord_teardown_record(
+        resource,
+        disposition,
+        evidence["http_status"],
+        evidence["discord_code"],
+    )
+
+
+def normalize_direct_observation(inventory, resource, evidence):
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "schema_version",
+        "kind",
+        "transport_instance_id",
+        "inventory_digest_sha256",
+        "resource_kind",
+        "resource_id",
+        "channel_id",
+        "http_status",
+        "discord_code",
+        "exists",
+    }:
+        fail("discord_resource_observation_evidence_invalid")
+    kind = resource["kind"]
+    absent_status = (
+        evidence["http_status"] == 200
+        and kind == "role"
+        and evidence["discord_code"] is None
+    ) or (
+        evidence["http_status"] == 404
+        and evidence["discord_code"] in DISCORD_RESOURCE_UNKNOWN_CODES[kind]
+    )
+    if (
+        evidence["schema_version"] != 1
+        or evidence["kind"] != "starring.d2.discord-resource-observation.v1"
+        or evidence["transport_instance_id"] != inventory["instance_id"]
+        or evidence["inventory_digest_sha256"] != inventory["digest_sha256"]
+        or evidence["resource_kind"] != kind
+        or evidence["resource_id"] != resource["resource_id"]
+        or evidence["channel_id"] != resource.get("channel_id")
+        or evidence["exists"] is not False
+        or not absent_status
+    ):
+        fail("discord_resource_absence_unconfirmed")
+    return {
+        "resource_kind": kind,
+        "resource_id": resource["resource_id"],
+        "channel_id": resource.get("channel_id"),
+        "http_status": evidence["http_status"],
+        "discord_code": evidence["discord_code"],
+        "exists": False,
+    }
+
+
+def observe_absent_discord_resources(context, platform, inventory):
+    observations = []
+    for resource in sorted(inventory["created"], key=discord_resource_teardown_key):
+        evidence = platform.discord_observe_resource(context, resource, inventory)
+        observations.append(
+            normalize_direct_observation(inventory, resource, evidence)
+        )
+    return observations
+
+
+def discord_resource_id_lists(resources):
+    return {
+        "resource_ids": sorted(resource["resource_id"] for resource in resources),
+        "message_ids": sorted(
+            resource["resource_id"]
+            for resource in resources
+            if resource["kind"] == "message"
+        ),
+        "channel_ids": sorted(
+            resource["resource_id"]
+            for resource in resources
+            if resource["kind"] == "channel"
+        ),
+        "role_ids": sorted(
+            resource["resource_id"]
+            for resource in resources
+            if resource["kind"] == "role"
+        ),
+    }
+
+
+def validate_discord_teardown_evidence(context, evidence, inventory):
+    required = {
+        "schema_version",
+        "kind",
+        "manifest_sha256",
+        "run_id",
+        "recorded_at",
+        "transport_instance_id",
+        "source_inventory_digest_sha256",
+        "final_inventory_digest_sha256",
+        "resource_union_sha256",
+        "created_resources",
+        "deleted_resources",
+        "active_resources",
+        "resource_ids",
+        "message_ids",
+        "channel_ids",
+        "role_ids",
+        "proxy_deletions",
+        "direct_observations",
+        "all_resources_absent",
+    }
+    resources = inventory["created"]
+    identifiers = discord_resource_id_lists(resources)
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != required
+        or evidence["schema_version"] != 1
+        or evidence["kind"] != DISCORD_TEARDOWN_EVIDENCE_KIND
+        or evidence["manifest_sha256"] != context.digest
+        or evidence["run_id"] != context.manifest["run_id"]
+        or not isinstance(evidence["recorded_at"], str)
+        or not TRANSPORT_RECORDED_AT_PATTERN.fullmatch(evidence["recorded_at"])
+        or evidence["transport_instance_id"] != inventory["instance_id"]
+        or not isinstance(evidence["source_inventory_digest_sha256"], str)
+        or not DIGEST_PATTERN.fullmatch(
+            evidence["source_inventory_digest_sha256"]
+        )
+        or evidence["final_inventory_digest_sha256"]
+        != inventory["digest_sha256"]
+        or evidence["resource_union_sha256"]
+        != discord_resource_union_sha256(resources)
+        or evidence["created_resources"] != resources
+        or evidence["deleted_resources"] != resources
+        or evidence["active_resources"] != []
+        or any(evidence[name] != value for name, value in identifiers.items())
+        or evidence["all_resources_absent"] is not True
+        or not isinstance(evidence["proxy_deletions"], list)
+        or not isinstance(evidence["direct_observations"], list)
+        or inventory["deleted"] != resources
+        or inventory["active"] != []
+    ):
+        fail("discord_resource_teardown_evidence_invalid")
+    progress_view = {
+        "schema_version": 1,
+        "kind": DISCORD_TEARDOWN_PROGRESS_KIND,
+        "manifest_sha256": context.digest,
+        "run_id": context.manifest["run_id"],
+        "transport_instance_id": inventory["instance_id"],
+        "source_inventory_digest_sha256": evidence[
+            "source_inventory_digest_sha256"
+        ],
+        "resource_union_sha256": evidence["resource_union_sha256"],
+        "created_resources": resources,
+        "deletions": evidence["proxy_deletions"],
+    }
+    validate_discord_teardown_progress(context, progress_view, inventory)
+    expected_resources = sorted(resources, key=discord_resource_teardown_key)
+    observations = evidence["direct_observations"]
+    if len(observations) != len(expected_resources):
+        fail("discord_resource_teardown_evidence_invalid")
+    for resource, observation in zip(expected_resources, observations):
+        normalized = {
+            "schema_version": 1,
+            "kind": "starring.d2.discord-resource-observation.v1",
+            "transport_instance_id": inventory["instance_id"],
+            "inventory_digest_sha256": inventory["digest_sha256"],
+            **observation,
+        }
+        normalize_direct_observation(inventory, resource, normalized)
+    return evidence
+
+
+def command_teardown_discord_resources(context, platform):
+    _state, snapshot = require_candidate_certification_boundary(context, platform)
+    inventory = platform.transport_control(context, "resource_inventory")
+    if inventory["instance_id"] != snapshot["instance_id"]:
+        fail("transport_instance_changed")
+    evidence_path = discord_teardown_evidence_path(context)
+    if evidence_path.exists():
+        evidence = load_private_json(
+            evidence_path, "discord_resource_teardown_evidence"
+        )
+        validate_discord_teardown_evidence(context, evidence, inventory)
+        observe_absent_discord_resources(context, platform, inventory)
+        final_inventory = platform.transport_control(context, "resource_inventory")
+        if final_inventory["digest_sha256"] != inventory["digest_sha256"]:
+            fail("discord_resource_teardown_replay_drift")
+        require_candidate_certification_boundary(context, platform)
+        return {
+            "status": "exact_replay",
+            "phase": "candidate_started",
+            "transport_instance_id": inventory["instance_id"],
+            "inventory_digest_sha256": inventory["digest_sha256"],
+            "resource_count": len(inventory["created"]),
+            "all_resources_absent": True,
+            "evidence": str(evidence_path),
+        }
+    progress_path = discord_teardown_progress_path(context)
+    if progress_path.exists():
+        progress = load_private_json(
+            progress_path, "discord_resource_teardown_progress"
+        )
+        validate_discord_teardown_progress(context, progress, inventory)
+    else:
+        progress = new_discord_teardown_progress(context, inventory)
+        append_journal(context, "discord_resource_teardown", "intent", "resources")
+        write_discord_teardown_progress(context, progress)
+    progress = reconcile_discord_teardown_progress(context, progress, inventory)
+    completed = {
+        discord_resource_identity_key(discord_teardown_record_resource(record))
+        for record in progress["deletions"]
+    }
+    for resource in sorted(inventory["created"], key=discord_resource_teardown_key):
+        key = discord_resource_identity_key(resource)
+        if key in completed:
+            continue
+        current = platform.transport_control(context, "resource_inventory")
+        if (
+            current["instance_id"] != inventory["instance_id"]
+            or current["created"] != inventory["created"]
+        ):
+            fail("discord_resource_teardown_inventory_drift")
+        if resource not in current["active"]:
+            progress["deletions"].append(
+                discord_teardown_record(resource, "reconciled_deleted")
+            )
+        else:
+            deletion = platform.discord_delete_resource_through_transport(
+                context, resource, current
+            )
+            record = normalize_proxy_deletion(current, resource, deletion)
+            refreshed = platform.transport_control(context, "resource_inventory")
+            if (
+                refreshed["instance_id"] != inventory["instance_id"]
+                or refreshed["created"] != inventory["created"]
+                or resource in refreshed["active"]
+                or resource not in refreshed["deleted"]
+            ):
+                fail("discord_resource_lifecycle_not_deleted")
+            progress["deletions"].append(record)
+        progress["deletions"].sort(
+            key=lambda value: discord_resource_teardown_key(
+                discord_teardown_record_resource(value)
+            )
+        )
+        write_discord_teardown_progress(context, progress)
+        completed.add(key)
+    final_inventory = platform.transport_control(context, "resource_inventory")
+    if (
+        final_inventory["instance_id"] != inventory["instance_id"]
+        or final_inventory["created"] != inventory["created"]
+        or final_inventory["deleted"] != inventory["created"]
+        or final_inventory["active"] != []
+    ):
+        fail("discord_resource_teardown_incomplete")
+    validate_discord_teardown_progress(context, progress, final_inventory)
+    if len(progress["deletions"]) != len(final_inventory["created"]):
+        fail("discord_resource_teardown_incomplete")
+    observations = observe_absent_discord_resources(
+        context, platform, final_inventory
+    )
+    _state, final_snapshot = require_candidate_certification_boundary(context, platform)
+    confirmed_inventory = platform.transport_control(context, "resource_inventory")
+    if (
+        final_snapshot["instance_id"] != final_inventory["instance_id"]
+        or confirmed_inventory["digest_sha256"]
+        != final_inventory["digest_sha256"]
+    ):
+        fail("discord_resource_teardown_final_drift")
+    evidence = {
+        "schema_version": 1,
+        "kind": DISCORD_TEARDOWN_EVIDENCE_KIND,
+        "manifest_sha256": context.digest,
+        "run_id": context.manifest["run_id"],
+        "recorded_at": utc_now(),
+        "transport_instance_id": final_inventory["instance_id"],
+        "source_inventory_digest_sha256": progress[
+            "source_inventory_digest_sha256"
+        ],
+        "final_inventory_digest_sha256": final_inventory["digest_sha256"],
+        "resource_union_sha256": progress["resource_union_sha256"],
+        "created_resources": final_inventory["created"],
+        "deleted_resources": final_inventory["deleted"],
+        "active_resources": final_inventory["active"],
+        **discord_resource_id_lists(final_inventory["created"]),
+        "proxy_deletions": progress["deletions"],
+        "direct_observations": observations,
+        "all_resources_absent": True,
+    }
+    validate_discord_teardown_evidence(context, evidence, final_inventory)
+    write_atomic(evidence_path, canonical_json(evidence) + "\n")
+    append_journal(context, "discord_resource_teardown", "complete", "resources")
+    return {
+        "status": "torn_down",
+        "phase": "candidate_started",
+        "transport_instance_id": final_inventory["instance_id"],
+        "inventory_digest_sha256": final_inventory["digest_sha256"],
+        "resource_count": len(final_inventory["created"]),
+        "all_resources_absent": True,
+        "evidence": str(evidence_path),
+    }
+
+
 def guarded_remove_root(context):
     expected = pathlib.Path(f"/private/tmp/starring-d2-{context.manifest['run_id']}")
     if context.root != expected or context.root.parent != pathlib.Path("/private/tmp"):
@@ -938,6 +1529,8 @@ def build_parser():
         "prepare",
         "start",
         "restart-drained-runtime",
+        "resource-inventory",
+        "teardown-discord-resources",
         "stop",
         "cleanup",
         "status",
@@ -979,6 +1572,8 @@ def main():
             "prepare": command_prepare,
             "start": command_start,
             "restart-drained-runtime": command_restart_drained_runtime,
+            "resource-inventory": command_resource_inventory,
+            "teardown-discord-resources": command_teardown_discord_resources,
             "stop": command_stop,
             "cleanup": command_cleanup,
             "status": command_status,

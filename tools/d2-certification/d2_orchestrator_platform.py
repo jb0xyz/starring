@@ -1156,6 +1156,34 @@ class Platform:
             or timeout_seconds > 30
         ):
             fail("discord_resource_request_invalid")
+        return self._discord_curl_request(
+            context, method, url, timeout_seconds, "=https"
+        )
+
+    def _discord_proxy_request(self, context, method, url, timeout_seconds):
+        port = context.manifest["services"]["transport"]["http_port"]
+        prefix = f"http://127.0.0.1:{port}/api/v10/"
+        if (
+            method != "DELETE"
+            or type(port) is not int
+            or port < 1024
+            or port > 65535
+            or not isinstance(url, str)
+            or not url.startswith(prefix)
+            or "?" in url
+            or "#" in url
+            or type(timeout_seconds) is not int
+            or timeout_seconds < 1
+            or timeout_seconds > 30
+        ):
+            fail("discord_resource_proxy_request_invalid")
+        return self._discord_curl_request(
+            context, method, url, timeout_seconds, "=http"
+        )
+
+    def _discord_curl_request(
+        self, context, method, url, timeout_seconds, protocol
+    ):
         identity = context.manifest["external_keychain"]["discord_bot_token"]
         script = "\n".join(
             (
@@ -1167,9 +1195,10 @@ class Platform:
                 'maximum="$6"',
                 'security="$7"',
                 'curl="$8"',
+                'protocol="$9"',
                 'value="$("$security" find-generic-password -s "$service" -a "$account" -w)" || exit 71',
                 'case "$value" in (""|*[!A-Za-z0-9._~-]*) unset value; exit 72;; esac',
-                'response="$({ printf \'header = "Authorization: Bot %s"\\n\' "$value"; } | "$curl" -q --silent --show-error --request "$method" --proto \'=https\' --proto-redir \'=https\' --header \'Accept: application/json\' --header \'User-Agent: Starring-D2-Certification/1\' --max-filesize "$maximum" --write-out \'\\n%{http_code}\' --connect-timeout "$timeout" --max-time "$timeout" --config - "$url")"',
+                'response="$({ printf \'header = "Authorization: Bot %s"\\n\' "$value"; } | "$curl" -q --silent --show-error --request "$method" --proto "$protocol" --proto-redir "$protocol" --max-redirs 0 --noproxy \'*\' --proxy \'\' --header \'Accept: application/json\' --header \'User-Agent: Starring-D2-Certification/1\' --max-filesize "$maximum" --write-out \'\\n%{http_code}\' --connect-timeout "$timeout" --max-time "$timeout" --config - "$url")"',
                 'result="$?"',
                 'unset value',
                 'test "$result" -eq 0 || exit "$result"',
@@ -1190,6 +1219,7 @@ class Platform:
                 str(MAX_DISCORD_RESPONSE_BYTES),
                 REQUIRED_PROGRAMS["security"],
                 REQUIRED_PROGRAMS["curl"],
+                protocol,
             ],
             timeout=timeout_seconds + 3,
         )
@@ -1252,13 +1282,27 @@ class Platform:
             return False, False
         return True, True
 
-    def _discord_resource_request_result(self, context, resource, method, timeout_seconds):
-        url = (
+    def _discord_resource_request_result(
+        self, context, resource, method, timeout_seconds, through_transport=False
+    ):
+        direct_url = (
             self._discord_resource_url(context, resource)
             if method == "GET"
             else self._discord_resource_delete_url(context, resource)
         )
-        status, body = self._discord_request(context, method, url, timeout_seconds)
+        if through_transport:
+            direct_prefix = "https://discord.com"
+            if not direct_url.startswith(direct_prefix):
+                fail("discord_resource_proxy_request_invalid")
+            port = context.manifest["services"]["transport"]["http_port"]
+            url = f"http://127.0.0.1:{port}{direct_url.removeprefix(direct_prefix)}"
+            status, body = self._discord_proxy_request(
+                context, method, url, timeout_seconds
+            )
+        else:
+            status, body = self._discord_request(
+                context, method, direct_url, timeout_seconds
+            )
         expected = DISCORD_RESOURCE_SUCCESS[(resource["kind"], method)]
         if status == expected:
             valid, exists = self._discord_success_body_valid(
@@ -1328,6 +1372,37 @@ class Platform:
                 (identity["kind"], "DELETE")
             ],
             "exists": False,
+        }
+
+    def discord_delete_resource_through_transport(
+        self, context, resource, inventory=None, timeout_seconds=10
+    ):
+        if inventory is None:
+            inventory = self.transport_control(context, "resource_inventory")
+        identity = self._manifest_owned_discord_resource(
+            context, resource, inventory
+        )
+        if identity not in inventory["active"]:
+            fail("discord_resource_not_active")
+        status, discord_code, _ = self._discord_resource_request_result(
+            context,
+            identity,
+            "DELETE",
+            timeout_seconds,
+            through_transport=True,
+        )
+        return {
+            "schema_version": 1,
+            "kind": "starring.d2.discord-resource-proxy-deletion.v1",
+            "transport_instance_id": inventory["instance_id"],
+            "inventory_digest_sha256": inventory["digest_sha256"],
+            "resource_kind": identity["kind"],
+            "resource_id": identity["resource_id"],
+            "channel_id": identity.get("channel_id"),
+            "http_status": status,
+            "discord_code": discord_code,
+            "deleted": status
+            == DISCORD_RESOURCE_SUCCESS[(identity["kind"], "DELETE")],
         }
 
     def _transport_snapshot_valid(self, context, snapshot, require_ready=True):
