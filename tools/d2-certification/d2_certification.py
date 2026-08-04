@@ -99,6 +99,7 @@ D2_TOOLCHAIN_SOURCE_FILES = (
     "d2_certification.py",
     "d2_evidence.py",
     "d2_finalization.py",
+    "d2_legacy_substrate_recovery.py",
     "d2_orchestrator_composition.py",
     "d2_orchestrator_contract.py",
     "d2_orchestrator_platform.py",

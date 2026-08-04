@@ -913,6 +913,24 @@ class D2CertificationTest(unittest.TestCase):
         ):
             MODULE.load_verified_manifest(manifest_path)
 
+    def test_legacy_substrate_recovery_source_drift_is_rejected(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        original = MODULE.source_tree_digest
+
+        def source_tree_digest(root, files, label):
+            if label == "source_tree_d2_toolchain":
+                self.assertIn("d2_legacy_substrate_recovery.py", files)
+                return "0" * 64
+            return original(root, files, label)
+
+        with mock.patch.object(
+            MODULE, "source_tree_digest", side_effect=source_tree_digest
+        ), self.assertRaisesRegex(
+            MODULE.CertificationError, "source_tree_d2_toolchain_digest_mismatch"
+        ):
+            MODULE.validate_candidate_files(manifest)
+
     def test_evidence_and_run_directory_require_exact_owned_modes(self):
         manifest_path = self.prepare()
         manifest = json.loads(manifest_path.read_text())
