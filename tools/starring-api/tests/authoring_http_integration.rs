@@ -47,6 +47,8 @@ const ORIGIN: &str = "https://starring.example";
 const SESSION: &str = "sssssssssssssssssssssssssssssssssssssssssss";
 const CSRF: &str = "ccccccccccccccccccccccccccccccccccccccccccc";
 const IDEMPOTENCY: &str = "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii";
+const WORKER_COMPLETION_SHA256: &str =
+    "ff2ed5390bd860fb5170ca1c96e22fda41990dc4be5e275eac4bcf334600ebe1";
 
 #[derive(Clone)]
 struct Evidence {
@@ -476,6 +478,7 @@ async fn worker_completion(
         }
     }
     let frontier = request["frontier"]["name"].as_str().unwrap();
+    assert_eq!(frontier, "interpret_intent_core");
     Json(json!({
         "schema_version": 1,
         "request_id": "request-1",
@@ -485,7 +488,7 @@ async fn worker_completion(
         "auth_mode": "chatgpt",
         "codex_cli_version": "codex-cli 0.146.0-alpha.3.1",
         "tool_call": {
-            "id": "interpret",
+            "id": "call-request-1",
             "name": frontier,
             "arguments": json!({
             "expected_revision": 0,
@@ -505,7 +508,8 @@ async fn worker_completion(
             "output_tokens": 20,
             "reasoning_output_tokens": 10
         },
-        "duration_ms": 10
+        "duration_ms": 10,
+        "completion_sha256": WORKER_COMPLETION_SHA256
     }))
 }
 
@@ -860,12 +864,22 @@ async fn concurrent_identical_posts_wait_then_recheck_and_replay_one_model_resul
     let second_response = second.await.unwrap().unwrap();
     assert_eq!(first_response.status(), StatusCode::CREATED);
     assert_eq!(second_response.status(), StatusCode::OK);
-    assert!(body_text(first_response)
-        .await
-        .contains("\"disposition\":\"created\""));
-    assert!(body_text(second_response)
-        .await
-        .contains("\"disposition\":\"exact_replay\""));
+    let first_body: Value = serde_json::from_str(&body_text(first_response).await).unwrap();
+    let second_body: Value = serde_json::from_str(&body_text(second_response).await).unwrap();
+    let model_completions = json!([{
+        "request_id": "request-1",
+        "completion_sha256": WORKER_COMPLETION_SHA256
+    }]);
+    assert_eq!(first_body["disposition"], "created");
+    assert_eq!(second_body["disposition"], "exact_replay");
+    assert_eq!(
+        first_body["projection"]["model_completions"],
+        model_completions
+    );
+    assert_eq!(
+        second_body["projection"]["model_completions"],
+        model_completions
+    );
     assert_eq!(worker.calls(), 1);
     assert_eq!(worker.settled(), 1);
     assert_eq!(facade.store.counts(), (3, 1, 1));
