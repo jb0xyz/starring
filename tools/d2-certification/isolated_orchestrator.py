@@ -2287,9 +2287,12 @@ def guarded_remove_root(context):
     expected = pathlib.Path(f"/private/tmp/starring-d2-{context.manifest['run_id']}")
     if context.root != expected or context.root.parent != pathlib.Path("/private/tmp"):
         fail("cleanup_root_guard_failed")
-    if not context.root.exists():
+    try:
+        metadata = context.root.lstat()
+    except FileNotFoundError:
         return
-    metadata = context.root.lstat()
+    except OSError:
+        fail("cleanup_root_invalid")
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or context.root.is_symlink()
@@ -2332,10 +2335,24 @@ def validate_cleanup_mutation_roots(context):
         fail("cleanup_cluster_invalid")
 
 
+def filesystem_entry_present(path, code):
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        fail(code)
+    return True
+
+
 def cleanup_absence(context, platform, expected_snapshot):
+    root_present = filesystem_entry_present(context.root, "cleanup_root_invalid")
+    cluster_present = filesystem_entry_present(
+        context.cluster_root, "cleanup_cluster_invalid"
+    )
     return {
-        "database_absent": not context.root.exists(),
-        "postgres_process_absent": not context.cluster_root.exists()
+        "database_absent": not root_present,
+        "postgres_process_absent": not cluster_present
         or not platform.postgres_running(context.cluster_root),
         "launchd_jobs_absent": all(
             not platform.launchd_loaded(service["label"])
@@ -2345,7 +2362,7 @@ def cleanup_absence(context, platform, expected_snapshot):
             not platform.keychain_present(service, account)
             for service, account in keychain_inventory(context)
         ),
-        "isolated_root_absent": not context.root.exists(),
+        "isolated_root_absent": not root_present,
         "protected_staging_unchanged": standing_snapshot(context, platform)
         == expected_snapshot,
     }

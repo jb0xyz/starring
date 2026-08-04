@@ -102,6 +102,16 @@ def _load_private(path, label):
     return load_json_file(path, label)
 
 
+def _filesystem_entry_present(path, code):
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        fail(code)
+    return True
+
+
 def finalization_directory(context):
     return context.artifact_directory / "finalization"
 
@@ -1666,7 +1676,9 @@ def command_finalize_run(
             for service, account in keychain_inventory(context)
         ):
             fail("run_keychain_items_still_present")
-        if context.root.exists() or platform.postgres_running(context.cluster_root):
+        if _filesystem_entry_present(
+            context.root, "isolated_runtime_absence_invalid"
+        ) or platform.postgres_running(context.cluster_root):
             fail("isolated_runtime_still_present")
         if not _external_present(context, platform):
             fail("external_keychain_identity_absent")
@@ -1680,7 +1692,9 @@ def command_finalize_run(
     command_finalize_database(context, platform)
     state = load_state(context)
     if not _cleanup_path(context).exists():
-        if context.root.exists() or context.root.is_symlink():
+        if _filesystem_entry_present(
+            context.root, "isolated_runtime_absence_invalid"
+        ):
             validate_mutation_roots(context)
         cleanup_boundary(context, platform)
     cleanup = _validate_cleanup(
@@ -1688,7 +1702,9 @@ def command_finalize_run(
     )
     if not _candidate_services_absent(context, platform):
         fail("candidate_services_still_loaded")
-    if platform.postgres_running(context.cluster_root) or context.root.exists():
+    if platform.postgres_running(context.cluster_root) or _filesystem_entry_present(
+        context.root, "isolated_runtime_absence_invalid"
+    ):
         fail("isolated_runtime_still_present")
     if any(
         platform.keychain_present(service, account)
@@ -2312,7 +2328,9 @@ def command_finalize_total_absence(
     )
     if not _candidate_services_absent(context, platform):
         fail("candidate_services_still_loaded")
-    if platform.postgres_running(context.cluster_root) or context.root.exists():
+    if platform.postgres_running(context.cluster_root) or _filesystem_entry_present(
+        context.root, "isolated_runtime_absence_invalid"
+    ):
         fail("isolated_runtime_still_present")
     if any(
         platform.keychain_present(service, account)

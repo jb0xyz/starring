@@ -238,6 +238,32 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertEqual(self.platform.bootouts, bootouts)
         self.assertEqual(self.platform.keychain_deletes, deletes)
 
+    def test_dangling_isolated_root_blocks_step16_and_step17_replay(self):
+        self.finalize()
+        root = self.context.root
+        root.symlink_to(root.with_name(root.name + "-missing"), target_is_directory=True)
+        try:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "isolated_runtime_still_present"
+            ):
+                self.finalize()
+            prefix = self.prefix_scan()
+            guild = self.guild_deletion()
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "isolated_runtime_still_present"
+            ):
+                FINALIZATION.command_finalize_total_absence(
+                    self.context, self.platform, str(prefix), str(guild)
+                )
+            self.assertFalse(
+                FINALIZATION.orchestration_absence_path(self.context).exists()
+            )
+            self.assertFalse(
+                FINALIZATION.step_seventeen_evidence_path(self.context).exists()
+            )
+        finally:
+            root.unlink()
+
     def test_finalize_requires_complete_coordinator_prefix_before_freeze(self):
         self.certification_mock.side_effect = ORCHESTRATOR.OrchestratorError(
             "finalization_certification_prefix_incomplete"
