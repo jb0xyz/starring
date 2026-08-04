@@ -1029,6 +1029,18 @@
           serving &&
           serving.state === "fresh"
         );
+        const gatewayDisconnected = Boolean(
+          product &&
+          operational &&
+          product.status === 200 &&
+          operational.status === 200 &&
+          product.body.state === "pending" &&
+          operational.body.state === "pending" &&
+          runtime &&
+          runtime.phase === "live" &&
+          serving &&
+          serving.state === "disconnected"
+        );
         if (!stillLive) {
           return Object.freeze({
             schema_version: 1,
@@ -1044,8 +1056,16 @@
             operational_state: operational && operational.body.state ? operational.body.state : "unavailable",
             runtime_phase: runtime && runtime.phase ? runtime.phase : "unavailable",
             serving_state: serving && serving.state ? serving.state : "unavailable",
-            public_code: publicProblem ? publicProblem.code : "live_state_lost",
-            retryable: publicProblem ? publicProblem.retryable : false,
+            public_code: gatewayDisconnected
+              ? "runtime_gateway_disconnected"
+              : publicProblem
+                ? publicProblem.code
+                : "live_state_lost",
+            retryable: gatewayDisconnected
+              ? true
+              : publicProblem
+                ? publicProblem.retryable
+                : false,
           });
         }
         if (attempt < attempts) {

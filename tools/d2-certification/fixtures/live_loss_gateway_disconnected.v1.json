@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "kind": "starring.d2.browser-live-loss-evidence.v1",
+  "observed_at": "2026-08-04T11:02:30Z",
+  "public_origin": "https://d2-api.starring.co.kr",
+  "installation_id": "installation-1",
+  "promotion_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "live_lost": true,
+  "deployment_http_status": 200,
+  "operational_http_status": 200,
+  "product_state": "pending",
+  "operational_state": "pending",
+  "runtime_phase": "live",
+  "serving_state": "disconnected",
+  "public_code": "runtime_gateway_disconnected",
+  "retryable": true
+}

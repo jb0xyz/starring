@@ -1261,22 +1261,22 @@ def assemble_live_loss_evidence(browser, transport, prior_binding):
     )
     _require_state(
         public["product_state"],
-        {"runtime_unavailable"},
+        {"pending"},
         "live_loss_product_state_invalid",
     )
     _require_state(
         public["operational_state"],
-        {"unavailable"},
+        {"pending"},
         "live_loss_operational_state_invalid",
     )
     _require_state(
         public["runtime_phase"],
-        {"disconnected"},
+        {"live"},
         "live_loss_runtime_phase_invalid",
     )
     _require_state(
         public["serving_state"],
-        {"absent"},
+        {"disconnected"},
         "live_loss_serving_state_invalid",
     )
     _require_state(

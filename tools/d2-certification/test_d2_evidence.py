@@ -10,6 +10,11 @@ MODULE_PATH = pathlib.Path(__file__).with_name("d2_evidence.py")
 SPEC = importlib.util.spec_from_file_location("d2_evidence_tests", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+LIVE_LOSS_GATEWAY_DISCONNECTED = json.loads(
+    (MODULE_PATH.parent / "fixtures" / "live_loss_gateway_disconnected.v1.json").read_text(
+        encoding="utf-8"
+    )
+)
 
 OBSERVED_AT = "2026-08-04T01:02:03Z"
 ORIGIN = "https://d2-api.starring.co.kr"
@@ -581,21 +586,7 @@ class D2EvidenceTest(unittest.TestCase):
         replacement = MODULE.assemble_replacement_evidence(
             replacement_browser, replacement_database
         )
-        loss_browser = envelope(
-            "starring.d2.browser-live-loss-evidence.v1",
-            public_origin=ORIGIN,
-            installation_id=INSTALLATION_ID,
-            promotion_id="a" * 64,
-            live_lost=True,
-            deployment_http_status=200,
-            operational_http_status=200,
-            product_state="runtime_unavailable",
-            operational_state="unavailable",
-            runtime_phase="disconnected",
-            serving_state="absent",
-            public_code="runtime_gateway_disconnected",
-            retryable=True,
-        )
+        loss_browser = copy.deepcopy(LIVE_LOSS_GATEWAY_DISCONNECTED)
         loss_transport = envelope(
             "starring.d2.transport-gateway-loss-evidence.v1",
             gateway_disconnected=True,

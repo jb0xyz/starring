@@ -5,6 +5,12 @@ import vm from "node:vm";
 
 
 const SOURCE = await readFile(new URL("./product_driver.js", import.meta.url), "utf8");
+const LIVE_LOSS_GATEWAY_DISCONNECTED = JSON.parse(
+  await readFile(
+    new URL("./fixtures/live_loss_gateway_disconnected.v1.json", import.meta.url),
+    "utf8",
+  ),
+);
 const DIGEST = "a".repeat(64);
 const PROCESS_INSTANCE_ID = "0123456789abcdef0123456789abcdef";
 
@@ -1695,6 +1701,38 @@ test("live loss evidence accepts only retryable public dependency failures", asy
   assert.equal(evidence.public_code, "dependency_unavailable");
   assert.equal(evidence.retryable, true);
   assert.equal(Object.hasOwn(evidence, "request_id"), false);
+});
+
+
+test("live loss evidence emits the exact gateway disconnected contract", async () => {
+  const responses = [
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "pending",
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "pending",
+      runtime: {
+        phase: "live",
+        serving: { state: "disconnected" },
+      },
+    }),
+  ];
+  const evidence = await driver(async () => responses.shift(), undefined, {
+    now: () => "2026-08-04T11:02:30Z",
+  }).waitForLiveLoss({
+    installationId: "installation-1",
+    promotionId: DIGEST,
+    attempts: 1,
+    intervalMilliseconds: 100,
+  });
+  assert.deepEqual(
+    { ...evidence },
+    LIVE_LOSS_GATEWAY_DISCONNECTED,
+  );
 });
 
 
