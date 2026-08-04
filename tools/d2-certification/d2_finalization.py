@@ -849,6 +849,7 @@ def certified_teardown_binding(context):
         context,
         _load_private(freeze_intent_path(context), "finalization_freeze_intent"),
     )
+    validate_freeze_certification(freeze, require_certification_prefix(context))
     return {
         "finalization_freeze_intent_sha256": _digest(freeze),
         "certification_step15_receipt_sha256": freeze[

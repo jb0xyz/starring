@@ -354,6 +354,27 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertEqual(self.platform.bootouts, bootouts)
         self.assertEqual(self.platform.destroy_calls, 0)
 
+    def test_frozen_teardown_revalidates_step15_completion_before_delete(self):
+        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        existing = set(self.platform.discord_existing)
+        self.certification_mock.side_effect = ORCHESTRATOR.OrchestratorError(
+            "finalization_certification_prefix_incomplete"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "finalization_certification_prefix_incomplete",
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform, frozen=True
+            )
+        self.assertEqual(self.platform.discord_existing, existing)
+        self.assertEqual(self.platform.proxy_deletions, [])
+        self.assertFalse(
+            ORCHESTRATOR.discord_teardown_progress_path(
+                self.context, frozen=True
+            ).exists()
+        )
+
     def test_existing_freeze_rejects_step15_completion_and_chronology_drift(self):
         FINALIZATION._ensure_effect_freeze(self.context, self.platform)
         bootouts = list(self.platform.bootouts)
