@@ -1838,17 +1838,7 @@ def command_verify(arguments):
         receipts = load_receipts_from_handle(handle, manifest, digest)
     if len(receipts) != len(STEP_SPECS):
         fail(f"certification_incomplete:{len(receipts)}_of_{len(STEP_SPECS)}")
-    summary = {
-        "schema_version": SCHEMA_VERSION,
-        "run_id": manifest["run_id"],
-        "commit_sha": manifest["commit_sha"],
-        "manifest_sha256": digest,
-        "steps": len(receipts),
-        "status": "passed",
-        "resource_prefix": manifest["discord"]["resource_prefix"],
-        "receipt_chain_head_sha256": receipts[-1]["receipt_sha256"],
-    }
-    print(canonical_json(summary))
+    fail("authoritative_verification_requires_d2_run")
 
 
 def parser():

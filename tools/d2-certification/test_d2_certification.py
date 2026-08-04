@@ -525,50 +525,35 @@ class D2CertificationTest(unittest.TestCase):
                 ):
                     MODULE.validate_cloudflare_tunnel_id(value)
 
-    def test_complete_seventeen_step_evidence_passes(self):
+    def test_complete_legacy_receipt_chain_is_not_release_authority(self):
         manifest_path = self.prepare()
         manifest = json.loads(manifest_path.read_text())
         for step, evidence in complete_evidence(manifest).items():
             self.assertEqual(self.record(manifest_path, step, evidence), 0)
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
             self.assertEqual(
-                MODULE.main(["verify", "--manifest", str(manifest_path)]), 0
+                MODULE.main(["verify", "--manifest", str(manifest_path)]), 1
             )
-        summary = json.loads(output.getvalue())
-        self.assertEqual(summary["status"], "passed")
-        self.assertEqual(summary["steps"], 17)
-        self.assertRegex(summary["receipt_chain_head_sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn(
+            "authoritative_verification_requires_d2_run", stderr.getvalue()
+        )
+        with self.assertRaisesRegex(
+            RUN_MODULE.CertificationError, "coordinator_intent_missing:1"
+        ):
+            RUN_MODULE.verify_certification(str(manifest_path))
 
-    def test_coordinator_resumes_from_the_receipt_chain(self):
+    def test_coordinator_rejects_legacy_raw_receipt_prefix(self):
         manifest_path = self.prepare()
         manifest = json.loads(manifest_path.read_text())
         evidence_by_step = complete_evidence(manifest)
-        for completed in range(18):
-            action = RUN_MODULE.next_certification_action(str(manifest_path))
-            self.assertEqual(action["completed_steps"], completed)
-            if completed == 17:
-                self.assertEqual(action["status"], "complete")
-                self.assertEqual(action["steps"], 17)
-                break
-            next_step = completed + 1
-            self.assertEqual(action["step"], next_step)
-            self.assertEqual(action["code"], MODULE.STEP_SPECS[next_step].code)
-            expected_status = (
-                "awaiting_human_boundary"
-                if next_step in RUN_MODULE.HUMAN_BOUNDARIES
-                else "next_step"
-            )
-            self.assertEqual(action["status"], expected_status)
-            self.assertEqual(
-                action["required_evidence_fields"],
-                list(MODULE.STEP_SPECS[next_step].required),
-            )
-            if expected_status == "awaiting_human_boundary":
-                self.assertEqual(
-                    action["boundary"], RUN_MODULE.HUMAN_BOUNDARIES[next_step]
-                )
-            self.assertEqual(self.record(manifest_path, next_step, evidence_by_step[next_step]), 0)
+        action = RUN_MODULE.next_certification_action(str(manifest_path))
+        self.assertEqual(action["step"], 1)
+        self.assertEqual(self.record(manifest_path, 1, evidence_by_step[1]), 0)
+        with self.assertRaisesRegex(
+            RUN_MODULE.CertificationError, "coordinator_intent_missing:1"
+        ):
+            RUN_MODULE.next_certification_action(str(manifest_path))
 
     def test_coordinator_does_not_advance_without_a_receipt(self):
         manifest_path = self.prepare()
