@@ -1283,3 +1283,223 @@ test("every fetch is aborted by the fixed request deadline", async () => {
   await assert.rejects(product.me(), /product_request_timeout/);
   assert.ok(Date.now() - started < 1000);
 });
+
+
+test("authentication evidence is exact and excludes profile and session material", async () => {
+  const calls = [];
+  const responses = [
+    response(200, {
+      principal_id: "discord:1056857223529250906",
+      display_name: "not retained",
+    }),
+    response(204, null),
+  ];
+  const evidence = await driver(async (url, options) => {
+    calls.push({ url, options });
+    return responses.shift();
+  }, undefined, {
+    now: () => "2026-08-04T11:00:00Z",
+  }).authenticationEvidence({
+    installationId: "installation-1",
+    guildId: "1533137713476272288",
+  });
+  assert.equal(calls.length, 2);
+  assert.deepEqual(
+    Object.keys(evidence),
+    [
+      "schema_version",
+      "kind",
+      "observed_at",
+      "public_origin",
+      "me_status",
+      "principal_id",
+      "installation_id",
+      "guild_id",
+      "authority_check_status",
+    ]
+  );
+  assert.equal(evidence.kind, "starring.d2.browser-authentication-evidence.v1");
+  assert.equal(evidence.authority_check_status, 204);
+  assert.equal(JSON.stringify(evidence).includes("not retained"), false);
+  assert.equal(JSON.stringify(evidence).includes("csrf-value"), false);
+});
+
+
+test("live evidence binds both public deployment projections", async () => {
+  const responses = [
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "pending",
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "pending",
+      runtime: null,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "live",
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "live",
+      runtime: {
+        phase: "live",
+        serving: { state: "fresh" },
+      },
+    }),
+  ];
+  const evidence = await driver(async () => responses.shift(), undefined, {
+    now: () => "2026-08-04T11:01:00Z",
+  }).waitForLiveEvidence({
+    installationId: "installation-1",
+    promotionId: DIGEST,
+    attempts: 2,
+    intervalMilliseconds: 100,
+  });
+  assert.equal(evidence.kind, "starring.d2.browser-live-evidence.v1");
+  assert.equal(evidence.pending_observed, true);
+  assert.equal(evidence.live_observed, true);
+  assert.equal(evidence.attempts, 2);
+  assert.equal(evidence.deployment_http_status, 200);
+  assert.equal(evidence.operational_http_status, 200);
+});
+
+
+test("live loss evidence accepts only retryable public dependency failures", async () => {
+  const sleeps = [];
+  const responses = [
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "live",
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "live",
+      runtime: {
+        phase: "live",
+        serving: { state: "fresh" },
+      },
+    }),
+    response(503, {
+      error: {
+        code: "dependency_unavailable",
+        request_id: "request-product",
+        retryable: true,
+      },
+    }),
+    response(503, {
+      error: {
+        code: "dependency_unavailable",
+        request_id: "request-operational",
+        retryable: true,
+      },
+    }),
+  ];
+  const evidence = await driver(async () => responses.shift(), undefined, {
+    sleep: async (milliseconds) => sleeps.push(milliseconds),
+    now: () => "2026-08-04T11:02:00Z",
+  }).waitForLiveLoss({
+    installationId: "installation-1",
+    promotionId: DIGEST,
+    attempts: 2,
+    intervalMilliseconds: 100,
+  });
+  assert.deepEqual(sleeps, [100]);
+  assert.equal(evidence.kind, "starring.d2.browser-live-loss-evidence.v1");
+  assert.equal(evidence.live_lost, true);
+  assert.equal(evidence.deployment_http_status, 503);
+  assert.equal(evidence.operational_http_status, 503);
+  assert.equal(evidence.public_code, "dependency_unavailable");
+  assert.equal(evidence.retryable, true);
+  assert.equal(Object.hasOwn(evidence, "request_id"), false);
+});
+
+
+test("replacement evidence binds one reviewed target transition without retaining the prompt", async () => {
+  const sourcePromotionId = "b".repeat(64);
+  const responses = [
+    response(201, {
+      session_id: "session-replacement",
+      generation: 1,
+      disposition: "created",
+      projection: {
+        state: "preview_ready",
+        preview: { revision: 1, receipt: { candidate_ruleset_hash: DIGEST } },
+      },
+    }),
+    response(201, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      replayed: false,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: DIGEST,
+      summary: {
+        panels: 1,
+        modals: 1,
+        rules: 4,
+        actions: 15,
+        target_version: 2,
+        required_approvals: 1,
+      },
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 2,
+      state: "approved",
+      replayed: false,
+    }),
+    response(202, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "runtime_pending",
+      replayed: false,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "live",
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "live",
+      runtime: {
+        phase: "live",
+        serving: { state: "fresh" },
+      },
+    }),
+  ];
+  const evidence = await driver(async () => responses.shift(), undefined, {
+    now: () => "2026-08-04T11:03:00Z",
+  }).runReplacementFlow({
+    installationId: "installation-1",
+    sourcePromotionId,
+    replacementKind: "update",
+    sessionId: "session-replacement",
+    message: "Do not retain this replacement prompt",
+    confirmPreview: async () => true,
+    liveAttempts: 1,
+    liveIntervalMilliseconds: 100,
+  });
+  assert.equal(evidence.kind, "starring.d2.browser-replacement-evidence.v1");
+  assert.equal(evidence.source_promotion_id, sourcePromotionId);
+  assert.equal(evidence.replacement_promotion_id, DIGEST);
+  assert.equal(evidence.replacement_kind, "update");
+  assert.equal(evidence.live_observed, true);
+  assert.equal(JSON.stringify(evidence).includes("replacement prompt"), false);
+});

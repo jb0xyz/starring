@@ -8,6 +8,10 @@
   const LIVE_RESTART_OPERATION = /^d2:[0-9a-f]{16}:certify-live-runtime-restart$/;
   const COOKIE_NAME = "__Host-starring_csrf";
   const LIVE_RESTART_CONFIRMATION_KIND = "starring.d2.live-runtime-restart-confirmation.v1";
+  const AUTHENTICATION_EVIDENCE_KIND = "starring.d2.browser-authentication-evidence.v1";
+  const LIVE_EVIDENCE_KIND = "starring.d2.browser-live-evidence.v1";
+  const LIVE_LOSS_EVIDENCE_KIND = "starring.d2.browser-live-loss-evidence.v1";
+  const REPLACEMENT_EVIDENCE_KIND = "starring.d2.browser-replacement-evidence.v1";
   const LIVE_FRESH_LEASE_CHECKPOINT = "live_fresh_lease";
   const SERVING_LEASE_MAXIMUM_NANOSECONDS = 45 * 1000000000;
   const APPLY_ACTIVE_STATES = new Set(["applying"]);
@@ -31,6 +35,13 @@
 
   function requireDigest(value, label) {
     if (typeof value !== "string" || !DIGEST.test(value)) {
+      throw new Error(`${label}_invalid`);
+    }
+    return value;
+  }
+
+  function requireSnowflake(value, label) {
+    if (typeof value !== "string" || !/^[1-9][0-9]{0,19}$/.test(value)) {
       throw new Error(`${label}_invalid`);
     }
     return value;
@@ -248,6 +259,7 @@
     const fetchImpl = options.fetchImpl || root.fetch;
     const cookieSource = options.cookieSource || (() => root.document.cookie);
     const randomUUID = options.randomUUID || (() => root.crypto.randomUUID());
+    const now = options.now || (() => new Date().toISOString());
     const sleep = options.sleep || ((milliseconds) => new Promise((resolve) => root.setTimeout(resolve, milliseconds)));
     const requestTimeoutMilliseconds = options.requestTimeoutMilliseconds === undefined
       ? 15000
@@ -256,11 +268,16 @@
       typeof fetchImpl !== "function" ||
       typeof cookieSource !== "function" ||
       typeof randomUUID !== "function" ||
+      typeof now !== "function" ||
       !Number.isInteger(requestTimeoutMilliseconds) ||
       requestTimeoutMilliseconds < 10 ||
       requestTimeoutMilliseconds > 30000
     ) {
       throw new Error("driver_dependency_invalid");
+    }
+
+    function observedAt() {
+      return requireUtcTimestamp(now(), "observed_at").value;
     }
 
     function boundedSignal(callerSignal) {
@@ -360,6 +377,35 @@
 
     async function authorityCheck(installationId) {
       return request(`/v1/installations/${installationPath(installationId)}/authority-check`);
+    }
+
+    async function authenticationEvidence(input) {
+      const installationId = requireResourceId(input.installationId, "installation_id");
+      const guildId = requireSnowflake(input.guildId, "guild_id");
+      const identity = await me();
+      const body = requireBody(identity.body, "me");
+      if (
+        identity.status !== 200 ||
+        typeof body.principal_id !== "string" ||
+        !/^discord:[1-9][0-9]{0,19}$/.test(body.principal_id)
+      ) {
+        throw new Error("me_identity_invalid");
+      }
+      const authority = await authorityCheck(installationId);
+      if (authority.status !== 204 || authority.body !== null) {
+        throw new Error("authority_check_invalid");
+      }
+      return Object.freeze({
+        schema_version: 1,
+        kind: AUTHENTICATION_EVIDENCE_KIND,
+        observed_at: observedAt(),
+        public_origin: origin,
+        me_status: identity.status,
+        principal_id: body.principal_id,
+        installation_id: installationId,
+        guild_id: guildId,
+        authority_check_status: authority.status,
+      });
     }
 
     async function authoringTurn(input) {
@@ -780,6 +826,10 @@
           operational.body.runtime.serving.state === "fresh"
         ) {
           return {
+            schema_version: 1,
+            kind: LIVE_EVIDENCE_KIND,
+            observed_at: observedAt(),
+            public_origin: origin,
             pending_observed: pendingObserved,
             live_observed: true,
             attempts: attempt,
@@ -789,6 +839,8 @@
             operational_state: operational.body.state,
             runtime_phase: operational.body.runtime.phase,
             serving_state: operational.body.runtime.serving.state,
+            deployment_http_status: product.status,
+            operational_http_status: operational.status,
           };
         }
         if (attempt < attempts) {
@@ -798,9 +850,135 @@
       throw new Error("deployment_live_timeout");
     }
 
+    async function waitForLiveLoss(input) {
+      const attempts = input.attempts === undefined ? 60 : input.attempts;
+      const intervalMilliseconds = input.intervalMilliseconds === undefined ? 2000 : input.intervalMilliseconds;
+      const installationId = requireResourceId(input.installationId, "installation_id");
+      const promotionId = requireDigest(input.promotionId, "promotion_id");
+      if (!Number.isInteger(attempts) || attempts < 1 || attempts > 180) {
+        throw new Error("attempts_invalid");
+      }
+      if (!Number.isInteger(intervalMilliseconds) || intervalMilliseconds < 100 || intervalMilliseconds > 10000) {
+        throw new Error("poll_interval_invalid");
+      }
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        let product;
+        let operational;
+        let publicProblem = null;
+        try {
+          product = await deployment(installationId, promotionId);
+        } catch (error) {
+          if (
+            !error ||
+            error.name !== "StarringD2ProductRequestError" ||
+            error.status !== 503 ||
+            error.retryable !== true ||
+            typeof error.code !== "string" ||
+            !RESOURCE_ID.test(error.code)
+          ) {
+            throw error;
+          }
+          publicProblem = error;
+        }
+        try {
+          operational = await operationalDeployment(installationId, promotionId);
+        } catch (error) {
+          if (
+            !error ||
+            error.name !== "StarringD2ProductRequestError" ||
+            error.status !== 503 ||
+            error.retryable !== true ||
+            typeof error.code !== "string" ||
+            !RESOURCE_ID.test(error.code)
+          ) {
+            throw error;
+          }
+          publicProblem = publicProblem || error;
+        }
+        const runtime = operational && operational.body.runtime
+          ? requireBody(operational.body.runtime, "operational_runtime")
+          : null;
+        const serving = runtime && runtime.serving
+          ? requireBody(runtime.serving, "operational_serving")
+          : null;
+        const stillLive = Boolean(
+          product &&
+          operational &&
+          product.body.state === "live" &&
+          operational.body.state === "live" &&
+          runtime &&
+          runtime.phase === "live" &&
+          serving &&
+          serving.state === "fresh"
+        );
+        if (!stillLive) {
+          return Object.freeze({
+            schema_version: 1,
+            kind: LIVE_LOSS_EVIDENCE_KIND,
+            observed_at: observedAt(),
+            public_origin: origin,
+            installation_id: installationId,
+            promotion_id: promotionId,
+            live_lost: true,
+            deployment_http_status: product ? product.status : publicProblem.status,
+            operational_http_status: operational ? operational.status : publicProblem.status,
+            product_state: product ? product.body.state : null,
+            operational_state: operational ? operational.body.state : null,
+            runtime_phase: runtime ? runtime.phase : null,
+            serving_state: serving ? serving.state : null,
+            public_code: publicProblem ? publicProblem.code : null,
+            retryable: publicProblem ? publicProblem.retryable : false,
+          });
+        }
+        if (attempt < attempts) {
+          await sleep(intervalMilliseconds);
+        }
+      }
+      throw new Error("deployment_live_loss_timeout");
+    }
+
+    async function runReplacementFlow(input) {
+      const sourcePromotionId = requireDigest(input.sourcePromotionId, "source_promotion_id");
+      if (!new Set(["update", "rollback"]).has(input.replacementKind)) {
+        throw new Error("replacement_kind_invalid");
+      }
+      const result = await runOneShotProductFlow(input);
+      const live = await waitForLive({
+        installationId: input.installationId,
+        promotionId: result.promotion.promotion_id,
+        attempts: input.liveAttempts,
+        intervalMilliseconds: input.liveIntervalMilliseconds,
+      });
+      if (result.promotion.promotion_id === sourcePromotionId) {
+        throw new Error("replacement_promotion_not_distinct");
+      }
+      return Object.freeze({
+        schema_version: 1,
+        kind: REPLACEMENT_EVIDENCE_KIND,
+        observed_at: observedAt(),
+        public_origin: origin,
+        installation_id: result.promotion.installation_id,
+        source_promotion_id: sourcePromotionId,
+        replacement_promotion_id: result.promotion.promotion_id,
+        replacement_kind: input.replacementKind,
+        preview_state: result.preview.state,
+        approval_state: result.approval.state,
+        apply_state: result.applied.state,
+        pending_observed: live.pending_observed,
+        live_observed: live.live_observed,
+        product_state: live.product_state,
+        operational_state: live.operational_state,
+        runtime_phase: live.runtime_phase,
+        serving_state: live.serving_state,
+        drain_conflict_observed: result.runtime_drain_observed,
+        drain_attempts: result.apply_attempts,
+      });
+    }
+
     return Object.freeze({
       me,
       authorityCheck,
+      authenticationEvidence,
       authoringTurn,
       authoringSession,
       promote,
@@ -814,6 +992,9 @@
       liveRuntimeRestartConfirmation,
       runOneShotProductFlow,
       waitForLive,
+      waitForLiveEvidence: waitForLive,
+      waitForLiveLoss,
+      runReplacementFlow,
     });
   }
 
