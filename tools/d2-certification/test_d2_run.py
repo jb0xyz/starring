@@ -1,5 +1,6 @@
 import concurrent.futures
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -77,12 +78,68 @@ class D2RunCoordinatorTest(unittest.TestCase):
         values.update(overrides)
         return self.envelope(d2_run.GATEWAY_HEALED_KIND, **values)
 
+    def step_nine_sources(self):
+        final = self.complete[9]
+        database = self.envelope(
+            "starring.d2.db-interaction-evidence.v1",
+            create_interaction_id=final["create_interaction_id"],
+            join_interaction_id=final["join_interaction_id"],
+            actor_user_id=final["actor_user_id"],
+            joined_role_id=final["joined_role_id"],
+            deployment_id=final["deployment_id"],
+            route_identity=test_d2_certification.route_identity(
+                "deployment-1",
+                test_d2_certification.PROCESS_INSTANCE_OLD,
+                1,
+                1,
+                1,
+            ),
+            instance_id=final["instance_id"],
+            role_ids=final["role_ids"],
+            channel_ids=final["channel_ids"],
+            panel_message_ids=final["panel_message_ids"],
+            ephemeral_count=2,
+        )
+        transport = self.envelope(
+            "starring.d2.transport-resource-evidence.v1",
+            role_ids=final["role_ids"],
+            channel_ids=final["channel_ids"],
+            panel_message_ids=final["panel_message_ids"],
+            inventory_digest_sha256=final["inventory_digest_sha256"],
+            transport_instance_id=final["transport_instance_id"],
+        )
+        browser = self.envelope(
+            d2_run.DISCORD_INTERACTION_OBSERVATION_KIND,
+            guild_id=self.manifest["discord"]["guild_id"],
+            resource_prefix=self.manifest["discord"]["resource_prefix"],
+            actor_user_id=final["actor_user_id"],
+            create_interaction_id=final["create_interaction_id"],
+            join_interaction_id=final["join_interaction_id"],
+            joined_role_id=final["joined_role_id"],
+            role_ids=final["role_ids"],
+            channel_ids=final["channel_ids"],
+            panel_message_ids=final["panel_message_ids"],
+            create_response_observed=True,
+            join_response_observed=True,
+            private_channel_observed=True,
+            role_assignment_observed=True,
+            join_panel_observed=True,
+            confirmation_surface="chrome_discord_web",
+        )
+        return database, transport, browser
+
     def object_digest(self, value):
         return d2_run.sha256_bytes(
             d2_run.canonical_json(value).encode("utf-8")
         )
 
     def step_sixteen_sources(self):
+        receipts = self.receipts()
+        completion = json.loads(
+            d2_run.coordinator_completion_path(self.manifest_path, 15).read_text(
+                encoding="utf-8"
+            )
+        )
         installation_id = self.complete[4]["installation_id"]
         channel_id = self.complete[9]["channel_ids"][0]
         resources = [
@@ -176,6 +233,12 @@ class D2RunCoordinatorTest(unittest.TestCase):
             "proxy_deletions": proxy_deletions,
             "direct_observations": direct_observations,
             "all_resources_absent": True,
+            "finalization_freeze_intent_sha256": "f" * 64,
+            "certification_step15_receipt_sha256": receipts[14]["receipt_sha256"],
+            "coordinator_step15_completion_sha256": self.object_digest(completion),
+            "freeze_resource_inventory_digest_sha256": self.complete[13][
+                "reconciliation_inventory_digest_sha256"
+            ],
         }
         finalization = self.envelope(
             d2_run.ORCHESTRATOR_FINALIZATION_KIND,
@@ -201,6 +264,24 @@ class D2RunCoordinatorTest(unittest.TestCase):
         return database, teardown, finalization
 
     def step_seventeen_sources(self, step_sixteen):
+        receipts = self.receipts()
+        completion = json.loads(
+            d2_run.coordinator_completion_path(self.manifest_path, 16).read_text(
+                encoding="utf-8"
+            )
+        )
+        completed_at = datetime.datetime.fromisoformat(
+            completion["observed_at"].replace("Z", "+00:00")
+        )
+        prefix_observed_at = (completed_at + datetime.timedelta(seconds=1)).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
+        guild_observed_at = (completed_at + datetime.timedelta(seconds=2)).isoformat(
+            timespec="seconds"
+        ).replace("+00:00", "Z")
+        orchestration_observed_at = (
+            completed_at + datetime.timedelta(seconds=3)
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
         database = self.envelope(
             d2_run.DB_ABSENCE_KIND,
             run_id=self.manifest["run_id"],
@@ -209,7 +290,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
         )
         prefix_scan = self.envelope(
             d2_run.PREFIX_SCAN_KIND,
-            observed_at="2026-08-04T01:03:00Z",
+            observed_at=prefix_observed_at,
             guild_id=self.manifest["discord"]["guild_id"],
             resource_prefix=self.manifest["discord"]["resource_prefix"],
             guild_observation_http_status=200,
@@ -220,7 +301,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
         )
         guild = self.envelope(
             d2_run.GUILD_DELETION_KIND,
-            observed_at="2026-08-04T01:04:00Z",
+            observed_at=guild_observed_at,
             guild_id=self.manifest["discord"]["guild_id"],
             deletion_confirmed=True,
             guild_observation_http_status=404,
@@ -229,7 +310,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
         )
         orchestration = self.envelope(
             d2_run.ORCHESTRATOR_ABSENCE_KIND,
-            observed_at="2026-08-04T01:05:00Z",
+            observed_at=orchestration_observed_at,
             manifest_sha256=self.manifest_digest,
             run_id=self.manifest["run_id"],
             installation_id=self.complete[4]["installation_id"],
@@ -241,6 +322,9 @@ class D2RunCoordinatorTest(unittest.TestCase):
             discord_teardown_sha256=self.object_digest(step_sixteen[1]),
             prefix_scan_sha256=self.object_digest(prefix_scan),
             guild_deletion_sha256=self.object_digest(guild),
+            step16_receipt_sha256=receipts[15]["receipt_sha256"],
+            coordinator_step16_completion_sha256=self.object_digest(completion),
+            coordinator_step16_completed_at=completion["observed_at"],
             unresolved_operation_count=0,
             unresolved_receipt_count=0,
             unresolved_journal_count=0,
@@ -401,6 +485,13 @@ class D2RunCoordinatorTest(unittest.TestCase):
         self.assertEqual(
             d2_run.STEP_SOURCE_SPECS[15][-1],
             {"kind": d2_run.GATEWAY_HEALED_KIND, "mode": "machine"},
+        )
+        self.assertEqual(
+            d2_run.STEP_SOURCE_SPECS[9][0],
+            {
+                "kind": d2_run.DISCORD_INTERACTION_OBSERVATION_KIND,
+                "mode": "chrome",
+            },
         )
 
     def test_direct_machine_source_advances_and_replays_without_raw_evidence(self):
@@ -669,6 +760,49 @@ class D2RunCoordinatorTest(unittest.TestCase):
                 self.manifest,
                 self.manifest_digest,
             )
+
+    def test_step_nine_binds_visible_join_to_durable_actor_role_and_resources(self):
+        self.append_prior(8)
+        database, transport, browser = self.step_nine_sources()
+        result = d2_run.advance_certification(
+            self.manifest_path,
+            9,
+            [
+                str(self.write_source(transport)),
+                str(self.write_source(browser)),
+                str(self.write_source(database)),
+            ],
+        )
+        self.assertEqual(result["disposition"], "created")
+        self.assertEqual(self.receipts()[8]["evidence"], self.complete[9])
+
+    def test_step_nine_rejects_durable_actor_role_or_ack_drift(self):
+        self.append_prior(8)
+        database, transport, browser = self.step_nine_sources()
+        cases = {
+            "actor_user_id": "1056857223529250907",
+            "joined_role_id": "1532677575736819851",
+            "ephemeral_count": 1,
+        }
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                changed = dict(database)
+                changed[field] = value
+                with self.assertRaisesRegex(
+                    d2_run.CertificationError,
+                    "coordinator_evidence_assembly_failed:",
+                ):
+                    d2_run.assemble_step_evidence(
+                        9,
+                        [
+                            {"kind": changed["kind"], "value": changed},
+                            {"kind": transport["kind"], "value": transport},
+                            {"kind": browser["kind"], "value": browser},
+                        ],
+                        self.receipts(),
+                        self.manifest,
+                        self.manifest_digest,
+                    )
 
     def test_step_thirteen_correlates_database_effect_with_transport_digest(self):
         self.append_prior(12)
@@ -1068,6 +1202,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
         self.assertEqual(len(self.receipts()), 15)
         database, teardown, finalization = self.step_sixteen_sources()
         teardown["source_inventory_digest_sha256"] = "f" * 64
+        teardown["freeze_resource_inventory_digest_sha256"] = "f" * 64
         finalization["discord_teardown_sha256"] = self.object_digest(teardown)
         with self.assertRaisesRegex(
             d2_run.CertificationError,

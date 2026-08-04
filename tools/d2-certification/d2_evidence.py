@@ -677,6 +677,8 @@ def assemble_interaction_evidence(database, transport):
     database_fields = {
         "create_interaction_id",
         "join_interaction_id",
+        "actor_user_id",
+        "joined_role_id",
         "deployment_id",
         "route_identity",
         "instance_id",
@@ -702,6 +704,8 @@ def assemble_interaction_evidence(database, transport):
         _require_snowflake(durable[field], f"interaction_{field}_invalid")
     if durable["create_interaction_id"] == durable["join_interaction_id"]:
         _fail("interaction_ids_not_distinct")
+    _require_snowflake(durable["actor_user_id"], "interaction_actor_user_id_invalid")
+    _require_snowflake(durable["joined_role_id"], "interaction_joined_role_id_invalid")
     _require_identifier(durable["deployment_id"], "interaction_deployment_id_invalid")
     _require_identifier(durable["instance_id"], "interaction_instance_id_invalid")
     route_id = canonical_route_identity_sha256(durable["route_identity"])
@@ -710,8 +714,12 @@ def assemble_interaction_evidence(database, transport):
     for field in ("role_ids", "channel_ids", "panel_message_ids"):
         durable_ids = _require_snowflake_list(durable[field], f"interaction_{field}_invalid")
         inventory_ids = _require_snowflake_list(inventory[field], f"transport_{field}_invalid")
+        if len(durable_ids) != 1:
+            _fail(f"interaction_{field}_cardinality_invalid")
         if durable_ids != inventory_ids:
             _fail(f"interaction_{field}_mismatch")
+    if durable["joined_role_id"] not in durable["role_ids"]:
+        _fail("interaction_joined_role_not_created")
     resource_ids = (
         durable["role_ids"]
         + durable["channel_ids"]
@@ -719,7 +727,8 @@ def assemble_interaction_evidence(database, transport):
     )
     if len(resource_ids) != len(set(resource_ids)):
         _fail("interaction_resource_identity_invalid")
-    _require_positive_integer(durable["ephemeral_count"], "interaction_ephemeral_count_invalid")
+    if durable["ephemeral_count"] != 2:
+        _fail("interaction_ephemeral_count_invalid")
     _require_identifier(inventory["transport_instance_id"], "transport_instance_id_invalid")
     _require_digest(
         inventory["inventory_digest_sha256"],
@@ -728,6 +737,8 @@ def assemble_interaction_evidence(database, transport):
     return {
         "create_interaction_id": durable["create_interaction_id"],
         "join_interaction_id": durable["join_interaction_id"],
+        "actor_user_id": durable["actor_user_id"],
+        "joined_role_id": durable["joined_role_id"],
         "deployment_id": durable["deployment_id"],
         "route_id": route_id,
         "instance_id": durable["instance_id"],
@@ -738,6 +749,82 @@ def assemble_interaction_evidence(database, transport):
         "inventory_digest_sha256": inventory["inventory_digest_sha256"],
         "transport_instance_id": inventory["transport_instance_id"],
     }
+
+
+def assemble_observed_interaction_evidence(
+    database, transport, discord, expected_scope
+):
+    assembled = assemble_interaction_evidence(database, transport)
+    discord_fields = {
+        "guild_id",
+        "resource_prefix",
+        "actor_user_id",
+        "create_interaction_id",
+        "join_interaction_id",
+        "joined_role_id",
+        "role_ids",
+        "channel_ids",
+        "panel_message_ids",
+        "create_response_observed",
+        "join_response_observed",
+        "private_channel_observed",
+        "role_assignment_observed",
+        "join_panel_observed",
+        "confirmation_surface",
+    }
+    visible = _require_envelope(
+        discord,
+        "starring.d2.browser-discord-interaction-observation.v1",
+        discord_fields,
+    )
+    scope = _require_exact_object(
+        expected_scope,
+        {"guild_id", "resource_prefix", "actor_user_id"},
+        "discord_interaction_scope_invalid",
+    )
+    _require_snowflake(scope["guild_id"], "discord_interaction_guild_id_invalid")
+    _require_snowflake(
+        scope["actor_user_id"], "discord_interaction_actor_user_id_invalid"
+    )
+    _require_identifier(
+        scope["resource_prefix"], "discord_interaction_resource_prefix_invalid"
+    )
+    if (
+        visible["guild_id"] != scope["guild_id"]
+        or visible["resource_prefix"] != scope["resource_prefix"]
+        or visible["actor_user_id"] != scope["actor_user_id"]
+        or assembled["actor_user_id"] != scope["actor_user_id"]
+    ):
+        _fail("discord_interaction_scope_mismatch")
+    for field in ("create_interaction_id", "join_interaction_id"):
+        _require_snowflake(visible[field], f"discord_{field}_invalid")
+        if visible[field] != assembled[field]:
+            _fail(f"discord_{field}_mismatch")
+    for field in ("role_ids", "channel_ids", "panel_message_ids"):
+        observed = _require_snowflake_list(
+            visible[field], f"discord_{field}_invalid"
+        )
+        if observed != assembled[field]:
+            _fail(f"discord_{field}_mismatch")
+    _require_snowflake(
+        visible["joined_role_id"], "discord_joined_role_id_invalid"
+    )
+    if visible["joined_role_id"] != assembled["joined_role_id"]:
+        _fail("discord_joined_role_mismatch")
+    if visible["joined_role_id"] not in visible["role_ids"]:
+        _fail("discord_joined_role_not_created")
+    for field in (
+        "create_response_observed",
+        "join_response_observed",
+        "private_channel_observed",
+        "role_assignment_observed",
+        "join_panel_observed",
+    ):
+        if visible[field] is not True:
+            _fail(f"discord_{field}_invalid")
+    if visible["confirmation_surface"] != "chrome_discord_web":
+        _fail("discord_confirmation_surface_invalid")
+    return assembled
 
 
 def assemble_duplicate_evidence(database, transport):

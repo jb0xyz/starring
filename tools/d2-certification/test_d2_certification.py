@@ -184,6 +184,8 @@ def complete_evidence(manifest):
         9: {
             "create_interaction_id": "1532677575736819845",
             "join_interaction_id": "1532677575736819846",
+            "actor_user_id": manifest["discord"]["actor_id"],
+            "joined_role_id": "1532677575736819847",
             "deployment_id": "deployment-1",
             "route_id": ROUTE_ID_INITIAL,
             "instance_id": "instance-1",

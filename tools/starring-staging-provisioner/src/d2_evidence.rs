@@ -799,13 +799,27 @@ async fn inspect_interaction(
         "posted_message",
     )
     .await?;
-    if role_ids.is_empty() || channel_ids.is_empty() || panel_message_ids.is_empty() {
+    let registered_instance_ids = successful_output_ids(
+        connection,
+        &application_id,
+        &create_interaction_id,
+        "instance_state",
+    )
+    .await?;
+    if role_ids.len() != 1
+        || channel_ids.len() != 1
+        || panel_message_ids.len() != 1
+        || registered_instance_ids.len() != 1
+        || registered_instance_ids[0] != instance_id
+    {
         return Err(D2ProvisionerErrorV1::Inspection);
     }
-    let (membership_guild_id, membership_user_id, joined_role_id) =
+    let (create_membership_guild_id, create_membership_user_id, create_role_id) =
+        successful_role_membership(connection, &application_id, &create_interaction_id).await?;
+    let (join_membership_guild_id, join_membership_user_id, joined_role_id) =
         successful_role_membership(connection, &application_id, &join_interaction_id).await?;
-    let ephemeral_count: i64 = sqlx::query_scalar(
-        "SELECT pg_catalog.count(*) FROM public.runtime_interaction_receipt_heads_v1 WHERE application_id = $1 AND interaction_id IN ($2, $3) AND acknowledgement_kind IN ('defer_ephemeral', 'respond_ephemeral') AND acknowledgement_result = 'succeeded'",
+    let acknowledgements = sqlx::query(
+        "SELECT pg_catalog.count(*) FILTER (WHERE interaction_id = $2) AS create_ack_count, pg_catalog.count(*) FILTER (WHERE interaction_id = $3) AS join_ack_count FROM public.runtime_interaction_receipt_heads_v1 WHERE application_id = $1 AND interaction_id IN ($2, $3) AND acknowledgement_kind IN ('defer_ephemeral', 'respond_ephemeral') AND acknowledgement_result = 'succeeded'",
     )
     .bind(&application_id)
     .bind(&create_interaction_id)
@@ -813,18 +827,25 @@ async fn inspect_interaction(
     .fetch_one(&mut *connection)
     .await
     .map_err(|_| D2ProvisionerErrorV1::Inspection)?;
+    let create_ack_count: i64 = get(&acknowledgements, "create_ack_count")?;
+    let join_ack_count: i64 = get(&acknowledgements, "join_ack_count")?;
+    let ephemeral_count = create_ack_count + join_ack_count;
     if !valid_snowflake(&create_interaction_id)
         || !valid_snowflake(&join_interaction_id)
         || !valid_snowflake(&actor_user_id)
         || actor_user_id != join_actor_user_id
-        || membership_guild_id != scope.guild_id
-        || membership_user_id != actor_user_id
+        || create_membership_guild_id != scope.guild_id
+        || join_membership_guild_id != scope.guild_id
+        || create_membership_user_id != actor_user_id
+        || join_membership_user_id != actor_user_id
+        || create_role_id != joined_role_id
         || !role_ids.contains(&joined_role_id)
         || !valid_identifier(&instance_id)
         || !valid_distinct_snowflakes(&role_ids)
         || !valid_distinct_snowflakes(&channel_ids)
         || !valid_distinct_snowflakes(&panel_message_ids)
-        || ephemeral_count != 2
+        || create_ack_count != 1
+        || join_ack_count != 1
     {
         return Err(D2ProvisionerErrorV1::Inspection);
     }

@@ -43,6 +43,102 @@ function driver(fetchImpl, cookie = "__Host-starring_csrf=csrf-value", options =
 }
 
 
+test("Discord interaction observation is canonical and exact", () => {
+  const evidence = driver(async () => response(500, null), undefined, {
+    now: () => "2026-08-04T12:00:00Z",
+  }).discordInteractionObservation({
+    guildId: "1524810437118525551",
+    resourcePrefix: "starring-d2-abcdef123456",
+    actorUserId: "1056857223529250906",
+    createInteractionId: "1524810437118525560",
+    joinInteractionId: "1524810437118525561",
+    joinedRoleId: "1524810437118525570",
+    roleIds: ["1524810437118525571", "1524810437118525570"],
+    channelIds: ["1524810437118525580"],
+    panelMessageIds: ["1524810437118525590"],
+    createResponseObserved: true,
+    joinResponseObserved: true,
+    privateChannelObserved: true,
+    roleAssignmentObserved: true,
+    joinPanelObserved: true,
+  });
+  assert.deepEqual(
+    { ...evidence },
+    {
+      schema_version: 1,
+      kind: "starring.d2.browser-discord-interaction-observation.v1",
+      observed_at: "2026-08-04T12:00:00Z",
+      guild_id: "1524810437118525551",
+      resource_prefix: "starring-d2-abcdef123456",
+      actor_user_id: "1056857223529250906",
+      create_interaction_id: "1524810437118525560",
+      join_interaction_id: "1524810437118525561",
+      joined_role_id: "1524810437118525570",
+      role_ids: ["1524810437118525570", "1524810437118525571"],
+      channel_ids: ["1524810437118525580"],
+      panel_message_ids: ["1524810437118525590"],
+      create_response_observed: true,
+      join_response_observed: true,
+      private_channel_observed: true,
+      role_assignment_observed: true,
+      join_panel_observed: true,
+      confirmation_surface: "chrome_discord_web",
+    },
+  );
+});
+
+
+test("Discord interaction observation rejects weak or ambiguous confirmation", () => {
+  const product = driver(async () => response(500, null), undefined, {
+    now: () => "2026-08-04T12:00:00Z",
+  });
+  const valid = {
+    guildId: "1524810437118525551",
+    resourcePrefix: "starring-d2-abcdef123456",
+    actorUserId: "1056857223529250906",
+    createInteractionId: "1524810437118525560",
+    joinInteractionId: "1524810437118525561",
+    joinedRoleId: "1524810437118525570",
+    roleIds: ["1524810437118525570"],
+    channelIds: ["1524810437118525580"],
+    panelMessageIds: ["1524810437118525590"],
+    createResponseObserved: true,
+    joinResponseObserved: true,
+    privateChannelObserved: true,
+    roleAssignmentObserved: true,
+    joinPanelObserved: true,
+  };
+  assert.throws(
+    () => product.discordInteractionObservation({
+      ...valid,
+      joinInteractionId: valid.createInteractionId,
+    }),
+    /discord_interaction_identity_invalid/,
+  );
+  assert.throws(
+    () => product.discordInteractionObservation({
+      ...valid,
+      roleIds: [valid.channelIds[0]],
+    }),
+    /discord_interaction_observation_invalid/,
+  );
+  assert.throws(
+    () => product.discordInteractionObservation({
+      ...valid,
+      joinPanelObserved: false,
+    }),
+    /discord_interaction_observation_invalid/,
+  );
+  assert.throws(
+    () => product.discordInteractionObservation({
+      ...valid,
+      joinedRoleId: "1524810437118525572",
+    }),
+    /discord_joined_role_invalid/,
+  );
+});
+
+
 test("one-shot flow uses product boundaries and returns no prompt or full preview ruleset", async () => {
   const calls = [];
   const responses = [

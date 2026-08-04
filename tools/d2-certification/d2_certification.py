@@ -250,6 +250,8 @@ STEP_SPECS = {
         (
             "create_interaction_id",
             "join_interaction_id",
+            "actor_user_id",
+            "joined_role_id",
             "deployment_id",
             "route_id",
             "instance_id",
@@ -1435,10 +1437,16 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             "instance_id",
         )
         require_snowflake_fields(
-            evidence, "create_interaction_id", "join_interaction_id"
+            evidence,
+            "create_interaction_id",
+            "join_interaction_id",
+            "actor_user_id",
+            "joined_role_id",
         )
         if evidence["create_interaction_id"] == evidence["join_interaction_id"]:
             fail("step_contract_failed:interaction_identity")
+        if evidence["actor_user_id"] != manifest["discord"]["actor_id"]:
+            fail("step_contract_failed:interaction_actor_identity")
         require_digest(evidence, "route_id")
         require_digest(evidence, "inventory_digest_sha256")
         if (
@@ -1449,7 +1457,7 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             fail("step_contract_failed:interaction_target_identity")
         for field in ("role_ids", "channel_ids", "panel_message_ids"):
             values = evidence[field]
-            if not isinstance(values, list) or not values:
+            if not isinstance(values, list) or len(values) != 1:
                 fail(f"step_contract_failed:{field}")
             for value in values:
                 if (
@@ -1465,7 +1473,10 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         )
         if len(all_resource_ids) != len(set(all_resource_ids)):
             fail("step_contract_failed:discord_resource_identity")
-        require_positive_integer(evidence, "ephemeral_count")
+        if evidence["joined_role_id"] not in evidence["role_ids"]:
+            fail("step_contract_failed:joined_role_identity")
+        if evidence["ephemeral_count"] != 2:
+            fail("step_contract_failed:ephemeral_count")
         if (
             evidence["transport_instance_id"]
             != prior_receipts[2]["evidence"]["transport_instance_id"]

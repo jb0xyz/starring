@@ -283,6 +283,8 @@ class D2EvidenceTest(unittest.TestCase):
             "starring.d2.db-interaction-evidence.v1",
             create_interaction_id="1532677575736819845",
             join_interaction_id="1532677575736819846",
+            actor_user_id="1056857223529250906",
+            joined_role_id="1532677575736819847",
             deployment_id="deployment-1",
             route_identity=route_identity(),
             instance_id="instance-1",
@@ -305,6 +307,74 @@ class D2EvidenceTest(unittest.TestCase):
         drifted["role_ids"] = ["1532677575736819852"]
         with self.assertRaisesRegex(MODULE.EvidenceContractError, "interaction_role_ids_mismatch"):
             MODULE.assemble_interaction_evidence(database, drifted)
+
+    def test_interaction_adapter_requires_exact_visible_discord_observation(self):
+        database = envelope(
+            "starring.d2.db-interaction-evidence.v1",
+            create_interaction_id="1532677575736819845",
+            join_interaction_id="1532677575736819846",
+            actor_user_id="1056857223529250906",
+            joined_role_id="1532677575736819847",
+            deployment_id="deployment-1",
+            route_identity=route_identity(),
+            instance_id="instance-1",
+            role_ids=["1532677575736819847"],
+            channel_ids=["1532677575736819848"],
+            panel_message_ids=["1532677575736819849"],
+            ephemeral_count=2,
+        )
+        transport = envelope(
+            "starring.d2.transport-resource-evidence.v1",
+            role_ids=["1532677575736819847"],
+            channel_ids=["1532677575736819848"],
+            panel_message_ids=["1532677575736819849"],
+            inventory_digest_sha256="b" * 64,
+            transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
+        )
+        discord = envelope(
+            "starring.d2.browser-discord-interaction-observation.v1",
+            guild_id="1532677575736819800",
+            resource_prefix="starring-d2-abcdef123456",
+            actor_user_id="1056857223529250906",
+            create_interaction_id="1532677575736819845",
+            join_interaction_id="1532677575736819846",
+            joined_role_id="1532677575736819847",
+            role_ids=["1532677575736819847"],
+            channel_ids=["1532677575736819848"],
+            panel_message_ids=["1532677575736819849"],
+            create_response_observed=True,
+            join_response_observed=True,
+            private_channel_observed=True,
+            role_assignment_observed=True,
+            join_panel_observed=True,
+            confirmation_surface="chrome_discord_web",
+        )
+        scope = {
+            "guild_id": "1532677575736819800",
+            "resource_prefix": "starring-d2-abcdef123456",
+            "actor_user_id": "1056857223529250906",
+        }
+        evidence = MODULE.assemble_observed_interaction_evidence(
+            database, transport, discord, scope
+        )
+        self.assertEqual(evidence["role_ids"], ["1532677575736819847"])
+        mismatches = {
+            "guild_id": "1532677575736819801",
+            "actor_user_id": "1056857223529250907",
+            "join_interaction_id": "1532677575736819850",
+            "joined_role_id": "1532677575736819851",
+            "role_ids": ["1532677575736819851"],
+            "join_panel_observed": False,
+            "confirmation_surface": "manual_text",
+        }
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                changed = copy.deepcopy(discord)
+                changed[field] = value
+                with self.assertRaises(MODULE.EvidenceContractError):
+                    MODULE.assemble_observed_interaction_evidence(
+                        database, transport, changed, scope
+                    )
 
     def test_duplicate_adapter_requires_independent_exact_witnesses(self):
         database = envelope(

@@ -14,6 +14,7 @@
   const LIVE_EVIDENCE_KIND = "starring.d2.browser-live-evidence.v1";
   const LIVE_LOSS_EVIDENCE_KIND = "starring.d2.browser-live-loss-evidence.v1";
   const REPLACEMENT_EVIDENCE_KIND = "starring.d2.browser-replacement-evidence.v1";
+  const DISCORD_INTERACTION_OBSERVATION_KIND = "starring.d2.browser-discord-interaction-observation.v1";
   const LIVE_FRESH_LEASE_CHECKPOINT = "live_fresh_lease";
   const SERVING_LEASE_MAXIMUM_NANOSECONDS = 45 * 1000000000;
   const APPLY_ACTIVE_STATES = new Set(["applying"]);
@@ -47,6 +48,17 @@
       throw new Error(`${label}_invalid`);
     }
     return value;
+  }
+
+  function requireSnowflakeList(value, label) {
+    if (!Array.isArray(value) || value.length < 1 || value.length > 128) {
+      throw new Error(`${label}_invalid`);
+    }
+    const normalized = value.map((item) => requireSnowflake(item, label)).sort();
+    if (new Set(normalized).size !== normalized.length) {
+      throw new Error(`${label}_invalid`);
+    }
+    return normalized;
   }
 
   function requireGeneration(value, label, allowZero) {
@@ -280,6 +292,62 @@
 
     function observedAt() {
       return requireUtcTimestamp(now(), "observed_at").value;
+    }
+
+    function discordInteractionObservation(input) {
+      const roleIds = requireSnowflakeList(input.roleIds, "role_ids");
+      const channelIds = requireSnowflakeList(input.channelIds, "channel_ids");
+      const panelMessageIds = requireSnowflakeList(
+        input.panelMessageIds,
+        "panel_message_ids",
+      );
+      const resourceIds = [...roleIds, ...channelIds, ...panelMessageIds];
+      if (
+        new Set(resourceIds).size !== resourceIds.length ||
+        input.createResponseObserved !== true ||
+        input.joinResponseObserved !== true ||
+        input.privateChannelObserved !== true ||
+        input.roleAssignmentObserved !== true ||
+        input.joinPanelObserved !== true
+      ) {
+        throw new Error("discord_interaction_observation_invalid");
+      }
+      const createInteractionId = requireSnowflake(
+        input.createInteractionId,
+        "create_interaction_id",
+      );
+      const joinInteractionId = requireSnowflake(
+        input.joinInteractionId,
+        "join_interaction_id",
+      );
+      if (createInteractionId === joinInteractionId) {
+        throw new Error("discord_interaction_identity_invalid");
+      }
+      const actorUserId = requireSnowflake(input.actorUserId, "actor_user_id");
+      const joinedRoleId = requireSnowflake(input.joinedRoleId, "joined_role_id");
+      if (!roleIds.includes(joinedRoleId)) {
+        throw new Error("discord_joined_role_invalid");
+      }
+      return Object.freeze({
+        schema_version: 1,
+        kind: DISCORD_INTERACTION_OBSERVATION_KIND,
+        observed_at: observedAt(),
+        guild_id: requireSnowflake(input.guildId, "guild_id"),
+        resource_prefix: requireResourceId(input.resourcePrefix, "resource_prefix"),
+        actor_user_id: actorUserId,
+        create_interaction_id: createInteractionId,
+        join_interaction_id: joinInteractionId,
+        joined_role_id: joinedRoleId,
+        role_ids: roleIds,
+        channel_ids: channelIds,
+        panel_message_ids: panelMessageIds,
+        create_response_observed: true,
+        join_response_observed: true,
+        private_channel_observed: true,
+        role_assignment_observed: true,
+        join_panel_observed: true,
+        confirmation_surface: "chrome_discord_web",
+      });
     }
 
     function boundedSignal(callerSignal) {
@@ -1030,6 +1098,7 @@
       me,
       authorityCheck,
       authenticationEvidence,
+      discordInteractionObservation,
       authoringTurn,
       authoringSession,
       promote,

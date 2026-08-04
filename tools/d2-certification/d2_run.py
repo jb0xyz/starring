@@ -66,6 +66,9 @@ DISCORD_RECONCILIATION_OBSERVATION_KIND = (
     "starring.d2.discord-reconciliation-role-observation.v1"
 )
 GATEWAY_HEALED_KIND = "starring.d2.transport-gateway-healed-evidence.v1"
+DISCORD_INTERACTION_OBSERVATION_KIND = (
+    "starring.d2.browser-discord-interaction-observation.v1"
+)
 
 
 def source_spec(kind, mode):
@@ -95,6 +98,7 @@ STEP_SOURCE_SPECS = {
         source_spec("starring.d2.db-live-evidence.v1", "machine"),
     ),
     9: (
+        source_spec(DISCORD_INTERACTION_OBSERVATION_KIND, "chrome"),
         source_spec("starring.d2.db-interaction-evidence.v1", "machine"),
         source_spec("starring.d2.transport-resource-evidence.v1", "machine"),
     ),
@@ -412,13 +416,40 @@ def finalization_assembler(name):
     return assembler
 
 
-def step_binding(step, prior_receipts, manifest, digest):
+def prior_completion_digest(
+    manifest_path, manifest, digest, step, receipt_sha256
+):
+    if manifest_path is None:
+        fail("coordinator_completion_binding_missing")
+    path = coordinator_completion_path(manifest_path, step)
+    if not path_present(path):
+        fail("coordinator_completion_binding_missing")
+    completion = validate_completion(
+        load_coordinator_record(path, "coordinator_completion"),
+        manifest,
+        digest,
+        step,
+    )
+    if completion["receipt_sha256"] != receipt_sha256:
+        fail("coordinator_completion_binding_invalid")
+    return sha256_bytes(canonical_json(completion).encode("utf-8"))
+
+
+def step_binding(
+    step,
+    prior_receipts,
+    manifest,
+    digest,
+    manifest_path=None,
+    finalization_freeze_intent_sha256=None,
+):
     if step not in {16, 17}:
         return None
     if len(prior_receipts) != step - 1:
         fail("coordinator_prior_receipt_missing")
     installation_id = prior_receipts[3]["evidence"]["installation_id"]
     if step == 16:
+        step15_receipt_sha256 = prior_receipts[14]["receipt_sha256"]
         created = prior_receipts[8]["evidence"]
         expected = sorted(
             set(
@@ -439,8 +470,18 @@ def step_binding(step, prior_receipts, manifest, digest):
                 "evidence"
             ]["reconciliation_inventory_digest_sha256"],
             "expected_discord_resource_ids": expected,
+            "finalization_freeze_intent_sha256": finalization_freeze_intent_sha256,
+            "certification_step15_receipt_sha256": step15_receipt_sha256,
+            "coordinator_step15_completion_sha256": prior_completion_digest(
+                manifest_path,
+                manifest,
+                digest,
+                15,
+                step15_receipt_sha256,
+            ),
         }
     teardown = prior_receipts[15]["evidence"]
+    step16_receipt_sha256 = prior_receipts[15]["receipt_sha256"]
     return {
         "manifest_sha256": digest,
         "run_id": manifest["run_id"],
@@ -449,6 +490,14 @@ def step_binding(step, prior_receipts, manifest, digest):
         "resource_prefix": manifest["discord"]["resource_prefix"],
         "precleanup_sha256": teardown["precleanup_sha256"],
         "discord_teardown_sha256": teardown["discord_teardown_sha256"],
+        "step16_receipt_sha256": step16_receipt_sha256,
+        "coordinator_step16_completion_sha256": prior_completion_digest(
+            manifest_path,
+            manifest,
+            digest,
+            16,
+            step16_receipt_sha256,
+        ),
     }
 
 
@@ -458,6 +507,7 @@ def assemble_step_evidence(
     prior_receipts,
     manifest,
     digest,
+    manifest_path=None,
 ):
     values = {source["kind"]: source["value"] for source in sources}
     try:
@@ -528,9 +578,15 @@ def assemble_step_evidence(
                 values["starring.d2.db-live-evidence.v1"],
             )
         if step == 9:
-            return d2_evidence.assemble_interaction_evidence(
+            return d2_evidence.assemble_observed_interaction_evidence(
                 values["starring.d2.db-interaction-evidence.v1"],
                 values["starring.d2.transport-resource-evidence.v1"],
+                values[DISCORD_INTERACTION_OBSERVATION_KIND],
+                {
+                    "guild_id": manifest["discord"]["guild_id"],
+                    "resource_prefix": manifest["discord"]["resource_prefix"],
+                    "actor_user_id": manifest["discord"]["actor_id"],
+                },
             )
         if step == 10:
             return d2_evidence.assemble_duplicate_evidence(
@@ -584,7 +640,16 @@ def assemble_step_evidence(
                 values[DB_PRECLEANUP_KIND],
                 values[DISCORD_TEARDOWN_KIND],
                 values[ORCHESTRATOR_FINALIZATION_KIND],
-                step_binding(step, prior_receipts, manifest, digest),
+                step_binding(
+                    step,
+                    prior_receipts,
+                    manifest,
+                    digest,
+                    manifest_path,
+                    values[DISCORD_TEARDOWN_KIND].get(
+                        "finalization_freeze_intent_sha256"
+                    ),
+                ),
             )
         if step == 17:
             return finalization_assembler("assemble_absence_evidence")(
@@ -597,6 +662,7 @@ def assemble_step_evidence(
                     prior_receipts,
                     manifest,
                     digest,
+                    manifest_path,
                 ),
             )
     except (
@@ -869,6 +935,7 @@ def advance_certification(manifest_path, step, raw_sources):
                 prior_receipts,
                 manifest,
                 digest,
+                verified_path,
             )
         else:
             if step != completed_steps + 1:
@@ -879,6 +946,7 @@ def advance_certification(manifest_path, step, raw_sources):
                 prior_receipts,
                 manifest,
                 digest,
+                verified_path,
             )
             intent = {
                 "schema_version": SCHEMA_VERSION,
