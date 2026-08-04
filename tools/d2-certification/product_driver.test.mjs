@@ -24,6 +24,58 @@ function response(status, body) {
 }
 
 
+function liveDeployment(overrides = {}) {
+  return {
+    installation_id: "installation-1",
+    promotion_id: DIGEST,
+    observed_at: "2026-08-04T11:00:05Z",
+    state: "live",
+    retryable: false,
+    failure_code: null,
+    attestation_revision: 11,
+    last_serving_heartbeat: "2026-08-04T11:00:00Z",
+    serving_lease_expires_at: "2026-08-04T11:00:45Z",
+    ...overrides,
+  };
+}
+
+
+function liveOperational(overrides = {}) {
+  const runtimeOverrides = overrides.runtime || {};
+  const attestationOverrides = runtimeOverrides.attestation || {};
+  const servingOverrides = runtimeOverrides.serving || {};
+  return {
+    installation_id: "installation-1",
+    promotion_id: DIGEST,
+    decision_observed_at: "2026-08-04T11:00:08Z",
+    state: "live",
+    ...overrides,
+    runtime: {
+      observed_at: "2026-08-04T11:00:10Z",
+      phase: "live",
+      current_attempt: 1,
+      last_failure_attempt: null,
+      failure: null,
+      retry: null,
+      operator_action: null,
+      ...runtimeOverrides,
+      attestation: {
+        deployment_revision: 11,
+        convergence_attempt: 1,
+        process_instance_id: PROCESS_INSTANCE_ID,
+        ...attestationOverrides,
+      },
+      serving: {
+        state: "fresh",
+        last_heartbeat_at: "2026-08-04T11:00:00Z",
+        lease_expires_at: "2026-08-04T11:00:45Z",
+        ...servingOverrides,
+      },
+    },
+  };
+}
+
+
 function driver(fetchImpl, cookie = "__Host-starring_csrf=csrf-value", options = {}) {
   const context = {
     URL,
@@ -310,9 +362,14 @@ test("certification authoring and decision phases are separated by a public prev
       preview: { revision: 1, receipt: { candidate_ruleset_hash: DIGEST } },
     },
   };
+  const sessionBody = {
+    session_id: "session-1",
+    observed_generation: 1,
+    projection: turnBody.projection,
+  };
   const responses = [
     response(201, turnBody),
-    response(200, turnBody),
+    response(200, sessionBody),
     response(201, {
       installation_id: "installation-1",
       promotion_id: DIGEST,
@@ -391,8 +448,7 @@ test("certification authoring and decision phases are separated by a public prev
 test("certification decision refuses a promotion that does not target the reviewed candidate", async () => {
   const turnBody = {
     session_id: "session-1",
-    generation: 1,
-    disposition: "created",
+    observed_generation: 1,
     projection: {
       state: "preview_ready",
       preview: { revision: 1, receipt: { candidate_ruleset_hash: DIGEST } },
@@ -440,6 +496,31 @@ test("certification decision refuses a promotion that does not target the review
     /promotion_candidate_identity_mismatch/,
   );
   assert.equal(confirmations, 0);
+});
+
+
+test("certification decision rejects the POST turn shape at the GET session boundary", async () => {
+  const responses = [
+    response(200, {
+      session_id: "session-1",
+      generation: 1,
+      disposition: "created",
+      projection: {
+        state: "preview_ready",
+        preview: { revision: 1, receipt: { candidate_ruleset_hash: DIGEST } },
+      },
+    }),
+  ];
+  await assert.rejects(
+    driver(async () => responses.shift()).completeCertificationDecision({
+      installationId: "installation-1",
+      sessionId: "session-1",
+      authoringGeneration: 1,
+      candidateRulesetHash: DIGEST,
+      confirmPreview: async () => true,
+    }),
+    /observed_generation_invalid/,
+  );
 });
 
 
@@ -1382,10 +1463,12 @@ test("live polling requires product and operational live with a fresh lease", as
   const responses = [
     response(200, { installation_id: "installation-1", promotion_id: DIGEST, state: "pending" }),
     response(200, { installation_id: "installation-1", promotion_id: DIGEST, state: "pending", runtime: { phase: "requested", serving: { state: "not_expected" } } }),
-    response(200, { installation_id: "installation-1", promotion_id: DIGEST, state: "live" }),
-    response(200, { installation_id: "installation-1", promotion_id: DIGEST, state: "live", runtime: { phase: "live", serving: { state: "fresh" } } }),
+    response(200, liveDeployment()),
+    response(200, liveOperational()),
   ];
-  const result = await driver(async () => responses.shift()).waitForLive({
+  const result = await driver(async () => responses.shift(), undefined, {
+    now: () => "2026-08-04T11:00:20Z",
+  }).waitForLive({
     installationId: "installation-1",
     promotionId: DIGEST,
     attempts: 2,
@@ -1403,19 +1486,12 @@ test("live polling requires product and operational live with a fresh lease", as
 
 test("live polling preserves a strict pending seed when the first poll is already live", async () => {
   const responses = [
-    response(200, {
-      installation_id: "installation-1",
-      promotion_id: DIGEST,
-      state: "live",
-    }),
-    response(200, {
-      installation_id: "installation-1",
-      promotion_id: DIGEST,
-      state: "live",
-      runtime: { phase: "live", serving: { state: "fresh" } },
-    }),
+    response(200, liveDeployment()),
+    response(200, liveOperational()),
   ];
-  const product = driver(async () => responses.shift());
+  const product = driver(async () => responses.shift(), undefined, {
+    now: () => "2026-08-04T11:00:20Z",
+  });
   const result = await product.waitForLive({
     installationId: "installation-1",
     promotionId: DIGEST,
@@ -1764,23 +1840,11 @@ test("live evidence binds both public deployment projections", async () => {
       state: "pending",
       runtime: null,
     }),
-    response(200, {
-      installation_id: "installation-1",
-      promotion_id: DIGEST,
-      state: "live",
-    }),
-    response(200, {
-      installation_id: "installation-1",
-      promotion_id: DIGEST,
-      state: "live",
-      runtime: {
-        phase: "live",
-        serving: { state: "fresh" },
-      },
-    }),
+    response(200, liveDeployment()),
+    response(200, liveOperational()),
   ];
   const evidence = await driver(async () => responses.shift(), undefined, {
-    now: () => "2026-08-04T11:01:00Z",
+    now: () => "2026-08-04T11:00:20Z",
   }).waitForLiveEvidence({
     installationId: "installation-1",
     promotionId: DIGEST,
@@ -1793,6 +1857,48 @@ test("live evidence binds both public deployment projections", async () => {
   assert.equal(evidence.attempts, 2);
   assert.equal(evidence.deployment_http_status, 200);
   assert.equal(evidence.operational_http_status, 200);
+  assert.equal(evidence.deployment_attestation_revision, 11);
+  assert.equal(evidence.attestation_revision, 11);
+  assert.equal(evidence.current_attempt, 1);
+  assert.equal(evidence.convergence_attempt, 1);
+  assert.equal(evidence.process_instance_id, PROCESS_INSTANCE_ID);
+  assert.equal(evidence.deployment_observed_at, "2026-08-04T11:00:05Z");
+  assert.equal(evidence.runtime_observed_at, "2026-08-04T11:00:10Z");
+  assert.equal(evidence.last_heartbeat_at, "2026-08-04T11:00:00Z");
+  assert.equal(evidence.lease_expires_at, "2026-08-04T11:00:45Z");
+});
+
+
+test("live evidence rejects public deployment and runtime identity drift", async () => {
+  for (const operational of [
+    liveOperational({
+      runtime: { attestation: { deployment_revision: 12 } },
+    }),
+    liveOperational({
+      runtime: { current_attempt: 2 },
+    }),
+    liveOperational({
+      runtime: { serving: { last_heartbeat_at: "2026-08-04T10:59:59Z" } },
+    }),
+  ]) {
+    const responses = [
+      response(200, liveDeployment()),
+      response(200, operational),
+    ];
+    const product = driver(async () => responses.shift(), undefined, {
+      now: () => "2026-08-04T11:00:20Z",
+    });
+    await assert.rejects(
+      product.waitForLiveEvidence({
+        installationId: "installation-1",
+        promotionId: DIGEST,
+        attempts: 1,
+        intervalMilliseconds: 100,
+        pendingObserved: true,
+      }),
+      /live_projection_identity_invalid/,
+    );
+  }
 });
 
 
@@ -1962,23 +2068,11 @@ test("replacement evidence binds one reviewed target transition without retainin
       state: "runtime_pending",
       replayed: false,
     }),
-    response(200, {
-      installation_id: "installation-1",
-      promotion_id: DIGEST,
-      state: "live",
-    }),
-    response(200, {
-      installation_id: "installation-1",
-      promotion_id: DIGEST,
-      state: "live",
-      runtime: {
-        phase: "live",
-        serving: { state: "fresh" },
-      },
-    }),
+    response(200, liveDeployment()),
+    response(200, liveOperational()),
   ];
   const evidence = await driver(async () => responses.shift(), undefined, {
-    now: () => "2026-08-04T11:03:00Z",
+    now: () => "2026-08-04T11:00:20Z",
   }).runReplacementFlow({
     installationId: "installation-1",
     sourcePromotionId,

@@ -128,6 +128,67 @@ class D2RunCoordinatorTest(unittest.TestCase):
         )
         return database, transport, browser
 
+    def step_eight_sources(self):
+        final = self.complete[8]
+        browser = self.envelope(
+            "starring.d2.browser-live-evidence.v1",
+            observed_at=final["public_observed_at"],
+            public_origin=final["public_origin"],
+            installation_id=final["installation_id"],
+            promotion_id=final["promotion_id"],
+            pending_observed=True,
+            live_observed=True,
+            attempts=2,
+            product_state="live",
+            operational_state="live",
+            runtime_phase="live",
+            serving_state="fresh",
+            deployment_http_status=200,
+            operational_http_status=200,
+            deployment_observed_at="2099-08-04T01:02:05Z",
+            deployment_attestation_revision=final["deployment_revision"],
+            deployment_last_heartbeat_at="2099-08-04T01:02:04Z",
+            deployment_lease_expires_at=final["public_lease_expires_at"],
+            decision_observed_at="2099-08-04T01:02:06Z",
+            runtime_observed_at="2099-08-04T01:02:07Z",
+            current_attempt=final["convergence_attempt"],
+            attestation_revision=final["deployment_revision"],
+            convergence_attempt=final["convergence_attempt"],
+            process_instance_id=final["process_instance_id"],
+            last_heartbeat_at=final["public_last_heartbeat_at"],
+            lease_expires_at=final["public_lease_expires_at"],
+        )
+        database = self.envelope(
+            "starring.d2.db-live-evidence.v1",
+            observed_at=final["database_observed_at"],
+            installation_id=final["installation_id"],
+            promotion_id=final["promotion_id"],
+            deployment_id=final["deployment_id"],
+            attestation_id=final["attestation_id"],
+            deployment_revision=final["deployment_revision"],
+            convergence_attempt=final["convergence_attempt"],
+            process_instance_id=final["process_instance_id"],
+            last_heartbeat_at=final["database_last_heartbeat_at"],
+            lease_expires_at=final["database_lease_expires_at"],
+            route_identity=test_d2_certification.route_identity(
+                "deployment-1",
+                test_d2_certification.PROCESS_INSTANCE_OLD,
+                1,
+                1,
+                1,
+            ),
+            serving_identity={
+                **test_d2_certification.serving_identity(
+                    "deployment-1",
+                    test_d2_certification.PROCESS_INSTANCE_OLD,
+                    1,
+                    1,
+                ),
+                "installation_id": final["installation_id"],
+            },
+        )
+        return browser, database
+
     def object_digest(self, value):
         return d2_run.sha256_bytes(
             d2_run.canonical_json(value).encode("utf-8")
@@ -841,6 +902,44 @@ class D2RunCoordinatorTest(unittest.TestCase):
             self.receipts()[6]["evidence"]["target_content_hash"],
             final["target_content_hash"],
         )
+
+    def test_step_eight_binds_public_live_to_exact_database_runtime_identity(self):
+        self.append_prior(7)
+        browser, database = self.step_eight_sources()
+        result = d2_run.advance_certification(
+            self.manifest_path,
+            8,
+            [str(self.write_source(database)), str(self.write_source(browser))],
+        )
+        self.assertEqual(result["disposition"], "created")
+        expected = dict(self.complete[8])
+        expected["serving_lease_id"] = (
+            d2_evidence.canonical_serving_identity_sha256(
+                database["serving_identity"]
+            )
+        )
+        self.assertEqual(self.receipts()[7]["evidence"], expected)
+
+    def test_step_eight_rejects_public_database_process_drift(self):
+        self.append_prior(7)
+        browser, database = self.step_eight_sources()
+        database["process_instance_id"] = (
+            test_d2_certification.PROCESS_INSTANCE_NEW
+        )
+        with self.assertRaisesRegex(
+            d2_run.CertificationError,
+            "coordinator_evidence_assembly_failed:live_public_database_runtime_identity_mismatch",
+        ):
+            d2_run.assemble_step_evidence(
+                8,
+                [
+                    {"kind": browser["kind"], "value": browser},
+                    {"kind": database["kind"], "value": database},
+                ],
+                self.receipts(),
+                self.manifest,
+                self.manifest_digest,
+            )
 
     def test_step_nine_binds_visible_join_to_durable_actor_role_and_resources(self):
         self.append_prior(8)

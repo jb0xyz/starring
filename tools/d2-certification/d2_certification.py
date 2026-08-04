@@ -252,6 +252,15 @@ STEP_SPECS = {
             "route_id",
             "attestation_id",
             "serving_lease_id",
+            "deployment_revision",
+            "convergence_attempt",
+            "process_instance_id",
+            "public_observed_at",
+            "database_observed_at",
+            "public_last_heartbeat_at",
+            "database_last_heartbeat_at",
+            "public_lease_expires_at",
+            "database_lease_expires_at",
             "public_origin",
         ),
     ),
@@ -1468,6 +1477,61 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             "attestation_id",
             "serving_lease_id",
         )
+        require_positive_integer(
+            evidence,
+            "deployment_revision",
+            "convergence_attempt",
+        )
+        if (
+            not isinstance(evidence["process_instance_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{32}", evidence["process_instance_id"])
+        ):
+            fail("step_contract_failed:process_instance_id")
+        for field in (
+            "public_observed_at",
+            "database_observed_at",
+            "public_last_heartbeat_at",
+            "database_last_heartbeat_at",
+            "public_lease_expires_at",
+            "database_lease_expires_at",
+        ):
+            if not validate_utc_timestamp(evidence[field]):
+                fail(f"step_contract_failed:{field}")
+        decision_observed_at = datetime.datetime.fromisoformat(
+            prior_receipts[6]["evidence"]["decision_observed_at"][:-1]
+            + "+00:00"
+        )
+        public_observed_at = datetime.datetime.fromisoformat(
+            evidence["public_observed_at"][:-1] + "+00:00"
+        )
+        database_observed_at = datetime.datetime.fromisoformat(
+            evidence["database_observed_at"][:-1] + "+00:00"
+        )
+        public_last_heartbeat_at = datetime.datetime.fromisoformat(
+            evidence["public_last_heartbeat_at"][:-1] + "+00:00"
+        )
+        database_last_heartbeat_at = datetime.datetime.fromisoformat(
+            evidence["database_last_heartbeat_at"][:-1] + "+00:00"
+        )
+        public_lease_expires_at = datetime.datetime.fromisoformat(
+            evidence["public_lease_expires_at"][:-1] + "+00:00"
+        )
+        database_lease_expires_at = datetime.datetime.fromisoformat(
+            evidence["database_lease_expires_at"][:-1] + "+00:00"
+        )
+        if (
+            not decision_observed_at
+            <= public_last_heartbeat_at
+            <= database_last_heartbeat_at
+            <= database_observed_at
+            < database_lease_expires_at
+            or not public_last_heartbeat_at
+            <= public_observed_at
+            < public_lease_expires_at
+            <= database_lease_expires_at
+            or public_observed_at > database_observed_at
+        ):
+            fail("step_contract_failed:live_chronology")
         if (
             evidence["installation_id"]
             != prior_receipts[6]["evidence"]["installation_id"]

@@ -6,6 +6,7 @@ import urllib.parse
 
 
 SCHEMA_VERSION = 1
+SERVING_LEASE_MAXIMUM = datetime.timedelta(seconds=45)
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 GATEWAY_OPERATION_ID_PATTERN = re.compile(
@@ -690,12 +691,29 @@ def assemble_live_evidence(browser, database):
         "serving_state",
         "deployment_http_status",
         "operational_http_status",
+        "deployment_observed_at",
+        "deployment_attestation_revision",
+        "deployment_last_heartbeat_at",
+        "deployment_lease_expires_at",
+        "decision_observed_at",
+        "runtime_observed_at",
+        "current_attempt",
+        "attestation_revision",
+        "convergence_attempt",
+        "process_instance_id",
+        "last_heartbeat_at",
+        "lease_expires_at",
     }
     database_fields = {
         "installation_id",
         "promotion_id",
         "deployment_id",
         "attestation_id",
+        "deployment_revision",
+        "convergence_attempt",
+        "process_instance_id",
+        "last_heartbeat_at",
+        "lease_expires_at",
         "route_identity",
         "serving_identity",
     }
@@ -716,8 +734,89 @@ def assemble_live_evidence(browser, database):
     _require_state(public["serving_state"], {"fresh"}, "live_serving_state_invalid")
     _require_http_status(public["deployment_http_status"], "deployment_http_status_invalid", {200})
     _require_http_status(public["operational_http_status"], "operational_http_status_invalid", {200})
+    _require_positive_integer(
+        public["deployment_attestation_revision"],
+        "deployment_attestation_revision_invalid",
+    )
+    _require_positive_integer(
+        public["attestation_revision"], "attestation_revision_invalid"
+    )
+    _require_positive_integer(public["current_attempt"], "current_attempt_invalid")
+    _require_positive_integer(
+        public["convergence_attempt"], "convergence_attempt_invalid"
+    )
+    _require_process_instance(
+        public["process_instance_id"], "live_process_instance_id_invalid"
+    )
+    deployment_observed_at = _timestamp_value(
+        public["deployment_observed_at"], "deployment_observed_at_invalid"
+    )
+    deployment_last_heartbeat_at = _timestamp_value(
+        public["deployment_last_heartbeat_at"],
+        "deployment_last_heartbeat_at_invalid",
+    )
+    deployment_lease_expires_at = _timestamp_value(
+        public["deployment_lease_expires_at"],
+        "deployment_lease_expires_at_invalid",
+    )
+    decision_observed_at = _timestamp_value(
+        public["decision_observed_at"], "live_decision_observed_at_invalid"
+    )
+    runtime_observed_at = _timestamp_value(
+        public["runtime_observed_at"], "runtime_observed_at_invalid"
+    )
+    public_last_heartbeat_at = _timestamp_value(
+        public["last_heartbeat_at"], "public_last_heartbeat_at_invalid"
+    )
+    public_lease_expires_at = _timestamp_value(
+        public["lease_expires_at"], "public_lease_expires_at_invalid"
+    )
+    public_observed_at = _timestamp_value(
+        public["observed_at"], "live_public_observed_at_invalid"
+    )
+    if (
+        public["deployment_attestation_revision"]
+        != public["attestation_revision"]
+        or public["current_attempt"] != public["convergence_attempt"]
+        or not deployment_last_heartbeat_at
+        <= deployment_observed_at
+        < deployment_lease_expires_at
+        or not deployment_observed_at
+        <= decision_observed_at
+        <= runtime_observed_at
+        <= public_observed_at
+        or deployment_last_heartbeat_at > public_last_heartbeat_at
+        or deployment_lease_expires_at > public_lease_expires_at
+        or not public_last_heartbeat_at
+        <= runtime_observed_at
+        <= public_observed_at
+        < public_lease_expires_at
+        or deployment_lease_expires_at - deployment_last_heartbeat_at
+        > SERVING_LEASE_MAXIMUM
+        or public_lease_expires_at - public_last_heartbeat_at
+        > SERVING_LEASE_MAXIMUM
+    ):
+        _fail("live_public_projection_identity_mismatch")
     _require_identifier(durable["deployment_id"], "live_deployment_id_invalid")
     _require_digest(durable["attestation_id"], "live_attestation_id_invalid")
+    _require_positive_integer(
+        durable["deployment_revision"], "db_deployment_revision_invalid"
+    )
+    _require_positive_integer(
+        durable["convergence_attempt"], "db_convergence_attempt_invalid"
+    )
+    _require_process_instance(
+        durable["process_instance_id"], "db_process_instance_id_invalid"
+    )
+    database_last_heartbeat_at = _timestamp_value(
+        durable["last_heartbeat_at"], "database_last_heartbeat_at_invalid"
+    )
+    database_lease_expires_at = _timestamp_value(
+        durable["lease_expires_at"], "database_lease_expires_at_invalid"
+    )
+    database_observed_at = _timestamp_value(
+        durable["observed_at"], "live_database_observed_at_invalid"
+    )
     route_id = canonical_route_identity_sha256(durable["route_identity"])
     serving_id = canonical_serving_identity_sha256(durable["serving_identity"])
     if durable["route_identity"]["deployment_id"] != durable["deployment_id"]:
@@ -740,6 +839,26 @@ def assemble_live_evidence(browser, database):
         or route_identity["origin_serving_revision"] != serving_identity["revision"]
     ):
         _fail("live_route_serving_identity_mismatch")
+    if (
+        durable["deployment_revision"] != public["attestation_revision"]
+        or durable["convergence_attempt"] != public["convergence_attempt"]
+        or durable["process_instance_id"] != public["process_instance_id"]
+        or durable["process_instance_id"] != serving_identity["process_instance_id"]
+        or durable["process_instance_id"]
+        != route_identity["origin_process_instance_id"]
+    ):
+        _fail("live_public_database_runtime_identity_mismatch")
+    if (
+        public_observed_at > database_observed_at
+        or public_last_heartbeat_at > database_last_heartbeat_at
+        or public_lease_expires_at > database_lease_expires_at
+        or not database_last_heartbeat_at
+        <= database_observed_at
+        < database_lease_expires_at
+        or database_lease_expires_at - database_last_heartbeat_at
+        > SERVING_LEASE_MAXIMUM
+    ):
+        _fail("live_public_database_chronology_mismatch")
     return {
         "pending_observed": True,
         "live_observed": True,
@@ -749,6 +868,15 @@ def assemble_live_evidence(browser, database):
         "route_id": route_id,
         "attestation_id": durable["attestation_id"],
         "serving_lease_id": serving_id,
+        "deployment_revision": durable["deployment_revision"],
+        "convergence_attempt": durable["convergence_attempt"],
+        "process_instance_id": durable["process_instance_id"],
+        "public_observed_at": public["observed_at"],
+        "database_observed_at": durable["observed_at"],
+        "public_last_heartbeat_at": public["last_heartbeat_at"],
+        "database_last_heartbeat_at": durable["last_heartbeat_at"],
+        "public_lease_expires_at": public["lease_expires_at"],
+        "database_lease_expires_at": durable["lease_expires_at"],
         "public_origin": public["public_origin"],
     }
 

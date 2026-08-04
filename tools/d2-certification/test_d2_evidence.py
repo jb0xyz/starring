@@ -182,13 +182,31 @@ class D2EvidenceTest(unittest.TestCase):
             serving_state="fresh",
             deployment_http_status=200,
             operational_http_status=200,
+            deployment_observed_at="2026-08-04T01:01:50Z",
+            deployment_attestation_revision=11,
+            deployment_last_heartbeat_at="2026-08-04T01:01:40Z",
+            deployment_lease_expires_at="2026-08-04T01:02:25Z",
+            decision_observed_at="2026-08-04T01:01:52Z",
+            runtime_observed_at="2026-08-04T01:01:55Z",
+            current_attempt=1,
+            attestation_revision=11,
+            convergence_attempt=1,
+            process_instance_id=PROCESS_NEW,
+            last_heartbeat_at="2026-08-04T01:01:45Z",
+            lease_expires_at="2026-08-04T01:02:30Z",
         )
         database = envelope(
             "starring.d2.db-live-evidence.v1",
+            observed_at="2026-08-04T01:02:04Z",
             installation_id=INSTALLATION_ID,
             promotion_id=PROMOTION_ID,
             deployment_id="deployment-1",
             attestation_id=ATTESTATION_ID,
+            deployment_revision=11,
+            convergence_attempt=1,
+            process_instance_id=PROCESS_NEW,
+            last_heartbeat_at="2026-08-04T01:02:00Z",
+            lease_expires_at="2026-08-04T01:02:45Z",
             route_identity=route_identity(),
             serving_identity=serving_identity(),
         )
@@ -198,10 +216,73 @@ class D2EvidenceTest(unittest.TestCase):
             evidence["serving_lease_id"],
             MODULE.canonical_serving_identity_sha256(serving_identity()),
         )
+        self.assertEqual(evidence["deployment_revision"], 11)
+        self.assertEqual(evidence["convergence_attempt"], 1)
+        self.assertEqual(evidence["process_instance_id"], PROCESS_NEW)
+        self.assertEqual(evidence["public_observed_at"], OBSERVED_AT)
+        self.assertEqual(evidence["database_observed_at"], "2026-08-04T01:02:04Z")
         drifted = copy.deepcopy(database)
         drifted["promotion_id"] = "f" * 64
         with self.assertRaisesRegex(MODULE.EvidenceContractError, "live_promotion_id_mismatch"):
             MODULE.assemble_live_evidence(browser, drifted)
+
+    def test_live_adapter_rejects_runtime_identity_and_lease_chronology_drift(self):
+        browser = envelope(
+            "starring.d2.browser-live-evidence.v1",
+            public_origin=ORIGIN,
+            installation_id=INSTALLATION_ID,
+            promotion_id=PROMOTION_ID,
+            pending_observed=True,
+            live_observed=True,
+            attempts=2,
+            product_state="live",
+            operational_state="live",
+            runtime_phase="live",
+            serving_state="fresh",
+            deployment_http_status=200,
+            operational_http_status=200,
+            deployment_observed_at="2026-08-04T01:01:50Z",
+            deployment_attestation_revision=11,
+            deployment_last_heartbeat_at="2026-08-04T01:01:40Z",
+            deployment_lease_expires_at="2026-08-04T01:02:25Z",
+            decision_observed_at="2026-08-04T01:01:52Z",
+            runtime_observed_at="2026-08-04T01:01:55Z",
+            current_attempt=1,
+            attestation_revision=11,
+            convergence_attempt=1,
+            process_instance_id=PROCESS_NEW,
+            last_heartbeat_at="2026-08-04T01:01:45Z",
+            lease_expires_at="2026-08-04T01:02:30Z",
+        )
+        database = envelope(
+            "starring.d2.db-live-evidence.v1",
+            observed_at="2026-08-04T01:02:04Z",
+            installation_id=INSTALLATION_ID,
+            promotion_id=PROMOTION_ID,
+            deployment_id="deployment-1",
+            attestation_id=ATTESTATION_ID,
+            deployment_revision=11,
+            convergence_attempt=1,
+            process_instance_id=PROCESS_NEW,
+            last_heartbeat_at="2026-08-04T01:02:00Z",
+            lease_expires_at="2026-08-04T01:02:45Z",
+            route_identity=route_identity(),
+            serving_identity=serving_identity(),
+        )
+        cases = (
+            ("deployment_revision", 12, "runtime_identity_mismatch"),
+            ("convergence_attempt", 2, "runtime_identity_mismatch"),
+            ("process_instance_id", PROCESS_OLD, "runtime_identity_mismatch"),
+            ("last_heartbeat_at", "2026-08-04T01:01:44Z", "chronology_mismatch"),
+            ("lease_expires_at", "2026-08-04T01:02:29Z", "chronology_mismatch"),
+            ("observed_at", "2026-08-04T01:02:02Z", "chronology_mismatch"),
+        )
+        for field, value, code in cases:
+            with self.subTest(field=field):
+                drifted = copy.deepcopy(database)
+                drifted[field] = value
+                with self.assertRaisesRegex(MODULE.EvidenceContractError, code):
+                    MODULE.assemble_live_evidence(browser, drifted)
 
     def test_authoring_preview_and_decision_adapters_are_exact(self):
         authoring = envelope(

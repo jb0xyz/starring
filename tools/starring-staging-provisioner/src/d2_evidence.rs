@@ -187,6 +187,11 @@ struct LiveEvidenceV1 {
     promotion_id: String,
     deployment_id: String,
     attestation_id: String,
+    deployment_revision: i64,
+    convergence_attempt: i64,
+    process_instance_id: String,
+    last_heartbeat_at: String,
+    lease_expires_at: String,
     route_identity: RouteIdentityV1,
     serving_identity: ServingIdentityV1,
 }
@@ -338,6 +343,11 @@ struct LiveObservationV1 {
     route: RouteIdentityV1,
     serving: ServingIdentityV1,
     promotion_id: String,
+    deployment_revision: i64,
+    convergence_attempt: i64,
+    process_instance_id: String,
+    last_heartbeat_at: String,
+    lease_expires_at: String,
 }
 
 pub async fn destroy_d2_from_manifest(
@@ -692,6 +702,11 @@ async fn inspect_live(
         promotion_id: observation.promotion_id,
         deployment_id,
         attestation_id,
+        deployment_revision: observation.deployment_revision,
+        convergence_attempt: observation.convergence_attempt,
+        process_instance_id: observation.process_instance_id,
+        last_heartbeat_at: observation.last_heartbeat_at,
+        lease_expires_at: observation.lease_expires_at,
         route_identity: observation.route,
         serving_identity: observation.serving,
     })
@@ -702,7 +717,7 @@ async fn load_live_observation(
     scope: &InspectionScopeV1,
 ) -> Result<LiveObservationV1, D2ProvisionerErrorV1> {
     let row = sqlx::query(
-        "SELECT deployment.promotion_id, deployment.deployment_id, deployment.runtime_generation, attestation.controller_fencing_token AS route_controller_fencing_token, attestation.v2_route_incarnation AS route_incarnation, lease.process_instance_id AS origin_process_instance_id, lease.lease_epoch AS origin_serving_lease_epoch, lease.revision AS origin_serving_revision, attestation.gateway_shard_id AS origin_gateway_shard_id, (attestation.v2_route_admission #>> '{gateway_owner_lease_id,lease_epoch}')::BIGINT AS origin_gateway_owner_lease_epoch, (attestation.v2_route_admission ->> 'attested_owner_revision')::BIGINT AS origin_gateway_owner_revision, lease.guild_id, lease.ruleset_key, lease.tenant_id, lease.installation_id, lease.attestation_id, lease.process_instance_id, lease.target_version, lease.target_content_hash, lease.binding_revision, lease.binding_fingerprint, lease.lease_epoch, lease.revision AS serving_revision FROM public.runtime_deployments AS deployment INNER JOIN public.runtime_attestations AS attestation ON attestation.tenant_id = deployment.tenant_id AND attestation.installation_id = deployment.installation_id AND attestation.deployment_id = deployment.deployment_id AND attestation.attestation_id = deployment.live_attestation_id INNER JOIN public.runtime_serving_leases AS lease ON lease.tenant_id = deployment.tenant_id AND lease.installation_id = deployment.installation_id AND lease.deployment_id = deployment.deployment_id AND lease.attestation_id = attestation.attestation_id WHERE deployment.tenant_id = $1 AND deployment.installation_id = $2 AND deployment.guild_id = $3 AND deployment.ruleset_key = $4 AND deployment.phase = 'live' AND attestation.record_format_version = 2 AND lease.connected AND lease.serving AND lease.expires_at > pg_catalog.transaction_timestamp()",
+        "SELECT deployment.promotion_id, deployment.deployment_id, deployment.runtime_generation, deployment.convergence_attempt_no AS deployment_convergence_attempt, attestation.deployment_revision, attestation.convergence_attempt_no AS attestation_convergence_attempt, attestation.process_instance_id AS attested_process_instance_id, attestation.controller_fencing_token AS route_controller_fencing_token, attestation.v2_route_incarnation AS route_incarnation, attestation.process_instance_id AS origin_process_instance_id, lease.lease_epoch AS origin_serving_lease_epoch, lease.revision AS origin_serving_revision, attestation.gateway_shard_id AS origin_gateway_shard_id, (attestation.v2_route_admission #>> '{gateway_owner_lease_id,lease_epoch}')::BIGINT AS origin_gateway_owner_lease_epoch, (attestation.v2_route_admission ->> 'attested_owner_revision')::BIGINT AS origin_gateway_owner_revision, lease.guild_id, lease.ruleset_key, lease.tenant_id, lease.installation_id, lease.attestation_id, lease.process_instance_id, lease.target_version, lease.target_content_hash, lease.binding_revision, lease.binding_fingerprint, lease.lease_epoch, lease.revision AS serving_revision, pg_catalog.to_char(lease.last_heartbeat_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS last_heartbeat_at, pg_catalog.to_char(lease.expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS lease_expires_at FROM public.runtime_deployments AS deployment INNER JOIN public.runtime_attestations AS attestation ON attestation.tenant_id = deployment.tenant_id AND attestation.installation_id = deployment.installation_id AND attestation.deployment_id = deployment.deployment_id AND attestation.attestation_id = deployment.live_attestation_id INNER JOIN public.runtime_serving_leases AS lease ON lease.tenant_id = deployment.tenant_id AND lease.installation_id = deployment.installation_id AND lease.deployment_id = deployment.deployment_id AND lease.attestation_id = attestation.attestation_id WHERE deployment.tenant_id = $1 AND deployment.installation_id = $2 AND deployment.guild_id = $3 AND deployment.ruleset_key = $4 AND deployment.phase = 'live' AND deployment.convergence_attempt_no = attestation.convergence_attempt_no AND attestation.record_format_version = 2 AND attestation.process_instance_id = lease.process_instance_id AND lease.connected AND lease.serving AND pg_catalog.isfinite(lease.last_heartbeat_at) AND pg_catalog.isfinite(lease.expires_at) AND lease.last_heartbeat_at <= pg_catalog.transaction_timestamp() AND lease.expires_at > pg_catalog.transaction_timestamp()",
     )
     .bind(&scope.tenant_id)
     .bind(&scope.installation_id)
@@ -714,6 +729,10 @@ async fn load_live_observation(
     .ok_or(D2ProvisionerErrorV1::Inspection)?;
     let deployment_id: String = get(&row, "deployment_id")?;
     let runtime_generation: i64 = get(&row, "runtime_generation")?;
+    let deployment_revision: i64 = get(&row, "deployment_revision")?;
+    let convergence_attempt: i64 = get(&row, "attestation_convergence_attempt")?;
+    let deployment_convergence_attempt: i64 = get(&row, "deployment_convergence_attempt")?;
+    let process_instance_id: String = get(&row, "attested_process_instance_id")?;
     let route = RouteIdentityV1 {
         deployment_id: deployment_id.clone(),
         runtime_generation,
@@ -744,10 +763,23 @@ async fn load_live_observation(
     };
     validate_route_identity(&route)?;
     validate_serving_identity(&serving, scope)?;
+    if deployment_revision < 1
+        || convergence_attempt < 1
+        || convergence_attempt != deployment_convergence_attempt
+        || process_instance_id != route.origin_process_instance_id
+        || process_instance_id != serving.process_instance_id
+    {
+        return Err(D2ProvisionerErrorV1::Inspection);
+    }
     Ok(LiveObservationV1 {
         route,
         serving,
         promotion_id: get(&row, "promotion_id")?,
+        deployment_revision,
+        convergence_attempt,
+        process_instance_id,
+        last_heartbeat_at: get(&row, "last_heartbeat_at")?,
+        lease_expires_at: get(&row, "lease_expires_at")?,
     })
 }
 
@@ -1727,6 +1759,11 @@ mod tests {
                 promotion_id: "d".repeat(64),
                 deployment_id: "deployment-1".to_owned(),
                 attestation_id: "a".repeat(64),
+                deployment_revision: 8,
+                convergence_attempt: 1,
+                process_instance_id: "0123456789abcdef0123456789abcdef".to_owned(),
+                last_heartbeat_at: "2026-08-01T11:59:58.000000Z".to_owned(),
+                lease_expires_at: "2026-08-01T12:00:43.000000Z".to_owned(),
                 route_identity: route,
                 serving_identity: serving,
             })),
@@ -1746,10 +1783,15 @@ mod tests {
             keys,
             [
                 "attestation_id",
+                "convergence_attempt",
                 "deployment_id",
+                "deployment_revision",
                 "installation_id",
                 "kind",
+                "last_heartbeat_at",
+                "lease_expires_at",
                 "observed_at",
+                "process_instance_id",
                 "promotion_id",
                 "route_identity",
                 "schema_version",
@@ -1832,15 +1874,25 @@ mod tests {
                     promotion_id: "d".repeat(64),
                     deployment_id: "deployment-1".to_owned(),
                     attestation_id: "a".repeat(64),
+                    deployment_revision: 8,
+                    convergence_attempt: 1,
+                    process_instance_id: "0123456789abcdef0123456789abcdef".to_owned(),
+                    last_heartbeat_at: "2026-08-01T11:59:58.000000Z".to_owned(),
+                    lease_expires_at: "2026-08-01T12:00:43.000000Z".to_owned(),
                     route_identity: route.clone(),
                     serving_identity: serving.clone(),
                 })),
                 vec![
                     "attestation_id",
+                    "convergence_attempt",
                     "deployment_id",
+                    "deployment_revision",
                     "installation_id",
                     "kind",
+                    "last_heartbeat_at",
+                    "lease_expires_at",
                     "observed_at",
+                    "process_instance_id",
                     "promotion_id",
                     "route_identity",
                     "schema_version",
@@ -2024,6 +2076,28 @@ mod tests {
         assert!(source.contains("tenant_id = $1"));
         assert!(source.contains("installation_id = $2"));
         assert!(!source.contains(&["SELECT ", "*"].concat()));
+    }
+
+    #[test]
+    fn live_evidence_binds_attestation_process_and_active_lease() {
+        let source = include_str!("d2_evidence.rs");
+        for predicate in [
+            "deployment.convergence_attempt_no = attestation.convergence_attempt_no",
+            "attestation.process_instance_id = lease.process_instance_id",
+            "lease.last_heartbeat_at <= pg_catalog.transaction_timestamp()",
+            "lease.expires_at > pg_catalog.transaction_timestamp()",
+        ] {
+            assert!(source.contains(predicate));
+        }
+        for field in [
+            "attestation.deployment_revision",
+            "attestation.convergence_attempt_no AS attestation_convergence_attempt",
+            "attestation.process_instance_id AS attested_process_instance_id",
+            "AS last_heartbeat_at",
+            "AS lease_expires_at",
+        ] {
+            assert!(source.contains(field));
+        }
     }
 
     #[test]

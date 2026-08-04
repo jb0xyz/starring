@@ -187,6 +187,19 @@
     };
   }
 
+  function sessionProjectionEvidence(session) {
+    const projection = session.projection;
+    const preview = projection && projection.preview;
+    const receipt = preview && preview.receipt;
+    return {
+      session_id: session.session_id,
+      observed_generation: session.observed_generation,
+      projection_state: projection && projection.state,
+      preview_revision: preview && preview.revision,
+      candidate_ruleset_hash: receipt && receipt.candidate_ruleset_hash,
+    };
+  }
+
   function decisionEvidence(view) {
     return {
       installation_id: view.installation_id,
@@ -262,6 +275,107 @@
       actions: summary.actions,
       target_version: summary.target_version,
       required_approvals: summary.required_approvals,
+    });
+  }
+
+  function exactLiveProjectionEvidence(product, operational, evidenceObservedAt) {
+    const productBody = requireBody(product.body, "deployment");
+    const operationalBody = requireBody(operational.body, "operational_deployment");
+    const runtime = requireBody(operationalBody.runtime, "operational_runtime");
+    const attestation = requireBody(runtime.attestation, "operational_attestation");
+    const serving = requireBody(runtime.serving, "operational_serving");
+    const deploymentObservedAt = requireUtcTimestamp(
+      productBody.observed_at,
+      "deployment_observed_at",
+    );
+    const deploymentLastHeartbeatAt = requireUtcTimestamp(
+      productBody.last_serving_heartbeat,
+      "deployment_last_heartbeat_at",
+    );
+    const deploymentLeaseExpiresAt = requireUtcTimestamp(
+      productBody.serving_lease_expires_at,
+      "deployment_lease_expires_at",
+    );
+    const decisionObservedAt = requireUtcTimestamp(
+      operationalBody.decision_observed_at,
+      "decision_observed_at",
+    );
+    const runtimeObservedAt = requireUtcTimestamp(
+      runtime.observed_at,
+      "runtime_observed_at",
+    );
+    const lastHeartbeatAt = requireUtcTimestamp(
+      serving.last_heartbeat_at,
+      "last_heartbeat_at",
+    );
+    const leaseExpiresAt = requireUtcTimestamp(
+      serving.lease_expires_at,
+      "lease_expires_at",
+    );
+    const observed = requireUtcTimestamp(evidenceObservedAt, "observed_at");
+    const deploymentRevision = requireGeneration(
+      productBody.attestation_revision,
+      "deployment_attestation_revision",
+      false,
+    );
+    const attestationRevision = requireGeneration(
+      attestation.deployment_revision,
+      "attestation_revision",
+      false,
+    );
+    const currentAttempt = requireGeneration(
+      runtime.current_attempt,
+      "current_attempt",
+      false,
+    );
+    const convergenceAttempt = requireGeneration(
+      attestation.convergence_attempt,
+      "convergence_attempt",
+      false,
+    );
+    const processInstanceId = typeof attestation.process_instance_id === "string"
+      ? attestation.process_instance_id
+      : "";
+    if (
+      productBody.state !== "live" ||
+      operationalBody.state !== "live" ||
+      runtime.phase !== "live" ||
+      serving.state !== "fresh" ||
+      !PROCESS_INSTANCE_ID.test(processInstanceId) ||
+      deploymentRevision !== attestationRevision ||
+      currentAttempt !== convergenceAttempt ||
+      compareUtcTimestamps(deploymentLastHeartbeatAt, deploymentObservedAt) > 0 ||
+      compareUtcTimestamps(deploymentObservedAt, deploymentLeaseExpiresAt) >= 0 ||
+      compareUtcTimestamps(deploymentObservedAt, decisionObservedAt) > 0 ||
+      compareUtcTimestamps(decisionObservedAt, runtimeObservedAt) > 0 ||
+      compareUtcTimestamps(runtimeObservedAt, observed) > 0 ||
+      compareUtcTimestamps(deploymentLastHeartbeatAt, lastHeartbeatAt) > 0 ||
+      compareUtcTimestamps(deploymentLeaseExpiresAt, leaseExpiresAt) > 0 ||
+      compareUtcTimestamps(lastHeartbeatAt, runtimeObservedAt) > 0 ||
+      compareUtcTimestamps(runtimeObservedAt, leaseExpiresAt) >= 0 ||
+      compareUtcTimestamps(observed, leaseExpiresAt) >= 0 ||
+      utcDifferenceNanoseconds(deploymentLeaseExpiresAt, deploymentLastHeartbeatAt) <= 0 ||
+      utcDifferenceNanoseconds(deploymentLeaseExpiresAt, deploymentLastHeartbeatAt) >
+        SERVING_LEASE_MAXIMUM_NANOSECONDS ||
+      utcDifferenceNanoseconds(leaseExpiresAt, lastHeartbeatAt) <= 0 ||
+      utcDifferenceNanoseconds(leaseExpiresAt, lastHeartbeatAt) >
+        SERVING_LEASE_MAXIMUM_NANOSECONDS
+    ) {
+      throw new Error("live_projection_identity_invalid");
+    }
+    return Object.freeze({
+      deployment_observed_at: deploymentObservedAt.value,
+      deployment_attestation_revision: deploymentRevision,
+      deployment_last_heartbeat_at: deploymentLastHeartbeatAt.value,
+      deployment_lease_expires_at: deploymentLeaseExpiresAt.value,
+      decision_observed_at: decisionObservedAt.value,
+      runtime_observed_at: runtimeObservedAt.value,
+      current_attempt: currentAttempt,
+      attestation_revision: attestationRevision,
+      convergence_attempt: convergenceAttempt,
+      process_instance_id: processInstanceId,
+      last_heartbeat_at: lastHeartbeatAt.value,
+      lease_expires_at: leaseExpiresAt.value,
     });
   }
 
@@ -814,11 +928,15 @@
         "candidate_ruleset_hash",
       );
       const current = await authoringSession(installationId, sessionId);
-      const currentProjection = projectionEvidence(current.body);
+      const currentProjection = sessionProjectionEvidence(current.body);
       if (
         current.status !== 200 ||
         currentProjection.projection_state !== "preview_ready" ||
-        currentProjection.generation !== generation ||
+        requireGeneration(
+          currentProjection.observed_generation,
+          "observed_generation",
+          false,
+        ) !== generation ||
         currentProjection.candidate_ruleset_hash !== candidateRulesetHash
       ) {
         throw new Error("authoring_preview_identity_mismatch");
@@ -1145,12 +1263,19 @@
           operational.body.state === "live" &&
           operational.body.runtime &&
           operational.body.runtime.phase === "live" &&
+          operational.body.runtime.serving &&
           operational.body.runtime.serving.state === "fresh"
         ) {
-          return {
+          const evidenceObservedAt = observedAt();
+          const exact = exactLiveProjectionEvidence(
+            product,
+            operational,
+            evidenceObservedAt,
+          );
+          return Object.freeze({
             schema_version: 1,
             kind: LIVE_EVIDENCE_KIND,
-            observed_at: observedAt(),
+            observed_at: evidenceObservedAt,
             public_origin: origin,
             pending_observed: pendingObserved,
             live_observed: true,
@@ -1163,7 +1288,8 @@
             serving_state: operational.body.runtime.serving.state,
             deployment_http_status: product.status,
             operational_http_status: operational.status,
-          };
+            ...exact,
+          });
         }
         if (attempt < attempts) {
           await sleep(intervalMilliseconds);
