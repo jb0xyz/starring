@@ -87,6 +87,14 @@ def _digest(value):
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _precise_utc_now():
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def _load_private(path, label):
     require_owned_mode(path, 0o600, label)
     return load_json_file(path, label)
@@ -1889,6 +1897,12 @@ def validate_orchestration_absence(
         guild["observed_at"], "orchestrator_total_absence_evidence_invalid"
     ):
         fail("discord_absence_chronology_invalid")
+    if _parse_timestamp(
+        guild["observed_at"], "orchestrator_total_absence_evidence_invalid"
+    ) >= _parse_timestamp(
+        value["observed_at"], "orchestrator_total_absence_evidence_invalid"
+    ):
+        fail("total_absence_observation_chronology_invalid")
     return value
 
 
@@ -1905,7 +1919,7 @@ def new_orchestration_absence(
     return {
         "schema_version": 1,
         "kind": ORCHESTRATION_ABSENCE_KIND,
-        "observed_at": utc_now(),
+        "observed_at": _precise_utc_now(),
         "manifest_sha256": context.digest,
         "run_id": context.manifest["run_id"],
         "installation_id": absence["installation_id"],
@@ -2193,6 +2207,12 @@ def assemble_absence_evidence(database, orchestration, prefix_scan, guild, bindi
         prefix_scan["observed_at"], "step17_source_evidence_invalid"
     ) >= _parse_timestamp(guild["observed_at"], "step17_source_evidence_invalid"):
         fail("step17_source_chronology_invalid")
+    if _parse_timestamp(
+        guild["observed_at"], "step17_source_evidence_invalid"
+    ) >= _parse_timestamp(
+        orchestration["observed_at"], "step17_source_evidence_invalid"
+    ):
+        fail("step17_source_chronology_invalid")
     fields = {
         name: orchestration[name]
         for name in (
@@ -2238,6 +2258,7 @@ def local_step17_binding(context, precleanup, teardown, step16_completion):
 def command_finalize_total_absence(
     context, platform, prefix_scan_evidence_path, guild_deletion_evidence_path
 ):
+    require_certification_eligible_teardown(context)
     step16_completion = require_certification_step_sixteen(context)
     ensure_finalization_directory(context)
     state = load_state(context, {"cleaned"})

@@ -650,6 +650,99 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertFalse(FINALIZATION.orchestration_absence_path(self.context).exists())
         self.assertFalse(FINALIZATION.step_seventeen_evidence_path(self.context).exists())
 
+    def test_total_absence_remains_disqualified_by_abort_tombstone(self):
+        self.finalize()
+        prefix = self.prefix_scan()
+        guild = self.guild_deletion()
+        tombstone = FINALIZATION.abort_teardown_tombstone_path(self.context)
+        tombstone.write_text("{}\n", encoding="utf-8")
+        tombstone.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "standalone_teardown_certification_disqualified",
+        ):
+            FINALIZATION.command_finalize_total_absence(
+                self.context, self.platform, str(prefix), str(guild)
+            )
+        self.assertFalse(FINALIZATION.orchestration_absence_path(self.context).exists())
+        self.assertFalse(FINALIZATION.step_seventeen_evidence_path(self.context).exists())
+
+    def test_total_absence_rejects_future_browser_evidence(self):
+        self.finalize()
+        prefix = self.prefix_scan(observed_at="2099-01-01T01:00:00.000001Z")
+        guild = self.guild_deletion(observed_at="2099-01-01T02:00:00.000001Z")
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "total_absence_observation_chronology_invalid",
+        ):
+            FINALIZATION.command_finalize_total_absence(
+                self.context, self.platform, str(prefix), str(guild)
+            )
+        self.assertFalse(FINALIZATION.orchestration_absence_path(self.context).exists())
+        self.assertFalse(FINALIZATION.step_seventeen_evidence_path(self.context).exists())
+
+    def test_total_absence_requires_current_keychain_boundaries(self):
+        self.finalize()
+        prefix = self.prefix_scan()
+        guild = self.guild_deletion()
+        external = ORCHESTRATOR.external_keychain_inventory(self.context)[0]
+        self.platform.keychain.remove(external)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "external_keychain_identity_absent",
+        ):
+            FINALIZATION.command_finalize_total_absence(
+                self.context, self.platform, str(prefix), str(guild)
+            )
+        self.platform.keychain.add(external)
+        owned = ORCHESTRATOR.keychain_inventory(self.context)[0]
+        self.platform.keychain.add(owned)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "run_keychain_items_still_present",
+        ):
+            FINALIZATION.command_finalize_total_absence(
+                self.context, self.platform, str(prefix), str(guild)
+            )
+        self.platform.keychain.remove(owned)
+        self.assertFalse(FINALIZATION.orchestration_absence_path(self.context).exists())
+        self.assertFalse(FINALIZATION.step_seventeen_evidence_path(self.context).exists())
+
+    def test_total_absence_step_write_crash_replays_immutable_observation(self):
+        self.finalize()
+        prefix = self.prefix_scan()
+        guild = self.guild_deletion()
+        real_write = FINALIZATION.write_atomic
+        failed = False
+
+        def fail_step(path, payload, mode=0o600):
+            nonlocal failed
+            if (
+                pathlib.Path(path)
+                == FINALIZATION.step_seventeen_evidence_path(self.context)
+                and not failed
+            ):
+                failed = True
+                raise ORCHESTRATOR.OrchestratorError(
+                    "injected_step17_write_failure"
+                )
+            return real_write(path, payload, mode)
+
+        with mock.patch.object(FINALIZATION, "write_atomic", side_effect=fail_step):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "injected_step17_write_failure"
+            ):
+                FINALIZATION.command_finalize_total_absence(
+                    self.context, self.platform, str(prefix), str(guild)
+                )
+        orchestration = FINALIZATION.orchestration_absence_path(self.context)
+        before = orchestration.read_bytes()
+        result = FINALIZATION.command_finalize_total_absence(
+            self.context, self.platform, str(prefix), str(guild)
+        )
+        self.assertEqual(result["status"], "total_absence_confirmed")
+        self.assertEqual(orchestration.read_bytes(), before)
+
     def test_total_absence_requires_step16_before_prefix_scan(self):
         self.finalize()
         prefix = self.prefix_scan()
@@ -738,6 +831,14 @@ class D2FinalizationTest(unittest.TestCase):
         ):
             FINALIZATION.assemble_absence_evidence(
                 database, orchestration, prefix_value, drifted, binding
+            )
+        chronology = copy.deepcopy(orchestration)
+        chronology["observed_at"] = guild["observed_at"]
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "step17_source_chronology_invalid"
+        ):
+            FINALIZATION.assemble_absence_evidence(
+                database, chronology, prefix_value, guild, binding
             )
 
     def test_total_absence_rejects_nonzero_prefix_scan(self):
