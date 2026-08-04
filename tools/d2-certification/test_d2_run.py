@@ -747,8 +747,12 @@ class D2RunCoordinatorTest(unittest.TestCase):
             authoring_http_status=final["authoring_http_status"],
             authoring_session_id=final["authoring_session_id"],
             authoring_generation=final["authoring_generation"],
+            expected_generation=final["expected_generation"],
+            authoring_disposition=final["authoring_disposition"],
             installation_id=final["installation_id"],
             one_shot=True,
+            worker_request_id=final["worker_request_id"],
+            worker_completion_sha256=final["worker_completion_sha256"],
         )
         browser_digest = d2_run.sha256_bytes(
             d2_evidence.canonical_json(browser).encode("utf-8")
@@ -777,6 +781,8 @@ class D2RunCoordinatorTest(unittest.TestCase):
             settled_requests_delta=1,
             active_requests_after=0,
             queued_requests_after=0,
+            worker_request_id=final["worker_request_id"],
+            worker_completion_sha256=final["worker_completion_sha256"],
         )
         result = d2_run.advance_certification(
             self.manifest_path,
@@ -836,13 +842,18 @@ class D2RunCoordinatorTest(unittest.TestCase):
             authoring_generation=final["generation"],
             projection_state=final["projection_state"],
             candidate_ruleset_hash=final["payload_digest"],
+            worker_request_id=final["worker_request_id"],
+            worker_completion_sha256=final["worker_completion_sha256"],
         )
         database = self.envelope(
             "starring.d2.db-authoring-evidence.v1",
             generation_encrypted=final["generation_encrypted"],
             projection_state=final["projection_state"],
             generation=final["generation"],
+            generation_count=final["generation_count"],
             payload_digest=final["payload_digest"],
+            worker_request_id=final["worker_request_id"],
+            worker_completion_sha256=final["worker_completion_sha256"],
             installation_id=final["installation_id"],
             authoring_session_id=final["authoring_session_id"],
             generation_created_at=final["generation_created_at"],

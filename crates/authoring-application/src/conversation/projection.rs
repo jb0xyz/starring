@@ -2,7 +2,8 @@ use std::fmt::{Debug, Formatter};
 
 use authoring_promotion::{AuthoringSessionId, SessionGeneration};
 use design_harness::{
-    verify_preview_ruleset_v1, DraftSummary, IntentRecipeReceiptV2, PreviewReadyArtifactV1,
+    verify_preview_ruleset_v1, DraftSummary, IntentRecipeReceiptV2, LlmCompletionProvenanceV1,
+    PreviewReadyArtifactV1,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,6 +18,7 @@ const MAX_CAPABILITY_SCALARS: usize = 128;
 const MAX_DRAFT_ITEMS: usize = 1_024;
 const MAX_UNRESOLVED_REFERENCES: usize = 1_024;
 const MAX_REFERENCE_BYTES: usize = 256;
+const MAX_MODEL_COMPLETIONS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,6 +89,8 @@ pub struct SafeAuthoringTurnProjectionV1 {
     capabilities: Vec<String>,
     draft: DraftSummary,
     preview: Option<SafeAuthoringPreviewV1>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    model_completions: Vec<LlmCompletionProvenanceV1>,
 }
 
 impl SafeAuthoringTurnProjectionV1 {
@@ -96,6 +100,7 @@ impl SafeAuthoringTurnProjectionV1 {
         capabilities: Vec<String>,
         draft: DraftSummary,
         preview: Option<SafeAuthoringPreviewV1>,
+        model_completions: Vec<LlmCompletionProvenanceV1>,
     ) -> Result<Self, SafeAuthoringProjectionError> {
         let projection = Self {
             schema_version: SAFE_PROJECTION_SCHEMA_VERSION,
@@ -104,6 +109,7 @@ impl SafeAuthoringTurnProjectionV1 {
             capabilities,
             draft,
             preview,
+            model_completions,
         };
         projection.validate()?;
         Ok(projection)
@@ -129,6 +135,10 @@ impl SafeAuthoringTurnProjectionV1 {
         self.preview.as_ref()
     }
 
+    pub fn model_completions(&self) -> &[LlmCompletionProvenanceV1] {
+        &self.model_completions
+    }
+
     pub fn to_canonical_json(&self) -> Result<Vec<u8>, SafeAuthoringProjectionError> {
         self.validate_fields()?;
         let bytes = serde_json::to_vec(self)
@@ -152,6 +162,7 @@ impl SafeAuthoringTurnProjectionV1 {
             capabilities: wire.capabilities,
             draft: wire.draft,
             preview: wire.preview.map(SafeAuthoringPreviewV1::from),
+            model_completions: wire.model_completions,
         };
         projection.validate()?;
         if projection.to_canonical_json()?.as_slice() != bytes {
@@ -228,6 +239,17 @@ impl SafeAuthoringTurnProjectionV1 {
         if self.capabilities.len() > MAX_CAPABILITIES {
             return Err(SafeAuthoringProjectionError::InvalidCapabilities);
         }
+        if self.model_completions.len() > MAX_MODEL_COMPLETIONS {
+            return Err(SafeAuthoringProjectionError::InvalidModelCompletions);
+        }
+        let mut request_ids = std::collections::BTreeSet::new();
+        let mut completion_digests = std::collections::BTreeSet::new();
+        if self.model_completions.iter().any(|provenance| {
+            !request_ids.insert(provenance.request_id())
+                || !completion_digests.insert(provenance.completion_sha256())
+        }) {
+            return Err(SafeAuthoringProjectionError::InvalidModelCompletions);
+        }
         for capability in &self.capabilities {
             validate_text(capability, MAX_CAPABILITY_BYTES, MAX_CAPABILITY_SCALARS)
                 .map_err(|_| SafeAuthoringProjectionError::InvalidCapabilities)?;
@@ -281,6 +303,8 @@ struct SafeAuthoringProjectionWireV1 {
     capabilities: Vec<String>,
     draft: DraftSummary,
     preview: Option<SafeAuthoringPreviewWireV1>,
+    #[serde(default)]
+    model_completions: Vec<LlmCompletionProvenanceV1>,
 }
 
 #[derive(Deserialize)]
@@ -392,6 +416,8 @@ pub enum SafeAuthoringProjectionError {
     InvalidText,
     #[error("safe authoring projection capabilities are invalid")]
     InvalidCapabilities,
+    #[error("safe authoring projection model completions are invalid")]
+    InvalidModelCompletions,
     #[error("safe authoring projection Draft summary is invalid")]
     InvalidDraft,
     #[error("safe authoring projection state shape is invalid")]

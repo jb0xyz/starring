@@ -94,6 +94,7 @@ fn regular_dependencies_exclude_product_and_persistent_edges() {
             "reqwest".to_string(),
             "serde".to_string(),
             "serde_json".to_string(),
+            "sha2".to_string(),
             "zeroize".to_string(),
         ])
     );
@@ -105,6 +106,7 @@ fn regular_dependencies_exclude_product_and_persistent_edges() {
             "reqwest".to_string(),
             "serde".to_string(),
             "serde_json".to_string(),
+            "sha2".to_string(),
             "tokio".to_string(),
             "zeroize".to_string(),
         ])

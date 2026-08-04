@@ -360,6 +360,10 @@ test("certification authoring and decision phases are separated by a public prev
     projection: {
       state: "preview_ready",
       preview: { revision: 1, receipt: { candidate_ruleset_hash: DIGEST } },
+      model_completions: [{
+        request_id: "worker-request-1",
+        completion_sha256: "c".repeat(64),
+      }],
     },
   };
   const sessionBody = {
@@ -424,6 +428,10 @@ test("certification authoring and decision phases are separated by a public prev
     "starring.d2.browser-preview-ready-evidence.v1",
   );
   assert.equal(authoring.preview_ready_evidence.candidate_ruleset_hash, DIGEST);
+  assert.equal(authoring.authoring_evidence.expected_generation, 0);
+  assert.equal(authoring.authoring_evidence.authoring_disposition, "created");
+  assert.equal(authoring.authoring_evidence.worker_request_id, "worker-request-1");
+  assert.equal(authoring.authoring_evidence.worker_completion_sha256, "c".repeat(64));
   let confirmations = 0;
   const decision = await product.completeCertificationDecision({
     installationId: "installation-1",

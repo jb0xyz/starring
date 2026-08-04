@@ -59,6 +59,19 @@ fn validate_snapshot_with_bindings(
     if snapshot.draft.ruleset.version != 1 {
         return Err(snapshot_invariant("draft ruleset version is not supported"));
     }
+    if snapshot.completion_provenance.len() > snapshot.observability.model_calls {
+        return Err(snapshot_invariant(
+            "completion provenance exceeds recorded model calls",
+        ));
+    }
+    let mut request_ids = BTreeSet::new();
+    let mut completion_digests = BTreeSet::new();
+    if snapshot.completion_provenance.iter().any(|provenance| {
+        !request_ids.insert(provenance.request_id())
+            || !completion_digests.insert(provenance.completion_sha256())
+    }) {
+        return Err(snapshot_invariant("completion provenance is not unique"));
+    }
     for (name, revision) in [
         ("validated_revision", snapshot.draft.validated_revision),
         ("simulated_revision", snapshot.draft.simulated_revision),

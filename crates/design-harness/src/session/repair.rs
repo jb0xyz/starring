@@ -345,6 +345,15 @@ impl<C: LlmClient> DesignSession<C> {
                 }
                 None
             }
+            LlmResponse::Provenanced { .. } => {
+                let error = StructuredError::new(
+                    "LLM_PROVENANCE_CONFLICT",
+                    "llm.provenance",
+                    "The model completion contained nested provenance",
+                    "Retry the turn with a fresh model completion",
+                );
+                Some(self.fail_repair(ticket, error, true))
+            }
         }
     }
 }

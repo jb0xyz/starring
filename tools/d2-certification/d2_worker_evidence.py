@@ -37,6 +37,8 @@ HEALTH_FIELDS = {
     "queued_requests",
     "accepted_requests_total",
     "settled_requests_total",
+    "last_successful_request_id",
+    "last_successful_completion_sha256",
 }
 SNAPSHOT_FIELDS = {
     "schema_version",
@@ -58,6 +60,8 @@ SNAPSHOT_FIELDS = {
     "queued_requests",
     "accepted_requests_total",
     "settled_requests_total",
+    "last_successful_request_id",
+    "last_successful_completion_sha256",
 }
 BROWSER_FIELDS = {
     "schema_version",
@@ -67,8 +71,12 @@ BROWSER_FIELDS = {
     "authoring_http_status",
     "authoring_session_id",
     "authoring_generation",
+    "expected_generation",
+    "authoring_disposition",
     "installation_id",
     "one_shot",
+    "worker_request_id",
+    "worker_completion_sha256",
 }
 AUTHORING_FIELDS = {
     "schema_version",
@@ -94,6 +102,8 @@ AUTHORING_FIELDS = {
     "settled_requests_delta",
     "active_requests_after",
     "queued_requests_after",
+    "worker_request_id",
+    "worker_completion_sha256",
 }
 
 
@@ -142,7 +152,9 @@ def validate_browser_authoring_evidence(value):
         or type(value["authoring_http_status"]) is not int
         or value["authoring_http_status"] not in {200, 201}
         or type(value["authoring_generation"]) is not int
-        or value["authoring_generation"] <= 0
+        or value["authoring_generation"] != 1
+        or value["expected_generation"] != 0
+        or value["authoring_disposition"] != "created"
         or value["one_shot"] is not True
         or not isinstance(value["public_origin"], str)
         or not value["public_origin"].startswith("https://")
@@ -153,6 +165,10 @@ def validate_browser_authoring_evidence(value):
         value["authoring_session_id"], "browser_authoring_evidence_invalid"
     )
     _require_identifier(value["installation_id"], "browser_authoring_evidence_invalid")
+    _require_identifier(value["worker_request_id"], "browser_authoring_evidence_invalid")
+    _require_digest(
+        value["worker_completion_sha256"], "browser_authoring_evidence_invalid"
+    )
     return value
 
 
@@ -195,6 +211,13 @@ def validate_worker_health(manifest, health):
         "settled_requests_total",
     ):
         _require_counter(health[field], "worker_health_evidence_invalid")
+    request_id = health["last_successful_request_id"]
+    completion_sha256 = health["last_successful_completion_sha256"]
+    if (request_id is None) != (completion_sha256 is None):
+        fail("worker_health_evidence_invalid")
+    if request_id is not None:
+        _require_identifier(request_id, "worker_health_evidence_invalid")
+        _require_digest(completion_sha256, "worker_health_evidence_invalid")
     return health
 
 
@@ -222,6 +245,10 @@ def worker_snapshot(manifest, manifest_sha256, checkpoint, health, observed_at=N
         "queued_requests": health["queued_requests"],
         "accepted_requests_total": health["accepted_requests_total"],
         "settled_requests_total": health["settled_requests_total"],
+        "last_successful_request_id": health["last_successful_request_id"],
+        "last_successful_completion_sha256": health[
+            "last_successful_completion_sha256"
+        ],
     }
 
 
@@ -273,6 +300,13 @@ def validate_worker_snapshot(manifest, manifest_sha256, checkpoint, value):
         "settled_requests_total",
     ):
         _require_counter(value[field], "worker_snapshot_invalid")
+    request_id = value["last_successful_request_id"]
+    completion_sha256 = value["last_successful_completion_sha256"]
+    if (request_id is None) != (completion_sha256 is None):
+        fail("worker_snapshot_invalid")
+    if request_id is not None:
+        _require_identifier(request_id, "worker_snapshot_invalid")
+        _require_digest(completion_sha256, "worker_snapshot_invalid")
     return value
 
 
@@ -320,6 +354,9 @@ def validate_authoring_evidence(context, browser, value):
         or value["settled_requests_after"] != value["settled_requests_before"] + 1
         or value["active_requests_after"] != 0
         or value["queued_requests_after"] != 0
+        or value["worker_request_id"] != browser["worker_request_id"]
+        or value["worker_completion_sha256"]
+        != browser["worker_completion_sha256"]
     ):
         fail("worker_authoring_evidence_invalid")
     _require_timestamp(value["observed_at"], "worker_authoring_evidence_invalid")
@@ -343,6 +380,12 @@ def validate_authoring_evidence(context, browser, value):
     )
     _require_digest(
         value["worker_source_sha256"], "worker_authoring_evidence_invalid"
+    )
+    _require_identifier(
+        value["worker_request_id"], "worker_authoring_evidence_invalid"
+    )
+    _require_digest(
+        value["worker_completion_sha256"], "worker_authoring_evidence_invalid"
     )
     for field in (
         "provider",
@@ -451,6 +494,10 @@ def capture_worker_authoring_checkpoint(context, health, checkpoint, browser=Non
         - before["settled_requests_total"],
         "active_requests_after": current["active_requests"],
         "queued_requests_after": current["queued_requests"],
+        "worker_request_id": current["last_successful_request_id"],
+        "worker_completion_sha256": current[
+            "last_successful_completion_sha256"
+        ],
     }
     validate_authoring_evidence(context, browser, evidence)
     final_path = authoring_path(context)

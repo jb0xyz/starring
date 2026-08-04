@@ -1040,6 +1040,14 @@ impl<C: LlmClient> DesignSession<C> {
                 "Retry the same user turn after the model gateway is available",
             ))
         })?;
+        let response = self.accept_completion_response(response).map_err(|()| {
+            IntentToolRequestFailure::Error(intent_error(
+                "LLM_PROVENANCE_CONFLICT",
+                "llm.provenance",
+                "The model completion provenance conflicted with this session",
+                "Retry the turn with a fresh model completion",
+            ))
+        })?;
         let calls = match response {
             LlmResponse::Text(text) => {
                 self.messages.push(Message::assistant(text));
@@ -1052,6 +1060,14 @@ impl<C: LlmClient> DesignSession<C> {
                 )));
             }
             LlmResponse::ToolCalls(calls) => calls,
+            LlmResponse::Provenanced { .. } => {
+                return Err(IntentToolRequestFailure::Error(intent_error(
+                    "LLM_PROVENANCE_CONFLICT",
+                    "llm.provenance",
+                    "The model completion contained nested provenance",
+                    "Retry the turn with a fresh model completion",
+                )));
+            }
         };
         if calls.len() != 1 || !valid_tool_call_ids(&calls) {
             self.messages.push(Message::assistant(format!(

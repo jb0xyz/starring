@@ -429,8 +429,12 @@ def assemble_authoring_evidence(browser, worker):
         "authoring_http_status",
         "authoring_session_id",
         "authoring_generation",
+        "expected_generation",
+        "authoring_disposition",
         "installation_id",
         "one_shot",
+        "worker_request_id",
+        "worker_completion_sha256",
     }
     worker_fields = {
         "manifest_sha256",
@@ -453,6 +457,8 @@ def assemble_authoring_evidence(browser, worker):
         "settled_requests_delta",
         "active_requests_after",
         "queued_requests_after",
+        "worker_request_id",
+        "worker_completion_sha256",
     }
     public = _require_envelope(
         browser, "starring.d2.browser-authoring-evidence.v1", browser_fields
@@ -467,12 +473,18 @@ def assemble_authoring_evidence(browser, worker):
     _require_identifier(
         public["authoring_session_id"], "authoring_session_id_invalid"
     )
-    _require_positive_integer(
-        public["authoring_generation"], "authoring_generation_invalid"
-    )
+    if public["authoring_generation"] != 1 or public["expected_generation"] != 0:
+        _fail("authoring_generation_invalid")
+    if public["authoring_disposition"] != "created":
+        _fail("authoring_disposition_invalid")
     _require_identifier(public["installation_id"], "authoring_installation_id_invalid")
     if public["one_shot"] is not True:
         _fail("authoring_one_shot_invalid")
+    _require_identifier(public["worker_request_id"], "authoring_worker_request_id_invalid")
+    _require_digest(
+        public["worker_completion_sha256"],
+        "authoring_worker_completion_sha256_invalid",
+    )
     for field in ("provider", "model", "reasoning_effort", "auth_mode"):
         _require_identifier(execution[field], f"authoring_{field}_invalid")
     _require_identifier(
@@ -488,8 +500,12 @@ def assemble_authoring_evidence(browser, worker):
         "manifest_sha256",
         "browser_evidence_sha256",
         "worker_source_sha256",
+        "worker_completion_sha256",
     ):
         _require_digest(execution[field], f"authoring_{field}_invalid")
+    _require_identifier(
+        execution["worker_request_id"], "authoring_worker_request_id_invalid"
+    )
     _require_timestamp(
         execution["browser_observed_at"], "authoring_browser_observed_at_invalid"
     )
@@ -535,12 +551,17 @@ def assemble_authoring_evidence(browser, worker):
         != execution["settled_requests_before"] + 1
         or execution["active_requests_after"] != 0
         or execution["queued_requests_after"] != 0
+        or execution["worker_request_id"] != public["worker_request_id"]
+        or execution["worker_completion_sha256"]
+        != public["worker_completion_sha256"]
     ):
         _fail("authoring_worker_request_boundary_invalid")
     return {
         "authoring_http_status": public["authoring_http_status"],
         "authoring_session_id": public["authoring_session_id"],
         "authoring_generation": public["authoring_generation"],
+        "expected_generation": public["expected_generation"],
+        "authoring_disposition": public["authoring_disposition"],
         "installation_id": public["installation_id"],
         "model": execution["model"],
         "provider": execution["provider"],
@@ -550,6 +571,8 @@ def assemble_authoring_evidence(browser, worker):
         "worker_before_observed_at": execution["worker_before_observed_at"],
         "worker_after_observed_at": execution["worker_after_observed_at"],
         "one_shot": True,
+        "worker_request_id": public["worker_request_id"],
+        "worker_completion_sha256": public["worker_completion_sha256"],
         "public_origin": public["public_origin"],
     }
 
@@ -562,12 +585,17 @@ def assemble_preview_evidence(browser, database):
         "authoring_generation",
         "projection_state",
         "candidate_ruleset_hash",
+        "worker_request_id",
+        "worker_completion_sha256",
     }
     database_fields = {
         "generation_encrypted",
         "projection_state",
         "generation",
+        "generation_count",
         "payload_digest",
+        "worker_request_id",
+        "worker_completion_sha256",
         "installation_id",
         "authoring_session_id",
         "generation_created_at",
@@ -592,13 +620,24 @@ def assemble_preview_evidence(browser, database):
     _require_digest(
         public["candidate_ruleset_hash"], "preview_candidate_ruleset_hash_invalid"
     )
+    _require_identifier(public["worker_request_id"], "preview_worker_request_id_invalid")
+    _require_digest(
+        public["worker_completion_sha256"],
+        "preview_worker_completion_sha256_invalid",
+    )
     if durable["generation_encrypted"] is not True:
         _fail("db_generation_encrypted_invalid")
     _require_state(
         durable["projection_state"], {"preview_ready"}, "db_projection_state_invalid"
     )
     _require_positive_integer(durable["generation"], "db_generation_invalid")
+    if durable["generation_count"] != 1:
+        _fail("db_generation_count_invalid")
     _require_digest(durable["payload_digest"], "db_payload_digest_invalid")
+    _require_identifier(durable["worker_request_id"], "db_worker_request_id_invalid")
+    _require_digest(
+        durable["worker_completion_sha256"], "db_worker_completion_sha256_invalid"
+    )
     _require_identifier(durable["installation_id"], "db_installation_id_invalid")
     _require_identifier(
         durable["authoring_session_id"], "db_authoring_session_id_invalid"
@@ -612,6 +651,9 @@ def assemble_preview_evidence(browser, database):
         or public["authoring_generation"] != durable["generation"]
         or public["projection_state"] != durable["projection_state"]
         or public["candidate_ruleset_hash"] != durable["payload_digest"]
+        or public["worker_request_id"] != durable["worker_request_id"]
+        or public["worker_completion_sha256"]
+        != durable["worker_completion_sha256"]
         or _timestamp_value(
             durable["generation_created_at"], "db_generation_created_at_invalid"
         )

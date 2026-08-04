@@ -5,9 +5,12 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use design_harness::{LlmClient, LlmError, LlmResponse, Message, ToolCall, ToolDefinition};
+use design_harness::{
+    LlmClient, LlmCompletionProvenanceV1, LlmError, LlmResponse, Message, ToolCall, ToolDefinition,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -69,6 +72,8 @@ pub struct CodexWorkerCallMetric {
     pub finish_reason: Option<String>,
     pub request_duration_ms: u64,
     pub gateway_model_duration_ms: Option<u64>,
+    pub worker_request_id: Option<String>,
+    pub completion_sha256: Option<String>,
 }
 
 #[derive(Clone)]
@@ -90,7 +95,7 @@ struct WorkerRequest<'a> {
     frontier: &'a ToolDefinition,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerResponse {
     schema_version: u32,
@@ -103,9 +108,10 @@ struct WorkerResponse {
     tool_call: WorkerToolCall,
     usage: WorkerUsage,
     duration_ms: u64,
+    completion_sha256: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerToolCall {
     id: String,
@@ -113,7 +119,7 @@ struct WorkerToolCall {
     arguments: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerUsage {
     input_tokens: u64,
@@ -141,6 +147,8 @@ struct WorkerHealth {
     queued_requests: usize,
     accepted_requests_total: u64,
     settled_requests_total: u64,
+    last_successful_request_id: Option<String>,
+    last_successful_completion_sha256: Option<String>,
 }
 
 struct MetricInput {
@@ -159,6 +167,8 @@ struct MetricObservation {
     completion_tokens: Option<u64>,
     finish_reason: Option<String>,
     provider_duration_ms: Option<u64>,
+    worker_request_id: Option<String>,
+    completion_sha256: Option<String>,
 }
 
 fn request_metric_input(
@@ -189,6 +199,8 @@ impl MetricObservation {
             completion_tokens: None,
             finish_reason: None,
             provider_duration_ms: None,
+            worker_request_id: None,
+            completion_sha256: None,
         }
     }
 }
@@ -301,6 +313,8 @@ impl CodexWorkerClient {
             finish_reason: observation.finish_reason,
             request_duration_ms: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
             gateway_model_duration_ms: observation.provider_duration_ms,
+            worker_request_id: observation.worker_request_id,
+            completion_sha256: observation.completion_sha256,
         });
         Ok(())
     }
@@ -415,6 +429,10 @@ impl LlmClient for CodexWorkerClient {
             }
         };
         let response = tool_call.response;
+        let provenance = LlmCompletionProvenanceV1::new(
+            response.request_id.clone(),
+            response.completion_sha256.clone(),
+        )?;
         self.record_metric(
             &metric_input,
             call_sequence,
@@ -426,10 +444,12 @@ impl LlmClient for CodexWorkerClient {
                 completion_tokens: Some(response.usage.output_tokens),
                 finish_reason: Some("tool_calls".to_string()),
                 provider_duration_ms: Some(response.duration_ms),
+                worker_request_id: Some(response.request_id.clone()),
+                completion_sha256: Some(response.completion_sha256.clone()),
             },
             started.elapsed(),
         )?;
-        Ok(LlmResponse::ToolCalls(vec![tool_call.call]))
+        LlmResponse::with_provenance(LlmResponse::ToolCalls(vec![tool_call.call]), provenance)
     }
 }
 
@@ -454,7 +474,9 @@ fn validate_response(
             "codex worker identity mismatch".to_string(),
         ));
     }
-    if response.tool_call.id.trim().is_empty() || response.tool_call.name != expected_frontier {
+    if response.tool_call.id != format!("call-{}", response.request_id)
+        || response.tool_call.name != expected_frontier
+    {
         return Err(LlmError::Client(
             "codex worker returned the wrong frontier".to_string(),
         ));
@@ -473,12 +495,49 @@ fn validate_response(
             "codex worker arguments must be an object".to_string(),
         ));
     }
+    if response.completion_sha256 != worker_completion_digest(&response)? {
+        return Err(LlmError::Client(
+            "codex worker completion digest is invalid".to_string(),
+        ));
+    }
     let call = ToolCall {
         id: response.tool_call.id.clone(),
         name: response.tool_call.name.clone(),
         arguments: response.tool_call.arguments.clone(),
     };
     Ok(ValidatedToolCall { call, response })
+}
+
+#[derive(Serialize)]
+struct WorkerResponseDigestPayload<'a> {
+    schema_version: u32,
+    request_id: &'a str,
+    provider: &'a str,
+    model: &'a str,
+    reasoning_effort: &'a str,
+    auth_mode: &'a str,
+    codex_cli_version: &'a str,
+    tool_call: &'a WorkerToolCall,
+    usage: &'a WorkerUsage,
+    duration_ms: u64,
+}
+
+fn worker_completion_digest(response: &WorkerResponse) -> Result<String, LlmError> {
+    let payload = WorkerResponseDigestPayload {
+        schema_version: response.schema_version,
+        request_id: &response.request_id,
+        provider: &response.provider,
+        model: &response.model,
+        reasoning_effort: &response.reasoning_effort,
+        auth_mode: &response.auth_mode,
+        codex_cli_version: &response.codex_cli_version,
+        tool_call: &response.tool_call,
+        usage: &response.usage,
+        duration_ms: response.duration_ms,
+    };
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|_| LlmError::Client("codex worker completion digest failed".to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn validate_health(health: &WorkerHealth) -> Result<(), LlmError> {
@@ -503,7 +562,25 @@ fn validate_health(health: &WorkerHealth) -> Result<(), LlmError> {
         && health.accepted_requests_total <= MAX_SAFE_JSON_INTEGER
         && health.settled_requests_total <= health.accepted_requests_total
         && health.accepted_requests_total - health.settled_requests_total
-            == (health.active_requests + health.queued_requests) as u64;
+            == (health.active_requests + health.queued_requests) as u64
+        && match (
+            health.last_successful_request_id.as_deref(),
+            health.last_successful_completion_sha256.as_deref(),
+        ) {
+            (None, None) => true,
+            (Some(request_id), Some(digest)) => {
+                !request_id.is_empty()
+                    && request_id.len() <= 128
+                    && request_id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+                    && digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }
+            _ => false,
+        };
     if valid {
         Ok(())
     } else {
@@ -519,9 +596,9 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        request_metric_input, validate_health, validate_response, CodexWorkerCallOutcome,
-        CodexWorkerClient, WorkerHealth, WorkerRequest, WorkerResponse, MAX_SAFE_JSON_INTEGER,
-        SERVING_CODEX_CLI_VERSION,
+        request_metric_input, validate_health, validate_response, worker_completion_digest,
+        CodexWorkerCallOutcome, CodexWorkerClient, WorkerHealth, WorkerRequest, WorkerResponse,
+        MAX_SAFE_JSON_INTEGER, SERVING_CODEX_CLI_VERSION,
     };
 
     fn response_value() -> Value {
@@ -534,7 +611,7 @@ mod tests {
             "auth_mode": "chatgpt",
             "codex_cli_version": "codex-cli 0.146.0-alpha.3.1",
             "tool_call": {
-                "id": "call-1",
+                "id": "call-request-1",
                 "name": "interpret_intent_core",
                 "arguments": "{\"route\":\"managed\"}"
             },
@@ -544,12 +621,15 @@ mod tests {
                 "output_tokens": 20,
                 "reasoning_output_tokens": 10
             },
-            "duration_ms": 5000
+            "duration_ms": 5000,
+            "completion_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
         })
     }
 
     fn response() -> WorkerResponse {
-        serde_json::from_value(response_value()).unwrap()
+        let mut response = serde_json::from_value::<WorkerResponse>(response_value()).unwrap();
+        response.completion_sha256 = worker_completion_digest(&response).unwrap();
+        response
     }
 
     fn frontier(name: &str) -> ToolDefinition {
@@ -659,7 +739,9 @@ mod tests {
             "active_requests": 0,
             "queued_requests": 0,
             "accepted_requests_total": 7,
-            "settled_requests_total": 7
+            "settled_requests_total": 7,
+            "last_successful_request_id": null,
+            "last_successful_completion_sha256": null
         }))
         .unwrap();
         assert!(validate_health(&health).is_ok());

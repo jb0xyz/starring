@@ -291,8 +291,12 @@ class D2EvidenceTest(unittest.TestCase):
             authoring_http_status=201,
             authoring_session_id="session-1",
             authoring_generation=1,
+            expected_generation=0,
+            authoring_disposition="created",
             installation_id=INSTALLATION_ID,
             one_shot=True,
+            worker_request_id="worker-request-1",
+            worker_completion_sha256="b" * 64,
         )
         worker = envelope(
             "starring.d2.worker-authoring-evidence.v1",
@@ -318,13 +322,18 @@ class D2EvidenceTest(unittest.TestCase):
             settled_requests_delta=1,
             active_requests_after=0,
             queued_requests_after=0,
+            worker_request_id="worker-request-1",
+            worker_completion_sha256="b" * 64,
         )
         preview = envelope(
             "starring.d2.db-authoring-evidence.v1",
             generation_encrypted=True,
             projection_state="preview_ready",
             generation=1,
+            generation_count=1,
             payload_digest="a" * 64,
+            worker_request_id="worker-request-1",
+            worker_completion_sha256="b" * 64,
             installation_id=INSTALLATION_ID,
             authoring_session_id="session-1",
             generation_created_at=OBSERVED_AT,
@@ -337,6 +346,8 @@ class D2EvidenceTest(unittest.TestCase):
             authoring_generation=1,
             projection_state="preview_ready",
             candidate_ruleset_hash="a" * 64,
+            worker_request_id="worker-request-1",
+            worker_completion_sha256="b" * 64,
         )
         decision = envelope(
             "starring.d2.browser-product-decision-evidence.v1",

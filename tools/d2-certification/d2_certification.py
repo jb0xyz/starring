@@ -199,6 +199,8 @@ STEP_SPECS = {
             "authoring_http_status",
             "authoring_session_id",
             "authoring_generation",
+            "expected_generation",
+            "authoring_disposition",
             "installation_id",
             "model",
             "provider",
@@ -208,6 +210,8 @@ STEP_SPECS = {
             "worker_before_observed_at",
             "worker_after_observed_at",
             "one_shot",
+            "worker_request_id",
+            "worker_completion_sha256",
             "public_origin",
         ),
     ),
@@ -217,7 +221,10 @@ STEP_SPECS = {
             "generation_encrypted",
             "projection_state",
             "generation",
+            "generation_count",
             "payload_digest",
+            "worker_request_id",
+            "worker_completion_sha256",
             "installation_id",
             "authoring_session_id",
             "generation_created_at",
@@ -1378,8 +1385,13 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         require_identifier(evidence, "authoring_session_id", "installation_id")
         if evidence["installation_id"] != prior_receipts[3]["evidence"]["installation_id"]:
             fail("step_contract_failed:installation_id")
-        require_positive_integer(evidence, "authoring_generation")
+        if evidence["authoring_generation"] != 1 or evidence["expected_generation"] != 0:
+            fail("step_contract_failed:authoring_generation")
+        if evidence["authoring_disposition"] != "created":
+            fail("step_contract_failed:authoring_disposition")
         require_true(evidence, "one_shot")
+        require_identifier(evidence, "worker_request_id")
+        require_digest(evidence, "worker_completion_sha256")
         if any(
             evidence[field] != manifest["authoring"][field]
             for field in ("provider", "model", "reasoning_effort", "auth_mode")
@@ -1399,7 +1411,11 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         if evidence["projection_state"] != "preview_ready":
             fail("step_contract_failed:projection_state")
         require_positive_integer(evidence, "generation")
+        if evidence["generation"] != 1 or evidence["generation_count"] != 1:
+            fail("step_contract_failed:generation_count")
         require_digest(evidence, "payload_digest")
+        require_identifier(evidence, "worker_request_id")
+        require_digest(evidence, "worker_completion_sha256")
         require_identifier(evidence, "installation_id", "authoring_session_id")
         if not validate_utc_timestamp(evidence["generation_created_at"]):
             fail("step_contract_failed:generation_created_at")
@@ -1414,6 +1430,10 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             != prior_receipts[4]["evidence"]["installation_id"]
             or evidence["authoring_session_id"]
             != prior_receipts[4]["evidence"]["authoring_session_id"]
+            or evidence["worker_request_id"]
+            != prior_receipts[4]["evidence"]["worker_request_id"]
+            or evidence["worker_completion_sha256"]
+            != prior_receipts[4]["evidence"]["worker_completion_sha256"]
         ):
             fail("step_contract_failed:generation")
         worker_before = datetime.datetime.fromisoformat(

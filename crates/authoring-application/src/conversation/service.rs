@@ -138,6 +138,7 @@ where
             ),
         };
         let model_calls_before = session.observability().model_calls;
+        let completion_provenance_before = session.completion_provenance().len();
         let outcome = session.run_burst(command.human_message().as_str()).await;
         drop(model_permit);
         ensure_request_active(&command)?;
@@ -153,6 +154,11 @@ where
         if !(1..=2).contains(&model_calls) {
             return Err(AuthoringConversationError::InvalidModelCallCount);
         }
+        let turn_completion_provenance = session
+            .completion_provenance()
+            .get(completion_provenance_before..)
+            .ok_or(AuthoringConversationError::InvalidSession)?
+            .to_vec();
         let snapshot = session.snapshot();
         snapshot
             .validate_durable_size()
@@ -167,7 +173,7 @@ where
             bindings,
         )
         .map_err(|_| AuthoringConversationError::InvalidSession)?;
-        let projected = project_turn(&restored, &outcome)?;
+        let projected = project_turn(&restored, &outcome, turn_completion_provenance)?;
         let binding_fingerprint = ResourceBindingFingerprint::parse(
             restored
                 .intent_recipe_binding_fingerprint()
@@ -455,6 +461,7 @@ struct ProjectedTurnV1 {
 fn project_turn<C>(
     session: &DesignSession<C>,
     outcome: &BurstOutcome,
+    model_completions: Vec<design_harness::LlmCompletionProvenanceV1>,
 ) -> Result<ProjectedTurnV1, AuthoringConversationError> {
     let current_artifact = session.export_preview_ready_artifact().ok();
     let draft = current_artifact
@@ -540,6 +547,7 @@ fn project_turn<C>(
         capabilities,
         draft,
         preview,
+        model_completions,
     )?;
     let canonical = projection.to_canonical_json()?;
     let projection = SafeAuthoringTurnProjectionV1::from_canonical_json(&canonical)?;

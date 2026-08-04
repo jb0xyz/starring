@@ -323,6 +323,12 @@ class FakePlatform:
             "queued_requests": self.worker_queued_requests,
             "accepted_requests_total": self.worker_accepted_requests,
             "settled_requests_total": self.worker_settled_requests,
+            "last_successful_request_id": (
+                "worker-request-1" if self.worker_accepted_requests > 0 else None
+            ),
+            "last_successful_completion_sha256": (
+                "b" * 64 if self.worker_accepted_requests > 0 else None
+            ),
         }
 
     def transport_health_status(self, context, timeout_seconds=3):
@@ -4059,8 +4065,12 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
                     "authoring_http_status": 201,
                     "authoring_session_id": "session-1",
                     "authoring_generation": 1,
+                    "expected_generation": 0,
+                    "authoring_disposition": "created",
                     "installation_id": "installation-1",
                     "one_shot": True,
+                    "worker_request_id": "worker-request-1",
+                    "worker_completion_sha256": "b" * 64,
                 },
                 separators=(",", ":"),
             ),

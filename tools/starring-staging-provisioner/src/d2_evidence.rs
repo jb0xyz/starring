@@ -175,7 +175,10 @@ struct AuthoringEvidenceV1 {
     generation_encrypted: bool,
     projection_state: String,
     generation: i64,
+    generation_count: i64,
     payload_digest: String,
+    worker_request_id: String,
+    worker_completion_sha256: String,
     installation_id: String,
     authoring_session_id: String,
     generation_created_at: String,
@@ -651,7 +654,7 @@ async fn inspect_authoring(
     scope: &InspectionScopeV1,
 ) -> Result<AuthoringEvidenceV1, D2ProvisionerErrorV1> {
     let row = sqlx::query(
-        "SELECT pg_catalog.count(*) OVER () AS scoped_count, session.session_id, session.current_generation, generation.stage, generation.candidate_hash, generation.safe_turn_projection_digest, pg_catalog.to_char(generation.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS generation_created_at, pg_catalog.octet_length(generation.snapshot_ciphertext) >= 16 AND pg_catalog.octet_length(generation.snapshot_nonce) BETWEEN 12 AND 32 AS sealed_snapshot_present FROM public.authoring_sessions AS session INNER JOIN public.authoring_session_generations AS generation ON generation.tenant_id = session.tenant_id AND generation.installation_id = session.installation_id AND generation.session_id = session.session_id AND generation.generation = session.current_generation WHERE session.tenant_id = $1 AND session.installation_id = $2 AND session.lifecycle_state = 'active' ORDER BY (generation.stage = 'preview_ready') DESC, session.updated_at DESC, session.session_id COLLATE pg_catalog.\"C\" DESC LIMIT 1",
+        "SELECT pg_catalog.count(*) OVER () AS scoped_count, session.session_id, session.current_generation, generation.stage, generation.candidate_hash, generation.safe_turn_projection_digest, (SELECT pg_catalog.count(*) FROM public.authoring_session_generations AS history WHERE history.tenant_id = session.tenant_id AND history.installation_id = session.installation_id AND history.session_id = session.session_id) AS generation_count, pg_catalog.jsonb_array_length(pg_catalog.convert_from(generation.safe_turn_projection, 'UTF8')::pg_catalog.jsonb -> 'model_completions') AS model_completion_count, pg_catalog.convert_from(generation.safe_turn_projection, 'UTF8')::pg_catalog.jsonb #>> '{model_completions,0,request_id}' AS worker_request_id, pg_catalog.convert_from(generation.safe_turn_projection, 'UTF8')::pg_catalog.jsonb #>> '{model_completions,0,completion_sha256}' AS worker_completion_sha256, pg_catalog.to_char(generation.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS generation_created_at, pg_catalog.octet_length(generation.snapshot_ciphertext) >= 16 AND pg_catalog.octet_length(generation.snapshot_nonce) BETWEEN 12 AND 32 AS sealed_snapshot_present FROM public.authoring_sessions AS session INNER JOIN public.authoring_session_generations AS generation ON generation.tenant_id = session.tenant_id AND generation.installation_id = session.installation_id AND generation.session_id = session.session_id AND generation.generation = session.current_generation WHERE session.tenant_id = $1 AND session.installation_id = $2 AND session.lifecycle_state = 'active' ORDER BY (generation.stage = 'preview_ready') DESC, session.updated_at DESC, session.session_id COLLATE pg_catalog.\"C\" DESC LIMIT 1",
     )
     .bind(&scope.tenant_id)
     .bind(&scope.installation_id)
@@ -663,10 +666,18 @@ async fn inspect_authoring(
     let candidate_ruleset_hash: String = get(&row, "candidate_hash")?;
     let safe_projection_digest: String = get(&row, "safe_turn_projection_digest")?;
     let scoped_count: i64 = get(&row, "scoped_count")?;
+    let generation_count: i64 = get(&row, "generation_count")?;
+    let model_completion_count: i32 = get(&row, "model_completion_count")?;
+    let worker_request_id: String = get(&row, "worker_request_id")?;
+    let worker_completion_sha256: String = get(&row, "worker_completion_sha256")?;
     if !exact_authoring_scope(scoped_count)
+        || generation_count != 1
+        || model_completion_count != 1
         || projection_state != "preview_ready"
         || !valid_sha256(&candidate_ruleset_hash)
         || !valid_sha256(&safe_projection_digest)
+        || !valid_identifier(&worker_request_id)
+        || !valid_sha256(&worker_completion_sha256)
         || !get::<bool>(&row, "sealed_snapshot_present")?
     {
         return Err(D2ProvisionerErrorV1::Inspection);
@@ -679,7 +690,10 @@ async fn inspect_authoring(
         generation_encrypted: true,
         projection_state,
         generation: get(&row, "current_generation")?,
+        generation_count,
         payload_digest: candidate_ruleset_hash,
+        worker_request_id,
+        worker_completion_sha256,
         installation_id: scope.installation_id.clone(),
         authoring_session_id,
         generation_created_at: get(&row, "generation_created_at")?,
@@ -1849,7 +1863,10 @@ mod tests {
                     generation_encrypted: true,
                     projection_state: "preview_ready".to_owned(),
                     generation: 1,
+                    generation_count: 1,
                     payload_digest: "a".repeat(64),
+                    worker_request_id: "worker-request-1".to_owned(),
+                    worker_completion_sha256: "b".repeat(64),
                     installation_id: "installation:starring-d2-test".to_owned(),
                     authoring_session_id: "session-1".to_owned(),
                     generation_created_at: "2026-08-04T01:02:03.000000Z".to_owned(),
@@ -1857,6 +1874,7 @@ mod tests {
                 vec![
                     "authoring_session_id",
                     "generation",
+                    "generation_count",
                     "generation_created_at",
                     "generation_encrypted",
                     "installation_id",
@@ -1865,6 +1883,8 @@ mod tests {
                     "payload_digest",
                     "projection_state",
                     "schema_version",
+                    "worker_completion_sha256",
+                    "worker_request_id",
                 ],
             ),
             (

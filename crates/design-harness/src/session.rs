@@ -6,7 +6,9 @@ use thiserror::Error;
 
 use crate::draft::{Draft, DraftSummary};
 use crate::errors::{StructuredError, ToolResult};
-use crate::llm::{LlmClient, LlmResponse, Message, MessageRole, ToolCall};
+use crate::llm::{
+    LlmClient, LlmCompletionProvenanceV1, LlmResponse, Message, MessageRole, ToolCall,
+};
 use crate::tools::{dispatch_tool, ToolDefinition};
 use crate::turn::{
     assign_turn_plan_repeat_targets, check_scope, derive_turn_plan_instance_manifests,
@@ -268,6 +270,8 @@ pub struct SessionSnapshot {
     pub adaptive_enabled: bool,
     #[serde(default)]
     pub brief_history: Vec<TurnBrief>,
+    #[serde(default)]
+    pub completion_provenance: Vec<LlmCompletionProvenanceV1>,
     #[serde(default)]
     pub(crate) intent_recipe: Option<intent_routing::IntentRecipeSessionSnapshotV2>,
 }
@@ -654,6 +658,7 @@ pub struct DesignSession<C> {
     plan_assembly: Option<PlanAssembly>,
     current_human_message_index: Option<usize>,
     brief_history: Vec<TurnBrief>,
+    completion_provenance: Vec<LlmCompletionProvenanceV1>,
     intent_recipe: Option<IntentRecipeRuntime>,
 }
 
@@ -722,6 +727,7 @@ impl<C> DesignSession<C> {
             plan_assembly: None,
             current_human_message_index: None,
             brief_history: Vec::new(),
+            completion_provenance: Vec::new(),
             intent_recipe: None,
         }
     }
@@ -740,6 +746,10 @@ impl<C> DesignSession<C> {
 
     pub fn observability(&self) -> &Observability {
         &self.observability
+    }
+
+    pub fn completion_provenance(&self) -> &[LlmCompletionProvenanceV1] {
+        &self.completion_provenance
     }
 
     pub fn turn_state(&self) -> Option<&TurnState> {
@@ -774,6 +784,7 @@ impl<C> DesignSession<C> {
             adaptive_turn: self.adaptive_turn.clone(),
             adaptive_enabled: self.adaptive_enabled,
             brief_history: self.brief_history.clone(),
+            completion_provenance: self.completion_provenance.clone(),
             intent_recipe: self
                 .intent_recipe
                 .as_ref()
@@ -855,6 +866,7 @@ impl<C> DesignSession<C> {
             plan_assembly: None,
             current_human_message_index: None,
             brief_history: snapshot.brief_history,
+            completion_provenance: snapshot.completion_provenance,
             intent_recipe: None,
         })
     }
@@ -1023,6 +1035,20 @@ impl<C> DesignSession<C> {
         if let Some(state) = self.turn_state.as_mut() {
             state.model_calls += 1;
         }
+    }
+
+    fn accept_completion_response(&mut self, response: LlmResponse) -> Result<LlmResponse, ()> {
+        let (response, provenance) = response.into_response_and_provenance();
+        if let Some(provenance) = provenance {
+            if self.completion_provenance.iter().any(|existing| {
+                existing.request_id() == provenance.request_id()
+                    || existing.completion_sha256() == provenance.completion_sha256()
+            }) {
+                return Err(());
+            }
+            self.completion_provenance.push(provenance);
+        }
+        Ok(response)
     }
 
     fn record_tool_call(&mut self) {
@@ -2270,6 +2296,16 @@ impl<C: LlmClient> DesignSession<C> {
                     return self.halt("LLM_CLIENT_ERROR", "The model client failed", None);
                 }
             };
+            let response = match self.accept_completion_response(response) {
+                Ok(response) => response,
+                Err(()) => {
+                    return self.halt(
+                        "LLM_PROVENANCE_CONFLICT",
+                        "The model completion provenance conflicted with this session",
+                        None,
+                    );
+                }
+            };
 
             if self.repair_state.is_some() {
                 if let Some(outcome) = self.handle_repair_response(response, &routed_tools).await {
@@ -2633,6 +2669,13 @@ impl<C: LlmClient> DesignSession<C> {
                         continue;
                     }
                     return self.halt("UNSTRUCTURED_MODEL_TEXT", &text, None);
+                }
+                LlmResponse::Provenanced { .. } => {
+                    return self.halt(
+                        "LLM_PROVENANCE_CONFLICT",
+                        "The model completion contained nested provenance",
+                        None,
+                    );
                 }
             }
         }

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 export const SCHEMA_VERSION = 1;
 export const PROVIDER = "codex_chatgpt";
 export const MODEL = "gpt-5.6-luna";
@@ -179,6 +181,7 @@ export function healthEnvelope(
   requestTimeoutMs,
   acceptedRequestsTotal,
   settledRequestsTotal,
+  lastSuccessfulCompletion,
 ) {
   return {
     schema_version: SCHEMA_VERSION,
@@ -197,11 +200,14 @@ export function healthEnvelope(
     queued_requests: queued,
     accepted_requests_total: acceptedRequestsTotal,
     settled_requests_total: settledRequestsTotal,
+    last_successful_request_id: lastSuccessfulCompletion?.request_id ?? null,
+    last_successful_completion_sha256:
+      lastSuccessfulCompletion?.completion_sha256 ?? null,
   };
 }
 
 export function completionEnvelope(identity, requestId, frontierName, result, durationMs) {
-  return {
+  const envelope = {
     schema_version: SCHEMA_VERSION,
     request_id: requestId,
     provider: PROVIDER,
@@ -217,4 +223,8 @@ export function completionEnvelope(identity, requestId, frontierName, result, du
     usage: result.usage,
     duration_ms: durationMs,
   };
+  const completionSha256 = createHash("sha256")
+    .update(JSON.stringify(envelope))
+    .digest("hex");
+  return { ...envelope, completion_sha256: completionSha256 };
 }

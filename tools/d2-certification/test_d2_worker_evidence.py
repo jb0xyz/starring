@@ -45,6 +45,10 @@ def health(accepted=7, settled=7, **overrides):
         "queued_requests": 0,
         "accepted_requests_total": accepted,
         "settled_requests_total": settled,
+        "last_successful_request_id": (
+            "worker-request-1" if accepted >= 8 else "worker-prior-request"
+        ),
+        "last_successful_completion_sha256": ("b" if accepted >= 8 else "c") * 64,
     }
     value.update(overrides)
     return value
@@ -59,8 +63,12 @@ def browser(session="session-1"):
         "authoring_http_status": 201,
         "authoring_session_id": session,
         "authoring_generation": 1,
+        "expected_generation": 0,
+        "authoring_disposition": "created",
         "installation_id": "installation-1",
         "one_shot": True,
+        "worker_request_id": "worker-request-1",
+        "worker_completion_sha256": "b" * 64,
     }
 
 

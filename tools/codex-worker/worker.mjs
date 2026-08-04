@@ -238,7 +238,7 @@ async function resolveToken(options) {
 
 function metricRecord(input) {
   return {
-    metric_schema_version: 2,
+    metric_schema_version: 3,
     timestamp: new Date().toISOString(),
     request_id: input.requestId,
     instance_id: input.identity.instance_id,
@@ -255,6 +255,7 @@ function metricRecord(input) {
     duration_ms: input.durationMs,
     ...input.timeline,
     usage: input.usage ?? null,
+    completion_sha256: input.completionSha256 ?? null,
     error_code: input.errorCode ?? null,
   };
 }
@@ -387,6 +388,7 @@ export async function startWorker(options = {}) {
   });
   const scheduler = new Scheduler(concurrency, maxQueue);
   const counters = new RequestCounters();
+  let lastSuccessfulCompletion = null;
   const admissions = new AdmissionRegistry({ ttlMs: timeoutMs + 5_000 });
   const logPath = options.metricsPath
     ?? process.env.STARRING_CODEX_WORKER_METRICS_LOG
@@ -434,6 +436,7 @@ export async function startWorker(options = {}) {
         timeoutMs,
         counterSnapshot.accepted,
         counterSnapshot.settled,
+        lastSuccessfulCompletion,
       ));
       return;
     }
@@ -491,12 +494,19 @@ export async function startWorker(options = {}) {
       validateRunnerResult(result, identity);
       const durationMs = Date.now() - started;
       const timing = timeline.finish("completed");
+      const completion = completionEnvelope(
+        identity,
+        requestId,
+        body.frontier.name,
+        result,
+        durationMs,
+      );
+      lastSuccessfulCompletion = Object.freeze({
+        request_id: requestId,
+        completion_sha256: completion.completion_sha256,
+      });
       if (!disconnect.signal.aborted) {
-        json(
-          response,
-          200,
-          completionEnvelope(identity, requestId, body.frontier.name, result, durationMs),
-        );
+        json(response, 200, completion);
       }
       await metrics.record(metricRecord({
         concurrency,
@@ -510,6 +520,7 @@ export async function startWorker(options = {}) {
         timeline: timing,
         timeoutMs,
         usage: result.usage,
+        completionSha256: completion.completion_sha256,
       }));
     } catch (error) {
       const durationMs = Date.now() - started;

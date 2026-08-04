@@ -274,6 +274,8 @@ test("health is authenticated, exact, and loopback only", async () => {
       "codex_cli_version",
       "concurrency_limit",
       "instance_id",
+      "last_successful_completion_sha256",
+      "last_successful_request_id",
       "model",
       "provider",
       "queue_capacity",
@@ -302,6 +304,8 @@ test("health is authenticated, exact, and loopback only", async () => {
       queued_requests: 0,
       accepted_requests_total: 0,
       settled_requests_total: 0,
+      last_successful_request_id: null,
+      last_successful_completion_sha256: null,
     });
     const metricsHealth = await responseJson(fixture.base, "/metrics-health");
     assert.equal(metricsHealth.status, 200);
@@ -496,6 +500,7 @@ test("successful completion returns the exact native envelope", async () => {
     assert.deepEqual(sortedKeys(result.body), [
       "auth_mode",
       "codex_cli_version",
+      "completion_sha256",
       "duration_ms",
       "model",
       "provider",
@@ -524,6 +529,7 @@ test("successful completion returns the exact native envelope", async () => {
       locale: "ko",
     });
     assert.match(result.body.tool_call.id, /^call-[0-9a-f-]+$/);
+    assert.match(result.body.completion_sha256, /^[0-9a-f]{64}$/);
     assert.ok(Number.isSafeInteger(result.body.duration_ms));
     assert.equal(calls.length, 1);
     assert.equal(calls[0].model, MODEL);
@@ -534,10 +540,16 @@ test("successful completion returns the exact native envelope", async () => {
     assert.equal(health.body.settled_requests_total, 1);
     assert.equal(health.body.active_requests, 0);
     assert.equal(health.body.queued_requests, 0);
+    assert.equal(health.body.last_successful_request_id, result.body.request_id);
+    assert.equal(
+      health.body.last_successful_completion_sha256,
+      result.body.completion_sha256,
+    );
     const records = await metricRecords(fixture);
     assert.equal(records.length, 1);
     assert.deepEqual(sortedKeys(records[0]), [
       "active_at_admission",
+      "completion_sha256",
       "concurrency_limit",
       "duration_ms",
       "error_code",
@@ -567,8 +579,9 @@ test("successful completion returns the exact native envelope", async () => {
       "usage",
       "worker_source_sha256",
     ]);
-    assert.equal(records[0].metric_schema_version, 2);
+    assert.equal(records[0].metric_schema_version, 3);
     assert.equal(records[0].request_id, result.body.request_id);
+    assert.equal(records[0].completion_sha256, result.body.completion_sha256);
     assert.equal(records[0].instance_id, "test-worker-instance");
     assert.equal(records[0].worker_source_sha256, "a".repeat(64));
     assert.equal(records[0].concurrency_limit, 2);

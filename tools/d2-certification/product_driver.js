@@ -184,6 +184,7 @@
       projection_state: projection && projection.state,
       preview_revision: preview && preview.revision,
       candidate_ruleset_hash: receipt && receipt.candidate_ruleset_hash,
+      model_completions: projection && projection.model_completions,
     };
   }
 
@@ -854,11 +855,19 @@
       });
     }
 
-    async function beginCertificationAuthoring(input) {
+  async function beginCertificationAuthoring(input) {
+      const expectedGeneration = requireGeneration(
+        input.expectedGeneration ?? 0,
+        "expected_generation",
+        true,
+      );
+      if (expectedGeneration !== 0) {
+        throw new Error("authoring_expected_generation_invalid");
+      }
       const turn = await authoringTurn({
         installationId: input.installationId,
         sessionId: input.sessionId,
-        expectedGeneration: input.expectedGeneration || 0,
+        expectedGeneration,
         message: input.message,
         idempotencyKey: input.authoringIdempotencyKey,
         signal: input.signal,
@@ -868,10 +877,22 @@
         ![200, 201].includes(turn.status) ||
         projection.projection_state !== "preview_ready" ||
         !Number.isSafeInteger(projection.generation) ||
-        projection.generation < 1
+        projection.generation !== 1 ||
+        projection.disposition !== "created" ||
+        !Array.isArray(projection.model_completions) ||
+        projection.model_completions.length !== 1
       ) {
         throw new Error("authoring_not_preview_ready");
       }
+      const completion = projection.model_completions[0];
+      const workerRequestId = requireResourceId(
+        completion && completion.request_id,
+        "worker_request_id",
+      );
+      const workerCompletionSha256 = requireDigest(
+        completion && completion.completion_sha256,
+        "worker_completion_sha256",
+      );
       const observed = observedAt();
       const installationId = requireResourceId(input.installationId, "installation_id");
       const sessionId = requireResourceId(turn.body.session_id, "authoring_session_id");
@@ -893,8 +914,12 @@
           authoring_http_status: turn.status,
           authoring_session_id: sessionId,
           authoring_generation: generation,
+          expected_generation: expectedGeneration,
+          authoring_disposition: projection.disposition,
           installation_id: installationId,
           one_shot: true,
+          worker_request_id: workerRequestId,
+          worker_completion_sha256: workerCompletionSha256,
         }),
         preview_ready_evidence: Object.freeze({
           schema_version: 1,
@@ -906,6 +931,8 @@
           authoring_generation: generation,
           projection_state: projection.projection_state,
           candidate_ruleset_hash: candidateRulesetHash,
+          worker_request_id: workerRequestId,
+          worker_completion_sha256: workerCompletionSha256,
         }),
         authoring_http_status: turn.status,
         authoring: projection,
