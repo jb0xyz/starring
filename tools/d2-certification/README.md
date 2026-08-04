@@ -361,9 +361,11 @@ const productEvidence = await product.runOneShotProductFlow({
 When an update must drain the currently live runtime, the driver handles the
 public `runtime_drain_required` and `runtime_drain_pending` conflicts as one
 bounded Apply handshake. It retries only the exact Apply request with the same
-payload digest, approved revision, and idempotency key. The default is 60 total
-attempts at a two-second interval. `runtimeDrainAttempts` accepts 1 through 180
-and `runtimeDrainIntervalMilliseconds` accepts 100 through 10000.
+payload digest, approved revision, and idempotency key. The default is 11 total
+attempts with a two, four, eight, then capped fifteen-second delay, for at most
+119 seconds of scheduled waiting. `runtimeDrainAttempts` accepts 1 through 180.
+An explicit `runtimeDrainIntervalMilliseconds` uses a fixed delay and accepts
+100 through 15000.
 
 An already approved promotion can resume without repeating authoring,
 promotion, preview, or approval:

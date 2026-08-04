@@ -457,14 +457,15 @@
     }
 
     async function applyWithDrainHandshake(input) {
-      const attempts = input.runtimeDrainAttempts === undefined ? 60 : input.runtimeDrainAttempts;
+      const attempts = input.runtimeDrainAttempts === undefined ? 11 : input.runtimeDrainAttempts;
+      const usesDefaultInterval = input.runtimeDrainIntervalMilliseconds === undefined;
       const intervalMilliseconds = input.runtimeDrainIntervalMilliseconds === undefined
         ? 2000
         : input.runtimeDrainIntervalMilliseconds;
       if (!Number.isInteger(attempts) || attempts < 1 || attempts > 180) {
         throw new Error("runtime_drain_attempts_invalid");
       }
-      if (!Number.isInteger(intervalMilliseconds) || intervalMilliseconds < 100 || intervalMilliseconds > 10000) {
+      if (!Number.isInteger(intervalMilliseconds) || intervalMilliseconds < 100 || intervalMilliseconds > 15000) {
         throw new Error("runtime_drain_interval_invalid");
       }
       const command = Object.freeze({
@@ -531,7 +532,10 @@
         if (input.signal && input.signal.aborted) {
           throw input.signal.reason || new Error(invalidStateConflict ? "apply_resume_aborted" : "runtime_drain_retry_aborted");
         }
-        await sleep(intervalMilliseconds);
+        const delayMilliseconds = usesDefaultInterval
+          ? Math.min(intervalMilliseconds * (2 ** Math.min(round - 1, 3)), 15000)
+          : intervalMilliseconds;
+        await sleep(delayMilliseconds);
       }
       throw new Error("runtime_drain_attempts_exhausted");
     }

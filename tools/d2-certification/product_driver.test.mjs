@@ -325,6 +325,89 @@ test("runtime drain handshake is bounded and does not retry unrelated conflicts"
 });
 
 
+test("runtime drain handshake defaults to bounded capped backoff with stable authority", async () => {
+  const calls = [];
+  const sleeps = [];
+  let responseIndex = 0;
+  const product = driver(async (url, options) => {
+    calls.push({ url, options });
+    responseIndex += 1;
+    if (responseIndex <= 4) {
+      return response(409, {
+        error: {
+          code: responseIndex === 1 ? "runtime_drain_required" : "runtime_drain_pending",
+          request_id: `request-default-${responseIndex}`,
+          retryable: true,
+        },
+      });
+    }
+    return response(202, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "runtime_pending",
+      replayed: false,
+    });
+  }, undefined, {
+    sleep: async (milliseconds) => sleeps.push(milliseconds),
+  });
+
+  const applied = await product.applyWithDrainHandshake({
+    installationId: "installation-1",
+    promotionId: DIGEST,
+    expectedPayloadDigest: DIGEST,
+    expectedRevision: 2,
+    idempotencyKey: "apply-default-backoff",
+  });
+
+  assert.equal(applied.attempts, 5);
+  assert.deepEqual(sleeps, [2000, 4000, 8000, 15000]);
+  assert.equal(new Set(calls.map((call) => call.url)).size, 1);
+  assert.equal(new Set(calls.map((call) => call.options.body)).size, 1);
+  assert.equal(
+    new Set(calls.map((call) => call.options.headers["idempotency-key"])).size,
+    1
+  );
+});
+
+
+test("runtime drain handshake default exhaustion emits eleven requests over 119 seconds", async () => {
+  const calls = [];
+  const sleeps = [];
+  const product = driver(async (url, options) => {
+    calls.push({ url, options });
+    return response(409, {
+      error: {
+        code: "runtime_drain_pending",
+        request_id: `request-exhausted-${calls.length}`,
+        retryable: true,
+      },
+    });
+  }, undefined, {
+    sleep: async (milliseconds) => sleeps.push(milliseconds),
+  });
+
+  await assert.rejects(
+    product.applyWithDrainHandshake({
+      installationId: "installation-1",
+      promotionId: DIGEST,
+      expectedPayloadDigest: DIGEST,
+      expectedRevision: 2,
+      idempotencyKey: "apply-default-exhausted",
+    }),
+    (error) => error.code === "runtime_drain_pending"
+  );
+
+  assert.equal(calls.length, 11);
+  assert.deepEqual(sleeps, [2000, 4000, 8000, 15000, 15000, 15000, 15000, 15000, 15000, 15000]);
+  assert.equal(sleeps.reduce((total, value) => total + value, 0), 119000);
+  assert.equal(new Set(calls.map((call) => call.options.body)).size, 1);
+  assert.equal(
+    new Set(calls.map((call) => call.options.headers["idempotency-key"])).size,
+    1
+  );
+});
+
+
 test("runtime drain handshake never retries a generic dependency failure", async () => {
   let calls = 0;
   let sleeps = 0;
