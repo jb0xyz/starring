@@ -109,6 +109,9 @@ class D2FinalizationTest(unittest.TestCase):
             }
         )
         self.platform.discord_existing.add(self.reconciliation_role_id)
+        self.certified_inventory_digest = self.platform.resource_inventory(
+            self.context
+        )["digest_sha256"]
         self.certification_gate = mock.patch.object(
             FINALIZATION,
             "require_certification_prefix",
@@ -116,6 +119,9 @@ class D2FinalizationTest(unittest.TestCase):
                 "step15_receipt_sha256": "a" * 64,
                 "step15_completion_sha256": "b" * 64,
                 "step15_completed_at": "2026-08-04T01:02:00.000001Z",
+                "reconciliation_inventory_digest_sha256": (
+                    self.certified_inventory_digest
+                ),
             },
         )
         self.certification_mock = self.certification_gate.start()
@@ -315,6 +321,9 @@ class D2FinalizationTest(unittest.TestCase):
             "step15_receipt_sha256": "a" * 64,
             "step15_completion_sha256": "e" * 64,
             "step15_completed_at": "2026-08-04T01:02:00.000001Z",
+            "reconciliation_inventory_digest_sha256": (
+                self.certified_inventory_digest
+            ),
         }
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError,
@@ -326,6 +335,9 @@ class D2FinalizationTest(unittest.TestCase):
             "step15_receipt_sha256": "a" * 64,
             "step15_completion_sha256": "b" * 64,
             "step15_completed_at": "2026-08-04T01:02:00.000001Z",
+            "reconciliation_inventory_digest_sha256": (
+                self.certified_inventory_digest
+            ),
         }
         path = FINALIZATION.freeze_intent_path(self.context)
         intent = json.loads(path.read_text())
@@ -339,6 +351,24 @@ class D2FinalizationTest(unittest.TestCase):
             self.finalize()
         self.assertEqual(self.platform.bootouts, bootouts)
         self.assertEqual(self.platform.destroy_calls, 0)
+
+    def test_freeze_rejects_uncertified_inventory_before_any_mutation(self):
+        resource_id = "1524810437118525599"
+        self.platform.resource_history.append(
+            {"kind": "role", "resource_id": resource_id, "state": "created"}
+        )
+        self.platform.discord_existing.add(resource_id)
+        bootouts = list(self.platform.bootouts)
+        existing = set(self.platform.discord_existing)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "finalization_freeze_certification_invalid",
+        ):
+            self.finalize()
+        self.assertEqual(self.platform.bootouts, bootouts)
+        self.assertEqual(self.platform.discord_existing, existing)
+        self.assertEqual(self.platform.destroy_calls, 0)
+        self.assertFalse(FINALIZATION.freeze_intent_path(self.context).exists())
 
     def test_freeze_rejects_boolean_schema_version(self):
         FINALIZATION._ensure_effect_freeze(self.context, self.platform)

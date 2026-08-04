@@ -713,6 +713,9 @@ def require_certification_prefix(context):
         "step15_receipt_sha256": receipts[14]["receipt_sha256"],
         "step15_completion_sha256": _digest(completion),
         "step15_completed_at": completion["observed_at"],
+        "reconciliation_inventory_digest_sha256": receipts[12]["evidence"][
+            "reconciliation_inventory_digest_sha256"
+        ],
     }
 
 
@@ -799,11 +802,14 @@ def validate_freeze_certification(intent, certification):
             "step15_receipt_sha256",
             "step15_completion_sha256",
             "step15_completed_at",
+            "reconciliation_inventory_digest_sha256",
         }
         or intent["certification_step15_receipt_sha256"]
         != certification["step15_receipt_sha256"]
         or intent["coordinator_step15_completion_sha256"]
         != certification["step15_completion_sha256"]
+        or intent["resource_inventory_digest_sha256"]
+        != certification["reconciliation_inventory_digest_sha256"]
     ):
         fail("finalization_freeze_certification_invalid")
     _require_digest(
@@ -812,6 +818,10 @@ def validate_freeze_certification(intent, certification):
     )
     _require_digest(
         certification["step15_completion_sha256"],
+        "finalization_freeze_certification_invalid",
+    )
+    _require_digest(
+        certification["reconciliation_inventory_digest_sha256"],
         "finalization_freeze_certification_invalid",
     )
     if _parse_timestamp(
