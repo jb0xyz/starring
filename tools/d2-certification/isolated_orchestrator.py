@@ -2089,11 +2089,14 @@ def validate_discord_teardown_evidence(
         or inventory["active"] != []
     ):
         fail("discord_resource_teardown_evidence_invalid")
-    if certification_binding is not None and any(
-        evidence[field] != value
-        for field, value in certification_binding.items()
-    ):
-        fail("discord_resource_teardown_evidence_invalid")
+    if certification_binding is not None:
+        if any(
+            evidence[field] != value
+            for field, value in certification_binding.items()
+        ) or evidence["source_inventory_digest_sha256"] != (
+            certification_binding["freeze_resource_inventory_digest_sha256"]
+        ):
+            fail("discord_resource_teardown_evidence_invalid")
     progress_view = {
         "schema_version": 1,
         "kind": DISCORD_TEARDOWN_PROGRESS_KIND,
@@ -2137,10 +2140,6 @@ def command_teardown_discord_resources(context, platform, frozen=False):
     if inventory["instance_id"] != snapshot["instance_id"]:
         fail("transport_instance_changed")
     certification_binding = certified_teardown_binding(context) if frozen else None
-    if certification_binding is not None and inventory["digest_sha256"] != (
-        certification_binding["freeze_resource_inventory_digest_sha256"]
-    ):
-        fail("discord_teardown_live_inventory_drift")
     if not frozen:
         ensure_abort_teardown_tombstone(context, inventory)
     evidence_path = discord_teardown_evidence_path(context, frozen)
@@ -2171,7 +2170,15 @@ def command_teardown_discord_resources(context, platform, frozen=False):
             progress_path, "discord_resource_teardown_progress"
         )
         validate_discord_teardown_progress(context, progress, inventory)
+        if certification_binding is not None and progress[
+            "source_inventory_digest_sha256"
+        ] != certification_binding["freeze_resource_inventory_digest_sha256"]:
+            fail("discord_resource_teardown_progress_invalid")
     else:
+        if certification_binding is not None and inventory["digest_sha256"] != (
+            certification_binding["freeze_resource_inventory_digest_sha256"]
+        ):
+            fail("discord_teardown_live_inventory_drift")
         progress = new_discord_teardown_progress(context, inventory)
         append_journal(context, "discord_resource_teardown", "intent", "resources")
         write_discord_teardown_progress(context, progress, frozen)

@@ -533,6 +533,62 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertTrue(self.platform.database_present)
         self.assertIn(resource_id, self.platform.discord_existing)
 
+    def test_certified_teardown_partial_failure_resumes_without_redeleting(self):
+        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        self.platform.proxy_failure_resource_id = "1524810437118525560"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_proxy_delete_failure"
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform, frozen=True
+            )
+        progress_path = ORCHESTRATOR.discord_teardown_progress_path(
+            self.context, frozen=True
+        )
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(progress["deletions"]), 2)
+        first_attempt = list(self.platform.proxy_deletions)
+        self.platform.proxy_failure_resource_id = None
+        result = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform, frozen=True
+        )
+        self.assertEqual(result["status"], "torn_down")
+        for resource in first_attempt[:2]:
+            self.assertEqual(self.platform.proxy_deletions.count(resource), 1)
+        deletions = list(self.platform.proxy_deletions)
+        replay = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform, frozen=True
+        )
+        self.assertEqual(replay["status"], "exact_replay")
+        self.assertEqual(self.platform.proxy_deletions, deletions)
+
+    def test_certified_teardown_rejects_uncertified_progress_source(self):
+        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        self.platform.proxy_failure_resource_id = "1524810437118525560"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_proxy_delete_failure"
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform, frozen=True
+            )
+        progress_path = ORCHESTRATOR.discord_teardown_progress_path(
+            self.context, frozen=True
+        )
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        progress["source_inventory_digest_sha256"] = "f" * 64
+        progress_path.write_text(json.dumps(progress), encoding="utf-8")
+        progress_path.chmod(0o600)
+        first_attempt = list(self.platform.proxy_deletions)
+        self.platform.proxy_failure_resource_id = None
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "discord_resource_teardown_progress_invalid",
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform, frozen=True
+            )
+        self.assertEqual(self.platform.proxy_deletions, first_attempt)
+
     def test_api_worker_stop_precedes_final_zero_blocker_capture(self):
         real_bootout = self.platform.launchd_bootout
         api_label = self.context.manifest["services"]["api"]["label"]
