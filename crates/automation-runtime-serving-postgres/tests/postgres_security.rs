@@ -261,7 +261,7 @@ async fn isolated_database(base: PgConnectOptions) -> IsolatedDatabase {
     .unwrap();
     assert_eq!(
         readiness_definition_digest,
-        "1d7bb5b18129f99ef87b5ad0dfe712b4e6beac33a0461218fedf67fa6990ac3b"
+        "e598fb40785ccd66ce44ec6c7f85e52fd9e004ab1e05de9c0c03963f06df45f1"
     );
     let password_literal = sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_literal($1)")
         .bind(&password)
@@ -668,15 +668,117 @@ async fn serving_scenario(
         .unwrap();
     assert_eq!(disconnected, disconnected_replay);
     session.apply_disconnect(disconnected).unwrap();
-    assert_pending_drain_expired_disconnect(&owner_pool, &adapter).await;
+    assert_pending_drain_heartbeat_and_expired_disconnect(&owner_pool, &adapter, &first_request)
+        .await;
 }
 
-async fn assert_pending_drain_expired_disconnect(
+async fn assert_pending_drain_heartbeat_and_expired_disconnect(
     owner_pool: &PgPool,
     adapter: &PostgresRuntimeServingLeaseV1,
+    heartbeat_template: &RuntimeHeartbeatServingV1,
 ) {
+    sqlx::query(
+        "UPDATE public.automation_installations SET lifecycle_state = 'active', \
+         updated_at = updated_at + INTERVAL '1 microsecond' \
+         WHERE installation_id = $1",
+    )
+    .bind(INSTALLATION)
+    .execute(owner_pool)
+    .await
+    .unwrap();
+    let baseline_identity = seed_expired_v2_serving_fixture(owner_pool).await;
+    let fresh_identity = reset_v2_serving_fixture(owner_pool, &baseline_identity, 2, true).await;
+    let heartbeat_request = v2_heartbeat_request(heartbeat_template, &fresh_identity);
+    assert_foreign_pending_drain_does_not_interrupt(owner_pool, &heartbeat_request).await;
+
     let lookup = create_pending_drain_fixture(owner_pool).await;
-    let identity = seed_expired_v2_serving_fixture(owner_pool).await;
+    let unchanged = serving_lease_image(owner_pool).await;
+    let mut exact = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *exact)
+        .await
+        .unwrap();
+    let exact_error = raw_heartbeat(&mut exact, &heartbeat_request)
+        .await
+        .unwrap_err();
+    assert_database_code(&exact_error, "RS003");
+    exact.rollback().await.unwrap();
+    assert_eq!(
+        adapter
+            .heartbeat_serving(heartbeat_request.clone())
+            .await
+            .unwrap_err(),
+        RuntimeServingPersistenceErrorV1::AuthorityChanged
+    );
+    let v2_lease_for = Duration::from_secs(31);
+    let mut exact_v2 = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *exact_v2)
+        .await
+        .unwrap();
+    let exact_v2_error = raw_heartbeat_v2(&mut exact_v2, &fresh_identity, v2_lease_for)
+        .await
+        .unwrap_err();
+    assert_database_code(&exact_v2_error, "RS003");
+    exact_v2.rollback().await.unwrap();
+    assert_eq!(
+        adapter
+            .heartbeat_serving_v2(&fresh_identity, v2_lease_for)
+            .await
+            .unwrap_err(),
+        RuntimeServingPersistenceErrorV1::AuthorityChanged
+    );
+    let mut replay_identity = fresh_identity.clone();
+    replay_identity.revision = NonZeroU64::new(1).unwrap();
+    assert_eq!(
+        adapter
+            .heartbeat_serving_v2(&replay_identity, v2_lease_for)
+            .await
+            .unwrap_err(),
+        RuntimeServingPersistenceErrorV1::AuthorityChanged
+    );
+    assert_eq!(serving_lease_image(owner_pool).await, unchanged);
+
+    set_attestation_fixture_triggers(owner_pool, false).await;
+    sqlx::query(
+        "UPDATE public.runtime_attestations SET v2_initial_lease_epoch = 2 \
+         WHERE attestation_id = $1",
+    )
+    .bind(fresh_identity.attestation_digest.as_str())
+    .execute(owner_pool)
+    .await
+    .unwrap();
+    let mut diverged = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *diverged)
+        .await
+        .unwrap();
+    let diverged_error = raw_heartbeat(&mut diverged, &heartbeat_request)
+        .await
+        .unwrap_err();
+    assert_database_code(&diverged_error, "RS004");
+    diverged.rollback().await.unwrap();
+    assert_eq!(
+        adapter
+            .heartbeat_serving(heartbeat_request.clone())
+            .await
+            .unwrap_err(),
+        RuntimeServingPersistenceErrorV1::PersistenceCorrupt
+    );
+    assert_eq!(serving_lease_image(owner_pool).await, unchanged);
+    sqlx::query(
+        "UPDATE public.runtime_attestations SET v2_initial_lease_epoch = 1 \
+         WHERE attestation_id = $1",
+    )
+    .bind(fresh_identity.attestation_digest.as_str())
+    .execute(owner_pool)
+    .await
+    .unwrap();
+    set_attestation_fixture_triggers(owner_pool, true).await;
+
+    assert_cleared_pending_drain_does_not_interrupt(owner_pool, &heartbeat_request).await;
+
+    let identity = reset_v2_serving_fixture(owner_pool, &baseline_identity, 3, false).await;
     let observation = adapter
         .observe_pending_drain_source_serving_v1(&lookup)
         .await
@@ -699,7 +801,7 @@ async fn assert_pending_drain_expired_disconnect(
         .disconnect_pending_drain_source_serving_if_expired_v1(&lookup, &identity)
         .await
         .unwrap();
-    assert_eq!(disconnected.identity.revision.get(), 2);
+    assert_eq!(disconnected.identity.revision.get(), 4);
     assert!(!disconnected.connected);
     assert!(!disconnected.serving);
     assert_eq!(disconnected.last_heartbeat_at, disconnected.expires_at);
@@ -711,7 +813,7 @@ async fn assert_pending_drain_expired_disconnect(
     assert_eq!(replay, disconnected);
     assert_eq!(serving_lease_image(owner_pool).await, disconnected_image);
 
-    let fresh_identity = reset_v2_serving_fixture(owner_pool, &identity, 3, true).await;
+    let fresh_identity = reset_v2_serving_fixture(owner_pool, &identity, 5, true).await;
     let fresh_image = serving_lease_image(owner_pool).await;
     assert_eq!(
         adapter
@@ -722,7 +824,7 @@ async fn assert_pending_drain_expired_disconnect(
     );
     assert_eq!(serving_lease_image(owner_pool).await, fresh_image);
 
-    let fenced_identity = reset_v2_serving_fixture(owner_pool, &identity, 4, false).await;
+    let fenced_identity = reset_v2_serving_fixture(owner_pool, &identity, 6, false).await;
     mutate_writer_fence(
         owner_pool,
         "UPDATE public.runtime_writer_fence \
@@ -751,6 +853,165 @@ async fn assert_pending_drain_expired_disconnect(
          WHERE singleton",
     )
     .await;
+}
+
+fn v2_heartbeat_request(
+    template: &RuntimeHeartbeatServingV1,
+    identity: &RuntimeServingIdentityV2,
+) -> RuntimeHeartbeatServingV1 {
+    let mut request = template.clone();
+    request.identity.scope = identity.scope.clone();
+    request.identity.attestation_id =
+        RuntimeAttestationIdV1::parse(identity.attestation_digest.as_str()).unwrap();
+    request.identity.process_instance_id = identity.process_identity.process_instance_id.clone();
+    request.identity.runtime_generation = identity.process_identity.runtime_generation;
+    request.identity.lease_epoch = identity.lease_epoch;
+    request.identity.expected_revision = identity.revision;
+    request
+}
+
+async fn assert_foreign_pending_drain_does_not_interrupt(
+    owner_pool: &PgPool,
+    heartbeat_request: &RuntimeHeartbeatServingV1,
+) {
+    let mut fixture = owner_pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *fixture)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_installations (installation_id, tenant_id, \
+         discord_application_id, discord_guild_id, ruleset_key, lifecycle_state, \
+         current_authority_revision) VALUES \
+         ('serving-test-foreign-installation', $1, '9300302', '9300102', \
+          'serving_test_foreign', 'active', 1)",
+    )
+    .bind(TENANT)
+    .execute(&mut *fixture)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_installation_authority_versions (installation_id, \
+         revision, tenant_id, binding_revision, resource_bindings, binding_fingerprint, \
+         policy_revision, required_approvals, activation_ttl_seconds, authority_payload_digest, \
+         created_by_principal_id, created_by_request_digest) \
+         VALUES ('serving-test-foreign-installation', 1, $1, 1, '{}'::JSONB, $2, \
+                 1, 1, 3600, $3, $4, $5)",
+    )
+    .bind(TENANT)
+    .bind(BINDING_FINGERPRINT)
+    .bind("8".repeat(64))
+    .bind(PRINCIPAL)
+    .bind("9".repeat(64))
+    .execute(&mut *fixture)
+    .await
+    .unwrap();
+    fixture.commit().await.unwrap();
+    set_slot_fence_fixture_triggers(owner_pool, false).await;
+    let unchanged = serving_lease_image(owner_pool).await;
+    let mut transaction = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("SET LOCAL statement_timeout = '2s'")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_slot_writer_fences_v2 \
+         SET pending_drain_intent_id = '11111111111111111111111111111111', \
+             pending_product_operation_id = '22222222222222222222222222222222', \
+             pending_tenant_id = $1, \
+             pending_installation_id = 'serving-test-foreign-installation', \
+             pending_deployment_id = 'serving-test-foreign-deployment', \
+             pending_expected_revision = 1, \
+             pending_marked_at = pg_catalog.clock_timestamp(), \
+             updated_at = pg_catalog.clock_timestamp() \
+         WHERE slot_guild_id = '9300102' \
+             AND slot_ruleset_key = 'serving_test_foreign'",
+    )
+    .bind(TENANT)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    raw_heartbeat(&mut transaction, heartbeat_request)
+        .await
+        .unwrap();
+    transaction.rollback().await.unwrap();
+    set_slot_fence_fixture_triggers(owner_pool, true).await;
+    assert_eq!(serving_lease_image(owner_pool).await, unchanged);
+}
+
+async fn assert_cleared_pending_drain_does_not_interrupt(
+    owner_pool: &PgPool,
+    heartbeat_request: &RuntimeHeartbeatServingV1,
+) {
+    set_slot_fence_fixture_triggers(owner_pool, false).await;
+    let unchanged = serving_lease_image(owner_pool).await;
+    let mut transaction = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("SET LOCAL statement_timeout = '2s'")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_slot_writer_fences_v2 \
+         SET pending_drain_intent_id = NULL, \
+             pending_product_operation_id = NULL, \
+             pending_tenant_id = NULL, \
+             pending_installation_id = NULL, \
+             pending_deployment_id = NULL, \
+             pending_expected_revision = NULL, \
+             pending_marked_at = NULL, \
+             updated_at = pg_catalog.clock_timestamp() \
+         WHERE slot_guild_id = $1 AND slot_ruleset_key = $2",
+    )
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    raw_heartbeat(&mut transaction, heartbeat_request)
+        .await
+        .unwrap();
+    transaction.rollback().await.unwrap();
+    set_slot_fence_fixture_triggers(owner_pool, true).await;
+    assert_eq!(serving_lease_image(owner_pool).await, unchanged);
+}
+
+async fn set_attestation_fixture_triggers(pool: &PgPool, enabled: bool) {
+    let action = if enabled { "ENABLE" } else { "DISABLE" };
+    sqlx::query(&format!(
+        "ALTER TABLE public.runtime_attestations {action} TRIGGER USER"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn set_slot_fence_fixture_triggers(pool: &PgPool, enabled: bool) {
+    let action = if enabled { "ENABLE" } else { "DISABLE" };
+    sqlx::query(&format!(
+        "ALTER TABLE public.runtime_slot_writer_fences_v2 {action} TRIGGER USER"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn assert_database_code(error: &sqlx::Error, expected: &str) {
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .as_deref(),
+        Some(expected),
+        "{error:?}"
+    );
 }
 
 async fn create_pending_drain_fixture(pool: &PgPool) -> RuntimePendingDrainServingLookupV1 {
@@ -862,8 +1123,18 @@ async fn seed_expired_v2_serving_fixture(pool: &PgPool) -> RuntimeServingIdentit
         framed_digest_v2(pool, "starring.runtime.live_attestation.v2", &live_bytes).await;
     let record: Value = serde_json::from_slice(&live_bytes).unwrap();
     let route_admission = json!({
-        "fixture": "pending-drain-serving-v2",
-        "state": "route-admitted"
+        "gateway_owner_lease_id": {
+            "gateway_shard_id": "shard:0",
+            "lease_epoch": 1,
+            "expected_build_revision": "test-build-1"
+        },
+        "attested_owner_revision": 1,
+        "gateway": {
+            "connection_epoch": 1,
+            "admission_revision": 1,
+            "connected_event_sequence": 1,
+            "resume_sequence": 2
+        }
     });
     let prepared_snapshot = json!({
         "fixture": "pending-drain-serving-v2",
@@ -885,6 +1156,43 @@ async fn seed_expired_v2_serving_fixture(pool: &PgPool) -> RuntimeServingIdentit
         .execute(&mut *transaction)
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_gateway_owners (gateway_shard_id, process_instance_id, \
+         lease_epoch, expected_build_revision, owner_revision, expires_at) \
+         VALUES ('shard:0', $1, 1, 'test-build-1', 1, $2)",
+    )
+    .bind(PROCESS)
+    .bind(now + TimeDelta::hours(1))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_gateway_owners SET owner_revision = 2 \
+         WHERE gateway_shard_id = 'shard:0'",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let acknowledgement_bytes = vec![b'x'; 197];
+    sqlx::query(
+        "INSERT INTO public.runtime_ingress_open_acknowledgements_v2 (gateway_shard_id, \
+         source_acknowledgement_revision, request_digest, canonical_request_bytes, \
+         fence_generation, maintenance_gate_generation, process_instance_id, \
+         owner_lease_epoch, expected_build_revision, observed_owner_revision, \
+         requested_owner_observed_at, requested_owner_expires_at, connection_epoch, \
+         admission_revision, connected_event_sequence, resume_sequence, \
+         acknowledgement_revision, acknowledged_at, expires_at) \
+         VALUES ('shard:0', NULL, pg_catalog.sha256($1), $1, 1, 1, $2, 1, \
+                 'test-build-1', 2, $3, $4, 1, 1, 1, 2, 1, $3, $5)",
+    )
+    .bind(&acknowledgement_bytes)
+    .bind(PROCESS)
+    .bind(now)
+    .bind(now + TimeDelta::hours(1))
+    .bind(now + TimeDelta::seconds(9))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
     sqlx::query(
         "DELETE FROM public.runtime_serving_leases \
          WHERE guild_id = $1 AND ruleset_key = $2",
@@ -1018,7 +1326,7 @@ async fn reset_v2_serving_fixture(
         .await
         .unwrap();
     let (last_heartbeat_at, expires_at) = if fresh {
-        (now, now + TimeDelta::seconds(30))
+        (now - TimeDelta::seconds(1), now + TimeDelta::seconds(30))
     } else {
         (now - TimeDelta::seconds(60), now - TimeDelta::seconds(30))
     };
@@ -1186,6 +1494,31 @@ async fn raw_heartbeat(
     .bind(i64::try_from(identity.lease_epoch.get()).unwrap())
     .bind(i64::try_from(identity.expected_revision.get()).unwrap())
     .bind(i64::try_from(request.lease_for.as_millis()).unwrap())
+    .fetch_all(&mut **transaction)
+    .await
+    .map(|_| ())
+}
+
+async fn raw_heartbeat_v2(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    identity: &RuntimeServingIdentityV2,
+    lease_for: Duration,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT * FROM public.starring_runtime_serving_heartbeat_v2(\
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10\
+         )",
+    )
+    .bind(identity.operation_id.as_str())
+    .bind(identity.scope.tenant_id.as_str())
+    .bind(identity.scope.installation_id.as_str())
+    .bind(identity.scope.deployment_id.as_str())
+    .bind(identity.attestation_digest.as_str())
+    .bind(identity.process_identity.process_instance_id.as_str())
+    .bind(i64::try_from(identity.process_identity.runtime_generation.get()).unwrap())
+    .bind(i64::try_from(identity.lease_epoch.get()).unwrap())
+    .bind(i64::try_from(identity.revision.get()).unwrap())
+    .bind(i64::try_from(lease_for.as_millis()).unwrap())
     .fetch_all(&mut **transaction)
     .await
     .map(|_| ())

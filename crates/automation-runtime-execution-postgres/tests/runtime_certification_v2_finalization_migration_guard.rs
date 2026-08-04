@@ -232,5 +232,5 @@ fn manifests_readiness_and_roles_expose_only_six_capabilities() {
     assert!(EXECUTION_DATABASE
         .contains("b632e1b778ef166f88e6ea206a30bd807b7357e210c29268bc98f39187310faf"));
     assert!(SERVING_DATABASE
-        .contains("1d7bb5b18129f99ef87b5ad0dfe712b4e6beac33a0461218fedf67fa6990ac3b"));
+        .contains("e598fb40785ccd66ce44ec6c7f85e52fd9e004ab1e05de9c0c03963f06df45f1"));
 }

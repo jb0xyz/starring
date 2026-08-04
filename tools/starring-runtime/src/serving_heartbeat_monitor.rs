@@ -289,8 +289,8 @@ impl RuntimeServingHeartbeatFailureV2 {
             }
             Self::OwnerLost | Self::OwnershipLost => RuntimeShutdownCauseV1::GatewayOwnerTerminal,
             Self::GatewayLost | Self::RegistryLost => RuntimeShutdownCauseV1::ReadinessLost,
+            Self::ProductAuthorityChanged => RuntimeShutdownCauseV1::ProductAuthorityChanged,
             Self::LeaseExpired
-            | Self::ProductAuthorityChanged
             | Self::DatabaseUnavailable
             | Self::DatabaseProtocolViolation
             | Self::HeartbeatOutcomeUnresolved

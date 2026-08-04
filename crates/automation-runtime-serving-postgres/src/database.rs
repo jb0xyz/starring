@@ -14,7 +14,7 @@ pub const DEFAULT_RUNTIME_SERVING_STATEMENT_TIMEOUT: Duration = Duration::from_s
 pub const DEFAULT_RUNTIME_SERVING_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_RUNTIME_SERVING_DATABASE_TIMEOUT: Duration = Duration::from_secs(30);
 const RUNTIME_SERVING_READINESS_DEFINITION_DIGEST_V1: &str =
-    "1d7bb5b18129f99ef87b5ad0dfe712b4e6beac33a0461218fedf67fa6990ac3b";
+    "e598fb40785ccd66ce44ec6c7f85e52fd9e004ab1e05de9c0c03963f06df45f1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeServingDatabaseTimeoutsV1 {

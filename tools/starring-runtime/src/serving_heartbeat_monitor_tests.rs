@@ -374,6 +374,51 @@ async fn owner_loss_is_terminal_fail_closed_and_returns_retained_state() {
 }
 
 #[tokio::test]
+async fn product_authority_change_requests_controlled_process_restart() {
+    let current = receipt(17, Utc::now(), Duration::from_secs(2));
+    let database = MockDatabaseV2::new_v2(
+        vec![Ok(observation(current.clone()))],
+        vec![Err(RuntimeServingPersistenceErrorV1::AuthorityChanged)],
+    );
+    let (registry, remaining_registry_observations) = MockRegistryV2::exact_v2(3);
+    let latch = RuntimeShutdownSignalLatchV1::create();
+    let ready = start_runtime_serving_heartbeat_monitor_with_ports_v2(
+        current.clone(),
+        database,
+        registry,
+        latch.trigger(),
+        latch.observer(),
+        RuntimeServingHeartbeatExternalObserversV2::without_gateway_v2(pending()),
+        test_config(),
+    )
+    .await
+    .unwrap();
+    let monitor = ready.into_monitor_v2();
+    let mut terminal = monitor.terminal_observer_v2();
+
+    assert_eq!(
+        terminal.wait_v2().await,
+        RuntimeServingHeartbeatTerminalStatusV2::FailedClosed(
+            RuntimeServingHeartbeatFailureV2::ProductAuthorityChanged
+        )
+    );
+    let exit = monitor.wait_v2().await;
+    assert_eq!(
+        exit.failure_v2(),
+        Some(RuntimeServingHeartbeatFailureV2::ProductAuthorityChanged)
+    );
+    assert_eq!(
+        exit.into_retained_v2().unwrap().last_confirmed_receipt_v2(),
+        &current
+    );
+    assert!(remaining_registry_observations.lock().unwrap().is_empty());
+    assert_eq!(
+        latch.observed().unwrap().cause(),
+        RuntimeShutdownCauseV1::ProductAuthorityChanged
+    );
+}
+
+#[tokio::test]
 async fn unknown_heartbeat_adopts_only_the_exact_one_step_successor() {
     let config = test_config();
     let current = receipt(17, Utc::now(), config.lease_for_v2());

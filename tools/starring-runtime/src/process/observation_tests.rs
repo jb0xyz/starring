@@ -785,6 +785,10 @@ fn production_open_shutdown_preserves_latched_cause_class() {
             crate::RuntimeShutdownCauseV1::HealthTerminal,
             RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
         ),
+        (
+            crate::RuntimeShutdownCauseV1::ProductAuthorityChanged,
+            RuntimeProcessProductionHandoffFailureV2::ProductAuthorityChanged,
+        ),
     ] {
         let latch = crate::process_supervisor::create_runtime_process_shutdown_latch_v1();
         let shutdown = latch.observer();
@@ -976,6 +980,42 @@ fn production_handoff_cleanup_reports_the_redacted_transition_code() {
         "RuntimeProcessProductionHandoffErrorV2(<redacted>)"
     );
     assert!(std::error::Error::source(&cleanup).is_none());
+}
+
+#[test]
+fn product_authority_restart_requires_successful_cleanup() {
+    let transition = RuntimeProcessProductionHandoffFailureV2::ProductAuthorityChanged;
+    let clean = finish_production_handoff_transition_v2(transition, Ok(()));
+    let cleanup = finish_production_handoff_transition_v2(
+        transition,
+        Err(RuntimeClosedRecoveryProcessCleanupFailureV2::OwnerHeld(
+            RuntimeOwnerHeldProcessShutdownErrorV1::Database(
+                RuntimeDatabasePoolShutdownErrorV1::TimedOut,
+            ),
+        )),
+    );
+
+    assert_eq!(
+        clean,
+        RuntimeProcessProductionHandoffErrorV2::Transition(transition)
+    );
+    assert_eq!(
+        clean.code(),
+        "runtime_process_production_handoff_product_authority_changed"
+    );
+    assert!(!clean.cleanup_class());
+    assert!(matches!(
+        cleanup,
+        RuntimeProcessProductionHandoffErrorV2::CleanupAfterTransition {
+            transition: RuntimeProcessProductionHandoffFailureV2::ProductAuthorityChanged,
+            ..
+        }
+    ));
+    assert_eq!(
+        cleanup.context(),
+        Some("runtime_process_production_handoff_product_authority_changed")
+    );
+    assert!(cleanup.cleanup_class());
 }
 
 #[test]

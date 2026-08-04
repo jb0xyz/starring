@@ -1000,8 +1000,8 @@ fn extract_manifest(sql: &'static str) -> Vec<&'static str> {
 mod tests {
     use super::*;
 
-    const EXPECTED_MIGRATION_COUNT: usize = 122;
-    const EXPECTED_MIGRATION_HEAD: i64 = 202608040001;
+    const EXPECTED_MIGRATION_COUNT: usize = 125;
+    const EXPECTED_MIGRATION_HEAD: i64 = 202608040004;
     const EFFECT_JOURNAL_MIGRATION: i64 = 202608010001;
     const RELATION_COUNT_BEFORE_EFFECT_JOURNAL: i64 = 184;
 
@@ -1047,7 +1047,7 @@ mod tests {
         assert_eq!(head.version, EXPECTED_MIGRATION_HEAD);
         assert_eq!(
             head.description,
-            "stabilize product apply consume commit contract v1"
+            "refresh serving pending product drain readiness v1"
         );
         assert_eq!(
             count_sql_lines_with_prefix(&head.sql, "CREATE TABLE public."),

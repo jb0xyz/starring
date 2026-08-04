@@ -188,6 +188,7 @@ impl Debug for RuntimeProcessStartupRecoveryObservationErrorV2 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeProcessProductionHandoffFailureV2 {
     ProcessShutdown,
+    ProductAuthorityChanged,
     OperationDeadlineElapsed,
     FinalizerUnavailable,
     FinalizerTerminal,
@@ -209,6 +210,9 @@ impl RuntimeProcessProductionHandoffFailureV2 {
     pub const fn code(self) -> &'static str {
         match self {
             Self::ProcessShutdown => "runtime_process_production_handoff_process_shutdown",
+            Self::ProductAuthorityChanged => {
+                "runtime_process_production_handoff_product_authority_changed"
+            }
             Self::OperationDeadlineElapsed => {
                 "runtime_process_production_handoff_operation_deadline_elapsed"
             }
@@ -2684,6 +2688,9 @@ pub(super) fn map_empty_open_shutdown_cause_v2(
         | crate::RuntimeShutdownCauseV1::IngressAcknowledgementTerminal
         | crate::RuntimeShutdownCauseV1::SupervisorFailure => {
             RuntimeProcessProductionHandoffFailureV2::ProtocolViolation
+        }
+        crate::RuntimeShutdownCauseV1::ProductAuthorityChanged => {
+            RuntimeProcessProductionHandoffFailureV2::ProductAuthorityChanged
         }
         crate::RuntimeShutdownCauseV1::Interrupt
         | crate::RuntimeShutdownCauseV1::Terminate

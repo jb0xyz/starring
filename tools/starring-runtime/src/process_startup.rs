@@ -14,7 +14,7 @@ use crate::{
     RuntimeClosedRecoveryProcessShutdownErrorV2, RuntimeConfigErrorV1, RuntimeConfigV1,
     RuntimePausedConnectedProcessShutdownErrorV1, RuntimeProcessClosedRecoveryTransitionErrorV2,
     RuntimeProcessPausedConnectedTransitionErrorV1, RuntimeProcessProductionHandoffErrorV2,
-    RuntimeProcessRecoveryPendingTransitionErrorV2,
+    RuntimeProcessProductionHandoffFailureV2, RuntimeProcessRecoveryPendingTransitionErrorV2,
     RuntimeProcessRecoveryReadinessTransitionErrorV2, RuntimeProcessStartupRecoveryLoopErrorV2,
     RuntimeRecoveryPendingProcessShutdownErrorV2, RuntimeSecretsResolutionErrorV1,
 };
@@ -136,6 +136,15 @@ impl RuntimeProcessStagingErrorV1 {
             | Self::ClosedRecovery(_)
             | Self::RecoveryReadiness(_) => false,
         }
+    }
+
+    pub const fn restart_class(self) -> bool {
+        matches!(
+            self,
+            Self::ProductionHandoff(RuntimeProcessProductionHandoffErrorV2::Transition(
+                RuntimeProcessProductionHandoffFailureV2::ProductAuthorityChanged
+            ))
+        )
     }
 }
 
@@ -521,5 +530,33 @@ mod tests {
             format!("{outcome:?}"),
             "RuntimeProcessStagingOutcomeV1(<redacted>)"
         );
+    }
+
+    #[test]
+    fn only_clean_product_authority_transition_requests_restart() {
+        let clean = RuntimeProcessStagingErrorV1::ProductionHandoff(
+            RuntimeProcessProductionHandoffErrorV2::Transition(
+                RuntimeProcessProductionHandoffFailureV2::ProductAuthorityChanged,
+            ),
+        );
+        let cleanup = RuntimeProcessStagingErrorV1::ProductionHandoff(
+            RuntimeProcessProductionHandoffErrorV2::CleanupAfterTransition {
+                transition: RuntimeProcessProductionHandoffFailureV2::ProductAuthorityChanged,
+                cleanup: RuntimeClosedRecoveryProcessCleanupFailureV2::Discord(
+                    RuntimeDiscordGatewayShutdownFailureV1::UnexpectedExit,
+                ),
+            },
+        );
+        let unrelated = RuntimeProcessStagingErrorV1::ProductionHandoff(
+            RuntimeProcessProductionHandoffErrorV2::Transition(
+                RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+            ),
+        );
+
+        assert!(clean.restart_class());
+        assert!(!clean.cleanup_class());
+        assert!(!cleanup.restart_class());
+        assert!(cleanup.cleanup_class());
+        assert!(!unrelated.restart_class());
     }
 }

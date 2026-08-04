@@ -7688,6 +7688,7 @@ fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_en
         "pub const fn code(self) -> &'static str",
         "pub const fn context(self) -> Option<&'static str>",
         "pub const fn configuration_class(self) -> bool",
+        "pub const fn restart_class(self) -> bool",
     ] {
         assert!(production.contains(required), "{required}");
     }
@@ -7773,6 +7774,12 @@ fn executable_delegates_once_without_raw_startup_or_runtime_authority() {
     assert!(main.contains("runtime_process_clean_shutdown"));
     assert!(main.contains("Self::CleanShutdown => ExitCode::SUCCESS"));
     assert!(main.contains("Self::Failed(error) if error.cleanup_class()"));
+    assert!(main.contains("Self::Failed(error) if error.restart_class()"));
+    assert!(main.contains("ExitCode::from(75)"));
+    assert!(
+        main.find("Self::Failed(error) if error.cleanup_class()")
+            < main.find("Self::Failed(error) if error.restart_class()")
+    );
     assert_eq!(
         entry
             .matches("run_runtime_process_staging_from_environment_v1()")
