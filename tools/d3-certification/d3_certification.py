@@ -108,6 +108,13 @@ FORBIDDEN_COMMAND_PATTERNS = (
     re.compile(r"security\s+find-generic-password"),
     re.compile(r"(?:/proc/[^\s]*/environ|\.env(?:\s|$))"),
 )
+FORBIDDEN_GIT_TRANSPORT_PATTERN = (
+    r"^(url\..*\.(insteadof|pushinsteadof)|"
+    r"remote\.origin\.(pushurl|uploadpack|receivepack|proxy)|"
+    r"core\.(sshcommand|gitproxy)|"
+    r"http(\..*)?\.(proxy|sslverify|sslcainfo|sslcapath|sslcert|sslkey|"
+    r"curloptresolve|followredirects))$"
+)
 
 
 class D3Error(Exception):
@@ -482,6 +489,27 @@ def github_repository_from_remote(repo, remote):
     return canonical_github_repository(values[0])
 
 
+def validate_release_transport(repo, remote):
+    if remote != "origin":
+        fail("release_ref_invalid")
+    status, _ = run_process(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "config",
+            "--get-regexp",
+            FORBIDDEN_GIT_TRANSPORT_PATTERN,
+        ],
+        repo,
+        "git_transport_overrides",
+        allowed=(0, 1),
+        discard=True,
+    )
+    if status == 0:
+        fail("git_transport_override_forbidden")
+
+
 def git_object(repo, sha, expected, label):
     observed = git_text(repo, ["cat-file", "-t", sha], f"{label}_type")
     if observed != expected:
@@ -644,6 +672,7 @@ def load_state(raw):
     require_directory(repo, "state_repo")
     if github_repository_from_remote(repo, manifest["remote"]) != manifest["github_repository"]:
         fail("state_github_repository_mismatch")
+    validate_release_transport(repo, manifest["remote"])
     require_directory(manifest_path.parent, "state_root", 0o700)
     require_directory(worktree, "state_worktree", 0o700)
     digest_path = manifest_path.with_name("state.sha256")
@@ -711,6 +740,26 @@ def fetch_candidate(repo, remote, base_ref, pr_number, prefix):
     )
 
 
+def fetch_main(repo, remote, base_ref):
+    base_remote_ref = f"refs/remotes/{remote}/{base_ref}"
+    git(
+        repo,
+        [
+            "fetch",
+            "--atomic",
+            "--no-tags",
+            "--force",
+            remote,
+            f"refs/heads/{base_ref}:{base_remote_ref}",
+        ],
+        "finalize_fetch",
+    )
+    return validate_sha(
+        git_text(repo, ["rev-parse", base_remote_ref], "finalize_main"),
+        "finalize_main",
+    )
+
+
 def command_prepare(arguments):
     repo = absolute_path(arguments.repo, "repo")
     output_root = absolute_path(arguments.output_root, "output_root")
@@ -726,6 +775,7 @@ def command_prepare(arguments):
         fail("pr_number_invalid")
     digests = gate_digests(arguments.gate)
     github_repository = github_repository_from_remote(repo, remote)
+    validate_release_transport(repo, remote)
     root = create_state_root(output_root, state_name(arguments.pr_number, expected_head, expected_base))
     with StateLock(root):
         intent_path = root / "prepare-intent.json"
@@ -1436,6 +1486,54 @@ def github_run(repository, run_id, main_commit, base_ref):
     }
 
 
+def github_pull(repository, state, main_commit):
+    _, raw = run_process(
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/pulls/{state['pr_number']}",
+        ],
+        pathlib.Path.cwd(),
+        f"pull_request_{state['pr_number']}",
+    )
+    value = load_json_bytes(raw, "pull_request")
+    base = value.get("base") if isinstance(value, dict) else None
+    head = value.get("head") if isinstance(value, dict) else None
+    base_repository = base.get("repo") if isinstance(base, dict) else None
+    head_repository = head.get("repo") if isinstance(head, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("number") != state["pr_number"]
+        or value.get("state") != "closed"
+        or value.get("draft") is not False
+        or value.get("merged") is not True
+        or value.get("merge_commit_sha") != main_commit
+        or not isinstance(base, dict)
+        or base.get("ref") != state["base_ref"]
+        or base.get("sha") != state["expected_base"]
+        or not isinstance(base_repository, dict)
+        or base_repository.get("full_name") != repository
+        or not isinstance(head, dict)
+        or head.get("sha") != state["expected_head"]
+        or not isinstance(head_repository, dict)
+        or head_repository.get("full_name") != repository
+    ):
+        fail("pull_request_merge_identity_invalid")
+    merged_at = validate_timestamp(value.get("merged_at"), "pull_request_merged_at")
+    return {
+        "number": state["pr_number"],
+        "state": "closed",
+        "draft": False,
+        "merged": True,
+        "merged_at": merged_at,
+        "merge_commit_sha": main_commit,
+        "base_ref": state["base_ref"],
+        "base_sha": state["expected_base"],
+        "head_sha": state["expected_head"],
+        "repository": repository,
+    }
+
+
 def command_finalize(arguments):
     repository = arguments.github_repository
     if not REPOSITORY_PATTERN.fullmatch(repository):
@@ -1461,23 +1559,11 @@ def command_finalize(arguments):
             fail("recheck_certification_binding_mismatch")
         if github_repository_from_remote(repo, state["remote"]) != repository:
             fail("github_repository_mismatch")
-        base_remote_ref = f"refs/remotes/{state['remote']}/{state['base_ref']}"
-        git(
-            repo,
-            [
-                "fetch",
-                "--atomic",
-                "--no-tags",
-                "--force",
-                state["remote"],
-                f"refs/heads/{state['base_ref']}:{base_remote_ref}",
-            ],
-            "finalize_fetch",
-        )
-        main_commit = validate_sha(git_text(repo, ["rev-parse", base_remote_ref], "finalize_main"), "finalize_main")
+        main_commit = fetch_main(repo, state["remote"], state["base_ref"])
         main_tree = commit_tree(repo, main_commit, "finalize_main")
         if main_tree != state["merge_tree"]:
             fail("main_tree_mismatch")
+        pull_request = github_pull(repository, state, main_commit)
         runs = [
             github_run(repository, run_id, main_commit, state["base_ref"])
             for run_id in run_ids
@@ -1504,6 +1590,7 @@ def command_finalize(arguments):
             "rechecked_base_commit": recheck["base_commit"],
             "recheck_sha256": recheck["record_sha256"],
             "github_repository": repository,
+            "pull_request": pull_request,
             "actions_runs": runs,
             "status": "passed",
         }

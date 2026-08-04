@@ -106,17 +106,65 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         git(self.seed, "push", "origin", f"{self.merge}:refs/pull/42/merge")
         git(self.root, "clone", str(self.remote), str(self.repo))
         git(self.repo, "remote", "set-url", "origin", self.github_remote_url)
+
+    def fetch_candidate_fixture(self, repo, remote, base_ref, pr_number, prefix):
+        self.assertEqual(repo, self.repo)
+        self.assertEqual(remote, "origin")
+        self.assertEqual(base_ref, "main")
+        self.assertEqual(pr_number, 42)
+        head_ref = f"refs/d3/pr-{pr_number}/{prefix}-head"
+        merge_ref = f"refs/d3/pr-{pr_number}/{prefix}-merge"
+        base_remote_ref = f"refs/remotes/{remote}/{base_ref}"
         git(
-            self.repo,
-            "config",
-            f"url.{self.remote.as_uri()}.insteadOf",
-            self.github_remote_url,
+            repo,
+            "fetch",
+            "--atomic",
+            "--no-tags",
+            "--force",
+            str(self.remote),
+            f"refs/heads/{base_ref}:{base_remote_ref}",
+            f"refs/pull/{pr_number}/head:{head_ref}",
+            f"refs/pull/{pr_number}/merge:{merge_ref}",
         )
+        return (
+            git(repo, "rev-parse", head_ref),
+            git(repo, "rev-parse", base_remote_ref),
+            git(repo, "rev-parse", merge_ref),
+        )
+
+    def fetch_main_fixture(self, repo, remote, base_ref):
+        self.assertEqual(repo, self.repo)
+        self.assertEqual(remote, "origin")
+        self.assertEqual(base_ref, "main")
+        base_remote_ref = f"refs/remotes/{remote}/{base_ref}"
+        git(
+            repo,
+            "fetch",
+            "--atomic",
+            "--no-tags",
+            "--force",
+            str(self.remote),
+            f"refs/heads/{base_ref}:{base_remote_ref}",
+        )
+        return git(repo, "rev-parse", base_remote_ref)
 
     def invoke(self, arguments):
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+            mock.patch.object(
+                MODULE,
+                "fetch_candidate",
+                side_effect=self.fetch_candidate_fixture,
+            ),
+            mock.patch.object(
+                MODULE,
+                "fetch_main",
+                side_effect=self.fetch_main_fixture,
+            ),
+        ):
             status = MODULE.main(arguments)
         result = json.loads(stdout.getvalue()) if stdout.getvalue() else None
         return status, result, stderr.getvalue()
@@ -258,6 +306,25 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                     MODULE.github_repository_from_remote(self.repo, "origin"),
                     self.github_repository,
                 )
+
+    def test_prepare_rejects_git_transport_rewrites_and_overrides(self):
+        overrides = (
+            (f"url.{self.remote.as_uri()}.insteadOf", self.github_remote_url),
+            ("remote.origin.pushurl", str(self.remote)),
+            ("core.sshCommand", "/usr/bin/false"),
+            ("http.sslVerify", "false"),
+            ("http.curloptResolve", "github.com:443:127.0.0.1"),
+        )
+        for index, (key, value) in enumerate(overrides, start=1):
+            with self.subTest(key=key):
+                git(self.repo, "config", "--add", key, value)
+                output = self.root / f"transport-override-{index}"
+                output.mkdir(mode=0o700)
+                arguments, _ = self.prepare_arguments(output_root=output)
+                status, _, error = self.invoke(arguments)
+                self.assertEqual(status, 1)
+                self.assertIn("git_transport_override_forbidden", error)
+                git(self.repo, "config", "--unset-all", key)
 
     def test_gate_execution_is_chained_redacted_and_exactly_replayed(self):
         state_path, _, gates = self.prepare()
@@ -730,6 +797,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         run_overrides=None,
         workflow_overrides=None,
         jobs=None,
+        pull_overrides=None,
     ):
         directory = self.root / "bin"
         directory.mkdir(exist_ok=True)
@@ -759,6 +827,25 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         }
         if workflow_overrides:
             workflow_value.update(workflow_overrides)
+        pull_value = {
+            "number": 42,
+            "state": "closed",
+            "draft": False,
+            "merged": True,
+            "merged_at": "2026-08-04T12:00:00Z",
+            "merge_commit_sha": head_sha,
+            "base": {
+                "ref": "main",
+                "sha": self.base,
+                "repo": {"full_name": "owner/repository"},
+            },
+            "head": {
+                "sha": self.head,
+                "repo": {"full_name": "owner/repository"},
+            },
+        }
+        if pull_overrides:
+            pull_value.update(pull_overrides)
         if jobs is None:
             jobs = [
                 {
@@ -783,6 +870,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 },
             ]
         responses = {
+            "repos/owner/repository/pulls/42": pull_value,
             "repos/owner/repository/actions/runs/101": run_value,
             "repos/owner/repository/actions/workflows/202": workflow_value,
             "repos/owner/repository/actions/runs/101/jobs?filter=latest&per_page=100": {
@@ -826,6 +914,21 @@ print(json.dumps(responses[endpoint]))
             self.assertEqual(status, 0, error)
             self.assertEqual(result["status"], "passed")
             self.assertEqual(result["main_tree"], self.tree)
+            self.assertEqual(
+                result["pull_request"],
+                {
+                    "number": 42,
+                    "state": "closed",
+                    "draft": False,
+                    "merged": True,
+                    "merged_at": "2026-08-04T12:00:00Z",
+                    "merge_commit_sha": self.merge,
+                    "base_ref": "main",
+                    "base_sha": self.base,
+                    "head_sha": self.head,
+                    "repository": self.github_repository,
+                },
+            )
             self.assertEqual(result["actions_runs"][0]["id"], 101)
             self.assertEqual(
                 result["actions_runs"][0]["workflow_path"],
@@ -845,6 +948,25 @@ print(json.dumps(responses[endpoint]))
             status, _, error = self.invoke(arguments)
             self.assertEqual(status, 1)
             self.assertIn("final_record_mismatch", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_finalize_rejects_unmerged_or_drifted_pull_request(self):
+        cases = (
+            {"state": "open", "merged": False, "merged_at": None},
+            {"merge_commit_sha": "a" * 40},
+            {"base": {"ref": "main", "sha": "b" * 40, "repo": {"full_name": "owner/repository"}}},
+            {"head": {"sha": "c" * 40, "repo": {"full_name": "owner/repository"}}},
+        )
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        try:
+            for overrides in cases:
+                with self.subTest(overrides=overrides):
+                    self.install_fake_gh(self.merge, pull_overrides=overrides)
+                    status, _, error = self.invoke(self.finalize_arguments(state_path))
+                    self.assertEqual(status, 1)
+                    self.assertIn("pull_request_merge_identity_invalid", error)
         finally:
             os.environ["PATH"] = self.previous_path
 

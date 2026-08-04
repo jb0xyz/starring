@@ -6,7 +6,7 @@ It never persists gate command text, process output, environment values, or cred
 
 ## Sequence
 
-Prepare a state directory from the current GitHub-generated merge ref. `origin` must be a credential-free `github.com` HTTPS or SSH URL. The gate manifest is fixed in code and accepts no missing, additional, duplicate, reordered, or changed command.
+Prepare a state directory from the current GitHub-generated merge ref. `origin` must be a credential-free `github.com` HTTPS or SSH URL. Git URL rewrites, alternate push URLs, custom upload/receive commands, proxies, SSH commands, TLS overrides, and curl address overrides are rejected. The gate manifest is fixed in code and accepts no missing, additional, duplicate, reordered, or changed command.
 
 ```zsh
 gates=(
@@ -90,7 +90,7 @@ python3 tools/d3-certification/d3_certification.py recheck \
   --state /private/tmp/starring-d3/RUN/state.json
 ```
 
-After an independent merge, bind the fetched `origin/main` tree and one successful post-merge Actions run. The repository argument must exactly equal the owner/repository identity pinned from `origin`. The GitHub CLI must already be authenticated without inline credentials.
+After an independent merge, bind the fetched `origin/main` tree, the closed and merged frozen pull request, and one successful post-merge Actions run. The PR's repository, base ref and SHA, head SHA, and merge commit must match the pinned state and fetched `main` exactly. The repository argument must exactly equal the owner/repository identity pinned from `origin`. The GitHub CLI must already be authenticated without inline credentials.
 
 ```sh
 python3 tools/d3-certification/d3_certification.py finalize \
@@ -99,4 +99,4 @@ python3 tools/d3-certification/d3_certification.py finalize \
   --actions-run-id RUN_ID
 ```
 
-`final.json` is the terminal D3 record. A passing record requires exact merge-tree equality on `main`, the complete canonical gate evidence chain, the same D2 receipt chain observed during pre-merge recheck, and successful `checks` and `postgres` jobs in the exact `CI` push workflow run against the fetched `main` commit.
+`final.json` is the terminal D3 record. A passing record requires the frozen PR to be closed and merged into the fetched `main` commit, exact merge-tree equality on `main`, the complete canonical gate evidence chain, the same D2 receipt chain observed during pre-merge recheck, and successful `checks` and `postgres` jobs in the exact `CI` push workflow run against that commit.
