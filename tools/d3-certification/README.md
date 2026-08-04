@@ -56,10 +56,17 @@ done
 
 Run the exact pinned gates in the detached worktree. Completed gates replay without execution. A failed or interrupted gate resumes as a new or incomplete durable attempt.
 
+The PostgreSQL URL file is a dedicated absolute mode-`0600` secret input. It
+must name an explicit loopback port and a `starring_test` or `starring_d3*`
+database with credentials. Its value is injected only into commands 17 through
+29, is never added to the command manifest or evidence, and all gate processes
+run with `CARGO_INCREMENTAL=0`.
+
 ```zsh
 run_gates=(
   python3 tools/d3-certification/d3_certification.py run-gates
   --state /private/tmp/starring-d3/RUN/state.json
+  --postgres-database-url-file /absolute/private/postgres-database-url
 )
 for gate in "${gates[@]}"; do
   run_gates+=(--gate "$gate")

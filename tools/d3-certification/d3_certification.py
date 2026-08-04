@@ -22,6 +22,7 @@ DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,191}$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
 REPOSITORY_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+POSTGRES_DATABASE_PATTERN = re.compile(r"^starring_(?:test|d3)(?:_[a-z0-9_]{1,48})?$")
 GITHUB_SCP_PATTERN = re.compile(r"^git@github\.com:(?P<path>[^:]+)$")
 UTC_PATTERN = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z$"
@@ -344,7 +345,15 @@ class StateLock:
             self.handle.close()
 
 
-def run_process(argv, cwd, label, allowed=(0,), timeout=None, discard=False):
+def run_process(
+    argv,
+    cwd,
+    label,
+    allowed=(0,),
+    timeout=None,
+    discard=False,
+    postgres_database_url=None,
+):
     environment = {
         name: os.environ[name]
         for name in SAFE_ENVIRONMENT_NAMES
@@ -352,6 +361,9 @@ def run_process(argv, cwd, label, allowed=(0,), timeout=None, discard=False):
     }
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["LC_ALL"] = "C"
+    environment["CARGO_INCREMENTAL"] = "0"
+    if postgres_database_url is not None:
+        environment["STARRING_TEST_DATABASE_URL"] = postgres_database_url
     try:
         result = subprocess.run(
             argv,
@@ -503,6 +515,57 @@ def validate_gate(command):
     if any(pattern.search(command) for pattern in FORBIDDEN_COMMAND_PATTERNS):
         fail("gate_command_sensitive")
     return command
+
+
+def load_postgres_database_url(raw):
+    if raw is None:
+        fail("postgres_database_url_file_required")
+    path = absolute_path(raw, "postgres_database_url")
+    try:
+        value = read_owned_bytes(
+            path,
+            "postgres_database_url",
+            0o600,
+            8192,
+        ).decode("utf-8")
+    except UnicodeDecodeError:
+        fail("postgres_database_url_encoding_invalid")
+    if value.endswith("\n"):
+        value = value[:-1]
+    if (
+        not value
+        or any(character.isspace() for character in value)
+        or "\x00" in value
+    ):
+        fail("postgres_database_url_invalid")
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+        username = parsed.username
+        password = parsed.password
+        hostname = parsed.hostname
+    except ValueError:
+        fail("postgres_database_url_invalid")
+    if (
+        parsed.scheme not in ("postgres", "postgresql")
+        or hostname not in ("127.0.0.1", "localhost", "::1")
+        or port is None
+        or not 1 <= port <= 65535
+        or not username
+        or password is None
+        or not password
+        or parsed.fragment
+        or parsed.query
+        or parsed.path.count("/") != 1
+    ):
+        fail("postgres_database_url_invalid")
+    try:
+        database = urllib.parse.unquote(parsed.path[1:], errors="strict")
+    except (UnicodeDecodeError, ValueError):
+        fail("postgres_database_url_invalid")
+    if not POSTGRES_DATABASE_PATTERN.fullmatch(database):
+        fail("postgres_database_url_invalid")
+    return value
 
 
 def gate_digests(commands):
@@ -913,6 +976,9 @@ def command_run_gates(arguments):
         state_path, state, _, repo, worktree = load_state(str(state_argument))
         if digests != state["gate_command_sha256"]:
             fail("gate_plan_mismatch")
+        postgres_database_url = load_postgres_database_url(
+            arguments.postgres_database_url_file
+        )
         validate_worktree(state, repo, worktree)
         evidence_path = root / "gate-evidence.jsonl"
         records = load_gate_evidence(evidence_path, state)
@@ -946,6 +1012,9 @@ def command_run_gates(arguments):
                     allowed=tuple(range(256)),
                     timeout=arguments.timeout_seconds,
                     discard=True,
+                    postgres_database_url=(
+                        postgres_database_url if index > 16 else None
+                    ),
                 )
             except D3Error:
                 return_code = 255
@@ -1277,8 +1346,7 @@ def github_run(repository, run_id, main_commit, base_ref):
         or value.get("head_branch") != base_ref
         or value.get("event") != "push"
         or value.get("name") != REQUIRED_ACTIONS_WORKFLOW["name"]
-        or value.get("path")
-        != f"{REQUIRED_ACTIONS_WORKFLOW['path']}@{base_ref}"
+        or value.get("path") != REQUIRED_ACTIONS_WORKFLOW["path"]
         or value.get("pull_requests") != []
         or not isinstance(repository_identity, dict)
         or repository_identity.get("full_name") != repository
@@ -1469,6 +1537,7 @@ def parser():
     gates = commands.add_parser("run-gates")
     gates.add_argument("--state", required=True)
     gates.add_argument("--gate", action="append", required=True)
+    gates.add_argument("--postgres-database-url-file")
     gates.add_argument("--timeout-seconds", type=int, default=7200)
     gates.set_defaults(handler=command_run_gates)
     bind = commands.add_parser("bind-d2")

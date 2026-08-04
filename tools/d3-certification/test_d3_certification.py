@@ -48,9 +48,18 @@ class D3CertificationTests(unittest.TestCase):
         self.remote = self.root / "origin.git"
         self.repo = self.root / "repo"
         self.output = self.root / "state"
+        self.postgres_database_url = (
+            "postgres://postgres:postgres@127.0.0.1:5432/starring_test"
+        )
+        self.postgres_database_url_file = self.root / "postgres-database-url"
         self.github_repository = "owner/repository"
         self.github_remote_url = "https://github.com/owner/repository.git"
         self.output.mkdir(mode=0o700)
+        write(
+            self.postgres_database_url_file,
+            self.postgres_database_url,
+            0o600,
+        )
         self.create_repository()
 
     def tearDown(self):
@@ -139,21 +148,47 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
     def invoke_gate_plan(self, state_path, gates=None, outcomes=None):
         gates = list(MODULE.REQUIRED_GATE_COMMANDS if gates is None else gates)
-        arguments = ["run-gates", "--state", str(state_path)]
+        arguments = [
+            "run-gates",
+            "--state",
+            str(state_path),
+            "--postgres-database-url-file",
+            str(self.postgres_database_url_file),
+        ]
         for gate in gates:
             arguments.extend(["--gate", gate])
         original = MODULE.run_process
         observed = []
         outcomes = iter([] if outcomes is None else outcomes)
 
-        def recording_runner(argv, cwd, label, allowed=(0,), timeout=None, discard=False):
+        database_urls = []
+
+        def recording_runner(
+            argv,
+            cwd,
+            label,
+            allowed=(0,),
+            timeout=None,
+            discard=False,
+            postgres_database_url=None,
+        ):
             if argv[:3] == ["/bin/zsh", "-f", "-c"]:
                 observed.append(argv[3])
+                database_urls.append(postgres_database_url)
                 return next(outcomes, 0), b""
-            return original(argv, cwd, label, allowed, timeout, discard)
+            return original(
+                argv,
+                cwd,
+                label,
+                allowed,
+                timeout,
+                discard,
+                postgres_database_url,
+            )
 
         with mock.patch.object(MODULE, "run_process", side_effect=recording_runner):
             status, result, error = self.invoke(arguments)
+        self.gate_database_urls = database_urls
         return status, result, error, observed
 
     def test_prepare_pins_merge_parents_tree_and_detached_worktree(self):
@@ -229,18 +264,89 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         status, result, error, observed = self.invoke_gate_plan(state_path, gates)
         self.assertEqual(status, 0, error)
         self.assertEqual(observed, list(MODULE.REQUIRED_GATE_COMMANDS))
+        self.assertEqual(self.gate_database_urls[:16], [None] * 16)
+        self.assertEqual(
+            self.gate_database_urls[16:],
+            [self.postgres_database_url] * 13,
+        )
         self.assertEqual(result["gates"], len(MODULE.REQUIRED_GATE_COMMANDS))
         evidence = state_path.with_name("gate-evidence.jsonl")
         before = evidence.read_bytes()
         lines = [json.loads(line) for line in before.splitlines()]
         self.assertEqual(len(lines), 2 * len(MODULE.REQUIRED_GATE_COMMANDS))
         self.assertNotIn(gates[0].encode("utf-8"), before)
+        self.assertNotIn(self.postgres_database_url.encode("utf-8"), before)
+        self.assertNotIn(b"postgres:postgres", before)
         self.assertTrue(all("command_sha256" in line for line in lines))
         status, replay, error, observed = self.invoke_gate_plan(state_path, gates)
         self.assertEqual(status, 0, error)
         self.assertEqual(observed, [])
         self.assertEqual(replay["evidence_chain_head_sha256"], result["evidence_chain_head_sha256"])
         self.assertEqual(evidence.read_bytes(), before)
+
+    def test_postgres_gate_secret_is_required_owned_and_test_only(self):
+        self.assertEqual(
+            MODULE.load_postgres_database_url(str(self.postgres_database_url_file)),
+            self.postgres_database_url,
+        )
+        state_path, _, gates = self.prepare()
+        arguments = ["run-gates", "--state", str(state_path)]
+        for gate in gates:
+            arguments.extend(["--gate", gate])
+        status, _, error = self.invoke(arguments)
+        self.assertEqual(status, 1)
+        self.assertIn("postgres_database_url_file_required", error)
+        invalid = (
+            "postgres://postgres:postgres@example.com:5432/starring_test",
+            "postgres://postgres:postgres@127.0.0.1:5432/starring_runtime_staging",
+            "postgres://postgres@127.0.0.1:5432/starring_test",
+            "postgres://postgres:postgres@127.0.0.1:5432/starring_test?sslmode=disable",
+        )
+        for index, value in enumerate(invalid, start=1):
+            with self.subTest(value=value):
+                path = self.root / f"invalid-postgres-{index}"
+                write(path, value, 0o600)
+                with self.assertRaisesRegex(
+                    MODULE.D3Error,
+                    "postgres_database_url_invalid",
+                ):
+                    MODULE.load_postgres_database_url(str(path))
+        write(self.postgres_database_url_file, self.postgres_database_url, 0o644)
+        with self.assertRaisesRegex(
+            MODULE.D3Error,
+            "postgres_database_url_ownership_invalid",
+        ):
+            MODULE.load_postgres_database_url(str(self.postgres_database_url_file))
+
+    def test_postgres_gate_secret_reaches_only_explicit_gate_process(self):
+        script = (
+            "import json,os;print(json.dumps({"
+            "'database':os.environ.get('STARRING_TEST_DATABASE_URL'),"
+            "'forbidden':'STARRING_FORBIDDEN_SECRET' in os.environ,"
+            "'incremental':os.environ.get('CARGO_INCREMENTAL')}))"
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "STARRING_TEST_DATABASE_URL": "parent-value",
+                "STARRING_FORBIDDEN_SECRET": "must-not-propagate",
+            },
+            clear=False,
+        ):
+            _, raw = MODULE.run_process(
+                [sys.executable, "-c", script],
+                self.repo,
+                "postgres_environment_probe",
+                postgres_database_url=self.postgres_database_url,
+            )
+        self.assertEqual(
+            json.loads(raw),
+            {
+                "database": self.postgres_database_url,
+                "forbidden": False,
+                "incremental": "0",
+            },
+        )
 
     def test_required_gate_manifest_matches_phase_d_contract(self):
         self.assertEqual(
@@ -632,7 +738,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             "id": 101,
             "workflow_id": 202,
             "name": "CI",
-            "path": ".github/workflows/ci.yml@main",
+            "path": ".github/workflows/ci.yml",
             "event": "push",
             "head_branch": "main",
             "head_sha": head_sha,
