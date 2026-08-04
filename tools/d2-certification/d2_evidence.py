@@ -324,6 +324,13 @@ def canonical_effect_identity_sha256(identity):
     )
 
 
+def effect_audit_reason_sha256(effect_id):
+    _require_digest(effect_id, "effect_id_invalid")
+    return hashlib.sha256(
+        b"starring-effect-v1:" + effect_id.encode("ascii")
+    ).hexdigest()
+
+
 def validate_canonical_identity_sha256(value, code):
     return _require_digest(value, code)
 
@@ -735,7 +742,6 @@ def assemble_reconciliation_evidence(database, transport):
         "unsafe_deletion_count",
     }
     transport_fields = {
-        "interaction_id",
         "injected_outcome",
         "transport_indeterminate_injections",
         "transport_last_audit_reason_sha256",
@@ -748,9 +754,7 @@ def assemble_reconciliation_evidence(database, transport):
     injected = _require_envelope(
         transport, "starring.d2.transport-indeterminate-evidence.v1", transport_fields
     )
-    interaction_id = _same(
-        durable["interaction_id"], injected["interaction_id"], "reconciliation_interaction_mismatch"
-    )
+    interaction_id = durable["interaction_id"]
     _require_snowflake(interaction_id, "reconciliation_interaction_id_invalid")
     if durable["effect_identity"]["interaction_id"] != interaction_id:
         _fail("reconciliation_effect_interaction_mismatch")
@@ -761,15 +765,31 @@ def assemble_reconciliation_evidence(database, transport):
         {"known_success", "known_failure", "compensated"},
         "reconciliation_state_invalid",
     )
+    _require_nonnegative_integer(
+        durable["duplicate_external_effect_count"],
+        "reconciliation_duplicate_effect_count_invalid",
+    )
+    _require_nonnegative_integer(
+        durable["unsafe_deletion_count"],
+        "reconciliation_unsafe_deletion_count_invalid",
+    )
     if durable["duplicate_external_effect_count"] != 0 or durable["unsafe_deletion_count"] != 0:
         _fail("reconciliation_safety_invalid")
     if injected["injected_outcome"] != "indeterminate":
         _fail("indeterminate_outcome_invalid")
+    _require_positive_integer(
+        injected["transport_indeterminate_injections"],
+        "indeterminate_injection_count_invalid",
+    )
     if injected["transport_indeterminate_injections"] != 1:
         _fail("indeterminate_injection_count_invalid")
     _require_digest(
         injected["transport_last_audit_reason_sha256"], "indeterminate_audit_digest_invalid"
     )
+    if injected["transport_last_audit_reason_sha256"] != effect_audit_reason_sha256(
+        effect_id
+    ):
+        _fail("reconciliation_audit_correlation_mismatch")
     _require_http_status(
         injected["transport_last_upstream_status"],
         "indeterminate_upstream_status_invalid",
@@ -887,7 +907,7 @@ def assemble_replacement_evidence(browser, database):
     }
 
 
-def assemble_live_loss_evidence(browser, transport):
+def assemble_live_loss_evidence(browser, transport, prior_route_id):
     browser_fields = {
         "public_origin",
         "installation_id",
@@ -905,7 +925,6 @@ def assemble_live_loss_evidence(browser, transport):
     transport_fields = {
         "gateway_disconnected",
         "runtime_ready_status",
-        "route_identity",
         "transport_gateway_partitioned",
         "transport_gateway_partition_events",
         "transport_instance_id",
@@ -937,7 +956,9 @@ def assemble_live_loss_evidence(browser, transport):
         injected["transport_gateway_partition_events"], "live_loss_partition_events_invalid"
     )
     _require_identifier(injected["transport_instance_id"], "transport_instance_id_invalid")
-    route_id = canonical_route_identity_sha256(injected["route_identity"])
+    route_id = validate_canonical_identity_sha256(
+        prior_route_id, "live_loss_prior_route_id_invalid"
+    )
     return {
         "gateway_disconnected": True,
         "live_lost": True,

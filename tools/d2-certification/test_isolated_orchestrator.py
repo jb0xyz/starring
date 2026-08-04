@@ -2990,6 +2990,238 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             self.assertEqual(arguments.command, command)
             self.assertEqual(arguments.manifest, str(self.manifest_path))
 
+    def test_transport_evidence_parser_requires_checkpoint(self):
+        for checkpoint in ORCHESTRATOR.TRANSPORT_EVIDENCE_KINDS:
+            arguments = ORCHESTRATOR.build_parser().parse_args(
+                [
+                    "transport-evidence",
+                    "--manifest",
+                    str(self.manifest_path),
+                    "--checkpoint",
+                    checkpoint,
+                ]
+            )
+            self.assertEqual(arguments.command, "transport-evidence")
+            self.assertEqual(arguments.checkpoint, checkpoint)
+
+    def test_interaction_transport_evidence_projects_exact_active_inventory(self):
+        inventory = self.start_candidate_with_discord_resources()
+        result = ORCHESTRATOR.command_transport_evidence(
+            self.context, self.platform, "interaction"
+        )
+        self.assertEqual(result["status"], "recorded")
+        path = ORCHESTRATOR.transport_evidence_path(self.context, "interaction")
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            set(evidence),
+            {
+                "schema_version",
+                "kind",
+                "observed_at",
+                "role_ids",
+                "channel_ids",
+                "panel_message_ids",
+                "transport_instance_id",
+            },
+        )
+        self.assertEqual(
+            evidence["role_ids"],
+            sorted(
+                resource["resource_id"]
+                for resource in inventory["active"]
+                if resource["kind"] == "role"
+            ),
+        )
+        self.assertEqual(
+            evidence["channel_ids"],
+            sorted(
+                resource["resource_id"]
+                for resource in inventory["active"]
+                if resource["kind"] == "channel"
+            ),
+        )
+        self.assertEqual(
+            evidence["panel_message_ids"],
+            sorted(
+                resource["resource_id"]
+                for resource in inventory["active"]
+                if resource["kind"] == "message"
+            ),
+        )
+        replay = ORCHESTRATOR.command_transport_evidence(
+            self.context, self.platform, "interaction"
+        )
+        self.assertEqual(replay["status"], "exact_replay")
+        self.platform.resource_history.append(
+            {
+                "kind": "role",
+                "resource_id": "1524810437118525590",
+                "state": "created",
+            }
+        )
+        self.platform.discord_existing.add("1524810437118525590")
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "transport_evidence_replay_drift"
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "interaction"
+            )
+
+    def test_duplicate_transport_evidence_is_counter_and_interaction_bound(self):
+        self.start_candidate_with_discord_resources()
+        gateway = self.platform.transport_state["gateway"]
+        gateway["last_duplicate_interaction_id"] = "1532677575736819846"
+        gateway["duplicate_injections"] = 1
+        gateway["duplicate_delivery_count"] = 2
+        result = ORCHESTRATOR.command_transport_evidence(
+            self.context, self.platform, "duplicate"
+        )
+        evidence = json.loads(
+            pathlib.Path(result["evidence"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            evidence["interaction_id"], "1532677575736819846"
+        )
+        self.assertEqual(evidence["delivery_count"], 2)
+        self.assertEqual(evidence["transport_duplicate_injections"], 1)
+        self.assertEqual(evidence["transport_duplicate_delivery_count"], 2)
+        self.assertNotIn("operation_id", evidence)
+        gateway["duplicate_delivery_count"] = 3
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "transport_duplicate_evidence_invalid"
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "duplicate"
+            )
+        gateway["duplicate_delivery_count"] = 2
+        gateway["duplicate_injections"] = True
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "transport_duplicate_evidence_invalid"
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "duplicate"
+            )
+
+    def test_reconciliation_transport_evidence_excludes_interaction_and_raw_snapshot(self):
+        self.start_candidate_with_discord_resources()
+        effect = self.platform.transport_state["effect_http"]
+        effect["indeterminate_injections"] = 1
+        effect["last_indeterminate_audit_reason_sha256"] = "a" * 64
+        effect["last_indeterminate_upstream_status"] = 201
+        result = ORCHESTRATOR.command_transport_evidence(
+            self.context, self.platform, "reconciliation"
+        )
+        evidence = json.loads(
+            pathlib.Path(result["evidence"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            set(evidence),
+            {
+                "schema_version",
+                "kind",
+                "observed_at",
+                "injected_outcome",
+                "transport_indeterminate_injections",
+                "transport_last_audit_reason_sha256",
+                "transport_last_upstream_status",
+                "transport_instance_id",
+            },
+        )
+        serialized = json.dumps(evidence)
+        for forbidden in (
+            "interaction_id",
+            "operation_id",
+            "snapshot",
+            "authorization",
+            "token",
+        ):
+            self.assertNotIn(forbidden, serialized.lower())
+        effect["last_indeterminate_audit_reason_sha256"] = "bad"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "transport_reconciliation_evidence_invalid",
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "reconciliation"
+            )
+        effect["last_indeterminate_audit_reason_sha256"] = "a" * 64
+        effect["indeterminate_injections"] = True
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "transport_reconciliation_evidence_invalid",
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "reconciliation"
+            )
+
+    def test_gateway_loss_transport_evidence_uses_unready_boundary_without_route(self):
+        self.start_candidate_with_discord_resources()
+        gateway = self.platform.transport_state["gateway"]
+        gateway["partitioned"] = True
+        gateway["partition_events"] = 1
+        self.platform.health_failure = "29091"
+        result = ORCHESTRATOR.command_transport_evidence(
+            self.context, self.platform, "gateway-loss"
+        )
+        evidence = json.loads(
+            pathlib.Path(result["evidence"]).read_text(encoding="utf-8")
+        )
+        self.assertTrue(evidence["gateway_disconnected"])
+        self.assertEqual(evidence["runtime_ready_status"], 503)
+        self.assertTrue(evidence["transport_gateway_partitioned"])
+        self.assertEqual(evidence["transport_gateway_partition_events"], 1)
+        self.assertNotIn("route_id", evidence)
+        self.assertNotIn("route_identity", evidence)
+        self.platform.health_failure = None
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "gateway_loss_runtime_readiness_invalid",
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "gateway-loss"
+            )
+        self.platform.health_failure = "29091"
+        gateway["partition_events"] = True
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "transport_gateway_loss_evidence_invalid",
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "gateway-loss"
+            )
+
+    def test_transport_evidence_requires_ready_health_phase_and_pinned_instance(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "orchestrator_phase_invalid"
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "duplicate"
+            )
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        gateway = self.platform.transport_state["gateway"]
+        gateway["last_duplicate_interaction_id"] = "1532677575736819846"
+        gateway["duplicate_injections"] = 1
+        gateway["duplicate_delivery_count"] = 2
+        self.platform.health_failure = "worker"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "candidate_health_unready"
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "duplicate"
+            )
+        self.platform.health_failure = None
+        self.platform.transport_state["instance_id"] = (
+            "d2ti-fedcba9876543210fedcba9876543210"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "transport_instance_changed"
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "duplicate"
+            )
+
     def test_resource_inventory_command_is_candidate_and_instance_bound(self):
         inventory = self.start_candidate_with_discord_resources()
         result = ORCHESTRATOR.command_resource_inventory(self.context, self.platform)

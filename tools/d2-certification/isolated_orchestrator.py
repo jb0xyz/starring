@@ -73,6 +73,12 @@ DISCORD_RESOURCE_UNKNOWN_CODES = {
 DISCORD_RESOURCE_SUCCESS_STATUS = {"role": 204, "channel": 200, "message": 204}
 DISCORD_TEARDOWN_PROGRESS_KIND = "starring.d2.discord-resource-teardown-progress.v1"
 DISCORD_TEARDOWN_EVIDENCE_KIND = "starring.d2.discord-resource-teardown.v1"
+TRANSPORT_EVIDENCE_KINDS = {
+    "interaction": "starring.d2.transport-resource-evidence.v1",
+    "duplicate": "starring.d2.transport-duplicate-evidence.v1",
+    "reconciliation": "starring.d2.transport-indeterminate-evidence.v1",
+    "gateway-loss": "starring.d2.transport-gateway-loss-evidence.v1",
+}
 
 
 def command_dry_run(context, platform):
@@ -855,6 +861,265 @@ def command_resource_inventory(context, platform):
     }
 
 
+def require_gateway_loss_certification_boundary(context, platform):
+    state = load_state(context, {"candidate_started"})
+    if not platform.postgres_running(context.cluster_root) or any(
+        not platform.launchd_loaded(context.manifest["services"][name]["label"])
+        for name in SERVICE_START_ORDER
+    ):
+        fail("candidate_state_drift")
+    if standing_snapshot(context, platform) != state["standing_snapshot"]:
+        fail("protected_staging_state_changed")
+    snapshot = platform.transport_control(context, "snapshot")
+    require_pinned_transport_snapshot(context, snapshot)
+    runtime_status = platform.http_status(
+        "http://127.0.0.1:"
+        f"{context.manifest['services']['runtime']['port']}/health/ready"
+    )
+    if runtime_status != 503:
+        fail("gateway_loss_runtime_readiness_invalid")
+    return snapshot, runtime_status
+
+
+def transport_evidence_path(context, checkpoint):
+    return context.artifact_directory / "transport-evidence" / f"{checkpoint}.json"
+
+
+def validate_transport_evidence_payload(context, checkpoint, evidence):
+    common = {"schema_version", "kind", "observed_at"}
+    fields = {
+        "interaction": {
+            "role_ids",
+            "channel_ids",
+            "panel_message_ids",
+            "transport_instance_id",
+        },
+        "duplicate": {
+            "interaction_id",
+            "delivery_count",
+            "transport_duplicate_injections",
+            "transport_duplicate_delivery_count",
+            "transport_last_duplicate_interaction_id",
+            "transport_instance_id",
+        },
+        "reconciliation": {
+            "injected_outcome",
+            "transport_indeterminate_injections",
+            "transport_last_audit_reason_sha256",
+            "transport_last_upstream_status",
+            "transport_instance_id",
+        },
+        "gateway-loss": {
+            "gateway_disconnected",
+            "runtime_ready_status",
+            "transport_gateway_partitioned",
+            "transport_gateway_partition_events",
+            "transport_instance_id",
+        },
+    }
+    if checkpoint not in TRANSPORT_EVIDENCE_KINDS:
+        fail("transport_evidence_checkpoint_invalid")
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != common | fields[checkpoint]
+        or evidence["schema_version"] != 1
+        or evidence["kind"] != TRANSPORT_EVIDENCE_KINDS[checkpoint]
+        or not isinstance(evidence["observed_at"], str)
+        or not TRANSPORT_RECORDED_AT_PATTERN.fullmatch(evidence["observed_at"])
+        or evidence["transport_instance_id"] != pinned_transport_instance_id(context)
+    ):
+        fail("transport_evidence_invalid")
+    if checkpoint == "interaction":
+        for field in ("role_ids", "channel_ids", "panel_message_ids"):
+            values = evidence[field]
+            if (
+                not isinstance(values, list)
+                or not values
+                or len(values) > 128
+                or values != sorted(values)
+                or len(values) != len(set(values))
+            ):
+                fail("transport_interaction_inventory_invalid")
+            for value in values:
+                validate_snowflake(value, f"transport_{field}")
+    elif checkpoint == "duplicate":
+        validate_snowflake(evidence["interaction_id"], "transport_interaction_id")
+        validate_snowflake(
+            evidence["transport_last_duplicate_interaction_id"],
+            "transport_last_duplicate_interaction_id",
+        )
+        if (
+            evidence["interaction_id"]
+            != evidence["transport_last_duplicate_interaction_id"]
+            or type(evidence["delivery_count"]) is not int
+            or evidence["delivery_count"] != 2
+            or type(evidence["transport_duplicate_injections"]) is not int
+            or evidence["transport_duplicate_injections"] != 1
+            or type(evidence["transport_duplicate_delivery_count"]) is not int
+            or evidence["transport_duplicate_delivery_count"] != 2
+        ):
+            fail("transport_duplicate_evidence_invalid")
+    elif checkpoint == "reconciliation":
+        if (
+            evidence["injected_outcome"] != "indeterminate"
+            or type(evidence["transport_indeterminate_injections"]) is not int
+            or evidence["transport_indeterminate_injections"] != 1
+            or not isinstance(
+                evidence["transport_last_audit_reason_sha256"], str
+            )
+            or not DIGEST_PATTERN.fullmatch(
+                evidence["transport_last_audit_reason_sha256"]
+            )
+            or type(evidence["transport_last_upstream_status"]) is not int
+            or not 200 <= evidence["transport_last_upstream_status"] <= 299
+        ):
+            fail("transport_reconciliation_evidence_invalid")
+    elif (
+        evidence["gateway_disconnected"] is not True
+        or type(evidence["runtime_ready_status"]) is not int
+        or evidence["runtime_ready_status"] != 503
+        or evidence["transport_gateway_partitioned"] is not True
+        or type(evidence["transport_gateway_partition_events"]) is not int
+        or evidence["transport_gateway_partition_events"] <= 0
+    ):
+        fail("transport_gateway_loss_evidence_invalid")
+    return evidence
+
+
+def interaction_transport_evidence(context, platform, snapshot):
+    inventory = platform.transport_control(context, "resource_inventory")
+    if (
+        inventory["instance_id"] != snapshot["instance_id"]
+        or inventory["deleted"] != []
+        or inventory["active"] != inventory["created"]
+    ):
+        fail("transport_interaction_inventory_invalid")
+    values = {
+        "role_ids": sorted(
+            resource["resource_id"]
+            for resource in inventory["active"]
+            if resource["kind"] == "role"
+        ),
+        "channel_ids": sorted(
+            resource["resource_id"]
+            for resource in inventory["active"]
+            if resource["kind"] == "channel"
+        ),
+        "panel_message_ids": sorted(
+            resource["resource_id"]
+            for resource in inventory["active"]
+            if resource["kind"] == "message"
+        ),
+    }
+    return {
+        "schema_version": 1,
+        "kind": TRANSPORT_EVIDENCE_KINDS["interaction"],
+        "observed_at": utc_now(),
+        **values,
+        "transport_instance_id": inventory["instance_id"],
+    }
+
+
+def duplicate_transport_evidence(snapshot):
+    gateway = snapshot["gateway"]
+    interaction_id = gateway["last_duplicate_interaction_id"]
+    return {
+        "schema_version": 1,
+        "kind": TRANSPORT_EVIDENCE_KINDS["duplicate"],
+        "observed_at": utc_now(),
+        "interaction_id": interaction_id,
+        "delivery_count": gateway["duplicate_delivery_count"],
+        "transport_duplicate_injections": gateway["duplicate_injections"],
+        "transport_duplicate_delivery_count": gateway[
+            "duplicate_delivery_count"
+        ],
+        "transport_last_duplicate_interaction_id": interaction_id,
+        "transport_instance_id": snapshot["instance_id"],
+    }
+
+
+def reconciliation_transport_evidence(snapshot):
+    effect = snapshot["effect_http"]
+    return {
+        "schema_version": 1,
+        "kind": TRANSPORT_EVIDENCE_KINDS["reconciliation"],
+        "observed_at": utc_now(),
+        "injected_outcome": "indeterminate",
+        "transport_indeterminate_injections": effect["indeterminate_injections"],
+        "transport_last_audit_reason_sha256": effect[
+            "last_indeterminate_audit_reason_sha256"
+        ],
+        "transport_last_upstream_status": effect[
+            "last_indeterminate_upstream_status"
+        ],
+        "transport_instance_id": snapshot["instance_id"],
+    }
+
+
+def gateway_loss_transport_evidence(snapshot, runtime_status):
+    gateway = snapshot["gateway"]
+    return {
+        "schema_version": 1,
+        "kind": TRANSPORT_EVIDENCE_KINDS["gateway-loss"],
+        "observed_at": utc_now(),
+        "gateway_disconnected": gateway["partitioned"],
+        "runtime_ready_status": runtime_status,
+        "transport_gateway_partitioned": gateway["partitioned"],
+        "transport_gateway_partition_events": gateway["partition_events"],
+        "transport_instance_id": snapshot["instance_id"],
+    }
+
+
+def command_transport_evidence(context, platform, checkpoint):
+    if checkpoint not in TRANSPORT_EVIDENCE_KINDS:
+        fail("transport_evidence_checkpoint_invalid")
+    if checkpoint == "gateway-loss":
+        snapshot, runtime_status = require_gateway_loss_certification_boundary(
+            context, platform
+        )
+        current = gateway_loss_transport_evidence(snapshot, runtime_status)
+    else:
+        _state, snapshot = require_candidate_certification_boundary(
+            context, platform
+        )
+        if checkpoint == "interaction":
+            current = interaction_transport_evidence(context, platform, snapshot)
+        elif checkpoint == "duplicate":
+            current = duplicate_transport_evidence(snapshot)
+        else:
+            current = reconciliation_transport_evidence(snapshot)
+    validate_transport_evidence_payload(context, checkpoint, current)
+    path = transport_evidence_path(context, checkpoint)
+    if path.exists():
+        recorded = load_private_json(path, f"transport_evidence_{checkpoint}")
+        validate_transport_evidence_payload(context, checkpoint, recorded)
+        current_semantics = {
+            key: value for key, value in current.items() if key != "observed_at"
+        }
+        recorded_semantics = {
+            key: value for key, value in recorded.items() if key != "observed_at"
+        }
+        if current_semantics != recorded_semantics:
+            fail("transport_evidence_replay_drift")
+        status = "exact_replay"
+        evidence = recorded
+    else:
+        append_journal(context, "transport_evidence", "intent", checkpoint)
+        write_atomic(path, canonical_json(current) + "\n")
+        evidence = load_private_json(path, f"transport_evidence_{checkpoint}")
+        validate_transport_evidence_payload(context, checkpoint, evidence)
+        append_journal(context, "transport_evidence", "complete", checkpoint)
+        status = "recorded"
+    return {
+        "status": status,
+        "phase": "candidate_started",
+        "checkpoint": checkpoint,
+        "kind": evidence["kind"],
+        "transport_instance_id": evidence["transport_instance_id"],
+        "evidence": str(path),
+    }
+
+
 def discord_resource_identity_key(resource):
     return (
         resource["kind"],
@@ -1559,6 +1824,13 @@ def build_parser():
             "heal-gateway",
         ),
     )
+    evidence = subparsers.add_parser("transport-evidence")
+    evidence.add_argument("--manifest", required=True)
+    evidence.add_argument(
+        "--checkpoint",
+        required=True,
+        choices=tuple(TRANSPORT_EVIDENCE_KINDS),
+    )
     return parser
 
 
@@ -1588,6 +1860,12 @@ def main():
                     context,
                     platform,
                     arguments.operation,
+                )
+            elif arguments.command == "transport-evidence":
+                result = command_transport_evidence(
+                    context,
+                    platform,
+                    arguments.checkpoint,
                 )
             elif arguments.command == "certify-live-runtime-restart":
                 confirmation_path = (

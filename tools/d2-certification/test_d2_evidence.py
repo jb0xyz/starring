@@ -90,6 +90,12 @@ class D2EvidenceTest(unittest.TestCase):
             MODULE.canonical_effect_identity_sha256(effect),
             "ffd64eff508caa4add5553394011dac57fe0a7126cbc21b9a476444b6d761d7a",
         )
+        self.assertEqual(
+            MODULE.effect_audit_reason_sha256(
+                MODULE.canonical_effect_identity_sha256(effect)
+            ),
+            "e114d60e98b6bd84e24c86db85597ce7d45e07e98c91466fd6817321c8c9b02d",
+        )
         reordered = dict(reversed(tuple(route.items())))
         self.assertEqual(
             MODULE.canonical_route_identity_sha256(reordered),
@@ -325,12 +331,16 @@ class D2EvidenceTest(unittest.TestCase):
             duplicate_external_effect_count=0,
             unsafe_deletion_count=0,
         )
+        effect_id = MODULE.canonical_effect_identity_sha256(
+            database["effect_identity"]
+        )
         transport = envelope(
             "starring.d2.transport-indeterminate-evidence.v1",
-            interaction_id=interaction_id,
             injected_outcome="indeterminate",
             transport_indeterminate_injections=1,
-            transport_last_audit_reason_sha256="f" * 64,
+            transport_last_audit_reason_sha256=MODULE.effect_audit_reason_sha256(
+                effect_id
+            ),
             transport_last_upstream_status=201,
             transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
         )
@@ -340,6 +350,30 @@ class D2EvidenceTest(unittest.TestCase):
         unsafe["unsafe_deletion_count"] = 1
         with self.assertRaisesRegex(MODULE.EvidenceContractError, "reconciliation_safety_invalid"):
             MODULE.assemble_reconciliation_evidence(unsafe, transport)
+        mismatched = copy.deepcopy(transport)
+        mismatched["transport_last_audit_reason_sha256"] = "f" * 64
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError,
+            "reconciliation_audit_correlation_mismatch",
+        ):
+            MODULE.assemble_reconciliation_evidence(database, mismatched)
+        raw_interaction = copy.deepcopy(transport)
+        raw_interaction["interaction_id"] = interaction_id
+        with self.assertRaisesRegex(MODULE.EvidenceContractError, "fields_invalid"):
+            MODULE.assemble_reconciliation_evidence(database, raw_interaction)
+        boolean_counter = copy.deepcopy(transport)
+        boolean_counter["transport_indeterminate_injections"] = True
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError, "indeterminate_injection_count_invalid"
+        ):
+            MODULE.assemble_reconciliation_evidence(database, boolean_counter)
+        boolean_safety = copy.deepcopy(database)
+        boolean_safety["unsafe_deletion_count"] = False
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError,
+            "reconciliation_unsafe_deletion_count_invalid",
+        ):
+            MODULE.assemble_reconciliation_evidence(boolean_safety, transport)
 
     def test_replacement_and_live_loss_adapters_require_independent_sources(self):
         replacement_browser = envelope(
@@ -396,14 +430,27 @@ class D2EvidenceTest(unittest.TestCase):
             "starring.d2.transport-gateway-loss-evidence.v1",
             gateway_disconnected=True,
             runtime_ready_status=503,
-            route_identity=route_identity("deployment-2", generation=2),
             transport_gateway_partitioned=True,
             transport_gateway_partition_events=1,
             transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
         )
-        loss = MODULE.assemble_live_loss_evidence(loss_browser, loss_transport)
+        loss = MODULE.assemble_live_loss_evidence(
+            loss_browser, loss_transport, replacement["replacement_route_id"]
+        )
         self.assertEqual(replacement["replacement_route_id"], loss["route_id"])
         self.assertEqual(loss["runtime_ready_status"], 503)
+        raw_route = copy.deepcopy(loss_transport)
+        raw_route["route_identity"] = route_identity(
+            "deployment-2", generation=2
+        )
+        with self.assertRaisesRegex(MODULE.EvidenceContractError, "fields_invalid"):
+            MODULE.assemble_live_loss_evidence(
+                loss_browser, raw_route, replacement["replacement_route_id"]
+            )
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError, "live_loss_prior_route_id_invalid"
+        ):
+            MODULE.assemble_live_loss_evidence(loss_browser, loss_transport, "route-raw")
 
     def test_envelopes_reject_extra_and_forbidden_nested_fields(self):
         browser = envelope(
