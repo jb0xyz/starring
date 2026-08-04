@@ -44,6 +44,15 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Build unsafe development activation
         run: cargo build --locked -p interaction-smoke --features unsafe-dev-activation
+      - name: Test D2 certification coordinator
+        run: python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'
+      - name: Test D2 product driver
+        run: node --test tools/d2-certification/product_driver.test.mjs
+      - name: Test D2 certification transport
+        run: |
+          cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check
+          cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml
+          cargo clippy --locked --manifest-path tools/d2-certification-transport/Cargo.toml --all-targets -- -D warnings
       - name: Check Codex worker
         run: npm --prefix tools/codex-worker run check
       - name: Test Codex worker
