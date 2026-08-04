@@ -70,7 +70,7 @@ fn transport_secrets_are_zeroizing_and_queries_are_not_traced() {
     assert!(facade.contains("pub struct ProductRequestId(String)"));
     assert_eq!(
         facade.matches("pub request_id: ProductRequestId").count(),
-        2
+        3
     );
     assert!(!facade.contains("pub idempotency_key: String"));
     assert!(!dto.contains("csrf_token"));

@@ -18,6 +18,9 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use automation_runtime_interaction::{
+    InteractionTokenEnvelopeKeyV1, InteractionTokenEnvelopeKeyringV1,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::startup::{
@@ -754,6 +757,59 @@ impl Debug for RuntimeDiscordBotTokenV1 {
     }
 }
 
+fn parse_interaction_token_envelope_keyring_v1(
+    secret: ResolvedSecretV1,
+) -> Result<InteractionTokenEnvelopeKeyringV1, RuntimeSecretResolutionErrorV1> {
+    let value = secret.take_secret();
+    let payload = value
+        .strip_prefix("v1;active=")
+        .ok_or(RuntimeSecretResolutionErrorV1::InvalidSecret)?;
+    let (active, retired) = payload
+        .split_once(";retired=")
+        .ok_or(RuntimeSecretResolutionErrorV1::InvalidSecret)?;
+    if retired.contains(";retired=") {
+        return Err(RuntimeSecretResolutionErrorV1::InvalidSecret);
+    }
+    let active = parse_interaction_token_envelope_key_v1(active)?;
+    let retired = if retired.is_empty() {
+        Vec::new()
+    } else {
+        retired
+            .split(',')
+            .map(parse_interaction_token_envelope_key_v1)
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    InteractionTokenEnvelopeKeyringV1::new(active, retired)
+        .map_err(|_| RuntimeSecretResolutionErrorV1::InvalidSecret)
+}
+
+fn parse_interaction_token_envelope_key_v1(
+    entry: &str,
+) -> Result<InteractionTokenEnvelopeKeyV1, RuntimeSecretResolutionErrorV1> {
+    let (key_id, encoded) = entry
+        .split_once('=')
+        .ok_or(RuntimeSecretResolutionErrorV1::InvalidSecret)?;
+    if encoded.contains('=') || encoded.len() != 64 {
+        return Err(RuntimeSecretResolutionErrorV1::InvalidSecret);
+    }
+    let mut secret = Zeroizing::new([0_u8; 32]);
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let high = lower_hex_nibble_v1(pair[0])?;
+        let low = lower_hex_nibble_v1(pair[1])?;
+        secret[index] = (high << 4) | low;
+    }
+    InteractionTokenEnvelopeKeyV1::new(key_id, secret)
+        .map_err(|_| RuntimeSecretResolutionErrorV1::InvalidSecret)
+}
+
+fn lower_hex_nibble_v1(byte: u8) -> Result<u8, RuntimeSecretResolutionErrorV1> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(RuntimeSecretResolutionErrorV1::InvalidSecret),
+    }
+}
+
 struct SecretResolverV1<E, K> {
     environment: E,
     keychain: K,
@@ -826,6 +882,19 @@ impl<E: EnvironmentSecretReaderV1, K: KeychainSecretReaderV1> SecretResolverV1<E
             cleanup_deadline,
         )?)
     }
+
+    fn resolve_interaction_token_envelope_keyring(
+        &self,
+        reference: &RuntimeSecretReferenceV1,
+        operation_cutoff: Instant,
+        cleanup_deadline: Instant,
+    ) -> Result<InteractionTokenEnvelopeKeyringV1, RuntimeSecretResolutionErrorV1> {
+        parse_interaction_token_envelope_keyring_v1(self.resolve(
+            reference,
+            operation_cutoff,
+            cleanup_deadline,
+        )?)
+    }
 }
 
 impl<E, K> Debug for SecretResolverV1<E, K> {
@@ -843,6 +912,9 @@ pub enum RuntimeSecretsResolutionErrorV1 {
     DiscordBotToken {
         source: RuntimeSecretResolutionErrorV1,
     },
+    InteractionTokenEnvelopeKeyring {
+        source: RuntimeSecretResolutionErrorV1,
+    },
     DuplicateDatabaseIdentity {
         capability: DatabaseCapabilityV1,
     },
@@ -851,7 +923,9 @@ pub enum RuntimeSecretsResolutionErrorV1 {
 impl RuntimeSecretsResolutionErrorV1 {
     pub const fn code(self) -> &'static str {
         match self {
-            Self::Database { source, .. } | Self::DiscordBotToken { source } => source.code(),
+            Self::Database { source, .. }
+            | Self::DiscordBotToken { source }
+            | Self::InteractionTokenEnvelopeKeyring { source } => source.code(),
             Self::DuplicateDatabaseIdentity { .. } => "runtime_secret_database_identity_duplicate",
         }
     }
@@ -860,6 +934,9 @@ impl RuntimeSecretsResolutionErrorV1 {
         match self {
             Self::Database { capability, .. } => Some(capability.code()),
             Self::DiscordBotToken { .. } => Some("discord_bot_token"),
+            Self::InteractionTokenEnvelopeKeyring { .. } => {
+                Some("interaction_token_envelope_keyring")
+            }
             Self::DuplicateDatabaseIdentity { capability } => Some(capability.code()),
         }
     }
@@ -870,6 +947,9 @@ impl Display for RuntimeSecretsResolutionErrorV1 {
         formatter.write_str(match self {
             Self::Database { .. } => "runtime database secret resolution failed",
             Self::DiscordBotToken { .. } => "Discord bot token resolution failed",
+            Self::InteractionTokenEnvelopeKeyring { .. } => {
+                "interaction token envelope keyring resolution failed"
+            }
             Self::DuplicateDatabaseIdentity { .. } => {
                 "runtime database secret identities must be unique"
             }
@@ -880,7 +960,9 @@ impl Display for RuntimeSecretsResolutionErrorV1 {
 impl std::error::Error for RuntimeSecretsResolutionErrorV1 {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Database { source, .. } | Self::DiscordBotToken { source } => Some(source),
+            Self::Database { source, .. }
+            | Self::DiscordBotToken { source }
+            | Self::InteractionTokenEnvelopeKeyring { source } => Some(source),
             Self::DuplicateDatabaseIdentity { .. } => None,
         }
     }
@@ -942,6 +1024,7 @@ impl Debug for RuntimeDatabaseSecretsByCapabilityV1 {
 pub struct ResolvedRuntimeSecretsV1 {
     database_urls: RuntimeDatabaseSecretsByCapabilityV1,
     discord_bot_token: RuntimeDiscordBotTokenV1,
+    interaction_token_envelope_keyring: InteractionTokenEnvelopeKeyringV1,
 }
 
 pub(crate) fn resolve_runtime_secrets_until_v1(
@@ -1021,9 +1104,23 @@ impl ResolvedRuntimeSecretsV1 {
             ),
             |source| RuntimeSecretsResolutionErrorV1::DiscordBotToken { source },
         )?;
+        let interaction_token_envelope_keyring = map_startup_secret_stage_v1(
+            run_runtime_startup_sync_stage_v1(
+                || Instant::now() < operation_cutoff,
+                || {
+                    resolver.resolve_interaction_token_envelope_keyring(
+                        references.interaction_token_envelope_keyring(),
+                        operation_cutoff,
+                        cleanup_deadline,
+                    )
+                },
+            ),
+            |source| RuntimeSecretsResolutionErrorV1::InteractionTokenEnvelopeKeyring { source },
+        )?;
         Ok(Self {
             database_urls,
             discord_bot_token,
+            interaction_token_envelope_keyring,
         })
     }
 
@@ -1033,6 +1130,10 @@ impl ResolvedRuntimeSecretsV1 {
 
     pub fn discord_bot_token(&self) -> &RuntimeDiscordBotTokenV1 {
         &self.discord_bot_token
+    }
+
+    pub fn interaction_token_envelope_keyring(&self) -> &InteractionTokenEnvelopeKeyringV1 {
+        &self.interaction_token_envelope_keyring
     }
 }
 
@@ -1353,6 +1454,12 @@ mod tests {
 
     use super::*;
 
+    fn interaction_token_key_hex_v1(start: u8) -> String {
+        (0_u8..32)
+            .map(|offset| format!("{:02x}", start.wrapping_add(offset)))
+            .collect()
+    }
+
     #[derive(Default)]
     struct FakeEnvironmentV1 {
         values: BTreeMap<String, String>,
@@ -1575,8 +1682,19 @@ mod tests {
             ),
             b"opaque.discord_bot-token_1234567890abcdef".to_vec(),
         );
-        let references =
-            RuntimeSecretReferencesV1::from_parts(database_references, token_reference);
+        let keyring_name = "STARRING_RUNTIME_TEST_INTERACTION_TOKEN_KEYRING";
+        environment.values.insert(
+            keyring_name.to_string(),
+            format!(
+                "v1;active=key-a={};retired=",
+                interaction_token_key_hex_v1(1)
+            ),
+        );
+        let references = RuntimeSecretReferencesV1::from_parts(
+            database_references,
+            token_reference,
+            RuntimeSecretReferenceV1::parse(&format!("env:{keyring_name}")).unwrap(),
+        );
         let resolved =
             ResolvedRuntimeSecretsV1::resolve(&references, &resolver(environment, keychain))
                 .unwrap();
@@ -1615,6 +1733,12 @@ mod tests {
             token.expose_secret(),
             "opaque.discord_bot-token_1234567890abcdef"
         );
+        let keyring = resolved.interaction_token_envelope_keyring();
+        assert_eq!(keyring.active_key_id(), "key-a");
+        assert_eq!(
+            format!("{keyring:?}"),
+            "InteractionTokenEnvelopeKeyringV1(<redacted>)"
+        );
         for rendered in [
             format!("{:?}", connection.password()),
             format!("{connection:?}"),
@@ -1650,6 +1774,8 @@ mod tests {
         let references = RuntimeSecretReferencesV1::from_parts(
             database_references,
             RuntimeSecretReferenceV1::parse("env:STARRING_RUNTIME_TEST_DISCORD_TOKEN").unwrap(),
+            RuntimeSecretReferenceV1::parse("env:STARRING_RUNTIME_TEST_INTERACTION_TOKEN_KEYRING")
+                .unwrap(),
         );
         let resolver = SecretResolverV1::new(
             CountingEnvironmentV1 {
@@ -1702,6 +1828,8 @@ mod tests {
         let references = RuntimeSecretReferencesV1::from_parts(
             database_references,
             RuntimeSecretReferenceV1::parse(&format!("env:{token_name}")).unwrap(),
+            RuntimeSecretReferenceV1::parse("env:STARRING_RUNTIME_TEST_INTERACTION_TOKEN_KEYRING")
+                .unwrap(),
         );
         let error = ResolvedRuntimeSecretsV1::resolve(
             &references,
@@ -1869,6 +1997,72 @@ mod tests {
             RuntimeDiscordBotTokenV1::parse(resolved_secret(oversized)).unwrap_err(),
             RuntimeSecretResolutionErrorV1::InvalidSecret
         );
+    }
+
+    #[test]
+    fn interaction_token_keyring_parser_accepts_rotation_and_redacts_key_material() {
+        let active = interaction_token_key_hex_v1(1);
+        let retired = interaction_token_key_hex_v1(101);
+        let keyring = parse_interaction_token_envelope_keyring_v1(resolved_secret(format!(
+            "v1;active=key-current={active};retired=key-previous={retired}"
+        )))
+        .unwrap();
+
+        assert_eq!(keyring.active_key_id(), "key-current");
+        assert_eq!(
+            keyring.configured_key_ids(),
+            ["key-current", "key-previous"]
+        );
+        let rendered = format!("{keyring:?}");
+        assert_eq!(rendered, "InteractionTokenEnvelopeKeyringV1(<redacted>)");
+        assert!(!rendered.contains(&active));
+        assert!(!rendered.contains(&retired));
+    }
+
+    #[test]
+    fn interaction_token_keyring_parser_enforces_key_count_and_key_id_contract() {
+        let active = interaction_token_key_hex_v1(200);
+        let retired = (1_u8..=7)
+            .map(|index| format!("key-{index}={}", interaction_token_key_hex_v1(index * 20)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let keyring = parse_interaction_token_envelope_keyring_v1(resolved_secret(format!(
+            "v1;active=active:key/current.v1={active};retired={retired}"
+        )))
+        .unwrap();
+        assert_eq!(keyring.active_key_id(), "active:key/current.v1");
+        assert_eq!(keyring.configured_key_ids().len(), 8);
+
+        let ninth = format!("key-8={}", interaction_token_key_hex_v1(160));
+        assert_eq!(
+            parse_interaction_token_envelope_keyring_v1(resolved_secret(format!(
+                "v1;active=active:key/current.v1={active};retired={retired},{ninth}"
+            )))
+            .unwrap_err(),
+            RuntimeSecretResolutionErrorV1::InvalidSecret
+        );
+    }
+
+    #[test]
+    fn interaction_token_keyring_parser_rejects_ambiguous_or_weak_inputs() {
+        let first = interaction_token_key_hex_v1(1);
+        let second = interaction_token_key_hex_v1(101);
+        for invalid in [
+            format!("active=key-a={first};retired="),
+            format!("v1;active=key-a={first}"),
+            format!("v1;active=key-a={first};retired=;retired="),
+            format!("v1;active=key a={first};retired="),
+            format!("v1;active=key-a={};retired=", first.to_uppercase()),
+            format!("v1;active=key-a={};retired=", &first[..62]),
+            format!("v1;active=key-a={};retired=", "12".repeat(32)),
+            format!("v1;active=key-a={first};retired=key-a={second}"),
+            format!("v1;active=key-a={first};retired=key-b={first}"),
+        ] {
+            assert_eq!(
+                parse_interaction_token_envelope_keyring_v1(resolved_secret(invalid)).unwrap_err(),
+                RuntimeSecretResolutionErrorV1::InvalidSecret
+            );
+        }
     }
 
     fn resolved_secret(value: String) -> ResolvedSecretV1 {

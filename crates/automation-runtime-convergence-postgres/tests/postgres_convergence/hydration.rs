@@ -1,11 +1,11 @@
 const EXACT_TARGET_IDENTITY_FUNCTION: &str =
     "public.starring_runtime_exact_target_reader_database_identity_v1()";
 const EXACT_TARGET_READINESS_FUNCTION: &str =
-    "public.starring_runtime_exact_target_database_readiness_v1()";
-const EXACT_TARGET_READ_FUNCTION: &str = "public.starring_runtime_exact_target_read_v1(text,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text)";
+    "public.starring_runtime_exact_target_database_readiness_v2()";
+const EXACT_TARGET_READ_FUNCTION: &str = "public.starring_runtime_exact_target_read_v2(text,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text)";
 const EXACT_TARGET_READINESS_RESULT: &str = "TABLE(database_identity text, database_name text, executor_role text, checked_at timestamp with time zone)";
 const EXACT_TARGET_READ_ARGUMENTS: &str = "expected_tenant_id text, expected_installation_id text, expected_deployment_id text, expected_promotion_id text, expected_activation_request_id text, expected_deployment_revision bigint, expected_controller_id text, expected_controller_fencing_token bigint, expected_convergence_attempt_no bigint, expected_runtime_generation bigint, expected_guild_id text, expected_ruleset_key text, expected_target_version bigint, expected_target_content_hash text, expected_binding_revision bigint, expected_binding_fingerprint text";
-const EXACT_TARGET_READ_RESULT: &str = "TABLE(deployment_revision bigint, convergence_attempt_no bigint, installation_authority_revision bigint, current_authority_revision bigint, guild_id text, ruleset_key text, target_version bigint, schema_version bigint, definition jsonb, content_hash text, canonical_content_hash text, created_by text, binding_revision bigint, binding_fingerprint text, resource_bindings jsonb)";
+const EXACT_TARGET_READ_RESULT: &str = "TABLE(deployment_revision bigint, convergence_attempt_no bigint, desired_target_digest text, installation_authority_revision bigint, installation_authority_payload_digest text, installation_authority_policy_revision bigint, installation_authority_required_approvals integer, installation_authority_activation_ttl_seconds bigint, current_authority_revision bigint, current_authority_payload_digest text, current_authority_policy_revision bigint, current_authority_required_approvals integer, current_authority_activation_ttl_seconds bigint, guild_id text, ruleset_key text, target_version bigint, schema_version bigint, definition jsonb, content_hash text, canonical_content_hash text, created_by text, binding_revision bigint, binding_fingerprint text, resource_bindings jsonb, database_observed_at timestamp with time zone)";
 
 #[tokio::test]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
@@ -126,11 +126,12 @@ async fn remove_exact_target_restricted_role(database: &mut RuntimeTestDatabase,
     .await
     .unwrap();
     let grant_role = format!("{role}_grant");
-    let grant_exists = sqlx::query_scalar::<_, bool>("SELECT pg_catalog.to_regrole($1) IS NOT NULL")
-        .bind(&grant_role)
-        .fetch_one(&mut database.administrator)
-        .await
-        .unwrap();
+    let grant_exists =
+        sqlx::query_scalar::<_, bool>("SELECT pg_catalog.to_regrole($1) IS NOT NULL")
+            .bind(&grant_role)
+            .fetch_one(&mut database.administrator)
+            .await
+            .unwrap();
     if grant_exists {
         sqlx::query(&format!("REVOKE {grant_role} FROM {role}"))
             .execute(&mut database.administrator)
@@ -263,10 +264,98 @@ async fn exact_target_restricted_role_scenario(
     assert_eq!(hydrated.artifact.ruleset_key.as_str(), RULESET);
     assert_eq!(hydrated.artifact.version, RuleSetVersionId::FIRST);
     assert_eq!(hydrated.artifact.content_hash.to_hex(), CONTENT_HASH);
+    assert_eq!(
+        hydrated.desired_target_digest,
+        runtime_desired_target_digest_v1(
+            &claim.snapshot.identity,
+            &claim.snapshot.target,
+            claim.snapshot.runtime_generation.get(),
+            1,
+            claim.snapshot.previous_runtime.as_ref(),
+        )
+    );
     assert_eq!(hydrated.installation_authority_revision, 1);
+    assert_eq!(
+        hydrated.installation_authority_payload_digest.as_str(),
+        authority_payload_digest_for_test(1, 1, BINDING_FINGERPRINT, 1, 1, 3600)
+    );
     assert_eq!(hydrated.current_authority_revision, 1);
+    assert_eq!(
+        hydrated.current_authority_payload_digest.as_str(),
+        authority_payload_digest_for_test(1, 1, BINDING_FINGERPRINT, 1, 1, 3600)
+    );
     assert!(hydrated.bindings.role_bindings.is_empty());
     assert!(hydrated.bindings.channel_bindings.is_empty());
+    assert!(hydrated.database_observed_at >= claim.acquired_at);
+    assert!(hydrated.database_observed_at < claim.expires_at);
+
+    let unchanged_bindings = json!({});
+    rotate_authority(
+        &owner_pool,
+        AuthorityRotation {
+            revision: 2,
+            binding_revision: 1,
+            resource_bindings: &unchanged_bindings,
+            binding_fingerprint: BINDING_FINGERPRINT,
+            policy_revision: 2,
+            required_approvals: 1,
+            activation_ttl_seconds: 7200,
+        },
+    )
+    .await;
+    let policy_rotated = reader.load_for_claim(&claim).await.unwrap();
+    assert_eq!(policy_rotated.installation_authority_revision, 1);
+    assert_eq!(policy_rotated.current_authority_revision, 2);
+    assert_ne!(
+        policy_rotated.installation_authority_payload_digest,
+        policy_rotated.current_authority_payload_digest
+    );
+    assert_eq!(
+        policy_rotated.current_authority_payload_digest.as_str(),
+        authority_payload_digest_for_test(2, 1, BINDING_FINGERPRINT, 2, 1, 7200)
+    );
+    let desired_target_digest = policy_rotated.desired_target_digest.as_str().to_owned();
+    replace_runtime_desired_target_digest_for_test(&owner_pool, &"0".repeat(64)).await;
+    assert!(matches!(
+        reader.load_for_claim(&claim).await.unwrap_err(),
+        RuntimeConvergenceStoreError::InvalidPersistedState("runtime exact target projection")
+    ));
+    replace_runtime_desired_target_digest_for_test(&owner_pool, &desired_target_digest).await;
+    let historical_authority_payload_digest = policy_rotated
+        .installation_authority_payload_digest
+        .as_str()
+        .to_owned();
+    replace_authority_payload_digest_for_test(&owner_pool, 1, &"0".repeat(64)).await;
+    assert!(matches!(
+        reader.load_for_claim(&claim).await.unwrap_err(),
+        RuntimeConvergenceStoreError::InvalidPersistedState("runtime exact target projection")
+    ));
+    replace_authority_payload_digest_for_test(&owner_pool, 1, &historical_authority_payload_digest)
+        .await;
+    let current_authority_payload_digest = policy_rotated
+        .current_authority_payload_digest
+        .as_str()
+        .to_owned();
+    replace_authority_payload_digest_for_test(&owner_pool, 2, &"0".repeat(64)).await;
+    assert!(matches!(
+        reader.load_for_claim(&claim).await.unwrap_err(),
+        RuntimeConvergenceStoreError::InvalidPersistedState("runtime exact target projection")
+    ));
+    replace_authority_payload_digest_for_test(&owner_pool, 2, &current_authority_payload_digest)
+        .await;
+    let restored = reader.load_for_claim(&claim).await.unwrap();
+    assert_eq!(
+        restored.desired_target_digest.as_str(),
+        desired_target_digest
+    );
+    assert_eq!(
+        restored.installation_authority_payload_digest.as_str(),
+        historical_authority_payload_digest
+    );
+    assert_eq!(
+        restored.current_authority_payload_digest.as_str(),
+        current_authority_payload_digest
+    );
 
     sqlx::query(
         "UPDATE public.product_control_plane_identity \
@@ -288,7 +377,10 @@ async fn exact_target_restricted_role_scenario(
     .execute(&owner_pool)
     .await
     .unwrap();
-    assert_eq!(reader.load_for_claim(&claim).await.unwrap().snapshot, claim.snapshot);
+    assert_eq!(
+        reader.load_for_claim(&claim).await.unwrap().snapshot,
+        claim.snapshot
+    );
 
     let mut stale = claim.clone();
     stale.fencing_token = FencingToken::new(claim.fencing_token.get() + 1).unwrap();
@@ -471,13 +563,13 @@ async fn exact_target_restricted_role_scenario(
 
     let original_readiness_definition = sqlx::query_scalar::<_, String>(
         "SELECT pg_catalog.pg_get_functiondef(pg_catalog.to_regprocedure(\
-         'public.starring_runtime_exact_target_database_readiness_v1()'))",
+         'public.starring_runtime_exact_target_database_readiness_v2()'))",
     )
     .fetch_one(&owner_pool)
     .await
     .unwrap();
     sqlx::query(
-        "CREATE OR REPLACE FUNCTION public.starring_runtime_exact_target_database_readiness_v1() \
+        "CREATE OR REPLACE FUNCTION public.starring_runtime_exact_target_database_readiness_v2() \
          RETURNS TABLE(database_identity TEXT, database_name TEXT, executor_role TEXT, \
           checked_at TIMESTAMPTZ) \
          LANGUAGE plpgsql VOLATILE STRICT PARALLEL UNSAFE SECURITY DEFINER \
@@ -560,12 +652,10 @@ async fn exact_target_restricted_role_scenario(
     single_reader.verify_database_v1().await.unwrap();
 
     let mut blocker = owner_pool.begin().await.unwrap();
-    sqlx::query(
-        "LOCK TABLE public.product_control_plane_identity IN ACCESS EXCLUSIVE MODE",
-    )
-    .execute(&mut *blocker)
-    .await
-    .unwrap();
+    sqlx::query("LOCK TABLE public.product_control_plane_identity IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
     let externally_cancelled = tokio::time::timeout(
         Duration::from_millis(100),
         single_reader.load_for_execution(&post_mutation_execution),
@@ -595,7 +685,10 @@ async fn exact_target_restricted_role_scenario(
     .await
     .unwrap();
     assert!(matches!(
-        reader.load_for_execution(&post_mutation_execution).await.unwrap_err(),
+        reader
+            .load_for_execution(&post_mutation_execution)
+            .await
+            .unwrap_err(),
         RuntimeConvergenceStoreError::DatabaseFailure
     ));
     assert!(matches!(
@@ -629,6 +722,52 @@ async fn assert_exact_target_readiness_authority_mismatch(
         reader.verify_database_v1().await.unwrap_err(),
         RuntimeConvergenceStoreError::DatabaseAuthorityMismatch
     ));
+}
+
+async fn replace_runtime_desired_target_digest_for_test(pool: &PgPool, digest: &str) {
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_deployments SET desired_target_digest = $2 \
+         WHERE deployment_id = $1",
+    )
+    .bind(DEPLOYMENT)
+    .bind(digest)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("SET LOCAL session_replication_role = origin")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+}
+
+async fn replace_authority_payload_digest_for_test(pool: &PgPool, revision: i64, digest: &str) {
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.automation_installation_authority_versions \
+         SET authority_payload_digest = $3 \
+         WHERE installation_id = $1 AND revision = $2",
+    )
+    .bind(INSTALLATION)
+    .bind(revision)
+    .bind(digest)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("SET LOCAL session_replication_role = origin")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
 }
 
 async fn assert_exact_target_role_boundary(pool: &PgPool, role: &str) {
@@ -745,8 +884,8 @@ async fn assert_exact_target_role_boundary(pool: &PgPool, role: &str) {
     assert_eq!(
         executable_names,
         vec![
-            "starring_runtime_exact_target_database_readiness_v1".to_string(),
-            "starring_runtime_exact_target_read_v1".to_string(),
+            "starring_runtime_exact_target_database_readiness_v2".to_string(),
+            "starring_runtime_exact_target_read_v2".to_string(),
             "starring_runtime_exact_target_reader_database_identity_v1".to_string(),
         ]
     );
@@ -780,6 +919,10 @@ async fn assert_exact_target_role_boundary(pool: &PgPool, role: &str) {
     .unwrap();
     assert_eq!(large_object_privilege_count, 0);
     for denied in [
+        "public.starring_runtime_exact_target_database_readiness_v1()",
+        "public.starring_runtime_exact_target_read_v1(text,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text)",
+        "public.starring_runtime_exact_target_schema_manifest_v1()",
+        "public.starring_runtime_exact_target_schema_manifest_v2()",
         "public.starring_runtime_mutation_clock()",
         "public.starring_runtime_lock_current_authority(text,text,text,text,bigint,text,text,bigint,text,bigint,text)",
         "public.starring_runtime_observe_previous_serving_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,jsonb)",

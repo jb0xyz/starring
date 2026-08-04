@@ -513,35 +513,11 @@ async fn requester_rejection_is_atomic_private_rotation_safe_and_exactly_replaya
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn rejection_preserves_prequorum_approval_and_advances_one_new_revision() {
+async fn rejection_from_pending_preserves_zero_approvals_and_advances_one_revision() {
     let pool = pool().await;
-    let fixture = seed_fixture_with_required_approvals(&pool, NonZeroU32::new(2).unwrap()).await;
-    let decisions = product_decisions(&pool);
+    let fixture = seed_fixture(&pool).await;
     let authentication = PostgresAuthentication::new(pool.clone());
-    let approval_authority = authority_adapter(fixture.clone());
     let deployments = PendingDeployments;
-    let approval_application = ProductControlApplication::new(
-        &authentication,
-        &approval_authority,
-        &decisions,
-        &deployments,
-    );
-    let approval = approval_application
-        .approve(
-            &fixture.credential,
-            &fixture.csrf,
-            &ProductRequestIdV1::parse(&format!("reject.preapproval.{}", suffix())).unwrap(),
-            &selector(&fixture),
-            approval_command(&fixture, &format!("reject-preapproval-{}", suffix())),
-        )
-        .await
-        .unwrap();
-    assert_eq!(approval.projection().revision().get(), 2);
-    assert_eq!(
-        approval.projection().phase(),
-        &ProductDecisionPhaseV1::PendingApproval
-    );
-
     let requester = requester_actor_fixture(&pool, &fixture).await;
     let rejection_authority = authority_adapter(requester.clone());
     let rejections = product_rejections(
@@ -566,17 +542,18 @@ async fn rejection_preserves_prequorum_approval_and_advances_one_new_revision() 
                 &requester,
                 &format!("reject-after-approval-{}", suffix()),
                 &reason,
-                2,
+                1,
             ),
         )
         .await
         .unwrap();
-    assert_eq!(rejection.projection().revision().get(), 3);
+    assert_eq!(rejection.projection().revision().get(), 2);
     assert_eq!(
         rejection.projection().phase(),
         &ProductDecisionPhaseV1::Rejected
     );
-    let persisted = sqlx::query_as::<_, (String, i64, String, String, i64, String, i64, i64)>(
+    let persisted =
+        sqlx::query_as::<_, (String, i64, String, String, i64, Option<String>, i64, i64)>(
         "SELECT activation.state, activation.product_revision, activation.rejected_by, \
          activation.rejection_reason, pg_catalog.count(approval.approver_id), \
          pg_catalog.min(approval.approver_id), \
@@ -598,13 +575,13 @@ async fn rejection_preserves_prequorum_approval_and_advances_one_new_revision() 
         persisted,
         (
             "rejected".to_string(),
-            3,
+            2,
             requester.approver_user.to_string(),
             reason,
+            0,
+            None,
             1,
-            fixture.approver_user.to_string(),
-            2,
-            2
+            1
         )
     );
 }

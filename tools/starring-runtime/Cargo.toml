@@ -4,23 +4,31 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+automation-panel-installation = { path = "../../crates/automation-panel-installation" }
 automation-runtime = { path = "../../crates/automation-runtime" }
 automation-runtime-controller = { path = "../../crates/automation-runtime-controller" }
 automation-runtime-convergence = { path = "../../crates/automation-runtime-convergence" }
 automation-runtime-convergence-postgres = { path = "../../crates/automation-runtime-convergence-postgres" }
 automation-runtime-execution-postgres = { path = "../../crates/automation-runtime-execution-postgres" }
+automation-runtime-interaction = { path = "../../crates/automation-runtime-interaction" }
 automation-runtime-interaction-postgres = { path = "../../crates/automation-runtime-interaction-postgres" }
+automation-runtime-panel-evidence = { path = "../../crates/automation-runtime-panel-evidence" }
 automation-runtime-panel-postgres = { path = "../../crates/automation-runtime-panel-postgres" }
 automation-runtime-registry = { path = "../../crates/automation-runtime-registry" }
 automation-runtime-serving-postgres = { path = "../../crates/automation-runtime-serving-postgres" }
 automation-runtime-worker = { path = "../../crates/automation-runtime-worker" }
+chrono = "0.4"
+discord-model = { path = "../../crates/discord-model" }
+futures = "0.3"
 getrandom = "0.4"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 thiserror.workspace = true
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 paused-discord-gateway = { package = "twilight-gateway", git = "https://github.com/twilight-rs/twilight.git", rev = "b4ce13b727e7731b917576ad977300ab6926bb6b", default-features = false, features = ["rustls-platform-verifier"] }
+paused-discord-model = { package = "twilight-model", git = "https://github.com/twilight-rs/twilight.git", rev = "b4ce13b727e7731b917576ad977300ab6926bb6b", default-features = false }
 zeroize = "1"
 
 [dev-dependencies]
-chrono = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde_json.workspace = true
+sha2 = "0.10"

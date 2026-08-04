@@ -1,6 +1,9 @@
-use crate::database_capability::{verify_same_database_distinct_roles, ScopedDatabaseTopologyV1};
+use crate::database_capability::{
+    verify_same_database_distinct_roles, ScopedDatabaseSessionIdentityV1, ScopedDatabaseTopologyV1,
+};
 use crate::{
-    AuthorizedSnapshotReadinessErrorV1, InstallationAuthorityReadinessErrorV1,
+    AuthoringConversationStoreReadinessErrorV1, AuthorizedSnapshotReadinessErrorV1,
+    InstallationAuthorityReadinessErrorV1, PostgresAuthoringConversationStoreV1,
     PostgresAuthorizedPromotionSnapshots, PostgresInstallationAuthoritySource,
     PostgresProductControl, PostgresProductDeploymentOperationalStatusesV2,
     PostgresProductDeploymentStatuses, PostgresProductIdentityStore, PostgresProductPromotions,
@@ -26,6 +29,16 @@ pub enum ProductApiReadinessErrorV1 {
     #[error("product API operational deployment-status readiness failed")]
     OperationalDeploymentStatus(#[source] ProductDeploymentOperationalStatusReadinessErrorV2),
     #[error("product API database topology is invalid")]
+    TopologyMismatch,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProductApiAuthoringReadinessErrorV1 {
+    #[error(transparent)]
+    Core(#[from] ProductApiReadinessErrorV1),
+    #[error("product API authoring-writer readiness failed")]
+    AuthoringWriter(#[source] AuthoringConversationStoreReadinessErrorV1),
+    #[error("product API authoring database topology is invalid")]
     TopologyMismatch,
 }
 
@@ -63,6 +76,59 @@ impl<'a, G, C> PostgresProductApiReadiness<'a, G, C> {
 
 impl<G, C: SnapshotEnvelopeCipher> PostgresProductApiReadiness<'_, G, C> {
     pub async fn verify_readiness(&self) -> Result<(), ProductApiReadinessErrorV1> {
+        let topologies = self.load_core_topologies().await?;
+        verify_same_database_distinct_roles(&topologies)
+            .map_err(|_| ProductApiReadinessErrorV1::TopologyMismatch)
+    }
+
+    pub async fn verify_authoring_readiness<W: SnapshotEnvelopeCipher>(
+        &self,
+        writer: &PostgresAuthoringConversationStoreV1<W>,
+    ) -> Result<(), ProductApiAuthoringReadinessErrorV1> {
+        let writer = match writer.check_readiness().await {
+            Ok(writer) => writer,
+            Err(AuthoringConversationStoreReadinessErrorV1::CapabilityMissing) => {
+                let core = self.load_core_topologies().await?;
+                let session_identity = writer.check_session_identity().await.ok();
+                if session_identity
+                    .as_ref()
+                    .is_some_and(|identity| reuses_core_role(&core, identity))
+                {
+                    return Err(ProductApiAuthoringReadinessErrorV1::TopologyMismatch);
+                }
+                return Err(ProductApiAuthoringReadinessErrorV1::AuthoringWriter(
+                    AuthoringConversationStoreReadinessErrorV1::CapabilityMissing,
+                ));
+            }
+            Err(error) => {
+                return Err(ProductApiAuthoringReadinessErrorV1::AuthoringWriter(error));
+            }
+        };
+        let core = self.load_core_topologies().await?;
+        let topologies: [ScopedDatabaseTopologyV1; 15] = [
+            core[0].clone(),
+            core[1].clone(),
+            core[2].clone(),
+            core[3].clone(),
+            core[4].clone(),
+            core[5].clone(),
+            core[6].clone(),
+            core[7].clone(),
+            core[8].clone(),
+            core[9].clone(),
+            core[10].clone(),
+            core[11].clone(),
+            core[12].clone(),
+            core[13].clone(),
+            writer,
+        ];
+        verify_same_database_distinct_roles(&topologies)
+            .map_err(|_| ProductApiAuthoringReadinessErrorV1::TopologyMismatch)
+    }
+
+    async fn load_core_topologies(
+        &self,
+    ) -> Result<[ScopedDatabaseTopologyV1; 14], ProductApiReadinessErrorV1> {
         let identity = self
             .identity
             .check_readiness()
@@ -98,7 +164,7 @@ impl<G, C: SnapshotEnvelopeCipher> PostgresProductApiReadiness<'_, G, C> {
             .check_readiness()
             .await
             .map_err(ProductApiReadinessErrorV1::OperationalDeploymentStatus)?;
-        let topologies: [ScopedDatabaseTopologyV1; 14] = [
+        Ok([
             identity[0].clone(),
             identity[1].clone(),
             identity[2].clone(),
@@ -113,8 +179,42 @@ impl<G, C: SnapshotEnvelopeCipher> PostgresProductApiReadiness<'_, G, C> {
             decisions[4].clone(),
             deployment_status,
             operational_deployment_status,
-        ];
-        verify_same_database_distinct_roles(&topologies)
-            .map_err(|_| ProductApiReadinessErrorV1::TopologyMismatch)
+        ])
+    }
+}
+
+fn reuses_core_role(
+    core: &[ScopedDatabaseTopologyV1],
+    writer: &ScopedDatabaseSessionIdentityV1,
+) -> bool {
+    core.iter()
+        .any(|topology| topology.role_name == writer.role_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_writer_override_is_role_reuse_not_database_identity_substitution() {
+        let core = [ScopedDatabaseTopologyV1 {
+            database_identity: "01234567-89ab-4def-8123-456789abcdef".to_string(),
+            database_name: "primary".to_string(),
+            role_name: "oauth".to_string(),
+        }];
+        assert!(reuses_core_role(
+            &core,
+            &ScopedDatabaseSessionIdentityV1 {
+                database_name: "secondary".to_string(),
+                role_name: "oauth".to_string(),
+            }
+        ));
+        assert!(!reuses_core_role(
+            &core,
+            &ScopedDatabaseSessionIdentityV1 {
+                database_name: "primary".to_string(),
+                role_name: "writer".to_string(),
+            }
+        ));
     }
 }

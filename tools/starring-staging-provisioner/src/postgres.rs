@@ -471,6 +471,7 @@ pub fn alter_role_password_sql(
         "starring_operational_deployment_status_reader" => {
             "starring_operational_deployment_status_reader"
         }
+        "starring_authoring_session_writer" => "starring_authoring_session_writer",
         "starring_runtime_execution" => "starring_runtime_execution",
         "starring_runtime_exact_target" => "starring_runtime_exact_target",
         "starring_runtime_panel" => "starring_runtime_panel",

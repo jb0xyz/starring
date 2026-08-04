@@ -19,7 +19,7 @@ const PREVIOUS_READINESS_DIGEST: &str =
 const CURRENT_READINESS_DIGEST: &str =
     "ee9364b3bb8b17a3a2386c0be06ae2ab12b519c77647a4073e96f45bfb5084a8";
 const LATEST_READINESS_DIGEST: &str =
-    "572d7ffd19d6f2edb5ec84ea6b7bfebd178c7da0568bce61af2f7907cfe72647";
+    "b632e1b778ef166f88e6ea206a30bd807b7357e210c29268bc98f39187310faf";
 const DIGEST_IDENTITY: &str =
     "starring_runtime_private_v2.starring_runtime_startup_recovery_terminal_digest_v2(smallint,text,bigint,bigint,bigint,bigint,text,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,timestamp with time zone,bytea)";
 const RECORD_IDENTITY: &str =

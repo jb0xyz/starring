@@ -504,8 +504,10 @@ async fn pending_drain_closes_known_slot_execution_writers(database: &IsolatedDa
     assert!(pending.0 .3.is_some());
 
     let adapter = verified_execution_adapter(database).await;
+    let execution = session.current_execution_receipt().unwrap();
 
-    let mut renewal_session = session.clone();
+    let mut renewal_session =
+        RuntimeConvergenceSessionV1::from_claim(execution.clone()).unwrap();
     let renewal = renewal_session
         .begin_renewal(Duration::from_secs(400))
         .unwrap();
@@ -519,7 +521,8 @@ async fn pending_drain_closes_known_slot_execution_writers(database: &IsolatedDa
         pending_drain_counts
     );
 
-    let mut mutation_session = session.clone();
+    let mut mutation_session =
+        RuntimeConvergenceSessionV1::from_claim(execution).unwrap();
     let mutation = mutation_session
         .begin_mutation(RuntimeConvergenceMutationV1::RecordBlockedFailure {
             failure_id: RuntimeFailureId::parse("runtime-pending-slot-epoch-failure").unwrap(),

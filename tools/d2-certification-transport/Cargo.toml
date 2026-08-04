@@ -1,0 +1,26 @@
+[package]
+name = "d2-certification-transport"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+futures-util = "0.3"
+getrandom = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
+percent-encoding = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+
+[dev-dependencies]
+paused-discord-gateway = { package = "twilight-gateway", git = "https://github.com/twilight-rs/twilight.git", rev = "b4ce13b727e7731b917576ad977300ab6926bb6b", default-features = false, features = ["rustls-platform-verifier"] }
+tempfile = "3"

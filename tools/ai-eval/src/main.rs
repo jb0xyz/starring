@@ -15,7 +15,6 @@ fn main() {
                     eprintln!("artifact write failed: {error}");
                 }
                 print!("{}", report.render());
-                return;
             }
             Err(error) => {
                 eprintln!("no endpoint: {error}");

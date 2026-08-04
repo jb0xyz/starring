@@ -1,10 +1,10 @@
 pub(super) const DATABASE_READINESS_QUERY: &str =
-    "SELECT * FROM public.starring_runtime_exact_target_database_readiness_v1()";
+    "SELECT * FROM public.starring_runtime_exact_target_database_readiness_v2()";
 
 pub(super) const DATABASE_READINESS_DEFINITION_QUERY: &str =
     "SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(\
         pg_catalog.pg_get_functiondef(pg_catalog.to_regprocedure(\
-            'public.starring_runtime_exact_target_database_readiness_v1()'\
+            'public.starring_runtime_exact_target_database_readiness_v2()'\
         )), 'UTF8')), 'hex')";
 
 pub(super) const DATABASE_BINDING_QUERY: &str =
@@ -13,5 +13,5 @@ pub(super) const DATABASE_BINDING_QUERY: &str =
         session_user::TEXT AS executor_role";
 
 pub(super) const EXACT_TARGET_QUERY: &str =
-    "SELECT * FROM public.starring_runtime_exact_target_read_v1(\
+    "SELECT * FROM public.starring_runtime_exact_target_read_v2(\
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)";

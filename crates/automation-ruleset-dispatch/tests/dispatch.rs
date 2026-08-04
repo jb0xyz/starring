@@ -15,7 +15,8 @@ use automation_ruleset::{
     RuleSetStore, RuleSetStoreError, RuleSetVersion, RuleSetVersionId,
 };
 use automation_ruleset_dispatch::{
-    dispatch_instance_action, dispatch_instance_action_with_resolver_v1, DispatchError,
+    dispatch_instance_action, dispatch_instance_action_with_resolver_v1,
+    execute_prepared_instance_action_v1, prepare_instance_action_with_resolver_v1, DispatchError,
     FailureResponseOutcome, GuildRoleSnapshot, GuildRoleSnapshotProvider,
     PinnedInstanceResolverErrorV1, PinnedInstanceResolverV1, ResolvedPinnedInstanceV1,
     SnapshotError,
@@ -442,6 +443,61 @@ fn narrow_dispatch_resolves_the_exact_pin_once() {
     assert_eq!(outcome, HandleOutcome::Executed);
     assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.trace.lock().unwrap()[..2], ["defer", "snapshot"]);
+}
+
+#[test]
+fn narrow_preparation_exposes_exact_execution_without_performing_effects() {
+    let fixture = fixture(false, false, None);
+    let version = publish(&fixture.rulesets.inner, join_rule("v1"));
+    let artifact = block_on(fixture.rulesets.inner.get_version(GUILD, &key(), version))
+        .unwrap()
+        .unwrap();
+    let resolver = CountingPinnedResolver {
+        calls: AtomicUsize::new(0),
+        resolved: ResolvedPinnedInstanceV1 {
+            instance: instance("room_a", version.get(), InstanceStatus::Active),
+            artifact,
+        },
+    };
+    let snapshot = StubSnapshot {
+        trace: fixture.trace.clone(),
+        result: Ok(admin_snapshot()),
+    };
+    let prepared = block_on(prepare_instance_action_with_resolver_v1(
+        &join_event("room_a"),
+        &InstanceId::parse("room_a").unwrap(),
+        "join",
+        "studyroom_demo",
+        &resolver,
+        &snapshot,
+        &ResourceBindingMap::default(),
+    ))
+    .unwrap();
+
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    assert!(prepared.leading_defer_ephemeral());
+    assert_eq!(prepared.context().ruleset_key, "studyroom_demo");
+    assert_eq!(prepared.context().ruleset_version.get(), version.get());
+    assert_eq!(
+        prepared
+            .context()
+            .instance
+            .as_ref()
+            .map(|context| context.instance.id.as_str()),
+        Some("room_a")
+    );
+    assert_eq!(prepared.plan().steps.len(), 2);
+    assert!(fixture.mutation.calls().is_empty());
+    assert_eq!(*fixture.trace.lock().unwrap(), vec!["snapshot"]);
+
+    let outcome = block_on(execute_prepared_instance_action_v1(
+        prepared,
+        &services(&fixture),
+    ))
+    .unwrap();
+    assert_eq!(outcome, HandleOutcome::Executed);
+    assert_eq!(fixture.mutation.calls().len(), 1);
+    assert_eq!(*fixture.trace.lock().unwrap(), vec!["snapshot", "edit"]);
 }
 
 #[test]

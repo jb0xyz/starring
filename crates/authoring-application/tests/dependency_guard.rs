@@ -55,14 +55,21 @@ fn regular_dependencies_stay_pure() {
         "rusqlite",
         "axum",
         "ai-gateway",
+        "authoring-application-discord",
+        "authoring-application-postgres",
         "automation-runtime",
         "automation-ruleset-activation",
         "automation-ruleset-readiness",
         "approval-manager",
+        "design-harness-codex-worker-client",
+        "hyper",
         "policy-engine",
         "preview",
         "postgres",
+        "reqwest",
         "tokio-postgres",
+        "tokio",
+        "tower",
     ];
 
     for dependency in &dependencies {
@@ -77,6 +84,10 @@ fn regular_dependencies_stay_pure() {
         assert!(
             !dependency.ends_with("-postgres"),
             "forbidden PostgreSQL adapter dependency: {dependency}"
+        );
+        assert!(
+            !dependency.starts_with("automation-runtime"),
+            "forbidden runtime dependency: {dependency}"
         );
     }
 }
@@ -102,6 +113,246 @@ ai-gateway = "1"
             "design-harness".to_string(),
         ])
     );
+}
+
+#[test]
+fn conversation_command_accepts_only_client_owned_inputs_and_server_commit_boundary() {
+    let command_source = include_str!("../src/conversation/command.rs");
+    let command = command_source
+        .split("pub struct StartOrAdvanceAuthoringTurnV1")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    let fields = command
+        .lines()
+        .filter_map(|line| line.trim().strip_suffix(','))
+        .filter_map(|line| line.split_once(':').map(|(field, _)| field.trim()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        fields,
+        BTreeSet::from([
+            "commit_boundary",
+            "expected_generation",
+            "human_message",
+            "idempotency_key",
+            "session_id",
+        ])
+    );
+    assert!(!command.contains("pub "));
+    assert!(command_source.contains("StartOrAdvanceAuthoringTurnV1(<redacted>)"));
+    assert!(!command_source.contains(
+        "#[derive(Clone, Debug, PartialEq, Eq)]\npub struct StartOrAdvanceAuthoringTurnV1"
+    ));
+
+    let constructor = command_source
+        .split("impl StartOrAdvanceAuthoringTurnV1")
+        .nth(1)
+        .unwrap()
+        .split("pub fn session_id")
+        .next()
+        .unwrap();
+    for forbidden in [
+        "tenant",
+        "principal",
+        "guild",
+        "acting_user",
+        "application_id",
+        "installation",
+        "model",
+        "recipe",
+        "draft",
+        "candidate",
+        "authority",
+        "binding",
+        "ruleset",
+        "preview",
+    ] {
+        assert!(
+            !constructor.contains(forbidden),
+            "conversation command constructor leaked {forbidden}"
+        );
+    }
+
+    let service = include_str!("../src/conversation/service.rs");
+    let entrypoint = service
+        .split("pub async fn start_or_advance_turn")
+        .nth(1)
+        .unwrap()
+        .split(") -> Result")
+        .next()
+        .unwrap();
+    for required in ["credential", "csrf", "installation", "command"] {
+        assert!(
+            entrypoint.contains(required),
+            "conversation entrypoint omitted {required}"
+        );
+    }
+    for forbidden in [
+        "tenant",
+        "principal",
+        "guild_id",
+        "acting_user",
+        "application_id",
+        "model",
+        "recipe",
+        "draft",
+        "candidate",
+        "authority_revision",
+        "authority_digest",
+        "binding",
+        "ruleset",
+        "preview",
+    ] {
+        assert!(
+            !entrypoint.contains(forbidden),
+            "conversation entrypoint leaked {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn conversation_application_derives_trusted_state_and_stays_edge_free() {
+    let service = include_str!("../src/conversation/service.rs");
+    for required in [
+        "authenticate_mutation(credential, csrf)",
+        "AuthenticatedActorV1::from_authentication_claims",
+        "authorize_installation(&actor, installation, CapabilityV1::Author)",
+        "LocalAuthoringRequestKeyV1::from_authorized_scope",
+        "AuthoringStoredRequestIdentityV1::from_access",
+        "AuthoringTurnOutcomeV1::NotCommitted",
+        "DesignSession::restore_intent_recipe",
+        "DesignSession::with_intent_recipe_config",
+        "session.run_burst(command.human_message().as_str())",
+        "session.export_preview_ready_artifact()",
+    ] {
+        assert!(
+            service.contains(required),
+            "conversation application omitted trusted derivation: {required}"
+        );
+    }
+
+    let composition = service
+        .split("pub struct ConversationApplication")
+        .nth(1)
+        .unwrap()
+        .split("impl<A, G, S, Q, C>")
+        .next()
+        .unwrap();
+    for required in [
+        "authentication",
+        "guild_authority",
+        "store",
+        "admission",
+        "client",
+        "config",
+    ] {
+        assert!(
+            composition.contains(required),
+            "conversation composition omitted {required}"
+        );
+    }
+    for forbidden in [
+        "Postgres",
+        "Twilight",
+        "DiscordGuild",
+        "CodexWorkerClient",
+        "ProductApplyPort",
+        "ProductDecisionPort",
+        "PromotionSubmissionPort",
+        "DeploymentStatusPort",
+        "Runtime",
+        "Activation",
+    ] {
+        assert!(
+            !composition.contains(forbidden),
+            "conversation composition gained forbidden edge: {forbidden}"
+        );
+    }
+
+    let conversation = conversation_source();
+    for forbidden in [
+        "sqlx::",
+        "rusqlite::",
+        "reqwest::",
+        "tokio::",
+        "twilight_",
+        "authoring_application_discord",
+        "authoring_application_postgres",
+        "design_harness_codex_worker_client",
+    ] {
+        assert!(
+            !conversation.contains(forbidden),
+            "conversation source gained forbidden edge: {forbidden}"
+        );
+    }
+
+    let ports = include_str!("../src/conversation/ports.rs");
+    for required in [
+        "from_verified_storage_match",
+        "PreviewReadyArtifactV1",
+        "preview_ready_artifact",
+        "projection.validate_for_storage",
+        "matches_access",
+    ] {
+        assert!(
+            ports.contains(required),
+            "conversation ports omitted storage boundary: {required}"
+        );
+    }
+    assert!(!ports.contains("Backend(String)"));
+
+    let projection = include_str!("../src/conversation/projection.rs");
+    for required in [
+        "SafeAuthoringProjectionError::NonDurableState",
+        "SafeAuthoringTurnStateV1::Unsupported | SafeAuthoringTurnStateV1::Rejected",
+    ] {
+        assert!(
+            projection.contains(required),
+            "conversation projection omitted durable-state boundary: {required}"
+        );
+    }
+
+    let library = include_str!("../src/lib.rs");
+    assert!(library.contains("pub use design_harness::PreviewReadyArtifactV1"));
+}
+
+#[test]
+fn conversation_sources_contain_no_comments() {
+    for (path, source) in [
+        (
+            "src/conversation/command.rs",
+            include_str!("../src/conversation/command.rs"),
+        ),
+        (
+            "src/conversation/mod.rs",
+            include_str!("../src/conversation/mod.rs"),
+        ),
+        (
+            "src/conversation/ports.rs",
+            include_str!("../src/conversation/ports.rs"),
+        ),
+        (
+            "src/conversation/projection.rs",
+            include_str!("../src/conversation/projection.rs"),
+        ),
+        (
+            "src/conversation/service.rs",
+            include_str!("../src/conversation/service.rs"),
+        ),
+    ] {
+        for (index, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            assert!(
+                !trimmed.starts_with("//")
+                    && !trimmed.starts_with("/*")
+                    && !trimmed.ends_with("*/"),
+                "source comment at {path}:{}",
+                index + 1
+            );
+        }
+    }
 }
 
 #[test]
@@ -392,6 +643,17 @@ fn source() -> String {
         include_str!("../src/promotion.rs"),
         include_str!("../src/status.rs"),
         include_str!("../src/status/runtime.rs"),
+    ]
+    .join("\n")
+}
+
+fn conversation_source() -> String {
+    [
+        include_str!("../src/conversation/command.rs"),
+        include_str!("../src/conversation/mod.rs"),
+        include_str!("../src/conversation/ports.rs"),
+        include_str!("../src/conversation/projection.rs"),
+        include_str!("../src/conversation/service.rs"),
     ]
     .join("\n")
 }

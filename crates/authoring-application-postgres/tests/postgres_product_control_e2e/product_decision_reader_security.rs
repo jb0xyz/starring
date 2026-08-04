@@ -177,6 +177,21 @@ async fn product_decision_reader_is_function_scoped_non_enumerating_and_fail_clo
                 .unwrap(),
             ProductStatusV1::PendingApproval
         );
+        let status = application
+            .get_product_status_observation(
+                &fixture.credential,
+                &selector(&fixture),
+                status_query(&fixture),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), ProductStatusV1::PendingApproval);
+        assert_eq!(status.decision().revision().get(), 1);
+        assert_eq!(
+            status.approval_payload_digest().as_str(),
+            fixture.payload_digest
+        );
+        assert!(status.deployment().is_none());
 
         sqlx::query(
             "UPDATE public.product_tenants \

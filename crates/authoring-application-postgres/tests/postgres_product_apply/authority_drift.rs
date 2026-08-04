@@ -543,7 +543,7 @@ async fn policy_drift_persists_exact_expected_and_observed_policy() {
             resource_bindings: &bindings,
             binding_fingerprint: &fingerprint,
             policy_revision: 2,
-            required_approvals: 2,
+            required_approvals: 1,
             activation_ttl_seconds: 1_800,
         },
     )
@@ -577,7 +577,7 @@ async fn policy_drift_persists_exact_expected_and_observed_policy() {
     assert_eq!(termination["reason"]["expected_revision"], 1);
     assert_eq!(termination["reason"]["observed_revision"], 2);
     assert_eq!(termination["reason"]["expected_required_approvals"], 1);
-    assert_eq!(termination["reason"]["observed_required_approvals"], 2);
+    assert_eq!(termination["reason"]["observed_required_approvals"], 1);
     assert_eq!(termination["reason"]["expected_ttl_seconds"], 3_600);
     assert_eq!(termination["reason"]["observed_ttl_seconds"], 1_800);
     assert_eq!(persisted.audit_authority_revision, Some(2));

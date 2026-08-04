@@ -6,19 +6,27 @@ use std::time::Duration;
 use authoring_application::{
     ApplyProductPromotionV1, ApprovalPayloadDigestV1, ApproveProductPromotionV1,
     AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationClaimsV1,
-    AuthenticationError, AuthenticationPort, AuthorizedApplyProductV1, AuthorizedApprovalPreviewV1,
-    AuthorizedApproveProductV1, AuthorizedCancelProductLifecycleV1, AuthorizedDeploymentStatusV1,
-    AuthorizedProductStatusV1, AuthorizedRejectProductV1, CancelProductLifecycleMutationV1,
-    CapabilityV1, DeploymentStatusPort, DeploymentStatusPortError, DeploymentStatusProjectionV1,
-    FreshGuildAuthorityError, InstallationSelectorV1, MutationAuthenticationPort,
-    ProductApplicationError, ProductApplyPort, ProductApprovalPort, ProductApprovalPreviewV1,
-    ProductControlApplication, ProductControlPortError, ProductDecisionPhaseV1,
-    ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductDrainSelectorV1,
-    ProductIdempotencyKeyV1, ProductLifecycleCancellationPort,
-    ProductLifecycleCancellationReasonV1, ProductLifecycleCancellationReceiptV1,
-    ProductMutationReceiptV1, ProductRejectionPort, ProductRequestIdV1, ProductRevisionV1,
-    ProductStatusQueryV1, ProductStatusV1, PromotionSelectorV1, RejectProductPromotionV1,
-    RejectionReasonV1,
+    AuthenticationError, AuthenticationPort, AuthoringAdmissionError, AuthoringCommitOutcomeV1,
+    AuthoringConversationConfigV1, AuthoringConversationError, AuthoringExpectedGenerationV1,
+    AuthoringHumanMessageV1, AuthoringMutationDispositionV1, AuthoringSessionCommitPort,
+    AuthoringSessionLoadError, AuthoringSessionLoadPort, AuthoringSessionLoadV1,
+    AuthoringStoredGenerationV1, AuthoringStoredRequestIdentityV1, AuthoringTurnAdmissionPort,
+    AuthoringTurnCheckV1, AuthoringTurnOutcomeV1, AuthorizedApplyProductV1,
+    AuthorizedApprovalPreviewV1, AuthorizedApproveProductV1, AuthorizedAuthoringCommitV1,
+    AuthorizedCancelProductLifecycleV1, AuthorizedConversationAccessV1,
+    AuthorizedDeploymentStatusV1, AuthorizedInstallationScopeV1, AuthorizedProductStatusV1,
+    AuthorizedRejectProductV1, CancelProductLifecycleMutationV1, CapabilityV1,
+    ConversationApplication, DeploymentStatusPort, DeploymentStatusPortError,
+    DeploymentStatusProjectionV1, FreshGuildAuthorityError, InstallationSelectorV1,
+    LocalAuthoringRequestKeyV1, MutationAuthenticationPort, ProductApplicationError,
+    ProductApplyPort, ProductApprovalPort, ProductApprovalPreviewV1, ProductControlApplication,
+    ProductControlPortError, ProductDecisionPhaseV1, ProductDecisionProjectionV1,
+    ProductDecisionQueryPort, ProductDrainSelectorV1, ProductIdempotencyKeyV1,
+    ProductLifecycleCancellationPort, ProductLifecycleCancellationReasonV1,
+    ProductLifecycleCancellationReceiptV1, ProductMutationReceiptV1, ProductRejectionPort,
+    ProductRequestIdV1, ProductRevisionV1, ProductStatusQueryV1, ProductStatusV1,
+    PromotionSelectorV1, RejectProductPromotionV1, RejectionReasonV1,
+    SafeAuthoringTurnProjectionV1, StartOrAdvanceAuthoringTurnV1,
 };
 use authoring_application_discord::{
     AuthorityClock, DiscordApplicationIdV1, DiscordAuthorityClientError, DiscordAuthorityConfigV1,
@@ -27,8 +35,12 @@ use authoring_application_discord::{
     DiscordRoleSnapshotV1, FreshDiscordAuthorityEvidenceV1, InstallationAuthorityRecordV1,
     InstallationAuthoritySource,
 };
-use authoring_promotion::{AutomationInstallationId, PrincipalId, PromotionId, TenantId};
+use authoring_promotion::{
+    AuthoringSessionId, AutomationInstallationId, PrincipalId, PromotionId, SessionGeneration,
+    TenantId,
+};
 use chrono::{TimeZone, Utc};
+use design_harness::{LlmClient, LlmError, LlmResponse, Message, ToolDefinition};
 use discord_model::{GuildId, Permissions, RoleId, UserId};
 
 #[derive(Clone)]
@@ -296,6 +308,85 @@ impl DeploymentStatusPort<FreshDiscordAuthorityEvidenceV1> for Deployments {
     }
 }
 
+struct AuthorReplayStore {
+    evidence: Arc<Mutex<Option<FreshDiscordAuthorityEvidenceV1>>>,
+    stored: AuthoringStoredGenerationV1,
+}
+
+impl AuthoringSessionLoadPort<FreshDiscordAuthorityEvidenceV1> for AuthorReplayStore {
+    async fn check_replay_or_head(
+        &self,
+        access: &AuthorizedConversationAccessV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<AuthoringTurnCheckV1, AuthoringSessionLoadError> {
+        self.evidence
+            .lock()
+            .unwrap()
+            .replace(access.evidence().clone());
+        Ok(AuthoringTurnCheckV1::ExactReplay(self.stored.clone()))
+    }
+
+    async fn load_exact_generation(
+        &self,
+        _access: &AuthorizedConversationAccessV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<AuthoringSessionLoadV1, AuthoringSessionLoadError> {
+        panic!("exact replay must not load an authoring generation")
+    }
+}
+
+impl AuthoringSessionCommitPort<FreshDiscordAuthorityEvidenceV1> for AuthorReplayStore {
+    async fn commit_authorized_generation(
+        &self,
+        _request: AuthorizedAuthoringCommitV1<'_, FreshDiscordAuthorityEvidenceV1>,
+    ) -> Result<AuthoringCommitOutcomeV1, AuthoringSessionLoadError> {
+        panic!("exact replay must not commit an authoring generation")
+    }
+}
+
+struct ReplayAdmission {
+    keyed_calls: Arc<Mutex<usize>>,
+    model_calls: Arc<Mutex<usize>>,
+}
+
+impl AuthoringTurnAdmissionPort for ReplayAdmission {
+    type KeyedPermit = ();
+    type ModelPermit = ();
+
+    async fn acquire_keyed(
+        &self,
+        _key: &LocalAuthoringRequestKeyV1,
+    ) -> Result<Self::KeyedPermit, AuthoringAdmissionError> {
+        *self.keyed_calls.lock().unwrap() += 1;
+        Ok(())
+    }
+
+    async fn acquire_model_capacity(&self) -> Result<Self::ModelPermit, AuthoringAdmissionError> {
+        *self.model_calls.lock().unwrap() += 1;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct NeverClient;
+
+impl LlmClient for NeverClient {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, LlmError> {
+        panic!("exact replay must not call the model")
+    }
+}
+
+struct AuthorReplayObservation {
+    result: Result<AuthoringTurnOutcomeV1, AuthoringConversationError>,
+    evidence: Option<FreshDiscordAuthorityEvidenceV1>,
+    authority_calls: usize,
+    apply_calls: usize,
+    keyed_calls: usize,
+    model_calls: usize,
+}
+
 fn app_id() -> DiscordApplicationIdV1 {
     DiscordApplicationIdV1::new(99).unwrap()
 }
@@ -453,6 +544,90 @@ fn cancellation_command() -> CancelProductLifecycleMutationV1 {
     }
 }
 
+fn authoring_command() -> StartOrAdvanceAuthoringTurnV1 {
+    StartOrAdvanceAuthoringTurnV1::new(
+        AuthoringSessionId::parse("author-session-1").unwrap(),
+        AuthoringExpectedGenerationV1::new(0).unwrap(),
+        ProductIdempotencyKeyV1::parse("author-request-1").unwrap(),
+        AuthoringHumanMessageV1::parse("Create a private study room").unwrap(),
+    )
+}
+
+fn authoring_replay_generation(
+    command: &StartOrAdvanceAuthoringTurnV1,
+) -> AuthoringStoredGenerationV1 {
+    let projection = SafeAuthoringTurnProjectionV1::from_canonical_json(
+        br#"{"schema_version":1,"state":"discussion","assistant_message":"Already designed","capabilities":[],"draft":{"panels":0,"modals":0,"rules":0,"actions":0,"unresolved_references":[]},"preview":null}"#,
+    )
+    .unwrap();
+    let identity = AuthoringStoredRequestIdentityV1::from_verified_storage_match(
+        AuthorizedInstallationScopeV1::from_fresh_authority(
+            TenantId::parse("tenant-1").unwrap(),
+            AutomationInstallationId::parse("install-1").unwrap(),
+            GuildId(10),
+            UserId(20),
+        ),
+        PrincipalId::parse("principal-1").unwrap(),
+        command.session_id().clone(),
+        command.expected_generation(),
+        command.idempotency_key().clone(),
+        command.human_message().clone(),
+    );
+    AuthoringStoredGenerationV1::from_storage(
+        identity,
+        SessionGeneration::new(1).unwrap(),
+        projection,
+        None,
+    )
+    .unwrap()
+}
+
+async fn author_replay(
+    authority_snapshot: DiscordGuildAuthoritySnapshotV1,
+) -> AuthorReplayObservation {
+    let mut client = runtime_client(Err(DiscordAuthorityClientError::InvalidResponse));
+    client.authority_result = Ok(authority_snapshot);
+    client.bot_user_id = None;
+    let authority_calls = client.authority_calls.clone();
+    let apply_calls = client.apply_calls.clone();
+    let adapter = runtime_adapter(client);
+    let command = authoring_command();
+    let evidence = Arc::new(Mutex::new(None));
+    let store = AuthorReplayStore {
+        evidence: evidence.clone(),
+        stored: authoring_replay_generation(&command),
+    };
+    let keyed_calls = Arc::new(Mutex::new(0));
+    let model_calls = Arc::new(Mutex::new(0));
+    let admission = ReplayAdmission {
+        keyed_calls: keyed_calls.clone(),
+        model_calls: model_calls.clone(),
+    };
+    let result = ConversationApplication::new(
+        &Authentication,
+        &adapter,
+        &store,
+        &admission,
+        &NeverClient,
+        AuthoringConversationConfigV1::default(),
+    )
+    .start_or_advance_turn("valid-credential", "valid-csrf", &installation(), command)
+    .await;
+    let evidence = evidence.lock().unwrap().take();
+    let authority_calls = *authority_calls.lock().unwrap();
+    let apply_calls = *apply_calls.lock().unwrap();
+    let keyed_calls = *keyed_calls.lock().unwrap();
+    let model_calls = *model_calls.lock().unwrap();
+    AuthorReplayObservation {
+        result,
+        evidence,
+        authority_calls,
+        apply_calls,
+        keyed_calls,
+        model_calls,
+    }
+}
+
 async fn capture_apply_evidence<K>(
     adapter: &DiscordGuildAuthorityAdapter<Source, RuntimeClient, K>,
 ) -> Result<FreshDiscordAuthorityEvidenceV1, ProductApplicationError>
@@ -534,6 +709,117 @@ async fn manager_is_authorized_with_exact_server_derived_evidence() {
         .await
         .unwrap();
     assert_eq!(status, ProductStatusV1::PendingApproval);
+}
+
+#[tokio::test]
+async fn author_accepts_owner_administrator_and_manager() {
+    let manager = snapshot(Permissions::MANAGE_GUILD);
+    let administrator = snapshot(Permissions::ADMINISTRATOR);
+    let mut owner = snapshot(Permissions::empty());
+    owner.owner_id = UserId(20);
+    for authority_snapshot in [owner, administrator, manager] {
+        let observation = author_replay(authority_snapshot).await;
+        let receipt = observation.result.unwrap().into_committed().unwrap();
+        let evidence = observation
+            .evidence
+            .expect("authorized replay must expose adapter-issued evidence");
+        assert_eq!(
+            receipt.disposition(),
+            AuthoringMutationDispositionV1::ExactReplay
+        );
+        assert_eq!(evidence.capability(), CapabilityV1::Author);
+        assert_eq!(observation.authority_calls, 2);
+        assert_eq!(observation.apply_calls, 0);
+        assert_eq!(observation.keyed_calls, 1);
+        assert_eq!(observation.model_calls, 0);
+    }
+}
+
+#[tokio::test]
+async fn author_uses_write_lifetime_non_runtime_snapshot_and_stable_digest() {
+    let observation = author_replay(snapshot(Permissions::MANAGE_GUILD)).await;
+    let receipt = observation.result.unwrap().into_committed().unwrap();
+    let evidence = observation
+        .evidence
+        .expect("authorized replay must expose adapter-issued evidence");
+    assert_eq!(
+        receipt.disposition(),
+        AuthoringMutationDispositionV1::ExactReplay
+    );
+    assert_eq!(evidence.capability(), CapabilityV1::Author);
+    assert_eq!(
+        evidence.expires_at() - evidence.observed_at(),
+        chrono::Duration::seconds(5)
+    );
+    assert_eq!(evidence.runtime_environment(), None);
+    assert_eq!(observation.authority_calls, 2);
+    assert_eq!(observation.apply_calls, 0);
+    assert_eq!(observation.keyed_calls, 1);
+    assert_eq!(observation.model_calls, 0);
+    assert_eq!(
+        evidence.observation_digest(),
+        "3de9f35236e8df04c0187e92289a0da5e309ae9ddead93052797dd74fb8d38a1"
+    );
+}
+
+#[tokio::test]
+async fn author_write_window_starts_before_the_discord_fetch() {
+    let started_at = Utc.with_ymd_and_hms(2026, 7, 19, 0, 0, 0).unwrap();
+    let completed_at = started_at + chrono::Duration::seconds(5);
+    let client = runtime_client(Err(DiscordAuthorityClientError::InvalidResponse));
+    let authority_calls = client.authority_calls.clone();
+    let apply_calls = client.apply_calls.clone();
+    let adapter = DiscordGuildAuthorityAdapter::with_clock(
+        Source {
+            result: Ok(record()),
+            calls: Arc::new(Mutex::new(0)),
+        },
+        client,
+        SequenceClock::new([started_at, completed_at]),
+        DiscordAuthorityConfigV1::default(),
+    );
+    let command = authoring_command();
+    let store = AuthorReplayStore {
+        evidence: Arc::new(Mutex::new(None)),
+        stored: authoring_replay_generation(&command),
+    };
+    let admission = ReplayAdmission {
+        keyed_calls: Arc::new(Mutex::new(0)),
+        model_calls: Arc::new(Mutex::new(0)),
+    };
+
+    let error = ConversationApplication::new(
+        &Authentication,
+        &adapter,
+        &store,
+        &admission,
+        &NeverClient,
+        AuthoringConversationConfigV1::default(),
+    )
+    .start_or_advance_turn("valid-credential", "valid-csrf", &installation(), command)
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error,
+        AuthoringConversationError::Authority(FreshGuildAuthorityError::Stale)
+    );
+    assert_eq!(*authority_calls.lock().unwrap(), 1);
+    assert_eq!(*apply_calls.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn ordinary_member_is_denied_authoring_before_replay_or_model_admission() {
+    let observation = author_replay(snapshot(Permissions::VIEW_CHANNEL)).await;
+    assert_eq!(
+        observation.result.unwrap_err(),
+        AuthoringConversationError::Authority(FreshGuildAuthorityError::Forbidden)
+    );
+    assert!(observation.evidence.is_none());
+    assert_eq!(observation.authority_calls, 1);
+    assert_eq!(observation.apply_calls, 0);
+    assert_eq!(observation.keyed_calls, 0);
+    assert_eq!(observation.model_calls, 0);
 }
 
 #[tokio::test]

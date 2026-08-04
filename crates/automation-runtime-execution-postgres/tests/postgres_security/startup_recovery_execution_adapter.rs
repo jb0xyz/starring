@@ -198,6 +198,176 @@ async fn startup_recovery_execution_port_verifies_reserved_progress_and_replay()
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_verifies_unreserved_progress_and_replay() {
+    let server = PostgresTestServer::start();
+
+    let applied_database = isolated_database(server.connect_options()).await;
+    certification_reservation_scenario(&applied_database).await;
+    remove_current_certification_reservation(&applied_database.owner_pool).await;
+    expire_current_gateway_owner(&applied_database.owner_pool).await;
+    let applied_adapter = verified_execution_adapter(&applied_database).await;
+    let applied_owner = acquire_startup_observation_port_owner(&applied_adapter).await;
+    let (mut applied_lifecycle, mut applied_permit, applied_authorization) =
+        authorize_reserved_awaiting_execution_port_call(
+            &applied_adapter,
+            applied_owner,
+            Duration::from_secs(5),
+        )
+        .await;
+    let applied_action = applied_authorization.request().action_identity().clone();
+    let applied_completed = RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+        &applied_adapter,
+        applied_authorization,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let applied = applied_lifecycle
+        .complete_startup_recovery_execution(&mut applied_permit, applied_completed)
+        .unwrap();
+    assert_eq!(
+        applied.class(),
+        RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
+    );
+    let RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed {
+        action_identity,
+        terminal_digest,
+    } = applied.outcome()
+    else {
+        panic!("unreserved awaiting adapter execution must progress")
+    };
+    assert_eq!(action_identity, &applied_action);
+    assert_ne!(terminal_digest.as_bytes(), &[0; 32]);
+    assert_eq!(
+        startup_stale_live_journal_count(
+            &applied_database.owner_pool,
+            applied_action.correlation().recovery_id().as_str(),
+        )
+        .await,
+        1
+    );
+    cleanup(applied_database).await;
+
+    let replayed_database = isolated_database(server.connect_options()).await;
+    certification_reservation_scenario(&replayed_database).await;
+    remove_current_certification_reservation(&replayed_database.owner_pool).await;
+    expire_current_gateway_owner(&replayed_database.owner_pool).await;
+    let replayed_adapter = verified_execution_adapter(&replayed_database).await;
+    let replayed_owner = acquire_startup_observation_port_owner(&replayed_adapter).await;
+    let (mut replayed_lifecycle, mut replayed_permit, replayed_authorization) =
+        authorize_reserved_awaiting_execution_port_call(
+            &replayed_adapter,
+            replayed_owner,
+            Duration::from_secs(5),
+        )
+        .await;
+    let direct_applied = execute_reserved_awaiting_from_authorization(
+        &replayed_database.executor_pool,
+        &replayed_authorization,
+    )
+    .await
+    .unwrap();
+    assert_eq!(direct_applied["journal_outcome_name"], "applied");
+    assert_eq!(direct_applied["terminal_outcome_name"], "progressed");
+    let expected_digest =
+        decode_lowercase_hex_32(direct_applied["terminal_digest"].as_str().unwrap());
+    let replayed_action = replayed_authorization.request().action_identity().clone();
+    let replayed_completed = RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+        &replayed_adapter,
+        replayed_authorization,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let replayed = replayed_lifecycle
+        .complete_startup_recovery_execution(&mut replayed_permit, replayed_completed)
+        .unwrap();
+    assert_eq!(
+        replayed.class(),
+        RuntimeStartupRecoveryClassV2::ReservedAwaitingCertification
+    );
+    let RuntimeStartupRecoveryExecutionReceiptOutcomeV2::Progressed {
+        action_identity,
+        terminal_digest,
+    } = replayed.outcome()
+    else {
+        panic!("unreserved awaiting exact replay must preserve progress proof")
+    };
+    assert_eq!(action_identity, &replayed_action);
+    assert_eq!(terminal_digest.as_bytes(), &expected_digest);
+    assert_eq!(
+        startup_stale_live_journal_count(
+            &replayed_database.owner_pool,
+            replayed_action.correlation().recovery_id().as_str(),
+        )
+        .await,
+        1
+    );
+
+    cleanup(replayed_database).await;
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_recovery_execution_port_maps_unreserved_owner_loss_without_mutation() {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    certification_reservation_scenario(&database).await;
+    remove_current_certification_reservation(&database.owner_pool).await;
+    expire_current_gateway_owner(&database.owner_pool).await;
+    let adapter = verified_execution_adapter(&database).await;
+    let owner = acquire_startup_observation_port_owner(&adapter).await;
+    let (_, _, authorization) = authorize_reserved_awaiting_execution_port_call(
+        &adapter,
+        owner.clone(),
+        Duration::from_secs(5),
+    )
+    .await;
+    let recovery_id = authorization
+        .request()
+        .correlation()
+        .recovery_id()
+        .as_str()
+        .to_owned();
+    let before = reserved_awaiting_execution_state(&database.owner_pool).await;
+    let released = RuntimeGatewayOwnerLeasePortV1::release_gateway_owner(
+        &adapter,
+        RuntimeReleaseGatewayOwnerLeaseV1 {
+            lease_id: owner.lease_id,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        released,
+        RuntimeReleaseGatewayOwnerLeaseOutcomeV1::Released { .. }
+    ));
+
+    assert!(matches!(
+        RuntimeStartupRecoveryExecutionPortV2::execute_startup_recovery(
+            &adapter,
+            authorization,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await,
+        Err(RuntimeExecutionPersistenceErrorV1::OwnershipLost)
+    ));
+    assert_eq!(
+        reserved_awaiting_execution_state(&database.owner_pool).await,
+        before
+    );
+    assert_eq!(
+        startup_stale_live_journal_count(&database.owner_pool, &recovery_id).await,
+        0
+    );
+
+    cleanup(database).await;
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
 async fn startup_recovery_execution_port_verifies_suspended_local_progress() {
     assert_suspended_local_execution_port_progress(Some(5)).await;
 }
@@ -231,14 +401,13 @@ async fn assert_suspended_local_execution_port_progress(last_resume_sequence: Op
 
     let adapter = verified_execution_adapter(&database).await;
     let owner = acquire_startup_observation_port_owner(&adapter).await;
-    let (mut lifecycle, mut permit, authorization) =
-        authorize_suspended_local_execution_port_call(
-            &adapter,
-            owner,
-            Duration::from_secs(5),
-            last_resume_sequence,
-        )
-        .await;
+    let (mut lifecycle, mut permit, authorization) = authorize_suspended_local_execution_port_call(
+        &adapter,
+        owner,
+        Duration::from_secs(5),
+        last_resume_sequence,
+    )
+    .await;
     assert_eq!(
         authorization
             .request()

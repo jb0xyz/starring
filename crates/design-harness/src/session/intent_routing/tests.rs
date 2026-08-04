@@ -171,6 +171,16 @@ fn private_room(expected_revision: u64, hub: Option<&str>) -> LlmResponse {
     interpretation_call("interpret", private_room_value(expected_revision, hub))
 }
 
+fn private_room_with_outcome(
+    expected_revision: u64,
+    hub: Option<&str>,
+    requested_outcome: &str,
+) -> LlmResponse {
+    let mut value = private_room_value(expected_revision, hub);
+    value["requested_outcome"] = json!(requested_outcome);
+    interpretation_call("interpret", value)
+}
+
 fn custom_static(expected_revision: u64, response: &str) -> LlmResponse {
     let mut value = private_room_value(expected_revision, Some("community_hub"));
     value["automation_kind"] = json!("custom_automation");
@@ -479,6 +489,216 @@ fn preview_ready_artifact_survives_exact_snapshot_restore() {
             bindings("community_hub", "701"),
         )
         .is_err());
+    });
+}
+
+#[test]
+fn working_draft_finalizes_without_candidate_mutation_and_restores_exactly() {
+    block_on(async {
+        let authoritative_bindings = bindings("community_hub", "700");
+        let client = ScriptedClient::new(vec![Ok(private_room_with_outcome(
+            0,
+            Some("community_hub"),
+            "working_draft",
+        ))]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_intent_recipe(client, authoritative_bindings.clone());
+
+        assert!(matches!(
+            session
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let draft_before = session.draft.clone();
+        let ruleset_bytes_before = serde_json::to_vec(&session.draft.ruleset).unwrap();
+        let receipt_before = receipt(&session);
+        let stage_before = session.snapshot().intent_recipe.unwrap().stage;
+        let IntentRecipeStageSnapshotV2::PreviewReady {
+            workspace: workspace_before,
+            request_evidence: evidence_before,
+            ..
+        } = &stage_before
+        else {
+            panic!("expected working Draft candidate")
+        };
+        assert_eq!(
+            workspace_before.requested_outcome,
+            crate::intent::IntentRequestedOutcome::WorkingDraft
+        );
+        assert_eq!(evidence_before.terminal_outcome_finalization_count(), 0);
+
+        probe.push(Ok(private_room_with_outcome(
+            receipt_before.candidate_revision,
+            Some("community_hub"),
+            "validated_preview",
+        )));
+        assert!(matches!(
+            session
+                .run_burst(
+                    "Keep the existing community_hub design unchanged and finalize it as a validated preview",
+                )
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+
+        let receipt_after = receipt(&session);
+        assert_eq!(session.draft, draft_before);
+        assert_eq!(
+            serde_json::to_vec(&session.draft.ruleset).unwrap(),
+            ruleset_bytes_before
+        );
+        assert_eq!(
+            receipt_after.candidate_revision,
+            receipt_before.candidate_revision
+        );
+        assert_eq!(
+            receipt_after.candidate_ruleset_hash,
+            receipt_before.candidate_ruleset_hash
+        );
+        assert_eq!(
+            receipt_after.candidate_draft_hash,
+            receipt_before.candidate_draft_hash
+        );
+        assert_eq!(
+            receipt_after.compiled_plan_hash,
+            receipt_before.compiled_plan_hash
+        );
+        let snapshot = session.snapshot();
+        let IntentRecipeStageSnapshotV2::PreviewReady {
+            workspace,
+            request_evidence,
+            ..
+        } = &snapshot.intent_recipe.as_ref().unwrap().stage
+        else {
+            panic!("expected finalized preview")
+        };
+        assert_eq!(workspace.revision, workspace_before.revision + 1);
+        assert_eq!(
+            workspace.requested_outcome,
+            crate::intent::IntentRequestedOutcome::ValidatedPreview
+        );
+        assert_eq!(request_evidence.entries().len(), 2);
+        assert_eq!(request_evidence.terminal_outcome_finalization_count(), 1);
+        assert_eq!(session.observability.intent_commits, 1);
+        assert_eq!(session.observability.intent_finalizations, 1);
+
+        let expected_artifact = session.export_preview_ready_artifact().unwrap();
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            snapshot,
+            authoritative_bindings,
+        )
+        .unwrap();
+        assert_eq!(restored.draft, draft_before);
+        assert_eq!(
+            restored.export_preview_ready_artifact().unwrap(),
+            expected_artifact
+        );
+    });
+}
+
+#[test]
+fn changed_behavior_finalization_fails_closed_without_stage_or_draft_mutation() {
+    block_on(async {
+        let authoritative_bindings = bindings("community_hub", "700");
+        let client = ScriptedClient::new(vec![Ok(private_room_with_outcome(
+            0,
+            Some("community_hub"),
+            "working_draft",
+        ))]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_intent_recipe(client, authoritative_bindings.clone());
+
+        assert!(matches!(
+            session
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let draft_before = session.draft.clone();
+        let stage_before = session.snapshot().intent_recipe.unwrap().stage;
+        let candidate_revision = receipt(&session).candidate_revision;
+        let (changed_core, changed_details) =
+            private_room_with_copy_details(candidate_revision, Some("community_hub"));
+        probe.push(Ok(changed_core));
+        probe.push(Ok(changed_details));
+
+        let outcome = session
+            .run_burst(
+                "Keep the existing community_hub design. Set the launcher create-button label to 'Start exact focus'. Prepare its validated preview.",
+            )
+            .await;
+        let BurstOutcome::Halted(report) = outcome else {
+            panic!("expected behavior-changing finalization to halt: {outcome:?}")
+        };
+        assert_eq!(report.code, "INTENT_OUTCOME_FINALIZATION_BEHAVIOR_CHANGED");
+        assert_eq!(session.draft, draft_before);
+        assert_eq!(
+            session.snapshot().intent_recipe.unwrap().stage,
+            stage_before
+        );
+        assert_eq!(probe.calls().len(), 3);
+        let restored = DesignSession::restore_intent_recipe(
+            ScriptedClient::new(Vec::new()),
+            SessionConfig::default(),
+            session.snapshot(),
+            authoritative_bindings,
+        )
+        .unwrap();
+        assert_eq!(restored.draft, draft_before);
+    });
+}
+
+#[test]
+fn restore_rejects_terminal_outcome_finalization_evidence_tampering() {
+    block_on(async {
+        let authoritative_bindings = bindings("community_hub", "700");
+        let client = ScriptedClient::new(vec![Ok(private_room_with_outcome(
+            0,
+            Some("community_hub"),
+            "working_draft",
+        ))]);
+        let probe = client.clone();
+        let mut session = DesignSession::with_intent_recipe(client, authoritative_bindings.clone());
+        assert!(matches!(
+            session
+                .run_burst("Create private study rooms in community_hub")
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        probe.push(Ok(private_room_with_outcome(
+            receipt(&session).candidate_revision,
+            Some("community_hub"),
+            "validated_preview",
+        )));
+        assert!(matches!(
+            session
+                .run_burst(
+                    "Keep the existing community_hub design unchanged and finalize it as a validated preview",
+                )
+                .await,
+            BurstOutcome::Ready { .. }
+        ));
+        let snapshot = session.snapshot();
+
+        for (field, replacement) in [
+            ("standalone_request_evidence_digest", json!("0".repeat(64))),
+            ("next_requested_outcome", json!("working_draft")),
+            ("next_workspace_revision", json!(99)),
+        ] {
+            let mut value = serde_json::to_value(&snapshot).unwrap();
+            value["intent_recipe"]["stage"]["request_evidence"]["entries"][1][field] = replacement;
+            let tampered = serde_json::from_value(value).unwrap();
+            assert!(DesignSession::restore_intent_recipe(
+                ScriptedClient::new(Vec::new()),
+                SessionConfig::default(),
+                tampered,
+                authoritative_bindings.clone(),
+            )
+            .is_err());
+        }
     });
 }
 

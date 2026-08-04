@@ -66,7 +66,8 @@ VALUES
     ('starring_decision_apply'),
     ('starring_decision_cancellation'),
     ('starring_deployment_status_reader'),
-    ('starring_operational_deployment_status_reader');
+    ('starring_operational_deployment_status_reader'),
+    ('starring_authoring_session_writer');
 
 CREATE TEMP TABLE starring_api_capability_manifest (
     role_name NAME NOT NULL,
@@ -97,7 +98,7 @@ VALUES
     ('starring_installation_authority_reader', 'public.starring_product_installation_authority_reader_database_identity_v1()'),
     ('starring_installation_authority_reader', 'public.starring_product_installation_authority_read_v1(text,text,bytea)'),
     ('starring_authorized_snapshot_reader', 'public.starring_product_authorized_snapshot_reader_database_identity_v1()'),
-    ('starring_authorized_snapshot_reader', 'public.starring_product_authorized_snapshot_read_v1(text,text,bytea,text,text)'),
+    ('starring_authorized_snapshot_reader', 'public.starring_product_authorized_snapshot_read_v2(text,text,bytea,text,text)'),
     ('starring_authorized_snapshot_reader', 'public.starring_product_authorized_snapshot_key_coverage_v1(text[])'),
     ('starring_promotion_executor', 'public.starring_product_promotion_executor_database_identity_v1()'),
     ('starring_promotion_executor', 'public.starring_product_promotion_replay_v1(text,text,text,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,bigint,text,text[],text[],text[])'),
@@ -126,9 +127,14 @@ VALUES
     ('starring_decision_cancellation', 'public.starring_product_lifecycle_cancellation_keyring_coverage_v1(text[],text[])'),
     ('starring_decision_cancellation', 'public.starring_product_cancel_runtime_drain_v2(text,text,text,bigint,text,text,bytea,bytea,text,text,text,text,bigint,text,text,timestamp with time zone,timestamp with time zone,text,boolean,text,text,text[],text[],text[],text,text,text,text,text,text,text,text,bigint,text,text,bigint)'),
     ('starring_deployment_status_reader', 'public.starring_product_deployment_status_reader_database_identity_v1()'),
-    ('starring_deployment_status_reader', 'public.starring_product_deployment_status_read_v1(text,text,text,text,text,text,text,text,bytea)'),
+    ('starring_deployment_status_reader', 'public.starring_product_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)'),
     ('starring_operational_deployment_status_reader', 'public.starring_product_deployment_status_reader_database_identity_v2()'),
-    ('starring_operational_deployment_status_reader', 'public.starring_product_deployment_status_read_v2(text,text,text,text,text,text,text,text,bytea)');
+    ('starring_operational_deployment_status_reader', 'public.starring_product_operational_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)'),
+    ('starring_authoring_session_writer', 'public.starring_authoring_session_writer_database_identity_v1()'),
+    ('starring_authoring_session_writer', 'public.starring_authoring_session_writer_check_v1(text,text,text,text,bigint,text[],text[],text[],text[])'),
+    ('starring_authoring_session_writer', 'public.starring_authoring_session_writer_load_v1(text,text,text,text,bigint)'),
+    ('starring_authoring_session_writer', 'public.starring_authoring_session_writer_commit_v1(text,text,text,text,bigint,text[],text[],text[],text[],text,text,text,text,bigint,bytea,bytea,text,text,smallint,text,jsonb,text,bigint,text,jsonb,text,bigint,text,bytea,text,bigint)'),
+    ('starring_authoring_session_writer', 'public.starring_authoring_session_writer_key_coverage_v1(text[],text[],text[])');
 
 DO $roles$
 DECLARE
@@ -636,8 +642,8 @@ DECLARE
     owner_oid OID := pg_catalog.to_regrole('starring_owner');
 BEGIN
     IF owner_oid IS NULL
-        OR (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_request_roles) <> 14
-        OR (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_capability_manifest) <> 48
+        OR (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_request_roles) <> 15
+        OR (SELECT pg_catalog.count(*) FROM pg_temp.starring_api_capability_manifest) <> 53
     THEN
         RAISE EXCEPTION 'staging API capability manifest cardinality is invalid'
             USING ERRCODE = '55000';
@@ -795,7 +801,7 @@ BEGIN
         FROM pg_catalog.pg_authid AS role
         INNER JOIN pg_temp.starring_api_request_roles AS expected
             ON expected.role_name = role.rolname
-    ) <> 14 THEN
+    ) <> 15 THEN
         RAISE EXCEPTION 'staging request role attribute postflight failed'
             USING ERRCODE = '55000';
     END IF;

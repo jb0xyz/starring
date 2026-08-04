@@ -1,5 +1,8 @@
 # Preview Model Implementation Plan (Phase 10)
 
+> Historical plan: its second-approval preview mapping is superseded by
+> `docs/superpowers/specs/2026-07-31-solo-product-approval-design.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development 또는 executing-plans. **Codex가 구현한다.** Task 끝에 보고. **완료 후 git push origin main.**
 
 **Goal:** `crates/preview` — `build_preview(title, &DiffResult, &OperationGraph, &PolicyDecision, &VirtualApplyResult, &AccessMatrix before, &AccessMatrix after) -> PreviewModel`. 코어 결과를 승인용 UI-중립 데이터로 결정론적 합성.

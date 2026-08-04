@@ -18,6 +18,7 @@ members = [
     "crates/automation-state",
     "crates/automation-core",
     "crates/design-harness",
+    "crates/design-harness-codex-worker-client",
     "crates/authoring-promotion",
     "crates/authoring-promotion-postgres",
     "crates/authoring-application",
@@ -32,6 +33,7 @@ members = [
     "crates/automation-runtime-convergence-postgres",
     "crates/automation-runtime-execution-postgres",
     "crates/automation-runtime-serving-postgres",
+    "crates/automation-runtime-interaction",
     "crates/automation-runtime-interaction-postgres",
     "crates/automation-runtime-panel-postgres",
     "crates/automation-runtime-panel-evidence",
@@ -55,6 +57,7 @@ members = [
     "tools/starring-db-bootstrap",
     "tools/starring-runtime",
     "tools/starring-staging-provisioner",
+    "tools/starring-staging-authority-operator",
 ]
 resolver = "2"
 

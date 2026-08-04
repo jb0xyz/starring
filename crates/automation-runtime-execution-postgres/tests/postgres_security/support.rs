@@ -47,17 +47,22 @@ use sqlx::{Connection, Executor, PgPool};
 
 const READINESS_FUNCTION: &str = "public.starring_runtime_execution_database_readiness_v1()";
 const EXACT_TARGET_FUNCTIONS: [&str; 3] = [
-    "public.starring_runtime_exact_target_database_readiness_v1()",
+    "public.starring_runtime_exact_target_database_readiness_v2()",
     "public.starring_runtime_exact_target_reader_database_identity_v1()",
-    "public.starring_runtime_exact_target_read_v1(text,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text)",
+    "public.starring_runtime_exact_target_read_v2(text,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text)",
 ];
-const SERVING_FUNCTIONS: [&str; 4] = [
+const SERVING_FUNCTIONS: [&str; 9] = [
     "public.starring_runtime_serving_database_readiness_v1()",
     "public.starring_runtime_serving_database_identity_v1()",
     "public.starring_runtime_serving_heartbeat_v1(text,text,text,text,text,bigint,bigint,bigint,bigint)",
     "public.starring_runtime_serving_disconnect_v1(text,text,text,text,text,bigint,bigint,bigint)",
+    "public.starring_runtime_serving_observe_v2(text,text,text,text,text,text,bigint,bigint)",
+    "public.starring_runtime_serving_heartbeat_v2(text,text,text,text,text,text,bigint,bigint,bigint,bigint)",
+    "public.starring_runtime_serving_disconnect_if_current_v2(text,text,text,text,text,text,bigint,bigint,bigint)",
+    "public.starring_runtime_serving_observe_pending_drain_source_v1(text,bigint,text)",
+    "public.starring_runtime_serving_disconnect_pending_drain_source_if_expired_v1(text,bigint,text,text,text,text,text,text,text,bigint,text,bigint,text,text,text,bigint,bigint,bigint)",
 ];
-const EXECUTOR_FUNCTIONS: [&str; 28] = [
+const EXECUTOR_FUNCTIONS: [&str; 31] = [
     "public.starring_runtime_execution_database_readiness_v1()",
     "public.starring_runtime_execution_database_identity_v1()",
     "public.starring_runtime_execution_claim_next_v1(text,bigint)",
@@ -86,6 +91,9 @@ const EXECUTOR_FUNCTIONS: [&str; 28] = [
     "public.starring_runtime_startup_recovery_execute_pending_drain_v2(text,bigint,bigint,bigint,bigint,bigint,bigint,text,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,text,bigint,bigint,text,bigint,bigint,bigint,bigint,text,bigint,bigint,bigint,text,bigint,text,boolean,bigint,bigint,bytea,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,boolean,text)",
     "public.starring_runtime_startup_recovery_select_pending_drain_v3(text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)",
     "public.starring_runtime_startup_recovery_pending_drain_succession_v3(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,text,bigint,bigint,text,bigint,bigint,bigint,bigint,text,bigint,bigint,bigint,text,bigint,text,text,boolean,bigint,bigint,bytea,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,boolean)",
+    "public.starring_runtime_certification_prepare_v2(text,text,text,text,text,bigint,text,bigint,bigint,bigint,timestamp with time zone)",
+    "public.starring_runtime_certification_commit_v2(text,text,text,text,text,bigint,text,bigint,bigint,bigint,bytea,text,bytea,text)",
+    "public.starring_runtime_certification_observe_v2(text,text,text,text,bigint,bigint,text)",
 ];
 const PRE_INGRESS_ACK_EXECUTOR_FUNCTIONS: [&str; 15] = [
     "public.starring_runtime_execution_database_readiness_v1()",
@@ -105,7 +113,7 @@ const PRE_INGRESS_ACK_EXECUTOR_FUNCTIONS: [&str; 15] = [
     "public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)",
 ];
 const EXPECTED_READINESS_DEFINITION_SHA256_V1: &str =
-    "572d7ffd19d6f2edb5ec84ea6b7bfebd178c7da0568bce61af2f7907cfe72647";
+    "b632e1b778ef166f88e6ea206a30bd807b7357e210c29268bc98f39187310faf";
 const TENANT: &str = "runtime-execution-tenant";
 const INSTALLATION: &str = "runtime-execution-installation";
 const PRINCIPAL: &str = "runtime-execution-principal";
@@ -410,7 +418,7 @@ async fn cleanup(mut database: IsolatedDatabase) {
 async fn assert_cross_runtime_readiness(database: &mut IsolatedDatabase) {
     assert_controller_lookup_index(&database.owner_pool).await;
     let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
-        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v2(), \
             public.starring_runtime_serving_schema_manifest_v1(), \
             public.starring_runtime_execution_schema_manifest_v1()",
     )
@@ -428,7 +436,7 @@ async fn assert_cross_runtime_readiness(database: &mut IsolatedDatabase) {
     .await
     .unwrap();
     let drifted = sqlx::query_as::<_, (bool, bool, bool)>(
-        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v2(), \
             public.starring_runtime_serving_schema_manifest_v1(), \
             public.starring_runtime_execution_schema_manifest_v1()",
     )
@@ -442,7 +450,7 @@ async fn assert_cross_runtime_readiness(database: &mut IsolatedDatabase) {
         restricted_readiness_pool(database, "exact", EXACT_TARGET_FUNCTIONS.as_slice()).await;
     let exact_rows = sqlx::query_scalar::<_, i64>(
         "SELECT pg_catalog.count(*) \
-         FROM public.starring_runtime_exact_target_database_readiness_v1()",
+         FROM public.starring_runtime_exact_target_database_readiness_v2()",
     )
     .fetch_one(&exact_pool)
     .await
@@ -548,7 +556,7 @@ async fn assert_controller_lookup_index(pool: &PgPool) {
         .await
         .unwrap();
     let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
-        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v2(), \
             public.starring_runtime_serving_schema_manifest_v1(), \
             public.starring_runtime_execution_schema_manifest_v1()",
     )
@@ -572,7 +580,7 @@ async fn assert_controller_lookup_index(pool: &PgPool) {
     .await
     .unwrap();
     let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
-        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v2(), \
             public.starring_runtime_serving_schema_manifest_v1(), \
             public.starring_runtime_execution_schema_manifest_v1()",
     )

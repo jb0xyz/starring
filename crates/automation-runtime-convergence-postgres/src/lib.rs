@@ -10,14 +10,15 @@ mod prepare;
 mod product_drain;
 mod projection;
 mod row;
+mod status_attestation;
 mod store;
 
 pub use database_identity::PostgresRuntimeConvergenceDatabaseIdentityReader;
 pub use error::RuntimeConvergenceStoreError;
 pub use evidence::{
     project_runtime_deployment_status_v1, project_runtime_deployment_status_v2,
-    RuntimeDeploymentStatusEvidenceV1, RuntimeDeploymentStatusEvidenceV2,
-    RuntimeDeploymentStatusExpectationV1,
+    RuntimeDeploymentAttestationEvidenceV2, RuntimeDeploymentStatusEvidenceV1,
+    RuntimeDeploymentStatusEvidenceV2, RuntimeDeploymentStatusExpectationV1,
 };
 pub use hydration::{
     verify_runtime_exact_target_database_v1, verify_runtime_exact_target_database_with_timeouts_v1,

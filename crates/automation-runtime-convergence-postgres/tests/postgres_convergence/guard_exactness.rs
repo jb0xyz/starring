@@ -25,8 +25,8 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
     .await
     .unwrap()
     .unwrap();
-    let session = RuntimeConvergenceSessionV1::from_claim(execution.clone()).unwrap();
-    let mut renewal_session = session.clone();
+    let mut renewal_session =
+        RuntimeConvergenceSessionV1::from_claim(execution.clone()).unwrap();
     let renewal = renewal_session
         .begin_renewal(Duration::from_secs(90))
         .unwrap();
@@ -141,8 +141,8 @@ async fn controller_guards_are_exact_and_renewal_replay_is_bounded_scenario(
     ));
     assert_eq!(execution_projection(&pool).await, renewed_projection);
 
-    let renewed_session = RuntimeConvergenceSessionV1::from_claim(first.execution.clone()).unwrap();
-    let mut mutation_session = renewed_session.clone();
+    let mut mutation_session =
+        RuntimeConvergenceSessionV1::from_claim(first.execution.clone()).unwrap();
     let mutation = mutation_session
         .begin_mutation(
             automation_runtime_controller::RuntimeConvergenceMutationV1::AcceptPreflight(
@@ -313,12 +313,13 @@ async fn renewal_and_mutation_from_one_guard_cannot_both_commit_scenario(
     .await
     .unwrap()
     .unwrap();
-    let base = RuntimeConvergenceSessionV1::from_claim(execution.clone()).unwrap();
-    let mut renewal_session = base.clone();
+    let mut renewal_session =
+        RuntimeConvergenceSessionV1::from_claim(execution.clone()).unwrap();
     let renewal = renewal_session
         .begin_renewal(Duration::from_secs(90))
         .unwrap();
-    let mut mutation_session = base;
+    let mut mutation_session =
+        RuntimeConvergenceSessionV1::from_claim(execution.clone()).unwrap();
     let mutation = mutation_session
         .begin_mutation(
             automation_runtime_controller::RuntimeConvergenceMutationV1::AcceptPreflight(

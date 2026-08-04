@@ -266,7 +266,7 @@ fn startup_recovery_action_journal_remains_private_behind_owner_fenced_execution
             .unwrap()
             .matches("public.starring_runtime_")
             .count(),
-        26
+        29
     );
 }
 

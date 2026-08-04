@@ -32,9 +32,22 @@ async fn read_raw_operational_deployment_status(
                 AND serving_projection IS NULL \
                 AND deployment_convergence_attempt_no IS NULL \
                 AND deployment_last_failure_attempt_no IS NULL \
-                AND attestation_convergence_attempt_no IS NULL AS payload_is_empty, \
+                AND attestation_convergence_attempt_no IS NULL \
+                AND attestation_record_format_version IS NULL \
+                AND attestation_serving_lease_duration_nanos IS NULL \
+                AND deployment_last_controller_id IS NULL \
+                AND v2_evidence_state IS NULL \
+                AND v2_operation_id IS NULL \
+                AND v2_intent_fingerprint IS NULL \
+                AND v2_certification_intent_bytes IS NULL \
+                AND v2_request_digest IS NULL \
+                AND v2_request_bytes IS NULL \
+                AND v2_live_attestation_bytes IS NULL \
+                AND v2_must_commit_before IS NULL \
+                AND v2_route_admission IS NULL \
+                AND v2_certified_snapshot IS NULL AS payload_is_empty, \
             database_now IS NOT NULL AS database_now_is_present \
-         FROM public.starring_product_deployment_status_read_v2(\
+         FROM public.starring_product_operational_deployment_status_read_v3(\
             $1, $2, $3, $4, $5, $6, $7, $8, $9) \
          LIMIT 2",
     )
@@ -127,6 +140,7 @@ struct OperationalLiveSeed {
     exact: ExactDeploymentSelectorV1,
     convergence_attempt: NonZeroU32,
     deployment_revision: NonZeroU64,
+    process_instance_id: String,
     last_heartbeat_at: SystemTime,
     lease_expires_at: SystemTime,
 }
@@ -180,6 +194,14 @@ async fn seed_operational_live(
         exact,
         convergence_attempt: claim.convergence_attempt,
         deployment_revision: NonZeroU64::new(live.snapshot.revision.get()).unwrap(),
+        process_instance_id: live
+            .snapshot
+            .live
+            .as_ref()
+            .unwrap()
+            .process_instance_id
+            .as_str()
+            .to_string(),
         last_heartbeat_at: serving.last_heartbeat_at.into(),
         lease_expires_at: serving.expires_at.into(),
     }
@@ -214,12 +236,12 @@ fn assert_live_attestation(
         observation.phase(),
         authoring_application::DeploymentConvergencePhaseV2::Live
     );
+    let attestation = observation.attestation().unwrap();
+    assert_eq!(attestation.deployment_revision(), seed.deployment_revision);
+    assert_eq!(attestation.convergence_attempt(), seed.convergence_attempt);
     assert_eq!(
-        observation.attestation(),
-        Some(authoring_application::DeploymentAttestationObservationV2::new(
-            seed.deployment_revision,
-            seed.convergence_attempt,
-        ))
+        attestation.process_instance_id().as_str(),
+        seed.process_instance_id.as_str()
     );
 }
 
@@ -241,6 +263,7 @@ impl authoring_application::ProductDecisionObservationPort<FreshDiscordAuthority
         Ok(
             authoring_application::ProductDecisionObservationV1::from_server_projection(
                 self.projection.clone(),
+                authoring_application::ApprovalPayloadDigestV1::parse(&"c".repeat(64)).unwrap(),
                 UNIX_EPOCH,
             ),
         )
@@ -566,6 +589,15 @@ async fn operational_status_binds_live_attempt_and_reports_exact_disconnect() {
         live.snapshot.revision.get()
     );
     assert_eq!(attestation.convergence_attempt(), claim.convergence_attempt);
+    assert_eq!(
+        attestation.process_instance_id().as_str(),
+        live.snapshot
+            .live
+            .as_ref()
+            .unwrap()
+            .process_instance_id
+            .as_str()
+    );
     assert_eq!(
         live_runtime.serving(),
         authoring_application::DeploymentServingFreshnessV2::Fresh {

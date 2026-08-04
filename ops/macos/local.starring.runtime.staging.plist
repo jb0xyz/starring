@@ -43,11 +43,11 @@
         <key>STARRING_RUNTIME_INSTANCE_LOOKUP_TIMEOUT_MILLISECONDS</key>
         <string>500</string>
         <key>STARRING_RUNTIME_GATEWAY_OWNER_LEASE_MILLISECONDS</key>
-        <string>30000</string>
+        <string>60000</string>
         <key>STARRING_RUNTIME_GATEWAY_OWNER_RENEW_BEFORE_MILLISECONDS</key>
-        <string>10000</string>
+        <string>40000</string>
         <key>STARRING_RUNTIME_GATEWAY_OWNER_SAFETY_MARGIN_MILLISECONDS</key>
-        <string>3000</string>
+        <string>5000</string>
         <key>STARRING_RUNTIME_CONVERGENCE_DATABASE_URL_SECRET_REFERENCE</key>
         <string>keychain:starring.runtime.staging:database.execution</string>
         <key>STARRING_RUNTIME_EXACT_TARGET_DATABASE_URL_SECRET_REFERENCE</key>
@@ -60,6 +60,8 @@
         <string>keychain:starring.runtime.staging:database.interaction</string>
         <key>STARRING_RUNTIME_DISCORD_BOT_TOKEN_SECRET_REFERENCE</key>
         <string>keychain:starring.runtime.staging:discord.bot-token</string>
+        <key>STARRING_RUNTIME_INTERACTION_TOKEN_ENVELOPE_KEYRING_SECRET_REFERENCE</key>
+        <string>keychain:starring.runtime.staging:interaction.token-envelope-keyring</string>
     </dict>
     <key>KeepAlive</key>
     <dict>

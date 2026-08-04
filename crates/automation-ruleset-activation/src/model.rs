@@ -194,8 +194,6 @@ pub enum ClaimDecision {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ApprovalDecisionError {
-    #[error("self approval is forbidden")]
-    SelfApprovalForbidden,
     #[error("approval already exists")]
     DuplicateApproval,
     #[error("product activation requires payload-bound approval")]
@@ -346,9 +344,7 @@ impl ActivationRequest {
             .windows(2)
             .all(|window| window[0].approver < window[1].approver)
             || self.approvals.iter().any(|approval| {
-                approval.approver == self.requester
-                    || approval.approved_at < self.created_at
-                    || approval.approved_at >= self.expires_at
+                approval.approved_at < self.created_at || approval.approved_at >= self.expires_at
             })
         {
             return Err("activation approvals are invalid".to_string());
@@ -625,9 +621,6 @@ impl ActivationRequest {
         }
         if self.state != ActivationRequestState::Pending {
             return Err(ApprovalDecisionError::NotPending);
-        }
-        if approver == self.requester {
-            return Err(ApprovalDecisionError::SelfApprovalForbidden);
         }
         if self
             .approvals

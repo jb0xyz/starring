@@ -20,6 +20,12 @@ pub const ADMIN_KEYCHAIN_SERVICE: &str = "starring.postgres.staging";
 pub const ADMIN_KEYCHAIN_ACCOUNT: &str = "database.cluster-admin";
 pub const PRODUCT_ACTION_KEYRING_ACCOUNT: &str = "keyring.product-action";
 pub const SNAPSHOT_ENVELOPE_KEYRING_ACCOUNT: &str = "keyring.snapshot-envelope";
+pub const INTERACTION_TOKEN_ENVELOPE_KEYRING_ACCOUNT: &str = "interaction.token-envelope-keyring";
+pub const AUTHORING_WRITER_IDENTITY: DatabaseIdentityV1 = DatabaseIdentityV1 {
+    service: API_KEYCHAIN_SERVICE,
+    account: "database.authoring-session-writer",
+    role: "starring_authoring_session_writer",
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DatabaseIdentityV1 {
@@ -28,7 +34,7 @@ pub struct DatabaseIdentityV1 {
     pub role: &'static str,
 }
 
-pub const APPLICATION_DATABASE_IDENTITIES: [DatabaseIdentityV1; 19] = [
+pub const APPLICATION_DATABASE_IDENTITIES: [DatabaseIdentityV1; 20] = [
     DatabaseIdentityV1 {
         service: API_KEYCHAIN_SERVICE,
         account: "database.oauth-flow-writer",
@@ -99,6 +105,7 @@ pub const APPLICATION_DATABASE_IDENTITIES: [DatabaseIdentityV1; 19] = [
         account: "database.operational-deployment-status-reader",
         role: "starring_operational_deployment_status_reader",
     },
+    AUTHORING_WRITER_IDENTITY,
     DatabaseIdentityV1 {
         service: RUNTIME_KEYCHAIN_SERVICE,
         account: "database.execution",
@@ -157,6 +164,11 @@ pub const SNAPSHOT_ENVELOPE_KEYRING_IDENTITY: KeychainIdentityV1 = KeychainIdent
     account: SNAPSHOT_ENVELOPE_KEYRING_ACCOUNT,
 };
 
+pub const INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY: KeychainIdentityV1 = KeychainIdentityV1 {
+    service: RUNTIME_KEYCHAIN_SERVICE,
+    account: INTERACTION_TOKEN_ENVELOPE_KEYRING_ACCOUNT,
+};
+
 pub const ADMIN_KEYCHAIN_IDENTITY: KeychainIdentityV1 = KeychainIdentityV1 {
     service: ADMIN_KEYCHAIN_SERVICE,
     account: ADMIN_KEYCHAIN_ACCOUNT,
@@ -171,9 +183,9 @@ pub fn validate_identity_manifest() -> Result<(), ProvisionerErrorV1> {
         .iter()
         .map(|identity| (identity.service, identity.account))
         .collect::<BTreeSet<_>>();
-    if APPLICATION_DATABASE_IDENTITIES.len() != 19
-        || roles.len() != 19
-        || keychain.len() != 19
+    if APPLICATION_DATABASE_IDENTITIES.len() != 20
+        || roles.len() != 20
+        || keychain.len() != 20
         || roles.contains(CLUSTER_ADMIN_ROLE)
         || roles.contains(OWNER_ROLE)
     {
@@ -263,7 +275,7 @@ mod tests {
                 .iter()
                 .filter(|identity| identity.service == API_KEYCHAIN_SERVICE)
                 .count(),
-            14
+            15
         );
         assert_eq!(
             APPLICATION_DATABASE_IDENTITIES
@@ -281,11 +293,26 @@ mod tests {
             }
         );
         assert_eq!(
-            APPLICATION_DATABASE_IDENTITIES[18],
+            APPLICATION_DATABASE_IDENTITIES[14],
+            DatabaseIdentityV1 {
+                service: API_KEYCHAIN_SERVICE,
+                account: "database.authoring-session-writer",
+                role: "starring_authoring_session_writer",
+            }
+        );
+        assert_eq!(
+            APPLICATION_DATABASE_IDENTITIES[19],
             DatabaseIdentityV1 {
                 service: RUNTIME_KEYCHAIN_SERVICE,
                 account: "database.interaction",
                 role: "starring_runtime_interaction",
+            }
+        );
+        assert_eq!(
+            INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY,
+            KeychainIdentityV1 {
+                service: "starring.runtime.staging",
+                account: "interaction.token-envelope-keyring",
             }
         );
     }

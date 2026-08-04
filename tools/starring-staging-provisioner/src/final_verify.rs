@@ -4,11 +4,11 @@ use sqlx::{Connection, Row};
 use crate::identity::{
     exact_admin_connect_options, exact_admin_target_connect_options,
     exact_database_connect_options, APPLICATION_DATABASE_IDENTITIES, CLUSTER_ADMIN_ROLE,
-    DATABASE_HOST, DATABASE_NAME, PRODUCT_ACTION_KEYRING_IDENTITY, RUNTIME_KEYCHAIN_SERVICE,
-    SNAPSHOT_ENVELOPE_KEYRING_IDENTITY,
+    DATABASE_HOST, DATABASE_NAME, INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY,
+    PRODUCT_ACTION_KEYRING_IDENTITY, RUNTIME_KEYCHAIN_SERVICE, SNAPSHOT_ENVELOPE_KEYRING_IDENTITY,
 };
 use crate::keychain::KeychainClientV1;
-use crate::keyring::validate_keyring_pair;
+use crate::keyring::validate_keyring_set;
 use crate::{ProvisionerErrorV1, StagingAcknowledgementV1};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +43,13 @@ pub async fn verify_final(
     keychain.preflight_discord()?;
     let product_action_keyring = keychain.read_required(PRODUCT_ACTION_KEYRING_IDENTITY)?;
     let snapshot_envelope_keyring = keychain.read_required(SNAPSHOT_ENVELOPE_KEYRING_IDENTITY)?;
-    validate_keyring_pair(&product_action_keyring, &snapshot_envelope_keyring)?;
+    let interaction_token_envelope_keyring =
+        keychain.read_required(INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY)?;
+    validate_keyring_set(
+        &product_action_keyring,
+        &snapshot_envelope_keyring,
+        &interaction_token_envelope_keyring,
+    )?;
     let admin_value = keychain.read_required(crate::identity::ADMIN_KEYCHAIN_IDENTITY)?;
     let admin_options = exact_admin_connect_options(&admin_value)?;
     let mut admin = PgConnection::connect_with(&admin_options)
@@ -73,11 +79,11 @@ pub async fn verify_final(
     Ok(FinalVerificationReportV1 {
         application_database_credentials: APPLICATION_DATABASE_IDENTITIES.len(),
         hba_rules: expected_hba_rules().len(),
-        keyrings: 2,
+        keyrings: 3,
     })
 }
 
-async fn verify_admin_connection(
+pub(crate) async fn verify_admin_connection(
     connection: &mut PgConnection,
     system_identifier: &str,
 ) -> Result<(), ProvisionerErrorV1> {
@@ -103,7 +109,7 @@ async fn verify_admin_connection(
     Ok(())
 }
 
-async fn verify_application_connection(
+pub(crate) async fn verify_application_connection(
     connection: &mut PgConnection,
     role: &str,
 ) -> Result<(), ProvisionerErrorV1> {
@@ -125,7 +131,7 @@ async fn verify_application_connection(
     Ok(())
 }
 
-async fn verify_admin_target_connection(
+pub(crate) async fn verify_admin_target_connection(
     connection: &mut PgConnection,
 ) -> Result<(), ProvisionerErrorV1> {
     let exact: bool = sqlx::query_scalar(
@@ -344,7 +350,9 @@ fn expected_rule(
     }
 }
 
-async fn verify_final_hba(connection: &mut PgConnection) -> Result<(), ProvisionerErrorV1> {
+pub(crate) async fn verify_final_hba(
+    connection: &mut PgConnection,
+) -> Result<(), ProvisionerErrorV1> {
     let rows = sqlx::query(
         "SELECT line_number, type, database, user_name, address, netmask, auth_method, COALESCE(options, ARRAY[]::TEXT[]), error FROM pg_catalog.pg_hba_file_rules ORDER BY line_number",
     )
@@ -427,7 +435,7 @@ mod tests {
             .enumerate()
             .all(|(index, rule)| rule.line_number == index as i32 + 1));
         assert_eq!(rules[0].users.len(), 5);
-        assert_eq!(rules[4].users.len(), 14);
+        assert_eq!(rules[4].users.len(), 15);
         assert_eq!(rules[8].users, [CLUSTER_ADMIN_ROLE]);
         assert_eq!(rules[12].databases, ["replication"]);
         assert_eq!(rules[14].connection_type, "local");
@@ -445,5 +453,7 @@ mod tests {
         assert!(source.contains("rolconnlimit = 2"));
         assert!(source.contains("pg_catalog.pg_db_role_setting"));
         assert!(source.contains("pg_catalog.pg_auth_members"));
+        assert!(source.contains("INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY"));
+        assert!(source.contains("keyrings: 3"));
     }
 }

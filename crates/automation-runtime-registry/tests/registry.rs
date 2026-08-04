@@ -4,8 +4,9 @@ use automation_ruleset::{
     content_hash, RuleSetKey, RuleSetVersion, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
 };
 use automation_runtime_convergence::{
-    BindingRevision, FencingToken, ProcessInstanceId, RuntimeDeploymentTargetV1, RuntimeGeneration,
-    RuntimeProcessIdentityV1,
+    ActivationRequestId, BindingRevision, DeploymentId, FencingToken, InstallationId,
+    ProcessInstanceId, PromotionId, RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1,
+    RuntimeGeneration, RuntimeProcessIdentityV1, TenantId,
 };
 use automation_runtime_registry::{
     ExactServingRouteV1, ServingSlotKeyV1, ServingSlotRegistryConfigV1, ServingSlotRegistryError,
@@ -23,6 +24,20 @@ fn registry(max_active: u32) -> ServingSlotRegistryV1 {
         max_active_interactions_per_slot: NonZeroU32::new(max_active).unwrap(),
         max_retired_routes_per_slot: NonZeroU32::new(4).unwrap(),
     })
+}
+
+fn deployment_identity(guild_id: u64, version: u32, process: &str) -> RuntimeDeploymentIdentityV1 {
+    RuntimeDeploymentIdentityV1 {
+        deployment_id: DeploymentId::parse(format!("deployment:{guild_id}:{version}:{process}"))
+            .unwrap(),
+        tenant_id: TenantId::parse(format!("tenant:{guild_id}")).unwrap(),
+        installation_id: InstallationId::parse(format!("installation:{guild_id}")).unwrap(),
+        promotion_id: PromotionId::parse("d".repeat(64)).unwrap(),
+        activation_request_id: ActivationRequestId::parse(format!(
+            "activation:{guild_id}:{version}:{process}"
+        ))
+        .unwrap(),
+    }
 }
 
 fn route(
@@ -58,6 +73,7 @@ fn route(
     }
     let binding_fingerprint = resource_binding_fingerprint_v2(&bindings);
     ExactServingRouteV1::new(
+        deployment_identity(guild_id, version, process),
         RuntimeProcessIdentityV1 {
             target: RuntimeDeploymentTargetV1 {
                 guild_id: GuildId(guild_id),
@@ -384,6 +400,7 @@ fn exact_route_constructor_rejects_mixed_bindings() {
         .insert(ResourceKey("member".to_string()), RoleId(5));
     assert_eq!(
         ExactServingRouteV1::new(
+            valid.deployment_identity().clone(),
             valid.identity().clone(),
             valid.ruleset().as_ref().clone(),
             different_bindings
@@ -391,6 +408,29 @@ fn exact_route_constructor_rejects_mixed_bindings() {
         .unwrap_err(),
         automation_runtime_registry::ExactServingRouteError::BindingFingerprintMismatch
     );
+}
+
+#[test]
+fn exact_route_preserves_the_explicit_deployment_identity() {
+    let route = route(10, "study", 3, 4, "identity-route", None);
+
+    assert_eq!(
+        route.deployment_identity(),
+        &deployment_identity(10, 3, "identity-route")
+    );
+    assert_eq!(route.process_identity(), route.identity());
+}
+
+#[test]
+fn mutation_token_exposes_the_exact_admitted_route_fence() {
+    let registry = registry(8);
+    let route = route(10, "study", 3, 4, "receipt-route", None);
+    let receipt = registry
+        .install(route.slot_key(), route, fence(17))
+        .unwrap();
+
+    assert_eq!(receipt.token.fencing_token(), fence(17));
+    assert_eq!(receipt.token.route_incarnation().get(), 1);
 }
 
 #[test]

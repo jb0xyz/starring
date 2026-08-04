@@ -414,6 +414,10 @@ WITH common_owner AS (
             'plpgsql', 'v'::"char", 'u'::"char", FALSE, FALSE, 0::REAL,
             'public.runtime_deployments',
             ARRAY['search_path=pg_catalog']::TEXT[]),
+        ('starring_product_apply_authority_projection_at_v2',
+            'expected_tenant_id text, expected_installation_id text, expected_promotion_id text, expected_principal_id text, expected_product_session_digest bytea, expected_acting_user_id text, expected_discord_application_id text, expected_guild_id text, expected_capability text, expected_authority_revision bigint, expected_authority_payload_digest text, expected_authority_observed_at timestamp with time zone, expected_authority_expires_at timestamp with time zone, expected_effective_permission_bits text, expected_guild_owner boolean, expected_payload_digest text, requested_authorization_clock timestamp with time zone',
+            'plpgsql', 'v'::"char", 'u'::"char", TRUE, FALSE, 0::REAL,
+            'jsonb', ARRAY['search_path=pg_catalog']::TEXT[]),
         ('starring_product_apply_consume_lock_core_v2',
             'expected_tenant_id text, expected_installation_id text, expected_promotion_id text, expected_product_revision bigint, expected_payload_digest text, expected_principal_id text, expected_product_session_digest bytea, session_subject_digest bytea, expected_acting_user_id text, expected_discord_application_id text, expected_guild_id text, expected_capability text, expected_authority_revision bigint, expected_authority_payload_digest text, expected_authority_observation_digest text, expected_authority_observed_at timestamp with time zone, expected_authority_expires_at timestamp with time zone, expected_effective_permission_bits text, expected_guild_owner boolean, product_request_id text, active_idempotency_key_digest text, idempotency_key_digest_candidates text[], idempotency_digest_key_id_candidates text[], idempotency_digest_key_fingerprint_candidates text[], idempotency_digest_key_id text, semantic_request_digest text, new_receipt_id text, new_audit_event_id text, new_apply_attempt_id text, new_deployment_id text, expected_source_deployment_id text',
             'plpgsql', 'v'::"char", 'u'::"char", TRUE, TRUE, 1::REAL,
@@ -425,7 +429,7 @@ WITH common_owner AS (
             'TABLE(outcome text, resulting_revision bigint, resulting_state text, exact_replay boolean, guild_id text, deployment_id text, desired_target_digest text)',
             ARRAY['search_path=pg_catalog']::TEXT[])
 ), private_routine_contract AS (
-    SELECT pg_catalog.count(*) = 13
+    SELECT pg_catalog.count(*) = 14
         AND pg_catalog.bool_and(COALESCE(
             namespace.oid IS NOT NULL
             AND namespace.nspowner = common_owner.owner_oid

@@ -7,13 +7,31 @@ use crate::interpret::interpret;
 use crate::modal_input::normalize_modal_submit_inputs;
 use crate::plan::{ActionPlan, PlannedAction};
 
-pub(crate) struct PreparedEventExecution {
-    pub(crate) context: RuntimeContext,
-    pub(crate) plan: ActionPlan,
-    pub(crate) defer_ephemeral: bool,
+pub struct PreparedEventExecution {
+    context: RuntimeContext,
+    plan: ActionPlan,
+    leading_defer_ephemeral: bool,
 }
 
-pub(crate) fn prepare_event_execution(
+impl PreparedEventExecution {
+    pub fn context(&self) -> &RuntimeContext {
+        &self.context
+    }
+
+    pub fn plan(&self) -> &ActionPlan {
+        &self.plan
+    }
+
+    pub fn leading_defer_ephemeral(&self) -> bool {
+        self.leading_defer_ephemeral
+    }
+
+    pub fn into_parts(self) -> (RuntimeContext, ActionPlan, bool) {
+        (self.context, self.plan, self.leading_defer_ephemeral)
+    }
+}
+
+pub fn prepare_event_execution(
     event: &RuntimeEvent,
     ruleset: &InteractionRuleSet,
     bindings: &ResourceBindingMap,
@@ -44,7 +62,7 @@ pub(crate) fn prepare_event_execution(
     Ok(Some(PreparedEventExecution {
         context,
         plan: ActionPlan { steps },
-        defer_ephemeral,
+        leading_defer_ephemeral: defer_ephemeral,
     }))
 }
 
@@ -126,13 +144,13 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(prepared.defer_ephemeral);
-        assert_eq!(prepared.context.guild_id, GuildId(7));
-        assert_eq!(prepared.context.actor, UserId(9));
-        assert_eq!(prepared.context.ruleset_key, "study");
-        assert_eq!(prepared.context.ruleset_version.get(), 3);
+        assert!(prepared.leading_defer_ephemeral());
+        assert_eq!(prepared.context().guild_id, GuildId(7));
+        assert_eq!(prepared.context().actor, UserId(9));
+        assert_eq!(prepared.context().ruleset_key, "study");
+        assert_eq!(prepared.context().ruleset_version.get(), 3);
         assert_eq!(
-            prepared.plan.steps,
+            prepared.plan().steps,
             vec![
                 PlannedAction::CreateRole {
                     key: "member".to_string(),
@@ -158,9 +176,9 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(!prepared.defer_ephemeral);
+        assert!(!prepared.leading_defer_ephemeral());
         assert_eq!(
-            prepared.plan.steps,
+            prepared.plan().steps,
             vec![PlannedAction::RespondEphemeral {
                 content: "ready".to_string(),
             }]
@@ -184,5 +202,31 @@ mod tests {
         .unwrap();
 
         assert!(prepared.is_none());
+    }
+
+    #[test]
+    fn prepared_execution_can_be_inspected_then_consumed_without_reinterpretation() {
+        let prepared = prepare_event_execution(
+            &submit(),
+            &ruleset(vec![
+                ActionSpec::DeferEphemeral,
+                ActionSpec::RespondEphemeral {
+                    content: "ready".to_string(),
+                },
+            ]),
+            &ResourceBindingMap::default(),
+            &identity(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(prepared.context().ruleset_key, "study");
+        assert_eq!(prepared.plan().steps.len(), 1);
+        assert!(prepared.leading_defer_ephemeral());
+
+        let (context, plan, leading_defer_ephemeral) = prepared.into_parts();
+        assert_eq!(context.ruleset_key, "study");
+        assert_eq!(plan.steps.len(), 1);
+        assert!(leading_defer_ephemeral);
     }
 }

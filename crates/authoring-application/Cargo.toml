@@ -8,6 +8,8 @@ authoring-promotion = { path = "../authoring-promotion" }
 automation-ruleset = { path = "../automation-ruleset" }
 design-harness = { path = "../design-harness" }
 discord-model = { path = "../discord-model" }
+serde = { workspace = true }
+serde_json = { workspace = true }
 subtle = "2"
 thiserror = { workspace = true }
 zeroize = "1"
@@ -15,4 +17,3 @@ zeroize = "1"
 [dev-dependencies]
 automation-ruleset-activation = { path = "../automation-ruleset-activation" }
 futures = "0.3"
-serde_json = { workspace = true }

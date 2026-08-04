@@ -10,9 +10,11 @@ pub(crate) struct ScopedFunctionContractV1<'a> {
     identity: &'a str,
     result: &'a str,
     returns_set: bool,
+    strict: bool,
     rows: f32,
     language: ScopedFunctionLanguageV1,
     identity_arguments: Option<&'a str>,
+    search_path: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,9 +38,11 @@ impl<'a> ScopedFunctionContractV1<'a> {
             identity,
             result,
             returns_set: true,
+            strict: true,
             rows,
             language: ScopedFunctionLanguageV1::Sql,
             identity_arguments: None,
+            search_path: "search_path=pg_catalog",
         }
     }
 
@@ -52,9 +56,11 @@ impl<'a> ScopedFunctionContractV1<'a> {
             identity,
             result,
             returns_set: true,
+            strict: true,
             rows,
             language: ScopedFunctionLanguageV1::Sql,
             identity_arguments: Some(identity_arguments),
+            search_path: "search_path=pg_catalog",
         }
     }
 
@@ -63,9 +69,11 @@ impl<'a> ScopedFunctionContractV1<'a> {
             identity,
             result,
             returns_set: false,
+            strict: true,
             rows: 0.0,
             language: ScopedFunctionLanguageV1::Sql,
             identity_arguments: None,
+            search_path: "search_path=pg_catalog",
         }
     }
 
@@ -74,9 +82,11 @@ impl<'a> ScopedFunctionContractV1<'a> {
             identity,
             result,
             returns_set: true,
+            strict: true,
             rows,
             language: ScopedFunctionLanguageV1::PlPgSql,
             identity_arguments: None,
+            search_path: "search_path=pg_catalog",
         }
     }
 
@@ -90,9 +100,28 @@ impl<'a> ScopedFunctionContractV1<'a> {
             identity,
             result,
             returns_set: true,
+            strict: true,
             rows,
             language: ScopedFunctionLanguageV1::PlPgSql,
             identity_arguments: Some(identity_arguments),
+            search_path: "search_path=pg_catalog",
+        }
+    }
+
+    pub(crate) const fn set_plpgsql_non_strict_trusted_public(
+        identity: &'a str,
+        result: &'a str,
+        rows: f32,
+    ) -> Self {
+        Self {
+            identity,
+            result,
+            returns_set: true,
+            strict: false,
+            rows,
+            language: ScopedFunctionLanguageV1::PlPgSql,
+            identity_arguments: None,
+            search_path: "search_path=pg_catalog, public",
         }
     }
 }
@@ -137,6 +166,12 @@ pub(crate) enum ScopedDatabaseProbeModeV1 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScopedDatabaseTopologyV1 {
     pub(crate) database_identity: String,
+    pub(crate) database_name: String,
+    pub(crate) role_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScopedDatabaseSessionIdentityV1 {
     pub(crate) database_name: String,
     pub(crate) role_name: String,
 }
@@ -327,15 +362,39 @@ pub(crate) async fn load_scoped_database_topology(
     let Some(database_identity) = database_identity else {
         return Err(ScopedDatabaseReadinessErrorV1::ContractMismatch);
     };
-    if !canonical_database_identity(&database_identity)
-        || database_name.is_empty()
-        || database_name.len() > 63
-        || role_name != session_role
-    {
+    if !canonical_database_identity(&database_identity) {
         return Err(ScopedDatabaseReadinessErrorV1::ContractMismatch);
     }
+    let session_identity =
+        validate_scoped_database_session_identity(database_name, role_name, session_role)?;
     Ok(ScopedDatabaseTopologyV1 {
         database_identity,
+        database_name: session_identity.database_name,
+        role_name: session_identity.role_name,
+    })
+}
+
+pub(crate) async fn load_scoped_database_session_identity(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<ScopedDatabaseSessionIdentityV1, ScopedDatabaseReadinessErrorV1> {
+    let (database_name, role_name, session_role) = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT current_database()::TEXT, current_user::TEXT, session_user::TEXT",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(readiness_database)?;
+    validate_scoped_database_session_identity(database_name, role_name, session_role)
+}
+
+fn validate_scoped_database_session_identity(
+    database_name: String,
+    role_name: String,
+    session_role: String,
+) -> Result<ScopedDatabaseSessionIdentityV1, ScopedDatabaseReadinessErrorV1> {
+    if database_name.is_empty() || database_name.len() > 63 || role_name != session_role {
+        return Err(ScopedDatabaseReadinessErrorV1::ContractMismatch);
+    }
+    Ok(ScopedDatabaseSessionIdentityV1 {
         database_name,
         role_name,
     })
@@ -620,7 +679,7 @@ async fn load_function_capability(
            function_contract.oid IS NOT NULL \
             AND function_contract.prokind = 'f' \
             AND function_contract.prosecdef \
-            AND function_contract.proisstrict \
+            AND function_contract.proisstrict = $8 \
             AND function_contract.provolatile = 'v' \
             AND function_contract.proparallel = 'u' \
             AND function_contract.proretset = $3 \
@@ -628,7 +687,7 @@ async fn load_function_capability(
             AND NOT function_contract.proleakproof \
             AND function_contract.pronargdefaults = 0 \
             AND function_contract.provariadic = 0 \
-            AND function_contract.proconfig = ARRAY['search_path=pg_catalog']::TEXT[] \
+            AND function_contract.proconfig = ARRAY[$7::TEXT] \
             AND function_contract.lanname = $5 \
             AND function_contract.function_result = $2 \
             AND ($6::TEXT IS NULL \
@@ -678,6 +737,8 @@ async fn load_function_capability(
     .bind(contract.rows)
     .bind(contract.language.database_name())
     .bind(contract.identity_arguments)
+    .bind(contract.search_path)
+    .bind(contract.strict)
     .fetch_one(&mut **transaction)
     .await
     .map_err(readiness_database)
@@ -898,8 +959,18 @@ mod tests {
     fn function_contracts_can_require_plpgsql() {
         let set = ScopedFunctionContractV1::set_plpgsql("public.read_v1(text)", "SETOF text", 1.0);
         assert!(set.returns_set);
+        assert!(set.strict);
         assert_eq!(set.language, ScopedFunctionLanguageV1::PlPgSql);
         assert_eq!(set.language.database_name(), "plpgsql");
+
+        let commit = ScopedFunctionContractV1::set_plpgsql_non_strict_trusted_public(
+            "public.commit_v1(text)",
+            "SETOF text",
+            1.0,
+        );
+        assert!(commit.returns_set);
+        assert!(!commit.strict);
+        assert_eq!(commit.search_path, "search_path=pg_catalog, public");
     }
 
     #[test]
@@ -930,6 +1001,30 @@ mod tests {
             "g1234567-89ab-4def-8123-456789abcdef",
         ] {
             assert!(!canonical_database_identity(invalid));
+        }
+    }
+
+    #[test]
+    fn session_identity_contains_only_database_name_and_direct_role() {
+        let identity = validate_scoped_database_session_identity(
+            "starring".to_string(),
+            "writer".to_string(),
+            "writer".to_string(),
+        )
+        .unwrap();
+        assert_eq!(identity.database_name, "starring");
+        assert_eq!(identity.role_name, "writer");
+        for (database, role, session_role) in
+            [("", "writer", "writer"), ("starring", "writer", "reader")]
+        {
+            assert_eq!(
+                validate_scoped_database_session_identity(
+                    database.to_string(),
+                    role.to_string(),
+                    session_role.to_string(),
+                ),
+                Err(ScopedDatabaseReadinessErrorV1::ContractMismatch)
+            );
         }
     }
 

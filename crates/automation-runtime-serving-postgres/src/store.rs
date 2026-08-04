@@ -26,9 +26,9 @@ pub const MAX_RUNTIME_SERVING_LEASE_DURATION: Duration = Duration::from_secs(300
 
 #[derive(Clone)]
 pub struct PostgresRuntimeServingLeaseV1 {
-    pool: PgPool,
-    expectation: RuntimeServingDatabaseExpectationV1,
-    timeouts: RuntimeServingDatabaseTimeoutsV1,
+    pub(crate) pool: PgPool,
+    pub(crate) expectation: RuntimeServingDatabaseExpectationV1,
+    pub(crate) timeouts: RuntimeServingDatabaseTimeoutsV1,
     initial_readiness: RuntimeServingDatabaseReadinessV1,
 }
 

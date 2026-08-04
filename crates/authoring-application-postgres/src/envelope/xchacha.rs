@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 
 use super::{
     validate_key_id, EncryptedSnapshotEnvelopeV1, SnapshotEnvelopeCipher,
-    SnapshotEnvelopeCipherError,
+    SnapshotEnvelopeCipherError, SnapshotEnvelopeEncryptionPort,
 };
 
 pub const XCHACHA20_POLY1305_SNAPSHOT_SUITE_V1: &str = "xchacha20_poly1305";
@@ -118,6 +118,10 @@ impl SnapshotEnvelopeKeyringV1 {
     fn key_for_id(&self, key_id: &str) -> Option<&SnapshotEnvelopeKeyV1> {
         self.keys.iter().find(|key| key.key_id() == key_id)
     }
+
+    fn active(&self) -> &SnapshotEnvelopeKeyV1 {
+        &self.keys[0]
+    }
 }
 
 impl Debug for SnapshotEnvelopeKeyringV1 {
@@ -183,6 +187,49 @@ impl SnapshotEnvelopeCipher for XChaCha20Poly1305SnapshotEnvelopeCipherV1 {
             .decrypt_in_place(&nonce, authenticated_data, &mut *plaintext)
             .map_err(|_| SnapshotEnvelopeCipherError::AuthenticationFailed)?;
         Ok(plaintext)
+    }
+}
+
+impl SnapshotEnvelopeEncryptionPort for XChaCha20Poly1305SnapshotEnvelopeCipherV1 {
+    fn active_encryption_key_id(&self) -> &str {
+        self.keyring.active_key_id()
+    }
+
+    fn encryption_suite(&self) -> &str {
+        XCHACHA20_POLY1305_SNAPSHOT_SUITE_V1
+    }
+
+    fn encryption_suite_version(&self) -> u16 {
+        XCHACHA20_POLY1305_SNAPSHOT_SUITE_VERSION_V1
+    }
+
+    fn encrypt(
+        &self,
+        plaintext: &Zeroizing<Vec<u8>>,
+        authenticated_data: &[u8],
+    ) -> Result<EncryptedSnapshotEnvelopeV1, SnapshotEnvelopeCipherError> {
+        if plaintext.is_empty() || authenticated_data.is_empty() {
+            return Err(SnapshotEnvelopeCipherError::AuthenticationFailed);
+        }
+        let mut nonce_bytes = [0_u8; XCHACHA20_POLY1305_SNAPSHOT_NONCE_BYTES_V1];
+        getrandom::fill(&mut nonce_bytes).map_err(|_| SnapshotEnvelopeCipherError::Backend)?;
+        let active = self.keyring.active();
+        let cipher_key: &Key = active.secret().into();
+        let cipher = XChaCha20Poly1305::new(cipher_key);
+        let nonce = XNonce::from(nonce_bytes);
+        let mut ciphertext = Zeroizing::new(plaintext.as_slice().to_vec());
+        cipher
+            .encrypt_in_place(&nonce, authenticated_data, &mut *ciphertext)
+            .map_err(|_| SnapshotEnvelopeCipherError::Backend)?;
+        let ciphertext = std::mem::take(&mut *ciphertext);
+        EncryptedSnapshotEnvelopeV1::from_persisted_parts(
+            ciphertext,
+            nonce_bytes.to_vec(),
+            active.key_id().to_string(),
+            XCHACHA20_POLY1305_SNAPSHOT_SUITE_V1.to_string(),
+            XCHACHA20_POLY1305_SNAPSHOT_SUITE_VERSION_V1,
+        )
+        .map_err(|_| SnapshotEnvelopeCipherError::Backend)
     }
 }
 
@@ -294,6 +341,42 @@ mod tests {
         assert_eq!(
             format!("{:?}", key("debug-key", 83)),
             "SnapshotEnvelopeKeyV1(<redacted>)"
+        );
+    }
+
+    #[tokio::test]
+    async fn encryption_uses_the_active_key_and_a_fresh_twenty_four_byte_nonce() {
+        let cipher = XChaCha20Poly1305SnapshotEnvelopeCipherV1::new(keyring(
+            "active-v2",
+            41,
+            [key("retired-v1", 19)],
+        ));
+        let plaintext = Zeroizing::new(PLAINTEXT.to_vec());
+        let first = cipher.encrypt(&plaintext, AUTHENTICATED_DATA).unwrap();
+        let second = cipher.encrypt(&plaintext, AUTHENTICATED_DATA).unwrap();
+        assert_eq!(first.encryption_key_id(), "active-v2");
+        assert_eq!(second.encryption_key_id(), "active-v2");
+        assert_eq!(
+            first.nonce().len(),
+            XCHACHA20_POLY1305_SNAPSHOT_NONCE_BYTES_V1
+        );
+        assert_ne!(first.nonce(), second.nonce());
+        assert_ne!(first.ciphertext(), second.ciphertext());
+        assert_eq!(
+            cipher
+                .decrypt(&first, AUTHENTICATED_DATA)
+                .await
+                .unwrap()
+                .as_slice(),
+            PLAINTEXT
+        );
+        assert_eq!(
+            cipher
+                .decrypt(&second, AUTHENTICATED_DATA)
+                .await
+                .unwrap()
+                .as_slice(),
+            PLAINTEXT
         );
     }
 

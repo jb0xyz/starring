@@ -4,7 +4,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use product_control_http::{
-    product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate,
+    product_control_router_with_operational_v2_and_lifecycle_v1_and_authoring_v1_and_readiness_gate,
     ProductApiReadinessGate, ProductControlFacade,
 };
 use starring_api::{
@@ -68,6 +68,7 @@ async fn run() -> ExitStatusV1 {
             }
         }
     };
+    emit_authoring_composition_status(service.authoring_dependencies_available());
     if shutdown.received_now().await {
         return close_cancelled_service(service).await;
     }
@@ -96,13 +97,16 @@ async fn serve(
     service: ComposedProductionServiceV1,
     mut shutdown: ShutdownSignalsV1,
 ) -> ExitStatusV1 {
+    let authoring_http_boundary = service.authoring_http_boundary_config();
     let (facade, http_boundary, bind_addr, database_shutdown) = service.into_parts();
     let readiness_gate = ProductApiReadinessGate::initially_unready();
-    let router = product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate(
-        facade.clone(),
-        http_boundary,
-        readiness_gate.clone(),
-    );
+    let router =
+        product_control_router_with_operational_v2_and_lifecycle_v1_and_authoring_v1_and_readiness_gate(
+            facade.clone(),
+            http_boundary,
+            authoring_http_boundary,
+            readiness_gate.clone(),
+        );
     let startup_facade = facade.clone();
     let startup_probe = async move { startup_facade.readiness().await.is_ok() };
     let runtime_facade = facade.clone();
@@ -349,6 +353,7 @@ fn database_role_code(role: DatabaseRoleV1) -> &'static str {
         DatabaseRoleV1::CancellationExecutor => "cancellation_executor",
         DatabaseRoleV1::DeploymentStatusReader => "deployment_status_reader",
         DatabaseRoleV1::OperationalDeploymentStatusReader => "operational_deployment_status_reader",
+        DatabaseRoleV1::AuthoringSessionWriter => "authoring_session_writer",
     }
 }
 
@@ -376,6 +381,19 @@ fn emit_status(status: ExitStatusV1) {
     } else {
         let _write_result = writeln!(stderr, "starring_api_status={}", status.code());
     }
+}
+
+fn emit_authoring_composition_status(available: bool) {
+    let mut stderr = std::io::stderr().lock();
+    let _write_result = write_authoring_composition_status(&mut stderr, available);
+}
+
+fn write_authoring_composition_status(
+    mut destination: impl Write,
+    available: bool,
+) -> std::io::Result<()> {
+    let status = if available { "ready" } else { "unavailable" };
+    writeln!(destination, "starring_api_authoring_status={status}")
 }
 
 #[cfg(test)]
@@ -409,6 +427,22 @@ mod tests {
         assert!(!status.success());
         assert!(ExitStatusV1::CleanShutdown.success());
         assert!(ExitStatusV1::StartupCancelled.success());
+    }
+
+    #[test]
+    fn authoring_composition_status_is_closed_and_finite() {
+        let mut ready = Vec::new();
+        let mut unavailable = Vec::new();
+        write_authoring_composition_status(&mut ready, true).unwrap();
+        write_authoring_composition_status(&mut unavailable, false).unwrap();
+        assert_eq!(
+            String::from_utf8(ready).unwrap(),
+            "starring_api_authoring_status=ready\n"
+        );
+        assert_eq!(
+            String::from_utf8(unavailable).unwrap(),
+            "starring_api_authoring_status=unavailable\n"
+        );
     }
 
     #[test]

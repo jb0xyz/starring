@@ -1,10 +1,11 @@
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::num::NonZeroU64;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use automation_runtime_controller::{
-    RuntimeDrainIntentIdV2, RuntimeGatewayOwnerLeaseReceiptV1, RuntimeServingSlotV2,
+    RuntimeDrainIntentIdV2, RuntimeGatewayOwnerLeaseReceiptV1, RuntimeServingReceiptV2,
+    RuntimeServingSlotV2,
 };
 use automation_runtime_convergence::{ProcessInstanceId, RuntimeDeploymentTargetV1};
 use chrono::{DateTime, Utc};
@@ -118,6 +119,45 @@ impl RuntimePendingDrainCandidateV2 {
 impl Debug for RuntimePendingDrainCandidateV2 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimePendingDrainCandidateV2(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimePendingDrainServingSourceCorrelationV3 {
+    intent_id: RuntimeDrainIntentIdV2,
+    source_intent_revision: NonZeroU64,
+    source_state_digest: RuntimePendingDrainStateDigestV2,
+}
+
+impl RuntimePendingDrainServingSourceCorrelationV3 {
+    pub fn new(
+        intent_id: RuntimeDrainIntentIdV2,
+        source_intent_revision: NonZeroU64,
+        source_state_digest: RuntimePendingDrainStateDigestV2,
+    ) -> Self {
+        Self {
+            intent_id,
+            source_intent_revision,
+            source_state_digest,
+        }
+    }
+
+    pub fn intent_id(&self) -> &RuntimeDrainIntentIdV2 {
+        &self.intent_id
+    }
+
+    pub fn source_intent_revision(&self) -> NonZeroU64 {
+        self.source_intent_revision
+    }
+
+    pub fn source_state_digest(&self) -> &RuntimePendingDrainStateDigestV2 {
+        &self.source_state_digest
+    }
+}
+
+impl Debug for RuntimePendingDrainServingSourceCorrelationV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimePendingDrainServingSourceCorrelationV3(<redacted>)")
     }
 }
 
@@ -383,6 +423,7 @@ pub enum RuntimePendingDrainExecutionProofV2 {
     NoCandidate(RuntimePendingDrainNoCandidateProofV2),
     Compound(Box<RuntimePendingDrainCompoundProofV2>),
     Deferred(Box<RuntimePendingDrainDeferredSelectionProofV3>),
+    ServingDeferred(Box<RuntimePendingDrainServingDeferredSelectionProofV3>),
     Succession(Box<RuntimePendingDrainSuccessionProofV3>),
 }
 
@@ -410,6 +451,7 @@ impl RuntimePendingDrainExecutionProofV2 {
                         .is_some_and(|identity| identity == proof.acknowledgement_action_identity)
             }
             Self::Deferred(proof) => proof.action_identity() == request.action_identity(),
+            Self::ServingDeferred(proof) => proof.action_identity() == request.action_identity(),
             Self::Succession(proof) => proof.action_identity() == request.action_identity(),
         }
     }
@@ -439,6 +481,10 @@ impl RuntimePendingDrainExecutionProofV2 {
             }
             (
                 Self::Deferred(proof),
+                RuntimeStartupRecoveryExecutionReceiptOutcomeV2::RetryAfter { retry_after },
+            ) => retry_after == &proof.retry_after(),
+            (
+                Self::ServingDeferred(proof),
                 RuntimeStartupRecoveryExecutionReceiptOutcomeV2::RetryAfter { retry_after },
             ) => retry_after == &proof.retry_after(),
             (
@@ -573,6 +619,89 @@ impl RuntimeSelectedPendingDrainCandidateV2 {
         &self.selection_owner_receipt
     }
 
+    pub fn check_fresh_serving_v3(
+        &self,
+        source: RuntimePendingDrainServingSourceCorrelationV3,
+        serving: RuntimeServingReceiptV2,
+        observed_at: DateTime<Utc>,
+    ) -> Result<RuntimeCheckedPendingDrainFreshServingEvidenceV3, RuntimePendingDrainCompoundErrorV2>
+    {
+        let target = &serving.identity.process_identity.target;
+        if source.intent_id != self.candidate.intent_id
+            || source.source_intent_revision != self.candidate.source_intent_revision
+            || source.source_state_digest != self.candidate.source_state_digest
+            || target != &self.candidate.expected_target
+            || RuntimeServingSlotV2::from_target(target) != self.candidate.slot
+        {
+            return Err(RuntimePendingDrainCompoundErrorV2::ServingEvidenceMismatch);
+        }
+        if !serving.connected
+            || !serving.serving
+            || serving.acquired_at > serving.last_heartbeat_at
+            || serving.last_heartbeat_at > observed_at
+            || serving.last_heartbeat_at > serving.expires_at
+            || observed_at < self.selection_owner_receipt.database_now
+        {
+            return Err(RuntimePendingDrainCompoundErrorV2::ServingClassificationMismatch);
+        }
+        if serving.expires_at <= observed_at {
+            return Err(RuntimePendingDrainCompoundErrorV2::ServingClassificationMismatch);
+        }
+        Ok(RuntimeCheckedPendingDrainFreshServingEvidenceV3 {
+            candidate: self.candidate.clone(),
+            source,
+            serving,
+            observed_at,
+        })
+    }
+
+    pub fn defer_for_fresh_serving_v3(
+        self,
+        evidence: RuntimeCheckedPendingDrainFreshServingEvidenceV3,
+    ) -> Result<RuntimeCompletedStartupRecoveryExecutionV2, RuntimePendingDrainCompoundErrorV2>
+    {
+        if evidence.candidate != self.candidate {
+            return Err(RuntimePendingDrainCompoundErrorV2::ServingEvidenceMismatch);
+        }
+        let remaining_serving = evidence
+            .serving
+            .expires_at
+            .signed_duration_since(evidence.observed_at)
+            .to_std()
+            .ok()
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(RuntimePendingDrainCompoundErrorV2::ServingClassificationMismatch)?;
+        let remaining_owner = self
+            .selection_owner_receipt
+            .expires_at
+            .signed_duration_since(evidence.observed_at)
+            .to_std()
+            .ok()
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(RuntimePendingDrainCompoundErrorV2::OwnerNotCurrent)?;
+        let retry_after = Duration::from_secs(1)
+            .min(remaining_serving)
+            .min(remaining_owner);
+        let action_identity = self.authorization.request().action_identity().clone();
+        let standard_receipt = RuntimeStartupRecoveryExecutionReceiptV2 {
+            correlation: self.authorization.request().correlation().clone(),
+            class: RuntimeStartupRecoveryClassV2::PendingRuntimeDrainIntent,
+            owner_receipt: self.selection_owner_receipt,
+            outcome: RuntimeStartupRecoveryExecutionReceiptOutcomeV2::RetryAfter { retry_after },
+        };
+        Ok(self.authorization.complete_pending_drain(
+            standard_receipt,
+            RuntimePendingDrainExecutionProofV2::ServingDeferred(Box::new(
+                RuntimePendingDrainServingDeferredSelectionProofV3 {
+                    action_identity,
+                    evidence,
+                    retry_after,
+                },
+            )),
+            None,
+        ))
+    }
+
     pub fn bind_registry_seal(
         self,
         seal: RuntimePendingDrainRegistrySealWitnessV2,
@@ -585,6 +714,57 @@ impl RuntimeSelectedPendingDrainCandidateV2 {
             seal,
             minimum_database_now: self.selection_owner_receipt.database_now,
         })
+    }
+}
+
+pub struct RuntimeCheckedPendingDrainFreshServingEvidenceV3 {
+    candidate: RuntimePendingDrainCandidateV2,
+    source: RuntimePendingDrainServingSourceCorrelationV3,
+    serving: RuntimeServingReceiptV2,
+    observed_at: DateTime<Utc>,
+}
+
+impl Debug for RuntimeCheckedPendingDrainFreshServingEvidenceV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeCheckedPendingDrainFreshServingEvidenceV3(<redacted>)")
+    }
+}
+
+pub struct RuntimePendingDrainServingDeferredSelectionProofV3 {
+    action_identity: RuntimeStartupRecoveryExecutionActionIdentityV2,
+    evidence: RuntimeCheckedPendingDrainFreshServingEvidenceV3,
+    retry_after: Duration,
+}
+
+impl RuntimePendingDrainServingDeferredSelectionProofV3 {
+    pub fn action_identity(&self) -> &RuntimeStartupRecoveryExecutionActionIdentityV2 {
+        &self.action_identity
+    }
+
+    pub fn candidate(&self) -> &RuntimePendingDrainCandidateV2 {
+        &self.evidence.candidate
+    }
+
+    pub fn serving(&self) -> &RuntimeServingReceiptV2 {
+        &self.evidence.serving
+    }
+
+    pub fn source_correlation(&self) -> &RuntimePendingDrainServingSourceCorrelationV3 {
+        &self.evidence.source
+    }
+
+    pub fn observed_at(&self) -> DateTime<Utc> {
+        self.evidence.observed_at
+    }
+
+    pub fn retry_after(&self) -> Duration {
+        self.retry_after
+    }
+}
+
+impl Debug for RuntimePendingDrainServingDeferredSelectionProofV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimePendingDrainServingDeferredSelectionProofV3(<redacted>)")
     }
 }
 
@@ -1322,4 +1502,8 @@ pub enum RuntimePendingDrainCompoundErrorV2 {
     PreviousClaimClassificationMismatch,
     #[error("runtime pending drain previous claim candidate is invalid")]
     InvalidPreviousClaimCandidate,
+    #[error("runtime pending drain serving evidence does not match the candidate")]
+    ServingEvidenceMismatch,
+    #[error("runtime pending drain serving classification does not match database time")]
+    ServingClassificationMismatch,
 }

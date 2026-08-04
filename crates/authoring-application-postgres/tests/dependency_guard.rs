@@ -20,6 +20,9 @@ fn snapshot_cipher_keeps_audited_crypto_and_secret_memory_boundaries() {
     assert!(cipher.contains("keys: Arc<[SnapshotEnvelopeKeyV1]>"));
     assert!(cipher.contains("AeadInOut"));
     assert!(cipher.contains("decrypt_in_place"));
+    assert!(cipher.contains("let mut ciphertext = Zeroizing::new(plaintext.as_slice().to_vec());"));
+    assert!(cipher.contains("let ciphertext = std::mem::take(&mut *ciphertext);"));
+    assert!(!cipher.contains("let mut ciphertext = plaintext.as_slice().to_vec();"));
     assert!(cipher.contains("let cipher_key: &Key = key.secret().into()"));
     assert!(cipher.contains("ConstantTimeEq"));
     assert!(cipher.contains("MAX_SNAPSHOT_ENVELOPE_KEYS: usize = 8"));
@@ -185,7 +188,8 @@ fn product_decision_adapter_keeps_atomic_security_and_idempotency_boundaries() {
         "starring_product_apply_lock_core_unfenced_v1",
         "pg_catalog.count(*) = 12",
         "private_routine_contract",
-        "pg_catalog.count(*) = 13",
+        "pg_catalog.count(*) = 14",
+        "starring_product_apply_authority_projection_at_v2",
         "starring_runtime_private_v2",
         "starring_runtime_slot_writer_fence_lock_v2",
         "starring_runtime_slot_writer_fence_begin_unsafe_v2",
@@ -916,7 +920,7 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     assert!(snapshot.contains(".bind(scope.tenant_id().as_str())"));
     assert!(snapshot.contains(".bind(scope.installation_id().as_str())"));
     assert!(snapshot
-        .contains("public.starring_product_authorized_snapshot_read_v1($1, $2, $3, $4, $5)"));
+        .contains("public.starring_product_authorized_snapshot_read_v2($1, $2, $3, $4, $5)"));
     for forbidden in [
         "public.authoring_sessions",
         "public.product_principals",
@@ -981,7 +985,7 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
         "RELATIONS: [ScopedRelationContractV1<'static>; 7]",
         "ScopedRelationContractV1::ordinary_without_rls",
         "begin_scoped_database_readiness(",
-        "public.starring_product_authorized_snapshot_read_v1(",
+        "public.starring_product_authorized_snapshot_read_v2(",
         "PROBE_DIGEST: [u8; 31]",
     ] {
         assert!(
@@ -1063,7 +1067,9 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
     for required in [
         "pg_catalog.to_regprocedure($1)",
         "pg_catalog.pg_get_function_result(function_row.oid)",
-        "function_contract.proconfig = ARRAY['search_path=pg_catalog']::TEXT[]",
+        "function_contract.proconfig = ARRAY[$7::TEXT]",
+        "search_path: \"search_path=pg_catalog\"",
+        "search_path: \"search_path=pg_catalog, public\"",
         "pg_catalog.aclexplode(COALESCE(",
         "privilege.is_grantable",
         "pg_catalog.has_table_privilege(",
@@ -1391,9 +1397,14 @@ fn authentication_and_snapshot_transactions_keep_their_security_shape() {
 fn deployment_status_uses_one_scoped_reader_and_the_shared_runtime_projector() {
     let adapter = include_str!("../src/deployment_status/mod.rs");
     let contract = include_str!("../src/deployment_status/contract.rs");
+    let operational_contract = include_str!("../src/deployment_status/operational/contract.rs");
     let query = include_str!("../src/deployment_status/query.rs");
+    let operational_query = include_str!("../src/deployment_status/operational/query.rs");
     let row = include_str!("../src/deployment_status/row.rs");
     let readiness = include_str!("../src/deployment_status/readiness.rs");
+    let migration = include_str!(
+        "../../../migrations/202608020001_project_runtime_certification_v2_status_evidence.sql"
+    );
     assert!(adapter.contains("pool: PgPool"));
     assert!(!adapter.contains("PostgresRuntimeConvergence"));
     for required in [
@@ -1410,7 +1421,7 @@ fn deployment_status_uses_one_scoped_reader_and_the_shared_runtime_projector() {
     }
     for required in [
         "starring_product_deployment_status_reader_database_identity_v1()",
-        "starring_product_deployment_status_read_v1(text,text,text,text,text,text,text,text,bytea)",
+        "starring_product_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)",
         "expected_product_session_digest bytea",
         "LIMIT 2",
     ] {
@@ -1419,10 +1430,40 @@ fn deployment_status_uses_one_scoped_reader_and_the_shared_runtime_projector() {
             "missing status contract: {required}"
         );
     }
+    for required in [
+        "starring_product_deployment_status_reader_database_identity_v2()",
+        "starring_product_operational_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)",
+        "expected_product_session_digest bytea",
+        "LIMIT 2",
+    ] {
+        assert!(
+            operational_contract.contains(required),
+            "missing operational status contract: {required}"
+        );
+    }
+    for required in [
+        "CREATE FUNCTION public.starring_product_deployment_status_read_core_v3(",
+        "CREATE FUNCTION public.starring_product_deployment_status_read_v3(",
+        "CREATE FUNCTION public.starring_product_operational_deployment_status_read_v3(",
+        "public.starring_product_deployment_status_read_core_v3(text,text,text,text,text,text,text,text,bytea)",
+        "public.starring_product_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)",
+        "public.starring_product_operational_deployment_status_read_v3(text,text,text,text,text,text,text,text,bytea)",
+    ] {
+        assert!(
+            migration.contains(required),
+            "missing status migration contract: {required}"
+        );
+    }
+    assert!(!contract.contains("starring_product_deployment_status_read_core_v3"));
+    assert!(!operational_contract.contains("starring_product_deployment_status_read_core_v3"));
     assert!(query.contains("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"));
     assert!(query.contains("sqlx::query_as::<_, ProductDeploymentStatusRow>(STATUS_QUERY)"));
     assert!(query.contains(".bind(actor.session_fingerprint().as_bytes().as_slice())"));
     assert!(query.contains(".fetch_all(&mut *transaction)"));
+    assert!(operational_query
+        .contains("sqlx::query_as::<_, ProductDeploymentOperationalStatusRow>(STATUS_QUERY)"));
+    assert!(operational_query.contains(".bind(actor.session_fingerprint().as_bytes().as_slice())"));
+    assert!(operational_query.contains(".fetch_all(&mut *transaction)"));
     for forbidden in [
         "runtime_deployments",
         "runtime_attestations",
@@ -1437,13 +1478,17 @@ fn deployment_status_uses_one_scoped_reader_and_the_shared_runtime_projector() {
             !query.contains(forbidden),
             "raw status SQL edge: {forbidden}"
         );
+        assert!(
+            !operational_query.contains(forbidden),
+            "raw operational status SQL edge: {forbidden}"
+        );
     }
     assert!(row.contains("request_mismatch"));
     assert!(row.contains("sensitive_evidence_is_empty"));
     assert!(!row.contains("derive(Debug"));
     for required in [
         "FUNCTIONS: [ScopedFunctionContractV1<'static>; 2]",
-        "RELATIONS: [ScopedRelationContractV1<'static>; 13]",
+        "RELATIONS: [ScopedRelationContractV1<'static>; 14]",
         "verify_scoped_executable_allowlist",
         "verify_scoped_schema_trust",
         "SUPPORT_CONTRACT_QUERY",
@@ -1466,6 +1511,26 @@ fn source_files_contain_no_comments() {
         (
             "src/authentication/readiness.rs",
             include_str!("../src/authentication/readiness.rs"),
+        ),
+        (
+            "src/authoring_writer/mod.rs",
+            include_str!("../src/authoring_writer/mod.rs"),
+        ),
+        (
+            "src/authoring_writer/digest.rs",
+            include_str!("../src/authoring_writer/digest.rs"),
+        ),
+        (
+            "src/authoring_writer/readiness.rs",
+            include_str!("../src/authoring_writer/readiness.rs"),
+        ),
+        (
+            "src/authoring_writer/row.rs",
+            include_str!("../src/authoring_writer/row.rs"),
+        ),
+        (
+            "src/authoring_writer/store.rs",
+            include_str!("../src/authoring_writer/store.rs"),
         ),
         ("src/bindings.rs", include_str!("../src/bindings.rs")),
         ("src/database.rs", include_str!("../src/database.rs")),
@@ -1667,6 +1732,18 @@ fn source_files_contain_no_comments() {
             include_str!("dependency_guard.rs"),
         ),
         (
+            "tests/authoring_writer_migration_guard.rs",
+            include_str!("authoring_writer_migration_guard.rs"),
+        ),
+        (
+            "tests/postgres_authoring_writer.rs",
+            include_str!("postgres_authoring_writer.rs"),
+        ),
+        (
+            "tests/postgres_authoring_writer/migration_security.rs",
+            include_str!("postgres_authoring_writer/migration_security.rs"),
+        ),
+        (
             "tests/postgres_adapter.rs",
             include_str!("postgres_adapter.rs"),
         ),
@@ -1799,4 +1876,21 @@ fn source_files_contain_no_comments() {
             );
         }
     }
+}
+
+#[test]
+fn author_capability_has_exhaustive_non_product_postgres_classification() {
+    let decisions = include_str!("../src/product_decisions/row.rs")
+        .split_whitespace()
+        .collect::<String>();
+    assert!(decisions.contains(
+        "CapabilityV1::Author|CapabilityV1::Promote|CapabilityV1::Approve|CapabilityV1::Reject|CapabilityV1::Apply|CapabilityV1::CancelLifecycle=>MAX_WRITE_AUTHORITY_LIFETIME"
+    ));
+
+    let deployment_status = include_str!("../src/deployment_status/row.rs")
+        .split_whitespace()
+        .collect::<String>();
+    assert!(deployment_status.contains(
+        "CapabilityV1::Author|CapabilityV1::Promote|CapabilityV1::Approve|CapabilityV1::Reject|CapabilityV1::CancelLifecycle=>None"
+    ));
 }

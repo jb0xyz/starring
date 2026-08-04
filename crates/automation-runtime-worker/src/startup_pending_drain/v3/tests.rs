@@ -3,18 +3,23 @@ use std::time::Duration;
 
 use automation_runtime_controller::{
     GatewayShardIdV1, RuntimeBuildRevisionV1, RuntimeCanonicalDrainIntentStateV2,
-    RuntimeCanonicalProductDrainV2, RuntimeDrainClaimProgressV2, RuntimeDrainClaimSealWitnessV2,
-    RuntimeDrainClaimV2, RuntimeDrainIntentDigestV2, RuntimeDrainIntentIdV2, RuntimeDrainIntentV2,
+    RuntimeCanonicalProductDrainV2, RuntimeCertificationOperationIdV2, RuntimeDeploymentScopeV1,
+    RuntimeDrainClaimProgressV2, RuntimeDrainClaimSealWitnessV2, RuntimeDrainClaimV2,
+    RuntimeDrainIntentDigestV2, RuntimeDrainIntentIdV2, RuntimeDrainIntentV2,
     RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayOwnerLeaseIdV1,
-    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyKindV2,
+    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyKindV2, RuntimeLiveAttestationDigestV2,
     RuntimePersistedProductDrainRootV2, RuntimePersistedRouteAbsentClaimedPendingDrainIntentV2,
-    RuntimeProductMutationDigestV2, RuntimeRecoveryIdV2, RuntimeStartupRecoveryStateV2,
-    RuntimeStartupServingStateV2,
+    RuntimeProductMutationDigestV2, RuntimeRecoveryIdV2, RuntimeServingIdentityV2,
+    RuntimeServingReceiptV2, RuntimeStartupRecoveryStateV2, RuntimeStartupServingStateV2,
 };
-use automation_runtime_convergence::{ControllerId, FencingToken, ProcessInstanceId};
+use automation_runtime_convergence::{
+    ControllerId, DeploymentId, FencingToken, InstallationId, ProcessInstanceId, RuntimeGeneration,
+    RuntimeProcessIdentityV1, TenantId,
+};
 use chrono::{DateTime, TimeDelta, Utc};
 
 use super::*;
+use crate::RuntimePendingDrainServingSourceCorrelationV3;
 use crate::{
     accept_runtime_registry_recovery_empty_observation_v2, RuntimeAcceptedStartupRecoveryOutcomeV2,
     RuntimeCapabilityReadinessKindV2, RuntimeCapabilityReadinessReceiptV2,
@@ -311,6 +316,68 @@ fn owner_receipt(
     }
 }
 
+fn serving_receipt_v3(
+    target: automation_runtime_convergence::RuntimeDeploymentTargetV1,
+    revision: u64,
+    heartbeat_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> RuntimeServingReceiptV2 {
+    RuntimeServingReceiptV2 {
+        identity: RuntimeServingIdentityV2 {
+            scope: RuntimeDeploymentScopeV1 {
+                tenant_id: TenantId::parse("tenant:1").unwrap(),
+                installation_id: InstallationId::parse("installation:1").unwrap(),
+                deployment_id: DeploymentId::parse("deployment:1").unwrap(),
+            },
+            operation_id: RuntimeCertificationOperationIdV2::parse(
+                "00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+            attestation_digest: RuntimeLiveAttestationDigestV2::parse("e".repeat(64)).unwrap(),
+            process_identity: RuntimeProcessIdentityV1 {
+                target,
+                runtime_generation: RuntimeGeneration::new(4).unwrap(),
+                process_instance_id: ProcessInstanceId::parse("runtime:source").unwrap(),
+            },
+            lease_epoch: non_zero(5),
+            revision: non_zero(revision),
+        },
+        acquired_at: heartbeat_at - TimeDelta::seconds(1),
+        last_heartbeat_at: heartbeat_at,
+        expires_at,
+        connected: true,
+        serving: true,
+    }
+}
+
+fn serving_source_correlation_v3(
+    candidate: &RuntimePendingDrainCandidateV2,
+) -> RuntimePendingDrainServingSourceCorrelationV3 {
+    RuntimePendingDrainServingSourceCorrelationV3::new(
+        candidate.intent_id().clone(),
+        candidate.source_intent_revision(),
+        candidate.source_state_digest().clone(),
+    )
+}
+
+fn selected_unclaimed_v3(
+    candidate: RuntimePendingDrainCandidateV2,
+) -> RuntimeSelectedPendingDrainCandidateV2 {
+    let (_, _, authorization) = begin_execution();
+    let selection = authorization.into_pending_drain_selection_v3().unwrap();
+    let receipt = RuntimePendingDrainSelectionReceiptV3::new(
+        selection.request().correlation().clone(),
+        owner_receipt(selection.request(), at(110)),
+        RuntimePendingDrainSelectionOutcomeV3::Unclaimed(candidate),
+    );
+    let RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selected) =
+        selection.accept_selection(receipt).unwrap()
+    else {
+        panic!("expected unclaimed candidate")
+    };
+    *selected
+}
+
 fn seal(
     request: &crate::RuntimeStartupRecoveryExecutionRequestV2,
     candidate: &RuntimePendingDrainPreviousOwnerClaimedCandidateV3,
@@ -557,6 +624,209 @@ fn fresh_previous_owner_is_sealless_and_uses_exact_deterministic_retry() {
             .observation_sequence()
             .get(),
         6
+    );
+}
+
+#[test]
+fn fresh_unclaimed_source_serving_is_sealless_and_defers_with_exact_evidence() {
+    let (mut lifecycle, mut permit, authorization) = begin_execution();
+    let selection = authorization.into_pending_drain_selection_v3().unwrap();
+    let key = canonical_key();
+    let candidate = RuntimePendingDrainCandidateV2::new(
+        key.intent_id,
+        key.slot,
+        key.expected_target,
+        non_zero(5),
+        RuntimePendingDrainStateDigestV2::new([5; 32]).unwrap(),
+    )
+    .unwrap();
+    let receipt = RuntimePendingDrainSelectionReceiptV3::new(
+        selection.request().correlation().clone(),
+        owner_receipt(selection.request(), at(110)),
+        RuntimePendingDrainSelectionOutcomeV3::Unclaimed(candidate.clone()),
+    );
+    let RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selected) =
+        selection.accept_selection(receipt).unwrap()
+    else {
+        panic!("expected unclaimed candidate")
+    };
+    let serving = serving_receipt_v3(candidate.expected_target().clone(), 7, at(111), at(115));
+    let evidence = selected
+        .check_fresh_serving_v3(
+            serving_source_correlation_v3(&candidate),
+            serving.clone(),
+            at(112),
+        )
+        .unwrap();
+    let completed = selected.defer_for_fresh_serving_v3(evidence).unwrap();
+    let accepted = lifecycle
+        .complete_startup_recovery_execution(&mut permit, completed)
+        .unwrap();
+    let RuntimePendingDrainExecutionProofV2::ServingDeferred(proof) =
+        accepted.pending_drain_proof().unwrap()
+    else {
+        panic!("expected serving deferred proof")
+    };
+    assert_eq!(proof.candidate(), &candidate);
+    assert_eq!(proof.serving(), &serving);
+    assert_eq!(proof.observed_at(), at(112));
+    assert_eq!(proof.retry_after(), Duration::from_secs(1));
+    assert_eq!(
+        permit
+            .registry_evidence()
+            .empty_observation()
+            .observation_sequence()
+            .get(),
+        6
+    );
+}
+
+#[test]
+fn unclaimed_source_serving_deferral_rejects_expired_and_target_drift() {
+    for drift_target in [false, true] {
+        let (_, _, authorization) = begin_execution();
+        let selection = authorization.into_pending_drain_selection_v3().unwrap();
+        let key = canonical_key();
+        let candidate = RuntimePendingDrainCandidateV2::new(
+            key.intent_id,
+            key.slot,
+            key.expected_target,
+            non_zero(5),
+            RuntimePendingDrainStateDigestV2::new([5; 32]).unwrap(),
+        )
+        .unwrap();
+        let receipt = RuntimePendingDrainSelectionReceiptV3::new(
+            selection.request().correlation().clone(),
+            owner_receipt(selection.request(), at(110)),
+            RuntimePendingDrainSelectionOutcomeV3::Unclaimed(candidate.clone()),
+        );
+        let RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selected) =
+            selection.accept_selection(receipt).unwrap()
+        else {
+            panic!("expected unclaimed candidate")
+        };
+        let mut target = candidate.expected_target().clone();
+        let expires_at = if drift_target {
+            target.version = target.version.next().unwrap();
+            at(115)
+        } else {
+            at(112)
+        };
+        let error = selected
+            .check_fresh_serving_v3(
+                serving_source_correlation_v3(&candidate),
+                serving_receipt_v3(target, 7, at(111), expires_at),
+                at(112),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            if drift_target {
+                RuntimePendingDrainCompoundErrorV2::ServingEvidenceMismatch
+            } else {
+                RuntimePendingDrainCompoundErrorV2::ServingClassificationMismatch
+            }
+        );
+    }
+}
+
+#[test]
+fn fresh_source_serving_check_rejects_source_drift_and_future_heartbeat() {
+    for case in 0..4 {
+        let (_, _, authorization) = begin_execution();
+        let selection = authorization.into_pending_drain_selection_v3().unwrap();
+        let key = canonical_key();
+        let candidate = RuntimePendingDrainCandidateV2::new(
+            key.intent_id,
+            key.slot,
+            key.expected_target,
+            non_zero(5),
+            RuntimePendingDrainStateDigestV2::new([5; 32]).unwrap(),
+        )
+        .unwrap();
+        let receipt = RuntimePendingDrainSelectionReceiptV3::new(
+            selection.request().correlation().clone(),
+            owner_receipt(selection.request(), at(110)),
+            RuntimePendingDrainSelectionOutcomeV3::Unclaimed(candidate.clone()),
+        );
+        let RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selected) =
+            selection.accept_selection(receipt).unwrap()
+        else {
+            panic!("expected unclaimed candidate")
+        };
+        let heartbeat_at = if case == 3 { at(113) } else { at(111) };
+        let source = RuntimePendingDrainServingSourceCorrelationV3::new(
+            if case == 0 {
+                RuntimeDrainIntentIdV2::parse("09".repeat(16)).unwrap()
+            } else {
+                candidate.intent_id().clone()
+            },
+            if case == 1 {
+                non_zero(6)
+            } else {
+                candidate.source_intent_revision()
+            },
+            if case == 2 {
+                RuntimePendingDrainStateDigestV2::new([6; 32]).unwrap()
+            } else {
+                candidate.source_state_digest().clone()
+            },
+        );
+        let error = selected
+            .check_fresh_serving_v3(
+                source,
+                serving_receipt_v3(
+                    candidate.expected_target().clone(),
+                    7,
+                    heartbeat_at,
+                    at(115),
+                ),
+                at(112),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            if case == 3 {
+                RuntimePendingDrainCompoundErrorV2::ServingClassificationMismatch
+            } else {
+                RuntimePendingDrainCompoundErrorV2::ServingEvidenceMismatch
+            }
+        );
+    }
+}
+
+#[test]
+fn checked_fresh_serving_evidence_cannot_cross_candidate_correlation() {
+    let key = canonical_key();
+    let candidate = RuntimePendingDrainCandidateV2::new(
+        key.intent_id,
+        key.slot,
+        key.expected_target,
+        non_zero(5),
+        RuntimePendingDrainStateDigestV2::new([5; 32]).unwrap(),
+    )
+    .unwrap();
+    let selected = selected_unclaimed_v3(candidate.clone());
+    let evidence = selected
+        .check_fresh_serving_v3(
+            serving_source_correlation_v3(&candidate),
+            serving_receipt_v3(candidate.expected_target().clone(), 7, at(111), at(115)),
+            at(112),
+        )
+        .unwrap();
+    let crossed = RuntimePendingDrainCandidateV2::new(
+        RuntimeDrainIntentIdV2::parse("09".repeat(16)).unwrap(),
+        candidate.slot().clone(),
+        candidate.expected_target().clone(),
+        candidate.source_intent_revision(),
+        candidate.source_state_digest().clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        selected_unclaimed_v3(crossed)
+            .defer_for_fresh_serving_v3(evidence)
+            .unwrap_err(),
+        RuntimePendingDrainCompoundErrorV2::ServingEvidenceMismatch
     );
 }
 

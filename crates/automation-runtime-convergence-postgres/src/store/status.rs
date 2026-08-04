@@ -4,6 +4,7 @@ use crate::error::database;
 use crate::model::{RuntimeDeploymentScopeV1, RuntimeDeploymentStatusV1};
 use crate::projection::{project_status, CurrentAuthorityOutcome, StatusProjectionEvidence};
 use crate::row::{ServingLeaseRow, SERVING_LEASE_COLUMNS};
+use crate::status_attestation::StatusAttestationEvidence;
 use crate::{PostgresRuntimeConvergence, RuntimeConvergenceStoreError};
 
 impl PostgresRuntimeConvergence {
@@ -50,7 +51,9 @@ impl PostgresRuntimeConvergence {
             }
         } else {
             None
-        };
+        }
+        .map(StatusAttestationEvidence::from_legacy)
+        .transpose()?;
         let serving = if should_load_live && attestation.is_some() {
             sqlx::query_as::<_, ServingLeaseRow>(&format!(
                 "SELECT {SERVING_LEASE_COLUMNS} FROM public.runtime_serving_leases \

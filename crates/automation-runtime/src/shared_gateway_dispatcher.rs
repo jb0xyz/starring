@@ -1,0 +1,1629 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::{Debug, Formatter};
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+
+#[cfg(any(test, doctest))]
+use automation_core::InteractionResponder;
+#[cfg(any(test, doctest))]
+use automation_instance::InstanceIdGenerator;
+use automation_instance::{
+    InstanceRegistrarV1, InstanceRouteReaderV1, InstanceStoreError,
+    InstanceTeardownRetryScanCursorV2, InstanceTeardownRetryScanPageV2,
+    InstanceTeardownRetryScannerV2, InstanceTeardownStoreV1, SecureRandomInstanceIdGenerator,
+};
+use automation_instance_teardown::{
+    InstanceTeardownService, Teardown, TeardownError, TeardownOutcome,
+};
+#[cfg(any(test, doctest))]
+use automation_ruleset_dispatch::GuildRoleSnapshotProvider;
+use automation_ruleset_dispatch::PinnedInstanceResolverV1;
+use automation_runtime_interaction::{
+    build_interaction_request_digest_v1, InteractionReceiptIdentityV1,
+    InteractionRequestDigestErrorV1, InteractionRequestDigestInputV1, InteractionRequestDigestV1,
+    InteractionRequestPayloadV1,
+};
+use automation_runtime_registry::ServingSlotRegistryV1;
+use discord_model::{ChannelId, GuildId, UserId};
+use twilight_http::Client;
+use twilight_model::application::interaction::message_component::MessageComponentInteractionData;
+use twilight_model::application::interaction::modal::{
+    ModalInteractionComponent, ModalInteractionData, ModalInteractionTextInput,
+};
+use twilight_model::application::interaction::{Interaction, InteractionData, InteractionType};
+use twilight_model::channel::message::component::ComponentType;
+use twilight_model::id::marker::{
+    ApplicationMarker, ChannelMarker, GuildMarker, InteractionMarker, UserMarker,
+};
+use twilight_model::id::Id;
+use twilight_model::oauth::ApplicationIntegrationMap;
+use twilight_model::user::User;
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::acquired_receipt_execution::{
+    execute_acquired_interaction_v1, AcquiredInteractionExecutionOutcomeV1,
+    AcquiredInteractionExecutionServicesV1, AcquiredInteractionLifecyclePermitV1,
+};
+use crate::discord_original_response::OwnedTwilightOriginalResponseObserverV1;
+use crate::effect_journal::InteractionEffectJournalPortV1;
+use crate::instance_deleter::OwnedTwilightInstanceDeleter;
+use crate::interaction_effect_recovery_executor::{
+    OwnedSharedGatewayDiscordEffectsV1, OwnedSharedGatewayInternalEffectRecoveryV1,
+};
+use crate::mutation::TwilightMutationAdapter;
+use crate::receipt_fenced_effects::InteractionEffectPermitV1;
+use crate::responder::TwilightInteractionResponder;
+#[cfg(any(test, doctest))]
+use crate::runner::InteractionExecutionOutcomeV3;
+use crate::shared_gateway_admission::{
+    SharedGatewayAdmissionBudgetV3, SharedGatewayAdmissionConfigV3, SharedGatewayAdmissionErrorV3,
+    SharedGatewayAdmissionReservationV3, SharedGatewayAdmittedInteractionV3,
+};
+use crate::shared_gateway_control::{GatewayConnectionObserverV3, GatewayReadyLeaseV3};
+#[cfg(any(test, doctest))]
+use crate::shared_gateway_executor::execute_admitted_interaction_v3;
+use crate::shared_gateway_executor::execution_inputs;
+use crate::shared_gateway_router::{parse_shared_gateway_route_v1, SharedGatewayRouteErrorV1};
+use crate::snapshot::OwnedTwilightGuildRoleSnapshotProvider;
+
+pub const MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3: usize = 100;
+pub const MAX_SHARED_GATEWAY_INTERACTION_TOKEN_BYTES_V3: usize = 4_096;
+pub const MAX_SHARED_GATEWAY_INTERACTION_LOCALE_BYTES_V3: usize = 64;
+pub const MAX_SHARED_GATEWAY_MODAL_INPUTS_V3: usize = 5;
+pub const MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3: usize = 4_000;
+pub const MAX_SHARED_GATEWAY_MODAL_PAYLOAD_BYTES_V3: usize = 20_000;
+const SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3: Duration = Duration::from_secs(2);
+const SHARED_GATEWAY_MUTATION_HTTP_TIMEOUT_V3: Duration = Duration::from_secs(15);
+const SHARED_GATEWAY_INITIAL_RESPONSE_BUDGET_V3: Duration = Duration::from_secs(3);
+const MIN_SHARED_GATEWAY_LOOPBACK_PROXY_PORT_V1: u16 = 1_024;
+pub const SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3: &str =
+    "Starring is temporarily unable to process this request. Please try again.";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SharedGatewayLoopbackHttpProxyV1(SocketAddrV4);
+
+impl SharedGatewayLoopbackHttpProxyV1 {
+    pub fn new(address: SocketAddrV4) -> Option<Self> {
+        (*address.ip() == Ipv4Addr::LOCALHOST
+            && address.port() >= MIN_SHARED_GATEWAY_LOOPBACK_PROXY_PORT_V1)
+            .then_some(Self(address))
+    }
+
+    fn authority(self) -> String {
+        self.0.to_string()
+    }
+}
+
+impl Debug for SharedGatewayLoopbackHttpProxyV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayLoopbackHttpProxyV1(<loopback>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SharedGatewayMutationHttpTransportV1 {
+    #[default]
+    Direct,
+    LoopbackProxy(SharedGatewayLoopbackHttpProxyV1),
+}
+
+#[derive(Clone, Copy)]
+pub struct SharedGatewayInteractionReceivedAtV3(Instant);
+
+impl SharedGatewayInteractionReceivedAtV3 {
+    pub fn now_v3() -> Self {
+        Self(Instant::now())
+    }
+
+    pub fn initial_response_deadline_v3(self) -> Instant {
+        self.0 + SHARED_GATEWAY_INITIAL_RESPONSE_BUDGET_V3
+    }
+}
+
+impl Debug for SharedGatewayInteractionReceivedAtV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayInteractionReceivedAtV3(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SharedGatewayInteractionApplicationIdV3(NonZeroU64);
+
+impl SharedGatewayInteractionApplicationIdV3 {
+    pub fn new(value: u64) -> Result<Self, SharedGatewayInteractionEnvelopeErrorV3> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(SharedGatewayInteractionEnvelopeErrorV3::Identity)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SharedGatewayInteractionIdV3(NonZeroU64);
+
+impl SharedGatewayInteractionIdV3 {
+    pub fn new(value: u64) -> Result<Self, SharedGatewayInteractionEnvelopeErrorV3> {
+        NonZeroU64::new(value)
+            .map(Self)
+            .ok_or(SharedGatewayInteractionEnvelopeErrorV3::Identity)
+    }
+
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SharedGatewayInteractionIdentityV3 {
+    guild_id: GuildId,
+    channel_id: ChannelId,
+    user_id: UserId,
+    application_id: SharedGatewayInteractionApplicationIdV3,
+    interaction_id: SharedGatewayInteractionIdV3,
+}
+
+impl SharedGatewayInteractionIdentityV3 {
+    pub fn new(
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        user_id: UserId,
+        application_id: SharedGatewayInteractionApplicationIdV3,
+        interaction_id: SharedGatewayInteractionIdV3,
+    ) -> Result<Self, SharedGatewayInteractionEnvelopeErrorV3> {
+        if guild_id.0 == 0 || channel_id.0 == 0 || user_id.0 == 0 {
+            return Err(SharedGatewayInteractionEnvelopeErrorV3::Identity);
+        }
+        Ok(Self {
+            guild_id,
+            channel_id,
+            user_id,
+            application_id,
+            interaction_id,
+        })
+    }
+
+    pub fn guild_id(self) -> GuildId {
+        self.guild_id
+    }
+
+    pub fn channel_id(self) -> ChannelId {
+        self.channel_id
+    }
+
+    pub fn user_id(self) -> UserId {
+        self.user_id
+    }
+
+    pub fn application_id(self) -> SharedGatewayInteractionApplicationIdV3 {
+        self.application_id
+    }
+
+    pub fn interaction_id(self) -> SharedGatewayInteractionIdV3 {
+        self.interaction_id
+    }
+}
+
+pub struct SharedGatewayInteractionTokenV3(Zeroizing<String>);
+
+impl SharedGatewayInteractionTokenV3 {
+    pub fn new(value: String) -> Result<Self, SharedGatewayInteractionEnvelopeErrorV3> {
+        let value = Zeroizing::new(value);
+        if value.is_empty() || value.len() > MAX_SHARED_GATEWAY_INTERACTION_TOKEN_BYTES_V3 {
+            return Err(SharedGatewayInteractionEnvelopeErrorV3::Token);
+        }
+        Ok(Self(value))
+    }
+
+    fn expose_v3(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl Debug for SharedGatewayInteractionTokenV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayInteractionTokenV3(<redacted>)")
+    }
+}
+
+pub struct SharedGatewayModalInputV3 {
+    component_id: i32,
+    custom_id: String,
+    value: Zeroizing<String>,
+}
+
+impl SharedGatewayModalInputV3 {
+    pub fn new(
+        component_id: i32,
+        custom_id: String,
+        value: String,
+    ) -> Result<Self, SharedGatewayInteractionEnvelopeErrorV3> {
+        let value = Zeroizing::new(value);
+        validate_custom_id_v3(&custom_id)?;
+        if value.len() > MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3 {
+            return Err(SharedGatewayInteractionEnvelopeErrorV3::ModalInput);
+        }
+        Ok(Self {
+            component_id,
+            custom_id,
+            value,
+        })
+    }
+
+    pub fn component_id(&self) -> i32 {
+        self.component_id
+    }
+
+    pub fn custom_id(&self) -> &str {
+        &self.custom_id
+    }
+}
+
+impl Debug for SharedGatewayModalInputV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayModalInputV3(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedGatewayInteractionKindV3 {
+    MessageComponent,
+    ModalSubmit,
+}
+
+enum SharedGatewayInteractionDataV3 {
+    MessageComponent {
+        custom_id: String,
+    },
+    ModalSubmit {
+        custom_id: String,
+        inputs: Vec<SharedGatewayModalInputV3>,
+    },
+}
+
+struct ZeroizingModalInputsV1(BTreeMap<String, String>);
+
+impl Drop for ZeroizingModalInputsV1 {
+    fn drop(&mut self) {
+        for value in self.0.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
+pub struct SharedGatewayInteractionEnvelopeV3 {
+    identity: SharedGatewayInteractionIdentityV3,
+    locale: Option<String>,
+    token: SharedGatewayInteractionTokenV3,
+    data: SharedGatewayInteractionDataV3,
+    received_at: SharedGatewayInteractionReceivedAtV3,
+}
+
+impl SharedGatewayInteractionEnvelopeV3 {
+    pub fn message_component_v3(
+        identity: SharedGatewayInteractionIdentityV3,
+        custom_id: String,
+        locale: Option<String>,
+        token: SharedGatewayInteractionTokenV3,
+    ) -> Result<Self, SharedGatewayInteractionEnvelopeErrorV3> {
+        Self::received_message_component_v3(
+            SharedGatewayInteractionReceivedAtV3::now_v3(),
+            identity,
+            custom_id,
+            locale,
+            token,
+        )
+    }
+
+    pub fn received_message_component_v3(
+        received_at: SharedGatewayInteractionReceivedAtV3,
+        identity: SharedGatewayInteractionIdentityV3,
+        custom_id: String,
+        locale: Option<String>,
+        token: SharedGatewayInteractionTokenV3,
+    ) -> Result<Self, SharedGatewayInteractionEnvelopeErrorV3> {
+        validate_custom_id_v3(&custom_id)?;
+        validate_locale_v3(locale.as_deref())?;
+        Ok(Self {
+            identity,
+            locale,
+            token,
+            data: SharedGatewayInteractionDataV3::MessageComponent { custom_id },
+            received_at,
+        })
+    }
+
+    pub fn modal_submit_v3(
+        identity: SharedGatewayInteractionIdentityV3,
+        custom_id: String,
+        inputs: Vec<SharedGatewayModalInputV3>,
+        locale: Option<String>,
+        token: SharedGatewayInteractionTokenV3,
+    ) -> Result<Self, SharedGatewayInteractionEnvelopeErrorV3> {
+        Self::received_modal_submit_v3(
+            SharedGatewayInteractionReceivedAtV3::now_v3(),
+            identity,
+            custom_id,
+            inputs,
+            locale,
+            token,
+        )
+    }
+
+    pub fn received_modal_submit_v3(
+        received_at: SharedGatewayInteractionReceivedAtV3,
+        identity: SharedGatewayInteractionIdentityV3,
+        custom_id: String,
+        inputs: Vec<SharedGatewayModalInputV3>,
+        locale: Option<String>,
+        token: SharedGatewayInteractionTokenV3,
+    ) -> Result<Self, SharedGatewayInteractionEnvelopeErrorV3> {
+        validate_custom_id_v3(&custom_id)?;
+        validate_locale_v3(locale.as_deref())?;
+        if inputs.is_empty() || inputs.len() > MAX_SHARED_GATEWAY_MODAL_INPUTS_V3 {
+            return Err(SharedGatewayInteractionEnvelopeErrorV3::ModalInputCount);
+        }
+        let mut custom_ids = BTreeSet::new();
+        let mut payload_bytes = custom_id.len();
+        for input in &inputs {
+            if !custom_ids.insert(input.custom_id.as_str()) {
+                return Err(SharedGatewayInteractionEnvelopeErrorV3::DuplicateModalInput);
+            }
+            payload_bytes = payload_bytes
+                .checked_add(input.custom_id.len())
+                .and_then(|total| total.checked_add(input.value.len()))
+                .ok_or(SharedGatewayInteractionEnvelopeErrorV3::ModalPayload)?;
+        }
+        if payload_bytes > MAX_SHARED_GATEWAY_MODAL_PAYLOAD_BYTES_V3 {
+            return Err(SharedGatewayInteractionEnvelopeErrorV3::ModalPayload);
+        }
+        Ok(Self {
+            identity,
+            locale,
+            token,
+            data: SharedGatewayInteractionDataV3::ModalSubmit { custom_id, inputs },
+            received_at,
+        })
+    }
+
+    pub fn initial_response_deadline_v3(&self) -> Instant {
+        self.received_at.initial_response_deadline_v3()
+    }
+
+    pub fn identity_v3(&self) -> SharedGatewayInteractionIdentityV3 {
+        self.identity
+    }
+
+    pub fn kind_v3(&self) -> SharedGatewayInteractionKindV3 {
+        match self.data {
+            SharedGatewayInteractionDataV3::MessageComponent { .. } => {
+                SharedGatewayInteractionKindV3::MessageComponent
+            }
+            SharedGatewayInteractionDataV3::ModalSubmit { .. } => {
+                SharedGatewayInteractionKindV3::ModalSubmit
+            }
+        }
+    }
+
+    pub fn custom_id_v3(&self) -> &str {
+        match &self.data {
+            SharedGatewayInteractionDataV3::MessageComponent { custom_id }
+            | SharedGatewayInteractionDataV3::ModalSubmit { custom_id, .. } => custom_id,
+        }
+    }
+
+    pub fn locale_v3(&self) -> Option<&str> {
+        self.locale.as_deref()
+    }
+
+    pub(crate) fn receipt_request_digest_v1(
+        &self,
+        receipt_identity: InteractionReceiptIdentityV1,
+    ) -> Result<InteractionRequestDigestV1, InteractionRequestDigestErrorV1> {
+        let identity = self.identity;
+        match &self.data {
+            SharedGatewayInteractionDataV3::MessageComponent { custom_id } => {
+                build_interaction_request_digest_v1(InteractionRequestDigestInputV1 {
+                    receipt_identity,
+                    guild_id: identity.guild_id,
+                    channel_id: identity.channel_id,
+                    actor_id: identity.user_id,
+                    locale: self.locale.as_deref(),
+                    payload: InteractionRequestPayloadV1::Button { custom_id },
+                })
+            }
+            SharedGatewayInteractionDataV3::ModalSubmit { custom_id, inputs } => {
+                let inputs = ZeroizingModalInputsV1(
+                    inputs
+                        .iter()
+                        .map(|input| (input.custom_id.clone(), input.value.as_str().to_owned()))
+                        .collect::<BTreeMap<_, _>>(),
+                );
+                build_interaction_request_digest_v1(InteractionRequestDigestInputV1 {
+                    receipt_identity,
+                    guild_id: identity.guild_id,
+                    channel_id: identity.channel_id,
+                    actor_id: identity.user_id,
+                    locale: self.locale.as_deref(),
+                    payload: InteractionRequestPayloadV1::ModalSubmit {
+                        custom_id,
+                        inputs: &inputs.0,
+                    },
+                })
+            }
+        }
+    }
+
+    pub(crate) fn receipt_interaction_token_copy_v1(&self) -> Zeroizing<String> {
+        Zeroizing::new(self.token.expose_v3().to_owned())
+    }
+
+    pub(crate) fn twilight_interaction_v3(&self) -> ZeroizingTwilightInteractionV3 {
+        let data = match &self.data {
+            SharedGatewayInteractionDataV3::MessageComponent { custom_id } => {
+                InteractionData::MessageComponent(Box::new(MessageComponentInteractionData {
+                    custom_id: custom_id.clone(),
+                    component_type: ComponentType::Button,
+                    resolved: None,
+                    values: Vec::new(),
+                }))
+            }
+            SharedGatewayInteractionDataV3::ModalSubmit { custom_id, inputs } => {
+                InteractionData::ModalSubmit(Box::new(ModalInteractionData {
+                    components: inputs
+                        .iter()
+                        .map(|input| {
+                            ModalInteractionComponent::TextInput(ModalInteractionTextInput {
+                                custom_id: input.custom_id.clone(),
+                                id: input.component_id,
+                                value: input.value.to_string(),
+                            })
+                        })
+                        .collect(),
+                    custom_id: custom_id.clone(),
+                    resolved: None,
+                }))
+            }
+        };
+        let identity = self.identity;
+        #[allow(deprecated)]
+        let interaction = Interaction {
+            app_permissions: None,
+            application_id: Id::<ApplicationMarker>::new(identity.application_id.get()),
+            authorizing_integration_owners: ApplicationIntegrationMap {
+                guild: None,
+                user: None,
+            },
+            channel: None,
+            channel_id: Some(Id::<ChannelMarker>::new(identity.channel_id.0)),
+            context: None,
+            data: Some(data),
+            entitlements: Vec::new(),
+            guild: None,
+            guild_id: Some(Id::<GuildMarker>::new(identity.guild_id.0)),
+            guild_locale: None,
+            id: Id::<InteractionMarker>::new(identity.interaction_id.get()),
+            kind: match self.kind_v3() {
+                SharedGatewayInteractionKindV3::MessageComponent => {
+                    InteractionType::MessageComponent
+                }
+                SharedGatewayInteractionKindV3::ModalSubmit => InteractionType::ModalSubmit,
+            },
+            locale: self.locale.clone(),
+            member: None,
+            message: None,
+            token: self.token.expose_v3().to_string(),
+            user: Some(minimal_user_v3(identity.user_id)),
+        };
+        ZeroizingTwilightInteractionV3(interaction)
+    }
+
+    #[cfg(any(test, doctest))]
+    pub(crate) fn from_twilight_interaction_v3(
+        interaction: Interaction,
+    ) -> Result<Option<Self>, SharedGatewayInteractionEnvelopeErrorV3> {
+        let interaction = ZeroizingTwilightInteractionV3(interaction);
+        let Some(guild_id) = interaction.0.guild_id else {
+            return Ok(None);
+        };
+        let Some(channel_id) = twilight_channel_id_v3(&interaction.0) else {
+            return Ok(None);
+        };
+        let Some(user_id) = interaction.0.author_id() else {
+            return Ok(None);
+        };
+        let identity = SharedGatewayInteractionIdentityV3::new(
+            GuildId(guild_id.get()),
+            ChannelId(channel_id.get()),
+            UserId(user_id.get()),
+            SharedGatewayInteractionApplicationIdV3::new(interaction.0.application_id.get())?,
+            SharedGatewayInteractionIdV3::new(interaction.0.id.get())?,
+        )?;
+        let token = SharedGatewayInteractionTokenV3::new(interaction.0.token.clone())?;
+        match interaction.0.data.as_ref() {
+            Some(InteractionData::MessageComponent(data)) => Self::message_component_v3(
+                identity,
+                data.custom_id.clone(),
+                interaction.0.locale.clone(),
+                token,
+            )
+            .map(Some),
+            Some(InteractionData::ModalSubmit(data)) => {
+                let mut inputs = Vec::new();
+                collect_twilight_modal_inputs_v3(&data.components, &mut inputs)?;
+                Self::modal_submit_v3(
+                    identity,
+                    data.custom_id.clone(),
+                    inputs,
+                    interaction.0.locale.clone(),
+                    token,
+                )
+                .map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+impl Debug for SharedGatewayInteractionEnvelopeV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayInteractionEnvelopeV3(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SharedGatewayInteractionEnvelopeErrorV3 {
+    #[error("shared gateway interaction identity is invalid")]
+    Identity,
+    #[error("shared gateway interaction custom id is invalid")]
+    CustomId,
+    #[error("shared gateway interaction locale is invalid")]
+    Locale,
+    #[error("shared gateway interaction token is invalid")]
+    Token,
+    #[error("shared gateway modal input count is invalid")]
+    ModalInputCount,
+    #[error("shared gateway modal input is invalid")]
+    ModalInput,
+    #[error("shared gateway modal input ids are not unique")]
+    DuplicateModalInput,
+    #[error("shared gateway modal payload is too large")]
+    ModalPayload,
+}
+
+impl SharedGatewayInteractionEnvelopeErrorV3 {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Identity => "shared_gateway_interaction_identity_invalid",
+            Self::CustomId => "shared_gateway_interaction_custom_id_invalid",
+            Self::Locale => "shared_gateway_interaction_locale_invalid",
+            Self::Token => "shared_gateway_interaction_token_invalid",
+            Self::ModalInputCount => "shared_gateway_modal_input_count_invalid",
+            Self::ModalInput => "shared_gateway_modal_input_invalid",
+            Self::DuplicateModalInput => "shared_gateway_modal_input_duplicate",
+            Self::ModalPayload => "shared_gateway_modal_payload_too_large",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SharedGatewayInteractionRejectionV3 {
+    Route(SharedGatewayRouteErrorV1),
+    Admission(SharedGatewayAdmissionErrorV3),
+}
+
+impl SharedGatewayInteractionRejectionV3 {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Route(error) => error.code(),
+            Self::Admission(error) => error.code(),
+        }
+    }
+}
+
+pub enum SharedGatewayInteractionReservationOutcomeV3 {
+    Reserved(Box<SharedGatewayReservedInteractionV3>),
+    Ignored,
+    Rejected {
+        reason: SharedGatewayInteractionRejectionV3,
+        envelope: Box<SharedGatewayInteractionEnvelopeV3>,
+    },
+}
+
+impl Debug for SharedGatewayInteractionReservationOutcomeV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayInteractionReservationOutcomeV3(<redacted>)")
+    }
+}
+
+pub struct SharedGatewayReservedInteractionV3 {
+    reservation: SharedGatewayAdmissionReservationV3,
+    envelope: SharedGatewayInteractionEnvelopeV3,
+}
+
+impl Debug for SharedGatewayReservedInteractionV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayReservedInteractionV3(<redacted>)")
+    }
+}
+
+pub struct SharedGatewayAdmittedEnvelopeV1 {
+    admitted: SharedGatewayAdmittedInteractionV3,
+    envelope: SharedGatewayInteractionEnvelopeV3,
+}
+
+impl SharedGatewayAdmittedEnvelopeV1 {
+    pub fn admitted_v1(&self) -> &SharedGatewayAdmittedInteractionV3 {
+        &self.admitted
+    }
+
+    pub fn envelope_v1(&self) -> &SharedGatewayInteractionEnvelopeV3 {
+        &self.envelope
+    }
+
+    pub fn into_parts_v1(
+        self,
+    ) -> (
+        SharedGatewayAdmittedInteractionV3,
+        SharedGatewayInteractionEnvelopeV3,
+    ) {
+        (self.admitted, self.envelope)
+    }
+}
+
+impl Debug for SharedGatewayAdmittedEnvelopeV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayAdmittedEnvelopeV1(<redacted>)")
+    }
+}
+
+pub enum SharedGatewayAdmissionDispatchOutcomeV1 {
+    Admitted(Box<SharedGatewayAdmittedEnvelopeV1>),
+    Ignored,
+    Rejected {
+        error: SharedGatewayAdmissionErrorV3,
+        envelope: Box<SharedGatewayInteractionEnvelopeV3>,
+    },
+}
+
+impl Debug for SharedGatewayAdmissionDispatchOutcomeV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayAdmissionDispatchOutcomeV1(<redacted>)")
+    }
+}
+
+#[cfg(any(test, doctest))]
+pub enum SharedGatewayInteractionDispatchOutcomeV3 {
+    Executed(InteractionExecutionOutcomeV3),
+    Ignored,
+    Rejected {
+        error: SharedGatewayAdmissionErrorV3,
+        envelope: Box<SharedGatewayInteractionEnvelopeV3>,
+    },
+}
+
+#[cfg(any(test, doctest))]
+impl Debug for SharedGatewayInteractionDispatchOutcomeV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedGatewayInteractionDispatchOutcomeV3(<redacted>)")
+    }
+}
+
+#[cfg(any(test, doctest))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedGatewayRejectionAcknowledgementOutcomeV3 {
+    Sent,
+    Failed,
+    TimedOut,
+}
+
+#[cfg(any(test, doctest))]
+pub async fn acknowledge_shared_gateway_interaction_rejection_v3(
+    interaction_http: &Client,
+    envelope: Box<SharedGatewayInteractionEnvelopeV3>,
+    failure_message: &str,
+) -> SharedGatewayRejectionAcknowledgementOutcomeV3 {
+    let interaction = envelope.twilight_interaction_v3();
+    let responder = TwilightInteractionResponder::from_interaction(
+        interaction_http,
+        interaction.as_interaction_v3(),
+        "",
+    );
+    match tokio::time::timeout(
+        SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3,
+        responder.respond_ephemeral(failure_message.to_string()),
+    )
+    .await
+    {
+        Ok(Ok(())) => SharedGatewayRejectionAcknowledgementOutcomeV3::Sent,
+        Ok(Err(_)) => SharedGatewayRejectionAcknowledgementOutcomeV3::Failed,
+        Err(_) => SharedGatewayRejectionAcknowledgementOutcomeV3::TimedOut,
+    }
+}
+
+pub fn reserve_shared_gateway_interaction_v3(
+    envelope: SharedGatewayInteractionEnvelopeV3,
+    ready_lease: Option<GatewayReadyLeaseV3>,
+    observer: &GatewayConnectionObserverV3,
+    admission_budget: &SharedGatewayAdmissionBudgetV3,
+) -> SharedGatewayInteractionReservationOutcomeV3 {
+    match parse_shared_gateway_route_v1(envelope.identity.guild_id, envelope.custom_id_v3()) {
+        Ok(Some(_)) => {}
+        Ok(None) => return SharedGatewayInteractionReservationOutcomeV3::Ignored,
+        Err(error) => {
+            return SharedGatewayInteractionReservationOutcomeV3::Rejected {
+                reason: SharedGatewayInteractionRejectionV3::Route(error),
+                envelope: Box::new(envelope),
+            };
+        }
+    }
+    let Some(ready_lease) = ready_lease else {
+        return SharedGatewayInteractionReservationOutcomeV3::Rejected {
+            reason: SharedGatewayInteractionRejectionV3::Admission(
+                SharedGatewayAdmissionErrorV3::NotReady,
+            ),
+            envelope: Box::new(envelope),
+        };
+    };
+    match admission_budget.try_reserve(observer, &ready_lease) {
+        Ok(reservation) => SharedGatewayInteractionReservationOutcomeV3::Reserved(Box::new(
+            SharedGatewayReservedInteractionV3 {
+                reservation,
+                envelope,
+            },
+        )),
+        Err(error) => SharedGatewayInteractionReservationOutcomeV3::Rejected {
+            reason: SharedGatewayInteractionRejectionV3::Admission(error),
+            envelope: Box::new(envelope),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(any(test, doctest))]
+pub async fn dispatch_reserved_shared_gateway_interaction_v3<I, G, T, PR, S>(
+    reserved: SharedGatewayReservedInteractionV3,
+    registry: &ServingSlotRegistryV1,
+    instances: &I,
+    instance_ids: &G,
+    teardown: &T,
+    pinned_resolver: &PR,
+    snapshot_provider: &S,
+    mutation_http: &Client,
+    interaction_http: &Client,
+    failure_message: &str,
+) -> SharedGatewayInteractionDispatchOutcomeV3
+where
+    I: InstanceRouteReaderV1 + InstanceRegistrarV1,
+    G: InstanceIdGenerator,
+    T: InstanceTeardownService,
+    PR: PinnedInstanceResolverV1,
+    S: GuildRoleSnapshotProvider,
+{
+    let SharedGatewayReservedInteractionV3 {
+        reservation,
+        envelope,
+    } = reserved;
+    match reservation
+        .admit(
+            registry,
+            instances,
+            envelope.identity.guild_id,
+            envelope.custom_id_v3(),
+        )
+        .await
+    {
+        Ok(Some(admitted)) => {
+            let interaction = envelope.twilight_interaction_v3();
+            SharedGatewayInteractionDispatchOutcomeV3::Executed(
+                execute_admitted_interaction_v3(
+                    mutation_http,
+                    interaction_http,
+                    admitted,
+                    interaction.as_interaction_v3(),
+                    failure_message,
+                    instances,
+                    instance_ids,
+                    teardown,
+                    pinned_resolver,
+                    snapshot_provider,
+                )
+                .await,
+            )
+        }
+        Ok(None) => SharedGatewayInteractionDispatchOutcomeV3::Ignored,
+        Err(error) => SharedGatewayInteractionDispatchOutcomeV3::Rejected {
+            error,
+            envelope: Box::new(envelope),
+        },
+    }
+}
+
+pub async fn admit_reserved_shared_gateway_interaction_v1<I>(
+    reserved: SharedGatewayReservedInteractionV3,
+    registry: &ServingSlotRegistryV1,
+    instances: &I,
+) -> SharedGatewayAdmissionDispatchOutcomeV1
+where
+    I: InstanceRouteReaderV1,
+{
+    let SharedGatewayReservedInteractionV3 {
+        reservation,
+        envelope,
+    } = reserved;
+    match reservation
+        .admit(
+            registry,
+            instances,
+            envelope.identity.guild_id,
+            envelope.custom_id_v3(),
+        )
+        .await
+    {
+        Ok(Some(admitted)) => SharedGatewayAdmissionDispatchOutcomeV1::Admitted(Box::new(
+            SharedGatewayAdmittedEnvelopeV1 { admitted, envelope },
+        )),
+        Ok(None) => SharedGatewayAdmissionDispatchOutcomeV1::Ignored,
+        Err(error) => SharedGatewayAdmissionDispatchOutcomeV1::Rejected {
+            error,
+            envelope: Box::new(envelope),
+        },
+    }
+}
+
+pub fn cancel_reserved_shared_gateway_interaction_v3(
+    reserved: SharedGatewayReservedInteractionV3,
+) -> Box<SharedGatewayInteractionEnvelopeV3> {
+    let SharedGatewayReservedInteractionV3 {
+        reservation,
+        envelope,
+    } = reserved;
+    drop(reservation);
+    Box::new(envelope)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum OwnedSharedGatewayDispatchServicesCompositionErrorV3 {
+    #[error("shared gateway dispatch service composition timed out")]
+    TimedOut,
+    #[error("shared gateway dispatch role snapshot provider is unavailable")]
+    SnapshotUnavailable,
+}
+
+impl OwnedSharedGatewayDispatchServicesCompositionErrorV3 {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::TimedOut => "shared_gateway_dispatch_composition_timed_out",
+            Self::SnapshotUnavailable => "shared_gateway_dispatch_snapshot_unavailable",
+        }
+    }
+}
+
+pub struct OwnedSharedGatewayDispatchServicesV3<I> {
+    registry: ServingSlotRegistryV1,
+    instances: I,
+    instance_ids: SecureRandomInstanceIdGenerator,
+    teardown: Arc<Teardown<I, OwnedTwilightInstanceDeleter>>,
+    snapshot_provider: OwnedTwilightGuildRoleSnapshotProvider,
+    mutation_http: Arc<Client>,
+    interaction_http: Arc<Client>,
+    admission_budget: SharedGatewayAdmissionBudgetV3,
+}
+
+impl<I> OwnedSharedGatewayDispatchServicesV3<I>
+where
+    I: Clone
+        + Send
+        + Sync
+        + 'static
+        + InstanceRouteReaderV1
+        + InstanceRegistrarV1
+        + InstanceTeardownStoreV1
+        + PinnedInstanceResolverV1,
+{
+    pub async fn compose_v3(
+        token: Zeroizing<String>,
+        registry: ServingSlotRegistryV1,
+        instances: I,
+        admission_config: SharedGatewayAdmissionConfigV3,
+        operation_deadline: Instant,
+    ) -> Result<Self, OwnedSharedGatewayDispatchServicesCompositionErrorV3> {
+        Self::compose_with_mutation_http_transport_v1(
+            token,
+            registry,
+            instances,
+            admission_config,
+            SharedGatewayMutationHttpTransportV1::Direct,
+            operation_deadline,
+        )
+        .await
+    }
+
+    pub async fn compose_with_mutation_http_transport_v1(
+        token: Zeroizing<String>,
+        registry: ServingSlotRegistryV1,
+        instances: I,
+        admission_config: SharedGatewayAdmissionConfigV3,
+        mutation_http_transport: SharedGatewayMutationHttpTransportV1,
+        operation_deadline: Instant,
+    ) -> Result<Self, OwnedSharedGatewayDispatchServicesCompositionErrorV3> {
+        if Instant::now() >= operation_deadline {
+            return Err(OwnedSharedGatewayDispatchServicesCompositionErrorV3::TimedOut);
+        }
+        let mutation_http = Arc::new(mutation_http_client_v1(
+            token.as_str(),
+            mutation_http_transport,
+        ));
+        let interaction_http = Arc::new(interaction_callback_http_client_v1(token.as_str()));
+        let snapshot_provider = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(operation_deadline),
+            OwnedTwilightGuildRoleSnapshotProvider::new(Arc::clone(&mutation_http)),
+        )
+        .await
+        .map_err(|_| OwnedSharedGatewayDispatchServicesCompositionErrorV3::TimedOut)?
+        .map_err(|_| OwnedSharedGatewayDispatchServicesCompositionErrorV3::SnapshotUnavailable)?;
+        let teardown = Arc::new(Teardown::new(
+            instances.clone(),
+            OwnedTwilightInstanceDeleter::new(Arc::clone(&mutation_http)),
+        ));
+        Ok(Self {
+            registry,
+            instances,
+            instance_ids: SecureRandomInstanceIdGenerator::new(),
+            teardown,
+            snapshot_provider,
+            mutation_http,
+            interaction_http,
+            admission_budget: SharedGatewayAdmissionBudgetV3::new(admission_config),
+        })
+    }
+
+    pub fn dispatch_capacity_v3(&self) -> std::num::NonZeroUsize {
+        self.admission_budget.capacity()
+    }
+
+    pub fn original_response_observer_v1(&self) -> OwnedTwilightOriginalResponseObserverV1 {
+        OwnedTwilightOriginalResponseObserverV1::new(Arc::clone(&self.interaction_http))
+    }
+
+    pub fn discord_effects_v1(&self) -> OwnedSharedGatewayDiscordEffectsV1 {
+        OwnedSharedGatewayDiscordEffectsV1::new(
+            Arc::clone(&self.mutation_http),
+            self.snapshot_provider.bot_user_id_v1(),
+        )
+    }
+
+    pub fn internal_effect_recovery_v1(&self) -> OwnedSharedGatewayInternalEffectRecoveryV1<I> {
+        OwnedSharedGatewayInternalEffectRecoveryV1::new(
+            self.instances.clone(),
+            Arc::clone(&self.teardown),
+        )
+    }
+
+    pub fn reserve_v3(
+        &self,
+        envelope: SharedGatewayInteractionEnvelopeV3,
+        ready_lease: Option<GatewayReadyLeaseV3>,
+        observer: &GatewayConnectionObserverV3,
+    ) -> SharedGatewayInteractionReservationOutcomeV3 {
+        reserve_shared_gateway_interaction_v3(
+            envelope,
+            ready_lease,
+            observer,
+            &self.admission_budget,
+        )
+    }
+
+    pub fn cancel_v3(
+        &self,
+        reserved: SharedGatewayReservedInteractionV3,
+    ) -> Box<SharedGatewayInteractionEnvelopeV3> {
+        cancel_reserved_shared_gateway_interaction_v3(reserved)
+    }
+
+    #[cfg(any(test, doctest))]
+    pub async fn dispatch_v3(
+        &self,
+        reserved: SharedGatewayReservedInteractionV3,
+    ) -> SharedGatewayInteractionDispatchOutcomeV3 {
+        dispatch_reserved_shared_gateway_interaction_v3(
+            reserved,
+            &self.registry,
+            &self.instances,
+            &self.instance_ids,
+            self.teardown.as_ref(),
+            &self.instances,
+            &self.snapshot_provider,
+            &self.mutation_http,
+            &self.interaction_http,
+            SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3,
+        )
+        .await
+    }
+
+    pub async fn admit_v1(
+        &self,
+        reserved: SharedGatewayReservedInteractionV3,
+    ) -> SharedGatewayAdmissionDispatchOutcomeV1 {
+        admit_reserved_shared_gateway_interaction_v1(reserved, &self.registry, &self.instances)
+            .await
+    }
+
+    pub async fn execute_acquired_v1<P>(
+        &self,
+        admitted: SharedGatewayAdmittedEnvelopeV1,
+        permit: P,
+    ) -> AcquiredInteractionExecutionOutcomeV1
+    where
+        P: AcquiredInteractionLifecyclePermitV1
+            + InteractionEffectJournalPortV1<Error = <P as InteractionEffectPermitV1>::Error>,
+    {
+        let (admitted, envelope) = admitted.into_parts_v1();
+        let (identity, _, _) = execution_inputs(admitted.route());
+        let mutation = TwilightMutationAdapter::new(&self.mutation_http, identity.key.clone());
+        let responder = {
+            let interaction = envelope.twilight_interaction_v3();
+            TwilightInteractionResponder::from_interaction(
+                &self.interaction_http,
+                interaction.as_interaction_v3(),
+                identity.key.as_str(),
+            )
+        };
+        execute_acquired_interaction_v1(
+            admitted,
+            envelope,
+            permit,
+            AcquiredInteractionExecutionServicesV1::new(
+                &mutation,
+                &responder,
+                &self.instances,
+                &self.instance_ids,
+                self.teardown.as_ref(),
+                &self.instances,
+                &self.snapshot_provider,
+            ),
+        )
+        .await
+    }
+
+    #[cfg(any(test, doctest))]
+    pub async fn acknowledge_rejection_v3(
+        &self,
+        envelope: Box<SharedGatewayInteractionEnvelopeV3>,
+    ) -> SharedGatewayRejectionAcknowledgementOutcomeV3 {
+        acknowledge_shared_gateway_interaction_rejection_v3(
+            &self.interaction_http,
+            envelope,
+            SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3,
+        )
+        .await
+    }
+}
+
+fn mutation_http_client_v1(token: &str, transport: SharedGatewayMutationHttpTransportV1) -> Client {
+    let builder = Client::builder()
+        .token(token.to_owned())
+        .timeout(SHARED_GATEWAY_MUTATION_HTTP_TIMEOUT_V3);
+    match transport {
+        SharedGatewayMutationHttpTransportV1::Direct => builder.build(),
+        SharedGatewayMutationHttpTransportV1::LoopbackProxy(proxy) => {
+            builder.proxy(proxy.authority(), true).build()
+        }
+    }
+}
+
+fn interaction_callback_http_client_v1(token: &str) -> Client {
+    Client::builder()
+        .token(token.to_owned())
+        .ratelimiter(None)
+        .timeout(SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3)
+        .build()
+}
+
+impl<I> OwnedSharedGatewayDispatchServicesV3<I>
+where
+    I: Clone
+        + Send
+        + Sync
+        + 'static
+        + InstanceRouteReaderV1
+        + InstanceRegistrarV1
+        + InstanceTeardownRetryScannerV2
+        + InstanceTeardownStoreV1
+        + PinnedInstanceResolverV1,
+{
+    pub async fn scan_teardown_retries_v1(
+        &self,
+        cursor: &InstanceTeardownRetryScanCursorV2,
+        limit: NonZeroUsize,
+    ) -> Result<InstanceTeardownRetryScanPageV2, InstanceStoreError> {
+        self.instances.scan_retryable_v2(cursor, limit).await
+    }
+
+    pub async fn retry_teardown_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: automation_instance::InstanceId,
+    ) -> Result<TeardownOutcome, TeardownError> {
+        self.teardown.teardown(guild_id, instance_id).await
+    }
+}
+
+impl<I> Debug for OwnedSharedGatewayDispatchServicesV3<I> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("OwnedSharedGatewayDispatchServicesV3(<redacted>)")
+    }
+}
+
+fn validate_custom_id_v3(custom_id: &str) -> Result<(), SharedGatewayInteractionEnvelopeErrorV3> {
+    if custom_id.is_empty() || custom_id.len() > MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3 {
+        return Err(SharedGatewayInteractionEnvelopeErrorV3::CustomId);
+    }
+    Ok(())
+}
+
+fn validate_locale_v3(locale: Option<&str>) -> Result<(), SharedGatewayInteractionEnvelopeErrorV3> {
+    if locale.is_some_and(|value| {
+        value.is_empty()
+            || value.len() > MAX_SHARED_GATEWAY_INTERACTION_LOCALE_BYTES_V3
+            || value.chars().any(char::is_control)
+    }) {
+        return Err(SharedGatewayInteractionEnvelopeErrorV3::Locale);
+    }
+    Ok(())
+}
+
+#[allow(deprecated)]
+#[cfg(any(test, doctest))]
+fn twilight_channel_id_v3(interaction: &Interaction) -> Option<Id<ChannelMarker>> {
+    interaction
+        .channel
+        .as_ref()
+        .map(|channel| channel.id)
+        .or(interaction.channel_id)
+}
+
+#[cfg(any(test, doctest))]
+fn collect_twilight_modal_inputs_v3(
+    components: &[ModalInteractionComponent],
+    inputs: &mut Vec<SharedGatewayModalInputV3>,
+) -> Result<(), SharedGatewayInteractionEnvelopeErrorV3> {
+    for component in components {
+        match component {
+            ModalInteractionComponent::TextInput(input) => {
+                inputs.push(SharedGatewayModalInputV3::new(
+                    input.id,
+                    input.custom_id.clone(),
+                    input.value.clone(),
+                )?);
+            }
+            ModalInteractionComponent::ActionRow(row) => {
+                collect_twilight_modal_inputs_v3(&row.components, inputs)?;
+            }
+            ModalInteractionComponent::Label(label) => {
+                collect_twilight_modal_inputs_v3(
+                    std::slice::from_ref(label.component.as_ref()),
+                    inputs,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn minimal_user_v3(user_id: UserId) -> User {
+    User {
+        accent_color: None,
+        avatar: None,
+        avatar_decoration: None,
+        avatar_decoration_data: None,
+        banner: None,
+        bot: false,
+        discriminator: 0,
+        email: None,
+        flags: None,
+        global_name: None,
+        id: Id::<UserMarker>::new(user_id.0),
+        locale: None,
+        mfa_enabled: None,
+        name: String::new(),
+        premium_type: None,
+        primary_guild: None,
+        public_flags: None,
+        system: None,
+        verified: None,
+    }
+}
+
+pub(crate) struct ZeroizingTwilightInteractionV3(Interaction);
+
+impl ZeroizingTwilightInteractionV3 {
+    pub(crate) fn as_interaction_v3(&self) -> &Interaction {
+        &self.0
+    }
+}
+
+impl Drop for ZeroizingTwilightInteractionV3 {
+    fn drop(&mut self) {
+        zeroize_twilight_interaction_v3(&mut self.0);
+    }
+}
+
+fn zeroize_twilight_interaction_v3(interaction: &mut Interaction) {
+    interaction.token.zeroize();
+    if let Some(InteractionData::ModalSubmit(data)) = interaction.data.as_mut() {
+        zeroize_twilight_modal_inputs_v3(&mut data.components);
+    }
+}
+
+fn zeroize_twilight_modal_inputs_v3(components: &mut [ModalInteractionComponent]) {
+    for component in components {
+        match component {
+            ModalInteractionComponent::TextInput(input) => input.value.zeroize(),
+            ModalInteractionComponent::ActionRow(row) => {
+                zeroize_twilight_modal_inputs_v3(&mut row.components);
+            }
+            ModalInteractionComponent::Label(label) => {
+                zeroize_twilight_modal_inputs_v3(std::slice::from_mut(label.component.as_mut()));
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+    use std::num::NonZeroUsize;
+    use std::thread;
+    use std::time::Duration;
+
+    use crate::custom_id::encode_button;
+    use crate::interaction_to_event;
+    use crate::shared_gateway_admission::SharedGatewayAdmissionConfigV3;
+    use crate::shared_gateway_control::{
+        shared_gateway_control_channel_v3, GatewayControlConfigV3, GatewayReadyKindV3,
+    };
+
+    use super::*;
+    use static_assertions::assert_not_impl_any;
+
+    assert_not_impl_any!(SharedGatewayInteractionEnvelopeV3: Clone, serde::Serialize);
+    assert_not_impl_any!(SharedGatewayInteractionTokenV3: Clone, serde::Serialize);
+    assert_not_impl_any!(SharedGatewayModalInputV3: Clone, serde::Serialize);
+
+    #[test]
+    fn loopback_http_proxy_type_rejects_privileged_and_non_loopback_addresses() {
+        assert!(SharedGatewayLoopbackHttpProxyV1::new(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            1024,
+        ))
+        .is_some());
+        for address in [
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1023),
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 21002),
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 21002),
+        ] {
+            assert!(SharedGatewayLoopbackHttpProxyV1::new(address).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_http_uses_the_opt_in_proxy_and_callback_client_stays_direct() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else {
+            panic!("test listener must be IPv4")
+        };
+        let request = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                assert!(request.len() <= 8 * 1024);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let proxy = SharedGatewayLoopbackHttpProxyV1::new(address).unwrap();
+        let mutation = mutation_http_client_v1(
+            "test-token",
+            SharedGatewayMutationHttpTransportV1::LoopbackProxy(proxy),
+        );
+        assert!(mutation.current_user().await.unwrap().status().is_success());
+        let request = request.join().unwrap();
+        assert!(request.starts_with("GET /api/v10/users/@me HTTP/1.1\r\n"));
+        assert!(mutation.ratelimiter().is_some());
+        let callback = interaction_callback_http_client_v1("test-token");
+        assert!(callback.ratelimiter().is_none());
+    }
+
+    fn identity() -> SharedGatewayInteractionIdentityV3 {
+        SharedGatewayInteractionIdentityV3::new(
+            GuildId(7),
+            ChannelId(8),
+            UserId(9),
+            SharedGatewayInteractionApplicationIdV3::new(10).unwrap(),
+            SharedGatewayInteractionIdV3::new(11).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn token() -> SharedGatewayInteractionTokenV3 {
+        SharedGatewayInteractionTokenV3::new("interaction-secret".to_string()).unwrap()
+    }
+
+    fn button() -> SharedGatewayInteractionEnvelopeV3 {
+        SharedGatewayInteractionEnvelopeV3::message_component_v3(
+            identity(),
+            encode_button(GuildId(7), "study", "create"),
+            Some("ko".to_string()),
+            token(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn source_neutral_envelope_preserves_exact_ids_and_redacts_secrets() {
+        fn assert_send<T: Send>() {}
+        let token = token();
+        assert!(!format!("{token:?}").contains("interaction-secret"));
+        let input =
+            SharedGatewayModalInputV3::new(17, "room_name".to_string(), "secret-room".to_string())
+                .unwrap();
+        assert!(!format!("{input:?}").contains("secret-room"));
+        let envelope = SharedGatewayInteractionEnvelopeV3::modal_submit_v3(
+            identity(),
+            "starring:7:study:modal:room".to_string(),
+            vec![input],
+            Some("ko".to_string()),
+            token,
+        )
+        .unwrap();
+        assert_send::<SharedGatewayInteractionEnvelopeV3>();
+        assert_eq!(envelope.identity_v3(), identity());
+        assert_eq!(
+            envelope.kind_v3(),
+            SharedGatewayInteractionKindV3::ModalSubmit
+        );
+        assert_eq!(envelope.locale_v3(), Some("ko"));
+        let debug = format!("{envelope:?}");
+        assert!(!debug.contains("interaction-secret"));
+        assert!(!debug.contains("secret-room"));
+
+        let interaction = envelope.twilight_interaction_v3();
+        assert_eq!(interaction.0.guild_id.unwrap().get(), 7);
+        #[allow(deprecated)]
+        let channel_id = interaction.0.channel_id.unwrap().get();
+        assert_eq!(channel_id, 8);
+        assert_eq!(interaction.0.author_id().unwrap().get(), 9);
+        assert_eq!(interaction.0.application_id.get(), 10);
+        assert_eq!(interaction.0.id.get(), 11);
+        let Some(InteractionData::ModalSubmit(modal)) = interaction.0.data.as_ref() else {
+            panic!("modal envelope must reconstruct modal interaction data")
+        };
+        assert_eq!(modal.custom_id, "starring:7:study:modal:room");
+        let ModalInteractionComponent::TextInput(input) = &modal.components[0] else {
+            panic!("modal input must retain its exact type")
+        };
+        assert_eq!(input.id, 17);
+        assert_eq!(input.custom_id, "room_name");
+        assert_eq!(input.value, "secret-room");
+    }
+
+    #[test]
+    fn legacy_and_source_neutral_paths_produce_identical_dispatch_inputs() {
+        let canonical = SharedGatewayInteractionEnvelopeV3::modal_submit_v3(
+            identity(),
+            "starring:7:study:modal:room".to_string(),
+            vec![SharedGatewayModalInputV3::new(
+                17,
+                "room_name".to_string(),
+                "secret-room".to_string(),
+            )
+            .unwrap()],
+            Some("ko".to_string()),
+            token(),
+        )
+        .unwrap();
+        let canonical_view = canonical.twilight_interaction_v3();
+        let normalized = SharedGatewayInteractionEnvelopeV3::from_twilight_interaction_v3(
+            canonical_view.0.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        let normalized_view = normalized.twilight_interaction_v3();
+
+        assert_eq!(
+            interaction_to_event(canonical_view.as_interaction_v3(), "study"),
+            interaction_to_event(normalized_view.as_interaction_v3(), "study")
+        );
+        assert_eq!(
+            parse_shared_gateway_route_v1(
+                canonical.identity_v3().guild_id(),
+                canonical.custom_id_v3(),
+            ),
+            parse_shared_gateway_route_v1(
+                normalized.identity_v3().guild_id(),
+                normalized.custom_id_v3(),
+            )
+        );
+        assert_eq!(canonical.identity_v3(), normalized.identity_v3());
+        assert_eq!(canonical.kind_v3(), normalized.kind_v3());
+        assert_eq!(canonical.locale_v3(), normalized.locale_v3());
+        assert_eq!(
+            (
+                canonical_view.0.application_id,
+                canonical_view.0.id,
+                canonical_view.0.guild_id,
+                canonical_view.0.author_id(),
+                canonical_view.0.token.as_str(),
+            ),
+            (
+                normalized_view.0.application_id,
+                normalized_view.0.id,
+                normalized_view.0.guild_id,
+                normalized_view.0.author_id(),
+                normalized_view.0.token.as_str(),
+            )
+        );
+        #[allow(deprecated)]
+        let channels = (canonical_view.0.channel_id, normalized_view.0.channel_id);
+        assert_eq!(channels.0, channels.1);
+    }
+
+    #[test]
+    fn envelope_rejects_unbounded_and_ambiguous_payloads() {
+        assert_eq!(
+            SharedGatewayInteractionTokenV3::new(String::new()).unwrap_err(),
+            SharedGatewayInteractionEnvelopeErrorV3::Token
+        );
+        assert_eq!(
+            SharedGatewayInteractionTokenV3::new(
+                "x".repeat(MAX_SHARED_GATEWAY_INTERACTION_TOKEN_BYTES_V3 + 1)
+            )
+            .unwrap_err(),
+            SharedGatewayInteractionEnvelopeErrorV3::Token
+        );
+        assert_eq!(
+            SharedGatewayInteractionEnvelopeV3::message_component_v3(
+                identity(),
+                "x".repeat(MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3 + 1),
+                None,
+                token(),
+            )
+            .unwrap_err(),
+            SharedGatewayInteractionEnvelopeErrorV3::CustomId
+        );
+        let duplicate = vec![
+            SharedGatewayModalInputV3::new(1, "name".to_string(), "a".to_string()).unwrap(),
+            SharedGatewayModalInputV3::new(2, "name".to_string(), "b".to_string()).unwrap(),
+        ];
+        assert_eq!(
+            SharedGatewayInteractionEnvelopeV3::modal_submit_v3(
+                identity(),
+                "starring:7:study:modal:room".to_string(),
+                duplicate,
+                None,
+                token(),
+            )
+            .unwrap_err(),
+            SharedGatewayInteractionEnvelopeErrorV3::DuplicateModalInput
+        );
+        let aggregate = (0..MAX_SHARED_GATEWAY_MODAL_INPUTS_V3)
+            .map(|index| {
+                SharedGatewayModalInputV3::new(
+                    index as i32,
+                    format!("field_{index}"),
+                    "x".repeat(MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3),
+                )
+                .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            SharedGatewayInteractionEnvelopeV3::modal_submit_v3(
+                identity(),
+                "starring:7:study:modal:room".to_string(),
+                aggregate,
+                None,
+                token(),
+            )
+            .unwrap_err(),
+            SharedGatewayInteractionEnvelopeErrorV3::ModalPayload
+        );
+    }
+
+    #[test]
+    fn private_twilight_view_zeroizes_token_and_modal_values() {
+        let envelope = SharedGatewayInteractionEnvelopeV3::modal_submit_v3(
+            identity(),
+            "starring:7:study:modal:room".to_string(),
+            vec![SharedGatewayModalInputV3::new(
+                17,
+                "room_name".to_string(),
+                "secret-room".to_string(),
+            )
+            .unwrap()],
+            None,
+            token(),
+        )
+        .unwrap();
+        let mut interaction = envelope.twilight_interaction_v3();
+        zeroize_twilight_interaction_v3(&mut interaction.0);
+        assert!(interaction.0.token.is_empty());
+        let Some(InteractionData::ModalSubmit(modal)) = interaction.0.data.as_ref() else {
+            panic!("modal envelope must reconstruct modal interaction data")
+        };
+        let ModalInteractionComponent::TextInput(input) = &modal.components[0] else {
+            panic!("modal input must retain its exact type")
+        };
+        assert!(input.value.is_empty());
+    }
+
+    #[test]
+    fn reservation_is_source_independent_bounded_and_fail_closed() {
+        let budget = SharedGatewayAdmissionBudgetV3::new(
+            SharedGatewayAdmissionConfigV3::new(NonZeroUsize::new(1).unwrap()).unwrap(),
+        );
+        let (control, mut runtime) =
+            shared_gateway_control_channel_v3(GatewayControlConfigV3::default());
+        let observer = control.connection_observer();
+
+        assert!(matches!(
+            reserve_shared_gateway_interaction_v3(button(), None, &observer, &budget),
+            SharedGatewayInteractionReservationOutcomeV3::Rejected {
+                reason: SharedGatewayInteractionRejectionV3::Admission(
+                    SharedGatewayAdmissionErrorV3::NotReady
+                ),
+                ..
+            }
+        ));
+
+        let epoch = runtime.mark_connected(GatewayReadyKindV3::Ready).unwrap();
+        let lease = observer.issue_ready_lease(epoch).unwrap();
+        let reserved =
+            reserve_shared_gateway_interaction_v3(button(), Some(lease), &observer, &budget);
+        assert!(matches!(
+            &reserved,
+            SharedGatewayInteractionReservationOutcomeV3::Reserved(_)
+        ));
+        assert!(matches!(
+            reserve_shared_gateway_interaction_v3(button(), Some(lease), &observer, &budget),
+            SharedGatewayInteractionReservationOutcomeV3::Rejected {
+                reason: SharedGatewayInteractionRejectionV3::Admission(
+                    SharedGatewayAdmissionErrorV3::Overloaded
+                ),
+                ..
+            }
+        ));
+        let SharedGatewayInteractionReservationOutcomeV3::Reserved(reserved) = reserved else {
+            panic!("interaction must remain reserved")
+        };
+        let cancelled = cancel_reserved_shared_gateway_interaction_v3(*reserved);
+        assert_eq!(
+            cancelled.custom_id_v3(),
+            encode_button(GuildId(7), "study", "create")
+        );
+        assert!(matches!(
+            reserve_shared_gateway_interaction_v3(button(), Some(lease), &observer, &budget),
+            SharedGatewayInteractionReservationOutcomeV3::Reserved(_)
+        ));
+    }
+}

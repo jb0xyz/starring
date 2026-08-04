@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 design-harness = { path = "../../crates/design-harness" }
+design-harness-codex-worker-client = { path = "../../crates/design-harness-codex-worker-client" }
 desired-state = { path = "../../crates/desired-state" }
 discord-model = { path = "../../crates/discord-model" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

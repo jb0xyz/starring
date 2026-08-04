@@ -6,6 +6,7 @@ pub mod mock;
 pub mod modal_input;
 pub mod plan;
 pub mod policy;
+pub mod preflight;
 mod prepare;
 pub mod run;
 pub mod template;
@@ -19,6 +20,7 @@ pub use adapter::{
 pub use event::{
     EventKind, ResolvedInstanceContext, RunningRuleSetIdentity, RuntimeContext, RuntimeEvent,
 };
+pub use execution::execute_prepared_event;
 pub use interpret::interpret;
 pub use mock::{
     MockInstanceTeardownService, MockInteractionResponder, MockMutationAdapter, MutationCall,
@@ -30,6 +32,7 @@ pub use plan::{
     PlannedOverwriteTarget, PlannedRole, ResponseDeliveryOutcome, RunResult, TeardownActionResult,
 };
 pub use policy::{analyze, privileged_mask, DynamicAction, PolicyFinding};
+pub use prepare::{prepare_event_execution, PreparedEventExecution};
 pub use run::{handle_event, run, HandleOutcome};
 pub use template::{SanitizeContext, TemplateError, TemplateString};
 pub use validate::{validate, validate_bindings, validate_structural, ValidationError};

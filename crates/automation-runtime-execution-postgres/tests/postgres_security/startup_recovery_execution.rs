@@ -125,6 +125,26 @@ async fn startup_stale_live_execution_progresses_once_with_canonical_projection(
     let server = PostgresTestServer::start();
     let database = isolated_database(server.connect_options()).await;
     seed_live_for_startup_observation(&database, 1_000).await;
+    seed_committed_succession_certification(&database.owner_pool).await;
+    let certification_terminal = sqlx::query_as::<_, (String, String)>(
+        "SELECT terminal_outcome_name, resulting_phase \
+         FROM public.runtime_certification_operation_terminals_v2",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        certification_terminal,
+        ("certification_committed".to_owned(), "live".to_owned())
+    );
+    let retained_certification_operations = sqlx::query_scalar::<_, i64>(
+        "SELECT pg_catalog.count(*) \
+         FROM public.runtime_certification_operations_v2",
+    )
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(retained_certification_operations, 1);
     let expiry = sqlx::query_scalar::<_, DateTime<Utc>>(
         "SELECT expires_at FROM public.runtime_serving_leases \
          WHERE deployment_id = $1",
@@ -135,6 +155,11 @@ async fn startup_stale_live_execution_progresses_once_with_canonical_projection(
     .unwrap();
     wait_for_database_time(&database.owner_pool, expiry).await;
     let owner = acquire_startup_observation_owner(&database.executor_pool).await;
+    let observed = observe_startup_state(&database.executor_pool, &owner, owner.4).await;
+    assert_eq!(observed["outcome_name"], "observed");
+    assert_eq!(observed["serving_state_name"], "recoverable_stale");
+    assert_eq!(observed["serving_count"], 1);
+    assert_eq!(observed["recoverable_awaiting_certification_count"], 0);
     let input = startup_stale_live_execution_input(
         &owner,
         "33000000000000000000000000000033",
@@ -202,6 +227,176 @@ async fn startup_stale_live_execution_progresses_once_with_canonical_projection(
     assert_eq!(
         startup_stale_live_journal_count(&database.owner_pool, &input.recovery_id).await,
         1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT pg_catalog.count(*) \
+             FROM public.runtime_certification_operations_v2",
+        )
+        .fetch_one(&database.owner_pool)
+        .await
+        .unwrap(),
+        retained_certification_operations
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT terminal_outcome_name, resulting_phase \
+             FROM public.runtime_certification_operation_terminals_v2",
+        )
+        .fetch_one(&database.owner_pool)
+        .await
+        .unwrap(),
+        certification_terminal
+    );
+
+    let adapter = verified_execution_adapter(&database).await;
+    let controller_id = ControllerId::parse("runtime-stale-live-controller").unwrap();
+    let claim_lease = Duration::from_secs(90);
+    let claimed = adapter
+        .claim_next_execution(RuntimeClaimNextExecutionV1 {
+            controller_id: controller_id.clone(),
+            lease_for: claim_lease,
+        })
+        .await
+        .unwrap()
+        .expect("recovered stale live deployment must remain claimable");
+    assert_eq!(
+        claimed.snapshot.revision.get(),
+        u64::try_from(post_state.0 + 1).unwrap()
+    );
+    assert_eq!(
+        claimed.snapshot.phase,
+        RuntimeDeploymentPhaseV1::RuntimePending {
+            condition: RuntimePendingConditionV1::Ready,
+        }
+    );
+    let mut session = RuntimeConvergenceSessionV1::from_claim(claimed).unwrap();
+    let renewal_request = session.begin_renewal(Duration::from_secs(120)).unwrap();
+    let renewed = adapter.renew_execution(renewal_request).await.unwrap();
+    session.apply_renewal(renewed).unwrap();
+    let mutation = session
+        .begin_mutation(RuntimeConvergenceMutationV1::BeginPanelReconciliation)
+        .unwrap();
+    let mutated = adapter.mutate(mutation).await.unwrap();
+    assert!(matches!(
+        mutated.outcome,
+        TransitionOutcomeV1::Applied { .. }
+    ));
+    session.apply_mutation(mutated).unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT pg_catalog.count(*) \
+             FROM public.runtime_certification_operations_v2",
+        )
+        .fetch_one(&database.owner_pool)
+        .await
+        .unwrap(),
+        retained_certification_operations
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT terminal_outcome_name, resulting_phase \
+             FROM public.runtime_certification_operation_terminals_v2",
+        )
+        .fetch_one(&database.owner_pool)
+        .await
+        .unwrap(),
+        certification_terminal
+    );
+
+    cleanup(database).await;
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn committed_terminal_exact_current_phase_mismatch_blocks_execution_writers() {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    seed_claimable_deployment(&database.owner_pool).await;
+    let adapter = verified_execution_adapter(&database).await;
+    let mut session = claimed_session(
+        &adapter,
+        "runtime-committed-terminal-controller",
+        Duration::from_secs(90),
+    )
+    .await;
+    advance_to_activation_applying(&database.owner_pool, &adapter, &mut session).await;
+    let activation = ActivationAttestationV1 {
+        activation_request_id: session.snapshot().identity.activation_request_id.clone(),
+        target: session.snapshot().target.clone(),
+        runtime_generation: session.snapshot().runtime_generation,
+        kind: ActivationOutcomeKindV1::Activated,
+        activated_at: database_now(&database.owner_pool).await,
+    };
+    mutate_applied(
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::AcceptActivation(activation),
+    )
+    .await;
+    mutate_applied(
+        &adapter,
+        &mut session,
+        RuntimeConvergenceMutationV1::BeginPanelReconciliation,
+    )
+    .await;
+    assert!(matches!(
+        session.snapshot().phase,
+        RuntimeDeploymentPhaseV1::ReconcilingPanels
+    ));
+    seed_exact_committed_terminal(
+        &database.owner_pool,
+        i64::try_from(session.snapshot().revision.get()).unwrap(),
+        i64::from(session.convergence_attempt().get()),
+    )
+    .await;
+    let unchanged = startup_stale_live_row(&database.owner_pool, "runtime_deployments").await;
+    let renewal = session.begin_renewal(Duration::from_secs(120)).unwrap();
+    let renewal_error = adapter.renew_execution(renewal.clone()).await.unwrap_err();
+    assert_eq!(
+        renewal_error,
+        RuntimeExecutionPersistenceErrorV1::OwnershipLost
+    );
+    let mutation_error = raw_mutate(
+        &database.executor_pool,
+        &renewal.guard,
+        "cancel",
+        json!({"reason": "terminal-phase-mismatch"}),
+    )
+    .await
+    .unwrap_err();
+    assert_sqlstate(&mutation_error, "RX001");
+    assert_eq!(
+        startup_stale_live_row(&database.owner_pool, "runtime_deployments").await,
+        unchanged
+    );
+
+    clear_execution_controller(&database.owner_pool).await;
+    let mut transaction = database.executor_pool.begin().await.unwrap();
+    let claim =
+        raw_selector_claim(&mut transaction, "runtime-committed-terminal-reclaim").await.unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(claim, None);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT pg_catalog.count(*) \
+             FROM public.runtime_certification_operations_v2",
+        )
+        .fetch_one(&database.owner_pool)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT terminal_outcome_name, resulting_phase \
+             FROM public.runtime_certification_operation_terminals_v2",
+        )
+        .fetch_one(&database.owner_pool)
+        .await
+        .unwrap(),
+        ("certification_committed".to_owned(), "live".to_owned())
     );
 
     cleanup(database).await;
@@ -516,6 +711,123 @@ async fn startup_stale_live_mutation_state(
     .fetch_one(pool)
     .await
     .unwrap()
+}
+
+async fn seed_exact_committed_terminal(pool: &PgPool, revision: i64, attempt: i64) {
+    let operation_id = "1234567890abcdef1234567890abcdef";
+    let fingerprint = "7".repeat(64);
+    let source_revision = revision.checked_sub(1).unwrap();
+    let terminal_at = database_now(pool).await;
+    let receipt = b"exact-current-committed-terminal";
+    let digest = sqlx::query_scalar::<_, String>(
+        "SELECT starring_runtime_private_v2.\
+            starring_runtime_certification_terminal_digest_v2(\
+                2::SMALLINT,$1,$2,$3,$4,$5,$6,$7,'certification_committed',\
+                'live',$8,$7,$9,$10\
+            )",
+    )
+    .bind(operation_id)
+    .bind(&fingerprint)
+    .bind(TENANT)
+    .bind(INSTALLATION)
+    .bind(DEPLOYMENT)
+    .bind(source_revision)
+    .bind(attempt)
+    .bind(revision)
+    .bind(terminal_at)
+    .bind(receipt.as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let mut transaction = pool.begin().await.unwrap();
+    for statement in [
+        "ALTER TABLE public.runtime_certification_operations_v2 DISABLE TRIGGER USER",
+        "ALTER TABLE public.runtime_certification_operation_terminals_v2 DISABLE TRIGGER USER",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO public.runtime_certification_operations_v2 (\
+            operation_id, tenant_id, installation_id, deployment_id, \
+            deployment_revision, convergence_attempt_no, certification_intent_bytes, \
+            intent_fingerprint\
+         ) VALUES ($1,$2,$3,$4,$5,$6,pg_catalog.convert_to('{}','UTF8'),$7)",
+    )
+    .bind(operation_id)
+    .bind(TENANT)
+    .bind(INSTALLATION)
+    .bind(DEPLOYMENT)
+    .bind(source_revision)
+    .bind(attempt)
+    .bind(&fingerprint)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_certification_operation_terminals_v2 (\
+            record_format_version, operation_id, intent_fingerprint, tenant_id, \
+            installation_id, deployment_id, deployment_revision, \
+            convergence_attempt_no, terminal_outcome_name, resulting_phase, \
+            resulting_deployment_revision, resulting_convergence_attempt_no, \
+            terminal_at, terminal_receipt_bytes, terminal_receipt_digest\
+         ) VALUES (\
+            2,$1,$2,$3,$4,$5,$6,$7,'certification_committed','live',\
+            $8,$7,$9,$10,$11\
+         )",
+    )
+    .bind(operation_id)
+    .bind(&fingerprint)
+    .bind(TENANT)
+    .bind(INSTALLATION)
+    .bind(DEPLOYMENT)
+    .bind(source_revision)
+    .bind(attempt)
+    .bind(revision)
+    .bind(terminal_at)
+    .bind(receipt.as_slice())
+    .bind(&digest)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    for statement in [
+        "ALTER TABLE public.runtime_certification_operation_terminals_v2 ENABLE TRIGGER USER",
+        "ALTER TABLE public.runtime_certification_operations_v2 ENABLE TRIGGER USER",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+}
+
+async fn clear_execution_controller(pool: &PgPool) {
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("ALTER TABLE public.runtime_deployments DISABLE TRIGGER USER")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_deployments \
+         SET controller_id = NULL, controller_fencing_token = NULL, \
+            controller_acquired_at = NULL, controller_lease_expires_at = NULL, \
+            snapshot = pg_catalog.jsonb_set(\
+                snapshot, '{controller_lease}', 'null'::JSONB, FALSE\
+            ) \
+         WHERE deployment_id = $1",
+    )
+    .bind(DEPLOYMENT)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE public.runtime_deployments ENABLE TRIGGER USER")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
 }
 
 async fn startup_stale_live_row(pool: &PgPool, relation: &str) -> Value {

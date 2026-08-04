@@ -2,8 +2,8 @@ use futures::FutureExt as _;
 use sqlx::Connection as _;
 
 const SNAPSHOT_FUNCTION: &str =
-    "public.starring_product_authorized_snapshot_read_v1(TEXT, TEXT, BYTEA, TEXT, TEXT)";
-const SNAPSHOT_FUNCTION_IDENTITY: &str =
+    "public.starring_product_authorized_snapshot_read_v2(TEXT, TEXT, BYTEA, TEXT, TEXT)";
+const SNAPSHOT_V1_FUNCTION_IDENTITY: &str =
     "public.starring_product_authorized_snapshot_read_v1(text,text,bytea,text,text)";
 const SNAPSHOT_DATABASE_IDENTITY_FUNCTION: &str =
     "public.starring_product_authorized_snapshot_reader_database_identity_v1()";
@@ -248,7 +248,7 @@ async fn snapshot_function_count(
 ) -> i64 {
     sqlx::query_scalar::<_, i64>(
         "SELECT pg_catalog.count(*) \
-         FROM public.starring_product_authorized_snapshot_read_v1($1, $2, $3, $4, $5)",
+         FROM public.starring_product_authorized_snapshot_read_v2($1, $2, $3, $4, $5)",
     )
     .bind(session_id)
     .bind(principal_id)
@@ -522,7 +522,7 @@ async fn authorized_snapshot_is_exactly_scoped_for_a_non_owner_role() {
         }
         assert_snapshot_permission_denied(
             &denied_pool,
-            "SELECT * FROM public.starring_product_authorized_snapshot_read_v1( \
+            "SELECT * FROM public.starring_product_authorized_snapshot_read_v2( \
              'missing', 'missing', decode(repeat('00', 32), 'hex'), 'missing', 'missing')",
         )
         .await;
@@ -764,7 +764,7 @@ async fn authorized_snapshot_is_exactly_scoped_for_a_non_owner_role() {
         .unwrap();
         let post_configuration_rows = sqlx::query_scalar::<_, i64>(
             "SELECT pg_catalog.count(*) \
-             FROM public.starring_product_authorized_snapshot_read_v1(\
+             FROM public.starring_product_authorized_snapshot_read_v2(\
               $1, $2, $3, $4, $5)",
         )
         .bind(fixture.session_id.as_str())
@@ -847,7 +847,7 @@ async fn authorized_snapshot_migration_rejects_split_ownership() {
         transaction.rollback().await.unwrap();
         let function_exists =
             sqlx::query_scalar::<_, bool>("SELECT pg_catalog.to_regprocedure($1) IS NOT NULL")
-                .bind(SNAPSHOT_FUNCTION_IDENTITY)
+                .bind(SNAPSHOT_V1_FUNCTION_IDENTITY)
                 .fetch_one(&database.pool)
                 .await
                 .unwrap();
@@ -968,7 +968,7 @@ async fn authorized_snapshot_migration_strips_hostile_default_grants() {
              FROM pg_catalog.pg_proc AS function_row \
              WHERE function_row.oid = pg_catalog.to_regprocedure($1)",
         )
-        .bind(SNAPSHOT_FUNCTION_IDENTITY)
+        .bind(SNAPSHOT_V1_FUNCTION_IDENTITY)
         .bind(&hostile_role)
         .fetch_one(&database.pool)
         .await
@@ -983,7 +983,7 @@ async fn authorized_snapshot_migration_strips_hostile_default_grants() {
              WHERE function_row.oid = pg_catalog.to_regprocedure($1) \
               AND privilege.grantee <> function_row.proowner",
         )
-        .bind(SNAPSHOT_FUNCTION_IDENTITY)
+        .bind(SNAPSHOT_V1_FUNCTION_IDENTITY)
         .fetch_one(&database.pool)
         .await
         .unwrap();

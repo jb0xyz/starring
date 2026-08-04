@@ -20,10 +20,7 @@ pub fn build_preview(
     after: &AccessMatrix,
 ) -> PreviewModel {
     let verdict = policy.verdict;
-    let approval_required = matches!(
-        verdict,
-        Verdict::RequireApproval | Verdict::RequireSecondApproval
-    );
+    let approval_required = verdict == Verdict::RequireApproval;
     let blocked = verdict == Verdict::Deny;
 
     let changes = graph

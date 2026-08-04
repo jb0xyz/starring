@@ -70,6 +70,12 @@
         <string>keychain:starring-api.staging:database.deployment-status-reader</string>
         <key>STARRING_API_OPERATIONAL_STATUS_DATABASE_SECRET_REFERENCE</key>
         <string>keychain:starring-api.staging:database.operational-deployment-status-reader</string>
+        <key>STARRING_API_AUTHORING_SESSION_WRITER_DATABASE_SECRET_REFERENCE</key>
+        <string>keychain:starring-api.staging:database.authoring-session-writer</string>
+        <key>STARRING_API_AUTHORING_WORKER_URL</key>
+        <string>http://127.0.0.1:18181</string>
+        <key>STARRING_API_AUTHORING_WORKER_TOKEN_SECRET_REFERENCE</key>
+        <string>keychain:com.starring.llm-api-key:llm-api</string>
         <key>STARRING_API_DISCORD_OAUTH_CLIENT_SECRET_REFERENCE</key>
         <string>keychain:starring-api.staging:discord.oauth-client-secret</string>
         <key>STARRING_API_DISCORD_BOT_TOKEN_REFERENCE</key>

@@ -14,7 +14,9 @@ pub use errors::{
     ToolSuccess,
 };
 pub use gates::{simulate_draft, validate_draft};
-pub use intent::IntentRequestedOutcome;
+pub use intent::{
+    verify_preview_ruleset_v1, IntentRequestedOutcome, PreviewRulesetVerificationErrorV1,
+};
 pub use llm::{LlmClient, LlmError, LlmResponse, Message, MessageRole, ToolCall};
 pub use resource_resolution::ResourceBindingFingerprint;
 pub use resource_resolution::ResourceBindingMap;

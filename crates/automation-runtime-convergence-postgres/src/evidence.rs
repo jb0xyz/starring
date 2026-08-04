@@ -14,6 +14,10 @@ use crate::model::{
 };
 use crate::projection::{project_status, CurrentAuthorityOutcome, StatusProjectionEvidence};
 use crate::row::{AttestationRow, DeploymentRow, PersistedDeployment, ServingLeaseRow};
+use crate::status_attestation::{
+    classify_status_attestation, decode_canonical_status_attestation_v2,
+    decode_legacy_status_attestation, StatusAttestationFormat, StatusAttestationRowV2,
+};
 use crate::RuntimeConvergenceStoreError;
 
 pub struct RuntimeDeploymentStatusExpectationV1 {
@@ -80,6 +84,25 @@ pub struct RuntimeDeploymentStatusEvidenceV1 {
     pub artifact_projection: Option<Value>,
     pub attestation_projection: Option<Value>,
     pub serving_projection: Option<Value>,
+    pub attestation_evidence_v2: RuntimeDeploymentAttestationEvidenceV2,
+}
+
+#[derive(Clone, Default)]
+pub struct RuntimeDeploymentAttestationEvidenceV2 {
+    pub attestation_record_format_version: Option<i16>,
+    pub attestation_serving_lease_duration_nanos: Option<i64>,
+    pub attestation_convergence_attempt_no: Option<i64>,
+    pub deployment_last_controller_id: Option<String>,
+    pub v2_evidence_state: Option<String>,
+    pub v2_operation_id: Option<String>,
+    pub v2_intent_fingerprint: Option<String>,
+    pub v2_certification_intent_bytes: Option<Vec<u8>>,
+    pub v2_request_digest: Option<String>,
+    pub v2_request_bytes: Option<Vec<u8>>,
+    pub v2_live_attestation_bytes: Option<Vec<u8>>,
+    pub v2_must_commit_before: Option<DateTime<Utc>>,
+    pub v2_route_admission: Option<Value>,
+    pub v2_certified_snapshot: Option<Value>,
 }
 
 pub struct RuntimeDeploymentStatusEvidenceV2 {
@@ -109,6 +132,16 @@ pub fn project_runtime_deployment_status_v2(
     if evidence.evidence.attestation_projection.is_some() != attestation_attempt.is_some() {
         return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
             "runtime attestation attempt presence",
+        ));
+    }
+    if evidence
+        .evidence
+        .attestation_evidence_v2
+        .attestation_convergence_attempt_no
+        != evidence.attestation_convergence_attempt_no
+    {
+        return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+            "runtime attestation attempt sidecar",
         ));
     }
     attach_attempt_evidence(
@@ -167,8 +200,16 @@ pub fn project_runtime_deployment_status_v2(
 pub fn project_runtime_deployment_status_v1(
     expectation: &RuntimeDeploymentStatusExpectationV1,
     observed_at: DateTime<Utc>,
-    evidence: RuntimeDeploymentStatusEvidenceV1,
+    mut evidence: RuntimeDeploymentStatusEvidenceV1,
 ) -> Result<RuntimeDeploymentStatusV1, RuntimeConvergenceStoreError> {
+    let last_controller_id = evidence
+        .attestation_evidence_v2
+        .deployment_last_controller_id
+        .clone();
+    attach_last_controller_evidence(
+        &mut evidence.deployment_projection,
+        last_controller_id.as_deref(),
+    )?;
     let deployment = decode_envelope::<DeploymentRow>(
         evidence.deployment_projection,
         "deployment evidence envelope",
@@ -249,12 +290,39 @@ pub fn project_runtime_deployment_status_v1(
             },
         );
     }
-    let attestation = decode_optional_envelope::<AttestationRow>(
-        evidence.attestation_projection,
-        "attestation evidence envelope",
-    )?
-    .map(AttestationRow::decode_legacy_evidence)
-    .transpose()?;
+    let attestation_format = classify_status_attestation(
+        &evidence.attestation_evidence_v2,
+        evidence.attestation_projection.is_some(),
+    )?;
+    let attestation = match (attestation_format, evidence.attestation_projection) {
+        (StatusAttestationFormat::None, None) => None,
+        (StatusAttestationFormat::LegacyV1, Some(projection)) => {
+            let persisted =
+                decode_envelope::<AttestationRow>(projection, "attestation evidence envelope")?
+                    .decode_legacy_evidence()?;
+            Some(decode_legacy_status_attestation(
+                persisted,
+                &evidence.attestation_evidence_v2,
+                &deployment,
+            )?)
+        }
+        (StatusAttestationFormat::CanonicalV2, Some(projection)) => {
+            let row = decode_envelope::<StatusAttestationRowV2>(
+                projection,
+                "attestation evidence envelope",
+            )?;
+            Some(decode_canonical_status_attestation_v2(
+                row,
+                evidence.attestation_evidence_v2,
+                &deployment,
+            )?)
+        }
+        _ => {
+            return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "runtime attestation product evidence",
+            ))
+        }
+    };
     let serving = decode_optional_envelope::<ServingLeaseRow>(
         evidence.serving_projection,
         "serving evidence envelope",
@@ -335,6 +403,28 @@ fn attach_attestation_attempt_evidence(
         i64::from(attempt.get()),
         "attestation convergence attempt evidence",
     )
+}
+
+fn attach_last_controller_evidence(
+    projection: &mut Value,
+    last_controller_id: Option<&str>,
+) -> Result<(), RuntimeConvergenceStoreError> {
+    let Some(last_controller_id) = last_controller_id else {
+        return Ok(());
+    };
+    let row = evidence_row(projection, "deployment controller evidence envelope")?;
+    if row
+        .insert(
+            "last_controller_id".to_string(),
+            Value::String(last_controller_id.to_string()),
+        )
+        .is_some()
+    {
+        return Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+            "deployment controller evidence fields",
+        ));
+    }
+    Ok(())
 }
 
 fn evidence_row<'a>(
@@ -743,8 +833,8 @@ mod tests {
     use super::{
         canonical_snowflake, decode_envelope, parse_positive_i64,
         project_runtime_deployment_status_v1, project_runtime_deployment_status_v2,
-        RuntimeDeploymentStatusEvidenceV1, RuntimeDeploymentStatusEvidenceV2,
-        RuntimeDeploymentStatusExpectationV1,
+        RuntimeDeploymentAttestationEvidenceV2, RuntimeDeploymentStatusEvidenceV1,
+        RuntimeDeploymentStatusEvidenceV2, RuntimeDeploymentStatusExpectationV1,
     };
     use crate::{
         prepare_requested_deployment_v1, DeploymentAvailabilityV1, EnqueueDeploymentV1,
@@ -919,6 +1009,10 @@ mod tests {
             }))),
             attestation_projection: None,
             serving_projection: None,
+            attestation_evidence_v2: RuntimeDeploymentAttestationEvidenceV2 {
+                v2_evidence_state: Some("no_attestation".into()),
+                ..Default::default()
+            },
         };
         (expectation, evidence, observed_at)
     }

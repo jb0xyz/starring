@@ -15,7 +15,13 @@ use crate::{
 mod admission;
 mod handoff;
 mod refresh;
+mod serving;
 mod shutdown;
+
+#[cfg(test)]
+pub(crate) use serving::{
+    runtime_serving_slot_work_test_authority_v2, RuntimeServingSlotWorkTestHandleV2,
+};
 
 pub use admission::{
     RuntimeAdmissionAcknowledgingProcessV2, RuntimeEmptyOpenEpochV2, RuntimeEmptyOpenProcessV2,
@@ -33,6 +39,19 @@ pub use refresh::{
     RuntimeEmptyOpenAcknowledgementRefreshAuthorizationFailureV2,
     RuntimeEmptyOpenAcknowledgementRefreshCompletionFailureV2,
     RuntimeEmptyOpenAcknowledgementRefreshInputV2, RuntimeEmptyOpenAcknowledgementRefreshV2,
+    RuntimeServingOpenBarrierCompletionAuthorityV3,
+};
+pub use serving::{
+    accept_runtime_route_set_observation_v2, RuntimeRouteSetEpochV2,
+    RuntimeRouteSetObservationErrorV2, RuntimeRouteSetObservationInputV2,
+    RuntimeRouteSetObservationV2, RuntimeServingOpenAcknowledgementRefreshAuthorizationFailureV2,
+    RuntimeServingOpenAcknowledgementRefreshCompletionFailureV2,
+    RuntimeServingOpenAcknowledgementRefreshInputV2, RuntimeServingOpenAcknowledgementRefreshV2,
+    RuntimeServingOpenEpochV2, RuntimeServingOpenObservationInputV2,
+    RuntimeServingOpenObservationPortV2, RuntimeServingOpenObservationV2,
+    RuntimeServingOpenPreparedV2, RuntimeServingOpenProcessV2, RuntimeServingOpenRequestV2,
+    RuntimeServingOpenSupervisorConfigErrorV2, RuntimeServingOpenSupervisorConfigV2,
+    RuntimeServingSlotWorkErrorV2, RuntimeServingSlotWorkPermitV2, RuntimeServingSlotWorkRequestV2,
 };
 pub use shutdown::{
     RuntimeProductionEmergencyProcessV2, RuntimeProductionInvalidationOutcomeV2,

@@ -22,6 +22,7 @@ pub enum RuntimeShutdownCauseV1 {
     SupervisorFailure,
     FinalizerTerminal,
     HealthTerminal,
+    ProductAuthorityChanged,
     IngressAcknowledgementTerminal,
     GatewayOwnerTerminal,
     DiscordTerminal,
@@ -37,6 +38,7 @@ impl RuntimeShutdownCauseV1 {
             Self::SupervisorFailure => "supervisor_failure",
             Self::FinalizerTerminal => "finalizer_terminal",
             Self::HealthTerminal => "health_terminal",
+            Self::ProductAuthorityChanged => "product_authority_changed",
             Self::IngressAcknowledgementTerminal => "ingress_acknowledgement_terminal",
             Self::GatewayOwnerTerminal => "gateway_owner_terminal",
             Self::DiscordTerminal => "discord_terminal",
@@ -466,6 +468,10 @@ mod tests {
         assert_eq!(
             RuntimeShutdownCauseV1::GatewayOwnerTerminal.code(),
             "gateway_owner_terminal"
+        );
+        assert_eq!(
+            RuntimeShutdownCauseV1::ProductAuthorityChanged.code(),
+            "product_authority_changed"
         );
         assert_eq!(
             RuntimeShutdownSignalErrorV1::Registration.code(),

@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Formatter};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,6 +17,10 @@ const RUNTIME_HEALTH_CONNECTION_TIMEOUT: Duration = Duration::from_millis(250);
 pub(crate) enum RuntimeHealthStartErrorV1 {
     #[error("runtime health listener bind failed")]
     Bind,
+    #[error("runtime health process instance identifier is invalid")]
+    InvalidProcessInstanceId,
+    #[error("runtime health operating system process identifier is invalid")]
+    InvalidOsPid,
     #[error("runtime health asynchronous executor is unavailable")]
     AsyncRuntimeUnavailable,
 }
@@ -26,6 +30,8 @@ impl RuntimeHealthStartErrorV1 {
     const fn code(self) -> &'static str {
         match self {
             Self::Bind => "runtime_health_bind",
+            Self::InvalidProcessInstanceId => "runtime_health_process_instance_id_invalid",
+            Self::InvalidOsPid => "runtime_health_os_pid_invalid",
             Self::AsyncRuntimeUnavailable => "runtime_health_async_runtime_unavailable",
         }
     }
@@ -54,6 +60,64 @@ pub(crate) struct RuntimeHealthReadinessHandleV1 {
     state: Arc<RuntimeHealthStateV1>,
 }
 
+#[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RuntimeHealthReadinessObserverV1 {
+    state: Arc<RuntimeHealthStateV1>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RuntimeHealthInteractionDispatchStatusV1 {
+    pub(crate) normalization_ignored: u64,
+    pub(crate) normalization_rejected: u64,
+    pub(crate) enqueued: u64,
+    pub(crate) completed: u64,
+    pub(crate) execution_failed: u64,
+    pub(crate) ignored: u64,
+    pub(crate) not_accepting: u64,
+    pub(crate) product_not_ready: u64,
+    pub(crate) route_rejected: u64,
+    pub(crate) gateway_not_ready: u64,
+    pub(crate) overloaded: u64,
+    pub(crate) admission_rejected: u64,
+    pub(crate) rejection_acknowledged: u64,
+    pub(crate) rejection_acknowledgement_failed: u64,
+    pub(crate) rejection_acknowledgement_timed_out: u64,
+    pub(crate) rejection_acknowledgement_dropped: u64,
+    pub(crate) dispatch_cancelled: u64,
+    pub(crate) rejection_acknowledgement_cancelled: u64,
+    pub(crate) receipt_acquired: u64,
+    pub(crate) receipt_completed_duplicate: u64,
+    pub(crate) receipt_in_flight_duplicate: u64,
+    pub(crate) receipt_terminal_duplicate: u64,
+    pub(crate) receipt_recovery_required_duplicate: u64,
+    pub(crate) receipt_claim_closed: u64,
+    pub(crate) receipt_claim_timeout: u64,
+    pub(crate) receipt_claim_unavailable: u64,
+    pub(crate) receipt_claim_rejected: u64,
+    pub(crate) receipt_claim_corrupt: u64,
+    pub(crate) receipt_authority_rejected: u64,
+    pub(crate) receipt_persistence_failed_before_effect: u64,
+    pub(crate) receipt_persistence_failed_after_effect: u64,
+    pub(crate) receipt_terminal_recovery_required: u64,
+    pub(crate) in_flight: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeHealthInteractionDispatchPublisherV1 {
+    state: Arc<RuntimeHealthStateV1>,
+}
+
+impl RuntimeHealthInteractionDispatchPublisherV1 {
+    pub(crate) fn publish_v1(&self, status: RuntimeHealthInteractionDispatchStatusV1) {
+        *self
+            .state
+            .interaction_dispatch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
+    }
+}
+
 impl RuntimeHealthReadinessHandleV1 {
     pub(crate) fn seal_readiness(&self) {
         self.state.readiness_sealed.store(true, Ordering::Release);
@@ -71,9 +135,23 @@ impl RuntimeHealthReadinessHandleV1 {
     }
 }
 
+impl RuntimeHealthReadinessObserverV1 {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn is_ready_v1(&self) -> bool {
+        self.state.ready.load(Ordering::Acquire)
+            && !self.state.readiness_sealed.load(Ordering::Acquire)
+    }
+}
+
 impl Debug for RuntimeHealthReadinessHandleV1 {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("RuntimeHealthReadinessHandleV1(<redacted>)")
+    }
+}
+
+impl Debug for RuntimeHealthReadinessObserverV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeHealthReadinessObserverV1(<redacted>)")
     }
 }
 
@@ -81,6 +159,9 @@ struct RuntimeHealthStateV1 {
     live: AtomicBool,
     ready: AtomicBool,
     readiness_sealed: AtomicBool,
+    os_pid: u32,
+    process_instance_id: String,
+    interaction_dispatch: Mutex<RuntimeHealthInteractionDispatchStatusV1>,
     stopped: watch::Sender<bool>,
 }
 
@@ -145,7 +226,23 @@ pub(crate) struct RuntimeHealthSupervisorV1 {
 }
 
 impl RuntimeHealthSupervisorV1 {
-    pub(crate) async fn start(bind_addr: SocketAddr) -> Result<Self, RuntimeHealthStartErrorV1> {
+    pub(crate) async fn start(
+        bind_addr: SocketAddr,
+        os_pid: u32,
+        process_instance_id: &str,
+    ) -> Result<Self, RuntimeHealthStartErrorV1> {
+        if !matches!(
+            bind_addr,
+            SocketAddr::V4(address) if *address.ip() == Ipv4Addr::LOCALHOST
+        ) {
+            return Err(RuntimeHealthStartErrorV1::Bind);
+        }
+        if !valid_runtime_health_process_instance_id_v1(process_instance_id) {
+            return Err(RuntimeHealthStartErrorV1::InvalidProcessInstanceId);
+        }
+        if os_pid == 0 || os_pid != std::process::id() {
+            return Err(RuntimeHealthStartErrorV1::InvalidOsPid);
+        }
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| RuntimeHealthStartErrorV1::AsyncRuntimeUnavailable)?;
         let listener = TcpListener::bind(bind_addr)
@@ -164,6 +261,9 @@ impl RuntimeHealthSupervisorV1 {
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
             readiness_sealed: AtomicBool::new(false),
+            os_pid,
+            process_instance_id: process_instance_id.to_owned(),
+            interaction_dispatch: Mutex::new(RuntimeHealthInteractionDispatchStatusV1::default()),
             stopped,
         });
         let (stop, stop_receiver) = mpsc::channel(1);
@@ -189,6 +289,20 @@ impl RuntimeHealthSupervisorV1 {
         }
     }
 
+    pub(crate) fn readiness_observer_v1(&self) -> RuntimeHealthReadinessObserverV1 {
+        RuntimeHealthReadinessObserverV1 {
+            state: self.state.clone(),
+        }
+    }
+
+    pub(crate) fn interaction_dispatch_publisher_v1(
+        &self,
+    ) -> RuntimeHealthInteractionDispatchPublisherV1 {
+        RuntimeHealthInteractionDispatchPublisherV1 {
+            state: self.state.clone(),
+        }
+    }
+
     pub(crate) fn take_readiness_publisher_v2(
         &mut self,
     ) -> Option<RuntimeHealthReadinessPublisherV2> {
@@ -208,7 +322,7 @@ impl RuntimeHealthSupervisorV1 {
     }
 
     #[cfg(test)]
-    fn bound_addr(&self) -> SocketAddr {
+    pub(crate) fn bound_addr(&self) -> SocketAddr {
         self.bound_addr
     }
 
@@ -247,6 +361,13 @@ impl RuntimeHealthSupervisorV1 {
             let _ = task.await;
         }
     }
+}
+
+fn valid_runtime_health_process_instance_id_v1(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl Drop for RuntimeHealthSupervisorV1 {
@@ -295,7 +416,7 @@ async fn run_runtime_health_listener_v1(
                 return command.is_some();
             }
             accepted = listener.accept() => {
-                let Ok((connection, _)) = accepted else {
+                let Ok((connection, peer_addr)) = accepted else {
                     drop(guard);
                     return false;
                 };
@@ -305,7 +426,7 @@ async fn run_runtime_health_listener_v1(
                         drop(guard);
                         return command.is_some();
                     }
-                    _ = handle_runtime_health_connection_v1(connection, &state) => {}
+                    _ = handle_runtime_health_connection_v1(connection, peer_addr, &state) => {}
                 }
             }
         }
@@ -314,6 +435,7 @@ async fn run_runtime_health_listener_v1(
 
 async fn handle_runtime_health_connection_v1(
     mut connection: TcpStream,
+    peer_addr: SocketAddr,
     state: &RuntimeHealthStateV1,
 ) {
     let request = async {
@@ -332,16 +454,21 @@ async fn handle_runtime_health_connection_v1(
                 break;
             }
         }
-        let response = runtime_health_response_v1(&bytes[..count], state);
-        connection.write_all(response).await?;
+        let response = runtime_health_response_v1(&bytes[..count], peer_addr, state);
+        connection.write_all(&response).await?;
         connection.shutdown().await
     };
     let _ = timeout(RUNTIME_HEALTH_CONNECTION_TIMEOUT, request).await;
 }
 
-fn runtime_health_response_v1(request: &[u8], state: &RuntimeHealthStateV1) -> &'static [u8] {
+fn runtime_health_response_v1(
+    request: &[u8],
+    peer_addr: SocketAddr,
+    state: &RuntimeHealthStateV1,
+) -> Vec<u8> {
     if !request.windows(4).any(|window| window == b"\r\n\r\n") {
-        return b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_found";
+        return b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_found"
+            .to_vec();
     }
     let request_line = request
         .windows(2)
@@ -354,9 +481,35 @@ fn runtime_health_response_v1(request: &[u8], state: &RuntimeHealthStateV1) -> &
                 || line == b"GET /health/live HTTP/1.0"
     ) {
         if state.live.load(Ordering::Acquire) {
-            return b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nlive";
+            return b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nlive"
+                .to_vec();
         }
-        return b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot_live";
+        return b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot_live"
+            .to_vec();
+    }
+    if matches!(
+        request_line,
+        Some(line)
+            if line == b"GET /health/identity HTTP/1.1"
+                || line == b"GET /health/identity HTTP/1.0"
+    ) {
+        let ready = state.ready.load(Ordering::Acquire);
+        let sealed = state.readiness_sealed.load(Ordering::Acquire);
+        if peer_addr.ip().is_loopback() && ready && !sealed {
+            let body = format!(
+                "{{\"schema_version\":1,\"os_pid\":{},\"process_instance_id\":\"{}\"}}",
+                state.os_pid,
+                state.process_instance_id.as_str(),
+            );
+            return format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .into_bytes();
+        }
+        return b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 20\r\nConnection: close\r\n\r\nidentity_unavailable"
+            .to_vec();
     }
     if matches!(
         request_line,
@@ -365,18 +518,95 @@ fn runtime_health_response_v1(request: &[u8], state: &RuntimeHealthStateV1) -> &
                 || line == b"GET /health/ready HTTP/1.0"
     ) {
         if state.ready.load(Ordering::Acquire) {
-            return b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nready";
+            return b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nready"
+                .to_vec();
         }
-        return b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_ready";
+        return b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_ready"
+            .to_vec();
     }
-    b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_found"
+    if matches!(
+        request_line,
+        Some(line)
+            if line == b"GET /health/interactions HTTP/1.1"
+                || line == b"GET /health/interactions HTTP/1.0"
+    ) {
+        let status = *state
+            .interaction_dispatch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let body = format!(
+            concat!(
+                "{{\"normalization_ignored\":{},\"normalization_rejected\":{},",
+                "\"enqueued\":{},\"completed\":{},\"execution_failed\":{},\"ignored\":{},",
+                "\"not_accepting\":{},\"product_not_ready\":{},\"route_rejected\":{},",
+                "\"gateway_not_ready\":{},\"overloaded\":{},\"admission_rejected\":{},",
+                "\"rejection_acknowledged\":{},\"rejection_acknowledgement_failed\":{},",
+                "\"rejection_acknowledgement_timed_out\":{},",
+                "\"rejection_acknowledgement_dropped\":{},\"dispatch_cancelled\":{},",
+                "\"rejection_acknowledgement_cancelled\":{},\"receipt_acquired\":{},",
+                "\"receipt_completed_duplicate\":{},\"receipt_in_flight_duplicate\":{},",
+                "\"receipt_terminal_duplicate\":{},",
+                "\"receipt_recovery_required_duplicate\":{},\"receipt_claim_closed\":{},",
+                "\"receipt_claim_timeout\":{},\"receipt_claim_unavailable\":{},",
+                "\"receipt_claim_rejected\":{},\"receipt_claim_corrupt\":{},",
+                "\"receipt_authority_rejected\":{},",
+                "\"receipt_persistence_failed_before_effect\":{},",
+                "\"receipt_persistence_failed_after_effect\":{},",
+                "\"receipt_terminal_recovery_required\":{},\"in_flight\":{}}}"
+            ),
+            status.normalization_ignored,
+            status.normalization_rejected,
+            status.enqueued,
+            status.completed,
+            status.execution_failed,
+            status.ignored,
+            status.not_accepting,
+            status.product_not_ready,
+            status.route_rejected,
+            status.gateway_not_ready,
+            status.overloaded,
+            status.admission_rejected,
+            status.rejection_acknowledged,
+            status.rejection_acknowledgement_failed,
+            status.rejection_acknowledgement_timed_out,
+            status.rejection_acknowledgement_dropped,
+            status.dispatch_cancelled,
+            status.rejection_acknowledgement_cancelled,
+            status.receipt_acquired,
+            status.receipt_completed_duplicate,
+            status.receipt_in_flight_duplicate,
+            status.receipt_terminal_duplicate,
+            status.receipt_recovery_required_duplicate,
+            status.receipt_claim_closed,
+            status.receipt_claim_timeout,
+            status.receipt_claim_unavailable,
+            status.receipt_claim_rejected,
+            status.receipt_claim_corrupt,
+            status.receipt_authority_rejected,
+            status.receipt_persistence_failed_before_effect,
+            status.receipt_persistence_failed_after_effect,
+            status.receipt_terminal_recovery_required,
+            status.in_flight,
+        );
+        return format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .into_bytes();
+    }
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot_found".to_vec()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 
     use super::*;
+
+    fn process_instance_id() -> String {
+        "0123456789abcdef0123456789abcdef".to_owned()
+    }
 
     async fn request(addr: SocketAddr, path: &str) -> String {
         let mut connection = TcpStream::connect(addr).await.unwrap();
@@ -391,23 +621,72 @@ mod tests {
 
     #[tokio::test]
     async fn listener_is_live_unready_redacted_and_stops_cleanly() {
-        let mut supervisor = RuntimeHealthSupervisorV1::start(SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
-            0,
-        )))
+        let mut supervisor = RuntimeHealthSupervisorV1::start(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            std::process::id(),
+            &process_instance_id(),
+        )
         .await
         .unwrap();
         let addr = supervisor.bound_addr();
         let publisher = supervisor.take_readiness_publisher_v2().unwrap();
+        let observer = supervisor.readiness_observer_v1();
+        let interaction_dispatch = supervisor.interaction_dispatch_publisher_v1();
 
         assert!(supervisor.is_live());
         assert!(!supervisor.readiness_handle().is_ready());
+        assert!(!observer.is_ready_v1());
         assert!(request(addr, "/health/live")
             .await
             .starts_with("HTTP/1.1 200"));
         assert!(request(addr, "/health/ready")
             .await
             .starts_with("HTTP/1.1 503"));
+        interaction_dispatch.publish_v1(RuntimeHealthInteractionDispatchStatusV1 {
+            normalization_rejected: 2,
+            execution_failed: 3,
+            rejection_acknowledgement_failed: 5,
+            receipt_acquired: 11,
+            receipt_completed_duplicate: 13,
+            receipt_in_flight_duplicate: 17,
+            receipt_terminal_duplicate: 19,
+            receipt_recovery_required_duplicate: 23,
+            receipt_claim_closed: 29,
+            receipt_claim_timeout: 31,
+            receipt_claim_unavailable: 37,
+            receipt_claim_rejected: 41,
+            receipt_claim_corrupt: 43,
+            receipt_authority_rejected: 47,
+            receipt_persistence_failed_before_effect: 53,
+            receipt_persistence_failed_after_effect: 59,
+            receipt_terminal_recovery_required: 61,
+            in_flight: 7,
+            ..RuntimeHealthInteractionDispatchStatusV1::default()
+        });
+        let interactions = request(addr, "/health/interactions").await;
+        assert!(interactions.starts_with("HTTP/1.1 200"));
+        assert!(interactions.contains("\"normalization_rejected\":2"));
+        assert!(interactions.contains("\"execution_failed\":3"));
+        assert!(interactions.contains("\"rejection_acknowledgement_failed\":5"));
+        assert!(interactions.contains("\"receipt_acquired\":11"));
+        assert!(interactions.contains("\"receipt_completed_duplicate\":13"));
+        assert!(interactions.contains("\"receipt_in_flight_duplicate\":17"));
+        assert!(interactions.contains("\"receipt_terminal_duplicate\":19"));
+        assert!(interactions.contains("\"receipt_recovery_required_duplicate\":23"));
+        assert!(interactions.contains("\"receipt_claim_closed\":29"));
+        assert!(interactions.contains("\"receipt_claim_timeout\":31"));
+        assert!(interactions.contains("\"receipt_claim_unavailable\":37"));
+        assert!(interactions.contains("\"receipt_claim_rejected\":41"));
+        assert!(interactions.contains("\"receipt_claim_corrupt\":43"));
+        assert!(interactions.contains("\"receipt_authority_rejected\":47"));
+        assert!(interactions.contains("\"receipt_persistence_failed_before_effect\":53"));
+        assert!(interactions.contains("\"receipt_persistence_failed_after_effect\":59"));
+        assert!(interactions.contains("\"receipt_terminal_recovery_required\":61"));
+        assert!(interactions.contains("\"in_flight\":7"));
+        assert!(!interactions.contains("interaction_id"));
+        assert!(!interactions.contains("token"));
+        assert!(!interactions.contains("digest"));
+        assert!(!interactions.contains("key_name"));
         assert!(request(addr, "/unknown").await.starts_with("HTTP/1.1 404"));
         assert_eq!(
             format!("{supervisor:?}"),
@@ -418,14 +697,20 @@ mod tests {
             "RuntimeHealthReadinessHandleV1(<redacted>)"
         );
         assert_eq!(
+            format!("{observer:?}"),
+            "RuntimeHealthReadinessObserverV1(<redacted>)"
+        );
+        assert_eq!(
             format!("{publisher:?}"),
             "RuntimeHealthReadinessPublisherV2(<redacted>)"
         );
         assert!(publisher.publish_ready_v2());
+        assert!(observer.is_ready_v1());
         assert!(request(addr, "/health/ready")
             .await
             .starts_with("HTTP/1.1 200"));
         publisher.remove_readiness_v2();
+        assert!(!observer.is_ready_v1());
         assert!(request(addr, "/health/ready")
             .await
             .starts_with("HTTP/1.1 503"));
@@ -440,10 +725,11 @@ mod tests {
 
     #[tokio::test]
     async fn elapsed_deadline_aborts_the_listener_and_removes_liveness() {
-        let supervisor = RuntimeHealthSupervisorV1::start(SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
-            0,
-        )))
+        let supervisor = RuntimeHealthSupervisorV1::start(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            std::process::id(),
+            &process_instance_id(),
+        )
         .await
         .unwrap();
         let addr = supervisor.bound_addr();
@@ -455,11 +741,134 @@ mod tests {
         assert!(TcpStream::connect(addr).await.is_err());
     }
 
+    #[tokio::test]
+    async fn identity_is_exposed_only_to_ready_unsealed_loopback_callers() {
+        let expected_process_instance_id = process_instance_id();
+        let mut supervisor = RuntimeHealthSupervisorV1::start(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            std::process::id(),
+            &expected_process_instance_id,
+        )
+        .await
+        .unwrap();
+        let addr = supervisor.bound_addr();
+        let publisher = supervisor.take_readiness_publisher_v2().unwrap();
+
+        let unready = request(addr, "/health/identity").await;
+        assert!(unready.starts_with("HTTP/1.1 503"));
+        assert_eq!(
+            unready.split_once("\r\n\r\n").unwrap().1,
+            "identity_unavailable"
+        );
+
+        assert!(publisher.publish_ready_v2());
+        let ready = request(addr, "/health/identity").await;
+        let expected_body = format!(
+            "{{\"schema_version\":1,\"os_pid\":{},\"process_instance_id\":\"{}\"}}",
+            std::process::id(),
+            expected_process_instance_id.as_str(),
+        );
+        assert!(ready.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert_eq!(ready.split_once("\r\n\r\n").unwrap().1, expected_body);
+        assert_eq!(expected_process_instance_id.as_str().len(), 32);
+        assert!(expected_process_instance_id
+            .as_str()
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+
+        let non_loopback = runtime_health_response_v1(
+            b"GET /health/identity HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "192.0.2.1:41000".parse().unwrap(),
+            &supervisor.state,
+        );
+        let non_loopback = String::from_utf8(non_loopback).unwrap();
+        assert!(non_loopback.starts_with("HTTP/1.1 503"));
+        assert_eq!(
+            non_loopback.split_once("\r\n\r\n").unwrap().1,
+            "identity_unavailable"
+        );
+
+        supervisor.readiness_handle().seal_readiness();
+        let sealed = request(addr, "/health/identity").await;
+        assert!(sealed.starts_with("HTTP/1.1 503"));
+        assert_eq!(
+            sealed.split_once("\r\n\r\n").unwrap().1,
+            "identity_unavailable"
+        );
+
+        supervisor
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_rejects_non_loopback_bind_addresses() {
+        assert!(matches!(
+            RuntimeHealthSupervisorV1::start(
+                "0.0.0.0:0".parse().unwrap(),
+                std::process::id(),
+                &process_instance_id(),
+            )
+            .await,
+            Err(RuntimeHealthStartErrorV1::Bind)
+        ));
+    }
+
+    #[tokio::test]
+    async fn listener_rejects_every_noncanonical_process_instance_id() {
+        for rejected in [
+            "runtime-process:generic",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+        ] {
+            assert!(matches!(
+                RuntimeHealthSupervisorV1::start(
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                    std::process::id(),
+                    rejected,
+                )
+                .await,
+                Err(RuntimeHealthStartErrorV1::InvalidProcessInstanceId)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_rejects_zero_and_foreign_operating_system_process_ids() {
+        let current = std::process::id();
+        let foreign = if current == u32::MAX {
+            current - 1
+        } else {
+            current + 1
+        };
+        for rejected in [0, foreign] {
+            assert!(matches!(
+                RuntimeHealthSupervisorV1::start(
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+                    rejected,
+                    &process_instance_id(),
+                )
+                .await,
+                Err(RuntimeHealthStartErrorV1::InvalidOsPid)
+            ));
+        }
+    }
+
     #[test]
     fn health_errors_are_finite() {
         assert_eq!(
             RuntimeHealthStartErrorV1::Bind.code(),
             "runtime_health_bind"
+        );
+        assert_eq!(
+            RuntimeHealthStartErrorV1::InvalidProcessInstanceId.code(),
+            "runtime_health_process_instance_id_invalid"
+        );
+        assert_eq!(
+            RuntimeHealthStartErrorV1::InvalidOsPid.code(),
+            "runtime_health_os_pid_invalid"
         );
         assert_eq!(
             RuntimeHealthShutdownErrorV1::DeadlineElapsed.code(),
@@ -474,20 +883,27 @@ mod tests {
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
             readiness_sealed: AtomicBool::new(false),
+            os_pid: std::process::id(),
+            process_instance_id: process_instance_id(),
+            interaction_dispatch: Mutex::new(RuntimeHealthInteractionDispatchStatusV1::default()),
             stopped,
         };
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 41_000);
 
         assert!(runtime_health_response_v1(
             b"GET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            peer_addr,
             &state,
         )
         .starts_with(b"HTTP/1.1 200"));
+        assert!(runtime_health_response_v1(
+            b"GET /health/live HTTP/1.1 extra\r\n\r\n",
+            peer_addr,
+            &state,
+        )
+        .starts_with(b"HTTP/1.1 404"));
         assert!(
-            runtime_health_response_v1(b"GET /health/live HTTP/1.1 extra\r\n\r\n", &state,)
-                .starts_with(b"HTTP/1.1 404")
-        );
-        assert!(
-            runtime_health_response_v1(b"GET /health/live HTTP/1.1\r\n", &state)
+            runtime_health_response_v1(b"GET /health/live HTTP/1.1\r\n", peer_addr, &state,)
                 .starts_with(b"HTTP/1.1 404")
         );
     }
@@ -499,6 +915,9 @@ mod tests {
             live: AtomicBool::new(true),
             ready: AtomicBool::new(false),
             readiness_sealed: AtomicBool::new(false),
+            os_pid: std::process::id(),
+            process_instance_id: process_instance_id(),
+            interaction_dispatch: Mutex::new(RuntimeHealthInteractionDispatchStatusV1::default()),
             stopped,
         });
         let publisher = RuntimeHealthReadinessPublisherV2 {
@@ -507,16 +926,24 @@ mod tests {
         let invalidator = RuntimeHealthReadinessHandleV1 {
             state: state.clone(),
         };
+        let observer = RuntimeHealthReadinessObserverV1 {
+            state: state.clone(),
+        };
 
         assert!(publisher.publish_ready_v2());
+        assert!(observer.is_ready_v1());
         publisher.remove_readiness_v2();
+        assert!(!observer.is_ready_v1());
         assert!(publisher.publish_ready_v2());
+        assert!(observer.is_ready_v1());
         invalidator.seal_readiness();
 
         assert!(invalidator.is_sealed());
         assert!(!invalidator.is_ready());
+        assert!(!observer.is_ready_v1());
         assert!(!publisher.publish_ready_v2());
         assert!(!invalidator.is_ready());
+        assert!(!observer.is_ready_v1());
     }
 
     #[test]
@@ -527,6 +954,11 @@ mod tests {
                 live: AtomicBool::new(true),
                 ready: AtomicBool::new(false),
                 readiness_sealed: AtomicBool::new(false),
+                os_pid: std::process::id(),
+                process_instance_id: process_instance_id(),
+                interaction_dispatch: Mutex::new(
+                    RuntimeHealthInteractionDispatchStatusV1::default(),
+                ),
                 stopped,
             });
             let publisher = RuntimeHealthReadinessPublisherV2 {

@@ -6,16 +6,13 @@ use std::path::PathBuf;
 use std::collections::BTreeSet;
 
 use design_harness::{ResourceBindingMap, SessionConfig};
+pub use design_harness_codex_worker_client::SERVING_MODEL;
 use desired_state::ResourceKey;
 use discord_model::{ChannelId, RoleId};
 use serde::Deserialize;
 
 const DEFAULT_BASE_URL: &str = "https://llm-api.starring.co.kr/v1";
 const DEFAULT_CODEX_WORKER_URL: &str = "http://127.0.0.1:18181";
-pub const SERVING_AUTH_MODE: &str = "chatgpt";
-pub const SERVING_MODEL: &str = "gpt-5.6-luna";
-pub const SERVING_PROVIDER: &str = "codex_chatgpt";
-pub const SERVING_REASONING_EFFORT: &str = "medium";
 pub(crate) const LEGACY_SERVING_MODEL: &str = "gemma4:12b-mlx";
 const DEFAULT_SESSION_ID: &str = "default";
 

@@ -690,6 +690,168 @@ async fn pending_drain_succession_catalog_image(
     )
 }
 
+async fn seed_live_pending_drain_candidate(
+    database: &IsolatedDatabase,
+) -> automation_runtime_controller::RuntimeCanonicalProductDrainV2 {
+    seed_live_for_startup_observation(database, 300_000).await;
+    let Json(snapshot) = sqlx::query_scalar::<_, Json<Value>>(
+        "SELECT snapshot FROM public.runtime_deployments \
+         WHERE deployment_id = $1",
+    )
+    .bind(DEPLOYMENT)
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    let snapshot = serde_json::from_value::<RuntimeDeploymentSnapshotV1>(snapshot).unwrap();
+    assert_eq!(snapshot.phase, RuntimeDeploymentPhaseV1::Live);
+    let canonical = canonical_product_drain(&snapshot);
+    disconnect_product_drain_serving_lease(database).await;
+    let inserted = committed_product_drain_first_apply(&database.owner_pool, &canonical)
+        .await
+        .unwrap();
+    assert_eq!(inserted.outcome_name, "inserted");
+    canonical
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_pending_drain_v3_selector_accepts_its_live_source() {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    let canonical = seed_live_pending_drain_candidate(&database).await;
+    let owner = acquire_startup_observation_owner(&database.executor_pool).await;
+    let observed = observe_startup_state(&database.executor_pool, &owner, owner.4).await;
+    assert_eq!(observed["outcome_name"], "observed");
+    assert_eq!(observed["serving_state_name"], "empty");
+    assert_eq!(observed["pending_runtime_drain_intent_count"], 1);
+    let selected = select_pending_drain_succession(&database.executor_pool, &owner)
+        .await
+        .unwrap();
+    assert_eq!(selected.selection_outcome_name, "unclaimed");
+    assert_eq!(
+        selected.selected_drain_intent_id.as_deref(),
+        Some(canonical.drain_preimage().key.intent_id.as_str())
+    );
+    assert_eq!(selected.selected_source_intent_revision, Some(1));
+    let selected_drain_intent_id = selected.selected_drain_intent_id.unwrap();
+    let fixture = PendingDrainExecutionFixture {
+        recovery_id: "12121212121212121212121212121212".to_string(),
+        owner,
+        minimum_database_now: selected.observed_database_now,
+        seal_key: decode_pending_drain_intent_id(&selected_drain_intent_id),
+        selected_drain_intent_id,
+        selected_source_intent_revision: selected.selected_source_intent_revision.unwrap(),
+        selected_source_state_digest: selected.selected_source_state_digest.unwrap(),
+    };
+    let claim = committed_pending_drain_claim(&database.executor_pool, &fixture)
+        .await
+        .unwrap();
+    assert_eq!(claim.journal_outcome_name, "applied");
+    assert_eq!(claim.terminal_outcome_name, "claimed");
+    let (phase, intent_revision, journal_count) = sqlx::query_as::<_, (String, i64, i64)>(
+        "SELECT deployment.phase, drain.intent_revision, (\
+            SELECT pg_catalog.count(*) \
+            FROM public.runtime_startup_recovery_actions_v2\
+         ) \
+         FROM public.runtime_deployments AS deployment \
+         CROSS JOIN public.runtime_drain_intents_v2 AS drain \
+         WHERE deployment.deployment_id = $1 \
+            AND drain.drain_intent_id = $2",
+    )
+    .bind(DEPLOYMENT)
+    .bind(canonical.drain_preimage().key.intent_id.as_str())
+    .fetch_one(&database.owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(phase, "live");
+    assert_eq!(intent_revision, 2);
+    assert_eq!(journal_count, 1);
+    cleanup(database).await;
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_pending_drain_v3_selector_rejects_an_unrelated_live_deployment() {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    seed_live_pending_drain_candidate(&database).await;
+    seed_second_claimable_deployment(&database.owner_pool).await;
+    let adapter = verified_execution_adapter(&database).await;
+    let (unrelated, _) = selector_stale_live_session(
+        &database,
+        &adapter,
+        "pending-drain-unrelated-live-controller",
+        "pending-drain-unrelated-live-panel",
+        "pending-drain-unrelated-live-process",
+    )
+    .await;
+    assert_eq!(
+        unrelated.snapshot().identity.deployment_id.as_str(),
+        SELECTOR_DEPLOYMENT
+    );
+    let before = pending_drain_execution_state(&database.owner_pool).await;
+    let owner = acquire_startup_observation_owner(&database.executor_pool).await;
+    let error = select_pending_drain_succession(&database.executor_pool, &owner)
+        .await
+        .unwrap_err();
+    assert_database_error(
+        &error,
+        "RX003",
+        "runtime_startup_pending_drain_higher_priority",
+    );
+    assert_eq!(pending_drain_execution_state(&database.owner_pool).await, before);
+    cleanup(database).await;
+    drop(server);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL 16"]
+async fn startup_pending_drain_v3_selector_rejects_a_detached_source_fence() {
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
+    seed_live_pending_drain_candidate(&database).await;
+    let mut transaction = database.owner_pool.begin().await.unwrap();
+    sqlx::query("ALTER TABLE public.runtime_slot_writer_fences_v2 DISABLE TRIGGER USER")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_slot_writer_fences_v2 \
+         SET pending_drain_intent_id = NULL, \
+             pending_product_operation_id = NULL, \
+             pending_tenant_id = NULL, \
+             pending_installation_id = NULL, \
+             pending_deployment_id = NULL, \
+             pending_expected_revision = NULL, \
+             pending_marked_at = NULL \
+         WHERE slot_guild_id = $1 AND slot_ruleset_key = $2",
+    )
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE public.runtime_slot_writer_fences_v2 ENABLE TRIGGER USER")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    let before = pending_drain_execution_state(&database.owner_pool).await;
+    let owner = acquire_startup_observation_owner(&database.executor_pool).await;
+    let error = select_pending_drain_succession(&database.executor_pool, &owner)
+        .await
+        .unwrap_err();
+    assert_database_error(
+        &error,
+        "RX003",
+        "runtime_startup_pending_drain_higher_priority",
+    );
+    assert_eq!(pending_drain_execution_state(&database.owner_pool).await, before);
+    cleanup(database).await;
+    drop(server);
+}
+
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL 16"]
 async fn startup_pending_drain_v3_selector_classifies_closed_source_states() {

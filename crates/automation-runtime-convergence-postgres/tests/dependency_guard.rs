@@ -51,6 +51,7 @@ fn adapter_sources_contain_no_comments() {
         include_str!("../src/store/previous_serving/row.rs"),
         include_str!("../src/store/serving.rs"),
         include_str!("../src/store/status.rs"),
+        include_str!("../src/status_attestation.rs"),
         include_str!("product_drain_prepare.rs"),
     ];
     for source in sources {
@@ -290,7 +291,7 @@ fn exact_target_hydration_is_scoped_to_private_capabilities() {
     }
 
     let contract = include_str!("../src/hydration/contract.rs");
-    assert!(contract.contains("starring_runtime_exact_target_read_v1"));
+    assert!(contract.contains("starring_runtime_exact_target_read_v2"));
     for relation in [
         "runtime_deployments",
         "activation_requests",
@@ -354,9 +355,9 @@ fn exact_target_database_capability_is_verified_and_fail_closed() {
     assert!(!adapter.contains("pub fn with_timeouts("));
     assert!(!adapter.contains("pub async fn database_identity("));
     let contract = include_str!("../src/hydration/contract.rs");
-    assert!(contract.contains("starring_runtime_exact_target_database_readiness_v1"));
+    assert!(contract.contains("starring_runtime_exact_target_database_readiness_v2"));
     assert!(contract.contains("starring_runtime_exact_target_reader_database_identity_v1"));
-    assert!(contract.contains("starring_runtime_exact_target_read_v1"));
+    assert!(contract.contains("starring_runtime_exact_target_read_v2"));
     assert!(contract.contains("pg_catalog.pg_get_functiondef"));
     assert!(!contract.contains("runtime_deployments"));
     assert!(!contract.contains("automation_ruleset_versions"));
@@ -365,7 +366,35 @@ fn exact_target_database_capability_is_verified_and_fail_closed() {
     assert!(adapter.contains("tokio::time::timeout_at"));
     assert!(adapter.contains("verify_runtime_exact_target_binding_v1"));
     let database = include_str!("../src/hydration/database.rs");
-    assert!(database.contains("RUNTIME_EXACT_TARGET_READINESS_DEFINITION_DIGEST_V1"));
+    assert!(database.contains("RUNTIME_EXACT_TARGET_READINESS_DEFINITION_DIGEST_V2"));
+}
+
+#[test]
+fn exact_target_v2_hydration_is_additive_and_cuts_over_the_reader_capability() {
+    let migration =
+        include_str!("../../../migrations/202607300002_add_runtime_exact_target_hydration_v2.sql");
+    for required in [
+        "CREATE FUNCTION public.starring_runtime_exact_target_read_v2(",
+        "CREATE FUNCTION public.starring_runtime_exact_target_schema_manifest_v2()",
+        "CREATE FUNCTION public.starring_runtime_exact_target_database_readiness_v2()",
+        "deployment.desired_target_digest",
+        "historical_authority.authority_payload_digest",
+        "current_authority.authority_payload_digest",
+        "historical_authority.policy_revision",
+        "current_authority.policy_revision",
+        "request_clock.database_now",
+        "REVOKE EXECUTE ON FUNCTION public.starring_runtime_exact_target_read_v1",
+        "REVOKE EXECUTE ON FUNCTION public.starring_runtime_exact_target_database_readiness_v1",
+        "ERRCODE = 'RE001'",
+    ] {
+        assert!(migration.contains(required), "missing contract: {required}");
+    }
+    assert!(!migration.contains("DROP FUNCTION"));
+    for line in migration.lines() {
+        let trimmed = line.trim_start();
+        assert!(!trimmed.starts_with("--"));
+        assert!(!trimmed.starts_with("/*"));
+    }
 }
 
 #[test]

@@ -34,6 +34,7 @@ impl RuntimeProcessExitStatusV1 {
                 ExitCode::from(70)
             }
             Self::Failed(error) if error.cleanup_class() => ExitCode::from(70),
+            Self::Failed(error) if error.restart_class() => ExitCode::from(75),
             Self::Failed(_) => ExitCode::from(69),
         }
     }
@@ -73,6 +74,7 @@ mod tests {
         RuntimeConfigurationFieldV1, RuntimeDatabasePoolShutdownErrorV1,
         RuntimeDiscordGatewayShutdownFailureV1, RuntimeGatewayOwnerShutdownFailureV1,
         RuntimeOwnerHeldProcessShutdownErrorV1, RuntimePausedConnectedProcessShutdownErrorV1,
+        RuntimeProcessProductionHandoffErrorV2, RuntimeProcessProductionHandoffFailureV2,
         RuntimeRecoveryPendingProcessCleanupFailureV2,
         RuntimeRecoveryPendingProcessShutdownErrorV2,
     };
@@ -123,6 +125,21 @@ mod tests {
                 ),
             ),
         );
+        let restart =
+            RuntimeProcessExitStatusV1::Failed(RuntimeProcessStagingErrorV1::ProductionHandoff(
+                RuntimeProcessProductionHandoffErrorV2::Transition(
+                    RuntimeProcessProductionHandoffFailureV2::ProductAuthorityChanged,
+                ),
+            ));
+        let restart_cleanup =
+            RuntimeProcessExitStatusV1::Failed(RuntimeProcessStagingErrorV1::ProductionHandoff(
+                RuntimeProcessProductionHandoffErrorV2::CleanupAfterTransition {
+                    transition: RuntimeProcessProductionHandoffFailureV2::ProductAuthorityChanged,
+                    cleanup: RuntimeClosedRecoveryProcessCleanupFailureV2::Discord(
+                        RuntimeDiscordGatewayShutdownFailureV1::UnexpectedExit,
+                    ),
+                },
+            ));
         assert_eq!(staged.code(), "runtime_process_clean_shutdown");
         assert_eq!(staged.context(), None);
         assert_eq!(staged.exit_code(), ExitCode::SUCCESS);
@@ -135,5 +152,7 @@ mod tests {
         assert_eq!(paused_shutdown.exit_code(), ExitCode::from(70));
         assert_eq!(recovery_pending_shutdown.exit_code(), ExitCode::from(70));
         assert_eq!(closed_recovery_shutdown.exit_code(), ExitCode::from(70));
+        assert_eq!(restart.exit_code(), ExitCode::from(75));
+        assert_eq!(restart_cleanup.exit_code(), ExitCode::from(70));
     }
 }

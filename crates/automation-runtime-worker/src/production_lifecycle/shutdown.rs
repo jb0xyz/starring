@@ -32,6 +32,9 @@ enum RuntimeProductionTerminalSourceV2 {
     OpenProduction {
         _state: Box<RuntimeEmptyOpenProcessV2>,
     },
+    ServingOpen {
+        _state: Box<RuntimeServingOpenProcessV2>,
+    },
     Emergency {
         _state: Box<RuntimeProductionEmergencyProcessV2>,
     },
@@ -45,7 +48,9 @@ impl RuntimeProductionTerminalSourceV2 {
             Self::AdmissionAcknowledging { .. } => {
                 RuntimeProductionLifecycleStageV2::AdmissionAcknowledging
             }
-            Self::OpenProduction { .. } => RuntimeProductionLifecycleStageV2::OpenProduction,
+            Self::OpenProduction { .. } | Self::ServingOpen { .. } => {
+                RuntimeProductionLifecycleStageV2::OpenProduction
+            }
             Self::Emergency { .. } => RuntimeProductionLifecycleStageV2::Emergency,
         }
     }
@@ -94,6 +99,9 @@ enum RuntimeProductionEmergencySourceV2 {
     OpenProduction {
         _state: Box<RuntimeEmptyOpenProcessV2>,
     },
+    ServingOpen {
+        _state: Box<RuntimeServingOpenProcessV2>,
+    },
 }
 
 impl RuntimeProductionEmergencySourceV2 {
@@ -104,7 +112,9 @@ impl RuntimeProductionEmergencySourceV2 {
             Self::AdmissionAcknowledging { .. } => {
                 RuntimeProductionLifecycleStageV2::AdmissionAcknowledging
             }
-            Self::OpenProduction { .. } => RuntimeProductionLifecycleStageV2::OpenProduction,
+            Self::OpenProduction { .. } | Self::ServingOpen { .. } => {
+                RuntimeProductionLifecycleStageV2::OpenProduction
+            }
         }
     }
 }
@@ -462,6 +472,73 @@ impl RuntimeEmptyOpenProcessV2 {
             generation,
             cause,
             source: RuntimeProductionTerminalSourceV2::OpenProduction {
+                _state: Box::new(self),
+            },
+        })
+    }
+}
+
+impl RuntimeServingOpenProcessV2 {
+    pub fn invalidate_production(
+        mut self,
+        expected_generation: RuntimeGatewayCoordinatorGenerationV2,
+        cause: RuntimeGatewayInvalidationCauseV2,
+    ) -> Result<
+        RuntimeProductionInvalidationOutcomeV2,
+        RuntimeProductionTransitionFailureV2<Self, Infallible>,
+    > {
+        if expected_generation != self.coordinator_generation() {
+            return Err(RuntimeProductionTransitionFailureV2::contract(
+                self,
+                RuntimeProductionLifecycleErrorV2::StaleGeneration,
+            ));
+        }
+        self.seal_slot_work();
+        match successor_generation(expected_generation) {
+            Ok(generation) => Ok(RuntimeProductionInvalidationOutcomeV2::Emergency(
+                RuntimeProductionEmergencyProcessV2 {
+                    generation,
+                    cause,
+                    source: RuntimeProductionEmergencySourceV2::ServingOpen {
+                        _state: Box::new(self),
+                    },
+                },
+            )),
+            Err(_) => Ok(RuntimeProductionInvalidationOutcomeV2::Shutdown(
+                RuntimeShuttingDownProcessV2 {
+                    generation: expected_generation,
+                    cause: RuntimeShutdownCauseV2::GenerationOverflow,
+                    source: RuntimeProductionTerminalSourceV2::ServingOpen {
+                        _state: Box::new(self),
+                    },
+                },
+            )),
+        }
+    }
+
+    pub fn begin_shutdown(
+        mut self,
+        expected_generation: RuntimeGatewayCoordinatorGenerationV2,
+        cause: RuntimeShutdownCauseV2,
+    ) -> Result<RuntimeShuttingDownProcessV2, RuntimeProductionTransitionFailureV2<Self, Infallible>>
+    {
+        if expected_generation != self.coordinator_generation() {
+            return Err(RuntimeProductionTransitionFailureV2::contract(
+                self,
+                RuntimeProductionLifecycleErrorV2::StaleGeneration,
+            ));
+        }
+        self.seal_slot_work();
+        let generation = successor_generation(expected_generation).unwrap_or(expected_generation);
+        let cause = if generation == expected_generation {
+            RuntimeShutdownCauseV2::GenerationOverflow
+        } else {
+            cause
+        };
+        Ok(RuntimeShuttingDownProcessV2 {
+            generation,
+            cause,
+            source: RuntimeProductionTerminalSourceV2::ServingOpen {
                 _state: Box::new(self),
             },
         })

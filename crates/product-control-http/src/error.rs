@@ -9,9 +9,12 @@ pub enum FacadeErrorCode {
     StalePayload,
     IdempotencyConflict,
     InvalidState,
+    RuntimeDrainRequired,
+    RuntimeDrainPending,
     Superseded,
     InvalidServerCandidate,
     UpstreamInvalidResponse,
+    AuthoringSaturated,
     DependencyUnavailable,
     DependencyTimeout,
     Internal,
@@ -34,7 +37,11 @@ impl FacadeError {
     pub fn retryable(self) -> bool {
         matches!(
             self.code,
-            FacadeErrorCode::DependencyUnavailable | FacadeErrorCode::DependencyTimeout
+            FacadeErrorCode::RuntimeDrainRequired
+                | FacadeErrorCode::RuntimeDrainPending
+                | FacadeErrorCode::AuthoringSaturated
+                | FacadeErrorCode::DependencyUnavailable
+                | FacadeErrorCode::DependencyTimeout
         )
     }
 
@@ -47,10 +54,14 @@ impl FacadeError {
             | FacadeErrorCode::StalePayload
             | FacadeErrorCode::IdempotencyConflict
             | FacadeErrorCode::InvalidState
+            | FacadeErrorCode::RuntimeDrainRequired
+            | FacadeErrorCode::RuntimeDrainPending
             | FacadeErrorCode::Superseded => StatusCode::CONFLICT,
             FacadeErrorCode::InvalidServerCandidate => StatusCode::UNPROCESSABLE_ENTITY,
             FacadeErrorCode::UpstreamInvalidResponse => StatusCode::BAD_GATEWAY,
-            FacadeErrorCode::DependencyUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            FacadeErrorCode::AuthoringSaturated | FacadeErrorCode::DependencyUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             FacadeErrorCode::DependencyTimeout => StatusCode::GATEWAY_TIMEOUT,
             FacadeErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -65,9 +76,12 @@ impl FacadeError {
             FacadeErrorCode::StalePayload => "stale_payload",
             FacadeErrorCode::IdempotencyConflict => "idempotency_conflict",
             FacadeErrorCode::InvalidState => "invalid_state",
+            FacadeErrorCode::RuntimeDrainRequired => "runtime_drain_required",
+            FacadeErrorCode::RuntimeDrainPending => "runtime_drain_pending",
             FacadeErrorCode::Superseded => "superseded",
             FacadeErrorCode::InvalidServerCandidate => "invalid_server_candidate",
             FacadeErrorCode::UpstreamInvalidResponse => "upstream_invalid_response",
+            FacadeErrorCode::AuthoringSaturated => "authoring_saturated",
             FacadeErrorCode::DependencyUnavailable => "dependency_unavailable",
             FacadeErrorCode::DependencyTimeout => "dependency_timeout",
             FacadeErrorCode::Internal => "internal_error",
@@ -89,11 +103,18 @@ impl FacadeError {
                 "The idempotency key was already used for a different request."
             }
             FacadeErrorCode::InvalidState => "The operation is not valid in the current state.",
+            FacadeErrorCode::RuntimeDrainRequired => {
+                "The active runtime must drain before this operation can continue."
+            }
+            FacadeErrorCode::RuntimeDrainPending => {
+                "The active runtime is still draining before this operation can continue."
+            }
             FacadeErrorCode::Superseded => "The requested target has been superseded.",
             FacadeErrorCode::InvalidServerCandidate => "The server-owned candidate is not valid.",
             FacadeErrorCode::UpstreamInvalidResponse => {
                 "An upstream service returned an invalid response."
             }
+            FacadeErrorCode::AuthoringSaturated => "Authoring capacity is busy. Retry shortly.",
             FacadeErrorCode::DependencyUnavailable => "A required dependency is unavailable.",
             FacadeErrorCode::DependencyTimeout => "A required dependency timed out.",
             FacadeErrorCode::Internal => "The request could not be completed.",
@@ -113,5 +134,24 @@ mod tests {
         assert_eq!(error.status(), StatusCode::CONFLICT);
         assert_eq!(error.code(), "invalid_state");
         assert!(!error.retryable());
+    }
+
+    #[test]
+    fn runtime_drain_errors_are_retryable_conflict_wire_errors() {
+        for (code, expected) in [
+            (
+                FacadeErrorCode::RuntimeDrainRequired,
+                "runtime_drain_required",
+            ),
+            (
+                FacadeErrorCode::RuntimeDrainPending,
+                "runtime_drain_pending",
+            ),
+        ] {
+            let error = FacadeError::new(code);
+            assert_eq!(error.status(), StatusCode::CONFLICT);
+            assert_eq!(error.code(), expected);
+            assert!(error.retryable());
+        }
     }
 }

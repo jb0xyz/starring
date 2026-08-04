@@ -14,8 +14,8 @@ use super::contract::{
 pub const DEFAULT_RUNTIME_EXACT_TARGET_STATEMENT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_RUNTIME_EXACT_TARGET_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_RUNTIME_EXACT_TARGET_DATABASE_TIMEOUT: Duration = Duration::from_secs(30);
-const RUNTIME_EXACT_TARGET_READINESS_DEFINITION_DIGEST_V1: &str =
-    "35903afa3bb9bebe712559a80a503823f4eeedf0d15ebd3d24ce3dbf706b5c14";
+const RUNTIME_EXACT_TARGET_READINESS_DEFINITION_DIGEST_V2: &str =
+    "3ada22bd8ca9b0eec6528ec9f6bff320c9bf29d816ee00d24a9cdec592aa359b";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RuntimeExactTargetDatabaseTimeoutsV1 {
@@ -191,7 +191,7 @@ async fn verify_runtime_exact_target_database_on_connection_v1(
             "runtime exact target database readiness definition",
         ));
     };
-    if definition_digest != RUNTIME_EXACT_TARGET_READINESS_DEFINITION_DIGEST_V1 {
+    if definition_digest != RUNTIME_EXACT_TARGET_READINESS_DEFINITION_DIGEST_V2 {
         return Err(RuntimeConvergenceStoreError::DatabaseAuthorityMismatch);
     }
     let rows =

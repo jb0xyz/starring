@@ -208,8 +208,9 @@ mod tests {
         content_hash, RuleSetVersion, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
     };
     use automation_runtime_convergence::{
-        BindingRevision, FencingToken, ProcessInstanceId, RuntimeDeploymentTargetV1,
-        RuntimeGeneration, RuntimeProcessIdentityV1,
+        ActivationRequestId, BindingRevision, DeploymentId, FencingToken, InstallationId,
+        ProcessInstanceId, PromotionId, RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1,
+        RuntimeGeneration, RuntimeProcessIdentityV1, TenantId,
     };
     use automation_runtime_registry::{
         ExactServingRouteV1, ServingSlotRegistryConfigV1, ServingSlotRegistryV1,
@@ -219,6 +220,20 @@ mod tests {
     use resource_resolution::{resource_binding_fingerprint_v2, ResourceBindingMap};
 
     use super::*;
+
+    fn deployment_identity(guild_id: GuildId, key: &str) -> RuntimeDeploymentIdentityV1 {
+        RuntimeDeploymentIdentityV1 {
+            deployment_id: DeploymentId::parse(format!("deployment:{}:{key}", guild_id.0)).unwrap(),
+            tenant_id: TenantId::parse("tenant:shared-gateway-router").unwrap(),
+            installation_id: InstallationId::parse("installation:shared-gateway-router").unwrap(),
+            promotion_id: PromotionId::parse("c".repeat(64)).unwrap(),
+            activation_request_id: ActivationRequestId::parse(format!(
+                "activation:{}:{key}",
+                guild_id.0
+            ))
+            .unwrap(),
+        }
+    }
 
     enum FakeLookupV1 {
         Pending,
@@ -361,6 +376,7 @@ mod tests {
             process_instance_id: ProcessInstanceId::parse("shared-gateway-process").unwrap(),
         };
         let route = ExactServingRouteV1::new(
+            deployment_identity(guild_id, key),
             identity.clone(),
             RuleSetVersion {
                 guild_id,

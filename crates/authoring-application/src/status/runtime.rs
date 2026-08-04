@@ -222,6 +222,7 @@ pub enum DeploymentStatusV1 {
 pub struct ProductStatusObservationV1 {
     status: ProductStatusV1,
     decision: ProductDecisionProjectionV1,
+    approval_payload_digest: crate::ApprovalPayloadDigestV1,
     decision_observed_at: SystemTime,
     deployment: Option<DeploymentStatusObservationV1>,
 }
@@ -230,12 +231,14 @@ impl ProductStatusObservationV1 {
     pub(crate) fn from_verified_application(
         status: ProductStatusV1,
         decision: ProductDecisionProjectionV1,
+        approval_payload_digest: crate::ApprovalPayloadDigestV1,
         decision_observed_at: SystemTime,
         deployment: Option<DeploymentStatusObservationV1>,
     ) -> Self {
         Self {
             status,
             decision,
+            approval_payload_digest,
             decision_observed_at,
             deployment,
         }
@@ -251,6 +254,10 @@ impl ProductStatusObservationV1 {
 
     pub fn decision_observed_at(&self) -> SystemTime {
         self.decision_observed_at
+    }
+
+    pub fn approval_payload_digest(&self) -> &crate::ApprovalPayloadDigestV1 {
+        &self.approval_payload_digest
     }
 
     pub fn deployment(&self) -> Option<&DeploymentStatusObservationV1> {

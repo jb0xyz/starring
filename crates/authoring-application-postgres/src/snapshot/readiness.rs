@@ -9,8 +9,8 @@ use crate::envelope::SnapshotEnvelopeCipher;
 use crate::ProductDatabaseFailureV1;
 
 const FUNCTION_IDENTITY: &str =
-    "public.starring_product_authorized_snapshot_read_v1(text,text,bytea,text,text)";
-const FUNCTION_RESULT: &str = "TABLE(session_tenant_id text, session_installation_id text, owner_principal_id text, owner_discord_user_id text, owner_disabled boolean, actor_session_digest bytea, current_generation bigint, session_lifecycle_state text, tenant_lifecycle_state text, installation_tenant_id text, discord_application_id text, discord_guild_id text, ruleset_key text, installation_lifecycle_state text, current_authority_revision bigint, generation bigint, snapshot_schema_version bigint, snapshot_ciphertext bytea, snapshot_nonce bytea, encryption_key_id text, encryption_suite text, encryption_suite_version smallint, authenticated_metadata_digest text, generation_resource_bindings jsonb, generation_binding_fingerprint text, installation_authority_revision bigint, generation_stage text, candidate_revision bigint, candidate_hash text, harness_contract_revision bigint, authority_tenant_id text, binding_revision bigint, authority_resource_bindings jsonb, authority_binding_fingerprint text, policy_revision bigint, required_approvals integer, activation_ttl_seconds bigint, authority_payload_digest text, database_now timestamp with time zone)";
+    "public.starring_product_authorized_snapshot_read_v2(text,text,bytea,text,text)";
+const FUNCTION_RESULT: &str = "TABLE(session_tenant_id text, session_installation_id text, owner_principal_id text, owner_discord_user_id text, owner_disabled boolean, actor_session_digest bytea, current_generation bigint, session_lifecycle_state text, tenant_lifecycle_state text, installation_tenant_id text, discord_application_id text, discord_guild_id text, ruleset_key text, installation_lifecycle_state text, current_authority_revision bigint, generation bigint, snapshot_schema_version bigint, snapshot_ciphertext bytea, snapshot_nonce bytea, encryption_key_id text, encryption_suite text, encryption_suite_version smallint, authenticated_metadata_digest text, generation_resource_bindings jsonb, generation_binding_fingerprint text, installation_authority_revision bigint, generation_stage text, candidate_revision bigint, candidate_hash text, harness_contract_revision bigint, authority_tenant_id text, binding_revision bigint, authority_resource_bindings jsonb, authority_binding_fingerprint text, policy_revision bigint, required_approvals integer, activation_ttl_seconds bigint, authority_payload_digest text, database_now timestamp with time zone, writer_request_digest text, writer_semantic_request_digest text, writer_digest_key_id text, writer_digest_key_fingerprint text, safe_turn_projection bytea, safe_turn_projection_digest text)";
 const DATABASE_IDENTITY_FUNCTION: &str =
     "public.starring_product_authorized_snapshot_reader_database_identity_v1()";
 const KEY_COVERAGE_FUNCTION: &str =
@@ -122,7 +122,7 @@ impl<C: SnapshotEnvelopeCipher> PostgresAuthorizedPromotionSnapshots<C> {
         }
         let probe_rows = sqlx::query_scalar::<_, i64>(
             "SELECT pg_catalog.count(*) \
-             FROM public.starring_product_authorized_snapshot_read_v1(\
+             FROM public.starring_product_authorized_snapshot_read_v2(\
               $1, $2, $3, $4, $5)",
         )
         .bind(PROBE_IDENTITY)

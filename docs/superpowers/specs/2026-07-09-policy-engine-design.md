@@ -5,6 +5,11 @@
 - **범위**: Phase 7 — `crates/policy-engine` (OperationGraph 안전 관문)
 - **선행**: Phase 1~6.5 완료. 아키텍처 문서 §9. **실증 동기**: gemma4:e4b가 확률적으로 admin 부여(`permissions:"87375"`) → Graphed 무방비 통과. Policy가 실행 전 차단해야 함.
 
+> 승인 정책 변경 (2026-07-31): `RequireSecondApproval`과 위험도별 2인
+> 승인 규칙은 `2026-07-31-solo-product-approval-design.md`에 의해
+> 폐기되었습니다. 승인 필요 작업은 모두 `RequireApproval`이며 한 명의
+> 인증된 관리자가 승인합니다.
+
 ---
 
 ## 0. 목적

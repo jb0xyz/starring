@@ -142,6 +142,8 @@ pub struct Observability {
     #[serde(default)]
     pub intent_commits: usize,
     #[serde(default)]
+    pub intent_finalizations: usize,
+    #[serde(default)]
     pub intent_rollbacks: usize,
     #[serde(default)]
     pub intent_conflicts: usize,

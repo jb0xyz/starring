@@ -563,3 +563,39 @@ fn process_intake_reservation_has_no_job_or_clone_surface() {
     assert!(!reservation.contains("derive(Clone"));
     assert!(!reservation.contains("derive(Copy"));
 }
+
+#[test]
+fn certification_finalizer_slot_is_pre_reserved_affine_bounded_and_redacted() {
+    let mutation = include_str!("../src/mutation_finalizer.rs");
+    let certification = include_str!("../src/process/certification_finalizer.rs");
+    for required in [
+        "RuntimeMutationFinalizerReservedProcessSlotV1",
+        "try_reserve_process_job_slot",
+        "try_acquire_owned",
+        "slot: OwnedSemaphorePermit",
+        "RuntimeReservedCertificationFinalizerSlotV2",
+        "reserve_certification_finalizer_slot_v2",
+        "submit_certification_finalizer_v2",
+        "RuntimeMutationFinalizerReservedProcessSlotV1(<redacted>)",
+        "RuntimeReservedCertificationFinalizerSlotV2(<redacted>)",
+    ] {
+        assert!(
+            mutation.contains(required) || certification.contains(required),
+            "{required}"
+        );
+    }
+    for type_name in [
+        "RuntimeMutationFinalizerReservedProcessSlotV1",
+        "RuntimeReservedCertificationFinalizerSlotV2",
+    ] {
+        for forbidden in ["Clone", "Copy", "Serialize", "Deserialize"] {
+            assert!(
+                !mutation.contains(&format!("{forbidden} for {type_name}"))
+                    && !certification.contains(&format!("{forbidden} for {type_name}")),
+                "{type_name}: {forbidden}"
+            );
+        }
+    }
+    assert!(!mutation.contains("unbounded_channel"));
+    assert!(!mutation.contains("reserve_owned().await"));
+}

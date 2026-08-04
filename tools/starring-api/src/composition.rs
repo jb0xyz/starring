@@ -9,31 +9,42 @@ use authoring_application_discord::{
     TwilightDiscordGuildAuthorityClient,
 };
 use authoring_application_postgres::{
-    PostgresAuthorizedPromotionSnapshots, PostgresInstallationAuthoritySource,
-    PostgresProductControl, PostgresProductDeploymentOperationalStatusesV2,
-    PostgresProductDeploymentStatuses, PostgresProductIdentityConfig, PostgresProductIdentityStore,
-    PostgresProductPromotions, ProductDecisionDatabasePoolsV1, ProductIdentityDatabasePoolsV1,
+    PostgresAuthoringConversationStoreV1, PostgresAuthorizedPromotionSnapshots,
+    PostgresInstallationAuthoritySource, PostgresProductControl,
+    PostgresProductDeploymentOperationalStatusesV2, PostgresProductDeploymentStatuses,
+    PostgresProductIdentityConfig, PostgresProductIdentityStore, PostgresProductPromotions,
+    ProductDecisionDatabasePoolsV1, ProductIdentityDatabasePoolsV1,
     XChaCha20Poly1305SnapshotEnvelopeCipherV1,
 };
-use product_control_http::{HttpBoundaryConfig, ProductControlFacade};
+use design_harness_codex_worker_client::{CodexWorkerClient, CODEX_WORKER_REQUEST_TIMEOUT_V1};
+use product_control_http::{
+    AuthoringHttpBoundaryConfigV1, HttpBoundaryConfig, ProductControlFacade,
+};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::ConnectOptions;
 use tokio::time::timeout;
 use twilight_http::Client as TwilightHttpClient;
 
-use crate::config::{DatabaseRoleV1, PoolConfigV1, ProductionConfigV1};
+use crate::config::{
+    DatabaseRoleV1, PoolConfigV1, ProductionAuthoringConfigV1, ProductionConfigV1,
+};
+use crate::facade::ProductionAuthoringDependenciesV1;
 use crate::secret::{
-    DatabaseEndpointV1, DatabaseSslModeV1, DatabaseUrlSecretV1, ResolvedProductionSecretsV1,
+    DatabaseEndpointV1, DatabaseSslModeV1, DatabaseUrlSecretV1, ResolvedAuthoringSecretsV1,
+    ResolvedProductionSecretsV1,
 };
 use crate::{
-    ProductionAuthorityDependenciesV1, ProductionFacadeConfigurationErrorV1,
-    ProductionIdentityDependenciesV1, ProductionPersistenceDependenciesV1,
-    ProductionProductControlFacadeV1,
+    AuthoringAdmissionConfigV1, AuthoringAdmissionV1, ProductionAuthorityDependenciesV1,
+    ProductionFacadeConfigurationErrorV1, ProductionIdentityDependenciesV1,
+    ProductionPersistenceDependenciesV1, ProductionProductControlFacadeV1,
 };
 
 const APPLICATION_NAME: &str = "starring-api";
 const STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(45);
+const AUTHORING_STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const DATABASE_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(crate) type ProductionAuthoringLlmClientV1 = CodexWorkerClient;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProductionReadinessPhaseV1 {
@@ -79,6 +90,7 @@ impl Debug for ProductionDatabasePoolShutdownErrorV1 {
 pub struct ComposedProductionServiceV1 {
     facade: Arc<ProductionProductControlFacadeV1>,
     http_boundary: HttpBoundaryConfig,
+    authoring_http_boundary: AuthoringHttpBoundaryConfigV1,
     loopback_bind_addr: SocketAddr,
     database_shutdown: ProductionDatabasePoolShutdownV1,
 }
@@ -94,6 +106,14 @@ impl ComposedProductionServiceV1 {
 
     pub fn loopback_bind_addr(&self) -> SocketAddr {
         self.loopback_bind_addr
+    }
+
+    pub fn authoring_http_boundary_config(&self) -> AuthoringHttpBoundaryConfigV1 {
+        self.authoring_http_boundary
+    }
+
+    pub fn authoring_dependencies_available(&self) -> bool {
+        self.facade.authoring_available()
     }
 
     pub fn into_parts(
@@ -118,6 +138,10 @@ impl Debug for ComposedProductionServiceV1 {
         formatter
             .debug_struct("ComposedProductionServiceV1")
             .field("loopback_bind_addr", &self.loopback_bind_addr)
+            .field(
+                "authoring_dependencies_available",
+                &self.facade.authoring_available(),
+            )
             .field("dependencies", &"<redacted>")
             .finish()
     }
@@ -125,16 +149,22 @@ impl Debug for ComposedProductionServiceV1 {
 
 #[derive(Clone)]
 pub struct ProductionDatabasePoolShutdownV1 {
-    pools: Arc<[PgPool; 14]>,
+    core_pools: Arc<[PgPool; 14]>,
+    authoring_pool: Option<PgPool>,
 }
 
 impl ProductionDatabasePoolShutdownV1 {
     pub async fn close(&self) -> Result<(), ProductionDatabasePoolShutdownErrorV1> {
-        close_pool_refs_with_deadline(self.pools.each_ref().map(Some)).await
+        close_pool_refs_with_deadline(pool_refs_with_authoring(
+            self.core_pools.each_ref().map(Some),
+            self.authoring_pool.as_ref(),
+        ))
+        .await
     }
 
     pub fn is_closed(&self) -> bool {
-        self.pools.iter().all(PgPool::is_closed)
+        self.core_pools.iter().all(PgPool::is_closed)
+            && self.authoring_pool.as_ref().is_none_or(PgPool::is_closed)
     }
 }
 
@@ -154,6 +184,9 @@ pub async fn compose_production_service_v1(
     }
     let return_paths = config.return_paths().to_vec();
     let http_boundary = config.http_boundary();
+    let authoring_http_boundary =
+        AuthoringHttpBoundaryConfigV1::production(CODEX_WORKER_REQUEST_TIMEOUT_V1)
+            .map_err(|_| ProductionCompositionErrorV1::HttpBoundaryConfiguration)?;
     let identity_config = PostgresProductIdentityConfig::production(
         config.oauth_redirect_uri(),
         return_paths.iter().cloned(),
@@ -178,8 +211,17 @@ pub async fn compose_production_service_v1(
     let application_id = config.discord().application_id();
     let bot_user_id = config.discord().bot_user_id();
     let authority_deadline = config.discord().timing().request_timeout();
-    let (database_urls, discord_bot_token, oauth_client_secret, action_keyring, snapshot_keyring) =
-        secrets.into_parts();
+    let authoring_config = config.authoring().cloned();
+    let (
+        database_urls,
+        discord_bot_token,
+        oauth_client_secret,
+        action_keyring,
+        snapshot_keyring,
+        authoring_secrets,
+    ) = secrets.into_parts();
+    let authoring_action_keyring = action_keyring.clone();
+    let authoring_snapshot_keyring = snapshot_keyring.clone();
     let database_pools = connect_database_pools_v1(database_urls, pool_config).await?;
     let mut discord_bot_token = discord_bot_token.into_zeroizing();
     let discord_http = Arc::new(
@@ -204,32 +246,114 @@ pub async fn compose_production_service_v1(
         },
     );
     let facade = match facade {
-        Ok(facade) => Arc::new(facade),
+        Ok(facade) => facade,
         Err(error) => {
             let _shutdown_result = database_pools.close().await;
             return Err(error);
         }
     };
-    match timeout(STARTUP_READINESS_TIMEOUT, facade.readiness()).await {
+    let (facade_readiness, authoring) = tokio::join!(
+        timeout(STARTUP_READINESS_TIMEOUT, facade.readiness()),
+        compose_optional_authoring_dependencies_v1(
+            &facade,
+            authoring_config,
+            authoring_secrets,
+            pool_config,
+            authoring_action_keyring,
+            authoring_snapshot_keyring,
+        ),
+    );
+    match facade_readiness {
         Ok(Ok(())) => {}
         Ok(Err(_)) => {
-            let _shutdown_result = database_pools.close().await;
+            let _shutdown_result = database_pools
+                .close_with_authoring(authoring.as_ref().map(|value| &value.pool))
+                .await;
             return Err(ProductionCompositionErrorV1::ReadinessFailed {
                 phase: ProductionReadinessPhaseV1::Aggregate,
             });
         }
         Err(_) => {
-            let _shutdown_result = database_pools.close().await;
+            let _shutdown_result = database_pools
+                .close_with_authoring(authoring.as_ref().map(|value| &value.pool))
+                .await;
             return Err(ProductionCompositionErrorV1::ReadinessTimedOut {
                 phase: ProductionReadinessPhaseV1::Aggregate,
             });
         }
     }
+    let (authoring_dependencies, authoring_pool) = match authoring {
+        Some(authoring) => (Some(authoring.dependencies), Some(authoring.pool)),
+        None => (None, None),
+    };
+    let facade = Arc::new(facade.with_authoring(authoring_dependencies));
     Ok(ComposedProductionServiceV1 {
         facade,
         http_boundary,
+        authoring_http_boundary,
         loopback_bind_addr,
-        database_shutdown: database_pools.into_shutdown(),
+        database_shutdown: database_pools.into_shutdown(authoring_pool),
+    })
+}
+
+struct ComposedOptionalAuthoringV1 {
+    dependencies: ProductionAuthoringDependenciesV1,
+    pool: PgPool,
+}
+
+async fn compose_optional_authoring_dependencies_v1(
+    facade: &ProductionProductControlFacadeV1,
+    config: Option<ProductionAuthoringConfigV1>,
+    secrets: Option<ResolvedAuthoringSecretsV1>,
+    pool_config: PoolConfigV1,
+    action_keyring: authoring_application_postgres::ProductActionDigestKeyringV1,
+    snapshot_keyring: authoring_application_postgres::SnapshotEnvelopeKeyringV1,
+) -> Option<ComposedOptionalAuthoringV1> {
+    let (config, secrets) = config.zip(secrets)?;
+    let (database_url, worker_token) = secrets.into_parts();
+    let worker = CodexWorkerClient::new_zeroizing(
+        config.worker_url().to_string(),
+        worker_token.into_zeroizing(),
+    )
+    .ok()?;
+    let pool = connect_pool_v1(database_url, pool_config).await.ok()?;
+    let store = PostgresAuthoringConversationStoreV1::new(
+        pool.clone(),
+        XChaCha20Poly1305SnapshotEnvelopeCipherV1::new(snapshot_keyring),
+        action_keyring,
+    );
+    let (authoring_readiness, worker_readiness) = tokio::join!(
+        timeout(
+            AUTHORING_STARTUP_READINESS_TIMEOUT,
+            facade.verify_authoring_readiness(&store)
+        ),
+        timeout(
+            AUTHORING_STARTUP_READINESS_TIMEOUT,
+            worker.preflight_contract()
+        ),
+    );
+    if !matches!(authoring_readiness, Ok(Ok(()))) {
+        let _shutdown_result =
+            await_pool_shutdown_with_timeout(pool.close(), DATABASE_POOL_SHUTDOWN_TIMEOUT).await;
+        return None;
+    }
+    let worker_contract = match worker_readiness {
+        Ok(Ok(contract)) => contract,
+        Ok(Err(_)) | Err(_) => {
+            let _shutdown_result =
+                await_pool_shutdown_with_timeout(pool.close(), DATABASE_POOL_SHUTDOWN_TIMEOUT)
+                    .await;
+            return None;
+        }
+    };
+    let admission = AuthoringAdmissionConfigV1::production_with_model_capacity(
+        worker_contract.concurrency_limit(),
+    )
+    .ok()
+    .map(AuthoringAdmissionV1::new)?;
+    Some(ComposedOptionalAuthoringV1 {
+        dependencies: ProductionAuthoringDependenciesV1::new(store, worker, admission),
+        pool,
     })
 }
 
@@ -330,7 +454,15 @@ struct ConnectedDatabasePoolsV1 {
 
 impl ConnectedDatabasePoolsV1 {
     async fn close(&self) -> Result<(), ProductionDatabasePoolShutdownErrorV1> {
-        close_pool_refs_with_deadline(self.pools().map(Some)).await
+        self.close_with_authoring(None).await
+    }
+
+    async fn close_with_authoring(
+        &self,
+        authoring: Option<&PgPool>,
+    ) -> Result<(), ProductionDatabasePoolShutdownErrorV1> {
+        close_pool_refs_with_deadline(pool_refs_with_authoring(self.pools().map(Some), authoring))
+            .await
     }
 
     fn pools(&self) -> [&PgPool; 14] {
@@ -352,9 +484,9 @@ impl ConnectedDatabasePoolsV1 {
         ]
     }
 
-    fn into_shutdown(self) -> ProductionDatabasePoolShutdownV1 {
+    fn into_shutdown(self, authoring_pool: Option<PgPool>) -> ProductionDatabasePoolShutdownV1 {
         ProductionDatabasePoolShutdownV1 {
-            pools: Arc::new([
+            core_pools: Arc::new([
                 self.oauth_flow_writer,
                 self.session_issuer,
                 self.session_api,
@@ -370,6 +502,7 @@ impl ConnectedDatabasePoolsV1 {
                 self.deployment_status,
                 self.operational_deployment_status,
             ]),
+            authoring_pool,
         }
     }
 }
@@ -436,8 +569,9 @@ async fn connect_database_pools_v1(
     ];
     if results.iter().any(|result| result.is_err()) {
         let error = first_database_error(results);
+        let core = results.map(|result| result.as_ref().ok());
         let _shutdown_result =
-            close_pool_refs_with_deadline(results.map(|result| result.as_ref().ok())).await;
+            close_pool_refs_with_deadline(pool_refs_with_authoring(core, None)).await;
         return Err(error);
     }
     Ok(ConnectedDatabasePoolsV1 {
@@ -462,7 +596,7 @@ async fn connect_database_pools_v1(
 fn first_database_error<T>(
     results: [&Result<T, DatabasePoolConnectErrorV1>; 14],
 ) -> ProductionCompositionErrorV1 {
-    DatabaseRoleV1::ALL
+    DatabaseRoleV1::CORE
         .into_iter()
         .zip(results)
         .find_map(|(role, result)| {
@@ -555,14 +689,14 @@ fn validate_database_transport_v1(
 }
 
 async fn close_pool_refs_with_deadline(
-    pools: [Option<&PgPool>; 14],
+    pools: [Option<&PgPool>; 15],
 ) -> Result<(), ProductionDatabasePoolShutdownErrorV1> {
     let close = begin_pool_closures(pools);
     await_pool_shutdown_with_timeout(close, DATABASE_POOL_SHUTDOWN_TIMEOUT).await
 }
 
-fn begin_pool_closures<'a>(pools: [Option<&'a PgPool>; 14]) -> impl Future<Output = ()> + 'a {
-    let [oauth_flow_writer, session_issuer, session_api, security_revoker, installation_authority, authorized_snapshot, promotion, decision_reader, approval_executor, rejection_executor, apply_executor, cancellation_executor, deployment_status, operational_deployment_status] =
+fn begin_pool_closures<'a>(pools: [Option<&'a PgPool>; 15]) -> impl Future<Output = ()> + 'a {
+    let [oauth_flow_writer, session_issuer, session_api, security_revoker, installation_authority, authorized_snapshot, promotion, decision_reader, approval_executor, rejection_executor, apply_executor, cancellation_executor, deployment_status, operational_deployment_status, authoring_session_writer] =
         pools;
     let oauth_flow_writer = oauth_flow_writer.map(|pool| pool.close());
     let session_issuer = session_issuer.map(|pool| pool.close());
@@ -578,6 +712,7 @@ fn begin_pool_closures<'a>(pools: [Option<&'a PgPool>; 14]) -> impl Future<Outpu
     let cancellation_executor = cancellation_executor.map(|pool| pool.close());
     let deployment_status = deployment_status.map(|pool| pool.close());
     let operational_deployment_status = operational_deployment_status.map(|pool| pool.close());
+    let authoring_session_writer = authoring_session_writer.map(|pool| pool.close());
     async move {
         tokio::join!(
             await_optional_pool_close(oauth_flow_writer),
@@ -594,8 +729,34 @@ fn begin_pool_closures<'a>(pools: [Option<&'a PgPool>; 14]) -> impl Future<Outpu
             await_optional_pool_close(cancellation_executor),
             await_optional_pool_close(deployment_status),
             await_optional_pool_close(operational_deployment_status),
+            await_optional_pool_close(authoring_session_writer),
         );
     }
+}
+
+fn pool_refs_with_authoring<'a>(
+    core: [Option<&'a PgPool>; 14],
+    authoring: Option<&'a PgPool>,
+) -> [Option<&'a PgPool>; 15] {
+    let [oauth_flow_writer, session_issuer, session_api, security_revoker, installation_authority, authorized_snapshot, promotion, decision_reader, approval_executor, rejection_executor, apply_executor, cancellation_executor, deployment_status, operational_deployment_status] =
+        core;
+    [
+        oauth_flow_writer,
+        session_issuer,
+        session_api,
+        security_revoker,
+        installation_authority,
+        authorized_snapshot,
+        promotion,
+        decision_reader,
+        approval_executor,
+        rejection_executor,
+        apply_executor,
+        cancellation_executor,
+        deployment_status,
+        operational_deployment_status,
+        authoring,
+    ]
 }
 
 async fn await_optional_pool_close<F>(close: Option<F>)
@@ -682,17 +843,25 @@ mod tests {
         );
         let database_url = format!("postgresql:{}{}opaque", "/", "/");
         let shutdown = ProductionDatabasePoolShutdownV1 {
-            pools: Arc::new(std::array::from_fn(|_| {
+            core_pools: Arc::new(std::array::from_fn(|_| {
                 PgPoolOptions::new()
                     .connect_lazy(&database_url)
                     .expect("test URL is structurally valid")
             })),
+            authoring_pool: Some(
+                PgPoolOptions::new()
+                    .connect_lazy(&database_url)
+                    .expect("test URL is structurally valid"),
+            ),
         };
         assert_eq!(
             format!("{shutdown:?}"),
             "ProductionDatabasePoolShutdownV1(<redacted>)"
         );
-        let close = begin_pool_closures(shutdown.pools.each_ref().map(Some));
+        let close = begin_pool_closures(pool_refs_with_authoring(
+            shutdown.core_pools.each_ref().map(Some),
+            shutdown.authoring_pool.as_ref(),
+        ));
         assert!(shutdown.is_closed());
         close.await;
         assert_eq!(shutdown.close().await, Ok(()));

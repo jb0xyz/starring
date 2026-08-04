@@ -1,6 +1,9 @@
+use std::num::NonZeroUsize;
+
 use automation_instance::{
     AutomationInstance, InstanceId, InstanceKind, InstanceResources, InstanceRuleSetVersion,
-    InstanceStatus, InstanceStore, InstanceStoreError,
+    InstanceStatus, InstanceStore, InstanceStoreError, InstanceTeardownClaimOutcomeV1,
+    InstanceTeardownMarkOutcomeV1, InstanceTeardownStoreV1, MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1,
 };
 use discord_model::{GuildId, UserId};
 use sqlx::PgPool;
@@ -213,6 +216,119 @@ impl InstanceStore for PostgresInstanceStore {
              FROM automation_instances WHERE guild_id = $1 AND status = 'deleting' ORDER BY instance_id",
         )
         .bind(guild_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.into_iter().map(AutomationInstance::try_from).collect()
+    }
+}
+
+impl InstanceTeardownStoreV1 for PostgresInstanceStore {
+    async fn get_for_teardown_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<Option<AutomationInstance>, InstanceStoreError> {
+        self.get(guild_id, instance_id).await
+    }
+
+    async fn claim_deleting_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<InstanceTeardownClaimOutcomeV1, InstanceStoreError> {
+        let mut transaction = self.pool.begin().await.map_err(backend)?;
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM automation_instances \
+             WHERE guild_id = $1 AND instance_id = $2 FOR UPDATE",
+        )
+        .bind(guild_id.to_string())
+        .bind(instance_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(backend)?
+        .ok_or(InstanceStoreError::NotFound)?;
+        let outcome = match status.as_str() {
+            "active" | "disabled" => {
+                let result = sqlx::query(
+                    "UPDATE automation_instances SET status = 'deleting' \
+                     WHERE guild_id = $1 AND instance_id = $2 AND status = $3",
+                )
+                .bind(guild_id.to_string())
+                .bind(instance_id.as_str())
+                .bind(status)
+                .execute(&mut *transaction)
+                .await
+                .map_err(backend)?;
+                if result.rows_affected() != 1 {
+                    return Err(backend("instance teardown claim state drift"));
+                }
+                InstanceTeardownClaimOutcomeV1::Claimed
+            }
+            "deleting" => InstanceTeardownClaimOutcomeV1::AlreadyDeleting,
+            "deleted" => InstanceTeardownClaimOutcomeV1::AlreadyDeleted,
+            _ => return Err(backend("invalid persisted instance status")),
+        };
+        transaction.commit().await.map_err(backend)?;
+        Ok(outcome)
+    }
+
+    async fn mark_deleted_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<InstanceTeardownMarkOutcomeV1, InstanceStoreError> {
+        let mut transaction = self.pool.begin().await.map_err(backend)?;
+        let status = sqlx::query_scalar::<_, String>(
+            "SELECT status FROM automation_instances \
+             WHERE guild_id = $1 AND instance_id = $2 FOR UPDATE",
+        )
+        .bind(guild_id.to_string())
+        .bind(instance_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(backend)?
+        .ok_or(InstanceStoreError::NotFound)?;
+        let outcome = match status.as_str() {
+            "deleting" => {
+                let result = sqlx::query(
+                    "UPDATE automation_instances SET status = 'deleted' \
+                     WHERE guild_id = $1 AND instance_id = $2 AND status = 'deleting'",
+                )
+                .bind(guild_id.to_string())
+                .bind(instance_id.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(backend)?;
+                if result.rows_affected() != 1 {
+                    return Err(backend("instance teardown mark state drift"));
+                }
+                InstanceTeardownMarkOutcomeV1::MarkedDeleted
+            }
+            "deleted" => InstanceTeardownMarkOutcomeV1::AlreadyDeleted,
+            "active" | "disabled" => return Err(InstanceStoreError::NotFound),
+            _ => return Err(backend("invalid persisted instance status")),
+        };
+        transaction.commit().await.map_err(backend)?;
+        Ok(outcome)
+    }
+
+    async fn list_retryable_v1(
+        &self,
+        guild_id: GuildId,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
+        if limit.get() > MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1 {
+            return Err(backend("instance teardown retry batch invalid"));
+        }
+        let limit = i64::try_from(limit.get()).map_err(backend)?;
+        let rows = sqlx::query_as::<_, AutomationInstanceRow>(
+            "SELECT guild_id, instance_id, ruleset_key, ruleset_version, kind, created_by, status, resources \
+             FROM automation_instances WHERE guild_id = $1 AND status = 'deleting' \
+             ORDER BY instance_id COLLATE \"C\" LIMIT $2",
+        )
+        .bind(guild_id.to_string())
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(backend)?;

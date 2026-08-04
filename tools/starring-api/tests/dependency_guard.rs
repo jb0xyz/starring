@@ -200,6 +200,7 @@ fn direct_dependencies_are_closed_to_reviewed_architecture_inputs() {
                     | "axum"
                     | "base64"
                     | "chrono"
+                    | "design-harness-codex-worker-client"
                     | "discord-model"
                     | "hyper"
                     | "hyper-util"
@@ -283,6 +284,8 @@ fn package_is_registered_once_and_source_modules_are_exactly_classified() {
                 | "config.rs"
                 | "composition.rs"
                 | "server.rs"
+                | "telemetry.rs"
+                | "authoring_admission.rs"
                 | "main.rs"
         ));
     }
@@ -353,6 +356,19 @@ fn raw_operational_adapters_remain_confined_to_facade_and_composition() {
 }
 
 #[test]
+fn codex_worker_client_remains_confined_to_composition() {
+    for (path, source) in source_files() {
+        if path != Path::new("composition.rs") {
+            assert_identifiers_absent(
+                &path,
+                &source,
+                &["design_harness_codex_worker_client", "CodexWorkerClient"],
+            );
+        }
+    }
+}
+
+#[test]
 fn executable_and_listener_cannot_name_adapter_families() {
     let sources = source_files();
     for path in [Path::new("main.rs"), Path::new("server.rs")] {
@@ -374,7 +390,7 @@ fn executable_is_pinned_to_the_lifecycle_gated_operational_router() {
     let sources = source_files();
     let main = source_named(&sources, "main.rs");
     for required in [
-        "product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate",
+        "product_control_router_with_operational_v2_and_lifecycle_v1_and_authoring_v1_and_readiness_gate",
         "ProductApiReadinessGate",
         "initially_unready",
         "serve_verified_loopback_with_runtime_readiness",
@@ -386,6 +402,7 @@ fn executable_is_pinned_to_the_lifecycle_gated_operational_router() {
         "product_control_router_with_readiness_gate",
         "product_control_router_with_operational_v2",
         "product_control_router_with_operational_v2_and_readiness_gate",
+        "product_control_router_with_operational_v2_and_lifecycle_v1_and_readiness_gate",
         "serve_verified_loopback",
     ] {
         assert!(

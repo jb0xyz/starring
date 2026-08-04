@@ -5,6 +5,21 @@ use std::process::Command;
 
 const WORKSPACE: &str = include_str!("../../../Cargo.toml");
 const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ci.yml");
+const TRACKED_SECRET_SCAN: &str = include_str!("../../ci/scan_tracked_secrets.py");
+const STANDING_RUNTIME_LAUNCHD: &str =
+    include_str!("../../../ops/macos/local.starring.runtime.staging.plist");
+
+#[test]
+fn standing_runtime_launchd_cannot_enable_the_disposable_discord_proxy() {
+    for forbidden in [
+        "STARRING_RUNTIME_DISCORD_TRANSPORT_MODE",
+        "STARRING_RUNTIME_DISCORD_GATEWAY_PROXY_URL",
+        "STARRING_RUNTIME_DISCORD_EFFECT_HTTP_PROXY_AUTHORITY",
+        "loopback_proxy_v1",
+    ] {
+        assert!(!STANDING_RUNTIME_LAUNCHD.contains(forbidden), "{forbidden}");
+    }
+}
 
 fn collect_source_files(root: &Path, directory: &Path, files: &mut Vec<(PathBuf, String)>) {
     let mut entries = fs::read_dir(directory)
@@ -30,7 +45,10 @@ fn collect_source_files(root: &Path, directory: &Path, files: &mut Vec<(PathBuf,
 
 #[test]
 fn paused_production_handoff_is_linear_shutdown_biased_and_non_serving() {
-    let observation = include_str!("../src/process/observation.rs");
+    let observation = source_before_external_test_module(
+        include_str!("../src/process/observation.rs"),
+        "observation_tests.rs",
+    );
     let gateway = source_before_test_module(include_str!("../src/gateway.rs"));
     let discord = source_before_test_module(include_str!("../src/discord.rs"));
     let closed_recovery = include_str!("../src/closed_recovery.rs");
@@ -309,6 +327,18 @@ fn source_before_test_module(source: &str) -> &str {
     production
 }
 
+fn source_before_external_test_module<'a>(source: &'a str, path: &str) -> &'a str {
+    let marker = format!("#[cfg(test)]\n#[path = \"{path}\"]\nmod tests;");
+    let (production, tests) = source
+        .split_once(&marker)
+        .unwrap_or_else(|| panic!("external test module boundary missing: {path}"));
+    assert!(
+        !tests.contains(&marker),
+        "duplicate external test module boundary: {path}"
+    );
+    production
+}
+
 fn braced_declaration<'a>(source: &'a str, marker: &str) -> &'a str {
     let start = source
         .find(marker)
@@ -571,11 +601,15 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
         [
             "src/build_revision.rs",
             "src/capability_readiness_supervisor.rs",
+            "src/certification_identity.rs",
             "src/closed_recovery.rs",
             "src/config.rs",
             "src/controller_identity.rs",
+            "src/database/effect_recovery.rs",
             "src/database.rs",
             "src/discord.rs",
+            "src/discord_actor_serving_tests.rs",
+            "src/discord_interaction_normalizer.rs",
             "src/discord_lifecycle.rs",
             "src/gateway.rs",
             "src/gateway_owner_startup.rs",
@@ -585,11 +619,16 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/identity_encoding.rs",
             "src/ingress_acknowledgement_safety.rs",
             "src/ingress_acknowledgement_supervisor.rs",
+            "src/interaction_effect_recovery_supervisor.rs",
+            "src/interaction_receipt.rs",
+            "src/interaction_receipt_recovery_supervisor.rs",
             "src/lib.rs",
             "src/lifecycle_timing.rs",
             "src/main.rs",
             "src/maintenance_ingress_gate.rs",
             "src/mutation_finalizer.rs",
+            "src/panel_reconciliation.rs",
+            "src/process/certification_finalizer.rs",
             "src/process/closed.rs",
             "src/process/connected.rs",
             "src/process/execution.rs",
@@ -597,8 +636,11 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/process/observation_tests.rs",
             "src/process/owner.rs",
             "src/process/pending_drain_finalizer.rs",
+            "src/process/pending_drain_serving.rs",
             "src/process/readiness.rs",
             "src/process/recovery.rs",
+            "src/process/serving.rs",
+            "src/process/serving_certification.rs",
             "src/process/startup_loop.rs",
             "src/process/startup_loop_tests.rs",
             "src/process.rs",
@@ -607,8 +649,14 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "src/process_supervisor.rs",
             "src/recovery_identity.rs",
             "src/registry.rs",
+            "src/registry_staging_tests.rs",
             "src/registry_succession_tests.rs",
+            "src/runtime_controller.rs",
+            "src/runtime_controller_fault_cohort_tests.rs",
+            "src/runtime_interaction_dispatch.rs",
             "src/secret.rs",
+            "src/serving_heartbeat_monitor.rs",
+            "src/serving_heartbeat_monitor_tests.rs",
             "src/shutdown.rs",
             "src/startup.rs",
             "src/startup_recovery_observation.rs",
@@ -616,6 +664,10 @@ fn package_is_registered_once_and_has_only_the_bounded_runtime_slice() {
             "tests/gateway_owner_startup_watchdog.rs",
             "tests/mutation_finalizer.rs",
             "tests/process_contract.rs",
+            "tests/serving_heartbeat_monitor_guard.rs",
+            "tests/staging_effect_acl_backfill_contract.rs",
+            "tests/staging_effect_inspection_contract.rs",
+            "tests/staging_receipt_acl_backfill_contract.rs",
             "tests/staging_role_bootstrap_contract.rs"
         ]
     );
@@ -638,6 +690,17 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
         twilight_gateway["features"],
         serde_json::json!(["rustls-platform-verifier"])
     );
+    let twilight_model = package_dependencies
+        .iter()
+        .find(|dependency| dependency["name"] == "twilight-model")
+        .unwrap();
+    assert_eq!(twilight_model["rename"], "paused-discord-model");
+    assert_eq!(
+        twilight_model["source"],
+        "git+https://github.com/twilight-rs/twilight.git?rev=b4ce13b727e7731b917576ad977300ab6926bb6b"
+    );
+    assert_eq!(twilight_model["uses_default_features"], false);
+    assert_eq!(twilight_model["features"], serde_json::json!([]));
     let tokio = package_dependencies
         .iter()
         .find(|dependency| dependency["name"] == "tokio")
@@ -650,7 +713,7 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
     let mut dependencies = package_dependencies
         .into_iter()
         .map(|dependency| {
-            if dependency["name"] != "twilight-gateway" {
+            if dependency["name"] != "twilight-gateway" && dependency["name"] != "twilight-model" {
                 assert!(dependency["rename"].is_null());
             }
             (
@@ -663,23 +726,31 @@ fn direct_dependencies_are_the_exact_runtime_composition_surface() {
     assert_eq!(
         dependencies,
         [
+            ("automation-panel-installation".to_string(), None),
             ("automation-runtime".to_string(), None),
             ("automation-runtime-controller".to_string(), None),
             ("automation-runtime-convergence".to_string(), None),
             ("automation-runtime-convergence-postgres".to_string(), None),
             ("automation-runtime-execution-postgres".to_string(), None),
+            ("automation-runtime-interaction".to_string(), None),
             ("automation-runtime-interaction-postgres".to_string(), None),
+            ("automation-runtime-panel-evidence".to_string(), None),
             ("automation-runtime-panel-postgres".to_string(), None),
             ("automation-runtime-registry".to_string(), None),
             ("automation-runtime-serving-postgres".to_string(), None),
             ("automation-runtime-worker".to_string(), None),
-            ("chrono".to_string(), Some("dev".to_string())),
+            ("chrono".to_string(), None),
+            ("discord-model".to_string(), None),
+            ("futures".to_string(), None),
             ("getrandom".to_string(), None),
+            ("rustls".to_string(), Some("dev".to_string())),
             ("serde_json".to_string(), Some("dev".to_string())),
+            ("sha2".to_string(), Some("dev".to_string())),
             ("sqlx".to_string(), None),
             ("thiserror".to_string(), None),
             ("tokio".to_string(), None),
             ("twilight-gateway".to_string(), None),
+            ("twilight-model".to_string(), None),
             ("zeroize".to_string(), None),
         ]
     );
@@ -714,6 +785,516 @@ fn paused_discord_gateway_dependency_is_feature_isolated() {
 }
 
 #[test]
+fn interaction_dispatch_lane_is_opaque_bounded_sendable_and_readiness_gated() {
+    let lane = source_before_test_module(include_str!("../src/runtime_interaction_dispatch.rs"));
+    let normalizer =
+        source_before_test_module(include_str!("../src/discord_interaction_normalizer.rs"));
+    let health = source_before_test_module(include_str!("../src/health.rs"));
+    let database = source_before_test_module(include_str!("../src/database.rs"));
+    let facade = source_before_test_module(include_str!(
+        "../../../crates/automation-runtime/src/shared_gateway_dispatcher.rs"
+    ));
+    for required in [
+        "FuturesUnordered<RuntimeInteractionDispatchFutureV1>",
+        "dyn Future<Output = RuntimeInteractionDispatchOutcomeV1> + Send + 'static",
+        "dispatch_capacity: NonZeroUsize",
+        "RuntimeProductionDiscordInteractionDispatchLaneV1",
+        "compose_runtime_discord_interaction_dispatch_lane_v1(",
+        "gateway.rejection_acknowledgement_capacity()",
+        "RuntimeProductionDiscordInteractionActorLaneV1",
+        "compose_runtime_discord_interaction_actor_lane_v1(",
+        "connection_observer: GatewayConnectionObserverV3",
+        "product_readiness: RuntimeHealthReadinessObserverV1",
+        "status: Option<RuntimeHealthInteractionDispatchPublisherV1>",
+        "accepting_lease: Option<GatewayReadyLeaseV3>",
+        "pub(crate) fn reconcile_accepting_v1(",
+        "pub(crate) fn handle_raw_interaction_v1(",
+        "normalize_pinned_runtime_discord_interaction_v1(interaction)",
+        "impl<P> RuntimeDiscordDispatchDrainLaneV1 for RuntimeDiscordInteractionActorLaneV1<P>",
+        "fn seal_until_v1(",
+        "RuntimeDiscordInteractionActorLaneV1::seal_and_drain_until_v1(self, deadline).await",
+        "fn abort_v1(&mut self)",
+        "status.publish_v1(RuntimeHealthInteractionDispatchStatusV1 {",
+        "normalization_ignored: report.normalization_ignored",
+        "normalization_rejected: report.normalization_rejected",
+        "execution_failed: report.execution_failed",
+        "rejection_acknowledgement_failed: report.rejection_acknowledgement_failed",
+        "in_flight: self.lane.in_flight_count_v1()",
+        ".current_connection()",
+        ".current_epoch()?",
+        "self.connection_observer.issue_ready_lease(epoch).ok()",
+        "self.connection_observer.ready_lease_is_current(&lease)",
+        "RuntimeDiscordInteractionActorLaneV1(<redacted>)",
+        "state: RuntimeInteractionLaneStateV1::Paused",
+        "not_accepting: u64",
+        "pub(crate) fn try_enqueue_v1<F>(",
+        "F: FnMut() -> bool",
+        "pub(crate) async fn pause_and_drain_until_v1(",
+        "pub(crate) async fn seal_and_drain_until_v1(",
+        "pub(crate) fn reopen_v1<F>(",
+        "observer.ready_lease_is_current(&ready_lease)",
+        "RuntimeInteractionReopenErrorV1::InFlight",
+        "RuntimeInteractionReopenErrorV1::Sealed",
+        "self.dispatches.len() >= self.dispatch_capacity.get()",
+        "drop(envelope)",
+        "RuntimeInteractionRejectionSchedulingV1::Dropped",
+        "rejection_acknowledgement_dropped",
+        "TokioInstant::from_std(deadline)",
+        "self.abort_v1()",
+        "RuntimeDiscordInteractionDispatchLaneV1(<redacted>)",
+    ] {
+        assert!(lane.contains(required), "{required}");
+    }
+    for required in [
+        "pub(crate) struct ZeroizingPinnedDiscordInteractionV1(",
+        "SharedGatewayInteractionReceivedAtV3",
+        "pub(crate) fn pin_runtime_discord_interaction_v1(",
+        "impl Drop for ZeroizingPinnedDiscordInteractionV1",
+        "zeroize_pinned_discord_interaction_v1(&mut self.0)",
+        "pub(crate) fn normalize_pinned_runtime_discord_interaction_v1(",
+    ] {
+        assert!(normalizer.contains(required), "{required}");
+    }
+    for required in [
+        "RuntimeHealthInteractionDispatchStatusV1",
+        "RuntimeHealthInteractionDispatchPublisherV1",
+        "GET /health/interactions HTTP/1.1",
+        "\\\"normalization_rejected\\\":{}",
+        "\\\"execution_failed\\\":{}",
+        "\\\"rejection_acknowledgement_failed\\\":{}",
+        "\\\"in_flight\\\":{}",
+    ] {
+        assert!(health.contains(required), "{required}");
+    }
+    let enqueue = braced_declaration(lane, "pub(crate) fn try_enqueue_v1<F>(");
+    let readiness_checks = enqueue
+        .match_indices("product_ready()")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let reserve = enqueue.find("self.port.reserve_v1(").unwrap();
+    let push = enqueue.find(".dispatch_v1(reservation)").unwrap();
+    assert_eq!(readiness_checks.len(), 2);
+    assert!(
+        readiness_checks[0] < reserve
+            && reserve < readiness_checks[1]
+            && readiness_checks[1] < push
+    );
+    for forbidden in [
+        "twilight_http",
+        "twilight_model",
+        "PostgresRuntimeInteractionV1",
+        "sqlx",
+        "tokio::spawn",
+        "JoinSet",
+        "mpsc",
+        "unbounded",
+        "SequenceInstanceIdGenerator",
+        "Serialize",
+        "Deserialize",
+        "RuntimeInteractionRejectionFutureV1",
+        "acknowledge_rejection_v1",
+    ] {
+        assert!(!contains_identifier(lane, forbidden), "{forbidden}");
+    }
+    for required in [
+        "#[derive(Clone)]\npub(crate) struct RuntimeInteractionDispatchDatabasePortV1",
+        "inner: Arc<OwnedSharedGatewayDispatchServicesV3<PostgresRuntimeInteractionV1>>",
+        "inner: Arc::new(inner)",
+        "RuntimeInteractionDispatchDatabasePortV1(<redacted>)",
+    ] {
+        assert!(database.contains(required), "{required}");
+    }
+    for required in [
+        "pub struct OwnedSharedGatewayDispatchServicesV3<I>",
+        "registry: ServingSlotRegistryV1",
+        "instances: I",
+        "instance_ids: SecureRandomInstanceIdGenerator",
+        "teardown: Arc<Teardown<I, OwnedTwilightInstanceDeleter>>",
+        "snapshot_provider: OwnedTwilightGuildRoleSnapshotProvider",
+        "mutation_http: Arc<Client>",
+        "interaction_http: Arc<Client>",
+        "admission_budget: SharedGatewayAdmissionBudgetV3",
+        "token: Zeroizing<String>",
+        ".ratelimiter(None)",
+        "tokio::time::timeout_at(",
+        "SHARED_GATEWAY_STABLE_FAILURE_MESSAGE_V3",
+        "OwnedSharedGatewayDispatchServicesV3(<redacted>)",
+    ] {
+        assert!(facade.contains(required), "{required}");
+    }
+    assert!(!facade.contains("SequenceInstanceIdGenerator"));
+}
+
+#[test]
+fn production_interaction_dispatch_claims_a_receipt_before_any_acquired_execution() {
+    let database = source_before_test_module(include_str!("../src/database.rs"));
+    let dispatch = braced_declaration(database, "async fn dispatch_admitted_v1(");
+    let claim = dispatch
+        .find("claim_runtime_interaction_receipt_v1(")
+        .unwrap();
+    let execute = dispatch.find("self.inner.execute_acquired_v1(").unwrap();
+    assert!(dispatch.contains("build_shared_gateway_durable_receipt_claim_input_v1("));
+    assert!(dispatch.contains("RuntimeInteractionReceiptClaimDispositionV1::Acquired(permit)"));
+    assert!(dispatch.contains("RuntimeInteractionReceiptClaimDispositionV1::Duplicate(class)"));
+    assert!(dispatch.contains("RuntimeInteractionReceiptClaimDispositionV1::Closed(reason)"));
+    assert!(claim < execute);
+    assert!(!database.contains("self.inner.dispatch_v3("));
+}
+
+#[test]
+fn teardown_retry_reuses_dispatch_authority_and_stops_before_database_close() {
+    let database = source_before_test_module(include_str!("../src/database.rs"));
+    let process = source_before_test_module(include_str!("../src/process.rs"));
+    let owner = source_before_test_module(include_str!("../src/process/owner.rs"));
+    let connected = source_before_test_module(include_str!("../src/process/connected.rs"));
+    let facade = source_before_test_module(include_str!(
+        "../../../crates/automation-runtime/src/shared_gateway_dispatcher.rs"
+    ));
+    let dispatch = braced_declaration(facade, "pub async fn dispatch_v3(");
+    let retry = braced_declaration(facade, "pub async fn retry_teardown_v1(");
+    assert!(facade.contains("teardown: Arc<Teardown<I, OwnedTwilightInstanceDeleter>>"));
+    assert!(facade.contains("let teardown = Arc::new(Teardown::new("));
+    assert!(dispatch.contains("self.teardown.as_ref()"));
+    assert!(retry.contains("self.teardown.teardown(guild_id, instance_id).await"));
+    assert!(!retry.contains("Client::builder"));
+    assert!(!retry.contains("Teardown::new"));
+
+    assert!(database.contains(
+        "struct RuntimeInteractionTeardownRetryDatabasePortV1 {\n    inner: Arc<OwnedSharedGatewayDispatchServicesV3<PostgresRuntimeInteractionV1>>,"
+    ));
+    let start = braced_declaration(
+        database,
+        "pub(crate) fn start_teardown_retry_supervisor_v1(",
+    );
+    assert!(start.contains("inner: Arc::clone(&self.inner)"));
+    assert!(start.contains("production_teardown_retry_config_v1()"));
+    for required in [
+        "const INSTANCE_TEARDOWN_RETRY_CADENCE: Duration = Duration::from_secs(30);",
+        "const INSTANCE_TEARDOWN_RETRY_PAGE_LIMIT: usize = 32;",
+        "const INSTANCE_TEARDOWN_RETRY_CONCURRENCY: usize = 4;",
+        "const INSTANCE_TEARDOWN_RETRY_SCAN_TIMEOUT: Duration = Duration::from_secs(5);",
+        "const INSTANCE_TEARDOWN_RETRY_TIMEOUT: Duration = Duration::from_secs(60);",
+    ] {
+        assert!(database.contains(required), "{required}");
+    }
+
+    let composition = braced_declaration(
+        process,
+        "pub(crate) async fn compose_runtime_process_foundation_v1(",
+    );
+    assert!(composition.contains("teardown_retry_supervisor: None"));
+    assert!(!composition.contains("start_teardown_retry_supervisor_v1"));
+    let activation =
+        braced_declaration(process, "pub(super) fn start_teardown_retry_supervisor_v1(");
+    assert_eq!(
+        activation
+            .matches("start_teardown_retry_supervisor_v1()")
+            .count(),
+        1
+    );
+    assert_eq!(
+        process
+            .matches("start_teardown_retry_supervisor_v1()")
+            .count(),
+        1
+    );
+    let owner_transition = braced_declaration(owner, "pub(crate) async fn into_owner_held_v1(");
+    assert_eq!(
+        owner_transition
+            .matches(".start_teardown_retry_supervisor_v1()")
+            .count(),
+        1
+    );
+    let final_operation_check = owner_transition
+        .rfind("if !self.startup_budget.operation_is_open()")
+        .unwrap();
+    let activation = owner_transition
+        .find("self.start_teardown_retry_supervisor_v1()")
+        .unwrap();
+    let owner_held = owner_transition
+        .rfind("Ok(RuntimeOwnerHeldProcessV1 {")
+        .unwrap();
+    assert!(final_operation_check < activation);
+    assert!(activation < owner_held);
+
+    let begin = braced_declaration(process, "pub(super) async fn begin_shutdown_v1(");
+    assert!(begin.contains("self.teardown_retry_supervisor.take()"));
+    assert!(begin.contains("teardown_retry.shutdown_until(deadline).await"));
+    let owner_shutdown = braced_declaration(owner, "pub(crate) async fn shutdown(self)");
+    let begin_shutdown = owner_shutdown.find(".begin_shutdown_v1(").unwrap();
+    let release_owner = owner_shutdown.find("owner.shutdown_until(").unwrap();
+    assert!(begin_shutdown < release_owner);
+    let paused_shutdown = braced_declaration(
+        connected,
+        "pub(super) async fn shutdown_paused_foundation_owner_v1<",
+    );
+    let begin_shutdown = paused_shutdown.find(".begin_shutdown_v1(").unwrap();
+    let release_owner = paused_shutdown
+        .find("shutdown_owner(owner_cleanup_deadline)")
+        .unwrap();
+    assert!(begin_shutdown < release_owner);
+
+    let finish = braced_declaration(process, "pub(super) async fn finish_shutdown_v1(");
+    let retry_shutdown = finish
+        .find("teardown_retry.shutdown_until(cleanup_deadline).await")
+        .unwrap();
+    let pool_close = finish
+        .find("shutdown.close_until(cleanup_deadline).await")
+        .unwrap();
+    assert!(retry_shutdown < pool_close);
+    assert!(process
+        .contains("Self::TeardownRetry => \"runtime_process_teardown_retry_supervisor_shutdown\""));
+}
+
+#[test]
+fn receipt_recovery_is_database_only_owner_bound_and_joined_before_release() {
+    let database = source_before_test_module(include_str!("../src/database.rs"));
+    let supervisor = source_before_test_module(include_str!(
+        "../src/interaction_receipt_recovery_supervisor.rs"
+    ));
+    let process = source_before_test_module(include_str!("../src/process.rs"));
+    let owner = source_before_test_module(include_str!("../src/process/owner.rs"));
+
+    let owner_transition = braced_declaration(owner, "pub(crate) async fn into_owner_held_v1(");
+    let owner_acquired = owner_transition
+        .find("let owner = match transition")
+        .unwrap();
+    let recovery_started = owner_transition
+        .find("self.start_receipt_recovery_supervisor_v1()")
+        .unwrap();
+    assert!(owner_acquired < recovery_started);
+
+    let begin = braced_declaration(process, "pub(super) async fn begin_shutdown_v1(");
+    assert!(begin.contains("receipt_recovery.shutdown_until(deadline).await"));
+    let finish = braced_declaration(process, "pub(super) async fn finish_shutdown_v1(");
+    let recovery_join = finish
+        .find("receipt_recovery.shutdown_until(cleanup_deadline).await")
+        .unwrap();
+    let pool_close = finish
+        .find("shutdown.close_until(cleanup_deadline).await")
+        .unwrap();
+    assert!(recovery_join < pool_close);
+
+    for required in [
+        "scan_recoverable_interaction_receipts_v1(&cursor, limit)",
+        "expire_interaction_receipt_token_v1(request)",
+        "terminalize_expired_interaction_receipt_v1(request)",
+        "RuntimeInteractionReceiptRecoverySupervisorConfigV1::production_v1()",
+    ] {
+        assert!(database.contains(required), "{required}");
+    }
+    for forbidden in [
+        "TwilightInteractionResponder",
+        "TwilightMutationAdapter",
+        "decrypt(",
+        "execute_acquired_v1",
+    ] {
+        let recovery_port = braced_declaration(
+            database,
+            "impl RuntimeInteractionReceiptRecoverySupervisorPortV1",
+        );
+        assert!(!recovery_port.contains(forbidden), "{forbidden}");
+    }
+    for required in [
+        "Duration::from_secs(15)",
+        "RUNTIME_INTERACTION_RECEIPT_RECOVERY_PAGE_LIMIT_V1: usize = 64",
+        "Duration::from_secs(5)",
+        "RuntimeInteractionReceiptRecoverySupervisorV1(<redacted>)",
+    ] {
+        assert!(supervisor.contains(required), "{required}");
+    }
+    assert!(process.contains(
+        "Self::InteractionReceiptRecovery => {\n                \"runtime_process_interaction_receipt_recovery_supervisor_shutdown\""
+    ));
+}
+
+#[test]
+fn effect_recovery_is_serving_open_bound_and_stops_first() {
+    let database = source_before_test_module(include_str!("../src/database.rs"));
+    let supervisor = source_before_test_module(include_str!(
+        "../src/interaction_effect_recovery_supervisor.rs"
+    ));
+    let process = source_before_test_module(include_str!("../src/process.rs"));
+    let process_startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let owner = source_before_test_module(include_str!("../src/process/owner.rs"));
+    let serving = source_before_test_module(include_str!("../src/process/serving.rs"));
+
+    let composition = braced_declaration(
+        process,
+        "pub(crate) async fn compose_runtime_process_foundation_v1(",
+    );
+    assert!(composition.contains("effect_recovery_supervisor: None"));
+    assert!(!composition.contains("start_effect_recovery_supervisor_v1"));
+    let activation = braced_declaration(
+        process,
+        "pub(super) fn start_effect_recovery_supervisor_v1(",
+    );
+    assert_eq!(
+        activation
+            .matches("start_effect_recovery_supervisor_v1()")
+            .count(),
+        1
+    );
+
+    let owner_transition = braced_declaration(owner, "pub(crate) async fn into_owner_held_v1(");
+    assert!(!owner_transition.contains("start_effect_recovery_supervisor_v1"));
+    let serving_transition =
+        braced_declaration(serving, "pub(crate) async fn enter_serving_open_v2(");
+    assert!(serving_transition.starts_with(
+        "pub(crate) async fn enter_serving_open_v2(\n        self,\n    ) -> Result<RuntimeServingOpenProcessV2"
+    ));
+    assert_eq!(
+        process_startup.matches(".enter_serving_open_v2()").count(),
+        1
+    );
+    assert_eq!(
+        serving_transition
+            .matches("start_effect_recovery_supervisor_v1()")
+            .count(),
+        1
+    );
+    let final_revalidation = serving_transition
+        .rfind("if let Err(transition) = process.revalidate_v2().await")
+        .unwrap();
+    let recovery_started = serving_transition
+        .find("process.foundation.start_effect_recovery_supervisor_v1()")
+        .unwrap();
+    let success = serving_transition.rfind("Ok(process)").unwrap();
+    assert!(final_revalidation < recovery_started);
+    assert!(recovery_started < success);
+
+    let stop_effect = braced_declaration(
+        process,
+        "pub(super) async fn stop_effect_recovery_supervisor_until_v1(",
+    );
+    assert!(stop_effect.contains("effect_recovery.shutdown_until(deadline).await"));
+    let begin = braced_declaration(process, "pub(super) async fn begin_shutdown_v1(");
+    let effect_shutdown = begin
+        .find("self.stop_effect_recovery_supervisor_until_v1(deadline)")
+        .unwrap();
+    let receipt_shutdown = begin
+        .find("receipt_recovery.shutdown_until(deadline).await")
+        .unwrap();
+    assert!(effect_shutdown < receipt_shutdown);
+    let serving_shutdown = braced_declaration(
+        serving,
+        "pub(super) async fn stop_runtime_controller_before_cleanup_v2(",
+    );
+    let effect_shutdown = serving_shutdown
+        .find("stop_effect_recovery_supervisor_until_v1(deadline)")
+        .unwrap();
+    let controller_shutdown = serving_shutdown
+        .find("controller.shutdown_until_v2(deadline)")
+        .unwrap();
+    assert!(effect_shutdown < controller_shutdown);
+    let finish = braced_declaration(process, "pub(super) async fn finish_shutdown_v1(");
+    let effect_shutdown = finish
+        .find("effect_recovery.shutdown_until(cleanup_deadline).await")
+        .unwrap();
+    let receipt_shutdown = finish
+        .find("receipt_recovery.shutdown_until(cleanup_deadline).await")
+        .unwrap();
+    let pool_close = finish
+        .find("shutdown.close_until(cleanup_deadline).await")
+        .unwrap();
+    assert!(effect_shutdown < receipt_shutdown);
+    assert!(effect_shutdown < pool_close);
+
+    assert!(database.contains("pub(crate) fn start_effect_recovery_supervisor_v1("));
+    assert!(
+        database.contains("RuntimeInteractionEffectRecoverySupervisorConfigV1::production_v1()")
+    );
+    assert!(supervisor.contains("RuntimeInteractionEffectRecoverySupervisorV1(<redacted>)"));
+    for code in [
+        "runtime_process_interaction_effect_recovery_supervisor_control_closed",
+        "runtime_process_interaction_effect_recovery_supervisor_panicked",
+        "runtime_process_interaction_effect_recovery_supervisor_shutdown_deadline_elapsed",
+    ] {
+        assert!(process.contains(code), "{code}");
+    }
+}
+
+#[test]
+fn effect_recovery_commits_claims_before_external_work_and_finalizes_separately() {
+    let recovery = include_str!("../src/database/effect_recovery.rs");
+    let observation = braced_declaration(recovery, "async fn recover_observation_v1(");
+    let claim = observation
+        .find("claim_interaction_effect_recovery_v1(")
+        .unwrap();
+    let external = observation
+        .find("executor.observe_v1(request).await")
+        .unwrap();
+    let reconcile = observation
+        .find("reconcile_interaction_effect_v1(request).await")
+        .unwrap();
+    assert!(claim < external && external < reconcile);
+
+    let compensation = braced_declaration(recovery, "async fn begin_compensation_v1(");
+    let intend = compensation
+        .find("intend_interaction_effect_compensation_v1(")
+        .unwrap();
+    let external = compensation
+        .find("executor.compensate_v1(request).await")
+        .unwrap();
+    let finish = compensation
+        .find("finish_interaction_effect_compensation_v1(request)")
+        .unwrap();
+    assert!(intend < external && external < finish);
+
+    let observation = braced_declaration(recovery, "async fn observe_compensation_v1(");
+    let claim = observation
+        .find("claim_interaction_effect_recovery_v1(")
+        .unwrap();
+    let external = observation
+        .find("executor.observe_compensation_v1(request).await")
+        .unwrap();
+    let reconcile = observation
+        .find("reconcile_interaction_effect_v1(request).await")
+        .unwrap();
+    assert!(claim < external && external < reconcile);
+
+    let response = braced_declaration(recovery, "async fn observe_response_tail_v1(");
+    let claim = response
+        .find("claim_interaction_response_tail_v1(request)")
+        .unwrap();
+    let token_budget = response
+        .find("response_token_has_minimum_budget_v1(")
+        .unwrap();
+    let decrypt = response.find("self.cipher.decrypt(").unwrap();
+    let external = response.find("executor.observe_v1(request).await").unwrap();
+    let finalize = response
+        .find("finalize_interaction_response_tail_v1(request)")
+        .unwrap();
+    assert!(claim < token_budget && token_budget < decrypt && decrypt < external);
+    assert!(external < finalize);
+    assert!(response.contains("finalize_response_token_unrecoverable_v1(&claim)"));
+    assert!(!response.contains("RuntimeInteractionEffectRecoveryDispositionV1::RouteBlocked"));
+
+    assert!(
+        recovery.contains("scan_recoverable_interaction_response_tails_v1(&source_cursor, limit)")
+    );
+    assert!(recovery.contains("scan_recoverable_interaction_effects_v1("));
+    assert!(recovery.contains("persist_recovery_block_v1(&claim"));
+    assert!(recovery.contains("persist_compensation_block_v1("));
+    assert!(recovery.contains("persist_response_tail_recovery_block_v1("));
+    assert!(recovery.contains("RuntimeInteractionEffectRecoveryDispositionV1::RouteBlocked"));
+    assert!(
+        recovery.contains("const RESPONSE_TAIL_MINIMUM_TOKEN_BUDGET_MILLISECONDS_V1: u64 = 12_000")
+    );
+    let definition = braced_declaration(recovery, "fn recovery_definition_v1(");
+    for required in [
+        "RuntimeInteractionEffectInstanceRegistrationIdentityV1::from_ruleset_version_v1(",
+        "ruleset_key.clone()",
+        "process.target.version",
+        "kind.clone()",
+        "candidate.origin().actor_user_id()",
+        ".resolved_instance_manifest_digest()",
+    ] {
+        assert!(definition.contains(required), "{required}");
+    }
+}
+
+#[test]
 fn source_is_comment_free_and_external_composition_is_bounded() {
     for (path, source) in source_files() {
         assert!(!has_rust_comment(&source), "{}", path.display());
@@ -743,7 +1324,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
                 path.display()
             );
         }
-        if path != Path::new("src/database.rs") {
+        if path != Path::new("src/database.rs") && !path.starts_with("src/database") {
             for forbidden in [
                 "sqlx",
                 "PgPool",
@@ -754,6 +1335,16 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
                 "PostgresRuntimeInteractionV1",
             ] {
                 if path == Path::new("src/process.rs") && forbidden == "PostgresRuntimeExecutionV1"
+                {
+                    continue;
+                }
+                if path == Path::new("src/process/serving_certification.rs")
+                    && forbidden == "PostgresRuntimeExecutionV1"
+                {
+                    continue;
+                }
+                if path == Path::new("src/serving_heartbeat_monitor.rs")
+                    && forbidden == "PostgresRuntimeServingLeaseV1"
                 {
                     continue;
                 }
@@ -779,6 +1370,18 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
                 "        RuntimeProcessIngressAcknowledgementJobV2,\n",
                 "    >;"
             )));
+        } else if path == Path::new("src/process/serving_certification.rs") {
+            let finalizer_wait =
+                braced_declaration(&source, "async fn await_committed_certification_v2(");
+            let empty_monitor_test = braced_declaration(
+                &source,
+                "async fn empty_monitor_set_never_emits_a_terminal_event(",
+            );
+            assert_eq!(source.matches("tokio::").count(), 6);
+            assert_eq!(finalizer_wait.matches("tokio::").count(), 3);
+            assert_eq!(empty_monitor_test.matches("tokio::").count(), 1);
+            assert!(source.contains("use tokio::task::JoinSet;"));
+            assert!(source.contains("#[tokio::test]"));
         } else if path != Path::new("src/capability_readiness_supervisor.rs")
             && path != Path::new("src/database.rs")
             && path != Path::new("src/gateway.rs")
@@ -787,8 +1390,12 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs")
             && path != Path::new("src/health.rs")
             && path != Path::new("src/discord.rs")
+            && path != Path::new("src/discord_actor_serving_tests.rs")
             && path != Path::new("src/ingress_acknowledgement_safety.rs")
             && path != Path::new("src/ingress_acknowledgement_supervisor.rs")
+            && path != Path::new("src/interaction_receipt.rs")
+            && path != Path::new("src/interaction_effect_recovery_supervisor.rs")
+            && path != Path::new("src/interaction_receipt_recovery_supervisor.rs")
             && path != Path::new("src/maintenance_ingress_gate.rs")
             && path != Path::new("src/process/closed.rs")
             && path != Path::new("src/process/connected.rs")
@@ -799,11 +1406,17 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
             && path != Path::new("src/process/pending_drain_finalizer.rs")
             && path != Path::new("src/process/readiness.rs")
             && path != Path::new("src/process/recovery.rs")
+            && path != Path::new("src/process/serving.rs")
             && path != Path::new("src/process/startup_loop.rs")
             && path != Path::new("src/process/startup_loop_tests.rs")
             && path != Path::new("src/process_startup.rs")
             && path != Path::new("src/process_supervisor.rs")
+            && path != Path::new("src/runtime_controller.rs")
+            && path != Path::new("src/runtime_interaction_dispatch.rs")
             && path != Path::new("src/mutation_finalizer.rs")
+            && path != Path::new("src/panel_reconciliation.rs")
+            && path != Path::new("src/serving_heartbeat_monitor.rs")
+            && path != Path::new("src/serving_heartbeat_monitor_tests.rs")
             && path != Path::new("src/shutdown.rs")
             && path != Path::new("src/startup_recovery_observation.rs")
         {
@@ -812,6 +1425,7 @@ fn source_is_comment_free_and_external_composition_is_bounded() {
         if path != Path::new("src/process_identity.rs")
             && path != Path::new("src/controller_identity.rs")
             && path != Path::new("src/recovery_identity.rs")
+            && path != Path::new("src/certification_identity.rs")
         {
             assert!(
                 !contains_identifier(&source, "getrandom"),
@@ -832,6 +1446,7 @@ fn mutation_finalizer_is_bounded_linear_supervised_and_handoff_compatible() {
         "const RUNTIME_MUTATION_FINALIZER_MAX_CAPACITY: usize = 1_024;",
         "RuntimeMutationFinalizerJobV1<J>",
         "StartupPendingDrain(J)",
+        "ProcessMutation(J)",
         "RuntimeMutationFinalizerGenerationV1",
         "RuntimeMutationFinalizerHandoffStateV1",
         "startup_intake_sealed",
@@ -890,6 +1505,80 @@ fn mutation_finalizer_is_bounded_linear_supervised_and_handoff_compatible() {
             );
         }
     }
+}
+
+#[test]
+fn certification_finalizer_reuses_the_process_root_supervisor_with_a_typed_affine_job() {
+    let finalizer = include_str!("../src/process/certification_finalizer.rs");
+    let process = include_str!("../src/process.rs");
+    let mutation = include_str!("../src/mutation_finalizer.rs");
+    for required in [
+        "RuntimeCertificationFinalizerJobV2<PostgresPreparedRuntimeCertificationV2>",
+        "RuntimeProcessMutationFinalizerJobV3<E>",
+        "StartupPendingDrain(Box<RuntimePendingDrainFinalizerJobV3<E>>)",
+        "Certification(Box<RuntimeProductionCertificationFinalizerJobV2>)",
+        "RuntimeProcessMutationFinalizerOutputV3<E>",
+        "RuntimeProcessMutationFinalizerErrorV3<E>",
+        "RuntimeProcessCertificationFinalizerPortV2",
+        "RuntimeProcessCertificationFinalizerPortV2(<redacted>)",
+        "RuntimeCertificationFinalizerPortV2<PostgresPreparedRuntimeCertificationV2>",
+        "try_register_process_job(",
+        "RuntimeProcessMutationFinalizerJobV3::Certification(Box::new(job))",
+        "Box::new(job)",
+        "(*job).into_registration()",
+        "RuntimeRegisteredCertificationFinalizerJobV2",
+        "RuntimeCertificationFinalizerCompletionFailureV2",
+        "RuntimeProductionMutationFinalizerCompletionV3",
+        "RuntimeProcessMutationFinalizerPortV3::new()",
+        "RuntimeProcessMutationFinalizerPortV3(<redacted>)",
+        "process_mutation_finalizer: Option<RuntimeProcessMutationFinalizerV3>",
+        "certification_finalizer_port_v2",
+        "next_process_mutation_finalizer_completion_v3",
+    ] {
+        assert!(
+            finalizer.contains(required)
+                || process.contains(required)
+                || mutation.contains(required),
+            "{required}"
+        );
+    }
+    for forbidden in [
+        "dyn RuntimeCertification",
+        "BoxFuture",
+        "Pin<Box",
+        "tokio::spawn",
+        "RuntimeMutationFinalizerSupervisorV1::start",
+        "unbounded_channel",
+    ] {
+        assert!(!finalizer.contains(forbidden), "{forbidden}");
+    }
+    for type_name in [
+        "RuntimeProcessMutationFinalizerJobV3",
+        "RuntimeRegisteredCertificationFinalizerJobV2",
+        "RuntimeCertificationFinalizerCompletionFailureV2",
+        "RuntimeProductionMutationFinalizerCompletionV3",
+    ] {
+        let attributes = declaration_attribute_block(finalizer, type_name);
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{type_name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(finalizer, type_name, forbidden),
+                "{type_name}: {forbidden}"
+            );
+        }
+    }
+    assert_eq!(
+        process
+            .matches("RuntimeProcessStartupMutationFinalizerV3")
+            .count(),
+        2
+    );
+    assert_eq!(process.matches("process_mutation_finalizer:").count(), 2);
+    assert!(mutation.contains("RuntimeMutationFinalizerJobV1::ProcessMutation(job)"));
+    assert!(mutation.contains("RuntimeMutationFinalizerPhaseV1::ProcessAccepting"));
 }
 
 #[test]
@@ -1001,6 +1690,47 @@ fn startup_provenance_is_compile_time_canonical_and_nonforgeable() {
 }
 
 #[test]
+fn ci_requires_the_complete_serial_postgres_manifest_and_tracked_secret_scan() {
+    let commands = [
+        "cargo test --locked -p automation-ruleset-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-instance-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-panel-installation-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-ruleset-activation-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p authoring-promotion-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p authoring-application-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-ruleset-dispatch -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-ruleset-readiness -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-runtime-convergence-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-runtime-execution-postgres --test postgres_security -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-runtime-serving-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-runtime-interaction-postgres -- --ignored --test-threads=1",
+        "cargo test --locked -p automation-runtime-panel-postgres -- --ignored --test-threads=1",
+    ];
+    let mut previous = 0;
+    for command in commands {
+        assert_eq!(CI_WORKFLOW.matches(command).count(), 1, "{command}");
+        let position = CI_WORKFLOW.find(command).unwrap();
+        assert!(position >= previous, "{command}");
+        previous = position;
+    }
+    assert!(!CI_WORKFLOW
+        .contains("automation-runtime-interaction-postgres --test postgres_security -- --ignored"));
+    assert!(CI_WORKFLOW.contains("- name: Scan tracked repository secrets\n        run: python3 tools/ci/scan_tracked_secrets.py"));
+    for required in [
+        "git\", \"ls-files\", \"-z",
+        "cloudflare_api_token",
+        "private_key_or_age_handoff",
+        "database_url_password",
+        "sensitive_assignment",
+        "tracked repository secret scan failed",
+    ] {
+        assert!(TRACKED_SECRET_SCAN.contains(required), "{required}");
+    }
+    assert!(!TRACKED_SECRET_SCAN.contains("print(content"));
+    assert!(!TRACKED_SECRET_SCAN.contains("print(match"));
+}
+
+#[test]
 fn startup_identity_entropy_is_exact_independent_and_confined() {
     let encoding = source_before_test_module(include_str!("../src/identity_encoding.rs"));
     let process = source_before_test_module(include_str!("../src/process_identity.rs"));
@@ -1083,6 +1813,70 @@ fn startup_identity_entropy_is_exact_independent_and_confined() {
 }
 
 #[test]
+fn certification_identity_entropy_is_exact_separate_and_confined() {
+    let identity = source_before_test_module(include_str!("../src/certification_identity.rs"));
+    for required in [
+        "RuntimeCertificationOperationIdGenerationAuthorityV2",
+        "RuntimeBarrierIdGenerationAuthorityV1",
+        "RuntimeCertificationOperationIdV2::parse(encode_runtime_identity_lower_hex_v1(bytes))",
+        "RuntimeBarrierIdV1::parse(encode_runtime_identity_lower_hex_v1(bytes))",
+        "RuntimeCertificationOperationIdGenerationAuthorityV2(<redacted>)",
+        "RuntimeBarrierIdGenerationAuthorityV1(<redacted>)",
+    ] {
+        assert!(identity.contains(required), "{required}");
+    }
+    for declaration in ["pub(crate) fn generate_v2(", "pub(crate) fn generate_v1("] {
+        let wrapper = braced_declaration(identity, declaration);
+        assert_eq!(wrapper.matches("getrandom::fill").count(), 1);
+    }
+    for declaration in [
+        "fn generate_runtime_certification_operation_id_with_v2<F>(",
+        "fn generate_runtime_barrier_id_with_v1<F>(",
+    ] {
+        let seam = braced_declaration(identity, declaration);
+        assert!(seam.contains("F: FnOnce("));
+        assert!(seam.contains("&mut [u8; RUNTIME_IDENTITY_ENTROPY_BYTES]"));
+        assert!(seam.contains("let mut bytes = [0_u8; RUNTIME_IDENTITY_ENTROPY_BYTES];"));
+        assert_eq!(seam.matches("fill(&mut bytes)?;").count(), 1);
+        assert!(!seam.contains("getrandom"));
+    }
+    for type_name in [
+        "RuntimeCertificationOperationIdGenerationAuthorityV2",
+        "RuntimeBarrierIdGenerationAuthorityV1",
+    ] {
+        let attributes = declaration_attribute_block(identity, type_name);
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(!contains_identifier(attributes, forbidden), "{type_name}");
+            assert!(
+                !implements_trait(identity, type_name, forbidden),
+                "{type_name}"
+            );
+        }
+    }
+    for forbidden in [
+        "SystemTime",
+        "Instant",
+        "process::id",
+        "hostname",
+        "Uuid",
+        "uuid",
+        "thread_rng",
+        "StdRng",
+        "getrandom::fill_uninit",
+        "getrandom::u32",
+        "getrandom::u64",
+        "OnceLock",
+        "LazyLock",
+        "thread_local",
+        "Atomic",
+        "hash(",
+        "xor",
+    ] {
+        assert!(!identity.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
 fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
     let sources = source_files();
     let gateway = sources
@@ -1102,7 +1896,9 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         } else {
             source
         };
-        if path == Path::new("src/registry_succession_tests.rs") {
+        if path == Path::new("src/registry_staging_tests.rs")
+            || path == Path::new("src/registry_succession_tests.rs")
+        {
             continue;
         }
         if path == Path::new("src/gateway_owner_startup_watchdog_handoff_tests.rs") {
@@ -1155,6 +1951,61 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         {
             let allowed_readiness_worker =
                 path == Path::new("src/database.rs") && identifier == "automation_runtime_worker";
+            let allowed_interaction_dispatch_lane = path
+                == Path::new("src/runtime_interaction_dispatch.rs")
+                && identifier == "automation_runtime";
+            let allowed_interaction_receipt = path == Path::new("src/interaction_receipt.rs")
+                && identifier == "automation_runtime";
+            let allowed_discord_actor_serving_tests = path
+                == Path::new("src/discord_actor_serving_tests.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime" | "automation_runtime_convergence"
+                );
+            let allowed_discord_actor_serving_v3 = path
+                == Path::new("src/discord_actor_serving_tests.rs")
+                && matches!(
+                    identifier,
+                    "GatewayAdmissionPolicyV3" | "GatewayControlConfigV3"
+                );
+            let allowed_interaction_dispatch_database = (path == Path::new("src/database.rs")
+                || path.starts_with("src/database"))
+                && matches!(
+                    identifier,
+                    "automation_runtime" | "automation_runtime_convergence"
+                );
+            let allowed_interaction_dispatch_v3 = matches!(
+                identifier,
+                "GatewayConnectionObserverV3"
+                    | "GatewayDisconnectKindV3"
+                    | "GatewayReadyLeaseV3"
+                    | "InteractionExecutionOutcomeV3"
+                    | "SharedGatewayAdmissionErrorV3"
+                    | "SharedGatewayInteractionDispatchOutcomeV3"
+                    | "SharedGatewayInteractionEnvelopeV3"
+                    | "SharedGatewayInteractionRejectionV3"
+                    | "SharedGatewayRejectionAcknowledgementOutcomeV3"
+                    | "GatewayControlConfigV3"
+                    | "GatewayReadyKindV3"
+                    | "SharedGatewayInteractionApplicationIdV3"
+                    | "SharedGatewayInteractionIdV3"
+                    | "SharedGatewayInteractionIdentityV3"
+                    | "SharedGatewayInteractionTokenV3"
+            ) && path
+                == Path::new("src/runtime_interaction_dispatch.rs")
+                || matches!(
+                    identifier,
+                    "GatewayConnectionObserverV3"
+                        | "GatewayReadyLeaseV3"
+                        | "OwnedSharedGatewayDispatchServicesCompositionErrorV3"
+                        | "OwnedSharedGatewayDispatchServicesV3"
+                        | "SharedGatewayAdmissionConfigV3"
+                        | "SharedGatewayInteractionEnvelopeV3"
+                        | "SharedGatewayInteractionIdentityV3"
+                        | "SharedGatewayInteractionKindV3"
+                        | "SharedGatewayInteractionReservationOutcomeV3"
+                        | "SharedGatewayReservedInteractionV3"
+                ) && (path == Path::new("src/database.rs") || path.starts_with("src/database"));
             let allowed_registry_adapter = path == Path::new("src/registry.rs")
                 && matches!(
                     identifier,
@@ -1188,7 +2039,40 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 && identifier == "automation_runtime_worker";
             let allowed_pending_drain_finalizer_dependency = path
                 == Path::new("src/process/pending_drain_finalizer.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime_controller" | "automation_runtime_worker"
+                );
+            let allowed_pending_drain_serving_dependency = path
+                == Path::new("src/process/pending_drain_serving.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime_controller" | "automation_runtime_worker"
+                );
+            let allowed_pending_drain_serving_database = path == Path::new("src/database.rs")
+                && identifier == "automation_runtime_controller";
+            let allowed_certification_finalizer_dependency = path
+                == Path::new("src/process/certification_finalizer.rs")
                 && identifier == "automation_runtime_worker";
+            let allowed_serving_certification_dependency = path
+                == Path::new("src/process/serving_certification.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime_controller"
+                        | "automation_runtime_convergence"
+                        | "automation_runtime_worker"
+                );
+            let allowed_certification_identity_dependency = path
+                == Path::new("src/certification_identity.rs")
+                && identifier == "automation_runtime_controller";
+            let allowed_serving_heartbeat_dependency = (path
+                == Path::new("src/serving_heartbeat_monitor.rs")
+                && identifier == "automation_runtime_controller")
+                || (path == Path::new("src/serving_heartbeat_monitor_tests.rs")
+                    && matches!(
+                        identifier,
+                        "automation_runtime_controller" | "automation_runtime_convergence"
+                    ));
             let allowed_pending_drain_finalizer_v3 = matches!(
                 identifier,
                 "RuntimeOwnedStartupRecoveryExecutionOutcomeV3"
@@ -1196,6 +2080,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     | "RuntimeProcessStartupMutationFinalizerV3"
                     | "RuntimePendingDrainMutationDatabaseV3"
                     | "RuntimePendingDrainFinalizerDispatchFailureV3"
+                    | "RuntimePendingDrainFinalizerFailedV3"
                     | "RuntimePendingDrainFinalizerJobV3"
                     | "RuntimePendingDrainFinalizerPortV3"
                     | "RuntimePendingDrainFinalizerSettledV3"
@@ -1205,6 +2090,14 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     | "RuntimePendingDrainMutationOutputV3"
                     | "RuntimePendingDrainMutationStageV3"
                     | "RuntimePendingDrainOwnedStageFailureV3"
+                    | "RuntimeProcessMutationFinalizerCompletionV3"
+                    | "RuntimeProcessMutationFinalizerErrorV3"
+                    | "RuntimeProcessMutationFinalizerJobV3"
+                    | "RuntimeProcessMutationFinalizerOutputV3"
+                    | "RuntimeProcessMutationFinalizerPortV3"
+                    | "RuntimeProcessMutationFinalizerProcessSupervisorV3"
+                    | "RuntimeProcessMutationFinalizerSupervisorV3"
+                    | "RuntimeProductionMutationFinalizerCompletionV3"
                     | "RuntimeProductionPendingDrainFinalizerEnvironmentV3"
                     | "RuntimeStartupRecoveryOwnedStepFutureV3"
                     | "RuntimeStartupRecoveryOwnedStepOutcomeV3"
@@ -1212,12 +2105,14 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 path.as_path(),
                 path if path == Path::new("src/database.rs")
                     || path == Path::new("src/process.rs")
+                    || path == Path::new("src/process/certification_finalizer.rs")
                     || path == Path::new("src/process/execution.rs")
                     || path == Path::new("src/process/pending_drain_finalizer.rs")
                     || path == Path::new("src/process/startup_loop.rs")
                     || path == Path::new("src/process/startup_loop_tests.rs")
             );
-            let allowed_observation_process = path == Path::new("src/process/observation.rs")
+            let allowed_observation_process = (path == Path::new("src/process/observation.rs")
+                || path == Path::new("src/process/serving.rs"))
                 && matches!(
                     identifier,
                     "automation_runtime_controller" | "automation_runtime_worker"
@@ -1242,6 +2137,38 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     identifier,
                     "automation_runtime_controller" | "automation_runtime_worker"
                 );
+            let allowed_runtime_controller = path == Path::new("src/runtime_controller.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime"
+                        | "automation_runtime_controller"
+                        | "automation_runtime_convergence"
+                        | "automation_runtime_worker"
+                );
+            let allowed_panel_reconciliation = path == Path::new("src/panel_reconciliation.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime"
+                        | "automation_runtime_controller"
+                        | "automation_runtime_convergence"
+                );
+            let allowed_discord_interaction_normalizer = path
+                == Path::new("src/discord_interaction_normalizer.rs")
+                && matches!(
+                    identifier,
+                    "automation_runtime"
+                        | "MAX_SHARED_GATEWAY_CUSTOM_ID_BYTES_V3"
+                        | "MAX_SHARED_GATEWAY_MODAL_INPUT_VALUE_BYTES_V3"
+                        | "SharedGatewayInteractionApplicationIdV3"
+                        | "SharedGatewayInteractionEnvelopeErrorV3"
+                        | "SharedGatewayInteractionEnvelopeV3"
+                        | "SharedGatewayInteractionIdV3"
+                        | "SharedGatewayInteractionIdentityV3"
+                        | "SharedGatewayInteractionKindV3"
+                        | "SharedGatewayInteractionReceivedAtV3"
+                        | "SharedGatewayInteractionTokenV3"
+                        | "SharedGatewayModalInputV3"
+                );
             let allowed_pending_drain_succession = path
                 == Path::new("src/process/pending_drain_finalizer.rs")
                 || matches!(
@@ -1261,6 +2188,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         "RuntimeAcceptedPendingDrainSelectionV3"
                             | "RuntimeAuthorizedPendingDrainSelectionV3"
                             | "RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3"
+                            | "RuntimePendingDrainServingSourceCorrelationV3"
                             | "RuntimePendingDrainSelectionPortV3"
                             | "RuntimePendingDrainSelectionReceiptV3"
                             | "RuntimePendingDrainSuccessionAcknowledgementExecutionPortV3"
@@ -1268,12 +2196,47 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                     ) if path == Path::new("src/database.rs")
                         || path == Path::new("src/process/execution.rs")
                         || path == Path::new("src/process/pending_drain_finalizer.rs")
+                        || path == Path::new("src/process/pending_drain_serving.rs")
                 );
+            let allowed_ordinary_barrier_v3 = matches!(
+                identifier,
+                "RuntimeClosedRecoveryOrdinaryBarrierCompletionAuthorityV3"
+                    | "RuntimeClosedRecoveryServingAcknowledgementRefreshTransitionV3"
+                    | "RuntimeDiscordOrdinaryBarrierFailureV3"
+                    | "RuntimeDiscordOrdinaryBarrierPauseOutcomeV3"
+                    | "RuntimeDiscordOrdinaryBarrierPortV3"
+                    | "RuntimeDiscordOrdinaryBarrierReservationV3"
+                    | "RuntimeDiscordOrdinaryBarrierResumeEvidenceV3"
+                    | "RuntimeDiscordOrdinaryBarrierResumeOutcomeV3"
+                    | "RuntimeExactIngressAcknowledgementReobservationV3"
+                    | "RuntimeServingBarrierAPausedStateV3"
+                    | "RuntimeServingOpenBarrierCompletionAuthorityV3"
+            ) && matches!(
+                path.as_path(),
+                path if path == Path::new("src/closed_recovery.rs")
+                    || path == Path::new("src/process.rs")
+                    || path == Path::new("src/process/observation.rs")
+                    || path == Path::new("src/process/serving.rs")
+                    || path == Path::new("src/process/serving_certification.rs")
+            );
             assert!(
                 (!identifier.ends_with("V3")
                     || allowed_pending_drain_succession
-                    || allowed_pending_drain_finalizer_v3)
+                    || allowed_pending_drain_finalizer_v3
+                    || allowed_ordinary_barrier_v3
+                    || allowed_discord_actor_serving_v3
+                    || allowed_discord_interaction_normalizer
+                    || (path == Path::new("src/interaction_receipt.rs")
+                        && matches!(
+                            identifier,
+                            "SharedGatewayInteractionIdentityV3" | "SharedGatewayInteractionKindV3"
+                        ))
+                    || allowed_interaction_dispatch_v3)
                     && (allowed_readiness_worker
+                        || allowed_interaction_dispatch_lane
+                        || allowed_interaction_receipt
+                        || allowed_discord_actor_serving_tests
+                        || allowed_interaction_dispatch_database
                         || allowed_registry_adapter
                         || allowed_closed_recovery
                         || allowed_startup_observation
@@ -1283,6 +2246,12 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_recovery_process
                         || allowed_execution_process
                         || allowed_pending_drain_finalizer_dependency
+                        || allowed_pending_drain_serving_dependency
+                        || allowed_pending_drain_serving_database
+                        || allowed_certification_finalizer_dependency
+                        || allowed_serving_certification_dependency
+                        || allowed_certification_identity_dependency
+                        || allowed_serving_heartbeat_dependency
                         || allowed_observation_process
                         || allowed_observation_process_tests
                         || allowed_process_identity
@@ -1291,6 +2260,9 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                         || allowed_mutation_finalizer
                         || allowed_maintenance_ingress_gate
                         || allowed_ingress_acknowledgement_supervisor
+                        || allowed_runtime_controller
+                        || allowed_panel_reconciliation
+                        || allowed_discord_interaction_normalizer
                         || !matches!(
                             identifier,
                             "automation_runtime"
@@ -1312,7 +2284,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         process_observation
             .matches("automation_runtime_controller")
             .count(),
-        6
+        8
     );
     assert!(process_observation.contains(concat!(
         "use automation_runtime_controller::{\n",
@@ -1571,6 +2543,87 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         "start_gateway_owner_production",
     ] {
         assert!(!owner_supervisor.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn certification_owner_freeze_thaw_is_linear_exact_and_fail_closed() {
+    let owner_supervisor = include_str!("../src/gateway_owner_startup_watchdog.rs");
+    for required in [
+        "RuntimeGatewayOwnerCertificationFreezeAuthorityV2",
+        "RuntimeGatewayOwnerCertificationFrozenObservationV2",
+        "RuntimeGatewayOwnerCertificationFrozenSupervisorV2",
+        "RuntimeGatewayOwnerSupervisorRoleV1::CertificationFrozen",
+        "RuntimeGatewayOwnerSupervisorCommandV1::FreezeCertification",
+        "RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification",
+        "pub(crate) fn prepare_certification_freeze_v2(\n        self,",
+        "owner: Option<Box<RuntimeGatewayOwnerProductionSupervisorV2>>",
+        "authority: RuntimeGatewayOwnerCertificationFrozenObservationV2",
+        "completion_deadline: Instant",
+        "expected.safety_deadline() <= cutoff",
+        "current.safety_deadline() <= cutoff",
+        "expected.receipt().database_lease_duration().is_none()",
+        "current.receipt().database_lease_duration().is_none()",
+        "current.receipt().lease_id != expected.receipt().lease_id",
+        "current.receipt().owner_revision == expected.receipt().owner_revision",
+        "current.receipt().expires_at == expected.receipt().expires_at",
+        "current.receipt().database_now >= expected.receipt().database_now",
+        "current.safety_deadline() <= expected.safety_deadline()",
+        ".checked_add(1)\n        == Some(current.receipt().owner_revision.get())",
+        "current.receipt().database_now > expected.receipt().database_now",
+        "current.receipt().expires_at > expected.receipt().expires_at",
+        "current.safety_deadline() > expected.safety_deadline()",
+        "force_production_renewal = false;",
+        "force_production_renewal = true;",
+        "let completion_deadline = self.cutoff.min(successor_deadline);",
+        ".thaw_certification_v2(authority, completion_deadline)",
+        ".wait_for_strict_successor_v2(previous_revision, completion_deadline)",
+        "RuntimeGatewayOwnerCertificationFreezeAuthorityV2(<redacted>)",
+        "RuntimeGatewayOwnerCertificationFrozenObservationV2(<redacted>)",
+        "RuntimeGatewayOwnerCertificationFrozenSupervisorV2(<redacted>)",
+    ] {
+        assert!(owner_supervisor.contains(required), "{required}");
+    }
+    assert_eq!(
+        owner_supervisor
+            .matches("timeout_at(TokioInstant::from_std(cutoff), acknowledgement)")
+            .count(),
+        1
+    );
+    assert_eq!(
+        owner_supervisor
+            .matches("timeout_at(TokioInstant::from_std(completion_deadline), acknowledgement)")
+            .count(),
+        1
+    );
+    assert_eq!(
+        owner_supervisor
+            .matches("wait_for_certification_freeze_terminal_until_v2")
+            .count(),
+        3
+    );
+    assert_eq!(
+        owner_supervisor
+            .matches("wait_for_certification_thaw_terminal_until_v2")
+            .count(),
+        3
+    );
+    for name in [
+        "RuntimeGatewayOwnerCertificationFreezeAuthorityV2",
+        "RuntimeGatewayOwnerCertificationFrozenObservationV2",
+        "RuntimeGatewayOwnerCertificationFrozenSupervisorV2",
+    ] {
+        let attributes = declaration_attribute_block(owner_supervisor, name);
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(owner_supervisor, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
     }
 }
 
@@ -1970,7 +3023,7 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         .find("exact_reobserve_ingress_acknowledgement_v2(")
         .unwrap();
     let schedule = refresh
-        .find("ingress_acknowledgement_schedule_v2(receipt, final_observation_started_at)")
+        .find("ingress_acknowledgement_schedule_v2(")
         .unwrap();
     let safety_rearm = refresh.find(".rearm_v2(schedule.safety_deadline)").unwrap();
     let refresh_revalidation = refresh.rfind(".revalidate_v2()").unwrap();
@@ -2067,7 +3120,7 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
     }
     let empty_open_shutdown = braced_declaration(
         process_observation,
-        "async fn shutdown_empty_open_process_v2(",
+        "async fn shutdown_empty_open_process_v2<G>(",
     );
     let readiness_remove = empty_open_shutdown
         .find("readiness.remove_readiness_v2()")
@@ -2082,11 +3135,16 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         "async fn stage_runtime_process_from_environment_v1(",
     );
     let startup_open = startup.find(".enter_empty_open_v2()").unwrap();
+    let startup_serving = startup.find(".enter_serving_open_v2()").unwrap();
     let startup_run = startup.find(".run_until_shutdown_v2()").unwrap();
     let startup_done = startup
         .find("Ok(RuntimeProcessStagingOutcomeV1 { _private: () })")
         .unwrap();
-    assert!(startup_open < startup_run && startup_run < startup_done);
+    assert!(
+        startup_open < startup_serving
+            && startup_serving < startup_run
+            && startup_run < startup_done
+    );
     assert!(!startup.contains("empty_open\n        .shutdown()"));
     for forbidden in [
         "RuntimeMaintenanceIngressGatePermitV2",
@@ -2144,8 +3202,12 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "EventTypeFlags::RESUMED",
         "EventTypeFlags::GATEWAY_RECONNECT",
         "EventTypeFlags::GATEWAY_INVALIDATE_SESSION",
+        "EventTypeFlags::INTERACTION_CREATE",
+        "Event::InteractionCreate(interaction)",
+        "RuntimeDiscordGatewayEventV1::Interaction(",
+        "pin_runtime_discord_interaction_v1(",
         "GatewayCommandAckV3::Paused { .. }",
-        "GatewayCommandAckV3::AdmissionResumed { .. }",
+        "GatewayCommandAckV3::AdmissionResumed { epoch }",
         "RuntimeDiscordGatewayExitV1::AdmissionOpened",
         "RuntimeDiscordGatewayTransportStateV1::Connecting",
         "RuntimeDiscordGatewayTransportStateV1::Active",
@@ -2169,20 +3231,24 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "finish_runtime_discord_gateway_if_connected_v1(",
         "start_receiver.await.is_ok()",
         "wait_for_lifecycle_drain_v1(",
+        "dispatch_drain.lane.poll_next_completion_v1()",
+        "if dispatch_drain.lane.has_in_flight_v1()",
+        "dispatch_drain.lane.handle_raw_interaction_v1(interaction)",
+        "dispatch_drain.lane.reconcile_accepting_v1()",
+        "seal_runtime_discord_dispatch_lane_until_v1(",
+        "dispatch_drain.lane.abort_v1()",
         "RuntimeDiscordGatewaySupervisorV1(<redacted>)",
     ] {
         assert!(discord.contains(required), "{required}");
     }
     assert_eq!(discord.matches("runtime.spawn(async move").count(), 2);
     for forbidden in [
-        "INTERACTION_CREATE",
         "twilight_http",
         "Client",
         "run_shared_gateway_v3",
         "resume_admission",
         "issue_ready_lease",
         "bot_runtime",
-        "InteractionCreate",
         "InteractionResponder",
         "transport_started",
         "catch_unwind",
@@ -2195,11 +3261,13 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "self._runtime.take()",
         "GatewayAdmissionPolicyV3::ExplicitResumeAfterEveryConnect",
         "pub(crate) fn admission_change_watch_v1(",
-        "pub(crate) fn begin_discord_drain_v1(",
+        "pub(crate) fn begin_discord_drain_until_v1(",
         "run_runtime_discord_control_v1(",
         "control.next_lifecycle()",
         "prepare_twilight_runtime_discord_gateway_driver_v1(",
         "prepare_discord_gateway_start_v1(operation_cutoff, Some(shutdown))",
+        "compose_runtime_discord_interaction_actor_lane_v1(",
+        "dispatch_drain_lane: Box::new(interaction_lane)",
         "shutdown: &mut RuntimeShutdownObserverV1,",
         "_observation = shutdown.wait()",
         "supervisor.release_start_v1()",
@@ -2234,8 +3302,12 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         "shutdown_paused_foundation_owner_v1",
         ".begin_shutdown_v1(RuntimeShutdownCauseV1::Explicit)",
         "foundation.observe_shutdown_registry_v1()",
-        ".begin_discord_drain_v1()",
+        ".begin_discord_drain_until_v1(discord_cleanup_deadline)",
         "foundation.finish_shutdown_v1(cleanup_deadline).await",
+        "self.foundation.interaction_dispatch_port_v1()",
+        "self.foundation.interaction_dispatch_status_publisher_v1()",
+        "self.foundation.product_readiness_observer_v1()",
+        "self.foundation.config.gateway()",
     ] {
         assert!(connected.contains(required), "{required}");
     }
@@ -2268,7 +3340,7 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
         .find("foundation.observe_shutdown_registry_v1()")
         .unwrap();
     let discord_drain = connected_shutdown
-        .find(".begin_discord_drain_v1()")
+        .find(".begin_discord_drain_until_v1(discord_cleanup_deadline)")
         .unwrap();
     let discord_shutdown = connected_shutdown.find(".shutdown_until(").unwrap();
     let owner_shutdown = connected_shutdown
@@ -2291,10 +3363,20 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
     let prepare = start
         .find("prepare_discord_gateway_start_v1(operation_cutoff, Some(shutdown))")
         .unwrap();
+    let compose = start
+        .find("compose_runtime_discord_interaction_actor_lane_v1(")
+        .unwrap();
     let spawn = start.find("start_runtime_discord_gateway_v1(").unwrap();
     let attach = start.find("attach_discord_supervisor_v1").unwrap();
     let release = start.find("supervisor.release_start_v1()").unwrap();
-    assert!(driver < prepare && prepare < spawn && spawn < attach && attach < release);
+    assert!(
+        driver < prepare
+            && prepare < compose
+            && compose < spawn
+            && spawn < attach
+            && attach < release
+    );
+    assert!(!start.contains("runtime_discord_immediate_dispatch_drain_lane_v1"));
     let prepare = braced_declaration(gateway, "async fn prepare_discord_gateway_start_v1(");
     let reserve = prepare.find("reserve_discord_supervisor_v1").unwrap();
     let recheck = prepare[reserve..]
@@ -2306,7 +3388,6 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
     for forbidden in [
         "resume_admission",
         "issue_ready_lease",
-        "dispatch",
         "execute",
         "serve",
         "activate",
@@ -2322,7 +3403,6 @@ fn paused_discord_connection_is_single_owned_closed_and_bounded() {
             "startup: {forbidden}"
         );
     }
-    assert!(!contains_identifier(connected, "readiness"));
     assert!(!contains_identifier(connected, "recovery"));
     assert!(!library.contains("RuntimeDiscordStartingProcessV1"));
     assert!(!library.contains("RuntimePausedConnectedProcessV1"));
@@ -2575,6 +3655,561 @@ fn recovery_pending_process_is_fresh_closed_linear_and_bounded() {
     assert!(!library.contains("RuntimeRecoveryPendingProcessV2"));
     assert!(!library.contains("RuntimeClosedRecoveryPendingPhaseV2"));
     assert!(!library.contains("RuntimeGatewayOwnerPreparedClosedRecoveryV2"));
+}
+
+#[test]
+fn serving_open_successor_is_linear_bounded_refreshable_and_non_mutating() {
+    let sources = source_files();
+    let serving = include_str!("../src/process/serving.rs");
+    let closed = include_str!("../src/closed_recovery.rs");
+    let startup = source_before_test_module(include_str!("../src/process_startup.rs"));
+    let transition = braced_declaration(serving, "pub(crate) async fn enter_serving_open_v2(");
+    let prepare = transition
+        .find(".prepare_serving_open_v2(config, serving_evidence)")
+        .unwrap();
+    let commit = transition.find("prepared.commit_v2()").unwrap();
+    let revalidate = transition.rfind("process.revalidate_v2().await").unwrap();
+    assert!(prepare < commit && commit < revalidate);
+    assert_eq!(startup.matches(".enter_empty_open_v2()").count(), 1);
+    assert_eq!(startup.matches(".enter_serving_open_v2()").count(), 1);
+    assert_eq!(startup.matches(".run_until_shutdown_v2()").count(), 1);
+    let empty = startup.find(".enter_empty_open_v2()").unwrap();
+    let successor = startup.find(".enter_serving_open_v2()").unwrap();
+    let run = startup.find(".run_until_shutdown_v2()").unwrap();
+    assert!(empty < successor && successor < run);
+    for required in [
+        "const SERVING_OPEN_SLOT_WORK_CAPACITY_V2: usize = 1;",
+        "RuntimeClosedRecoveryServingOpenEvidenceV2",
+        "RuntimeClosedRecoveryServingAcknowledgementEvidenceV2",
+        ".authorize_acknowledgement_refresh_v2(evidence)",
+        "RuntimeClosedRecoveryIngressAcknowledgementOutcomeV2::ServingOpenRefresh",
+        "RuntimeClosedRecoveryIngressAcknowledgementRetainedStateV2::ServingOpenRefresh",
+        "shutdown_serving_open_process_v2(",
+        "shutdown_refreshing_serving_open_process_v2(",
+    ] {
+        assert!(serving.contains(required), "{required}");
+    }
+    for required in [
+        "RuntimeClosedRecoveryPreparedServingOpenProcessV2",
+        "RuntimeClosedRecoverySupervisedServingOpenProcessV2",
+        "RuntimeRegistryPreparedServingTransitionV2",
+        "RuntimeRegistryServingBindingV2",
+        "worker.prepare_serving_open(&port, config)",
+        "registry.commit_v2(worker.route_set_epoch())",
+        "let route_set = match self.observe_registry_route_set_v2()",
+        "RuntimeServingOpenAcknowledgementRefreshInputV2",
+        "RuntimeClosedRecoveryIngressAcknowledgementAuthorityV2::ServingOpenRefresh",
+    ] {
+        assert!(closed.contains(required), "{required}");
+    }
+    for forbidden in [
+        "Shard::new(",
+        "run_shared_gateway_v3",
+        "begin_paused_discord_connection_v1",
+        "enter_empty_open_v2",
+        "RuntimeMaintenanceIngressGatePermitV2",
+        "try_acquire_v2",
+        "INTERACTION_CREATE",
+        "hydrate",
+        "activate",
+        "deploy",
+        "sqlx",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+    ] {
+        assert!(
+            !contains_identifier(serving, forbidden),
+            "serving: {forbidden}"
+        );
+    }
+    assert_eq!(
+        sources
+            .iter()
+            .filter(|(path, _)| path.starts_with("src"))
+            .map(|(_, source)| source.matches("Shard::new(").count())
+            .sum::<usize>(),
+        1
+    );
+}
+
+#[test]
+fn runtime_controller_is_exact_refreshing_installation_scoped_and_cleanup_ordered() {
+    let controller = source_before_test_module(include_str!("../src/runtime_controller.rs"));
+    let serving = include_str!("../src/process/serving.rs");
+
+    for required in [
+        "const RUNTIME_CONTROLLER_COMMAND_CAPACITY_V2: usize = 1;",
+        "claim_next_execution(RuntimeClaimNextExecutionV1",
+        "prepare_claim_v2(retained_receipt).await",
+        "runtime_discord_preflight_blocking_mutation_v2()",
+        "RuntimeConvergenceMutationV1::Cancel",
+        "reason: \"runtime_discord_preflight_blocked\".to_owned()",
+        "stage_ready.begin_exact_hydration_refresh()",
+        "refresh.execute(&self.database)",
+        "stage_ready.stage(&stage, Utc::now())",
+        "RuntimeControllerDiscordPreflightDispositionV2::DeploymentBlocked",
+        "self.cancel_blocked_preflight_v2(preflight_failure_receipt)",
+        "RuntimeControllerAttemptV2::RetryRetained(Box::new(",
+        "retained_receipt = receipt",
+        "runtime_claim_requires_renewal_v2(receipt.expires_at, &self.config, now)",
+        "RuntimeRegistryReplacementRouteV2",
+        "match staged.into_staged_recovery()",
+        "self.replace_staged_v2(*staged).await",
+        "RuntimeExactPanelReconciliationV2::new(",
+        "RuntimeExactPanelReconciliationRequestV2::new(",
+        "RuntimeConvergenceMutationV1::AcceptPanelCertificate",
+        "RuntimePanelObservationBudgetV2::default()",
+        "RuntimePanelFailureActionV2::ObserveJournal",
+        "RuntimePanelFailureActionV2::BlockDeployment",
+        "RuntimePanelFailureActionV2::FailProcess",
+        "RuntimeFailureKindV1::PanelReconciliation",
+        "RuntimeHeldRouteOutcomeV2::Retry",
+        "held.finish_retry_v2()",
+    ] {
+        assert!(controller.contains(required), "{required}");
+    }
+    for forbidden in [
+        "RuntimeEmergencyGatewaySection",
+        "RuntimeRecoveryPendingGatewaySection",
+        "GatewayBarrier",
+        "gateway_barrier",
+        ".activate(",
+        "resume_reserved_runtime_discord_admission",
+    ] {
+        assert!(!controller.contains(forbidden), "{forbidden}");
+    }
+
+    let converge = braced_declaration(controller, "async fn converge_claim_v2(");
+    let initial_hydration = converge.find("claimed.begin_hydration()").unwrap();
+    let discord_preflight = converge.find("preflight.execute(&self.discord)").unwrap();
+    let accept_preflight = converge.find("mutation.execute(&self.database").unwrap();
+    let exact_refresh = converge
+        .find("stage_ready.begin_exact_hydration_refresh()")
+        .unwrap();
+    let registry_stage = converge
+        .find("stage_ready.stage(&stage, Utc::now())")
+        .unwrap();
+    assert!(
+        initial_hydration < discord_preflight
+            && discord_preflight < accept_preflight
+            && accept_preflight < exact_refresh
+            && exact_refresh < registry_stage
+    );
+
+    let replacement = braced_declaration(controller, "async fn replace_staged_v2(");
+    let request_drain = replacement.find("staged.begin_request_drain()").unwrap();
+    let observe_previous = replacement
+        .find("drain_requested.begin_previous_serving_observation()")
+        .unwrap();
+    let pause = replacement
+        .find("observed.begin_barrier_a_pause(Utc::now())")
+        .unwrap();
+    let predecessor_transition = replacement
+        .find("paused.begin_predecessor_transition().execute(&predecessor)")
+        .unwrap();
+    let resume = replacement
+        .find("draining.begin_barrier_a_resume()")
+        .unwrap();
+    let disconnect = replacement
+        .find("resumed.begin_previous_serving_disconnect()")
+        .unwrap();
+    let retire = replacement
+        .find("retirement_ready.begin_predecessor_retirement()")
+        .unwrap();
+    let accept_drain = replacement.find("removed.begin_accept_drain()").unwrap();
+    assert!(
+        request_drain < observe_previous
+            && observe_previous < pause
+            && pause < predecessor_transition
+            && predecessor_transition < resume
+            && resume < disconnect
+            && disconnect < retire
+            && retire < accept_drain
+    );
+
+    let held = braced_declaration(controller, "struct RuntimeHeldDrainedRouteV2");
+    assert!(
+        held.find("staged: RuntimeRegistryReplacementRouteV2")
+            .unwrap()
+            < held.find("permit: RuntimeServingSlotWorkPermitV2").unwrap()
+    );
+    let renewal = braced_declaration(controller, "async fn renew_held_v2(");
+    let database_renewal = renewal.find(".renew_execution(renewal)").unwrap();
+    let session_renewal = renewal.find(".apply_renewal(renewal)").unwrap();
+    let registry_renewal = renewal
+        .find(".advance_authority_v2(held.session.fencing_token())")
+        .unwrap();
+    assert!(database_renewal < session_renewal && session_renewal < registry_renewal);
+
+    let panels = braced_declaration(controller, "async fn reconcile_held_panels_v2(");
+    let exact_request = panels
+        .find("RuntimeExactPanelReconciliationRequestV2::new(")
+        .unwrap();
+    let reconcile = panels.find("panels.reconcile_exact_v2(request)").unwrap();
+    let certificate = panels
+        .find("RuntimeConvergenceMutationV1::AcceptPanelCertificate")
+        .unwrap();
+    assert!(exact_request < reconcile && reconcile < certificate);
+
+    let advance = braced_declaration(controller, "async fn advance_drained_v2(");
+    let observation_budget = advance
+        .find("let mut panel_observation = RuntimePanelObservationBudgetV2::default()")
+        .unwrap();
+    let continuation_loop = advance.find("loop {").unwrap();
+    let observe = advance
+        .find("RuntimePanelFailureActionV2::ObserveJournal")
+        .unwrap();
+    let refence = observe
+        + advance[observe..]
+            .find("self.renew_held_v2(&mut held).await")
+            .unwrap();
+    let block = advance
+        .find("RuntimePanelFailureActionV2::BlockDeployment")
+        .unwrap();
+    let block_and_finish = advance
+        .find("self.block_and_finish_held_panel_v2(held, code).await")
+        .unwrap();
+    let process_fatal = advance
+        .find("RuntimePanelFailureActionV2::FailProcess")
+        .unwrap();
+    let process_fatal_cleanup = advance[process_fatal..]
+        .find("held.finish_advance_v2(")
+        .unwrap()
+        + process_fatal;
+    assert!(
+        observation_budget < continuation_loop
+            && continuation_loop < observe
+            && observe < refence
+            && refence < block
+            && block < block_and_finish
+            && block_and_finish < process_fatal
+            && process_fatal < process_fatal_cleanup
+    );
+
+    let block_and_finish =
+        braced_declaration(controller, "async fn block_and_finish_held_panel_v2(");
+    let remove_staged = block_and_finish.find("held.remove_staged_v2()").unwrap();
+    let record_block = block_and_finish
+        .find(".block_held_panel_session_v2(&mut route_removed.session, code)")
+        .unwrap();
+    let continue_controller = block_and_finish
+        .find("RuntimeHeldPostCleanupOutcomeV2::Continue")
+        .unwrap();
+    let finish_removed = block_and_finish
+        .find("route_removed.finish_advance_v2(outcome)")
+        .unwrap();
+    assert!(
+        remove_staged < record_block
+            && record_block < continue_controller
+            && continue_controller < finish_removed
+    );
+
+    let block_session = braced_declaration(controller, "async fn block_held_panel_session_v2(");
+    let stable_failure = block_session
+        .find("runtime_panel_failure_id_v2(session)")
+        .unwrap();
+    let record_failure = block_session
+        .find("RuntimeConvergenceMutationV1::RecordBlockedFailure")
+        .unwrap();
+    let persist_failure = block_session
+        .find("self.database.execution().mutate(request)")
+        .unwrap();
+    let release = block_session
+        .find("RuntimeConvergenceSessionStateV1::Released")
+        .unwrap();
+    assert!(
+        stable_failure < record_failure
+            && record_failure < persist_failure
+            && persist_failure < release
+    );
+
+    let cleanup = braced_declaration(controller, "fn cleanup_v2(");
+    let remove = cleanup.find("let cleanup = staged.remove_v2()").unwrap();
+    let drop_authority = cleanup
+        .find("drop((session, permit, evidence, hydrated, witness))")
+        .unwrap();
+    let return_cleanup = cleanup.rfind("cleanup").unwrap();
+    assert!(remove < drop_authority && drop_authority < return_cleanup);
+    let cleanup_outcome = braced_declaration(controller, "fn runtime_held_cleanup_outcome_v2(");
+    assert!(
+        cleanup_outcome.find("if cleanup.is_err()").unwrap()
+            < cleanup_outcome
+                .find("RuntimeHeldPostCleanupOutcomeV2::Continue")
+                .unwrap()
+    );
+    assert!(cleanup_outcome.contains("RuntimeServingControllerActorExitV2::CleanupFailed"));
+
+    let run = braced_declaration(controller, "async fn run_v2(");
+    assert!(run.contains("RuntimeHeldAdvanceOutcomeV2::Continue => break"));
+
+    assert!(!serving.contains("OwnedDiscordRuntimePreflightV1"));
+    let shutdown = braced_declaration(serving, "async fn shutdown(mut self)");
+    assert!(
+        shutdown
+            .find("stop_runtime_controller_before_cleanup_v2")
+            .unwrap()
+            < shutdown.find("shutdown_serving_open_process_v2(").unwrap()
+    );
+}
+
+#[test]
+fn serving_shutdown_observes_valid_route_sets_without_weakening_empty_shutdown() {
+    let process = source_before_test_module(include_str!("../src/process.rs"));
+    let observation = include_str!("../src/process/observation.rs");
+    let serving_process = include_str!("../src/process/serving.rs");
+    let empty = braced_declaration(
+        process,
+        "pub(super) fn observe_shutdown_registry_v1(&mut self)",
+    );
+    let serving = braced_declaration(
+        process,
+        "pub(super) fn observe_shutdown_serving_registry_v2(",
+    );
+
+    assert!(empty.contains("self.registry.observe_recovery_empty_projection_v2()"));
+    assert!(!empty.contains("RuntimeRouteSetObservationV2"));
+    assert!(serving.contains("RuntimeRouteSetObservationV2"));
+    assert!(serving.contains("accept_shutdown_serving_registry_observation_v2(observation)"));
+    assert!(!serving.contains("observe_recovery_empty_projection_v2()"));
+    let lost_serving = braced_declaration(
+        process,
+        "pub(super) fn observe_shutdown_serving_registry_without_lifecycle_v2(&mut self)",
+    );
+    assert!(lost_serving.contains("self.registry.observe_shutdown_route_set_v2()"));
+    assert!(lost_serving.contains("self.observe_shutdown_serving_registry_v2(observation)"));
+
+    for marker in [
+        "pub(super) async fn shutdown_serving_open_process_v2<G>(",
+        "pub(super) async fn shutdown_refreshing_serving_open_process_v2<G>(",
+    ] {
+        let shutdown = braced_declaration(observation, marker);
+        let sealed = shutdown
+            .find("let (lifecycle, registry_observation) = lifecycle.begin_shutdown_v2();")
+            .unwrap();
+        let first_await = shutdown.find(".await").unwrap();
+        let foundation = shutdown
+            .find("foundation.observe_shutdown_serving_registry_v2(registry_observation);")
+            .unwrap();
+        let discord_drain = shutdown
+            .find(".begin_discord_drain_until_v1(cleanup_deadline)")
+            .unwrap();
+        assert!(sealed < first_await);
+        assert!(sealed < foundation && foundation < discord_drain);
+        assert!(!shutdown.contains("lifecycle.observe_registry_route_set_v2()"));
+        assert!(!shutdown.contains("foundation.observe_shutdown_registry_v1()"));
+    }
+
+    for required in [
+        "RuntimeClosedRecoveryShuttingDownServingOpenProcessV2",
+        "let worker = match worker.begin_shutdown(generation, RuntimeShutdownCauseV2::Explicit)",
+        "let worker = worker.begin_shutdown(RuntimeShutdownCauseV2::Explicit);",
+        "let registry_observation = registry.observe_shutdown_route_set_v2();",
+    ] {
+        assert!(include_str!("../src/closed_recovery.rs").contains(required));
+    }
+
+    for marker in [
+        "pub(super) async fn shutdown_empty_open_process_v2<G>(",
+        "pub(super) async fn shutdown_refreshing_empty_open_process_v2<G>(",
+    ] {
+        let shutdown = braced_declaration(observation, marker);
+        assert!(shutdown.contains("foundation.observe_shutdown_registry_v1()"));
+        assert!(!shutdown.contains("observe_shutdown_serving_registry_v2"));
+    }
+
+    let lost = braced_declaration(
+        observation,
+        "pub(super) async fn shutdown_process_without_lifecycle_v2(",
+    );
+    assert!(lost.contains("RuntimeLifecycleLostRegistryObservationV2::Empty"));
+    assert!(lost.contains("foundation.observe_shutdown_registry_v1()"));
+    assert!(lost.contains("RuntimeLifecycleLostRegistryObservationV2::Serving"));
+    assert!(lost.contains("foundation.observe_shutdown_serving_registry_without_lifecycle_v2()"));
+    assert!(serving_process.contains("RuntimeLifecycleLostRegistryObservationV2::Serving,"));
+}
+
+#[test]
+fn serving_certification_is_linear_supervised_bounded_and_fail_closed() {
+    let process = include_str!("../src/process.rs");
+    let serving = include_str!("../src/process/serving.rs");
+    let certification = include_str!("../src/process/serving_certification.rs");
+    assert!(process.contains("mod serving_certification;"));
+    for required in [
+        "RuntimeServingControllerEventV2::Certification",
+        "handle_certification_v2",
+        "RuntimeServingCertificationMonitorSetV2::production_v2",
+        "runtime_registry_max_slots_v2()",
+        "next_terminal_v2()",
+        "stop_all_until_v2",
+    ] {
+        assert!(serving.contains(required), "{required}");
+    }
+    let orchestration = braced_declaration(certification, "async fn execute_certification_v2(");
+    let ordered = [
+        "remove_readiness_v2",
+        "begin_close_v2",
+        "prepare_certification_freeze_v2",
+        "freeze_v2",
+        "reserve_and_prepare_certification_v2",
+        "pause_certification_barrier_b_v2",
+        "activate_certification_barrier_b_v2",
+        "resume_certification_barrier_b_v2",
+        "prepare_serving_monitor_v2",
+        "submit_certification_finalizer_v2",
+        "await_committed_certification_v2",
+        "apply_certification_v2",
+        "thaw_v2",
+        "begin_open_v2",
+        "publish_preopen_acknowledgement_v2",
+        "commit_open_v2",
+        "authorize_certification_barrier_b_completion_v2",
+        "complete_certification_barrier_b_v2",
+        "observe_exact_current_ready_attestation_v2",
+        "bind_gateway_ready_invalidation_observer_v2",
+        "start_runtime_process_serving_heartbeat_monitor_v2",
+        "complete_slot_work_v2",
+        "insert_v2",
+        "revalidate_v2",
+        "start_gateway_monitor_v2",
+        "publish_ready_v2",
+    ];
+    let mut previous = 0;
+    for required in ordered {
+        let position = orchestration.find(required).unwrap();
+        assert!(position >= previous, "{required}");
+        previous = position;
+    }
+    let prepared_registry_monitor = orchestration
+        .find("let (pending, registry_monitor) = match")
+        .unwrap();
+    let retained_registry_monitor = orchestration
+        .find("frozen.core.pending_registry_monitor = Some(registry_monitor);")
+        .unwrap();
+    let finalizer_submission = orchestration
+        .find("submit_certification_finalizer_v2")
+        .unwrap();
+    let completion_deadline = orchestration
+        .find("let completion_deadline = acceptance_deadline.min(schedule.safety_deadline);")
+        .unwrap();
+    let ingress_commit = orchestration
+        .find("let maintenance_ingress = match opening.commit_open_v2()")
+        .unwrap();
+    let completion_authorization = orchestration
+        .find("let completion = match lifecycle")
+        .unwrap();
+    let post_authorization_deadline = completion_authorization
+        + orchestration[completion_authorization..]
+            .find("if Instant::now() >= completion_deadline")
+            .unwrap();
+    let dropped_completion = orchestration.find("drop(completion);").unwrap();
+    let completed_barrier = orchestration.find("let completed_barrier = match").unwrap();
+    let taken_registry_monitor = orchestration
+        .find("let registry_monitor = match core.pending_registry_monitor.take()")
+        .unwrap();
+    let heartbeat = orchestration
+        .find("start_runtime_process_serving_heartbeat_monitor_v2")
+        .unwrap();
+    assert!(
+        prepared_registry_monitor < retained_registry_monitor
+            && retained_registry_monitor < finalizer_submission
+            && completion_deadline < ingress_commit
+            && ingress_commit < completion_authorization
+            && completion_authorization < post_authorization_deadline
+            && post_authorization_deadline < dropped_completion
+            && dropped_completion < completed_barrier
+            && completed_barrier < taken_registry_monitor
+            && taken_registry_monitor < heartbeat
+    );
+    let registry_cleanup =
+        braced_declaration(certification, "fn remove_pending_registry_monitor_v2(");
+    for required in [
+        "self.pending_registry_monitor.take()",
+        "monitor.remove_exact_serving_v2()",
+        "RuntimeServingCertificationFailureV2::Registry.transition_v2()",
+    ] {
+        assert!(registry_cleanup.contains(required), "{required}");
+    }
+    assert_eq!(
+        certification
+            .matches("let transition = self.remove_pending_registry_monitor_v2(transition);")
+            .count(),
+        5
+    );
+    assert_eq!(
+        certification
+            .matches("let transition = self.core.remove_pending_registry_monitor_v2(transition);")
+            .count(),
+        2
+    );
+    let expected_gateway_ready = orchestration
+        .find("let expected_gateway_ready = completed_barrier.gateway_v2().ready_v2().clone()")
+        .unwrap();
+    let current_gateway_ready = orchestration
+        .find("let current_gateway_ready = match lifecycle.observe_exact_current_ready_attestation_v2()")
+        .unwrap();
+    let exact_gateway_ready = orchestration
+        .find("if current_gateway_ready != expected_gateway_ready")
+        .unwrap();
+    let gateway_observer = orchestration
+        .find("bind_gateway_ready_invalidation_observer_v2(&expected_gateway_ready)")
+        .unwrap();
+    assert!(
+        completed_barrier < expected_gateway_ready
+            && expected_gateway_ready < current_gateway_ready
+            && current_gateway_ready < exact_gateway_ready
+            && exact_gateway_ready < gateway_observer
+            && gateway_observer < heartbeat
+    );
+    let post_start_deadline = heartbeat
+        + orchestration[heartbeat..]
+            .find("if Instant::now() >= completion_deadline")
+            .unwrap();
+    let slot_completion = orchestration.find("complete_slot_work_v2").unwrap();
+    assert!(heartbeat < post_start_deadline && post_start_deadline < slot_completion);
+    let final_revalidation = orchestration
+        .find("if process.revalidate_v2().await.is_err()")
+        .unwrap();
+    let final_gateway_ready = orchestration
+        .find("let final_gateway_ready = match process")
+        .unwrap();
+    let final_exact_gateway_ready = orchestration
+        .find("if final_gateway_ready != expected_gateway_ready")
+        .unwrap();
+    let final_deadline = final_exact_gateway_ready
+        + orchestration[final_exact_gateway_ready..]
+            .find("if Instant::now() >= completion_deadline")
+            .unwrap();
+    let normal_gateway_monitor = orchestration
+        .find("process.start_gateway_monitor_v2(&expected_gateway_ready)")
+        .unwrap();
+    let publish_ready = orchestration
+        .find("process.readiness.publish_ready_v2()")
+        .unwrap();
+    assert!(
+        heartbeat < final_revalidation
+            && final_revalidation < final_gateway_ready
+            && final_gateway_ready < final_exact_gateway_ready
+            && final_exact_gateway_ready < final_deadline
+            && final_deadline < normal_gateway_monitor
+            && normal_gateway_monitor < publish_ready
+    );
+    for required in [
+        "shutdown_serving_open_process_v2",
+        "shutdown_certification_frozen_serving_open_process_v2",
+        "shutdown_refreshing_serving_open_process_v2",
+        "shutdown_orphaned_admission_process_v2",
+        "shutdown_orphaned_empty_open_process_v2",
+        "shutdown_refreshing_empty_open_process_v2",
+        "shutdown_process_without_lifecycle_v2",
+        "stop_runtime_controller_before_cleanup_v2",
+        "std::future::pending::<()>().await",
+        "self.stop_all_until_v2(Instant::now()).await",
+    ] {
+        assert!(certification.contains(required), "{required}");
+    }
+    assert!(!certification.contains("start_runtime_serving_heartbeat_monitor_v2"));
 }
 
 #[test]
@@ -2877,6 +4512,7 @@ fn committed_closed_recovery_process_is_linear_retained_and_non_serving() {
     let recovery_resume = startup_stage.find(".into_recovery_resume_v2()").unwrap();
     let admission = startup_stage.find(".resume_recovery_v2()").unwrap();
     let empty_open = startup_stage.find(".enter_empty_open_v2()").unwrap();
+    let serving_open = startup_stage.find(".enter_serving_open_v2()").unwrap();
     let run = startup_stage.find(".run_until_shutdown_v2()").unwrap();
     assert!(
         pending < committed
@@ -2887,7 +4523,8 @@ fn committed_closed_recovery_process_is_linear_retained_and_non_serving() {
             && process_bound < recovery_resume
             && recovery_resume < admission
             && admission < empty_open
-            && empty_open < run
+            && empty_open < serving_open
+            && serving_open < run
     );
     assert!(!startup_stage.contains("empty_open\n        .shutdown()"));
     assert!(!library.contains("RuntimeClosedRecoveryProcessV2"));
@@ -4371,7 +6008,7 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
         .find("execute_owned_pending_drain_stage_v3(")
         .unwrap();
     let pending_gateway_completion = pending_execution
-        .rfind(".complete_startup_recovery_execution_v2(completed)")
+        .rfind("complete_pending_drain_recovery_owned_v3(")
         .unwrap();
     assert!(
         pending_begin < pending_select
@@ -4389,8 +6026,11 @@ fn supported_startup_recovery_execution_is_interruptible_one_way_and_forces_fres
         pending_execution
             .matches("execute_owned_pending_drain_stage_v3(")
             .count(),
-        4
+        5
     );
+    let completion_helper =
+        braced_declaration(execution, "fn complete_pending_drain_recovery_owned_v3(");
+    assert!(completion_helper.contains(".complete_startup_recovery_execution_v2(completed)"));
     let registration =
         braced_declaration(finalizer, "pub(crate) fn register_pending_drain_job_v3<");
     let register = registration.find(".try_register(").unwrap();
@@ -4722,11 +6362,13 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         .find(|(path, _)| path == Path::new("src/registry.rs"))
         .map(|(_, source)| source.as_str())
         .unwrap();
-    let production = registry.split("#[cfg(test)]").next().unwrap();
+    let production = source_before_test_module(registry);
 
     for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
         if path != Path::new("src/registry.rs")
+            && path != Path::new("src/registry_staging_tests.rs")
             && path != Path::new("src/registry_succession_tests.rs")
+            && path != Path::new("src/runtime_controller.rs")
         {
             assert!(
                 !contains_identifier(source, "automation_runtime_registry"),
@@ -4744,6 +6386,26 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
                 );
             }
         }
+    }
+    let runtime_controller = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/runtime_controller.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
+    assert!(runtime_controller.contains("use automation_runtime_registry::{"));
+    assert!(runtime_controller.contains("ExactServingRouteError, ExactServingRouteV1"));
+    assert!(runtime_controller.contains("SlotLifecycleV1, SlotRouteWitnessV1"));
+    for forbidden in [
+        "ServingSlotRegistryV1",
+        "SlotMutationTokenV1",
+        "SlotAdmissionStateV2",
+        "RegistryRecoveryObservationGuardV2",
+        "RegistryEmptyRecoveryCursorV2",
+    ] {
+        assert!(
+            !contains_identifier(runtime_controller, forbidden),
+            "{forbidden}"
+        );
     }
     for required in [
         "const REGISTRY_MAX_SLOTS: NonZeroU32 = NonZeroU32::new(4_096).unwrap();",
@@ -4765,6 +6427,20 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "pub(crate) fn revalidate_empty_projection_v2(",
         "_section: &RuntimeRecoveryPendingGatewaySectionV2<'_>",
         "fn revalidate_empty_projection_unordered_v2(",
+        "pub(crate) struct RuntimeRegistryPreparedServingTransitionV2",
+        "pub(crate) struct RuntimeRegistryServingBindingV2",
+        "pub(crate) struct RuntimeRegistryServingTransitionFailureV2",
+        "pub(crate) fn prepare_serving_transition_v2(",
+        "route_set_epoch: &RuntimeRouteSetEpochV2",
+        "pub(crate) fn observe_route_set_v2(",
+        "pub(crate) fn commit_v2(",
+        "pub(crate) fn cancel_v2(self) -> RuntimeRegistryEmptyRecoveryBindingV2",
+        "pub(crate) fn into_binding_v2(self) -> RuntimeRegistryEmptyRecoveryBindingV2",
+        "accept_runtime_route_set_observation_v2(",
+        "RuntimeRouteSetObservationInputV2 {",
+        "RuntimeRegistryPreparedServingTransitionV2(<redacted>)",
+        "RuntimeRegistryServingBindingV2(<redacted>)",
+        "RuntimeRegistryServingTransitionFailureV2(<redacted>)",
         "RuntimeRegistryRecoveryObservationInputV2 {",
         "observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(",
         "retained_slot_count: observation.retained_slot_count()",
@@ -4819,6 +6495,9 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "RuntimeRegistryRecoveryGuardV1",
         "RuntimeLockedRegistryEmptyEvidenceV2",
         "RuntimeRegistryEmptyRecoveryBindingV2",
+        "RuntimeRegistryPreparedServingTransitionV2",
+        "RuntimeRegistryServingBindingV2",
+        "RuntimeRegistryServingTransitionFailureV2",
         "RuntimeRegistryPendingDrainSealBindingV2",
         "RuntimeRegistryPendingDrainSuccessionSealBindingV3",
     ] {
@@ -4852,6 +6531,29 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "    process_instance_id: ProcessInstanceId,\n",
         "    registry: ServingSlotRegistryV1,\n",
         "    cursor: RegistryEmptyRecoveryCursorV2,\n",
+        "}"
+    )));
+    assert!(production.contains(concat!(
+        "pub(crate) struct RuntimeRegistryPreparedServingTransitionV2 {\n",
+        "    binding: RuntimeRegistryEmptyRecoveryBindingV2,\n",
+        "    initial_registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,\n",
+        "    initial_retained_slot_count: u64,\n",
+        "    initial_retained_empty_tombstone_count: u64,\n",
+        "}"
+    )));
+    assert!(production.contains(concat!(
+        "pub(crate) struct RuntimeRegistryServingBindingV2 {\n",
+        "    process_instance_id: ProcessInstanceId,\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "    initial_registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,\n",
+        "    initial_retained_slot_count: u64,\n",
+        "    initial_retained_empty_tombstone_count: u64,\n",
+        "}"
+    )));
+    assert!(production.contains(concat!(
+        "pub(crate) struct RuntimeRegistryServingTransitionFailureV2 {\n",
+        "    binding: RuntimeRegistryEmptyRecoveryBindingV2,\n",
+        "    error: RuntimeRegistryRecoveryObservationErrorV1,\n",
         "}"
     )));
     assert_eq!(
@@ -4932,6 +6634,25 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         1
     );
     assert!(!production.contains(".unseal_drain_claim_v2("));
+    let serving_binding = braced_declaration(production, "impl RuntimeRegistryServingBindingV2");
+    assert_eq!(
+        serving_binding
+            .matches("pub(crate) fn observe_route_set_v2(")
+            .count(),
+        1
+    );
+    for forbidden in [
+        "pub(crate) fn install(",
+        "pub(crate) fn activate",
+        "pub(crate) fn begin_drain",
+        "pub(crate) fn remove",
+        "pub(crate) fn admit",
+        "pub(crate) fn registry",
+        "pub(crate) fn into_registry",
+        "pub(crate) fn cursor",
+    ] {
+        assert!(!serving_binding.contains(forbidden), "{forbidden}");
+    }
     for forbidden in [
         "pub fn cursor",
         "pub fn registry",
@@ -4953,6 +6674,9 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
             "RegistryEmptyRecoveryCursorV2",
             "RuntimeRegistryRecoveryGuardV1",
             "RuntimeRegistryEmptyRecoveryBindingV2",
+            "RuntimeRegistryPreparedServingTransitionV2",
+            "RuntimeRegistryServingBindingV2",
+            "RuntimeRegistryServingTransitionFailureV2",
         ] {
             assert!(
                 !contains_identifier(header, forbidden),
@@ -4969,10 +6693,425 @@ fn registry_adapter_is_non_authorizing_fixed_and_confined() {
         "RuntimeRegistryRecoveryGuardV1",
         "RuntimeLockedRegistryEmptyEvidenceV2",
         "RuntimeRegistryEmptyRecoveryBindingV2",
+        "RuntimeRegistryPreparedServingTransitionV2",
+        "RuntimeRegistryServingBindingV2",
+        "RuntimeRegistryServingTransitionFailureV2",
         "RuntimeRegistryPendingDrainSealBindingV2",
         "RuntimeRegistryPendingDrainSuccessionSealBindingV3",
     ] {
         assert!(!library.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn staged_registry_port_is_process_bound_owned_and_fail_closed() {
+    let registry = source_before_test_module(include_str!("../src/registry.rs"));
+    let closed_recovery = include_str!("../src/closed_recovery.rs");
+
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryStagingPortV2 {\n",
+        "    process_instance_id: ProcessInstanceId,\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "}"
+    )));
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryStagedRouteV2 {\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "    identity: RuntimeProcessIdentityV1,\n",
+        "    token: Option<SlotMutationTokenV1>,\n",
+        "    emergency: RuntimeRegistryEmergencyTriggerV2,\n",
+        "}"
+    )));
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryStagedInstallEvidenceV2 {\n",
+        "    route: SlotRouteWitnessV1,\n",
+        "    active_interactions: u32,\n",
+        "    admission_generation: NonZeroU64,\n",
+        "    slot_observation_sequence: NonZeroU64,\n",
+        "    registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,\n",
+        "}"
+    )));
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryStagedInstallV2 {\n",
+        "    outcome: RuntimeRegistryStagedInstallOutcomeV2,\n",
+        "    evidence: RuntimeRegistryStagedInstallEvidenceV2,\n",
+        "    authority: RuntimeRegistryStagedRouteV2,\n",
+        "}"
+    )));
+    assert!(contains_identifier(
+        declaration_attribute_block(registry, "RuntimeRegistryStagingPortV2"),
+        "Clone"
+    ));
+    assert!(!contains_identifier(
+        declaration_attribute_block(registry, "RuntimeRegistryStagedRouteV2"),
+        "Clone"
+    ));
+    assert!(!implements_trait(
+        registry,
+        "RuntimeRegistryStagedRouteV2",
+        "Clone"
+    ));
+    assert!(!contains_identifier(
+        declaration_attribute_block(registry, "RuntimeRegistryStagedInstallV2"),
+        "Clone"
+    ));
+    assert!(!implements_trait(
+        registry,
+        "RuntimeRegistryStagedInstallV2",
+        "Clone"
+    ));
+    assert!(!registry.contains("RuntimeRouteWitnessV2"));
+
+    let binding = braced_declaration(registry, "impl RuntimeRegistryServingBindingV2");
+    let factory = braced_declaration(
+        binding,
+        "pub(crate) fn staging_port_v2(&self) -> RuntimeRegistryStagingPortV2",
+    );
+    assert!(factory.contains("process_instance_id: self.process_instance_id.clone()"));
+    assert!(factory.contains("registry: self.registry.clone()"));
+    assert!(!binding.contains("install_staged_route_v2"));
+
+    let port = braced_declaration(registry, "impl RuntimeRegistryStagingPortV2");
+    let install = braced_declaration(port, "pub(crate) fn install_staged_route_v2(");
+    let process_match = install
+        .find("route.identity().process_instance_id")
+        .unwrap();
+    let registry_install = install.find(".install(key, route, fencing_token)").unwrap();
+    let lifecycle = install.find("SlotInstallOutcomeV1::Staged").unwrap();
+    let authority = install
+        .find("let staged = RuntimeRegistryStagedRouteV2")
+        .unwrap();
+    let witness = install.find("self.registry.route_witness(token)").unwrap();
+    let atomic = install
+        .find("self.registry.atomic_observation_v2(token.key())")
+        .unwrap();
+    let global = install
+        .find("self.registry.recovery_observation_v2()")
+        .unwrap();
+    let complete = install.find("complete_staged_install_v2(").unwrap();
+    assert!(
+        process_match < registry_install
+            && registry_install < lifecycle
+            && lifecycle < authority
+            && authority < witness
+            && witness < atomic
+            && atomic < global
+            && global < complete
+    );
+    assert!(install.contains(concat!(
+        "SlotInstallOutcomeV1::Staged => ",
+        "RuntimeRegistryStagedInstallOutcomeV2::Installed"
+    )));
+    assert!(install.contains(concat!(
+        "SlotInstallOutcomeV1::AlreadyStaged => {\n",
+        "                RuntimeRegistryStagedInstallOutcomeV2::ExactReplay\n",
+        "            }"
+    )));
+    assert!(install
+        .contains(") -> Result<RuntimeRegistryStagedInstallV2, RuntimeRegistryStagingErrorV2>"));
+    assert!(install.contains(concat!(
+        "SlotInstallOutcomeV1::AlreadyServing | SlotInstallOutcomeV1::AlreadyDraining => {\n",
+        "                return Err(RuntimeRegistryStagingErrorV2::UnexpectedLifecycle);\n",
+        "            }"
+    )));
+    let completion = braced_declaration(registry, "fn complete_staged_install_v2(");
+    for required in [
+        "staged: RuntimeRegistryStagedRouteV2",
+        "witness: Result<SlotRouteWitnessV1, ServingSlotRegistryError>",
+        "atomic: Result<Option<SlotAtomicObservationV2>, ServingSlotRegistryError>",
+        "registry_observation: Result<RegistryRecoveryObservationV2, ServingSlotRegistryError>",
+        "validate_staged_evidence_v2(&staged, witness, atomic, registry_observation)?",
+        "authority: staged",
+    ] {
+        assert!(completion.contains(required), "{required}");
+    }
+    let validation = braced_declaration(registry, "fn validate_staged_evidence_v2(");
+    for required in [
+        "witness.identity != staged.identity",
+        "witness.fencing_token != token.fencing_token()",
+        "witness.lifecycle != SlotLifecycleV1::Staged",
+        "let selected_route_is_valid = match atomic.route.as_ref()",
+        "Some(selected) if selected == &witness",
+        "atomic.admission_state == SlotAdmissionStateV2::Staged",
+        "atomic.active_interactions == 0",
+        "SlotLifecycleV1::Serving => atomic.admission_state == SlotAdmissionStateV2::Serving",
+        "SlotLifecycleV1::Draining => atomic.admission_state == SlotAdmissionStateV2::Draining",
+        "|| !selected_route_is_valid",
+        "registry_observation.registry_failed_closed()",
+        "registry_observation.failed_closed_slot_count() != 0",
+        "registry_observation.staged_route_count() == 0",
+        "registry_observation.observation_sequence().get() < atomic.observation_sequence.get()",
+        "staged.ensure_staged_v2()?",
+        "route: witness",
+    ] {
+        assert!(validation.contains(required), "{required}");
+    }
+    for forbidden in ["pub(crate) fn registry", "pub(crate) fn into_registry"] {
+        assert!(!port.contains(forbidden), "{forbidden}");
+    }
+
+    let staged = braced_declaration(registry, "impl RuntimeRegistryStagedRouteV2");
+    let advance = braced_declaration(staged, "pub(crate) fn advance_authority_v2(");
+    let advance_registry = advance.find(".advance_authority(").unwrap();
+    let retain_successor = advance.find("self.token = Some(successor)").unwrap();
+    let refresh_evidence = advance.find("self.observe_staged_evidence_v2()").unwrap();
+    assert!(advance_registry < retain_successor && retain_successor < refresh_evidence);
+    assert!(advance.contains(
+        ") -> Result<RuntimeRegistryStagedInstallEvidenceV2, RuntimeRegistryStagingErrorV2>"
+    ));
+    let explicit = braced_declaration(
+        staged,
+        "pub(crate) fn remove_v2(mut self) -> Result<(), RuntimeRegistryStagingErrorV2>",
+    );
+    assert!(explicit.contains("let result = self.remove_inner_v2()"));
+    assert!(explicit.contains("if result.is_err()"));
+    assert!(explicit.contains("self.emergency.trip_v2()"));
+    let cleanup = braced_declaration(
+        staged,
+        "fn remove_inner_v2(&mut self) -> Result<(), RuntimeRegistryStagingErrorV2>",
+    );
+    assert!(cleanup.contains("SlotRemovalOutcomeV1::RemovedStaged => Ok(())"));
+    assert!(cleanup.contains("SlotRemovalOutcomeV1::RemovedDraining"));
+    assert!(cleanup.contains("RuntimeRegistryStagingErrorV2::UnexpectedLifecycle"));
+    let drop_impl = braced_declaration(registry, "impl Drop for RuntimeRegistryStagedRouteV2");
+    assert!(drop_impl.contains("self.token.is_some() && self.remove_inner_v2().is_err()"));
+    assert!(drop_impl.contains("self.emergency.trip_v2()"));
+
+    let lifecycle = braced_declaration(
+        closed_recovery,
+        "impl RuntimeClosedRecoverySupervisedServingOpenProcessV2",
+    );
+    let getter = braced_declaration(
+        lifecycle,
+        "pub(crate) fn staging_port_v2(&self) -> RuntimeRegistryStagingPortV2",
+    );
+    assert!(getter.contains("self.registry.staging_port_v2()"));
+    assert!(!lifecycle.contains("install_staged_route_v2"));
+    for forbidden in [
+        "ExactServingRouteV1",
+        "SlotMutationTokenV1",
+        "ServingSlotRegistryV1",
+    ] {
+        assert!(!getter.contains(forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn barrier_b_registry_activation_is_linear_exact_and_token_sealed() {
+    let registry = source_before_test_module(include_str!("../src/registry.rs"));
+
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryBarrierBServingAuthorityV2 {\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "    token: SlotMutationTokenV1,\n",
+        "    route: SlotRouteWitnessV1,\n",
+        "    activation_sequence: NonZeroU64,\n",
+        "    emergency: RuntimeRegistryEmergencyTriggerV2,\n",
+        "    armed: bool,\n",
+        "}"
+    )));
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryBarrierBServingCompletionWitnessV2 {\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "    token: SlotMutationTokenV1,\n",
+        "    route: SlotRouteWitnessV1,\n",
+        "    activation_sequence: NonZeroU64,\n",
+        "    emergency: RuntimeRegistryEmergencyTriggerV2,\n",
+        "    completion_liveness: Arc<Mutex<bool>>,\n",
+        "}"
+    )));
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryBarrierBServingMonitorAuthorityV2 {\n",
+        "    registry: ServingSlotRegistryV1,\n",
+        "    token: SlotMutationTokenV1,\n",
+        "    route: SlotRouteWitnessV1,\n",
+        "    activation_sequence: NonZeroU64,\n",
+        "    emergency: RuntimeRegistryEmergencyTriggerV2,\n",
+        "    completion_liveness: Arc<Mutex<bool>>,\n",
+        "    armed: bool,\n",
+        "}"
+    )));
+    assert!(registry.contains(concat!(
+        "pub(crate) struct RuntimeRegistryBarrierBActivationEvidenceV2 {\n",
+        "    outcome: RuntimeRegistryBarrierBActivationOutcomeV2,\n",
+        "    route: SlotRouteWitnessV1,\n",
+        "    activation_sequence: NonZeroU64,\n",
+        "    active_interactions: u32,\n",
+        "    admission_generation: NonZeroU64,\n",
+        "    slot_observation_sequence: NonZeroU64,\n",
+        "}"
+    )));
+    for authority in [
+        "RuntimeRegistryBarrierBActivationV2",
+        "RuntimeRegistryBarrierBServingAuthorityV2",
+        "RuntimeRegistryBarrierBServingMonitorAuthorityV2",
+        "RuntimeRegistryBarrierBServingCompletionWitnessV2",
+        "RuntimeRegistryBarrierBServingCompletionGuardV2",
+    ] {
+        assert!(!contains_identifier(
+            declaration_attribute_block(registry, authority),
+            "Clone"
+        ));
+        assert!(!implements_trait(registry, authority, "Clone"));
+    }
+    let replacement = braced_declaration(registry, "impl RuntimeRegistryReplacementRouteV2");
+    let activate = braced_declaration(replacement, "pub(crate) fn activate_barrier_b_v2(");
+    for required in [
+        "self,",
+        "let expected_identity = self.identity",
+        ".state\n            .into_inner()",
+        "RuntimeRegistryPredecessorStateV2::Removed { .. }",
+        "state.staged.identity != expected_identity",
+        "activate_barrier_b_staged_route_v2(state.staged)",
+    ] {
+        assert!(activate.contains(required), "{required}");
+    }
+    let activation = braced_declaration(registry, "fn activate_barrier_b_staged_route_v2(");
+    let candidate = activation
+        .find("validate_barrier_b_activation_candidate_v2")
+        .unwrap();
+    let registry_activation = activation
+        .find(".activate_with_sequence_v2(token, &staged.identity)")
+        .unwrap();
+    let exact_route = activation.find("let exact_route = staged").unwrap();
+    let authority_route = activation
+        .find("let route = evidence.route.clone()")
+        .unwrap();
+    let take_token = activation.find(".token\n        .take()").unwrap();
+    assert!(
+        candidate < registry_activation
+            && registry_activation < exact_route
+            && exact_route < authority_route
+            && authority_route < take_token
+    );
+    for required in [
+        "SlotActivationOutcomeV1::Activated",
+        "SlotActivationOutcomeV1::AlreadyServing",
+        "route.identity != staged_route.identity",
+        "route.fencing_token != staged_route.fencing_token",
+        "route.incarnation != staged_route.incarnation",
+        "route.lifecycle != SlotLifecycleV1::Serving",
+        "atomic.admission_state != SlotAdmissionStateV2::Serving",
+        "exact_route != *route || exact_atomic != *atomic",
+        "let registry = staged.registry.clone()",
+        "let route = evidence.route.clone()",
+        "let activation_sequence = evidence.activation_sequence",
+        "let emergency = staged.emergency.clone()",
+        "token,",
+    ] {
+        assert!(activation.contains(required), "{required}");
+    }
+    let authority = braced_declaration(registry, "impl RuntimeRegistryBarrierBServingAuthorityV2");
+    for required in [
+        "pub(crate) fn ensure_exact_serving_v2(",
+        "pub(crate) fn remove_exact_serving_v2(",
+        "pub(crate) fn into_serving_monitor_v2(",
+        "pub(crate) fn into_serving_monitor_with_completion_v2(",
+        "RuntimeRegistryBarrierBServingMonitorAuthorityV2 {",
+        "RuntimeRegistryBarrierBServingCompletionWitnessV2 {",
+        "let completion_liveness = Arc::new(Mutex::new(true))",
+        "self.armed = false",
+    ] {
+        assert!(authority.contains(required), "{required}");
+    }
+    let monitor = braced_declaration(
+        registry,
+        "impl RuntimeRegistryBarrierBServingMonitorAuthorityV2",
+    );
+    for required in [
+        "pub(crate) fn observe_exact_serving_v2(",
+        "pub(crate) fn remove_exact_serving_v2(",
+        "observe_exact_barrier_b_serving_v2(",
+        "remove_exact_barrier_b_serving_v2(",
+        "close_barrier_b_serving_completion_v2(",
+        "self.armed = false",
+    ] {
+        assert!(monitor.contains(required), "{required}");
+    }
+    for sealed in [authority, monitor] {
+        for forbidden in [
+            "fn token",
+            "fn into_token",
+            "-> &SlotMutationTokenV1",
+            "-> SlotMutationTokenV1",
+            "fn registry",
+            "fn into_registry",
+            "-> &ServingSlotRegistryV1",
+            "-> ServingSlotRegistryV1",
+        ] {
+            assert!(!sealed.contains(forbidden), "{forbidden}");
+        }
+    }
+    let observe = braced_declaration(registry, "fn observe_exact_barrier_b_serving_v2(");
+    for required in [
+        ".route_witness(token)",
+        ".atomic_observation_v2(token.key())",
+        "route != *expected_route",
+        "route.lifecycle != SlotLifecycleV1::Serving",
+        "atomic.route.as_ref() != Some(expected_route)",
+        "atomic.admission_state != SlotAdmissionStateV2::Serving",
+        ".activate_with_sequence_v2(token, &expected_route.identity)",
+        "activation.outcome() != SlotActivationOutcomeV1::AlreadyServing",
+        "activation.route() != expected_route",
+        "activation.activation_sequence() != expected_activation_sequence",
+        "activation.observation() != &atomic",
+    ] {
+        assert!(observe.contains(required), "{required}");
+    }
+    let removal = braced_declaration(registry, "fn remove_exact_barrier_b_serving_v2(");
+    let exact_observation = removal.find("observe_exact_barrier_b_serving_v2(").unwrap();
+    let begin_drain = removal.find(".begin_drain(token)").unwrap();
+    let active_check = removal.find("if active != 0").unwrap();
+    let draining_observation = removal.find("let draining_route = registry").unwrap();
+    let remove = removal.find(".remove(token)").unwrap();
+    let removed_observation = removal.find("let removed_atomic = registry").unwrap();
+    assert!(
+        exact_observation < begin_drain
+            && begin_drain < active_check
+            && active_check < draining_observation
+            && draining_observation < remove
+            && remove < removed_observation
+    );
+    for required in [
+        "SlotDrainOutcomeV1::DrainStarted",
+        "SlotDrainOutcomeV1::AlreadyDraining",
+        "RuntimeRegistryBarrierBServingErrorV2::ExactServingLost",
+        "expected_draining_route.lifecycle = SlotLifecycleV1::Draining",
+        "draining_atomic.route.as_ref() != Some(&expected_draining_route)",
+        "draining_atomic.admission_state != SlotAdmissionStateV2::Draining",
+        "removal != SlotRemovalOutcomeV1::RemovedDraining",
+        "removed_atomic.route.is_some()",
+        "removed_atomic.admission_state != SlotAdmissionStateV2::Empty",
+    ] {
+        assert!(removal.contains(required), "{required}");
+    }
+    let authority_drop = braced_declaration(
+        registry,
+        "impl Drop for RuntimeRegistryBarrierBServingAuthorityV2",
+    );
+    assert!(authority_drop.contains("if self.armed"));
+    assert!(authority_drop.contains("self.emergency.trip_v2()"));
+    let monitor_drop = braced_declaration(
+        registry,
+        "impl Drop for RuntimeRegistryBarrierBServingMonitorAuthorityV2",
+    );
+    assert!(monitor_drop.contains("if self.armed"));
+    assert!(monitor_drop.contains("close_barrier_b_serving_completion_v2("));
+    assert!(monitor_drop.contains("remove_exact_barrier_b_serving_v2("));
+    assert!(monitor_drop.contains(".is_err()"));
+    assert!(monitor_drop.contains("self.emergency.trip_v2()"));
+    for redacted in [
+        "RuntimeRegistryBarrierBActivationV2",
+        "RuntimeRegistryBarrierBServingAuthorityV2",
+        "RuntimeRegistryBarrierBServingMonitorAuthorityV2",
+        "RuntimeRegistryBarrierBServingCompletionWitnessV2",
+        "RuntimeRegistryBarrierBActivationEvidenceV2",
+        "RuntimeRegistryBarrierBExactServingObservationV2",
+        "RuntimeRegistryBarrierBRemovalEvidenceV2",
+    ] {
+        let debug = braced_declaration(registry, &format!("impl Debug for {redacted}"));
+        assert!(debug.contains(&format!("{redacted}(<redacted>)")));
+        assert!(!debug.contains("self.token"));
     }
 }
 
@@ -5397,7 +7536,7 @@ fn secret_resolution_remains_bounded_redacted_and_adapter_free() {
         resolver
             .matches("run_runtime_startup_sync_stage_v1(")
             .count(),
-        2
+        3
     );
     for capability in [
         "DatabaseCapabilityV1::Convergence",
@@ -5456,6 +7595,7 @@ fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_en
     let recovery_resume = staging.find(".into_recovery_resume_v2()").unwrap();
     let admission = staging.find(".resume_recovery_v2()").unwrap();
     let empty_open = staging.find(".enter_empty_open_v2()").unwrap();
+    let serving_open = staging.find(".enter_serving_open_v2()").unwrap();
     let run = staging.find(".run_until_shutdown_v2()").unwrap();
     let outcome = staging.find("Ok(RuntimeProcessStagingOutcomeV1").unwrap();
     assert!(
@@ -5475,7 +7615,8 @@ fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_en
             && process_bound < recovery_resume
             && recovery_resume < admission
             && admission < empty_open
-            && empty_open < run
+            && empty_open < serving_open
+            && serving_open < run
             && owner < run
             && run < outcome
     );
@@ -5503,6 +7644,7 @@ fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_en
         ".into_recovery_resume_v2()",
         ".resume_recovery_v2()",
         ".enter_empty_open_v2()",
+        ".enter_serving_open_v2()",
         ".run_until_shutdown_v2()",
     ] {
         assert_eq!(staging.matches(operation).count(), 1, "{operation}");
@@ -5546,6 +7688,7 @@ fn process_startup_is_the_single_ordered_bounded_recovery_fixed_point_staging_en
         "pub const fn code(self) -> &'static str",
         "pub const fn context(self) -> Option<&'static str>",
         "pub const fn configuration_class(self) -> bool",
+        "pub const fn restart_class(self) -> bool",
     ] {
         assert!(production.contains(required), "{required}");
     }
@@ -5631,6 +7774,12 @@ fn executable_delegates_once_without_raw_startup_or_runtime_authority() {
     assert!(main.contains("runtime_process_clean_shutdown"));
     assert!(main.contains("Self::CleanShutdown => ExitCode::SUCCESS"));
     assert!(main.contains("Self::Failed(error) if error.cleanup_class()"));
+    assert!(main.contains("Self::Failed(error) if error.restart_class()"));
+    assert!(main.contains("ExitCode::from(75)"));
+    assert!(
+        main.find("Self::Failed(error) if error.cleanup_class()")
+            < main.find("Self::Failed(error) if error.restart_class()")
+    );
     assert_eq!(
         entry
             .matches("run_runtime_process_staging_from_environment_v1()")
@@ -5945,6 +8094,12 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
     let cleanup = composer
         .find(".close_until(startup_budget.cleanup_deadline())")
         .unwrap();
+    let interaction_dispatch = composer
+        .find(".compose_interaction_dispatch_port_v1(")
+        .unwrap();
+    let finalizer = composer
+        .find("RuntimeProcessMutationFinalizerSupervisorV3::start(")
+        .unwrap();
 
     assert!(
         deadline_before_process_identity < process_identity
@@ -5959,6 +8114,8 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
             && closed < deadline_after_closed_result
             && deadline_after_closed_result < closed_result
             && closed_result < cleanup
+            && cleanup < interaction_dispatch
+            && interaction_dispatch < finalizer
     );
     for required in [
         "pub(crate) struct RuntimeProcessFoundationV1",
@@ -5970,6 +8127,10 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         "build_revision,",
         "process_instance_id: ProcessInstanceId,",
         "controller_id: ControllerId,",
+        "interaction_dispatch_port: RuntimeInteractionDispatchDatabasePortV1,",
+        "pub(super) fn interaction_dispatch_port_v1(",
+        "self.interaction_dispatch_port.clone()",
+        "secrets.discord_bot_token()",
         "compose_runtime_registry_bootstrap_v1(process_instance_id.clone(), gateway_config)",
         "compose_runtime_gateway_bootstrap_v1(",
         "RuntimeProcessFoundationV1(<redacted>)",
@@ -5983,6 +8144,8 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         "pub(super) async fn begin_shutdown_v1(",
         "pub(super) async fn finish_shutdown_v1(",
         "RuntimeProcessRootSupervisorV1",
+        "let os_pid = std::process::id();",
+        "RuntimeProcessRootSupervisorV1::start(\n        config.health_bind_addr(),\n        os_pid,\n        process_instance_id.as_str(),",
         "mutation_finalizer:",
         "shutdown_health_until(cleanup_deadline)",
         "shutdown.close_until(cleanup_deadline).await",
@@ -5996,7 +8159,13 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         composer
             .matches("if !startup_budget.operation_is_open()")
             .count(),
-        6
+        7
+    );
+    assert_eq!(
+        composer
+            .matches(".compose_interaction_dispatch_port_v1(")
+            .count(),
+        1
     );
     assert_eq!(
         composer
@@ -6077,7 +8246,7 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
         .find("let shutdown = databases.shutdown()")
         .unwrap();
     let closed_components = shutdown
-        .find("drop((gateway, registry, databases))")
+        .find("drop((gateway, registry, interaction_dispatch_port, databases))")
         .unwrap();
     let close = shutdown
         .find("shutdown.close_until(cleanup_deadline).await")
@@ -6133,4 +8302,190 @@ fn process_foundation_composes_closed_components_in_order_and_cleans_up_failure(
             );
         }
     }
+}
+
+#[test]
+fn ordinary_discord_barrier_consumes_actor_and_lifecycle_bound_authority() {
+    let gateway = include_str!("../src/gateway.rs");
+    let discord = include_str!("../src/discord.rs");
+    let closed = include_str!("../src/closed_recovery.rs");
+    let observation = include_str!("../src/process/observation.rs");
+    let serving = include_str!("../src/process/serving.rs");
+    let completion = braced_declaration(gateway, "pub(crate) fn complete_ordinary_barrier_v3(");
+    assert!(completion.contains("authority: RuntimeServingOpenBarrierCompletionAuthorityV3"));
+    assert!(!completion.contains("RuntimeIngressOpenAcknowledgementReceiptV2"));
+    assert!(!completion.contains("RuntimeAcceptedIngressOpenAcknowledgementV2"));
+    let acknowledgement = completion.find("authority.acknowledgement_v3()").unwrap();
+    let generation = completion
+        .find("authority.coordinator_generation_v3()")
+        .unwrap();
+    let first_ready = completion
+        .find("observe_exact_resumed_ordinary_barrier_ready_v3(&evidence)")
+        .unwrap();
+    let authority_ready = completion.find("authority.gateway_ready_v3()").unwrap();
+    let second_ready = completion
+        .rfind("observe_exact_resumed_ordinary_barrier_ready_v3(&evidence)")
+        .unwrap();
+    let deactivate = completion
+        .find("RuntimeDiscordOrdinaryResumeAuthorizationV3::Inactive")
+        .unwrap();
+    let clear = completion
+        .find("complete_ordinary_barrier_acknowledgement_v3(&evidence)")
+        .unwrap();
+    assert!(
+        acknowledgement < generation
+            && generation < first_ready
+            && first_ready < authority_ready
+            && authority_ready < second_ready
+            && second_ready < deactivate
+            && deactivate < clear
+    );
+    for forbidden in [
+        "complete_ordinary_barrier_after_ingress_acknowledgement_v3",
+        "complete_ordinary_barrier_after_observed_ingress_acknowledgement_v3",
+    ] {
+        assert!(!gateway.contains(forbidden), "{forbidden}");
+    }
+    let resume = braced_declaration(gateway, "async fn resume_ordinary_discord_admission_v3(");
+    let authorize = resume
+        .find("RuntimeDiscordOrdinaryResumeAuthorizationV3::Authorized")
+        .unwrap();
+    let raw_resume = resume.find("control.resume_admission(&token)").unwrap();
+    let lifecycle = resume.find("control.next_lifecycle()").unwrap();
+    let actor = resume
+        .find("observe_exact_ordinary_resume_actor_v3(")
+        .unwrap();
+    let ready = resume
+        .find("control.issue_ready_lease(reservation.expected.epoch())")
+        .unwrap();
+    let resumed = resume
+        .find("coordinator.complete_ordinary_barrier_resume_v3(&reservation)")
+        .unwrap();
+    assert!(
+        authorize < raw_resume
+            && raw_resume < lifecycle
+            && lifecycle < actor
+            && actor < ready
+            && ready < resumed
+    );
+    let actor_acknowledgement = discord
+        .find("ordinary_resume_actor_observation.send_replace(observation)")
+        .unwrap();
+    assert!(discord[actor_acknowledgement..].contains("wait_for_lifecycle_drain_v1("));
+    for name in [
+        "RuntimeDiscordOrdinaryBarrierReservationV3",
+        "RuntimeDiscordOrdinaryBarrierResumeEvidenceV3",
+    ] {
+        let attributes = declaration_attribute_block(gateway, name);
+        for forbidden in ["Clone", "Copy"] {
+            assert!(
+                !contains_identifier(attributes, forbidden),
+                "{name}: {forbidden}"
+            );
+            assert!(
+                !implements_trait(gateway, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
+    }
+    let exact_reobservation = braced_declaration(
+        observation,
+        "RuntimeExactIngressAcknowledgementReobservationV3",
+    );
+    assert!(exact_reobservation.contains(
+        "receipt: automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2"
+    ));
+    assert_eq!(
+        observation
+            .matches("Ok(RuntimeExactIngressAcknowledgementReobservationV3 {")
+            .count(),
+        1
+    );
+    let exact_attributes = declaration_attribute_block(
+        observation,
+        "RuntimeExactIngressAcknowledgementReobservationV3",
+    );
+    for forbidden in ["Clone", "Copy"] {
+        assert!(!contains_identifier(exact_attributes, forbidden));
+        assert!(!implements_trait(
+            observation,
+            "RuntimeExactIngressAcknowledgementReobservationV3",
+            forbidden,
+        ));
+    }
+    let authorize = braced_declaration(
+        closed,
+        "pub(crate) async fn authorize_ordinary_barrier_completion_v3(",
+    );
+    let exact_ready = authorize
+        .find("observe_exact_resumed_ordinary_barrier_ready_v3(&evidence)")
+        .unwrap();
+    let worker_authority = authorize
+        .find("authorize_ordinary_barrier_completion_v3(final_observation.receipt_v3())")
+        .unwrap();
+    let exact_receipt = authorize
+        .find("worker.accepts_final_reobservation_v3(final_observation.receipt_v3())")
+        .unwrap();
+    let owner_registry = authorize
+        .find("self.revalidate_owner_and_registry_v2().await")
+        .unwrap();
+    let stable_ready = authorize
+        .rfind("observe_exact_resumed_ordinary_barrier_ready_v3(&evidence)")
+        .unwrap();
+    assert!(
+        exact_ready < worker_authority
+            && worker_authority < exact_receipt
+            && exact_receipt < owner_registry
+            && owner_registry < stable_ready
+    );
+    let certification_authorize = braced_declaration(
+        closed,
+        "pub(crate) async fn authorize_certification_barrier_b_completion_v2(",
+    );
+    let certification_exact_ready = certification_authorize
+        .find("observe_exact_resumed_ordinary_barrier_ready_v3(pending.resume_evidence_v3())")
+        .unwrap();
+    let certification_worker_authority = certification_authorize
+        .find("authorize_ordinary_barrier_completion_v3(final_observation.receipt_v3())")
+        .unwrap();
+    let certification_exact_receipt = certification_authorize
+        .find("worker.accepts_final_reobservation_v3(final_observation.receipt_v3())")
+        .unwrap();
+    let certification_owner_registry = certification_authorize
+        .find("self.revalidate_owner_and_registry_v2().await")
+        .unwrap();
+    let certification_stable_ready = certification_authorize
+        .rfind("observe_exact_resumed_ordinary_barrier_ready_v3(pending.resume_evidence_v3())")
+        .unwrap();
+    assert!(
+        certification_exact_ready < certification_worker_authority
+            && certification_worker_authority < certification_exact_receipt
+            && certification_exact_receipt < certification_owner_registry
+            && certification_owner_registry < certification_stable_ready
+    );
+    assert!(!certification_authorize.contains("observe_exact_current_ready_attestation_v2"));
+    let serving_resume = braced_declaration(serving, "pub(crate) async fn run_until_shutdown_v2(");
+    let durable_refresh = serving_resume
+        .find("refresh_acknowledgement_with_ready_v3(gateway_ready, false)")
+        .unwrap();
+    let completion_authority = serving_resume
+        .find("authorize_ordinary_barrier_completion_v3(evidence, receipt)")
+        .unwrap();
+    let barrier_completion = serving_resume
+        .find("complete_ordinary_barrier_v3(completion)")
+        .unwrap();
+    let normal_revalidation = barrier_completion
+        + serving_resume[barrier_completion..]
+            .find("self.revalidate_v2().await")
+            .unwrap();
+    let monitor = normal_revalidation
+        + serving_resume[normal_revalidation..]
+            .find("self.start_gateway_monitor_v2(&ready)")
+            .unwrap();
+    assert!(
+        durable_refresh < completion_authority
+            && completion_authority < barrier_completion
+            && barrier_completion < normal_revalidation
+            && normal_revalidation < monitor
+    );
 }

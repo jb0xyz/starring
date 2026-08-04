@@ -16,12 +16,14 @@ const TERMINAL_PROJECTION_DOMAIN: &[u8] =
 const TERMINAL_PROJECTION_VERSION: i16 = 2;
 const NO_CANDIDATE_TAG: i16 = 0;
 const PROGRESSED_TAG: i16 = 1;
+const UNRESERVED_PROGRESSED_TAG: i16 = 2;
 const RESERVATION_FRAME_VERSION: i16 = 2;
 const TERMINAL_SCALAR_VERSION: i16 = 2;
 
 pub(super) enum RuntimeReservedStartupRecoveryTerminalProjectionV2 {
     NoCandidate,
     Progressed(Box<RuntimeReservedStartupRecoveryProgressedProjectionV2>),
+    UnreservedProgressed(Box<RuntimeUnreservedStartupRecoveryProgressedProjectionV2>),
 }
 
 pub(super) struct RuntimeReservedStartupRecoveryProgressedProjectionV2 {
@@ -45,6 +47,14 @@ pub(super) struct RuntimeReservedStartupRecoveryProgressedProjectionV2 {
     pub terminal_receipt_digest: String,
 }
 
+pub(super) struct RuntimeUnreservedStartupRecoveryProgressedProjectionV2 {
+    pub source_deployment: Value,
+    pub successor_deployment: Value,
+    pub source_slot_fence: Value,
+    pub successor_slot_fence: Value,
+    pub terminal_at: DateTime<Utc>,
+}
+
 pub(super) fn decode_reserved_terminal_projection_v2(
     terminal_outcome_name: &str,
     projection: &[u8],
@@ -66,6 +76,9 @@ fn decode_progressed_projection(
     projection: &[u8],
 ) -> Result<RuntimeReservedStartupRecoveryTerminalProjectionV2, RuntimeExecutionPersistenceErrorV1>
 {
+    if projection.starts_with(&projection_prefix(UNRESERVED_PROGRESSED_TAG)) {
+        return decode_unreserved_progressed_projection(projection);
+    }
     let prefix = projection_prefix(PROGRESSED_TAG);
     let remainder = projection
         .strip_prefix(prefix.as_slice())
@@ -120,6 +133,36 @@ fn decode_progressed_projection(
                 terminal_at,
                 terminal_receipt_bytes,
                 terminal_receipt_digest,
+            },
+        )),
+    )
+}
+
+fn decode_unreserved_progressed_projection(
+    projection: &[u8],
+) -> Result<RuntimeReservedStartupRecoveryTerminalProjectionV2, RuntimeExecutionPersistenceErrorV1>
+{
+    let prefix = projection_prefix(UNRESERVED_PROGRESSED_TAG);
+    let remainder = projection
+        .strip_prefix(prefix.as_slice())
+        .ok_or_else(invalid)?;
+    let mut cursor = Cursor::new(remainder);
+    let source_deployment = cursor.take_jsonb_frame()?;
+    let successor_deployment = cursor.take_jsonb_frame()?;
+    let source_slot_fence = cursor.take_jsonb_frame()?;
+    let successor_slot_fence = cursor.take_jsonb_frame()?;
+    let terminal_at = postgres_timestamp(cursor.take_i64()?)?;
+    if !cursor.is_empty() {
+        return Err(invalid());
+    }
+    Ok(
+        RuntimeReservedStartupRecoveryTerminalProjectionV2::UnreservedProgressed(Box::new(
+            RuntimeUnreservedStartupRecoveryProgressedProjectionV2 {
+                source_deployment: source_deployment.value,
+                successor_deployment: successor_deployment.value,
+                source_slot_fence: source_slot_fence.value,
+                successor_slot_fence: successor_slot_fence.value,
+                terminal_at,
             },
         )),
     )
@@ -319,6 +362,27 @@ mod tests {
     fn progressed_projection_rejects_truncated_fixed_identity() {
         let mut projection = projection_prefix(PROGRESSED_TAG);
         projection.extend_from_slice(b"00112233445566778899aabbccddeef");
+        assert!(decode_reserved_terminal_projection_v2("progressed", &projection).is_err());
+    }
+
+    #[test]
+    fn unreserved_projection_requires_four_jsonb_frames_and_terminal_time() {
+        let frame = [1, b'{', b'}'];
+        let framed = [
+            i64::try_from(frame.len()).unwrap().to_be_bytes().as_slice(),
+            frame.as_slice(),
+        ]
+        .concat();
+        let mut projection = projection_prefix(UNRESERVED_PROGRESSED_TAG);
+        for _ in 0..4 {
+            projection.extend_from_slice(&framed);
+        }
+        projection.extend_from_slice(&0_i64.to_be_bytes());
+        assert!(matches!(
+            decode_reserved_terminal_projection_v2("progressed", &projection).unwrap(),
+            RuntimeReservedStartupRecoveryTerminalProjectionV2::UnreservedProgressed(_)
+        ));
+        projection.push(0);
         assert!(decode_reserved_terminal_projection_v2("progressed", &projection).is_err());
     }
 

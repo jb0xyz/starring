@@ -11,6 +11,7 @@ use design_harness::{
     LlmClient, LlmError, LlmResponse, Message, MessageRole, ToolCall, ToolDefinition,
     EXTRACT_PRIVATE_STUDY_ROOM_DETAILS,
 };
+use design_harness_codex_worker_client::{CodexWorkerCallMetric, CodexWorkerCallOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -89,6 +90,41 @@ pub struct ModelCallMetric {
     pub finish_reason: Option<String>,
     pub request_duration_ms: u64,
     pub gateway_model_duration_ms: Option<u64>,
+}
+
+impl From<CodexWorkerCallOutcome> for ModelCallOutcome {
+    fn from(outcome: CodexWorkerCallOutcome) -> Self {
+        match outcome {
+            CodexWorkerCallOutcome::Succeeded => Self::Succeeded,
+            CodexWorkerCallOutcome::TransportError => Self::TransportError,
+            CodexWorkerCallOutcome::HttpError => Self::HttpError,
+            CodexWorkerCallOutcome::ResponseBodyError => Self::ResponseBodyError,
+            CodexWorkerCallOutcome::MalformedJson => Self::MalformedJson,
+            CodexWorkerCallOutcome::InvalidResponse => Self::InvalidResponse,
+        }
+    }
+}
+
+impl From<CodexWorkerCallMetric> for ModelCallMetric {
+    fn from(metric: CodexWorkerCallMetric) -> Self {
+        Self {
+            call_sequence: metric.call_sequence,
+            attempt: metric.attempt,
+            frontier_name: metric.frontier_name,
+            outcome: metric.outcome.into(),
+            http_status: metric.http_status,
+            served_model: metric.served_model,
+            request_body_bytes: metric.request_body_bytes,
+            message_bytes: metric.message_bytes,
+            tool_bytes: metric.tool_bytes,
+            duplicated_schema_bytes: metric.duplicated_schema_bytes,
+            prompt_tokens: metric.prompt_tokens,
+            completion_tokens: metric.completion_tokens,
+            finish_reason: metric.finish_reason,
+            request_duration_ms: metric.request_duration_ms,
+            gateway_model_duration_ms: metric.gateway_model_duration_ms,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -727,9 +763,53 @@ mod tests {
 
     use super::{
         adapt_single_frontier_response, build_request_body, completion_usage, is_retryable_status,
-        parse_response_value, request_metric_input, GemmaClient, ModelCallOutcome, TransportPolicy,
-        INTENT_SERVING_MODEL,
+        parse_response_value, request_metric_input, GemmaClient, ModelCallMetric, ModelCallOutcome,
+        TransportPolicy, INTENT_SERVING_MODEL,
     };
+
+    #[test]
+    fn codex_worker_metric_conversion_preserves_the_eval_wire_shape() {
+        let metric =
+            ModelCallMetric::from(design_harness_codex_worker_client::CodexWorkerCallMetric {
+                call_sequence: 7,
+                attempt: 1,
+                frontier_name: "interpret_intent_core".to_string(),
+                outcome:
+                    design_harness_codex_worker_client::CodexWorkerCallOutcome::InvalidResponse,
+                http_status: Some(200),
+                served_model: Some("gpt-5.6-luna".to_string()),
+                request_body_bytes: 101,
+                message_bytes: 31,
+                tool_bytes: 61,
+                duplicated_schema_bytes: 0,
+                prompt_tokens: Some(80),
+                completion_tokens: Some(20),
+                finish_reason: Some("tool_calls".to_string()),
+                request_duration_ms: 900,
+                gateway_model_duration_ms: Some(700),
+            });
+
+        assert_eq!(
+            serde_json::to_value(metric).unwrap(),
+            json!({
+                "call_sequence": 7,
+                "attempt": 1,
+                "frontier_name": "interpret_intent_core",
+                "outcome": "invalid_response",
+                "http_status": 200,
+                "served_model": "gpt-5.6-luna",
+                "request_body_bytes": 101,
+                "message_bytes": 31,
+                "tool_bytes": 61,
+                "duplicated_schema_bytes": 0,
+                "prompt_tokens": 80,
+                "completion_tokens": 20,
+                "finish_reason": "tool_calls",
+                "request_duration_ms": 900,
+                "gateway_model_duration_ms": 700
+            })
+        );
+    }
 
     fn read_request(stream: &mut TcpStream) -> String {
         stream

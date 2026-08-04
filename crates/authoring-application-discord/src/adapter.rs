@@ -22,6 +22,7 @@ const DIGEST_LENGTH: usize = 64;
 const MAX_GUILD_ROLES: usize = 250;
 const MAX_MEMBER_ROLES: usize = 250;
 const AUTHORITY_DIGEST_DOMAIN_V1: &[u8] = b"starring.discord-authority.v1";
+const AUTHOR_AUTHORITY_DIGEST_DOMAIN_V1: &[u8] = b"starring.discord-authority.author.v1";
 const APPLY_RUNTIME_AUTHORITY_DIGEST_DOMAIN_V1: &[u8] =
     b"starring.discord-authority.apply-runtime.v1";
 const CANCEL_LIFECYCLE_RUNTIME_AUTHORITY_DIGEST_DOMAIN_V1: &[u8] =
@@ -103,7 +104,8 @@ impl DiscordAuthorityConfigV1 {
     fn evidence_lifetime(self, capability: CapabilityV1) -> TimeDelta {
         match capability {
             CapabilityV1::Read => self.read_lifetime,
-            CapabilityV1::Promote
+            CapabilityV1::Author
+            | CapabilityV1::Promote
             | CapabilityV1::Approve
             | CapabilityV1::Reject
             | CapabilityV1::Apply
@@ -479,6 +481,7 @@ fn observation_digest(
 ) -> String {
     let mut hasher = Sha256::new();
     let digest_domain = match capability {
+        CapabilityV1::Author => AUTHOR_AUTHORITY_DIGEST_DOMAIN_V1,
         CapabilityV1::Apply => APPLY_RUNTIME_AUTHORITY_DIGEST_DOMAIN_V1,
         CapabilityV1::CancelLifecycle => CANCEL_LIFECYCLE_RUNTIME_AUTHORITY_DIGEST_DOMAIN_V1,
         CapabilityV1::Promote
@@ -573,6 +576,7 @@ fn update_field(hasher: &mut Sha256, value: &[u8]) {
 
 fn capability_name(capability: CapabilityV1) -> &'static [u8] {
     match capability {
+        CapabilityV1::Author => b"author",
         CapabilityV1::Promote => b"promote",
         CapabilityV1::Read => b"read",
         CapabilityV1::Approve => b"approve",

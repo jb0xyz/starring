@@ -34,6 +34,24 @@ pub(crate) fn decode_resource_bindings(value: Value) -> Result<ResourceBindingMa
     Ok(bindings)
 }
 
+pub(crate) fn encode_resource_bindings(
+    bindings: &ResourceBindingMap,
+) -> Result<Value, &'static str> {
+    let stored = StoredResourceBindingsV1 {
+        role_bindings: bindings
+            .role_bindings
+            .iter()
+            .map(|(key, id)| (key.0.clone(), id.to_string()))
+            .collect(),
+        channel_bindings: bindings
+            .channel_bindings
+            .iter()
+            .map(|(key, id)| (key.0.clone(), id.to_string()))
+            .collect(),
+    };
+    serde_json::to_value(stored).map_err(|_| "resource bindings could not be encoded")
+}
+
 fn canonical_snowflake(value: &str) -> Option<u64> {
     let parsed = value.parse::<u64>().ok()?;
     (parsed != 0 && parsed.to_string() == value).then_some(parsed)
@@ -77,5 +95,25 @@ mod tests {
             }))
             .is_err());
         }
+    }
+
+    #[test]
+    fn bindings_encode_to_the_exact_canonical_storage_shape() {
+        let mut bindings = ResourceBindingMap::default();
+        bindings
+            .role_bindings
+            .insert(ResourceKey("member".to_string()), RoleId(701));
+        bindings
+            .channel_bindings
+            .insert(ResourceKey("community_hub".to_string()), ChannelId(700));
+        let encoded = encode_resource_bindings(&bindings).unwrap();
+        assert_eq!(
+            encoded,
+            json!({
+                "role_bindings": {"member": "701"},
+                "channel_bindings": {"community_hub": "700"}
+            })
+        );
+        assert_eq!(decode_resource_bindings(encoded).unwrap(), bindings);
     }
 }

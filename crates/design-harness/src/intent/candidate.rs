@@ -1,9 +1,12 @@
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
+use automation_core::validate::validate_structural;
+use automation_state::InteractionRuleSet;
 use resource_resolution::ResourceBindingMap;
 use schemars::JsonSchema;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::draft::Draft;
 use crate::errors::StructuredError;
@@ -14,7 +17,7 @@ use crate::turn::{
 };
 
 use super::catalog::MAX_COMPILED_REQUIREMENTS;
-use super::compile::{compile_intent, CompiledIntentV2};
+use super::compile::{compile_intent, compiled_intents_behaviorally_equivalent, CompiledIntentV2};
 use super::identity::{canonical_json_digest, IdentityErrorSpec};
 use super::model::IntentRequestedOutcome;
 use super::normalize::ValidatedIntentV2;
@@ -36,6 +39,40 @@ pub struct IntentExecutionReportV1 {
     pub close_executed: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewRulesetVerificationErrorV1 {
+    Malformed,
+    UnsupportedVersion,
+    NonCanonicalShape,
+    StructurallyInvalid,
+    SerializationFailed,
+    IdentityMismatch,
+}
+
+pub fn verify_preview_ruleset_v1(
+    ruleset: &Value,
+    expected_candidate_ruleset_hash: &str,
+) -> Result<(), PreviewRulesetVerificationErrorV1> {
+    let typed = serde_json::from_value::<InteractionRuleSet>(ruleset.clone())
+        .map_err(|_| PreviewRulesetVerificationErrorV1::Malformed)?;
+    if typed.version != 1 {
+        return Err(PreviewRulesetVerificationErrorV1::UnsupportedVersion);
+    }
+    let canonical = serde_json::to_value(&typed)
+        .map_err(|_| PreviewRulesetVerificationErrorV1::SerializationFailed)?;
+    if canonical != *ruleset {
+        return Err(PreviewRulesetVerificationErrorV1::NonCanonicalShape);
+    }
+    validate_structural(&typed)
+        .map_err(|_| PreviewRulesetVerificationErrorV1::StructurallyInvalid)?;
+    let actual = candidate_ruleset_identity_hash_v1(&typed)
+        .map_err(|_| PreviewRulesetVerificationErrorV1::SerializationFailed)?;
+    if actual != expected_candidate_ruleset_hash {
+        return Err(PreviewRulesetVerificationErrorV1::IdentityMismatch);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommittedIntentCandidateV1 {
@@ -51,6 +88,34 @@ pub struct PreparedIntentCandidateV1 {
     compilation: CompiledIntentV2,
     preview: DraftPreview,
     execution: IntentExecutionReportV1,
+}
+
+#[derive(Debug)]
+pub(crate) struct VerifiedExistingIntentCandidateV1 {
+    candidate: Draft,
+    compilation: CompiledIntentV2,
+    compiled_operations: usize,
+    #[cfg(test)]
+    simulation_traces: u32,
+}
+
+impl VerifiedExistingIntentCandidateV1 {
+    pub(crate) fn candidate(&self) -> &Draft {
+        &self.candidate
+    }
+
+    pub(crate) fn compilation(&self) -> &CompiledIntentV2 {
+        &self.compilation
+    }
+
+    pub(crate) fn compiled_operations(&self) -> usize {
+        self.compiled_operations
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulation_traces(&self) -> u32 {
+        self.simulation_traces
+    }
 }
 
 impl PreparedIntentCandidateV1 {
@@ -132,6 +197,53 @@ pub async fn prepare_intent_candidate(
     })
 }
 
+pub(crate) async fn verify_existing_intent_candidate(
+    candidate: &Draft,
+    intent: &ValidatedIntentV2,
+    existing_compilation: &CompiledIntentV2,
+    bindings: &ResourceBindingMap,
+) -> Result<VerifiedExistingIntentCandidateV1, StructuredError> {
+    let compiled = compile_intent(intent)?;
+    if !compiled_intents_behaviorally_equivalent(existing_compilation, &compiled) {
+        return Err(candidate_error(
+            "INTENT_EXISTING_CANDIDATE_BEHAVIOR_MISMATCH",
+            "intent.candidate.compilation",
+            "The requested outcome does not compile to the existing candidate behavior",
+            "Prepare a new candidate when any executable or compiler-owned behavior changes",
+        ));
+    }
+    let available_channel_keys = bindings
+        .channel_bindings
+        .keys()
+        .map(|key| key.0.clone())
+        .collect::<Vec<_>>();
+    verify_external_channel_keys(&compiled, &available_channel_keys)?;
+    let mut verified = candidate.clone();
+    validate_candidate_with_bindings(&mut verified, bindings)?;
+    let simulation = simulate_compiled_intent(&mut verified, intent, &compiled, bindings).await?;
+    #[cfg(test)]
+    let simulation_traces = simulation.traces_run;
+    #[cfg(not(test))]
+    let _ = simulation;
+    render_preview_with_bindings(&verified, bindings)?;
+    if verified != *candidate {
+        return Err(candidate_error(
+            "INTENT_EXISTING_CANDIDATE_STATE_MISMATCH",
+            "intent.candidate.draft",
+            "Validation or simulation changed the existing candidate Draft state",
+            "Finalize only an exact current candidate that already passed every required gate",
+        ));
+    }
+    let compiled_operations = compiled.requirements.len();
+    Ok(VerifiedExistingIntentCandidateV1 {
+        candidate: verified,
+        compilation: compiled,
+        compiled_operations,
+        #[cfg(test)]
+        simulation_traces,
+    })
+}
+
 pub(crate) fn replay_intent_candidate_preparation(
     root: &Draft,
     intent: &ValidatedIntentV2,
@@ -195,9 +307,15 @@ fn verify_external_channel_keys(
 }
 
 pub(crate) fn candidate_ruleset_hash(candidate: &Draft) -> Result<String, StructuredError> {
+    candidate_ruleset_identity_hash_v1(&candidate.ruleset)
+}
+
+fn candidate_ruleset_identity_hash_v1(
+    ruleset: &InteractionRuleSet,
+) -> Result<String, StructuredError> {
     canonical_json_digest(
         CANDIDATE_RULESET_DIGEST_DOMAIN_V1,
-        &candidate.ruleset,
+        ruleset,
         IdentityErrorSpec::new(
             "INTENT_CANDIDATE_SERIALIZATION_FAILED",
             "intent.candidate.ruleset_hash",
@@ -261,8 +379,10 @@ mod tests {
 
     use super::*;
     use crate::intent::{
-        propose_private_study_room, ClosePolicyV1, ExistingChannelKey, IntentLocaleV1,
-        IntentProposalOutcomeV2, IntentResolutionContext, PrivateStudyRoomControlsProposalV1,
+        prepare_private_study_room, propose_private_study_room,
+        upgrade_working_draft_to_validated_preview, ClosePolicyV1, ExistingChannelKey,
+        IntentLocaleV1, IntentProposalOutcomeV2, IntentResolutionContext,
+        PreparedIntentWorkspaceV2, PrivateStudyRoomControlsProposalV1,
         PrivateStudyRoomCopyProposalV1, PrivateStudyRoomNamingProposalV1,
         PrivateStudyRoomProposalV2,
     };
@@ -352,6 +472,82 @@ mod tests {
                 draft_state_hash(&content_changed).unwrap()
             );
         });
+    }
+
+    #[test]
+    fn preview_ruleset_verifier_reuses_the_candidate_identity_contract() {
+        let ruleset = json!({
+            "version": 1,
+            "panels": [{
+                "key": "welcome_panel",
+                "channel": "welcome_channel",
+                "content": "Choose a welcome",
+                "buttons": [{
+                    "label": "Welcome",
+                    "route": {"static": {"key": "welcome"}}
+                }]
+            }],
+            "modals": [],
+            "rules": [{
+                "key": "welcome_rule",
+                "trigger": {"type": "button_click", "component": "welcome"},
+                "actions": [{"type": "respond_ephemeral", "content": "Welcome!"}]
+            }]
+        });
+
+        assert_eq!(
+            verify_preview_ruleset_v1(
+                &ruleset,
+                "f283047e6367d67067822a399200ffd2ea6c1a6940969e0ab9abd399cb43d537"
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            verify_preview_ruleset_v1(
+                &ruleset,
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            Err(PreviewRulesetVerificationErrorV1::IdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn preview_ruleset_verifier_rejects_untyped_noncanonical_and_structural_inputs() {
+        assert_eq!(
+            verify_preview_ruleset_v1(
+                &json!({
+                    "version": 1,
+                    "panels": [],
+                    "modals": [],
+                    "rules": [{"key": "broken"}]
+                }),
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            Err(PreviewRulesetVerificationErrorV1::Malformed)
+        );
+        assert_eq!(
+            verify_preview_ruleset_v1(
+                &json!({"version": 1}),
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            Err(PreviewRulesetVerificationErrorV1::NonCanonicalShape)
+        );
+        assert_eq!(
+            verify_preview_ruleset_v1(
+                &json!({
+                    "version": 1,
+                    "panels": [],
+                    "modals": [],
+                    "rules": [{
+                        "key": "orphan_rule",
+                        "trigger": {"type": "button_click", "component": "missing"},
+                        "actions": [{"type": "respond_ephemeral", "content": "Welcome!"}]
+                    }]
+                }),
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            ),
+            Err(PreviewRulesetVerificationErrorV1::StructurallyInvalid)
+        );
     }
 
     fn bindings(hub: &str) -> ResourceBindingMap {
@@ -478,6 +674,113 @@ mod tests {
 
             assert_eq!(error.code, "INTENT_CANDIDATE_STALE");
             assert_eq!(changed, expected);
+        });
+    }
+
+    #[test]
+    fn existing_working_draft_can_only_finalize_through_exact_behavioral_verification() {
+        block_on(async {
+            let proposal = PrivateStudyRoomProposalV2 {
+                requested_outcome: IntentRequestedOutcome::WorkingDraft,
+                hub_channel: Some(ExistingChannelKey("community_hub".to_string())),
+                locale: Some(IntentLocaleV1::En),
+                copy: PrivateStudyRoomCopyProposalV1::default(),
+                naming: PrivateStudyRoomNamingProposalV1::default(),
+                controls: PrivateStudyRoomControlsProposalV1::default(),
+            };
+            let context = IntentResolutionContext::from_channel_bindings([ExistingChannelKey(
+                "community_hub".to_string(),
+            )]);
+            let PreparedIntentWorkspaceV2::Resolved {
+                workspace,
+                intent: working_intent,
+            } = prepare_private_study_room(proposal, &context).unwrap()
+            else {
+                panic!("expected resolved working draft");
+            };
+            let prepared = prepare_intent_candidate(
+                &Draft::new(),
+                &working_intent,
+                &bindings("community_hub"),
+            )
+            .await
+            .unwrap();
+            let existing_compilation = prepared.compilation().clone();
+            let existing_candidate = prepared.candidate().clone();
+            let PreparedIntentWorkspaceV2::Resolved {
+                intent: preview_intent,
+                ..
+            } = upgrade_working_draft_to_validated_preview(
+                &workspace,
+                workspace.revision,
+                &context,
+            )
+            .unwrap()
+            else {
+                panic!("expected resolved preview intent");
+            };
+
+            let no_change = prepare_intent_candidate(
+                &existing_candidate,
+                &preview_intent,
+                &bindings("community_hub"),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(no_change.code, "TURN_PLAN_NO_CHANGES");
+
+            let verified = verify_existing_intent_candidate(
+                &existing_candidate,
+                &preview_intent,
+                &existing_compilation,
+                &bindings("community_hub"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(verified.candidate(), &existing_candidate);
+            assert_eq!(
+                verified.compiled_operations(),
+                existing_compilation.requirements.len()
+            );
+            assert_eq!(verified.compiled_operations(), 22);
+            assert_eq!(verified.simulation_traces(), 4);
+            assert!(compiled_intents_behaviorally_equivalent(
+                &existing_compilation,
+                verified.compilation()
+            ));
+
+            let missing_binding = verify_existing_intent_candidate(
+                &existing_candidate,
+                &preview_intent,
+                &existing_compilation,
+                &ResourceBindingMap::default(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(missing_binding.code, "INTENT_EXTERNAL_BINDING_MISSING");
+
+            let changed_intent = resolved_intent("community_hub", Some(ClosePolicyV1::AnyMember));
+            let mismatch = verify_existing_intent_candidate(
+                &existing_candidate,
+                &changed_intent,
+                &existing_compilation,
+                &bindings("community_hub"),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(mismatch.code, "INTENT_EXISTING_CANDIDATE_BEHAVIOR_MISMATCH");
+
+            let mut stale_gate_state = existing_candidate.clone();
+            stale_gate_state.simulated_revision = None;
+            let mismatch = verify_existing_intent_candidate(
+                &stale_gate_state,
+                &preview_intent,
+                &existing_compilation,
+                &bindings("community_hub"),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(mismatch.code, "INTENT_EXISTING_CANDIDATE_STATE_MISMATCH");
         });
     }
 }

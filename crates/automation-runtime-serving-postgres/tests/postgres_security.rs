@@ -7,9 +7,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use automation_ruleset::{RuleSetContentHash, RuleSetKey, RuleSetVersionId};
 use automation_runtime_controller::{
-    RuntimeAttestationIdV1, RuntimeConvergenceErrorClassV1, RuntimeDeploymentScopeV1,
-    RuntimeHeartbeatServingV1, RuntimeServingIdentityV1, RuntimeServingLeasePort,
-    RuntimeServingReceiptV1, RuntimeServingSessionV1,
+    RuntimeAttestationIdV1, RuntimeCertificationOperationIdV2, RuntimeConvergenceErrorClassV1,
+    RuntimeDeploymentScopeV1, RuntimeDrainIntentIdV2, RuntimeHeartbeatServingV1,
+    RuntimeLiveAttestationDigestV2, RuntimeServingIdentityV1, RuntimeServingIdentityV2,
+    RuntimeServingLeasePort, RuntimeServingReceiptV1, RuntimeServingSessionV1,
 };
 use automation_runtime_convergence::{
     ActivationAttestationV1, ActivationOutcomeKindV1, ActivationRequestId, BindingRevision,
@@ -17,10 +18,11 @@ use automation_runtime_convergence::{
     GatewayReadyAttestationV1, GatewayReadyKindV1, InstallationId, LeaseRequestV1,
     PanelCertificateId, PanelCertificateV1, PanelReportDigestV1, PreflightAttestationV1,
     ProcessInstanceId, PromotionId, RuntimeDeployment, RuntimeDeploymentIdentityV1,
-    RuntimeDeploymentTargetV1, RuntimeGeneration, TenantId,
+    RuntimeDeploymentTargetV1, RuntimeGeneration, RuntimeProcessIdentityV1, TenantId,
 };
 use automation_runtime_serving_postgres::{
-    PostgresRuntimeServingLeaseV1, RuntimeServingDatabaseExpectationV1,
+    PostgresRuntimeServingLeaseV1, RuntimePendingDrainServingLookupV1,
+    RuntimePendingDrainServingObservationV1, RuntimeServingDatabaseExpectationV1,
     RuntimeServingDatabaseTimeoutsV1, RuntimeServingPersistenceErrorV1, MIGRATOR,
 };
 use chrono::{DateTime, TimeDelta, Utc};
@@ -44,11 +46,22 @@ const ATTESTATION: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const CONTENT_HASH: &str = "9f2bbed3d90d3439ebe5bb07a69f8ff179c29e8c71500b6890a7d24653a65ff6";
 const BINDING_FINGERPRINT: &str =
     "a44fd4f629a1183147a25a8afb93b026de7e3f92efe737637da222617df0c655";
+const PENDING_DRAIN_PRODUCT_OPERATION: &str = "1234567890abcdef1234567890abcdef";
+const PENDING_DRAIN_INTENT: &str = "fedcba0987654321fedcba0987654321";
+const PENDING_DRAIN_CERTIFICATION_OPERATION: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
 const READINESS_FUNCTION: &str = "public.starring_runtime_serving_database_readiness_v1()";
 const IDENTITY_FUNCTION: &str = "public.starring_runtime_serving_database_identity_v1()";
 const HEARTBEAT_FUNCTION: &str = "public.starring_runtime_serving_heartbeat_v1(TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT,BIGINT)";
 const DISCONNECT_FUNCTION: &str =
     "public.starring_runtime_serving_disconnect_v1(TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT)";
+const OBSERVE_V2_FUNCTION: &str =
+    "public.starring_runtime_serving_observe_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT,BIGINT)";
+const HEARTBEAT_V2_FUNCTION: &str = "public.starring_runtime_serving_heartbeat_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT,BIGINT)";
+const DISCONNECT_V2_FUNCTION: &str = "public.starring_runtime_serving_disconnect_if_current_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT)";
+const OBSERVE_PENDING_DRAIN_SOURCE_FUNCTION: &str =
+    "public.starring_runtime_serving_observe_pending_drain_source_v1(TEXT,BIGINT,TEXT)";
+const DISCONNECT_PENDING_DRAIN_SOURCE_IF_EXPIRED_FUNCTION: &str =
+    "public.starring_runtime_serving_disconnect_pending_drain_source_if_expired_v1(TEXT,BIGINT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BIGINT,TEXT,BIGINT,TEXT,TEXT,TEXT,BIGINT,BIGINT,BIGINT)";
 
 struct IsolatedDatabase {
     name: String,
@@ -68,6 +81,45 @@ struct EphemeralPostgresCluster {
     administrator_role: String,
     pg_ctl: String,
     running: bool,
+}
+
+enum PostgresTestServer {
+    External(Box<PgConnectOptions>),
+    Ephemeral(EphemeralPostgresCluster),
+}
+
+impl PostgresTestServer {
+    fn start() -> Self {
+        if let Some(url) = std::env::var_os("STARRING_TEST_DATABASE_URL") {
+            let url = url
+                .into_string()
+                .expect("STARRING_TEST_DATABASE_URL must be valid Unicode");
+            let options = url
+                .parse::<PgConnectOptions>()
+                .expect("STARRING_TEST_DATABASE_URL must be a PostgreSQL URL");
+            let database = options
+                .get_database()
+                .expect("STARRING_TEST_DATABASE_URL must name a database");
+            assert!(
+                database.starts_with("starring_")
+                    && database.split('_').any(|segment| segment == "test")
+                    && database.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'),
+                "refusing to use a database outside the strict Starring test namespace"
+            );
+            Self::External(Box::new(options))
+        } else {
+            Self::Ephemeral(EphemeralPostgresCluster::start())
+        }
+    }
+
+    fn connect_options(&self) -> PgConnectOptions {
+        match self {
+            Self::External(options) => options.as_ref().clone(),
+            Self::Ephemeral(cluster) => cluster.connect_options(),
+        }
+    }
 }
 
 impl EphemeralPostgresCluster {
@@ -183,8 +235,8 @@ impl Drop for EphemeralPostgresCluster {
 #[tokio::test]
 #[ignore = "requires initdb and pg_ctl"]
 async fn serving_mutations_are_replay_safe_bounded_and_least_privilege() {
-    let cluster = EphemeralPostgresCluster::start();
-    let database = isolated_database(cluster.connect_options()).await;
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
     let owner_pool = database.owner_pool.clone();
     let executor_pool = database.executor_pool.clone();
     let deadline_pool = database.deadline_pool.clone();
@@ -205,7 +257,7 @@ async fn serving_mutations_are_replay_safe_bounded_and_least_privilege() {
     .await;
     cleanup(database).await;
     outcome.expect("restricted serving proof must complete");
-    drop(cluster);
+    drop(server);
 }
 
 async fn isolated_database(base: PgConnectOptions) -> IsolatedDatabase {
@@ -237,6 +289,19 @@ async fn isolated_database(base: PgConnectOptions) -> IsolatedDatabase {
         .await
         .unwrap();
     MIGRATOR.run(&owner_pool).await.unwrap();
+    let readiness_definition_digest = sqlx::query_scalar::<_, String>(
+        "SELECT pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(\
+            pg_catalog.pg_get_functiondef(pg_catalog.to_regprocedure(\
+                'public.starring_runtime_serving_database_readiness_v1()'\
+            )), 'UTF8')), 'hex')",
+    )
+    .fetch_one(&owner_pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        readiness_definition_digest,
+        "e598fb40785ccd66ce44ec6c7f85e52fd9e004ab1e05de9c0c03963f06df45f1"
+    );
     let password_literal = sqlx::query_scalar::<_, String>("SELECT pg_catalog.quote_literal($1)")
         .bind(&password)
         .fetch_one(&owner_pool)
@@ -261,6 +326,13 @@ async fn isolated_database(base: PgConnectOptions) -> IsolatedDatabase {
         format!("GRANT EXECUTE ON FUNCTION {IDENTITY_FUNCTION} TO {role}"),
         format!("GRANT EXECUTE ON FUNCTION {HEARTBEAT_FUNCTION} TO {role}"),
         format!("GRANT EXECUTE ON FUNCTION {DISCONNECT_FUNCTION} TO {role}"),
+        format!("GRANT EXECUTE ON FUNCTION {OBSERVE_V2_FUNCTION} TO {role}"),
+        format!("GRANT EXECUTE ON FUNCTION {HEARTBEAT_V2_FUNCTION} TO {role}"),
+        format!("GRANT EXECUTE ON FUNCTION {DISCONNECT_V2_FUNCTION} TO {role}"),
+        format!("GRANT EXECUTE ON FUNCTION {OBSERVE_PENDING_DRAIN_SOURCE_FUNCTION} TO {role}"),
+        format!(
+            "GRANT EXECUTE ON FUNCTION {DISCONNECT_PENDING_DRAIN_SOURCE_IF_EXPIRED_FUNCTION} TO {role}"
+        ),
     ] {
         owner_pool.execute(statement.as_str()).await.unwrap();
     }
@@ -381,6 +453,51 @@ async fn serving_scenario(
     assert_eq!(adapter.initial_readiness().database_name, database_name);
     assert_eq!(adapter.initial_readiness().executor_role, role);
     assert!(adapter.verify_database_v1().await.is_ok());
+    let pending_drain_lookup = RuntimePendingDrainServingLookupV1::new(
+        RuntimeDrainIntentIdV2::parse("00112233445566778899aabbccddeeff").unwrap(),
+        NonZeroU64::new(1).unwrap(),
+        [0xab; 32],
+    )
+    .unwrap();
+    assert!(matches!(
+        adapter
+            .observe_pending_drain_source_serving_v1(&pending_drain_lookup)
+            .await
+            .unwrap(),
+        RuntimePendingDrainServingObservationV1::Diverged { .. }
+    ));
+    let unchanged_pending_drain_serving = serving_lease_image(&owner_pool).await;
+    let pending_drain_identity = RuntimeServingIdentityV2 {
+        scope: RuntimeDeploymentScopeV1 {
+            tenant_id: TenantId::parse(TENANT).unwrap(),
+            installation_id: InstallationId::parse(INSTALLATION).unwrap(),
+            deployment_id: DeploymentId::parse(DEPLOYMENT).unwrap(),
+        },
+        operation_id: RuntimeCertificationOperationIdV2::parse("00112233445566778899aabbccddeeff")
+            .unwrap(),
+        attestation_digest: RuntimeLiveAttestationDigestV2::parse(ATTESTATION).unwrap(),
+        process_identity: RuntimeProcessIdentityV1 {
+            target: runtime_target(),
+            runtime_generation: RuntimeGeneration::FIRST,
+            process_instance_id: ProcessInstanceId::parse(PROCESS).unwrap(),
+        },
+        lease_epoch: NonZeroU64::new(1).unwrap(),
+        revision: NonZeroU64::new(1).unwrap(),
+    };
+    assert_eq!(
+        adapter
+            .disconnect_pending_drain_source_serving_if_expired_v1(
+                &pending_drain_lookup,
+                &pending_drain_identity,
+            )
+            .await
+            .unwrap_err(),
+        RuntimeServingPersistenceErrorV1::OwnershipLost
+    );
+    assert_eq!(
+        serving_lease_image(&owner_pool).await,
+        unchanged_pending_drain_serving
+    );
     let foreign_database_error = match PgConnection::connect_with(&foreign_database_options).await {
         Ok(connection) => {
             connection.close().await.unwrap();
@@ -590,6 +707,699 @@ async fn serving_scenario(
         .unwrap();
     assert_eq!(disconnected, disconnected_replay);
     session.apply_disconnect(disconnected).unwrap();
+    assert_pending_drain_heartbeat_and_expired_disconnect(&owner_pool, &adapter, &first_request)
+        .await;
+}
+
+async fn assert_pending_drain_heartbeat_and_expired_disconnect(
+    owner_pool: &PgPool,
+    adapter: &PostgresRuntimeServingLeaseV1,
+    heartbeat_template: &RuntimeHeartbeatServingV1,
+) {
+    sqlx::query(
+        "UPDATE public.automation_installations SET lifecycle_state = 'active', \
+         updated_at = updated_at + INTERVAL '1 microsecond' \
+         WHERE installation_id = $1",
+    )
+    .bind(INSTALLATION)
+    .execute(owner_pool)
+    .await
+    .unwrap();
+    let baseline_identity = seed_expired_v2_serving_fixture(owner_pool).await;
+    let fresh_identity = reset_v2_serving_fixture(owner_pool, &baseline_identity, 2, true).await;
+    let heartbeat_request = v2_heartbeat_request(heartbeat_template, &fresh_identity);
+    assert_foreign_pending_drain_does_not_interrupt(owner_pool, &heartbeat_request).await;
+
+    let lookup = create_pending_drain_fixture(owner_pool).await;
+    let unchanged = serving_lease_image(owner_pool).await;
+    let mut exact = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *exact)
+        .await
+        .unwrap();
+    let exact_error = raw_heartbeat(&mut exact, &heartbeat_request)
+        .await
+        .unwrap_err();
+    assert_database_code(&exact_error, "RS003");
+    exact.rollback().await.unwrap();
+    assert_eq!(
+        adapter
+            .heartbeat_serving(heartbeat_request.clone())
+            .await
+            .unwrap_err(),
+        RuntimeServingPersistenceErrorV1::AuthorityChanged
+    );
+    let v2_lease_for = Duration::from_secs(31);
+    let mut exact_v2 = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *exact_v2)
+        .await
+        .unwrap();
+    let exact_v2_error = raw_heartbeat_v2(&mut exact_v2, &fresh_identity, v2_lease_for)
+        .await
+        .unwrap_err();
+    assert_database_code(&exact_v2_error, "RS003");
+    exact_v2.rollback().await.unwrap();
+    assert_eq!(
+        adapter
+            .heartbeat_serving_v2(&fresh_identity, v2_lease_for)
+            .await
+            .unwrap_err(),
+        RuntimeServingPersistenceErrorV1::AuthorityChanged
+    );
+    let mut replay_identity = fresh_identity.clone();
+    replay_identity.revision = NonZeroU64::new(1).unwrap();
+    assert_eq!(
+        adapter
+            .heartbeat_serving_v2(&replay_identity, v2_lease_for)
+            .await
+            .unwrap_err(),
+        RuntimeServingPersistenceErrorV1::AuthorityChanged
+    );
+    assert_eq!(serving_lease_image(owner_pool).await, unchanged);
+
+    set_attestation_fixture_triggers(owner_pool, false).await;
+    sqlx::query(
+        "UPDATE public.runtime_attestations SET v2_initial_lease_epoch = 2 \
+         WHERE attestation_id = $1",
+    )
+    .bind(fresh_identity.attestation_digest.as_str())
+    .execute(owner_pool)
+    .await
+    .unwrap();
+    let mut diverged = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *diverged)
+        .await
+        .unwrap();
+    let diverged_error = raw_heartbeat(&mut diverged, &heartbeat_request)
+        .await
+        .unwrap_err();
+    assert_database_code(&diverged_error, "RS004");
+    diverged.rollback().await.unwrap();
+    assert_eq!(
+        adapter
+            .heartbeat_serving(heartbeat_request.clone())
+            .await
+            .unwrap_err(),
+        RuntimeServingPersistenceErrorV1::PersistenceCorrupt
+    );
+    assert_eq!(serving_lease_image(owner_pool).await, unchanged);
+    sqlx::query(
+        "UPDATE public.runtime_attestations SET v2_initial_lease_epoch = 1 \
+         WHERE attestation_id = $1",
+    )
+    .bind(fresh_identity.attestation_digest.as_str())
+    .execute(owner_pool)
+    .await
+    .unwrap();
+    set_attestation_fixture_triggers(owner_pool, true).await;
+
+    assert_cleared_pending_drain_does_not_interrupt(owner_pool, &heartbeat_request).await;
+
+    let identity = reset_v2_serving_fixture(owner_pool, &baseline_identity, 3, false).await;
+    let observation = adapter
+        .observe_pending_drain_source_serving_v1(&lookup)
+        .await
+        .unwrap();
+    let RuntimePendingDrainServingObservationV1::Expired {
+        source, serving, ..
+    } = observation
+    else {
+        panic!("pending drain source must observe the expired serving lease")
+    };
+    assert_eq!(source.intent_id(), lookup.intent_id());
+    assert_eq!(
+        source.source_intent_revision(),
+        lookup.source_intent_revision()
+    );
+    assert_eq!(source.source_state_digest(), lookup.source_state_digest());
+    assert_eq!(serving.identity, identity);
+
+    let disconnected = adapter
+        .disconnect_pending_drain_source_serving_if_expired_v1(&lookup, &identity)
+        .await
+        .unwrap();
+    assert_eq!(disconnected.identity.revision.get(), 4);
+    assert!(!disconnected.connected);
+    assert!(!disconnected.serving);
+    assert_eq!(disconnected.last_heartbeat_at, disconnected.expires_at);
+    let disconnected_image = serving_lease_image(owner_pool).await;
+    let replay = adapter
+        .disconnect_pending_drain_source_serving_if_expired_v1(&lookup, &identity)
+        .await
+        .unwrap();
+    assert_eq!(replay, disconnected);
+    assert_eq!(serving_lease_image(owner_pool).await, disconnected_image);
+
+    let fresh_identity = reset_v2_serving_fixture(owner_pool, &identity, 5, true).await;
+    let fresh_image = serving_lease_image(owner_pool).await;
+    assert_eq!(
+        adapter
+            .disconnect_pending_drain_source_serving_if_expired_v1(&lookup, &fresh_identity)
+            .await
+            .unwrap_err(),
+        RuntimeServingPersistenceErrorV1::OwnershipLost
+    );
+    assert_eq!(serving_lease_image(owner_pool).await, fresh_image);
+
+    let fenced_identity = reset_v2_serving_fixture(owner_pool, &identity, 6, false).await;
+    mutate_writer_fence(
+        owner_pool,
+        "UPDATE public.runtime_writer_fence \
+         SET fence_state = 'closed', fence_generation = 4, \
+             cutover_lease_epoch_high_water = 1, \
+             cutover_coordinator_id = '00112233445566778899aabbccddeeff', \
+             cutover_expires_at = pg_catalog.clock_timestamp() + INTERVAL '1 hour' \
+         WHERE singleton",
+    )
+    .await;
+    let fenced_image = serving_lease_image(owner_pool).await;
+    assert_eq!(
+        adapter
+            .disconnect_pending_drain_source_serving_if_expired_v1(&lookup, &fenced_identity)
+            .await
+            .unwrap_err(),
+        RuntimeServingPersistenceErrorV1::RetryNotReady
+    );
+    assert_eq!(serving_lease_image(owner_pool).await, fenced_image);
+    mutate_writer_fence(
+        owner_pool,
+        "UPDATE public.runtime_writer_fence \
+         SET fence_state = 'open', fence_generation = 5, \
+             cutover_lease_epoch_high_water = 1, \
+             cutover_coordinator_id = NULL, cutover_expires_at = NULL \
+         WHERE singleton",
+    )
+    .await;
+}
+
+fn v2_heartbeat_request(
+    template: &RuntimeHeartbeatServingV1,
+    identity: &RuntimeServingIdentityV2,
+) -> RuntimeHeartbeatServingV1 {
+    let mut request = template.clone();
+    request.identity.scope = identity.scope.clone();
+    request.identity.attestation_id =
+        RuntimeAttestationIdV1::parse(identity.attestation_digest.as_str()).unwrap();
+    request.identity.process_instance_id = identity.process_identity.process_instance_id.clone();
+    request.identity.runtime_generation = identity.process_identity.runtime_generation;
+    request.identity.lease_epoch = identity.lease_epoch;
+    request.identity.expected_revision = identity.revision;
+    request
+}
+
+async fn assert_foreign_pending_drain_does_not_interrupt(
+    owner_pool: &PgPool,
+    heartbeat_request: &RuntimeHeartbeatServingV1,
+) {
+    let mut fixture = owner_pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *fixture)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_installations (installation_id, tenant_id, \
+         discord_application_id, discord_guild_id, ruleset_key, lifecycle_state, \
+         current_authority_revision) VALUES \
+         ('serving-test-foreign-installation', $1, '9300302', '9300102', \
+          'serving_test_foreign', 'active', 1)",
+    )
+    .bind(TENANT)
+    .execute(&mut *fixture)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.automation_installation_authority_versions (installation_id, \
+         revision, tenant_id, binding_revision, resource_bindings, binding_fingerprint, \
+         policy_revision, required_approvals, activation_ttl_seconds, authority_payload_digest, \
+         created_by_principal_id, created_by_request_digest) \
+         VALUES ('serving-test-foreign-installation', 1, $1, 1, '{}'::JSONB, $2, \
+                 1, 1, 3600, $3, $4, $5)",
+    )
+    .bind(TENANT)
+    .bind(BINDING_FINGERPRINT)
+    .bind("8".repeat(64))
+    .bind(PRINCIPAL)
+    .bind("9".repeat(64))
+    .execute(&mut *fixture)
+    .await
+    .unwrap();
+    fixture.commit().await.unwrap();
+    set_slot_fence_fixture_triggers(owner_pool, false).await;
+    let unchanged = serving_lease_image(owner_pool).await;
+    let mut transaction = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("SET LOCAL statement_timeout = '2s'")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_slot_writer_fences_v2 \
+         SET pending_drain_intent_id = '11111111111111111111111111111111', \
+             pending_product_operation_id = '22222222222222222222222222222222', \
+             pending_tenant_id = $1, \
+             pending_installation_id = 'serving-test-foreign-installation', \
+             pending_deployment_id = 'serving-test-foreign-deployment', \
+             pending_expected_revision = 1, \
+             pending_marked_at = pg_catalog.clock_timestamp(), \
+             updated_at = pg_catalog.clock_timestamp() \
+         WHERE slot_guild_id = '9300102' \
+             AND slot_ruleset_key = 'serving_test_foreign'",
+    )
+    .bind(TENANT)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    raw_heartbeat(&mut transaction, heartbeat_request)
+        .await
+        .unwrap();
+    transaction.rollback().await.unwrap();
+    set_slot_fence_fixture_triggers(owner_pool, true).await;
+    assert_eq!(serving_lease_image(owner_pool).await, unchanged);
+}
+
+async fn assert_cleared_pending_drain_does_not_interrupt(
+    owner_pool: &PgPool,
+    heartbeat_request: &RuntimeHeartbeatServingV1,
+) {
+    set_slot_fence_fixture_triggers(owner_pool, false).await;
+    let unchanged = serving_lease_image(owner_pool).await;
+    let mut transaction = owner_pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("SET LOCAL statement_timeout = '2s'")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_slot_writer_fences_v2 \
+         SET pending_drain_intent_id = NULL, \
+             pending_product_operation_id = NULL, \
+             pending_tenant_id = NULL, \
+             pending_installation_id = NULL, \
+             pending_deployment_id = NULL, \
+             pending_expected_revision = NULL, \
+             pending_marked_at = NULL, \
+             updated_at = pg_catalog.clock_timestamp() \
+         WHERE slot_guild_id = $1 AND slot_ruleset_key = $2",
+    )
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    raw_heartbeat(&mut transaction, heartbeat_request)
+        .await
+        .unwrap();
+    transaction.rollback().await.unwrap();
+    set_slot_fence_fixture_triggers(owner_pool, true).await;
+    assert_eq!(serving_lease_image(owner_pool).await, unchanged);
+}
+
+async fn set_attestation_fixture_triggers(pool: &PgPool, enabled: bool) {
+    let action = if enabled { "ENABLE" } else { "DISABLE" };
+    sqlx::query(&format!(
+        "ALTER TABLE public.runtime_attestations {action} TRIGGER USER"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn set_slot_fence_fixture_triggers(pool: &PgPool, enabled: bool) {
+    let action = if enabled { "ENABLE" } else { "DISABLE" };
+    sqlx::query(&format!(
+        "ALTER TABLE public.runtime_slot_writer_fences_v2 {action} TRIGGER USER"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn assert_database_code(error: &sqlx::Error, expected: &str) {
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .as_deref(),
+        Some(expected),
+        "{error:?}"
+    );
+}
+
+async fn create_pending_drain_fixture(pool: &PgPool) -> RuntimePendingDrainServingLookupV1 {
+    let revision = sqlx::query_scalar::<_, i64>(
+        "SELECT revision FROM public.runtime_deployments WHERE deployment_id = $1",
+    )
+    .bind(DEPLOYMENT)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let target = runtime_target();
+    let canonical = automation_runtime_controller::RuntimeCanonicalProductDrainV2::new(
+        automation_runtime_controller::RuntimeProductMutationPreimageV2 {
+            operation_id: automation_runtime_controller::RuntimeProductOperationIdV2::parse(
+                PENDING_DRAIN_PRODUCT_OPERATION,
+            )
+            .unwrap(),
+            scope: RuntimeDeploymentScopeV1 {
+                tenant_id: TenantId::parse(TENANT).unwrap(),
+                installation_id: InstallationId::parse(INSTALLATION).unwrap(),
+                deployment_id: DeploymentId::parse(DEPLOYMENT).unwrap(),
+            },
+            expected_revision: automation_runtime_convergence::DeploymentRevision::new(
+                u64::try_from(revision).unwrap(),
+            )
+            .unwrap(),
+            slot: automation_runtime_controller::RuntimeServingSlotV2::from_target(&target),
+            expected_target: target,
+            mutation_kind: automation_runtime_controller::RuntimeProductMutationKindV2::Teardown,
+            product_semantic_request_digest:
+                automation_runtime_controller::RuntimeProductSemanticRequestDigestV2::parse(
+                    "7".repeat(64),
+                )
+                .unwrap(),
+        },
+        RuntimeDrainIntentIdV2::parse(PENDING_DRAIN_INTENT).unwrap(),
+    )
+    .unwrap();
+    let product = canonical.product_preimage();
+    let drain = canonical.drain_preimage();
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ WRITE")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let created = sqlx::query_as::<_, (String, Option<i64>, Option<String>)>(
+        "SELECT outcome_name, intent_revision, intent_state \
+         FROM starring_runtime_private_v2.starring_runtime_product_drain_first_apply_core_v2(\
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20\
+         )",
+    )
+    .bind(product.operation_id.as_str())
+    .bind(drain.key.intent_id.as_str())
+    .bind(product.scope.tenant_id.as_str())
+    .bind(product.scope.installation_id.as_str())
+    .bind(product.scope.deployment_id.as_str())
+    .bind(i64::try_from(product.expected_revision.get()).unwrap())
+    .bind(product.slot.guild_id.to_string())
+    .bind(product.slot.ruleset_key.as_str())
+    .bind(product.expected_target.guild_id.to_string())
+    .bind(product.expected_target.ruleset_key.as_str())
+    .bind(i64::from(product.expected_target.version.get()))
+    .bind(product.expected_target.content_hash.to_hex())
+    .bind(i64::try_from(product.expected_target.binding_revision.get()).unwrap())
+    .bind(product.expected_target.binding_fingerprint.as_str())
+    .bind("teardown")
+    .bind(product.product_semantic_request_digest.as_str())
+    .bind(canonical.product_mutation_request_bytes())
+    .bind(canonical.product_mutation_digest().as_str())
+    .bind(canonical.drain_intent_request_bytes())
+    .bind(canonical.drain_intent_digest().as_str())
+    .fetch_one(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(
+        created,
+        ("inserted".to_string(), Some(1), Some("pending".to_string()))
+    );
+    transaction.commit().await.unwrap();
+    let source = sqlx::query_as::<_, (i64, String)>(
+        "SELECT intent_revision, canonical_state_digest \
+         FROM public.runtime_drain_intents_v2 WHERE drain_intent_id = $1",
+    )
+    .bind(PENDING_DRAIN_INTENT)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    RuntimePendingDrainServingLookupV1::new(
+        RuntimeDrainIntentIdV2::parse(PENDING_DRAIN_INTENT).unwrap(),
+        NonZeroU64::new(u64::try_from(source.0).unwrap()).unwrap(),
+        decode_hex_32(&source.1),
+    )
+    .unwrap()
+}
+
+async fn seed_expired_v2_serving_fixture(pool: &PgPool) -> RuntimeServingIdentityV2 {
+    let request_bytes = b"{}".to_vec();
+    let request_digest = framed_digest_v2(
+        pool,
+        "starring.runtime.certification_request.v2",
+        &request_bytes,
+    )
+    .await;
+    let live_bytes = format!(
+        "{{\"format_version\":2,\"request_digest\":\"{request_digest}\",\"request\":{{}}}}"
+    )
+    .into_bytes();
+    let attestation_digest =
+        framed_digest_v2(pool, "starring.runtime.live_attestation.v2", &live_bytes).await;
+    let record: Value = serde_json::from_slice(&live_bytes).unwrap();
+    let route_admission = json!({
+        "gateway_owner_lease_id": {
+            "gateway_shard_id": "shard:0",
+            "lease_epoch": 1,
+            "expected_build_revision": "test-build-1"
+        },
+        "attested_owner_revision": 1,
+        "gateway": {
+            "connection_epoch": 1,
+            "admission_revision": 1,
+            "connected_event_sequence": 1,
+            "resume_sequence": 2
+        }
+    });
+    let prepared_snapshot = json!({
+        "fixture": "pending-drain-serving-v2",
+        "revision": 9,
+        "phase": { "phase": "awaiting_gateway_ready" }
+    });
+    let certified_snapshot = json!({
+        "fixture": "pending-drain-serving-v2",
+        "revision": 10,
+        "phase": { "phase": "live" }
+    });
+    let now = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    set_v2_fixture_triggers(pool, false).await;
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET CONSTRAINTS ALL DEFERRED")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_gateway_owners (gateway_shard_id, process_instance_id, \
+         lease_epoch, expected_build_revision, owner_revision, expires_at) \
+         VALUES ('shard:0', $1, 1, 'test-build-1', 1, $2)",
+    )
+    .bind(PROCESS)
+    .bind(now + TimeDelta::hours(1))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_gateway_owners SET owner_revision = 2 \
+         WHERE gateway_shard_id = 'shard:0'",
+    )
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    let acknowledgement_bytes = vec![b'x'; 197];
+    sqlx::query(
+        "INSERT INTO public.runtime_ingress_open_acknowledgements_v2 (gateway_shard_id, \
+         source_acknowledgement_revision, request_digest, canonical_request_bytes, \
+         fence_generation, maintenance_gate_generation, process_instance_id, \
+         owner_lease_epoch, expected_build_revision, observed_owner_revision, \
+         requested_owner_observed_at, requested_owner_expires_at, connection_epoch, \
+         admission_revision, connected_event_sequence, resume_sequence, \
+         acknowledgement_revision, acknowledged_at, expires_at) \
+         VALUES ('shard:0', NULL, pg_catalog.sha256($1), $1, 1, 1, $2, 1, \
+                 'test-build-1', 2, $3, $4, 1, 1, 1, 2, 1, $3, $5)",
+    )
+    .bind(&acknowledgement_bytes)
+    .bind(PROCESS)
+    .bind(now)
+    .bind(now + TimeDelta::hours(1))
+    .bind(now + TimeDelta::seconds(9))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "DELETE FROM public.runtime_serving_leases \
+         WHERE guild_id = $1 AND ruleset_key = $2",
+    )
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_deployments SET live_attestation_id = $1 \
+         WHERE deployment_id = $2",
+    )
+    .bind(&attestation_digest)
+    .bind(DEPLOYMENT)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE public.runtime_attestations \
+         SET attestation_id = $1, attestation_digest = $1, \
+             record_format_version = 2, record = $2, v2_operation_id = $3, \
+             v2_intent_fingerprint = $4, v2_request_digest = $5, \
+             v2_request_bytes = $6, v2_live_attestation_bytes = $7, \
+             v2_must_commit_before = certified_at + INTERVAL '1 hour', \
+             v2_route_admission = $8, v2_route_incarnation = 1, \
+             v2_route_activation_sequence = 1, v2_initial_lease_epoch = 1, \
+             v2_initial_serving_revision = 1, v2_prepared_snapshot = $9, \
+             v2_certified_snapshot = $10 \
+         WHERE attestation_id = $11",
+    )
+    .bind(&attestation_digest)
+    .bind(Json(record))
+    .bind(PENDING_DRAIN_CERTIFICATION_OPERATION)
+    .bind("6".repeat(64))
+    .bind(&request_digest)
+    .bind(&request_bytes)
+    .bind(&live_bytes)
+    .bind(Json(route_admission))
+    .bind(Json(prepared_snapshot))
+    .bind(Json(certified_snapshot))
+    .bind(ATTESTATION)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO public.runtime_serving_leases \
+         (guild_id, ruleset_key, tenant_id, installation_id, deployment_id, \
+          attestation_id, process_instance_id, runtime_generation, target_version, \
+          target_content_hash, binding_revision, binding_fingerprint, lease_epoch, \
+          revision, connected, serving, acquired_at, last_heartbeat_at, expires_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,1,1,$8,1,$9,1,1,TRUE,TRUE,$10,$11,$12)",
+    )
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .bind(TENANT)
+    .bind(INSTALLATION)
+    .bind(DEPLOYMENT)
+    .bind(&attestation_digest)
+    .bind(PROCESS)
+    .bind(CONTENT_HASH)
+    .bind(BINDING_FINGERPRINT)
+    .bind(now - TimeDelta::seconds(90))
+    .bind(now - TimeDelta::seconds(60))
+    .bind(now - TimeDelta::seconds(30))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    set_v2_fixture_triggers(pool, true).await;
+    RuntimeServingIdentityV2 {
+        scope: RuntimeDeploymentScopeV1 {
+            tenant_id: TenantId::parse(TENANT).unwrap(),
+            installation_id: InstallationId::parse(INSTALLATION).unwrap(),
+            deployment_id: DeploymentId::parse(DEPLOYMENT).unwrap(),
+        },
+        operation_id: RuntimeCertificationOperationIdV2::parse(
+            PENDING_DRAIN_CERTIFICATION_OPERATION,
+        )
+        .unwrap(),
+        attestation_digest: RuntimeLiveAttestationDigestV2::parse(attestation_digest).unwrap(),
+        process_identity: RuntimeProcessIdentityV1 {
+            target: runtime_target(),
+            runtime_generation: RuntimeGeneration::FIRST,
+            process_instance_id: ProcessInstanceId::parse(PROCESS).unwrap(),
+        },
+        lease_epoch: NonZeroU64::new(1).unwrap(),
+        revision: NonZeroU64::new(1).unwrap(),
+    }
+}
+
+async fn framed_digest_v2(pool: &PgPool, domain: &str, payload: &[u8]) -> String {
+    sqlx::query_scalar(
+        "SELECT starring_runtime_private_v2.starring_runtime_framed_digest_v2(\
+            pg_catalog.convert_to($1, 'UTF8') || pg_catalog.decode('00', 'hex'), $2\
+         )",
+    )
+    .bind(domain)
+    .bind(payload)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn set_v2_fixture_triggers(pool: &PgPool, enabled: bool) {
+    let action = if enabled { "ENABLE" } else { "DISABLE" };
+    for table in [
+        "runtime_attestations",
+        "runtime_deployments",
+        "runtime_serving_leases",
+    ] {
+        sqlx::query(&format!("ALTER TABLE public.{table} {action} TRIGGER USER"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+}
+
+async fn reset_v2_serving_fixture(
+    pool: &PgPool,
+    baseline: &RuntimeServingIdentityV2,
+    revision: u64,
+    fresh: bool,
+) -> RuntimeServingIdentityV2 {
+    let now = sqlx::query_scalar::<_, DateTime<Utc>>("SELECT pg_catalog.clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE public.runtime_serving_leases DISABLE TRIGGER USER")
+        .execute(pool)
+        .await
+        .unwrap();
+    let (last_heartbeat_at, expires_at) = if fresh {
+        (now - TimeDelta::seconds(1), now + TimeDelta::seconds(30))
+    } else {
+        (now - TimeDelta::seconds(60), now - TimeDelta::seconds(30))
+    };
+    sqlx::query(
+        "UPDATE public.runtime_serving_leases \
+         SET revision = $1, connected = TRUE, serving = TRUE, \
+             acquired_at = $2, last_heartbeat_at = $3, expires_at = $4 \
+         WHERE guild_id = $5 AND ruleset_key = $6",
+    )
+    .bind(i64::try_from(revision).unwrap())
+    .bind(now - TimeDelta::seconds(90))
+    .bind(last_heartbeat_at)
+    .bind(expires_at)
+    .bind(GUILD.to_string())
+    .bind(RULESET)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE public.runtime_serving_leases ENABLE TRIGGER USER")
+        .execute(pool)
+        .await
+        .unwrap();
+    let mut identity = baseline.clone();
+    identity.revision = NonZeroU64::new(revision).unwrap();
+    identity
+}
+
+fn decode_hex_32(value: &str) -> [u8; 32] {
+    assert_eq!(value.len(), 64);
+    let mut decoded = [0_u8; 32];
+    for (index, byte) in decoded.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    decoded
 }
 
 async fn assert_writer_fence_snapshot_and_fail_closed(
@@ -723,6 +1533,31 @@ async fn raw_heartbeat(
     .bind(i64::try_from(identity.lease_epoch.get()).unwrap())
     .bind(i64::try_from(identity.expected_revision.get()).unwrap())
     .bind(i64::try_from(request.lease_for.as_millis()).unwrap())
+    .fetch_all(&mut **transaction)
+    .await
+    .map(|_| ())
+}
+
+async fn raw_heartbeat_v2(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    identity: &RuntimeServingIdentityV2,
+    lease_for: Duration,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT * FROM public.starring_runtime_serving_heartbeat_v2(\
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10\
+         )",
+    )
+    .bind(identity.operation_id.as_str())
+    .bind(identity.scope.tenant_id.as_str())
+    .bind(identity.scope.installation_id.as_str())
+    .bind(identity.scope.deployment_id.as_str())
+    .bind(identity.attestation_digest.as_str())
+    .bind(identity.process_identity.process_instance_id.as_str())
+    .bind(i64::try_from(identity.process_identity.runtime_generation.get()).unwrap())
+    .bind(i64::try_from(identity.lease_epoch.get()).unwrap())
+    .bind(i64::try_from(identity.revision.get()).unwrap())
+    .bind(i64::try_from(lease_for.as_millis()).unwrap())
     .fetch_all(&mut **transaction)
     .await
     .map(|_| ())

@@ -16,7 +16,7 @@ const FUNCTIONS: [ScopedFunctionContractV1<'static>; 2] = [
     ScopedFunctionContractV1::scalar(DATABASE_IDENTITY_FUNCTION, "text"),
     ScopedFunctionContractV1::set_named(STATUS_FUNCTION, STATUS_RESULT, 1.0, STATUS_ARGUMENTS),
 ];
-const RELATIONS: [ScopedRelationContractV1<'static>; 13] = [
+const RELATIONS: [ScopedRelationContractV1<'static>; 14] = [
     ScopedRelationContractV1::ordinary_without_rls("public.product_control_plane_identity"),
     ScopedRelationContractV1::ordinary_without_rls("public.product_principals"),
     ScopedRelationContractV1::ordinary_without_rls("public.product_auth_sessions"),
@@ -30,6 +30,7 @@ const RELATIONS: [ScopedRelationContractV1<'static>; 13] = [
     ),
     ScopedRelationContractV1::ordinary_without_rls("public.automation_ruleset_activations"),
     ScopedRelationContractV1::ordinary_without_rls("public.automation_ruleset_versions"),
+    ScopedRelationContractV1::ordinary_without_rls("public.runtime_certification_operations_v2"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_attestations"),
     ScopedRelationContractV1::ordinary_without_rls("public.runtime_serving_leases"),
 ];
@@ -52,7 +53,7 @@ WITH common_owner AS (
     WHERE namespace.nspname = 'public'
         AND function_row.proname IN (
             'starring_product_deployment_status_reader_database_identity_v1',
-            'starring_product_deployment_status_read_v1'
+            'starring_product_deployment_status_read_v3'
         )
 ), expected_support_functions(function_name, function_identity) AS (
     VALUES
@@ -72,6 +73,8 @@ WITH common_owner AS (
             'public.validate_runtime_attestation_attempt_projection()'),
         ('reject_immutable_product_row',
             'public.reject_immutable_product_row()'),
+        ('reject_runtime_certification_reservation_mutation_v2',
+            'public.reject_runtime_certification_reservation_mutation_v2()'),
         ('validate_runtime_serving_lease_transition',
             'public.validate_runtime_serving_lease_transition()'),
         ('reject_runtime_serving_lease_delete',
@@ -83,7 +86,7 @@ WITH common_owner AS (
         ('starring_ruleset_content_hash_v1',
             'public.starring_ruleset_content_hash_v1(bigint,jsonb)')
 ), support_function_identity_contract AS (
-    SELECT (SELECT pg_catalog.count(*) FROM expected_support_functions) = 13
+    SELECT (SELECT pg_catalog.count(*) FROM expected_support_functions) = 14
         AND NOT EXISTS (
             SELECT 1
             FROM expected_support_functions AS expected
@@ -146,6 +149,14 @@ WITH common_owner AS (
             'public.reject_immutable_product_row()',
             'CREATE TRIGGER runtime_attestations_reject_mutation BEFORE DELETE OR UPDATE ON public.runtime_attestations FOR EACH ROW EXECUTE FUNCTION public.reject_immutable_product_row()',
             FALSE, FALSE, FALSE, FALSE),
+        ('public.runtime_certification_operations_v2',
+            'public.reject_runtime_certification_reservation_mutation_v2()',
+            'CREATE TRIGGER runtime_certification_operations_v2_reject_row_mutation BEFORE INSERT OR DELETE OR UPDATE ON public.runtime_certification_operations_v2 FOR EACH ROW EXECUTE FUNCTION public.reject_runtime_certification_reservation_mutation_v2()',
+            FALSE, TRUE, TRUE, TRUE),
+        ('public.runtime_certification_operations_v2',
+            'public.reject_runtime_certification_reservation_mutation_v2()',
+            'CREATE TRIGGER runtime_certification_operations_v2_reject_truncate BEFORE TRUNCATE ON public.runtime_certification_operations_v2 FOR EACH STATEMENT EXECUTE FUNCTION public.reject_runtime_certification_reservation_mutation_v2()',
+            FALSE, TRUE, TRUE, TRUE),
         ('public.runtime_serving_leases',
             'public.validate_runtime_serving_lease_transition()',
             'CREATE TRIGGER runtime_serving_leases_validate_transition BEFORE INSERT OR UPDATE ON public.runtime_serving_leases FOR EACH ROW EXECUTE FUNCTION public.validate_runtime_serving_lease_transition()',
@@ -194,13 +205,14 @@ WITH common_owner AS (
     WHERE NOT trigger_row.tgisinternal
         AND trigger_row.tgrelid IN (
             pg_catalog.to_regclass('public.runtime_deployments'),
+            pg_catalog.to_regclass('public.runtime_certification_operations_v2'),
             pg_catalog.to_regclass('public.runtime_attestations'),
             pg_catalog.to_regclass('public.runtime_serving_leases'),
             pg_catalog.to_regclass('public.automation_ruleset_versions')
         )
 ), trigger_manifest AS (
-    SELECT (SELECT pg_catalog.count(*) FROM expected_triggers) = 12
-        AND (SELECT pg_catalog.count(*) FROM actual_triggers) = 12
+    SELECT (SELECT pg_catalog.count(*) FROM expected_triggers) = 14
+        AND (SELECT pg_catalog.count(*) FROM actual_triggers) = 14
         AND NOT EXISTS (
             SELECT 1
             FROM expected_triggers AS expected
@@ -215,7 +227,7 @@ WITH common_owner AS (
                 OR actual.trigger_oid IS NULL
         ) AS valid
 ), support_function_contract AS (
-    SELECT pg_catalog.count(*) = 12
+    SELECT pg_catalog.count(*) = 14
         AND pg_catalog.bool_and(COALESCE(
             function_row.oid IS NOT NULL
             AND function_row.proowner = common_owner.owner_oid
@@ -387,7 +399,7 @@ impl PostgresProductDeploymentStatuses {
             .map_err(map_readiness)?;
         let probe_count = sqlx::query_scalar::<_, i64>(
             "SELECT pg_catalog.count(*) \
-             FROM public.starring_product_deployment_status_read_v1(\
+             FROM public.starring_product_deployment_status_read_v3(\
                 $1, $1, $1, $1, $1, $1, $1, $1, $2)",
         )
         .bind(PROBE_IDENTITY)
@@ -430,9 +442,9 @@ mod tests {
     #[test]
     fn readiness_manifest_is_exact_and_nonempty() {
         assert_eq!(FUNCTIONS.len(), 2);
-        assert_eq!(RELATIONS.len(), 13);
+        assert_eq!(RELATIONS.len(), 14);
         assert_eq!(PROBE_SESSION_DIGEST.len(), 31);
-        assert!(SUPPORT_CONTRACT_QUERY.contains("pg_catalog.count(*) = 12"));
+        assert!(SUPPORT_CONTRACT_QUERY.contains("pg_catalog.count(*) = 14"));
     }
 
     #[test]

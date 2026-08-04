@@ -1,6 +1,7 @@
 mod application;
 mod authority;
 mod control;
+mod conversation;
 mod identity;
 mod lifecycle;
 mod promotion;
@@ -25,6 +26,22 @@ pub use control::{
     ProductStatusQueryV1, PromotionSelectorV1, RejectProductPromotionV1, RejectionReasonError,
     RejectionReasonV1,
 };
+pub use conversation::{
+    AuthoringAdmissionError, AuthoringCommitBoundaryV1, AuthoringCommitOutcomeV1,
+    AuthoringConversationConfigError, AuthoringConversationConfigV1, AuthoringConversationError,
+    AuthoringConversationStorePort, AuthoringExpectedGenerationError,
+    AuthoringExpectedGenerationV1, AuthoringHumanMessageError, AuthoringHumanMessageV1,
+    AuthoringMutationDispositionV1, AuthoringSessionCommitPort, AuthoringSessionLoadError,
+    AuthoringSessionLoadPort, AuthoringSessionLoadV1, AuthoringSessionObservationErrorV1,
+    AuthoringSessionObservationV1, AuthoringSessionReadPort, AuthoringStoredGenerationV1,
+    AuthoringStoredRequestIdentityV1, AuthoringTurnAdmissionPort, AuthoringTurnCheckV1,
+    AuthoringTurnOutcomeV1, AuthoringTurnReceiptV1, AuthorizedAuthoringCommitV1,
+    AuthorizedConversationAccessV1, AuthorizedConversationReadAccessV1, ConversationApplication,
+    LocalAuthoringRequestKeyV1, ReadAuthoringSessionV1, SafeAuthoringPreviewV1,
+    SafeAuthoringProjectionError, SafeAuthoringTurnProjectionV1, SafeAuthoringTurnStateV1,
+    StartOrAdvanceAuthoringTurnV1, AUTHORING_MAX_MODEL_CALLS_V1,
+};
+pub use design_harness::PreviewReadyArtifactV1;
 pub use identity::{
     AuthenticatedActorV1, AuthenticatedSessionFingerprintV1, AuthenticationBackendFailureV1,
     AuthenticationClaimsV1, AuthenticationError, AuthenticationPort, MutationAuthenticationPort,
@@ -53,12 +70,13 @@ pub use status::{
     DeploymentFailureCodeErrorV1, DeploymentFailureCodeV1, DeploymentFailureMetadataV1,
     DeploymentOperationalObservationErrorV2, DeploymentOperationalObservationV2,
     DeploymentOperationalProjectionV2, DeploymentOperationalStatusPortV2,
-    DeploymentOperatorActionV2, DeploymentRetryObservationV2, DeploymentServingFreshnessV2,
-    DeploymentStatusObservationErrorV1, DeploymentStatusObservationPort,
-    DeploymentStatusObservationV1, DeploymentStatusPort, DeploymentStatusPortError,
-    DeploymentStatusProjectionV1, DeploymentStatusV1, ExactDeploymentSelectorError,
-    ExactDeploymentSelectorV1, ExactLiveProjectionV1, ProductApplicationError,
-    ProductApplyResultV1, ProductDecisionPhaseV1, ProductDecisionProjectionV1,
-    ProductDeploymentOperationalStatusV2, ProductDeploymentStatusObservationV1,
-    ProductStatusObservationV1, ProductStatusV1, RuntimeDeploymentQueryV1,
+    DeploymentOperatorActionV2, DeploymentProcessInstanceIdErrorV2, DeploymentProcessInstanceIdV2,
+    DeploymentRetryObservationV2, DeploymentServingFreshnessV2, DeploymentStatusObservationErrorV1,
+    DeploymentStatusObservationPort, DeploymentStatusObservationV1, DeploymentStatusPort,
+    DeploymentStatusPortError, DeploymentStatusProjectionV1, DeploymentStatusV1,
+    ExactDeploymentSelectorError, ExactDeploymentSelectorV1, ExactLiveProjectionV1,
+    ProductApplicationError, ProductApplyResultV1, ProductDecisionPhaseV1,
+    ProductDecisionProjectionV1, ProductDeploymentOperationalStatusV2,
+    ProductDeploymentStatusObservationV1, ProductStatusObservationV1, ProductStatusV1,
+    RuntimeDeploymentQueryV1,
 };

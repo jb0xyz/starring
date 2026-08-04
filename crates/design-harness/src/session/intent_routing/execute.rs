@@ -2,9 +2,11 @@ use serde_json::json;
 
 use crate::errors::StructuredError;
 use crate::intent::{
-    apply_existing_channel_decision, candidate_ruleset_hash, draft_state_hash,
-    prepare_intent_candidate, IntentWorkspaceV2, MissingDecision, PreparedIntentWorkspaceV2,
-    ValidatedIntentV2, INTENT_IDENTITY_REVISION,
+    apply_existing_channel_decision, candidate_ruleset_hash, compile_intent, draft_state_hash,
+    prepare_intent_candidate, prepare_intent_workspace, upgrade_working_draft_to_validated_preview,
+    verify_existing_intent_candidate, verify_outcome_only_finalization, IntentRequestedOutcome,
+    IntentWorkspaceV2, MissingDecision, PreparedIntentWorkspaceV2, ValidatedIntentV2,
+    INTENT_IDENTITY_REVISION,
 };
 use crate::turn::{
     parse_interpret_intent_core_for_serving,
@@ -22,6 +24,7 @@ use super::evidence::IntentRecipeEvidenceV4;
 use super::grounding::{deterministically_selected_option, unambiguously_selects_option};
 use super::request_evidence::{
     AcceptedIntentResolutionV1, AcceptedResolutionEvidenceInputV1, IntentRequestEvidenceChainV1,
+    TerminalOutcomeFinalizationEvidenceInputV1,
 };
 use super::state::{
     intent_error, IntentFallbackV1, IntentRecipeRuntime, IntentRecipeStageSnapshotV2,
@@ -337,6 +340,295 @@ impl<C> DesignSession<C> {
         })
     }
 
+    async fn try_finalize_existing_preview(
+        &mut self,
+        current_workspace: &IntentWorkspaceV2,
+        current_intent: &ValidatedIntentV2,
+        standalone_request_evidence: &IntentRequestEvidenceChainV1,
+        standalone_route_decision: &IntentRouteDecisionV2,
+        standalone_recipe_evidence: &IntentRecipeEvidenceV4,
+    ) -> Result<Option<IntentTurnSuccess>, StructuredError> {
+        let Some(stage) = self
+            .intent_recipe
+            .as_ref()
+            .map(|runtime| runtime.snapshot.stage.clone())
+        else {
+            return Ok(None);
+        };
+        let IntentRecipeStageSnapshotV2::PreviewReady {
+            root_draft_revision,
+            workspace: persisted_workspace,
+            identity_revision,
+            intent_revision: persisted_intent_revision,
+            candidate_revision,
+            compiler_input_hash: persisted_compiler_input_hash,
+            semantic_intent_hash: persisted_semantic_intent_hash,
+            compiled_plan_hash: persisted_compiled_plan_hash,
+            candidate_ruleset_hash: persisted_candidate_ruleset_hash,
+            candidate_draft_hash: persisted_candidate_draft_hash,
+            external_channel_bindings: persisted_external_channel_bindings,
+            compiled_operations,
+            request_evidence: persisted_request_evidence,
+            route_decision: persisted_route_decision,
+            recipe_evidence: persisted_recipe_evidence,
+            ..
+        } = stage
+        else {
+            return Ok(None);
+        };
+        if persisted_workspace.requested_outcome != IntentRequestedOutcome::WorkingDraft
+            || current_workspace.requested_outcome != IntentRequestedOutcome::ValidatedPreview
+            || current_intent.requested_outcome() != IntentRequestedOutcome::ValidatedPreview
+        {
+            return Ok(None);
+        }
+        self.observability.intent_compile_attempts =
+            self.observability.intent_compile_attempts.saturating_add(1);
+        let result = async {
+            let (bindings, context, context_fingerprint) = self
+                .intent_recipe
+                .as_ref()
+                .map(|runtime| {
+                    (
+                        runtime.bindings.clone(),
+                        runtime.resolution_context(),
+                        runtime.snapshot.context_fingerprint.clone(),
+                    )
+                })
+                .ok_or_else(|| {
+                    intent_error(
+                        "INTENT_SESSION_DISABLED",
+                        "intent.session",
+                        "Intent recipe mode is not enabled",
+                        "Construct the session with resource bindings",
+                    )
+                })?;
+            standalone_request_evidence.validate_against_transcript(&self.messages)?;
+            if standalone_request_evidence.entries().len() != 1
+                || standalone_request_evidence.terminal_outcome_finalization_count() != 0
+                || standalone_request_evidence.initial_expected_revision()? != candidate_revision
+                || standalone_request_evidence.initial_head()?
+                    != standalone_request_evidence.head()
+                || standalone_route_decision.request_evidence_hash()
+                    != Some(standalone_request_evidence.head())
+                || standalone_recipe_evidence.core_semantic_digest()
+                    != standalone_route_decision.semantic_ir_digest()
+                || standalone_recipe_evidence.source_human_turn_digest()
+                    != standalone_request_evidence.initial_human_turn_digest()?
+            {
+                return Err(intent_error(
+                    "INTENT_OUTCOME_FINALIZATION_EVIDENCE_MISMATCH",
+                    "intent.request_evidence",
+                    "The outcome finalization request is not bound to one current private intent turn",
+                    "Retry the finalization from the current preview-ready Draft",
+                ));
+            }
+            let PreparedIntentWorkspaceV2::Resolved {
+                workspace: normalized_persisted_workspace,
+                intent: persisted_intent,
+            } = prepare_intent_workspace(persisted_workspace.clone(), &context)?
+            else {
+                return Err(intent_error(
+                    "INTENT_OUTCOME_FINALIZATION_SOURCE_UNRESOLVED",
+                    "intent.workspace",
+                    "The committed working Draft workspace no longer resolves",
+                    "Start a new intent from the current canonical Draft",
+                ));
+            };
+            let persisted_compilation = compile_intent(&persisted_intent)?;
+            let actual_candidate_ruleset_hash = candidate_ruleset_hash(&self.draft)?;
+            let actual_candidate_draft_hash = draft_state_hash(&self.draft)?;
+            let expected_candidate_revision = u64::try_from(compiled_operations)
+                .ok()
+                .and_then(|operations| root_draft_revision.checked_add(operations));
+            if normalized_persisted_workspace != persisted_workspace
+                || persisted_intent.revision() != persisted_intent_revision
+                || identity_revision != INTENT_IDENTITY_REVISION
+                || persisted_compilation.manifest.identity_revision != identity_revision
+                || persisted_compilation.manifest.compiler_input_hash
+                    != persisted_compiler_input_hash
+                || persisted_compilation.manifest.semantic_intent_hash
+                    != persisted_semantic_intent_hash
+                || persisted_compilation.manifest.compiled_plan_hash
+                    != persisted_compiled_plan_hash
+                || persisted_compilation.manifest.external_channel_bindings
+                    != persisted_external_channel_bindings
+                || persisted_compilation.requirements.len() != compiled_operations
+                || expected_candidate_revision != Some(candidate_revision)
+                || self.draft.draft_revision != candidate_revision
+                || self.draft.validated_revision != Some(candidate_revision)
+                || self.draft.simulated_revision != Some(candidate_revision)
+                || actual_candidate_ruleset_hash != persisted_candidate_ruleset_hash
+                || actual_candidate_draft_hash != persisted_candidate_draft_hash
+            {
+                return Err(intent_error(
+                    "INTENT_OUTCOME_FINALIZATION_SOURCE_MISMATCH",
+                    "intent.session.stage",
+                    "The committed working Draft no longer matches its compiler and candidate identities",
+                    "Start a new intent from the current canonical Draft",
+                ));
+            }
+            let standalone_compilation = compile_intent(current_intent)?;
+            let PreparedIntentWorkspaceV2::Resolved {
+                workspace: finalized_workspace,
+                intent: finalized_intent,
+            } = upgrade_working_draft_to_validated_preview(
+                &persisted_workspace,
+                persisted_workspace.revision,
+                &context,
+            )?
+            else {
+                return Err(intent_error(
+                    "INTENT_OUTCOME_FINALIZATION_UNRESOLVED",
+                    "intent.workspace",
+                    "The outcome-only workspace transition no longer resolves",
+                    "Start a new intent from the current canonical Draft",
+                ));
+            };
+            let finalized_compilation = compile_intent(&finalized_intent)?;
+            verify_outcome_only_finalization(
+                &persisted_compilation,
+                &standalone_compilation,
+                &finalized_compilation,
+            )?;
+            let verified = verify_existing_intent_candidate(
+                &self.draft,
+                &finalized_intent,
+                &persisted_compilation,
+                &bindings,
+            )
+            .await?;
+            let finalized_compiler_input_hash =
+                verified.compilation().manifest.compiler_input_hash.clone();
+            let finalized_semantic_intent_hash =
+                verified.compilation().manifest.semantic_intent_hash.clone();
+            let finalized_compiled_plan_hash =
+                verified.compilation().manifest.compiled_plan_hash.clone();
+            if verified.candidate() != &self.draft
+                || verified.candidate().draft_revision != candidate_revision
+                || verified.compiled_operations() != compiled_operations
+                || verified.compilation().manifest.identity_revision != identity_revision
+                || verified.compilation().manifest.external_channel_bindings
+                    != persisted_external_channel_bindings
+                || finalized_compiled_plan_hash != persisted_compiled_plan_hash
+            {
+                return Err(intent_error(
+                    "INTENT_OUTCOME_FINALIZATION_CANDIDATE_CHANGED",
+                    "intent.candidate",
+                    "Finalization verification changed the committed candidate footprint",
+                    "Start a new intent from the current canonical Draft",
+                ));
+            }
+            let transcript_message_index = u64::try_from(
+                self.current_human_message_index.ok_or_else(|| {
+                    intent_error(
+                        "INTENT_HUMAN_MESSAGE_MISSING",
+                        "intent.request_evidence",
+                        "The finalization request is not present in the append-only transcript",
+                        "Retry the finalization as a new intent turn",
+                    )
+                })?,
+            )
+            .map_err(|_| {
+                intent_error(
+                    "INTENT_HUMAN_MESSAGE_INDEX_OVERFLOW",
+                    "intent.request_evidence",
+                    "The finalization transcript index exceeds the supported range",
+                    "Start a compacted intent session",
+                )
+            })?;
+            let standalone_recipe_evidence_digest =
+                standalone_recipe_evidence.binding_digest()?;
+            let mut finalized_request_evidence = persisted_request_evidence;
+            finalized_request_evidence.append_terminal_outcome_finalization(
+                &self.messages,
+                TerminalOutcomeFinalizationEvidenceInputV1 {
+                    transcript_message_index,
+                    expected_draft_revision: candidate_revision,
+                    prior_workspace_revision: persisted_workspace.revision,
+                    next_workspace_revision: finalized_workspace.revision,
+                    standalone_request_evidence_digest: standalone_request_evidence.head(),
+                    standalone_adjudication_digest: standalone_route_decision
+                        .adjudication_digest(),
+                    standalone_recipe_evidence_digest: &standalone_recipe_evidence_digest,
+                },
+            )?;
+            let decision_binding_digest =
+                preview_ready_binding_digest_v4(PreviewReadyBindingInputV4 {
+                    protocol_version: INTENT_RECIPE_PROTOCOL_VERSION_V4,
+                    context_fingerprint: &context_fingerprint,
+                    root_draft_revision,
+                    workspace: &finalized_workspace,
+                    identity_revision,
+                    intent_revision: finalized_intent.revision(),
+                    candidate_revision,
+                    compiler_input_hash: &finalized_compiler_input_hash,
+                    semantic_intent_hash: &finalized_semantic_intent_hash,
+                    compiled_plan_hash: &finalized_compiled_plan_hash,
+                    candidate_ruleset_hash: &persisted_candidate_ruleset_hash,
+                    candidate_draft_hash: &persisted_candidate_draft_hash,
+                    external_channel_bindings: &persisted_external_channel_bindings,
+                    compiled_operations,
+                    request_evidence: &finalized_request_evidence,
+                    route_decision: &persisted_route_decision,
+                    recipe_evidence: &persisted_recipe_evidence,
+                })?;
+            let runtime = self.intent_recipe.as_mut().ok_or_else(|| {
+                intent_error(
+                    "INTENT_SESSION_DISABLED",
+                    "intent.session",
+                    "Intent recipe mode is not enabled",
+                    "Construct the session with resource bindings",
+                )
+            })?;
+            runtime.snapshot.stage = IntentRecipeStageSnapshotV2::PreviewReady {
+                root_draft_revision,
+                workspace: finalized_workspace,
+                identity_revision,
+                intent_revision: finalized_intent.revision(),
+                candidate_revision,
+                compiler_input_hash: finalized_compiler_input_hash,
+                semantic_intent_hash: finalized_semantic_intent_hash.clone(),
+                compiled_plan_hash: finalized_compiled_plan_hash.clone(),
+                candidate_ruleset_hash: persisted_candidate_ruleset_hash.clone(),
+                candidate_draft_hash: persisted_candidate_draft_hash,
+                external_channel_bindings: persisted_external_channel_bindings,
+                compiled_operations,
+                request_evidence: finalized_request_evidence,
+                route_decision: persisted_route_decision,
+                recipe_evidence: persisted_recipe_evidence,
+                decision_binding_digest,
+            };
+            Ok(IntentTurnSuccess::Ready {
+                summary: format!(
+                    "Finalized the existing private study room candidate as a validated preview at Draft revision {candidate_revision}"
+                ),
+                intent_revision: finalized_intent.revision(),
+                draft_revision: candidate_revision,
+                semantic_intent_hash: finalized_semantic_intent_hash,
+                compiled_plan_hash: finalized_compiled_plan_hash,
+                candidate_ruleset_hash: persisted_candidate_ruleset_hash,
+                compiled_operations,
+            })
+        }
+        .await;
+        match result {
+            Ok(success) => {
+                self.observability.intent_compile_successes = self
+                    .observability
+                    .intent_compile_successes
+                    .saturating_add(1);
+                self.observability.intent_finalizations =
+                    self.observability.intent_finalizations.saturating_add(1);
+                Ok(Some(success))
+            }
+            Err(error) => {
+                self.record_intent_rollback(&error);
+                Err(error)
+            }
+        }
+    }
+
     fn record_intent_rollback(&mut self, error: &StructuredError) {
         self.observability.intent_rollbacks = self.observability.intent_rollbacks.saturating_add(1);
         if error.code.contains("CONFLICT") || error.code == "INTENT_CANDIDATE_STALE" {
@@ -539,6 +831,18 @@ impl<C> DesignSession<C> {
                 )
             }
             PreparedIntentWorkspaceV2::Resolved { workspace, intent } => {
+                if let Some(success) = self
+                    .try_finalize_existing_preview(
+                        &workspace,
+                        &intent,
+                        &request_evidence,
+                        &route_decision,
+                        &recipe_evidence,
+                    )
+                    .await?
+                {
+                    return Ok(success);
+                }
                 self.prepare_and_commit_intent(
                     workspace,
                     intent,

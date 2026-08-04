@@ -104,12 +104,26 @@ async fn assert_slot_writer_fence_gates_clear(
 }
 
 async fn slot_writer_fence_manifests(pool: &PgPool) -> (bool, bool, bool, bool) {
-    sqlx::query_as(
+    let exact_target_v2 = sqlx::query_scalar::<_, bool>(
+        "SELECT pg_catalog.to_regprocedure(\
+            'public.starring_runtime_exact_target_schema_manifest_v2()'\
+         ) IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let query = if exact_target_v2 {
+        "SELECT public.starring_runtime_interaction_schema_manifest_v1(), \
+                public.starring_runtime_exact_target_schema_manifest_v2(), \
+                public.starring_runtime_serving_schema_manifest_v1(), \
+                public.starring_runtime_execution_schema_manifest_v1()"
+    } else {
         "SELECT public.starring_runtime_interaction_schema_manifest_v1(), \
                 public.starring_runtime_exact_target_schema_manifest_v1(), \
                 public.starring_runtime_serving_schema_manifest_v1(), \
-                public.starring_runtime_execution_schema_manifest_v1()",
-    )
+                public.starring_runtime_execution_schema_manifest_v1()"
+    };
+    sqlx::query_as(query)
     .fetch_one(pool)
     .await
     .unwrap()

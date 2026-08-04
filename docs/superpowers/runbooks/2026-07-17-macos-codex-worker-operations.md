@@ -23,7 +23,7 @@ authentication and product-level admission remain the backend's responsibility.
 | listen address | `127.0.0.1:18181` |
 | model | `gpt-5.6-luna` |
 | reasoning effort | `medium` |
-| Codex CLI version | `codex-cli 0.144.2` |
+| Codex CLI version | `codex-cli 0.146.0-alpha.3.1` |
 | active request limit | `2` |
 | queue capacity | `8` |
 | request timeout | `55000 ms` |
@@ -48,7 +48,7 @@ cd /Users/jungbogeon/starring
 test -x /opt/homebrew/opt/node@24/bin/node
 test -x /Applications/ChatGPT.app/Contents/Resources/codex
 test -f tools/codex-worker/worker.mjs
-/Applications/ChatGPT.app/Contents/Resources/codex --version | grep -Fx 'codex-cli 0.144.2'
+/Applications/ChatGPT.app/Contents/Resources/codex --version | grep -Fx 'codex-cli 0.146.0-alpha.3.1'
 /Applications/ChatGPT.app/Contents/Resources/codex login status
 security find-generic-password -s com.starring.llm-api-key -a llm-api >/dev/null
 plutil -lint ops/macos/local.starring.codex-worker.plist
@@ -89,7 +89,7 @@ lsof -nP -iTCP:18181 -sTCP:LISTEN
 API_KEY="$(security find-generic-password -s com.starring.llm-api-key -a llm-api -w)"
 printf 'Authorization: Bearer %s\n' "${API_KEY}" \
   | curl -fsS http://127.0.0.1:18181/health -H @- \
-  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and .codex_cli_version == "codex-cli 0.144.2" and (.instance_id | type) == "string" and (.instance_id | length) > 0 and (.worker_source_sha256 | test("^[0-9a-f]{64}$")) and .concurrency_limit == 2 and .queue_capacity == 8 and .request_timeout_ms == 55000 and .active_requests == 0 and .queued_requests == 0 and (.accepted_requests_total | type) == "number" and (.settled_requests_total | type) == "number" and .accepted_requests_total == .settled_requests_total'
+  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and .codex_cli_version == "codex-cli 0.146.0-alpha.3.1" and (.instance_id | type) == "string" and (.instance_id | length) > 0 and (.worker_source_sha256 | test("^[0-9a-f]{64}$")) and .concurrency_limit == 2 and .queue_capacity == 8 and .request_timeout_ms == 55000 and .active_requests == 0 and .queued_requests == 0 and (.accepted_requests_total | type) == "number" and (.settled_requests_total | type) == "number" and .accepted_requests_total == .settled_requests_total'
 ```
 
 The listener output must show `127.0.0.1:18181`. Stop immediately if it shows
@@ -163,7 +163,7 @@ this point; health requests do not increment completion counters.
 lsof -nP -iTCP:18181 -sTCP:LISTEN
 printf 'Authorization: Bearer %s\n' "${API_KEY}" \
   | curl -fsS http://127.0.0.1:18181/health -H @- \
-  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and .codex_cli_version == "codex-cli 0.144.2" and (.instance_id | type) == "string" and (.instance_id | length) > 0 and (.worker_source_sha256 | test("^[0-9a-f]{64}$")) and .concurrency_limit == 1 and .queue_capacity == 0 and .request_timeout_ms == 55000 and .active_requests == 0 and .queued_requests == 0 and .accepted_requests_total == .settled_requests_total'
+  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and .codex_cli_version == "codex-cli 0.146.0-alpha.3.1" and (.instance_id | type) == "string" and (.instance_id | length) > 0 and (.worker_source_sha256 | test("^[0-9a-f]{64}$")) and .concurrency_limit == 1 and .queue_capacity == 0 and .request_timeout_ms == 55000 and .active_requests == 0 and .queued_requests == 0 and .accepted_requests_total == .settled_requests_total'
 test -z "$(git status --porcelain --untracked-files=normal)"
 ```
 
@@ -226,58 +226,27 @@ launchctl kickstart -k "$DOMAIN/local.starring.codex-worker"
 unset API_KEY
 ```
 
-The 2026-07-17 run completed 232 samples but failed acceptance at 203/232 rows
-and 295/298 planned model calls. It is recorded in
-`eval/design-harness/measurements.md` and does not establish a repeated Luna V4
-acceptance pass. A future pass requires a fresh output directory, clean source,
-new dedicated worker instance, and satisfaction of every authoritative check.
+The authoritative V15 run at
+`eval/design-harness/results/luna-v4-acceptance-v15-20260717T112904Z` used clean
+source `7f138b308644f954cd38ceee78768f3d6b7bf551` and passed 232/232
+Promptfoo rows with the exact 298/298 model/tool calls, zero provider errors,
+repairs, or retries, and matching 298/298 worker accepted/settled deltas. Its
+manifest and acceptance artifacts both report `passed`. The worker for that
+certificate was pinned to `codex-cli 0.144.2`; the routine service has since
+advanced to the separately checked pin in this runbook. Do not relabel the V15
+evidence as a certificate for the newer CLI or for commercial concurrency,
+soak, Discord execution, or availability.
 
-## Cut over from the local Gemma stack
+## Current cutover state
 
-The existing public raw-LLM path is
-`local.cloudflared.starring` to `local.llm-api` on port `18080`, then
-`local.ollama.server` on port `11434`. The new Codex worker is not a public
-replacement for that route. Any backend moving to Luna must first be configured
-to call `127.0.0.1:18181` locally and pass its smoke test.
+The Gemma raw-LLM services `local.llm-api` and `local.ollama.server` are retired
+and disabled. The Starring API now owns loopback port `18080`; never use that
+port to infer that the retired LLM gateway is running, and never boot it out as
+part of worker maintenance. `local.cloudflared.starring` may carry the product
+API route and is also outside worker ownership. The Codex worker remains a
+private dependency at `127.0.0.1:18181` and must never become a tunnel origin.
 
-Stopping `local.llm-api` aborts active and queued requests. Before the change,
-inspect its health output and wait for `active_requests` and `queued_requests` to
-reach zero when those fields are present.
-
-```zsh
-curl -fsS http://127.0.0.1:18080/health | jq
-```
-
-After the new worker smoke test succeeds and the old gateway is drained, stop
-the old stack in this order:
-
-```zsh
-DOMAIN="gui/$(id -u)"
-launchctl disable "$DOMAIN/local.llm-api"
-launchctl bootout "$DOMAIN/local.llm-api"
-ollama stop gemma4:12b-mlx
-launchctl disable "$DOMAIN/local.ollama.server"
-launchctl bootout "$DOMAIN/local.ollama.server"
-```
-
-Pairing `disable` with `bootout` is intentional. `bootout` alone would allow a
-`RunAtLoad` LaunchAgent to return at the next login.
-
-The Cloudflare service may be stopped only after confirming that its remotely
-managed tunnel has no ingress other than the retired raw LLM endpoint. If it is
-raw-LLM-only, stop it last:
-
-```zsh
-DOMAIN="gui/$(id -u)"
-launchctl disable "$DOMAIN/local.cloudflared.starring"
-launchctl bootout "$DOMAIN/local.cloudflared.starring"
-```
-
-If the tunnel also serves another hostname or service, leave the LaunchAgent
-running and remove or replace only the raw LLM ingress through the Cloudflare
-configuration. Never change that ingress to `127.0.0.1:18181`.
-
-## Post-cutover verification
+## Service verification
 
 ```zsh
 DOMAIN="gui/$(id -u)"
@@ -294,45 +263,21 @@ printf 'Authorization: Bearer %s\n' "${API_KEY}" \
 unset API_KEY
 ```
 
-The worker must be healthy and bound only to loopback. Ports `18080` and `11434`
-must have no listeners, `ollama ps` must list no loaded model, and the disabled
-map must contain the retired services. If Cloudflare was raw-LLM-only, its label
-must also be disabled and absent from the running launchd domain.
+The worker must be healthy and bound only to loopback. If port `18080` is
+present, its process must be the reviewed `starring-api` binary bound only to
+`127.0.0.1`; it must never be `local.llm-api`. Port `11434` must have no
+listener, `ollama ps` must list no loaded model, and the disabled map must
+contain both retired LLM service labels.
 
 ## Rollback
 
-Rollback restores the previous local gateway without downloading or deleting a
-model. Stop the Codex worker first, then restore Ollama, the local gateway, and
-the tunnel in dependency order.
-
-```zsh
-DOMAIN="gui/$(id -u)"
-launchctl disable "$DOMAIN/local.starring.codex-worker"
-launchctl bootout "$DOMAIN/local.starring.codex-worker"
-launchctl enable "$DOMAIN/local.ollama.server"
-launchctl bootstrap "$DOMAIN" "$HOME/Library/LaunchAgents/local.ollama.server.plist"
-launchctl kickstart -k "$DOMAIN/local.ollama.server"
-until curl -fsS http://127.0.0.1:11434/api/version >/dev/null; do sleep 1; done
-launchctl enable "$DOMAIN/local.llm-api"
-launchctl bootstrap "$DOMAIN" "$HOME/Library/LaunchAgents/local.llm-api.plist"
-launchctl kickstart -k "$DOMAIN/local.llm-api"
-until curl -fsS http://127.0.0.1:18080/health >/dev/null; do sleep 1; done
-```
-
-If the Cloudflare service was disabled during cutover, restore it only after the
-local gateway is healthy:
-
-```zsh
-DOMAIN="gui/$(id -u)"
-launchctl enable "$DOMAIN/local.cloudflared.starring"
-launchctl bootstrap "$DOMAIN" "$HOME/Library/LaunchAgents/local.cloudflared.starring.plist"
-launchctl kickstart -k "$DOMAIN/local.cloudflared.starring"
-```
-
-The first Gemma request may need up to 120 seconds while the model is loaded.
-Keep the installed model files for this rollback path. Do not run
-`ollama rm gemma4:12b-mlx`, delete Ollama blobs, or remove the existing legacy
-LaunchAgent plists during the Luna trial.
+Worker rollback means restoring a previously verified worker plist and source
+revision with the same loopback, Keychain, model, and CLI contract. It does not
+authorize re-enabling Gemma or the retired raw-LLM gateway. If no compatible
+worker is available, leave authoring degraded while independently healthy core
+API operations continue, or close the API according to its runbook. Do not
+move port `18181` into Cloudflare, reuse the API's port `18080`, or substitute a
+different provider behind the Luna identity.
 
 ## Routine operations
 

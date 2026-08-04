@@ -1,19 +1,21 @@
 # macOS Starring Integrated Staging Cutover
 
-## Status: not executed
+## Status: staging foundation executed; Phase D certification incomplete
 
-This runbook is an executable staging plan. No command in this document was run
-as part of authoring it. No old cluster was stopped or moved, no new cluster was
-initialized, no role or Keychain item was changed, and no LaunchAgent or tunnel
-was loaded or unloaded. Every acceptance result and receipt remains absent
-until an operator runs the applicable block and records its exit status.
+The dedicated PostgreSQL 16 cluster, twenty application credentials, three
+keyrings, final HBA, API, runtime, and product-path staging foundation described
+by this runbook now exist. The B6 measurement records the bounded staging Live
+exercise. This document remains the fresh-cutover and recovery procedure; it is
+not itself evidence that a later source tree, migration, binary, backup, or
+disposable-guild cohort passed. Re-run the applicable blocks and retain a new
+acceptance record for every replacement environment.
 
 This cutover creates a disposable, dedicated PostgreSQL 16 staging cluster for
-the Starring API and the empty-open runtime on one Mac mini. It does not
-authorize customer traffic, a customer Discord guild, or production Live
-automation. Runtime readiness in this release means paused Discord connection,
-owner and ingress-acknowledgement convergence, and an empty in-process registry.
-It does not mean that a customer interaction route is installed.
+the Starring API and serving runtime on one Mac mini. The runtime can converge
+an exact Requested deployment and serve an admitted route, but process
+readiness alone never means a customer route is Live. Production authorization
+requires the exact product deployment projection plus the complete Phase D
+release certificate.
 
 The host still uses one macOS GUI login as the Keychain and LaunchAgent
 boundary. Codex and other processes under that login are inside the same secret
@@ -27,6 +29,7 @@ blocks in:
 
 - [Production Control Plane Cutover Runbook](./2026-07-19-production-control-plane-cutover.md)
 - [macOS Starring Runtime Staging Operations](./2026-07-29-macos-starring-runtime-staging-operations.md)
+- [Commercial certification Phase D handoff](../handoffs/2026-08-01-commercial-certification-phase-d-handoff.md)
 - `ops/postgres/staging-api-role-bootstrap.sql`
 - `ops/postgres/staging-api-role-enable.sql`
 - `ops/postgres/staging-runtime-role-bootstrap.sql`
@@ -80,8 +83,8 @@ by this procedure.
 
 ## Credential inventory
 
-There are exactly nineteen application database login credentials: fourteen
-for the API and five for the runtime. They all connect to the one fixed
+There are exactly twenty application database login credentials: fifteen for
+the API and five for the runtime. They all connect to the one fixed
 database, use distinct role names and passwords, and have no membership.
 
 | Keychain service/account | Exact database role |
@@ -100,6 +103,7 @@ database, use distinct role names and passwords, and have no membership.
 | `starring-api.staging/database.cancellation-executor` | `starring_decision_cancellation` |
 | `starring-api.staging/database.deployment-status-reader` | `starring_deployment_status_reader` |
 | `starring-api.staging/database.operational-deployment-status-reader` | `starring_operational_deployment_status_reader` |
+| `starring-api.staging/database.authoring-session-writer` | `starring_authoring_session_writer` |
 | `starring.runtime.staging/database.execution` | `starring_runtime_execution` |
 | `starring.runtime.staging/database.exact-target` | `starring_runtime_exact_target` |
 | `starring.runtime.staging/database.panel` | `starring_runtime_panel` |
@@ -116,8 +120,8 @@ The provisioner generates each application password independently from 32
 random bytes and encodes it as exactly 43 URL-safe unpadded Base64 characters.
 Operators never type, export, or record these generated values.
 
-There are three provider-credential Keychain entries in addition to the
-nineteen database entries:
+There are three Discord provider-credential Keychain entries in addition to
+the twenty application database entries:
 
 | Keychain service/account | Value |
 | --- | --- |
@@ -127,6 +131,17 @@ nineteen database entries:
 
 These three provider entries must already exist and remain unchanged. The two
 bot-token entries must contain the same reviewed token.
+
+Conversational authoring also requires one pre-existing private loopback worker
+credential:
+
+| Keychain service/account | Value |
+| --- | --- |
+| `com.starring.llm-api-key/llm-api` | Codex worker bearer credential |
+
+The provisioner does not create, rotate, or read this item. Gate 0 proves only
+that it exists, and the installed API plist references it by fixed Keychain
+identity. No runbook command reads or prints its value.
 
 There are exactly two API keyring entries:
 
@@ -141,16 +156,34 @@ exactly 32 random bytes. Key IDs are immutable and unique inside a keyring, and
 material must differ across the two purposes. Record key IDs only. Never record
 material or a material hash.
 
+There is exactly one runtime interaction-token envelope keyring entry:
+
+| Keychain service/account | Purpose |
+| --- | --- |
+| `starring.runtime.staging/interaction.token-envelope-keyring` | restart-recoverable Discord interaction-token encryption |
+
+Its payload is exactly
+`v1;active=KEY_ID=64_LOWERCASE_HEX;retired=KEY_ID=64_LOWERCASE_HEX,...`.
+It contains one active key and zero through seven retired keys, for at most
+eight keys total. Each material value is exactly 32 independently generated
+random bytes encoded as 64 lowercase hexadecimal characters. IDs are bounded,
+unique, and immutable within the keyring. Materials are unique within the
+keyring and across both API keyring purposes. Record only the active key ID.
+Never record material or a material hash.
+
 The provisioner also creates one operational administrator URL:
 
 | Keychain service/account | Exact database role and database |
 | --- | --- |
 | `starring.postgres.staging/database.cluster-admin` | `starring_cluster_admin` on `postgres` |
 
-The complete inventory after provisioning is twenty database URLs, three
-unchanged provider items, and two keyrings: twenty-five Keychain items. The
-application plists reference only their own nineteen URLs, the three provider
-items, and the two API keyrings. They never reference the administrator URL.
+The complete inventory after provisioning is twenty-one database URLs, three
+unchanged Discord provider items, one unchanged authoring-worker item, two API
+keyrings, and one runtime interaction-token keyring: twenty-eight Keychain
+items. The application plists reference only their own twenty URLs, the three
+Discord provider items, the authoring-worker item, the two API keyrings, and
+the runtime interaction-token keyring. They never reference the administrator
+URL.
 
 The cluster-administrator password is generated only by the one-shot
 provisioner and is never typed or exported. `starring_owner` has no password.
@@ -339,7 +372,8 @@ Run the local preflight before stopping anything:
   for ENTRY in \
     "starring-api.staging:discord.oauth-client-secret" \
     "starring-api.staging:discord.bot-token" \
-    "starring.runtime.staging:discord.bot-token"
+    "starring.runtime.staging:discord.bot-token" \
+    "com.starring.llm-api-key:llm-api"
   do
     SERVICE="${ENTRY%%:*}"
     ACCOUNT="${ENTRY#*:}"
@@ -854,7 +888,7 @@ major, independently reviewed system identifier, acknowledgement, peer rule,
 and ident map before mutation. It creates or normalizes the non-login owner and
 fixed database, runs the compile-time SQLx migration set under
 `SET ROLE starring_owner`, verifies its own exact ledger, verifies every
-user-schema relation and all 97 capability functions, resets role, and removes
+user-schema relation and all 137 capability functions, resets role, and removes
 all inbound and outbound owner memberships. In peer mode it is the sole owner
 of cluster-administrator normalization. It creates no migrator login.
 
@@ -871,7 +905,7 @@ of cluster-administrator normalization. It creates no migrator login.
     "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
     >"$STARRING_CUTOVER_EVIDENCE/starring-db-bootstrap.txt"
   grep -E \
-    '^database=starring_runtime_staging owner=starring_owner migrations=[1-9][0-9]* relations=171 capability_functions=97$' \
+    '^database=starring_runtime_staging owner=starring_owner migrations=121 relations=198 capability_functions=137$' \
     "$STARRING_CUTOVER_EVIDENCE/starring-db-bootstrap.txt" >/dev/null
 )
 ```
@@ -1140,21 +1174,25 @@ A failure in either manifest leaves staging offline. Rerun both quarantine
 blocks in the same order after correcting the reported drift. Never continue
 from a partial role manifest.
 
-## Gate 10: provision twenty credentials and two keyrings
+## Gate 10: provision twenty-one credentials and three keyrings
 
 Keep all services stopped. The immutable one-shot provisioner checks the peer
 boundary, independently approved system identifier and acknowledgement,
-database quiescence, passwordless owner, and all nineteen passwordless
+database quiescence, passwordless owner, and all twenty passwordless
 `NOLOGIN` application roles. It also requires the three pre-existing Discord
 provider items to be readable and verifies that the API and runtime bot-token
-items are identical without printing either value.
+items are identical without printing either value. The separately preflighted
+authoring-worker item is not part of provisioner mutation or semantic reads.
 
-It generates twenty distinct 32-byte random passwords, two independent
-32-byte keyrings, and independent PostgreSQL SCRAM-SHA-256 verifiers with
-4,096 PBKDF2-HMAC-SHA-256 iterations. It writes nineteen fixed application
-URLs, one fixed administrator URL, and two keyring objects to Keychain, then
-applies only verifier strings in one database transaction. It restores prior
-managed Keychain values on a pre-commit failure. A
+It generates twenty-one distinct 32-byte random passwords, two independent API
+keyrings, one dedicated runtime interaction-token envelope keyring, and
+independent PostgreSQL SCRAM-SHA-256 verifiers with 4,096
+PBKDF2-HMAC-SHA-256 iterations. It writes twenty fixed application URLs, one
+fixed administrator URL, and three keyring objects to Keychain, then applies
+only verifier strings in one database transaction. All twenty-four managed
+Keychain writes share one rollback boundary. It restores every prior managed
+Keychain value, including removal of a newly created runtime keyring item, on
+a pre-commit failure. A
 `database_commit_indeterminate` result is an incident: preserve the new
 values, keep all clients stopped, and reconcile database and Keychain state
 without rerunning.
@@ -1171,12 +1209,12 @@ without rerunning.
     "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
     >"$STARRING_CUTOVER_EVIDENCE/starring-staging-provisioner.txt"
   grep -E \
-    '^provisioned database=starring_runtime_staging application_database_credentials=19 keyrings=2 product_action_key_id=[A-Za-z0-9_-]+ snapshot_envelope_key_id=[A-Za-z0-9_-]+$' \
+    '^provisioned database=starring_runtime_staging application_database_credentials=20 keyrings=3 product_action_key_id=[A-Za-z0-9_-]+ snapshot_envelope_key_id=[A-Za-z0-9_-]+ interaction_token_envelope_key_id=[A-Za-z0-9_-]+$' \
     "$STARRING_CUTOVER_EVIDENCE/starring-staging-provisioner.txt" >/dev/null
 )
 ```
 
-The nineteen application roles remain `NOLOGIN`. Verify only aggregate state
+The twenty application roles remain `NOLOGIN`. Verify only aggregate state
 and verifier format, never verifier text:
 
 ```zsh
@@ -1208,6 +1246,7 @@ and verifier format, never verifier text:
             ('starring_decision_cancellation'),
             ('starring_deployment_status_reader'),
             ('starring_operational_deployment_status_reader'),
+            ('starring_authoring_session_writer'),
             ('starring_runtime_execution'),
             ('starring_runtime_exact_target'),
             ('starring_runtime_panel'),
@@ -1227,7 +1266,7 @@ and verifier format, never verifier text:
           ON role.rolname = managed.role_name
       "
   )"
-  test "$PASSWORD_PROOF" = '19|19|19'
+  test "$PASSWORD_PROOF" = '20|20|20'
   ADMIN_PASSWORD_PROOF="$(
     /opt/homebrew/opt/postgresql@16/bin/psql \
       --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
@@ -1328,7 +1367,7 @@ Only a reviewed reconciliation may begin a new Gate 10 attempt.
 ## Gate 10A: atomically replace peer bootstrap with the final HBA
 
 This is the security-boundary transition. The final manifest exposes only the
-nineteen exact roles on IPv4 loopback to the fixed database and the cluster
+twenty exact roles on IPv4 loopback to the fixed database and the cluster
 administrator on IPv4 loopback to `postgres` and the fixed database. It has no
 migrator path, no peer path, no IPv6 allow, no socket allow, and no physical
 replication allow.
@@ -1526,7 +1565,8 @@ is empty. Administrator authentication uses only the ephemeral Keychain-backed
           'starring_decision_apply',
           'starring_decision_cancellation',
           'starring_deployment_status_reader',
-          'starring_operational_deployment_status_reader'
+          'starring_operational_deployment_status_reader',
+          'starring_authoring_session_writer'
         ]::TEXT[] AS api_roles,
         ARRAY['starring_cluster_admin']::TEXT[] AS administrator
     )
@@ -1833,12 +1873,228 @@ variable:
 The final HBA and these probes supersede every HBA installation or proof block
 in the component runbooks.
 
+### Existing nineteen-role staging cluster: incremental authoring writer
+
+This subsection is an archived migration-89 receipt procedure. It is retained
+only to interpret the original nineteen-role cutover evidence and must not be
+run against the current 117-migration source or staging database. Current
+environments use the complete twenty-role verifier and the additive receipt and
+effect ACL procedures in the runtime operations runbook.
+
+This subsection applies only to the already provisioned staging cluster that
+has fourteen API roles, five runtime roles, the final TCP administrator
+credential, and no authoring-writer role or Keychain item. Do not rerun the
+one-shot provisioner and do not replay either full role bootstrap against that
+cluster.
+
+Keep the tunnel, API, and runtime stopped while applying the trusted
+authoring-writer migration. Before the migration, prove only the new item is
+absent without reading any Keychain value. Apply the complete approved
+migration set through the immutable bootstrap binary's fixed Keychain mode
+while the legacy administrator HBA is still active. The bootstrap verifies the
+complete migration ledger, checksums, relation ownership, capability ownership,
+database isolation, and exact cluster identity. Independently retain its exact
+receipt and the successful ledger cardinality:
+
+```zsh
+(
+  set -euo pipefail
+  set +x
+  cd /Users/jungbogeon/starring
+  DOMAIN="gui/$(id -u)"
+  ! launchctl print \
+    "$DOMAIN/$STARRING_STAGING_TUNNEL_LABEL" >/dev/null 2>&1
+  ! launchctl print "$DOMAIN/local.starring.api.staging" >/dev/null 2>&1
+  ! launchctl print "$DOMAIN/local.starring.runtime.staging" >/dev/null 2>&1
+  ! /usr/bin/security find-generic-password \
+    -s starring-api.staging \
+    -a database.authoring-session-writer >/dev/null 2>&1
+  env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
+    "$STARRING_BOOTSTRAP_BINARY" \
+    --keychain-admin \
+    "$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    >"$STARRING_CUTOVER_EVIDENCE/authoring-writer-migration.txt"
+  grep -Fx \
+    'database=starring_runtime_staging owner=starring_owner migrations=89 relations=171 capability_functions=102' \
+    "$STARRING_CUTOVER_EVIDENCE/authoring-writer-migration.txt" >/dev/null
+  MIGRATION_LEDGER_PROOF="$(
+    starring_with_admin_pgpass /usr/bin/env \
+      PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
+      --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
+      --host 127.0.0.1 --port 5432 \
+      --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+      --dbname starring_runtime_staging --tuples-only --no-align \
+      --command "SELECT pg_catalog.concat_ws('|', pg_catalog.count(*), pg_catalog.count(*) FILTER (WHERE success), pg_catalog.max(version)) FROM public._sqlx_migrations"
+  )"
+  test "$MIGRATION_LEDGER_PROOF" = '89|89|202607300001'
+)
+```
+
+Only after that succeeds, archive the active nineteen-role HBA, stage the
+reviewed replacement inside PGDATA, compare it byte-for-byte with the approved
+manifest, atomically rename it into place, sync, reload, and prove that
+PostgreSQL parsed all fifteen rules without an error. The active legacy HBA
+must differ from the replacement; this assertion distinguishes historical
+pre-incremental evidence from final twenty-role state. Build and install the
+bootstrap and provisioner from the same approved revision as the migration and
+HBA:
+
+```zsh
+(
+  set -euo pipefail
+  set +x
+  cd /Users/jungbogeon/starring
+  DOMAIN="gui/$(id -u)"
+  ! launchctl print \
+    "$DOMAIN/$STARRING_STAGING_TUNNEL_LABEL" >/dev/null 2>&1
+  ! launchctl print "$DOMAIN/local.starring.api.staging" >/dev/null 2>&1
+  ! launchctl print "$DOMAIN/local.starring.runtime.staging" >/dev/null 2>&1
+  ! /usr/bin/security find-generic-password \
+    -s starring-api.staging \
+    -a database.authoring-session-writer >/dev/null 2>&1
+  LEGACY_HBA_ARCHIVE="$STARRING_CUTOVER_EVIDENCE/pre-authoring-writer-pg_hba.conf"
+  AUTHORING_HBA_TEMP="$STARRING_PGDATA/.pg_hba.conf.authoring-${STARRING_CUTOVER_ID}"
+  test ! -e "$LEGACY_HBA_ARCHIVE"
+  test ! -e "$AUTHORING_HBA_TEMP"
+  cp -p "$STARRING_PGDATA/pg_hba.conf" "$LEGACY_HBA_ARCHIVE"
+  install -m 600 ops/postgres/staging-integrated-pg_hba.conf \
+    "$AUTHORING_HBA_TEMP"
+  cmp -s ops/postgres/staging-integrated-pg_hba.conf \
+    "$AUTHORING_HBA_TEMP"
+  ! cmp -s "$LEGACY_HBA_ARCHIVE" "$AUTHORING_HBA_TEMP"
+  grep -F 'starring_authoring_session_writer' \
+    "$AUTHORING_HBA_TEMP" >/dev/null
+  mv "$AUTHORING_HBA_TEMP" "$STARRING_PGDATA/pg_hba.conf"
+  sync
+  /opt/homebrew/opt/postgresql@16/bin/pg_ctl \
+    --pgdata "$STARRING_PGDATA" reload
+  cmp -s "$STARRING_PGDATA/pg_hba.conf" \
+    ops/postgres/staging-integrated-pg_hba.conf
+  HBA_RELOAD_PROOF="$(
+    starring_with_admin_pgpass /usr/bin/env \
+      PGSSLMODE=disable /opt/homebrew/opt/postgresql@16/bin/psql \
+      --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
+      --host 127.0.0.1 --port 5432 \
+      --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+      --dbname postgres --tuples-only --no-align \
+      --command "SELECT pg_catalog.concat_ws('|', pg_catalog.count(*) FILTER (WHERE error IS NOT NULL), pg_catalog.count(*)) FROM pg_catalog.pg_hba_file_rules"
+  )"
+  test "$HBA_RELOAD_PROOF" = '0|15'
+)
+```
+
+An historical staging installation created before C1 has no runtime
+interaction-token envelope keyring. It cannot rejoin this path until a
+dedicated incremental provision has created the exact runtime item and the
+current final verifier has accepted its semantic payload. Keep every service
+stopped and do not rerun the one-shot fresh provisioner to backfill it. The
+incremental mode rejects ambient `PG*` variables, makes no PostgreSQL
+connection or mutation, requires both API keyrings to be valid and distinct,
+and writes no secret through arguments, environment, logs, or output.
+
+Run the keyring mode twice. The first call creates only the absent runtime
+item. The second proves exact replay without rotation. Store only the outcome
+and active key ID as evidence:
+
+```zsh
+(
+  set -euo pipefail
+  set +x
+  env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$STARRING_PROVISIONER_BINARY" \
+    --provision-interaction-token-keyring \
+    "$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    >"$STARRING_CUTOVER_EVIDENCE/interaction-keyring-created.txt"
+  grep -E \
+    '^outcome=created active_key_id=[A-Za-z0-9_-]+$' \
+    "$STARRING_CUTOVER_EVIDENCE/interaction-keyring-created.txt" >/dev/null
+  env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$STARRING_PROVISIONER_BINARY" \
+    --provision-interaction-token-keyring \
+    "$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    >"$STARRING_CUTOVER_EVIDENCE/interaction-keyring-replay.txt"
+  grep -E \
+    '^outcome=exact_replay active_key_id=[A-Za-z0-9_-]+$' \
+    "$STARRING_CUTOVER_EVIDENCE/interaction-keyring-replay.txt" >/dev/null
+  test "$(cut -d= -f3 "$STARRING_CUTOVER_EVIDENCE/interaction-keyring-created.txt")" = \
+    "$(cut -d= -f3 "$STARRING_CUTOVER_EVIDENCE/interaction-keyring-replay.txt")"
+)
+```
+
+Any invalid pre-existing runtime item, invalid API keyring, different active
+key ID on replay, or nonzero exit is a fail-closed incident. Preserve the item,
+keep services stopped, and inspect only stable error codes. Never copy key
+material or its hash into evidence.
+
+Run the incremental mode twice. The first call must create exactly one
+credential and the second must prove exact replay:
+
+```zsh
+(
+  set -euo pipefail
+  set +x
+  env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$STARRING_PROVISIONER_BINARY" \
+    --provision-authoring-writer \
+    "$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    >"$STARRING_CUTOVER_EVIDENCE/authoring-writer-created.txt"
+  grep -Fx \
+    'provisioned authoring_writer=created database=starring_runtime_staging credential_items=1 capabilities=5 snapshot_reader=v2_only' \
+    "$STARRING_CUTOVER_EVIDENCE/authoring-writer-created.txt" >/dev/null
+  env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    "$STARRING_PROVISIONER_BINARY" \
+    --provision-authoring-writer \
+    "$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    >"$STARRING_CUTOVER_EVIDENCE/authoring-writer-replay.txt"
+  grep -Fx \
+    'provisioned authoring_writer=exact_replay database=starring_runtime_staging credential_items=1 capabilities=5 snapshot_reader=v2_only' \
+    "$STARRING_CUTOVER_EVIDENCE/authoring-writer-replay.txt" >/dev/null
+  /usr/bin/security find-generic-password \
+    -s starring-api.staging \
+    -a database.authoring-session-writer >/dev/null
+  env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
+    "$STARRING_PROVISIONER_BINARY" \
+    --verify-final \
+    "$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    >"$STARRING_CUTOVER_EVIDENCE/authoring-writer-final-verifier.txt"
+  grep -Fx \
+    'verified database=starring_runtime_staging application_database_credentials=20 keyrings=3 hba_rules=15' \
+    "$STARRING_CUTOVER_EVIDENCE/authoring-writer-final-verifier.txt" >/dev/null
+)
+```
+
+The incremental mode serializes concurrent attempts, reads only the existing
+administrator credential, and writes only the authoring-writer item. One
+serializable transaction creates the new role with its exact five functions
+and atomically replaces the existing snapshot reader's v1 execute with v2
+execute. It does not change any other role, credential, keyring, or ACL. Fresh
+state is exactly absent writer role, absent writer item, and v1-only snapshot
+reader access. Replay is exactly complete writer state and v2-only snapshot
+reader access. Mixed, missing, or excess access fails closed. A missing
+migration, old HBA, malformed replay, or asymmetric role and Keychain state
+stops with a stable error code. A pre-commit failure restores the Keychain
+item. A commit-indeterminate or failed compensating rollback preserves the
+generated item for reconciliation instead of destroying the only matching
+credential. A successful compensating rollback restores v1-only snapshot
+access before dropping the writer and removing its Keychain item. The final
+verifier receipt above is required before this historical path rejoins Gate 11;
+the earlier nineteen-role verifier, if recorded, is pre-incremental evidence
+only.
+
 ## Gate 11: prove the exact Keychain inventory without reading values
 
-Gate 10 already created the twenty database URLs and two keyrings and left the
-three provider items unchanged. Inventory only their existence. Never add
-`-w`, never export a Keychain value, and never copy an access-control list or
-secret payload into evidence:
+Fresh Gate 10, or the historical incremental path after its required final
+verification, has created twenty application database URLs, one administrator
+URL, two API keyrings, and one runtime interaction-token keyring while leaving
+the three Discord provider items and the authoring-worker item unchanged.
+Inventory only their existence. Never add `-w`, never export a Keychain value,
+and never copy an access-control list or secret payload into evidence:
 
 ```zsh
 (
@@ -1860,6 +2116,7 @@ secret payload into evidence:
     "starring-api.staging:database.cancellation-executor" \
     "starring-api.staging:database.deployment-status-reader" \
     "starring-api.staging:database.operational-deployment-status-reader" \
+    "starring-api.staging:database.authoring-session-writer" \
     "starring-api.staging:discord.oauth-client-secret" \
     "starring-api.staging:discord.bot-token" \
     "starring-api.staging:keyring.product-action" \
@@ -1869,7 +2126,9 @@ secret payload into evidence:
     "starring.runtime.staging:database.panel" \
     "starring.runtime.staging:database.serving" \
     "starring.runtime.staging:database.interaction" \
+    "starring.runtime.staging:interaction.token-envelope-keyring" \
     "starring.runtime.staging:discord.bot-token" \
+    "com.starring.llm-api-key:llm-api" \
     "starring.postgres.staging:database.cluster-admin"
   do
     SERVICE="${ENTRY%%:*}"
@@ -1878,13 +2137,17 @@ secret payload into evidence:
       -s "$SERVICE" -a "$ACCOUNT" >/dev/null
     COUNT=$(( COUNT + 1 ))
   done
-  test "$COUNT" = 25
+  test "$COUNT" = 28
 )
 ```
 
-The provisioner has already semantically validated every generated URL and
-keyring and both equal bot-token values. Application startup and the final
-verifier perform independent semantic reads without printing them.
+The provisioner has already semantically validated every generated URL, all
+three keyrings, and both equal bot-token values. Application startup and the
+final verifier perform independent semantic reads without printing them.
+The runtime service now owns exactly seven Keychain accounts. Any later
+rotation or complete removal must use the seven-account inventory and bounded
+interaction-token keyring procedure in the runtime staging operations runbook;
+never reuse the six-account pre-C1 checklist.
 
 ## Gate 12: build and install both services without starting them
 
@@ -1898,8 +2161,12 @@ Run the exact runtime
 block from the same clean revision. Do not run the source runbook's combined
 install-and-start block.
 
-Install the runtime plist without starting it, and replace only the three
-non-secret API placeholders in the installed API plist:
+Install the runtime plist without starting it. The API installation block
+copies the checked-in template, so materialize the installed API plist before
+startup: restore the independently approved actual origin and Discord IDs,
+override both OAuth return settings to the only deployed route `/v1/me`, and
+set all three authoring references explicitly. Do not retain the template's
+`/app` return path or infer actual IDs from that template:
 
 ```zsh
 (
@@ -1925,6 +2192,62 @@ non-secret API placeholders in the installed API plist:
   /usr/libexec/PlistBuddy \
     -c "Set :EnvironmentVariables:STARRING_API_DISCORD_BOT_USER_ID ${STARRING_DISCORD_BOT_USER_ID}" \
     "$API_PLIST"
+  /usr/libexec/PlistBuddy \
+    -c 'Set :EnvironmentVariables:STARRING_API_OAUTH_RETURN_PATHS_JSON [\"/v1/me\"]' \
+    "$API_PLIST"
+  /usr/libexec/PlistBuddy \
+    -c 'Set :EnvironmentVariables:STARRING_API_OAUTH_DEFAULT_RETURN_PATH /v1/me' \
+    "$API_PLIST"
+  /usr/libexec/PlistBuddy \
+    -c 'Set :EnvironmentVariables:STARRING_API_AUTHORING_SESSION_WRITER_DATABASE_SECRET_REFERENCE keychain:starring-api.staging:database.authoring-session-writer' \
+    "$API_PLIST"
+  /usr/libexec/PlistBuddy \
+    -c 'Set :EnvironmentVariables:STARRING_API_AUTHORING_WORKER_URL http://127.0.0.1:18181' \
+    "$API_PLIST"
+  /usr/libexec/PlistBuddy \
+    -c 'Set :EnvironmentVariables:STARRING_API_AUTHORING_WORKER_TOKEN_SECRET_REFERENCE keychain:com.starring.llm-api-key:llm-api' \
+    "$API_PLIST"
+  test "$(
+    /usr/libexec/PlistBuddy \
+      -c 'Print :EnvironmentVariables:STARRING_API_PUBLIC_ORIGIN' \
+      "$API_PLIST"
+  )" = "$STARRING_STAGING_PUBLIC_ORIGIN"
+  test "$(
+    /usr/libexec/PlistBuddy \
+      -c 'Print :EnvironmentVariables:STARRING_API_DISCORD_APPLICATION_ID' \
+      "$API_PLIST"
+  )" = "$STARRING_DISCORD_APPLICATION_ID"
+  test "$(
+    /usr/libexec/PlistBuddy \
+      -c 'Print :EnvironmentVariables:STARRING_API_DISCORD_BOT_USER_ID' \
+      "$API_PLIST"
+  )" = "$STARRING_DISCORD_BOT_USER_ID"
+  test "$(
+    /usr/libexec/PlistBuddy \
+      -c 'Print :EnvironmentVariables:STARRING_API_OAUTH_RETURN_PATHS_JSON' \
+      "$API_PLIST"
+  )" = '["/v1/me"]'
+  test "$(
+    /usr/libexec/PlistBuddy \
+      -c 'Print :EnvironmentVariables:STARRING_API_OAUTH_DEFAULT_RETURN_PATH' \
+      "$API_PLIST"
+  )" = '/v1/me'
+  test "$(
+    /usr/libexec/PlistBuddy \
+      -c 'Print :EnvironmentVariables:STARRING_API_AUTHORING_SESSION_WRITER_DATABASE_SECRET_REFERENCE' \
+      "$API_PLIST"
+  )" = 'keychain:starring-api.staging:database.authoring-session-writer'
+  test "$(
+    /usr/libexec/PlistBuddy \
+      -c 'Print :EnvironmentVariables:STARRING_API_AUTHORING_WORKER_URL' \
+      "$API_PLIST"
+  )" = 'http://127.0.0.1:18181'
+  test "$(
+    /usr/libexec/PlistBuddy \
+      -c 'Print :EnvironmentVariables:STARRING_API_AUTHORING_WORKER_TOKEN_SECRET_REFERENCE' \
+      "$API_PLIST"
+  )" = 'keychain:com.starring.llm-api-key:llm-api'
+  ! grep -F '/app' "$API_PLIST" >/dev/null
   ! grep -Eq 'REPLACE_WITH_|api\.example\.com' "$API_PLIST"
   plutil -lint "$API_PLIST"
   plutil -lint "$RUNTIME_PLIST"
@@ -1958,10 +2281,11 @@ application process stopped:
 ```
 
 Run the independent final verifier. It
-reads the administrator and all nineteen application URLs directly from
-Keychain, proves exact TCP role and database identity for all twenty
+reads the administrator and all twenty application URLs directly from
+Keychain, proves exact TCP role and database identity for all twenty-one
 connections, proves all application roles are direct `LOGIN` roles without
-membership, strictly revalidates both keyrings, and re-proves the
+membership, strictly revalidates all three keyrings without emitting material,
+and re-proves the
 fifteen-rule HBA contract:
 
 ```zsh
@@ -1976,7 +2300,7 @@ fifteen-rule HBA contract:
     "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
     >"$STARRING_CUTOVER_EVIDENCE/starring-staging-final-verifier.txt"
   grep -Fx \
-    'verified database=starring_runtime_staging application_database_credentials=19 keyrings=2 hba_rules=15' \
+    'verified database=starring_runtime_staging application_database_credentials=20 keyrings=3 hba_rules=15' \
     "$STARRING_CUTOVER_EVIDENCE/starring-staging-final-verifier.txt" >/dev/null
 )
 ```
@@ -2034,13 +2358,13 @@ quarantine through the administrator Keychain URL:
 
 After Gate 10A, any nonzero exit through the end of both service-readiness
 gates is an activation failure. Immediately run the post-final quarantine
-procedure. Quarantine clears all nineteen passwords and the peer path is
+procedure. Quarantine clears all twenty passwords and the peer path is
 already gone, so continue to physical rollback. There is no in-place
 reprovision retry after Gate 10A.
 
 ## Gate 14: combined negative probes
 
-First prove all nineteen roles are direct logins, have no membership or
+First prove all twenty roles are direct logins, have no membership or
 ownership, and lack database and schema creation:
 
 ```zsh
@@ -2073,6 +2397,7 @@ ownership, and lack database and schema creation:
             ('starring_decision_cancellation'),
             ('starring_deployment_status_reader'),
             ('starring_operational_deployment_status_reader'),
+            ('starring_authoring_session_writer'),
             ('starring_runtime_execution'),
             ('starring_runtime_exact_target'),
             ('starring_runtime_panel'),
@@ -2124,7 +2449,7 @@ ownership, and lack database and schema creation:
         )
       "
   )"
-  test "$ROLE_PROOF" = '19|19|0|0|0'
+  test "$ROLE_PROOF" = '20|20|0|0|0'
 )
 ```
 
@@ -2152,6 +2477,7 @@ by HBA before authentication on `postgres`:
     starring_decision_cancellation
     starring_deployment_status_reader
     starring_operational_deployment_status_reader
+    starring_authoring_session_writer
     starring_runtime_execution
     starring_runtime_exact_target
     starring_runtime_panel
@@ -2200,7 +2526,7 @@ authentication loop. Gate 15 still requires the runtime's deep readiness
 functions. Never reinstall the runtime-only HBA manifest.
 
 Create one temporary future database and grant `PUBLIC` connectivity. The
-final integrated HBA must still deny all nineteen roles:
+final integrated HBA must still deny all twenty roles:
 
 ```zsh
 (
@@ -2232,6 +2558,7 @@ final integrated HBA must still deny all nineteen roles:
     starring_decision_cancellation
     starring_deployment_status_reader
     starring_operational_deployment_status_reader
+    starring_authoring_session_writer
     starring_runtime_execution
     starring_runtime_exact_target
     starring_runtime_panel
@@ -2324,6 +2651,13 @@ Then start the API:
   INGRESS_SERVICE="$DOMAIN/$STARRING_STAGING_TUNNEL_LABEL"
   SERVICE="$DOMAIN/local.starring.api.staging"
   PLIST="$HOME/Library/LaunchAgents/local.starring.api.staging.plist"
+  API_LOG="$HOME/Library/Logs/starring-api/runtime.log"
+  if test -f "$API_LOG"
+  then
+    API_LOG_OFFSET="$(wc -c <"$API_LOG" | tr -d ' ')"
+  else
+    API_LOG_OFFSET=0
+  fi
   ! launchctl print "$INGRESS_SERVICE" >/dev/null 2>&1
   ! launchctl print "$SERVICE" >/dev/null 2>&1
   launchctl enable "$SERVICE"
@@ -2350,14 +2684,26 @@ Then start the API:
     "$STARRING_CUTOVER_EVIDENCE/api-listener.txt" >/dev/null
   launchctl print "$SERVICE" \
     >"$STARRING_CUTOVER_EVIDENCE/api-launchctl-accepted.txt"
+  /usr/bin/tail -c "+$(( API_LOG_OFFSET + 1 ))" "$API_LOG" \
+    | grep -Fx 'starring_api_authoring_status=ready' \
+    >"$STARRING_CUTOVER_EVIDENCE/api-authoring-startup-status.txt"
+  test "$(
+    wc -l <"$STARRING_CUTOVER_EVIDENCE/api-authoring-startup-status.txt" \
+      | tr -d ' '
+  )" = 1
+  ! /usr/bin/tail -c "+$(( API_LOG_OFFSET + 1 ))" "$API_LOG" \
+    | grep -F 'starring_api_authoring_status=unavailable' >/dev/null
   ! launchctl print "$INGRESS_SERVICE" >/dev/null 2>&1
 )
 ```
 
-API readiness must be the aggregate fourteen-pool readiness described in
+API startup evidence must combine aggregate fourteen-core-pool readiness with
+the separately successful fifteenth authoring-writer and loopback-worker
+preflights described in
 [Startup and deep-readiness proof](./2026-07-19-production-control-plane-cutover.md#startup-and-deep-readiness-proof).
-Runtime readiness must remain the empty-open contract described in the runtime
-runbook. Review only finite redacted status lines from both logs. Never copy a
+Runtime readiness must satisfy the serving-process contract described in the
+runtime runbook; an exact route is accepted only through its separate product
+deployment projection. Review only finite redacted status lines from both logs. Never copy a
 database URL, OAuth code, Discord token, Keychain value, or key material into
 evidence.
 
@@ -2379,20 +2725,29 @@ The cutover is accepted only when a change record contains all of these facts:
 - exact seven-rule bootstrap HBA and ident proof, final fifteen-rule HBA
   proof, peer-removal proof, and physical replication rejection;
 - immutable bootstrap and provisioner binary SHA-256 values;
-- embedded bootstrap receipt with 171 relations and 97 capability functions;
+- embedded bootstrap receipt with 121 migrations, 198 relations, and 137
+  capability functions;
 - exact migration ledger diff with no difference;
 - exact database, `public` schema, ledger, relation, routine, and type ownership
   proof plus owner zero-membership postflight and migrator absence;
 - API quarantine and runtime quarantine exit status;
-- one-shot provisioner receipt and aggregate `19|19|19` verifier proof without
-  verifier values;
-- Keychain existence count `25`, provider credential versions, and generated
-  key IDs only;
-- runtime enable, API enable, and final twenty-connection/two-keyring verifier
+- fresh-path one-shot provisioner receipt and aggregate `20|20|20` verifier
+  proof without verifier values; for the historical path, retain the
+  pre-incremental nineteen-role receipt and instead record the legacy HBA
+  archive, atomic replacement and reload proof, writer-created receipt,
+  exact-replay receipt, and twenty-application-credential final verifier;
+- Keychain existence count `28`, Discord provider credential versions,
+  authoring-worker item existence, and generated key IDs only;
+- runtime enable, API enable, and final
+  twenty-one-connection/three-keyring verifier exit status;
+- aggregate application-role proof `20|20|0|0|0` and combined negative-probe
   exit status;
-- combined negative-probe exit status;
+- installed API plist proof for the unchanged approved origin and Discord IDs,
+  OAuth return allowlist and default `/v1/me`, and all three exact authoring
+  references;
 - runtime listener, readiness, and SIGTERM acceptance;
-- API listener and aggregate readiness;
+- API listener, fourteen-core-pool readiness, and the current process's exact
+  `starring_api_authoring_status=ready` startup line;
 - confirmation that `local.cloudflared.starring` remains unloaded;
 - statement that no customer route or customer guild was exercised.
 
@@ -2592,12 +2947,20 @@ deletion and archive retention are separate reviewed follow-up operations.
 
 ## End state
 
-Authoring this document does not change the host. Before execution, the only
-truthful status is:
+The retained integrated staging foundation has been executed and B6 reached one
+exact staging Live route. That historical result does not transfer to another
+tree or restored environment. For every new execution, record the result using
+this closed form:
 
 ```text
-integrated staging cutover: not executed
-database cutover evidence: absent
-application activation evidence: absent
+integrated staging cutover: accepted | rolled_back | incomplete
+database cutover evidence: retained | absent
+application readiness evidence: retained | absent
+exact route Live evidence: retained | absent
+Phase D disposable-guild certificate: retained | absent
 public ingress: not authorized by this runbook
 ```
+
+Only `accepted` with retained database and application readiness evidence is a
+successful infrastructure cutover. It still does not authorize production
+traffic or substitute for the exact Phase D release certificate.

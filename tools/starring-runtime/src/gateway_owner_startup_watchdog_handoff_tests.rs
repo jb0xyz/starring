@@ -7,17 +7,26 @@ use std::time::{Duration, Instant};
 
 use automation_runtime_controller::{
     GatewayShardIdV1, RuntimeAcquireGatewayOwnerLeaseOutcomeV1, RuntimeAcquireGatewayOwnerLeaseV1,
-    RuntimeBuildRevisionV1, RuntimeDrainIntentIdV2, RuntimeGatewayAdmissionSequenceV2,
-    RuntimeGatewayOwnerLeaseIdV1, RuntimeGatewayOwnerLeaseObservationV1,
-    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyKindV2,
-    RuntimeObserveGatewayOwnerLeaseV1, RuntimeObservedGatewayOwnerLeaseV1, RuntimeRecoveryIdV2,
+    RuntimeBuildRevisionV1, RuntimeCertificationOperationIdV2, RuntimeDeploymentScopeV1,
+    RuntimeDrainIntentIdV2, RuntimeGatewayAdmissionSequenceV2, RuntimeGatewayOwnerLeaseIdV1,
+    RuntimeGatewayOwnerLeaseObservationV1, RuntimeGatewayOwnerLeaseReceiptV1,
+    RuntimeGatewayReadyKindV2, RuntimeLiveAttestationDigestV2, RuntimeObserveGatewayOwnerLeaseV1,
+    RuntimeObservedGatewayOwnerLeaseV1, RuntimeRecoveryIdV2,
     RuntimeReleaseGatewayOwnerLeaseOutcomeV1, RuntimeReleaseGatewayOwnerLeaseV1,
-    RuntimeRenewGatewayOwnerLeaseOutcomeV1, RuntimeRenewGatewayOwnerLeaseV1, RuntimeServingSlotV2,
+    RuntimeRenewGatewayOwnerLeaseOutcomeV1, RuntimeRenewGatewayOwnerLeaseV1,
+    RuntimeServingIdentityV2, RuntimeServingReceiptV2, RuntimeServingSlotV2,
     RuntimeStartupRecoveryObservationReceiptV2, RuntimeStartupRecoveryStateV2,
     RuntimeStartupServingStateV2,
 };
-use automation_runtime_convergence::{ProcessInstanceId, RuntimeDeploymentTargetV1};
+use automation_runtime_convergence::{
+    DeploymentId, InstallationId, ProcessInstanceId, RuntimeDeploymentTargetV1, RuntimeGeneration,
+    RuntimeProcessIdentityV1, TenantId,
+};
 use automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1 as PendingDrainPersistenceErrorV1;
+use automation_runtime_serving_postgres::{
+    RuntimePendingDrainServingLookupV1, RuntimePendingDrainServingObservationV1,
+    RuntimePendingDrainServingSourceEvidenceV1, RuntimeServingPersistenceErrorV1,
+};
 use automation_runtime_worker::{
     accept_gateway_owner_acquire_v1, accept_runtime_registry_recovery_empty_observation_v2,
     RuntimeAcceptedGatewayOwnerAcquireV1, RuntimeAcceptedGatewayOwnerReceiptV1,
@@ -647,6 +656,60 @@ fn pending_drain_candidate_v2() -> RuntimePendingDrainCandidateV2 {
     .unwrap()
 }
 
+fn pending_drain_serving_source_evidence_v1(
+    candidate: &RuntimePendingDrainCandidateV2,
+) -> RuntimePendingDrainServingSourceEvidenceV1 {
+    RuntimePendingDrainServingSourceEvidenceV1::from(
+        &RuntimePendingDrainServingLookupV1::new(
+            candidate.intent_id().clone(),
+            candidate.source_intent_revision(),
+            *candidate.source_state_digest().as_bytes(),
+        )
+        .unwrap(),
+    )
+}
+
+fn pending_drain_test_serving_receipt_v1(
+    target: RuntimeDeploymentTargetV1,
+    revision: u64,
+    observed_at: DateTime<Utc>,
+    connected: bool,
+) -> RuntimeServingReceiptV2 {
+    let expires_at = observed_at - TimeDelta::milliseconds(1);
+    let last_heartbeat_at = if connected {
+        expires_at - TimeDelta::milliseconds(1)
+    } else {
+        expires_at
+    };
+    RuntimeServingReceiptV2 {
+        identity: RuntimeServingIdentityV2 {
+            scope: RuntimeDeploymentScopeV1 {
+                tenant_id: TenantId::parse("tenant:pending-drain").unwrap(),
+                installation_id: InstallationId::parse("installation:pending-drain").unwrap(),
+                deployment_id: DeploymentId::parse("deployment:pending-drain").unwrap(),
+            },
+            operation_id: RuntimeCertificationOperationIdV2::parse(
+                "00112233445566778899aabbccddeeff",
+            )
+            .unwrap(),
+            attestation_digest: RuntimeLiveAttestationDigestV2::parse("a".repeat(64)).unwrap(),
+            process_identity: RuntimeProcessIdentityV1 {
+                target,
+                runtime_generation: RuntimeGeneration::new(4).unwrap(),
+                process_instance_id: ProcessInstanceId::parse("process:pending-drain-source")
+                    .unwrap(),
+            },
+            lease_epoch: NonZeroU64::new(5).unwrap(),
+            revision: NonZeroU64::new(revision).unwrap(),
+        },
+        acquired_at: last_heartbeat_at - TimeDelta::milliseconds(1),
+        last_heartbeat_at,
+        expires_at,
+        connected,
+        serving: connected,
+    }
+}
+
 fn pending_drain_owner_receipt_v2(
     request: &automation_runtime_worker::RuntimeStartupRecoveryExecutionRequestV2,
     database_now: DateTime<Utc>,
@@ -742,6 +805,14 @@ struct FakePendingDrainRecoveryEnvironmentV2 {
     succession_revision_delta: u64,
     events: Vec<PendingDrainTestStageV2>,
     mutation_fingerprints: Vec<PendingDrainTestMutationFingerprintV2>,
+    serving_observations:
+        VecDeque<Result<RuntimePendingDrainServingObservationV1, RuntimeServingPersistenceErrorV1>>,
+    serving_disconnects:
+        VecDeque<Result<RuntimeServingReceiptV2, RuntimeServingPersistenceErrorV1>>,
+    current_serving: Option<RuntimeServingReceiptV2>,
+    serving_observation_calls: usize,
+    serving_disconnect_calls: usize,
+    selection_database_now: Option<DateTime<Utc>>,
 }
 
 impl FakePendingDrainRecoveryEnvironmentV2 {
@@ -754,6 +825,12 @@ impl FakePendingDrainRecoveryEnvironmentV2 {
             succession_revision_delta: 1,
             events: Vec::new(),
             mutation_fingerprints: Vec::new(),
+            serving_observations: VecDeque::new(),
+            serving_disconnects: VecDeque::new(),
+            current_serving: None,
+            serving_observation_calls: 0,
+            serving_disconnect_calls: 0,
+            selection_database_now: None,
         }
     }
 
@@ -820,6 +897,29 @@ impl FakePendingDrainRecoveryEnvironmentV2 {
 
     fn with_succession_revision_delta(mut self, delta: u64) -> Self {
         self.succession_revision_delta = delta;
+        self
+    }
+
+    fn with_serving_observations(
+        mut self,
+        observations: impl IntoIterator<
+            Item = Result<
+                RuntimePendingDrainServingObservationV1,
+                RuntimeServingPersistenceErrorV1,
+            >,
+        >,
+    ) -> Self {
+        self.serving_observations = observations.into_iter().collect();
+        self
+    }
+
+    fn with_serving_disconnects(
+        mut self,
+        disconnects: impl IntoIterator<
+            Item = Result<RuntimeServingReceiptV2, RuntimeServingPersistenceErrorV1>,
+        >,
+    ) -> Self {
+        self.serving_disconnects = disconnects.into_iter().collect();
         self
     }
 
@@ -915,15 +1015,100 @@ impl crate::process::RuntimePendingDrainRecoveryEnvironmentV2
                 )
             }
         };
+        let database_now = pending_drain_test_database_now_v2(authorization.request(), 1);
+        self.selection_database_now = Some(database_now);
         let receipt = RuntimePendingDrainSelectionReceiptV3::new(
             authorization.request().correlation().clone(),
-            pending_drain_owner_receipt_v2(
-                authorization.request(),
-                pending_drain_test_database_now_v2(authorization.request(), 1),
-            ),
+            pending_drain_owner_receipt_v2(authorization.request(), database_now),
             outcome,
         );
         self.finish_stage_v2(PendingDrainTestStageV2::Selection, receipt)
+    }
+
+    async fn observe_pending_drain_source_serving_v1(
+        &mut self,
+        _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        candidate: &RuntimePendingDrainCandidateV2,
+    ) -> Result<
+        RuntimePendingDrainServingObservationV1,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            RuntimeServingPersistenceErrorV1,
+        >,
+    > {
+        self.serving_observation_calls += 1;
+        let result = self.serving_observations.pop_front().unwrap_or_else(|| {
+            let observed_at = self.selection_database_now.unwrap() + TimeDelta::milliseconds(1);
+            let serving = pending_drain_test_serving_receipt_v1(
+                candidate.expected_target().clone(),
+                7,
+                observed_at,
+                false,
+            );
+            Ok(RuntimePendingDrainServingObservationV1::Disconnected {
+                source: pending_drain_serving_source_evidence_v1(candidate),
+                serving: Box::new(serving),
+                observed_at,
+            })
+        });
+        match result {
+            Ok(observation) => {
+                self.current_serving = match &observation {
+                    RuntimePendingDrainServingObservationV1::Fresh { serving, .. }
+                    | RuntimePendingDrainServingObservationV1::Expired { serving, .. }
+                    | RuntimePendingDrainServingObservationV1::Disconnected { serving, .. } => {
+                        Some((**serving).clone())
+                    }
+                    RuntimePendingDrainServingObservationV1::Absent { .. }
+                    | RuntimePendingDrainServingObservationV1::Diverged { .. } => None,
+                };
+                Ok(observation)
+            }
+            Err(error) => {
+                Err(crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(error))
+            }
+        }
+    }
+
+    async fn disconnect_pending_drain_source_serving_v1(
+        &mut self,
+        _session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        candidate: &RuntimePendingDrainCandidateV2,
+        identity: &RuntimeServingIdentityV2,
+    ) -> Result<
+        RuntimeServingReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            RuntimeServingPersistenceErrorV1,
+        >,
+    > {
+        self.serving_disconnect_calls += 1;
+        assert_eq!(
+            candidate.expected_target(),
+            &identity.process_identity.target
+        );
+        assert_eq!(
+            candidate.slot(),
+            &automation_runtime_controller::RuntimeServingSlotV2::from_target(
+                &identity.process_identity.target,
+            )
+        );
+        let result = self.serving_disconnects.pop_front().unwrap_or_else(|| {
+            let mut serving = self.current_serving.clone().unwrap();
+            assert_eq!(&serving.identity, identity);
+            serving.identity.revision = NonZeroU64::new(identity.revision.get() + 1).unwrap();
+            serving.connected = false;
+            serving.serving = false;
+            serving.last_heartbeat_at = serving.expires_at;
+            Ok(serving)
+        });
+        match result {
+            Ok(serving) => {
+                self.current_serving = Some(serving.clone());
+                Ok(serving)
+            }
+            Err(error) => {
+                Err(crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(error))
+            }
+        }
     }
 
     async fn record_pending_drain_no_candidate_v2(
@@ -1148,6 +1333,44 @@ impl crate::process::RuntimePendingDrainMutationEnvironmentV3
             self,
             session,
             authorization,
+        )
+        .await
+    }
+
+    async fn observe_pending_drain_source_serving_v3(
+        &mut self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        candidate: &RuntimePendingDrainCandidateV2,
+    ) -> Result<
+        RuntimePendingDrainServingObservationV1,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            RuntimeServingPersistenceErrorV1,
+        >,
+    > {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::observe_pending_drain_source_serving_v1(
+            self,
+            session,
+            candidate,
+        )
+        .await
+    }
+
+    async fn disconnect_pending_drain_source_serving_v3(
+        &mut self,
+        session: &crate::closed_recovery::RuntimeClosedRecoverySessionV2,
+        candidate: &RuntimePendingDrainCandidateV2,
+        identity: &RuntimeServingIdentityV2,
+    ) -> Result<
+        RuntimeServingReceiptV2,
+        crate::process::RuntimeStartupRecoveryExecutionAwaitFailureV2<
+            RuntimeServingPersistenceErrorV1,
+        >,
+    > {
+        crate::process::RuntimePendingDrainRecoveryEnvironmentV2::disconnect_pending_drain_source_serving_v1(
+            self,
+            session,
+            candidate,
+            identity,
         )
         .await
     }
@@ -2358,6 +2581,81 @@ async fn root_finalizer_owns_each_pending_drain_mutation_and_exactly_finalizes_o
 }
 
 #[tokio::test]
+async fn root_finalizer_owns_expired_serving_disconnect_and_one_indeterminate_reobservation() {
+    for (recovery_id, indeterminate) in [
+        ("d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4", false),
+        ("d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5", true),
+    ] {
+        let (gateway, registry, mut session, port) =
+            initial_pending_drain_continue_fresh_registry_fixture_v2(recovery_id).await;
+        let mut environment = FakePendingDrainRecoveryEnvironmentV2::candidate();
+        let selected = select_pending_drain_for_finalizer_v3(&mut session, &mut environment).await;
+        let automation_runtime_worker::RuntimeAcceptedPendingDrainSelectionV3::Unclaimed(selected) =
+            selected
+        else {
+            panic!("unclaimed selection")
+        };
+        let observed_at = environment.selection_database_now.unwrap() + TimeDelta::milliseconds(1);
+        let source = pending_drain_test_serving_receipt_v1(
+            selected.candidate().expected_target().clone(),
+            7,
+            observed_at,
+            true,
+        );
+        environment.current_serving = Some(source.clone());
+        if indeterminate {
+            let mut disconnected = source.clone();
+            disconnected.identity.revision = NonZeroU64::new(8).unwrap();
+            disconnected.connected = false;
+            disconnected.serving = false;
+            disconnected.last_heartbeat_at = disconnected.expires_at;
+            environment = environment
+                .with_serving_disconnects([Err(RuntimeServingPersistenceErrorV1::Indeterminate)])
+                .with_serving_observations([Ok(
+                    RuntimePendingDrainServingObservationV1::Disconnected {
+                        source: pending_drain_serving_source_evidence_v1(selected.candidate()),
+                        serving: Box::new(disconnected),
+                        observed_at: observed_at + TimeDelta::milliseconds(1),
+                    },
+                )]);
+        }
+        let source_evidence = pending_drain_serving_source_evidence_v1(selected.candidate());
+        let stage = crate::process::pending_drain_serving_disconnect_stage_for_test_v1(
+            selected,
+            RuntimePendingDrainServingObservationV1::Expired {
+                source: source_evidence,
+                serving: Box::new(source),
+                observed_at,
+            },
+        )
+        .unwrap();
+        let job =
+            crate::process::RuntimePendingDrainFinalizerJobV3::new(session, environment, stage);
+        let mut supervisor = pending_drain_finalizer_supervisor_v3();
+        let settled =
+            crate::process::register_and_complete_pending_drain_job_v3(&mut supervisor, job)
+                .await
+                .unwrap();
+        let (session, environment, output) = settled.into_parts();
+        assert!(matches!(
+            output,
+            crate::process::RuntimePendingDrainMutationOutputV3::ServingResolved(_)
+        ));
+        assert_eq!(environment.serving_disconnect_calls, 1);
+        assert_eq!(
+            environment.serving_observation_calls,
+            usize::from(indeterminate)
+        );
+        assert!(registry.observe_recovery_empty_projection_v2().is_ok());
+        drop(session);
+        drop(gateway);
+        let report = supervisor.join().await;
+        assert_eq!(report.exit(), crate::RuntimeSupervisorExitV1::Commanded);
+        wait_for(|| port.release_calls() == 1).await;
+    }
+}
+
+#[tokio::test]
 async fn root_finalizer_keeps_seal_on_second_uncertainty_and_returns_session_to_mailbox() {
     let (gateway, registry, mut session, port) =
         initial_pending_drain_continue_fresh_registry_fixture_v2(
@@ -2588,6 +2886,223 @@ async fn production_pending_drain_driver_defers_fresh_previous_owner_without_sea
     run.assert_events(&[PendingDrainTestStageV2::Selection]);
     assert!(run.environment.mutation_fingerprints.is_empty());
     assert_eq!(run.successor.as_ref().unwrap(), &run.source);
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_defers_fresh_unclaimed_source_without_mutation() {
+    let candidate = pending_drain_candidate_v2();
+    let observed_at = at_millis(1_000_102);
+    let mut serving = pending_drain_test_serving_receipt_v1(
+        candidate.expected_target().clone(),
+        7,
+        observed_at,
+        true,
+    );
+    serving.expires_at = observed_at + TimeDelta::milliseconds(500);
+    let run = run_pending_drain_test_v2(
+        "cececececececececececececececece",
+        FakePendingDrainRecoveryEnvironmentV2::candidate().with_serving_observations([Ok(
+            RuntimePendingDrainServingObservationV1::Fresh {
+                source: pending_drain_serving_source_evidence_v1(&candidate),
+                serving: Box::new(serving),
+                observed_at,
+            },
+        )]),
+    )
+    .await;
+    run.assert_success();
+    run.assert_events(&[PendingDrainTestStageV2::Selection]);
+    assert_eq!(run.environment.serving_observation_calls, 1);
+    assert_eq!(run.environment.serving_disconnect_calls, 0);
+    assert!(run.environment.mutation_fingerprints.is_empty());
+    assert_eq!(run.successor.as_ref().unwrap(), &run.source);
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_disconnects_expired_source_before_s1() {
+    let candidate = pending_drain_candidate_v2();
+    let observed_at = at_millis(1_000_102);
+    let serving = pending_drain_test_serving_receipt_v1(
+        candidate.expected_target().clone(),
+        7,
+        observed_at,
+        true,
+    );
+    let run = run_pending_drain_test_v2(
+        "cfcfcfcfcfcfcfcfcfcfcfcfcfcfcfcf",
+        FakePendingDrainRecoveryEnvironmentV2::candidate().with_serving_observations([Ok(
+            RuntimePendingDrainServingObservationV1::Expired {
+                source: pending_drain_serving_source_evidence_v1(&candidate),
+                serving: Box::new(serving),
+                observed_at,
+            },
+        )]),
+    )
+    .await;
+    run.assert_success();
+    run.assert_events(&[
+        PendingDrainTestStageV2::Selection,
+        PendingDrainTestStageV2::Claim,
+        PendingDrainTestStageV2::Acknowledgement,
+    ]);
+    assert_eq!(run.environment.serving_observation_calls, 1);
+    assert_eq!(run.environment.serving_disconnect_calls, 1);
+    run.assert_candidate_completed();
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_rejects_mismatched_determinate_disconnect_before_s1() {
+    let candidate = pending_drain_candidate_v2();
+    let observed_at = at_millis(1_000_102);
+    let source = pending_drain_test_serving_receipt_v1(
+        candidate.expected_target().clone(),
+        7,
+        observed_at,
+        true,
+    );
+    let mut scope_mismatch = source.clone();
+    scope_mismatch.identity.revision = NonZeroU64::new(8).unwrap();
+    scope_mismatch.identity.scope.tenant_id = TenantId::parse("tenant:detached").unwrap();
+    scope_mismatch.connected = false;
+    scope_mismatch.serving = false;
+    scope_mismatch.last_heartbeat_at = scope_mismatch.expires_at;
+    let mut clock_regression = source.clone();
+    clock_regression.identity.revision = NonZeroU64::new(8).unwrap();
+    clock_regression.connected = false;
+    clock_regression.serving = false;
+    clock_regression.expires_at = source.expires_at - TimeDelta::milliseconds(1);
+    clock_regression.last_heartbeat_at = clock_regression.expires_at;
+    for (recovery_id, mismatched) in [
+        ("c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7", scope_mismatch),
+        ("c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6", clock_regression),
+    ] {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::candidate()
+                .with_serving_observations([Ok(RuntimePendingDrainServingObservationV1::Expired {
+                    source: pending_drain_serving_source_evidence_v1(&candidate),
+                    serving: Box::new(source.clone()),
+                    observed_at,
+                })])
+                .with_serving_disconnects([Ok(mismatched)]),
+        )
+        .await;
+        run.assert_error(
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainCompound,
+        );
+        run.assert_events(&[PendingDrainTestStageV2::Selection]);
+        assert_eq!(run.environment.serving_observation_calls, 1);
+        assert_eq!(run.environment.serving_disconnect_calls, 1);
+        assert!(run.environment.mutation_fingerprints.is_empty());
+        run.assert_registry_sealed(false);
+    }
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_reobserves_once_after_indeterminate_disconnect() {
+    let candidate = pending_drain_candidate_v2();
+    let observed_at = at_millis(1_000_102);
+    let source = pending_drain_test_serving_receipt_v1(
+        candidate.expected_target().clone(),
+        7,
+        observed_at,
+        true,
+    );
+    let mut disconnected = source.clone();
+    disconnected.identity.revision = NonZeroU64::new(8).unwrap();
+    disconnected.connected = false;
+    disconnected.serving = false;
+    disconnected.last_heartbeat_at = disconnected.expires_at;
+    let run = run_pending_drain_test_v2(
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        FakePendingDrainRecoveryEnvironmentV2::candidate()
+            .with_serving_observations([
+                Ok(RuntimePendingDrainServingObservationV1::Expired {
+                    source: pending_drain_serving_source_evidence_v1(&candidate),
+                    serving: Box::new(source),
+                    observed_at,
+                }),
+                Ok(RuntimePendingDrainServingObservationV1::Disconnected {
+                    source: pending_drain_serving_source_evidence_v1(&candidate),
+                    serving: Box::new(disconnected),
+                    observed_at: observed_at + TimeDelta::milliseconds(1),
+                }),
+            ])
+            .with_serving_disconnects([Err(RuntimeServingPersistenceErrorV1::Indeterminate)]),
+    )
+    .await;
+    run.assert_success();
+    assert_eq!(run.environment.serving_observation_calls, 2);
+    assert_eq!(run.environment.serving_disconnect_calls, 1);
+    run.assert_exact_mutation_fingerprints(PendingDrainTestStageV2::Claim, 1);
+    run.assert_candidate_completed();
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_fails_closed_on_noncurrent_source_evidence() {
+    for (recovery_id, observation) in [
+        (
+            "cacacacacacacacacacacacacacacaca",
+            RuntimePendingDrainServingObservationV1::Absent {
+                source: pending_drain_serving_source_evidence_v1(&pending_drain_candidate_v2()),
+                observed_at: at_millis(1_000_102),
+            },
+        ),
+        (
+            "c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9",
+            RuntimePendingDrainServingObservationV1::Diverged {
+                observed_at: at_millis(1_000_102),
+            },
+        ),
+    ] {
+        let run = run_pending_drain_test_v2(
+            recovery_id,
+            FakePendingDrainRecoveryEnvironmentV2::candidate()
+                .with_serving_observations([Ok(observation)]),
+        )
+        .await;
+        run.assert_error(
+            crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainCompound,
+        );
+        assert_eq!(run.environment.serving_disconnect_calls, 0);
+        assert!(run.environment.mutation_fingerprints.is_empty());
+        run.assert_registry_sealed(false);
+    }
+}
+
+#[tokio::test]
+async fn production_pending_drain_driver_fails_closed_after_indeterminate_identity_drift() {
+    let candidate = pending_drain_candidate_v2();
+    let observed_at = at_millis(1_000_102);
+    let source = pending_drain_test_serving_receipt_v1(
+        candidate.expected_target().clone(),
+        7,
+        observed_at,
+        true,
+    );
+    let run = run_pending_drain_test_v2(
+        "c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8",
+        FakePendingDrainRecoveryEnvironmentV2::candidate()
+            .with_serving_observations([
+                Ok(RuntimePendingDrainServingObservationV1::Expired {
+                    source: pending_drain_serving_source_evidence_v1(&candidate),
+                    serving: Box::new(source),
+                    observed_at,
+                }),
+                Ok(RuntimePendingDrainServingObservationV1::Diverged {
+                    observed_at: observed_at + TimeDelta::milliseconds(1),
+                }),
+            ])
+            .with_serving_disconnects([Err(RuntimeServingPersistenceErrorV1::Indeterminate)]),
+    )
+    .await;
+    run.assert_error(
+        crate::process::RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainCompound,
+    );
+    assert_eq!(run.environment.serving_observation_calls, 2);
+    assert_eq!(run.environment.serving_disconnect_calls, 1);
+    assert!(run.environment.mutation_fingerprints.is_empty());
+    run.assert_registry_sealed(false);
 }
 
 #[tokio::test]
@@ -5797,6 +6312,41 @@ async fn process_activation_fixture_with_renew_steps(
     )
 }
 
+async fn certification_production_fixture(
+    renew_steps: impl IntoIterator<Item = FakeRenewStepV1>,
+    process_generation: NonZeroU64,
+) -> (
+    RuntimeGatewayOwnerProductionSupervisorV2,
+    FakePortV1,
+    Arc<AtomicBool>,
+    RuntimeGatewayOwnerLeaseReceiptV1,
+) {
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture_with_renew_steps(
+        Duration::from_secs(2),
+        Duration::from_millis(1_200),
+        Duration::from_millis(200),
+        None,
+        Instant::now() + Duration::from_secs(1),
+        renew_steps,
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let mut process = frozen.try_into_process_frozen_v2().unwrap();
+    process
+        .start_production_renewal_in_place_v2()
+        .await
+        .unwrap();
+    (
+        process.try_into_production_v2().unwrap(),
+        port,
+        invalidated,
+        receipt,
+    )
+}
+
 #[tokio::test]
 async fn exact_process_activation_preserves_the_frozen_receipt_and_generation() {
     let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
@@ -6498,6 +7048,901 @@ async fn production_renewal_unknown_is_terminal_and_fail_closed() {
     );
     assert!(invalidated.load(Ordering::Acquire));
     assert_eq!(port.renew_calls(), 1);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[test]
+fn certification_freeze_observation_acceptance_is_exact_and_monotonic() {
+    let now = Instant::now();
+    let cutoff = now + Duration::from_secs(10);
+    let expected_safety_deadline = now + Duration::from_secs(30);
+    let expected = RuntimeGatewayOwnerCurrentObservationV1 {
+        receipt: receipt(Duration::from_secs(60)),
+        safety_deadline: expected_safety_deadline,
+    };
+
+    assert!(accept_certification_freeze_observation_v2(
+        &expected, &expected, cutoff
+    ));
+
+    let mut refined = expected.clone();
+    refined.receipt.database_now += TimeDelta::milliseconds(1);
+    assert!(accept_certification_freeze_observation_v2(
+        &expected, &refined, cutoff
+    ));
+
+    let mut tightened = refined.clone();
+    tightened.safety_deadline -= Duration::from_millis(1);
+    assert!(accept_certification_freeze_observation_v2(
+        &expected, &tightened, cutoff
+    ));
+
+    let mut regressed_database_time = expected.clone();
+    regressed_database_time.receipt.database_now -= TimeDelta::milliseconds(1);
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &regressed_database_time,
+        cutoff
+    ));
+
+    let mut drifted_expiry = refined.clone();
+    drifted_expiry.receipt.expires_at += TimeDelta::milliseconds(1);
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &drifted_expiry,
+        cutoff
+    ));
+
+    let mut extended_safety = refined.clone();
+    extended_safety.safety_deadline += Duration::from_millis(1);
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &extended_safety,
+        cutoff
+    ));
+
+    let mut foreign_lease = refined.clone();
+    foreign_lease.receipt.lease_id.lease_epoch = NonZeroU64::new(2).unwrap();
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &foreign_lease,
+        cutoff
+    ));
+
+    let mut successor = expected.clone();
+    successor.receipt.owner_revision = NonZeroU64::new(4).unwrap();
+    successor.receipt.database_now += TimeDelta::milliseconds(1);
+    successor.receipt.expires_at += TimeDelta::milliseconds(1);
+    successor.safety_deadline += Duration::from_millis(1);
+    assert!(accept_certification_freeze_observation_v2(
+        &expected, &successor, cutoff
+    ));
+
+    let mut revision_skip = successor.clone();
+    revision_skip.receipt.owner_revision = NonZeroU64::new(5).unwrap();
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &revision_skip,
+        cutoff
+    ));
+
+    let mut successor_without_database_advance = successor.clone();
+    successor_without_database_advance.receipt.database_now = expected.receipt.database_now;
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &successor_without_database_advance,
+        cutoff
+    ));
+
+    let mut successor_without_expiry_advance = successor.clone();
+    successor_without_expiry_advance.receipt.expires_at = expected.receipt.expires_at;
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &successor_without_expiry_advance,
+        cutoff
+    ));
+
+    let mut successor_without_safety_advance = successor.clone();
+    successor_without_safety_advance.safety_deadline = expected.safety_deadline;
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &successor_without_safety_advance,
+        cutoff
+    ));
+
+    let mut stale_current = refined.clone();
+    stale_current.receipt.database_now = stale_current.receipt.expires_at;
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &stale_current,
+        cutoff
+    ));
+
+    let mut unsafe_expected = expected.clone();
+    unsafe_expected.safety_deadline = cutoff;
+    assert!(!accept_certification_freeze_observation_v2(
+        &unsafe_expected,
+        &successor,
+        cutoff
+    ));
+
+    let mut unsafe_current = refined.clone();
+    unsafe_current.safety_deadline = cutoff;
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &unsafe_current,
+        cutoff
+    ));
+
+    let mut stale_expected = expected.clone();
+    stale_expected.receipt.database_now = stale_expected.receipt.expires_at;
+    assert!(!accept_certification_freeze_observation_v2(
+        &stale_expected,
+        &successor,
+        cutoff
+    ));
+
+    let mut maximum_revision = expected.clone();
+    maximum_revision.receipt.owner_revision = NonZeroU64::new(u64::MAX).unwrap();
+    let mut wrapped_successor = successor;
+    wrapped_successor.receipt.owner_revision = NonZeroU64::new(1).unwrap();
+    assert!(!accept_certification_freeze_observation_v2(
+        &maximum_revision,
+        &wrapped_successor,
+        cutoff
+    ));
+
+    assert!(!accept_certification_freeze_observation_v2(
+        &expected,
+        &refined,
+        Instant::now()
+    ));
+}
+
+#[tokio::test]
+async fn certification_freeze_uses_latest_published_same_revision_observation() {
+    let process_generation = NonZeroU64::new(60).unwrap();
+    let (production, port, invalidated, receipt) =
+        certification_production_fixture([], process_generation).await;
+    let renewed = production
+        .wait_for_strict_successor_v2(
+            receipt.owner_revision,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    {
+        let mut current = port
+            .state
+            .receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.database_now += TimeDelta::milliseconds(1);
+    }
+    let refreshed = production.observe_current_v2().await.unwrap();
+
+    assert_eq!(
+        refreshed.receipt().owner_revision,
+        renewed.receipt().owner_revision
+    );
+    assert_eq!(refreshed.receipt().expires_at, renewed.receipt().expires_at);
+    assert!(refreshed.receipt().database_now > renewed.receipt().database_now);
+    assert!(refreshed.safety_deadline() <= renewed.safety_deadline());
+
+    let authority = production
+        .prepare_certification_freeze_v2(Instant::now() + Duration::from_millis(500))
+        .unwrap();
+    assert_eq!(authority.expected_observation_v2(), &refreshed);
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+
+    assert_eq!(observation.observation_v2(), &refreshed);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        frozen
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn certification_freeze_accepts_a_queued_same_revision_observation_refinement() {
+    let process_generation = NonZeroU64::new(69).unwrap();
+    let (production, port, invalidated, receipt) =
+        certification_production_fixture([], process_generation).await;
+    let renewed = production
+        .wait_for_strict_successor_v2(
+            receipt.owner_revision,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    let renew_calls = port.renew_calls();
+    let gate = Arc::new(Notify::new());
+    port.block_next_observation(gate.clone());
+    let observe_calls = port.observe_calls();
+    let commands = production.inner().supervisor_commands.clone();
+    let (response, acknowledgement) = oneshot::channel();
+    commands
+        .send(RuntimeGatewayOwnerSupervisorCommandV1::Observe { response })
+        .await
+        .unwrap();
+    wait_for(|| port.observe_calls() > observe_calls).await;
+
+    let cutoff = Instant::now() + Duration::from_millis(500);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    assert_eq!(authority.expected_observation_v2(), &renewed);
+    {
+        let mut current = port
+            .state
+            .receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        current.database_now += TimeDelta::milliseconds(1);
+    }
+    let mut freezing = Box::pin(authority.freeze_v2());
+    tokio::select! {
+        biased;
+        result = &mut freezing => panic!("unexpected certification freeze result: {result:?}"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+
+    gate.notify_one();
+    let refined = acknowledgement.await.unwrap().unwrap();
+    let (frozen, observation) = freezing.await.unwrap();
+
+    assert_eq!(
+        refined.receipt().owner_revision,
+        renewed.receipt().owner_revision
+    );
+    assert_eq!(refined.receipt().expires_at, renewed.receipt().expires_at);
+    assert!(refined.receipt().database_now > renewed.receipt().database_now);
+    assert!(refined.safety_deadline() <= renewed.safety_deadline());
+    assert_eq!(observation.observation_v2(), &refined);
+    assert_eq!(port.renew_calls(), renew_calls);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        frozen
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn certification_freeze_queues_behind_inflight_renewal_and_stops_automatic_renewal() {
+    let gate = Arc::new(Notify::new());
+    let process_generation = NonZeroU64::new(61).unwrap();
+    let (production, port, invalidated, receipt) = certification_production_fixture(
+        [FakeRenewStepV1::Blocked(gate.clone())],
+        process_generation,
+    )
+    .await;
+    wait_for(|| port.renew_calls() == 1).await;
+    let cutoff = Instant::now() + Duration::from_millis(1_350);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let expected_revision = authority.expected_observation_v2().receipt().owner_revision;
+
+    assert_eq!(authority.process_generation_v2(), process_generation);
+    assert_eq!(authority.cutoff_v2(), cutoff);
+    assert_eq!(
+        format!("{authority:?}"),
+        "RuntimeGatewayOwnerCertificationFreezeAuthorityV2(<redacted>)"
+    );
+    let mut freezing = Box::pin(authority.freeze_v2());
+    tokio::select! {
+        biased;
+        result = &mut freezing => panic!("unexpected certification freeze result: {result:?}"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+
+    gate.notify_one();
+    let (frozen, observation) = freezing.await.unwrap();
+
+    assert_eq!(
+        observation.observation_v2().receipt().lease_id,
+        receipt.lease_id
+    );
+    assert_eq!(
+        observation.observation_v2().receipt().owner_revision.get(),
+        expected_revision.get() + 1
+    );
+    assert_eq!(observation.process_generation_v2(), process_generation);
+    assert_eq!(observation.cutoff_v2(), cutoff);
+    assert_eq!(frozen.frozen_observation_v2(), observation.observation_v2());
+    assert_eq!(frozen.process_generation_v2(), process_generation);
+    assert_eq!(frozen.cutoff_v2(), cutoff);
+    assert_eq!(
+        format!("{observation:?}"),
+        "RuntimeGatewayOwnerCertificationFrozenObservationV2(<redacted>)"
+    );
+    assert_eq!(
+        format!("{frozen:?}"),
+        "RuntimeGatewayOwnerCertificationFrozenSupervisorV2(<redacted>)"
+    );
+    sleep(Duration::from_millis(900)).await;
+    assert_eq!(port.renew_calls(), 1);
+    assert_eq!(
+        frozen.observe_current_v2().await.unwrap(),
+        *observation.observation_v2()
+    );
+    assert_eq!(frozen.terminal_status_v2(), None);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        frozen
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn certification_freeze_send_queue_stall_is_bounded_by_the_cutoff() {
+    let gate = Arc::new(Notify::new());
+    let process_generation = NonZeroU64::new(62).unwrap();
+    let (production, port, invalidated, _) = certification_production_fixture(
+        [FakeRenewStepV1::Blocked(gate.clone())],
+        process_generation,
+    )
+    .await;
+    wait_for(|| port.renew_calls() == 1).await;
+    let (response, observation_acknowledgement) = oneshot::channel();
+    production
+        .inner()
+        .supervisor_commands
+        .send(RuntimeGatewayOwnerSupervisorCommandV1::Observe { response })
+        .await
+        .unwrap();
+    let cutoff = Instant::now() + Duration::from_millis(120);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let started_at = Instant::now();
+
+    assert!(matches!(
+        authority.freeze_v2().await,
+        Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed)
+    ));
+    assert!(Instant::now() >= cutoff);
+    assert!(started_at.elapsed() < Duration::from_millis(400));
+    assert!(invalidated.load(Ordering::Acquire));
+
+    gate.notify_one();
+    drop(observation_acknowledgement);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn certification_freeze_ack_stall_is_bounded_by_the_cutoff() {
+    let gate = Arc::new(Notify::new());
+    let process_generation = NonZeroU64::new(63).unwrap();
+    let (production, port, invalidated, _) = certification_production_fixture(
+        [FakeRenewStepV1::Blocked(gate.clone())],
+        process_generation,
+    )
+    .await;
+    wait_for(|| port.renew_calls() == 1).await;
+    let cutoff = Instant::now() + Duration::from_millis(120);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let started_at = Instant::now();
+
+    assert!(matches!(
+        authority.freeze_v2().await,
+        Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::DeadlineElapsed)
+    ));
+    assert!(Instant::now() >= cutoff);
+    assert!(started_at.elapsed() < Duration::from_millis(400));
+    assert!(invalidated.load(Ordering::Acquire));
+
+    gate.notify_one();
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn stale_certification_freeze_process_generation_is_terminal_and_fail_closed() {
+    let process_generation = NonZeroU64::new(65).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let expected_observation = production.inner().current_observation.borrow().clone();
+
+    assert_eq!(
+        production
+            .inner()
+            .freeze_certification_v2(
+                expected_observation,
+                NonZeroU64::new(64).unwrap(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await,
+        Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::ProcessGenerationMismatch)
+    );
+    assert_eq!(
+        production.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn stale_certification_freeze_receipt_after_queued_renewal_is_terminal() {
+    let gate = Arc::new(Notify::new());
+    let process_generation = NonZeroU64::new(66).unwrap();
+    let (production, port, invalidated, _) = certification_production_fixture(
+        [FakeRenewStepV1::Blocked(gate.clone())],
+        process_generation,
+    )
+    .await;
+    wait_for(|| port.renew_calls() == 1).await;
+    let mut expected_observation = production.inner().current_observation.borrow().clone();
+    expected_observation.receipt.owner_revision = NonZeroU64::new(
+        expected_observation
+            .receipt
+            .owner_revision
+            .get()
+            .checked_add(2)
+            .unwrap(),
+    )
+    .unwrap();
+    let release = tokio::spawn(async move {
+        sleep(Duration::from_millis(20)).await;
+        gate.notify_one();
+    });
+
+    assert_eq!(
+        production
+            .inner()
+            .freeze_certification_v2(
+                expected_observation,
+                process_generation,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await,
+        Err(RuntimeGatewayOwnerCertificationFreezeErrorV2::OwnerReceiptMismatch)
+    );
+    release.await.unwrap();
+    assert_eq!(
+        production.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 1);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn certification_frozen_cutoff_is_terminal_without_an_automatic_renewal() {
+    let process_generation = NonZeroU64::new(67).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let cutoff = Instant::now() + Duration::from_millis(150);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let (frozen, _observation) = authority.freeze_v2().await.unwrap();
+    let renew_calls = port.renew_calls();
+
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed
+    );
+    assert_eq!(port.renew_calls(), renew_calls);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn exact_certification_thaw_resumes_with_a_strict_successor() {
+    let gate = Arc::new(Notify::new());
+    let process_generation = NonZeroU64::new(71).unwrap();
+    let (production, port, invalidated, _) = certification_production_fixture(
+        [FakeRenewStepV1::Blocked(gate.clone())],
+        process_generation,
+    )
+    .await;
+    wait_for(|| port.renew_calls() == 1).await;
+    let authority = production
+        .prepare_certification_freeze_v2(Instant::now() + Duration::from_millis(1_350))
+        .unwrap();
+    let mut freezing = Box::pin(authority.freeze_v2());
+    tokio::select! {
+        biased;
+        result = &mut freezing => panic!("unexpected certification freeze result: {result:?}"),
+        _ = sleep(Duration::from_millis(20)) => {}
+    }
+    gate.notify_one();
+    let (frozen, observation) = freezing.await.unwrap();
+    let frozen_revision = observation.observation_v2().receipt().owner_revision;
+
+    let (production, successor) = frozen
+        .thaw_v2(observation, Instant::now() + Duration::from_millis(800))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        successor.receipt().owner_revision.get(),
+        frozen_revision.get() + 1
+    );
+    assert_eq!(production.process_generation_v2(), process_generation);
+    assert_eq!(port.renew_calls(), 2);
+    assert_eq!(production.terminal_status_v2(), None);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        production
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn production_observation_crossing_renewal_boundary_retries_after_successor() {
+    let process_generation = NonZeroU64::new(72).unwrap();
+    let (mut frozen, port, invalidated, receipt) = process_activation_fixture(
+        Duration::from_millis(700),
+        Duration::from_millis(450),
+        Duration::from_millis(100),
+        None,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    frozen
+        .activate_process_ownership_in_place_v2(process_generation)
+        .await
+        .unwrap();
+    let mut process = frozen.try_into_process_frozen_v2().unwrap();
+    process
+        .start_production_renewal_in_place_v2()
+        .await
+        .unwrap();
+    let production = process.try_into_production_v2().unwrap();
+    let first = production
+        .wait_for_strict_successor_v2(
+            receipt.owner_revision,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    let authority = production
+        .prepare_certification_freeze_v2(Instant::now() + Duration::from_millis(500))
+        .unwrap();
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let (production, thawed) = frozen
+        .thaw_v2(observation, Instant::now() + Duration::from_millis(450))
+        .await
+        .unwrap();
+    assert!(thawed.receipt().owner_revision > first.receipt().owner_revision);
+
+    port.block_next_observation(Arc::new(Notify::new()));
+    let renew_calls = port.renew_calls();
+    let observe_calls = port.observe_calls();
+    let observed = timeout(Duration::from_secs(1), production.observe_current_v2())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        observed.receipt().owner_revision.get(),
+        thawed.receipt().owner_revision.get() + 1
+    );
+    assert_eq!(port.renew_calls(), renew_calls + 1);
+    assert_eq!(port.observe_calls(), observe_calls + 2);
+    assert_eq!(production.terminal_status_v2(), None);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        production
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn production_observation_recovery_is_bounded_to_one_retry() {
+    let process_generation = NonZeroU64::new(77).unwrap();
+    let (production, port, invalidated, receipt) =
+        certification_production_fixture([], process_generation).await;
+    production
+        .wait_for_strict_successor_v2(
+            receipt.owner_revision,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    port.push_observation_step(FakeObservationStepV1::Error(FakeErrorV1::Retryable));
+    port.push_observation_step(FakeObservationStepV1::Error(FakeErrorV1::Retryable));
+    let observe_calls = port.observe_calls();
+
+    assert_eq!(
+        production.observe_current_v2().await,
+        Err(RuntimeGatewayOwnerCurrentObservationErrorV1::Retryable)
+    );
+    assert_eq!(port.observe_calls(), observe_calls + 2);
+    assert_eq!(production.terminal_status_v2(), None);
+    assert!(!invalidated.load(Ordering::Acquire));
+    assert_eq!(
+        production
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap(),
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn production_observation_terminal_failures_are_never_retried() {
+    let cases = [
+        (
+            FakeErrorV1::OwnershipLost,
+            RuntimeGatewayOwnerCurrentObservationErrorV1::OwnershipLost,
+            RuntimeGatewayOwnerStartupWatchdogExitV1::OwnershipLost,
+        ),
+        (
+            FakeErrorV1::ProtocolViolation,
+            RuntimeGatewayOwnerCurrentObservationErrorV1::ProtocolViolation,
+            RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation,
+        ),
+    ];
+    for (injected, expected_error, expected_exit) in cases {
+        let process_generation = NonZeroU64::new(78).unwrap();
+        let (production, port, invalidated, receipt) =
+            certification_production_fixture([], process_generation).await;
+        production
+            .wait_for_strict_successor_v2(
+                receipt.owner_revision,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        port.push_observation_step(FakeObservationStepV1::Error(injected));
+        let observe_calls = port.observe_calls();
+
+        assert_eq!(production.observe_current_v2().await, Err(expected_error));
+        assert_eq!(port.observe_calls(), observe_calls + 1);
+        assert_eq!(production.terminal_observation_v2().await, expected_exit);
+        assert!(invalidated.load(Ordering::Acquire));
+        assert_eq!(port.release_calls(), 1);
+    }
+}
+
+#[tokio::test]
+async fn certification_thaw_send_queue_stall_is_bounded_by_the_authority_cutoff() {
+    let process_generation = NonZeroU64::new(72).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let cutoff = Instant::now() + Duration::from_millis(300);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let renew_calls = port.renew_calls();
+    let sender = frozen.inner().supervisor_commands.clone();
+    let permit = sender.reserve_owned().await.unwrap();
+    let started_at = Instant::now();
+
+    assert!(matches!(
+        frozen
+            .thaw_v2(observation, Instant::now() + Duration::from_secs(1))
+            .await,
+        Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed)
+    ));
+    assert!(Instant::now() >= cutoff);
+    assert!(started_at.elapsed() < Duration::from_millis(600));
+    assert_eq!(port.renew_calls(), renew_calls);
+    assert!(invalidated.load(Ordering::Acquire));
+
+    drop(permit);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn certification_thaw_send_queue_uses_the_earlier_successor_deadline() {
+    let process_generation = NonZeroU64::new(75).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let cutoff = Instant::now() + Duration::from_millis(600);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let renew_calls = port.renew_calls();
+    let sender = frozen.inner().supervisor_commands.clone();
+    let permit = sender.reserve_owned().await.unwrap();
+    let successor_deadline = Instant::now() + Duration::from_millis(100);
+    let started_at = Instant::now();
+
+    assert!(matches!(
+        frozen.thaw_v2(observation, successor_deadline).await,
+        Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed)
+    ));
+    assert!(Instant::now() >= successor_deadline);
+    assert!(Instant::now() < cutoff);
+    assert!(started_at.elapsed() < Duration::from_millis(350));
+    assert_eq!(port.renew_calls(), renew_calls);
+    assert!(invalidated.load(Ordering::Acquire));
+
+    drop(permit);
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn late_certification_thaw_command_never_restores_production_generation() {
+    let process_generation = NonZeroU64::new(76).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let cutoff = Instant::now() + Duration::from_millis(600);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let renew_calls = port.renew_calls();
+    let completion_deadline = Instant::now() + Duration::from_millis(80);
+    sleep_until(TokioInstant::from_std(completion_deadline)).await;
+    let (response, acknowledgement) = oneshot::channel();
+    frozen
+        .inner()
+        .supervisor_commands
+        .send(RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification {
+            authority: observation,
+            completion_deadline,
+            response,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        acknowledgement.await.unwrap(),
+        Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed)
+    );
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::SafetyElapsed
+    );
+    assert_eq!(
+        frozen.inner().production_generation.load(Ordering::Acquire),
+        0
+    );
+    assert_eq!(port.renew_calls(), renew_calls);
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn certification_thaw_strict_successor_stall_is_bounded_by_the_authority_cutoff() {
+    let process_generation = NonZeroU64::new(74).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let cutoff = Instant::now() + Duration::from_millis(300);
+    let authority = production.prepare_certification_freeze_v2(cutoff).unwrap();
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let gate = Arc::new(Notify::new());
+    port.state
+        .renew_steps
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push_back(FakeRenewStepV1::Blocked(gate.clone()));
+    let started_at = Instant::now();
+
+    assert!(matches!(
+        frozen
+            .thaw_v2(observation, Instant::now() + Duration::from_secs(1))
+            .await,
+        Err(RuntimeGatewayOwnerCertificationThawErrorV2::DeadlineElapsed)
+    ));
+    assert!(Instant::now() >= cutoff);
+    assert!(started_at.elapsed() < Duration::from_millis(600));
+    assert!(invalidated.load(Ordering::Acquire));
+
+    gate.notify_one();
+    wait_for(|| port.release_calls() == 1).await;
+}
+
+#[tokio::test]
+async fn stale_certification_thaw_authority_is_fail_closed() {
+    let process_generation = NonZeroU64::new(73).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let authority = production
+        .prepare_certification_freeze_v2(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let (frozen, mut observation) = authority.freeze_v2().await.unwrap();
+    observation.observation.receipt.owner_revision = NonZeroU64::new(
+        observation
+            .observation
+            .receipt
+            .owner_revision
+            .get()
+            .checked_add(1)
+            .unwrap(),
+    )
+    .unwrap();
+    let terminal = frozen.terminal_observation_v2();
+
+    assert!(matches!(
+        frozen
+            .thaw_v2(observation, Instant::now() + Duration::from_millis(500),)
+            .await,
+        Err(RuntimeGatewayOwnerCertificationThawErrorV2::StaleAuthority)
+    ));
+    assert_eq!(
+        terminal.await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::Shutdown
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn lost_certification_freeze_acknowledgement_is_terminal_and_fail_closed() {
+    let gate = Arc::new(Notify::new());
+    let process_generation = NonZeroU64::new(79).unwrap();
+    let (production, port, invalidated, _) = certification_production_fixture(
+        [FakeRenewStepV1::Blocked(gate.clone())],
+        process_generation,
+    )
+    .await;
+    wait_for(|| port.renew_calls() == 1).await;
+    let expected_observation = production.inner().current_observation.borrow().clone();
+    let cutoff = Instant::now() + Duration::from_secs(1);
+    let (response, acknowledgement) = oneshot::channel();
+    drop(acknowledgement);
+    production
+        .inner()
+        .supervisor_commands
+        .send(
+            RuntimeGatewayOwnerSupervisorCommandV1::FreezeCertification {
+                expected_observation,
+                process_generation,
+                cutoff,
+                response,
+            },
+        )
+        .await
+        .unwrap();
+    let terminal = production.terminal_observation_v2();
+
+    gate.notify_one();
+
+    assert_eq!(
+        terminal.await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert!(invalidated.load(Ordering::Acquire));
+    assert_eq!(port.renew_calls(), 1);
+    assert_eq!(port.release_calls(), 1);
+}
+
+#[tokio::test]
+async fn lost_certification_thaw_acknowledgement_is_terminal_before_renewal() {
+    let process_generation = NonZeroU64::new(83).unwrap();
+    let (production, port, invalidated, _) =
+        certification_production_fixture([], process_generation).await;
+    let authority = production
+        .prepare_certification_freeze_v2(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    let (frozen, observation) = authority.freeze_v2().await.unwrap();
+    let completion_deadline = observation.cutoff_v2();
+    let renew_calls = port.renew_calls();
+    let (response, acknowledgement) = oneshot::channel();
+    drop(acknowledgement);
+    frozen
+        .inner()
+        .supervisor_commands
+        .send(RuntimeGatewayOwnerSupervisorCommandV1::ThawCertification {
+            authority: observation,
+            completion_deadline,
+            response,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        frozen.terminal_observation_v2().await,
+        RuntimeGatewayOwnerStartupWatchdogExitV1::ProtocolViolation
+    );
+    assert_eq!(port.renew_calls(), renew_calls);
+    assert!(invalidated.load(Ordering::Acquire));
     assert_eq!(port.release_calls(), 1);
 }
 

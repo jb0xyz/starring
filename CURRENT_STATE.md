@@ -12,9 +12,10 @@ Detailed rationale lives in the per-topic specs, plans, and runbooks under
 ## System Summary
 
 Starring is an AI-based Discord control plane: "Terraform / Kubernetes for
-Discord with a natural-language frontend." A Rust workspace of **38 crates and 6
-tools**, PostgreSQL-backed at its durable runtime boundaries, organized into
-three layers. The defining safety principle is constant across all layers:
+Discord with a natural-language frontend." A Rust workspace of **48 crates, 10
+Rust tools, and 58 workspace members**, PostgreSQL-backed at its durable runtime
+boundaries, organized into three layers. The defining safety principle is
+constant across all layers:
 
 > AI designs at install/authoring time. The runtime executes deterministically.
 > Event-time LLM calls are forbidden (enforced per-crate by `no_ai_gateway`
@@ -22,8 +23,11 @@ three layers. The defining safety principle is constant across all layers:
 
 Layer 1 and Layer 2 production runtime boundaries are PostgreSQL-or-die and
 fail-closed: they do not start, and do not mutate Discord, on an unsafe or
-unverifiable state. The model-facing Layer 3 harness keeps local authoring state
-in SQLite and cannot touch Discord or the production database. A separate
+unverifiable state. The model-facing Layer 3 harness cannot touch Discord,
+promotion, approval, Apply, deployment, or runtime mutation authority. Its CLI
+edge keeps local authoring state in SQLite; the trusted product edge reuses the
+same harness through a strict loopback worker client and stores only validated
+generations through an isolated encrypted PostgreSQL writer. A separate
 server-side promotion boundary bridges sealed authoring artifacts into the
 PostgreSQL-backed Layer 2 lifecycle without exposing that authority to the model.
 
@@ -115,11 +119,29 @@ independently grounded slot-specific exact literal in that current turn before
 compilation. Duplicate keys, cross-slot substitutions, stale-turn literals, and
 path or value drift fail closed without repair or Draft mutation.
 
-The authoring surface currently exists as the pure `design-harness` crate and
-the SQLite/loopback-worker `design-harness-cli` edge. It is a CLI and evaluation
-checkpoint, not a production API or UI. The only implemented product recipe is
-the private study room recipe. Typed-planner fallback is classified but not yet
-handed off to an actual typed-planner session.
+The model-facing authoring core remains the pure `design-harness` crate. Its
+SQLite `design-harness` CLI edge remains the evaluation surface, while the
+trusted server-side edge now reuses the same strict Codex worker protocol through
+`design-harness-codex-worker-client`. The pure conversation application accepts
+one bounded human turn, restores or initializes the exact design session, runs
+the same one-shot or multi-turn harness path, independently validates the safe
+projection, rechecks authentication and fresh `Author` authority after the model
+call, and commits by generation compare-and-set. Keyed single flight and bounded
+model capacity prevent duplicate calls without holding a database transaction
+across Luna. The product HTTP surface exposes authenticated POST-turn and
+GET-session routes; there is no frontend UI yet. The only implemented product
+recipe is the private study room recipe. Typed-planner fallback is classified
+but not yet handed off to an actual typed-planner session.
+
+Committed Phase A code contains the trusted authoring path from an authenticated
+turn to an encrypted durable generation. The 2026-07-30 A6 live milestone is
+certified: one signed-in one-shot request reached generation 1
+`preview_ready`, an authenticated GET independently read that encrypted
+generation, a signed-in resumed conversation advanced `needs_input` generation
+1 to `preview_ready` generation 2, and the exact one-shot generation reached
+`pending_approval`. The run stopped with zero approvals, Apply operations,
+deployments, and active-pointer mutations. Aggregate evidence is recorded in
+`docs/superpowers/measurements/2026-07-30-authoring-milestone-a6.md`.
 
 The implemented `authoring-application` route authenticates an opaque product
 session, derives a fresh Discord guild-authority observation, and loads one
@@ -222,13 +244,19 @@ exact desired-target digest, attestation, process generation, connected serving
 lease, and unexpired heartbeat.
 
 `product-control-http` provides the hardened Axum route contract for OAuth,
-session, promotion, approval, rejection, Apply, product status, deployment
-status, and health. It enforces exact Host and Origin, strict JSON, bounded
-bodies and concurrency, deadlines, panic isolation, double-submit CSRF,
-host-only Secure cookies, idempotency-key validation, no-store responses, and
-closed response validation. OAuth start has a process-wide bounded admission
-budget, and installation-scoped authority failures conceal whether a guessed
-installation exists. The session-bound
+session, conversational authoring, promotion, approval, rejection, Apply,
+product status, deployment status, and health. The authoring routes are
+`POST /v1/installations/{installation_id}/authoring/sessions/{session_id}/turns`
+and
+`GET /v1/installations/{installation_id}/authoring/sessions/{session_id}`.
+They expose only a closed safe projection, never a snapshot, transcript,
+ciphertext, model backend error, or authority-bearing server field. The HTTP
+boundary enforces exact Host and Origin, strict JSON, bounded bodies and
+concurrency, deadlines, panic isolation, double-submit CSRF, host-only Secure
+cookies, idempotency-key validation, no-store responses, and closed response
+validation. OAuth start has a process-wide bounded admission budget, and
+installation-scoped authority failures conceal whether a guessed installation
+exists. The session-bound
 `GET /v1/installations/{installation_id}/authority-check` route performs the
 same fresh `Apply` authority evaluation used by product mutation admission and
 returns only an empty `204`; it does not retain authority evidence or mutate
@@ -236,31 +264,60 @@ Discord, installation, promotion, or runtime state. A staging-only, fail-closed 
 workflow can atomically create a tenant, installation, immutable authority
 revision 1, and its initial runtime writer fence. It supports exact replay,
 requires the canonical empty-binding fingerprint, and does not create a
-permanent provisioner role. A public installation administration API remains
-deferred. `tools/starring-api` now supplies the closed
-production-facade bridge, validated environment and Keychain configuration,
-thirteen independently credentialed PostgreSQL pools, aggregate and post-bind
-deep readiness, and a bounded loopback-only HTTP process. Database connection
-material is complete and explicit; ambient PostgreSQL variables and `.pgpass`
-cannot fill missing authority or transport fields. Runtime readiness is
-supervised outside the request path; its first error, timeout, or panic closes
-business admission and the listener before graceful drain. Explicit parameter
-privileges and per-role database settings are treated as excess capability, so
-server-side privilege drift also closes admission. The checked-in
-LaunchAgent and exact thirteen-role bootstrap are deliberately staging-only.
-That process is a runnable staging control plane; it is not evidence of
-production Live because the separate runtime worker, trusted authoring writer,
-isolated production secret account, and retention scheduler remain absent.
+permanent provisioner role. A separate fail-closed staging operator has advanced
+the live installation to immutable authority revision 2 with the reviewed
+`community_hub` Discord text-channel binding. A public installation
+administration API remains deferred.
+
+`tools/starring-api` supplies the closed production-facade bridge, validated
+environment and Keychain configuration, fourteen independently credentialed
+core PostgreSQL pools plus one isolated authoring-writer pool, aggregate and
+post-bind deep readiness, and a bounded loopback-only HTTP process. The
+integrated staging inventory has 20 pairwise-distinct application database
+credentials across the 15 API and 5 runtime capabilities, three
+purpose-separated keyrings, 28 total Keychain items, and an exact 15-rule final
+HBA manifest. Database connection material
+is complete and explicit; ambient PostgreSQL variables and `.pgpass` cannot fill
+missing authority or transport fields. Runtime readiness is supervised outside
+the request path; its first error, timeout, or panic closes business admission
+and the listener before graceful drain. Explicit parameter privileges and
+per-role database settings are treated as excess capability, so server-side
+privilege drift also closes admission. The checked-in LaunchAgents and exact
+capability manifests are staging-only. Authoring admission is isolated from the
+core product surface, so an absent, saturated, unhealthy, or drifted writer or
+worker closes authoring without granting fallback database authority. A6 now
+proves this runnable authoring path through exact promotion. Phase B now
+composes exact deployment convergence, panel reconciliation, certification,
+serving monitoring, and deterministic interaction dispatch on the canonical
+Discord shard. The B6 staging run reached real Live and executed the current
+recipe, but it is not a commercial release certificate.
+
+The Phase C source implements the durable duplicate-interaction receipt
+boundary, complete deterministic action-plan preflight, per-effect PostgreSQL
+journal, exact Discord observation, reverse-order bounded compensation,
+response-tail recovery, route-scoped unsafe-recovery admission, and bounded
+production recovery supervisor. All external Discord calls remain outside
+database transactions. An unresolved or uncorrelatable mutable non-response
+effect is recorded as `recovery_required` and blocks the affected route instead
+of being guessed or blindly replayed. An unrecoverable response tail closes
+only the exact receipt without inventing delivery. Phase C remains a
+source-level hardening checkpoint, not a commercial release certificate; the
+complete restart, live fault, load, restore, and disposable-guild cohorts remain
+Phase D work.
 
 The active authoring provider is `codex_chatgpt`, pinned to
 `gpt-5.6-luna` with `medium` reasoning effort and ChatGPT authentication. The
-CLI reaches it only through the bearer-authenticated worker bound to
-`127.0.0.1:18181`; that raw worker is not a Cloudflare origin. The retired
-`local.cloudflared.starring`, `local.llm-api`, and `local.ollama.server`
-services are disabled and unloaded. The `gemma4:12b-mlx` model file remains on
-disk only as rollback material. Interactive CLI startup now defaults to Intent
-Recipe mode and fails closed before network access when its bindings are absent.
-Adaptive and Typed Plan remain explicit legacy rollback modes only.
+CLI and trusted API conversation composition reach it only through the strict
+bearer-authenticated worker bound to `127.0.0.1:18181`; that raw worker is not a
+Cloudflare origin or public route. The retired `local.llm-api` and
+`local.ollama.server` services are disabled and unloaded. The
+`gemma4:12b-mlx` model file remains on disk only as rollback material.
+Interactive CLI startup now defaults to Intent Recipe mode and fails closed
+before network access when its bindings are absent. Adaptive and Typed Plan
+remain explicit legacy rollback modes only. The current exact Codex CLI pin is
+`codex-cli 0.146.0-alpha.3.1`; a bundled-CLI update changes this identity,
+closes model admission, and requires an explicit tested pin advance and worker
+restart.
 
 The worker health contract exposes its stable process instance, source digest,
 capacity, timeout, and monotonic accepted and settled completion counters. The
@@ -291,11 +348,11 @@ Compiler, persistence, runtime, and server checkpoint.
 
 ## Workspace Topology
 
-38 crates, 6 Rust tools. The recurring pattern is **pure core + edge adapter**: pure
-crates hold the domain and logic and are forbidden `sqlx`/`twilight`
-dependencies (guarded by `dependency_guard` tests); a paired `*-postgres`
-adapter (or the `automation-runtime` Twilight edge) provides persistence and
-Discord I/O.
+48 crates and 10 Rust tools form 58 workspace members. The recurring pattern is
+**pure core + edge adapter**: pure crates hold the domain and logic and are
+forbidden `sqlx`/`twilight` dependencies (guarded by `dependency_guard` tests);
+a paired `*-postgres` adapter (or a dedicated runtime or Discord edge) provides
+persistence and Discord I/O.
 
 - **Shared domain**: `discord-model`, `domain`, `resource-resolution`,
   `desired-state`.
@@ -305,7 +362,9 @@ Discord I/O.
 - **Layer 2 rule engine**: `automation-state` (schema), `automation-core`
   (interpret/run/validate), `automation-runtime` (Twilight edge).
 - **Layer 3 authoring**: `design-harness` (pure Draft, conversation, Intent IR,
-  Recipe Compiler, candidate gates, and exact simulation).
+  Recipe Compiler, candidate gates, and exact simulation) and
+  `design-harness-codex-worker-client` (strict loopback worker protocol shared by
+  trusted edges).
 - **Layer 3 to Layer 2 promotion and product control**:
   `authoring-application` (pure authenticated use cases),
   `authoring-application-discord` (Discord OAuth and fresh guild authority),
@@ -323,20 +382,30 @@ Discord I/O.
   authority).
 - **Layer 2 durable instances**: `automation-instance` + `-postgres`,
   `automation-instance-teardown`, `automation-panel-installation` + `-postgres`.
+- **Layer 2 durable interaction execution**:
+  `automation-runtime-interaction` (pure receipt, effect, digest, plan, and
+  recovery contracts) and `automation-runtime-interaction-postgres` (narrow
+  durable receipt and effect-journal adapter).
 - **Rust tools**: `interaction-smoke` (feature-gated, test-database-only Layer 2
-  manual runner),
-  `executor-smoke`, `starring-demo`, `ai-eval`, `design-harness`
-  (Luna-medium/SQLite CLI and evaluation edge), and `starring-api`
-  (authenticated loopback product-control process). `codex-worker` is a
-  separate private loopback ChatGPT-login Codex service rather than a workspace
-  member.
+  manual runner), `executor-smoke`, `starring-demo`, `ai-eval`,
+  `design-harness` (Luna-medium/SQLite CLI and evaluation edge), `starring-api`
+  (authenticated loopback product-control process), `starring-db-bootstrap`,
+  `starring-runtime`, `starring-staging-provisioner`, and
+  `starring-staging-authority-operator`. `codex-worker` is a separate private
+  loopback ChatGPT-login Codex service rather than a workspace member.
 
-Persistence is forty-two migrations under `/migrations`, including the
+Persistence is 117 ordered migrations under `/migrations`, ending at
+`202608010002_fix_runtime_interaction_effect_response_tail_scan_v1.sql`,
+including the
 original instance and RuleSet stores, product-bound activation context and
 terminal states, the authoring promotion journal, atomic Product Apply and
 runtime deployment, runtime convergence, current-versus-historical binding
 separation, artifact integrity, exclusive product-slot ownership, scoped
-installation-authority reads, and scoped product-session authentication.
+installation-authority reads, scoped product-session authentication, durable
+interaction receipts, the per-effect recovery journal, and the additive
+response-tail recovery-scan correction. Migration 117 changes no table or
+capability count; it preserves the function signature, owner, ACL, and security
+attributes while replacing the invalid qualified `greatest` expression.
 
 ## Durable RuleSet Lifecycle
 
@@ -436,17 +505,19 @@ in-flight legacy activation.
 - **CI** (`.github/workflows/ci.yml`, GitHub Actions, push + PR): a DB-less job
   (fmt, build, `cargo test --workspace`, clippy `-D warnings`, unsafe-dev feature
   build, and design-harness JavaScript/Promptfoo static checks) and a PostgreSQL
-  job (nine adapter or integration packages' ignored tests, serial). No live Discord
-  or LLM in CI.
+  job (thirteen explicit adapter or integration commands, serial). The DB-less
+  job also scans tracked repository content for secret patterns before build.
+  No live Discord or LLM runs in CI.
 - **Test volume**: the complete Rust workspace suite, the design-harness
   JavaScript evaluator and acceptance self-tests, two Promptfoo configuration
   validations, and the ignored PostgreSQL integration suites for contention,
   CAS, lease, partial-unique, and reconnect behavior. At the final Luna V4
-  checkpoint, the focused `design-harness` library target passed 742 tests, the
-  CLI gate passed 82 tests plus its dependency guard, and the JavaScript gate
-  passed 106 tests. Relevant clippy `-D warnings` and formatting gates also
-  passed. The exact resumable repeated Luna matrix is implemented, statically
-  verified, and passed live at 232/232 samples and 298/298 planned model calls.
+  checkpoint, the independently audited `design-harness` library target passed
+  878 tests, the CLI gate passed 82 tests plus its dependency guard, and the
+  JavaScript gate passed 106 tests. Relevant clippy `-D warnings` and formatting
+  gates also passed. The exact resumable repeated Luna matrix is implemented,
+  statically verified, and passed live at 232/232 samples and 298/298 planned
+  model calls.
   The clean evidence source also passed GitHub Actions CI run 31: the complete
   workspace checks and PostgreSQL integration job were both green. CI remains
   separate from the local live-model certificate.
@@ -457,6 +528,17 @@ in-flight legacy activation.
   sequence passed all nine packages and 209 tests. Focused product Apply passed
   34/34, including both advisory-lock race orders and final-pointer transaction
   semantics. The isolated `interaction-smoke` suite passed 24/24.
+- **Current Phase A checkpoint**: A1–A6 focused pure, Discord-authority,
+  PostgreSQL-adapter, HTTP-boundary, API-composition, dependency-guard, Clippy,
+  and formatting gates are green. The complete authoring PostgreSQL integration
+  suite passed 181 tests serially, including the dedicated trusted-writer 10/10;
+  the 60-case writer-capability lifecycle and actual staging contract also
+  passed. The staging migration and least-privilege capability inventory are
+  installed, the final HBA has 15 rules, and installation authority revision 2
+  binds `community_hub` to the reviewed Discord text channel. A6 produced two
+  active sessions and three distinct XChaCha20-Poly1305 encrypted generations,
+  independently read the one-shot generation, promoted that exact generation,
+  and stopped before approval or Apply.
 
 ## What Is Complete
 
@@ -477,22 +559,43 @@ Stated as capabilities (durable across the phase numbering):
 - PreviewReady-to-approval promotion core: exact inactive publication,
   idempotent durable journal, product-bound approval payload, two-layer journal
   link gate, and no active-pointer mutation during publication or promotion.
+- Reusable strict loopback Codex worker client with provider, model, reasoning,
+  authentication, source identity, response-shape, usage, and single-frontier
+  checks and no SQL, Discord, promotion, or runtime authority.
 - Pure authenticated product application that sequences opaque-session
   authentication, mutation CSRF, fresh Discord authority, atomic server-owned
-  session snapshots, promotion, approval, Apply, and exact status projection.
+  session snapshots, conversational authoring, promotion, approval, Apply, and
+  exact status projection. The authoring sub-application has only authoring
+  ports and cannot receive promotion, Apply, runtime, or Discord-mutation
+  capabilities.
+- Trusted encrypted authoring-generation writer with active-key
+  XChaCha20-Poly1305 encryption, fresh nonces, authenticated metadata, bounded
+  canonical safe projections, exact replay, semantic idempotency conflict,
+  generation compare-and-set, retained-key coverage, and a fixed-function
+  non-owner database role with no direct relation access.
 - Hardened product HTTP transport contract with exact-origin checks, secure
   cookie and CSRF boundaries, strict payload parsing, resource limits, stable
   response validation, bounded OAuth-start admission, non-enumerating
-  installation authority, and no raw authority-bearing fields.
+  installation authority, and no raw authority-bearing fields. Authenticated
+  authoring POST and GET routes share the same closed projection contract, use
+  authoring-only timeout and capacity bounds, and keep committed exact replay
+  independent of a new model call.
+- Live-proven Phase A authoring vertical slice: Discord OAuth authentication,
+  one-shot `preview_ready`, authenticated encrypted-generation read, resumed
+  `needs_input` to `preview_ready`, and promotion of the exact stored generation
+  to `pending_approval`. The evidence contains three pairwise-distinct
+  XChaCha20-Poly1305 envelopes and stops with zero approvals, Apply records,
+  deployments, or active pointers.
 - Runnable loopback product-control composition with process-only configuration,
-  environment or macOS Keychain secret references, thirteen distinct bounded
-  database pools, aggregate capability readiness, bind-time deep revalidation,
-  explicit database credential provenance, atomic single-owner readiness,
-  periodic parameter-ACL and role-setting drift detection, bounded HTTP
-  admission and drain, and bounded concurrent pool shutdown. Stable process
-  failures expose only closed status, role, and readiness-phase codes. A
-  staging-only PostgreSQL manifest reconciles the thirteen exact capability
-  roles and fails closed on unexpected privileges or topology.
+  environment or macOS Keychain secret references, fourteen distinct bounded
+  core database pools plus one independently admitted authoring-writer pool,
+  aggregate capability readiness, bind-time deep revalidation, explicit
+  database credential provenance, atomic single-owner readiness, periodic
+  parameter-ACL and role-setting drift detection, bounded HTTP admission and
+  drain, and bounded concurrent pool shutdown. Stable process failures expose
+  only closed status, role, and readiness-phase codes. A staging-only PostgreSQL
+  manifest reconciles the exact 15 API and 5 runtime capability roles and fails
+  closed on unexpected privileges or topology.
 - Discord identify-only OAuth exchange and fresh bot-observed guild manager
   evidence with bounded write and read lifetimes.
 - PostgreSQL product identity, OAuth flow, opaque session and CSRF storage,
@@ -569,6 +672,16 @@ Stated as capabilities (durable across the phase numbering):
 - Fenced PostgreSQL runtime convergence with exact desired-target digests,
   attestation, serving lease and heartbeat evidence, stale-Live recovery, and
   product status that never equates an Applied pointer with Live.
+- The existing `tools/starring-runtime` process now owns one canonical Discord
+  shard, stages exact requested targets, drains and replaces routes, reconciles
+  certified panels, finalizes V2 Live certification, monitors serving leases,
+  dispatches static and historical-instance interactions, and preserves
+  least-privilege instance teardown state. Its bounded periodic teardown
+  supervisor starts only after canonical owner acquisition and operation-open,
+  uses the same narrow interaction capability and shared Discord client as live
+  dispatch, and stops before owner release. The B6 staging slice proved the real
+  product path from approval and Apply through Live, Discord resource creation,
+  restart reconstruction, and automatic exact per-instance footprint cleanup.
 - Current-versus-historical authority separation: policy-only rotation preserves
   runtime eligibility, while lifecycle, target, binding revision, fingerprint,
   or binding-map mismatch fails closed.
@@ -615,34 +728,31 @@ Stated as capabilities (durable across the phase numbering):
 
 ## What Is Not Yet Built
 
-- A production user-facing authoring API or UI. The current harness is a CLI and
-  evaluation checkpoint.
-- A production release certificate for `tools/starring-api`. The binary and its
-  thirteen-role aggregate readiness exist, but real credential provisioning,
-  migration/capability evidence, non-interactive Keychain reboot proof,
-  staging OAuth, disposable-guild authorization, backup/restore, and failure
-  drills remain operator gates before public ingress.
-- Least-privilege PostgreSQL deployment roles, restrictive default privileges,
-  row policies, and whole-process capability probes. Installation-authority and
-  authentication read/touch slices and all three product-decision slices now
-  have isolated non-owner, direct-DML denial tests and executable readiness
-  probes. The API composition invokes their complete aggregate readiness;
-  the checked-in reconciliation manifest is limited to a disposable staging
-  cluster. A separately reviewed production credential bootstrap covering the
-  remaining PostgreSQL catalog ACL surfaces, an automated isolated-cluster
-  manifest gate, and a restored-environment whole-process drill are still
-  release blockers.
-- A production `tools/starring-runtime` worker that performs the actual Discord
-  drain, hydration, panel reconciliation, gateway start, attestation, and
-  heartbeat loop. The durable state machine is implemented, but no production
-  process currently advances Requested deployments to Live.
-- A trusted server-side writer that accepts only harness-validated
-  `PreviewReadyArtifactV1` output and advances encrypted PostgreSQL authoring
-  generations. Existing product control can start from a pre-seeded durable
-  generation but is not yet connected to the Luna harness output.
+- A frontend authoring UI. The authenticated conversational authoring API exists,
+  but the current user surfaces are the product HTTP contract and the separate
+  CLI/evaluation edge.
+- A commercial release certificate for `tools/starring-api`. Its fourteen core
+  pools plus isolated writer pool and staging capability inventory exist, but
+  non-interactive reboot, restored-environment, backup/restore, failure,
+  concurrency, saturation, soak, and public-ingress drills remain release work.
+- Production credential and operational certification beyond the integrated
+  staging cluster. Staging has 20 pairwise-distinct application database
+  credentials, three purpose-separated keyrings, 28 total Keychain items,
+  fixed function allowlists, restrictive grants, and a 15-rule HBA;
+  restored-cluster reconciliation,
+  production secret-account isolation, rotation, and whole-process negative
+  capability evidence remain release blockers.
+- Commercial runtime certification beyond the completed Phase C source
+  candidate. The receipt, preflight, effect-journal, reconciliation,
+  compensation, route-admission, and recovery-supervisor boundaries exist, but
+  D1 restart and injected-failure cohorts are complete while the exact release
+  tree still needs the disposable-guild, load, restore, merge-candidate, and
+  merged-main cohorts.
 - An administrative / management API.
 - Broader multi-process lease/ownership beyond the single per-request lease.
-- A periodic teardown-retry worker (teardown resumes on boot, not on a schedule).
+- A dedicated live teardown-retry progress and degraded-health projection. The
+  bounded periodic worker exists and was exercised, but ongoing scan and item
+  failure counters are not yet exposed through a separate health endpoint.
 - Compact `RouteId` / custom-id compression (deferred until length is a real
   constraint).
 - Any non-Discord adapter.
@@ -650,18 +760,14 @@ Stated as capabilities (durable across the phase numbering):
 - Actual typed-planner handoff, structured brainstorming state, recipe editing
   and recompilation, typed multi-turn preference accumulation, and bounded
   Intent transcript compression.
-- Whole-action-plan deterministic preflight before the first Discord side
-  effect.
-- Provisioning-state persistence, compensation, reconciliation, and replay
-  idempotency for partial external failures.
 
 ## Known Limitations
 
 - The product-control HTTP process is runnable only as a staging control plane.
-  It authenticates and authorizes the implemented product operations, but it
-  cannot make Requested deployments Live without the separate runtime worker,
-  and it cannot accept new Luna designs without a trusted server-side writer.
-  Public ingress remains a release decision gated by the operational runbook.
+  It authenticates and authorizes conversational authoring and the implemented
+  product operations, and the staging runtime can make exact Requested
+  deployments Live. Public ingress remains a release decision gated by the
+  operational runbook and later commercial certification.
 - `interaction-smoke` is non-production manual tooling. It is unavailable
   without its compile feature, requires `STARRING_ALLOW_INTERACTION_SMOKE=1`,
   is marked non-publishable, and accepts only ASCII alphanumeric/underscore
@@ -672,24 +778,42 @@ Stated as capabilities (durable across the phase numbering):
   and both smoke features entirely.
 - The HTTP `/v1/me` database mismatch is resolved: `current_principal` uses the
   session-only projection, while `verify_csrf` uses the distinct mutation
-  projection. The production facade and thirteen-role startup composition now
-  exercise this boundary, while the production runtime process remains absent.
-- Apply can durably reach `RuntimePending`, and tests can drive exact simulated
-  attestation to Live. Commercial operation still requires the separate runtime
-  worker and real Discord lifecycle integration.
+  projection. The production facade and fifteen-pool API startup composition now
+  exercise this boundary, and the B6 staging route exercised the real runtime
+  successor.
+- Apply can durably reach `RuntimePending`, and the exact staging runtime can
+  advance it to real Live with a certified panel and fresh serving lease.
+  Commercial operation still requires the exact candidate to pass the Phase D
+  disposable-guild, load, restore, merge-candidate, CI, and merged-main
+  certification gates.
 - The `automation-panel-installation-postgres` ignored tests share a guild
   constant and must run serially (`--test-threads=1`); CI does this. A cleaner
   per-test isolation is deferred.
 - `last_apply_error` keeps only the latest attempt (no history table). Legacy and
   manual `observed_active` remains informational; product-authoring requests bind
   an exact expected baseline and fail as `Superseded` when it drifts.
-- Discord and DB are not jointly atomic; the guarantees are "no durable
-  incomplete state" and idempotent convergence, not distributed transactions.
-- Layer 1's live end-to-end maturity is not certified here.
+- Discord and DB are not jointly atomic. Ordinary action execution now writes
+  an exact per-effect journal, observes ambiguous results before retry, and
+  performs only bounded compensation with exact preimages. Mutable non-response
+  effects that cannot be correlated safely remain durably `recovery_required`
+  and route-blocked. An unrecoverable response tail terminalizes only its exact
+  receipt. D1 proves the bounded restart and failure boundaries; D2 must still
+  prove the exact indeterminate-effect scenario against a disposable Discord
+  guild.
+  Observation, compensation-attempt, and compensation-observation recovery each
+  have a database-enforced 64-attempt hard cap. The production recovery
+  supervisor exposes task liveness and progress to serving readiness; task exit
+  or three consecutive failed sweeps fails closed. A present teardown target
+  without the exact persisted registration identity is treated as a conflict,
+  never adopted by instance ID or resource manifest alone.
+- Layer 2's functional product/runtime staging execution is proven, but its
+  commercial failure, load, recovery, and release maturity is not certified
+  here. Layer 1's live end-to-end maturity remains uncertified.
 - The first recipe checkpoint does not certify commercial readiness. Custom
   copy, naming, and controls now have a passing repeated V4 acceptance matrix,
-  but concurrent load, throughput, soak recovery, high availability, a
-  production API and identity boundary, live Discord execution, and external
+  and the authenticated API, identity boundary, and A6 live authoring path are
+  proven. B6 also proves one exact live Discord execution and restart path, but
+  concurrent load, throughput, soak recovery, high availability, and external
   Discord failure recovery remain uncertified.
 - V4 structurally removes the V3 identity defect in which three full-detail
   repetitions produced one RuleSet and one compiled-plan identity but two
@@ -704,8 +828,14 @@ Stated as capabilities (durable across the phase numbering):
   authentication mode, not a weights or remote backend-configuration digest.
   The declared 16,384-token context remains an evaluation policy; the worker
   does not attest the remote model's active context window.
-- Runtime actions are still prepared and executed one at a time. A later
-  deterministic failure can leave an earlier Discord mutation behind.
+- Runtime actions now receive complete deterministic preflight before the first
+  mutation and commit an exact effect journal around each effect-plan external
+  call. Initial defer and direct response paths retain the C1 receipt-level
+  intent/result journal, while an unrecoverable response tail terminalizes that
+  exact receipt. A later mutation failure therefore enters bounded observation,
+  compensation, or an explicit route-blocked state instead of leaving an
+  untracked mutation. The disposable-guild indeterminate-effect and cleanup
+  certificate remains D2 work.
 - V3 Intent snapshots are deliberately incompatible with V4. V6 and V7
   non-Intent snapshots can be promoted at the CLI store edge, but any V6 or V7
   snapshot containing Intent state is rejected. Future protocol, prompt,
@@ -728,48 +858,70 @@ Stated as capabilities (durable across the phase numbering):
   workspace test, Clippy, and formatting gates completed locally; treat a
   recurrence as a host operational fault and continue requiring independent CI
   before merge.
-- The data volume is about 83% used with roughly 36 GiB free. Keep at least
-  30 GiB free and recover additional headroom before retaining another large
-  build or evaluation cohort; this is an operational capacity floor, not a
-  certified production margin.
+- Keep at least 30 GiB free before retaining another large build or evaluation
+  cohort. Recheck the current filesystem immediately before each release build;
+  a previously recorded free-space value is not a capacity guarantee. This is
+  an operational floor, not a certified production margin.
 
 ## Next Phase: Prove Commercial Operation
 
-The direction is no longer an automation-versus-game product fork. The near-term
-Harness Track comes first; a separate Stateful Runtime Track follows only after
-the authoring and execution boundary is reliable.
+Phase A A1–A6, Phase B B1–B6, and the Phase C source implementation are
+complete. The API has fourteen core pools and one isolated writer pool; the
+retained integrated staging cluster has 20 application credentials, three
+keyrings, 28 total Keychain items, a 15-rule HBA, 117 migration-ledger entries
+through `202608010002`, and authority revision 2
+`community_hub` binding. The live signed-in gate proved one-shot and resumed
+multi-turn authoring, three encrypted durable generations, authenticated read,
+and exact PreviewReady promotion. The B6 gate then proved approval, Apply,
+RuntimePending-to-Live convergence, real Discord resource effects, restart
+reconstruction, and exact per-instance footprint cleanup.
 
-The immediate sequence is:
+Migration 117,
+`202608010002_fix_runtime_interaction_effect_response_tail_scan_v1.sql`, repairs
+the invalid qualified PostgreSQL expression exposed by the first D1 restart
+drill. The corrected immutable candidate at
+`b4f2bb09f4997c2fda33ddef6a1175e642ca19ba` is deployed. Its forced-restart
+successor reacquired exact authority in 66 seconds and then held process,
+liveness, readiness, and fresh acknowledgement evidence for 40/40 samples over
+83 seconds. The complete deterministic and PostgreSQL D1 failure matrix is
+green. D2 and D3 remain required.
 
-1. Provision and independently verify the thirteen API credentials against a
-   restored staging database, then complete the Keychain reboot, OAuth,
-   disposable-guild authority, shutdown, backup, and rollback drills in the
-   control-plane runbook without enabling customer ingress.
-2. Complete least-privilege PostgreSQL owner, API, runtime, and maintenance roles;
-   restrictive grants/default privileges; row policies; direct-DML denial; and
-   a CI-tested positive/negative capability matrix.
-3. Build `tools/starring-runtime` with its separate DB role and bot credential,
-   then prove Requested through exact Live and Live-loss recovery against a real
-   Discord test guild.
-4. Connect a trusted server-side harness writer so only validated and simulated
-   Luna output can advance encrypted `PreviewReady` generations.
-5. Preserve the passing clean-source cohort and failed diagnostic cohorts as
-   separate immutable evidence, then measure queueing, concurrency, saturation,
-   soak recovery, and worker high availability before setting a commercial SLO.
-6. Add typed multi-turn preference accumulation and the typed-planner handoff
-   while preserving the same deterministic candidate gates and no-deploy model
-   boundary.
-7. Add whole-plan deterministic preflight, compensation, reconciliation, and
-   uncertain-external-effect replay before expanding the recipe catalog or
-   beginning the separate `StatefulSpec` runtime arc.
+The accepted next sequence is:
 
-The handoff document linked above is authoritative for the detailed ordering,
-current evidence, commands, and known maintenance debt.
+1. **Phase D — commercial certification:** run the final disposable-guild E2E,
+   backup/restore and non-interactive reboot drills, concurrency, saturation and
+   soak measurement, complete local gates, final PR and merge-candidate CI,
+   merged-main CI, and source-of-truth/runbook closure.
+2. After the commercial certificate, add typed multi-turn preference
+   accumulation and typed-planner handoff, then consider broader recipes or the
+   separate `StatefulSpec` runtime arc.
+
+`docs/superpowers/plans/2026-07-29-authoring-runtime-commercial-completion.md`
+is authoritative for task ordering, acceptance conditions, and estimates.
+`docs/superpowers/measurements/2026-07-30-authoring-milestone-a6.md` is the
+aggregate Phase A live certificate.
+`docs/superpowers/measurements/2026-07-31-runtime-milestone-b6.md` records the
+Phase B staging runtime evidence and its standing-fixture scope. Neither
+measurement is a commercial certification.
+`docs/superpowers/measurements/2026-08-01-runtime-milestone-c3.md` records the
+Phase C source-level durability, recovery, and isolated PostgreSQL evidence. It
+is also not a commercial certification.
+`docs/superpowers/measurements/2026-08-01-runtime-phase-d1.md` records the
+completed restart and failure cohorts. D1 alone is not a commercial
+certification.
 
 ## Source Documents
 
+- Active Phase D continuation and operational handoff:
+  `docs/superpowers/handoffs/2026-08-01-commercial-certification-phase-d-handoff.md`.
 - Design specs, plans, and runbooks: `docs/superpowers/{specs,plans,runbooks}/`
   (per-phase rationale; the 16–18f arc and the CI and rollback runbooks).
+- Phase B staging runtime evidence:
+  `docs/superpowers/measurements/2026-07-31-runtime-milestone-b6.md`.
+- Phase C source hardening evidence:
+  `docs/superpowers/measurements/2026-08-01-runtime-milestone-c3.md`.
+- Phase D1 restart and failure evidence:
+  `docs/superpowers/measurements/2026-08-01-runtime-phase-d1.md`.
 - Current Intent V4 semantic-identity implementation handoff:
   `docs/superpowers/handoffs/2026-07-15-intent-v4-semantic-identity-handoff.md`.
 - Current Luna V4 acceptance and hardening handoff:

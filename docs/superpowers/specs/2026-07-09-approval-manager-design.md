@@ -5,6 +5,11 @@
 - **범위**: Phase 11 — `crates/approval-manager` (verdict → 승인 상태머신)
 - **선행**: Phase 1~10 완료. 순수 코어의 **마지막 결정론 관문** (Executor 앞).
 
+> 승인 정책 변경 (2026-07-31): `RequireSecondApproval`,
+> `PendingSecondApproval`, 2인 quorum은
+> `2026-07-31-solo-product-approval-design.md`에 의해 폐기되었습니다.
+> 승인 필요 작업은 요청자를 포함한 한 명의 인증된 관리자가 승인합니다.
+
 ---
 
 ## 0. 목적

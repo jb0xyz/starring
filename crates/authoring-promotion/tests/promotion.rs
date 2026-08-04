@@ -43,26 +43,43 @@ struct ScriptedClient {
 
 impl ScriptedClient {
     fn validated_preview() -> Self {
-        let response = LlmResponse::ToolCalls(vec![ToolCall {
-            id: "interpret".to_string(),
-            name: "interpret_intent_core".to_string(),
-            arguments: json!({
-                "expected_revision": 0,
-                "request_mode": "build",
-                "automation_kind": "managed_private_study_room",
-                "requested_outcome": "validated_preview",
-                "hub_channel": "community_hub",
-                "language": "en",
-                "close_policy": "disabled",
-                "other_unmapped_required_capabilities": [],
-                "response": ""
-            })
-            .to_string(),
-        }]);
         Self {
-            responses: Arc::new(Mutex::new(vec![Ok(response)].into())),
+            responses: Arc::new(Mutex::new(
+                vec![Ok(intent_response(0, "validated_preview"))].into(),
+            )),
         }
     }
+
+    fn working_draft() -> Self {
+        Self {
+            responses: Arc::new(Mutex::new(
+                vec![Ok(intent_response(0, "working_draft"))].into(),
+            )),
+        }
+    }
+
+    fn push(&self, response: LlmResponse) {
+        self.responses.lock().unwrap().push_back(Ok(response));
+    }
+}
+
+fn intent_response(expected_revision: u64, requested_outcome: &str) -> LlmResponse {
+    LlmResponse::ToolCalls(vec![ToolCall {
+        id: "interpret".to_string(),
+        name: "interpret_intent_core".to_string(),
+        arguments: json!({
+            "expected_revision": expected_revision,
+            "request_mode": "build",
+            "automation_kind": "managed_private_study_room",
+            "requested_outcome": requested_outcome,
+            "hub_channel": "community_hub",
+            "language": "en",
+            "close_policy": "disabled",
+            "other_unmapped_required_capabilities": [],
+            "response": ""
+        })
+        .to_string(),
+    }])
 }
 
 impl LlmClient for ScriptedClient {
@@ -94,6 +111,34 @@ async fn artifact(validated_preview: bool) -> PreviewReadyArtifactV1 {
     };
     assert!(matches!(
         session.run_burst(request).await,
+        BurstOutcome::Ready { .. }
+    ));
+    session.export_preview_ready_artifact().unwrap()
+}
+
+async fn finalized_working_draft_artifact() -> PreviewReadyArtifactV1 {
+    let mut bindings = ResourceBindingMap::default();
+    bindings.channel_bindings.insert(
+        serde_json::from_value(json!("community_hub")).unwrap(),
+        "700".parse().unwrap(),
+    );
+    let client = ScriptedClient::working_draft();
+    let probe = client.clone();
+    let mut session = DesignSession::with_intent_recipe(client, bindings);
+    assert!(matches!(
+        session
+            .run_burst("Create private study rooms in community_hub")
+            .await,
+        BurstOutcome::Ready { .. }
+    ));
+    let candidate_revision = session.draft().draft_revision;
+    probe.push(intent_response(candidate_revision, "validated_preview"));
+    assert!(matches!(
+        session
+            .run_burst(
+                "Keep the existing community_hub design unchanged and finalize it as a validated preview",
+            )
+            .await,
         BurstOutcome::Ready { .. }
     ));
     session.export_preview_ready_artifact().unwrap()
@@ -753,6 +798,12 @@ fn exact_idempotent_replay_succeeds_and_changed_payload_conflicts() {
         let mut changed_quorum =
             start_input_from_artifact("same-key", "studyrooms", &sealed_artifact);
         changed_quorum.context.policy.required_approvals = NonZeroU32::new(2).unwrap();
+        assert_eq!(
+            service.start(changed_quorum).await.unwrap_err(),
+            PromotionError::Store(PromotionStoreError::InvalidRecord(
+                PromotionRecordValidationError::Policy,
+            ))
+        );
         let mut changed_ttl = start_input_from_artifact("same-key", "studyrooms", &sealed_artifact);
         changed_ttl.context.policy.ttl_seconds = NonZeroU64::new(7200).unwrap();
         let conflicting = [
@@ -764,7 +815,6 @@ fn exact_idempotent_replay_succeeds_and_changed_payload_conflicts() {
             changed_installation,
             changed_binding,
             changed_policy,
-            changed_quorum,
             changed_ttl,
         ];
         for input in conflicting {
@@ -1086,6 +1136,27 @@ fn working_draft_is_rejected_before_any_store_or_external_capability() {
         );
         assert_eq!(publication.calls.load(Ordering::SeqCst), 0);
         assert_eq!(activation.calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn outcome_only_finalized_working_draft_is_accepted_by_the_promotion_planner() {
+    block_on(async {
+        let artifact = finalized_working_draft_artifact().await;
+        let plan = plan_start_promotion_v1(start_input_from_artifact(
+            "finalized-working",
+            "studyrooms",
+            &artifact,
+        ))
+        .unwrap();
+        assert_eq!(
+            plan.intent.evidence.candidate_revision,
+            artifact.receipt().candidate_revision
+        );
+        assert_eq!(
+            plan.intent.evidence.candidate_ruleset_hash.as_str(),
+            artifact.receipt().candidate_ruleset_hash
+        );
     });
 }
 

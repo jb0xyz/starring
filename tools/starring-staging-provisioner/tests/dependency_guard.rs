@@ -168,6 +168,7 @@ fn source_keeps_fixed_process_and_secret_transport_boundaries() {
     assert!(keychain.contains("\"delete-generic-password\""));
     assert!(keychain.contains(".arg(\"-i\")"));
     assert!(keychain.contains("input.extend_from_slice(b\" -X \")"));
+    assert!(keychain.contains("input.extend_from_slice(b\"-U \")"));
     assert!(keychain.contains(".stdin(Stdio::piped())"));
     assert!(keychain.contains(".stdout(Stdio::null())"));
     assert!(keychain.contains(".stderr(Stdio::null())"));
@@ -191,4 +192,80 @@ fn workspace_and_fixed_target_membership_are_present_once() {
     );
     assert!(identity
         .contains("pub const PEER_SOCKET_DIRECTORY: &str = \"/private/tmp/starring-bootstrap\""));
+}
+
+#[test]
+fn incremental_writer_mode_is_explicit_and_runbooked_once() {
+    let main = include_str!("../src/main.rs");
+    let incremental = include_str!("../src/incremental_writer.rs");
+    let readme = include_str!("../README.md");
+    let runbook = include_str!(
+        "../../../docs/superpowers/runbooks/2026-07-29-macos-starring-integrated-staging-cutover.md"
+    );
+    assert_eq!(main.matches("\"--provision-authoring-writer\"").count(), 1);
+    assert_eq!(incremental.matches("CREATE ROLE ").count(), 3);
+    assert_eq!(incremental.matches("starring-api.staging").count(), 1);
+    assert!(readme.contains("authoring_writer=exact_replay"));
+    assert!(main.contains("snapshot_reader=v2_only"));
+    assert!(runbook.contains("authoring-writer-created.txt"));
+    assert!(runbook.contains("authoring-writer-replay.txt"));
+    assert!(runbook.contains("Do not rerun the\none-shot provisioner"));
+}
+
+#[test]
+fn incremental_interaction_keyring_mode_is_keychain_only_and_runbooked() {
+    let main = include_str!("../src/main.rs");
+    let incremental = include_str!("../src/incremental_keyring.rs");
+    let readme = include_str!("../README.md");
+    let runtime_runbook = include_str!(
+        "../../../docs/superpowers/runbooks/2026-07-29-macos-starring-runtime-staging-operations.md"
+    );
+    let cutover_runbook = include_str!(
+        "../../../docs/superpowers/runbooks/2026-07-29-macos-starring-integrated-staging-cutover.md"
+    );
+    assert_eq!(
+        main.matches("\"--provision-interaction-token-keyring\"")
+            .count(),
+        1
+    );
+    assert!(main.contains("\"outcome={} active_key_id={}\""));
+    for forbidden in [
+        "sqlx",
+        "StagingPostgresSessionV1",
+        "PgConnection",
+        "apply_verifiers",
+        "DatabaseMutation",
+    ] {
+        assert!(!incremental.contains(forbidden), "{forbidden}");
+    }
+    assert!(incremental.contains("begin_create_interaction_token_keyring"));
+    assert!(incremental.contains("validate_keyring_set"));
+    assert!(readme.contains("outcome=created|exact_replay"));
+    assert!(runtime_runbook.contains("performs no database connection or mutation"));
+    assert!(cutover_runbook.contains("interaction-keyring-created.txt"));
+    assert!(cutover_runbook.contains("interaction-keyring-replay.txt"));
+}
+
+#[test]
+fn interaction_token_keyring_identity_output_and_inventory_are_exact() {
+    let identity = include_str!("../src/identity.rs");
+    let main = include_str!("../src/main.rs");
+    let runtime_runbook = include_str!(
+        "../../../docs/superpowers/runbooks/2026-07-29-macos-starring-runtime-staging-operations.md"
+    );
+    let cutover_runbook = include_str!(
+        "../../../docs/superpowers/runbooks/2026-07-29-macos-starring-integrated-staging-cutover.md"
+    );
+    assert_eq!(
+        identity
+            .matches("interaction.token-envelope-keyring")
+            .count(),
+        2
+    );
+    assert!(main.contains("application_database_credentials=20 keyrings=3"));
+    assert!(main.contains("interaction_token_envelope_key_id={}"));
+    assert!(runtime_runbook.contains("exactly seven accounts"));
+    assert!(runtime_runbook.contains("delete all seven"));
+    assert!(cutover_runbook.contains("test \"$COUNT\" = 28"));
+    assert!(cutover_runbook.contains("twenty-one-connection/three-keyring"));
 }

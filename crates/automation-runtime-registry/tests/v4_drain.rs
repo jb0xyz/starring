@@ -18,9 +18,9 @@ use automation_runtime_controller::{
     RuntimeStartupRecoveryStateV2, RuntimeStartupServingStateV2,
 };
 use automation_runtime_convergence::{
-    BindingRevision, DeploymentId, DeploymentRevision, FencingToken, InstallationId,
-    ProcessInstanceId, RuntimeDeploymentTargetV1, RuntimeGeneration, RuntimeProcessIdentityV1,
-    TenantId,
+    ActivationRequestId, BindingRevision, DeploymentId, DeploymentRevision, FencingToken,
+    InstallationId, ProcessInstanceId, PromotionId, RuntimeDeploymentIdentityV1,
+    RuntimeDeploymentTargetV1, RuntimeGeneration, RuntimeProcessIdentityV1, TenantId,
 };
 use automation_runtime_registry::{
     ExactServingRouteV1, PreviousRouteEnvelopeV4, ServingSlotRegistryConfigV1,
@@ -90,6 +90,14 @@ fn route(process: &str) -> ExactServingRouteV1 {
     let bindings = ResourceBindingMap::default();
     let binding_fingerprint = resource_binding_fingerprint_v2(&bindings);
     ExactServingRouteV1::new(
+        RuntimeDeploymentIdentityV1 {
+            deployment_id: DeploymentId::parse(format!("deployment:{process}")).unwrap(),
+            tenant_id: TenantId::parse("tenant:1").unwrap(),
+            installation_id: InstallationId::parse("installation:1").unwrap(),
+            promotion_id: PromotionId::parse("e".repeat(64)).unwrap(),
+            activation_request_id: ActivationRequestId::parse(format!("activation:{process}"))
+                .unwrap(),
+        },
         RuntimeProcessIdentityV1 {
             target: RuntimeDeploymentTargetV1 {
                 guild_id: ruleset.guild_id,

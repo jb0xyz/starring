@@ -180,7 +180,8 @@ fn authority_evidence_lifetime_is_bounded(
 ) -> bool {
     let maximum = match capability {
         CapabilityV1::Read => MAX_READ_AUTHORITY_LIFETIME,
-        CapabilityV1::Promote
+        CapabilityV1::Author
+        | CapabilityV1::Promote
         | CapabilityV1::Approve
         | CapabilityV1::Reject
         | CapabilityV1::Apply
@@ -227,6 +228,8 @@ fn validate_record_and_activation(
             != row.historical_authority_binding_revision
         || i64::try_from(record.intent.authority.policy.revision.get()).ok()
             != row.historical_authority_policy_revision
+        || row.activation_required_approvals != 1
+        || row.historical_authority_required_approvals != Some(1)
         || i32::try_from(record.intent.authority.policy.required_approvals.get()).ok()
             != row.historical_authority_required_approvals
         || i64::try_from(record.intent.authority.policy.ttl_seconds.get()).ok()

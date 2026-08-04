@@ -6,6 +6,13 @@ Status: core bridge implemented; production edge and runtime convergence pending
 
 Branch: `feat/authoring-promotion-bridge`
 
+> Product approval update (2026-07-31): the distinct-approver and requester
+> self-approval prohibitions in this historical design are superseded by
+> `2026-07-31-solo-product-approval-design.md`. Product approval requires
+> exactly one authenticated manager and permits the requester to approve. All
+> other promotion, payload-binding, Apply, and runtime safety invariants remain
+> in force.
+
 ## Outcome
 
 Connect a validated conversational Intent candidate to the existing durable

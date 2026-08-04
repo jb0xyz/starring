@@ -824,13 +824,13 @@ async fn advance_authority(pool: &PgPool, fixture: &Fixture) -> AuthorityRevisio
 #[ignore]
 async fn exact_replay_uses_current_authorization_and_preserves_historical_authority() {
     let pool = pool().await;
-    let fixture = seed_fixture(&pool, 2).await;
+    let fixture = seed_fixture(&pool, 1).await;
     let first_invocation =
         ApprovalInvocation::new(&fixture, &fixture.first_approver, 1, "authority-v1");
     let first = approve(&pool, &fixture, &first_invocation).await.unwrap();
     assert_eq!(first.outcome, "ok");
     assert_eq!(first.resulting_revision, Some(2));
-    assert_eq!(first.resulting_state.as_deref(), Some("pending"));
+    assert_eq!(first.resulting_state.as_deref(), Some("approved"));
     assert!(!first.exact_replay);
     let receipt_before = sqlx::query_scalar::<_, serde_json::Value>(
         "SELECT pg_catalog.to_jsonb(receipt) \
@@ -907,7 +907,7 @@ async fn exact_replay_uses_current_authorization_and_preserves_historical_author
     assert_eq!(rejected.outcome, "authorization_stale");
     assert_eq!(
         persisted_counts(&pool, &fixture).await,
-        (1, 1, 1, 1, 2, "pending".to_string())
+        (1, 1, 1, 1, 2, "approved".to_string())
     );
 }
 
@@ -915,7 +915,7 @@ async fn exact_replay_uses_current_authorization_and_preserves_historical_author
 #[ignore]
 async fn approval_rechecks_expiring_authority_after_activation_lock_wait() {
     let pool = pool().await;
-    let fixture = seed_fixture(&pool, 2).await;
+    let fixture = seed_fixture(&pool, 1).await;
     let mut blocker = pool.begin().await.unwrap();
     sqlx::query_scalar::<_, String>(
         "SELECT id FROM public.activation_requests WHERE id = $1 FOR UPDATE",
@@ -968,17 +968,16 @@ async fn approval_rechecks_expiring_authority_after_activation_lock_wait() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn guarded_approval_is_atomic_payload_bound_quorum_aware_and_replayable() {
+async fn guarded_approval_is_atomic_payload_bound_solo_and_replayable() {
     let pool = pool().await;
-    let fixture = seed_fixture(&pool, 2).await;
-    let mut first_invocation =
-        ApprovalInvocation::new(&fixture, &fixture.first_approver, 1, "first");
+    let fixture = seed_fixture(&pool, 1).await;
+    let mut first_invocation = ApprovalInvocation::new(&fixture, &fixture.requester, 1, "first");
     first_invocation.guild_owner = false;
     first_invocation.permission_bits = "8".to_string();
     let first = approve(&pool, &fixture, &first_invocation).await.unwrap();
     assert_eq!(first.outcome, "ok");
     assert_eq!(first.resulting_revision, Some(2));
-    assert_eq!(first.resulting_state.as_deref(), Some("pending"));
+    assert_eq!(first.resulting_state.as_deref(), Some("approved"));
     assert!(!first.exact_replay);
     let audit_binding_fingerprint = sqlx::query_scalar::<_, String>(
         "SELECT binding_fingerprint FROM public.product_audit_events WHERE receipt_id = $1",
@@ -1020,7 +1019,7 @@ async fn guarded_approval_is_atomic_payload_bound_quorum_aware_and_replayable() 
     let replay = approve(&pool, &fixture, &replay_invocation).await.unwrap();
     assert_eq!(replay.outcome, "ok");
     assert_eq!(replay.resulting_revision, Some(2));
-    assert_eq!(replay.resulting_state.as_deref(), Some("pending"));
+    assert_eq!(replay.resulting_state.as_deref(), Some("approved"));
     assert!(replay.exact_replay);
     let mut retired_removed = replay_invocation.clone();
     retired_removed.request_id = Some("approval.first.new-key-only".to_string());
@@ -1044,30 +1043,7 @@ async fn guarded_approval_is_atomic_payload_bound_quorum_aware_and_replayable() 
     assert_eq!(conflict.outcome, "idempotency_conflict");
     assert_eq!(
         persisted_counts(&pool, &fixture).await,
-        (1, 1, 2, 1, 2, "pending".to_string())
-    );
-    let mut rolled_back =
-        ApprovalInvocation::new(&fixture, &fixture.second_approver, 2, "second-rollback");
-    rolled_back.guild_owner = false;
-    rolled_back.permission_bits = "32".to_string();
-    rolled_back.audit_id = first_invocation.audit_id.clone();
-    assert!(approve(&pool, &fixture, &rolled_back).await.is_err());
-    assert_eq!(
-        persisted_counts(&pool, &fixture).await,
-        (1, 1, 2, 1, 2, "pending".to_string())
-    );
-    let mut second =
-        ApprovalInvocation::new(&fixture, &fixture.second_approver, 2, "second-success");
-    second.guild_owner = false;
-    second.permission_bits = "32".to_string();
-    let approved = approve(&pool, &fixture, &second).await.unwrap();
-    assert_eq!(approved.outcome, "ok");
-    assert_eq!(approved.resulting_revision, Some(3));
-    assert_eq!(approved.resulting_state.as_deref(), Some("approved"));
-    assert!(!approved.exact_replay);
-    assert_eq!(
-        persisted_counts(&pool, &fixture).await,
-        (2, 2, 3, 2, 3, "approved".to_string())
+        (1, 1, 2, 1, 2, "approved".to_string())
     );
     let promotion_delete = sqlx::query("DELETE FROM public.authoring_promotions WHERE id = $1")
         .bind(&fixture.promotion_id)
@@ -1122,7 +1098,7 @@ async fn guarded_approval_is_atomic_payload_bound_quorum_aware_and_replayable() 
           target_resource_id, resulting_revision, resulting_state, result_code, \
           http_disposition_class) \
          VALUES ($1, $2, $3, $4, 'product_approve_v1', $5, 'test-missing-audit', \
-          $6, $7, 'authoring_promotion', $8, 2, 'pending', 'approval_recorded', 2)",
+          $6, $7, 'authoring_promotion', $8, 2, 'approved', 'approval_quorum_reached', 2)",
     )
     .bind(&missing_audit_receipt)
     .bind(&fixture.tenant_id)
@@ -1166,15 +1142,15 @@ async fn guarded_approval_is_atomic_payload_bound_quorum_aware_and_replayable() 
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(persisted_subject, fixture.first_approver.session_subject);
-    assert_ne!(persisted_subject, fixture.first_approver.session_digest);
+    assert_eq!(persisted_subject, fixture.requester.session_subject);
+    assert_ne!(persisted_subject, fixture.requester.session_digest);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn concurrent_same_idempotency_performs_exactly_one_mutation() {
     let pool = pool().await;
-    let fixture = seed_fixture(&pool, 2).await;
+    let fixture = seed_fixture(&pool, 1).await;
     let mut invocation =
         ApprovalInvocation::new(&fixture, &fixture.first_approver, 1, "concurrent");
     invocation.guild_owner = false;
@@ -1205,7 +1181,7 @@ async fn concurrent_same_idempotency_performs_exactly_one_mutation() {
     assert!(retry.exact_replay);
     assert_eq!(
         persisted_counts(&pool, &fixture).await,
-        (1, 1, 1, 1, 2, "pending".to_string())
+        (1, 1, 1, 1, 2, "approved".to_string())
     );
 }
 
@@ -1213,7 +1189,7 @@ async fn concurrent_same_idempotency_performs_exactly_one_mutation() {
 #[ignore]
 async fn rolling_keyrings_conflict_across_targets_in_both_orders_and_concurrently() {
     let pool = pool().await;
-    let first = seed_fixture(&pool, 2).await;
+    let first = seed_fixture(&pool, 1).await;
     let second = seed_additional_target(&pool, &first, "old-first-second").await;
     let old_digest = digest(&format!("{}:rotation-one:old", first.tenant_id));
     let new_digest = digest(&format!("{}:rotation-one:new", first.tenant_id));
@@ -1303,7 +1279,7 @@ async fn rolling_keyrings_conflict_across_targets_in_both_orders_and_concurrentl
         (0, 0, 0, 0, 1, "pending".to_string())
     );
 
-    let third = seed_fixture(&pool, 2).await;
+    let third = seed_fixture(&pool, 1).await;
     let fourth = seed_additional_target(&pool, &third, "new-first-fourth").await;
     let old_digest = digest(&format!("{}:rotation-two:old", third.tenant_id));
     let new_digest = digest(&format!("{}:rotation-two:new", third.tenant_id));
@@ -1345,7 +1321,7 @@ async fn rolling_keyrings_conflict_across_targets_in_both_orders_and_concurrentl
         (0, 0, 0, 0, 1, "pending".to_string())
     );
 
-    let ambiguity_first = seed_fixture(&pool, 2).await;
+    let ambiguity_first = seed_fixture(&pool, 1).await;
     let ambiguity_second =
         seed_additional_target(&pool, &ambiguity_first, "ambiguity-second").await;
     let ambiguous = seed_additional_target(&pool, &ambiguity_first, "ambiguity-target").await;
@@ -1447,7 +1423,7 @@ async fn rolling_keyrings_conflict_across_targets_in_both_orders_and_concurrentl
         (0, 0, 0, 0, 1, "pending".to_string())
     );
 
-    let fifth = seed_fixture(&pool, 2).await;
+    let fifth = seed_fixture(&pool, 1).await;
     let sixth = seed_additional_target(&pool, &fifth, "concurrent-new").await;
     let old_digest = digest(&format!("{}:rotation-three:old", fifth.tenant_id));
     let new_digest = digest(&format!("{}:rotation-three:new", fifth.tenant_id));
@@ -1502,7 +1478,7 @@ async fn rolling_keyrings_conflict_across_targets_in_both_orders_and_concurrentl
     assert_eq!(fifth_counts.2 + sixth_counts.2, expected_aliases);
     assert_eq!(fifth_counts.3 + sixth_counts.3, 1);
 
-    let disjoint_old = seed_fixture(&pool, 2).await;
+    let disjoint_old = seed_fixture(&pool, 1).await;
     let disjoint_new = seed_additional_target(&pool, &disjoint_old, "disjoint-new").await;
     let mut old_only = ApprovalInvocation::new(
         &disjoint_old,
@@ -1562,7 +1538,7 @@ async fn rolling_keyrings_conflict_across_targets_in_both_orders_and_concurrentl
 #[ignore]
 async fn rejected_approvals_leave_no_decision_receipt_or_audit() {
     let pool = pool().await;
-    let fixture = seed_fixture(&pool, 2).await;
+    let fixture = seed_fixture(&pool, 1).await;
     let mut payload =
         ApprovalInvocation::new(&fixture, &fixture.first_approver, 1, "wrong-payload");
     payload.payload_digest = digest(&format!("{}:wrong-payload", fixture.promotion_id));
@@ -1581,14 +1557,6 @@ async fn rejected_approvals_leave_no_decision_receipt_or_audit() {
     assert_eq!(
         approve(&pool, &fixture, &authority).await.unwrap().outcome,
         "authority_mismatch"
-    );
-    let self_approval = ApprovalInvocation::new(&fixture, &fixture.requester, 1, "self-approval");
-    assert_eq!(
-        approve(&pool, &fixture, &self_approval)
-            .await
-            .unwrap()
-            .outcome,
-        "self_approval_forbidden"
     );
     let mut insufficient_permission =
         ApprovalInvocation::new(&fixture, &fixture.first_approver, 1, "permission-denied");

@@ -2,6 +2,7 @@ use std::num::NonZeroU32;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use authoring_application::{
+    AuthoringMutationDispositionV1, AuthoringSessionObservationV1, AuthoringTurnOutcomeV1,
     DeploymentConvergencePhaseV2, DeploymentOperationalObservationV2,
     DeploymentOperatorActionV2 as ApplicationOperatorActionV2, DeploymentRetryObservationV2,
     DeploymentServingFreshnessV2, DeploymentStatusObservationV1, DeploymentStatusProjectionV1,
@@ -15,17 +16,86 @@ use authoring_application_discord::DiscordApplicationIdV1;
 use authoring_application_postgres::{
     CurrentProductPrincipalV1, IssuedProductSessionV1, OAuthFlowIssueV1,
 };
+use authoring_promotion::AuthoringSessionId;
 use chrono::{DateTime, Utc};
 use product_control_http::{
-    ApplyView, ApprovalPreviewView, CsrfSecret, CurrentPrincipal, DecisionView,
-    DeploymentAttestationViewV2, DeploymentFailureViewV2, DeploymentOperationalStateV2,
-    DeploymentOperationalViewV2, DeploymentOperatorActionV2, DeploymentRetryStateV2,
-    DeploymentRetryViewV2, DeploymentRuntimePhaseV2, DeploymentServingFreshnessStateV2,
-    DeploymentServingFreshnessViewV2, DeploymentState, DeploymentView, DiscordAuthorizationRequest,
-    FacadeError, FacadeErrorCode, LifecycleCancellationView, OAuthCallbackResult, OAuthStartResult,
-    OAuthState, ProductState, PromotionView, RuntimeDeploymentOperationalViewV2,
-    SafeApprovalSummary, SessionCredential,
+    ApplyView, ApprovalPreviewView, AuthoringSessionViewV1, AuthoringTurnDispositionV1,
+    AuthoringTurnViewV1, CsrfSecret, CurrentPrincipal, DecisionView, DeploymentAttestationViewV2,
+    DeploymentFailureViewV2, DeploymentOperationalStateV2, DeploymentOperationalViewV2,
+    DeploymentOperatorActionV2, DeploymentRetryStateV2, DeploymentRetryViewV2,
+    DeploymentRuntimePhaseV2, DeploymentServingFreshnessStateV2, DeploymentServingFreshnessViewV2,
+    DeploymentState, DeploymentView, DiscordAuthorizationRequest, FacadeError, FacadeErrorCode,
+    LifecycleCancellationView, OAuthCallbackResult, OAuthStartResult, OAuthState, ProductState,
+    ProductStatusView, PromotionView, RuntimeDeploymentOperationalViewV2, SafeApprovalSummary,
+    SessionCredential,
 };
+
+pub fn project_authoring_turn(
+    expected_session_id: &AuthoringSessionId,
+    outcome: &AuthoringTurnOutcomeV1,
+) -> Result<AuthoringTurnViewV1, FacadeError> {
+    outcome.projection().validate().map_err(|_| internal())?;
+    match outcome {
+        AuthoringTurnOutcomeV1::Committed(receipt) => {
+            if receipt.session_id() != expected_session_id
+                || matches!(
+                    receipt.projection().state(),
+                    authoring_application::SafeAuthoringTurnStateV1::Unsupported
+                        | authoring_application::SafeAuthoringTurnStateV1::Rejected
+                )
+            {
+                return Err(internal());
+            }
+            Ok(AuthoringTurnViewV1 {
+                session_id: receipt.session_id().as_str().to_string(),
+                generation: Some(receipt.generation().get()),
+                disposition: Some(match receipt.disposition() {
+                    AuthoringMutationDispositionV1::Created => AuthoringTurnDispositionV1::Created,
+                    AuthoringMutationDispositionV1::ExactReplay => {
+                        AuthoringTurnDispositionV1::ExactReplay
+                    }
+                }),
+                projection: receipt.projection().clone(),
+            })
+        }
+        AuthoringTurnOutcomeV1::NotCommitted(projection) => {
+            if !matches!(
+                projection.state(),
+                authoring_application::SafeAuthoringTurnStateV1::Unsupported
+                    | authoring_application::SafeAuthoringTurnStateV1::Rejected
+            ) {
+                return Err(internal());
+            }
+            Ok(AuthoringTurnViewV1 {
+                session_id: expected_session_id.as_str().to_string(),
+                generation: None,
+                disposition: None,
+                projection: projection.clone(),
+            })
+        }
+    }
+}
+
+pub fn project_authoring_session(
+    observation: &AuthoringSessionObservationV1,
+) -> Result<AuthoringSessionViewV1, FacadeError> {
+    observation
+        .projection()
+        .validate()
+        .map_err(|_| internal())?;
+    if matches!(
+        observation.projection().state(),
+        authoring_application::SafeAuthoringTurnStateV1::Unsupported
+            | authoring_application::SafeAuthoringTurnStateV1::Rejected
+    ) {
+        return Err(internal());
+    }
+    Ok(AuthoringSessionViewV1 {
+        session_id: observation.session_id().as_str().to_string(),
+        observed_generation: observation.generation().get(),
+        projection: observation.projection().clone(),
+    })
+}
 
 pub fn project_oauth_start(
     issue: &OAuthFlowIssueV1,
@@ -87,13 +157,49 @@ pub fn project_promotion(
 
 pub fn project_product_status(
     observation: &ProductStatusObservationV1,
-) -> Result<DecisionView, FacadeError> {
+) -> Result<ProductStatusView, FacadeError> {
     ensure_product_status_matches_decision(observation.status(), observation.decision().phase())?;
-    Ok(decision_view(
-        observation.decision(),
-        product_state(observation.status()),
-        false,
-    ))
+    let revision = observation.decision().revision().get();
+    let apply_source_revision = apply_source_revision(observation.status(), revision)?;
+    Ok(ProductStatusView {
+        installation_id: observation
+            .decision()
+            .installation_id()
+            .as_str()
+            .to_string(),
+        promotion_id: observation.decision().promotion_id().as_str().to_string(),
+        revision,
+        state: product_state(observation.status()),
+        payload_digest: observation.approval_payload_digest().as_str().to_string(),
+        apply_source_revision,
+        replayed: false,
+    })
+}
+
+fn apply_source_revision(
+    status: ProductStatusV1,
+    revision: u64,
+) -> Result<Option<u64>, FacadeError> {
+    Ok(match status {
+        ProductStatusV1::Applying => Some(
+            revision
+                .checked_sub(1)
+                .filter(|source| *source > 0)
+                .ok_or_else(internal)?,
+        ),
+        ProductStatusV1::RuntimePending | ProductStatusV1::Live => Some(
+            revision
+                .checked_sub(2)
+                .filter(|source| *source > 0)
+                .ok_or_else(internal)?,
+        ),
+        ProductStatusV1::PendingApproval
+        | ProductStatusV1::Approved
+        | ProductStatusV1::Rejected
+        | ProductStatusV1::Expired
+        | ProductStatusV1::Superseded
+        | ProductStatusV1::Withdrawn => None,
+    })
 }
 
 pub fn project_decision_mutation(receipt: &ProductMutationReceiptV1) -> DecisionView {
@@ -582,6 +688,7 @@ fn project_attestation(
     DeploymentAttestationViewV2 {
         deployment_revision: value.deployment_revision().get(),
         convergence_attempt: value.convergence_attempt().get(),
+        process_instance_id: value.process_instance_id().as_str().to_string(),
     }
 }
 
@@ -651,17 +758,21 @@ fn internal() -> FacadeError {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::num::{NonZeroU32, NonZeroU64};
     use std::time::Duration;
 
     use authoring_application::{
-        DeploymentOperationalProjectionV2, ExactDeploymentSelectorV1, ExactLiveProjectionV1,
+        DeploymentAttestationObservationV2, DeploymentOperationalProjectionV2,
+        DeploymentProcessInstanceIdV2, ExactDeploymentSelectorV1, ExactLiveProjectionV1,
         ProductDecisionProjectionV1, ProductDrainSelectorV1,
         ProductLifecycleCancellationDeploymentProjectionV1,
         ProductLifecycleCancellationDrainProjectionV1,
         ProductLifecycleCancellationSlotProjectionV1, ProductRevisionV1,
+        SafeAuthoringTurnProjectionV1,
     };
-    use authoring_promotion::{AutomationInstallationId, PromotionId, TenantId};
+    use authoring_promotion::{
+        AuthoringSessionId, AutomationInstallationId, PromotionId, SessionGeneration, TenantId,
+    };
     use discord_model::GuildId;
 
     use super::*;
@@ -682,6 +793,13 @@ mod tests {
             digest('b'),
         )
         .unwrap()
+    }
+
+    fn safe_authoring_projection(state: &str) -> SafeAuthoringTurnProjectionV1 {
+        let bytes = format!(
+            "{{\"schema_version\":1,\"state\":\"{state}\",\"assistant_message\":\"Safe response\",\"capabilities\":[],\"draft\":{{\"panels\":0,\"modals\":0,\"rules\":0,\"actions\":0,\"unresolved_references\":[]}},\"preview\":null}}"
+        );
+        SafeAuthoringTurnProjectionV1::from_canonical_json(bytes.as_bytes()).unwrap()
     }
 
     fn decision(phase: ProductDecisionPhaseV1) -> ProductDecisionProjectionV1 {
@@ -720,6 +838,62 @@ mod tests {
     }
 
     #[test]
+    fn authoring_projection_exposes_only_the_canonical_safe_projection() {
+        let session_id = AuthoringSessionId::parse("session-1").unwrap();
+        let outcome = AuthoringTurnOutcomeV1::NotCommitted(safe_authoring_projection("rejected"));
+        let view = project_authoring_turn(&session_id, &outcome).unwrap();
+        assert_eq!(view.session_id, "session-1");
+        assert_eq!(view.generation, None);
+        assert_eq!(view.disposition, None);
+        assert_eq!(
+            view.projection.state(),
+            authoring_application::SafeAuthoringTurnStateV1::Rejected
+        );
+
+        let observation = AuthoringSessionObservationV1::from_storage(
+            session_id,
+            SessionGeneration::new(7).unwrap(),
+            safe_authoring_projection("discussion"),
+            None,
+        )
+        .unwrap();
+        let view = project_authoring_session(&observation).unwrap();
+        assert_eq!(view.session_id, "session-1");
+        assert_eq!(view.observed_generation, 7);
+        assert_eq!(
+            view.projection.state(),
+            authoring_application::SafeAuthoringTurnStateV1::Discussion
+        );
+    }
+
+    #[test]
+    fn authoring_projection_rejects_non_durable_read_and_commit_shapes() {
+        let session_id = AuthoringSessionId::parse("session-1").unwrap();
+        let invalid_turn =
+            AuthoringTurnOutcomeV1::NotCommitted(safe_authoring_projection("discussion"));
+        assert_eq!(
+            project_authoring_turn(&session_id, &invalid_turn)
+                .unwrap_err()
+                .error_code(),
+            FacadeErrorCode::Internal
+        );
+
+        let invalid_read = AuthoringSessionObservationV1::from_storage(
+            session_id,
+            SessionGeneration::new(1).unwrap(),
+            safe_authoring_projection("unsupported"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            project_authoring_session(&invalid_read)
+                .unwrap_err()
+                .error_code(),
+            FacadeErrorCode::Internal
+        );
+    }
+
+    #[test]
     fn mutation_projection_preserves_revision_state_and_replay() {
         let projection = decision(ProductDecisionPhaseV1::Approved);
         let receipt = ProductMutationReceiptV1::from_server_projection(projection, true);
@@ -727,6 +901,38 @@ mod tests {
         assert_eq!(view.revision, 4);
         assert_eq!(view.state, ProductState::Approved);
         assert!(view.replayed);
+    }
+
+    #[test]
+    fn apply_source_revision_is_state_bound_and_fails_closed_on_underflow() {
+        assert_eq!(
+            apply_source_revision(ProductStatusV1::Applying, 2).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            apply_source_revision(ProductStatusV1::RuntimePending, 3).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            apply_source_revision(ProductStatusV1::Live, 4).unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            apply_source_revision(ProductStatusV1::Approved, 1).unwrap(),
+            None
+        );
+        assert_eq!(
+            apply_source_revision(ProductStatusV1::Applying, 1)
+                .unwrap_err()
+                .error_code(),
+            FacadeErrorCode::Internal
+        );
+        assert_eq!(
+            apply_source_revision(ProductStatusV1::RuntimePending, 2)
+                .unwrap_err()
+                .error_code(),
+            FacadeErrorCode::Internal
+        );
     }
 
     #[test]
@@ -897,6 +1103,51 @@ mod tests {
             DeploymentServingFreshnessStateV2::NotExpected
         );
         assert_eq!(projected.observed_at.timestamp(), 100);
+    }
+
+    #[test]
+    fn operational_runtime_projection_exposes_the_validated_process_identity() {
+        let observed_at = UNIX_EPOCH + Duration::from_secs(100);
+        let revision = NonZeroU64::new(7).unwrap();
+        let attempt = NonZeroU32::new(2).unwrap();
+        let base = DeploymentStatusObservationV1::from_server_projection(
+            DeploymentStatusProjectionV1::ExactLive(ExactLiveProjectionV1::from_exact_attestation(
+                exact_deployment(),
+                revision,
+            )),
+            observed_at,
+            Some(observed_at - Duration::from_secs(1)),
+            Some(observed_at + Duration::from_secs(10)),
+        )
+        .unwrap();
+        let runtime = DeploymentOperationalObservationV2::from_server_projection(
+            base,
+            DeploymentOperationalProjectionV2 {
+                phase: DeploymentConvergencePhaseV2::Live,
+                current_attempt: attempt.get(),
+                last_failure_attempt: None,
+                retry: None,
+                operator_action: None,
+                attestation: Some(DeploymentAttestationObservationV2::new(
+                    revision,
+                    attempt,
+                    DeploymentProcessInstanceIdV2::from_server_projection(
+                        "0123456789abcdef0123456789abcdef",
+                    )
+                    .unwrap(),
+                )),
+                serving: DeploymentServingFreshnessV2::Fresh {
+                    last_heartbeat_at: observed_at - Duration::from_secs(1),
+                    lease_expires_at: observed_at + Duration::from_secs(10),
+                },
+            },
+        )
+        .unwrap();
+        let projected = project_operational_runtime(&runtime).unwrap();
+        assert_eq!(
+            projected.attestation.unwrap().process_instance_id,
+            "0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[test]

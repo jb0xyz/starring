@@ -20,7 +20,7 @@ const PREVIOUS_READINESS_DIGEST: &str =
 const CURRENT_READINESS_DIGEST: &str =
     "c5972296ea84090bae5708fc9efa90cd9f9f848acb156e40680c0ba04fb57b5c";
 const LATEST_READINESS_DIGEST: &str =
-    "572d7ffd19d6f2edb5ec84ea6b7bfebd178c7da0568bce61af2f7907cfe72647";
+    "b632e1b778ef166f88e6ea206a30bd807b7357e210c29268bc98f39187310faf";
 
 fn dollar_block(tag: &str) -> &'static str {
     MIGRATION
@@ -198,8 +198,8 @@ fn rust_contract_and_security_fixture_expose_the_latest_capabilities() {
         .split("];")
         .next()
         .unwrap();
-    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 26]"));
-    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 28"));
+    assert!(CONTRACT_SOURCE.contains("OPERATION_CAPABILITY_IDENTITIES_V1: [&str; 29]"));
+    assert!(CONTRACT_SOURCE.contains("capabilities.clone().count() != 31"));
     for identity in [RESERVE_IDENTITY, OBSERVE_IDENTITY] {
         assert_eq!(operations.matches(identity).count(), 1, "{identity}");
     }
@@ -218,7 +218,7 @@ fn rust_contract_and_security_fixture_expose_the_latest_capabilities() {
         .split("];")
         .next()
         .unwrap();
-    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 28]"));
+    assert!(SECURITY_SUPPORT_SOURCE.contains("const EXECUTOR_FUNCTIONS: [&str; 31]"));
     for identity in [RESERVE_IDENTITY, OBSERVE_IDENTITY] {
         assert_eq!(
             executor_functions.matches(identity).count(),

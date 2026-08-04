@@ -9,7 +9,7 @@ use crate::discord::{
     RuntimeDiscordGatewayExitV1, RuntimeDiscordGatewayShutdownErrorV1,
     RuntimeDiscordGatewayStartErrorV1, RuntimeDiscordGatewaySupervisorV1,
 };
-use crate::gateway::RuntimeGatewayReadyObservationErrorV1;
+use crate::gateway::{RuntimeDiscordProductionStartV1, RuntimeGatewayReadyObservationErrorV1};
 use crate::lifecycle_timing::{
     RuntimeLifecycleTimingMetricV2, RuntimeLifecycleTimingOutcomeV2,
     RuntimeLifecycleTimingTerminalReporterV2,
@@ -179,14 +179,25 @@ impl RuntimeOwnerHeldProcessV1 {
         }
         let operation_cutoff = self.foundation.startup_budget.operation_cutoff();
         let discord_cleanup_deadline = self.foundation.startup_budget.discord_cleanup_deadline();
+        let interaction_dispatch = self.foundation.interaction_dispatch_port_v1();
+        let interaction_dispatch_status =
+            self.foundation.interaction_dispatch_status_publisher_v1();
+        let gateway_config = self.foundation.config.gateway();
+        let product_readiness = self.foundation.product_readiness_observer_v1();
         let mut shutdown = self.foundation.shutdown_observer_v1();
         let discord = self
             .foundation
             .gateway
             .start_discord_gateway_v1(
-                self.foundation.secrets.discord_bot_token(),
-                operation_cutoff,
-                discord_cleanup_deadline,
+                RuntimeDiscordProductionStartV1::new(
+                    self.foundation.secrets.discord_bot_token(),
+                    interaction_dispatch,
+                    interaction_dispatch_status,
+                    gateway_config,
+                    product_readiness,
+                    operation_cutoff,
+                    discord_cleanup_deadline,
+                ),
                 &mut shutdown,
             )
             .await;
@@ -653,7 +664,9 @@ pub(super) async fn shutdown_paused_foundation_discord_v1(
         .discord_cleanup_deadline()
         .min(cleanup_deadline);
     foundation.observe_shutdown_registry_v1();
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(discord_cleanup_deadline);
     let timing = foundation
         .lifecycle_timing_v2()
         .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin);
@@ -700,7 +713,9 @@ where
         .min(cleanup_deadline);
     foundation.observe_shutdown_registry_v1();
     let _ = order.record(RuntimePausedShutdownEventV1::RegistryProved);
-    let discord_drain = foundation.gateway.begin_discord_drain_v1();
+    let discord_drain = foundation
+        .gateway
+        .begin_discord_drain_until_v1(discord_cleanup_deadline);
     let lifecycle_timing = foundation.lifecycle_timing_v2();
     let discord_timing =
         lifecycle_timing.start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownGatewayDrainJoin);

@@ -1,11 +1,21 @@
+use std::num::{NonZeroU32, NonZeroU64};
+
 use automation_ruleset::{
     content_hash, RuleSetContentHash, RuleSetKey, RuleSetSchemaVersion, RuleSetVersion,
     RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
 };
+use automation_runtime_controller::{
+    runtime_desired_target_digest_v1, RuntimeDesiredTargetDigestV1,
+};
 use automation_runtime_convergence::{BindingRevision, DeploymentRevision};
 use automation_state::InteractionRuleSet;
+use chrono::{DateTime, Utc};
 use discord_model::{GuildId, UserId};
-use resource_resolution::{resource_binding_fingerprint_v2, ResourceBindingFingerprint};
+use resource_resolution::{
+    installation_authority_payload_digest_v1, resource_binding_fingerprint_v2,
+    InstallationAuthorityPayloadDigestV1, InstallationAuthorityPayloadIdentityV1,
+    InstallationAuthorityPolicyV1, InstallationAuthorityScopeV1, ResourceBindingFingerprint,
+};
 use serde_json::Value;
 use sqlx::types::Json;
 
@@ -21,8 +31,17 @@ const MAX_RUNTIME_EXACT_TARGET_RESOURCE_BINDINGS_BYTES: usize = 262_144;
 pub(super) struct RuntimeExactTargetRow {
     deployment_revision: i64,
     convergence_attempt_no: i64,
+    desired_target_digest: String,
     installation_authority_revision: i64,
+    installation_authority_payload_digest: String,
+    installation_authority_policy_revision: i64,
+    installation_authority_required_approvals: i32,
+    installation_authority_activation_ttl_seconds: i64,
     current_authority_revision: i64,
+    current_authority_payload_digest: String,
+    current_authority_policy_revision: i64,
+    current_authority_required_approvals: i32,
+    current_authority_activation_ttl_seconds: i64,
     guild_id: String,
     ruleset_key: String,
     target_version: i64,
@@ -34,6 +53,7 @@ pub(super) struct RuntimeExactTargetRow {
     binding_revision: i64,
     binding_fingerprint: String,
     resource_bindings: Option<Json<Value>>,
+    database_observed_at: DateTime<Utc>,
 }
 
 impl RuntimeExactTargetRow {
@@ -54,10 +74,6 @@ impl RuntimeExactTargetRow {
             .ok()
             .and_then(std::num::NonZeroU32::new)
             .ok_or_else(invalid)?;
-        let installation_authority_revision =
-            u64::try_from(self.installation_authority_revision).map_err(|_| invalid())?;
-        let current_authority_revision =
-            u64::try_from(self.current_authority_revision).map_err(|_| invalid())?;
         let guild_id = canonical_guild_id(&self.guild_id).ok_or_else(invalid)?;
         let ruleset_key = RuleSetKey::parse(&self.ruleset_key).map_err(|_| invalid())?;
         let version = u32::try_from(self.target_version)
@@ -97,16 +113,58 @@ impl RuntimeExactTargetRow {
             })?;
         let calculated_hash = content_hash(schema_version, &definition).map_err(|_| invalid())?;
         let calculated_fingerprint = resource_binding_fingerprint_v2(&bindings);
+        let desired_target_digest =
+            RuntimeDesiredTargetDigestV1::parse(self.desired_target_digest.clone())
+                .map_err(|_| invalid())?;
+        let calculated_desired_target_digest = runtime_desired_target_digest_v1(
+            &snapshot.identity,
+            target,
+            snapshot.runtime_generation.get(),
+            u64::try_from(self.installation_authority_revision).map_err(|_| invalid())?,
+            snapshot.previous_runtime.as_ref(),
+        );
+        let (installation_authority_revision, installation_authority_payload_digest) =
+            decode_authority_payload(
+                snapshot.identity.tenant_id.as_str(),
+                snapshot.identity.installation_id.as_str(),
+                self.installation_authority_revision,
+                &self.installation_authority_payload_digest,
+                self.installation_authority_policy_revision,
+                self.installation_authority_required_approvals,
+                self.installation_authority_activation_ttl_seconds,
+                binding_revision,
+                &persisted_fingerprint,
+            )?;
+        let (current_authority_revision, current_authority_payload_digest) =
+            decode_authority_payload(
+                snapshot.identity.tenant_id.as_str(),
+                snapshot.identity.installation_id.as_str(),
+                self.current_authority_revision,
+                &self.current_authority_payload_digest,
+                self.current_authority_policy_revision,
+                self.current_authority_required_approvals,
+                self.current_authority_activation_ttl_seconds,
+                binding_revision,
+                &persisted_fingerprint,
+            )?;
+        let lease = snapshot.controller_lease.as_ref().ok_or_else(invalid)?;
         if deployment_revision != snapshot.revision
             || convergence_attempt != execution.convergence_attempt
-            || installation_authority_revision == 0
-            || current_authority_revision == 0
+            || lease.controller_id != *execution.controller_id
+            || lease.fencing_token != execution.fencing_token
+            || lease.acquired_at != execution.acquired_at
+            || lease.expires_at != execution.expires_at
+            || snapshot.last_fencing_token != Some(execution.fencing_token)
+            || execution.acquired_at >= execution.expires_at
+            || self.database_observed_at < execution.acquired_at
+            || self.database_observed_at >= execution.expires_at
             || guild_id != target.guild_id
             || ruleset_key != target.ruleset_key
             || version != target.version
             || schema_version != CURRENT_RULESET_SCHEMA_VERSION
             || persisted_hash != target.content_hash
             || calculated_hash != target.content_hash
+            || desired_target_digest != calculated_desired_target_digest
             || self.canonical_content_hash.as_deref() != Some(self.content_hash.as_str())
             || automation_core::validate_structural(&definition).is_err()
             || binding_revision != target.binding_revision
@@ -117,8 +175,11 @@ impl RuntimeExactTargetRow {
         }
         Ok(RuntimeExactTargetV1 {
             snapshot: snapshot.clone(),
+            desired_target_digest,
             installation_authority_revision,
+            installation_authority_payload_digest,
             current_authority_revision,
+            current_authority_payload_digest,
             artifact: RuleSetVersion {
                 guild_id,
                 ruleset_key,
@@ -129,8 +190,58 @@ impl RuntimeExactTargetRow {
                 created_by,
             },
             bindings,
+            database_observed_at: self.database_observed_at,
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_authority_payload(
+    tenant_id: &str,
+    installation_id: &str,
+    revision: i64,
+    payload_digest: &str,
+    policy_revision: i64,
+    required_approvals: i32,
+    activation_ttl_seconds: i64,
+    binding_revision: BindingRevision,
+    binding_fingerprint: &ResourceBindingFingerprint,
+) -> Result<(u64, InstallationAuthorityPayloadDigestV1), RuntimeConvergenceStoreError> {
+    let invalid =
+        || RuntimeConvergenceStoreError::InvalidPersistedState("runtime exact target projection");
+    let revision = positive_u64(revision).ok_or_else(invalid)?;
+    let policy_revision = positive_u64(policy_revision).ok_or_else(invalid)?;
+    let required_approvals = u32::try_from(required_approvals)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or_else(invalid)?;
+    let activation_ttl_seconds = positive_u64(activation_ttl_seconds).ok_or_else(invalid)?;
+    let policy = InstallationAuthorityPolicyV1::new(
+        policy_revision,
+        required_approvals,
+        activation_ttl_seconds,
+    )
+    .map_err(|_| invalid())?;
+    let scope =
+        InstallationAuthorityScopeV1::new(tenant_id, installation_id).map_err(|_| invalid())?;
+    let identity = InstallationAuthorityPayloadIdentityV1::new(
+        scope,
+        revision,
+        NonZeroU64::new(binding_revision.get()).ok_or_else(invalid)?,
+        binding_fingerprint,
+        policy,
+    )
+    .map_err(|_| invalid())?;
+    let persisted =
+        InstallationAuthorityPayloadDigestV1::parse(payload_digest).map_err(|_| invalid())?;
+    if persisted != installation_authority_payload_digest_v1(&identity) {
+        return Err(invalid());
+    }
+    Ok((revision.get(), persisted))
+}
+
+fn positive_u64(value: i64) -> Option<NonZeroU64> {
+    u64::try_from(value).ok().and_then(NonZeroU64::new)
 }
 
 fn canonical_guild_id(value: &str) -> Option<GuildId> {
@@ -153,6 +264,12 @@ fn validate_json_size(value: &Value, maximum: usize) -> Result<(), ()> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    use resource_resolution::{
+        installation_authority_payload_digest_v1, InstallationAuthorityPayloadIdentityV1,
+        InstallationAuthorityPolicyV1, InstallationAuthorityScopeV1, ResourceBindingFingerprint,
+    };
     use serde_json::json;
 
     use super::*;
@@ -171,5 +288,70 @@ mod tests {
     fn exact_target_json_payloads_are_bounded_by_encoded_bytes() {
         assert!(validate_json_size(&json!({"value": "small"}), 32).is_ok());
         assert!(validate_json_size(&json!({"value": "oversized"}), 8).is_err());
+    }
+
+    #[test]
+    fn authority_payload_digest_is_recomputed_from_exact_persisted_evidence() {
+        let fingerprint = ResourceBindingFingerprint::parse(&"a".repeat(64)).unwrap();
+        let policy = InstallationAuthorityPolicyV1::new(
+            NonZeroU64::new(3).unwrap(),
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU64::new(7200).unwrap(),
+        )
+        .unwrap();
+        let identity = InstallationAuthorityPayloadIdentityV1::new(
+            InstallationAuthorityScopeV1::new("tenant", "installation").unwrap(),
+            NonZeroU64::new(4).unwrap(),
+            NonZeroU64::new(2).unwrap(),
+            &fingerprint,
+            policy,
+        )
+        .unwrap();
+        let digest = installation_authority_payload_digest_v1(&identity);
+        let decoded = decode_authority_payload(
+            "tenant",
+            "installation",
+            4,
+            digest.as_str(),
+            3,
+            1,
+            7200,
+            BindingRevision::new(2).unwrap(),
+            &fingerprint,
+        )
+        .unwrap();
+        assert_eq!(decoded, (4, digest.clone()));
+        assert!(matches!(
+            decode_authority_payload(
+                "tenant",
+                "installation",
+                4,
+                &"0".repeat(64),
+                3,
+                1,
+                7200,
+                BindingRevision::new(2).unwrap(),
+                &fingerprint,
+            ),
+            Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "runtime exact target projection"
+            ))
+        ));
+        assert!(matches!(
+            decode_authority_payload(
+                "tenant",
+                "installation",
+                4,
+                digest.as_str(),
+                4,
+                1,
+                7200,
+                BindingRevision::new(2).unwrap(),
+                &fingerprint,
+            ),
+            Err(RuntimeConvergenceStoreError::InvalidPersistedState(
+                "runtime exact target projection"
+            ))
+        ));
     }
 }

@@ -4,6 +4,8 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Duration;
 
+use crate::runtime_controller::RuntimeServingControllerConfigV2;
+
 const MAX_CONFIGURATION_VALUE_BYTES: usize = 8 * 1024;
 const MAX_ENVIRONMENT_NAME_BYTES: usize = 128;
 const MAX_KEYCHAIN_COMPONENT_BYTES: usize = 128;
@@ -107,8 +109,12 @@ pub enum RuntimeConfigurationFieldV1 {
     GatewayOwnerLease,
     GatewayOwnerRenewBefore,
     GatewayOwnerSafetyMargin,
+    DiscordTransportMode,
+    DiscordGatewayProxyUrl,
+    DiscordEffectHttpProxyAuthority,
     DatabaseUrlSecretReference(DatabaseCapabilityV1),
     DiscordBotTokenSecretReference,
+    InteractionTokenEnvelopeKeyringSecretReference,
 }
 
 impl RuntimeConfigurationFieldV1 {
@@ -142,9 +148,17 @@ impl RuntimeConfigurationFieldV1 {
             Self::GatewayOwnerSafetyMargin => {
                 "STARRING_RUNTIME_GATEWAY_OWNER_SAFETY_MARGIN_MILLISECONDS"
             }
+            Self::DiscordTransportMode => "STARRING_RUNTIME_DISCORD_TRANSPORT_MODE",
+            Self::DiscordGatewayProxyUrl => "STARRING_RUNTIME_DISCORD_GATEWAY_PROXY_URL",
+            Self::DiscordEffectHttpProxyAuthority => {
+                "STARRING_RUNTIME_DISCORD_EFFECT_HTTP_PROXY_AUTHORITY"
+            }
             Self::DatabaseUrlSecretReference(capability) => capability.reference_environment_name(),
             Self::DiscordBotTokenSecretReference => {
                 "STARRING_RUNTIME_DISCORD_BOT_TOKEN_SECRET_REFERENCE"
+            }
+            Self::InteractionTokenEnvelopeKeyringSecretReference => {
+                "STARRING_RUNTIME_INTERACTION_TOKEN_ENVELOPE_KEYRING_SECRET_REFERENCE"
             }
         }
     }
@@ -169,6 +183,9 @@ impl RuntimeConfigurationFieldV1 {
             Self::GatewayOwnerLease => "gateway_owner_lease",
             Self::GatewayOwnerRenewBefore => "gateway_owner_renew_before",
             Self::GatewayOwnerSafetyMargin => "gateway_owner_safety_margin",
+            Self::DiscordTransportMode => "discord_transport_mode",
+            Self::DiscordGatewayProxyUrl => "discord_gateway_proxy_url",
+            Self::DiscordEffectHttpProxyAuthority => "discord_effect_http_proxy_authority",
             Self::DatabaseUrlSecretReference(capability) => match capability {
                 DatabaseCapabilityV1::Convergence => "convergence_database_url_secret_reference",
                 DatabaseCapabilityV1::ExactTarget => "exact_target_database_url_secret_reference",
@@ -177,6 +194,9 @@ impl RuntimeConfigurationFieldV1 {
                 DatabaseCapabilityV1::Interaction => "interaction_database_url_secret_reference",
             },
             Self::DiscordBotTokenSecretReference => "discord_bot_token_secret_reference",
+            Self::InteractionTokenEnvelopeKeyringSecretReference => {
+                "interaction_token_envelope_keyring_secret_reference"
+            }
         }
     }
 }
@@ -358,6 +378,7 @@ pub struct GatewayResourceConfigV1 {
     rejection_acknowledgement_capacity: NonZeroUsize,
     drain_timeout: Duration,
     instance_lookup_timeout: Duration,
+    discord_transport: RuntimeDiscordTransportConfigV1,
 }
 
 impl Default for GatewayResourceConfigV1 {
@@ -369,6 +390,7 @@ impl Default for GatewayResourceConfigV1 {
             rejection_acknowledgement_capacity: NonZeroUsize::new(64).expect("nonzero capacity"),
             drain_timeout: Duration::from_secs(15),
             instance_lookup_timeout: Duration::from_millis(500),
+            discord_transport: RuntimeDiscordTransportConfigV1::Direct,
         }
     }
 }
@@ -396,6 +418,41 @@ impl GatewayResourceConfigV1 {
 
     pub fn instance_lookup_timeout(self) -> Duration {
         self.instance_lookup_timeout
+    }
+
+    pub(crate) fn discord_transport(self) -> RuntimeDiscordTransportConfigV1 {
+        self.discord_transport
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RuntimeDiscordTransportConfigV1 {
+    #[default]
+    Direct,
+    LoopbackProxy {
+        gateway_address: SocketAddrV4,
+        effect_http_proxy_address: SocketAddrV4,
+    },
+}
+
+impl RuntimeDiscordTransportConfigV1 {
+    pub(crate) fn gateway_proxy_url(self) -> Option<String> {
+        match self {
+            Self::Direct => None,
+            Self::LoopbackProxy {
+                gateway_address, ..
+            } => Some(format!("ws://{gateway_address}")),
+        }
+    }
+
+    pub(crate) fn effect_http_proxy_address(self) -> Option<SocketAddrV4> {
+        match self {
+            Self::Direct => None,
+            Self::LoopbackProxy {
+                effect_http_proxy_address,
+                ..
+            } => Some(effect_http_proxy_address),
+        }
     }
 }
 
@@ -437,16 +494,19 @@ impl GatewayOwnerTimingConfigV1 {
 pub struct RuntimeSecretReferencesV1 {
     database_urls: [RuntimeSecretReferenceV1; 5],
     discord_bot_token: RuntimeSecretReferenceV1,
+    interaction_token_envelope_keyring: RuntimeSecretReferenceV1,
 }
 
 impl RuntimeSecretReferencesV1 {
     pub(crate) fn from_parts(
         database_urls: [RuntimeSecretReferenceV1; 5],
         discord_bot_token: RuntimeSecretReferenceV1,
+        interaction_token_envelope_keyring: RuntimeSecretReferenceV1,
     ) -> Self {
         Self {
             database_urls,
             discord_bot_token,
+            interaction_token_envelope_keyring,
         }
     }
 
@@ -456,6 +516,10 @@ impl RuntimeSecretReferencesV1 {
 
     pub fn discord_bot_token(&self) -> &RuntimeSecretReferenceV1 {
         &self.discord_bot_token
+    }
+
+    pub fn interaction_token_envelope_keyring(&self) -> &RuntimeSecretReferenceV1 {
+        &self.interaction_token_envelope_keyring
     }
 }
 
@@ -472,6 +536,7 @@ pub struct RuntimeConfigV1 {
     database_operation: DatabaseOperationConfigV1,
     gateway: GatewayResourceConfigV1,
     gateway_owner: GatewayOwnerTimingConfigV1,
+    runtime_controller: RuntimeServingControllerConfigV2,
     secret_references: RuntimeSecretReferencesV1,
 }
 
@@ -491,7 +556,9 @@ impl RuntimeConfigV1 {
         let database_pool = parse_database_pool(source)?;
         let database_operation = parse_database_operation(source)?;
         let gateway = parse_gateway_resources(source)?;
-        let gateway_owner = parse_gateway_owner_timing(source, database_operation)?;
+        let runtime_controller = RuntimeServingControllerConfigV2::production_v2();
+        let gateway_owner =
+            parse_gateway_owner_timing(source, database_operation, &runtime_controller)?;
         let secret_references = parse_secret_references(source)?;
         Ok(Self {
             health_bind_addr,
@@ -499,6 +566,7 @@ impl RuntimeConfigV1 {
             database_operation,
             gateway,
             gateway_owner,
+            runtime_controller,
             secret_references,
         })
     }
@@ -523,6 +591,10 @@ impl RuntimeConfigV1 {
         self.gateway_owner
     }
 
+    pub(crate) fn runtime_controller(&self) -> RuntimeServingControllerConfigV2 {
+        self.runtime_controller.clone()
+    }
+
     pub fn secret_references(&self) -> &RuntimeSecretReferencesV1 {
         &self.secret_references
     }
@@ -537,6 +609,7 @@ impl Debug for RuntimeConfigV1 {
             .field("database_operation", &self.database_operation)
             .field("gateway", &self.gateway)
             .field("gateway_owner", &self.gateway_owner)
+            .field("runtime_controller", &self.runtime_controller)
             .field("secret_references", &"<redacted>")
             .finish()
     }
@@ -659,6 +732,7 @@ fn parse_gateway_resources(
     if instance_lookup_timeout.is_zero() || instance_lookup_timeout > MAX_INSTANCE_LOOKUP_TIMEOUT {
         return Err(RuntimeConfigErrorV1::InvalidValue(lookup_field));
     }
+    let discord_transport = parse_discord_transport(source)?;
     Ok(GatewayResourceConfigV1 {
         global_admission_capacity,
         command_capacity,
@@ -666,12 +740,65 @@ fn parse_gateway_resources(
         rejection_acknowledgement_capacity,
         drain_timeout,
         instance_lookup_timeout,
+        discord_transport,
     })
+}
+
+fn parse_discord_transport(
+    source: &impl ConfigurationSourceV1,
+) -> Result<RuntimeDiscordTransportConfigV1, RuntimeConfigErrorV1> {
+    let mode_field = RuntimeConfigurationFieldV1::DiscordTransportMode;
+    let gateway_field = RuntimeConfigurationFieldV1::DiscordGatewayProxyUrl;
+    let effect_http_field = RuntimeConfigurationFieldV1::DiscordEffectHttpProxyAuthority;
+    let mode = read_optional(source, mode_field)?;
+    let gateway = read_optional(source, gateway_field)?;
+    let effect_http = read_optional(source, effect_http_field)?;
+    match (mode, gateway, effect_http) {
+        (None, None, None) => Ok(RuntimeDiscordTransportConfigV1::Direct),
+        (None, _, _) => Err(RuntimeConfigErrorV1::Missing(mode_field)),
+        (Some(mode), None, _) if mode == "loopback_proxy_v1" => {
+            Err(RuntimeConfigErrorV1::Missing(gateway_field))
+        }
+        (Some(mode), Some(_), None) if mode == "loopback_proxy_v1" => {
+            Err(RuntimeConfigErrorV1::Missing(effect_http_field))
+        }
+        (Some(mode), Some(gateway), Some(effect_http)) if mode == "loopback_proxy_v1" => {
+            let gateway_address = parse_canonical_loopback_gateway_proxy_v1(&gateway)
+                .ok_or(RuntimeConfigErrorV1::InvalidValue(gateway_field))?;
+            let effect_http_proxy_address = parse_canonical_loopback_http_proxy_v1(&effect_http)
+                .ok_or(RuntimeConfigErrorV1::InvalidValue(effect_http_field))?;
+            if gateway_address.port() == effect_http_proxy_address.port() {
+                return Err(RuntimeConfigErrorV1::InvalidValue(effect_http_field));
+            }
+            Ok(RuntimeDiscordTransportConfigV1::LoopbackProxy {
+                gateway_address,
+                effect_http_proxy_address,
+            })
+        }
+        (Some(_), _, _) => Err(RuntimeConfigErrorV1::InvalidValue(mode_field)),
+    }
+}
+
+fn parse_canonical_loopback_gateway_proxy_v1(value: &str) -> Option<SocketAddrV4> {
+    let authority = value.strip_prefix("ws://")?;
+    let address = parse_canonical_loopback_proxy_authority_v1(authority)?;
+    (value == format!("ws://{address}")).then_some(address)
+}
+
+fn parse_canonical_loopback_http_proxy_v1(value: &str) -> Option<SocketAddrV4> {
+    let address = parse_canonical_loopback_proxy_authority_v1(value)?;
+    (value == address.to_string()).then_some(address)
+}
+
+fn parse_canonical_loopback_proxy_authority_v1(value: &str) -> Option<SocketAddrV4> {
+    let address = value.parse::<SocketAddrV4>().ok()?;
+    (*address.ip() == Ipv4Addr::LOCALHOST && address.port() >= MIN_BIND_PORT).then_some(address)
 }
 
 fn parse_gateway_owner_timing(
     source: &impl ConfigurationSourceV1,
     database_operation: DatabaseOperationConfigV1,
+    runtime_controller: &RuntimeServingControllerConfigV2,
 ) -> Result<GatewayOwnerTimingConfigV1, RuntimeConfigErrorV1> {
     if database_operation.statement_timeout() > MAX_STARTUP_OWNER_STATEMENT_TIMEOUT {
         return Err(RuntimeConfigErrorV1::InvalidValue(
@@ -680,19 +807,19 @@ fn parse_gateway_owner_timing(
     }
     let lease_field = RuntimeConfigurationFieldV1::GatewayOwnerLease;
     let lease_for =
-        Duration::from_millis(parse_optional_number::<u64>(source, lease_field, 30_000)?);
+        Duration::from_millis(parse_optional_number::<u64>(source, lease_field, 60_000)?);
     if !(MIN_GATEWAY_OWNER_LEASE..=MAX_GATEWAY_OWNER_LEASE).contains(&lease_for) {
         return Err(RuntimeConfigErrorV1::InvalidValue(lease_field));
     }
     let renew_field = RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore;
     let renew_before =
-        Duration::from_millis(parse_optional_number::<u64>(source, renew_field, 10_000)?);
+        Duration::from_millis(parse_optional_number::<u64>(source, renew_field, 40_000)?);
     if renew_before.is_zero() || renew_before >= lease_for {
         return Err(RuntimeConfigErrorV1::InvalidValue(renew_field));
     }
     let safety_field = RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin;
     let safety_margin =
-        Duration::from_millis(parse_optional_number::<u64>(source, safety_field, 3_000)?);
+        Duration::from_millis(parse_optional_number::<u64>(source, safety_field, 5_000)?);
     if safety_margin <= database_operation.statement_timeout() || safety_margin >= renew_before {
         return Err(RuntimeConfigErrorV1::InvalidValue(safety_field));
     }
@@ -700,6 +827,13 @@ fn parse_gateway_owner_timing(
         .checked_sub(safety_margin)
         .ok_or(RuntimeConfigErrorV1::InvalidValue(renew_field))?;
     if renewal_window <= database_operation.statement_timeout() {
+        return Err(RuntimeConfigErrorV1::InvalidValue(renew_field));
+    }
+    let certification_runway = runtime_controller
+        .gateway_ready_timeout_v2()
+        .checked_add(database_operation.statement_timeout())
+        .ok_or(RuntimeConfigErrorV1::InvalidValue(renew_field))?;
+    if renewal_window <= certification_runway {
         return Err(RuntimeConfigErrorV1::InvalidValue(renew_field));
     }
     Ok(GatewayOwnerTimingConfigV1 {
@@ -733,6 +867,10 @@ fn parse_secret_references(
         source,
         RuntimeConfigurationFieldV1::DiscordBotTokenSecretReference,
     )?;
+    let interaction_token_envelope_keyring = parse_secret_reference(
+        source,
+        RuntimeConfigurationFieldV1::InteractionTokenEnvelopeKeyringSecretReference,
+    )?;
     let duplicate_database = database_urls.iter().enumerate().any(|(index, candidate)| {
         database_urls
             .iter()
@@ -743,6 +881,10 @@ fn parse_secret_references(
         || database_urls
             .iter()
             .any(|reference| reference == &discord_bot_token)
+        || database_urls
+            .iter()
+            .any(|reference| reference == &interaction_token_envelope_keyring)
+        || discord_bot_token == interaction_token_envelope_keyring
     {
         return Err(RuntimeConfigErrorV1::DuplicateSecretReference);
     }
@@ -752,6 +894,7 @@ fn parse_secret_references(
     Ok(RuntimeSecretReferencesV1::from_parts(
         database_urls,
         discord_bot_token,
+        interaction_token_envelope_keyring,
     ))
 }
 
@@ -872,6 +1015,10 @@ mod tests {
             RuntimeConfigurationFieldV1::DiscordBotTokenSecretReference,
             "env:STARRING_RUNTIME_SECRET_DISCORD_BOT_TOKEN",
         );
+        source.insert(
+            RuntimeConfigurationFieldV1::InteractionTokenEnvelopeKeyringSecretReference,
+            "env:STARRING_RUNTIME_SECRET_INTERACTION_TOKEN_ENVELOPE_KEYRING",
+        );
         source
     }
 
@@ -922,14 +1069,18 @@ mod tests {
             config.gateway().instance_lookup_timeout(),
             Duration::from_millis(500)
         );
-        assert_eq!(config.gateway_owner().lease_for(), Duration::from_secs(30));
+        assert_eq!(
+            config.gateway().discord_transport(),
+            RuntimeDiscordTransportConfigV1::Direct
+        );
+        assert_eq!(config.gateway_owner().lease_for(), Duration::from_secs(60));
         assert_eq!(
             config.gateway_owner().renew_before(),
-            Duration::from_secs(10)
+            Duration::from_secs(40)
         );
         assert_eq!(
             config.gateway_owner().safety_margin(),
-            Duration::from_secs(3)
+            Duration::from_secs(5)
         );
     }
 
@@ -952,6 +1103,13 @@ mod tests {
                 .discord_bot_token()
                 .environment_name(),
             Some("STARRING_RUNTIME_SECRET_DISCORD_BOT_TOKEN")
+        );
+        assert_eq!(
+            config
+                .secret_references()
+                .interaction_token_envelope_keyring()
+                .environment_name(),
+            Some("STARRING_RUNTIME_SECRET_INTERACTION_TOKEN_ENVELOPE_KEYRING")
         );
         let mut missing = valid_source();
         missing.values.remove(
@@ -1011,6 +1169,35 @@ mod tests {
         assert_eq!(
             RuntimeConfigV1::from_source(&token_alias).unwrap_err(),
             RuntimeConfigErrorV1::DuplicateSecretReference
+        );
+        let mut keyring_alias = valid_source();
+        keyring_alias.insert(
+            RuntimeConfigurationFieldV1::InteractionTokenEnvelopeKeyringSecretReference,
+            "env:STARRING_RUNTIME_SECRET_DISCORD_BOT_TOKEN",
+        );
+        assert_eq!(
+            RuntimeConfigV1::from_source(&keyring_alias).unwrap_err(),
+            RuntimeConfigErrorV1::DuplicateSecretReference
+        );
+        let mut keyring_database_alias = valid_source();
+        keyring_database_alias.insert(
+            RuntimeConfigurationFieldV1::InteractionTokenEnvelopeKeyringSecretReference,
+            "env:STARRING_RUNTIME_SECRET_DATABASE_4",
+        );
+        assert_eq!(
+            RuntimeConfigV1::from_source(&keyring_database_alias).unwrap_err(),
+            RuntimeConfigErrorV1::DuplicateSecretReference
+        );
+        let mut missing_keyring = valid_source();
+        missing_keyring.values.remove(
+            RuntimeConfigurationFieldV1::InteractionTokenEnvelopeKeyringSecretReference
+                .environment_name(),
+        );
+        assert_eq!(
+            RuntimeConfigV1::from_source(&missing_keyring).unwrap_err(),
+            RuntimeConfigErrorV1::Missing(
+                RuntimeConfigurationFieldV1::InteractionTokenEnvelopeKeyringSecretReference
+            )
         );
         for rejected in [
             "env:",
@@ -1139,7 +1326,165 @@ mod tests {
     }
 
     #[test]
-    fn gateway_owner_timing_is_bounded_ordered_and_covers_database_latency() {
+    fn loopback_discord_transport_is_explicit_canonical_and_split_by_protocol() {
+        let mut source = valid_source();
+        source.insert(
+            RuntimeConfigurationFieldV1::DiscordTransportMode,
+            "loopback_proxy_v1",
+        );
+        source.insert(
+            RuntimeConfigurationFieldV1::DiscordGatewayProxyUrl,
+            "ws://127.0.0.1:21001",
+        );
+        source.insert(
+            RuntimeConfigurationFieldV1::DiscordEffectHttpProxyAuthority,
+            "127.0.0.1:21002",
+        );
+        let transport = RuntimeConfigV1::from_source(&source)
+            .unwrap()
+            .gateway()
+            .discord_transport();
+        assert_eq!(
+            transport.gateway_proxy_url().as_deref(),
+            Some("ws://127.0.0.1:21001")
+        );
+        assert_eq!(
+            transport.effect_http_proxy_address(),
+            Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 21002))
+        );
+    }
+
+    #[test]
+    fn discord_gateway_and_effect_http_proxy_require_distinct_ports() {
+        let mut source = valid_source();
+        source.insert(
+            RuntimeConfigurationFieldV1::DiscordTransportMode,
+            "loopback_proxy_v1",
+        );
+        source.insert(
+            RuntimeConfigurationFieldV1::DiscordGatewayProxyUrl,
+            "ws://127.0.0.1:21001",
+        );
+        source.insert(
+            RuntimeConfigurationFieldV1::DiscordEffectHttpProxyAuthority,
+            "127.0.0.1:21001",
+        );
+        assert_eq!(
+            RuntimeConfigV1::from_source(&source).unwrap_err(),
+            RuntimeConfigErrorV1::InvalidValue(
+                RuntimeConfigurationFieldV1::DiscordEffectHttpProxyAuthority
+            )
+        );
+    }
+
+    #[test]
+    fn discord_transport_variables_are_all_or_none() {
+        let fields = [
+            (
+                RuntimeConfigurationFieldV1::DiscordTransportMode,
+                "loopback_proxy_v1",
+            ),
+            (
+                RuntimeConfigurationFieldV1::DiscordGatewayProxyUrl,
+                "ws://127.0.0.1:21001",
+            ),
+            (
+                RuntimeConfigurationFieldV1::DiscordEffectHttpProxyAuthority,
+                "127.0.0.1:21002",
+            ),
+        ];
+        for mask in 1_u8..7 {
+            let mut source = valid_source();
+            for (index, (field, value)) in fields.iter().enumerate() {
+                if mask & (1 << index) != 0 {
+                    source.insert(*field, *value);
+                }
+            }
+            assert!(RuntimeConfigV1::from_source(&source).is_err(), "{mask}");
+        }
+    }
+
+    #[test]
+    fn discord_transport_rejects_non_opt_in_modes_and_unsafe_gateway_urls() {
+        for mode in ["direct", "loopback_proxy_v2", "LOOPBACK_PROXY_V1"] {
+            let mut source = valid_source();
+            source.insert(RuntimeConfigurationFieldV1::DiscordTransportMode, mode);
+            source.insert(
+                RuntimeConfigurationFieldV1::DiscordGatewayProxyUrl,
+                "ws://127.0.0.1:21001",
+            );
+            source.insert(
+                RuntimeConfigurationFieldV1::DiscordEffectHttpProxyAuthority,
+                "127.0.0.1:21002",
+            );
+            assert_eq!(
+                RuntimeConfigV1::from_source(&source).unwrap_err(),
+                RuntimeConfigErrorV1::InvalidValue(
+                    RuntimeConfigurationFieldV1::DiscordTransportMode
+                )
+            );
+        }
+        for gateway in [
+            "wss://127.0.0.1:21001",
+            "ws://127.0.0.2:21001",
+            "ws://0.0.0.0:21001",
+            "ws://127.0.0.1:80",
+            "ws://127.0.0.1:21001/",
+            "ws://[::1]:21001",
+        ] {
+            let mut source = valid_source();
+            source.insert(
+                RuntimeConfigurationFieldV1::DiscordTransportMode,
+                "loopback_proxy_v1",
+            );
+            source.insert(RuntimeConfigurationFieldV1::DiscordGatewayProxyUrl, gateway);
+            source.insert(
+                RuntimeConfigurationFieldV1::DiscordEffectHttpProxyAuthority,
+                "127.0.0.1:21002",
+            );
+            assert_eq!(
+                RuntimeConfigV1::from_source(&source).unwrap_err(),
+                RuntimeConfigErrorV1::InvalidValue(
+                    RuntimeConfigurationFieldV1::DiscordGatewayProxyUrl
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn discord_transport_rejects_unsafe_effect_http_authorities() {
+        for authority in [
+            "http://127.0.0.1:21002",
+            "127.0.0.2:21002",
+            "0.0.0.0:21002",
+            "127.0.0.1:80",
+            "127.0.0.1:21002/",
+            "[::1]:21002",
+        ] {
+            let mut source = valid_source();
+            source.insert(
+                RuntimeConfigurationFieldV1::DiscordTransportMode,
+                "loopback_proxy_v1",
+            );
+            source.insert(
+                RuntimeConfigurationFieldV1::DiscordGatewayProxyUrl,
+                "ws://127.0.0.1:21001",
+            );
+            source.insert(
+                RuntimeConfigurationFieldV1::DiscordEffectHttpProxyAuthority,
+                authority,
+            );
+            assert_eq!(
+                RuntimeConfigV1::from_source(&source).unwrap_err(),
+                RuntimeConfigErrorV1::InvalidValue(
+                    RuntimeConfigurationFieldV1::DiscordEffectHttpProxyAuthority
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_owner_timing_is_bounded_ordered_and_covers_certification_runway() {
         for (field, rejected) in [
             (RuntimeConfigurationFieldV1::GatewayOwnerLease, "999"),
             (RuntimeConfigurationFieldV1::GatewayOwnerLease, "300001"),
@@ -1155,7 +1500,7 @@ mod tests {
             ),
             (
                 RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
-                "10000",
+                "40000",
             ),
         ] {
             let mut source = valid_source();
@@ -1167,13 +1512,33 @@ mod tests {
         }
 
         let mut short_window = valid_source();
-        short_window.insert(RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore, "5000");
+        short_window.insert(
+            RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore,
+            "35000",
+        );
         short_window.insert(
             RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
             "3000",
         );
         assert_eq!(
             RuntimeConfigV1::from_source(&short_window).unwrap_err(),
+            RuntimeConfigErrorV1::InvalidValue(
+                RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore
+            )
+        );
+
+        let mut legacy_timing = valid_source();
+        legacy_timing.insert(RuntimeConfigurationFieldV1::GatewayOwnerLease, "30000");
+        legacy_timing.insert(
+            RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore,
+            "10000",
+        );
+        legacy_timing.insert(
+            RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
+            "3000",
+        );
+        assert_eq!(
+            RuntimeConfigV1::from_source(&legacy_timing).unwrap_err(),
             RuntimeConfigErrorV1::InvalidValue(
                 RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore
             )
@@ -1196,10 +1561,10 @@ mod tests {
         );
 
         let mut custom = valid_source();
-        custom.insert(RuntimeConfigurationFieldV1::GatewayOwnerLease, "60000");
+        custom.insert(RuntimeConfigurationFieldV1::GatewayOwnerLease, "90000");
         custom.insert(
             RuntimeConfigurationFieldV1::GatewayOwnerRenewBefore,
-            "20000",
+            "50000",
         );
         custom.insert(
             RuntimeConfigurationFieldV1::GatewayOwnerSafetyMargin,
@@ -1208,8 +1573,8 @@ mod tests {
         let timing = RuntimeConfigV1::from_source(&custom)
             .unwrap()
             .gateway_owner();
-        assert_eq!(timing.lease_for(), Duration::from_secs(60));
-        assert_eq!(timing.renew_before(), Duration::from_secs(20));
+        assert_eq!(timing.lease_for(), Duration::from_secs(90));
+        assert_eq!(timing.renew_before(), Duration::from_secs(50));
         assert_eq!(timing.safety_margin(), Duration::from_secs(5));
     }
 

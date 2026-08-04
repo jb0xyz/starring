@@ -284,7 +284,7 @@ fn product_apply_consume_guard(
     }
 }
 
-fn product_apply_consume_awaiting_snapshot(
+fn product_apply_consume_live_snapshot(
     prepared: &PreparedRequestedDeploymentV1,
 ) -> (
     automation_runtime_convergence::RuntimeDeploymentSnapshotV1,
@@ -374,9 +374,9 @@ fn product_apply_consume_awaiting_snapshot(
                     "product-apply-consume-panel-report",
                 ))
                 .unwrap(),
-                target,
+                target: target.clone(),
                 runtime_generation,
-                process_instance_id,
+                process_instance_id: process_instance_id.clone(),
                 declared_count: 0,
                 installed_count: 0,
                 unchanged_count: 0,
@@ -391,6 +391,19 @@ fn product_apply_consume_awaiting_snapshot(
             },
         )
         .unwrap();
+    deployment
+        .certify_live(
+            &product_apply_consume_guard(&deployment, &controller_id, fencing_token, at(10)),
+            automation_runtime_convergence::GatewayReadyAttestationV1 {
+                target,
+                runtime_generation,
+                process_instance_id,
+                kind: automation_runtime_convergence::GatewayReadyKindV1::DiscordReady,
+                ready_at: at(9),
+            },
+            at(10),
+        )
+        .unwrap();
     let mut snapshot = deployment.snapshot();
     snapshot.controller_lease = None;
     RuntimeDeployment::restore(snapshot.clone()).unwrap();
@@ -402,30 +415,53 @@ async fn persist_product_apply_consume_source(
     snapshot: &automation_runtime_convergence::RuntimeDeploymentSnapshotV1,
     last_controller_id: &str,
 ) {
-    let panel_time = snapshot.panel_certificate.as_ref().unwrap().reconciled_at;
+    let live = snapshot.live.as_ref().unwrap();
+    let live_attestation_id = digest("product-apply-consume-live-attestation");
     let mut transaction = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL TIME ZONE 'UTC'")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
     sqlx::query("SET LOCAL session_replication_role = replica")
         .execute(&mut *transaction)
         .await
         .unwrap();
     let changed = sqlx::query(
         "UPDATE public.runtime_deployments \
-         SET snapshot = $1, revision = $2, phase = 'awaiting_gateway_ready', \
+         SET snapshot = pg_catalog.jsonb_set(\
+                pg_catalog.jsonb_set(\
+                    pg_catalog.jsonb_set(\
+                        pg_catalog.jsonb_set(\
+                            $1::JSONB, '{live,activation,activated_at}', \
+                            pg_catalog.to_jsonb($5::TIMESTAMPTZ), FALSE\
+                        ), \
+                        '{live,panel_certificate,reconciled_at}', \
+                        pg_catalog.to_jsonb($6::TIMESTAMPTZ), FALSE\
+                    ), \
+                    '{live,gateway_ready,ready_at}', \
+                    pg_catalog.to_jsonb($7::TIMESTAMPTZ), FALSE\
+                ), \
+                '{live,certified_at}', \
+                pg_catalog.to_jsonb($8::TIMESTAMPTZ), FALSE\
+             ), revision = $2, phase = 'live', \
              controller_id = NULL, controller_fencing_token = NULL, \
              controller_acquired_at = NULL, controller_lease_expires_at = NULL, \
              last_fencing_token = $3, last_controller_id = $4, \
              next_retry_at = NULL, last_stable_error_code = NULL, \
-             live_attestation_id = NULL, live_at = NULL, blocked_at = NULL, \
+             live_attestation_id = $9, live_at = $8, blocked_at = NULL, \
              superseded_at = NULL, cancelled_at = NULL, \
-             convergence_attempt_no = 1, last_failure_attempt_no = NULL, \
-             updated_at = $5 \
-         WHERE tenant_id = $6 AND installation_id = $7 AND deployment_id = $8",
+             convergence_attempt_no = 1, last_failure_attempt_no = NULL, updated_at = $8 \
+         WHERE tenant_id = $10 AND installation_id = $11 AND deployment_id = $12",
     )
     .bind(Json(serde_json::to_value(snapshot).unwrap()))
     .bind(i64::try_from(snapshot.revision.get()).unwrap())
     .bind(i64::try_from(snapshot.last_fencing_token.unwrap().get()).unwrap())
     .bind(last_controller_id)
-    .bind(panel_time)
+    .bind(live.activation.activated_at)
+    .bind(live.panel_certificate.reconciled_at)
+    .bind(live.gateway_ready.ready_at)
+    .bind(live.certified_at)
+    .bind(&live_attestation_id)
     .bind(snapshot.identity.tenant_id.as_str())
     .bind(snapshot.identity.installation_id.as_str())
     .bind(snapshot.identity.deployment_id.as_str())
@@ -433,6 +469,32 @@ async fn persist_product_apply_consume_source(
     .await
     .unwrap();
     assert_eq!(changed.rows_affected(), 1);
+    sqlx::query(
+        "INSERT INTO public.runtime_serving_leases \
+         (guild_id, ruleset_key, tenant_id, installation_id, deployment_id, \
+          attestation_id, process_instance_id, runtime_generation, target_version, \
+          target_content_hash, binding_revision, binding_fingerprint, lease_epoch, \
+          revision, connected, serving, acquired_at, last_heartbeat_at, expires_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,1,1,TRUE,TRUE, \
+             pg_catalog.clock_timestamp() - INTERVAL '1 second', \
+             pg_catalog.clock_timestamp(), \
+             pg_catalog.clock_timestamp() + INTERVAL '60 seconds')",
+    )
+    .bind(live.target.guild_id.to_string())
+    .bind(live.target.ruleset_key.as_str())
+    .bind(snapshot.identity.tenant_id.as_str())
+    .bind(snapshot.identity.installation_id.as_str())
+    .bind(snapshot.identity.deployment_id.as_str())
+    .bind(&live_attestation_id)
+    .bind(live.process_instance_id.as_str())
+    .bind(i64::try_from(live.runtime_generation.get()).unwrap())
+    .bind(i64::from(live.target.version.get()))
+    .bind(live.target.content_hash.to_hex())
+    .bind(i64::try_from(live.target.binding_revision.get()).unwrap())
+    .bind(live.target.binding_fingerprint.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
     sqlx::query("SET LOCAL session_replication_role = origin")
         .execute(&mut *transaction)
         .await
@@ -552,6 +614,7 @@ async fn persist_product_apply_consume_acknowledgement(
     pool: &PgPool,
     intent_id: &str,
     acknowledgement: &ProductApplyConsumeAcknowledgement,
+    snapshot: &automation_runtime_convergence::RuntimeDeploymentSnapshotV1,
 ) {
     let mut transaction = pool.begin().await.unwrap();
     sqlx::query("SET LOCAL session_replication_role = replica")
@@ -572,6 +635,21 @@ async fn persist_product_apply_consume_acknowledgement(
     .await
     .unwrap();
     assert_eq!(changed.rows_affected(), 1);
+    let disconnected = sqlx::query(
+        "UPDATE public.runtime_serving_leases \
+         SET revision = revision + 1, connected = FALSE, serving = FALSE \
+         WHERE tenant_id = $1 AND installation_id = $2 AND deployment_id = $3 \
+             AND guild_id = $4 AND ruleset_key = $5",
+    )
+    .bind(snapshot.identity.tenant_id.as_str())
+    .bind(snapshot.identity.installation_id.as_str())
+    .bind(snapshot.identity.deployment_id.as_str())
+    .bind(snapshot.target.guild_id.to_string())
+    .bind(snapshot.target.ruleset_key.as_str())
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    assert_eq!(disconnected.rows_affected(), 1);
     sqlx::query("SET LOCAL session_replication_role = origin")
         .execute(&mut *transaction)
         .await
@@ -963,18 +1041,51 @@ async fn product_apply_consumes_acknowledged_runtime_drain_and_replays_exactly()
         let source_operation = Operation::new("consume-source");
         let source_prepared = complete_apply(&database.pool, &fixture, &source_operation).await;
         let (source_snapshot, last_controller_id) =
-            product_apply_consume_awaiting_snapshot(&source_prepared);
+            product_apply_consume_live_snapshot(&source_prepared);
         persist_product_apply_consume_source(
             &database.pool,
             &source_snapshot,
             &last_controller_id,
         )
         .await;
+        let persisted_source_snapshot = sqlx::query_scalar::<_, Json<Value>>(
+            "SELECT snapshot FROM public.runtime_deployments WHERE deployment_id = $1",
+        )
+        .bind(&source_operation.deployment_id)
+        .fetch_one(&database.pool)
+        .await?;
+        let normalized_source_snapshot = serde_json::to_value(
+            RuntimeDeployment::restore(
+                serde_json::from_value(persisted_source_snapshot.0.clone()).unwrap(),
+            )
+            .unwrap()
+            .snapshot(),
+        )
+        .unwrap();
+        for pointer in [
+            "/live/activation/activated_at",
+            "/live/panel_certificate/reconciled_at",
+            "/live/gateway_ready/ready_at",
+            "/live/certified_at",
+        ] {
+            let persisted = persisted_source_snapshot
+                .0
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .unwrap();
+            let normalized = normalized_source_snapshot
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .unwrap();
+            assert!(persisted.ends_with("+00:00"));
+            assert!(normalized.ends_with('Z'));
+            assert_ne!(persisted, normalized);
+        }
         let fixture =
             seed_competing_product_activation(&database.pool, &fixture, "consume-result").await;
 
         let operation = Operation::new("consume-result");
-        let call = Call::valid(&fixture);
+        let mut call = Call::valid(&fixture);
         let product_operation_id = &digest("consume-product-operation")[..32];
         let drain_intent_id = &digest("consume-drain-intent")[..32];
         let terminal_action_id = digest("consume-terminal-action");
@@ -1025,6 +1136,7 @@ async fn product_apply_consumes_acknowledged_runtime_drain_and_replays_exactly()
             &database.pool,
             drain_intent_id,
             &acknowledgement,
+            &source_snapshot,
         )
         .await;
         let consume = ProductApplyConsumeCall {
@@ -1037,6 +1149,37 @@ async fn product_apply_consumes_acknowledged_runtime_drain_and_replays_exactly()
         };
 
         let mut transaction = begin_serializable(&database.pool).await;
+        let transaction_time = sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT pg_catalog.transaction_timestamp()",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        call.observed_at = transaction_time - TimeDelta::milliseconds(1);
+        call.expires_at = transaction_time + TimeDelta::seconds(1);
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "UPDATE public.activation_requests SET expires_at = $1 WHERE id = $2",
+        )
+        .bind(call.expires_at)
+        .bind(&fixture.activation_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE public.authoring_promotions \
+             SET record = pg_catalog.jsonb_set(\
+                record, '{stage,activation,expires_at}', \
+                pg_catalog.to_jsonb($1::TIMESTAMPTZ), FALSE\
+             ) WHERE id = $2",
+        )
+        .bind(call.expires_at)
+        .bind(&fixture.promotion_id)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("SET LOCAL session_replication_role = origin")
+            .execute(&mut *transaction)
+            .await?;
         let prepared = consume_product_apply_runtime_drain_in(
             &mut transaction,
             "prepare",
@@ -1062,6 +1205,22 @@ async fn product_apply_consumes_acknowledged_runtime_drain_and_replays_exactly()
         let preparation_token = prepared.preparation_token.clone().unwrap();
         let terminal_time = prepared.terminal_database_time.unwrap();
         assert!(terminal_time >= acknowledgement.acknowledged_at);
+        sqlx::query("SELECT pg_catalog.pg_sleep(1.1)")
+            .execute(&mut *transaction)
+            .await?;
+        let (authority_expired, activation_expired) =
+            sqlx::query_as::<_, (bool, bool)>(
+                "SELECT pg_catalog.clock_timestamp() >= $1, \
+                    pg_catalog.clock_timestamp() >= (\
+                        SELECT expires_at FROM public.activation_requests WHERE id = $2\
+                    )",
+            )
+            .bind(call.expires_at)
+            .bind(&fixture.activation_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+        assert!(authority_expired);
+        assert!(activation_expired);
         let lock = LockRow {
             outcome: "ready".to_string(),
             exact_replay: false,
@@ -1123,6 +1282,24 @@ async fn product_apply_consumes_acknowledged_runtime_drain_and_replays_exactly()
         let expected_result_snapshot =
             serde_json::from_slice::<Value>(&commit_projection.result_deployment_snapshot_bytes)
                 .unwrap();
+        let source_supersession_exact = sqlx::query_scalar::<_, bool>(
+            "SELECT starring_runtime_private_v2.\
+                starring_runtime_product_drain_source_supersession_exact_v2(\
+                    source, $1, drain, $2, $3\
+                ) \
+             FROM public.runtime_deployments AS source \
+             INNER JOIN public.runtime_drain_intents_v2 AS drain \
+                ON drain.deployment_id = source.deployment_id \
+             WHERE source.deployment_id = $4 AND drain.drain_intent_id = $5",
+        )
+        .bind(Json(&expected_source_result_snapshot))
+        .bind(Json(&expected_result_snapshot))
+        .bind(terminal_time)
+        .bind(consume.source_deployment_id)
+        .bind(consume.drain_intent_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        assert!(source_supersession_exact);
         let applied = consume_product_apply_runtime_drain_in(
             &mut transaction,
             "commit",
@@ -1240,13 +1417,28 @@ async fn product_apply_consumes_acknowledged_runtime_drain_and_replays_exactly()
             .await?;
         progress.commit().await?;
 
+        let mut expired_transaction = begin_serializable(&database.pool).await;
+        let expired = consume_product_apply_runtime_drain_in(
+            &mut expired_transaction,
+            "commit",
+            &fixture,
+            &operation,
+            &call,
+            &consume,
+            Some(&commit_projection),
+        )
+        .await?;
+        assert_eq!(expired.outcome_name, "authorization_stale");
+        expired_transaction.rollback().await?;
+
+        let replay_call = Call::valid(&fixture);
         let mut replay_transaction = begin_serializable(&database.pool).await;
         let replayed = consume_product_apply_runtime_drain_in(
             &mut replay_transaction,
             "commit",
             &fixture,
             &operation,
-            &call,
+            &replay_call,
             &consume,
             Some(&commit_projection),
         )

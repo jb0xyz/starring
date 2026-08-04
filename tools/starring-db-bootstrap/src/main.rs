@@ -6,9 +6,24 @@ use std::process::ExitCode;
 use sqlx::postgres::PgConnectOptions;
 use starring_db_bootstrap::{
     bootstrap_staging_database_with_authentication, parse_admin_connect_options,
-    peer_bootstrap_connect_options, BootstrapAuthenticationV1, StagingAcknowledgementV1,
+    parse_keychain_admin_connect_options, peer_bootstrap_connect_options,
+    read_admin_url_from_keychain, BootstrapAuthenticationV1, StagingAcknowledgementV1,
 };
 use zeroize::Zeroizing;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdminInputModeV1 {
+    Interactive,
+    Keychain,
+    TemporaryPeer,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommandArgumentsV1<'a> {
+    mode: AdminInputModeV1,
+    system_identifier: &'a str,
+    acknowledgement: &'a str,
+}
 
 struct EchoGuard {
     fd: RawFd,
@@ -55,7 +70,7 @@ impl Drop for EchoGuard {
     }
 }
 
-fn read_admin_url() -> Result<Zeroizing<String>, ()> {
+fn read_interactive_admin_url() -> Result<Zeroizing<String>, ()> {
     let mut terminal = OpenOptions::new()
         .read(true)
         .write(true)
@@ -89,6 +104,33 @@ fn postgres_environment_is_present() -> bool {
     std::env::vars_os().any(|(name, _)| name.to_string_lossy().starts_with("PG"))
 }
 
+fn parse_command_arguments<'a>(arguments: &[&'a str]) -> Result<CommandArgumentsV1<'a>, ()> {
+    match arguments {
+        [system_identifier, acknowledgement] if !system_identifier.starts_with('-') => {
+            Ok(CommandArgumentsV1 {
+                mode: AdminInputModeV1::Interactive,
+                system_identifier,
+                acknowledgement,
+            })
+        }
+        [mode, system_identifier, acknowledgement] if *mode == "--keychain-admin" => {
+            Ok(CommandArgumentsV1 {
+                mode: AdminInputModeV1::Keychain,
+                system_identifier,
+                acknowledgement,
+            })
+        }
+        [mode, system_identifier, acknowledgement] if *mode == "--peer-bootstrap" => {
+            Ok(CommandArgumentsV1 {
+                mode: AdminInputModeV1::TemporaryPeer,
+                system_identifier,
+                acknowledgement,
+            })
+        }
+        _ => Err(()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     if postgres_environment_is_present() {
@@ -104,61 +146,64 @@ async fn main() -> ExitCode {
         eprintln!("command_line_arguments_not_allowed");
         return ExitCode::from(64);
     };
-    let (options, authentication, acknowledgement): (
-        PgConnectOptions,
-        BootstrapAuthenticationV1,
-        StagingAcknowledgementV1,
-    ) = match arguments.as_slice() {
-        [system_identifier, acknowledgement] => {
-            let acknowledgement =
-                match StagingAcknowledgementV1::parse(system_identifier, acknowledgement) {
-                    Ok(acknowledgement) => acknowledgement,
-                    Err(error) => {
-                        eprintln!("{}", error.code());
-                        return ExitCode::from(64);
-                    }
-                };
-            let admin_url = match read_admin_url() {
-                Ok(value) => value,
-                Err(()) => {
-                    eprintln!("admin_url_input_failed");
-                    return ExitCode::from(1);
-                }
-            };
-            let options = match parse_admin_connect_options(&admin_url) {
-                Ok(options) => options,
-                Err(error) => {
-                    eprintln!("{}", error.code());
-                    return ExitCode::from(1);
-                }
-            };
-            drop(admin_url);
-            (
-                options,
-                BootstrapAuthenticationV1::AuthenticatedUrl,
-                acknowledgement,
-            )
-        }
-        [mode, system_identifier, acknowledgement] if *mode == "--peer-bootstrap" => {
-            let acknowledgement =
-                match StagingAcknowledgementV1::parse(system_identifier, acknowledgement) {
-                    Ok(acknowledgement) => acknowledgement,
-                    Err(error) => {
-                        eprintln!("{}", error.code());
-                        return ExitCode::from(64);
-                    }
-                };
-            (
-                peer_bootstrap_connect_options(),
-                BootstrapAuthenticationV1::TemporaryPeer,
-                acknowledgement,
-            )
-        }
-        _ => {
+    let command = match parse_command_arguments(&arguments) {
+        Ok(command) => command,
+        Err(()) => {
             eprintln!("command_line_arguments_not_allowed");
             return ExitCode::from(64);
         }
     };
+    let acknowledgement =
+        match StagingAcknowledgementV1::parse(command.system_identifier, command.acknowledgement) {
+            Ok(acknowledgement) => acknowledgement,
+            Err(error) => {
+                eprintln!("{}", error.code());
+                return ExitCode::from(64);
+            }
+        };
+    let (options, authentication): (PgConnectOptions, BootstrapAuthenticationV1) =
+        match command.mode {
+            AdminInputModeV1::Interactive => {
+                let admin_url = match read_interactive_admin_url() {
+                    Ok(value) => value,
+                    Err(()) => {
+                        eprintln!("admin_url_input_failed");
+                        return ExitCode::from(1);
+                    }
+                };
+                let options = match parse_admin_connect_options(&admin_url) {
+                    Ok(options) => options,
+                    Err(error) => {
+                        eprintln!("{}", error.code());
+                        return ExitCode::from(1);
+                    }
+                };
+                drop(admin_url);
+                (options, BootstrapAuthenticationV1::AuthenticatedUrl)
+            }
+            AdminInputModeV1::Keychain => {
+                let admin_url = match read_admin_url_from_keychain() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!("{}", error.code());
+                        return ExitCode::from(1);
+                    }
+                };
+                let options = match parse_keychain_admin_connect_options(&admin_url) {
+                    Ok(options) => options,
+                    Err(error) => {
+                        eprintln!("{}", error.code());
+                        return ExitCode::from(1);
+                    }
+                };
+                drop(admin_url);
+                (options, BootstrapAuthenticationV1::AuthenticatedUrl)
+            }
+            AdminInputModeV1::TemporaryPeer => (
+                peer_bootstrap_connect_options(),
+                BootstrapAuthenticationV1::TemporaryPeer,
+            ),
+        };
     match bootstrap_staging_database_with_authentication(options, authentication, acknowledgement)
         .await
     {
@@ -174,6 +219,61 @@ async fn main() -> ExitCode {
         Err(error) => {
             eprintln!("{}", error.code());
             ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SYSTEM_IDENTIFIER: &str = "7623456789012345678";
+    const ACKNOWLEDGEMENT: &str = "acknowledgement";
+
+    #[test]
+    fn command_dispatch_preserves_existing_modes_and_adds_explicit_keychain_mode() {
+        assert_eq!(
+            parse_command_arguments(&[SYSTEM_IDENTIFIER, ACKNOWLEDGEMENT]),
+            Ok(CommandArgumentsV1 {
+                mode: AdminInputModeV1::Interactive,
+                system_identifier: SYSTEM_IDENTIFIER,
+                acknowledgement: ACKNOWLEDGEMENT,
+            })
+        );
+        assert_eq!(
+            parse_command_arguments(&["--keychain-admin", SYSTEM_IDENTIFIER, ACKNOWLEDGEMENT]),
+            Ok(CommandArgumentsV1 {
+                mode: AdminInputModeV1::Keychain,
+                system_identifier: SYSTEM_IDENTIFIER,
+                acknowledgement: ACKNOWLEDGEMENT,
+            })
+        );
+        assert_eq!(
+            parse_command_arguments(&["--peer-bootstrap", SYSTEM_IDENTIFIER, ACKNOWLEDGEMENT]),
+            Ok(CommandArgumentsV1 {
+                mode: AdminInputModeV1::TemporaryPeer,
+                system_identifier: SYSTEM_IDENTIFIER,
+                acknowledgement: ACKNOWLEDGEMENT,
+            })
+        );
+    }
+
+    #[test]
+    fn command_dispatch_rejects_implicit_or_ambiguous_modes() {
+        for arguments in [
+            Vec::<&str>::new(),
+            vec!["--keychain-admin"],
+            vec!["--keychain-admin", SYSTEM_IDENTIFIER],
+            vec!["--unknown", SYSTEM_IDENTIFIER, ACKNOWLEDGEMENT],
+            vec![
+                "--keychain-admin",
+                "--peer-bootstrap",
+                SYSTEM_IDENTIFIER,
+                ACKNOWLEDGEMENT,
+            ],
+            vec![SYSTEM_IDENTIFIER, ACKNOWLEDGEMENT, "extra"],
+        ] {
+            assert_eq!(parse_command_arguments(&arguments), Err(()));
         }
     }
 }

@@ -1,6 +1,9 @@
 mod crypto;
+mod d2;
 mod final_verify;
 mod identity;
+mod incremental_keyring;
+mod incremental_writer;
 mod keychain;
 mod keyring;
 mod postgres;
@@ -9,14 +12,28 @@ use thiserror::Error;
 
 use crypto::GeneratedSecretsV1;
 use keychain::KeychainClientV1;
-use keyring::validate_keyring_pair;
+use keyring::validate_keyring_set;
 use postgres::StagingPostgresSessionV1;
+
+pub use d2::{
+    onboard_d2_from_manifest, provision_d2_from_manifest, quarantine_d2_from_manifest,
+    D2OnboardingOutcomeV1, D2OnboardingReportV1, D2ProvisionerErrorV1, D2ProvisioningOutcomeV1,
+    D2ProvisioningReportV1, D2QuarantineReportV1,
+};
 
 pub use final_verify::{verify_final, FinalVerificationReportV1};
 pub use identity::{
     ADMIN_DATABASE_NAME, ADMIN_KEYCHAIN_ACCOUNT, ADMIN_KEYCHAIN_SERVICE,
     APPLICATION_DATABASE_IDENTITIES, CLUSTER_ADMIN_ROLE, DATABASE_HOST, DATABASE_NAME,
     DATABASE_PORT, OWNER_ROLE, PEER_SOCKET_DIRECTORY,
+};
+pub use incremental_keyring::{
+    provision_interaction_token_keyring, IncrementalInteractionTokenKeyringOutcomeV1,
+    IncrementalInteractionTokenKeyringReportV1,
+};
+pub use incremental_writer::{
+    provision_authoring_writer, IncrementalAuthoringWriterOutcomeV1,
+    IncrementalAuthoringWriterReportV1,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -71,6 +88,16 @@ pub enum ProvisionerErrorV1 {
     FinalConnectionContract,
     #[error("keyring_contract_failed")]
     KeyringContract,
+    #[error("incremental_authoring_writer_busy")]
+    IncrementalAuthoringWriterBusy,
+    #[error("incremental_authoring_writer_contract_failed")]
+    IncrementalAuthoringWriterContract,
+    #[error("incremental_authoring_writer_partial_state")]
+    IncrementalAuthoringWriterPartialState,
+    #[error("incremental_authoring_writer_rollback_failed")]
+    IncrementalAuthoringWriterRollback,
+    #[error("incremental_interaction_token_keyring_busy")]
+    IncrementalInteractionTokenKeyringBusy,
 }
 
 impl ProvisionerErrorV1 {
@@ -101,6 +128,19 @@ impl ProvisionerErrorV1 {
             Self::FinalRoleContract => "final_role_contract_failed",
             Self::FinalConnectionContract => "final_connection_contract_failed",
             Self::KeyringContract => "keyring_contract_failed",
+            Self::IncrementalAuthoringWriterBusy => "incremental_authoring_writer_busy",
+            Self::IncrementalAuthoringWriterContract => {
+                "incremental_authoring_writer_contract_failed"
+            }
+            Self::IncrementalAuthoringWriterPartialState => {
+                "incremental_authoring_writer_partial_state"
+            }
+            Self::IncrementalAuthoringWriterRollback => {
+                "incremental_authoring_writer_rollback_failed"
+            }
+            Self::IncrementalInteractionTokenKeyringBusy => {
+                "incremental_interaction_token_keyring_busy"
+            }
         }
     }
 }
@@ -142,6 +182,7 @@ impl StagingAcknowledgementV1 {
 pub struct ProvisioningReportV1 {
     product_action_key_id: String,
     snapshot_envelope_key_id: String,
+    interaction_token_envelope_key_id: String,
 }
 
 impl ProvisioningReportV1 {
@@ -152,6 +193,10 @@ impl ProvisioningReportV1 {
     pub fn snapshot_envelope_key_id(&self) -> &str {
         &self.snapshot_envelope_key_id
     }
+
+    pub fn interaction_token_envelope_key_id(&self) -> &str {
+        &self.interaction_token_envelope_key_id
+    }
 }
 
 pub async fn provision_staging(
@@ -161,9 +206,10 @@ pub async fn provision_staging(
     keychain.preflight_discord()?;
     let database = StagingPostgresSessionV1::connect_and_preflight(&acknowledgement).await?;
     let secrets = GeneratedSecretsV1::generate()?;
-    validate_keyring_pair(
+    validate_keyring_set(
         secrets.product_action_keyring_payload(),
         secrets.snapshot_envelope_keyring_payload(),
+        secrets.interaction_token_envelope_keyring_payload(),
     )?;
     let keychain_items = secrets.keychain_items();
     let keychain_update = keychain.begin_update(&keychain_items)?;
@@ -181,6 +227,7 @@ pub async fn provision_staging(
     Ok(ProvisioningReportV1 {
         product_action_key_id: secrets.product_action_key_id().to_owned(),
         snapshot_envelope_key_id: secrets.snapshot_envelope_key_id().to_owned(),
+        interaction_token_envelope_key_id: secrets.interaction_token_envelope_key_id().to_owned(),
     })
 }
 
@@ -220,6 +267,11 @@ mod tests {
             ProvisionerErrorV1::KeychainWrite,
             ProvisionerErrorV1::DatabaseMutation,
             ProvisionerErrorV1::DatabaseCommitIndeterminate,
+            ProvisionerErrorV1::IncrementalAuthoringWriterBusy,
+            ProvisionerErrorV1::IncrementalAuthoringWriterContract,
+            ProvisionerErrorV1::IncrementalAuthoringWriterPartialState,
+            ProvisionerErrorV1::IncrementalAuthoringWriterRollback,
+            ProvisionerErrorV1::IncrementalInteractionTokenKeyringBusy,
         ] {
             assert_eq!(error.to_string(), error.code());
             assert!(!error.to_string().contains("postgresql://"));

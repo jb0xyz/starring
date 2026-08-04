@@ -1,10 +1,14 @@
 mod build_revision;
 mod capability_readiness_supervisor;
+#[cfg_attr(not(test), allow(dead_code))]
+mod certification_identity;
 mod closed_recovery;
 mod config;
 mod controller_identity;
 mod database;
 mod discord;
+#[cfg_attr(not(test), allow(dead_code))]
+mod discord_interaction_normalizer;
 mod discord_lifecycle;
 mod gateway;
 mod gateway_owner_startup;
@@ -13,17 +17,27 @@ mod health;
 mod identity_encoding;
 mod ingress_acknowledgement_safety;
 mod ingress_acknowledgement_supervisor;
+#[cfg_attr(not(test), allow(dead_code))]
+mod interaction_effect_recovery_supervisor;
+mod interaction_receipt;
+mod interaction_receipt_recovery_supervisor;
 mod lifecycle_timing;
 #[cfg_attr(not(test), allow(dead_code))]
 mod maintenance_ingress_gate;
 mod mutation_finalizer;
+mod panel_reconciliation;
 mod process;
 mod process_identity;
 mod process_startup;
 mod process_supervisor;
 mod recovery_identity;
 mod registry;
+mod runtime_controller;
+#[allow(dead_code)]
+mod runtime_interaction_dispatch;
 mod secret;
+#[cfg_attr(not(test), allow(dead_code))]
+mod serving_heartbeat_monitor;
 mod shutdown;
 mod startup;
 
@@ -37,6 +51,7 @@ pub use controller_identity::RuntimeControllerIdGenerationErrorV1;
 pub use database::{
     RuntimeDatabaseCompositionErrorV1, RuntimeDatabaseDependenciesV1,
     RuntimeDatabasePoolShutdownErrorV1, RuntimeDatabasePoolShutdownV1, RuntimeDatabaseReadinessV1,
+    RuntimeInteractionDispatchCompositionErrorV1,
 };
 pub use gateway::{
     compose_runtime_gateway_bootstrap_v1, RuntimeGatewayBootstrapErrorV1,

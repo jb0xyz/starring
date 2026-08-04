@@ -3,35 +3,34 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::time::Duration;
 
-use automation_core::InteractionResponder;
 use automation_instance::{InstanceIdGenerator, InstanceRegistrarV1, InstanceRouteReaderV1};
 use automation_instance_teardown::InstanceTeardownService;
 use automation_ruleset_dispatch::{GuildRoleSnapshotProvider, PinnedInstanceResolverV1};
 use automation_runtime_registry::ServingSlotRegistryV1;
-use discord_model::GuildId;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt as FuturesStreamExt;
 use twilight_gateway::{Event, EventTypeFlags, Intents, Shard, ShardId, StreamExt};
 use twilight_http::Client;
-use twilight_model::application::interaction::{Interaction, InteractionData};
 use twilight_model::gateway::CloseFrame;
 
-use crate::responder::TwilightInteractionResponder;
 use crate::runner::InteractionExecutionOutcomeV3;
 use crate::shared_gateway_admission::{
     SharedGatewayAdmissionBudgetV3, SharedGatewayAdmissionErrorV3,
-    SharedGatewayAdmissionReservationV3,
 };
 use crate::shared_gateway_control::{
     GatewayCommandAckV3, GatewayConnectionObserverV3, GatewayDisconnectKindV3, GatewayReadyKindV3,
     GatewayReadyLeaseV3, GatewayRuntimeCommandOutcomeV3, SharedGatewayRuntimeControlV3,
 };
-use crate::shared_gateway_executor::execute_admitted_interaction_v3;
-use crate::shared_gateway_router::parse_shared_gateway_route_v1;
+use crate::shared_gateway_dispatcher::{
+    acknowledge_shared_gateway_interaction_rejection_v3,
+    dispatch_reserved_shared_gateway_interaction_v3, reserve_shared_gateway_interaction_v3,
+    SharedGatewayInteractionDispatchOutcomeV3, SharedGatewayInteractionEnvelopeV3,
+    SharedGatewayInteractionRejectionV3, SharedGatewayInteractionReservationOutcomeV3,
+    SharedGatewayRejectionAcknowledgementOutcomeV3,
+};
 
 const MAX_SHARED_GATEWAY_DRAIN_TIMEOUT_V3: Duration = Duration::from_secs(60);
 const MAX_SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENTS_V3: usize = 1_024;
-const SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SharedGatewayRuntimeConfigV3 {
@@ -127,34 +126,18 @@ pub struct SharedGatewayExitV3 {
     pub report: SharedGatewayRuntimeReportV3,
 }
 
-enum SharedGatewayDispatchOutcomeV3 {
-    Executed(InteractionExecutionOutcomeV3),
-    Ignored,
-    Rejected {
-        error: SharedGatewayAdmissionErrorV3,
-        interaction: Box<Interaction>,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SharedGatewayRejectionAcknowledgementOutcomeV3 {
-    Sent,
-    Failed,
-    TimedOut,
-}
-
 type SharedGatewayDispatchFutureV3<'a> =
-    Pin<Box<dyn Future<Output = SharedGatewayDispatchOutcomeV3> + 'a>>;
+    Pin<Box<dyn Future<Output = SharedGatewayInteractionDispatchOutcomeV3> + 'a>>;
 type SharedGatewayRejectionAcknowledgementFutureV3<'a> =
     Pin<Box<dyn Future<Output = SharedGatewayRejectionAcknowledgementOutcomeV3> + 'a>>;
 
 impl SharedGatewayRuntimeReportV3 {
     fn record_dispatch(
         &mut self,
-        outcome: SharedGatewayDispatchOutcomeV3,
-    ) -> Option<Box<Interaction>> {
+        outcome: SharedGatewayInteractionDispatchOutcomeV3,
+    ) -> Option<Box<SharedGatewayInteractionEnvelopeV3>> {
         match outcome {
-            SharedGatewayDispatchOutcomeV3::Executed(outcome) => {
+            SharedGatewayInteractionDispatchOutcomeV3::Executed(outcome) => {
                 if matches!(
                     outcome,
                     InteractionExecutionOutcomeV3::StaticFailed
@@ -168,13 +151,22 @@ impl SharedGatewayRuntimeReportV3 {
                 }
                 None
             }
-            SharedGatewayDispatchOutcomeV3::Ignored => {
+            SharedGatewayInteractionDispatchOutcomeV3::Ignored => {
                 increment(&mut self.ignored);
                 None
             }
-            SharedGatewayDispatchOutcomeV3::Rejected { error, interaction } => {
+            SharedGatewayInteractionDispatchOutcomeV3::Rejected { error, envelope } => {
                 self.record_admission_error(&error);
-                Some(interaction)
+                Some(envelope)
+            }
+        }
+    }
+
+    fn record_reservation_rejection(&mut self, reason: &SharedGatewayInteractionRejectionV3) {
+        match reason {
+            SharedGatewayInteractionRejectionV3::Route(_) => increment(&mut self.route_rejected),
+            SharedGatewayInteractionRejectionV3::Admission(error) => {
+                self.record_admission_error(error)
             }
         }
     }
@@ -213,7 +205,7 @@ fn interaction_callback_client(token: String) -> Client {
     Client::builder()
         .token(token)
         .ratelimiter(None)
-        .timeout(SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3)
+        .timeout(Duration::from_secs(2))
         .build()
 }
 
@@ -497,7 +489,7 @@ fn current_ready_lease(observer: &GatewayConnectionObserverV3) -> Option<Gateway
 
 #[allow(clippy::too_many_arguments)]
 fn enqueue_interaction<'a, I, G, T, PR, S>(
-    interaction: Interaction,
+    interaction: twilight_model::application::interaction::Interaction,
     ready_lease: Option<GatewayReadyLeaseV3>,
     observer: &GatewayConnectionObserverV3,
     admission_budget: &SharedGatewayAdmissionBudgetV3,
@@ -523,75 +515,52 @@ fn enqueue_interaction<'a, I, G, T, PR, S>(
     PR: PinnedInstanceResolverV1,
     S: GuildRoleSnapshotProvider,
 {
-    let Some((guild_id, custom_id)) = interaction_route(&interaction) else {
-        increment(&mut report.ignored);
-        return;
-    };
-    match parse_shared_gateway_route_v1(guild_id, &custom_id) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            increment(&mut report.ignored);
-            return;
+    let envelope =
+        match SharedGatewayInteractionEnvelopeV3::from_twilight_interaction_v3(interaction) {
+            Ok(Some(envelope)) => envelope,
+            Ok(None) => {
+                increment(&mut report.ignored);
+                return;
+            }
+            Err(_) => {
+                increment(&mut report.route_rejected);
+                return;
+            }
+        };
+    match reserve_shared_gateway_interaction_v3(envelope, ready_lease, observer, admission_budget) {
+        SharedGatewayInteractionReservationOutcomeV3::Reserved(reserved) => {
+            active.push(Box::pin(dispatch_reserved_shared_gateway_interaction_v3(
+                *reserved,
+                registry,
+                instances,
+                instance_ids,
+                teardown,
+                pinned_resolver,
+                snapshot_provider,
+                mutation_http,
+                interaction_http,
+                failure_message,
+            )));
         }
-        Err(_) => {
-            increment(&mut report.route_rejected);
+        SharedGatewayInteractionReservationOutcomeV3::Ignored => {
+            increment(&mut report.ignored);
+        }
+        SharedGatewayInteractionReservationOutcomeV3::Rejected { reason, envelope } => {
+            report.record_reservation_rejection(&reason);
             enqueue_rejection_acknowledgement(
-                Box::new(interaction),
+                envelope,
                 interaction_http,
                 failure_message,
                 rejection_acknowledgements,
                 rejection_acknowledgement_capacity,
                 report,
             );
-            return;
         }
     }
-    let Some(ready_lease) = ready_lease else {
-        increment(&mut report.not_ready);
-        enqueue_rejection_acknowledgement(
-            Box::new(interaction),
-            interaction_http,
-            failure_message,
-            rejection_acknowledgements,
-            rejection_acknowledgement_capacity,
-            report,
-        );
-        return;
-    };
-    let reservation = match admission_budget.try_reserve(observer, &ready_lease) {
-        Ok(reservation) => reservation,
-        Err(error) => {
-            report.record_admission_error(&error);
-            enqueue_rejection_acknowledgement(
-                Box::new(interaction),
-                interaction_http,
-                failure_message,
-                rejection_acknowledgements,
-                rejection_acknowledgement_capacity,
-                report,
-            );
-            return;
-        }
-    };
-    active.push(Box::pin(dispatch_reserved(
-        reservation,
-        registry,
-        instances,
-        instance_ids,
-        teardown,
-        pinned_resolver,
-        snapshot_provider,
-        mutation_http,
-        interaction_http,
-        failure_message,
-        guild_id,
-        custom_id,
-        interaction,
-    )));
 }
 
 fn enqueue_rejection_acknowledgement<'a>(
-    interaction: Box<Interaction>,
+    envelope: Box<SharedGatewayInteractionEnvelopeV3>,
     http: &'a Client,
     failure_message: &'a str,
     active: &mut FuturesUnordered<SharedGatewayRejectionAcknowledgementFutureV3<'a>>,
@@ -599,7 +568,7 @@ fn enqueue_rejection_acknowledgement<'a>(
     report: &mut SharedGatewayRuntimeReportV3,
 ) {
     enqueue_rejection_acknowledgement_future(
-        Box::pin(acknowledge_rejection(http, interaction, failure_message)),
+        Box::pin(acknowledge_rejection(http, envelope, failure_message)),
         active,
         capacity,
         report,
@@ -621,81 +590,11 @@ fn enqueue_rejection_acknowledgement_future<'a>(
 
 async fn acknowledge_rejection(
     interaction_http: &Client,
-    interaction: Box<Interaction>,
+    envelope: Box<SharedGatewayInteractionEnvelopeV3>,
     failure_message: &str,
 ) -> SharedGatewayRejectionAcknowledgementOutcomeV3 {
-    let responder =
-        TwilightInteractionResponder::from_interaction(interaction_http, &interaction, "");
-    match tokio::time::timeout(
-        SHARED_GATEWAY_REJECTION_ACKNOWLEDGEMENT_TIMEOUT_V3,
-        responder.respond_ephemeral(failure_message.to_string()),
-    )
-    .await
-    {
-        Ok(Ok(())) => SharedGatewayRejectionAcknowledgementOutcomeV3::Sent,
-        Ok(Err(_)) => SharedGatewayRejectionAcknowledgementOutcomeV3::Failed,
-        Err(_) => SharedGatewayRejectionAcknowledgementOutcomeV3::TimedOut,
-    }
-}
-
-fn interaction_route(interaction: &Interaction) -> Option<(GuildId, String)> {
-    let guild_id = GuildId(interaction.guild_id?.get());
-    let custom_id = match interaction.data.as_ref()? {
-        InteractionData::MessageComponent(data) => data.custom_id.clone(),
-        InteractionData::ModalSubmit(data) => data.custom_id.clone(),
-        _ => return None,
-    };
-    Some((guild_id, custom_id))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_reserved<I, G, T, PR, S>(
-    reservation: SharedGatewayAdmissionReservationV3,
-    registry: &ServingSlotRegistryV1,
-    instances: &I,
-    instance_ids: &G,
-    teardown: &T,
-    pinned_resolver: &PR,
-    snapshot_provider: &S,
-    mutation_http: &Client,
-    interaction_http: &Client,
-    failure_message: &str,
-    guild_id: GuildId,
-    custom_id: String,
-    interaction: Interaction,
-) -> SharedGatewayDispatchOutcomeV3
-where
-    I: InstanceRouteReaderV1 + InstanceRegistrarV1,
-    G: InstanceIdGenerator,
-    T: InstanceTeardownService,
-    PR: PinnedInstanceResolverV1,
-    S: GuildRoleSnapshotProvider,
-{
-    match reservation
-        .admit(registry, instances, guild_id, &custom_id)
+    acknowledge_shared_gateway_interaction_rejection_v3(interaction_http, envelope, failure_message)
         .await
-    {
-        Ok(Some(admitted)) => SharedGatewayDispatchOutcomeV3::Executed(
-            execute_admitted_interaction_v3(
-                mutation_http,
-                interaction_http,
-                admitted,
-                &interaction,
-                failure_message,
-                instances,
-                instance_ids,
-                teardown,
-                pinned_resolver,
-                snapshot_provider,
-            )
-            .await,
-        ),
-        Ok(None) => SharedGatewayDispatchOutcomeV3::Ignored,
-        Err(error) => SharedGatewayDispatchOutcomeV3::Rejected {
-            error,
-            interaction: Box::new(interaction),
-        },
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -714,7 +613,7 @@ async fn finish_gateway<'a, F>(
     rejection_acknowledgement_capacity: NonZeroUsize,
 ) -> SharedGatewayExitV3
 where
-    F: Future<Output = SharedGatewayDispatchOutcomeV3>,
+    F: Future<Output = SharedGatewayInteractionDispatchOutcomeV3>,
 {
     control.begin_runtime_failure_drain();
     shard.close(CloseFrame::NORMAL);
@@ -723,9 +622,9 @@ where
         rejection_acknowledgements,
         &mut report,
         drain_timeout,
-        |interaction, acknowledgements, report| {
+        |envelope, acknowledgements, report| {
             enqueue_rejection_acknowledgement(
-                interaction,
+                envelope,
                 http,
                 failure_message,
                 acknowledgements,
@@ -753,9 +652,9 @@ async fn drain_active<'a, F, A>(
     mut acknowledge_rejection: A,
 ) -> SharedGatewayDrainOutcomeV3
 where
-    F: Future<Output = SharedGatewayDispatchOutcomeV3>,
+    F: Future<Output = SharedGatewayInteractionDispatchOutcomeV3>,
     A: FnMut(
-        Box<Interaction>,
+        Box<SharedGatewayInteractionEnvelopeV3>,
         &mut FuturesUnordered<SharedGatewayRejectionAcknowledgementFutureV3<'a>>,
         &mut SharedGatewayRuntimeReportV3,
     ),
@@ -869,10 +768,14 @@ mod tests {
     async fn drain_collects_completed_work() {
         let mut active = FuturesUnordered::new();
         active.push(std::future::ready(
-            SharedGatewayDispatchOutcomeV3::Executed(InteractionExecutionOutcomeV3::StaticExecuted),
+            SharedGatewayInteractionDispatchOutcomeV3::Executed(
+                InteractionExecutionOutcomeV3::StaticExecuted,
+            ),
         ));
         active.push(std::future::ready(
-            SharedGatewayDispatchOutcomeV3::Executed(InteractionExecutionOutcomeV3::StaticFailed),
+            SharedGatewayInteractionDispatchOutcomeV3::Executed(
+                InteractionExecutionOutcomeV3::StaticFailed,
+            ),
         ));
         let mut acknowledgements: FuturesUnordered<
             SharedGatewayRejectionAcknowledgementFutureV3<'_>,

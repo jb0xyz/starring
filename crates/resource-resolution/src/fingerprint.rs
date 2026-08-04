@@ -1,8 +1,8 @@
 use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Deserializer, Serialize};
-use sha2::{Digest, Sha256};
 
+use crate::digest::LengthFramedSha256;
 use crate::ResourceBindingMap;
 
 const RESOURCE_CONTEXT_DOMAIN_V2: &[u8] = b"starring.intent.resource_context.v2\0";
@@ -57,7 +57,7 @@ pub struct ResourceBindingFingerprintError;
 pub fn resource_binding_fingerprint_v2(
     bindings: &ResourceBindingMap,
 ) -> ResourceBindingFingerprint {
-    let mut digest = LengthFramedDigest::new(RESOURCE_CONTEXT_DOMAIN_V2);
+    let mut digest = LengthFramedSha256::new(RESOURCE_CONTEXT_DOMAIN_V2);
     for (key, id) in &bindings.channel_bindings {
         digest.update(b"channel");
         digest.update(key.0.as_bytes());
@@ -69,38 +69,6 @@ pub fn resource_binding_fingerprint_v2(
         digest.update(id.to_string().as_bytes());
     }
     ResourceBindingFingerprint(digest.finalize())
-}
-
-struct LengthFramedDigest {
-    hasher: Sha256,
-}
-
-impl LengthFramedDigest {
-    fn new(domain: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        update_length_framed(&mut hasher, domain);
-        Self { hasher }
-    }
-
-    fn update(&mut self, field: &[u8]) {
-        update_length_framed(&mut self.hasher, field);
-    }
-
-    fn finalize(self) -> String {
-        let bytes = self.hasher.finalize();
-        let mut output = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            use std::fmt::Write;
-            write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
-        }
-        output
-    }
-}
-
-fn update_length_framed(hasher: &mut Sha256, bytes: &[u8]) {
-    let length = u64::try_from(bytes.len()).expect("binding fingerprint field exceeds u64::MAX");
-    hasher.update(length.to_be_bytes());
-    hasher.update(bytes);
 }
 
 #[cfg(test)]

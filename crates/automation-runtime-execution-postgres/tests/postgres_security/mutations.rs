@@ -916,7 +916,7 @@ async fn assert_marker_database_invariants(database: &IsolatedDatabase) {
     .await
     .unwrap();
     let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
-        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v2(), \
             public.starring_runtime_serving_schema_manifest_v1(), \
             public.starring_runtime_execution_schema_manifest_v1()",
     )
@@ -926,7 +926,7 @@ async fn assert_marker_database_invariants(database: &IsolatedDatabase) {
     assert_eq!(manifests, (true, true, false));
     transaction.rollback().await.unwrap();
     let manifests = sqlx::query_as::<_, (bool, bool, bool)>(
-        "SELECT public.starring_runtime_exact_target_schema_manifest_v1(), \
+        "SELECT public.starring_runtime_exact_target_schema_manifest_v2(), \
             public.starring_runtime_serving_schema_manifest_v1(), \
             public.starring_runtime_execution_schema_manifest_v1()",
     )
@@ -1124,4 +1124,3 @@ async fn wait_for_database_time(pool: &PgPool, boundary: DateTime<Utc>) {
     let remaining = (boundary - now).to_std().unwrap_or_default();
     tokio::time::sleep(remaining + Duration::from_millis(10)).await;
 }
-

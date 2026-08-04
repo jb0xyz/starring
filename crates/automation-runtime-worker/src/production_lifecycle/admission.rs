@@ -279,6 +279,21 @@ pub struct RuntimeIngressOpenAcknowledgementObservationV2 {
     accepted: RuntimeAcceptedIngressOpenAcknowledgementV2,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum RuntimeServingGatewayReadyRefreshV3 {
+    Current,
+    ResumedSuccessor,
+}
+
+impl RuntimeServingGatewayReadyRefreshV3 {
+    pub(super) const fn admission_revision_delta_v3(self) -> u64 {
+        match self {
+            Self::Current => 0,
+            Self::ResumedSuccessor => 1,
+        }
+    }
+}
+
 impl RuntimeIngressOpenAcknowledgementObservationV2 {
     pub fn from_accepted(accepted: RuntimeAcceptedIngressOpenAcknowledgementV2) -> Self {
         Self { accepted }
@@ -286,6 +301,18 @@ impl RuntimeIngressOpenAcknowledgementObservationV2 {
 
     pub fn acknowledgement(&self) -> &RuntimeDurableIngressOpenAcknowledgementV2 {
         self.accepted.acknowledgement()
+    }
+
+    pub fn accepts_exact_reobservation_v3(
+        &self,
+        receipt: &automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2,
+    ) -> bool {
+        let accepted = self.accepted.receipt();
+        receipt.source_acknowledgement_revision() == accepted.source_acknowledgement_revision()
+            && receipt.request_digest() == accepted.request_digest()
+            && receipt.acknowledgement() == accepted.acknowledgement()
+            && receipt.observed_database_now() >= accepted.observed_database_now()
+            && receipt.observed_database_now() < receipt.acknowledgement().expires_at()
     }
 
     #[cfg(test)]

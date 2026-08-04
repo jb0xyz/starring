@@ -3,19 +3,35 @@ use std::num::{NonZeroU64, NonZeroU8};
 
 use automation_runtime_controller::RuntimeBuildRevisionV1;
 use automation_runtime_convergence::{ControllerId, ProcessInstanceId};
-use automation_runtime_worker::RuntimeMutationFinalizerGenerationV1;
+use automation_runtime_worker::{
+    RuntimeMutationFinalizerGenerationV1, RuntimeRouteSetObservationV2,
+};
 
 use crate::build_revision::CompiledRuntimeBuildRevisionV1;
 use crate::capability_readiness_supervisor::{
     RuntimeCapabilityReadinessActivationErrorV2, RuntimeCapabilityReadinessSupervisorExitV2,
 };
 use crate::controller_identity::generate_runtime_controller_id_v1;
-use crate::database::compose_runtime_database_dependencies_v1;
-use crate::health::RuntimeHealthReadinessPublisherV2;
+use crate::database::{
+    compose_runtime_database_dependencies_v1, RuntimeInteractionDispatchCompositionErrorV1,
+    RuntimeInteractionDispatchCompositionInputV1, RuntimeInteractionDispatchDatabasePortV1,
+    RuntimeInteractionEffectRecoverySupervisorExitV1,
+    RuntimeInteractionReceiptRecoverySupervisorExitV1,
+    RuntimeInteractionTeardownRetrySupervisorExitV1, RuntimeInteractionTeardownRetrySupervisorV1,
+};
+use crate::health::{
+    RuntimeHealthInteractionDispatchPublisherV1, RuntimeHealthReadinessObserverV1,
+    RuntimeHealthReadinessPublisherV2,
+};
 use crate::ingress_acknowledgement_supervisor::{
     RuntimeIngressAcknowledgementSupervisorConfigV2, RuntimeIngressAcknowledgementSupervisorExitV2,
     RuntimeIngressAcknowledgementSupervisorV2, RuntimeWorkerIngressAcknowledgementJobV2,
 };
+use crate::interaction_effect_recovery_supervisor::{
+    RuntimeInteractionEffectRecoverySupervisorHealthV1,
+    RuntimeInteractionEffectRecoverySupervisorV1,
+};
+use crate::interaction_receipt_recovery_supervisor::RuntimeInteractionReceiptRecoverySupervisorV1;
 use crate::lifecycle_timing::{
     RuntimeLifecycleTimingMetricV2, RuntimeLifecycleTimingOutcomeV2,
     RuntimeLifecycleTimingRecorderV2, RuntimeLifecycleTimingTerminalReporterV2,
@@ -40,6 +56,7 @@ use crate::{
     RuntimeRegistryRecoveryObservationErrorV1, RuntimeShutdownCauseV1, RuntimeSupervisorExitV1,
 };
 
+mod certification_finalizer;
 mod closed;
 pub(crate) mod connected;
 mod execution;
@@ -47,10 +64,20 @@ mod execution;
 mod observation;
 mod owner;
 mod pending_drain_finalizer;
+mod pending_drain_serving;
 mod readiness;
 mod recovery;
+mod serving;
+mod serving_certification;
 mod startup_loop;
 
+#[allow(unused_imports)]
+pub(crate) use certification_finalizer::{
+    complete_certification_finalizer_job_v2, RuntimeCertificationFinalizerCompletionFailureV2,
+    RuntimeProcessCertificationFinalizerPortV2,
+    RuntimeProductionCertificationFinalizationOutcomeV2,
+    RuntimeProductionMutationFinalizerCompletionV3, RuntimeRegisteredCertificationFinalizerJobV2,
+};
 pub use closed::{
     RuntimeClosedRecoveryProcessCleanupFailureV2, RuntimeClosedRecoveryProcessShutdownErrorV2,
     RuntimeProcessClosedRecoveryCommitFailureV2, RuntimeProcessClosedRecoveryTransitionErrorV2,
@@ -58,11 +85,13 @@ pub use closed::{
 };
 #[cfg(test)]
 pub(crate) use execution::{
-    execute_pending_drain_recovery_with_environment_v2, RuntimePendingDrainRecoveryEnvironmentV2,
+    execute_pending_drain_recovery_with_environment_v2,
+    pending_drain_serving_disconnect_stage_for_test_v1, RuntimePendingDrainRecoveryEnvironmentV2,
     RuntimeStartupRecoveryExecutionAwaitFailureV2,
 };
 #[cfg(test)]
 pub(crate) use observation::execute_recovery_resume_gateway_stage_v2;
+pub(crate) use observation::RuntimeExactIngressAcknowledgementReobservationV3;
 pub use observation::{
     RuntimeProcessProductionHandoffErrorV2, RuntimeProcessProductionHandoffFailureV2,
     RuntimeProcessStartupRecoveryObservationErrorV2,
@@ -106,6 +135,8 @@ pub enum RuntimeProcessFoundationCompositionErrorV1 {
     Registry(RuntimeRegistryBootstrapErrorV1),
     #[error("runtime process foundation gateway composition failed")]
     Gateway(RuntimeGatewayBootstrapErrorV1),
+    #[error("runtime process foundation interaction dispatch composition failed")]
+    InteractionDispatch(RuntimeInteractionDispatchCompositionErrorV1),
     #[error("runtime process foundation mutation finalizer composition failed")]
     MutationFinalizer(RuntimeMutationFinalizerStartErrorV1),
     #[error("runtime process foundation shutdown signal composition failed")]
@@ -120,6 +151,11 @@ pub enum RuntimeProcessFoundationCompositionErrorV1 {
     #[error("runtime process foundation gateway failure cleanup failed")]
     CleanupAfterGateway {
         composition: RuntimeGatewayBootstrapErrorV1,
+        cleanup: RuntimeDatabasePoolShutdownErrorV1,
+    },
+    #[error("runtime process foundation interaction dispatch failure cleanup failed")]
+    CleanupAfterInteractionDispatch {
+        composition: RuntimeInteractionDispatchCompositionErrorV1,
         cleanup: RuntimeDatabasePoolShutdownErrorV1,
     },
     #[error("runtime process foundation mutation finalizer failure cleanup failed")]
@@ -147,6 +183,7 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
             Self::Database(error) => error.code(),
             Self::Registry(error) => error.code(),
             Self::Gateway(error) => error.code(),
+            Self::InteractionDispatch(error) => error.code(),
             Self::MutationFinalizer(_) => "runtime_process_foundation_mutation_finalizer",
             Self::ShutdownSignal => "runtime_process_foundation_shutdown_signal",
             Self::HealthListener => "runtime_process_foundation_health_listener",
@@ -154,6 +191,9 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
                 "runtime_process_foundation_cleanup_after_registry"
             }
             Self::CleanupAfterGateway { .. } => "runtime_process_foundation_cleanup_after_gateway",
+            Self::CleanupAfterInteractionDispatch { .. } => {
+                "runtime_process_foundation_cleanup_after_interaction_dispatch"
+            }
             Self::CleanupAfterMutationFinalizer { .. } => {
                 "runtime_process_foundation_cleanup_after_mutation_finalizer"
             }
@@ -176,11 +216,13 @@ impl RuntimeProcessFoundationCompositionErrorV1 {
             Self::Database(error) => error.context(),
             Self::Registry(_)
             | Self::Gateway(_)
+            | Self::InteractionDispatch(_)
             | Self::MutationFinalizer(_)
             | Self::ShutdownSignal
             | Self::HealthListener
             | Self::CleanupAfterRegistry { .. }
             | Self::CleanupAfterGateway { .. }
+            | Self::CleanupAfterInteractionDispatch { .. }
             | Self::CleanupAfterMutationFinalizer { .. }
             | Self::CleanupAfterRootSupervisor { .. }
             | Self::OperationDeadlineElapsed
@@ -204,6 +246,12 @@ pub enum RuntimeProcessFoundationShutdownFailureV1 {
     HealthListener,
     IngressAcknowledgement,
     CapabilityReadiness,
+    InteractionEffectRecoveryControlClosed,
+    InteractionEffectRecoveryPanicked,
+    InteractionEffectRecoveryDeadlineElapsed,
+    InteractionReceiptRecovery,
+    TeardownRetry,
+    RuntimeController,
 }
 
 impl RuntimeProcessFoundationShutdownFailureV1 {
@@ -220,6 +268,20 @@ impl RuntimeProcessFoundationShutdownFailureV1 {
                 "runtime_process_ingress_acknowledgement_supervisor_shutdown"
             }
             Self::CapabilityReadiness => "runtime_process_capability_readiness_supervisor_shutdown",
+            Self::InteractionEffectRecoveryControlClosed => {
+                "runtime_process_interaction_effect_recovery_supervisor_control_closed"
+            }
+            Self::InteractionEffectRecoveryPanicked => {
+                "runtime_process_interaction_effect_recovery_supervisor_panicked"
+            }
+            Self::InteractionEffectRecoveryDeadlineElapsed => {
+                "runtime_process_interaction_effect_recovery_supervisor_shutdown_deadline_elapsed"
+            }
+            Self::InteractionReceiptRecovery => {
+                "runtime_process_interaction_receipt_recovery_supervisor_shutdown"
+            }
+            Self::TeardownRetry => "runtime_process_teardown_retry_supervisor_shutdown",
+            Self::RuntimeController => "runtime_process_serving_controller_shutdown",
         }
     }
 }
@@ -300,15 +362,13 @@ impl RuntimeProcessFoundationShutdownFailuresV1 {
 }
 
 type RuntimeProcessStartupMutationFinalizerV3 =
-    pending_drain_finalizer::RuntimePendingDrainFinalizerSupervisorV3<
+    certification_finalizer::RuntimeProcessMutationFinalizerSupervisorV3<
         execution::RuntimeProductionPendingDrainFinalizerEnvironmentV3,
     >;
 
 type RuntimeProcessMutationFinalizerV3 =
-    crate::mutation_finalizer::RuntimeMutationFinalizerProcessSupervisorV1<
-        pending_drain_finalizer::RuntimePendingDrainFinalizerPortV3<
-            execution::RuntimeProductionPendingDrainFinalizerEnvironmentV3,
-        >,
+    certification_finalizer::RuntimeProcessMutationFinalizerProcessSupervisorV3<
+        execution::RuntimeProductionPendingDrainFinalizerEnvironmentV3,
     >;
 
 pub(super) type RuntimeProcessIngressAcknowledgementJobV2 =
@@ -325,6 +385,10 @@ pub(super) type RuntimeProcessIngressAcknowledgementSupervisorV2 =
 pub(crate) struct RuntimeProcessFoundationV1 {
     gateway: RuntimeGatewayBootstrapV1,
     registry: RuntimeRegistryBootstrapV1,
+    interaction_dispatch_port: RuntimeInteractionDispatchDatabasePortV1,
+    effect_recovery_supervisor: Option<RuntimeInteractionEffectRecoverySupervisorV1>,
+    receipt_recovery_supervisor: Option<RuntimeInteractionReceiptRecoverySupervisorV1>,
+    teardown_retry_supervisor: Option<RuntimeInteractionTeardownRetrySupervisorV1>,
     databases: RuntimeDatabaseDependenciesV1,
     secrets: ResolvedRuntimeSecretsV1,
     config: RuntimeConfigV1,
@@ -386,6 +450,73 @@ impl RuntimeProcessFoundationV1 {
         &self,
     ) -> crate::process_supervisor::RuntimeProcessInvalidationTriggerV1 {
         self.root_supervisor.invalidation_trigger()
+    }
+
+    pub(super) fn product_readiness_observer_v1(&self) -> RuntimeHealthReadinessObserverV1 {
+        self.root_supervisor.readiness_observer_v1()
+    }
+
+    pub(super) fn interaction_dispatch_port_v1(&self) -> RuntimeInteractionDispatchDatabasePortV1 {
+        self.interaction_dispatch_port.clone()
+    }
+
+    pub(super) fn interaction_dispatch_status_publisher_v1(
+        &self,
+    ) -> RuntimeHealthInteractionDispatchPublisherV1 {
+        self.root_supervisor.interaction_dispatch_publisher_v1()
+    }
+
+    pub(super) fn start_teardown_retry_supervisor_v1(&mut self) {
+        assert!(
+            self.teardown_retry_supervisor.is_none(),
+            "runtime teardown retry supervisor already active"
+        );
+        self.teardown_retry_supervisor = Some(
+            self.interaction_dispatch_port
+                .start_teardown_retry_supervisor_v1(),
+        );
+    }
+
+    pub(super) fn start_receipt_recovery_supervisor_v1(&mut self) {
+        assert!(
+            self.receipt_recovery_supervisor.is_none(),
+            "runtime interaction receipt recovery supervisor already active"
+        );
+        self.receipt_recovery_supervisor = Some(
+            self.interaction_dispatch_port
+                .start_receipt_recovery_supervisor_v1(),
+        );
+    }
+
+    pub(super) fn start_effect_recovery_supervisor_v1(&mut self) {
+        assert!(
+            self.effect_recovery_supervisor.is_none(),
+            "runtime interaction effect recovery supervisor already active"
+        );
+        self.effect_recovery_supervisor = Some(
+            self.interaction_dispatch_port
+                .start_effect_recovery_supervisor_v1(),
+        );
+    }
+
+    pub(super) fn effect_recovery_supervisor_health_v1(
+        &self,
+    ) -> Option<RuntimeInteractionEffectRecoverySupervisorHealthV1> {
+        self.effect_recovery_supervisor
+            .as_ref()
+            .map(RuntimeInteractionEffectRecoverySupervisorV1::health_v1)
+    }
+
+    pub(super) async fn stop_effect_recovery_supervisor_until_v1(
+        &mut self,
+        deadline: std::time::Instant,
+    ) {
+        if let Some(effect_recovery) = self.effect_recovery_supervisor.take() {
+            let report = effect_recovery.shutdown_until(deadline).await;
+            if let Some(failure) = effect_recovery_shutdown_failure_v1(report.exit()) {
+                self.shutdown_failures.record(failure);
+            }
+        }
     }
 
     pub(super) fn trip_shutdown_v1(
@@ -549,6 +680,28 @@ impl RuntimeProcessFoundationV1 {
             .map(|process| process.process_intake_health())
     }
 
+    #[allow(dead_code)]
+    pub(super) fn certification_finalizer_port_v2(
+        &self,
+    ) -> Option<RuntimeProcessCertificationFinalizerPortV2<'_>> {
+        self.process_mutation_finalizer
+            .as_ref()
+            .map(RuntimeProcessCertificationFinalizerPortV2::new)
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn next_process_mutation_finalizer_completion_v3(
+        &mut self,
+    ) -> Option<RuntimeProductionMutationFinalizerCompletionV3> {
+        match self.process_mutation_finalizer.as_mut() {
+            Some(process) => process
+                .next_completion()
+                .await
+                .map(RuntimeProductionMutationFinalizerCompletionV3::new),
+            None => None,
+        }
+    }
+
     pub(super) async fn begin_shutdown_v1(
         &mut self,
         cause: RuntimeShutdownCauseV1,
@@ -559,6 +712,22 @@ impl RuntimeProcessFoundationV1 {
             .expect("runtime lifecycle terminal reporter");
         let observation = self.trip_shutdown_v1(cause);
         let deadline = self.effective_shutdown_deadline_v1(observation);
+        self.stop_effect_recovery_supervisor_until_v1(deadline)
+            .await;
+        if let Some(receipt_recovery) = self.receipt_recovery_supervisor.take() {
+            let report = receipt_recovery.shutdown_until(deadline).await;
+            if report.exit() != RuntimeInteractionReceiptRecoverySupervisorExitV1::Commanded {
+                self.shutdown_failures
+                    .record(RuntimeProcessFoundationShutdownFailureV1::InteractionReceiptRecovery);
+            }
+        }
+        if let Some(teardown_retry) = self.teardown_retry_supervisor.take() {
+            let report = teardown_retry.shutdown_until(deadline).await;
+            if report.exit() != RuntimeInteractionTeardownRetrySupervisorExitV1::Commanded {
+                self.shutdown_failures
+                    .record(RuntimeProcessFoundationShutdownFailureV1::TeardownRetry);
+            }
+        }
         let finalizer_present =
             self.mutation_finalizer.is_some() || self.process_mutation_finalizer.is_some();
         let finalizer_timing = finalizer_present.then(|| {
@@ -648,6 +817,31 @@ impl RuntimeProcessFoundationV1 {
         }
     }
 
+    pub(super) fn observe_shutdown_serving_registry_v2(
+        &mut self,
+        observation: Result<
+            RuntimeRouteSetObservationV2,
+            RuntimeRegistryRecoveryObservationErrorV1,
+        >,
+    ) {
+        let timing = self
+            .lifecycle_timing
+            .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownRegistryObservation);
+        match accept_shutdown_serving_registry_observation_v2(observation) {
+            Ok(()) => timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::Completed),
+            Err(error) => {
+                self.shutdown_failures
+                    .record(RuntimeProcessFoundationShutdownFailureV1::Registry(error));
+                timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::FailedClosed);
+            }
+        }
+    }
+
+    pub(super) fn observe_shutdown_serving_registry_without_lifecycle_v2(&mut self) {
+        let observation = self.registry.observe_shutdown_route_set_v2();
+        self.observe_shutdown_serving_registry_v2(observation);
+    }
+
     pub(super) fn record_finalizer_shutdown_exit_v1(&mut self, exit: RuntimeSupervisorExitV1) {
         if exit != RuntimeSupervisorExitV1::Commanded {
             self.shutdown_failures
@@ -664,6 +858,11 @@ impl RuntimeProcessFoundationV1 {
             self.shutdown_failures
                 .record(RuntimeProcessFoundationShutdownFailureV1::IngressAcknowledgement);
         }
+    }
+
+    pub(super) fn record_runtime_controller_shutdown_failure_v2(&mut self) {
+        self.shutdown_failures
+            .record(RuntimeProcessFoundationShutdownFailureV1::RuntimeController);
     }
 
     pub(crate) async fn shutdown(mut self) -> Result<(), RuntimeProcessFoundationShutdownErrorV1> {
@@ -687,6 +886,10 @@ impl RuntimeProcessFoundationV1 {
         let Self {
             gateway,
             registry,
+            interaction_dispatch_port,
+            effect_recovery_supervisor,
+            receipt_recovery_supervisor,
+            teardown_retry_supervisor,
             databases,
             secrets,
             config,
@@ -706,6 +909,25 @@ impl RuntimeProcessFoundationV1 {
             mut root_supervisor,
             mut shutdown_failures,
         } = self;
+        if let Some(effect_recovery) = effect_recovery_supervisor {
+            let report = effect_recovery.shutdown_until(cleanup_deadline).await;
+            if let Some(failure) = effect_recovery_shutdown_failure_v1(report.exit()) {
+                shutdown_failures.record(failure);
+            }
+        }
+        if let Some(receipt_recovery) = receipt_recovery_supervisor {
+            let report = receipt_recovery.shutdown_until(cleanup_deadline).await;
+            if report.exit() != RuntimeInteractionReceiptRecoverySupervisorExitV1::Commanded {
+                shutdown_failures
+                    .record(RuntimeProcessFoundationShutdownFailureV1::InteractionReceiptRecovery);
+            }
+        }
+        if let Some(teardown_retry) = teardown_retry_supervisor {
+            let report = teardown_retry.shutdown_until(cleanup_deadline).await;
+            if report.exit() != RuntimeInteractionTeardownRetrySupervisorExitV1::Commanded {
+                shutdown_failures.record(RuntimeProcessFoundationShutdownFailureV1::TeardownRetry);
+            }
+        }
         let finalizer_present =
             mutation_finalizer.is_some() || process_mutation_finalizer.is_some();
         let finalizer_timing = finalizer_present.then(|| {
@@ -800,7 +1022,7 @@ impl RuntimeProcessFoundationV1 {
         let database_timing = lifecycle_timing
             .start_span_v2(RuntimeLifecycleTimingMetricV2::ShutdownDatabasePoolsClose);
         let shutdown = databases.shutdown();
-        drop((gateway, registry, databases));
+        drop((gateway, registry, interaction_dispatch_port, databases));
         match shutdown.close_until(cleanup_deadline).await {
             Ok(()) => database_timing.finish_v2(RuntimeLifecycleTimingOutcomeV2::Completed),
             Err(error) => {
@@ -871,6 +1093,23 @@ fn merge_lifecycle_timing_outcome_v2(
             RuntimeLifecycleTimingOutcomeV2::FailedClosed
         }
         (_, next) => next,
+    }
+}
+
+fn effect_recovery_shutdown_failure_v1(
+    exit: RuntimeInteractionEffectRecoverySupervisorExitV1,
+) -> Option<RuntimeProcessFoundationShutdownFailureV1> {
+    match exit {
+        RuntimeInteractionEffectRecoverySupervisorExitV1::Commanded => None,
+        RuntimeInteractionEffectRecoverySupervisorExitV1::ControlClosed => {
+            Some(RuntimeProcessFoundationShutdownFailureV1::InteractionEffectRecoveryControlClosed)
+        }
+        RuntimeInteractionEffectRecoverySupervisorExitV1::Panicked => {
+            Some(RuntimeProcessFoundationShutdownFailureV1::InteractionEffectRecoveryPanicked)
+        }
+        RuntimeInteractionEffectRecoverySupervisorExitV1::DeadlineElapsed => Some(
+            RuntimeProcessFoundationShutdownFailureV1::InteractionEffectRecoveryDeadlineElapsed,
+        ),
     }
 }
 
@@ -957,6 +1196,7 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
     }
     let process_instance_id = process_instance_id
         .map_err(RuntimeProcessFoundationCompositionErrorV1::ProcessInstanceId)?;
+    let os_pid = std::process::id();
     let controller_id = generate_runtime_controller_id_v1();
     if !startup_budget.operation_is_open() {
         return Err(RuntimeProcessFoundationCompositionErrorV1::OperationDeadlineElapsed);
@@ -1001,17 +1241,56 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
         drop(closed_components);
         return Err(cleanup_after_operation_deadline_v1(databases, &startup_budget).await);
     }
+    let interaction_dispatch_port = databases
+        .compose_interaction_dispatch_port_v1(RuntimeInteractionDispatchCompositionInputV1 {
+            registry: closed_components
+                .registry
+                .interaction_dispatch_registry_v1(),
+            token: secrets.discord_bot_token(),
+            token_envelope_keyring: secrets.interaction_token_envelope_keyring(),
+            build_revision: build_revision.as_str(),
+            process_instance_id: &process_instance_id,
+            gateway: config.gateway(),
+            operation_deadline: startup_budget.operation_cutoff(),
+        })
+        .await;
+    let interaction_dispatch_port = match interaction_dispatch_port {
+        Ok(port) => port,
+        Err(composition) => {
+            drop(closed_components);
+            let shutdown = databases.shutdown();
+            drop(databases);
+            return match shutdown
+                .close_until(startup_budget.cleanup_deadline())
+                .await
+            {
+                Ok(()) => Err(
+                    RuntimeProcessFoundationCompositionErrorV1::InteractionDispatch(composition),
+                ),
+                Err(cleanup) => Err(
+                    RuntimeProcessFoundationCompositionErrorV1::CleanupAfterInteractionDispatch {
+                        composition,
+                        cleanup,
+                    },
+                ),
+            };
+        }
+    };
+    if !startup_budget.operation_is_open() {
+        drop((closed_components, interaction_dispatch_port));
+        return Err(cleanup_after_operation_deadline_v1(databases, &startup_budget).await);
+    }
     let finalizer_generation =
         RuntimeMutationFinalizerGenerationV1::new(NonZeroU64::MIN).expect("finalizer generation");
     let mutation_finalizer =
-        match pending_drain_finalizer::RuntimePendingDrainFinalizerSupervisorV3::start(
+        match certification_finalizer::RuntimeProcessMutationFinalizerSupervisorV3::start(
             pending_drain_finalizer::production_finalizer_config_v3(),
             finalizer_generation,
-            pending_drain_finalizer::RuntimePendingDrainFinalizerPortV3::new(),
+            certification_finalizer::RuntimeProcessMutationFinalizerPortV3::new(),
         ) {
             Ok(finalizer) => finalizer,
             Err(composition) => {
-                drop(closed_components);
+                drop((closed_components, interaction_dispatch_port));
                 let shutdown = databases.shutdown();
                 drop(databases);
                 return match shutdown
@@ -1039,6 +1318,8 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
     );
     let root_supervisor = match RuntimeProcessRootSupervisorV1::start(
         config.health_bind_addr(),
+        os_pid,
+        process_instance_id.as_str(),
         mutation_finalizer.seal_handle(),
         mutation_finalizer.terminal_observer(),
         closed_components.gateway.shutdown_handle_v1(),
@@ -1061,7 +1342,7 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
                 .shutdown_until(startup_budget.cleanup_deadline())
                 .await;
             drop(finalizer_report);
-            drop(closed_components);
+            drop((closed_components, interaction_dispatch_port));
             let shutdown = databases.shutdown();
             drop(databases);
             let cleanup = shutdown
@@ -1084,6 +1365,10 @@ pub(crate) async fn compose_runtime_process_foundation_v1(
     Ok(RuntimeProcessFoundationV1 {
         gateway: closed_components.gateway,
         registry: closed_components.registry,
+        interaction_dispatch_port,
+        effect_recovery_supervisor: None,
+        receipt_recovery_supervisor: None,
+        teardown_retry_supervisor: None,
         databases,
         secrets,
         config,
@@ -1116,6 +1401,12 @@ fn map_root_supervisor_composition_error_v1(
             RuntimeProcessFoundationCompositionErrorV1::HealthListener
         }
     }
+}
+
+fn accept_shutdown_serving_registry_observation_v2(
+    observation: Result<RuntimeRouteSetObservationV2, RuntimeRegistryRecoveryObservationErrorV1>,
+) -> Result<(), RuntimeRegistryRecoveryObservationErrorV1> {
+    observation.map(drop)
 }
 
 async fn cleanup_after_operation_deadline_v1(
@@ -1192,7 +1483,9 @@ mod tests {
     use std::rc::Rc;
 
     use automation_runtime_worker::{
-        RuntimeGatewayClosedSnapshotV2, RuntimeGatewayEmergencyCauseV2,
+        accept_runtime_route_set_observation_v2, RuntimeGatewayClosedSnapshotV2,
+        RuntimeGatewayEmergencyCauseV2, RuntimeRegistryGlobalObservationSequenceV2,
+        RuntimeRegistryRecoveryObservationInputV2, RuntimeRouteSetObservationInputV2,
     };
 
     use super::*;
@@ -1275,6 +1568,79 @@ mod tests {
     }
 
     #[test]
+    fn serving_shutdown_accepts_nonempty_route_sets_and_preserves_registry_errors() {
+        let observation =
+            accept_runtime_route_set_observation_v2(RuntimeRouteSetObservationInputV2 {
+                process_instance_id: process_instance_id(),
+                registry: RuntimeRegistryRecoveryObservationInputV2 {
+                    observation_sequence: RuntimeRegistryGlobalObservationSequenceV2::new(
+                        NonZeroU64::MIN,
+                    ),
+                    retained_slot_count: 1,
+                    retained_empty_tombstone_count: 0,
+                    staged_route_count: 0,
+                    serving_route_count: 1,
+                    draining_route_count: 0,
+                    sealed_slot_count: 0,
+                    active_interaction_count: 1,
+                    failed_closed_slot_count: 0,
+                    registry_failed_closed: false,
+                },
+            })
+            .unwrap();
+
+        assert!(!observation.is_empty());
+        assert_eq!(
+            accept_shutdown_serving_registry_observation_v2(Ok(observation)),
+            Ok(())
+        );
+        assert_eq!(
+            accept_shutdown_serving_registry_observation_v2(Err(
+                RuntimeRegistryRecoveryObservationErrorV1::RegistryUnavailable,
+            )),
+            Err(RuntimeRegistryRecoveryObservationErrorV1::RegistryUnavailable)
+        );
+    }
+
+    #[test]
+    fn effect_recovery_shutdown_exits_are_typed_and_redacted() {
+        assert_eq!(
+            effect_recovery_shutdown_failure_v1(
+                RuntimeInteractionEffectRecoverySupervisorExitV1::Commanded,
+            ),
+            None
+        );
+        let cases = [
+            (
+                RuntimeInteractionEffectRecoverySupervisorExitV1::ControlClosed,
+                RuntimeProcessFoundationShutdownFailureV1::InteractionEffectRecoveryControlClosed,
+                "runtime_process_interaction_effect_recovery_supervisor_control_closed",
+            ),
+            (
+                RuntimeInteractionEffectRecoverySupervisorExitV1::Panicked,
+                RuntimeProcessFoundationShutdownFailureV1::InteractionEffectRecoveryPanicked,
+                "runtime_process_interaction_effect_recovery_supervisor_panicked",
+            ),
+            (
+                RuntimeInteractionEffectRecoverySupervisorExitV1::DeadlineElapsed,
+                RuntimeProcessFoundationShutdownFailureV1::InteractionEffectRecoveryDeadlineElapsed,
+                "runtime_process_interaction_effect_recovery_supervisor_shutdown_deadline_elapsed",
+            ),
+        ];
+        for (exit, failure, code) in cases {
+            assert_eq!(effect_recovery_shutdown_failure_v1(exit), Some(failure));
+            let error = RuntimeProcessFoundationShutdownErrorV1::single(failure);
+            assert_eq!(error.code(), code);
+            assert_eq!(error.primary(), failure);
+            assert_eq!(error.database_only(), None);
+            assert_eq!(
+                format!("{error:?}"),
+                "RuntimeProcessFoundationShutdownErrorV1(<redacted>)"
+            );
+        }
+    }
+
+    #[test]
     fn public_errors_keep_stable_finite_codes_and_redacted_debug() {
         let database = RuntimeProcessFoundationCompositionErrorV1::Database(
             RuntimeDatabaseCompositionErrorV1::Unavailable {
@@ -1297,6 +1663,9 @@ mod tests {
         );
         let controller_id = RuntimeProcessFoundationCompositionErrorV1::ControllerId(
             RuntimeControllerIdGenerationErrorV1::EntropyUnavailable,
+        );
+        let interaction_dispatch = RuntimeProcessFoundationCompositionErrorV1::InteractionDispatch(
+            RuntimeInteractionDispatchCompositionErrorV1::SnapshotUnavailable,
         );
 
         assert_eq!(
@@ -1326,6 +1695,11 @@ mod tests {
             "runtime_database_startup_cleanup_timed_out"
         );
         assert_eq!(database_cleanup.context(), None);
+        assert_eq!(
+            interaction_dispatch.code(),
+            "runtime_interaction_dispatch_snapshot_unavailable"
+        );
+        assert_eq!(interaction_dispatch.context(), None);
         let deadline = RuntimeProcessFoundationCompositionErrorV1::OperationDeadlineElapsed;
         let deadline_cleanup =
             RuntimeProcessFoundationCompositionErrorV1::CleanupAfterOperationDeadline {

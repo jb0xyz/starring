@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use automation_runtime_execution_postgres::RuntimeExecutionPersistenceErrorV1;
+use automation_runtime_serving_postgres::RuntimeServingPersistenceErrorV1;
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
 use crate::RuntimeClosedRecoveryProcessCleanupFailureV2;
@@ -45,6 +46,7 @@ pub enum RuntimeProcessStartupRecoveryLoopFailureV2 {
     SuspendedLocalEffectRetryAfterUnsupported,
     PendingRuntimeDrainRecoveryUnavailable,
     PendingRuntimeDrainExecution(RuntimeExecutionPersistenceErrorV1),
+    PendingRuntimeDrainServing(RuntimeServingPersistenceErrorV1),
     PendingRuntimeDrainExecutionRejected(RuntimeProcessClosedRecoveryCommitFailureV2),
     PendingRuntimeDrainCompound,
     ProtocolViolation,
@@ -90,6 +92,7 @@ impl RuntimeProcessStartupRecoveryLoopFailureV2 {
                 "runtime_process_startup_recovery_loop_pending_runtime_drain_recovery_unavailable"
             }
             Self::PendingRuntimeDrainExecution(error) => runtime_execution_error_code_v2(error),
+            Self::PendingRuntimeDrainServing(error) => runtime_serving_error_code_v1(error),
             Self::PendingRuntimeDrainExecutionRejected(error) => error.code(),
             Self::PendingRuntimeDrainCompound => {
                 "runtime_process_startup_recovery_loop_pending_runtime_drain_compound"
@@ -119,10 +122,32 @@ impl RuntimeProcessStartupRecoveryLoopFailureV2 {
             | Self::SuspendedLocalEffectRetryAfterUnsupported
             | Self::PendingRuntimeDrainRecoveryUnavailable
             | Self::PendingRuntimeDrainExecution(_)
+            | Self::PendingRuntimeDrainServing(_)
             | Self::PendingRuntimeDrainExecutionRejected(_)
             | Self::PendingRuntimeDrainCompound
             | Self::ProtocolViolation => None,
         }
+    }
+}
+
+const fn runtime_serving_error_code_v1(error: RuntimeServingPersistenceErrorV1) -> &'static str {
+    match error {
+        RuntimeServingPersistenceErrorV1::InvalidInput => "runtime_serving_invalid_input",
+        RuntimeServingPersistenceErrorV1::DatabaseAuthorityMismatch => {
+            "runtime_serving_database_authority_mismatch"
+        }
+        RuntimeServingPersistenceErrorV1::OwnershipLost => "runtime_serving_ownership_lost",
+        RuntimeServingPersistenceErrorV1::AuthorityChanged => "runtime_serving_authority_changed",
+        RuntimeServingPersistenceErrorV1::PersistenceCorrupt => {
+            "runtime_serving_persistence_corrupt"
+        }
+        RuntimeServingPersistenceErrorV1::RetryNotReady => "runtime_serving_retry_not_ready",
+        RuntimeServingPersistenceErrorV1::Timeout => "runtime_serving_timeout",
+        RuntimeServingPersistenceErrorV1::Concurrency => "runtime_serving_concurrency",
+        RuntimeServingPersistenceErrorV1::Unavailable => "runtime_serving_unavailable",
+        RuntimeServingPersistenceErrorV1::DatabaseFailure => "runtime_serving_database_failure",
+        RuntimeServingPersistenceErrorV1::Indeterminate => "runtime_serving_indeterminate",
+        _ => "runtime_serving_unknown",
     }
 }
 

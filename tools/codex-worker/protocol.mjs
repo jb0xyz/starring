@@ -3,7 +3,7 @@ export const PROVIDER = "codex_chatgpt";
 export const MODEL = "gpt-5.6-luna";
 export const REASONING_EFFORT = "medium";
 export const AUTH_MODE = "chatgpt";
-export const CODEX_CLI_VERSION = "codex-cli 0.144.2";
+export const CODEX_CLI_VERSION = "codex-cli 0.146.0-alpha.3.1";
 
 const REQUEST_KEYS = [
   "schema_version",

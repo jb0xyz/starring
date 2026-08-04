@@ -96,6 +96,35 @@ pub fn compile_intent(intent: &ValidatedIntentV2) -> Result<CompiledIntentV2, St
     finalize_compilation(intent, expansion)
 }
 
+pub(crate) fn compiled_intents_behaviorally_equivalent(
+    left: &CompiledIntentV2,
+    right: &CompiledIntentV2,
+) -> bool {
+    let mut normalized = left.clone();
+    normalized.manifest.compiler_input_hash = right.manifest.compiler_input_hash.clone();
+    normalized.manifest.semantic_intent_hash = right.manifest.semantic_intent_hash.clone();
+    normalized == *right
+}
+
+pub(crate) fn verify_outcome_only_finalization(
+    working: &CompiledIntentV2,
+    standalone: &CompiledIntentV2,
+    finalized: &CompiledIntentV2,
+) -> Result<(), StructuredError> {
+    if compiled_intents_behaviorally_equivalent(working, standalone)
+        && compiled_intents_behaviorally_equivalent(working, finalized)
+        && standalone.manifest.semantic_intent_hash == finalized.manifest.semantic_intent_hash
+    {
+        return Ok(());
+    }
+    Err(compile_error(
+        "INTENT_OUTCOME_FINALIZATION_BEHAVIOR_CHANGED",
+        "intent.compiler",
+        "The finalization request changes semantic, executable, or compiler-owned behavior",
+        "Commit behavior changes as a working Draft before requesting validated_preview",
+    ))
+}
+
 fn finalize_compilation(
     intent: &ValidatedIntentV2,
     expansion: RecipeExpansion,

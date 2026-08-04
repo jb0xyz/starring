@@ -167,6 +167,58 @@ pub(crate) fn apply_existing_channel_decision(
     prepare_intent_workspace(updated, context)
 }
 
+pub(crate) fn upgrade_working_draft_to_validated_preview(
+    workspace: &IntentWorkspaceV2,
+    expected_revision: u64,
+    context: &IntentResolutionContext,
+) -> Result<PreparedIntentWorkspaceV2, StructuredError> {
+    if workspace.revision != expected_revision {
+        return Err(StructuredError::new(
+            "STALE_INTENT_WORKSPACE_REVISION",
+            "intent.revision",
+            format!(
+                "Intent workspace revision {} does not match expected revision {expected_revision}",
+                workspace.revision
+            ),
+            format!("Retry with current revision {}", workspace.revision),
+        ));
+    }
+    if workspace.requested_outcome != IntentRequestedOutcome::WorkingDraft {
+        return Err(StructuredError::new(
+            "INTENT_OUTCOME_UPGRADE_NOT_ALLOWED",
+            "intent.requested_outcome",
+            "Only a working_draft workspace can be upgraded to validated_preview",
+            "Start from the exact committed working_draft workspace",
+        ));
+    }
+    let next_revision = workspace.revision.checked_add(1).ok_or_else(|| {
+        StructuredError::new(
+            "INTENT_WORKSPACE_REVISION_OVERFLOW",
+            "intent.revision",
+            "Intent workspace revision cannot be incremented",
+            "Start a new intent workspace",
+        )
+    })?;
+    let original_features = workspace.features.clone();
+    let mut upgraded = workspace.clone();
+    upgraded.revision = next_revision;
+    upgraded.requested_outcome = IntentRequestedOutcome::ValidatedPreview;
+    let prepared = prepare_intent_workspace(upgraded, context)?;
+    let prepared_workspace = match &prepared {
+        PreparedIntentWorkspaceV2::NeedsInput { workspace, .. }
+        | PreparedIntentWorkspaceV2::Resolved { workspace, .. } => workspace,
+    };
+    if prepared_workspace.features != original_features {
+        return Err(StructuredError::new(
+            "INTENT_OUTCOME_UPGRADE_FEATURE_MISMATCH",
+            "intent.features",
+            "Outcome upgrade changed the normalized feature workspace",
+            "Upgrade only an already normalized committed working_draft workspace",
+        ));
+    }
+    Ok(prepared)
+}
+
 fn workspace_from_proposal(proposal: PrivateStudyRoomProposalV2) -> IntentWorkspaceV2 {
     IntentWorkspaceV2 {
         schema_version: INTENT_SCHEMA_VERSION,

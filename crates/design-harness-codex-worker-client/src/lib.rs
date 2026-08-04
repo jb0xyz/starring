@@ -8,23 +8,77 @@ use std::time::{Duration, Instant};
 use design_harness::{LlmClient, LlmError, LlmResponse, Message, ToolCall, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-use crate::client::{ModelCallMetric, ModelCallOutcome};
-use crate::config::{SERVING_AUTH_MODE, SERVING_MODEL, SERVING_PROVIDER, SERVING_REASONING_EFFORT};
+use zeroize::Zeroizing;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_RETAINED_MODEL_CALL_METRICS: usize = 4096;
-const SERVING_CODEX_CLI_VERSION: &str = "codex-cli 0.144.2";
+const SERVING_CODEX_CLI_VERSION: &str = "codex-cli 0.146.0-alpha.3.1";
 const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+pub const SERVING_AUTH_MODE: &str = "chatgpt";
+pub const SERVING_MODEL: &str = "gpt-5.6-luna";
+pub const SERVING_PROVIDER: &str = "codex_chatgpt";
+pub const SERVING_REASONING_EFFORT: &str = "medium";
+pub const CODEX_WORKER_REQUEST_TIMEOUT_V1: Duration = REQUEST_TIMEOUT;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CodexWorkerPreflightV1 {
+    concurrency_limit: usize,
+    queue_capacity: usize,
+    request_timeout: Duration,
+}
+
+impl CodexWorkerPreflightV1 {
+    pub fn concurrency_limit(self) -> usize {
+        self.concurrency_limit
+    }
+
+    pub fn queue_capacity(self) -> usize {
+        self.queue_capacity
+    }
+
+    pub fn request_timeout(self) -> Duration {
+        self.request_timeout
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexWorkerCallOutcome {
+    Succeeded,
+    TransportError,
+    HttpError,
+    ResponseBodyError,
+    MalformedJson,
+    InvalidResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CodexWorkerCallMetric {
+    pub call_sequence: u64,
+    pub attempt: usize,
+    pub frontier_name: String,
+    pub outcome: CodexWorkerCallOutcome,
+    pub http_status: Option<u16>,
+    pub served_model: Option<String>,
+    pub request_body_bytes: usize,
+    pub message_bytes: usize,
+    pub tool_bytes: usize,
+    pub duplicated_schema_bytes: usize,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub finish_reason: Option<String>,
+    pub request_duration_ms: u64,
+    pub gateway_model_duration_ms: Option<u64>,
+}
 
 #[derive(Clone)]
 pub struct CodexWorkerClient {
     http: reqwest::Client,
     completion_endpoint: String,
     health_endpoint: String,
-    token: String,
+    token: Arc<Zeroizing<String>>,
     call_sequence: Arc<AtomicU64>,
-    metrics: Arc<Mutex<VecDeque<ModelCallMetric>>>,
+    metrics: Arc<Mutex<VecDeque<CodexWorkerCallMetric>>>,
 }
 
 #[derive(Serialize)]
@@ -98,7 +152,7 @@ struct MetricInput {
 }
 
 struct MetricObservation {
-    outcome: ModelCallOutcome,
+    outcome: CodexWorkerCallOutcome,
     http_status: Option<u16>,
     served_model: Option<String>,
     prompt_tokens: Option<u64>,
@@ -126,7 +180,7 @@ fn request_metric_input(
 }
 
 impl MetricObservation {
-    fn failed(outcome: ModelCallOutcome, http_status: Option<u16>) -> Self {
+    fn failed(outcome: CodexWorkerCallOutcome, http_status: Option<u16>) -> Self {
         Self {
             outcome,
             http_status,
@@ -141,6 +195,10 @@ impl MetricObservation {
 
 impl CodexWorkerClient {
     pub fn new(base_url: String, token: String) -> Result<Self, LlmError> {
+        Self::new_zeroizing(base_url, Zeroizing::new(token))
+    }
+
+    pub fn new_zeroizing(base_url: String, token: Zeroizing<String>) -> Result<Self, LlmError> {
         if token.trim().is_empty() {
             return Err(LlmError::Client(
                 "codex worker token must not be empty".to_string(),
@@ -170,17 +228,21 @@ impl CodexWorkerClient {
             http,
             completion_endpoint: format!("{base_url}/v1/frontier-completions"),
             health_endpoint: format!("{base_url}/health"),
-            token,
+            token: Arc::new(token),
             call_sequence: Arc::new(AtomicU64::new(0)),
             metrics: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
     pub async fn preflight(&self) -> Result<(), LlmError> {
+        self.preflight_contract().await.map(drop)
+    }
+
+    pub async fn preflight_contract(&self) -> Result<CodexWorkerPreflightV1, LlmError> {
         let response = self
             .http
             .get(&self.health_endpoint)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .send()
             .await
             .map_err(|_| LlmError::Client("codex worker preflight failed".to_string()))?;
@@ -194,10 +256,15 @@ impl CodexWorkerClient {
             .json::<WorkerHealth>()
             .await
             .map_err(|_| LlmError::Client("codex worker health is invalid".to_string()))?;
-        validate_health(&health)
+        validate_health(&health)?;
+        Ok(CodexWorkerPreflightV1 {
+            concurrency_limit: health.concurrency_limit,
+            queue_capacity: health.queue_capacity,
+            request_timeout: Duration::from_millis(health.request_timeout_ms),
+        })
     }
 
-    pub fn model_call_metrics(&self) -> Result<Vec<ModelCallMetric>, LlmError> {
+    pub fn model_call_metrics(&self) -> Result<Vec<CodexWorkerCallMetric>, LlmError> {
         self.metrics
             .lock()
             .map(|metrics| metrics.iter().cloned().collect())
@@ -218,7 +285,7 @@ impl CodexWorkerClient {
         if metrics.len() == MAX_RETAINED_MODEL_CALL_METRICS {
             metrics.pop_front();
         }
-        metrics.push_back(ModelCallMetric {
+        metrics.push_back(CodexWorkerCallMetric {
             call_sequence,
             attempt: 1,
             frontier_name: input.frontier_name.clone(),
@@ -268,7 +335,7 @@ impl LlmClient for CodexWorkerClient {
         let response = self
             .http
             .post(&self.completion_endpoint)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.as_str())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
             .send()
@@ -279,7 +346,7 @@ impl LlmClient for CodexWorkerClient {
                 self.record_metric(
                     &metric_input,
                     call_sequence,
-                    MetricObservation::failed(ModelCallOutcome::TransportError, None),
+                    MetricObservation::failed(CodexWorkerCallOutcome::TransportError, None),
                     started.elapsed(),
                 )?;
                 return Err(LlmError::Client("codex worker request failed".to_string()));
@@ -290,7 +357,7 @@ impl LlmClient for CodexWorkerClient {
             self.record_metric(
                 &metric_input,
                 call_sequence,
-                MetricObservation::failed(ModelCallOutcome::HttpError, Some(status.as_u16())),
+                MetricObservation::failed(CodexWorkerCallOutcome::HttpError, Some(status.as_u16())),
                 started.elapsed(),
             )?;
             return Err(LlmError::Client(format!(
@@ -305,7 +372,7 @@ impl LlmClient for CodexWorkerClient {
                     &metric_input,
                     call_sequence,
                     MetricObservation::failed(
-                        ModelCallOutcome::ResponseBodyError,
+                        CodexWorkerCallOutcome::ResponseBodyError,
                         Some(status.as_u16()),
                     ),
                     started.elapsed(),
@@ -322,7 +389,7 @@ impl LlmClient for CodexWorkerClient {
                     &metric_input,
                     call_sequence,
                     MetricObservation::failed(
-                        ModelCallOutcome::MalformedJson,
+                        CodexWorkerCallOutcome::MalformedJson,
                         Some(status.as_u16()),
                     ),
                     started.elapsed(),
@@ -339,7 +406,7 @@ impl LlmClient for CodexWorkerClient {
                     &metric_input,
                     call_sequence,
                     MetricObservation::failed(
-                        ModelCallOutcome::InvalidResponse,
+                        CodexWorkerCallOutcome::InvalidResponse,
                         Some(status.as_u16()),
                     ),
                     started.elapsed(),
@@ -352,7 +419,7 @@ impl LlmClient for CodexWorkerClient {
             &metric_input,
             call_sequence,
             MetricObservation {
-                outcome: ModelCallOutcome::Succeeded,
+                outcome: CodexWorkerCallOutcome::Succeeded,
                 http_status: Some(status.as_u16()),
                 served_model: Some(SERVING_MODEL.to_string()),
                 prompt_tokens: Some(response.usage.input_tokens),
@@ -449,22 +516,23 @@ fn validate_health(health: &WorkerHealth) -> Result<(), LlmError> {
 #[cfg(test)]
 mod tests {
     use design_harness::{LlmClient, Message, ToolDefinition};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::{
-        request_metric_input, validate_health, validate_response, CodexWorkerClient, WorkerHealth,
-        WorkerRequest, WorkerResponse, MAX_SAFE_JSON_INTEGER, SERVING_CODEX_CLI_VERSION,
+        request_metric_input, validate_health, validate_response, CodexWorkerCallOutcome,
+        CodexWorkerClient, WorkerHealth, WorkerRequest, WorkerResponse, MAX_SAFE_JSON_INTEGER,
+        SERVING_CODEX_CLI_VERSION,
     };
 
-    fn response() -> WorkerResponse {
-        serde_json::from_value(json!({
+    fn response_value() -> Value {
+        json!({
             "schema_version": 1,
             "request_id": "request-1",
             "provider": "codex_chatgpt",
             "model": "gpt-5.6-luna",
             "reasoning_effort": "medium",
             "auth_mode": "chatgpt",
-            "codex_cli_version": "codex-cli 0.144.2",
+            "codex_cli_version": "codex-cli 0.146.0-alpha.3.1",
             "tool_call": {
                 "id": "call-1",
                 "name": "interpret_intent_core",
@@ -477,8 +545,19 @@ mod tests {
                 "reasoning_output_tokens": 10
             },
             "duration_ms": 5000
-        }))
-        .unwrap()
+        })
+    }
+
+    fn response() -> WorkerResponse {
+        serde_json::from_value(response_value()).unwrap()
+    }
+
+    fn frontier(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: "frontier".to_string(),
+            parameters: json!({"type":"object"}),
+        }
     }
 
     #[test]
@@ -486,13 +565,41 @@ mod tests {
         let valid = validate_response(response(), "interpret_intent_core").unwrap();
         assert_eq!(valid.call.name, "interpret_intent_core");
 
+        let mut wrong_schema = response();
+        wrong_schema.schema_version = 2;
+        assert!(validate_response(wrong_schema, "interpret_intent_core").is_err());
+
+        let mut wrong_provider = response();
+        wrong_provider.provider = "other".to_string();
+        assert!(validate_response(wrong_provider, "interpret_intent_core").is_err());
+
+        let mut wrong_model = response();
+        wrong_model.model = "gpt-5.6-terra".to_string();
+        assert!(validate_response(wrong_model, "interpret_intent_core").is_err());
+
         let mut wrong = response();
         wrong.reasoning_effort = "low".to_string();
         assert!(validate_response(wrong, "interpret_intent_core").is_err());
 
+        let mut wrong_auth = response();
+        wrong_auth.auth_mode = "api_key".to_string();
+        assert!(validate_response(wrong_auth, "interpret_intent_core").is_err());
+
+        let mut missing_request = response();
+        missing_request.request_id = " ".to_string();
+        assert!(validate_response(missing_request, "interpret_intent_core").is_err());
+
         let mut wrong_version = response();
         wrong_version.codex_cli_version = "codex-cli 0.145.0".to_string();
         assert!(validate_response(wrong_version, "interpret_intent_core").is_err());
+
+        let mut missing_call = response();
+        missing_call.tool_call.id.clear();
+        assert!(validate_response(missing_call, "interpret_intent_core").is_err());
+
+        let mut wrong_frontier = response();
+        wrong_frontier.tool_call.name = "other".to_string();
+        assert!(validate_response(wrong_frontier, "interpret_intent_core").is_err());
     }
 
     #[test]
@@ -504,6 +611,34 @@ mod tests {
         let mut arguments = response();
         arguments.tool_call.arguments = "[]".to_string();
         assert!(validate_response(arguments, "interpret_intent_core").is_err());
+
+        let mut reasoning_usage = response();
+        reasoning_usage.usage.reasoning_output_tokens = 21;
+        assert!(validate_response(reasoning_usage, "interpret_intent_core").is_err());
+    }
+
+    #[test]
+    fn response_shape_rejects_unknown_fields_at_every_protocol_level() {
+        let mut response_field = response_value();
+        response_field
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), Value::Null);
+        assert!(serde_json::from_value::<WorkerResponse>(response_field).is_err());
+
+        let mut tool_field = response_value();
+        tool_field["tool_call"]
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), Value::Null);
+        assert!(serde_json::from_value::<WorkerResponse>(tool_field).is_err());
+
+        let mut usage_field = response_value();
+        usage_field["usage"]
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), Value::Null);
+        assert!(serde_json::from_value::<WorkerResponse>(usage_field).is_err());
     }
 
     #[test]
@@ -515,7 +650,7 @@ mod tests {
             "model": "gpt-5.6-luna",
             "reasoning_effort": "medium",
             "auth_mode": "chatgpt",
-            "codex_cli_version": "codex-cli 0.144.2",
+            "codex_cli_version": "codex-cli 0.146.0-alpha.3.1",
             "instance_id": "test-worker-instance",
             "worker_source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "concurrency_limit": 2,
@@ -581,19 +716,46 @@ mod tests {
 
     #[test]
     fn client_rejects_non_loopback_worker_urls() {
-        let result = CodexWorkerClient::new(
-            "https://llm-api.starring.co.kr".to_string(),
-            "test-token".to_string(),
+        for base_url in [
+            "https://127.0.0.1:18181",
+            "http://localhost:18181",
+            "http://[::1]:18181",
+            "http://user@127.0.0.1:18181",
+            "http://user:password@127.0.0.1:18181",
+            "http://127.0.0.1:18181/path",
+            "http://127.0.0.1:18181?query=value",
+            "http://127.0.0.1:18181#fragment",
+        ] {
+            assert!(
+                CodexWorkerClient::new(base_url.to_string(), "test-token".to_string()).is_err(),
+                "{base_url}"
+            );
+        }
+        assert!(
+            CodexWorkerClient::new("http://127.0.0.1:18181".to_string(), " ".to_string()).is_err()
         );
-        assert!(result.is_err());
     }
 
     #[test]
     fn client_transport_disables_proxy_autodiscovery() {
-        let source = include_str!("codex_worker.rs");
+        let source = include_str!("lib.rs");
         assert!(source.contains(
             "reqwest::Client::builder()\n            .no_proxy()\n            .timeout(REQUEST_TIMEOUT)"
         ));
+    }
+
+    #[test]
+    fn client_has_no_debug_or_serialization_surface() {
+        let source = include_str!("lib.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let prefix = production
+            .split("pub struct CodexWorkerClient")
+            .next()
+            .unwrap();
+        let attributes = prefix.rsplit("\n\n").next().unwrap().trim();
+        assert_eq!(attributes, "#[derive(Clone)]");
+        assert!(!production.contains("impl Debug for CodexWorkerClient"));
+        assert!(!production.contains("impl Serialize for CodexWorkerClient"));
     }
 
     #[test]
@@ -630,5 +792,25 @@ mod tests {
         );
         assert_eq!(metric.duplicated_schema_bytes, 0);
         assert!(metric.request_body_bytes > metric.message_bytes + metric.tool_bytes);
+    }
+
+    #[tokio::test]
+    async fn worker_token_is_absent_from_errors_and_metrics() {
+        let token = "worker-token-redaction-marker";
+        let client =
+            CodexWorkerClient::new("http://127.0.0.1:1".to_string(), token.to_string()).unwrap();
+        let error = client
+            .complete(&[Message::user("private input")], &[frontier("only")])
+            .await
+            .unwrap_err();
+        assert!(!format!("{error}").contains(token));
+        assert!(!format!("{error:?}").contains(token));
+
+        let metrics = client.model_call_metrics().unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].outcome, CodexWorkerCallOutcome::TransportError);
+        let serialized = serde_json::to_string(&metrics).unwrap();
+        assert!(!serialized.contains(token));
+        assert!(!serialized.contains("private input"));
     }
 }

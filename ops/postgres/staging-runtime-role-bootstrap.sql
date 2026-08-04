@@ -116,6 +116,9 @@ VALUES
     ('execution', 'public.starring_runtime_product_drain_observe_v2(text,text,text,bigint,text,text)'),
     ('execution', 'public.starring_runtime_certification_reserve_intent_v2(bigint,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,text,text,bigint,bigint,text,text,text,bigint,bytea,text)'),
     ('execution', 'public.starring_runtime_certification_reservation_observe_v2(text,text,text,bigint,bigint)'),
+    ('execution', 'public.starring_runtime_certification_prepare_v2(text,text,text,text,text,bigint,text,bigint,bigint,bigint,timestamp with time zone)'),
+    ('execution', 'public.starring_runtime_certification_commit_v2(text,text,text,text,text,bigint,text,bigint,bigint,bigint,bytea,text,bytea,text)'),
+    ('execution', 'public.starring_runtime_certification_observe_v2(text,text,text,text,bigint,bigint,text)'),
     ('execution', 'public.starring_runtime_startup_recovery_observe_v2(text,text,bigint,text,bigint,timestamp with time zone)'),
     ('execution', 'public.starring_runtime_startup_recovery_execute_stale_live_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)'),
     ('execution', 'public.starring_runtime_startup_recovery_execute_reserved_awaiting_v2(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)'),
@@ -125,9 +128,9 @@ VALUES
     ('execution', 'public.starring_runtime_startup_recovery_execute_pending_drain_v2(text,bigint,bigint,bigint,bigint,bigint,bigint,text,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,text,bigint,bigint,text,bigint,bigint,bigint,bigint,text,bigint,bigint,bigint,text,bigint,text,boolean,bigint,bigint,bytea,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,boolean,text)'),
     ('execution', 'public.starring_runtime_startup_recovery_select_pending_drain_v3(text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone)'),
     ('execution', 'public.starring_runtime_startup_recovery_pending_drain_succession_v3(text,bigint,bigint,bigint,bigint,text,text,bigint,text,bigint,timestamp with time zone,timestamp with time zone,text,bigint,bigint,text,bigint,bigint,bigint,bigint,text,bigint,bigint,bigint,text,bigint,text,text,boolean,bigint,bigint,bytea,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,bigint,boolean)'),
-    ('exact_target', 'public.starring_runtime_exact_target_database_readiness_v1()'),
+    ('exact_target', 'public.starring_runtime_exact_target_database_readiness_v2()'),
     ('exact_target', 'public.starring_runtime_exact_target_reader_database_identity_v1()'),
-    ('exact_target', 'public.starring_runtime_exact_target_read_v1(text,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text)'),
+    ('exact_target', 'public.starring_runtime_exact_target_read_v2(text,text,text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text)'),
     ('panel', 'public.starring_runtime_panel_database_identity_v1()'),
     ('panel', 'public.starring_runtime_panel_database_readiness_v1()'),
     ('panel', 'public.starring_runtime_panel_reconciliation_claim_v1(text,text,text,bigint,text,bigint,bigint,bigint,text,text,bigint,text,bigint,text,bigint,bigint,text)'),
@@ -141,11 +144,43 @@ VALUES
     ('serving', 'public.starring_runtime_serving_database_identity_v1()'),
     ('serving', 'public.starring_runtime_serving_heartbeat_v1(text,text,text,text,text,bigint,bigint,bigint,bigint)'),
     ('serving', 'public.starring_runtime_serving_disconnect_v1(text,text,text,text,text,bigint,bigint,bigint)'),
+    ('serving', 'public.starring_runtime_serving_observe_v2(text,text,text,text,text,text,bigint,bigint)'),
+    ('serving', 'public.starring_runtime_serving_heartbeat_v2(text,text,text,text,text,text,bigint,bigint,bigint,bigint)'),
+    ('serving', 'public.starring_runtime_serving_disconnect_if_current_v2(text,text,text,text,text,text,bigint,bigint,bigint)'),
+    ('serving', 'public.starring_runtime_serving_observe_pending_drain_source_v1(text,bigint,text)'),
+    ('serving', 'public.starring_runtime_serving_disconnect_pending_drain_source_if_expired_v1(text,bigint,text,text,text,text,text,text,text,bigint,text,bigint,text,text,text,bigint,bigint,bigint)'),
     ('interaction', 'public.starring_runtime_interaction_database_readiness_v1()'),
     ('interaction', 'public.starring_runtime_interaction_database_identity_v1()'),
     ('interaction', 'public.starring_runtime_interaction_route_read_v1(text,text)'),
     ('interaction', 'public.starring_runtime_interaction_pinned_read_v1(text,text)'),
-    ('interaction', 'public.starring_runtime_interaction_instance_register_v1(text,text,text,bigint,text,text,jsonb)');
+    ('interaction', 'public.starring_runtime_interaction_instance_register_v1(text,text,text,bigint,text,text,jsonb)'),
+    ('interaction', 'public.starring_runtime_interaction_instance_get_for_teardown_v1(text,text)'),
+    ('interaction', 'public.starring_runtime_interaction_instance_claim_deleting_v1(text,text)'),
+    ('interaction', 'public.starring_runtime_interaction_instance_mark_deleted_v1(text,text)'),
+    ('interaction', 'public.starring_runtime_interaction_instance_list_retryable_v1(text,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_instance_scan_retryable_v2(text,text,text,text,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_receipt_authority_observe_v1(text,text,text,text,text,text,bigint,text,bigint,text,bigint,bigint,bigint,text,text,text,text,text)'),
+    ('interaction', 'public.starring_runtime_interaction_receipt_claim_v1(text,text,text,text,text,text,text,text,text,text,bigint,text,bigint,text,bigint,bigint,bigint,text,text,text,text,text,text,text,bigint,bigint,bigint,bigint,bigint,text,text,bytea,bigint,text,smallint,text,bytea,bytea,bytea,timestamp with time zone,timestamp with time zone)'),
+    ('interaction', 'public.starring_runtime_interaction_receipt_plan_bind_v1(text,text,bigint,bigint,text,bytea)'),
+    ('interaction', 'public.starring_runtime_interaction_receipt_acknowledgement_intend_v1(text,text,bigint,bigint,text,text,bytea)'),
+    ('interaction', 'public.starring_runtime_interaction_receipt_acknowledgement_finish_v1(text,text,bigint,bigint,text,bytea,text,bytea)'),
+    ('interaction', 'public.starring_runtime_interaction_receipt_execution_intend_v1(text,text,bigint,bigint,text,bytea)'),
+    ('interaction', 'public.starring_runtime_interaction_receipt_finish_v1(text,text,bigint,bigint,text,bytea,text,text,bytea)'),
+    ('interaction', 'public.starring_runtime_interaction_receipt_scan_recoverable_v1(timestamp with time zone,text,text,timestamp with time zone,text,text,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_receipt_recover_v1(text,text,bigint,bigint,text,bigint,bigint,bigint,text,text,text,bytea,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_receipt_token_expire_v1(text,text,bigint,bigint,bytea)'),
+    ('interaction', 'public.starring_runtime_interaction_receipt_terminalize_expired_v1(text,text,bigint,bigint,text,text,bytea)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_plan_bind_v1(text,text,bigint,bigint,text,bytea,bytea,bytea,jsonb)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_intend_v1(text,text,bigint,bigint,text,bytea,bigint,bigint,bytea,bytea,bytea,jsonb,bytea,jsonb,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_finish_v1(text,text,bigint,bigint,text,bytea,bigint,bigint,bytea,text,text)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_scan_recoverable_v1(timestamp with time zone,text,text,bigint,timestamp with time zone,text,text,bigint,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_recovery_claim_v1(text,text,bigint,bigint,text,text,text,bigint,bigint,bigint,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_reconcile_v1(text,text,bigint,bigint,bigint,text,text,text,bigint,bigint,bigint,text,text,bytea,text,bytea,text,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_compensation_intend_v1(text,text,bigint,bigint,text,text,text,bigint,bigint,bigint,bytea,bytea,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_compensation_finish_v1(text,text,bigint,bigint,bigint,text,bytea,text,bytea,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_response_tail_scan_v1(timestamp with time zone,text,text,bigint,timestamp with time zone,text,text,bigint,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_response_tail_claim_v1(text,text,bigint,bigint,text,text,text,bigint,bigint,bigint,bytea,bytea,bytea,bigint)'),
+    ('interaction', 'public.starring_runtime_interaction_effect_response_tail_finalize_v1(text,text,bigint,bigint,text,bigint,bigint,text,text,text,bigint,bigint,bigint,bytea,bytea,text,bytea,bytea,bigint)');
 
 SELECT pg_catalog.pg_advisory_lock(
     pg_catalog.hashtextextended(
@@ -248,7 +283,7 @@ BEGIN
     IF (
         SELECT pg_catalog.count(*)
         FROM pg_temp.starring_runtime_capability_functions
-    ) <> 49 THEN
+    ) <> 84 THEN
         RAISE EXCEPTION 'runtime capability function manifest is invalid'
             USING ERRCODE = '55000';
     END IF;

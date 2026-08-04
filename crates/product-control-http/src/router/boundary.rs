@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::State;
+use axum::extract::{MatchedPath, State};
 use axum::http::header::{
     AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST,
     REFERRER_POLICY, SET_COOKIE, STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS,
     X_FRAME_OPTIONS,
 };
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -65,7 +65,9 @@ pub(super) async fn request_boundary(mut request: Request<Body>, next: Next) -> 
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response.headers_mut().insert(
         CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'; base-uri 'none'"),
+        HeaderValue::from_static(
+            "default-src 'none'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+        ),
     );
     response
         .headers_mut()
@@ -97,7 +99,7 @@ pub(super) async fn request_boundary(mut request: Request<Body>, next: Next) -> 
 
 pub(super) async fn resource_boundary<F>(
     State(state): State<HttpState<F>>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response
 where
@@ -129,21 +131,63 @@ where
             &request_id,
         );
     }
-    let permit = match Arc::clone(&state.in_flight).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let mut response = problem(
-                StatusCode::TOO_MANY_REQUESTS,
-                "concurrency_exhausted",
-                "The service is busy. Retry shortly.",
-                true,
-                &request_id,
-            );
-            response
-                .headers_mut()
-                .insert("retry-after", HeaderValue::from_static("1"));
-            return response;
-        }
+    let is_authoring_turn = request.method() == Method::POST
+        && request
+            .extensions()
+            .get::<MatchedPath>()
+            .is_some_and(|path| path.as_str() == super::AUTHORING_TURN_PATH_V1);
+    let (permit, request_timeout) = if is_authoring_turn {
+        let config = match state.authoring_config {
+            Some(config) => config,
+            None => {
+                return map_facade(
+                    FacadeError::new(crate::FacadeErrorCode::Internal),
+                    &request_id,
+                )
+            }
+        };
+        let authoring_in_flight = match state.authoring_in_flight.as_ref().map(Arc::clone) {
+            Some(value) => value,
+            None => {
+                return map_facade(
+                    FacadeError::new(crate::FacadeErrorCode::Internal),
+                    &request_id,
+                )
+            }
+        };
+        let permit = match authoring_in_flight.try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let mut response = map_facade(
+                    FacadeError::new(crate::FacadeErrorCode::AuthoringSaturated),
+                    &request_id,
+                );
+                if let Ok(value) = HeaderValue::from_str(&config.retry_after_seconds().to_string())
+                {
+                    response.headers_mut().insert("retry-after", value);
+                }
+                return response;
+            }
+        };
+        (permit, config.request_timeout())
+    } else {
+        let permit = match Arc::clone(&state.in_flight).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let mut response = problem(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "concurrency_exhausted",
+                    "The service is busy. Retry shortly.",
+                    true,
+                    &request_id,
+                );
+                response
+                    .headers_mut()
+                    .insert("retry-after", HeaderValue::from_static("1"));
+                return response;
+            }
+        };
+        (permit, state.config.request_timeout())
     };
     if !state.readiness_gate.is_ready() {
         drop(permit);
@@ -152,10 +196,37 @@ where
             &request_id,
         );
     }
+    let commit_boundary = if is_authoring_turn {
+        let boundary = authoring_application::AuthoringCommitBoundaryV1::new();
+        request.extensions_mut().insert(boundary.clone());
+        Some(boundary)
+    } else {
+        None
+    };
     let future = std::panic::AssertUnwindSafe(next.run(request)).catch_unwind();
-    let outcome = tokio::time::timeout(state.config.request_timeout(), future).await;
+    let outcome = match commit_boundary {
+        Some(commit_boundary) => {
+            let mut future = Box::pin(future);
+            match tokio::time::timeout(request_timeout, future.as_mut()).await {
+                Ok(outcome) => completed_outcome(outcome, &request_id),
+                Err(_) => {
+                    if commit_boundary.cancel_before_commit()
+                        || !commit_boundary.commit_phase_started()
+                    {
+                        request_timeout_problem(&request_id)
+                    } else {
+                        completed_outcome(future.await, &request_id)
+                    }
+                }
+            }
+        }
+        None => bounded_outcome(
+            tokio::time::timeout(request_timeout, future).await,
+            &request_id,
+        ),
+    };
     drop(permit);
-    bounded_outcome(outcome, &request_id)
+    outcome
 }
 
 fn bounded_outcome(
@@ -163,22 +234,35 @@ fn bounded_outcome(
     request_id: &RequestId,
 ) -> Response {
     match outcome {
-        Ok(Ok(response)) => response,
-        Ok(Err(_)) => problem(
+        Ok(outcome) => completed_outcome(outcome, request_id),
+        Err(_) => request_timeout_problem(request_id),
+    }
+}
+
+fn completed_outcome(
+    outcome: Result<Response, Box<dyn std::any::Any + Send>>,
+    request_id: &RequestId,
+) -> Response {
+    match outcome {
+        Ok(response) => response,
+        Err(_) => problem(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
             "The request could not be completed.",
             false,
             request_id,
         ),
-        Err(_) => problem(
-            StatusCode::GATEWAY_TIMEOUT,
-            "request_timeout",
-            "The request deadline expired.",
-            true,
-            request_id,
-        ),
     }
+}
+
+fn request_timeout_problem(request_id: &RequestId) -> Response {
+    problem(
+        StatusCode::GATEWAY_TIMEOUT,
+        "request_timeout",
+        "The request deadline expired.",
+        true,
+        request_id,
+    )
 }
 
 #[allow(clippy::result_large_err)]
@@ -425,7 +509,7 @@ pub(super) fn secure_http_only_cookie(
 
 pub(super) fn secure_csrf_cookie(value: &str, max_age_seconds: u32) -> Zeroizing<String> {
     Zeroizing::new(format!(
-        "{CSRF_COOKIE}={value}; Path=/; Max-Age={max_age_seconds}; Secure; SameSite=Strict"
+        "{CSRF_COOKIE}={value}; Path=/; Max-Age={max_age_seconds}; Secure; SameSite=Lax"
     ))
 }
 
@@ -437,7 +521,7 @@ pub(super) fn clear_cookie(name: &str) -> Zeroizing<String> {
 
 pub(super) fn clear_csrf_cookie() -> Zeroizing<String> {
     Zeroizing::new(format!(
-        "{CSRF_COOKIE}=; Path=/; Max-Age=0; Secure; SameSite=Strict"
+        "{CSRF_COOKIE}=; Path=/; Max-Age=0; Secure; SameSite=Lax"
     ))
 }
 

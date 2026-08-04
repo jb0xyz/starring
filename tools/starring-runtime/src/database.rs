@@ -2,9 +2,32 @@ use std::collections::BTreeSet;
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::net::IpAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
+use automation_runtime::{
+    build_shared_gateway_durable_receipt_claim_input_v1, AcquiredInteractionExecutionOutcomeV1,
+    GatewayConnectionObserverV3, GatewayReadyLeaseV3, InstanceTeardownRetryExecutionFutureV1,
+    InstanceTeardownRetryExecutionRequestV1, InstanceTeardownRetryScanFutureV1,
+    InstanceTeardownRetryScanRequestV1, InstanceTeardownRetrySupervisorConfigV1,
+    InstanceTeardownRetrySupervisorExitV1, InstanceTeardownRetrySupervisorPortV1,
+    InstanceTeardownRetrySupervisorV1, InteractionEffectIntentDispositionV1,
+    InteractionEffectJournalIntendV1, InteractionEffectJournalPlanV1,
+    InteractionEffectPlanBindDispositionV1, InteractionInitialResponseIntentDispositionV1,
+    InteractionInitialResponseIntentV1, InteractionInitialResponseKindV1,
+    InteractionInitialResponseResultKindV1, InteractionInitialResponseResultV1,
+    InteractionTerminalFinishV1, OwnedSharedGatewayDispatchServicesCompositionErrorV3,
+    OwnedSharedGatewayDispatchServicesV3, SharedGatewayAdmissionConfigV3,
+    SharedGatewayAdmissionDispatchOutcomeV1, SharedGatewayDurableReceiptClaimInputErrorV1,
+    SharedGatewayDurableReceiptClaimInputV1, SharedGatewayDurableReceiptRouteV1,
+    SharedGatewayInteractionEnvelopeV3, SharedGatewayInteractionIdentityV3,
+    SharedGatewayInteractionKindV3, SharedGatewayInteractionReservationOutcomeV3,
+    SharedGatewayLoopbackHttpProxyV1, SharedGatewayMutationHttpTransportV1,
+    SharedGatewayReservedInteractionV3,
+};
+use automation_runtime_controller::{RuntimeServingIdentityV2, RuntimeServingReceiptV2};
+use automation_runtime_convergence::ProcessInstanceId;
 use automation_runtime_convergence_postgres::{
     PostgresRuntimeExactTargetReader, RuntimeConvergenceStoreError,
     RuntimeExactTargetDatabaseExpectationV1, RuntimeExactTargetDatabaseReadinessV1,
@@ -15,17 +38,45 @@ use automation_runtime_execution_postgres::{
     RuntimeExecutionDatabaseExpectationV1, RuntimeExecutionDatabaseReadinessV1,
     RuntimeExecutionDatabaseTimeoutsV1, RuntimeExecutionPersistenceErrorV1,
 };
+use automation_runtime_interaction::{
+    InteractionActionPlanDigestV1, InteractionEffectActionIndexV1,
+    InteractionEffectAttemptOutcomeV1, InteractionEffectMaterializedPlanV1,
+    InteractionGatewayShardIdentityV1, InteractionReceiptClaimRootV1, InteractionReceiptStateV1,
+    InteractionRuntimeBuildRevisionV1, InteractionTokenEnvelopeKeyringV1,
+    InteractionTokenEnvelopeTimeV1, InteractionTokenV1, XChaCha20Poly1305InteractionTokenCipherV1,
+    MAX_INTERACTION_TOKEN_LIFETIME_MILLISECONDS_V1,
+};
 use automation_runtime_interaction_postgres::{
     PostgresRuntimeInteractionV1, RuntimeInteractionDatabaseExpectationV1,
     RuntimeInteractionDatabaseReadinessV1, RuntimeInteractionDatabaseTimeoutsV1,
-    RuntimeInteractionPersistenceErrorV1, RuntimeInteractionRouteTimeoutV1,
+    RuntimeInteractionEffectFinishRequestV1, RuntimeInteractionEffectIntendRequestV1,
+    RuntimeInteractionEffectMutationDispositionV1, RuntimeInteractionEffectPlanActionV1,
+    RuntimeInteractionEffectPlanBindRequestV1, RuntimeInteractionErrorClassV1,
+    RuntimeInteractionPersistenceErrorV1, RuntimeInteractionReceiptClaimLeaseV1,
+    RuntimeInteractionReceiptClaimOutcomeV1, RuntimeInteractionReceiptClaimRequestV1,
+    RuntimeInteractionReceiptExclusiveClaimV1,
+    RuntimeInteractionReceiptInitialResponseIntentDispositionV1 as PostgresInitialResponseIntentDispositionV1,
+    RuntimeInteractionReceiptInitialResponseIntentV1 as PostgresInitialResponseIntentV1,
+    RuntimeInteractionReceiptInitialResponseKindV1 as PostgresInitialResponseKindV1,
+    RuntimeInteractionReceiptInitialResponseResultKindV1 as PostgresInitialResponseResultKindV1,
+    RuntimeInteractionReceiptInitialResponseResultV1 as PostgresInitialResponseResultV1,
+    RuntimeInteractionReceiptMutationDispositionV1, RuntimeInteractionReceiptOpaqueDigestV1,
+    RuntimeInteractionReceiptRecoveryScanCursorV1, RuntimeInteractionReceiptRequestKindV1,
+    RuntimeInteractionReceiptRouteV1, RuntimeInteractionReceiptTerminalOutcomeV1,
+    RuntimeInteractionReceiptTerminalStateV1,
+    RuntimeInteractionReceiptTerminalizeExpiredDispositionV1,
+    RuntimeInteractionReceiptTerminalizeExpiredRequestV1,
+    RuntimeInteractionReceiptTokenExpiryDispositionV1,
+    RuntimeInteractionReceiptTokenExpiryRequestV1, RuntimeInteractionRouteTimeoutV1,
+    MIN_RUNTIME_INTERACTION_EFFECT_RETRY_DELAY,
 };
 use automation_runtime_panel_postgres::{
     PostgresRuntimePanelV1, RuntimePanelDatabaseExpectationV1, RuntimePanelDatabaseReadinessV1,
     RuntimePanelDatabaseTimeoutsV1, RuntimePanelPersistenceErrorV1,
 };
 use automation_runtime_serving_postgres::{
-    PostgresRuntimeServingLeaseV1, RuntimeServingDatabaseExpectationV1,
+    PostgresRuntimeServingLeaseV1, RuntimePendingDrainServingLookupV1,
+    RuntimePendingDrainServingObservationV1, RuntimeServingDatabaseExpectationV1,
     RuntimeServingDatabaseReadinessV1, RuntimeServingDatabaseTimeoutsV1,
     RuntimeServingPersistenceErrorV1,
 };
@@ -43,15 +94,65 @@ use automation_runtime_worker::{
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgSslMode};
 use sqlx::ConnectOptions;
 use tokio::time::{sleep_until, timeout, timeout_at, Instant as TokioInstant};
+use zeroize::Zeroizing;
 
+use crate::interaction_receipt::{
+    claim_runtime_interaction_receipt_v1, RuntimeInteractionReceiptClaimDispositionV1,
+    RuntimeInteractionReceiptClosedReasonV1, RuntimeInteractionReceiptPermitErrorV1,
+    RuntimeInteractionReceiptPersistenceClaimOutcomeV1,
+    RuntimeInteractionReceiptPersistenceMutationDispositionV1,
+    RuntimeInteractionReceiptPersistencePortV1, RUNTIME_INTERACTION_RECEIPT_CLAIM_LEASE_V1,
+};
+use crate::interaction_receipt_recovery_supervisor::{
+    RuntimeInteractionReceiptRecoveryCandidateV1,
+    RuntimeInteractionReceiptRecoveryMutationDispositionV1,
+    RuntimeInteractionReceiptRecoveryMutationFutureV1,
+    RuntimeInteractionReceiptRecoveryMutationRequestV1,
+    RuntimeInteractionReceiptRecoveryScanFutureV1, RuntimeInteractionReceiptRecoveryScanPageV1,
+    RuntimeInteractionReceiptRecoveryScanRequestV1,
+    RuntimeInteractionReceiptRecoverySupervisorConfigV1,
+    RuntimeInteractionReceiptRecoverySupervisorPortV1,
+    RuntimeInteractionReceiptRecoverySupervisorV1,
+};
+use crate::registry::RuntimeInteractionDispatchRegistryV1;
+use crate::runtime_interaction_dispatch::{
+    RuntimeInteractionDispatchFutureV1, RuntimeInteractionDispatchOutcomeV1,
+    RuntimeInteractionDispatchPortV1, RuntimeInteractionDispatchReservationOutcomeV1,
+};
 use crate::startup::RuntimeStartupBudgetV1;
 use crate::{
     DatabaseCapabilityV1, DatabasePoolConfigV1, ResolvedRuntimeSecretsV1, RuntimeConfigV1,
     RuntimeDatabaseConnectionSecretV1, RuntimeDatabaseEndpointV1, RuntimeDatabaseSslModeV1,
+    RuntimeDiscordBotTokenV1,
 };
+
+mod effect_recovery;
+
+use effect_recovery::RuntimeInteractionEffectRecoveryDatabasePortV1;
 
 const PERIODIC_READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const DATABASE_POOL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+const INSTANCE_TEARDOWN_RETRY_CADENCE: Duration = Duration::from_secs(30);
+const INSTANCE_TEARDOWN_RETRY_PAGE_LIMIT: usize = 32;
+const INSTANCE_TEARDOWN_RETRY_CONCURRENCY: usize = 4;
+const INSTANCE_TEARDOWN_RETRY_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+const INSTANCE_TEARDOWN_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
+const INTERACTION_TOKEN_EXPIRY_OBSERVATION_DIGEST_V1: [u8; 32] = [
+    0xaf, 0x7b, 0x69, 0xa6, 0x9d, 0x1f, 0xfd, 0x1a, 0x69, 0x9c, 0x1c, 0x7c, 0x77, 0xd5, 0x28, 0x14,
+    0x8a, 0x39, 0xc0, 0xa4, 0x45, 0xab, 0x19, 0x98, 0x69, 0x5a, 0xfb, 0x7e, 0x08, 0x81, 0x16, 0x6b,
+];
+const INTERACTION_EXPIRED_TERMINALIZATION_OBSERVATION_DIGEST_V1: [u8; 32] = [
+    0xcf, 0x5d, 0x17, 0xfb, 0xbb, 0x08, 0xd9, 0xe2, 0xd0, 0x97, 0xc8, 0x1c, 0xf1, 0x78, 0x4b, 0x9a,
+    0x3d, 0x59, 0xc9, 0x1d, 0x35, 0x25, 0x71, 0x56, 0xc0, 0xf0, 0xc7, 0xc1, 0x02, 0x97, 0xce, 0x15,
+];
+
+pub(crate) type RuntimeInteractionTeardownRetrySupervisorV1 = InstanceTeardownRetrySupervisorV1;
+pub(crate) type RuntimeInteractionTeardownRetrySupervisorExitV1 =
+    InstanceTeardownRetrySupervisorExitV1;
+pub(crate) type RuntimeInteractionReceiptRecoverySupervisorExitV1 =
+    crate::interaction_receipt_recovery_supervisor::RuntimeInteractionReceiptRecoverySupervisorExitV1;
+pub(crate) type RuntimeInteractionEffectRecoverySupervisorExitV1 =
+    crate::interaction_effect_recovery_supervisor::RuntimeInteractionEffectRecoverySupervisorExitV1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeDatabaseCompositionErrorV1 {
@@ -307,9 +408,868 @@ impl Debug for RuntimeDatabaseReadinessProbeV2 {
 #[derive(Clone)]
 pub(crate) struct RuntimePendingDrainMutationDatabaseV3 {
     execution: PostgresRuntimeExecutionV1,
+    serving: PostgresRuntimeServingLeaseV1,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeControllerDatabaseV2 {
+    execution: PostgresRuntimeExecutionV1,
+    exact_target: PostgresRuntimeExactTargetReader,
+    panel: PostgresRuntimePanelV1,
+    serving: PostgresRuntimeServingLeaseV1,
+}
+
+impl RuntimeControllerDatabaseV2 {
+    pub(crate) fn execution(&self) -> &PostgresRuntimeExecutionV1 {
+        &self.execution
+    }
+
+    pub(crate) fn exact_target(&self) -> &PostgresRuntimeExactTargetReader {
+        &self.exact_target
+    }
+
+    pub(crate) fn panel(&self) -> &PostgresRuntimePanelV1 {
+        &self.panel
+    }
+
+    pub(crate) fn serving(&self) -> &PostgresRuntimeServingLeaseV1 {
+        &self.serving
+    }
+}
+
+impl Debug for RuntimeControllerDatabaseV2 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeControllerDatabaseV2(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeInteractionDispatchCompositionErrorV1 {
+    #[error("runtime interaction dispatch admission configuration is invalid")]
+    AdmissionConfiguration,
+    #[error("runtime interaction dispatch route configuration is invalid")]
+    RouteConfiguration,
+    #[error("runtime interaction dispatch service composition timed out")]
+    TimedOut,
+    #[error("runtime interaction dispatch role snapshot provider is unavailable")]
+    SnapshotUnavailable,
+}
+
+impl RuntimeInteractionDispatchCompositionErrorV1 {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::AdmissionConfiguration => "runtime_interaction_dispatch_admission_configuration",
+            Self::RouteConfiguration => "runtime_interaction_dispatch_route_configuration",
+            Self::TimedOut => "runtime_interaction_dispatch_composition_timed_out",
+            Self::SnapshotUnavailable => "runtime_interaction_dispatch_snapshot_unavailable",
+        }
+    }
+}
+
+pub(crate) struct RuntimeInteractionDispatchCompositionInputV1<'a> {
+    pub(crate) registry: RuntimeInteractionDispatchRegistryV1,
+    pub(crate) token: &'a RuntimeDiscordBotTokenV1,
+    pub(crate) token_envelope_keyring: &'a InteractionTokenEnvelopeKeyringV1,
+    pub(crate) build_revision: &'a str,
+    pub(crate) process_instance_id: &'a ProcessInstanceId,
+    pub(crate) gateway: crate::GatewayResourceConfigV1,
+    pub(crate) operation_deadline: StdInstant,
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeInteractionDispatchDatabasePortV1 {
+    inner: Arc<OwnedSharedGatewayDispatchServicesV3<PostgresRuntimeInteractionV1>>,
+    receipt: RuntimeInteractionReceiptDatabaseV1,
+    gateway_shard_identity: InteractionGatewayShardIdentityV1,
+    runtime_build_revision: InteractionRuntimeBuildRevisionV1,
+    process_instance_id: ProcessInstanceId,
+}
+
+#[derive(Clone)]
+struct RuntimeInteractionReceiptDatabaseV1 {
+    store: PostgresRuntimeInteractionV1,
+    cipher: XChaCha20Poly1305InteractionTokenCipherV1,
+}
+
+struct RuntimeInteractionEffectDatabaseIntentPermitV1 {
+    action_index: InteractionEffectActionIndexV1,
+    effect_head_revision: u64,
+}
+
+impl Debug for RuntimeInteractionDispatchDatabasePortV1 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeInteractionDispatchDatabasePortV1(<redacted>)")
+    }
+}
+
+impl RuntimeInteractionDispatchPortV1 for RuntimeInteractionDispatchDatabasePortV1 {
+    type Reservation = SharedGatewayReservedInteractionV3;
+
+    fn dispatch_capacity_v1(&self) -> std::num::NonZeroUsize {
+        self.inner.dispatch_capacity_v3()
+    }
+
+    fn reserve_v1(
+        &self,
+        envelope: SharedGatewayInteractionEnvelopeV3,
+        ready_lease: Option<GatewayReadyLeaseV3>,
+        observer: &GatewayConnectionObserverV3,
+    ) -> RuntimeInteractionDispatchReservationOutcomeV1<Self::Reservation> {
+        match self.inner.reserve_v3(envelope, ready_lease, observer) {
+            SharedGatewayInteractionReservationOutcomeV3::Reserved(reserved) => {
+                RuntimeInteractionDispatchReservationOutcomeV1::Reserved(*reserved)
+            }
+            SharedGatewayInteractionReservationOutcomeV3::Ignored => {
+                RuntimeInteractionDispatchReservationOutcomeV1::Ignored
+            }
+            SharedGatewayInteractionReservationOutcomeV3::Rejected { reason, envelope } => {
+                RuntimeInteractionDispatchReservationOutcomeV1::Rejected { reason, envelope }
+            }
+        }
+    }
+
+    fn cancel_v1(&self, reservation: Self::Reservation) -> Box<SharedGatewayInteractionEnvelopeV3> {
+        self.inner.cancel_v3(reservation)
+    }
+
+    fn dispatch_v1(
+        self: Arc<Self>,
+        reservation: Self::Reservation,
+    ) -> RuntimeInteractionDispatchFutureV1 {
+        Box::pin(async move {
+            match self.inner.admit_v1(reservation).await {
+                SharedGatewayAdmissionDispatchOutcomeV1::Admitted(admitted) => {
+                    self.dispatch_admitted_v1(*admitted).await
+                }
+                SharedGatewayAdmissionDispatchOutcomeV1::Ignored => {
+                    RuntimeInteractionDispatchOutcomeV1::Ignored
+                }
+                SharedGatewayAdmissionDispatchOutcomeV1::Rejected { error, envelope } => {
+                    drop(envelope);
+                    RuntimeInteractionDispatchOutcomeV1::AdmissionRejected(error)
+                }
+            }
+        })
+    }
+}
+
+impl RuntimeInteractionDispatchDatabasePortV1 {
+    async fn dispatch_admitted_v1(
+        &self,
+        admitted: automation_runtime::SharedGatewayAdmittedEnvelopeV1,
+    ) -> RuntimeInteractionDispatchOutcomeV1 {
+        let identity = admitted.envelope_v1().identity_v3();
+        let kind = admitted.envelope_v1().kind_v3();
+        let initial_response_deadline =
+            TokioInstant::from_std(admitted.envelope_v1().initial_response_deadline_v3());
+        let input = build_shared_gateway_durable_receipt_claim_input_v1(
+            admitted.envelope_v1(),
+            admitted.admitted_v1(),
+            self.gateway_shard_identity.clone(),
+            self.runtime_build_revision.clone(),
+        );
+        let input = match input {
+            Ok(input) => input,
+            Err(error) => {
+                return RuntimeInteractionDispatchOutcomeV1::ReceiptClosed(
+                    map_receipt_claim_input_error_v1(error),
+                )
+            }
+        };
+        match claim_runtime_interaction_receipt_v1(
+            &self.receipt,
+            input,
+            identity,
+            kind,
+            initial_response_deadline,
+        )
+        .await
+        {
+            RuntimeInteractionReceiptClaimDispositionV1::Acquired(permit) => {
+                map_acquired_interaction_outcome_v1(
+                    self.inner.execute_acquired_v1(admitted, *permit).await,
+                )
+            }
+            RuntimeInteractionReceiptClaimDispositionV1::Duplicate(class) => {
+                RuntimeInteractionDispatchOutcomeV1::ReceiptDuplicate(class)
+            }
+            RuntimeInteractionReceiptClaimDispositionV1::Closed(reason) => {
+                RuntimeInteractionDispatchOutcomeV1::ReceiptClosed(reason)
+            }
+        }
+    }
+}
+
+fn map_receipt_claim_input_error_v1(
+    error: SharedGatewayDurableReceiptClaimInputErrorV1,
+) -> RuntimeInteractionReceiptClosedReasonV1 {
+    match error {
+        SharedGatewayDurableReceiptClaimInputErrorV1::Identity
+        | SharedGatewayDurableReceiptClaimInputErrorV1::RouteHint
+        | SharedGatewayDurableReceiptClaimInputErrorV1::RequestDigest => {
+            RuntimeInteractionReceiptClosedReasonV1::InvalidInput
+        }
+        SharedGatewayDurableReceiptClaimInputErrorV1::RouteMismatch
+        | SharedGatewayDurableReceiptClaimInputErrorV1::ExpectedRoute => {
+            RuntimeInteractionReceiptClosedReasonV1::InvalidAuthority
+        }
+    }
+}
+
+fn map_acquired_interaction_outcome_v1(
+    outcome: AcquiredInteractionExecutionOutcomeV1,
+) -> RuntimeInteractionDispatchOutcomeV1 {
+    match outcome {
+        AcquiredInteractionExecutionOutcomeV1::Terminalized(finish) => {
+            map_terminal_receipt_state_v1(finish.state())
+        }
+        AcquiredInteractionExecutionOutcomeV1::AcknowledgementTerminalized { state, .. } => {
+            map_terminal_receipt_state_v1(state)
+        }
+        AcquiredInteractionExecutionOutcomeV1::AuthorityRejected => {
+            RuntimeInteractionDispatchOutcomeV1::AuthorityRejected
+        }
+        AcquiredInteractionExecutionOutcomeV1::ExecutionDeadlineElapsed => {
+            RuntimeInteractionDispatchOutcomeV1::RecoveryRequired
+        }
+        AcquiredInteractionExecutionOutcomeV1::EffectRecoveryPending => {
+            RuntimeInteractionDispatchOutcomeV1::RecoveryRequired
+        }
+        AcquiredInteractionExecutionOutcomeV1::PersistenceFailed {
+            external_effect_may_have_occurred,
+            ..
+        } => RuntimeInteractionDispatchOutcomeV1::PersistenceFailed {
+            external_effect_may_have_occurred,
+        },
+    }
+}
+
+fn map_terminal_receipt_state_v1(
+    state: InteractionReceiptStateV1,
+) -> RuntimeInteractionDispatchOutcomeV1 {
+    match state {
+        InteractionReceiptStateV1::Completed => RuntimeInteractionDispatchOutcomeV1::Completed,
+        InteractionReceiptStateV1::Failed => RuntimeInteractionDispatchOutcomeV1::Failed,
+        InteractionReceiptStateV1::RecoveryRequired => {
+            RuntimeInteractionDispatchOutcomeV1::RecoveryRequired
+        }
+        InteractionReceiptStateV1::Claimed
+        | InteractionReceiptStateV1::Acknowledging
+        | InteractionReceiptStateV1::Deferred
+        | InteractionReceiptStateV1::Prepared
+        | InteractionReceiptStateV1::Executing => {
+            RuntimeInteractionDispatchOutcomeV1::RecoveryRequired
+        }
+    }
+}
+
+impl RuntimeInteractionReceiptPersistencePortV1 for RuntimeInteractionReceiptDatabaseV1 {
+    type Claim = RuntimeInteractionReceiptExclusiveClaimV1;
+    type EffectIntentPermit = RuntimeInteractionEffectDatabaseIntentPermitV1;
+
+    fn claim_root_v1(claim: &Self::Claim) -> &InteractionReceiptClaimRootV1 {
+        claim.claim_root()
+    }
+
+    async fn claim_receipt_v1(
+        &self,
+        input: SharedGatewayDurableReceiptClaimInputV1,
+        identity: SharedGatewayInteractionIdentityV3,
+        kind: SharedGatewayInteractionKindV3,
+    ) -> Result<
+        RuntimeInteractionReceiptPersistenceClaimOutcomeV1<Self::Claim>,
+        RuntimeInteractionReceiptClosedReasonV1,
+    > {
+        let (candidate, durable_route, mut token) = input.into_parts_v1();
+        let receipt_identity = candidate.identity();
+        if receipt_identity.application_id().get() != identity.application_id().get()
+            || receipt_identity.interaction_id().get() != identity.interaction_id().get()
+        {
+            return Err(RuntimeInteractionReceiptClosedReasonV1::InvalidInput);
+        }
+        let route = map_persistence_receipt_route_v1(durable_route)?;
+        let authority = self
+            .store
+            .observe_interaction_receipt_authority_v1(candidate, route)
+            .await
+            .map_err(map_receipt_persistence_error_v1)?;
+        let issued_at = u64::try_from(authority.observed_database_now().timestamp_millis())
+            .map_err(|_| RuntimeInteractionReceiptClosedReasonV1::TokenEnvelope)?;
+        let expires_at = issued_at
+            .checked_add(MAX_INTERACTION_TOKEN_LIFETIME_MILLISECONDS_V1)
+            .ok_or(RuntimeInteractionReceiptClosedReasonV1::TokenEnvelope)?;
+        let envelope_time = InteractionTokenEnvelopeTimeV1::new(issued_at, expires_at)
+            .map_err(|_| RuntimeInteractionReceiptClosedReasonV1::TokenEnvelope)?;
+        let token = InteractionTokenV1::new(std::mem::take(&mut *token))
+            .map_err(|_| RuntimeInteractionReceiptClosedReasonV1::TokenEnvelope)?;
+        let encrypted_token = self
+            .cipher
+            .encrypt(&token, authority.claim_root(), envelope_time)
+            .map_err(|_| RuntimeInteractionReceiptClosedReasonV1::TokenEnvelope)?;
+        let request_kind = match kind {
+            SharedGatewayInteractionKindV3::MessageComponent => {
+                RuntimeInteractionReceiptRequestKindV1::MessageComponent
+            }
+            SharedGatewayInteractionKindV3::ModalSubmit => {
+                RuntimeInteractionReceiptRequestKindV1::ModalSubmit
+            }
+        };
+        let claim_lease =
+            RuntimeInteractionReceiptClaimLeaseV1::new(RUNTIME_INTERACTION_RECEIPT_CLAIM_LEASE_V1)
+                .map_err(map_receipt_persistence_error_v1)?;
+        let request = RuntimeInteractionReceiptClaimRequestV1::new(
+            authority,
+            identity.channel_id(),
+            identity.user_id(),
+            request_kind,
+            encrypted_token,
+            claim_lease,
+        )
+        .map_err(map_receipt_persistence_error_v1)?;
+        let outcome = self
+            .store
+            .claim_interaction_receipt_v1(request)
+            .await
+            .map_err(map_receipt_persistence_error_v1)?;
+        Ok(match outcome {
+            RuntimeInteractionReceiptClaimOutcomeV1::Acquired(claim) => {
+                RuntimeInteractionReceiptPersistenceClaimOutcomeV1::Acquired(*claim)
+            }
+            RuntimeInteractionReceiptClaimOutcomeV1::CompletedDuplicate(_) => {
+                RuntimeInteractionReceiptPersistenceClaimOutcomeV1::CompletedDuplicate
+            }
+            RuntimeInteractionReceiptClaimOutcomeV1::InFlightDuplicate(_) => {
+                RuntimeInteractionReceiptPersistenceClaimOutcomeV1::InFlightDuplicate
+            }
+            RuntimeInteractionReceiptClaimOutcomeV1::TerminalDuplicate(_) => {
+                RuntimeInteractionReceiptPersistenceClaimOutcomeV1::TerminalDuplicate
+            }
+            RuntimeInteractionReceiptClaimOutcomeV1::RecoveryRequired(_) => {
+                RuntimeInteractionReceiptPersistenceClaimOutcomeV1::RecoveryRequired
+            }
+        })
+    }
+
+    async fn commit_initial_response_intent_v1(
+        &self,
+        claim: &mut Self::Claim,
+        intent: &InteractionInitialResponseIntentV1,
+    ) -> Result<InteractionInitialResponseIntentDispositionV1, RuntimeInteractionReceiptPermitErrorV1>
+    {
+        let intent = PostgresInitialResponseIntentV1::new(
+            map_persistence_initial_response_kind_v1(intent.kind()),
+            RuntimeInteractionReceiptOpaqueDigestV1::new(*intent.digest().as_bytes()),
+        );
+        let disposition = self
+            .store
+            .intend_interaction_receipt_initial_response_v1(claim, intent)
+            .await
+            .map_err(map_receipt_permit_error_v1)?;
+        Ok(match disposition {
+            PostgresInitialResponseIntentDispositionV1::ExternalCallAuthorized => {
+                InteractionInitialResponseIntentDispositionV1::ExternalCallAuthorized
+            }
+            PostgresInitialResponseIntentDispositionV1::ExactReplaySuppressed => {
+                InteractionInitialResponseIntentDispositionV1::ExactReplaySuppressed
+            }
+        })
+    }
+
+    async fn commit_initial_response_result_v1(
+        &self,
+        claim: &mut Self::Claim,
+        result: &InteractionInitialResponseResultV1,
+    ) -> Result<(), RuntimeInteractionReceiptPermitErrorV1> {
+        let result = PostgresInitialResponseResultV1::new(
+            RuntimeInteractionReceiptOpaqueDigestV1::new(*result.intent_digest().as_bytes()),
+            map_persistence_initial_response_result_kind_v1(result.result()),
+            RuntimeInteractionReceiptOpaqueDigestV1::new(*result.digest().as_bytes()),
+        );
+        self.store
+            .finish_interaction_receipt_initial_response_v1(claim, result)
+            .await
+            .map_err(map_receipt_permit_error_v1)?;
+        Ok(())
+    }
+
+    async fn commit_action_plan_v1(
+        &self,
+        claim: &mut Self::Claim,
+        digest: &InteractionActionPlanDigestV1,
+    ) -> Result<(), RuntimeInteractionReceiptPermitErrorV1> {
+        self.store
+            .bind_interaction_receipt_action_plan_v1(claim, digest.clone())
+            .await
+            .map_err(map_receipt_permit_error_v1)?;
+        Ok(())
+    }
+
+    async fn commit_execution_intent_v1(
+        &self,
+        claim: &mut Self::Claim,
+    ) -> Result<
+        RuntimeInteractionReceiptPersistenceMutationDispositionV1,
+        RuntimeInteractionReceiptPermitErrorV1,
+    > {
+        let disposition = self
+            .store
+            .intend_interaction_receipt_execution_v1(claim)
+            .await
+            .map_err(map_receipt_permit_error_v1)?;
+        Ok(match disposition {
+            RuntimeInteractionReceiptMutationDispositionV1::Applied => {
+                RuntimeInteractionReceiptPersistenceMutationDispositionV1::Applied
+            }
+            RuntimeInteractionReceiptMutationDispositionV1::ExactReplay => {
+                RuntimeInteractionReceiptPersistenceMutationDispositionV1::ExactReplay
+            }
+        })
+    }
+
+    async fn bind_effect_plan_v1(
+        &self,
+        claim: &mut Self::Claim,
+        plan: &InteractionEffectJournalPlanV1,
+    ) -> Result<InteractionEffectPlanBindDispositionV1, RuntimeInteractionReceiptPermitErrorV1>
+    {
+        let actions = plan
+            .entries()
+            .iter()
+            .map(|entry| {
+                RuntimeInteractionEffectPlanActionV1::new(
+                    entry.definition().clone(),
+                    entry.expected_postimage_digest().clone(),
+                )
+                .map_err(map_receipt_permit_error_v1)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let request = RuntimeInteractionEffectPlanBindRequestV1::new(
+            claim,
+            plan.preflight_certificate_digest().clone(),
+            plan.snapshot_digest().clone(),
+            actions,
+        )
+        .map_err(map_receipt_permit_error_v1)?;
+        let outcome = self
+            .store
+            .bind_interaction_effect_plan_v1(request)
+            .await
+            .map_err(map_receipt_permit_error_v1)?;
+        Ok(match outcome.disposition() {
+            RuntimeInteractionEffectMutationDispositionV1::Applied => {
+                InteractionEffectPlanBindDispositionV1::Fresh
+            }
+            RuntimeInteractionEffectMutationDispositionV1::ExactReplay => {
+                InteractionEffectPlanBindDispositionV1::ExactReplay
+            }
+        })
+    }
+
+    async fn intend_effect_v1(
+        &self,
+        claim: &mut Self::Claim,
+        intent: InteractionEffectJournalIntendV1<'_>,
+    ) -> Result<
+        InteractionEffectIntentDispositionV1<Self::EffectIntentPermit>,
+        RuntimeInteractionReceiptPermitErrorV1,
+    > {
+        let request = RuntimeInteractionEffectIntendRequestV1::new(
+            claim,
+            intent.materialized(),
+            1,
+            intent.resolved_instance_manifest_digest().cloned(),
+            MIN_RUNTIME_INTERACTION_EFFECT_RETRY_DELAY,
+        )
+        .map_err(map_receipt_permit_error_v1)?;
+        let action_index = intent.materialized().definition().action().action_index();
+        let checkpoint = self
+            .store
+            .intend_interaction_effect_v1(request)
+            .await
+            .map_err(map_receipt_permit_error_v1)?;
+        Ok(match checkpoint.disposition() {
+            RuntimeInteractionEffectMutationDispositionV1::Applied => {
+                InteractionEffectIntentDispositionV1::ExternalCallAuthorized(
+                    RuntimeInteractionEffectDatabaseIntentPermitV1 {
+                        action_index,
+                        effect_head_revision: checkpoint.effect_head_revision(),
+                    },
+                )
+            }
+            RuntimeInteractionEffectMutationDispositionV1::ExactReplay => {
+                InteractionEffectIntentDispositionV1::ExactReplay
+            }
+        })
+    }
+
+    async fn finish_effect_v1(
+        &self,
+        claim: &mut Self::Claim,
+        permit: &Self::EffectIntentPermit,
+        materialized: &InteractionEffectMaterializedPlanV1,
+        outcome: &InteractionEffectAttemptOutcomeV1,
+    ) -> Result<(), RuntimeInteractionReceiptPermitErrorV1> {
+        if permit.action_index != materialized.definition().action().action_index() {
+            return Err(RuntimeInteractionReceiptPermitErrorV1::Contract);
+        }
+        let request = RuntimeInteractionEffectFinishRequestV1::new(
+            claim,
+            materialized,
+            permit.effect_head_revision,
+            outcome.clone(),
+        )
+        .map_err(map_receipt_permit_error_v1)?;
+        self.store
+            .finish_interaction_effect_v1(request)
+            .await
+            .map_err(map_receipt_permit_error_v1)?;
+        Ok(())
+    }
+
+    async fn commit_terminal_v1(
+        &self,
+        claim: &mut Self::Claim,
+        finish: &InteractionTerminalFinishV1,
+    ) -> Result<(), RuntimeInteractionReceiptPermitErrorV1> {
+        if claim.action_plan_digest() != finish.action_plan_digest() {
+            return Err(RuntimeInteractionReceiptPermitErrorV1::Contract);
+        }
+        let terminal = RuntimeInteractionReceiptTerminalOutcomeV1::new(
+            map_persistence_terminal_state_v1(finish.state())?,
+            finish.outcome_code(),
+            RuntimeInteractionReceiptOpaqueDigestV1::new(*finish.terminal_digest().as_bytes()),
+        )
+        .map_err(map_receipt_permit_error_v1)?;
+        self.store
+            .finish_interaction_receipt_v1(claim, terminal)
+            .await
+            .map_err(map_receipt_permit_error_v1)?;
+        Ok(())
+    }
+}
+
+fn map_persistence_receipt_route_v1(
+    route: SharedGatewayDurableReceiptRouteV1,
+) -> Result<RuntimeInteractionReceiptRouteV1, RuntimeInteractionReceiptClosedReasonV1> {
+    match route {
+        SharedGatewayDurableReceiptRouteV1::StaticComponent { component_key, .. } => {
+            RuntimeInteractionReceiptRouteV1::static_route(component_key)
+        }
+        SharedGatewayDurableReceiptRouteV1::InstanceAction {
+            instance_id,
+            action,
+        } => RuntimeInteractionReceiptRouteV1::instance_route(action, instance_id),
+    }
+    .map_err(map_receipt_persistence_error_v1)
+}
+
+fn map_persistence_initial_response_kind_v1(
+    kind: InteractionInitialResponseKindV1,
+) -> PostgresInitialResponseKindV1 {
+    match kind {
+        InteractionInitialResponseKindV1::RespondEphemeral => {
+            PostgresInitialResponseKindV1::RespondEphemeral
+        }
+        InteractionInitialResponseKindV1::OpenModal => PostgresInitialResponseKindV1::OpenModal,
+        InteractionInitialResponseKindV1::DeferEphemeral => {
+            PostgresInitialResponseKindV1::DeferEphemeral
+        }
+    }
+}
+
+fn map_persistence_initial_response_result_kind_v1(
+    kind: InteractionInitialResponseResultKindV1,
+) -> PostgresInitialResponseResultKindV1 {
+    match kind {
+        InteractionInitialResponseResultKindV1::Succeeded => {
+            PostgresInitialResponseResultKindV1::Succeeded
+        }
+        InteractionInitialResponseResultKindV1::DefinitiveFailure => {
+            PostgresInitialResponseResultKindV1::DefinitiveFailure
+        }
+        InteractionInitialResponseResultKindV1::Indeterminate => {
+            PostgresInitialResponseResultKindV1::Indeterminate
+        }
+    }
+}
+
+fn map_persistence_terminal_state_v1(
+    state: InteractionReceiptStateV1,
+) -> Result<RuntimeInteractionReceiptTerminalStateV1, RuntimeInteractionReceiptPermitErrorV1> {
+    match state {
+        InteractionReceiptStateV1::Completed => {
+            Ok(RuntimeInteractionReceiptTerminalStateV1::Completed)
+        }
+        InteractionReceiptStateV1::Failed => Ok(RuntimeInteractionReceiptTerminalStateV1::Failed),
+        InteractionReceiptStateV1::RecoveryRequired => {
+            Ok(RuntimeInteractionReceiptTerminalStateV1::RecoveryRequired)
+        }
+        InteractionReceiptStateV1::Claimed
+        | InteractionReceiptStateV1::Acknowledging
+        | InteractionReceiptStateV1::Deferred
+        | InteractionReceiptStateV1::Prepared
+        | InteractionReceiptStateV1::Executing => {
+            Err(RuntimeInteractionReceiptPermitErrorV1::Contract)
+        }
+    }
+}
+
+fn map_receipt_persistence_error_v1(
+    error: RuntimeInteractionPersistenceErrorV1,
+) -> RuntimeInteractionReceiptClosedReasonV1 {
+    match error.class() {
+        RuntimeInteractionErrorClassV1::InvalidInput => {
+            RuntimeInteractionReceiptClosedReasonV1::InvalidInput
+        }
+        RuntimeInteractionErrorClassV1::InvalidAuthority => {
+            RuntimeInteractionReceiptClosedReasonV1::InvalidAuthority
+        }
+        RuntimeInteractionErrorClassV1::Conflict => {
+            RuntimeInteractionReceiptClosedReasonV1::Conflict
+        }
+        RuntimeInteractionErrorClassV1::PersistenceCorrupt => {
+            RuntimeInteractionReceiptClosedReasonV1::PersistenceCorrupt
+        }
+        RuntimeInteractionErrorClassV1::Timeout => RuntimeInteractionReceiptClosedReasonV1::Timeout,
+        RuntimeInteractionErrorClassV1::Unavailable => {
+            RuntimeInteractionReceiptClosedReasonV1::Unavailable
+        }
+        RuntimeInteractionErrorClassV1::Indeterminate => {
+            RuntimeInteractionReceiptClosedReasonV1::Indeterminate
+        }
+    }
+}
+
+fn map_receipt_permit_error_v1(
+    error: RuntimeInteractionPersistenceErrorV1,
+) -> RuntimeInteractionReceiptPermitErrorV1 {
+    RuntimeInteractionReceiptPermitErrorV1::Persistence(map_receipt_persistence_error_v1(error))
+}
+
+struct RuntimeInteractionTeardownRetryDatabasePortV1 {
+    inner: Arc<OwnedSharedGatewayDispatchServicesV3<PostgresRuntimeInteractionV1>>,
+}
+
+struct RuntimeInteractionReceiptRecoveryDatabasePortV1 {
+    store: PostgresRuntimeInteractionV1,
+    process_instance_id: ProcessInstanceId,
+    runtime_build_revision: InteractionRuntimeBuildRevisionV1,
+}
+
+impl RuntimeInteractionReceiptRecoverySupervisorPortV1
+    for RuntimeInteractionReceiptRecoveryDatabasePortV1
+{
+    type Cursor = RuntimeInteractionReceiptRecoveryScanCursorV1;
+    type Error = RuntimeInteractionPersistenceErrorV1;
+
+    fn scan_recoverable_v1(
+        self: Arc<Self>,
+        request: RuntimeInteractionReceiptRecoveryScanRequestV1<Self::Cursor>,
+    ) -> RuntimeInteractionReceiptRecoveryScanFutureV1<Self::Cursor, Self::Error> {
+        Box::pin(async move {
+            let (cursor, limit) = request.into_parts();
+            let cursor = cursor.unwrap_or_default();
+            let page = self
+                .store
+                .scan_recoverable_interaction_receipts_v1(&cursor, limit)
+                .await?;
+            let candidates = page
+                .candidates()
+                .iter()
+                .map(|candidate| {
+                    RuntimeInteractionReceiptRecoveryCandidateV1::new(
+                        candidate.key().identity(),
+                        candidate.state(),
+                        candidate.head_revision(),
+                        candidate.claim_revision(),
+                        candidate.key().claim_expires_at(),
+                        candidate.token_expires_at(),
+                    )
+                    .map_err(|_| RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            RuntimeInteractionReceiptRecoveryScanPageV1::new(
+                candidates,
+                page.next_cursor(),
+                page.exhausted(),
+                page.observed_database_now(),
+            )
+            .map_err(|_| RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt)
+        })
+    }
+
+    fn expire_token_v1(
+        self: Arc<Self>,
+        request: RuntimeInteractionReceiptRecoveryMutationRequestV1,
+    ) -> RuntimeInteractionReceiptRecoveryMutationFutureV1<Self::Error> {
+        Box::pin(async move {
+            let candidate = request.into_candidate();
+            let request = RuntimeInteractionReceiptTokenExpiryRequestV1::new(
+                candidate.identity(),
+                candidate.head_revision(),
+                candidate.claim_revision(),
+                RuntimeInteractionReceiptOpaqueDigestV1::new(
+                    INTERACTION_TOKEN_EXPIRY_OBSERVATION_DIGEST_V1,
+                ),
+            )?;
+            let outcome = self
+                .store
+                .expire_interaction_receipt_token_v1(request)
+                .await?;
+            Ok(match outcome.disposition() {
+                RuntimeInteractionReceiptTokenExpiryDispositionV1::RecoveryRequired => {
+                    RuntimeInteractionReceiptRecoveryMutationDispositionV1::RecoveryRequired
+                }
+                RuntimeInteractionReceiptTokenExpiryDispositionV1::TokenAbsent
+                | RuntimeInteractionReceiptTokenExpiryDispositionV1::TerminalTokenDeleted
+                | RuntimeInteractionReceiptTokenExpiryDispositionV1::EffectsCompleted
+                | RuntimeInteractionReceiptTokenExpiryDispositionV1::ResponseUnconfirmed
+                | RuntimeInteractionReceiptTokenExpiryDispositionV1::ResponseUnrecoverable => {
+                    RuntimeInteractionReceiptRecoveryMutationDispositionV1::Converged
+                }
+                RuntimeInteractionReceiptTokenExpiryDispositionV1::TokenNotExpired
+                | RuntimeInteractionReceiptTokenExpiryDispositionV1::EffectRecoveryPending => {
+                    RuntimeInteractionReceiptRecoveryMutationDispositionV1::Deferred
+                }
+            })
+        })
+    }
+
+    fn terminalize_expired_v1(
+        self: Arc<Self>,
+        request: RuntimeInteractionReceiptRecoveryMutationRequestV1,
+    ) -> RuntimeInteractionReceiptRecoveryMutationFutureV1<Self::Error> {
+        Box::pin(async move {
+            let candidate = request.into_candidate();
+            let request = RuntimeInteractionReceiptTerminalizeExpiredRequestV1::new(
+                candidate.identity(),
+                candidate.head_revision(),
+                candidate.claim_revision(),
+                self.process_instance_id.clone(),
+                self.runtime_build_revision.clone(),
+                RuntimeInteractionReceiptOpaqueDigestV1::new(
+                    INTERACTION_EXPIRED_TERMINALIZATION_OBSERVATION_DIGEST_V1,
+                ),
+            )?;
+            let outcome = self
+                .store
+                .terminalize_expired_interaction_receipt_v1(request)
+                .await?;
+            Ok(match outcome.disposition() {
+                RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::RecoveryRequired
+                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::PristineClaimAbandoned => {
+                    RuntimeInteractionReceiptRecoveryMutationDispositionV1::RecoveryRequired
+                }
+                RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::TerminalReceipt
+                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::EffectsCompleted
+                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::ResponseUnconfirmed
+                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::ResponseUnrecoverable => {
+                    RuntimeInteractionReceiptRecoveryMutationDispositionV1::Converged
+                }
+                RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::ClaimRenewed
+                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::RevisionRace
+                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::RouteAuthorityStale
+                | RuntimeInteractionReceiptTerminalizeExpiredDispositionV1::EffectRecoveryPending => {
+                    RuntimeInteractionReceiptRecoveryMutationDispositionV1::Deferred
+                }
+            })
+        })
+    }
+}
+
+impl InstanceTeardownRetrySupervisorPortV1 for RuntimeInteractionTeardownRetryDatabasePortV1 {
+    fn scan_retryable_v1(
+        self: Arc<Self>,
+        request: InstanceTeardownRetryScanRequestV1,
+    ) -> InstanceTeardownRetryScanFutureV1 {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let (cursor, limit) = request.into_parts();
+            inner.scan_teardown_retries_v1(&cursor, limit).await
+        })
+    }
+
+    fn retry_teardown_v1(
+        self: Arc<Self>,
+        request: InstanceTeardownRetryExecutionRequestV1,
+    ) -> InstanceTeardownRetryExecutionFutureV1 {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let (guild_id, instance_id) = request.into_parts();
+            inner.retry_teardown_v1(guild_id, instance_id).await
+        })
+    }
+}
+
+impl RuntimeInteractionDispatchDatabasePortV1 {
+    pub(crate) fn start_effect_recovery_supervisor_v1(
+        &self,
+    ) -> crate::interaction_effect_recovery_supervisor::RuntimeInteractionEffectRecoverySupervisorV1
+    {
+        crate::interaction_effect_recovery_supervisor::RuntimeInteractionEffectRecoverySupervisorV1::start(
+            RuntimeInteractionEffectRecoveryDatabasePortV1::from_dispatch_port_v1(self),
+            crate::interaction_effect_recovery_supervisor::RuntimeInteractionEffectRecoverySupervisorConfigV1::production_v1(),
+        )
+    }
+
+    pub(crate) fn start_receipt_recovery_supervisor_v1(
+        &self,
+    ) -> RuntimeInteractionReceiptRecoverySupervisorV1 {
+        RuntimeInteractionReceiptRecoverySupervisorV1::start(
+            RuntimeInteractionReceiptRecoveryDatabasePortV1 {
+                store: self.receipt.store.clone(),
+                process_instance_id: self.process_instance_id.clone(),
+                runtime_build_revision: self.runtime_build_revision.clone(),
+            },
+            RuntimeInteractionReceiptRecoverySupervisorConfigV1::production_v1(),
+        )
+    }
+
+    pub(crate) fn start_teardown_retry_supervisor_v1(
+        &self,
+    ) -> RuntimeInteractionTeardownRetrySupervisorV1 {
+        InstanceTeardownRetrySupervisorV1::start(
+            RuntimeInteractionTeardownRetryDatabasePortV1 {
+                inner: Arc::clone(&self.inner),
+            },
+            production_teardown_retry_config_v1(),
+        )
+    }
+}
+
+fn production_teardown_retry_config_v1() -> InstanceTeardownRetrySupervisorConfigV1 {
+    InstanceTeardownRetrySupervisorConfigV1::new(
+        INSTANCE_TEARDOWN_RETRY_CADENCE,
+        NonZeroUsize::new(INSTANCE_TEARDOWN_RETRY_PAGE_LIMIT)
+            .expect("instance teardown retry page limit is non-zero"),
+        NonZeroUsize::new(INSTANCE_TEARDOWN_RETRY_CONCURRENCY)
+            .expect("instance teardown retry concurrency is non-zero"),
+        INSTANCE_TEARDOWN_RETRY_SCAN_TIMEOUT,
+        INSTANCE_TEARDOWN_RETRY_TIMEOUT,
+    )
+    .expect("production instance teardown retry configuration is bounded")
 }
 
 impl RuntimePendingDrainMutationDatabaseV3 {
+    pub(crate) async fn observe_source_serving_v3(
+        &self,
+        lookup: &RuntimePendingDrainServingLookupV1,
+    ) -> Result<RuntimePendingDrainServingObservationV1, RuntimeServingPersistenceErrorV1> {
+        self.serving
+            .observe_pending_drain_source_serving_v1(lookup)
+            .await
+    }
+
+    pub(crate) async fn disconnect_source_serving_v3(
+        &self,
+        lookup: &RuntimePendingDrainServingLookupV1,
+        identity: &RuntimeServingIdentityV2,
+    ) -> Result<RuntimeServingReceiptV2, RuntimeServingPersistenceErrorV1> {
+        self.serving
+            .disconnect_pending_drain_source_serving_if_expired_v1(lookup, identity)
+            .await
+    }
+
     pub(crate) async fn record_no_candidate_v3(
         &self,
         selection: &RuntimeSelectedPendingDrainNoCandidateV2,
@@ -369,7 +1329,88 @@ impl RuntimeDatabaseDependenciesV1 {
     pub(crate) fn pending_drain_mutation_v3(&self) -> RuntimePendingDrainMutationDatabaseV3 {
         RuntimePendingDrainMutationDatabaseV3 {
             execution: self.execution.clone(),
+            serving: self.serving.clone(),
         }
+    }
+
+    pub(crate) fn runtime_controller_v2(&self) -> RuntimeControllerDatabaseV2 {
+        RuntimeControllerDatabaseV2 {
+            execution: self.execution.clone(),
+            exact_target: self.exact_target.clone(),
+            panel: self.panel.clone(),
+            serving: self.serving.clone(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn compose_interaction_dispatch_port_v1(
+        &self,
+        input: RuntimeInteractionDispatchCompositionInputV1<'_>,
+    ) -> Result<
+        RuntimeInteractionDispatchDatabasePortV1,
+        RuntimeInteractionDispatchCompositionErrorV1,
+    > {
+        let RuntimeInteractionDispatchCompositionInputV1 {
+            registry,
+            token,
+            token_envelope_keyring,
+            build_revision,
+            process_instance_id,
+            gateway,
+            operation_deadline,
+        } = input;
+        let admission_config =
+            SharedGatewayAdmissionConfigV3::new(gateway.global_admission_capacity())
+                .map_err(|_| RuntimeInteractionDispatchCompositionErrorV1::AdmissionConfiguration)?
+                .with_instance_lookup_timeout(gateway.instance_lookup_timeout())
+                .map_err(|_| RuntimeInteractionDispatchCompositionErrorV1::RouteConfiguration)?;
+        let mutation_http_transport = match gateway.discord_transport().effect_http_proxy_address()
+        {
+            Some(address) => SharedGatewayLoopbackHttpProxyV1::new(address)
+                .map(SharedGatewayMutationHttpTransportV1::LoopbackProxy)
+                .ok_or(RuntimeInteractionDispatchCompositionErrorV1::RouteConfiguration)?,
+            None => SharedGatewayMutationHttpTransportV1::Direct,
+        };
+        let inner = OwnedSharedGatewayDispatchServicesV3::compose_with_mutation_http_transport_v1(
+            Zeroizing::new(token.expose_secret().to_owned()),
+            registry.into_registry_v1(),
+            self.interaction.clone(),
+            admission_config,
+            mutation_http_transport,
+            operation_deadline,
+        )
+        .await
+        .map_err(
+            |error: OwnedSharedGatewayDispatchServicesCompositionErrorV3| match error {
+                OwnedSharedGatewayDispatchServicesCompositionErrorV3::TimedOut => {
+                    RuntimeInteractionDispatchCompositionErrorV1::TimedOut
+                }
+                OwnedSharedGatewayDispatchServicesCompositionErrorV3::SnapshotUnavailable => {
+                    RuntimeInteractionDispatchCompositionErrorV1::SnapshotUnavailable
+                }
+            },
+        )?;
+        let gateway_shard_identity = InteractionGatewayShardIdentityV1::parse(
+            crate::gateway::runtime_gateway_shard_id_v1()
+                .as_str()
+                .to_owned(),
+        )
+        .map_err(|_| RuntimeInteractionDispatchCompositionErrorV1::RouteConfiguration)?;
+        let runtime_build_revision =
+            InteractionRuntimeBuildRevisionV1::parse(build_revision.to_owned())
+                .map_err(|_| RuntimeInteractionDispatchCompositionErrorV1::RouteConfiguration)?;
+        Ok(RuntimeInteractionDispatchDatabasePortV1 {
+            inner: Arc::new(inner),
+            receipt: RuntimeInteractionReceiptDatabaseV1 {
+                store: self.interaction.clone(),
+                cipher: XChaCha20Poly1305InteractionTokenCipherV1::new(
+                    token_envelope_keyring.clone(),
+                ),
+            },
+            gateway_shard_identity,
+            runtime_build_revision,
+            process_instance_id: process_instance_id.clone(),
+        })
     }
 
     pub fn exact_target(&self) -> &PostgresRuntimeExactTargetReader {
@@ -1386,6 +2427,16 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn teardown_retry_production_limits_are_exact_and_bounded() {
+        let config = production_teardown_retry_config_v1();
+        assert_eq!(config.cadence(), Duration::from_secs(30));
+        assert_eq!(config.page_limit().get(), 32);
+        assert_eq!(config.max_concurrency().get(), 4);
+        assert_eq!(config.scan_timeout(), Duration::from_secs(5));
+        assert_eq!(config.per_instance_timeout(), Duration::from_secs(60));
+    }
 
     #[test]
     fn expected_authority_is_checked_before_connecting() {

@@ -1,20 +1,32 @@
+#[cfg(any(test, doctest))]
 use std::future::Future;
 use std::sync::Arc;
 
 use automation_core::RunningRuleSetIdentity;
+#[cfg(not(any(test, doctest)))]
+use automation_instance::InstanceRuleSetVersion;
+#[cfg(any(test, doctest))]
 use automation_instance::{InstanceIdGenerator, InstanceRegistrarV1, InstanceRuleSetVersion};
+#[cfg(any(test, doctest))]
 use automation_instance_teardown::InstanceTeardownService;
 use automation_ruleset::RuleSetVersion;
+#[cfg(any(test, doctest))]
 use automation_ruleset_dispatch::{GuildRoleSnapshotProvider, PinnedInstanceResolverV1};
 use automation_runtime_registry::ExactServingRouteV1;
 use resource_resolution::ResourceBindingMap;
+#[cfg(any(test, doctest))]
 use twilight_http::Client;
+#[cfg(any(test, doctest))]
 use twilight_model::application::interaction::Interaction;
 
+#[cfg(any(test, doctest))]
 use crate::mutation::TwilightMutationAdapter;
+#[cfg(any(test, doctest))]
 use crate::runner::{handle_interaction_with_resolver_v1, InteractionExecutionOutcomeV3};
+#[cfg(any(test, doctest))]
 use crate::shared_gateway_admission::SharedGatewayAdmittedInteractionV3;
 
+#[cfg(any(test, doctest))]
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_admitted_interaction_v3(
     mutation_http: &Client,
@@ -47,7 +59,7 @@ pub async fn execute_admitted_interaction_v3(
     hold_admission_while(admitted, handler).await
 }
 
-fn execution_inputs(
+pub(crate) fn execution_inputs(
     route: &ExactServingRouteV1,
 ) -> (
     RunningRuleSetIdentity,
@@ -64,6 +76,7 @@ fn execution_inputs(
     (identity, artifact, Arc::clone(route.bindings()))
 }
 
+#[cfg(any(test, doctest))]
 async fn hold_admission_while<F>(
     admitted: SharedGatewayAdmittedInteractionV3,
     future: F,
@@ -85,8 +98,9 @@ mod tests {
         content_hash, RuleSetKey, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
     };
     use automation_runtime_convergence::{
-        BindingRevision, FencingToken, ProcessInstanceId, RuntimeDeploymentTargetV1,
-        RuntimeGeneration, RuntimeProcessIdentityV1,
+        ActivationRequestId, BindingRevision, DeploymentId, FencingToken, InstallationId,
+        ProcessInstanceId, PromotionId, RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1,
+        RuntimeGeneration, RuntimeProcessIdentityV1, TenantId,
     };
     use automation_runtime_registry::{
         ServingSlotKeyV1, ServingSlotRegistryConfigV1, ServingSlotRegistryV1,
@@ -105,6 +119,17 @@ mod tests {
     };
 
     use super::*;
+
+    fn deployment_identity() -> RuntimeDeploymentIdentityV1 {
+        RuntimeDeploymentIdentityV1 {
+            deployment_id: DeploymentId::parse("deployment:shared-executor-test").unwrap(),
+            tenant_id: TenantId::parse("tenant:shared-executor-test").unwrap(),
+            installation_id: InstallationId::parse("installation:shared-executor-test").unwrap(),
+            promotion_id: PromotionId::parse("a".repeat(64)).unwrap(),
+            activation_request_id: ActivationRequestId::parse("activation:shared-executor-test")
+                .unwrap(),
+        }
+    }
 
     fn exact_route(version: u32) -> ExactServingRouteV1 {
         let guild_id = GuildId(77);
@@ -131,6 +156,7 @@ mod tests {
             process_instance_id: ProcessInstanceId::parse("shared-executor-test").unwrap(),
         };
         ExactServingRouteV1::new(
+            deployment_identity(),
             identity,
             RuleSetVersion {
                 guild_id,

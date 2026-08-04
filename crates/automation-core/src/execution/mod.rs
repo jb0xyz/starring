@@ -37,7 +37,7 @@ where
     Ok(output.finish())
 }
 
-pub(crate) async fn execute_prepared_event<M, R, S, G, T>(
+pub async fn execute_prepared_event<M, R, S, G, T>(
     prepared: PreparedEventExecution,
     services: &AutomationServices<'_, M, R, S, G, T>,
     failure_message: &str,
@@ -49,14 +49,14 @@ where
     G: InstanceIdGenerator,
     T: InstanceTeardownService,
 {
-    if prepared.defer_ephemeral {
+    if prepared.leading_defer_ephemeral() {
         services.responder.defer_ephemeral().await?;
     }
-    match execute_plan(&prepared.context, &prepared.plan, services).await {
+    match execute_plan(prepared.context(), prepared.plan(), services).await {
         Ok(_) => Ok(()),
         Err(error) => {
-            if prepared.defer_ephemeral {
-                if let Ok(rendered) = prepare_failure_message(failure_message, &prepared.context) {
+            if prepared.leading_defer_ephemeral() {
+                if let Ok(rendered) = prepare_failure_message(failure_message, prepared.context()) {
                     let _ = services.responder.edit_response(rendered).await;
                 }
             }

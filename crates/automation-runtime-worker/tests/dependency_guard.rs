@@ -51,8 +51,16 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
         relative_sources,
         [
             PathBuf::from("src/capability_readiness.rs"),
+            PathBuf::from("src/certification_finalization/tests.rs"),
+            PathBuf::from("src/certification_finalization.rs"),
             PathBuf::from("src/certification_reservation.rs"),
             PathBuf::from("src/closed_recovery.rs"),
+            PathBuf::from("src/convergence/hydration.rs"),
+            PathBuf::from("src/convergence/preflight.rs"),
+            PathBuf::from("src/convergence/replacement.rs"),
+            PathBuf::from("src/convergence/staging.rs"),
+            PathBuf::from("src/convergence/tests.rs"),
+            PathBuf::from("src/convergence.rs"),
             PathBuf::from("src/gateway_lifecycle.rs"),
             PathBuf::from("src/gateway_lifecycle_tests.rs"),
             PathBuf::from("src/gateway_owner.rs"),
@@ -64,6 +72,9 @@ fn worker_dependency_surface_is_pure_library_only_and_closed() {
             PathBuf::from("src/production_lifecycle/admission.rs"),
             PathBuf::from("src/production_lifecycle/handoff.rs"),
             PathBuf::from("src/production_lifecycle/refresh.rs"),
+            PathBuf::from("src/production_lifecycle/serving/route_set.rs"),
+            PathBuf::from("src/production_lifecycle/serving/slot_work.rs"),
+            PathBuf::from("src/production_lifecycle/serving.rs"),
             PathBuf::from("src/production_lifecycle/shutdown.rs"),
             PathBuf::from("src/production_lifecycle/tests.rs"),
             PathBuf::from("src/production_lifecycle.rs"),
@@ -200,6 +211,134 @@ fn certification_reservation_port_is_pure_checked_and_non_authorizing() {
             .count(),
         1
     );
+}
+
+#[test]
+fn certification_finalization_is_session_bound_linear_and_lookup_only_after_unknown() {
+    let source = include_str!("../src/certification_finalization.rs");
+    let finalizer_port = source
+        .split("pub trait RuntimeCertificationFinalizerPortV2<P> {")
+        .nth(1)
+        .and_then(|source| source.split("\n}").next())
+        .unwrap();
+    let reserved = source
+        .split("impl RuntimeReservedCertificationV2 {")
+        .nth(1)
+        .and_then(|source| source.split("\n}\n\nimpl Debug").next())
+        .unwrap();
+    let lookup_only = source
+        .split("impl<E, R> RuntimeCertificationLookupOnlyRecoveryV2<E, R>")
+        .nth(1)
+        .and_then(|source| source.split("\n}\n\nimpl<E, R> Debug").next())
+        .unwrap();
+
+    assert!(reserved.contains("authority: RuntimeCertificationReservationAuthorityV2,"));
+    assert!(reserved.contains("authority.into_reserved_intent()"));
+    assert!(!reserved.contains("reservation: RuntimeReservedCertificationIntentV2,"));
+    assert!(source.contains(
+        "pub fn into_session_outcome(self) -> RuntimeCertificationIntentReservationOutcomeV2"
+    ));
+    assert!(source.contains(
+        "RuntimeCertificationIntentReservationOutcomeV2::Diverged(\n                    RuntimeCertificationDivergenceV2::ReservationMismatch,"
+    ));
+    assert!(source.contains("struct RuntimeCertificationCommitAuthorityV2 {\n    _private: (),\n}"));
+    assert!(!source.contains("from_barrier_completion_v2"));
+    assert!(source.contains(
+        "pub fn complete_barrier_b_v2(\n        self,\n        barrier_id: RuntimeBarrierIdV1,\n        paused_gateway: RuntimePausedGatewayObservationV2,\n        route_admission: RuntimeRouteAdmissionAttestationV2,"
+    ));
+    assert!(source.contains("fn canonicalize_barrier_b_completion_v2<P>("));
+    for exact_check in [
+        "paused_gateway.process_instance_id() != &intent.process_identity.process_instance_id",
+        "&route_admission.barrier_id != barrier_id",
+        "route_admission.pause.coordinator_generation.get()",
+        "route_admission.pause.connection_epoch != paused_gateway.connection_epoch()",
+        "route_admission.pause.paused_admission_revision != paused_gateway.admission_revision()",
+        "route_admission.pause.pause_sequence != paused_gateway.transition_sequence()",
+        "route_admission.gateway.kind != paused_gateway.kind()",
+        "route_admission.gateway.connected_event_sequence",
+        "RuntimeLiveAttestationRecordV2::from_request(request)?",
+        ".bind_live_record(record)",
+    ] {
+        assert!(source.contains(exact_check), "{exact_check}");
+    }
+    assert!(source.contains(
+        "pub struct RuntimeCompletedCertificationBarrierBV2<P> {\n    prepared: P,\n    canonical: RuntimeCanonicalLiveAttestationV2,\n}"
+    ));
+    assert!(source.contains(
+        "pub fn authorize_finalization(self) -> RuntimeCertificationFinalizerRegistrationV2<P>"
+    ));
+    assert!(source.contains(
+        "pub fn into_registration(self) -> RuntimeCertificationFinalizerRegistrationV2<P>"
+    ));
+    assert_eq!(
+        source
+            .matches("authority: RuntimeCertificationCommitAuthorityV2 { _private: () },")
+            .count(),
+        1
+    );
+    let prepared_impl = source
+        .split("impl<P> RuntimePreparedCertificationV2<P>")
+        .nth(1)
+        .and_then(|source| source.split("\n}\n\nfn canonicalize_barrier_b").next())
+        .unwrap();
+    assert!(!prepared_impl.contains("authorize_finalization"));
+    assert!(source.contains(
+        "pub struct RuntimeAuthorizedCertificationRequestV2 {\n    canonical: RuntimeCanonicalLiveAttestationV2,\n    authority: RuntimeCertificationCommitAuthorityV2,\n}"
+    ));
+    assert!(source.contains(
+        "pub struct RuntimeCommittedCertificationV2 {\n    canonical: RuntimeCanonicalLiveAttestationV2,\n    receipt: RuntimeCertificationReceiptV2,\n}"
+    ));
+    assert!(source.contains("pub fn canonical(&self) -> &RuntimeCanonicalLiveAttestationV2"));
+    assert!(source.contains("pub fn into_parts("));
+    assert!(source.contains(
+        "RuntimeCommittedCertificationV2 {\n            canonical: expected.clone(),\n            receipt,"
+    ));
+    for name in [
+        "RuntimeReservedCertificationV2",
+        "RuntimePreparedCertificationV2<P>",
+        "RuntimeCompletedCertificationBarrierBV2<P>",
+        "RuntimeCertificationBarrierBCompletionFailureV2<P>",
+        "RuntimeCertificationCommitAuthorityV2",
+        "RuntimeAuthorizedCertificationRequestV2",
+        "RuntimeCertificationFinalizerRegistrationV2<P>",
+        "RuntimeCertificationFinalizerJobV2<P>",
+        "RuntimeCommittedCertificationV2",
+        "RuntimeCertificationLookupOnlyRecoveryV2<E, R>",
+    ] {
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !implements_trait(source, name, forbidden),
+                "{name}: {forbidden}"
+            );
+        }
+    }
+    for expected in [
+        "fn accept_certification_finalizer(",
+        "registration: RuntimeCertificationFinalizerRegistrationV2<P>,",
+        "RuntimeCertificationFinalizerRejectionV2<P, Self::Error>",
+    ] {
+        assert!(finalizer_port.contains(expected), "{expected}");
+    }
+    assert!(!finalizer_port.contains("Future"));
+    assert!(!finalizer_port.contains("async"));
+    for expected in [
+        "RuntimeCertificationFinalizationOutcomeV2::Committed",
+        "RuntimeCertificationFinalizationOutcomeV2::DefinitelyRolledBack",
+        "RuntimeCertificationFinalizationOutcomeV2::Indeterminate",
+        "RuntimeCertificationRecoveryResolutionV2::DefinitelyRolledBack",
+    ] {
+        assert!(source.contains(expected), "{expected}");
+    }
+    assert!(lookup_only.contains("pub fn lookup(&self)"));
+    assert!(lookup_only.contains("pub fn quiesce_and_observe("));
+    for forbidden in [
+        "commit_live_v2",
+        "prepare_live_v2",
+        "authorize_finalization",
+        "heartbeat",
+    ] {
+        assert!(!lookup_only.contains(forbidden), "{forbidden}");
+    }
 }
 
 #[test]
@@ -1829,8 +1968,13 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
     let handoff = include_str!("../src/production_lifecycle/handoff.rs");
     let admission = include_str!("../src/production_lifecycle/admission.rs");
     let refresh = include_str!("../src/production_lifecycle/refresh.rs");
+    let serving = include_str!("../src/production_lifecycle/serving.rs");
+    let serving_route_set = include_str!("../src/production_lifecycle/serving/route_set.rs");
+    let serving_slot_work = include_str!("../src/production_lifecycle/serving/slot_work.rs");
     let shutdown = include_str!("../src/production_lifecycle/shutdown.rs");
-    let source = format!("{model}\n{handoff}\n{admission}\n{refresh}\n{shutdown}");
+    let source = format!(
+        "{model}\n{handoff}\n{admission}\n{refresh}\n{serving}\n{serving_route_set}\n{serving_slot_work}\n{shutdown}"
+    );
     let root = include_str!("../src/lib.rs");
     let closed = include_str!("../src/gateway_lifecycle.rs");
 
@@ -1838,6 +1982,9 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
     assert!(handoff.lines().count() < 500);
     assert!(admission.lines().count() < 700);
     assert!(refresh.lines().count() < 400);
+    assert!(serving.lines().count() < 925);
+    assert!(serving_route_set.lines().count() < 200);
+    assert!(serving_slot_work.lines().count() < 350);
     assert!(shutdown.lines().count() < 650);
 
     for authority in [
@@ -1849,6 +1996,12 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
         "RuntimeAdmissionAcknowledgingProcessV2",
         "RuntimeEmptyOpenEpochV2",
         "RuntimeEmptyOpenProcessV2",
+        "RuntimeRouteSetEpochV2",
+        "RuntimeServingOpenPreparedV2",
+        "RuntimeServingOpenEpochV2",
+        "RuntimeServingOpenProcessV2",
+        "RuntimeServingSlotWorkRequestV2",
+        "RuntimeServingSlotWorkPermitV2",
         "RuntimeProductionEmergencyProcessV2",
         "RuntimeShuttingDownProcessV2",
     ] {
@@ -1882,6 +2035,11 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
         "pub fn begin_production_handoff<P>(\n        self,",
         "pub fn resume_recovery<P>(\n        self,",
         "pub fn observe_open_production<P>(\n        self,",
+        "pub fn prepare_serving_open<P>(\n        self,",
+        "pub fn commit(self) -> RuntimeServingOpenProcessV2",
+        "pub fn cancel(self) -> RuntimeEmptyOpenProcessV2",
+        "pub fn authorize_slot_work(\n        &self,",
+        "pub fn begin_slot_work(\n        &mut self,",
         "pub fn invalidate_production(\n        self,",
         "pub fn begin_shutdown(\n        self,",
     ] {
@@ -1892,6 +2050,7 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
         "RuntimeProductionHandoffObservationPortV2",
         "RuntimeRecoveryResumePortV2",
         "RuntimeOpenProductionObservationPortV2",
+        "RuntimeServingOpenObservationPortV2",
     ] {
         let body = source
             .split(&format!("pub trait {port} {{"))
@@ -1913,6 +2072,8 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
         "RuntimeProductionLifecycleStageV2::OpenProduction",
         "RuntimeProductionLifecycleStageV2::Shutdown",
         "RuntimeIngressOpenAcknowledgementObservationV2",
+        "RuntimeRouteSetEpochV2",
+        "RuntimeServingSlotWorkSupervisorV2",
         "RuntimeProductionInvalidationOutcomeV2",
         "RuntimeShutdownCauseV2::GenerationOverflow",
     ] {
@@ -1941,6 +2102,11 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
         "RuntimeRecoveryResumePermitV2",
         "RuntimeAdmissionAcknowledgingProcessV2",
         "RuntimeEmptyOpenProcessV2",
+        "RuntimeRouteSetEpochV2",
+        "RuntimeServingOpenPreparedV2",
+        "RuntimeServingOpenProcessV2",
+        "RuntimeServingSlotWorkRequestV2",
+        "RuntimeServingSlotWorkPermitV2",
         "RuntimeProductionEmergencyProcessV2",
         "RuntimeShuttingDownProcessV2",
     ] {
@@ -1949,6 +2115,118 @@ fn production_lifecycle_suffix_is_linear_pure_and_has_no_customer_ingress() {
     assert!(!contains_identifier(root, "RuntimePublicAdmissionPermitV2"));
     assert!(!closed.contains("AdmissionAcknowledging"));
     assert!(!closed.contains("OpenProduction"));
+}
+
+#[test]
+fn serving_open_authority_is_linear_epoch_fenced_and_keyed() {
+    let serving_root = include_str!("../src/production_lifecycle/serving.rs");
+    let serving_route_set = include_str!("../src/production_lifecycle/serving/route_set.rs");
+    let serving_slot_work = include_str!("../src/production_lifecycle/serving/slot_work.rs");
+    let serving = format!("{serving_root}\n{serving_route_set}\n{serving_slot_work}");
+    let shutdown = include_str!("../src/production_lifecycle/shutdown.rs");
+    let lifecycle = include_str!("../src/production_lifecycle.rs");
+    let root = include_str!("../src/lib.rs");
+
+    let prepared = serving_root
+        .split("pub struct RuntimeServingOpenPreparedV2 {")
+        .nth(1)
+        .and_then(|source| source.split("\n}\n").next())
+        .unwrap();
+    assert!(prepared.contains("state: Box<RuntimeEmptyOpenProcessV2>,"));
+    assert!(prepared.contains("route_set_epoch: RuntimeRouteSetEpochV2,"));
+
+    let process = serving_root
+        .split("pub struct RuntimeServingOpenProcessV2 {")
+        .nth(1)
+        .and_then(|source| source.split("\n}\n").next())
+        .unwrap();
+    assert!(!process.contains("RuntimeEmptyOpenProcessV2"));
+    assert!(process.contains("_admission: RuntimeAdmissionAcknowledgingProcessV2,"));
+    assert!(process.contains("epoch: RuntimeServingOpenEpochV2,"));
+    assert!(process.contains("supervisor: RuntimeServingSlotWorkSupervisorV2,"));
+
+    let route_epoch = serving_root
+        .split("pub struct RuntimeRouteSetEpochV2 {")
+        .nth(1)
+        .and_then(|source| source.split("impl Debug for RuntimeRouteSetEpochV2").next())
+        .unwrap();
+    assert!(!route_epoch.contains("pub fn new("));
+    assert!(route_epoch.contains(
+        "initial_registry_observation_sequence: RuntimeRegistryGlobalObservationSequenceV2,"
+    ));
+    assert!(route_epoch.contains("initial_retained_slot_count: u64,"));
+    assert!(route_epoch.contains("initial_retained_empty_tombstone_count: u64,"));
+
+    for required in [
+        "let RuntimeEmptyOpenProcessV2 { _admission, epoch } = *state;",
+        "registry_empty: _,",
+        "RuntimeProductionLifecycleStageV2::OpenProduction",
+        "observed.route_set.observation_sequence() != request.registry_observation_sequence",
+        "observed.route_set.retained_slot_count()",
+        "request.route_set_epoch.initial_retained_slot_count",
+        "observed.route_set.retained_empty_tombstone_count()",
+        "request\n                .route_set_epoch\n                .initial_retained_empty_tombstone_count",
+        "observed.gateway_owner.database_now < previous_owner.database_now",
+        "observed.writer_fence_open",
+        "observed.maintenance_gate_open",
+        "observed.finalizer_accepting",
+        "ingress_acknowledgement_predecessor",
+        "if !observed.supervisors_running",
+        "BTreeMap<RuntimeServingSlotV2, NonZeroU64>",
+        "state.active.contains_key(&slot)",
+        "state.active.len() >= state.max_in_flight.get()",
+        "impl Drop for RuntimeServingSlotWorkPermitV2",
+        "state.active.get(&identity.slot)",
+        "Arc::downgrade(&self.state)",
+        "RuntimeServingSlotWorkErrorV2::StaleRouteSetEpoch",
+        "RuntimeServingOpenAcknowledgementRefreshV2",
+        "route_set_sequence < previous_route_set_sequence",
+        "route_set_sequence == previous_route_set_sequence",
+        "input.route_set != epoch.route_set",
+    ] {
+        assert!(serving.contains(required), "{required}");
+    }
+
+    for forbidden in [
+        "successor_generation(",
+        "RuntimeProductionLifecycleStageV2::Serving",
+        "pub route_set_epoch:",
+        "pub supervisor:",
+        "async fn",
+        "tokio",
+        "sqlx",
+        "twilight",
+        "serde",
+    ] {
+        assert!(!serving.contains(forbidden), "{forbidden}");
+    }
+
+    for authority in [
+        "RuntimeRouteSetEpochV2",
+        "RuntimeServingOpenPreparedV2",
+        "RuntimeServingOpenEpochV2",
+        "RuntimeServingOpenProcessV2",
+        "RuntimeServingSlotWorkRequestV2",
+        "RuntimeServingSlotWorkPermitV2",
+        "RuntimeServingOpenAcknowledgementRefreshV2",
+    ] {
+        assert!(
+            serving.contains(&format!("{authority}(<redacted>)")),
+            "{authority}"
+        );
+        for forbidden in ["Clone", "Copy", "Default", "Serialize", "Deserialize"] {
+            assert!(
+                !implements_trait(&serving, authority, forbidden),
+                "{authority} implements {forbidden}"
+            );
+        }
+        assert!(contains_identifier(lifecycle, authority), "{authority}");
+        assert!(contains_identifier(root, authority), "{authority}");
+    }
+
+    assert!(shutdown.contains("RuntimeProductionEmergencySourceV2::ServingOpen"));
+    assert!(shutdown.contains("RuntimeProductionTerminalSourceV2::ServingOpen"));
+    assert!(shutdown.contains("impl RuntimeServingOpenProcessV2"));
 }
 
 #[test]

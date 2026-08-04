@@ -73,7 +73,7 @@ impl PolicyRule for DestructiveOperationRule {
                     "role deletion",
                 ),
                 Operation::DeleteChannel { key } => (
-                    Verdict::RequireSecondApproval,
+                    Verdict::RequireApproval,
                     format!("channel:{}", key.0),
                     "channel deletion",
                 ),
@@ -195,12 +195,10 @@ mod tests {
             },
         ]);
         let findings = DestructiveOperationRule.evaluate(&graph);
+        assert_eq!(findings.len(), 2);
         assert!(findings
             .iter()
-            .any(|finding| finding.verdict == Verdict::RequireApproval));
-        assert!(findings
-            .iter()
-            .any(|finding| finding.verdict == Verdict::RequireSecondApproval));
+            .all(|finding| finding.verdict == Verdict::RequireApproval));
     }
 
     #[test]

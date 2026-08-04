@@ -128,6 +128,7 @@ impl RuntimeLifecycleShutdownSourceV2 {
             RuntimeShutdownCauseV1::SupervisorFailure
             | RuntimeShutdownCauseV1::FinalizerTerminal
             | RuntimeShutdownCauseV1::HealthTerminal
+            | RuntimeShutdownCauseV1::ProductAuthorityChanged
             | RuntimeShutdownCauseV1::IngressAcknowledgementTerminal
             | RuntimeShutdownCauseV1::GatewayOwnerTerminal
             | RuntimeShutdownCauseV1::DiscordTerminal
@@ -657,6 +658,16 @@ mod tests {
         assert_eq!(
             format!("{observer:?}"),
             "RuntimeLifecycleTimingObserverV2(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn product_authority_change_is_supervised_shutdown() {
+        assert_eq!(
+            RuntimeLifecycleShutdownSourceV2::from_cause_v2(
+                RuntimeShutdownCauseV1::ProductAuthorityChanged
+            ),
+            RuntimeLifecycleShutdownSourceV2::Supervisor
         );
     }
 

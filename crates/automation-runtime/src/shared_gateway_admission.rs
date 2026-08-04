@@ -209,6 +209,7 @@ impl SharedGatewayAdmissionReservationV3 {
         Ok(Some(SharedGatewayAdmittedInteractionV3 {
             admitted,
             ready_lease: self.ready_lease,
+            custom_id: custom_id.to_string(),
             _global_permit: self.global_permit,
         }))
     }
@@ -217,6 +218,7 @@ impl SharedGatewayAdmissionReservationV3 {
 pub struct SharedGatewayAdmittedInteractionV3 {
     admitted: AdmittedInteractionV1,
     ready_lease: GatewayReadyLeaseV3,
+    custom_id: String,
     _global_permit: OwnedSemaphorePermit,
 }
 
@@ -231,6 +233,10 @@ impl SharedGatewayAdmittedInteractionV3 {
 
     pub fn epoch(&self) -> GatewayConnectionEpochV3 {
         self.ready_lease.epoch()
+    }
+
+    pub(crate) fn custom_id_v3(&self) -> &str {
+        &self.custom_id
     }
 }
 
@@ -247,8 +253,9 @@ mod tests {
         content_hash, RuleSetKey, RuleSetVersion, RuleSetVersionId, CURRENT_RULESET_SCHEMA_VERSION,
     };
     use automation_runtime_convergence::{
-        BindingRevision, FencingToken, ProcessInstanceId, RuntimeDeploymentTargetV1,
-        RuntimeGeneration, RuntimeProcessIdentityV1,
+        ActivationRequestId, BindingRevision, DeploymentId, FencingToken, InstallationId,
+        ProcessInstanceId, PromotionId, RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1,
+        RuntimeGeneration, RuntimeProcessIdentityV1, TenantId,
     };
     use automation_runtime_registry::{
         ExactServingRouteV1, ServingSlotKeyV1, ServingSlotRegistryConfigV1,
@@ -264,6 +271,21 @@ mod tests {
     };
 
     use super::*;
+
+    fn deployment_identity(guild_id: GuildId, key: &str) -> RuntimeDeploymentIdentityV1 {
+        RuntimeDeploymentIdentityV1 {
+            deployment_id: DeploymentId::parse(format!("deployment:{}:{key}", guild_id.0)).unwrap(),
+            tenant_id: TenantId::parse("tenant:shared-gateway-admission").unwrap(),
+            installation_id: InstallationId::parse("installation:shared-gateway-admission")
+                .unwrap(),
+            promotion_id: PromotionId::parse("b".repeat(64)).unwrap(),
+            activation_request_id: ActivationRequestId::parse(format!(
+                "activation:{}:{key}",
+                guild_id.0
+            ))
+            .unwrap(),
+        }
+    }
 
     struct ControlledInstanceStore {
         inner: InMemoryInstanceStore,
@@ -382,6 +404,7 @@ mod tests {
             process_instance_id: ProcessInstanceId::parse(format!("process-{key}")).unwrap(),
         };
         let route = ExactServingRouteV1::new(
+            deployment_identity(guild_id, key),
             identity.clone(),
             RuleSetVersion {
                 guild_id,

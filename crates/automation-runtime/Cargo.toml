@@ -12,6 +12,7 @@ automation-core = { path = "../automation-core" }
 automation-ruleset = { path = "../automation-ruleset" }
 automation-ruleset-dispatch = { path = "../automation-ruleset-dispatch" }
 automation-ruleset-readiness = { path = "../automation-ruleset-readiness" }
+automation-runtime-interaction = { path = "../automation-runtime-interaction" }
 automation-runtime-registry = { path = "../automation-runtime-registry" }
 desired-state = { path = "../desired-state" }
 discord-model = { path = "../discord-model" }
@@ -20,9 +21,13 @@ twilight-gateway = "0.17"
 twilight-http = "0.17"
 twilight-model = "0.17"
 futures = "0.3"
+sha2 = "0.10"
 thiserror = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+zeroize = "1"
 
 [dev-dependencies]
 automation-runtime-convergence = { path = "../automation-runtime-convergence" }
 rustls = { version = "0.23", features = ["ring"] }
+serde = "1"
+static_assertions = "1"

@@ -279,8 +279,8 @@ async fn certify_product_runtime_live(
 ) {
     let target = claim.snapshot.target.clone();
     let generation = claim.snapshot.runtime_generation;
-    let process_instance_id =
-        ProcessInstanceId::parse(format!("product-live-process-{}", suffix())).unwrap();
+    let process_instance_id = sha256_hex(&format!("product-live-process:{}", suffix()));
+    let process_instance_id = ProcessInstanceId::parse(&process_instance_id[..32]).unwrap();
     let panel_report_digest = sha256_hex(&format!("product-panel-report:{}", suffix()));
     let mutation_guard = ProductRuntimeMutationGuard::from_claim(scope, claim);
     let revision = mutate_product_runtime(
@@ -416,9 +416,23 @@ async fn read_raw_deployment_status(
                 AND active_target_version IS NULL \
                 AND artifact_projection IS NULL \
                 AND attestation_projection IS NULL \
-                AND serving_projection IS NULL AS payload_is_empty, \
+                AND serving_projection IS NULL \
+                AND attestation_record_format_version IS NULL \
+                AND attestation_serving_lease_duration_nanos IS NULL \
+                AND attestation_convergence_attempt_no IS NULL \
+                AND deployment_last_controller_id IS NULL \
+                AND v2_evidence_state IS NULL \
+                AND v2_operation_id IS NULL \
+                AND v2_intent_fingerprint IS NULL \
+                AND v2_certification_intent_bytes IS NULL \
+                AND v2_request_digest IS NULL \
+                AND v2_request_bytes IS NULL \
+                AND v2_live_attestation_bytes IS NULL \
+                AND v2_must_commit_before IS NULL \
+                AND v2_route_admission IS NULL \
+                AND v2_certified_snapshot IS NULL AS payload_is_empty, \
             database_now IS NOT NULL AS database_now_is_present \
-         FROM public.starring_product_deployment_status_read_v1(\
+         FROM public.starring_product_deployment_status_read_v3(\
             $1, $2, $3, $4, $5, $6, $7, $8, $9) \
          LIMIT 2",
     )
@@ -1125,6 +1139,7 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
         "automation_installation_authority_versions",
         "automation_ruleset_activations",
         "automation_ruleset_versions",
+        "runtime_certification_operations_v2",
         "runtime_attestations",
         "runtime_serving_leases",
     ] {
@@ -1138,9 +1153,12 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
     for function in [
         "public.starring_product_deployment_status_reader_database_identity_v1()",
         "public.starring_product_deployment_status_read_v1(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
+        "public.starring_product_deployment_status_read_v3(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
         "public.starring_product_deployment_status_reader_database_identity_v2()",
         "public.starring_product_deployment_status_read_core_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
         "public.starring_product_deployment_status_read_v2(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
+        "public.starring_product_deployment_status_read_core_v3(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
+        "public.starring_product_operational_deployment_status_read_v3(TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA)",
         "public.validate_runtime_deployment_projection()",
         "public.validate_runtime_convergence_attempt_projection()",
         "public.enforce_runtime_deployment_policy_shadow()",
@@ -1149,6 +1167,7 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
         "public.validate_runtime_attestation_projection()",
         "public.validate_runtime_attestation_attempt_projection()",
         "public.reject_immutable_product_row()",
+        "public.reject_runtime_certification_reservation_mutation_v2()",
         "public.validate_runtime_serving_lease_transition()",
         "public.reject_runtime_serving_lease_delete()",
         "public.reject_ruleset_artifact_mutation()",
@@ -1191,7 +1210,7 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
     sqlx::query(&format!(
         "GRANT EXECUTE ON FUNCTION \
          public.starring_product_deployment_status_reader_database_identity_v1(), \
-         public.starring_product_deployment_status_read_v1( \
+         public.starring_product_deployment_status_read_v3( \
           TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA) TO {reader_v1_role}"
     ))
     .execute(&database.pool)
@@ -1200,7 +1219,7 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
     sqlx::query(&format!(
         "GRANT EXECUTE ON FUNCTION \
          public.starring_product_deployment_status_reader_database_identity_v2(), \
-         public.starring_product_deployment_status_read_v2( \
+         public.starring_product_operational_deployment_status_read_v3( \
           TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,TEXT,BYTEA) TO {reader_v2_role}"
     ))
     .execute(&database.pool)
@@ -1302,7 +1321,7 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
             .unwrap();
         let row_count = sqlx::query_scalar::<_, i64>(
             "SELECT pg_catalog.count(*) FROM \
-             public.starring_product_deployment_status_read_v1(\
+             public.starring_product_deployment_status_read_v3(\
                 $1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(&raw_request.deployment_id)
@@ -1356,7 +1375,7 @@ async fn product_status_reader_direct_login_is_ready_and_returns_pending_without
             "UPDATE public.runtime_deployments SET phase = phase WHERE FALSE",
             "CREATE TABLE public.forbidden_operational_status_table (value INTEGER)",
             "SELECT public.starring_product_deployment_status_reader_database_identity_v1()",
-            "SELECT * FROM public.starring_product_deployment_status_read_core_v2(\
+            "SELECT * FROM public.starring_product_deployment_status_read_core_v3(\
                 'x','x','x','x','x','x','x','x','x'::BYTEA)",
         ] {
             assert_database_permission_denied(&reader_v2_pool, statement).await;

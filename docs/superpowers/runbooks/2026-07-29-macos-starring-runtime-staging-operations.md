@@ -3,15 +3,19 @@
 This runbook installs and operates `starring-runtime` as the logged-in Mac
 mini user's LaunchAgent. The staging service is
 `local.starring.runtime.staging`, its health listener is loopback-only at
-`127.0.0.1:19091`, and every database URL and the Discord bot token are
-resolved indirectly from macOS Keychain.
+`127.0.0.1:19091`, and every database URL, the Discord bot token, and the
+interaction-token envelope keyring are resolved indirectly from macOS
+Keychain.
 
-This is an empty-open runtime substrate. A successful startup can acquire and
-renew the production owner, connect Discord in the paused state, publish the
-durable ingress acknowledgement, and report ready. It does not install a
-customer interaction route, populate the in-process registry, or execute a
-customer Discord interaction. Do not describe `ready` as customer traffic
-serving until a separately reviewed route-admission release exists.
+This runtime can acquire and renew the production owner, connect the canonical
+Discord shard, reconstruct durable routes, converge Requested deployments,
+serve admitted interactions, and recover bounded receipt and effect work. The
+B6 staging milestone proved one exact route through Live and real interactions.
+That proof is not the Phase D commercial certificate. Process `ready` means the
+runtime's process-wide authorities and supervisors are current; it never proves
+that a particular installation or route is Live. Use the product deployment
+status for the exact installation and promotion before describing customer
+traffic as serving.
 
 ## Fixed operating contract
 
@@ -27,6 +31,7 @@ serving until a separately reviewed route-admission release exists.
 | process shutdown bound | 30 seconds |
 | launchd exit timeout | 35 seconds |
 | PostgreSQL pools | 5 roles × 2 connections, ceiling 10 |
+| runtime Keychain inventory | exactly 7 service/account items |
 | role bootstrap | `ops/postgres/staging-runtime-role-bootstrap.sql` |
 
 The runtime requires exactly five distinct PostgreSQL login identities:
@@ -69,8 +74,10 @@ starring-runtime-dedicated-staging-cluster-v2:SYSTEM_IDENTIFIER:starring_runtime
 ```
 
 Every `zsh` block below is a fail-fast subshell. Run a block as one unit and
-continue only when its exit status is zero. Secrets are entered only at an
-interactive password prompt.
+continue only when its exit status is zero. Secret input follows the contract
+of each block: legacy bootstrap prompts use hidden terminal input, while
+reviewed incremental paths read only their fixed Keychain items and never
+prompt on the server.
 
 ## Local preconditions and independent inventory
 
@@ -240,6 +247,369 @@ fails the block.
   diff -u "$EXPECTED_LEDGER" "$APPLIED_LEDGER"
 )
 ```
+
+## Backfill C1 interaction receipt function ACLs
+
+Use this incremental path only when an already-provisioned staging cluster has
+applied migration `202607310022` but the five runtime role bootstrap must not
+be rerun because its existing SCRAM credentials must remain unchanged. A new
+cluster should use the full bootstrap path below instead. Keep both staging
+LaunchAgents unloaded. The script rejects any other client backend or prepared
+transaction, validates the exact 115-entry repository migration ledger, and
+holds a transaction advisory lock for the whole operation.
+
+The transaction can change only the ACLs of the 17 C1 receipt-boundary
+functions. It removes `PUBLIC` and unrelated grants, gives the 11 exported
+receipt capabilities non-grantable `EXECUTE` to
+`starring_runtime_interaction`, and leaves the six internal manifest, claim
+helper, and trigger guard functions owner-only. It snapshots every PostgreSQL
+role attribute including the SCRAM verifier for `starring_owner` and
+`starring_runtime_interaction`, proves the snapshot is unchanged before
+commit, and runs interaction database readiness under the actual interaction
+session identity. A failed check rolls back every ACL change. An exact replay
+is safe and produces the same ACL topology.
+
+```zsh
+(
+  set -euo pipefail
+  set +x
+  umask 077
+  cd /Users/jungbogeon/starring
+  STAGING_DATABASE=starring_runtime_staging
+  DOMAIN="gui/$(id -u)"
+  ADMIN_PGPASS_DIR=
+  ADMIN_PGPASS_PATH=
+  cleanup_admin_pgpass() {
+    CLEANUP_STATUS=0
+    if test -n "${ADMIN_PGPASS_PATH:-}" \
+      && test -e "$ADMIN_PGPASS_PATH"
+    then
+      if test -f "$ADMIN_PGPASS_PATH" \
+        && ! test -L "$ADMIN_PGPASS_PATH"
+      then
+        /bin/dd if=/dev/zero of="$ADMIN_PGPASS_PATH" \
+          bs=4096 count=1 conv=notrunc >/dev/null 2>&1 \
+          || CLEANUP_STATUS=1
+      else
+        CLEANUP_STATUS=1
+      fi
+      /bin/rm -f "$ADMIN_PGPASS_PATH" >/dev/null 2>&1 \
+        || CLEANUP_STATUS=1
+    fi
+    if test -n "${ADMIN_PGPASS_DIR:-}"
+    then
+      /bin/rmdir "$ADMIN_PGPASS_DIR" >/dev/null 2>&1 \
+        || CLEANUP_STATUS=1
+    fi
+    return "$CLEANUP_STATUS"
+  }
+  trap \
+    'TRAP_STATUS=$?; trap - EXIT HUP INT TERM; cleanup_admin_pgpass || CLEANUP_STATUS=$?; if test "$TRAP_STATUS" -eq 0 && test "${CLEANUP_STATUS:-0}" -ne 0; then exit "$CLEANUP_STATUS"; fi; exit "$TRAP_STATUS"' \
+    EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  : "${STARRING_STAGING_CLUSTER_ADMIN:?load the reviewed cluster administrator}"
+  : "${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER:?load the reviewed system identifier}"
+  : "${STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT:?load the reviewed dedicated-cluster acknowledgement}"
+  test "$STARRING_STAGING_CLUSTER_ADMIN" = starring_cluster_admin
+  ! launchctl print "$DOMAIN/local.starring.runtime.staging" >/dev/null 2>&1
+  ! launchctl print "$DOMAIN/local.starring.api.staging" >/dev/null 2>&1
+  unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
+  unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
+  ADMIN_PGPASS_DIR="$(
+    /usr/bin/mktemp -d /private/tmp/starring-admin-pgpass.XXXXXX
+  )"
+  test -d "$ADMIN_PGPASS_DIR"
+  test "$(
+    /usr/bin/stat -f '%u:%Lp' "$ADMIN_PGPASS_DIR"
+  )" = "$(/usr/bin/id -u):700"
+  /bin/ls -lde "$ADMIN_PGPASS_DIR" \
+    | /usr/bin/awk \
+      'NR == 1 { ok = ($1 == "drwx------" || $1 == "drwx------@") } NR > 1 { ok = 0 } END { exit(ok ? 0 : 1) }'
+  ADMIN_PGPASS_PATH="$ADMIN_PGPASS_DIR/pgpass"
+  /usr/bin/security find-generic-password -w \
+    -s starring.postgres.staging \
+    -a database.cluster-admin \
+    | /usr/bin/sed -nE \
+      's#^postgresql://starring_cluster_admin:([A-Za-z0-9_-]{43})@127\.0\.0\.1:5432/postgres\?sslmode=disable$#127.0.0.1:5432:*:starring_cluster_admin:\1#p' \
+      >"$ADMIN_PGPASS_PATH"
+  test -f "$ADMIN_PGPASS_PATH"
+  ! test -L "$ADMIN_PGPASS_PATH"
+  test "$(
+    /usr/bin/stat -f '%u:%Lp' "$ADMIN_PGPASS_PATH"
+  )" = "$(/usr/bin/id -u):600"
+  /bin/ls -le "$ADMIN_PGPASS_PATH" \
+    | /usr/bin/awk \
+      'NR == 1 { ok = ($1 == "-rw-------" || $1 == "-rw-------@") } NR > 1 { ok = 0 } END { exit(ok ? 0 : 1) }'
+  test "$(
+    /usr/bin/wc -l <"$ADMIN_PGPASS_PATH" | /usr/bin/tr -d ' '
+  )" = 1
+  /usr/bin/grep -Eq \
+    '^127\.0\.0\.1:5432:\*:starring_cluster_admin:[A-Za-z0-9_-]{43}$' \
+    "$ADMIN_PGPASS_PATH"
+  PGPASSFILE="$ADMIN_PGPASS_PATH" PGSSLMODE=disable \
+    /opt/homebrew/opt/postgresql@16/bin/psql \
+    --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
+    --host 127.0.0.1 --port 5432 \
+    --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+    --dbname "$STAGING_DATABASE" \
+    --set expected_database="$STAGING_DATABASE" \
+    --set expected_system_identifier="$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    --set runtime_dedicated_cluster_acknowledgement="$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    --file ops/postgres/staging-runtime-interaction-receipt-acl-backfill.sql
+)
+```
+
+Do not substitute a database URL, password environment variable, inline SQL
+credential, or interactive server prompt. The administrator URL flows from the
+fixed Keychain item through a mode-`0600` temporary `PGPASSFILE`; the trap
+overwrites and removes that file on success, error, or signal. Do not use this
+script if any migration later than `202607310022` exists; update and
+independently review its fixed ledger and function manifests first.
+
+For an existing credentialed cluster, a successful C1 backfill completes the
+runtime-role ACL step. Skip the following bootstrap, quarantine, password
+creation, role-enable, and credential-rotation sections; resuming any of those
+fresh-cluster sections would intentionally reset the existing runtime role
+credentials. Continue at `Store indirect secrets in Keychain` and use only its
+dedicated legacy interaction-token keyring mode before building the immutable
+revision.
+
+## Backfill C3 interaction effect function ACLs
+
+Use this additive path after migration `202608010002` when an existing
+credentialed cluster must receive the exact effect-journal capability ACLs
+without rotating its runtime credentials or rerunning either role bootstrap.
+Keep API and runtime unloaded. The script requires cluster-wide zero client
+backends and zero prepared transactions, verifies the exact 117-entry ledger
+and migration checksum, preserves both role attribute and SCRAM-verifier
+snapshots, and rechecks quiescence before commit.
+
+The fixed manifest contains 22 functions. Eleven external capabilities receive
+non-grantable `EXECUTE` for `starring_runtime_interaction`; eleven guards,
+manifest helpers, and cross-record functions remain owner-only. `PUBLIC`,
+unrelated roles, grant options, direct relations, role membership, role
+settings, and owner drift fail closed. Exact replay produces the same ACL.
+
+Use the complete Keychain-to-mode-`0600` temporary `PGPASSFILE` setup and trap
+from the C1 section, but execute only this current-head script at the final
+`psql` step:
+
+```zsh
+PGPASSFILE="$ADMIN_PGPASS_PATH" PGSSLMODE=disable \
+  /opt/homebrew/opt/postgresql@16/bin/psql \
+  --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
+  --host 127.0.0.1 --port 5432 \
+  --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+  --dbname "$STAGING_DATABASE" \
+  --set expected_database="$STAGING_DATABASE" \
+  --set expected_system_identifier="$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+  --set runtime_dedicated_cluster_acknowledgement="$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+  --file ops/postgres/staging-runtime-interaction-effect-acl-backfill.sql
+```
+
+Do not run the older C1 SQL file in the same transaction or leave either
+LaunchAgent loaded. On failure, retain only the stable error, prove the
+transaction rolled back, and keep both services stopped.
+
+## Inspect duplicate receipts without exposing identities
+
+The loopback-only interaction health projection is a process-local, redacted
+counter view. It contains no application, guild, installation, interaction,
+route, user, token, payload, or effect identity. Capture it before and after a
+reviewed duplicate-delivery drill to classify the receipt result without
+querying receipt tables or copying Discord interaction data into evidence:
+
+```zsh
+(
+  set -euo pipefail
+  SNAPSHOT="$(
+    curl --fail --silent --show-error --max-time 1 \
+      http://127.0.0.1:19091/health/interactions
+  )"
+  print -r -- "$SNAPSHOT" | jq -e '
+    [
+      .receipt_acquired,
+      .receipt_completed_duplicate,
+      .receipt_in_flight_duplicate,
+      .receipt_terminal_duplicate,
+      .receipt_recovery_required_duplicate,
+      .receipt_claim_closed,
+      .receipt_claim_timeout,
+      .receipt_claim_unavailable,
+      .receipt_claim_rejected,
+      .receipt_claim_corrupt,
+      .receipt_authority_rejected,
+      .receipt_persistence_failed_before_effect,
+      .receipt_persistence_failed_after_effect,
+      .receipt_terminal_recovery_required,
+      .in_flight
+    ] | all(type == "number" and . >= 0)
+  ' >/dev/null
+  print -r -- "$SNAPSHOT" | jq '{
+    receipt_acquired,
+    receipt_completed_duplicate,
+    receipt_in_flight_duplicate,
+    receipt_terminal_duplicate,
+    receipt_recovery_required_duplicate,
+    receipt_claim_closed,
+    receipt_claim_timeout,
+    receipt_claim_unavailable,
+    receipt_claim_rejected,
+    receipt_claim_corrupt,
+    receipt_authority_rejected,
+    receipt_persistence_failed_before_effect,
+    receipt_persistence_failed_after_effect,
+    receipt_terminal_recovery_required,
+    in_flight
+  }'
+)
+```
+
+The counters are monotonic only for the current runtime process and reset after
+a restart. A duplicate counter increase proves the runtime classified a replay;
+it does not alone prove that Discord observed one mutable effect. Pair it with
+the disposable-guild resource count and the durable final receipt/effect state
+required by the Phase D E2E. Never use direct table reads, raw interaction IDs,
+or token ciphertext as routine operational evidence.
+
+## Inspect durable interaction effect recovery blocks
+
+Run this read-only inspection after migration `202608010002` is present when
+an interaction route remains blocked or before deciding whether manual
+recovery is appropriate. The inspection uses one repeatable-read transaction,
+validates PostgreSQL 16, the fixed staging database and dedicated cluster, the
+exact 117-entry migration ledger, and the interaction-effect schema manifest.
+It then emits only recovery block code, action kind, aggregate count, and the
+oldest and newest block times. It never emits application, interaction,
+action, or Discord output identifiers, nor digest, correlation,
+response-token, input, preimage, or payload values. An unknown code or a
+recovery-required head without its exact terminal event makes the command fail
+before any projection is printed.
+
+The runtime and API may remain loaded because this operation neither locks the
+service boundary nor changes database state. A zero-row result means there are
+no current recovery-required effects in the transaction snapshot.
+
+```zsh
+(
+  set -euo pipefail
+  set +x
+  umask 077
+  cd /Users/jungbogeon/starring
+  STAGING_DATABASE=starring_runtime_staging
+  ADMIN_PGPASS_DIR=
+  ADMIN_PGPASS_PATH=
+  cleanup_admin_pgpass() {
+    CLEANUP_STATUS=0
+    if test -n "${ADMIN_PGPASS_PATH:-}" \
+      && test -e "$ADMIN_PGPASS_PATH"
+    then
+      if test -f "$ADMIN_PGPASS_PATH" \
+        && ! test -L "$ADMIN_PGPASS_PATH"
+      then
+        /bin/dd if=/dev/zero of="$ADMIN_PGPASS_PATH" \
+          bs=4096 count=1 conv=notrunc >/dev/null 2>&1 \
+          || CLEANUP_STATUS=1
+      else
+        CLEANUP_STATUS=1
+      fi
+      /bin/rm -f "$ADMIN_PGPASS_PATH" >/dev/null 2>&1 \
+        || CLEANUP_STATUS=1
+    fi
+    if test -n "${ADMIN_PGPASS_DIR:-}"
+    then
+      /bin/rmdir "$ADMIN_PGPASS_DIR" >/dev/null 2>&1 \
+        || CLEANUP_STATUS=1
+    fi
+    return "$CLEANUP_STATUS"
+  }
+  trap \
+    'TRAP_STATUS=$?; trap - EXIT HUP INT TERM; cleanup_admin_pgpass || CLEANUP_STATUS=$?; if test "$TRAP_STATUS" -eq 0 && test "${CLEANUP_STATUS:-0}" -ne 0; then exit "$CLEANUP_STATUS"; fi; exit "$TRAP_STATUS"' \
+    EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  : "${STARRING_STAGING_CLUSTER_ADMIN:?load the reviewed cluster administrator}"
+  : "${STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER:?load the reviewed system identifier}"
+  : "${STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT:?load the reviewed dedicated-cluster acknowledgement}"
+  test "$STARRING_STAGING_CLUSTER_ADMIN" = starring_cluster_admin
+  unset PGAPPNAME PGDATABASE PGHOST PGHOSTADDR PGOPTIONS PGPASSFILE
+  unset PGPASSWORD PGPORT PGSSLCERT PGSSLKEY PGSSLMODE PGSSLROOTCERT PGUSER
+  ADMIN_PGPASS_DIR="$(
+    /usr/bin/mktemp -d /private/tmp/starring-admin-pgpass.XXXXXX
+  )"
+  test -d "$ADMIN_PGPASS_DIR"
+  test "$(
+    /usr/bin/stat -f '%u:%Lp' "$ADMIN_PGPASS_DIR"
+  )" = "$(/usr/bin/id -u):700"
+  /bin/ls -lde "$ADMIN_PGPASS_DIR" \
+    | /usr/bin/awk \
+      'NR == 1 { ok = ($1 == "drwx------" || $1 == "drwx------@") } NR > 1 { ok = 0 } END { exit(ok ? 0 : 1) }'
+  ADMIN_PGPASS_PATH="$ADMIN_PGPASS_DIR/pgpass"
+  /usr/bin/security find-generic-password -w \
+    -s starring.postgres.staging \
+    -a database.cluster-admin \
+    | /usr/bin/sed -nE \
+      's#^postgresql://starring_cluster_admin:([A-Za-z0-9_-]{43})@127\.0\.0\.1:5432/postgres\?sslmode=disable$#127.0.0.1:5432:*:starring_cluster_admin:\1#p' \
+      >"$ADMIN_PGPASS_PATH"
+  test -f "$ADMIN_PGPASS_PATH"
+  ! test -L "$ADMIN_PGPASS_PATH"
+  test "$(
+    /usr/bin/stat -f '%u:%Lp' "$ADMIN_PGPASS_PATH"
+  )" = "$(/usr/bin/id -u):600"
+  /bin/ls -le "$ADMIN_PGPASS_PATH" \
+    | /usr/bin/awk \
+      'NR == 1 { ok = ($1 == "-rw-------" || $1 == "-rw-------@") } NR > 1 { ok = 0 } END { exit(ok ? 0 : 1) }'
+  test "$(
+    /usr/bin/wc -l <"$ADMIN_PGPASS_PATH" | /usr/bin/tr -d ' '
+  )" = 1
+  /usr/bin/grep -Eq \
+    '^127\.0\.0\.1:5432:\*:starring_cluster_admin:[A-Za-z0-9_-]{43}$' \
+    "$ADMIN_PGPASS_PATH"
+  PGPASSFILE="$ADMIN_PGPASS_PATH" PGSSLMODE=disable \
+    /opt/homebrew/opt/postgresql@16/bin/psql \
+    --no-psqlrc --set ON_ERROR_STOP=1 --no-password \
+    --host 127.0.0.1 --port 5432 \
+    --username "$STARRING_STAGING_CLUSTER_ADMIN" \
+    --dbname "$STAGING_DATABASE" \
+    --set expected_database="$STAGING_DATABASE" \
+    --set expected_system_identifier="$STARRING_STAGING_EXPECTED_SYSTEM_IDENTIFIER" \
+    --set runtime_dedicated_cluster_acknowledgement="$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
+    --file ops/postgres/staging-runtime-interaction-effect-inspection.sql
+)
+```
+
+Do not replace the fixed Keychain-to-`PGPASSFILE` path with a database URL,
+password environment variable, command-line password, inline credential, or
+interactive prompt. Do not replay an interaction, delete an effect row, or
+edit a journal row in response to this projection. Preserve the durable
+journal and use the action below for the exact reported code.
+
+| Recovery block code | Required operator action |
+| --- | --- |
+| `recovery_blocked_discord_read_rejected` | Keep the route blocked, inspect Discord connectivity and audit-read permission, repair the external read path, then rerun this inspection before considering recovery. |
+| `recovery_blocked_response_token_unavailable` | Preserve the receipt and effect history, do not fabricate a response, and treat response delivery as unrecoverable while verifying the product-visible state. |
+| `recovery_blocked_observation_protocol` | Stop automatic recovery for the route, preserve the journal, compare the observed Discord state with the expected protocol shape, and escalate as a code defect. |
+| `recovery_blocked_compensation_conflict` | Do not delete external state; compare the target with the preserved preimage and perform only a documented manual reconciliation. |
+| `recovery_blocked_compensation_unsupported` | Leave the route blocked and choose a documented manual remediation; neither retry nor delete the external resource. |
+| `recovery_blocked_non_compensable` | Preserve the external state and journal, avoid automatic deletion, and resolve the product state through a documented manual procedure. |
+| `recovery_blocked_internal_conflict` | Keep the route blocked, verify installation, instance, and route authority through supported product reads, and never override durable records. |
+| `recovery_blocked_discord_forbidden` | Restore the intended bot permission through Discord administration and do not retry the mutation until exact authority has been re-established. |
+| `recovery_blocked_internal_authority` | Keep the route blocked and restore or rotate authority through the reviewed product or operator path; never repair it with direct table edits. |
+| `recovery_blocked_attempt_budget_exhausted` | Leave automatic retries stopped, inspect exact current external state, and choose a documented manual remediation before any new attempt. |
+
+`recovery_required` is a durable safety state, not a transient HTTP retry hint.
+The exact unsafe route remains blocked while unrelated routes may continue. Do
+not clear it by deleting a receipt, effect head, event, or resource. The
+15-second recovery supervisor may observe or compensate only within its
+database-enforced bounded protocol. Three consecutive failed sweeps make the
+supervisor unhealthy and the serving-process revalidation fails closed; a
+supervisor exit is also not ready. Preserve the redacted inspection result,
+repair only the classified dependency or authority, and let the reviewed
+recovery path advance durable state. Escalate any code without a documented
+operator action as a release-blocking protocol defect.
 
 ## Bootstrap the five database roles
 
@@ -760,9 +1130,34 @@ for the full URL without putting it in the command line:
   /usr/bin/security add-generic-password -U \
     -s starring.runtime.staging -a database.interaction -w
   /usr/bin/security add-generic-password -U \
+    -s starring.runtime.staging -a interaction.token-envelope-keyring -w
+  /usr/bin/security add-generic-password -U \
     -s starring.runtime.staging -a discord.bot-token -w
 )
 ```
+
+The interaction-token prompt accepts only this payload shape:
+
+```text
+v1;active=KEY_ID=64_LOWERCASE_HEX;retired=KEY_ID=64_LOWERCASE_HEX,...
+```
+
+The active key plus retired keys must total at most eight. IDs must be bounded
+and unique, and every 64-character lowercase hexadecimal material value must
+decode to a distinct non-repetitive 32-byte key. Fresh integrated staging uses
+the one-shot provisioner to generate and write this item in the same rollback
+boundary as the other managed items. The interactive command is only for a
+separately reviewed standalone provision or rotation payload prepared without
+shell variables, arguments, history, clipboard evidence, or terminal logging.
+Record only its key ID.
+
+For an already-live legacy staging cluster missing only this item, keep the API
+and runtime stopped and use the staging provisioner's
+`--provision-interaction-token-keyring` mode. It rejects every ambient `PG*`
+variable, performs no database connection or mutation, revalidates both API
+keyrings, creates only the absent runtime item, and returns exact replay without
+rotation when the existing item is valid. Do not use the interactive command
+or rerun the one-shot provisioner for that backfill.
 
 The last prompt receives the Discord bot token, not a URL. Never use `-A`,
 never place a value after `-w`, and never export these values.
@@ -785,6 +1180,7 @@ include `-w`, because `find-generic-password -w` prints the secret:
     database.panel \
     database.serving \
     database.interaction \
+    interaction.token-envelope-keyring \
     discord.bot-token
   do
     /usr/bin/security find-generic-password \
@@ -792,6 +1188,38 @@ include `-w`, because `find-generic-password -w` prints the secret:
   done
 )
 ```
+
+## Rotate runtime secrets
+
+Every runtime secret-rotation inventory contains exactly seven accounts:
+
+```text
+database.execution
+database.exact-target
+database.panel
+database.serving
+database.interaction
+interaction.token-envelope-keyring
+discord.bot-token
+```
+
+Keep the runtime and API stopped for database or shared Discord-token
+rotation. The interaction-token envelope keyring has its own staged rotation
+contract. Create a new independent active key, move the previous active key to
+the retired list, retain every still-required retired key, and keep the total
+at eight or fewer. Apply the complete payload as one Keychain item through a
+separately reviewed rollback-capable operation. Do not rerun the one-shot fresh
+provisioner and do not update active and retired material in separate writes.
+
+After the update, run the final provisioner verifier while applications remain
+stopped, then start the runtime and repeat liveness, readiness, and SIGTERM
+acceptance. The verifier and runtime may report only key IDs or stable error
+codes. Keep the former active key retired for at least the 15-minute maximum
+Discord interaction-token lifetime and until receipt cleanup has independently
+proved that no recoverable token uses it. Removing a retired key is a second
+reviewed rotation with the same stop, semantic verification, startup, and
+rollback gates. Never exceed seven retired keys and never copy key material or
+its hash into a change record.
 
 ## Build and install an immutable revision
 
@@ -861,7 +1289,7 @@ tight crash loop. `RunAtLoad=true` starts the process during `bootstrap`; do
 not follow bootstrap with `kickstart -k`, because `-k` would terminate a newly
 started process without its shutdown protocol.
 
-## Health and empty-open verification
+## Health and serving-process verification
 
 First prove the listener is loopback-only and liveness is available:
 
@@ -903,8 +1331,10 @@ acknowledgement converge. Allow one bounded startup window:
 ```
 
 The log must contain only finite status codes and contexts, never a database
-URL, password, Discord token, or Keychain value. `ready` at this release still
-means empty-open only. There is no customer-route smoke request to send.
+URL, password, Discord token, or Keychain value. Process readiness is not a
+route projection. For a route-bearing acceptance, independently require the
+exact product deployment status to report Live with fresh serving evidence and
+exercise only the reviewed disposable-guild interaction path.
 
 ## SIGTERM acceptance
 
@@ -1113,6 +1543,56 @@ API owner corrects the failure and the complete password, enable, runtime, and
 API readiness sequence is repeated. When `api_was_loaded=false`, do not run the
 restore block; record that the API intentionally remained stopped.
 
+## Backup, restore, and failure-drill contract
+
+Take a database backup before every migration or capability-ACL change. Close
+public ingress first, then stop API and runtime, apply the cluster-quiescence
+proof above, and require zero other client backends and zero prepared
+transactions. Create a PostgreSQL 16 custom-format dump as the reviewed cluster
+administrator through the same Keychain-to-mode-`0600` `PGPASSFILE` boundary
+used by the effect inspection. The backup file and its directory must be mode
+`0600` and `0700`, respectively. Record only:
+
+- UTC backup identifier
+- source Git revision and binary SHA-256
+- migration head and successful ledger count
+- dump byte count and SHA-256
+- `pg_restore --list` success
+
+Do not record the administrator URL, `PGPASSFILE`, Keychain output, relation
+rows, receipt or effect identities, encrypted payloads, or Discord identifiers.
+A dump that has not passed a restore drill is not a verified backup.
+
+Restore only into an isolated PostgreSQL 16 cluster or a unique disposable
+database with all staging clients and public ingress unable to reach it. Never
+restore over `starring_runtime_staging`. Require `pg_restore --exit-on-error` to
+finish, diff the restored `_sqlx_migrations` versions and checksums against the
+repository, verify the common owner and function manifests, and run the exact
+capability readiness suites before deleting the disposable restore target. A
+different database name may intentionally fail application database-identity
+readiness; that is not permission to weaken the identity contract. A production
+recovery uses a reviewed replacement cluster with the original logical database
+identity, then reruns HBA, role, Keychain-reference, API, runtime, route, and
+serving checks before ingress reopens.
+
+For a full-cluster cutover backup and restoration, use Gate 2 and the rollback
+sequence in
+[macOS Starring Integrated Staging Cutover](./2026-07-29-macos-starring-integrated-staging-cutover.md).
+Those steps archive the prior data directory without deleting it. Do not mix a
+logical dump rollback with an unreviewed reverse migration.
+
+Run failure drills only on the reviewed staging or disposable-guild target. For
+each drill, capture the pre-state, inject exactly one failure, observe the
+closed state, remove the injection, and prove bounded convergence before moving
+to the next case. The release cohort must cover database loss before claim and
+before effect, Discord loss before effect, indeterminate Discord outcome,
+gateway disconnect, owner and controller lease loss, writer-fence and authority
+changes, binding-map drift, process kill/restart, and duplicate HTTP and Discord
+delivery. Stop a drill immediately on false Live, a stale writer, a second
+mutable effect, missing durable recovery state, or an automatic deletion not
+authorized by an exact preimage. Keep the exact checkpoint and stable redacted
+code; never retain injected secrets or full interaction payloads.
+
 ## Routine operation
 
 ```zsh
@@ -1194,11 +1674,34 @@ it:
 Then repeat the listener, liveness, readiness, and SIGTERM checks. Database
 migrations are forward-only and this role bootstrap has no automatic database
 rollback. If the previous executable is not compatible with the current
-schema, leave the empty-open service stopped and restore a separately verified
-database snapshot instead of improvising reverse SQL.
+schema, leave the serving process stopped and restore a separately verified
+database snapshot instead of improvising reverse SQL. Binary rollback never
+rewinds a durable route, receipt, effect journal, or deployment by itself.
 
 To revoke the staging runtime completely, stop the LaunchAgent, disable its
-label, delete all six `starring.runtime.staging` Keychain items by exact
+label, delete all seven `starring.runtime.staging` Keychain items by exact
 service/account, and ask a database administrator to return the five login
 roles to `NOLOGIN`. Never delete Keychain items while a rollback decision is
-still pending.
+still pending. The exact removal inventory is:
+
+```zsh
+(
+  set -euo pipefail
+  DOMAIN="gui/$(id -u)"
+  SERVICE="$DOMAIN/local.starring.runtime.staging"
+  ! launchctl print "$SERVICE" >/dev/null 2>&1
+  launchctl disable "$SERVICE"
+  for ACCOUNT in \
+    database.execution \
+    database.exact-target \
+    database.panel \
+    database.serving \
+    database.interaction \
+    interaction.token-envelope-keyring \
+    discord.bot-token
+  do
+    /usr/bin/security delete-generic-password \
+      -s starring.runtime.staging -a "$ACCOUNT" >/dev/null
+  done
+)
+```

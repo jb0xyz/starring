@@ -7,6 +7,8 @@ use super::{
     ProductDecisionProjectionV1,
 };
 
+const DEPLOYMENT_PROCESS_INSTANCE_ID_LENGTH_V2: usize = 32;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeploymentConvergencePhaseV2 {
     Requested,
@@ -68,26 +70,69 @@ pub enum DeploymentOperatorActionV2 {
     RestoreProductAuthority,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DeploymentProcessInstanceIdErrorV2 {
+    #[error("runtime process instance identifier must contain exactly 32 characters")]
+    Length,
+    #[error("runtime process instance identifier must be lowercase hexadecimal")]
+    LowerHex,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeploymentProcessInstanceIdV2(String);
+
+impl DeploymentProcessInstanceIdV2 {
+    pub fn from_server_projection(
+        value: impl Into<String>,
+    ) -> Result<Self, DeploymentProcessInstanceIdErrorV2> {
+        let value = value.into();
+        if value.len() != DEPLOYMENT_PROCESS_INSTANCE_ID_LENGTH_V2 {
+            return Err(DeploymentProcessInstanceIdErrorV2::Length);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(DeploymentProcessInstanceIdErrorV2::LowerHex);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeploymentAttestationObservationV2 {
     deployment_revision: NonZeroU64,
     convergence_attempt: NonZeroU32,
+    process_instance_id: DeploymentProcessInstanceIdV2,
 }
 
 impl DeploymentAttestationObservationV2 {
-    pub fn new(deployment_revision: NonZeroU64, convergence_attempt: NonZeroU32) -> Self {
+    pub fn new(
+        deployment_revision: NonZeroU64,
+        convergence_attempt: NonZeroU32,
+        process_instance_id: DeploymentProcessInstanceIdV2,
+    ) -> Self {
         Self {
             deployment_revision,
             convergence_attempt,
+            process_instance_id,
         }
     }
 
-    pub fn deployment_revision(self) -> NonZeroU64 {
+    pub fn deployment_revision(&self) -> NonZeroU64 {
         self.deployment_revision
     }
 
-    pub fn convergence_attempt(self) -> NonZeroU32 {
+    pub fn convergence_attempt(&self) -> NonZeroU32 {
         self.convergence_attempt
+    }
+
+    pub fn process_instance_id(&self) -> &DeploymentProcessInstanceIdV2 {
+        &self.process_instance_id
     }
 }
 
@@ -222,7 +267,7 @@ impl DeploymentOperationalObservationV2 {
     }
 
     pub fn attestation(&self) -> Option<DeploymentAttestationObservationV2> {
-        self.attestation
+        self.attestation.clone()
     }
 
     pub fn serving(&self) -> DeploymentServingFreshnessV2 {
@@ -367,7 +412,7 @@ impl DeploymentOperationalObservationV2 {
             DeploymentStatusProjectionV1::ExactLive(live) => Some(live.attestation_revision()),
             _ => None,
         };
-        let attestation_exact = self.attestation.is_some_and(|attestation| {
+        let attestation_exact = self.attestation.as_ref().is_some_and(|attestation| {
             attestation.convergence_attempt().get() == self.current_attempt
                 && exact_live.is_none_or(|revision| revision == attestation.deployment_revision())
         });
@@ -682,7 +727,14 @@ mod tests {
         let revision = NonZeroU64::new(7).unwrap();
         let attempt = NonZeroU32::new(2).unwrap();
         let mut operations = operations(DeploymentConvergencePhaseV2::Live, 2);
-        operations.attestation = Some(DeploymentAttestationObservationV2::new(revision, attempt));
+        operations.attestation = Some(DeploymentAttestationObservationV2::new(
+            revision,
+            attempt,
+            DeploymentProcessInstanceIdV2::from_server_projection(
+                "0123456789abcdef0123456789abcdef",
+            )
+            .unwrap(),
+        ));
         operations.serving = DeploymentServingFreshnessV2::Fresh {
             last_heartbeat_at: observed_at - Duration::from_secs(1),
             lease_expires_at: observed_at + Duration::from_secs(10),
@@ -700,6 +752,14 @@ mod tests {
         assert_eq!(
             observation.attestation().unwrap().convergence_attempt(),
             attempt
+        );
+        assert_eq!(
+            observation
+                .attestation()
+                .unwrap()
+                .process_instance_id()
+                .as_str(),
+            "0123456789abcdef0123456789abcdef"
         );
         assert!(matches!(
             observation.serving(),
@@ -764,5 +824,34 @@ mod tests {
             invalid_retry,
         )
         .is_err());
+    }
+
+    #[test]
+    fn process_instance_identity_accepts_only_the_canonical_runtime_grammar() {
+        for valid in [
+            "0123456789abcdef0123456789abcdef",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert_eq!(
+                DeploymentProcessInstanceIdV2::from_server_projection(valid)
+                    .unwrap()
+                    .as_str(),
+                valid
+            );
+        }
+        for invalid in [
+            "",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "runtime:process-1",
+            "gggggggggggggggggggggggggggggggg",
+            "0123456789abcdef0123456789abcde-",
+        ] {
+            assert!(
+                DeploymentProcessInstanceIdV2::from_server_projection(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
     }
 }

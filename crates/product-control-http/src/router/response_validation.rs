@@ -1,10 +1,71 @@
 use crate::facade::{valid_digest, valid_resource_id};
 use crate::{
-    ApplyView, ApprovalPreviewView, CurrentPrincipalView, DecisionView,
-    DeploymentOperationalStateV2, DeploymentOperationalViewV2, DeploymentOperatorActionV2,
-    DeploymentRetryStateV2, DeploymentRuntimePhaseV2, DeploymentServingFreshnessStateV2,
-    DeploymentState, DeploymentView, LifecycleCancellationView, ProductState, PromotionView,
+    ApplyView, ApprovalPreviewView, AuthoringSessionViewV1, AuthoringTurnDispositionV1,
+    AuthoringTurnViewV1, CurrentPrincipalView, DecisionView, DeploymentOperationalStateV2,
+    DeploymentOperationalViewV2, DeploymentOperatorActionV2, DeploymentRetryStateV2,
+    DeploymentRuntimePhaseV2, DeploymentServingFreshnessStateV2, DeploymentState, DeploymentView,
+    LifecycleCancellationView, ProductState, ProductStatusView, PromotionView,
 };
+
+const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_AUTHORING_RESPONSE_BYTES: usize = 384 * 1_024;
+
+pub(super) fn valid_authoring_turn_view(
+    view: &AuthoringTurnViewV1,
+    session_id: &str,
+    expected_generation: u64,
+) -> bool {
+    if view.session_id != session_id
+        || !valid_resource_id(&view.session_id)
+        || view.projection.validate_preview_integrity().is_err()
+        || !bounded_authoring_response(view)
+    {
+        return false;
+    }
+    let durable = !matches!(
+        view.projection.state(),
+        authoring_application::SafeAuthoringTurnStateV1::Unsupported
+            | authoring_application::SafeAuthoringTurnStateV1::Rejected
+    );
+    match view.disposition {
+        Some(AuthoringTurnDispositionV1::Created)
+        | Some(AuthoringTurnDispositionV1::ExactReplay) => {
+            durable
+                && expected_generation
+                    .checked_add(1)
+                    .filter(|generation| *generation <= MAX_SAFE_JSON_INTEGER)
+                    == view.generation
+        }
+        None => {
+            view.generation.is_none()
+                && matches!(
+                    view.projection.state(),
+                    authoring_application::SafeAuthoringTurnStateV1::Unsupported
+                        | authoring_application::SafeAuthoringTurnStateV1::Rejected
+                )
+        }
+    }
+}
+
+pub(super) fn valid_authoring_session_view(
+    view: &AuthoringSessionViewV1,
+    session_id: &str,
+) -> bool {
+    view.session_id == session_id
+        && valid_resource_id(&view.session_id)
+        && (1..=MAX_SAFE_JSON_INTEGER).contains(&view.observed_generation)
+        && !matches!(
+            view.projection.state(),
+            authoring_application::SafeAuthoringTurnStateV1::Unsupported
+                | authoring_application::SafeAuthoringTurnStateV1::Rejected
+        )
+        && view.projection.validate_preview_integrity().is_ok()
+        && bounded_authoring_response(view)
+}
+
+fn bounded_authoring_response<T: serde::Serialize>(view: &T) -> bool {
+    serde_json::to_vec(view).is_ok_and(|body| body.len() <= MAX_AUTHORING_RESPONSE_BYTES)
+}
 
 pub(super) fn valid_current_principal(view: &CurrentPrincipalView) -> bool {
     valid_resource_id(&view.principal_id)
@@ -30,6 +91,37 @@ pub(super) fn valid_decision_view(
     view.installation_id == installation_id
         && view.promotion_id == promotion_id
         && view.revision > 0
+}
+
+pub(super) fn valid_product_status_view(
+    view: &ProductStatusView,
+    installation_id: &str,
+    promotion_id: &str,
+) -> bool {
+    let source_revision_valid = match view.state {
+        ProductState::Applying => view.apply_source_revision.is_some_and(|source| {
+            (1..=MAX_SAFE_JSON_INTEGER).contains(&source)
+                && source.checked_add(1) == Some(view.revision)
+        }),
+        ProductState::RuntimePending | ProductState::Live => {
+            view.apply_source_revision.is_some_and(|source| {
+                (1..=MAX_SAFE_JSON_INTEGER).contains(&source)
+                    && source.checked_add(2) == Some(view.revision)
+            })
+        }
+        ProductState::PendingApproval
+        | ProductState::Approved
+        | ProductState::Rejected
+        | ProductState::Expired
+        | ProductState::Superseded
+        | ProductState::Withdrawn => view.apply_source_revision.is_none(),
+    };
+    view.installation_id == installation_id
+        && view.promotion_id == promotion_id
+        && (1..=MAX_SAFE_JSON_INTEGER).contains(&view.revision)
+        && valid_digest(&view.payload_digest)
+        && source_revision_valid
+        && !view.replayed
 }
 
 pub(super) fn valid_approval_view(
@@ -71,7 +163,7 @@ pub(super) fn valid_preview_view(
         && view.summary.target_version > 0
         && valid_digest(&view.summary.target_content_hash)
         && valid_digest(&view.summary.binding_fingerprint)
-        && view.summary.required_approvals > 0
+        && view.summary.required_approvals == 1
 }
 
 pub(super) fn valid_apply_view(
@@ -262,6 +354,10 @@ fn valid_runtime_common(
             attestation.deployment_revision > 0
                 && attestation.convergence_attempt > 0
                 && attestation.convergence_attempt == runtime.current_attempt
+                && authoring_application::DeploymentProcessInstanceIdV2::from_server_projection(
+                    attestation.process_instance_id.clone(),
+                )
+                .is_ok()
         })
 }
 

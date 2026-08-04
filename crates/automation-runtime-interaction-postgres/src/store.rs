@@ -1,6 +1,11 @@
+use std::num::NonZeroUsize;
+
 use automation_instance::{
     AutomationInstance, InstanceId, InstanceRegistrarV1, InstanceRouteReaderV1, InstanceStatus,
-    InstanceStoreError,
+    InstanceStoreError, InstanceTeardownClaimOutcomeV1, InstanceTeardownMarkOutcomeV1,
+    InstanceTeardownRetryScanCursorV2, InstanceTeardownRetryScanPageV2,
+    InstanceTeardownRetryScannerV2, InstanceTeardownStoreV1, MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1,
+    MAX_INSTANCE_TEARDOWN_RETRY_SCAN_BATCH_V2,
 };
 use automation_ruleset::RuleSetStoreError;
 use automation_ruleset_dispatch::{
@@ -11,7 +16,11 @@ use serde_json::Value;
 use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
 
-use crate::contract::{INSTANCE_REGISTER_QUERY, PINNED_READ_QUERY, ROUTE_READ_QUERY};
+use crate::contract::{
+    INSTANCE_REGISTER_QUERY, INSTANCE_TEARDOWN_CLAIM_QUERY, INSTANCE_TEARDOWN_GET_QUERY,
+    INSTANCE_TEARDOWN_MARK_QUERY, INSTANCE_TEARDOWN_RETRY_QUERY,
+    INSTANCE_TEARDOWN_RETRY_SCAN_QUERY, PINNED_READ_QUERY, ROUTE_READ_QUERY,
+};
 use crate::database::{
     begin_interaction_transaction, begin_interaction_transaction_on_connection,
     verify_runtime_interaction_binding_v1, verify_runtime_interaction_database_with_timeouts_v1,
@@ -19,7 +28,8 @@ use crate::database::{
 use crate::error::{map_mutation_commit_error, map_mutation_error, map_query_error};
 use crate::route_connection::RouteConnectionGuardV1;
 use crate::row::{
-    InstanceRowV1, PinnedInstanceRowErrorV1, PinnedInstanceRowOutcomeV1, PinnedInstanceRowV1,
+    InstanceRowV1, InstanceTeardownRetryScanRowV2, PinnedInstanceRowErrorV1,
+    PinnedInstanceRowOutcomeV1, PinnedInstanceRowV1,
 };
 use crate::{
     RuntimeInteractionDatabaseExpectationV1, RuntimeInteractionDatabaseReadinessV1,
@@ -29,16 +39,16 @@ use crate::{
 
 #[derive(Clone)]
 pub struct PostgresRuntimeInteractionV1 {
-    pool: PgPool,
-    expectation: RuntimeInteractionDatabaseExpectationV1,
-    timeouts: RuntimeInteractionDatabaseTimeoutsV1,
+    pub(crate) pool: PgPool,
+    pub(crate) expectation: RuntimeInteractionDatabaseExpectationV1,
+    pub(crate) timeouts: RuntimeInteractionDatabaseTimeoutsV1,
     route_database_timeouts: RuntimeInteractionDatabaseTimeoutsV1,
     route_timeout: RuntimeInteractionRouteTimeoutV1,
     initial_readiness: RuntimeInteractionDatabaseReadinessV1,
 }
 
 #[derive(sqlx::FromRow)]
-struct InstanceRegistrationOutcomeRowV1 {
+struct InstanceOutcomeRowV1 {
     outcome: String,
 }
 
@@ -196,7 +206,7 @@ impl InstanceRegistrarV1 for PostgresRuntimeInteractionV1 {
         verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)
             .await
             .map_err(instance_backend)?;
-        let rows = sqlx::query_as::<_, InstanceRegistrationOutcomeRowV1>(INSTANCE_REGISTER_QUERY)
+        let rows = sqlx::query_as::<_, InstanceOutcomeRowV1>(INSTANCE_REGISTER_QUERY)
             .bind(instance.guild_id.to_string())
             .bind(instance.id.as_str())
             .bind(&instance.ruleset_key)
@@ -220,6 +230,236 @@ impl InstanceRegistrarV1 for PostgresRuntimeInteractionV1 {
             .await
             .map_err(|error| instance_backend(map_mutation_commit_error(&error)))?;
         Ok(())
+    }
+}
+
+impl InstanceTeardownStoreV1 for PostgresRuntimeInteractionV1 {
+    async fn get_for_teardown_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<Option<AutomationInstance>, InstanceStoreError> {
+        let mut transaction = begin_interaction_transaction(&self.pool, self.timeouts)
+            .await
+            .map_err(instance_route_error)?;
+        verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)
+            .await
+            .map_err(instance_route_error)?;
+        let rows = sqlx::query_as::<_, InstanceRowV1>(INSTANCE_TEARDOWN_GET_QUERY)
+            .bind(guild_id.to_string())
+            .bind(instance_id.as_str())
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|error| instance_route_error(map_query_error(&error)))?;
+        let instance = match rows.len() {
+            0 => None,
+            1 => Some(
+                rows.into_iter()
+                    .next()
+                    .ok_or_else(instance_corrupt)?
+                    .decode(guild_id, instance_id)
+                    .map_err(instance_backend)?,
+            ),
+            _ => return Err(instance_corrupt()),
+        };
+        transaction
+            .commit()
+            .await
+            .map_err(|error| instance_route_error(map_query_error(&error)))?;
+        Ok(instance)
+    }
+
+    async fn claim_deleting_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<InstanceTeardownClaimOutcomeV1, InstanceStoreError> {
+        let outcome = self
+            .teardown_mutation_outcome_v1(INSTANCE_TEARDOWN_CLAIM_QUERY, guild_id, instance_id)
+            .await?;
+        match outcome.as_str() {
+            "claimed" => Ok(InstanceTeardownClaimOutcomeV1::Claimed),
+            "already_deleting" => Ok(InstanceTeardownClaimOutcomeV1::AlreadyDeleting),
+            "already_deleted" => Ok(InstanceTeardownClaimOutcomeV1::AlreadyDeleted),
+            "not_found" => Err(InstanceStoreError::NotFound),
+            _ => Err(instance_corrupt()),
+        }
+    }
+
+    async fn mark_deleted_v1(
+        &self,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<InstanceTeardownMarkOutcomeV1, InstanceStoreError> {
+        let outcome = self
+            .teardown_mutation_outcome_v1(INSTANCE_TEARDOWN_MARK_QUERY, guild_id, instance_id)
+            .await?;
+        match outcome.as_str() {
+            "marked_deleted" => Ok(InstanceTeardownMarkOutcomeV1::MarkedDeleted),
+            "already_deleted" => Ok(InstanceTeardownMarkOutcomeV1::AlreadyDeleted),
+            "not_found" => Err(InstanceStoreError::NotFound),
+            "conflict" => Err(instance_backend(
+                RuntimeInteractionPersistenceErrorV1::Conflict,
+            )),
+            _ => Err(instance_corrupt()),
+        }
+    }
+
+    async fn list_retryable_v1(
+        &self,
+        guild_id: GuildId,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<AutomationInstance>, InstanceStoreError> {
+        if limit.get() > MAX_INSTANCE_TEARDOWN_RETRY_BATCH_V1 {
+            return Err(instance_backend(
+                RuntimeInteractionPersistenceErrorV1::InvalidInput,
+            ));
+        }
+        let limit = i64::try_from(limit.get())
+            .map_err(|_| instance_backend(RuntimeInteractionPersistenceErrorV1::InvalidInput))?;
+        let mut transaction = begin_interaction_transaction(&self.pool, self.timeouts)
+            .await
+            .map_err(instance_route_error)?;
+        verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)
+            .await
+            .map_err(instance_route_error)?;
+        let rows = sqlx::query_as::<_, InstanceRowV1>(INSTANCE_TEARDOWN_RETRY_QUERY)
+            .bind(guild_id.to_string())
+            .bind(limit)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|error| instance_route_error(map_query_error(&error)))?;
+        if rows.len() > usize::try_from(limit).map_err(|_| instance_corrupt())? {
+            return Err(instance_corrupt());
+        }
+        let instances = rows
+            .into_iter()
+            .map(|row| row.decode_retryable(guild_id).map_err(instance_backend))
+            .collect::<Result<Vec<_>, _>>()?;
+        if instances.windows(2).any(|pair| pair[0].id >= pair[1].id) {
+            return Err(instance_corrupt());
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|error| instance_route_error(map_query_error(&error)))?;
+        Ok(instances)
+    }
+}
+
+impl InstanceTeardownRetryScannerV2 for PostgresRuntimeInteractionV1 {
+    async fn scan_retryable_v2(
+        &self,
+        cursor: &InstanceTeardownRetryScanCursorV2,
+        limit: NonZeroUsize,
+    ) -> Result<InstanceTeardownRetryScanPageV2, InstanceStoreError> {
+        if limit.get() > MAX_INSTANCE_TEARDOWN_RETRY_SCAN_BATCH_V2 {
+            return Err(instance_backend(
+                RuntimeInteractionPersistenceErrorV1::InvalidInput,
+            ));
+        }
+        let limit_i64 = i64::try_from(limit.get())
+            .map_err(|_| instance_backend(RuntimeInteractionPersistenceErrorV1::InvalidInput))?;
+        let after_guild_id = cursor
+            .after()
+            .map(|key| key.guild_id().to_string())
+            .unwrap_or_default();
+        let after_instance_id = cursor
+            .after()
+            .map(|key| key.instance_id().as_str())
+            .unwrap_or_default();
+        let through_guild_id = cursor
+            .through()
+            .map(|key| key.guild_id().to_string())
+            .unwrap_or_default();
+        let through_instance_id = cursor
+            .through()
+            .map(|key| key.instance_id().as_str())
+            .unwrap_or_default();
+        let mut transaction = begin_interaction_transaction(&self.pool, self.timeouts)
+            .await
+            .map_err(instance_route_error)?;
+        verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)
+            .await
+            .map_err(instance_route_error)?;
+        let rows =
+            sqlx::query_as::<_, InstanceTeardownRetryScanRowV2>(INSTANCE_TEARDOWN_RETRY_SCAN_QUERY)
+                .bind(after_guild_id)
+                .bind(after_instance_id)
+                .bind(through_guild_id)
+                .bind(through_instance_id)
+                .bind(limit_i64)
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|error| instance_route_error(map_query_error(&error)))?;
+        if rows.len() > limit.get() {
+            return Err(instance_corrupt());
+        }
+        let decoded = rows
+            .into_iter()
+            .map(InstanceTeardownRetryScanRowV2::decode)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(instance_backend)?;
+        let through = decoded
+            .first()
+            .map(|(_, through)| through.clone())
+            .or_else(|| cursor.through().cloned());
+        if decoded.iter().any(|(_, row_through)| {
+            through
+                .as_ref()
+                .is_none_or(|through| row_through != through)
+        }) || cursor
+            .through()
+            .is_some_and(|expected| through.as_ref() != Some(expected))
+        {
+            return Err(instance_corrupt());
+        }
+        let keys = decoded.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+        if keys.iter().any(|key| {
+            cursor
+                .after()
+                .is_some_and(|after| key.cmp_c_v2(after).is_le())
+        }) {
+            return Err(instance_corrupt());
+        }
+        let page = InstanceTeardownRetryScanPageV2::new(keys, through, limit)
+            .ok_or_else(instance_corrupt)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| instance_route_error(map_query_error(&error)))?;
+        Ok(page)
+    }
+}
+
+impl PostgresRuntimeInteractionV1 {
+    async fn teardown_mutation_outcome_v1(
+        &self,
+        query: &str,
+        guild_id: GuildId,
+        instance_id: &InstanceId,
+    ) -> Result<String, InstanceStoreError> {
+        let mut transaction = begin_interaction_transaction(&self.pool, self.timeouts)
+            .await
+            .map_err(instance_backend)?;
+        verify_runtime_interaction_binding_v1(&mut transaction, &self.expectation)
+            .await
+            .map_err(instance_backend)?;
+        let rows = sqlx::query_as::<_, InstanceOutcomeRowV1>(query)
+            .bind(guild_id.to_string())
+            .bind(instance_id.as_str())
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|error| instance_backend(map_mutation_error(&error)))?;
+        let [row] = rows.as_slice() else {
+            return Err(instance_corrupt());
+        };
+        let outcome = row.outcome.clone();
+        transaction
+            .commit()
+            .await
+            .map_err(|error| instance_backend(map_mutation_commit_error(&error)))?;
+        Ok(outcome)
     }
 }
 

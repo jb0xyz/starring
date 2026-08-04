@@ -3,12 +3,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use authoring_application_postgres::{
-    OperatingSystemSecretGenerator, PostgresAuthorizedPromotionSnapshots,
+    AuthoringConversationStoreReadinessErrorV1, OperatingSystemSecretGenerator,
+    PostgresAuthoringConversationStoreV1, PostgresAuthorizedPromotionSnapshots,
     PostgresInstallationAuthoritySource, PostgresProductApiReadiness, PostgresProductControl,
     PostgresProductDeploymentOperationalStatusesV2, PostgresProductDeploymentStatuses,
     PostgresProductIdentityConfig, PostgresProductIdentityStore, PostgresProductPromotions,
-    ProductActionDigestKeyV1, ProductActionDigestKeyringV1, ProductApiReadinessErrorV1,
-    ProductDecisionDatabasePoolsV1, ProductIdentityDatabasePoolsV1,
+    ProductActionDigestKeyV1, ProductActionDigestKeyringV1, ProductApiAuthoringReadinessErrorV1,
+    ProductApiReadinessErrorV1, ProductDecisionDatabasePoolsV1, ProductIdentityDatabasePoolsV1,
     ProductIdentityReadinessErrorV1, SnapshotEnvelopeKeyV1, SnapshotEnvelopeKeyringV1,
     XChaCha20Poly1305SnapshotEnvelopeCipherV1, MIGRATOR,
 };
@@ -36,6 +37,15 @@ const APPLY_EXECUTOR: usize = 10;
 const CANCELLATION_EXECUTOR: usize = 11;
 const DEPLOYMENT_STATUS: usize = 12;
 const OPERATIONAL_DEPLOYMENT_STATUS: usize = 13;
+const AUTHORING_WRITER: usize = 14;
+const AUTHORING_WRITER_FUNCTIONS: [&str; 5] = [
+    "public.starring_authoring_session_writer_database_identity_v1()",
+    "public.starring_authoring_session_writer_check_v1(text,text,text,text,bigint,text[],text[],text[],text[])",
+    "public.starring_authoring_session_writer_load_v1(text,text,text,text,bigint)",
+    "public.starring_authoring_session_writer_commit_v1(text,text,text,text,bigint,text[],text[],text[],text[],text,text,text,text,bigint,bytea,bytea,text,text,smallint,text,jsonb,text,bigint,text,jsonb,text,bigint,text,bytea,text,bigint)",
+    "public.starring_authoring_session_writer_key_coverage_v1(text[],text[],text[])",
+];
+const UNEXPECTED_AUTHORING_FUNCTION: &str = "public.starring_runtime_panel_database_identity_v1()";
 
 static SUFFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -333,6 +343,17 @@ async fn provision_secondary(
     )
 }
 
+async fn provision_authoring_writer(
+    database: &mut TestDatabase,
+    owner: &str,
+    role: &RoleCredentials,
+) -> PgPool {
+    create_login(database, role).await;
+    grant_database_access(database, owner, [role.name.clone()]).await;
+    grant_functions(database, &role.name, &AUTHORING_WRITER_FUNCTIONS).await;
+    role_pool(&database.name, role).await
+}
+
 fn action_keyring() -> ProductActionDigestKeyringV1 {
     ProductActionDigestKeyringV1::new(
         ProductActionDigestKeyV1::from_bytes(
@@ -407,6 +428,63 @@ async fn verify_api(
     .await
 }
 
+async fn verify_authoring_api(
+    pools: &[PgPool],
+    operational_status_pool: PgPool,
+    authoring_writer_pool: PgPool,
+) -> Result<(), ProductApiAuthoringReadinessErrorV1> {
+    let identity = PostgresProductIdentityStore::<OperatingSystemSecretGenerator>::production(
+        ProductIdentityDatabasePoolsV1::new(
+            pools[OAUTH_FLOW_WRITER].clone(),
+            pools[SESSION_ISSUER].clone(),
+            pools[SESSION_API].clone(),
+            pools[SECURITY_REVOKER].clone(),
+        ),
+        PostgresProductIdentityConfig::production(
+            "https://starring.example/oauth/discord/callback",
+            ["/".to_string()],
+        )
+        .unwrap(),
+    );
+    let authority = PostgresInstallationAuthoritySource::new(pools[INSTALLATION_AUTHORITY].clone());
+    let snapshots = PostgresAuthorizedPromotionSnapshots::new(
+        pools[AUTHORIZED_SNAPSHOT].clone(),
+        snapshot_cipher(),
+    );
+    let promotions =
+        PostgresProductPromotions::new(pools[PROMOTION].clone(), action_keyring()).unwrap();
+    let control = PostgresProductControl::new(
+        ProductDecisionDatabasePoolsV1::new(
+            pools[DECISION_READER].clone(),
+            pools[APPROVAL_EXECUTOR].clone(),
+            pools[APPLY_EXECUTOR].clone(),
+        ),
+        pools[REJECTION_EXECUTOR].clone(),
+        pools[CANCELLATION_EXECUTOR].clone(),
+        action_keyring(),
+    )
+    .unwrap();
+    let statuses = PostgresProductDeploymentStatuses::new(pools[DEPLOYMENT_STATUS].clone());
+    let operational_statuses =
+        PostgresProductDeploymentOperationalStatusesV2::new(operational_status_pool);
+    let writer = PostgresAuthoringConversationStoreV1::new(
+        authoring_writer_pool,
+        snapshot_cipher(),
+        action_keyring(),
+    );
+    PostgresProductApiReadiness::new(
+        &identity,
+        &authority,
+        &snapshots,
+        &promotions,
+        &control,
+        &statuses,
+        &operational_statuses,
+    )
+    .verify_authoring_readiness(&writer)
+    .await
+}
+
 async fn destroy_databases(
     primary: TestDatabase,
     secondary: TestDatabase,
@@ -443,7 +521,7 @@ async fn destroy_databases(
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires STARRING_TEST_DATABASE_URL"]
-async fn product_api_readiness_enforces_fourteen_isolated_database_capabilities() {
+async fn product_api_readiness_enforces_fifteen_role_authoring_topology_and_capabilities() {
     let mut primary = isolated_database("primary").await;
     let mut secondary = isolated_database("secondary").await;
     let roles = primary_roles();
@@ -453,10 +531,17 @@ async fn product_api_readiness_enforces_fourteen_isolated_database_capabilities(
         name: format!("starring_api_secondary_status_{}", suffix()),
         password: password(),
     };
+    let secondary_writer = RoleCredentials {
+        name: format!("starring_api_secondary_writer_{}", suffix()),
+        password: password(),
+    };
+    let writer_membership_role = format!("starring_api_writer_membership_{}", suffix());
     for identifier in [
         primary_owner.as_str(),
         secondary_owner.as_str(),
         distinct_secondary.name.as_str(),
+        secondary_writer.name.as_str(),
+        writer_membership_role.as_str(),
     ] {
         assert_safe_identifier(identifier);
     }
@@ -465,6 +550,8 @@ async fn product_api_readiness_enforces_fourteen_isolated_database_capabilities(
         .map(|role| role.name.clone())
         .chain([
             distinct_secondary.name.clone(),
+            secondary_writer.name.clone(),
+            writer_membership_role.clone(),
             primary_owner.clone(),
             secondary_owner.clone(),
         ])
@@ -479,6 +566,9 @@ async fn product_api_readiness_enforces_fourteen_isolated_database_capabilities(
             &distinct_secondary,
         )
         .await;
+        create_owner(&mut primary, &writer_membership_role).await;
+        let secondary_writer_pool =
+            provision_authoring_writer(&mut secondary, &secondary_owner, &secondary_writer).await;
 
         verify_api(
             &primary_pools,
@@ -486,6 +576,201 @@ async fn product_api_readiness_enforces_fourteen_isolated_database_capabilities(
         )
         .await
         .unwrap();
+        verify_authoring_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+            primary_pools[AUTHORING_WRITER].clone(),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query(&format!(
+            "REVOKE EXECUTE ON FUNCTION {} FROM {}",
+            AUTHORING_WRITER_FUNCTIONS[0], roles[AUTHORING_WRITER].name
+        ))
+        .execute(&primary.owner_pool)
+        .await
+        .unwrap();
+        let missing_writer_capability = verify_authoring_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+            primary_pools[AUTHORING_WRITER].clone(),
+        )
+        .await;
+        assert!(matches!(
+            missing_writer_capability,
+            Err(ProductApiAuthoringReadinessErrorV1::AuthoringWriter(
+                AuthoringConversationStoreReadinessErrorV1::CapabilityMissing
+            ))
+        ));
+        grant_functions(
+            &primary,
+            &roles[AUTHORING_WRITER].name,
+            &AUTHORING_WRITER_FUNCTIONS[..1],
+        )
+        .await;
+
+        sqlx::query(&format!(
+            "GRANT SELECT ON TABLE public.authoring_session_generations TO {}",
+            roles[AUTHORING_WRITER].name
+        ))
+        .execute(&primary.owner_pool)
+        .await
+        .unwrap();
+        let writer_relation_capability = verify_authoring_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+            primary_pools[AUTHORING_WRITER].clone(),
+        )
+        .await;
+        assert!(
+            matches!(
+                writer_relation_capability,
+                Err(ProductApiAuthoringReadinessErrorV1::AuthoringWriter(
+                    AuthoringConversationStoreReadinessErrorV1::ExcessCapability
+                ))
+            ),
+            "writer relation capability returned {writer_relation_capability:?}"
+        );
+        sqlx::query(&format!(
+            "REVOKE SELECT ON TABLE public.authoring_session_generations FROM {}",
+            roles[AUTHORING_WRITER].name
+        ))
+        .execute(&primary.owner_pool)
+        .await
+        .unwrap();
+        verify_authoring_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+            primary_pools[AUTHORING_WRITER].clone(),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query(&format!(
+            "GRANT EXECUTE ON FUNCTION {UNEXPECTED_AUTHORING_FUNCTION} TO {}",
+            roles[AUTHORING_WRITER].name
+        ))
+        .execute(&primary.owner_pool)
+        .await
+        .unwrap();
+        let excessive_writer_capability = verify_authoring_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+            primary_pools[AUTHORING_WRITER].clone(),
+        )
+        .await;
+        assert!(matches!(
+            excessive_writer_capability,
+            Err(ProductApiAuthoringReadinessErrorV1::AuthoringWriter(
+                AuthoringConversationStoreReadinessErrorV1::ExcessCapability
+            ))
+        ));
+        sqlx::query(&format!(
+            "REVOKE EXECUTE ON FUNCTION {UNEXPECTED_AUTHORING_FUNCTION} FROM {}",
+            roles[AUTHORING_WRITER].name
+        ))
+        .execute(&primary.owner_pool)
+        .await
+        .unwrap();
+        verify_authoring_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+            primary_pools[AUTHORING_WRITER].clone(),
+        )
+        .await
+        .unwrap();
+
+        sqlx::query(&format!(
+            "GRANT {} TO {}",
+            writer_membership_role, roles[AUTHORING_WRITER].name
+        ))
+        .execute(&primary.owner_pool)
+        .await
+        .unwrap();
+        let writer_membership = verify_authoring_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+            primary_pools[AUTHORING_WRITER].clone(),
+        )
+        .await;
+        assert!(matches!(
+            writer_membership,
+            Err(ProductApiAuthoringReadinessErrorV1::AuthoringWriter(
+                AuthoringConversationStoreReadinessErrorV1::ExcessCapability
+            ))
+        ));
+        sqlx::query(&format!(
+            "REVOKE {} FROM {}",
+            writer_membership_role, roles[AUTHORING_WRITER].name
+        ))
+        .execute(&primary.owner_pool)
+        .await
+        .unwrap();
+        verify_authoring_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+            primary_pools[AUTHORING_WRITER].clone(),
+        )
+        .await
+        .unwrap();
+
+        let reused_core_role = verify_authoring_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+            primary_pools[OAUTH_FLOW_WRITER].clone(),
+        )
+        .await;
+        assert!(
+            matches!(
+                reused_core_role,
+                Err(ProductApiAuthoringReadinessErrorV1::TopologyMismatch)
+            ),
+            "reused core role returned {reused_core_role:?}"
+        );
+
+        sqlx::query(&format!(
+            "REVOKE EXECUTE ON FUNCTION {} FROM {}",
+            AUTHORING_WRITER_FUNCTIONS[0], secondary_writer.name
+        ))
+        .execute(&secondary.owner_pool)
+        .await
+        .unwrap();
+        let incomplete_writer_on_other_database = verify_authoring_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+            secondary_writer_pool.clone(),
+        )
+        .await;
+        assert!(
+            matches!(
+                incomplete_writer_on_other_database,
+                Err(ProductApiAuthoringReadinessErrorV1::AuthoringWriter(
+                    AuthoringConversationStoreReadinessErrorV1::CapabilityMissing
+                ))
+            ),
+            "incomplete writer on other database returned {incomplete_writer_on_other_database:?}"
+        );
+        grant_functions(
+            &secondary,
+            &secondary_writer.name,
+            &AUTHORING_WRITER_FUNCTIONS[..1],
+        )
+        .await;
+
+        let mixed_authoring_database = verify_authoring_api(
+            &primary_pools,
+            primary_pools[OPERATIONAL_DEPLOYMENT_STATUS].clone(),
+            secondary_writer_pool.clone(),
+        )
+        .await;
+        assert!(
+            matches!(
+                mixed_authoring_database,
+                Err(ProductApiAuthoringReadinessErrorV1::TopologyMismatch)
+            ),
+            "mixed authoring database returned {mixed_authoring_database:?}"
+        );
 
         sqlx::query(
             "ALTER TABLE public.product_action_receipts \
@@ -674,6 +959,7 @@ async fn product_api_readiness_enforces_fourteen_isolated_database_capabilities(
         for pool in primary_pools {
             pool.close().await;
         }
+        secondary_writer_pool.close().await;
         reused_secondary_pool.close().await;
         distinct_secondary_pool.close().await;
     })

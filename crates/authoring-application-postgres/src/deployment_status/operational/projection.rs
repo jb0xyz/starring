@@ -3,8 +3,8 @@ use std::num::NonZeroU64;
 use authoring_application::{
     AuthorizedDeploymentStatusV1, DeploymentAttestationObservationV2, DeploymentConvergencePhaseV2,
     DeploymentOperationalObservationV2, DeploymentOperationalProjectionV2,
-    DeploymentOperatorActionV2, DeploymentRetryObservationV2, DeploymentServingFreshnessV2,
-    DeploymentStatusObservationV1, DeploymentStatusPortError,
+    DeploymentOperatorActionV2, DeploymentProcessInstanceIdV2, DeploymentRetryObservationV2,
+    DeploymentServingFreshnessV2, DeploymentStatusObservationV1, DeploymentStatusPortError,
 };
 use authoring_application_discord::FreshDiscordAuthorityEvidenceV1;
 use automation_runtime_convergence::{RuntimeDeploymentPhaseV1, RuntimePendingConditionV1};
@@ -44,12 +44,24 @@ pub(super) fn project_operational_status(
     let operator_action = operator_action(&status);
     let attestation = status
         .attestation
+        .as_ref()
         .map(|attestation| {
             let revision =
                 NonZeroU64::new(attestation.deployment_revision.get()).ok_or_else(indeterminate)?;
+            let live = status
+                .status
+                .snapshot
+                .live
+                .as_ref()
+                .ok_or_else(indeterminate)?;
+            let process_instance_id = DeploymentProcessInstanceIdV2::from_server_projection(
+                live.process_instance_id.as_str().to_string(),
+            )
+            .map_err(|_| indeterminate())?;
             Ok::<_, DeploymentStatusPortError>(DeploymentAttestationObservationV2::new(
                 revision,
                 attestation.convergence_attempt,
+                process_instance_id,
             ))
         })
         .transpose()?;

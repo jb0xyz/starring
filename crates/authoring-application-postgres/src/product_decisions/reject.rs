@@ -300,7 +300,6 @@ mod tests {
             "ok",
             "invalid_input",
             "duplicate_decision",
-            "self_approval_forbidden",
             "unexpected",
             "",
         ] {

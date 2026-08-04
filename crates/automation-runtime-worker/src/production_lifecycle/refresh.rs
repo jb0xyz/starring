@@ -3,23 +3,128 @@ use std::num::NonZeroU64;
 
 use automation_runtime_controller::{
     RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2,
-    RuntimeIngressOpenAcknowledgementLeaseDurationV2,
-    RuntimePublishIngressOpenAcknowledgementInputV2, RuntimePublishIngressOpenAcknowledgementV2,
-    RuntimeWriterFenceGenerationV1,
+    RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimeIngressOpenAcknowledgementReceiptV2,
+    RuntimeIngressOpenAcknowledgementV2, RuntimePublishIngressOpenAcknowledgementInputV2,
+    RuntimePublishIngressOpenAcknowledgementV2, RuntimeWriterFenceGenerationV1,
 };
 
+use super::admission::RuntimeServingGatewayReadyRefreshV3;
 use super::{
     RuntimeEmptyOpenProcessV2, RuntimeIngressOpenAcknowledgementObservationV2,
     RuntimeMaintenanceGateGenerationV2, RuntimeMutationFinalizerGenerationV1,
-    RuntimeProductionLifecycleErrorV2,
+    RuntimeProductionLifecycleErrorV2, RuntimeServingOpenProcessV2,
 };
 use crate::{
     RuntimeAcceptedIngressOpenAcknowledgementV2, RuntimeAuthorizedIngressOpenAcknowledgementV2,
-    RuntimeCapabilityReadinessSetV2,
+    RuntimeCapabilityReadinessSetV2, RuntimeGatewayCoordinatorGenerationV2,
     RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
     RuntimeIngressOpenAcknowledgementPredecessorV2,
     RuntimeIngressOpenAcknowledgementSingleFlightV2, RuntimeRegistryRecoveryEmptyObservationV2,
 };
+
+pub struct RuntimeServingOpenBarrierCompletionAuthorityV3 {
+    coordinator_generation: RuntimeGatewayCoordinatorGenerationV2,
+    gateway_ready: RuntimeGatewayReadyAttestationV2,
+    final_receipt: RuntimeIngressOpenAcknowledgementReceiptV2,
+}
+
+impl RuntimeServingOpenBarrierCompletionAuthorityV3 {
+    pub fn coordinator_generation_v3(&self) -> RuntimeGatewayCoordinatorGenerationV2 {
+        self.coordinator_generation
+    }
+
+    pub fn gateway_ready_v3(&self) -> &RuntimeGatewayReadyAttestationV2 {
+        &self.gateway_ready
+    }
+
+    pub fn acknowledgement_v3(&self) -> &RuntimeIngressOpenAcknowledgementV2 {
+        self.final_receipt.acknowledgement()
+    }
+
+    pub fn accepts_final_reobservation_v3(
+        &self,
+        receipt: &RuntimeIngressOpenAcknowledgementReceiptV2,
+    ) -> bool {
+        &self.final_receipt == receipt
+    }
+}
+
+impl Debug for RuntimeServingOpenBarrierCompletionAuthorityV3 {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RuntimeServingOpenBarrierCompletionAuthorityV3(<redacted>)")
+    }
+}
+
+impl RuntimeServingOpenProcessV2 {
+    pub fn authorize_ordinary_barrier_completion_v3(
+        &self,
+        final_receipt: &RuntimeIngressOpenAcknowledgementReceiptV2,
+    ) -> Result<RuntimeServingOpenBarrierCompletionAuthorityV3, RuntimeProductionLifecycleErrorV2>
+    {
+        let epoch = self.epoch();
+        if !epoch
+            .ingress_acknowledgement()
+            .accepts_exact_reobservation_v3(final_receipt)
+        {
+            return Err(RuntimeProductionLifecycleErrorV2::IngressAcknowledgementMismatch);
+        }
+        let acknowledgement = final_receipt.acknowledgement();
+        let gateway_ready = epoch.gateway_ready();
+        if !gateway_ready.was_explicitly_resumed()
+            || acknowledgement.process_instance_id() != epoch.process_instance_id()
+            || acknowledgement.connection_epoch() != gateway_ready.connection_epoch
+            || acknowledgement.admission_revision() != gateway_ready.admission_revision
+            || acknowledgement.connected_event_sequence() != gateway_ready.connected_event_sequence
+            || acknowledgement.resume_sequence() != gateway_ready.resume_sequence
+        {
+            return Err(RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch);
+        }
+        if acknowledgement.gateway_owner_lease_id() != &epoch.gateway_owner().lease_id
+            || acknowledgement.observed_owner_revision() != epoch.gateway_owner().owner_revision
+            || final_receipt.observed_database_now() < epoch.gateway_owner().database_now
+            || final_receipt.observed_database_now() >= epoch.gateway_owner().expires_at
+        {
+            return Err(RuntimeProductionLifecycleErrorV2::OwnerMismatch);
+        }
+        Ok(RuntimeServingOpenBarrierCompletionAuthorityV3 {
+            coordinator_generation: epoch.coordinator_generation(),
+            gateway_ready: gateway_ready.clone(),
+            final_receipt: final_receipt.clone(),
+        })
+    }
+}
+
+pub(super) fn validate_serving_gateway_ready_refresh_v3(
+    current: &RuntimeGatewayReadyAttestationV2,
+    observed: &RuntimeGatewayReadyAttestationV2,
+    transition: RuntimeServingGatewayReadyRefreshV3,
+) -> Result<(), RuntimeProductionLifecycleErrorV2> {
+    if observed.connection_epoch != current.connection_epoch {
+        return Err(RuntimeProductionLifecycleErrorV2::StaleConnectionEpoch);
+    }
+    let expected_admission_revision = current
+        .admission_revision
+        .get()
+        .checked_add(transition.admission_revision_delta_v3())
+        .filter(|revision| *revision <= i64::MAX as u64);
+    if expected_admission_revision != Some(observed.admission_revision.get()) {
+        return Err(RuntimeProductionLifecycleErrorV2::StaleAdmissionRevision);
+    }
+    let accepted = match transition {
+        RuntimeServingGatewayReadyRefreshV3::Current => observed == current,
+        RuntimeServingGatewayReadyRefreshV3::ResumedSuccessor => {
+            observed.process_instance_id == current.process_instance_id
+                && observed.kind == current.kind
+                && observed.connected_event_sequence == current.connected_event_sequence
+                && observed.resume_sequence > current.resume_sequence
+                && observed.was_explicitly_resumed()
+        }
+    };
+    if !accepted {
+        return Err(RuntimeProductionLifecycleErrorV2::GatewayReadyMismatch);
+    }
+    Ok(())
+}
 
 pub struct RuntimeEmptyOpenAcknowledgementRefreshInputV2 {
     pub owner_receipt: RuntimeGatewayOwnerLeaseReceiptV1,

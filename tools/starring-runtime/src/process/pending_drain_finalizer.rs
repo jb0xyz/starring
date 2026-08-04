@@ -1,25 +1,31 @@
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
-use std::marker::PhantomData;
 
+use automation_runtime_controller::{RuntimeServingIdentityV2, RuntimeServingReceiptV2};
+use automation_runtime_serving_postgres::{
+    RuntimePendingDrainServingObservationV1, RuntimeServingPersistenceErrorV1,
+};
 use automation_runtime_worker::{
     RuntimeAuthorizedPendingDrainAcknowledgementV2, RuntimeAuthorizedPendingDrainClaimV2,
     RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3,
     RuntimeCompletedStartupRecoveryExecutionV2, RuntimePendingDrainAcknowledgementReceiptV2,
     RuntimePendingDrainClaimReceiptV2, RuntimePendingDrainCompoundErrorV2,
     RuntimePendingDrainNoCandidateReceiptV2, RuntimePendingDrainSuccessionAcknowledgementReceiptV3,
-    RuntimeSelectedPendingDrainNoCandidateV2,
+    RuntimeSelectedPendingDrainCandidateV2, RuntimeSelectedPendingDrainNoCandidateV2,
 };
 
+use super::certification_finalizer::{
+    RuntimeProcessMutationFinalizerCompletionV3, RuntimeProcessMutationFinalizerErrorV3,
+    RuntimeProcessMutationFinalizerJobV3, RuntimeProcessMutationFinalizerOutputV3,
+    RuntimeProcessMutationFinalizerPortV3, RuntimeProcessMutationFinalizerSupervisorV3,
+};
 use super::execution::RuntimeStartupRecoveryExecutionAwaitFailureV2;
 use super::startup_loop::RuntimeProcessStartupRecoveryLoopFailureV2;
 use crate::closed_recovery::RuntimeClosedRecoverySessionV2;
 use crate::{
-    RuntimeMutationFinalizerCompletionResultV1, RuntimeMutationFinalizerCompletionV1,
-    RuntimeMutationFinalizerConfigV1, RuntimeMutationFinalizerJobIdV1,
-    RuntimeMutationFinalizerJobV1, RuntimeMutationFinalizerPortV1,
-    RuntimeMutationFinalizerRegistrationRejectionReasonV1, RuntimeMutationFinalizerSupervisorV1,
-    RuntimeSupervisorExitV1,
+    RuntimeMutationFinalizerCompletionResultV1, RuntimeMutationFinalizerConfigV1,
+    RuntimeMutationFinalizerJobIdV1, RuntimeMutationFinalizerJobV1,
+    RuntimeMutationFinalizerRegistrationRejectionReasonV1, RuntimeSupervisorExitV1,
 };
 
 pub(crate) trait RuntimePendingDrainMutationEnvironmentV3: Send + 'static {
@@ -83,6 +89,31 @@ pub(crate) trait RuntimePendingDrainMutationEnvironmentV3: Send + 'static {
         >,
     > + Send
            + 'a;
+
+    fn observe_pending_drain_source_serving_v3<'a>(
+        &'a mut self,
+        session: &'a RuntimeClosedRecoverySessionV2,
+        candidate: &'a automation_runtime_worker::RuntimePendingDrainCandidateV2,
+    ) -> impl Future<
+        Output = Result<
+            RuntimePendingDrainServingObservationV1,
+            RuntimeStartupRecoveryExecutionAwaitFailureV2<RuntimeServingPersistenceErrorV1>,
+        >,
+    > + Send
+           + 'a;
+
+    fn disconnect_pending_drain_source_serving_v3<'a>(
+        &'a mut self,
+        session: &'a RuntimeClosedRecoverySessionV2,
+        candidate: &'a automation_runtime_worker::RuntimePendingDrainCandidateV2,
+        identity: &'a RuntimeServingIdentityV2,
+    ) -> impl Future<
+        Output = Result<
+            RuntimeServingReceiptV2,
+            RuntimeStartupRecoveryExecutionAwaitFailureV2<RuntimeServingPersistenceErrorV1>,
+        >,
+    > + Send
+           + 'a;
 }
 
 pub(crate) enum RuntimePendingDrainMutationStageV3 {
@@ -90,6 +121,9 @@ pub(crate) enum RuntimePendingDrainMutationStageV3 {
     Claim(Box<RuntimeAuthorizedPendingDrainClaimV2>),
     Acknowledgement(Box<RuntimeAuthorizedPendingDrainAcknowledgementV2>),
     Succession(Box<RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3>),
+    ServingDisconnect(
+        Box<super::pending_drain_serving::RuntimeCheckedPendingDrainExpiredServingV1>,
+    ),
 }
 
 impl Debug for RuntimePendingDrainMutationStageV3 {
@@ -137,6 +171,7 @@ impl<E> Debug for RuntimePendingDrainFinalizerJobV3<E> {
 pub(crate) enum RuntimePendingDrainMutationOutputV3 {
     Completed(RuntimeCompletedStartupRecoveryExecutionV2),
     ClaimAccepted(RuntimeAuthorizedPendingDrainAcknowledgementV2),
+    ServingResolved(Box<RuntimeSelectedPendingDrainCandidateV2>),
 }
 
 impl Debug for RuntimePendingDrainMutationOutputV3 {
@@ -193,36 +228,11 @@ impl<E> Debug for RuntimePendingDrainFinalizerFailedV3<E> {
     }
 }
 
-pub(crate) struct RuntimePendingDrainFinalizerPortV3<E> {
-    environment: PhantomData<fn() -> E>,
-}
-
-impl<E> RuntimePendingDrainFinalizerPortV3<E> {
-    pub(crate) const fn new() -> Self {
-        Self {
-            environment: PhantomData,
-        }
-    }
-}
-
-impl<E> RuntimeMutationFinalizerPortV1 for RuntimePendingDrainFinalizerPortV3<E>
-where
-    E: RuntimePendingDrainMutationEnvironmentV3,
-{
-    type Job = RuntimePendingDrainFinalizerJobV3<E>;
-    type Output = RuntimePendingDrainFinalizerSettledV3<E>;
-    type Error = RuntimePendingDrainFinalizerFailedV3<E>;
-
-    async fn execute(
-        &self,
-        job: RuntimeMutationFinalizerJobV1<Self::Job>,
-    ) -> Result<Self::Output, Self::Error> {
-        execute_pending_drain_finalizer_job_v3(job.into_startup_pending_drain()).await
-    }
-}
-
 pub(crate) type RuntimePendingDrainFinalizerSupervisorV3<E> =
-    RuntimeMutationFinalizerSupervisorV1<RuntimePendingDrainFinalizerPortV3<E>>;
+    RuntimeProcessMutationFinalizerSupervisorV3<E>;
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) type RuntimePendingDrainFinalizerPortV3<E> = RuntimeProcessMutationFinalizerPortV3<E>;
 
 pub(crate) enum RuntimePendingDrainFinalizerDispatchFailureV3<E> {
     Rejected {
@@ -264,11 +274,7 @@ impl Debug for RuntimePendingDrainRegisteredJobV3 {
     }
 }
 
-type RuntimePendingDrainFinalizerCompletionV3<E> = RuntimeMutationFinalizerCompletionV1<
-    RuntimePendingDrainFinalizerJobV3<E>,
-    RuntimePendingDrainFinalizerSettledV3<E>,
-    RuntimePendingDrainFinalizerFailedV3<E>,
->;
+type RuntimePendingDrainFinalizerCompletionV3<E> = RuntimeProcessMutationFinalizerCompletionV3<E>;
 
 pub(crate) fn register_pending_drain_job_v3<E>(
     supervisor: &RuntimePendingDrainFinalizerSupervisorV3<E>,
@@ -279,8 +285,9 @@ where
 {
     match supervisor
         .intake()
-        .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(job))
-    {
+        .try_register(RuntimeMutationFinalizerJobV1::StartupPendingDrain(
+            RuntimeProcessMutationFinalizerJobV3::StartupPendingDrain(Box::new(job)),
+        )) {
         Ok(waiter) => {
             let job_id = waiter.job_id();
             drop(waiter);
@@ -289,10 +296,10 @@ where
         Err(rejected) => {
             let reason = rejected.reason();
             let job = rejected.into_job().into_startup_pending_drain();
-            Err(RuntimePendingDrainFinalizerDispatchFailureV3::Rejected {
-                job: Box::new(job),
-                reason,
-            })
+            let RuntimeProcessMutationFinalizerJobV3::StartupPendingDrain(job) = job else {
+                unreachable!()
+            };
+            Err(RuntimePendingDrainFinalizerDispatchFailureV3::Rejected { job, reason })
         }
     }
 }
@@ -332,19 +339,29 @@ pub(crate) fn complete_pending_drain_job_v3<E>(
         );
     }
     match completion.into_result() {
-        RuntimeMutationFinalizerCompletionResultV1::Settled(settled) => Ok(settled),
-        RuntimeMutationFinalizerCompletionResultV1::Failed(failed) => Err(
-            RuntimePendingDrainFinalizerDispatchFailureV3::Failed(Box::new(failed)),
-        ),
-        RuntimeMutationFinalizerCompletionResultV1::Undispatched { job, exit } => Err(
-            RuntimePendingDrainFinalizerDispatchFailureV3::Undispatched {
-                job: Box::new(job.into_startup_pending_drain()),
-                exit,
-            },
-        ),
+        RuntimeMutationFinalizerCompletionResultV1::Settled(
+            RuntimeProcessMutationFinalizerOutputV3::StartupPendingDrain(settled),
+        ) => Ok(*settled),
+        RuntimeMutationFinalizerCompletionResultV1::Failed(
+            RuntimeProcessMutationFinalizerErrorV3::StartupPendingDrain(failed),
+        ) => Err(RuntimePendingDrainFinalizerDispatchFailureV3::Failed(
+            failed,
+        )),
+        RuntimeMutationFinalizerCompletionResultV1::Undispatched {
+            job:
+                RuntimeMutationFinalizerJobV1::StartupPendingDrain(
+                    RuntimeProcessMutationFinalizerJobV3::StartupPendingDrain(job),
+                ),
+            exit,
+        } => Err(RuntimePendingDrainFinalizerDispatchFailureV3::Undispatched { job, exit }),
         RuntimeMutationFinalizerCompletionResultV1::DispatchedTerminal(exit) => {
             Err(RuntimePendingDrainFinalizerDispatchFailureV3::DispatchedTerminal(exit))
         }
+        _ => Err(
+            RuntimePendingDrainFinalizerDispatchFailureV3::DispatchedTerminal(
+                RuntimeSupervisorExitV1::ProtocolViolation,
+            ),
+        ),
     }
 }
 
@@ -363,7 +380,7 @@ where
     complete_registered_pending_drain_job_v3(supervisor, registered).await
 }
 
-async fn execute_pending_drain_finalizer_job_v3<E>(
+pub(super) async fn execute_pending_drain_finalizer_job_v3<E>(
     job: RuntimePendingDrainFinalizerJobV3<E>,
 ) -> Result<RuntimePendingDrainFinalizerSettledV3<E>, RuntimePendingDrainFinalizerFailedV3<E>>
 where
@@ -495,6 +512,61 @@ where
                 .map_err(pending_drain_compound_failure_v3)?;
             Ok(RuntimePendingDrainMutationOutputV3::Completed(completed))
         }
+        RuntimePendingDrainMutationStageV3::ServingDisconnect(evidence) => {
+            let (selection, serving) = (*evidence).into_parts();
+            match environment
+                .disconnect_pending_drain_source_serving_v3(
+                    session,
+                    selection.candidate(),
+                    &serving.identity,
+                )
+                .await
+            {
+                Ok(disconnected) => {
+                    super::pending_drain_serving::validate_pending_drain_serving_disconnect_v1(
+                        &serving,
+                        &disconnected,
+                    )
+                    .map_err(pending_drain_compound_failure_v3)?;
+                    revalidate_pending_drain_finalizer_stage_v3(environment, session)?;
+                    return Ok(RuntimePendingDrainMutationOutputV3::ServingResolved(
+                        selection,
+                    ));
+                }
+                Err(RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(
+                    RuntimeServingPersistenceErrorV1::Indeterminate,
+                )) => {}
+                Err(error) => {
+                    return Err(map_pending_drain_serving_finalizer_await_failure_v1(
+                        environment,
+                        session,
+                        error,
+                    ));
+                }
+            }
+            revalidate_pending_drain_finalizer_stage_v3(environment, session)?;
+            let observation = environment
+                .observe_pending_drain_source_serving_v3(session, selection.candidate())
+                .await
+                .map_err(|error| {
+                    map_pending_drain_serving_finalizer_await_failure_v1(
+                        environment,
+                        session,
+                        error,
+                    )
+                })?;
+            revalidate_pending_drain_finalizer_stage_v3(environment, session)?;
+            super::pending_drain_serving::validate_pending_drain_disconnected_reobservation_v1(
+                &selection,
+                &serving,
+                None,
+                observation,
+            )
+            .map_err(pending_drain_compound_failure_v3)?;
+            Ok(RuntimePendingDrainMutationOutputV3::ServingResolved(
+                selection,
+            ))
+        }
     }
 }
 
@@ -541,6 +613,24 @@ where
         RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(error) => {
             environment.current_transition_v3(session).unwrap_or(
                 RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainExecution(error),
+            )
+        }
+    }
+}
+
+fn map_pending_drain_serving_finalizer_await_failure_v1<E>(
+    environment: &E,
+    session: &RuntimeClosedRecoverySessionV2,
+    error: RuntimeStartupRecoveryExecutionAwaitFailureV2<RuntimeServingPersistenceErrorV1>,
+) -> RuntimeProcessStartupRecoveryLoopFailureV2
+where
+    E: RuntimePendingDrainMutationEnvironmentV3,
+{
+    match error {
+        RuntimeStartupRecoveryExecutionAwaitFailureV2::Transition(transition) => transition,
+        RuntimeStartupRecoveryExecutionAwaitFailureV2::Database(error) => {
+            environment.current_transition_v3(session).unwrap_or(
+                RuntimeProcessStartupRecoveryLoopFailureV2::PendingRuntimeDrainServing(error),
             )
         }
     }

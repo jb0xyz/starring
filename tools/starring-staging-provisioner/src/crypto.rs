@@ -9,8 +9,8 @@ use zeroize::Zeroizing;
 use crate::identity::{
     database_url, validate_identity_manifest, DatabaseIdentityV1, KeychainIdentityV1,
     ADMIN_DATABASE_NAME, ADMIN_KEYCHAIN_IDENTITY, APPLICATION_DATABASE_IDENTITIES,
-    CLUSTER_ADMIN_ROLE, DATABASE_NAME, PRODUCT_ACTION_KEYRING_IDENTITY,
-    SNAPSHOT_ENVELOPE_KEYRING_IDENTITY,
+    CLUSTER_ADMIN_ROLE, DATABASE_NAME, INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY,
+    PRODUCT_ACTION_KEYRING_IDENTITY, SNAPSHOT_ENVELOPE_KEYRING_IDENTITY,
 };
 use crate::ProvisionerErrorV1;
 
@@ -42,6 +42,26 @@ pub struct DatabaseSecretV1 {
 }
 
 impl DatabaseSecretV1 {
+    pub(crate) fn generate(identity: DatabaseIdentityV1) -> Result<Self, ProvisionerErrorV1> {
+        let mut source = SystemRandomSourceV1;
+        Self::generate_with(identity, &mut source)
+    }
+
+    fn generate_with(
+        identity: DatabaseIdentityV1,
+        source: &mut impl RandomSourceV1,
+    ) -> Result<Self, ProvisionerErrorV1> {
+        let password = unique_password(source, std::iter::empty())?;
+        let verifier = random_scram_verifier(source, password.as_bytes())?;
+        let url = database_url(identity.role, password.as_str(), DATABASE_NAME);
+        Ok(Self {
+            identity,
+            password,
+            verifier,
+            url,
+        })
+    }
+
     pub fn identity(&self) -> DatabaseIdentityV1 {
         self.identity
     }
@@ -66,11 +86,16 @@ impl Debug for DatabaseSecretV1 {
 }
 
 pub struct AdminSecretV1 {
+    password: Zeroizing<String>,
     verifier: Zeroizing<String>,
     url: Zeroizing<String>,
 }
 
 impl AdminSecretV1 {
+    pub fn password(&self) -> &str {
+        self.password.as_str()
+    }
+
     pub fn verifier(&self) -> &str {
         self.verifier.as_str()
     }
@@ -117,6 +142,7 @@ pub struct GeneratedSecretsV1 {
     admin: AdminSecretV1,
     product_action_keyring: KeyringSecretV1,
     snapshot_envelope_keyring: KeyringSecretV1,
+    interaction_token_envelope_keyring: KeyringSecretV1,
 }
 
 impl GeneratedSecretsV1 {
@@ -148,6 +174,7 @@ impl GeneratedSecretsV1 {
             ADMIN_DATABASE_NAME,
         );
         let admin = AdminSecretV1 {
+            password: admin_password,
             verifier: admin_verifier,
             url: admin_url,
         };
@@ -155,19 +182,26 @@ impl GeneratedSecretsV1 {
             source,
             PRODUCT_ACTION_KEYRING_IDENTITY,
             "product-action-v1",
-            None,
+            &[],
         )?;
-        let (snapshot_envelope_keyring, _) = generate_keyring(
+        let (snapshot_envelope_keyring, snapshot_material) = generate_keyring(
             source,
             SNAPSHOT_ENVELOPE_KEYRING_IDENTITY,
             "snapshot-envelope-v1",
-            Some(&product_material),
+            &[&product_material],
+        )?;
+        let (interaction_token_envelope_keyring, _) = generate_interaction_token_envelope_keyring(
+            source,
+            INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY,
+            "interaction-token-envelope-v1",
+            &[&product_material, &snapshot_material],
         )?;
         Ok(Self {
             database,
             admin,
             product_action_keyring,
             snapshot_envelope_keyring,
+            interaction_token_envelope_keyring,
         })
     }
 
@@ -203,6 +237,10 @@ impl GeneratedSecretsV1 {
             identity: self.snapshot_envelope_keyring.identity(),
             value: self.snapshot_envelope_keyring.payload(),
         });
+        items.push(SecretItemRefV1 {
+            identity: self.interaction_token_envelope_keyring.identity(),
+            value: self.interaction_token_envelope_keyring.payload(),
+        });
         items
     }
 
@@ -214,12 +252,20 @@ impl GeneratedSecretsV1 {
         self.snapshot_envelope_keyring.active_key_id()
     }
 
+    pub fn interaction_token_envelope_key_id(&self) -> &str {
+        self.interaction_token_envelope_keyring.active_key_id()
+    }
+
     pub fn product_action_keyring_payload(&self) -> &[u8] {
         self.product_action_keyring.payload()
     }
 
     pub fn snapshot_envelope_keyring_payload(&self) -> &[u8] {
         self.snapshot_envelope_keyring.payload()
+    }
+
+    pub fn interaction_token_envelope_keyring_payload(&self) -> &[u8] {
+        self.interaction_token_envelope_keyring.payload()
     }
 }
 
@@ -259,7 +305,7 @@ fn generate_keyring(
     source: &mut impl RandomSourceV1,
     identity: KeychainIdentityV1,
     key_id_prefix: &str,
-    forbidden_material: Option<&[u8; KEYRING_MATERIAL_BYTES]>,
+    forbidden_materials: &[&[u8; KEYRING_MATERIAL_BYTES]],
 ) -> Result<(KeyringSecretV1, Zeroizing<[u8; KEYRING_MATERIAL_BYTES]>), ProvisionerErrorV1> {
     let mut key_id_random = Zeroizing::new([0_u8; KEY_ID_RANDOM_BYTES]);
     source.fill(&mut *key_id_random)?;
@@ -267,20 +313,7 @@ fn generate_keyring(
         "{key_id_prefix}-{}",
         URL_SAFE_NO_PAD.encode(key_id_random.as_slice())
     );
-    let mut material = None;
-    for _ in 0..8 {
-        let mut candidate = Zeroizing::new([0_u8; KEYRING_MATERIAL_BYTES]);
-        source.fill(&mut *candidate)?;
-        let repetitive = candidate
-            .iter()
-            .all(|value| *value == candidate.first().copied().unwrap_or_default());
-        let forbidden = forbidden_material.is_some_and(|forbidden| forbidden == &*candidate);
-        if !repetitive && !forbidden {
-            material = Some(candidate);
-            break;
-        }
-    }
-    let material = material.ok_or(ProvisionerErrorV1::Random)?;
+    let material = generate_key_material(source, forbidden_materials)?;
     let encoded = Zeroizing::new(STANDARD.encode(material.as_slice()));
     let payload = Zeroizing::new(format!(
         "{{\"version\":1,\"active\":{{\"id\":\"{active_key_id}\",\"material\":\"{}\"}},\"retired\":[]}}",
@@ -294,6 +327,78 @@ fn generate_keyring(
         },
         material,
     ))
+}
+
+fn generate_interaction_token_envelope_keyring(
+    source: &mut impl RandomSourceV1,
+    identity: KeychainIdentityV1,
+    key_id_prefix: &str,
+    forbidden_materials: &[&[u8; KEYRING_MATERIAL_BYTES]],
+) -> Result<(KeyringSecretV1, Zeroizing<[u8; KEYRING_MATERIAL_BYTES]>), ProvisionerErrorV1> {
+    let mut key_id_random = Zeroizing::new([0_u8; KEY_ID_RANDOM_BYTES]);
+    source.fill(&mut *key_id_random)?;
+    let active_key_id = format!(
+        "{key_id_prefix}-{}",
+        URL_SAFE_NO_PAD.encode(key_id_random.as_slice())
+    );
+    let material = generate_key_material(source, forbidden_materials)?;
+    let encoded = lower_hex_key_material(&material);
+    let payload = Zeroizing::new(format!(
+        "v1;active={active_key_id}={};retired=",
+        encoded.as_str()
+    ));
+    Ok((
+        KeyringSecretV1 {
+            identity,
+            active_key_id,
+            payload,
+        },
+        material,
+    ))
+}
+
+pub(crate) fn generate_incremental_interaction_token_envelope_keyring(
+    source: &mut impl RandomSourceV1,
+    product_action_material: &[u8; KEYRING_MATERIAL_BYTES],
+    snapshot_envelope_material: &[u8; KEYRING_MATERIAL_BYTES],
+) -> Result<KeyringSecretV1, ProvisionerErrorV1> {
+    generate_interaction_token_envelope_keyring(
+        source,
+        INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY,
+        "interaction-token-envelope-v1",
+        &[product_action_material, snapshot_envelope_material],
+    )
+    .map(|(keyring, _)| keyring)
+}
+
+fn generate_key_material(
+    source: &mut impl RandomSourceV1,
+    forbidden_materials: &[&[u8; KEYRING_MATERIAL_BYTES]],
+) -> Result<Zeroizing<[u8; KEYRING_MATERIAL_BYTES]>, ProvisionerErrorV1> {
+    for _ in 0..8 {
+        let mut candidate = Zeroizing::new([0_u8; KEYRING_MATERIAL_BYTES]);
+        source.fill(&mut *candidate)?;
+        let repetitive = [1_usize, 2, 4, 8, 16].into_iter().any(|period| {
+            (period..candidate.len()).all(|index| candidate[index] == candidate[index % period])
+        });
+        let forbidden = forbidden_materials
+            .iter()
+            .any(|forbidden| forbidden.as_slice() == candidate.as_slice());
+        if !repetitive && !forbidden {
+            return Ok(candidate);
+        }
+    }
+    Err(ProvisionerErrorV1::Random)
+}
+
+fn lower_hex_key_material(material: &[u8; KEYRING_MATERIAL_BYTES]) -> Zeroizing<String> {
+    let alphabet = b"0123456789abcdef";
+    let mut encoded = Zeroizing::new(String::with_capacity(KEYRING_MATERIAL_BYTES * 2));
+    for byte in material {
+        encoded.push(char::from(alphabet[(byte >> 4) as usize]));
+        encoded.push(char::from(alphabet[(byte & 0x0f) as usize]));
+    }
+    encoded
 }
 
 fn random_scram_verifier(
@@ -409,8 +514,8 @@ mod tests {
     fn generated_passwords_verifiers_and_keyrings_are_distinct_and_shaped() {
         let mut random = DeterministicRandomV1 { state: 1 };
         let secrets = GeneratedSecretsV1::generate_with(&mut random).unwrap();
-        assert_eq!(secrets.database().len(), 19);
-        assert_eq!(secrets.keychain_items().len(), 22);
+        assert_eq!(secrets.database().len(), 20);
+        assert_eq!(secrets.keychain_items().len(), 24);
         let mut passwords = secrets
             .database()
             .iter()
@@ -429,7 +534,7 @@ mod tests {
                 .copied()
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
-            20
+            21
         );
         assert!(passwords.iter().all(|password| password.len() == 43));
         assert!(secrets
@@ -441,6 +546,23 @@ mod tests {
             secrets.product_action_key_id(),
             secrets.snapshot_envelope_key_id()
         );
+        assert_ne!(
+            secrets.product_action_key_id(),
+            secrets.interaction_token_envelope_key_id()
+        );
+        assert_ne!(
+            secrets.snapshot_envelope_key_id(),
+            secrets.interaction_token_envelope_key_id()
+        );
+        let validated_ids = crate::keyring::validate_keyring_set(
+            secrets.product_action_keyring_payload(),
+            secrets.snapshot_envelope_keyring_payload(),
+            secrets.interaction_token_envelope_keyring_payload(),
+        )
+        .unwrap();
+        assert_eq!(validated_ids.0, secrets.product_action_key_id());
+        assert_eq!(validated_ids.1, secrets.snapshot_envelope_key_id());
+        assert_eq!(validated_ids.2, secrets.interaction_token_envelope_key_id());
         let keyrings = secrets
             .keychain_items()
             .into_iter()
@@ -459,6 +581,54 @@ mod tests {
             keyrings[0]["active"]["material"],
             keyrings[1]["active"]["material"]
         );
+        let interaction = secrets
+            .keychain_items()
+            .into_iter()
+            .find(|item| {
+                item.identity == crate::identity::INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY
+            })
+            .unwrap();
+        let interaction = std::str::from_utf8(interaction.value).unwrap();
+        assert!(interaction.starts_with("v1;active=interaction-token-envelope-v1-"));
+        let material = interaction
+            .strip_prefix("v1;active=")
+            .and_then(|value| value.split_once('='))
+            .map(|(_, value)| value)
+            .and_then(|value| value.split_once(";retired="))
+            .map(|(material, retired)| {
+                assert!(retired.is_empty());
+                material
+            })
+            .unwrap();
+        assert_eq!(material.len(), 64);
+        assert!(material
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    }
+
+    #[test]
+    fn incremental_database_secret_generates_only_the_requested_identity() {
+        let mut random = DeterministicRandomV1 { state: 7 };
+        let secret = DatabaseSecretV1::generate_with(
+            crate::identity::AUTHORING_WRITER_IDENTITY,
+            &mut random,
+        )
+        .unwrap();
+        assert_eq!(
+            secret.identity(),
+            crate::identity::AUTHORING_WRITER_IDENTITY
+        );
+        assert_eq!(secret.password().len(), 43);
+        assert!(valid_scram_verifier(secret.verifier()));
+        assert_eq!(
+            std::str::from_utf8(secret.url()).unwrap(),
+            database_url(
+                crate::identity::AUTHORING_WRITER_IDENTITY.role,
+                secret.password(),
+                DATABASE_NAME
+            )
+            .as_str()
+        );
     }
 
     #[test]
@@ -476,6 +646,17 @@ mod tests {
                 .value,
         )
         .unwrap();
+        let interaction_keyring_payload = std::str::from_utf8(
+            secrets
+                .keychain_items()
+                .into_iter()
+                .find(|item| {
+                    item.identity == crate::identity::INTERACTION_TOKEN_ENVELOPE_KEYRING_IDENTITY
+                })
+                .unwrap()
+                .value,
+        )
+        .unwrap();
         let rendered = format!(
             "{secrets:?} {:?} {:?} {}",
             secrets.database()[0],
@@ -485,6 +666,7 @@ mod tests {
         assert!(!rendered.contains(database_secret));
         assert!(!rendered.contains(verifier));
         assert!(!rendered.contains(keyring_payload));
+        assert!(!rendered.contains(interaction_keyring_payload));
         assert_eq!(rendered.matches("<redacted>").count(), 3);
     }
 }

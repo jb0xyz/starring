@@ -6,6 +6,5 @@ pub enum Verdict {
     Allow,
     Warn,
     RequireApproval,
-    RequireSecondApproval,
     Deny,
 }

@@ -44,11 +44,14 @@ pub(super) fn select_operational_evidence(
     let deployment_convergence_attempt_no = row
         .deployment_convergence_attempt_no
         .ok_or_else(indeterminate)?;
-    let base = select_exact_evidence(vec![row.base], request)?;
+    let attestation_convergence_attempt_no = row.attestation_convergence_attempt_no;
+    let mut base = select_exact_evidence(vec![row.base], request)?;
+    base.attestation_evidence_v2
+        .attestation_convergence_attempt_no = attestation_convergence_attempt_no;
     Ok(ProductDeploymentOperationalStatusEvidenceV2 {
         base,
         deployment_convergence_attempt_no,
         deployment_last_failure_attempt_no: row.deployment_last_failure_attempt_no,
-        attestation_convergence_attempt_no: row.attestation_convergence_attempt_no,
+        attestation_convergence_attempt_no,
     })
 }
