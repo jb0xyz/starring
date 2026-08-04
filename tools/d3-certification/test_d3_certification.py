@@ -4,6 +4,7 @@ import io
 import json
 import os
 import pathlib
+import shlex
 import stat
 import subprocess
 import sys
@@ -250,13 +251,17 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 "cargo test --locked --workspace",
                 "cargo clippy --locked --workspace --all-targets -- -D warnings",
                 "cargo build --locked -p interaction-smoke --features unsafe-dev-activation",
-                "python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'",
                 "npm --prefix tools/codex-worker run check",
                 "npm --prefix tools/codex-worker test",
                 "npm --prefix eval/codex-worker-slo run check",
                 "npm --prefix eval/design-harness ci",
                 "npm --prefix eval/design-harness run audit",
                 "npm --prefix eval/design-harness run check",
+                "python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'",
+                "node --test tools/d2-certification/product_driver.test.mjs",
+                "cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check",
+                "cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml",
+                "cargo clippy --locked --manifest-path tools/d2-certification-transport/Cargo.toml --all-targets -- -D warnings",
                 "cargo test --locked -p automation-ruleset-postgres -- --ignored --test-threads=1",
                 "cargo test --locked -p automation-instance-postgres -- --ignored --test-threads=1",
                 "cargo test --locked -p automation-panel-installation-postgres -- --ignored --test-threads=1",
@@ -272,6 +277,35 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 "cargo test --locked -p automation-runtime-panel-postgres -- --ignored --test-threads=1",
             ),
         )
+
+    def test_readme_gate_manifest_matches_code_order(self):
+        readme = MODULE_PATH.with_name("README.md").read_text(encoding="utf-8")
+        lines = readme.splitlines()
+        start = lines.index("gates=(") + 1
+        end = lines.index(")", start)
+        documented = []
+        for line in lines[start:end]:
+            parts = shlex.split(line.strip())
+            self.assertEqual(len(parts), 1)
+            documented.append(parts[0])
+        self.assertEqual(tuple(documented), MODULE.REQUIRED_GATE_COMMANDS)
+
+    def test_prepare_rejects_each_missing_d2_standalone_gate(self):
+        standalone = (
+            "python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'",
+            "node --test tools/d2-certification/product_driver.test.mjs",
+            "cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check",
+            "cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml",
+            "cargo clippy --locked --manifest-path tools/d2-certification-transport/Cargo.toml --all-targets -- -D warnings",
+        )
+        required = list(MODULE.REQUIRED_GATE_COMMANDS)
+        for command in standalone:
+            with self.subTest(command=command):
+                gates = [candidate for candidate in required if candidate != command]
+                arguments, _ = self.prepare_arguments(gates)
+                status, _, error = self.invoke(arguments)
+                self.assertEqual(status, 1)
+                self.assertIn("gate_manifest_mismatch", error)
 
     def test_gate_failure_is_durable_and_retry_can_succeed(self):
         state_path, _, gates = self.prepare()

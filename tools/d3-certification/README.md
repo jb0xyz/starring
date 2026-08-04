@@ -15,13 +15,17 @@ gates=(
   'cargo test --locked --workspace'
   'cargo clippy --locked --workspace --all-targets -- -D warnings'
   'cargo build --locked -p interaction-smoke --features unsafe-dev-activation'
-  "python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'"
   'npm --prefix tools/codex-worker run check'
   'npm --prefix tools/codex-worker test'
   'npm --prefix eval/codex-worker-slo run check'
   'npm --prefix eval/design-harness ci'
   'npm --prefix eval/design-harness run audit'
   'npm --prefix eval/design-harness run check'
+  "python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'"
+  'node --test tools/d2-certification/product_driver.test.mjs'
+  'cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check'
+  'cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml'
+  'cargo clippy --locked --manifest-path tools/d2-certification-transport/Cargo.toml --all-targets -- -D warnings'
   'cargo test --locked -p automation-ruleset-postgres -- --ignored --test-threads=1'
   'cargo test --locked -p automation-instance-postgres -- --ignored --test-threads=1'
   'cargo test --locked -p automation-panel-installation-postgres -- --ignored --test-threads=1'
