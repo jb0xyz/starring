@@ -9,6 +9,8 @@
   const COOKIE_NAME = "__Host-starring_csrf";
   const LIVE_RESTART_CONFIRMATION_KIND = "starring.d2.live-runtime-restart-confirmation.v1";
   const AUTHENTICATION_EVIDENCE_KIND = "starring.d2.browser-authentication-evidence.v1";
+  const AUTHORING_EVIDENCE_KIND = "starring.d2.browser-authoring-evidence.v1";
+  const PRODUCT_DECISION_EVIDENCE_KIND = "starring.d2.browser-product-decision-evidence.v1";
   const LIVE_EVIDENCE_KIND = "starring.d2.browser-live-evidence.v1";
   const LIVE_LOSS_EVIDENCE_KIND = "starring.d2.browser-live-loss-evidence.v1";
   const REPLACEMENT_EVIDENCE_KIND = "starring.d2.browser-replacement-evidence.v1";
@@ -523,6 +525,7 @@
         signal: input.signal,
       });
       let runtimeDrainObserved = false;
+      let runtimePendingObserved = false;
       let applyAttempts = 0;
       let statusObservations = 0;
       let invalidStateConflict = null;
@@ -531,11 +534,13 @@
           applyAttempts += 1;
           try {
             const result = await apply(command);
+            runtimePendingObserved = runtimePendingObserved || result.body.state === "runtime_pending";
             return Object.freeze({
               status: result.status,
               body: result.body,
               attempts: applyAttempts,
               runtime_drain_observed: runtimeDrainObserved,
+              runtime_pending_observed: runtimePendingObserved,
               resumed_after_conflict: false,
               status_observations: statusObservations,
             });
@@ -555,6 +560,7 @@
         if (invalidStateConflict) {
           const observed = await promotion(command.installationId, command.promotionId, command.signal);
           statusObservations += 1;
+          runtimePendingObserved = runtimePendingObserved || observed.body.state === "runtime_pending";
           const resolution = classifyApplyStatus(observed.body);
           if (resolution === "complete") {
             requireApplyStatusBinding(observed.body, command);
@@ -563,6 +569,7 @@
               body: observed.body,
               attempts: applyAttempts,
               runtime_drain_observed: runtimeDrainObserved,
+              runtime_pending_observed: runtimePendingObserved,
               resumed_after_conflict: true,
               status_observations: statusObservations,
             });
@@ -771,7 +778,35 @@
       if (!applied.body || !["runtime_pending", "live"].includes(applied.body.state)) {
         throw new Error("promotion_not_applied");
       }
+      if (![200, 201].includes(turn.status)) {
+        throw new Error("authoring_http_status_invalid");
+      }
+      const authoringEvidence = Object.freeze({
+        schema_version: 1,
+        kind: AUTHORING_EVIDENCE_KIND,
+        observed_at: observedAt(),
+        public_origin: origin,
+        authoring_http_status: turn.status,
+        authoring_session_id: requireResourceId(turn.body.session_id, "authoring_session_id"),
+        authoring_generation: requireGeneration(turn.body.generation, "authoring_generation", false),
+        installation_id: requireResourceId(input.installationId, "installation_id"),
+        one_shot: true,
+      });
+      const productDecisionEvidence = Object.freeze({
+        schema_version: 1,
+        kind: PRODUCT_DECISION_EVIDENCE_KIND,
+        observed_at: observedAt(),
+        public_origin: origin,
+        installation_id: requireResourceId(applied.body.installation_id, "installation_id"),
+        promotion_id: requireDigest(applied.body.promotion_id, "promotion_id"),
+        preview_state: preview.body.state,
+        approval_state: approved.body.state,
+        apply_state: applied.body.state,
+        runtime_pending_observed: applied.runtime_pending_observed,
+      });
       return {
+        authoring_evidence: authoringEvidence,
+        product_decision_evidence: productDecisionEvidence,
         authoring_http_status: turn.status,
         authoring: projectionEvidence(turn.body),
         promotion_http_status: promoted.status,
@@ -790,6 +825,7 @@
         apply_http_status: applied.status,
         apply_attempts: applied.attempts,
         runtime_drain_observed: applied.runtime_drain_observed,
+        runtime_pending_observed: applied.runtime_pending_observed,
         apply_resumed_after_conflict: applied.resumed_after_conflict,
         apply_status_observations: applied.status_observations,
         applied: {
@@ -810,7 +846,11 @@
       if (!Number.isInteger(intervalMilliseconds) || intervalMilliseconds < 100 || intervalMilliseconds > 10000) {
         throw new Error("poll_interval_invalid");
       }
-      let pendingObserved = false;
+      const pendingObservedSeed = input.pendingObserved === undefined ? false : input.pendingObserved;
+      if (typeof pendingObservedSeed !== "boolean") {
+        throw new Error("pending_observed_invalid");
+      }
+      let pendingObserved = pendingObservedSeed;
       for (let attempt = 1; attempt <= attempts; attempt += 1) {
         const product = await deployment(input.installationId, input.promotionId);
         const operational = await operationalDeployment(input.installationId, input.promotionId);
@@ -922,11 +962,11 @@
             live_lost: true,
             deployment_http_status: product ? product.status : publicProblem.status,
             operational_http_status: operational ? operational.status : publicProblem.status,
-            product_state: product ? product.body.state : null,
-            operational_state: operational ? operational.body.state : null,
-            runtime_phase: runtime ? runtime.phase : null,
-            serving_state: serving ? serving.state : null,
-            public_code: publicProblem ? publicProblem.code : null,
+            product_state: product && product.body.state ? product.body.state : "unavailable",
+            operational_state: operational && operational.body.state ? operational.body.state : "unavailable",
+            runtime_phase: runtime && runtime.phase ? runtime.phase : "unavailable",
+            serving_state: serving && serving.state ? serving.state : "unavailable",
+            public_code: publicProblem ? publicProblem.code : "live_state_lost",
             retryable: publicProblem ? publicProblem.retryable : false,
           });
         }
@@ -948,6 +988,7 @@
         promotionId: result.promotion.promotion_id,
         attempts: input.liveAttempts,
         intervalMilliseconds: input.liveIntervalMilliseconds,
+        pendingObserved: result.product_decision_evidence.runtime_pending_observed,
       });
       if (result.promotion.promotion_id === sourcePromotionId) {
         throw new Error("replacement_promotion_not_distinct");

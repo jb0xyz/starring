@@ -130,15 +130,142 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
   assert.equal(calls[4].options.method, "POST");
   assert.equal(evidence.authoring.projection_state, "preview_ready");
   assert.equal(evidence.applied.state, "runtime_pending");
+  assert.deepEqual(
+    Object.keys(evidence.authoring_evidence).sort(),
+    [
+      "authoring_generation",
+      "authoring_http_status",
+      "authoring_session_id",
+      "installation_id",
+      "kind",
+      "observed_at",
+      "one_shot",
+      "public_origin",
+      "schema_version",
+    ]
+  );
+  assert.equal(evidence.authoring_evidence.kind, "starring.d2.browser-authoring-evidence.v1");
+  assert.equal(evidence.authoring_evidence.authoring_http_status, 201);
+  assert.equal(evidence.authoring_evidence.authoring_session_id, "session-1");
+  assert.equal(evidence.authoring_evidence.authoring_generation, 1);
+  assert.equal(evidence.authoring_evidence.installation_id, "installation-1");
+  assert.equal(evidence.authoring_evidence.one_shot, true);
+  assert.deepEqual(
+    Object.keys(evidence.product_decision_evidence).sort(),
+    [
+      "apply_state",
+      "approval_state",
+      "installation_id",
+      "kind",
+      "observed_at",
+      "preview_state",
+      "promotion_id",
+      "public_origin",
+      "runtime_pending_observed",
+      "schema_version",
+    ]
+  );
+  assert.equal(
+    evidence.product_decision_evidence.kind,
+    "starring.d2.browser-product-decision-evidence.v1"
+  );
+  assert.equal(evidence.product_decision_evidence.preview_state, "pending_approval");
+  assert.equal(evidence.product_decision_evidence.approval_state, "approved");
+  assert.equal(evidence.product_decision_evidence.apply_state, "runtime_pending");
+  assert.equal(evidence.product_decision_evidence.runtime_pending_observed, true);
   const serialized = JSON.stringify(evidence);
   assert.equal(serialized.includes("Create the private study room automation"), false);
   assert.equal(serialized.includes("assistant_message"), false);
+  assert.equal(serialized.includes("csrf-value"), false);
+  assert.equal(serialized.includes("request_id"), false);
+  assert.equal(serialized.includes("provider"), false);
+  assert.equal(serialized.includes("reasoning_effort"), false);
+  assert.equal(serialized.includes("auth_mode"), false);
   assert.equal(serialized.includes("ruleset"), true);
   assert.equal(serialized.includes('"hidden"'), false);
   assert.equal(Object.hasOwn(evidence.preview, "ruleset"), false);
   assert.equal(Object.hasOwn(evidence.preview.summary, "target_content_hash"), false);
   assert.equal(Object.hasOwn(evidence.preview.summary, "binding_fingerprint"), false);
   assert.equal(Object.hasOwn(evidence.preview.summary, "expires_at"), false);
+});
+
+
+test("one-shot exact replay emits strict redacted evidence when apply is already live", async () => {
+  const responses = [
+    response(200, {
+      session_id: "session-replay",
+      generation: 4,
+      disposition: "exact_replay",
+      projection: {
+        state: "preview_ready",
+        assistant_message: "secret assistant output",
+        preview: {
+          revision: 4,
+          ruleset: { secret: "not retained" },
+          receipt: { candidate_ruleset_hash: DIGEST },
+        },
+      },
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: DIGEST,
+      replayed: true,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: DIGEST,
+      summary: {
+        panels: 1,
+        modals: 1,
+        rules: 4,
+        actions: 15,
+        target_version: 1,
+        required_approvals: 1,
+      },
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 2,
+      state: "approved",
+      replayed: true,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "live",
+      replayed: true,
+    }),
+  ];
+  const evidence = await driver(async () => responses.shift(), undefined, {
+    now: () => "2026-08-04T12:00:00Z",
+  }).runOneShotProductFlow({
+    installationId: "installation-1",
+    sessionId: "session-replay",
+    expectedGeneration: 3,
+    message: "secret replay prompt",
+    confirmPreview: async () => true,
+  });
+  assert.equal(evidence.authoring_evidence.authoring_http_status, 200);
+  assert.equal(evidence.authoring_evidence.authoring_generation, 4);
+  assert.equal(evidence.authoring_evidence.one_shot, true);
+  assert.equal(evidence.product_decision_evidence.apply_state, "live");
+  assert.equal(evidence.product_decision_evidence.runtime_pending_observed, false);
+  assert.equal(evidence.runtime_pending_observed, false);
+  const serialized = JSON.stringify({
+    authoring: evidence.authoring_evidence,
+    decision: evidence.product_decision_evidence,
+  });
+  assert.equal(serialized.includes("secret replay prompt"), false);
+  assert.equal(serialized.includes("secret assistant output"), false);
+  assert.equal(serialized.includes("not retained"), false);
+  assert.equal(serialized.includes("csrf-value"), false);
 });
 
 
@@ -479,6 +606,7 @@ test("invalid apply state resumes from the exact runtime pending promotion", asy
   assert.equal(applied.status, 200);
   assert.equal(applied.body.state, "runtime_pending");
   assert.equal(applied.attempts, 1);
+  assert.equal(applied.runtime_pending_observed, true);
   assert.equal(applied.resumed_after_conflict, true);
   assert.equal(applied.status_observations, 1);
 });
@@ -542,6 +670,7 @@ test("invalid apply state observes applying until the exact promotion is live", 
   assert.deepEqual(sleeps, [100, 100]);
   assert.equal(applied.body.state, "live");
   assert.equal(applied.attempts, 1);
+  assert.equal(applied.runtime_pending_observed, false);
   assert.equal(applied.resumed_after_conflict, true);
   assert.equal(applied.status_observations, 3);
 });
@@ -1013,6 +1142,44 @@ test("live polling requires product and operational live with a fresh lease", as
 });
 
 
+test("live polling preserves a strict pending seed when the first poll is already live", async () => {
+  const responses = [
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "live",
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "live",
+      runtime: { phase: "live", serving: { state: "fresh" } },
+    }),
+  ];
+  const product = driver(async () => responses.shift());
+  const result = await product.waitForLive({
+    installationId: "installation-1",
+    promotionId: DIGEST,
+    attempts: 1,
+    intervalMilliseconds: 100,
+    pendingObserved: true,
+  });
+  assert.equal(result.pending_observed, true);
+  assert.equal(result.live_observed, true);
+  assert.equal(result.attempts, 1);
+  await assert.rejects(
+    product.waitForLive({
+      installationId: "installation-1",
+      promotionId: DIGEST,
+      attempts: 1,
+      intervalMilliseconds: 100,
+      pendingObserved: 1,
+    }),
+    /pending_observed_invalid/
+  );
+});
+
+
 test("live restart confirmation cross-binds both canonical status projections", async () => {
   const heartbeat = "2026-08-03T01:00:01.000001Z";
   const expires = "2026-08-03T01:00:46.000001Z";
@@ -1416,9 +1583,42 @@ test("live loss evidence accepts only retryable public dependency failures", asy
   assert.equal(evidence.live_lost, true);
   assert.equal(evidence.deployment_http_status, 503);
   assert.equal(evidence.operational_http_status, 503);
+  assert.equal(evidence.product_state, "unavailable");
+  assert.equal(evidence.operational_state, "unavailable");
+  assert.equal(evidence.runtime_phase, "unavailable");
+  assert.equal(evidence.serving_state, "unavailable");
   assert.equal(evidence.public_code, "dependency_unavailable");
   assert.equal(evidence.retryable, true);
   assert.equal(Object.hasOwn(evidence, "request_id"), false);
+});
+
+
+test("live loss evidence replaces null runtime state with closed sentinels", async () => {
+  const responses = [
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "pending",
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "pending",
+      runtime: null,
+    }),
+  ];
+  const evidence = await driver(async () => responses.shift()).waitForLiveLoss({
+    installationId: "installation-1",
+    promotionId: DIGEST,
+    attempts: 1,
+    intervalMilliseconds: 100,
+  });
+  assert.equal(evidence.product_state, "pending");
+  assert.equal(evidence.operational_state, "pending");
+  assert.equal(evidence.runtime_phase, "unavailable");
+  assert.equal(evidence.serving_state, "unavailable");
+  assert.equal(evidence.public_code, "live_state_lost");
+  assert.equal(evidence.retryable, false);
 });
 
 
@@ -1500,6 +1700,7 @@ test("replacement evidence binds one reviewed target transition without retainin
   assert.equal(evidence.source_promotion_id, sourcePromotionId);
   assert.equal(evidence.replacement_promotion_id, DIGEST);
   assert.equal(evidence.replacement_kind, "update");
+  assert.equal(evidence.pending_observed, true);
   assert.equal(evidence.live_observed, true);
   assert.equal(JSON.stringify(evidence).includes("replacement prompt"), false);
 });
