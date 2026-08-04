@@ -579,12 +579,20 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temporary.name).resolve()
         self.registry_path = self.root / "discord-ownership-registry.json"
+        self.runtime_root_parent = self.root / "runtime-roots"
+        self.runtime_root_parent.mkdir(mode=0o700)
         self.registry_patch = mock.patch.object(
             CONTRACT,
             "GLOBAL_DISCORD_OWNERSHIP_REGISTRY_PATH",
             self.registry_path,
         )
+        self.runtime_root_patch = mock.patch.object(
+            CONTRACT,
+            "D2_RUNTIME_ROOT_PARENT",
+            self.runtime_root_parent,
+        )
         self.registry_patch.start()
+        self.runtime_root_patch.start()
         self.artifact_root = self.root / "immutable-candidates"
         self.artifact_root.mkdir()
         self.run_id = f"d2-20260801t120000z-{secrets.token_hex(6)}"
@@ -638,6 +646,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             if path.is_dir():
                 path.chmod(0o700)
         self.artifact_root.chmod(0o700)
+        self.runtime_root_patch.stop()
         self.registry_patch.stop()
         self.temporary.cleanup()
 
@@ -1079,6 +1088,22 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         )
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
+    def test_prepare_rejects_unregistered_legacy_d2_runtime_root(self):
+        legacy_run_id = f"d2-20260731t235959z-{secrets.token_hex(6)}"
+        legacy_root = self.runtime_root_parent / f"starring-d2-{legacy_run_id}"
+        legacy_root.mkdir(mode=0o700)
+        try:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "unregistered_d2_runtime_present",
+            ):
+                ORCHESTRATOR.command_prepare(self.context, self.platform)
+            self.assertFalse(self.context.artifact_directory.exists())
+            self.assertFalse(self.context.root.exists())
+            self.assertFalse(self.registry_path.exists())
+        finally:
+            legacy_root.rmdir()
+
     def test_distinct_discord_identities_have_distinct_durable_owners(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         other = self.prepare_additional_context(
@@ -1111,8 +1136,46 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             "discord_ownership_claim_absent",
         ):
             ORCHESTRATOR.command_prepare(self.context, self.platform)
-        CONTRACT.claim_discord_ownership(self.context)
+        registry = CONTRACT.empty_discord_ownership_registry()
+        registry["owners"] = [CONTRACT.discord_ownership_record(self.context)]
+        CONTRACT.write_discord_ownership_registry(registry)
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_cleaned_replay_refuses_unexpected_live_ownership_claim(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        registry = CONTRACT.empty_discord_ownership_registry()
+        registry["owners"] = [CONTRACT.discord_ownership_record(self.context)]
+        CONTRACT.write_discord_ownership_registry(registry)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "cleaned_state_discord_ownership_drift",
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(
+            CONTRACT.load_discord_ownership_registry()["owners"],
+            [CONTRACT.discord_ownership_record(self.context)],
+        )
+        CONTRACT.release_discord_ownership(self.context)
+        replay = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(replay["status"], "already_cleaned")
+
+    def test_cleaned_replay_does_not_release_later_run_reusing_identity(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        later = self.prepare_additional_context(
+            guild_id=self.context.manifest["discord"]["guild_id"],
+            application_id=self.context.manifest["discord"]["application_id"],
+            bot_user_id=self.context.manifest["discord"]["bot_user_id"],
+        )
+        ORCHESTRATOR.command_prepare(later, self.platform)
+        replay = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(replay["status"], "already_cleaned")
+        self.assertEqual(
+            CONTRACT.load_discord_ownership_registry()["owners"],
+            [CONTRACT.discord_ownership_record(later)],
+        )
+        ORCHESTRATOR.command_cleanup(later, self.platform)
 
     def test_registry_permissions_and_shape_fail_closed(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
@@ -1124,7 +1187,28 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         ):
             ORCHESTRATOR.command_dry_run(self.context, self.platform)
         self.registry_path.chmod(0o600)
-        self.registry_path.write_text('{"owners":[],"owners":[]}\n', encoding="utf-8")
+        self.registry_path.write_text(
+            (
+                '{"schema_version":1,"kind":'
+                f'"{CONTRACT.DISCORD_OWNERSHIP_REGISTRY_KIND}",'
+                '"owners":[],"owners":[]}\n'
+            ),
+            encoding="utf-8",
+        )
+        self.registry_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "discord_ownership_registry_invalid",
+        ):
+            ORCHESTRATOR.command_dry_run(self.context, self.platform)
+        self.registry_path.write_text(
+            (
+                '{"schema_version":true,"kind":'
+                f'"{CONTRACT.DISCORD_OWNERSHIP_REGISTRY_KIND}",'
+                '"owners":[]}\n'
+            ),
+            encoding="utf-8",
+        )
         self.registry_path.chmod(0o600)
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError,
@@ -2674,6 +2758,44 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         replay = ORCHESTRATOR.command_cleanup(self.context, self.platform)
         self.assertEqual(replay["status"], "already_cleaned")
 
+    def test_preparing_state_before_claim_cleans_and_replays(self):
+        preflight = ORCHESTRATOR.command_dry_run(self.context, self.platform)
+        self.context.artifact_directory.mkdir(mode=0o700, parents=True)
+        ORCHESTRATOR.save_state(
+            self.context, "preparing", preflight["standing_snapshot"]
+        )
+        self.assertFalse(self.registry_path.exists())
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+        self.assertEqual(CONTRACT.load_discord_ownership_registry()["owners"], [])
+        replay = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(replay["status"], "already_cleaned")
+
+    def test_release_before_cleaned_state_write_is_exactly_recoverable(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        real_save_state = ORCHESTRATOR.save_state
+
+        def crash_on_cleaned(context, phase, snapshot):
+            if phase == "cleaned":
+                raise ORCHESTRATOR.OrchestratorError(
+                    "injected_cleaned_state_write_crash"
+                )
+            return real_save_state(context, phase, snapshot)
+
+        with mock.patch.object(
+            ORCHESTRATOR, "save_state", side_effect=crash_on_cleaned
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "injected_cleaned_state_write_crash",
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertFalse(self.context.root.exists())
+        self.assertEqual(CONTRACT.load_discord_ownership_registry()["owners"], [])
+        self.assertEqual(ORCHESTRATOR.load_state(self.context)["phase"], "prepared")
+        recovered = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(recovered["phase"], "cleaned")
+        self.assertEqual(CONTRACT.load_discord_ownership_registry()["owners"], [])
+
     def test_candidate_starting_state_is_bounded_stopped_then_retried(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         state = ORCHESTRATOR.load_state(self.context, {"prepared"})
@@ -3932,7 +4054,7 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
                 {
                     "schema_version": 1,
                     "kind": "starring.d2.browser-authoring-evidence.v1",
-                    "observed_at": "2026-08-04T12:00:01.123Z",
+                    "observed_at": ORCHESTRATOR.utc_now(),
                     "public_origin": self.context.manifest["public_origin"],
                     "authoring_http_status": 201,
                     "authoring_session_id": "session-1",

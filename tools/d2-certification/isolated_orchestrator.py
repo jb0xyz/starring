@@ -47,6 +47,7 @@ from d2_orchestrator_contract import (
     release_discord_ownership,
     require_discord_ownership_available,
     require_discord_ownership_claimed,
+    require_discord_ownership_released,
     save_state,
     standing_snapshot,
     utc_now,
@@ -2416,7 +2417,7 @@ def cleanup(context, platform, expected_snapshot, from_failure=False):
 def command_cleanup(context, platform):
     state = load_state(context)
     if state["phase"] == "cleaned":
-        release_discord_ownership(context)
+        require_discord_ownership_released(context)
         return {
             "status": "already_cleaned",
             "phase": "cleaned",

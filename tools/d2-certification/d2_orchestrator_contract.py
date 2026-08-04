@@ -95,6 +95,7 @@ GLOBAL_LOCK_PATH = pathlib.Path("/private/tmp/starring-d2-certification.lock")
 GLOBAL_DISCORD_OWNERSHIP_REGISTRY_PATH = pathlib.Path(
     "/private/tmp/starring-d2-discord-ownership-registry.json"
 )
+D2_RUNTIME_ROOT_PARENT = pathlib.Path("/private/tmp")
 DISCORD_OWNERSHIP_REGISTRY_KIND = "starring.d2.discord-ownership-registry.v1"
 DISCORD_OWNERSHIP_RECORD_FIELDS = {
     "run_id",
@@ -291,8 +292,24 @@ def discord_ownership_record(context):
     }
 
 
+def require_registered_d2_runtime_roots(registry):
+    registered_run_ids = {owner["run_id"] for owner in registry["owners"]}
+    try:
+        entries = tuple(D2_RUNTIME_ROOT_PARENT.iterdir())
+    except OSError:
+        fail("discord_ownership_reconciliation_failed")
+    for entry in entries:
+        name = entry.name
+        if not name.startswith("starring-d2-"):
+            continue
+        run_id = name.removeprefix("starring-d2-")
+        if RUN_ID_PATTERN.fullmatch(run_id) and run_id not in registered_run_ids:
+            fail("unregistered_d2_runtime_present")
+
+
 def require_discord_ownership_available(context):
     registry = load_discord_ownership_registry()
+    require_registered_d2_runtime_roots(registry)
     record = discord_ownership_record(context)
     for owner in registry["owners"]:
         if owner == record:
@@ -325,6 +342,24 @@ def require_discord_ownership_claimed(context):
     record = discord_ownership_record(context)
     if record not in registry["owners"]:
         fail("discord_ownership_claim_absent")
+    return registry
+
+
+def require_discord_ownership_released(context):
+    registry = load_discord_ownership_registry()
+    record = discord_ownership_record(context)
+    for owner in registry["owners"]:
+        if owner == record:
+            fail("cleaned_state_discord_ownership_drift")
+        if any(
+            owner[field] == record[field]
+            for field in (
+                "run_id",
+                "manifest_sha256",
+                "manifest_path",
+            )
+        ):
+            fail("discord_ownership_claim_mismatch")
     return registry
 
 
