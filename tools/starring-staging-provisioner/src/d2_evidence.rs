@@ -231,6 +231,7 @@ struct ReconciliationEvidenceV1 {
     effect_identity: EffectIdentityV1,
     interaction_id: String,
     route_identity: RouteIdentityV1,
+    output_role_id: String,
     reconciliation_state: String,
     duplicate_external_effect_count: i64,
     unsafe_deletion_count: i64,
@@ -888,7 +889,7 @@ async fn inspect_reconciliation(
     scope: &InspectionScopeV1,
 ) -> Result<ReconciliationEvidenceV1, D2ProvisionerErrorV1> {
     let row = sqlx::query(
-        "SELECT pg_catalog.count(*) OVER () AS candidate_count, root.application_id, root.interaction_id, root.deployment_id, root.runtime_generation, root.route_controller_fencing_token, root.route_incarnation, root.origin_process_instance_id, root.origin_serving_lease_epoch, root.origin_serving_revision, root.origin_gateway_shard_id, root.origin_gateway_owner_lease_epoch, root.origin_gateway_owner_revision, effect.action_index, effect.state AS effect_state, effect.output_id, effect.compensation_result_digest IS NOT NULL AS compensation_completed, (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS event WHERE event.application_id = effect.application_id AND event.interaction_id = effect.interaction_id AND event.action_index = effect.action_index AND event.event_kind = 'indeterminate') AS indeterminate_event_count, (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS event WHERE event.application_id = effect.application_id AND event.interaction_id = effect.interaction_id AND event.action_index = effect.action_index AND event.event_kind IN ('known_succeeded', 'reconciled_success')) AS success_event_count, (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS event WHERE event.application_id = effect.application_id AND event.interaction_id = effect.interaction_id AND event.action_index = effect.action_index AND event.event_kind = 'reconciled_failure') AS failure_event_count, (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS event WHERE event.application_id = effect.application_id AND event.interaction_id = effect.interaction_id AND event.action_index = effect.action_index AND event.event_kind = 'compensated') AS compensated_event_count, (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS deleted WHERE deleted.application_id = effect.application_id AND deleted.interaction_id = effect.interaction_id AND deleted.action_index = effect.action_index AND deleted.event_kind = 'compensated' AND NOT EXISTS (SELECT 1 FROM public.runtime_interaction_effect_events_v1 AS intended WHERE intended.application_id = deleted.application_id AND intended.interaction_id = deleted.interaction_id AND intended.action_index = deleted.action_index AND intended.event_kind = 'compensation_intended' AND intended.event_revision < deleted.event_revision)) AS unsafe_deletion_count FROM public.runtime_interaction_receipt_roots_v1 AS root INNER JOIN public.runtime_interaction_receipt_heads_v1 AS head ON head.application_id = root.application_id AND head.interaction_id = root.interaction_id INNER JOIN public.runtime_interaction_effect_heads_v1 AS effect ON effect.application_id = root.application_id AND effect.interaction_id = root.interaction_id WHERE root.application_id = $1 AND root.tenant_id = $2 AND root.installation_id = $3 AND root.guild_id = $4 AND root.ruleset_key = $5 AND head.state IN ('completed', 'failed') AND effect.action_kind = 'create_role' AND effect.state IN ('reconciled_succeeded', 'known_failed', 'compensated') AND EXISTS (SELECT 1 FROM public.runtime_interaction_effect_events_v1 AS event WHERE event.application_id = effect.application_id AND event.interaction_id = effect.interaction_id AND event.action_index = effect.action_index AND event.event_kind = 'indeterminate') AND NOT EXISTS (SELECT 1 FROM public.runtime_interaction_effect_heads_v1 AS blocked WHERE blocked.application_id = root.application_id AND blocked.interaction_id = root.interaction_id AND blocked.action_kind <> 'edit_response' AND blocked.state IN ('intended', 'indeterminate', 'observing', 'observation_pending', 'compensation_intended', 'compensation_indeterminate', 'compensation_observing', 'compensation_observation_pending', 'recovery_required')) ORDER BY effect.updated_at DESC, root.interaction_id COLLATE pg_catalog.\"C\" DESC, effect.action_index LIMIT 1",
+        "SELECT pg_catalog.count(*) OVER () AS candidate_count, root.application_id, root.interaction_id, root.deployment_id, root.runtime_generation, root.route_controller_fencing_token, root.route_incarnation, root.origin_process_instance_id, root.origin_serving_lease_epoch, root.origin_serving_revision, root.origin_gateway_shard_id, root.origin_gateway_owner_lease_epoch, root.origin_gateway_owner_revision, effect.action_index, effect.state AS effect_state, effect.output_id, (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS event WHERE event.application_id = effect.application_id AND event.interaction_id = effect.interaction_id AND event.action_index = effect.action_index AND event.event_kind = 'indeterminate') AS indeterminate_event_count, (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS event WHERE event.application_id = effect.application_id AND event.interaction_id = effect.interaction_id AND event.action_index = effect.action_index AND event.event_kind IN ('known_succeeded', 'reconciled_success')) AS success_event_count, (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS event WHERE event.application_id = effect.application_id AND event.interaction_id = effect.interaction_id AND event.action_index = effect.action_index AND event.event_kind = 'reconciled_failure') AS failure_event_count, (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS event WHERE event.application_id = effect.application_id AND event.interaction_id = effect.interaction_id AND event.action_index = effect.action_index AND event.event_kind = 'compensated') AS compensated_event_count, (SELECT pg_catalog.count(*) FROM public.runtime_interaction_effect_events_v1 AS deleted WHERE deleted.application_id = effect.application_id AND deleted.interaction_id = effect.interaction_id AND deleted.action_index = effect.action_index AND deleted.event_kind = 'compensated' AND NOT EXISTS (SELECT 1 FROM public.runtime_interaction_effect_events_v1 AS intended WHERE intended.application_id = deleted.application_id AND intended.interaction_id = deleted.interaction_id AND intended.action_index = deleted.action_index AND intended.event_kind = 'compensation_intended' AND intended.event_revision < deleted.event_revision)) AS unsafe_deletion_count FROM public.runtime_interaction_receipt_roots_v1 AS root INNER JOIN public.runtime_interaction_receipt_heads_v1 AS head ON head.application_id = root.application_id AND head.interaction_id = root.interaction_id INNER JOIN public.runtime_interaction_effect_heads_v1 AS effect ON effect.application_id = root.application_id AND effect.interaction_id = root.interaction_id WHERE root.application_id = $1 AND root.tenant_id = $2 AND root.installation_id = $3 AND root.guild_id = $4 AND root.ruleset_key = $5 AND head.state = 'completed' AND effect.action_kind = 'create_role' AND effect.state = 'reconciled_succeeded' AND effect.output_kind = 'role' AND effect.output_id IS NOT NULL AND EXISTS (SELECT 1 FROM public.runtime_interaction_effect_events_v1 AS event WHERE event.application_id = effect.application_id AND event.interaction_id = effect.interaction_id AND event.action_index = effect.action_index AND event.event_kind = 'indeterminate') AND NOT EXISTS (SELECT 1 FROM public.runtime_interaction_effect_heads_v1 AS blocked WHERE blocked.application_id = root.application_id AND blocked.interaction_id = root.interaction_id AND blocked.action_kind <> 'edit_response' AND blocked.state IN ('intended', 'indeterminate', 'observing', 'observation_pending', 'compensation_intended', 'compensation_indeterminate', 'compensation_observing', 'compensation_observation_pending', 'recovery_required')) ORDER BY effect.updated_at DESC, root.interaction_id COLLATE pg_catalog.\"C\" DESC, effect.action_index LIMIT 1",
     )
     .bind(&scope.application_id)
     .bind(&scope.tenant_id)
@@ -914,36 +915,16 @@ async fn inspect_reconciliation(
     let compensated_event_count: i64 = get(&row, "compensated_event_count")?;
     let unsafe_deletion_count: i64 = get(&row, "unsafe_deletion_count")?;
     let output_id: Option<String> = get(&row, "output_id")?;
-    let compensation_completed: bool = get(&row, "compensation_completed")?;
-    let reconciliation_state = match effect_state.as_str() {
-        "reconciled_succeeded"
-            if success_event_count == 1
-                && failure_event_count == 0
-                && compensated_event_count == 0
-                && output_id.as_deref().is_some_and(valid_snowflake) =>
-        {
-            "known_success"
-        }
-        "known_failed"
-            if success_event_count == 0
-                && failure_event_count == 1
-                && compensated_event_count == 0
-                && output_id.is_none() =>
-        {
-            "known_failure"
-        }
-        "compensated"
-            if success_event_count <= 1
-                && compensated_event_count == 1
-                && compensation_completed =>
-        {
-            "compensated"
-        }
-        _ => return Err(D2ProvisionerErrorV1::Inspection),
-    };
+    let output_role_id = output_id
+        .filter(|value| valid_snowflake(value))
+        .ok_or(D2ProvisionerErrorV1::Inspection)?;
     let duplicate_external_effect_count = success_event_count.saturating_sub(1);
     if candidate_count != 1
         || indeterminate_event_count != 1
+        || effect_state != "reconciled_succeeded"
+        || success_event_count != 1
+        || failure_event_count != 0
+        || compensated_event_count != 0
         || duplicate_external_effect_count != 0
         || unsafe_deletion_count != 0
     {
@@ -954,7 +935,8 @@ async fn inspect_reconciliation(
         interaction_id: effect_identity.interaction_id.clone(),
         effect_identity,
         route_identity,
-        reconciliation_state: reconciliation_state.to_owned(),
+        output_role_id,
+        reconciliation_state: "known_success".to_owned(),
         duplicate_external_effect_count,
         unsafe_deletion_count,
     })
@@ -1797,6 +1779,7 @@ mod tests {
                     },
                     interaction_id: "1533137713476272288".to_owned(),
                     route_identity: route.clone(),
+                    output_role_id: "1533137713476272289".to_owned(),
                     reconciliation_state: "known_success".to_owned(),
                     duplicate_external_effect_count: 0,
                     unsafe_deletion_count: 0,
@@ -1807,6 +1790,7 @@ mod tests {
                     "interaction_id",
                     "kind",
                     "observed_at",
+                    "output_role_id",
                     "reconciliation_state",
                     "route_identity",
                     "schema_version",
