@@ -348,7 +348,7 @@ async fn isolated_database_with_upgrade_boundary(
         .username(&role)
         .password(&password);
     let executor_pool = PgPoolOptions::new()
-        .max_connections(4)
+        .max_connections(3)
         .connect_with(executor_options.clone())
         .await
         .unwrap();
