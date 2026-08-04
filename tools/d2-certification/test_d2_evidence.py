@@ -245,6 +245,9 @@ class D2EvidenceTest(unittest.TestCase):
             public_origin=ORIGIN,
             installation_id=INSTALLATION_ID,
             promotion_id=PROMOTION_ID,
+            authoring_session_id="session-1",
+            authoring_generation=1,
+            payload_digest="a" * 64,
             preview_state="pending_approval",
             approval_state="approved",
             apply_state="runtime_pending",
@@ -258,6 +261,10 @@ class D2EvidenceTest(unittest.TestCase):
             MODULE.assemble_decision_evidence(decision)["apply_state"],
             "runtime_pending",
         )
+        assembled_decision = MODULE.assemble_decision_evidence(decision)
+        self.assertEqual(assembled_decision["authoring_session_id"], "session-1")
+        self.assertEqual(assembled_decision["authoring_generation"], 1)
+        self.assertEqual(assembled_decision["payload_digest"], "a" * 64)
         fast_live = copy.deepcopy(decision)
         fast_live["apply_state"] = "live"
         self.assertEqual(

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import contextlib
+import copy
 import importlib.util
 import io
 import json
@@ -161,6 +162,9 @@ def complete_evidence(manifest):
         7: {
             "installation_id": installation_id,
             "promotion_id": DIGEST,
+            "authoring_session_id": "authoring-session-1",
+            "authoring_generation": 1,
+            "payload_digest": DIGEST,
             "preview_state": "pending_approval",
             "approval_state": "approved",
             "apply_state": "runtime_pending",
@@ -656,6 +660,29 @@ class D2CertificationTest(unittest.TestCase):
             status = self.record(manifest_path, 10, evidence_by_step[10])
         self.assertEqual(status, 1)
         self.assertIn("step_contract_failed:transport_instance_id", stderr.getvalue())
+
+    def test_step_seven_binds_exact_authoring_preview_identity(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence_by_step = complete_evidence(manifest)
+        for step in range(1, 7):
+            self.assertEqual(self.record(manifest_path, step, evidence_by_step[step]), 0)
+        mutations = (
+            ("authoring_session_id", "authoring-session-other"),
+            ("authoring_generation", 2),
+            ("payload_digest", "f" * 64),
+        )
+        for field, replacement in mutations:
+            evidence = copy.deepcopy(evidence_by_step[7])
+            evidence[field] = replacement
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(self.record(manifest_path, 7, evidence), 1)
+            self.assertIn(
+                "step_contract_failed:product_decision_authoring_identity",
+                stderr.getvalue(),
+            )
+        self.assertEqual(self.record(manifest_path, 7, evidence_by_step[7]), 0)
 
     def test_record_rejects_out_of_order_step(self):
         manifest_path = self.prepare()

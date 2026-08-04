@@ -155,9 +155,12 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
     [
       "apply_state",
       "approval_state",
+      "authoring_generation",
+      "authoring_session_id",
       "installation_id",
       "kind",
       "observed_at",
+      "payload_digest",
       "preview_state",
       "promotion_id",
       "public_origin",
@@ -170,6 +173,9 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
     "starring.d2.browser-product-decision-evidence.v1"
   );
   assert.equal(evidence.product_decision_evidence.preview_state, "pending_approval");
+  assert.equal(evidence.product_decision_evidence.authoring_session_id, "session-1");
+  assert.equal(evidence.product_decision_evidence.authoring_generation, 1);
+  assert.equal(evidence.product_decision_evidence.payload_digest, DIGEST);
   assert.equal(evidence.product_decision_evidence.approval_state, "approved");
   assert.equal(evidence.product_decision_evidence.apply_state, "runtime_pending");
   assert.equal(evidence.product_decision_evidence.runtime_pending_observed, true);
@@ -256,6 +262,9 @@ test("one-shot exact replay emits strict redacted evidence when apply is already
   assert.equal(evidence.authoring_evidence.authoring_generation, 4);
   assert.equal(evidence.authoring_evidence.one_shot, true);
   assert.equal(evidence.product_decision_evidence.apply_state, "live");
+  assert.equal(evidence.product_decision_evidence.authoring_session_id, "session-replay");
+  assert.equal(evidence.product_decision_evidence.authoring_generation, 4);
+  assert.equal(evidence.product_decision_evidence.payload_digest, DIGEST);
   assert.equal(evidence.product_decision_evidence.runtime_pending_observed, false);
   assert.equal(evidence.runtime_pending_observed, false);
   const serialized = JSON.stringify({

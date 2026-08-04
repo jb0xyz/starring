@@ -221,6 +221,9 @@ STEP_SPECS = {
         (
             "installation_id",
             "promotion_id",
+            "authoring_session_id",
+            "authoring_generation",
+            "payload_digest",
             "preview_state",
             "approval_state",
             "apply_state",
@@ -1379,10 +1382,20 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         ):
             fail("step_contract_failed:generation")
     elif step == 7:
-        require_identifier(evidence, "installation_id")
-        require_digest(evidence, "promotion_id")
+        require_identifier(evidence, "installation_id", "authoring_session_id")
+        require_positive_integer(evidence, "authoring_generation")
+        require_digest(evidence, "promotion_id", "payload_digest")
         if evidence["installation_id"] != prior_receipts[5]["evidence"]["installation_id"]:
             fail("step_contract_failed:installation_id")
+        if (
+            evidence["authoring_session_id"]
+            != prior_receipts[5]["evidence"]["authoring_session_id"]
+            or evidence["authoring_generation"]
+            != prior_receipts[5]["evidence"]["generation"]
+            or evidence["payload_digest"]
+            != prior_receipts[5]["evidence"]["payload_digest"]
+        ):
+            fail("step_contract_failed:product_decision_authoring_identity")
         if (
             evidence["preview_state"] != "pending_approval"
             or evidence["approval_state"] != "approved"

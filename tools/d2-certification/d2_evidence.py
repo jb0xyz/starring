@@ -543,6 +543,9 @@ def assemble_decision_evidence(browser):
         "public_origin",
         "installation_id",
         "promotion_id",
+        "authoring_session_id",
+        "authoring_generation",
+        "payload_digest",
         "preview_state",
         "approval_state",
         "apply_state",
@@ -554,6 +557,13 @@ def assemble_decision_evidence(browser):
     _require_public_origin(value["public_origin"], "browser_public_origin_invalid")
     _require_identifier(value["installation_id"], "decision_installation_id_invalid")
     _require_digest(value["promotion_id"], "decision_promotion_id_invalid")
+    _require_identifier(
+        value["authoring_session_id"], "decision_authoring_session_id_invalid"
+    )
+    _require_positive_integer(
+        value["authoring_generation"], "decision_authoring_generation_invalid"
+    )
+    _require_digest(value["payload_digest"], "decision_payload_digest_invalid")
     _require_state(value["preview_state"], {"pending_approval"}, "preview_state_invalid")
     _require_state(value["approval_state"], {"approved"}, "approval_state_invalid")
     _require_state(
@@ -564,6 +574,9 @@ def assemble_decision_evidence(browser):
     return {
         "installation_id": value["installation_id"],
         "promotion_id": value["promotion_id"],
+        "authoring_session_id": value["authoring_session_id"],
+        "authoring_generation": value["authoring_generation"],
+        "payload_digest": value["payload_digest"],
         "preview_state": value["preview_state"],
         "approval_state": value["approval_state"],
         "apply_state": "runtime_pending",

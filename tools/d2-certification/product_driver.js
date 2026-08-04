@@ -799,6 +799,16 @@
         public_origin: origin,
         installation_id: requireResourceId(applied.body.installation_id, "installation_id"),
         promotion_id: requireDigest(applied.body.promotion_id, "promotion_id"),
+        authoring_session_id: requireResourceId(
+          turn.body.session_id,
+          "authoring_session_id",
+        ),
+        authoring_generation: requireGeneration(
+          turn.body.generation,
+          "authoring_generation",
+          false,
+        ),
+        payload_digest: requireDigest(preview.body.payload_digest, "payload_digest"),
         preview_state: preview.body.state,
         approval_state: approved.body.state,
         apply_state: applied.body.state,
