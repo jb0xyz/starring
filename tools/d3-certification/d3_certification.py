@@ -21,6 +21,8 @@ SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,191}$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+REPOSITORY_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+GITHUB_SCP_PATTERN = re.compile(r"^git@github\.com:(?P<path>[^:]+)$")
 UTC_PATTERN = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z$"
 )
@@ -50,6 +52,33 @@ REQUIRED_ACTIONS_WORKFLOW = {
     "state": "active",
 }
 REQUIRED_ACTIONS_JOBS = ("checks", "postgres")
+REQUIRED_GATE_COMMANDS = (
+    "cargo fmt --all -- --check",
+    "cargo build --locked --workspace --all-targets",
+    "cargo test --locked --workspace",
+    "cargo clippy --locked --workspace --all-targets -- -D warnings",
+    "cargo build --locked -p interaction-smoke --features unsafe-dev-activation",
+    "python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'",
+    "npm --prefix tools/codex-worker run check",
+    "npm --prefix tools/codex-worker test",
+    "npm --prefix eval/codex-worker-slo run check",
+    "npm --prefix eval/design-harness ci",
+    "npm --prefix eval/design-harness run audit",
+    "npm --prefix eval/design-harness run check",
+    "cargo test --locked -p automation-ruleset-postgres -- --ignored --test-threads=1",
+    "cargo test --locked -p automation-instance-postgres -- --ignored --test-threads=1",
+    "cargo test --locked -p automation-panel-installation-postgres -- --ignored --test-threads=1",
+    "cargo test --locked -p automation-ruleset-activation-postgres -- --ignored --test-threads=1",
+    "cargo test --locked -p authoring-promotion-postgres -- --ignored --test-threads=1",
+    "cargo test --locked -p authoring-application-postgres -- --ignored --test-threads=1",
+    "cargo test --locked -p automation-ruleset-dispatch -- --ignored --test-threads=1",
+    "cargo test --locked -p automation-ruleset-readiness -- --ignored --test-threads=1",
+    "cargo test --locked -p automation-runtime-convergence-postgres -- --ignored --test-threads=1",
+    "cargo test --locked -p automation-runtime-execution-postgres --test postgres_security -- --ignored --test-threads=1",
+    "cargo test --locked -p automation-runtime-serving-postgres -- --ignored --test-threads=1",
+    "cargo test --locked -p automation-runtime-interaction-postgres -- --ignored --test-threads=1",
+    "cargo test --locked -p automation-runtime-panel-postgres -- --ignored --test-threads=1",
+)
 SAFE_ENVIRONMENT_NAMES = (
     "CARGO_HOME",
     "DEVELOPER_DIR",
@@ -352,14 +381,89 @@ def git_text(repo, arguments, label):
         fail(f"{label}_output_invalid")
 
 
-def validate_remote_url(repo, remote):
-    value = git_text(repo, ["remote", "get-url", remote], "remote_url")
+def github_repository_path(path):
+    if path.startswith("/"):
+        path = path[1:]
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if (
+        len(parts) != 2
+        or not all(REPOSITORY_COMPONENT_PATTERN.fullmatch(part) for part in parts)
+    ):
+        fail("remote_url_invalid")
+    return "/".join(parts)
+
+
+def canonical_github_repository(value):
     if not value or any(character.isspace() for character in value):
         fail("remote_url_invalid")
-    if "://" in value:
+    scp = GITHUB_SCP_PATTERN.fullmatch(value)
+    if scp is not None:
+        repository = github_repository_path(scp.group("path"))
+        if value not in (
+            f"git@github.com:{repository}",
+            f"git@github.com:{repository}.git",
+        ):
+            fail("remote_url_invalid")
+        return repository
+    try:
         parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        fail("remote_url_invalid")
+    if parsed.scheme == "https":
         if parsed.username is not None or parsed.password is not None:
             fail("remote_url_credentials_forbidden")
+        if (
+            parsed.hostname != "github.com"
+            or port is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            fail("remote_url_invalid")
+        repository = github_repository_path(parsed.path)
+        if value not in (
+            f"https://github.com/{repository}",
+            f"https://github.com/{repository}.git",
+        ):
+            fail("remote_url_invalid")
+        return repository
+    if parsed.scheme == "ssh":
+        if parsed.password is not None:
+            fail("remote_url_credentials_forbidden")
+        if (
+            parsed.username != "git"
+            or parsed.hostname != "github.com"
+            or port is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            fail("remote_url_invalid")
+        repository = github_repository_path(parsed.path)
+        if value not in (
+            f"ssh://git@github.com/{repository}",
+            f"ssh://git@github.com/{repository}.git",
+        ):
+            fail("remote_url_invalid")
+        return repository
+    fail("remote_url_invalid")
+
+
+def github_repository_from_remote(repo, remote):
+    try:
+        raw = git(
+            repo,
+            ["config", "--get-all", f"remote.{remote}.url"],
+            "remote_url",
+            allowed=(0, 1),
+        ).decode("ascii")
+    except UnicodeDecodeError:
+        fail("remote_url_invalid")
+    values = raw.splitlines()
+    if len(values) != 1:
+        fail("remote_url_invalid")
+    return canonical_github_repository(values[0])
 
 
 def git_object(repo, sha, expected, label):
@@ -398,9 +502,13 @@ def validate_gate(command):
 
 
 def gate_digests(commands):
-    if not commands or len(commands) > 64:
-        fail("gate_count_invalid")
-    return [sha256_bytes(validate_gate(command).encode("utf-8")) for command in commands]
+    validated = tuple(validate_gate(command) for command in commands)
+    if validated != REQUIRED_GATE_COMMANDS:
+        fail("gate_manifest_mismatch")
+    return [
+        sha256_bytes(command.encode("utf-8"))
+        for command in REQUIRED_GATE_COMMANDS
+    ]
 
 
 def state_name(pr_number, expected_head, expected_base):
@@ -427,6 +535,7 @@ def load_state(raw):
         "pr_number",
         "repo_path",
         "remote",
+        "github_repository",
         "base_ref",
         "expected_head",
         "expected_base",
@@ -444,6 +553,11 @@ def load_state(raw):
     if type(manifest["pr_number"]) is not int or manifest["pr_number"] <= 0:
         fail("state_pr_invalid")
     validate_name(manifest["remote"], "state_remote")
+    if (
+        not isinstance(manifest["github_repository"], str)
+        or not REPOSITORY_PATTERN.fullmatch(manifest["github_repository"])
+    ):
+        fail("state_github_repository_invalid")
     validate_name(manifest["base_ref"], "state_base_ref")
     validate_sha(manifest["expected_head"], "state_expected_head")
     validate_sha(manifest["expected_base"], "state_expected_base")
@@ -451,14 +565,18 @@ def load_state(raw):
     validate_sha(manifest["merge_tree"], "state_merge_tree")
     if manifest["merge_parents"] != [manifest["expected_base"], manifest["expected_head"]]:
         fail("state_parents_invalid")
-    if not isinstance(manifest["gate_command_sha256"], list) or not manifest["gate_command_sha256"]:
+    required_gate_digests = [
+        sha256_bytes(command.encode("utf-8"))
+        for command in REQUIRED_GATE_COMMANDS
+    ]
+    if manifest["gate_command_sha256"] != required_gate_digests:
         fail("state_gates_invalid")
-    for digest in manifest["gate_command_sha256"]:
-        validate_digest(digest, "state_gate_digest")
     validate_timestamp(manifest["created_at"], "state_created_at")
     repo = absolute_path(manifest["repo_path"], "state_repo")
     worktree = absolute_path(manifest["worktree_path"], "state_worktree")
     require_directory(repo, "state_repo")
+    if github_repository_from_remote(repo, manifest["remote"]) != manifest["github_repository"]:
+        fail("state_github_repository_mismatch")
     require_directory(manifest_path.parent, "state_root", 0o700)
     require_directory(worktree, "state_worktree", 0o700)
     digest_path = manifest_path.with_name("state.sha256")
@@ -540,7 +658,7 @@ def command_prepare(arguments):
     if arguments.pr_number <= 0:
         fail("pr_number_invalid")
     digests = gate_digests(arguments.gate)
-    validate_remote_url(repo, remote)
+    github_repository = github_repository_from_remote(repo, remote)
     root = create_state_root(output_root, state_name(arguments.pr_number, expected_head, expected_base))
     with StateLock(root):
         intent_path = root / "prepare-intent.json"
@@ -550,6 +668,7 @@ def command_prepare(arguments):
             "pr_number": arguments.pr_number,
             "repo_path": str(repo),
             "remote": remote,
+            "github_repository": github_repository,
             "base_ref": base_ref,
             "expected_head": expected_head,
             "expected_base": expected_base,
@@ -569,6 +688,7 @@ def command_prepare(arguments):
                     not isinstance(interrupted_state, dict)
                     or interrupted_state.get("pr_number") != arguments.pr_number
                     or interrupted_state.get("repo_path") != str(repo)
+                    or interrupted_state.get("github_repository") != github_repository
                     or interrupted_state.get("expected_head") != expected_head
                     or interrupted_state.get("expected_base") != expected_base
                     or interrupted_state.get("gate_command_sha256") != digests
@@ -583,6 +703,7 @@ def command_prepare(arguments):
                 "pr_number": arguments.pr_number,
                 "repo_path": str(repo),
                 "remote": remote,
+                "github_repository": github_repository,
                 "base_ref": base_ref,
                 "expected_head": expected_head,
                 "expected_base": expected_base,
@@ -622,6 +743,7 @@ def command_prepare(arguments):
             "pr_number": arguments.pr_number,
             "repo_path": str(repo),
             "remote": remote,
+            "github_repository": github_repository,
             "base_ref": base_ref,
             "expected_head": expected_head,
             "expected_base": expected_base,
@@ -1004,7 +1126,8 @@ def command_recheck(arguments):
         state_path, state, _, repo, _ = load_state(str(state_argument))
         gate_chain = require_gate_completion(state_path.parent, state)
         binding = load_binding(state_path.parent, state)
-        validate_remote_url(repo, state["remote"])
+        if github_repository_from_remote(repo, state["remote"]) != state["github_repository"]:
+            fail("state_github_repository_mismatch")
         head, base, merge = fetch_candidate(
             repo, state["remote"], state["base_ref"], state["pr_number"], "recheck"
         )
@@ -1251,6 +1374,8 @@ def command_finalize(arguments):
     state_argument, root = state_lock_target(arguments.state)
     with StateLock(root):
         state_path, state, _, repo, _ = load_state(str(state_argument))
+        if repository != state["github_repository"]:
+            fail("github_repository_mismatch")
         gate_chain = require_gate_completion(root, state)
         binding = load_binding(root, state)
         recheck = load_recheck(root, state)
@@ -1262,7 +1387,8 @@ def command_finalize(arguments):
             != binding["coordinator_evidence_sha256"]
         ):
             fail("recheck_certification_binding_mismatch")
-        validate_remote_url(repo, state["remote"])
+        if github_repository_from_remote(repo, state["remote"]) != repository:
+            fail("github_repository_mismatch")
         base_remote_ref = f"refs/remotes/{state['remote']}/{state['base_ref']}"
         git(
             repo,

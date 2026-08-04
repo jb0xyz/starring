@@ -6,28 +6,61 @@ It never persists gate command text, process output, environment values, or cred
 
 ## Sequence
 
-Prepare a state directory from the current GitHub-generated merge ref. Every gate command is supplied here so its digest is immutable before execution.
+Prepare a state directory from the current GitHub-generated merge ref. `origin` must be a credential-free `github.com` HTTPS or SSH URL. The gate manifest is fixed in code and accepts no missing, additional, duplicate, reordered, or changed command.
 
-```sh
-python3 tools/d3-certification/d3_certification.py prepare \
-  --repo /absolute/path/to/starring \
-  --output-root /private/tmp/starring-d3 \
-  --pr-number 30 \
-  --expected-head HEAD_SHA \
-  --expected-base BASE_SHA \
-  --gate 'cargo test --workspace' \
-  --gate 'cargo clippy --workspace --all-targets -- -D warnings' \
-  --gate 'cargo fmt --all -- --check'
+```zsh
+gates=(
+  'cargo fmt --all -- --check'
+  'cargo build --locked --workspace --all-targets'
+  'cargo test --locked --workspace'
+  'cargo clippy --locked --workspace --all-targets -- -D warnings'
+  'cargo build --locked -p interaction-smoke --features unsafe-dev-activation'
+  "python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'"
+  'npm --prefix tools/codex-worker run check'
+  'npm --prefix tools/codex-worker test'
+  'npm --prefix eval/codex-worker-slo run check'
+  'npm --prefix eval/design-harness ci'
+  'npm --prefix eval/design-harness run audit'
+  'npm --prefix eval/design-harness run check'
+  'cargo test --locked -p automation-ruleset-postgres -- --ignored --test-threads=1'
+  'cargo test --locked -p automation-instance-postgres -- --ignored --test-threads=1'
+  'cargo test --locked -p automation-panel-installation-postgres -- --ignored --test-threads=1'
+  'cargo test --locked -p automation-ruleset-activation-postgres -- --ignored --test-threads=1'
+  'cargo test --locked -p authoring-promotion-postgres -- --ignored --test-threads=1'
+  'cargo test --locked -p authoring-application-postgres -- --ignored --test-threads=1'
+  'cargo test --locked -p automation-ruleset-dispatch -- --ignored --test-threads=1'
+  'cargo test --locked -p automation-ruleset-readiness -- --ignored --test-threads=1'
+  'cargo test --locked -p automation-runtime-convergence-postgres -- --ignored --test-threads=1'
+  'cargo test --locked -p automation-runtime-execution-postgres --test postgres_security -- --ignored --test-threads=1'
+  'cargo test --locked -p automation-runtime-serving-postgres -- --ignored --test-threads=1'
+  'cargo test --locked -p automation-runtime-interaction-postgres -- --ignored --test-threads=1'
+  'cargo test --locked -p automation-runtime-panel-postgres -- --ignored --test-threads=1'
+)
+prepare=(
+  python3 tools/d3-certification/d3_certification.py prepare
+  --repo /absolute/path/to/starring
+  --output-root /private/tmp/starring-d3
+  --pr-number 30
+  --expected-head HEAD_SHA
+  --expected-base BASE_SHA
+)
+for gate in "${gates[@]}"; do
+  prepare+=(--gate "$gate")
+done
+"${prepare[@]}"
 ```
 
 Run the exact pinned gates in the detached worktree. Completed gates replay without execution. A failed or interrupted gate resumes as a new or incomplete durable attempt.
 
-```sh
-python3 tools/d3-certification/d3_certification.py run-gates \
-  --state /private/tmp/starring-d3/RUN/state.json \
-  --gate 'cargo test --workspace' \
-  --gate 'cargo clippy --workspace --all-targets -- -D warnings' \
-  --gate 'cargo fmt --all -- --check'
+```zsh
+run_gates=(
+  python3 tools/d3-certification/d3_certification.py run-gates
+  --state /private/tmp/starring-d3/RUN/state.json
+)
+for gate in "${gates[@]}"; do
+  run_gates+=(--gate "$gate")
+done
+"${run_gates[@]}"
 ```
 
 Capture the canonical output of `d2_run.py verify` in an owned mode-`0600` JSON file, then bind its required 17-step coordinator ledger to the D2 manifest, all 17 chained receipts, and the pinned commit tree. Set `umask 077` before redirecting the verifier output so the record is never created with a permissive mode. The low-level receipt verifier is not release authority.
@@ -46,7 +79,7 @@ python3 tools/d3-certification/d3_certification.py recheck \
   --state /private/tmp/starring-d3/RUN/state.json
 ```
 
-After an independent merge, bind the fetched `origin/main` tree and successful post-merge Actions run IDs. The GitHub CLI must already be authenticated without inline credentials.
+After an independent merge, bind the fetched `origin/main` tree and one successful post-merge Actions run. The repository argument must exactly equal the owner/repository identity pinned from `origin`. The GitHub CLI must already be authenticated without inline credentials.
 
 ```sh
 python3 tools/d3-certification/d3_certification.py finalize \
@@ -55,4 +88,4 @@ python3 tools/d3-certification/d3_certification.py finalize \
   --actions-run-id RUN_ID
 ```
 
-`final.json` is the terminal D3 record. A passing record requires exact merge-tree equality on `main`, a complete gate evidence chain, the same D2 receipt chain observed during pre-merge recheck, and every named Actions run to be completed successfully against the fetched `main` commit.
+`final.json` is the terminal D3 record. A passing record requires exact merge-tree equality on `main`, the complete canonical gate evidence chain, the same D2 receipt chain observed during pre-merge recheck, and successful `checks` and `postgres` jobs in the exact `CI` push workflow run against the fetched `main` commit.

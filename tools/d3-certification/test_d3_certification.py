@@ -47,6 +47,8 @@ class D3CertificationTests(unittest.TestCase):
         self.remote = self.root / "origin.git"
         self.repo = self.root / "repo"
         self.output = self.root / "state"
+        self.github_repository = "owner/repository"
+        self.github_remote_url = "https://github.com/owner/repository.git"
         self.output.mkdir(mode=0o700)
         self.create_repository()
 
@@ -93,6 +95,13 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         git(self.seed, "push", "origin", f"{self.head}:refs/pull/42/head")
         git(self.seed, "push", "origin", f"{self.merge}:refs/pull/42/merge")
         git(self.root, "clone", str(self.remote), str(self.repo))
+        git(self.repo, "remote", "set-url", "origin", self.github_remote_url)
+        git(
+            self.repo,
+            "config",
+            f"url.{self.remote.as_uri()}.insteadOf",
+            self.github_remote_url,
+        )
 
     def invoke(self, arguments):
         stdout = io.StringIO()
@@ -102,26 +111,49 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         result = json.loads(stdout.getvalue()) if stdout.getvalue() else None
         return status, result, stderr.getvalue()
 
-    def prepare(self, gates=None):
-        gates = gates or ["python3 -c 'raise SystemExit(0)'", "git diff --quiet"]
+    def prepare_arguments(self, gates=None, output_root=None, expected_head=None):
+        gates = list(MODULE.REQUIRED_GATE_COMMANDS if gates is None else gates)
         arguments = [
             "prepare",
             "--repo",
             str(self.repo),
             "--output-root",
-            str(self.output),
+            str(self.output if output_root is None else output_root),
             "--pr-number",
             "42",
             "--expected-head",
-            self.head,
+            self.head if expected_head is None else expected_head,
             "--expected-base",
             self.base,
         ]
         for gate in gates:
             arguments.extend(["--gate", gate])
+        return arguments, gates
+
+    def prepare(self, gates=None):
+        arguments, gates = self.prepare_arguments(gates)
         status, result, error = self.invoke(arguments)
         self.assertEqual(status, 0, error)
         return pathlib.Path(result["state"]), result, gates
+
+    def invoke_gate_plan(self, state_path, gates=None, outcomes=None):
+        gates = list(MODULE.REQUIRED_GATE_COMMANDS if gates is None else gates)
+        arguments = ["run-gates", "--state", str(state_path)]
+        for gate in gates:
+            arguments.extend(["--gate", gate])
+        original = MODULE.run_process
+        observed = []
+        outcomes = iter([] if outcomes is None else outcomes)
+
+        def recording_runner(argv, cwd, label, allowed=(0,), timeout=None, discard=False):
+            if argv[:3] == ["/bin/zsh", "-f", "-c"]:
+                observed.append(argv[3])
+                return next(outcomes, 0), b""
+            return original(argv, cwd, label, allowed, timeout, discard)
+
+        with mock.patch.object(MODULE, "run_process", side_effect=recording_runner):
+            status, result, error = self.invoke(arguments)
+        return status, result, error, observed
 
     def test_prepare_pins_merge_parents_tree_and_detached_worktree(self):
         state_path, first, gates = self.prepare()
@@ -129,6 +161,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(state["merge_commit"], self.merge)
         self.assertEqual(state["merge_tree"], self.tree)
         self.assertEqual(state["merge_parents"], [self.base, self.head])
+        self.assertEqual(state["github_repository"], self.github_repository)
         worktree = pathlib.Path(state["worktree_path"])
         self.assertEqual(stat.S_IMODE(worktree.stat().st_mode), 0o700)
         detached = subprocess.run(
@@ -139,111 +172,134 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         )
         self.assertEqual(detached.returncode, 1)
         state_path.with_name("state.sha256").unlink()
-        _, second, _ = self.invoke(
-            [
-                "prepare",
-                "--repo",
-                str(self.repo),
-                "--output-root",
-                str(self.output),
-                "--pr-number",
-                "42",
-                "--expected-head",
-                self.head,
-                "--expected-base",
-                self.base,
-                "--gate",
-                gates[0],
-                "--gate",
-                gates[1],
-            ]
-        )
+        replay_arguments, _ = self.prepare_arguments(gates)
+        _, second, _ = self.invoke(replay_arguments)
         self.assertEqual(second["disposition"], "exact_replay")
         self.assertEqual(second["state_sha256"], first["state_sha256"])
         self.assertTrue(state_path.with_name("state.sha256").exists())
 
     def test_prepare_rejects_wrong_head_and_credential_remote(self):
-        status, _, error = self.invoke(
-            [
-                "prepare",
-                "--repo",
-                str(self.repo),
-                "--output-root",
-                str(self.output),
-                "--pr-number",
-                "42",
-                "--expected-head",
-                "a" * 40,
-                "--expected-base",
-                self.base,
-                "--gate",
-                "true",
-            ]
-        )
+        arguments, _ = self.prepare_arguments(expected_head="a" * 40)
+        status, _, error = self.invoke(arguments)
         self.assertEqual(status, 1)
         self.assertIn("pr_head_mismatch", error)
         git(self.repo, "remote", "set-url", "origin", "https://user:pass@github.com/o/r.git")
         other = self.root / "other"
         other.mkdir(mode=0o700)
-        status, _, error = self.invoke(
-            [
-                "prepare",
-                "--repo",
-                str(self.repo),
-                "--output-root",
-                str(other),
-                "--pr-number",
-                "42",
-                "--expected-head",
-                self.head,
-                "--expected-base",
-                self.base,
-                "--gate",
-                "true",
-            ]
-        )
+        arguments, _ = self.prepare_arguments(output_root=other)
+        status, _, error = self.invoke(arguments)
         self.assertEqual(status, 1)
         self.assertIn("remote_url_credentials_forbidden", error)
 
+    def test_prepare_rejects_local_and_non_github_origins(self):
+        for index, remote_url in enumerate(
+            (
+                str(self.remote),
+                "https://example.com/owner/repository.git",
+                "https://[github.com/owner/repository.git",
+            ),
+            start=1,
+        ):
+            with self.subTest(remote_url=remote_url):
+                git(self.repo, "remote", "set-url", "origin", remote_url)
+                output = self.root / f"foreign-{index}"
+                output.mkdir(mode=0o700)
+                arguments, _ = self.prepare_arguments(output_root=output)
+                status, _, error = self.invoke(arguments)
+                self.assertEqual(status, 1)
+                self.assertIn("remote_url_invalid", error)
+
+    def test_github_ssh_and_https_origins_canonicalize(self):
+        urls = (
+            "https://github.com/owner/repository.git",
+            "git@github.com:owner/repository.git",
+            "ssh://git@github.com/owner/repository.git",
+        )
+        for remote_url in urls:
+            with self.subTest(remote_url=remote_url):
+                git(self.repo, "remote", "set-url", "origin", remote_url)
+                self.assertEqual(
+                    MODULE.github_repository_from_remote(self.repo, "origin"),
+                    self.github_repository,
+                )
+
     def test_gate_execution_is_chained_redacted_and_exactly_replayed(self):
         state_path, _, gates = self.prepare()
-        arguments = ["run-gates", "--state", str(state_path)]
-        for gate in gates:
-            arguments.extend(["--gate", gate])
-        status, result, error = self.invoke(arguments)
+        status, result, error, observed = self.invoke_gate_plan(state_path, gates)
         self.assertEqual(status, 0, error)
-        self.assertEqual(result["gates"], 2)
+        self.assertEqual(observed, list(MODULE.REQUIRED_GATE_COMMANDS))
+        self.assertEqual(result["gates"], len(MODULE.REQUIRED_GATE_COMMANDS))
         evidence = state_path.with_name("gate-evidence.jsonl")
         before = evidence.read_bytes()
         lines = [json.loads(line) for line in before.splitlines()]
-        self.assertEqual(len(lines), 4)
+        self.assertEqual(len(lines), 2 * len(MODULE.REQUIRED_GATE_COMMANDS))
         self.assertNotIn(gates[0].encode("utf-8"), before)
         self.assertTrue(all("command_sha256" in line for line in lines))
-        status, replay, error = self.invoke(arguments)
+        status, replay, error, observed = self.invoke_gate_plan(state_path, gates)
         self.assertEqual(status, 0, error)
+        self.assertEqual(observed, [])
         self.assertEqual(replay["evidence_chain_head_sha256"], result["evidence_chain_head_sha256"])
         self.assertEqual(evidence.read_bytes(), before)
 
+    def test_required_gate_manifest_matches_phase_d_contract(self):
+        self.assertEqual(
+            MODULE.REQUIRED_GATE_COMMANDS,
+            (
+                "cargo fmt --all -- --check",
+                "cargo build --locked --workspace --all-targets",
+                "cargo test --locked --workspace",
+                "cargo clippy --locked --workspace --all-targets -- -D warnings",
+                "cargo build --locked -p interaction-smoke --features unsafe-dev-activation",
+                "python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'",
+                "npm --prefix tools/codex-worker run check",
+                "npm --prefix tools/codex-worker test",
+                "npm --prefix eval/codex-worker-slo run check",
+                "npm --prefix eval/design-harness ci",
+                "npm --prefix eval/design-harness run audit",
+                "npm --prefix eval/design-harness run check",
+                "cargo test --locked -p automation-ruleset-postgres -- --ignored --test-threads=1",
+                "cargo test --locked -p automation-instance-postgres -- --ignored --test-threads=1",
+                "cargo test --locked -p automation-panel-installation-postgres -- --ignored --test-threads=1",
+                "cargo test --locked -p automation-ruleset-activation-postgres -- --ignored --test-threads=1",
+                "cargo test --locked -p authoring-promotion-postgres -- --ignored --test-threads=1",
+                "cargo test --locked -p authoring-application-postgres -- --ignored --test-threads=1",
+                "cargo test --locked -p automation-ruleset-dispatch -- --ignored --test-threads=1",
+                "cargo test --locked -p automation-ruleset-readiness -- --ignored --test-threads=1",
+                "cargo test --locked -p automation-runtime-convergence-postgres -- --ignored --test-threads=1",
+                "cargo test --locked -p automation-runtime-execution-postgres --test postgres_security -- --ignored --test-threads=1",
+                "cargo test --locked -p automation-runtime-serving-postgres -- --ignored --test-threads=1",
+                "cargo test --locked -p automation-runtime-interaction-postgres -- --ignored --test-threads=1",
+                "cargo test --locked -p automation-runtime-panel-postgres -- --ignored --test-threads=1",
+            ),
+        )
+
     def test_gate_failure_is_durable_and_retry_can_succeed(self):
-        marker = self.root / "marker"
-        command = f"test -f {shlex_quote(marker)} || (touch {shlex_quote(marker)}; exit 9)"
-        state_path, _, gates = self.prepare([command])
-        arguments = ["run-gates", "--state", str(state_path), "--gate", gates[0]]
-        status, _, error = self.invoke(arguments)
+        state_path, _, gates = self.prepare()
+        status, _, error, observed = self.invoke_gate_plan(
+            state_path,
+            gates,
+            outcomes=[9],
+        )
         self.assertEqual(status, 1)
+        self.assertEqual(observed, [MODULE.REQUIRED_GATE_COMMANDS[0]])
         self.assertIn("gate_failed:1:9", error)
-        status, result, error = self.invoke(arguments)
+        status, result, error, observed = self.invoke_gate_plan(state_path, gates)
         self.assertEqual(status, 0, error)
+        self.assertEqual(observed, list(MODULE.REQUIRED_GATE_COMMANDS))
         self.assertEqual(result["status"], "passed")
         records = [
             json.loads(line)
             for line in state_path.with_name("gate-evidence.jsonl").read_text().splitlines()
         ]
-        self.assertEqual([record["attempt"] for record in records], [1, 1, 2, 2])
-        self.assertEqual([record.get("exit_code") for record in records if "exit_code" in record], [9, 0])
+        first_gate = [record for record in records if record["gate_index"] == 1]
+        self.assertEqual([record["attempt"] for record in first_gate], [1, 1, 2, 2])
+        self.assertEqual(
+            [record.get("exit_code") for record in first_gate if "exit_code" in record],
+            [9, 0],
+        )
 
     def test_gate_execution_resumes_a_durable_incomplete_attempt(self):
-        state_path, _, gates = self.prepare(["true"])
+        state_path, _, gates = self.prepare()
         state = json.loads(state_path.read_text(encoding="utf-8"))
         evidence_path = state_path.with_name("gate-evidence.jsonl")
         records = []
@@ -258,32 +314,47 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 "attempt": 1,
             },
         )
-        status, result, error = self.invoke(
-            ["run-gates", "--state", str(state_path), "--gate", gates[0]]
-        )
+        status, result, error, observed = self.invoke_gate_plan(state_path, gates)
         self.assertEqual(status, 0, error)
+        self.assertEqual(observed, list(MODULE.REQUIRED_GATE_COMMANDS))
         self.assertEqual(result["status"], "passed")
         evidence = [
             json.loads(line)
             for line in evidence_path.read_text(encoding="utf-8").splitlines()
         ]
-        self.assertEqual(len(evidence), 2)
+        self.assertEqual(len(evidence), 2 * len(MODULE.REQUIRED_GATE_COMMANDS))
         self.assertEqual(evidence[0]["kind"], "starring.d3.gate-started.v1")
         self.assertEqual(evidence[1]["kind"], "starring.d3.gate-completed.v1")
         self.assertEqual(evidence[1]["attempt"], 1)
 
     def test_gate_plan_and_sensitive_command_fail_closed(self):
-        state_path, _, _ = self.prepare(["true"])
+        state_path, _, _ = self.prepare()
         status, _, error = self.invoke(
             ["run-gates", "--state", str(state_path), "--gate", "false"]
         )
         self.assertEqual(status, 1)
-        self.assertIn("gate_plan_mismatch", error)
+        self.assertIn("gate_manifest_mismatch", error)
         status, _, error = self.invoke(
             ["run-gates", "--state", str(state_path), "--gate", "env"]
         )
         self.assertEqual(status, 1)
         self.assertIn("gate_command_sensitive", error)
+
+    def test_prepare_rejects_changed_missing_added_and_duplicate_gates(self):
+        required = list(MODULE.REQUIRED_GATE_COMMANDS)
+        variants = {
+            "changed": ["cargo fmt --all"] + required[1:],
+            "missing": required[:-1],
+            "added": required + ["true"],
+            "duplicate": required + [required[-1]],
+            "reordered": [required[1], required[0]] + required[2:],
+        }
+        for name, gates in variants.items():
+            with self.subTest(name=name):
+                arguments, _ = self.prepare_arguments(gates)
+                status, _, error = self.invoke(arguments)
+                self.assertEqual(status, 1)
+                self.assertIn("gate_manifest_mismatch", error)
 
     def test_process_environment_is_allowlisted(self):
         previous_secret = os.environ.get("STARRING_TEST_SECRET")
@@ -444,7 +515,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         )
         self.assertEqual(status, 1)
         self.assertIn("d2_receipt_sequence_invalid", error)
-        self.assertEqual(gates[0], "python3 -c 'raise SystemExit(0)'")
+        self.assertEqual(gates, list(MODULE.REQUIRED_GATE_COMMANDS))
 
     def test_d2_binding_rejects_the_legacy_receipt_only_final_record(self):
         state_path, _, _ = self.prepare()
@@ -469,10 +540,9 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
     def complete_prerequisites(self):
         state_path, _, gates = self.prepare()
-        gate_arguments = ["run-gates", "--state", str(state_path)]
-        for gate in gates:
-            gate_arguments.extend(["--gate", gate])
-        self.assertEqual(self.invoke(gate_arguments)[0], 0)
+        status, _, error, observed = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        self.assertEqual(observed, list(MODULE.REQUIRED_GATE_COMMANDS))
         manifest_path, final_path = self.make_d2(state_path)
         self.assertEqual(
             self.invoke(
@@ -500,6 +570,19 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         status, _, error = self.invoke(["recheck", "--state", str(state_path)])
         self.assertEqual(status, 1)
         self.assertIn("pr_base_changed", error)
+
+    def test_state_rejects_origin_repository_movement(self):
+        state_path, _, _ = self.prepare()
+        git(
+            self.repo,
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/foreign/repository.git",
+        )
+        status, _, error = self.invoke(["recheck", "--state", str(state_path)])
+        self.assertEqual(status, 1)
+        self.assertIn("state_github_repository_mismatch", error)
 
     def install_fake_gh(
         self,
@@ -582,13 +665,13 @@ print(json.dumps(responses[endpoint]))
             self.previous_path = os.environ.get("PATH", "")
             os.environ["PATH"] = str(directory) + os.pathsep + self.previous_path
 
-    def finalize_arguments(self, state_path):
+    def finalize_arguments(self, state_path, repository=None):
         return [
             "finalize",
             "--state",
             str(state_path),
             "--github-repository",
-            "owner/repository",
+            self.github_repository if repository is None else repository,
             "--actions-run-id",
             "101",
         ]
@@ -624,6 +707,15 @@ print(json.dumps(responses[endpoint]))
             self.assertIn("final_record_mismatch", error)
         finally:
             os.environ["PATH"] = self.previous_path
+
+    def test_finalize_rejects_repository_other_than_pinned_origin(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        status, _, error = self.invoke(
+            self.finalize_arguments(state_path, repository="foreign/repository")
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("github_repository_mismatch", error)
 
     def test_finalize_rejects_pull_request_actions_run(self):
         state_path = self.complete_prerequisites()
@@ -764,11 +856,5 @@ print(json.dumps(responses[endpoint]))
         status, _, error = self.invoke(["recheck", "--state", str(state_path)])
         self.assertEqual(status, 1)
         self.assertIn("state_digest_unavailable", error)
-
-
-def shlex_quote(path):
-    return "'" + str(path).replace("'", "'\"'\"'") + "'"
-
-
 if __name__ == "__main__":
     unittest.main()
