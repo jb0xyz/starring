@@ -83,6 +83,45 @@ struct EphemeralPostgresCluster {
     running: bool,
 }
 
+enum PostgresTestServer {
+    External(Box<PgConnectOptions>),
+    Ephemeral(EphemeralPostgresCluster),
+}
+
+impl PostgresTestServer {
+    fn start() -> Self {
+        if let Some(url) = std::env::var_os("STARRING_TEST_DATABASE_URL") {
+            let url = url
+                .into_string()
+                .expect("STARRING_TEST_DATABASE_URL must be valid Unicode");
+            let options = url
+                .parse::<PgConnectOptions>()
+                .expect("STARRING_TEST_DATABASE_URL must be a PostgreSQL URL");
+            let database = options
+                .get_database()
+                .expect("STARRING_TEST_DATABASE_URL must name a database");
+            assert!(
+                database.starts_with("starring_")
+                    && database.split('_').any(|segment| segment == "test")
+                    && database.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'),
+                "refusing to use a database outside the strict Starring test namespace"
+            );
+            Self::External(Box::new(options))
+        } else {
+            Self::Ephemeral(EphemeralPostgresCluster::start())
+        }
+    }
+
+    fn connect_options(&self) -> PgConnectOptions {
+        match self {
+            Self::External(options) => options.as_ref().clone(),
+            Self::Ephemeral(cluster) => cluster.connect_options(),
+        }
+    }
+}
+
 impl EphemeralPostgresCluster {
     fn start() -> Self {
         let suffix = SystemTime::now()
@@ -196,8 +235,8 @@ impl Drop for EphemeralPostgresCluster {
 #[tokio::test]
 #[ignore = "requires initdb and pg_ctl"]
 async fn serving_mutations_are_replay_safe_bounded_and_least_privilege() {
-    let cluster = EphemeralPostgresCluster::start();
-    let database = isolated_database(cluster.connect_options()).await;
+    let server = PostgresTestServer::start();
+    let database = isolated_database(server.connect_options()).await;
     let owner_pool = database.owner_pool.clone();
     let executor_pool = database.executor_pool.clone();
     let deadline_pool = database.deadline_pool.clone();
@@ -218,7 +257,7 @@ async fn serving_mutations_are_replay_safe_bounded_and_least_privilege() {
     .await;
     cleanup(database).await;
     outcome.expect("restricted serving proof must complete");
-    drop(cluster);
+    drop(server);
 }
 
 async fn isolated_database(base: PgConnectOptions) -> IsolatedDatabase {
