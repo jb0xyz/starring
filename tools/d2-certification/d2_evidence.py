@@ -681,6 +681,7 @@ def assemble_decision_evidence(browser):
         "apply_state",
         "runtime_pending_observed",
         "preview_completion_challenge_sha256",
+        "decision_command_sha256",
         "chrome_confirmation",
     }
     value = _require_envelope(
@@ -703,6 +704,9 @@ def assemble_decision_evidence(browser):
         value["preview_completion_challenge_sha256"],
         "preview_completion_challenge_invalid",
     )
+    _require_digest(
+        value["decision_command_sha256"], "decision_command_sha256_invalid"
+    )
     _require_state(value["preview_state"], {"pending_approval"}, "preview_state_invalid")
     _require_state(value["approval_state"], {"approved"}, "approval_state_invalid")
     _require_state(
@@ -724,6 +728,7 @@ def assemble_decision_evidence(browser):
             "payload_digest",
             "target_content_hash",
             "preview_completion_challenge_sha256",
+            "decision_command_sha256",
             "summary",
         },
         "chrome_preview_confirmation_fields_invalid",
@@ -763,6 +768,10 @@ def assemble_decision_evidence(browser):
         confirmation["preview_completion_challenge_sha256"],
         "chrome_preview_confirmation_challenge_invalid",
     )
+    _require_digest(
+        confirmation["decision_command_sha256"],
+        "chrome_preview_confirmation_command_invalid",
+    )
     summary = _require_exact_object(
         confirmation["summary"],
         {
@@ -794,6 +803,8 @@ def assemble_decision_evidence(browser):
         or confirmation["target_content_hash"] != value["target_content_hash"]
         or confirmation["preview_completion_challenge_sha256"]
         != value["preview_completion_challenge_sha256"]
+        or confirmation["decision_command_sha256"]
+        != value["decision_command_sha256"]
     ):
         _fail("chrome_preview_confirmation_binding_invalid")
     return {
@@ -811,6 +822,7 @@ def assemble_decision_evidence(browser):
         "preview_completion_challenge_sha256": value[
             "preview_completion_challenge_sha256"
         ],
+        "decision_command_sha256": value["decision_command_sha256"],
         "confirmation_surface": confirmation["confirmation_surface"],
         "chrome_confirmation_sha256": hashlib.sha256(
             canonical_json(confirmation).encode("utf-8")

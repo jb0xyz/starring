@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { webcrypto } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
@@ -91,6 +92,8 @@ function driver(fetchImpl, cookie = "__Host-starring_csrf=csrf-value", options =
     setTimeout,
     clearTimeout,
     confirm: nativeConfirm,
+    crypto: webcrypto,
+    TextEncoder,
   };
   context.globalThis = context;
   vm.runInNewContext(SOURCE, context, { filename: "product_driver.js" });
@@ -457,14 +460,17 @@ test("certification authoring and decision phases are separated by a public prev
   assert.equal(authoring.authoring_evidence.worker_request_id, "worker-request-1");
   assert.equal(authoring.authoring_evidence.worker_completion_sha256, "c".repeat(64));
   const command = certificationDecisionCommand(product);
+  const commandDigest = await product.decisionCommandSha256(command);
   const decision = await product.completeCertificationDecision({
     command,
+    decisionCommandSha256: commandDigest,
   });
   assert.equal(calls.length, 6);
   assert.equal(confirmations, 1);
   assert.match(confirmationPrompt, new RegExp(DIGEST));
   assert.match(confirmationPrompt, new RegExp(approvalDigest));
   assert.match(confirmationPrompt, new RegExp(PREVIEW_COMPLETION_CHALLENGE));
+  assert.match(confirmationPrompt, new RegExp(commandDigest));
   assert.equal(decision.product_decision_evidence.target_content_hash, DIGEST);
   assert.equal(decision.product_decision_evidence.payload_digest, approvalDigest);
   assert.equal(
@@ -479,11 +485,23 @@ test("certification authoring and decision phases are separated by a public prev
     decision.product_decision_evidence.chrome_confirmation.accepted,
     true,
   );
+  assert.equal(
+    decision.product_decision_evidence.decision_command_sha256,
+    commandDigest,
+  );
+  assert.equal(
+    decision.product_decision_evidence.chrome_confirmation.decision_command_sha256,
+    commandDigest,
+  );
+  const decisionEvidenceJson = JSON.stringify(decision.product_decision_evidence);
+  assert.equal(decisionEvidenceJson.includes(command.promotion_idempotency_key), false);
+  assert.equal(decisionEvidenceJson.includes(command.approval_idempotency_key), false);
+  assert.equal(decisionEvidenceJson.includes(command.apply_idempotency_key), false);
   assert.equal(decision.applied.state, "runtime_pending");
 });
 
 
-test("certification decision command is exact, immutable, and redacted", () => {
+test("certification decision command is exact, immutable, and redacted", async () => {
   const product = driver(async () => response(500, null));
   const command = certificationDecisionCommand(product);
   assert.equal(Object.isFrozen(command), true);
@@ -515,10 +533,52 @@ test("certification decision command is exact, immutable, and redacted", () => {
   assert.equal(serialized.includes("prompt"), false);
   assert.equal(serialized.includes("message"), false);
   assert.equal(serialized.includes("token"), false);
+  assert.equal(
+    await product.decisionCommandSha256(command),
+    "e9dc0ba6cb9715964bcf0938ad3102284d0f48c88efaba92e47a4ebf5242936d",
+  );
   assert.throws(
     () => certificationDecisionCommand(product, { authoringGeneration: true }),
     /authoring_generation_invalid/,
   );
+  assert.throws(() => {
+    command.apply_idempotency_key = "d2.certification_apply.replaced";
+  }, TypeError);
+});
+
+
+test("certification decision rejects persisted command and key tampering before I/O", async () => {
+  let calls = 0;
+  const product = driver(async () => {
+    calls += 1;
+    return response(500, null);
+  });
+  const command = certificationDecisionCommand(product);
+  const commandDigest = await product.decisionCommandSha256(command);
+  await assert.rejects(
+    product.completeCertificationDecision({ command }),
+    /certification_decision_command_digest_required/,
+  );
+  const mutations = [
+    (value) => {
+      value.candidate_ruleset_hash = "e".repeat(64);
+    },
+    (value) => {
+      value.apply_idempotency_key = "d2.certification_apply.tampered";
+    },
+  ];
+  for (const mutate of mutations) {
+    const restored = JSON.parse(JSON.stringify(command));
+    mutate(restored);
+    await assert.rejects(
+      product.completeCertificationDecision({
+        command: restored,
+        decisionCommandSha256: commandDigest,
+      }),
+      /certification_decision_command_digest_mismatch/,
+    );
+  }
+  assert.equal(calls, 0);
 });
 
 
@@ -612,8 +672,12 @@ test("certification decision resumes with the same command after committed respo
       };
       const firstProduct = driver(fetchImpl);
       const command = certificationDecisionCommand(firstProduct);
+      const commandDigest = await firstProduct.decisionCommandSha256(command);
       await assert.rejects(
-        firstProduct.completeCertificationDecision({ command }),
+        firstProduct.completeCertificationDecision({
+          command,
+          decisionCommandSha256: commandDigest,
+        }),
         /response_lost_after_commit/,
       );
       const restoredCommand = JSON.parse(JSON.stringify(command));
@@ -622,10 +686,19 @@ test("certification decision resumes with the same command after committed respo
           throw new Error("new_idempotency_key_forbidden");
         },
       });
+      assert.equal(
+        await resumedProduct.decisionCommandSha256(restoredCommand),
+        commandDigest,
+      );
       const result = await resumedProduct.completeCertificationDecision({
         command: restoredCommand,
+        decisionCommandSha256: commandDigest,
       });
       assert.equal(result.applied.state, "runtime_pending");
+      assert.equal(
+        result.product_decision_evidence.decision_command_sha256,
+        commandDigest,
+      );
       assert.equal(faultInjected, true);
       assert.deepEqual(
         [...new Set(observedKeys.promote)],
@@ -687,9 +760,11 @@ test("certification decision refuses a promotion that does not target the review
       return true;
     },
   });
+  const command = certificationDecisionCommand(product);
   await assert.rejects(
     product.completeCertificationDecision({
-      command: certificationDecisionCommand(product),
+      command,
+      decisionCommandSha256: await product.decisionCommandSha256(command),
     }),
     /promotion_candidate_identity_mismatch/,
   );
@@ -755,9 +830,11 @@ test("certification decision stops when native Chrome confirmation is declined",
     calls += 1;
     return responses.shift();
   }, undefined, { nativeConfirm: () => false });
+  const command = certificationDecisionCommand(product);
   await assert.rejects(
     product.completeCertificationDecision({
-      command: certificationDecisionCommand(product),
+      command,
+      decisionCommandSha256: await product.decisionCommandSha256(command),
     }),
     /preview_not_approved_by_operator/,
   );
@@ -778,9 +855,11 @@ test("certification decision rejects the POST turn shape at the GET session boun
     }),
   ];
   const product = driver(async () => responses.shift());
+  const command = certificationDecisionCommand(product);
   await assert.rejects(
     product.completeCertificationDecision({
-      command: certificationDecisionCommand(product),
+      command,
+      decisionCommandSha256: await product.decisionCommandSha256(command),
     }),
     /observed_generation_invalid/,
   );

@@ -94,6 +94,7 @@ def chrome_confirmation(
         payload_digest=payload_digest,
         target_content_hash=target_content_hash,
         preview_completion_challenge_sha256=challenge,
+        decision_command_sha256="f" * 64,
         summary={
             "panels": 1,
             "modals": 1,
@@ -389,6 +390,7 @@ class D2EvidenceTest(unittest.TestCase):
             apply_state="runtime_pending",
             runtime_pending_observed=True,
             preview_completion_challenge_sha256="d" * 64,
+            decision_command_sha256="f" * 64,
             chrome_confirmation=chrome_confirmation(),
         )
         self.assertTrue(
@@ -407,6 +409,7 @@ class D2EvidenceTest(unittest.TestCase):
         self.assertEqual(assembled_decision["authoring_session_id"], "session-1")
         self.assertEqual(assembled_decision["authoring_generation"], 1)
         self.assertEqual(assembled_decision["payload_digest"], "a" * 64)
+        self.assertEqual(assembled_decision["decision_command_sha256"], "f" * 64)
         self.assertEqual(
             assembled_decision["chrome_confirmation_sha256"],
             hashlib.sha256(
@@ -434,6 +437,14 @@ class D2EvidenceTest(unittest.TestCase):
             MODULE.EvidenceContractError, "chrome_preview_confirmation_binding_invalid"
         ):
             MODULE.assemble_decision_evidence(mismatched_confirmation)
+        mismatched_command = copy.deepcopy(decision)
+        mismatched_command["chrome_confirmation"]["decision_command_sha256"] = (
+            "e" * 64
+        )
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError, "chrome_preview_confirmation_binding_invalid"
+        ):
+            MODULE.assemble_decision_evidence(mismatched_command)
         for field, path in (
             ("schema_version", None),
             ("revision", None),

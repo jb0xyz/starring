@@ -247,6 +247,7 @@ STEP_SPECS = {
             "public_origin",
             "decision_observed_at",
             "preview_completion_challenge_sha256",
+            "decision_command_sha256",
             "confirmation_surface",
             "chrome_confirmation_sha256",
         ),
@@ -1465,6 +1466,7 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             "payload_digest",
             "target_content_hash",
             "preview_completion_challenge_sha256",
+            "decision_command_sha256",
             "chrome_confirmation_sha256",
         )
         if evidence["installation_id"] != prior_receipts[5]["evidence"]["installation_id"]:

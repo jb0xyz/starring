@@ -914,6 +914,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
             payload_digest=final["payload_digest"],
             target_content_hash=final["target_content_hash"],
             preview_completion_challenge_sha256="f" * 64,
+            decision_command_sha256=final["decision_command_sha256"],
             summary={
                 "panels": 1,
                 "modals": 1,
@@ -938,6 +939,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
             apply_state=final["apply_state"],
             runtime_pending_observed=True,
             preview_completion_challenge_sha256="f" * 64,
+            decision_command_sha256=final["decision_command_sha256"],
             chrome_confirmation=confirmation,
         )
         with self.assertRaisesRegex(

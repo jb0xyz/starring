@@ -185,6 +185,7 @@ def complete_evidence(manifest):
             "public_origin": manifest["cloudflare"]["public_origin"],
             "decision_observed_at": "2099-08-04T01:02:03Z",
             "preview_completion_challenge_sha256": "d" * 64,
+            "decision_command_sha256": "f" * 64,
             "confirmation_surface": "chrome_confirm",
             "chrome_confirmation_sha256": "e" * 64,
         },

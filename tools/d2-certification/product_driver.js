@@ -14,6 +14,7 @@
   const PRODUCT_DECISION_EVIDENCE_KIND = "starring.d2.browser-product-decision-evidence.v1";
   const CHROME_PREVIEW_CONFIRMATION_KIND = "starring.d2.chrome-preview-confirmation.v1";
   const CERTIFICATION_DECISION_COMMAND_KIND = "starring.d2.certification-decision-command.v1";
+  const CERTIFICATION_DECISION_COMMAND_DIGEST_DOMAIN = "starring.d2.certification-decision-command-sha256.v1\u0000";
   const LIVE_EVIDENCE_KIND = "starring.d2.browser-live-evidence.v1";
   const LIVE_LOSS_EVIDENCE_KIND = "starring.d2.browser-live-loss-evidence.v1";
   const REPLACEMENT_EVIDENCE_KIND = "starring.d2.browser-replacement-evidence.v1";
@@ -31,6 +32,25 @@
     "withdrawn",
   ]);
   const FINALIZE_EXISTING_PREVIEW_MESSAGE = "Do not change the current Draft. Keep every existing feature and the current community_hub channel binding exactly unchanged. The only allowed semantic transition is requested_outcome from working_draft to validated_preview. Revalidate the exact current candidate, run the required simulation, and finish with a promotable preview. Do not ask another question.";
+
+  function canonicalJson(value) {
+    if (value === null) {
+      return "null";
+    }
+    if (typeof value === "string" || typeof value === "boolean") {
+      return JSON.stringify(value);
+    }
+    if (typeof value === "number" && Number.isSafeInteger(value)) {
+      return JSON.stringify(value);
+    }
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+    }
+    if (typeof value === "object") {
+      return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+    }
+    throw new Error("canonical_json_value_invalid");
+  }
 
   function requireResourceId(value, label) {
     if (typeof value !== "string" || !RESOURCE_ID.test(value)) {
@@ -584,6 +604,25 @@
       });
     }
 
+    async function decisionCommandSha256(value) {
+      const command = requireCertificationDecisionCommand(value);
+      if (
+        !root.crypto ||
+        !root.crypto.subtle ||
+        typeof root.crypto.subtle.digest !== "function" ||
+        typeof root.TextEncoder !== "function"
+      ) {
+        throw new Error("web_crypto_unavailable");
+      }
+      const encoded = new root.TextEncoder().encode(
+        CERTIFICATION_DECISION_COMMAND_DIGEST_DOMAIN + canonicalJson(command),
+      );
+      const digest = await root.crypto.subtle.digest("SHA-256", encoded);
+      return Array.from(new Uint8Array(digest))
+        .map((value) => value.toString(16).padStart(2, "0"))
+        .join("");
+    }
+
     async function request(path, options = {}) {
       if (typeof path !== "string" || (!path.startsWith("/v1/") && !path.startsWith("/v2/"))) {
         throw new Error("request_path_invalid");
@@ -1033,6 +1072,16 @@
         throw new Error("native_preview_confirmation_unavailable");
       }
       const command = requireCertificationDecisionCommand(input.command);
+      if (!Object.hasOwn(input, "decisionCommandSha256")) {
+        throw new Error("certification_decision_command_digest_required");
+      }
+      const decisionCommandDigest = await decisionCommandSha256(command);
+      if (requireDigest(
+        input.decisionCommandSha256,
+        "decision_command_sha256",
+      ) !== decisionCommandDigest) {
+        throw new Error("certification_decision_command_digest_mismatch");
+      }
       const installationId = command.installation_id;
       const sessionId = command.authoring_session_id;
       const generation = command.authoring_generation;
@@ -1084,6 +1133,7 @@
         payload_digest: preview.body.payload_digest,
         target_content_hash: targetContentHash,
         preview_completion_challenge_sha256: previewCompletionChallengeSha256,
+        decision_command_sha256: decisionCommandDigest,
         summary: safeSummary,
       });
       const confirmed = root.confirm(
@@ -1104,6 +1154,7 @@
         payload_digest: preview.body.payload_digest,
         target_content_hash: targetContentHash,
         preview_completion_challenge_sha256: previewCompletionChallengeSha256,
+        decision_command_sha256: decisionCommandDigest,
         summary: safeSummary,
       });
       const approved = await approve({
@@ -1145,6 +1196,7 @@
         apply_state: applied.body.state,
         runtime_pending_observed: applied.runtime_pending_observed,
         preview_completion_challenge_sha256: previewCompletionChallengeSha256,
+        decision_command_sha256: decisionCommandDigest,
         chrome_confirmation: chromeConfirmation,
       });
       return Object.freeze({
@@ -1595,6 +1647,7 @@
       beginCertificationAuthoring,
       completeCertificationDecision,
       createCertificationDecisionCommand,
+      decisionCommandSha256,
       runOneShotProductFlow,
       waitForLive,
       waitForLiveEvidence: waitForLive,
