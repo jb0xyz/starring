@@ -787,6 +787,8 @@ mod tests {
                 finish_reason: Some("tool_calls".to_string()),
                 request_duration_ms: 900,
                 gateway_model_duration_ms: Some(700),
+                worker_request_id: Some("worker-request-7".to_string()),
+                completion_sha256: Some("a".repeat(64)),
             });
 
         assert_eq!(

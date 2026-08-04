@@ -1178,8 +1178,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use design_harness::{
-        simulate_draft, validate_draft, BurstOutcome, DesignSession, Draft, LlmClient, LlmError,
-        LlmResponse, Message, ResourceBindingMap, SessionConfig, ToolCall, ToolDefinition,
+        simulate_draft, validate_draft, BurstOutcome, DesignSession, Draft, LlmClient,
+        LlmCompletionProvenanceV1, LlmError, LlmResponse, Message, ResourceBindingMap,
+        SessionConfig, ToolCall, ToolDefinition,
     };
     use serde_json::json;
 
@@ -1211,6 +1212,18 @@ mod tests {
         responses: Arc<Mutex<VecDeque<LlmResponse>>>,
         calls: Arc<Mutex<IntentEvalCalls>>,
         metrics: Arc<Mutex<Vec<ModelCallMetric>>>,
+    }
+
+    fn intent_eval_finish_reason(response: &LlmResponse) -> Option<&'static str> {
+        let response = match response {
+            LlmResponse::Provenanced { response, .. } => response.as_ref(),
+            response => response,
+        };
+        match response {
+            LlmResponse::ToolCalls(_) => Some("tool_calls"),
+            LlmResponse::Text(_) => Some("stop"),
+            LlmResponse::Provenanced { .. } => None,
+        }
     }
 
     impl LlmClient for StubClient {
@@ -1247,10 +1260,7 @@ mod tests {
                 .ok_or_else(|| {
                     LlmError::Client("intent eval response queue is empty".to_string())
                 })?;
-            let finish_reason = match &response {
-                LlmResponse::ToolCalls(_) => Some("tool_calls".to_string()),
-                LlmResponse::Text(_) => Some("stop".to_string()),
-            };
+            let finish_reason = intent_eval_finish_reason(&response).map(ToString::to_string);
             let mut metrics = self
                 .metrics
                 .lock()
@@ -1305,6 +1315,41 @@ mod tests {
                 .map(|metrics| metrics.clone())
                 .map_err(|_| LlmError::Client("intent eval metrics are unavailable".to_string()))
         }
+    }
+
+    #[tokio::test]
+    async fn intent_eval_client_preserves_provenanced_responses() {
+        let tool_calls = vec![ToolCall {
+            id: "interpret".to_string(),
+            name: "interpret_intent_core".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let provenance =
+            LlmCompletionProvenanceV1::new("worker-request-7".to_string(), "a".repeat(64)).unwrap();
+        let response = LlmResponse::with_provenance(
+            LlmResponse::ToolCalls(tool_calls.clone()),
+            provenance.clone(),
+        )
+        .unwrap();
+        let client = IntentEvalClient {
+            responses: Arc::new(Mutex::new(VecDeque::from([response.clone()]))),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            metrics: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let returned = client.complete(&[], &[]).await.unwrap();
+
+        assert_eq!(returned, response);
+        assert_eq!(
+            client.model_call_metrics().unwrap()[0]
+                .finish_reason
+                .as_deref(),
+            Some("tool_calls")
+        );
+        assert_eq!(
+            returned.into_response_and_provenance(),
+            (LlmResponse::ToolCalls(tool_calls), Some(provenance))
+        );
     }
 
     #[test]
