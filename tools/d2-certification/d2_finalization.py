@@ -699,7 +699,7 @@ def require_certification_prefix(context):
     receipts = d2_run.load_receipts(
         context.manifest_path, context.manifest, context.digest
     )
-    if len(receipts) != 15:
+    if len(receipts) not in {15, 16, 17}:
         fail("finalization_certification_prefix_incomplete")
     pending = d2_run.coordinator_pending_step(
         context.manifest_path, context.manifest, context.digest, receipts
@@ -1647,6 +1647,7 @@ def command_finalize_run(
     ensure_finalization_directory(context)
     if not _external_present(context, platform):
         fail("external_keychain_identity_absent")
+    _ensure_effect_freeze(context, platform)
     step_path = step_sixteen_evidence_path(context)
     if step_path.exists():
         precleanup, teardown, _intent, _result, absence = _load_database_artifacts(context)
@@ -1683,7 +1684,6 @@ def command_finalize_run(
         if not _external_present(context, platform):
             fail("external_keychain_identity_absent")
         return {"status": "exact_replay", "phase": "cleaned", "step": 16}
-    _ensure_effect_freeze(context, platform)
     if not _external_present(context, platform):
         fail("external_keychain_identity_absent")
     teardown_path = context.artifact_directory / "discord-resource-teardown-evidence.json"

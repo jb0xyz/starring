@@ -238,6 +238,20 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertEqual(self.platform.bootouts, bootouts)
         self.assertEqual(self.platform.keychain_deletes, deletes)
 
+    def test_finalize_run_exact_replay_revalidates_step15_completion(self):
+        self.finalize()
+        bootouts = list(self.platform.bootouts)
+        self.certification_mock.side_effect = ORCHESTRATOR.OrchestratorError(
+            "finalization_certification_prefix_incomplete"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "finalization_certification_prefix_incomplete",
+        ):
+            self.finalize()
+        self.assertEqual(self.platform.bootouts, bootouts)
+        self.assertEqual(self.platform.destroy_calls, 1)
+
     def test_dangling_isolated_root_blocks_step16_and_step17_replay(self):
         self.finalize()
         root = self.context.root
