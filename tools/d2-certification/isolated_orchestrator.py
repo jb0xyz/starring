@@ -13,6 +13,7 @@ import unicodedata
 
 from d2_certification import (
     CertificationError,
+    STEP_SPECS,
     canonical_json,
     load_json_file,
     require_absolute_path,
@@ -62,6 +63,11 @@ from d2_finalization import (
     command_finalize_total_absence,
 )
 from d2_live_runtime_restart import command_certify_live_runtime_restart
+from d2_source_contract import (
+    publish_bootstrap_source,
+    publish_candidate_source,
+    publish_onboarding_source,
+)
 from d2_worker_evidence import capture_worker_authoring_checkpoint
 
 
@@ -284,6 +290,7 @@ def write_database_evidence(context, database_evidence):
         context.artifact_directory / "step-01-evidence.json",
         canonical_json(step_one_evidence) + "\n",
     )
+    return publish_bootstrap_source(context, step_one_evidence, utc_now())
 
 
 def write_candidate_evidence(context, statuses, platform):
@@ -316,6 +323,31 @@ def write_candidate_evidence(context, statuses, platform):
         context.artifact_directory / "step-03-evidence.json",
         canonical_json(evidence) + "\n",
     )
+    return publish_candidate_source(context, evidence, utc_now())
+
+
+def load_step_evidence(context, step):
+    path = context.artifact_directory / f"step-{step:02d}-evidence.json"
+    try:
+        require_owned_mode(path, 0o600, f"step_{step:02d}_evidence")
+    except CertificationError as error:
+        fail(str(error))
+    evidence = load_json(path, f"step_{step:02d}_evidence_invalid")
+    if not isinstance(evidence, dict) or set(evidence) != set(
+        STEP_SPECS[step].required
+    ):
+        fail(f"step_{step:02d}_evidence_invalid")
+    return evidence
+
+
+def candidate_coordinator_sources(context):
+    bootstrap = publish_bootstrap_source(
+        context, load_step_evidence(context, 1), utc_now()
+    )
+    candidate = publish_candidate_source(
+        context, load_step_evidence(context, 3), utc_now()
+    )
+    return {"1": str(bootstrap), "3": str(candidate)}
 
 
 def pinned_transport_instance_id(context):
@@ -359,7 +391,11 @@ def command_start(context, platform):
         require_pinned_transport_snapshot(
             context, platform.transport_control(context, "snapshot")
         )
-        return {"status": "already_started", "phase": "candidate_started"}
+        return {
+            "status": "already_started",
+            "phase": "candidate_started",
+            "coordinator_sources": candidate_coordinator_sources(context),
+        }
     if state["phase"] in {
         "substrate_starting",
         "substrate_started",
@@ -386,7 +422,7 @@ def command_start(context, platform):
             fail("bootstrap_tcp_exposure_detected")
         append_journal(context, "database_bootstrap", "intent", "database")
         database_evidence = platform.bootstrap_database(context)
-        write_database_evidence(context, database_evidence)
+        bootstrap_source = write_database_evidence(context, database_evidence)
         append_journal(context, "database_bootstrap", "complete", "database")
         save_state(context, "credentials_sealing", state["standing_snapshot"])
         present, total = managed_keychain_presence(context, platform)
@@ -416,7 +452,7 @@ def command_start(context, platform):
             fail("candidate_health_unready")
         if standing_snapshot(context, platform) != state["standing_snapshot"]:
             fail("protected_staging_state_changed")
-        write_candidate_evidence(context, statuses, platform)
+        candidate_source = write_candidate_evidence(context, statuses, platform)
         append_journal(context, "postgres_start", "complete", "cluster")
         save_state(context, "candidate_started", state["standing_snapshot"])
         return {
@@ -425,6 +461,10 @@ def command_start(context, platform):
             "candidate_services_loaded": True,
             "database_schema_ready": True,
             "credentials_sealed": True,
+            "coordinator_sources": {
+                "1": str(bootstrap_source),
+                "3": str(candidate_source),
+            },
         }
     except BaseException:
         try:
@@ -521,9 +561,16 @@ def command_onboard(context, platform, principal_id, display_name):
             context.artifact_directory / "onboarding-evidence.json",
             canonical_json(output) + "\n",
         )
+        coordinator_source = publish_onboarding_source(
+            context, output, utc_now()
+        )
         append_journal(context, "installation_onboard", "complete", "installation")
         save_state(context, "candidate_started", state["standing_snapshot"])
-        return {"status": "onboarded", **output}
+        return {
+            "status": "onboarded",
+            **output,
+            "coordinator_source": str(coordinator_source),
+        }
     except BaseException:
         save_state(context, "candidate_started", state["standing_snapshot"])
         append_journal(context, "installation_onboard", "failed", "installation")

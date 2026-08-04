@@ -104,6 +104,7 @@ D2_TOOLCHAIN_SOURCE_FILES = (
     "d2_drained_runtime_restart.py",
     "d2_live_runtime_restart.py",
     "d2_run.py",
+    "d2_source_contract.py",
     "d2_worker_evidence.py",
     "isolated_orchestrator.py",
     "product_driver.js",

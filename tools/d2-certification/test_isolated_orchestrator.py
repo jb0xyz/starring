@@ -34,6 +34,8 @@ CONTRACT = sys.modules["d2_orchestrator_contract"]
 PLATFORM = sys.modules["d2_orchestrator_platform"]
 DRAINED_RUNTIME_RESTART = sys.modules["d2_drained_runtime_restart"]
 LIVE_RUNTIME_RESTART = sys.modules["d2_live_runtime_restart"]
+D2_RUN = sys.modules["d2_run"]
+D2_SOURCE_CONTRACT = sys.modules["d2_source_contract"]
 from test_d2_certification import complete_evidence as complete_certification_evidence
 
 
@@ -723,7 +725,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             self.assertEqual(CERTIFICATION.main(arguments), 0)
         return pathlib.Path(json.loads(output.getvalue())["manifest"])
 
-    def record_prerequisite_receipts(self):
+    def record_prerequisite_receipts(self, coordinator=True):
         evidence_by_step = complete_certification_evidence(self.context.manifest)
         for step in range(1, 11):
             path = self.root / f"live-restart-step-{step}.json"
@@ -746,6 +748,55 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
                     ),
                     0,
                 )
+        if not coordinator:
+            return
+        receipts = D2_RUN.load_receipts(
+            self.manifest_path, self.context.manifest, self.context.digest
+        )
+        D2_RUN.ensure_coordinator_directory(self.manifest_path)
+        for step in range(1, 11):
+            intent = {
+                "schema_version": 1,
+                "kind": D2_RUN.COORDINATOR_INTENT_KIND,
+                "run_id": self.context.manifest["run_id"],
+                "manifest_sha256": self.context.digest,
+                "step": step,
+                "code": D2_RUN.STEP_SPECS[step].code,
+                "observed_at": "2026-08-04T01:02:03Z",
+                "receipt_chain_head_sha256": (
+                    D2_RUN.ZERO_DIGEST
+                    if step == 1
+                    else receipts[step - 2]["receipt_sha256"]
+                ),
+                "sources": [
+                    {
+                        "kind": specification["kind"],
+                        "sha256": hashlib.sha256(
+                            f"{step}:{specification['kind']}".encode("utf-8")
+                        ).hexdigest(),
+                    }
+                    for specification in D2_RUN.STEP_SOURCE_SPECS[step]
+                ],
+            }
+            D2_RUN.write_private_json(
+                D2_RUN.coordinator_intent_path(self.manifest_path, step), intent
+            )
+            completion = {
+                "schema_version": 1,
+                "kind": D2_RUN.COORDINATOR_COMPLETION_KIND,
+                "run_id": self.context.manifest["run_id"],
+                "manifest_sha256": self.context.digest,
+                "step": step,
+                "code": D2_RUN.STEP_SPECS[step].code,
+                "observed_at": "2026-08-04T01:02:03Z",
+                "intent_sha256": D2_RUN.intent_digest(intent),
+                "receipt_sha256": receipts[step - 1]["receipt_sha256"],
+                "receipt_disposition": "created",
+            }
+            D2_RUN.write_private_json(
+                D2_RUN.coordinator_completion_path(self.manifest_path, step),
+                completion,
+            )
 
     def write_live_restart_confirmation(self, awaiting, overrides=None):
         boundary = datetime.datetime.fromisoformat(
@@ -877,6 +928,9 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             )
         started = ORCHESTRATOR.command_start(self.context, self.platform)
         self.assertEqual(started["phase"], "candidate_started")
+        self.assertEqual(set(started["coordinator_sources"]), {"1", "3"})
+        for source in started["coordinator_sources"].values():
+            self.assertEqual(pathlib.Path(source).stat().st_mode & 0o777, 0o600)
         self.assertTrue(started["candidate_services_loaded"])
         self.assertTrue(started["database_schema_ready"])
         self.assertTrue(
@@ -1430,23 +1484,17 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         )
         self.assertEqual(replay["status"], "exact_replay")
         self.assertEqual(replay["new_pid"], result["new_pid"])
+        self.assertEqual(
+            replay["coordinator_source"], result["coordinator_source"]
+        )
         self.assertEqual(len(self.platform.signals), 1)
         self.assertEqual(len(self.platform.start_order), replay_start_count)
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(
-                CERTIFICATION.main(
-                    [
-                        "record",
-                        "--manifest",
-                        str(self.manifest_path),
-                        "--step",
-                        "11",
-                        "--evidence",
-                        str(evidence_path),
-                    ]
-                ),
-                0,
-            )
+        coordinator_source = pathlib.Path(result["coordinator_source"])
+        self.assertEqual(coordinator_source.stat().st_mode & 0o777, 0o600)
+        advanced = D2_RUN.advance_certification(
+            self.manifest_path, 11, [str(coordinator_source)]
+        )
+        self.assertEqual(advanced["step"], 11)
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_live_runtime_restart_rejects_local_identity_pid_mismatch_before_signal(self):
@@ -1951,6 +1999,20 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError,
             "live_runtime_restart_prerequisites_invalid",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertEqual(self.platform.signals, [])
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_runtime_restart_rejects_raw_receipts_without_coordinator_prefix(self):
+        self.record_prerequisite_receipts(coordinator=False)
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        with self.assertRaisesRegex(
+            D2_RUN.CertificationError,
+            "coordinator_intent_missing:1",
         ):
             ORCHESTRATOR.command_certify_live_runtime_restart(
                 self.context, self.platform
@@ -2512,7 +2574,78 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             result["hub_channel_id"],
             self.context.manifest["discord"]["hub_channel_id"],
         )
+        coordinator_source = pathlib.Path(result["coordinator_source"])
+        self.assertEqual(coordinator_source.stat().st_mode & 0o777, 0o600)
+        source = json.loads(coordinator_source.read_text(encoding="utf-8"))
+        self.assertEqual(
+            source["kind"],
+            "starring.d2.orchestrator-onboarding-evidence.v1",
+        )
+        self.assertEqual(source["manifest_sha256"], self.context.digest)
+        replay = ORCHESTRATOR.command_onboard(
+            self.context,
+            self.platform,
+            "discord:1056857223529250906",
+            "보건",
+        )
+        self.assertEqual(
+            replay["coordinator_source"], result["coordinator_source"]
+        )
         self.assertNotIn("display_name", evidence)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_actual_start_and_onboarding_sources_advance_coordinator(self):
+        self.context.artifact_directory.mkdir(mode=0o700, parents=True)
+        prior_absence = D2_SOURCE_CONTRACT.publish_prior_absence_source(
+            self.context,
+            {
+                "schema_version": 1,
+                "kind": D2_SOURCE_CONTRACT.PREFLIGHT_KIND,
+                "observed_at": "2026-08-04T01:02:03Z",
+                "manifest_sha256": self.context.digest,
+                "prior_runtime_owner_count": 0,
+                "prior_smoke_process_count": 0,
+                "standing_snapshot_sha256": "a" * 64,
+                "external_credential_count": 3,
+            },
+        )
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        started = ORCHESTRATOR.command_start(self.context, self.platform)
+        D2_RUN.advance_certification(
+            self.manifest_path, 1, [started["coordinator_sources"]["1"]]
+        )
+        D2_RUN.advance_certification(
+            self.manifest_path, 2, [str(prior_absence)]
+        )
+        D2_RUN.advance_certification(
+            self.manifest_path, 3, [started["coordinator_sources"]["3"]]
+        )
+        onboarded = ORCHESTRATOR.command_onboard(
+            self.context,
+            self.platform,
+            "discord:1056857223529250906",
+            "보건",
+        )
+        authentication = self.root / "browser-authentication.json"
+        authentication.write_text(
+            D2_RUN.canonical_json(
+                {
+                    "schema_version": 1,
+                    "kind": "starring.d2.browser-authentication-evidence.v1",
+                    "observed_at": "2026-08-04T01:02:03Z",
+                    **complete_certification_evidence(self.context.manifest)[4],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        authentication.chmod(0o600)
+        result = D2_RUN.advance_certification(
+            self.manifest_path,
+            4,
+            [str(authentication), onboarded["coordinator_source"]],
+        )
+        self.assertEqual(result["step"], 4)
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_platform_onboarding_output_is_bound_to_the_manifest_hub(self):

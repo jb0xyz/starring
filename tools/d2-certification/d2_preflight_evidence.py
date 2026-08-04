@@ -23,6 +23,7 @@ from d2_orchestrator_contract import (
     write_atomic,
 )
 from d2_orchestrator_platform import Platform
+from d2_source_contract import publish_prior_absence_source
 from isolated_orchestrator import command_dry_run
 
 
@@ -189,10 +190,12 @@ def command_preflight_evidence(context, platform):
         recorded = load_private_evidence(path)
         validate_preflight_evidence(context, recorded)
         status = "recorded"
+    coordinator_source = publish_prior_absence_source(context, recorded)
     return {
         "status": status,
         "manifest_sha256": context.digest,
         "evidence": str(path),
+        "coordinator_source": str(coordinator_source),
     }
 
 

@@ -47,6 +47,7 @@ ORCHESTRATOR_PRIOR_ABSENCE_KIND = (
     "starring.d2.orchestrator-prior-absence-evidence.v1"
 )
 ORCHESTRATOR_CANDIDATE_KIND = "starring.d2.orchestrator-candidate-evidence.v1"
+ORCHESTRATOR_ONBOARDING_KIND = "starring.d2.orchestrator-onboarding-evidence.v1"
 LIVE_RUNTIME_RESTART_KIND = "starring.d2.live-runtime-restart-evidence.v1"
 DB_PRECLEANUP_KIND = "starring.d2.db-precleanup-evidence.v1"
 DISCORD_TEARDOWN_KIND = "starring.d2.discord-resource-teardown.v1"
@@ -76,6 +77,7 @@ STEP_SOURCE_SPECS = {
     3: (source_spec(ORCHESTRATOR_CANDIDATE_KIND, "machine"),),
     4: (
         source_spec("starring.d2.browser-authentication-evidence.v1", "chrome"),
+        source_spec(ORCHESTRATOR_ONBOARDING_KIND, "machine"),
     ),
     5: (
         source_spec("starring.d2.browser-authoring-evidence.v1", "chrome"),
@@ -334,19 +336,67 @@ def validate_source_mapping(step, raw_paths):
     return [loaded[kind] for kind in expected_kinds]
 
 
-def validate_direct_source(step, kind, value):
+def validate_direct_source(step, kind, value, manifest, digest):
     if (
         not isinstance(value, dict)
-        or set(value) != {"schema_version", "kind", "observed_at", "evidence"}
+        or set(value)
+        != {
+            "schema_version",
+            "kind",
+            "observed_at",
+            "manifest_sha256",
+            "run_id",
+            "evidence",
+        }
         or type(value["schema_version"]) is not int
         or value["schema_version"] != SCHEMA_VERSION
         or value["kind"] != kind
         or not validate_utc_timestamp(value["observed_at"])
+        or value["manifest_sha256"] != digest
+        or value["run_id"] != manifest["run_id"]
         or not isinstance(value["evidence"], dict)
         or set(value["evidence"]) != set(STEP_SPECS[step].required)
     ):
         fail("coordinator_direct_source_invalid")
     return dict(value["evidence"])
+
+
+def validate_onboarding_source(value, manifest, digest):
+    fields = {
+        "schema_version",
+        "kind",
+        "observed_at",
+        "manifest_sha256",
+        "run_id",
+        "outcome",
+        "installation_id",
+        "principal_id",
+        "guild_id",
+        "discord_application_id",
+        "binding_key",
+        "hub_channel_id",
+    }
+    discord = manifest["discord"]
+    if (
+        not isinstance(value, dict)
+        or set(value) != fields
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != SCHEMA_VERSION
+        or value["kind"] != ORCHESTRATOR_ONBOARDING_KIND
+        or not validate_utc_timestamp(value["observed_at"])
+        or value["manifest_sha256"] != digest
+        or value["run_id"] != manifest["run_id"]
+        or value["outcome"] not in {"fresh", "exact_replay"}
+        or value["installation_id"]
+        != f"installation:{discord['resource_prefix']}"
+        or value["principal_id"] != f"discord:{discord['actor_id']}"
+        or value["guild_id"] != discord["guild_id"]
+        or value["discord_application_id"] != discord["application_id"]
+        or value["binding_key"] != "community_hub"
+        or value["hub_channel_id"] != discord["hub_channel_id"]
+    ):
+        fail("coordinator_onboarding_source_invalid")
+    return value
 
 
 def finalization_assembler(name):
@@ -411,22 +461,45 @@ def assemble_step_evidence(
     try:
         if step == 1:
             return validate_direct_source(
-                step, ORCHESTRATOR_BOOTSTRAP_KIND, values[ORCHESTRATOR_BOOTSTRAP_KIND]
+                step,
+                ORCHESTRATOR_BOOTSTRAP_KIND,
+                values[ORCHESTRATOR_BOOTSTRAP_KIND],
+                manifest,
+                digest,
             )
         if step == 2:
             return validate_direct_source(
                 step,
                 ORCHESTRATOR_PRIOR_ABSENCE_KIND,
                 values[ORCHESTRATOR_PRIOR_ABSENCE_KIND],
+                manifest,
+                digest,
             )
         if step == 3:
             return validate_direct_source(
-                step, ORCHESTRATOR_CANDIDATE_KIND, values[ORCHESTRATOR_CANDIDATE_KIND]
+                step,
+                ORCHESTRATOR_CANDIDATE_KIND,
+                values[ORCHESTRATOR_CANDIDATE_KIND],
+                manifest,
+                digest,
             )
         if step == 4:
-            return d2_evidence.assemble_authentication_evidence(
+            authentication = d2_evidence.assemble_authentication_evidence(
                 values["starring.d2.browser-authentication-evidence.v1"]
             )
+            onboarding = validate_onboarding_source(
+                values[ORCHESTRATOR_ONBOARDING_KIND], manifest, digest
+            )
+            if (
+                authentication["principal_id"] != onboarding["principal_id"]
+                or authentication["installation_id"]
+                != onboarding["installation_id"]
+                or authentication["guild_id"] != onboarding["guild_id"]
+                or authentication["public_origin"]
+                != manifest["cloudflare"]["public_origin"]
+            ):
+                fail("coordinator_onboarding_binding_invalid")
+            return authentication
         if step == 5:
             worker = values["starring.d2.worker-authoring-evidence.v1"]
             if (
@@ -464,7 +537,11 @@ def assemble_step_evidence(
             )
         if step == 11:
             return validate_direct_source(
-                step, LIVE_RUNTIME_RESTART_KIND, values[LIVE_RUNTIME_RESTART_KIND]
+                step,
+                LIVE_RUNTIME_RESTART_KIND,
+                values[LIVE_RUNTIME_RESTART_KIND],
+                manifest,
+                digest,
             )
         if step == 12:
             return d2_evidence.assemble_reconstruction_evidence(

@@ -8,13 +8,11 @@ import re
 import stat
 import time
 
+import d2_run
 from d2_certification import (
     LIVE_FRESH_LEASE_CHECKPOINT,
     canonical_json,
     fsync_directory,
-    load_receipts_from_handle,
-    open_locked_receipts,
-    require_owned_mode,
 )
 from d2_drained_runtime_restart import (
     command_restart_drained_runtime,
@@ -35,6 +33,7 @@ from d2_orchestrator_contract import (
     utc_now,
     write_atomic,
 )
+from d2_source_contract import publish_live_runtime_restart_source
 
 
 RECORDED_AT_PATTERN = re.compile(
@@ -184,14 +183,25 @@ def step_11_prerequisites(context, receipts):
 
 @contextlib.contextmanager
 def locked_step_11_prerequisites(context):
-    receipts_path = context.manifest_path.with_name("receipts.jsonl")
-    require_owned_mode(receipts_path, 0o600, "receipts")
-    with open_locked_receipts(receipts_path, False) as handle:
-        receipts = load_receipts_from_handle(
-            handle, context.manifest, context.digest
+    with d2_run.coordinator_lock(context.manifest_path, False):
+        receipts = d2_run.load_receipts(
+            context.manifest_path, context.manifest, context.digest
         )
         if len(receipts) != 10:
             fail("live_runtime_restart_prerequisites_invalid")
+        pending = d2_run.coordinator_pending_step(
+            context.manifest_path,
+            context.manifest,
+            context.digest,
+            receipts,
+        )
+        if pending is not None or any(
+            not d2_run.path_present(
+                d2_run.coordinator_completion_path(context.manifest_path, step)
+            )
+            for step in range(1, 11)
+        ):
+            fail("live_runtime_restart_coordinator_prefix_incomplete")
         yield step_11_prerequisites(context, receipts)
 
 
@@ -854,7 +864,10 @@ def publish_step_11_evidence(context, completion):
             fail("live_runtime_restart_step_11_evidence_changed")
     else:
         write_live_runtime_restart_record(context, "step-11-evidence", evidence)
-    return evidence, path
+    coordinator_source = publish_live_runtime_restart_source(
+        context, evidence, completion["recorded_at"]
+    )
+    return evidence, path, coordinator_source
 
 
 def require_completed_live_runtime_restart(
@@ -931,7 +944,9 @@ def require_bound_running_runtime_identity(
     return after, process["process_instance_id"]
 
 
-def live_runtime_restart_result(status, completion, evidence, evidence_path):
+def live_runtime_restart_result(
+    status, completion, evidence, evidence_path, coordinator_source
+):
     return {
         "status": status,
         "phase": "candidate_started",
@@ -950,6 +965,7 @@ def live_runtime_restart_result(status, completion, evidence, evidence_path):
             "canonical_confirmation_sha256"
         ],
         "evidence_path": str(evidence_path),
+        "coordinator_source": str(coordinator_source),
     }
 
 
@@ -1001,9 +1017,15 @@ def certify_live_runtime_restart(
         ensure_live_runtime_restart_journal(
             context, "complete", completion["operation_id"]
         )
-        evidence, evidence_path = publish_step_11_evidence(context, completion)
+        evidence, evidence_path, coordinator_source = publish_step_11_evidence(
+            context, completion
+        )
         return live_runtime_restart_result(
-            "exact_replay", completion, evidence, evidence_path
+            "exact_replay",
+            completion,
+            evidence,
+            evidence_path,
+            coordinator_source,
         )
     if intent is None:
         identity = drained_runtime_restart_identity(context)
@@ -1179,9 +1201,15 @@ def certify_live_runtime_restart(
     ensure_live_runtime_restart_journal(
         context, "complete", intent["operation_id"]
     )
-    evidence, evidence_path = publish_step_11_evidence(context, completion)
+    evidence, evidence_path, coordinator_source = publish_step_11_evidence(
+        context, completion
+    )
     return live_runtime_restart_result(
-        "live_runtime_restart_certified", completion, evidence, evidence_path
+        "live_runtime_restart_certified",
+        completion,
+        evidence,
+        evidence_path,
+        coordinator_source,
     )
 
 

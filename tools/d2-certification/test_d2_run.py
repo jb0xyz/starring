@@ -48,7 +48,12 @@ class D2RunCoordinatorTest(unittest.TestCase):
 
     def direct_source(self, step, kind):
         return self.write_source(
-            self.envelope(kind, evidence=self.complete[step])
+            self.envelope(
+                kind,
+                manifest_sha256=self.manifest_digest,
+                run_id=self.manifest["run_id"],
+                evidence=self.complete[step],
+            )
         )
 
     def object_digest(self, value):
@@ -324,7 +329,31 @@ class D2RunCoordinatorTest(unittest.TestCase):
                 }
             ],
         )
-        self.append_prior(4)
+        self.append_prior(3)
+        action = d2_run.next_certification_action(self.manifest_path)
+        self.assertEqual(action["step"], 4)
+        self.assertEqual(
+            action["required_sources"],
+            [
+                {
+                    "kind": "starring.d2.browser-authentication-evidence.v1",
+                    "mode": "chrome",
+                },
+                {
+                    "kind": d2_run.ORCHESTRATOR_ONBOARDING_KIND,
+                    "mode": "machine",
+                },
+            ],
+        )
+        d2_run.append_step_receipt(
+            self.verified_path,
+            self.manifest,
+            self.manifest_digest,
+            4,
+            self.complete[4],
+            OBSERVED_AT,
+        )
+        self.write_coordinator_records(last_step=4)
         action = d2_run.next_certification_action(self.manifest_path)
         self.assertEqual(action["step"], 5)
         self.assertEqual(
@@ -375,6 +404,26 @@ class D2RunCoordinatorTest(unittest.TestCase):
         self.assertEqual(
             set(intent["sources"][0]), {"kind", "sha256"}
         )
+
+    def test_direct_machine_source_requires_current_manifest_and_run(self):
+        for field, value in (
+            ("manifest_sha256", "f" * 64),
+            ("run_id", "d2-20260804t010203z-ffffffffffff"),
+        ):
+            with self.subTest(field=field):
+                source = self.direct_source(
+                    1, d2_run.ORCHESTRATOR_BOOTSTRAP_KIND
+                )
+                envelope = json.loads(source.read_text(encoding="utf-8"))
+                envelope[field] = value
+                self.rewrite_record(source, envelope)
+                with self.assertRaisesRegex(
+                    d2_run.CertificationError,
+                    "coordinator_direct_source_invalid",
+                ):
+                    d2_run.advance_certification(
+                        self.manifest_path, 1, [str(source)]
+                    )
 
     def test_raw_final_evidence_and_wrong_next_step_are_rejected(self):
         raw = self.write_source(self.complete[1])

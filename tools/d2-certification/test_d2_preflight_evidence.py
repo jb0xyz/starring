@@ -1,3 +1,4 @@
+import json
 import pathlib
 import subprocess
 import sys
@@ -138,6 +139,23 @@ class PreflightEvidenceTests(unittest.TestCase):
         self.assertEqual(value["prior_runtime_owner_count"], 0)
         self.assertEqual(value["prior_smoke_process_count"], 0)
         self.assertEqual(value["external_credential_count"], 3)
+        source_path = pathlib.Path(first["coordinator_source"])
+        self.assertEqual(first["coordinator_source"], replay["coordinator_source"])
+        self.assertEqual(source_path.stat().st_mode & 0o777, 0o600)
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            source["kind"],
+            "starring.d2.orchestrator-prior-absence-evidence.v1",
+        )
+        self.assertEqual(source["manifest_sha256"], self.context.digest)
+        self.assertEqual(source["run_id"], self.context.manifest["run_id"])
+        self.assertEqual(
+            source["evidence"],
+            {
+                "prior_runtime_owner_count": 0,
+                "prior_smoke_process_count": 0,
+            },
+        )
 
     def test_busy_owner_and_process_fail_without_writing_evidence(self):
         cases = [
