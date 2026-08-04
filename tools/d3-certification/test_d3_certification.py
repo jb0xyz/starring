@@ -501,43 +501,117 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(status, 1)
         self.assertIn("pr_base_changed", error)
 
-    def install_fake_gh(self, head_sha):
+    def install_fake_gh(
+        self,
+        head_sha,
+        run_overrides=None,
+        workflow_overrides=None,
+        jobs=None,
+    ):
         directory = self.root / "bin"
         directory.mkdir(exist_ok=True)
         script = directory / "gh"
-        value = {
+        run_value = {
             "id": 101,
             "workflow_id": 202,
             "name": "CI",
+            "path": ".github/workflows/ci.yml@main",
             "event": "push",
+            "head_branch": "main",
             "head_sha": head_sha,
             "status": "completed",
             "conclusion": "success",
+            "run_attempt": 1,
+            "pull_requests": [],
+            "repository": {"full_name": "owner/repository"},
+            "head_repository": {"full_name": "owner/repository"},
         }
-        body = f"#!{sys.executable}\nimport json\nprint(json.dumps({value!r}))\n"
+        if run_overrides:
+            run_value.update(run_overrides)
+        workflow_value = {
+            "id": 202,
+            "name": "CI",
+            "path": ".github/workflows/ci.yml",
+            "state": "active",
+        }
+        if workflow_overrides:
+            workflow_value.update(workflow_overrides)
+        if jobs is None:
+            jobs = [
+                {
+                    "id": 301,
+                    "run_id": 101,
+                    "workflow_name": "CI",
+                    "head_branch": "main",
+                    "head_sha": head_sha,
+                    "name": "checks",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "id": 302,
+                    "run_id": 101,
+                    "workflow_name": "CI",
+                    "head_branch": "main",
+                    "head_sha": head_sha,
+                    "name": "postgres",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+            ]
+        responses = {
+            "repos/owner/repository/actions/runs/101": run_value,
+            "repos/owner/repository/actions/workflows/202": workflow_value,
+            "repos/owner/repository/actions/runs/101/jobs?filter=latest&per_page=100": {
+                "total_count": len(jobs),
+                "jobs": jobs,
+            },
+        }
+        body = f"""#!{sys.executable}
+import json
+import sys
+
+responses = {responses!r}
+endpoint = sys.argv[-1]
+if endpoint not in responses:
+    raise SystemExit(2)
+print(json.dumps(responses[endpoint]))
+"""
         write(script, body, 0o700)
-        self.previous_path = os.environ.get("PATH", "")
-        os.environ["PATH"] = str(directory) + os.pathsep + self.previous_path
+        if not hasattr(self, "previous_path"):
+            self.previous_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(directory) + os.pathsep + self.previous_path
+
+    def finalize_arguments(self, state_path):
+        return [
+            "finalize",
+            "--state",
+            str(state_path),
+            "--github-repository",
+            "owner/repository",
+            "--actions-run-id",
+            "101",
+        ]
 
     def test_finalize_requires_main_tree_and_successful_actions(self):
         state_path = self.complete_prerequisites()
         git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
         self.install_fake_gh(self.merge)
         try:
-            arguments = [
-                "finalize",
-                "--state",
-                str(state_path),
-                "--github-repository",
-                "owner/repository",
-                "--actions-run-id",
-                "101",
-            ]
+            arguments = self.finalize_arguments(state_path)
             status, result, error = self.invoke(arguments)
             self.assertEqual(status, 0, error)
             self.assertEqual(result["status"], "passed")
             self.assertEqual(result["main_tree"], self.tree)
             self.assertEqual(result["actions_runs"][0]["id"], 101)
+            self.assertEqual(
+                result["actions_runs"][0]["workflow_path"],
+                ".github/workflows/ci.yml",
+            )
+            self.assertEqual(
+                [job["name"] for job in result["actions_runs"][0]["jobs"]],
+                ["checks", "postgres"],
+            )
             status, replay, error = self.invoke(arguments)
             self.assertEqual(status, 0, error)
             self.assertEqual(replay["disposition"], "exact_replay")
@@ -548,6 +622,109 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             status, _, error = self.invoke(arguments)
             self.assertEqual(status, 1)
             self.assertIn("final_record_mismatch", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_finalize_rejects_pull_request_actions_run(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        self.install_fake_gh(self.merge, run_overrides={"event": "pull_request"})
+        try:
+            status, _, error = self.invoke(self.finalize_arguments(state_path))
+            self.assertEqual(status, 1)
+            self.assertIn("actions_run_identity_invalid", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_finalize_rejects_workflow_dispatch_actions_run(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        self.install_fake_gh(self.merge, run_overrides={"event": "workflow_dispatch"})
+        try:
+            status, _, error = self.invoke(self.finalize_arguments(state_path))
+            self.assertEqual(status, 1)
+            self.assertIn("actions_run_identity_invalid", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_finalize_rejects_foreign_actions_workflow(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        self.install_fake_gh(
+            self.merge,
+            workflow_overrides={"path": ".github/workflows/foreign.yml"},
+        )
+        try:
+            status, _, error = self.invoke(self.finalize_arguments(state_path))
+            self.assertEqual(status, 1)
+            self.assertIn("actions_workflow_identity_invalid", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_finalize_rejects_foreign_actions_branch(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        self.install_fake_gh(self.merge, run_overrides={"head_branch": "release"})
+        try:
+            status, _, error = self.invoke(self.finalize_arguments(state_path))
+            self.assertEqual(status, 1)
+            self.assertIn("actions_run_identity_invalid", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_finalize_rejects_skipped_postgres_job(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        jobs = [
+            {
+                "id": 301,
+                "run_id": 101,
+                "workflow_name": "CI",
+                "head_branch": "main",
+                "head_sha": self.merge,
+                "name": "checks",
+                "status": "completed",
+                "conclusion": "success",
+            },
+            {
+                "id": 302,
+                "run_id": 101,
+                "workflow_name": "CI",
+                "head_branch": "main",
+                "head_sha": self.merge,
+                "name": "postgres",
+                "status": "completed",
+                "conclusion": "skipped",
+            },
+        ]
+        self.install_fake_gh(self.merge, jobs=jobs)
+        try:
+            status, _, error = self.invoke(self.finalize_arguments(state_path))
+            self.assertEqual(status, 1)
+            self.assertIn("actions_jobs_invalid", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_finalize_rejects_missing_postgres_job(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        jobs = [
+            {
+                "id": 301,
+                "run_id": 101,
+                "workflow_name": "CI",
+                "head_branch": "main",
+                "head_sha": self.merge,
+                "name": "checks",
+                "status": "completed",
+                "conclusion": "success",
+            }
+        ]
+        self.install_fake_gh(self.merge, jobs=jobs)
+        try:
+            status, _, error = self.invoke(self.finalize_arguments(state_path))
+            self.assertEqual(status, 1)
+            self.assertIn("actions_jobs_invalid", error)
         finally:
             os.environ["PATH"] = self.previous_path
 

@@ -44,6 +44,12 @@ D2_STEP_CODES = (
     "test_resources_torn_down",
     "total_absence_confirmed",
 )
+REQUIRED_ACTIONS_WORKFLOW = {
+    "name": "CI",
+    "path": ".github/workflows/ci.yml",
+    "state": "active",
+}
+REQUIRED_ACTIONS_JOBS = ("checks", "postgres")
 SAFE_ENVIRONMENT_NAMES = (
     "CARGO_HOME",
     "DEVELOPER_DIR",
@@ -1123,7 +1129,7 @@ def load_recheck(root, state):
     return record
 
 
-def github_run(repository, run_id, main_commit):
+def github_run(repository, run_id, main_commit, base_ref):
     if type(run_id) is not int or run_id <= 0 or run_id > 9223372036854775807:
         fail("actions_run_id_invalid")
     _, raw = run_process(
@@ -1134,27 +1140,104 @@ def github_run(repository, run_id, main_commit):
     value = load_json_bytes(raw, "actions_run")
     if not isinstance(value, dict):
         fail("actions_run_invalid")
+    workflow_id = value.get("workflow_id")
+    repository_identity = value.get("repository")
+    head_repository_identity = value.get("head_repository")
+    run_attempt = value.get("run_attempt")
     if (
         value.get("id") != run_id
         or value.get("head_sha") != main_commit
-        or value.get("status") != "completed"
-        or value.get("conclusion") != "success"
-        or type(value.get("workflow_id")) is not int
-        or value["workflow_id"] <= 0
-        or not isinstance(value.get("name"), str)
-        or not value["name"]
-        or not isinstance(value.get("event"), str)
-        or not value["event"]
+        or value.get("head_branch") != base_ref
+        or value.get("event") != "push"
+        or value.get("name") != REQUIRED_ACTIONS_WORKFLOW["name"]
+        or value.get("path")
+        != f"{REQUIRED_ACTIONS_WORKFLOW['path']}@{base_ref}"
+        or value.get("pull_requests") != []
+        or not isinstance(repository_identity, dict)
+        or repository_identity.get("full_name") != repository
+        or not isinstance(head_repository_identity, dict)
+        or head_repository_identity.get("full_name") != repository
+        or type(run_attempt) is not int
+        or run_attempt <= 0
     ):
+        fail("actions_run_identity_invalid")
+    if value.get("status") != "completed" or value.get("conclusion") != "success":
         fail("actions_run_not_successful")
+    if type(workflow_id) is not int or workflow_id <= 0:
+        fail("actions_workflow_identity_invalid")
+    _, raw_workflow = run_process(
+        ["gh", "api", f"repos/{repository}/actions/workflows/{workflow_id}"],
+        pathlib.Path.cwd(),
+        f"actions_workflow_{workflow_id}",
+    )
+    workflow = load_json_bytes(raw_workflow, "actions_workflow")
+    if (
+        not isinstance(workflow, dict)
+        or workflow.get("id") != workflow_id
+        or workflow.get("name") != REQUIRED_ACTIONS_WORKFLOW["name"]
+        or workflow.get("path") != REQUIRED_ACTIONS_WORKFLOW["path"]
+        or workflow.get("state") != REQUIRED_ACTIONS_WORKFLOW["state"]
+    ):
+        fail("actions_workflow_identity_invalid")
+    _, raw_jobs = run_process(
+        [
+            "gh",
+            "api",
+            f"repos/{repository}/actions/runs/{run_id}/jobs?filter=latest&per_page=100",
+        ],
+        pathlib.Path.cwd(),
+        f"actions_jobs_{run_id}",
+    )
+    jobs_value = load_json_bytes(raw_jobs, "actions_jobs")
+    jobs = jobs_value.get("jobs") if isinstance(jobs_value, dict) else None
+    if (
+        not isinstance(jobs, list)
+        or jobs_value.get("total_count") != len(REQUIRED_ACTIONS_JOBS)
+        or len(jobs) != len(REQUIRED_ACTIONS_JOBS)
+    ):
+        fail("actions_jobs_invalid")
+    normalized_jobs = []
+    observed_names = set()
+    for job in jobs:
+        if (
+            not isinstance(job, dict)
+            or type(job.get("id")) is not int
+            or job["id"] <= 0
+            or job.get("run_id") != run_id
+            or job.get("workflow_name") != REQUIRED_ACTIONS_WORKFLOW["name"]
+            or job.get("head_branch") != base_ref
+            or job.get("head_sha") != main_commit
+            or job.get("name") not in REQUIRED_ACTIONS_JOBS
+            or job.get("status") != "completed"
+            or job.get("conclusion") != "success"
+            or job["name"] in observed_names
+        ):
+            fail("actions_jobs_invalid")
+        observed_names.add(job["name"])
+        normalized_jobs.append(
+            {
+                "id": job["id"],
+                "name": job["name"],
+                "status": "completed",
+                "conclusion": "success",
+            }
+        )
+    if observed_names != set(REQUIRED_ACTIONS_JOBS):
+        fail("actions_jobs_invalid")
+    normalized_jobs.sort(key=lambda job: REQUIRED_ACTIONS_JOBS.index(job["name"]))
     return {
         "id": run_id,
-        "workflow_id": value["workflow_id"],
-        "name": value["name"],
-        "event": value["event"],
+        "run_attempt": run_attempt,
+        "workflow_id": workflow_id,
+        "workflow_name": workflow["name"],
+        "workflow_path": workflow["path"],
+        "head_branch": value["head_branch"],
         "head_sha": value["head_sha"],
+        "event": "push",
+        "repository": repository,
         "status": "completed",
         "conclusion": "success",
+        "jobs": normalized_jobs,
     }
 
 
@@ -1163,7 +1246,7 @@ def command_finalize(arguments):
     if not REPOSITORY_PATTERN.fullmatch(repository):
         fail("github_repository_invalid")
     run_ids = arguments.actions_run_id
-    if not run_ids or len(run_ids) != len(set(run_ids)):
+    if len(run_ids) != 1 or len(run_ids) != len(set(run_ids)):
         fail("actions_run_ids_invalid")
     state_argument, root = state_lock_target(arguments.state)
     with StateLock(root):
@@ -1197,7 +1280,10 @@ def command_finalize(arguments):
         main_tree = commit_tree(repo, main_commit, "finalize_main")
         if main_tree != state["merge_tree"]:
             fail("main_tree_mismatch")
-        runs = [github_run(repository, run_id, main_commit) for run_id in run_ids]
+        runs = [
+            github_run(repository, run_id, main_commit, state["base_ref"])
+            for run_id in run_ids
+        ]
         final_path = root / "final.json"
         identity = {
             "schema_version": SCHEMA_VERSION,
