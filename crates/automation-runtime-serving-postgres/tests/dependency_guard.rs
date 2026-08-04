@@ -483,9 +483,14 @@ fn database_readiness_rejects_every_foreign_database_capability() {
 }
 
 #[test]
-fn postgres_security_proof_owns_its_ephemeral_cluster() {
+fn postgres_security_proof_uses_only_strict_test_servers() {
     let proof = include_str!("postgres_security.rs");
     for required in [
+        "enum PostgresTestServer",
+        "STARRING_TEST_DATABASE_URL",
+        "refusing to use a database outside the strict Starring test namespace",
+        "Self::External(Box::new(options))",
+        "Self::Ephemeral(EphemeralPostgresCluster::start())",
         "struct EphemeralPostgresCluster",
         "STARRING_TEST_INITDB",
         "STARRING_TEST_PG_CTL",
@@ -497,7 +502,6 @@ fn postgres_security_proof_owns_its_ephemeral_cluster() {
     ] {
         assert!(proof.contains(required));
     }
-    assert!(!proof.contains("STARRING_TEST_DATABASE_URL"));
 }
 
 #[test]
