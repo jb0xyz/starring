@@ -578,6 +578,13 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temporary.name).resolve()
+        self.registry_path = self.root / "discord-ownership-registry.json"
+        self.registry_patch = mock.patch.object(
+            CONTRACT,
+            "GLOBAL_DISCORD_OWNERSHIP_REGISTRY_PATH",
+            self.registry_path,
+        )
+        self.registry_patch.start()
         self.artifact_root = self.root / "immutable-candidates"
         self.artifact_root.mkdir()
         self.run_id = f"d2-20260801t120000z-{secrets.token_hex(6)}"
@@ -631,6 +638,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             if path.is_dir():
                 path.chmod(0o700)
         self.artifact_root.chmod(0o700)
+        self.registry_patch.stop()
         self.temporary.cleanup()
 
     def advance_live_clock(self, seconds):
@@ -679,7 +687,12 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         } | {hub_channel_id}
         return self.platform.resource_inventory(self.context)
 
-    def prepare_manifest(self):
+    def prepare_manifest(
+        self,
+        guild_id="1524810437118525551",
+        application_id="1524810437118525552",
+        bot_user_id="1524810437118525553",
+    ):
         arguments = [
             "prepare",
             "--output-root",
@@ -687,13 +700,13 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             "--commit",
             "a" * 40,
             "--discord-guild-id",
-            "1524810437118525551",
+            guild_id,
             "--discord-hub-channel-id",
             "1524810437118525554",
             "--discord-application-id",
-            "1524810437118525552",
+            application_id,
             "--discord-bot-user-id",
-            "1524810437118525553",
+            bot_user_id,
             "--discord-actor-id",
             "1056857223529250906",
             "--discord-oauth-keychain",
@@ -724,6 +737,30 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         with contextlib.redirect_stdout(output):
             self.assertEqual(CERTIFICATION.main(arguments), 0)
         return pathlib.Path(json.loads(output.getvalue())["manifest"])
+
+    def prepare_additional_context(
+        self,
+        guild_id,
+        application_id,
+        bot_user_id,
+    ):
+        original_run_id = self.run_id
+        self.run_id = f"d2-20260801t120000z-{secrets.token_hex(6)}"
+        try:
+            manifest_path = self.prepare_manifest(
+                guild_id=guild_id,
+                application_id=application_id,
+                bot_user_id=bot_user_id,
+            )
+        finally:
+            self.run_id = original_run_id
+        context = ORCHESTRATOR.load_context(manifest_path)
+        self.addCleanup(
+            lambda: ORCHESTRATOR.guarded_remove_root(context)
+            if context.root.exists()
+            else None
+        )
+        return context
 
     def record_prerequisite_receipts(self, coordinator=True):
         evidence_by_step = complete_certification_evidence(self.context.manifest)
@@ -917,6 +954,14 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
     def test_prepare_start_stop_cleanup_is_idempotent_and_preserves_staging(self):
         prepared = ORCHESTRATOR.command_prepare(self.context, self.platform)
         self.assertEqual(prepared["phase"], "prepared")
+        registry = CONTRACT.load_discord_ownership_registry()
+        self.assertEqual(
+            registry["owners"],
+            [CONTRACT.discord_ownership_record(self.context)],
+        )
+        self.assertEqual(self.registry_path.stat().st_mode & 0o777, 0o600)
+        replayed_prepare = ORCHESTRATOR.command_prepare(self.context, self.platform)
+        self.assertEqual(replayed_prepare["status"], "already_prepared")
         self.assertTrue((self.isolated_root / "postgres" / "PG_VERSION").is_file())
         self.assertEqual(len(self.platform.keychain_writes), 4)
         for name in ("api", "runtime", "worker", "transport", "tunnel"):
@@ -997,6 +1042,105 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         )
         again = ORCHESTRATOR.command_cleanup(self.context, self.platform)
         self.assertEqual(again["status"], "already_cleaned")
+        self.assertEqual(CONTRACT.load_discord_ownership_registry()["owners"], [])
+
+    def test_prepare_rejects_other_run_with_same_guild_or_application(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        same_guild = self.prepare_additional_context(
+            guild_id=self.context.manifest["discord"]["guild_id"],
+            application_id="1524810437118525602",
+            bot_user_id="1524810437118525603",
+        )
+        same_application = self.prepare_additional_context(
+            guild_id="1524810437118525611",
+            application_id=self.context.manifest["discord"]["application_id"],
+            bot_user_id="1524810437118525613",
+        )
+        keychain_write_count = len(self.platform.keychain_writes)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "discord_guild_owned_by_other_d2_run",
+        ):
+            ORCHESTRATOR.command_prepare(same_guild, self.platform)
+        self.assertFalse(same_guild.artifact_directory.exists())
+        self.assertFalse(same_guild.root.exists())
+        self.assertEqual(len(self.platform.keychain_writes), keychain_write_count)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "discord_application_owned_by_other_d2_run",
+        ):
+            ORCHESTRATOR.command_prepare(same_application, self.platform)
+        self.assertFalse(same_application.artifact_directory.exists())
+        self.assertFalse(same_application.root.exists())
+        self.assertEqual(len(self.platform.keychain_writes), keychain_write_count)
+        self.assertEqual(
+            CONTRACT.load_discord_ownership_registry()["owners"],
+            [CONTRACT.discord_ownership_record(self.context)],
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_distinct_discord_identities_have_distinct_durable_owners(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        other = self.prepare_additional_context(
+            guild_id="1524810437118525621",
+            application_id="1524810437118525622",
+            bot_user_id="1524810437118525623",
+        )
+        ORCHESTRATOR.command_prepare(other, self.platform)
+        self.assertEqual(
+            set(
+                owner["run_id"]
+                for owner in CONTRACT.load_discord_ownership_registry()["owners"]
+            ),
+            {self.context.manifest["run_id"], other.manifest["run_id"]},
+        )
+        ORCHESTRATOR.command_cleanup(other, self.platform)
+        self.assertEqual(
+            CONTRACT.load_discord_ownership_registry()["owners"],
+            [CONTRACT.discord_ownership_record(self.context)],
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_prepare_replay_fails_closed_when_durable_owner_is_missing(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        CONTRACT.write_discord_ownership_registry(
+            CONTRACT.empty_discord_ownership_registry()
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "discord_ownership_claim_absent",
+        ):
+            ORCHESTRATOR.command_prepare(self.context, self.platform)
+        CONTRACT.claim_discord_ownership(self.context)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_registry_permissions_and_shape_fail_closed(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.registry_path.chmod(0o644)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "discord_ownership_registry_invalid",
+        ):
+            ORCHESTRATOR.command_dry_run(self.context, self.platform)
+        self.registry_path.chmod(0o600)
+        self.registry_path.write_text('{"owners":[],"owners":[]}\n', encoding="utf-8")
+        self.registry_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "discord_ownership_registry_invalid",
+        ):
+            ORCHESTRATOR.command_dry_run(self.context, self.platform)
+        self.registry_path.unlink()
+        outside = self.root / "registry-target.json"
+        outside.write_text("{}\n", encoding="utf-8")
+        outside.chmod(0o600)
+        self.registry_path.symlink_to(outside)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "discord_ownership_registry_invalid",
+        ):
+            ORCHESTRATOR.command_dry_run(self.context, self.platform)
 
     def test_generated_jobs_are_unloaded_and_reference_only_dedicated_credentials(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
@@ -1319,6 +1463,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         with self.assertRaisesRegex(ORCHESTRATOR.OrchestratorError, "injected_initdb_failure"):
             ORCHESTRATOR.command_prepare(self.context, self.platform)
         self.assertFalse(self.isolated_root.exists())
+        self.assertEqual(CONTRACT.load_discord_ownership_registry()["owners"], [])
         state = ORCHESTRATOR.load_state(self.context, {"cleaned"})
         self.assertEqual(state["phase"], "cleaned")
         receipts = [
@@ -2515,11 +2660,19 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         ORCHESTRATOR.save_state(
             self.context, "preparing", preflight["standing_snapshot"]
         )
+        CONTRACT.claim_discord_ownership(self.context)
+        self.assertEqual(
+            CONTRACT.load_discord_ownership_registry()["owners"],
+            [CONTRACT.discord_ownership_record(self.context)],
+        )
         self.isolated_root.mkdir(mode=0o700)
         (self.isolated_root / "partial").write_text("partial", encoding="utf-8")
         result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
         self.assertEqual(result["phase"], "cleaned")
         self.assertFalse(self.isolated_root.exists())
+        self.assertEqual(CONTRACT.load_discord_ownership_registry()["owners"], [])
+        replay = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(replay["status"], "already_cleaned")
 
     def test_candidate_starting_state_is_bounded_stopped_then_retried(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
@@ -2845,6 +2998,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
 
     def test_cleanup_refuses_keychain_namespace_without_matching_owner(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
+        owner = CONTRACT.discord_ownership_record(self.context)
         service = self.context.manifest["keychain_services"]["api"]
         account = ORCHESTRATOR.keychain_inventory(self.context)[0][1]
         self.platform.keychain.add((service, account))
@@ -2854,8 +3008,12 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         ):
             ORCHESTRATOR.command_cleanup(self.context, self.platform)
         self.assertIn((service, account), self.platform.keychain)
+        self.assertEqual(
+            CONTRACT.load_discord_ownership_registry()["owners"], [owner]
+        )
         self.platform.owner_values[service] = self.context.manifest["run_id"]
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(CONTRACT.load_discord_ownership_registry()["owners"], [])
 
     def test_cleanup_never_dispatches_a_protected_label_or_credential(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)

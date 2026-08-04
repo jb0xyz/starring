@@ -34,6 +34,9 @@ REQUIRED_PROGRAMS = {
 PROTECTED_PORTS = {5432, 18080, 18181, 19091}
 PROTECTED_PLIST_ROOT = pathlib.Path.home() / "Library" / "LaunchAgents"
 IDENTITY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$")
+DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+RUN_ID_PATTERN = re.compile(r"^d2-[0-9]{8}t[0-9]{6}z-[0-9a-f]{12}$")
+SNOWFLAKE_PATTERN = re.compile(r"^[1-9][0-9]{0,19}$")
 PHASES = {
     "preparing",
     "prepared",
@@ -89,6 +92,18 @@ PROTECTED_KEYCHAIN_SERVICES = {
     "com.cloudflare.tunnel.macmini-llm-prod",
 }
 GLOBAL_LOCK_PATH = pathlib.Path("/private/tmp/starring-d2-certification.lock")
+GLOBAL_DISCORD_OWNERSHIP_REGISTRY_PATH = pathlib.Path(
+    "/private/tmp/starring-d2-discord-ownership-registry.json"
+)
+DISCORD_OWNERSHIP_REGISTRY_KIND = "starring.d2.discord-ownership-registry.v1"
+DISCORD_OWNERSHIP_RECORD_FIELDS = {
+    "run_id",
+    "manifest_sha256",
+    "manifest_path",
+    "guild_id",
+    "application_id",
+    "bot_user_id",
+}
 
 
 class OrchestratorError(Exception):
@@ -143,6 +158,196 @@ def load_json(path, code):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         fail(code)
+
+
+def strict_registry_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail("discord_ownership_registry_invalid")
+        value[key] = item
+    return value
+
+
+def validate_registry_snowflake(value):
+    if (
+        not isinstance(value, str)
+        or not SNOWFLAKE_PATTERN.fullmatch(value)
+        or int(value) > 18446744073709551615
+    ):
+        fail("discord_ownership_registry_invalid")
+    return value
+
+
+def validate_discord_ownership_registry(registry):
+    if (
+        not isinstance(registry, dict)
+        or set(registry) != {"schema_version", "kind", "owners"}
+        or type(registry.get("schema_version")) is not int
+        or registry.get("schema_version") != SCHEMA_VERSION
+        or registry.get("kind") != DISCORD_OWNERSHIP_REGISTRY_KIND
+        or not isinstance(registry.get("owners"), list)
+    ):
+        fail("discord_ownership_registry_invalid")
+    owners = registry["owners"]
+    for owner in owners:
+        if not isinstance(owner, dict) or set(owner) != DISCORD_OWNERSHIP_RECORD_FIELDS:
+            fail("discord_ownership_registry_invalid")
+        if (
+            not isinstance(owner["run_id"], str)
+            or not RUN_ID_PATTERN.fullmatch(owner["run_id"])
+            or not isinstance(owner["manifest_sha256"], str)
+            or not DIGEST_PATTERN.fullmatch(owner["manifest_sha256"])
+            or not isinstance(owner["manifest_path"], str)
+            or not pathlib.Path(owner["manifest_path"]).is_absolute()
+        ):
+            fail("discord_ownership_registry_invalid")
+        validate_registry_snowflake(owner["guild_id"])
+        validate_registry_snowflake(owner["application_id"])
+        validate_registry_snowflake(owner["bot_user_id"])
+    if owners != sorted(owners, key=lambda owner: owner["run_id"]):
+        fail("discord_ownership_registry_invalid")
+    for field in (
+        "run_id",
+        "manifest_sha256",
+        "manifest_path",
+        "guild_id",
+        "application_id",
+    ):
+        values = [owner[field] for owner in owners]
+        if len(values) != len(set(values)):
+            fail("discord_ownership_registry_invalid")
+    return registry
+
+
+def empty_discord_ownership_registry():
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": DISCORD_OWNERSHIP_REGISTRY_KIND,
+        "owners": [],
+    }
+
+
+def load_discord_ownership_registry():
+    path = GLOBAL_DISCORD_OWNERSHIP_REGISTRY_PATH
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return empty_discord_ownership_registry()
+    except OSError:
+        fail("discord_ownership_registry_invalid")
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or metadata.st_size <= 0
+            or metadata.st_size > 1048576
+        ):
+            fail("discord_ownership_registry_invalid")
+        payload = b""
+        while len(payload) <= 1048576:
+            chunk = os.read(descriptor, min(65536, 1048577 - len(payload)))
+            if not chunk:
+                break
+            payload += chunk
+        if len(payload) > 1048576:
+            fail("discord_ownership_registry_invalid")
+    finally:
+        os.close(descriptor)
+    try:
+        registry = json.loads(
+            payload.decode("utf-8"), object_pairs_hook=strict_registry_object
+        )
+    except OrchestratorError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        fail("discord_ownership_registry_invalid")
+    return validate_discord_ownership_registry(registry)
+
+
+def write_discord_ownership_registry(registry):
+    validate_discord_ownership_registry(registry)
+    write_atomic(
+        GLOBAL_DISCORD_OWNERSHIP_REGISTRY_PATH,
+        json.dumps(
+            registry, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        + "\n",
+    )
+
+
+def discord_ownership_record(context):
+    discord = context.manifest["discord"]
+    return {
+        "run_id": context.manifest["run_id"],
+        "manifest_sha256": context.digest,
+        "manifest_path": str(context.manifest_path),
+        "guild_id": discord["guild_id"],
+        "application_id": discord["application_id"],
+        "bot_user_id": discord["bot_user_id"],
+    }
+
+
+def require_discord_ownership_available(context):
+    registry = load_discord_ownership_registry()
+    record = discord_ownership_record(context)
+    for owner in registry["owners"]:
+        if owner == record:
+            continue
+        if any(
+            owner[field] == record[field]
+            for field in ("run_id", "manifest_sha256", "manifest_path")
+        ):
+            fail("discord_ownership_record_mismatch")
+        if owner["guild_id"] == record["guild_id"]:
+            fail("discord_guild_owned_by_other_d2_run")
+        if owner["application_id"] == record["application_id"]:
+            fail("discord_application_owned_by_other_d2_run")
+    return registry
+
+
+def claim_discord_ownership(context):
+    registry = require_discord_ownership_available(context)
+    record = discord_ownership_record(context)
+    if record in registry["owners"]:
+        return "already_claimed"
+    registry["owners"].append(record)
+    registry["owners"].sort(key=lambda owner: owner["run_id"])
+    write_discord_ownership_registry(registry)
+    return "claimed"
+
+
+def require_discord_ownership_claimed(context):
+    registry = load_discord_ownership_registry()
+    record = discord_ownership_record(context)
+    if record not in registry["owners"]:
+        fail("discord_ownership_claim_absent")
+    return registry
+
+
+def release_discord_ownership(context):
+    registry = load_discord_ownership_registry()
+    record = discord_ownership_record(context)
+    if record not in registry["owners"]:
+        for owner in registry["owners"]:
+            if any(
+                owner[field] == record[field]
+                for field in (
+                    "run_id",
+                    "manifest_sha256",
+                    "manifest_path",
+                    "guild_id",
+                    "application_id",
+                )
+            ):
+                fail("discord_ownership_claim_mismatch")
+        return "already_released"
+    registry["owners"].remove(record)
+    write_discord_ownership_registry(registry)
+    return "released"
 
 
 def validate_identity(value, code):

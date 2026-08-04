@@ -35,6 +35,7 @@ from d2_orchestrator_contract import (
     STANDING_PUBLIC_ORIGIN,
     OrchestratorError,
     append_journal,
+    claim_discord_ownership,
     external_keychain_inventory,
     fail,
     global_operation_lock,
@@ -43,6 +44,9 @@ from d2_orchestrator_contract import (
     load_context,
     load_state,
     owner_identities,
+    release_discord_ownership,
+    require_discord_ownership_available,
+    require_discord_ownership_claimed,
     save_state,
     standing_snapshot,
     utc_now,
@@ -105,8 +109,9 @@ TRANSPORT_EVIDENCE_KINDS = {
 def command_dry_run(context, platform):
     validate_programs(platform)
     validate_candidate_programs(context, platform)
-    validate_ports(context, platform, require_available=True)
     validate_dedicated_discord_identity(context)
+    require_discord_ownership_available(context)
+    validate_ports(context, platform, require_available=True)
     if context.root.exists():
         fail("isolated_root_busy")
     for service in context.manifest["services"].values():
@@ -131,6 +136,7 @@ def command_prepare(context, platform):
     if context.state_path.exists():
         state = load_state(context)
         if state["phase"] in {"prepared", "substrate_started", "stopped"}:
+            require_discord_ownership_claimed(context)
             if (
                 not (context.cluster_root / "PG_VERSION").is_file()
                 or any(
@@ -152,8 +158,10 @@ def command_prepare(context, platform):
     preflight = command_dry_run(context, platform)
     context.artifact_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     save_state(context, "preparing", preflight["standing_snapshot"])
-    append_journal(context, "prepare", "intent", "run")
     try:
+        claim_discord_ownership(context)
+        append_journal(context, "discord_ownership", "complete", "identity")
+        append_journal(context, "prepare", "intent", "run")
         append_journal(context, "root_create", "intent", "isolated_root")
         context.root.mkdir(mode=0o700)
         context.socket_directory.mkdir(mode=0o700)
@@ -2371,6 +2379,11 @@ def cleanup(context, platform, expected_snapshot, from_failure=False):
     if failures:
         append_journal(context, "cleanup", "failed", "run")
         fail("cleanup_incomplete")
+    try:
+        release_discord_ownership(context)
+    except BaseException:
+        append_journal(context, "cleanup", "failed", "run")
+        fail("cleanup_incomplete")
     save_state(context, "cleaned", expected_snapshot)
     evidence = {
         "schema_version": 1,
@@ -2403,6 +2416,7 @@ def cleanup(context, platform, expected_snapshot, from_failure=False):
 def command_cleanup(context, platform):
     state = load_state(context)
     if state["phase"] == "cleaned":
+        release_discord_ownership(context)
         return {
             "status": "already_cleaned",
             "phase": "cleaned",
