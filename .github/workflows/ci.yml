@@ -46,6 +46,8 @@ jobs:
         run: cargo build --locked -p interaction-smoke --features unsafe-dev-activation
       - name: Test D2 certification coordinator
         run: python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'
+      - name: Test D3 exact-tree certification
+        run: python3 -m unittest discover -s tools/d3-certification -p 'test_*.py'
       - name: Test D2 product driver
         run: node --test tools/d2-certification/product_driver.test.mjs
       - name: Test D2 certification transport
