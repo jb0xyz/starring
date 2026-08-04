@@ -1,12 +1,15 @@
 import copy
+import ctypes
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 
 DIRECTORY = pathlib.Path(__file__).parent
@@ -121,6 +124,287 @@ class CommandPlatform(PLATFORM.Platform):
 
 def command_response(returncode, stdout=b"", stderr=b""):
     return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+class FakeCFunction:
+    def __init__(self, callback):
+        self.callback = callback
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self, *arguments):
+        return self.callback(*arguments)
+
+
+def pointer_value(value):
+    return value.value if isinstance(value, ctypes.c_void_p) else value
+
+
+class FakeKeychainFrameworkState:
+    def __init__(self):
+        self.name = (b"service", b"account")
+        self.items = {self.name: 101}
+        self.references = {101: b"persistent-reference-a"}
+        self.find_status = 0
+        self.find_output_on_error = False
+        self.reference_status = 0
+        self.reference_output_on_error = False
+        self.delete_status = 0
+        self.swap_before_delete = None
+        self.deleted = []
+        self.released = []
+        self.data_handles = {}
+        self.buffers = {}
+        self.next_data_handle = 1001
+
+
+class FakeSecurityFramework:
+    def __init__(self, state):
+        self.state = state
+        self.SecKeychainFindGenericPassword = FakeCFunction(self.find)
+        self.SecKeychainItemCreatePersistentReference = FakeCFunction(
+            self.create_reference
+        )
+        self.SecKeychainItemDelete = FakeCFunction(self.delete)
+
+    def find(
+        self,
+        keychain,
+        service_length,
+        service,
+        account_length,
+        account,
+        password_length,
+        password_data,
+        item_output,
+    ):
+        if self.state.find_status != 0:
+            if self.state.find_output_on_error:
+                item_output._obj.value = 101
+            return self.state.find_status
+        name = (service[:service_length], account[:account_length])
+        item = self.state.items.get(name)
+        if item is None:
+            return -25300
+        item_output._obj.value = item
+        return 0
+
+    def create_reference(self, item, persistent_output):
+        if self.state.reference_status != 0:
+            if self.state.reference_output_on_error:
+                handle = self.state.next_data_handle
+                self.state.next_data_handle += 1
+                self.state.data_handles[handle] = b"error-reference"
+                persistent_output._obj.value = handle
+            return self.state.reference_status
+        item_value = pointer_value(item)
+        reference = self.state.references.get(item_value)
+        if reference is None:
+            return -50
+        handle = self.state.next_data_handle
+        self.state.next_data_handle += 1
+        self.state.data_handles[handle] = reference
+        persistent_output._obj.value = handle
+        return 0
+
+    def delete(self, item):
+        item_value = pointer_value(item)
+        if self.state.swap_before_delete is not None:
+            replacement_item, replacement_reference = self.state.swap_before_delete
+            self.state.items[self.state.name] = replacement_item
+            self.state.references[replacement_item] = replacement_reference
+            self.state.swap_before_delete = None
+        self.state.deleted.append(item_value)
+        if self.state.delete_status != 0:
+            return self.state.delete_status
+        for name, current in list(self.state.items.items()):
+            if current == item_value:
+                del self.state.items[name]
+        self.state.references.pop(item_value, None)
+        return 0
+
+
+class FakeCoreFoundationFramework:
+    def __init__(self, state):
+        self.state = state
+        self.CFDataGetLength = FakeCFunction(self.data_length)
+        self.CFDataGetBytePtr = FakeCFunction(self.data_pointer)
+        self.CFRelease = FakeCFunction(self.release)
+
+    def data_length(self, data):
+        return len(self.state.data_handles[pointer_value(data)])
+
+    def data_pointer(self, data):
+        handle = pointer_value(data)
+        buffer = ctypes.create_string_buffer(self.state.data_handles[handle])
+        self.state.buffers[handle] = buffer
+        return ctypes.addressof(buffer)
+
+    def release(self, value):
+        self.state.released.append(pointer_value(value))
+
+
+class PlatformKeychainReferenceTests(unittest.TestCase):
+    def setUp(self):
+        self.state = FakeKeychainFrameworkState()
+        self.security = FakeSecurityFramework(self.state)
+        self.core = FakeCoreFoundationFramework(self.state)
+        self.cdll = mock.patch.object(
+            PLATFORM.ctypes,
+            "CDLL",
+            side_effect=lambda path: (
+                self.security if "Security.framework" in path else self.core
+            ),
+        )
+        self.cdll.start()
+        self.platform = PLATFORM.Platform()
+
+    def tearDown(self):
+        self.cdll.stop()
+
+    def assert_platform_failure(self, code, operation):
+        with self.assertRaisesRegex(CONTRACT.OrchestratorError, f"^{code}$"):
+            operation()
+
+    def test_identity_hashes_persistent_reference_and_releases_both_objects(self):
+        expected = hashlib.sha256(b"persistent-reference-a").hexdigest()
+        self.assertEqual(
+            self.platform.keychain_item_identity("service", "account"), expected
+        )
+        self.assertEqual(self.state.released, [1001, 101])
+        self.assertIsNotNone(self.security.SecKeychainFindGenericPassword.argtypes)
+        self.assertEqual(
+            self.security.SecKeychainItemDelete.restype, ctypes.c_int32
+        )
+
+    def test_exact_delete_cannot_delete_name_replacement(self):
+        expected = hashlib.sha256(b"persistent-reference-a").hexdigest()
+        self.state.swap_before_delete = (202, b"persistent-reference-b")
+        self.platform.keychain_delete_exact("service", "account", expected)
+        self.assertEqual(self.state.deleted, [101])
+        self.assertEqual(self.state.items[self.state.name], 202)
+        self.assertEqual(self.state.references[202], b"persistent-reference-b")
+        self.assertEqual(self.state.released, [1001, 101])
+
+    def test_exact_delete_rejects_identity_drift_without_delete(self):
+        self.assert_platform_failure(
+            "keychain_reference_identity_drift",
+            lambda: self.platform.keychain_delete_exact(
+                "service", "account", "f" * 64
+            ),
+        )
+        self.assertEqual(self.state.deleted, [])
+        self.assertEqual(self.state.items[self.state.name], 101)
+        self.assertEqual(self.state.released, [1001, 101])
+
+    def test_not_found_and_framework_errors_fail_closed_and_release_refs(self):
+        self.state.items.clear()
+        self.assertIsNone(
+            self.platform.keychain_item_identity("service", "account")
+        )
+        self.state.find_status = -50
+        self.state.find_output_on_error = True
+        self.assert_platform_failure(
+            "keychain_reference_observation_failed",
+            lambda: self.platform.keychain_item_identity("service", "account"),
+        )
+        self.state.find_status = 0
+        self.state.find_output_on_error = False
+        self.state.items[self.state.name] = 101
+        self.state.reference_status = -50
+        self.state.reference_output_on_error = True
+        self.assert_platform_failure(
+            "keychain_reference_observation_failed",
+            lambda: self.platform.keychain_item_identity("service", "account"),
+        )
+        self.assertEqual(self.state.released, [101, 1001, 101])
+
+    def test_delete_error_releases_reference_and_item(self):
+        expected = hashlib.sha256(b"persistent-reference-a").hexdigest()
+        self.state.delete_status = -50
+        self.assert_platform_failure(
+            "keychain_reference_delete_failed",
+            lambda: self.platform.keychain_delete_exact(
+                "service", "account", expected
+            ),
+        )
+        self.assertEqual(self.state.deleted, [101])
+        self.assertEqual(self.state.items[self.state.name], 101)
+        self.assertEqual(self.state.released, [1001, 101])
+
+    def test_name_based_delete_is_forbidden_without_command_fallback(self):
+        self.assert_platform_failure(
+            "keychain_name_delete_forbidden",
+            lambda: self.platform.keychain_delete("service", "account"),
+        )
+
+    def test_production_cleanup_has_no_name_based_delete_calls(self):
+        for name in (
+            "isolated_orchestrator.py",
+            "d2_legacy_substrate_recovery.py",
+        ):
+            source = (DIRECTORY / name).read_text(encoding="utf-8")
+            self.assertNotIn(".keychain_delete(", source)
+            self.assertIn(".keychain_delete_exact(", source)
+
+
+class PlatformExclusiveRenameTests(unittest.TestCase):
+    def test_exclusive_rename_succeeds_only_when_destination_is_absent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = pathlib.Path(temporary)
+            source = parent / "source"
+            destination = parent / "destination"
+            source.mkdir()
+            descriptor = os.open(
+                parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                PLATFORM.rename_exclusive(
+                    descriptor,
+                    source.name,
+                    descriptor,
+                    destination.name,
+                )
+            finally:
+                os.close(descriptor)
+            self.assertFalse(source.exists())
+            self.assertTrue(destination.is_dir())
+
+    def test_exclusive_rename_preserves_preexisting_directory_and_symlink(self):
+        for destination_kind in ("directory", "symlink"):
+            with self.subTest(destination_kind=destination_kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    parent = pathlib.Path(temporary)
+                    source = parent / "source"
+                    destination = parent / "destination"
+                    target = parent / "target"
+                    source.mkdir()
+                    target.mkdir()
+                    if destination_kind == "directory":
+                        destination.mkdir()
+                    else:
+                        destination.symlink_to(target, target_is_directory=True)
+                    descriptor = os.open(
+                        parent,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                    )
+                    try:
+                        with self.assertRaises(OSError):
+                            PLATFORM.rename_exclusive(
+                                descriptor,
+                                source.name,
+                                descriptor,
+                                destination.name,
+                            )
+                    finally:
+                        os.close(descriptor)
+                    self.assertTrue(source.is_dir())
+                    if destination_kind == "directory":
+                        self.assertTrue(destination.is_dir())
+                        self.assertFalse(destination.is_symlink())
+                    else:
+                        self.assertTrue(destination.is_symlink())
 
 
 class PlatformAbsenceObservationTests(unittest.TestCase):

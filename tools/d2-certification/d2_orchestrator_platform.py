@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import json
 import os
@@ -50,6 +51,51 @@ def strict_json_object(pairs):
             raise ValueError("duplicate_key")
         result[key] = value
     return result
+
+
+def rename_exclusive(
+    source_directory,
+    source_name,
+    destination_directory,
+    destination_name,
+):
+    for name in (source_name, destination_name):
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in {".", ".."}
+            or "/" in name
+            or "\x00" in name
+        ):
+            fail("exclusive_rename_name_invalid")
+    library = ctypes.CDLL(None, use_errno=True)
+    if hasattr(library, "renameatx_np"):
+        operation = library.renameatx_np
+        flags = 0x00000004
+    elif hasattr(library, "renameat2"):
+        operation = library.renameat2
+        flags = 0x00000001
+    else:
+        fail("exclusive_rename_unavailable")
+    operation.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    operation.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    result = operation(
+        source_directory,
+        os.fsencode(source_name),
+        destination_directory,
+        os.fsencode(destination_name),
+        flags,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination_name)
 
 
 class Platform:
@@ -227,26 +273,116 @@ class Platform:
         fail("keychain_probe_failed")
 
     def keychain_item_identity(self, service, account):
-        result = self.run(
-            [
-                REQUIRED_PROGRAMS["security"],
-                "find-generic-password",
-                "-s",
-                service,
-                "-a",
-                account,
-            ],
-            timeout=10,
-        )
-        if result.returncode == 44:
+        found = self._keychain_item_reference(service, account)
+        if found is None:
             return None
-        if result.returncode != 0:
-            fail("keychain_probe_failed")
-        if len(result.stdout) + len(result.stderr) > 64 * 1024:
-            fail("keychain_observation_invalid")
-        return hashlib.sha256(
-            result.stdout + b"\x00" + result.stderr
-        ).hexdigest()
+        security, core_foundation, item = found
+        try:
+            return self._keychain_reference_identity(
+                security, core_foundation, item
+            )
+        finally:
+            core_foundation.CFRelease(item)
+
+    def _keychain_frameworks(self):
+        try:
+            security = ctypes.CDLL(
+                "/System/Library/Frameworks/Security.framework/Security"
+            )
+            core_foundation = ctypes.CDLL(
+                "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+            )
+        except OSError:
+            fail("keychain_framework_unavailable")
+        security.SecKeychainFindGenericPassword.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+            ctypes.c_uint32,
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        security.SecKeychainFindGenericPassword.restype = ctypes.c_int32
+        security.SecKeychainItemCreatePersistentReference.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        security.SecKeychainItemCreatePersistentReference.restype = ctypes.c_int32
+        security.SecKeychainItemDelete.argtypes = [ctypes.c_void_p]
+        security.SecKeychainItemDelete.restype = ctypes.c_int32
+        core_foundation.CFDataGetLength.argtypes = [ctypes.c_void_p]
+        core_foundation.CFDataGetLength.restype = ctypes.c_long
+        core_foundation.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
+        core_foundation.CFDataGetBytePtr.restype = ctypes.c_void_p
+        core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
+        core_foundation.CFRelease.restype = None
+        return security, core_foundation
+
+    def _keychain_item_reference(self, service, account):
+        security, core_foundation = self._keychain_frameworks()
+        service_bytes = service.encode("utf-8")
+        account_bytes = account.encode("utf-8")
+        item = ctypes.c_void_p()
+        status = security.SecKeychainFindGenericPassword(
+            None,
+            len(service_bytes),
+            service_bytes,
+            len(account_bytes),
+            account_bytes,
+            None,
+            None,
+            ctypes.byref(item),
+        )
+        if status == -25300:
+            if item.value:
+                core_foundation.CFRelease(item)
+            return None
+        if status != 0 or not item.value:
+            if item.value:
+                core_foundation.CFRelease(item)
+            fail("keychain_reference_observation_failed")
+        return security, core_foundation, item
+
+    def _keychain_reference_identity(self, security, core_foundation, item):
+        persistent = ctypes.c_void_p()
+        status = security.SecKeychainItemCreatePersistentReference(
+            item, ctypes.byref(persistent)
+        )
+        if status != 0 or not persistent.value:
+            if persistent.value:
+                core_foundation.CFRelease(persistent)
+            fail("keychain_reference_observation_failed")
+        try:
+            length = core_foundation.CFDataGetLength(persistent)
+            pointer = core_foundation.CFDataGetBytePtr(persistent)
+            if length <= 0 or length > 64 * 1024 or not pointer:
+                fail("keychain_reference_observation_failed")
+            return hashlib.sha256(ctypes.string_at(pointer, length)).hexdigest()
+        finally:
+            core_foundation.CFRelease(persistent)
+
+    def keychain_delete_exact(self, service, account, expected_identity):
+        if (
+            not isinstance(expected_identity, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_identity)
+        ):
+            fail("keychain_reference_identity_invalid")
+        found = self._keychain_item_reference(service, account)
+        if found is None:
+            fail("keychain_reference_identity_drift")
+        security, core_foundation, item = found
+        try:
+            observed = self._keychain_reference_identity(
+                security, core_foundation, item
+            )
+            if observed != expected_identity:
+                fail("keychain_reference_identity_drift")
+            if security.SecKeychainItemDelete(item) != 0:
+                fail("keychain_reference_delete_failed")
+        finally:
+            core_foundation.CFRelease(item)
 
     def keychain_write_new(self, service, account, value):
         if self.keychain_present(service, account):
@@ -271,19 +407,7 @@ class Platform:
             fail("keychain_write_failed")
 
     def keychain_delete(self, service, account):
-        result = self.run(
-            [
-                REQUIRED_PROGRAMS["security"],
-                "delete-generic-password",
-                "-s",
-                service,
-                "-a",
-                account,
-            ],
-            timeout=10,
-        )
-        if result.returncode not in (0, 44):
-            fail("keychain_delete_failed")
+        fail("keychain_name_delete_forbidden")
 
     def keychain_owner_matches(self, service, expected):
         result = self.run(
@@ -320,20 +444,7 @@ class Platform:
             fail("postgres_observation_failed")
         if self.postgres_pid(cluster) is not None:
             return False
-        process_result = self.run(
-            [pathlib.Path("/bin/ps"), "-axo", "pid=,command="], timeout=10
-        )
-        if (
-            process_result.returncode != 0
-            or process_result.stderr
-            or len(process_result.stdout) > 4 * 1024 * 1024
-        ):
-            fail("postgres_process_observation_failed")
-        try:
-            process_output = process_result.stdout.decode("utf-8")
-        except UnicodeDecodeError:
-            fail("postgres_process_observation_failed")
-        if str(cluster) in process_output:
+        if not self.postgres_process_path_absent(cluster):
             return False
         open_file_result = self.run(
             [pathlib.Path("/usr/sbin/lsof"), "-Fn", "+D", cluster], timeout=30
@@ -347,6 +458,23 @@ class Platform:
         ):
             fail("postgres_open_file_observation_failed")
         return True
+
+    def postgres_process_path_absent(self, cluster_root):
+        cluster = pathlib.Path(cluster_root)
+        process_result = self.run(
+            [pathlib.Path("/bin/ps"), "-axo", "pid=,command="], timeout=10
+        )
+        if (
+            process_result.returncode != 0
+            or process_result.stderr
+            or len(process_result.stdout) > 4 * 1024 * 1024
+        ):
+            fail("postgres_process_observation_failed")
+        try:
+            process_output = process_result.stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            fail("postgres_process_observation_failed")
+        return str(cluster) not in process_output
 
     def postgres_cluster_identity(self, cluster_root):
         result = self.run(
@@ -417,7 +545,9 @@ class Platform:
             fail("postgres_start_failed")
 
     def postgres_stop(self, cluster_root):
-        if not cluster_root.exists() or not self.postgres_running(cluster_root):
+        if not cluster_root.exists():
+            return
+        if self.postgres_absent(cluster_root):
             return
         result = self.run(
             [
@@ -433,7 +563,7 @@ class Platform:
             ],
             timeout=45,
         )
-        if result.returncode != 0:
+        if result.returncode != 0 or not self.postgres_absent(cluster_root):
             fail("postgres_stop_failed")
 
     def bootstrap_database(self, context):

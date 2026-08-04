@@ -24,6 +24,8 @@ class FakePlatform:
         self.owner_values = {}
         self.deleted = []
         self.delete_failure = None
+        self.replace_at_delete = None
+        self.crash_after_delete = None
         self.identity_versions = {}
         self.identity_reads = {}
         self.replace_identity = None
@@ -76,11 +78,21 @@ class FakePlatform:
             return False
         return self.owner_values.get(service) == expected
 
-    def keychain_delete(self, service, account):
+    def keychain_delete_exact(self, service, account, expected_identity):
         if self.delete_failure == (service, account):
             raise OrchestratorError("keychain_delete_failed")
+        if self.keychain_item_identity(service, account) != expected_identity:
+            raise OrchestratorError("keychain_reference_identity_drift")
+        if self.replace_at_delete == (service, account):
+            identity = (service, account)
+            self.identity_versions[identity] = (
+                self.identity_versions.get(identity, 0) + 1
+            )
+            return
         self.keychain.discard((service, account))
         self.deleted.append((service, account))
+        if self.crash_after_delete == (service, account):
+            raise OrchestratorError("injected_keychain_delete_crash")
 
 
 class LegacySubstrateRecoveryTest(unittest.TestCase):
@@ -141,12 +153,22 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
         self.snapshot_patch.start()
         self.registry = self.registry_patch.start()
         self.context, self.state = recovery.load_legacy_context(self.manifest_path)
+        self.production_allowlist = recovery.LEGACY_SUBSTRATE_ALLOWLIST
+        historical = recovery.historical_provenance(self.context)
+        fixture_identity = recovery.legacy_substrate_identity(
+            self.context, historical
+        )
+        self.allowlist_patch = mock.patch.object(
+            recovery, "LEGACY_SUBSTRATE_ALLOWLIST", frozenset({fixture_identity})
+        )
+        self.allowlist_patch.start()
         for service, account in keychain_inventory(self.context):
             self.platform.keychain.add((service, account))
         for service in self.manifest["keychain_services"].values():
             self.platform.owner_values[service] = self.run_id
 
     def tearDown(self):
+        self.allowlist_patch.stop()
         self.registry_patch.stop()
         self.snapshot_patch.stop()
         self.runtime_patch.stop()
@@ -307,6 +329,79 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
             self.digest,
         )
 
+    def allowlist_context(self, identity):
+        context = mock.Mock()
+        context.manifest = {"run_id": identity[0]}
+        context.root = pathlib.Path(identity[1])
+        context.digest = identity[2]
+        historical = {
+            "database_system_identifier": identity[3],
+            "journal_sha256": identity[4],
+            "database_evidence_sha256": identity[5],
+            "provenance_sha256": identity[6],
+        }
+        return context, historical
+
+    def test_code_reviewed_allowlist_accepts_only_two_exact_known_identities(self):
+        self.assertEqual(len(self.production_allowlist), 2)
+        with mock.patch.object(
+            recovery,
+            "LEGACY_SUBSTRATE_ALLOWLIST",
+            self.production_allowlist,
+        ):
+            for identity in self.production_allowlist:
+                context, historical = self.allowlist_context(identity)
+                self.assertEqual(
+                    recovery.require_allowlisted_legacy_substrate(
+                        context, historical
+                    ),
+                    identity,
+                )
+
+    def test_code_reviewed_allowlist_rejects_drift_of_every_bound_field(self):
+        identity = sorted(self.production_allowlist)[0]
+        replacements = (
+            "d2-20260803t171033z-fd1232a7b31c",
+            "/private/tmp/starring-d2-d2-20260803t171033z-fd1232a7b31c",
+            "0" * 64,
+            "7669853998318333590",
+            "1" * 64,
+            "2" * 64,
+            "3" * 64,
+        )
+        with mock.patch.object(
+            recovery,
+            "LEGACY_SUBSTRATE_ALLOWLIST",
+            self.production_allowlist,
+        ):
+            for index, replacement in enumerate(replacements):
+                with self.subTest(field=index):
+                    changed = list(identity)
+                    changed[index] = replacement
+                    context, historical = self.allowlist_context(tuple(changed))
+                    with self.assertRaisesRegex(
+                        OrchestratorError,
+                        "legacy_substrate_identity_not_allowlisted",
+                    ):
+                        recovery.require_allowlisted_legacy_substrate(
+                            context, historical
+                        )
+
+    def test_forged_internally_consistent_substrate_is_not_allowlisted(self):
+        status = recovery.command_status(self.context, self.state, self.platform)
+        self.assertTrue(status["runtime_root_present"])
+        with mock.patch.object(
+            recovery,
+            "LEGACY_SUBSTRATE_ALLOWLIST",
+            self.production_allowlist,
+        ):
+            with self.assertRaisesRegex(
+                OrchestratorError, "legacy_substrate_identity_not_allowlisted"
+            ):
+                self.recover()
+        self.assertTrue(self.root.exists())
+        self.assertEqual(len(self.platform.keychain), 29)
+
     def test_historical_source_pins_do_not_block_status(self):
         result = recovery.command_status(self.context, self.state, self.platform)
         self.assertEqual(result["phase"], "candidate_started")
@@ -465,21 +560,28 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
                 recovery.command_status(self.context, self.state, self.platform)
 
     def test_recovery_detects_root_inode_swap_after_quarantine_rename(self):
-        original_rename = recovery.os.rename
+        original_rename = recovery.rename_exclusive
         preserved = self.base / "preserved-root"
 
-        def swap_then_rename(source, target, src_dir_fd=None, dst_dir_fd=None):
-            original_rename(self.root, preserved)
+        def swap_then_rename(
+            source_directory,
+            source_name,
+            destination_directory,
+            destination_name,
+        ):
+            self.root.rename(preserved)
             self.root.mkdir(mode=0o700)
             (self.root / "postgres").mkdir(mode=0o700)
             return original_rename(
-                source,
-                target,
-                src_dir_fd=src_dir_fd,
-                dst_dir_fd=dst_dir_fd,
+                source_directory,
+                source_name,
+                destination_directory,
+                destination_name,
             )
 
-        with mock.patch.object(recovery.os, "rename", side_effect=swap_then_rename):
+        with mock.patch.object(
+            recovery, "rename_exclusive", side_effect=swap_then_rename
+        ):
             with self.assertRaisesRegex(
                 OrchestratorError, "legacy_substrate_root_swap_detected"
             ):
@@ -499,6 +601,90 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
         self.assertFalse(recovery.quarantine_path(self.context).exists())
         saved = recovery.load_recovery_progress(self.context)
         self.assertEqual(saved["phase"], "deleted")
+
+    def test_recovery_exclusive_rename_rejects_destination_race(self):
+        real_rename = recovery.rename_exclusive
+        quarantine = recovery.quarantine_path(self.context)
+
+        def race_destination(
+            source_directory,
+            source_name,
+            destination_directory,
+            destination_name,
+        ):
+            quarantine.mkdir(mode=0o700)
+            return real_rename(
+                source_directory,
+                source_name,
+                destination_directory,
+                destination_name,
+            )
+
+        with mock.patch.object(
+            recovery, "rename_exclusive", side_effect=race_destination
+        ):
+            with self.assertRaisesRegex(
+                OrchestratorError, "legacy_substrate_root_swap_detected"
+            ):
+                self.recover()
+        self.assertTrue(self.root.exists())
+        self.assertTrue(quarantine.is_dir())
+
+    def test_recovery_rejects_planned_progress_after_external_root_loss(self):
+        provenance = recovery.require_recovery_provenance(
+            self.context, self.platform
+        )
+        progress = recovery.ensure_recovery_progress(self.context, provenance)
+        self.assertEqual(progress["phase"], "planned")
+        preserved = self.base / "externally-preserved-root"
+        self.root.rename(preserved)
+        try:
+            with self.assertRaisesRegex(
+                OrchestratorError, "legacy_substrate_root_loss_unproven"
+            ):
+                recovery.recover_runtime_root(
+                    self.context, provenance, self.platform
+                )
+            self.assertEqual(
+                recovery.load_recovery_progress(self.context)["phase"],
+                "planned",
+            )
+        finally:
+            preserved.rename(self.root)
+
+    def test_recovery_does_not_certify_loss_before_quarantine_recheck(self):
+        provenance = recovery.require_recovery_provenance(
+            self.context, self.platform
+        )
+        progress = recovery.ensure_recovery_progress(self.context, provenance)
+        quarantine = recovery.quarantine_path(self.context)
+        self.root.rename(quarantine)
+        self.platform.postgres_error = "injected_pre_recheck_crash"
+        with self.assertRaisesRegex(
+            OrchestratorError, "injected_pre_recheck_crash"
+        ):
+            recovery.recover_runtime_root(
+                self.context, provenance, self.platform
+            )
+        self.assertEqual(
+            recovery.load_recovery_progress(self.context)["phase"], "planned"
+        )
+        self.platform.postgres_error = None
+        preserved = self.base / "externally-moved-quarantine"
+        quarantine.rename(preserved)
+        try:
+            with self.assertRaisesRegex(
+                OrchestratorError, "legacy_substrate_root_loss_unproven"
+            ):
+                recovery.recover_runtime_root(
+                    self.context, provenance, self.platform
+                )
+        finally:
+            preserved.rename(quarantine)
+        result = recovery.recover_runtime_root(
+            self.context, provenance, self.platform
+        )
+        self.assertEqual(result["phase"], "deleted")
 
     def test_recovery_fails_closed_on_launchd_and_postgres_observation_errors(self):
         self.platform.launchd_error = "launchd_observation_failed"
@@ -532,6 +718,36 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
         ):
             self.recover()
         self.assertEqual(self.platform.deleted, [])
+        self.assertTrue(self.root.exists())
+
+    def test_recovery_does_not_delete_replacement_at_exact_delete_boundary(self):
+        service = self.manifest["keychain_services"]["api"]
+        target = (service, "database.apply-executor")
+        self.platform.replace_at_delete = target
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_keychain_delete_unconfirmed"
+        ):
+            self.recover()
+        self.assertIn(target, self.platform.keychain)
+        self.assertNotIn(target, self.platform.deleted)
+
+    def test_recovery_replay_preserves_replacement_after_delete_crash(self):
+        service = self.manifest["keychain_services"]["api"]
+        target = (service, "database.apply-executor")
+        self.platform.crash_after_delete = target
+        with self.assertRaisesRegex(
+            OrchestratorError, "injected_keychain_delete_crash"
+        ):
+            self.recover()
+        self.assertNotIn(target, self.platform.keychain)
+        self.platform.crash_after_delete = None
+        self.platform.keychain.add(target)
+        self.platform.identity_versions[target] = 1
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_keychain_identity_drift"
+        ):
+            self.recover()
+        self.assertIn(target, self.platform.keychain)
         self.assertTrue(self.root.exists())
 
     def test_recovery_records_failure_and_resumes_partial_keychain_cleanup(self):
@@ -598,8 +814,20 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
         self.assertEqual(repaired[-1]["status"], "complete")
         self.assertEqual(
             result["keychain_identity_boundary"],
-            "metadata-reobserved-before-each-delete",
+            "persistent-reference-baseline-reobserved-before-each-delete",
         )
+
+    def test_cleaned_replay_reconstructs_deleted_progress_from_trusted_evidence(self):
+        self.recover()
+        progress = recovery.load_recovery_progress(self.context)
+        recovery.save_recovery_progress(self.context, progress, "quarantined")
+        context, cleaned = recovery.load_legacy_context(self.manifest_path)
+        result = recovery.command_recover(
+            context, cleaned, self.platform, self.run_id, self.digest
+        )
+        self.assertEqual(result["status"], "already_recovered")
+        repaired = recovery.load_recovery_progress(context)
+        self.assertEqual(repaired["phase"], "deleted")
 
     def test_loader_rejects_digest_label_root_and_state_tampering(self):
         cases = []

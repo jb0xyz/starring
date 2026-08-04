@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -79,8 +80,14 @@ class FakePlatform:
         self.postgres_tcp = False
         self.postgres_port = None
         self.postgres_process_pid = None
+        self.postgres_observation_error = False
+        self.postgres_process_observations = []
+        self.launchd_observation_error = False
         self.keychain_writes = []
         self.keychain_deletes = []
+        self.keychain_identity_versions = {}
+        self.keychain_replace_at_delete = None
+        self.keychain_crash_after_delete = None
         self.owner_values = {}
         self.bootouts = []
         self.initdb_failure = False
@@ -132,6 +139,11 @@ class FakePlatform:
     def launchd_loaded(self, label):
         return label in self.loaded
 
+    def launchd_absent(self, label):
+        if self.launchd_observation_error:
+            ORCHESTRATOR.fail("launchd_observation_failed")
+        return label not in self.loaded
+
     def launchd_job(self, label):
         if label not in self.loaded:
             return None
@@ -153,6 +165,15 @@ class FakePlatform:
     def keychain_present(self, service, account):
         return (service, account) in self.keychain
 
+    def keychain_item_identity(self, service, account):
+        identity = (service, account)
+        if identity not in self.keychain:
+            return None
+        version = self.keychain_identity_versions.get(identity, 0)
+        return hashlib.sha256(
+            f"{service}\x00{account}\x00{version}".encode("utf-8")
+        ).hexdigest()
+
     def keychain_write_new(self, service, account, value):
         if (service, account) in self.keychain:
             ORCHESTRATOR.fail("keychain_identity_busy")
@@ -161,17 +182,38 @@ class FakePlatform:
         if account == ORCHESTRATOR.OWNER_ACCOUNT:
             self.owner_values[service] = value.decode("ascii")
 
-    def keychain_delete(self, service, account):
+    def keychain_delete_exact(self, service, account, expected_identity):
+        identity = (service, account)
+        if self.keychain_item_identity(service, account) != expected_identity:
+            ORCHESTRATOR.fail("keychain_reference_identity_drift")
+        if self.keychain_replace_at_delete == identity:
+            self.keychain_identity_versions[identity] = (
+                self.keychain_identity_versions.get(identity, 0) + 1
+            )
+            return
         self.keychain.discard((service, account))
         self.keychain_deletes.append((service, account))
         if account == ORCHESTRATOR.OWNER_ACCOUNT:
             self.owner_values.pop(service, None)
+        if self.keychain_crash_after_delete == identity:
+            ORCHESTRATOR.fail("injected_keychain_delete_crash")
 
     def keychain_owner_matches(self, service, expected):
         return self.owner_values.get(service) == expected
 
     def postgres_running(self, cluster_root):
         return self.postgres
+
+    def postgres_absent(self, cluster_root):
+        if self.postgres_observation_error:
+            ORCHESTRATOR.fail("postgres_observation_failed")
+        return not self.postgres
+
+    def postgres_process_path_absent(self, cluster_root):
+        self.postgres_process_observations.append(pathlib.Path(cluster_root))
+        if self.postgres_observation_error:
+            ORCHESTRATOR.fail("postgres_process_observation_failed")
+        return not self.postgres
 
     def postgres_pid(self, cluster_root):
         return self.postgres_process_pid if self.postgres else None
@@ -646,8 +688,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
     def tearDown(self):
         self.live_sleep.stop()
         self.live_monotonic.stop()
-        if self.isolated_root.exists():
-            ORCHESTRATOR.guarded_remove_root(self.context)
+        self.remove_test_root(self.context)
         for path in self.artifact_root.rglob("*"):
             if path.is_dir():
                 path.chmod(0o700)
@@ -655,6 +696,17 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.runtime_root_patch.stop()
         self.registry_patch.stop()
         self.temporary.cleanup()
+
+    def remove_test_root(self, context):
+        if not context.root.exists():
+            return
+        self.platform.postgres = False
+        self.platform.postgres_process_pid = None
+        self.platform.postgres_observation_error = False
+        self.platform.launchd_observation_error = False
+        for service in context.manifest["services"].values():
+            self.platform.loaded.discard(service["label"])
+        ORCHESTRATOR.guarded_remove_root(context, self.platform)
 
     def advance_live_clock(self, seconds):
         self.live_clock += seconds
@@ -771,9 +823,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             self.run_id = original_run_id
         context = ORCHESTRATOR.load_context(manifest_path)
         self.addCleanup(
-            lambda: ORCHESTRATOR.guarded_remove_root(context)
-            if context.root.exists()
-            else None
+            lambda: self.remove_test_root(context)
         )
         return context
 
@@ -2744,7 +2794,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         )
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
-    def test_preparing_state_allows_manifest_reconstructed_sigkill_cleanup(self):
+    def test_preparing_state_allows_identity_bound_sigkill_cleanup(self):
         preflight = ORCHESTRATOR.command_dry_run(self.context, self.platform)
         self.context.artifact_directory.mkdir(mode=0o700, parents=True)
         ORCHESTRATOR.save_state(
@@ -2756,6 +2806,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             [CONTRACT.discord_ownership_record(self.context)],
         )
         self.isolated_root.mkdir(mode=0o700)
+        ORCHESTRATOR.record_cleanup_root_identity(self.context)
         (self.isolated_root / "partial").write_text("partial", encoding="utf-8")
         result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
         self.assertEqual(result["phase"], "cleaned")
@@ -3143,6 +3194,512 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
         self.assertEqual(CONTRACT.load_discord_ownership_registry()["owners"], [])
 
+    def test_cleanup_does_not_delete_keychain_replacement_at_delete_boundary(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        service = self.context.manifest["keychain_services"]["api"]
+        account = ORCHESTRATOR.OWNER_ACCOUNT
+        target = (service, account)
+        self.platform.keychain_replace_at_delete = target
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertIn(target, self.platform.keychain)
+        self.assertNotIn(target, self.platform.keychain_deletes)
+
+    def test_cleanup_replay_preserves_replacement_after_delete_crash(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        service = self.context.manifest["keychain_services"]["api"]
+        account = next(
+            account
+            for item_service, account in ORCHESTRATOR.keychain_inventory(
+                self.context
+            )
+            if item_service == service and account != ORCHESTRATOR.OWNER_ACCOUNT
+        )
+        target = (service, account)
+        self.platform.keychain.add(target)
+        self.platform.keychain_crash_after_delete = target
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertNotIn(target, self.platform.keychain)
+        self.platform.keychain_crash_after_delete = None
+        self.platform.keychain.add(target)
+        self.platform.keychain_identity_versions[target] = 1
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertIn(target, self.platform.keychain)
+        self.platform.keychain.remove(target)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_cleanup_rejects_root_replaced_after_prepare_identity_capture(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        preserved = self.isolated_root.with_name(
+            f".{self.isolated_root.name}.preserved-{secrets.token_hex(4)}"
+        )
+        self.isolated_root.rename(preserved)
+        self.isolated_root.mkdir(mode=0o700)
+        try:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "cleanup_root_swap_detected",
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+            self.assertTrue(self.isolated_root.exists())
+            self.assertTrue(preserved.exists())
+            self.assertEqual(self.platform.keychain_deletes, [])
+        finally:
+            self.isolated_root.rmdir()
+            preserved.rename(self.isolated_root)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_cleanup_rejects_root_device_drift_before_mutation(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        real_metadata = ORCHESTRATOR.cleanup_path_metadata
+
+        def drifted_metadata(path, code):
+            metadata = real_metadata(path, code)
+            if pathlib.Path(path) == self.isolated_root and metadata is not None:
+                return SimpleNamespace(
+                    st_mode=metadata.st_mode,
+                    st_uid=metadata.st_uid,
+                    st_dev=metadata.st_dev + 1,
+                    st_ino=metadata.st_ino,
+                )
+            return metadata
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "cleanup_path_metadata",
+            side_effect=drifted_metadata,
+        ):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "cleanup_root_invalid",
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertTrue(self.isolated_root.exists())
+        self.assertEqual(self.platform.keychain_deletes, [])
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_cleanup_requires_prepare_time_root_identity(self):
+        preflight = ORCHESTRATOR.command_dry_run(self.context, self.platform)
+        self.context.artifact_directory.mkdir(mode=0o700, parents=True)
+        ORCHESTRATOR.save_state(
+            self.context, "preparing", preflight["standing_snapshot"]
+        )
+        CONTRACT.claim_discord_ownership(self.context)
+        self.isolated_root.mkdir(mode=0o700)
+        partial = self.isolated_root / "partial"
+        partial.write_text("partial", encoding="utf-8")
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "cleanup_root_identity_invalid",
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertTrue(partial.exists())
+        partial.unlink()
+        self.isolated_root.rmdir()
+        CONTRACT.release_discord_ownership(self.context)
+
+    def test_cleanup_resumes_after_crash_between_quarantine_and_phase_write(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        real_save = ORCHESTRATOR.save_cleanup_root_progress
+        injected = False
+
+        def fail_once(context, progress, phase):
+            nonlocal injected
+            if phase == "quarantined" and not injected:
+                injected = True
+                ORCHESTRATOR.fail("injected_quarantine_crash")
+            return real_save(context, progress, phase)
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "save_cleanup_root_progress",
+            side_effect=fail_once,
+        ):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        quarantine = ORCHESTRATOR.cleanup_root_quarantine_path(self.context)
+        self.assertFalse(self.isolated_root.exists())
+        self.assertTrue(quarantine.exists())
+        self.assertEqual(
+            ORCHESTRATOR.load_cleanup_root_progress(self.context)["phase"],
+            "planned",
+        )
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+        self.assertFalse(quarantine.exists())
+        self.assertEqual(
+            ORCHESTRATOR.load_cleanup_root_progress(self.context)["phase"],
+            "deleted",
+        )
+
+    def test_cleanup_reobserves_postgres_and_launchd_after_quarantine(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        real_observation = (
+            ORCHESTRATOR.require_quarantined_cleanup_substrate_inert
+        )
+        injected_postgres = False
+
+        def activate_postgres(context, platform):
+            nonlocal injected_postgres
+            if not injected_postgres:
+                injected_postgres = True
+                platform.postgres = True
+            return real_observation(context, platform)
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "require_quarantined_cleanup_substrate_inert",
+            side_effect=activate_postgres,
+        ):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        quarantine = ORCHESTRATOR.cleanup_root_quarantine_path(self.context)
+        self.assertTrue(quarantine.exists())
+        self.assertEqual(
+            ORCHESTRATOR.load_cleanup_root_progress(self.context)["phase"],
+            "planned",
+        )
+        self.platform.postgres = False
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        injected_launchd = False
+
+        def activate_launchd(context, platform):
+            nonlocal injected_launchd
+            if not injected_launchd:
+                injected_launchd = True
+                platform.loaded.add(runtime_label)
+            return real_observation(context, platform)
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "require_quarantined_cleanup_substrate_inert",
+            side_effect=activate_launchd,
+        ):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertTrue(quarantine.exists())
+        self.platform.loaded.discard(runtime_label)
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+        self.assertFalse(quarantine.exists())
+
+    def test_cleanup_does_not_certify_loss_before_quarantine_recheck(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "require_quarantined_cleanup_substrate_inert",
+            side_effect=ORCHESTRATOR.OrchestratorError(
+                "injected_pre_recheck_crash"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        quarantine = ORCHESTRATOR.cleanup_root_quarantine_path(self.context)
+        self.assertEqual(
+            ORCHESTRATOR.load_cleanup_root_progress(self.context)["phase"],
+            "planned",
+        )
+        preserved = quarantine.with_name(
+            f"{quarantine.name}.external-{secrets.token_hex(4)}"
+        )
+        quarantine.rename(preserved)
+        try:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+            self.assertEqual(
+                ORCHESTRATOR.load_cleanup_root_progress(self.context)["phase"],
+                "planned",
+            )
+        finally:
+            preserved.rename(quarantine)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_cleanup_recovers_only_verified_delete_completion_window(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        real_save = ORCHESTRATOR.save_cleanup_root_progress
+        injected = False
+
+        def fail_deleted_write(context, progress, phase):
+            nonlocal injected
+            if phase == "deleted" and not injected:
+                injected = True
+                ORCHESTRATOR.fail("injected_deleted_phase_crash")
+            return real_save(context, progress, phase)
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "save_cleanup_root_progress",
+            side_effect=fail_deleted_write,
+        ):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        quarantine = ORCHESTRATOR.cleanup_root_quarantine_path(self.context)
+        self.assertFalse(self.isolated_root.exists())
+        self.assertFalse(quarantine.exists())
+        self.assertEqual(
+            ORCHESTRATOR.load_cleanup_root_progress(self.context)["phase"],
+            "quarantined",
+        )
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+        self.assertEqual(
+            ORCHESTRATOR.load_cleanup_root_progress(self.context)["phase"],
+            "deleted",
+        )
+
+    def test_cleanup_exclusive_rename_rejects_destination_race(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        quarantine = ORCHESTRATOR.cleanup_root_quarantine_path(self.context)
+
+        def race_destination(
+            source_directory,
+            source_name,
+            destination_directory,
+            destination_name,
+        ):
+            quarantine.mkdir(mode=0o700)
+            return PLATFORM.rename_exclusive(
+                source_directory,
+                source_name,
+                destination_directory,
+                destination_name,
+            )
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "rename_exclusive",
+            side_effect=race_destination,
+        ):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertTrue(self.isolated_root.exists())
+        self.assertTrue(quarantine.is_dir())
+        quarantine.rmdir()
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_cleanup_rejects_external_root_loss_without_progress(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        preserved = self.isolated_root.with_name(
+            f".{self.isolated_root.name}.lost-{secrets.token_hex(4)}"
+        )
+        self.isolated_root.rename(preserved)
+        try:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+            self.assertTrue(preserved.exists())
+            self.assertFalse(
+                ORCHESTRATOR.cleanup_root_progress_path(self.context).exists()
+            )
+        finally:
+            preserved.rename(self.isolated_root)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_cleanup_rejects_external_root_loss_from_planned_progress(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        identity = ORCHESTRATOR.load_cleanup_root_identity(self.context)
+        progress = {
+            "schema_version": 1,
+            "kind": ORCHESTRATOR.CLEANUP_ROOT_PROGRESS_KIND,
+            "manifest_sha256": self.context.digest,
+            "run_id": self.context.manifest["run_id"],
+            "root_device": identity["root_device"],
+            "root_inode": identity["root_inode"],
+            "quarantine_name": ORCHESTRATOR.cleanup_root_quarantine_name(
+                self.context
+            ),
+            "phase": "planned",
+        }
+        ORCHESTRATOR.write_atomic(
+            ORCHESTRATOR.cleanup_root_progress_path(self.context),
+            ORCHESTRATOR.canonical_json(progress) + "\n",
+        )
+        preserved = self.isolated_root.with_name(
+            f".{self.isolated_root.name}.planned-{secrets.token_hex(4)}"
+        )
+        self.isolated_root.rename(preserved)
+        try:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+            self.assertEqual(
+                ORCHESTRATOR.load_cleanup_root_progress(self.context)["phase"],
+                "planned",
+            )
+        finally:
+            preserved.rename(self.isolated_root)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_postgres_observation_error_blocks_root_deletion(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        self.platform.postgres_observation_error = True
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertTrue(self.isolated_root.exists())
+        self.platform.postgres_observation_error = False
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_launchd_observation_error_blocks_root_deletion(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        self.platform.launchd_observation_error = True
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertTrue(self.isolated_root.exists())
+        self.platform.launchd_observation_error = False
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_missing_root_still_requires_process_path_observation(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        preserved = self.isolated_root.with_name(
+            f".{self.isolated_root.name}.missing-{secrets.token_hex(4)}"
+        )
+        self.isolated_root.rename(preserved)
+        self.platform.postgres_observation_error = True
+        try:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+            self.assertIn(
+                self.context.cluster_root,
+                self.platform.postgres_process_observations,
+            )
+            self.assertTrue(preserved.exists())
+        finally:
+            self.platform.postgres_observation_error = False
+            preserved.rename(self.isolated_root)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_cleaned_replay_rejects_corrupt_evidence_and_progress(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        evidence_path = self.context.artifact_directory / "cleanup-evidence.json"
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        corrupted = {**evidence, "isolated_root_absent": False}
+        evidence_path.write_text(json.dumps(corrupted), encoding="utf-8")
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_evidence_invalid"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+        progress_path = ORCHESTRATOR.cleanup_root_progress_path(self.context)
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        progress_path.write_text(
+            json.dumps({**progress, "phase": "planned"}), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "cleanup_root_progress_not_terminal",
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_cleaned_replay_reconstructs_only_missing_cleanup_evidence(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        evidence_path = self.context.artifact_directory / "cleanup-evidence.json"
+        evidence_path.unlink()
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["status"], "already_cleaned")
+        ORCHESTRATOR.validate_cleanup_evidence(
+            self.context,
+            json.loads(evidence_path.read_text(encoding="utf-8")),
+        )
+
+    def test_cleaned_replay_completes_journal_after_evidence_write_crash(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        evidence_path = self.context.artifact_directory / "cleanup-evidence.json"
+        real_write = ORCHESTRATOR.write_atomic
+        injected = False
+
+        def fail_evidence_write(path, payload, mode=0o600):
+            nonlocal injected
+            if pathlib.Path(path) == evidence_path and not injected:
+                injected = True
+                ORCHESTRATOR.fail("injected_cleanup_evidence_crash")
+            return real_write(path, payload, mode)
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "write_atomic",
+            side_effect=fail_evidence_write,
+        ):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "injected_cleanup_evidence_crash",
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(ORCHESTRATOR.load_state(self.context)["phase"], "cleaned")
+        self.assertFalse(evidence_path.exists())
+        replay = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(replay["status"], "already_cleaned")
+        cleanup_rows = [
+            row
+            for row in ORCHESTRATOR.cleanup_journal_rows(self.context)
+            if row["action"] == "cleanup"
+        ]
+        self.assertEqual(cleanup_rows[-1]["status"], "complete")
+
+    def test_cleaned_replay_completes_journal_after_complete_append_crash(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        real_append = ORCHESTRATOR.append_journal
+        injected = False
+
+        def fail_complete(context, action, status, target):
+            nonlocal injected
+            if action == "cleanup" and status == "complete" and not injected:
+                injected = True
+                ORCHESTRATOR.fail("injected_cleanup_journal_crash")
+            return real_append(context, action, status, target)
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "append_journal",
+            side_effect=fail_complete,
+        ):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "injected_cleanup_journal_crash",
+            ):
+                ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        evidence_path = self.context.artifact_directory / "cleanup-evidence.json"
+        self.assertTrue(evidence_path.exists())
+        replay = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(replay["status"], "already_cleaned")
+        cleanup_rows = [
+            row
+            for row in ORCHESTRATOR.cleanup_journal_rows(self.context)
+            if row["action"] == "cleanup"
+        ]
+        self.assertEqual(cleanup_rows[-1]["status"], "complete")
+
     def test_cleanup_never_dispatches_a_protected_label_or_credential(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
@@ -3461,6 +4018,7 @@ class LaunchdPlatformTests(unittest.TestCase):
 class D2DiscordResourceOrchestratorTest(unittest.TestCase):
     setUp = D2IsolatedOrchestratorTest.setUp
     tearDown = D2IsolatedOrchestratorTest.tearDown
+    remove_test_root = D2IsolatedOrchestratorTest.remove_test_root
     advance_live_clock = D2IsolatedOrchestratorTest.advance_live_clock
     prepare_manifest = D2IsolatedOrchestratorTest.prepare_manifest
     start_candidate_with_discord_resources = (

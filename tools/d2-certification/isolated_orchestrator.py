@@ -5,7 +5,6 @@ import hashlib
 import os
 import pathlib
 import re
-import shutil
 import signal
 import stat
 import sys
@@ -57,7 +56,7 @@ from d2_orchestrator_contract import (
     validate_programs,
     write_atomic,
 )
-from d2_orchestrator_platform import Platform
+from d2_orchestrator_platform import Platform, rename_exclusive
 from d2_drained_runtime_restart import (
     command_restart_drained_runtime,
     drained_runtime_restart_directory,
@@ -77,6 +76,7 @@ from d2_legacy_substrate_recovery import (
     command_recover as command_recover_legacy_substrate,
     command_status as command_legacy_substrate_status,
     load_legacy_context,
+    load_lifecycle_journal,
 )
 from d2_source_contract import (
     publish_bootstrap_source,
@@ -100,6 +100,9 @@ DISCORD_RESOURCE_SUCCESS_STATUS = {"role": 204, "channel": 200, "message": 204}
 DISCORD_TEARDOWN_PROGRESS_KIND = "starring.d2.discord-resource-teardown-progress.v1"
 DISCORD_TEARDOWN_EVIDENCE_KIND = "starring.d2.discord-resource-teardown.v1"
 DISCORD_TEARDOWN_ABORT_KIND = "starring.d2.discord-resource-teardown-abort.v1"
+CLEANUP_ROOT_PROGRESS_KIND = "starring.d2.cleanup-root-progress.v1"
+CLEANUP_ROOT_IDENTITY_KIND = "starring.d2.cleanup-root-identity.v1"
+CLEANUP_KEYCHAIN_BASELINE_KIND = "starring.d2.cleanup-keychain-baseline.v1"
 RECONCILIATION_DISCORD_OBSERVATION_KIND = (
     "starring.d2.discord-reconciliation-role-observation.v1"
 )
@@ -143,8 +146,16 @@ def command_prepare(context, platform):
         state = load_state(context)
         if state["phase"] in {"prepared", "substrate_started", "stopped"}:
             require_discord_ownership_claimed(context)
+            root_identity = load_cleanup_root_identity(context)
+            root_metadata = cleanup_path_metadata(
+                context.root, "cleanup_root_invalid"
+            )
             if (
-                not (context.cluster_root / "PG_VERSION").is_file()
+                root_identity is None
+                or not cleanup_root_identity_matches(
+                    root_metadata, root_identity
+                )
+                or not (context.cluster_root / "PG_VERSION").is_file()
                 or any(
                     not platform.keychain_owner_matches(
                         service, context.manifest["run_id"]
@@ -170,6 +181,7 @@ def command_prepare(context, platform):
         append_journal(context, "prepare", "intent", "run")
         append_journal(context, "root_create", "intent", "isolated_root")
         context.root.mkdir(mode=0o700)
+        record_cleanup_root_identity(context)
         context.socket_directory.mkdir(mode=0o700)
         context.log_directory.mkdir(mode=0o700)
         append_journal(context, "root_create", "complete", "isolated_root")
@@ -527,8 +539,19 @@ def command_stop(context, platform):
         platform.postgres_stop(context.cluster_root)
     except BaseException:
         failures.append("postgres")
-    if platform.postgres_running(context.cluster_root):
-        failures.append("postgres_running")
+    try:
+        if any(
+            not platform.launchd_absent(service["label"])
+            for service in context.manifest["services"].values()
+        ):
+            failures.append("launchd_absence")
+    except BaseException:
+        failures.append("launchd_observation")
+    try:
+        if not cleanup_postgres_absent(context, platform):
+            failures.append("postgres_absence")
+    except BaseException:
+        failures.append("postgres_observation")
     if failures:
         fail("candidate_stop_incomplete")
     append_journal(context, "postgres_stop", "complete", "cluster")
@@ -2288,56 +2311,470 @@ def command_teardown_discord_resources(context, platform, frozen=False):
     }
 
 
-def guarded_remove_root(context):
+def cleanup_root_quarantine_name(context):
+    return f".{context.root.name}.cleanup-{context.digest[:16]}"
+
+
+def cleanup_root_quarantine_path(context):
+    return context.root.parent / cleanup_root_quarantine_name(context)
+
+
+def cleanup_root_progress_path(context):
+    return context.artifact_directory / "cleanup-root-progress.json"
+
+
+def cleanup_root_identity_path(context):
+    return context.artifact_directory / "cleanup-root-identity.json"
+
+
+def cleanup_path_metadata(path, code):
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        fail(code)
+
+
+def validate_cleanup_root_directory(context, root):
     expected = pathlib.Path(f"/private/tmp/starring-d2-{context.manifest['run_id']}")
     if context.root != expected or context.root.parent != pathlib.Path("/private/tmp"):
         fail("cleanup_root_guard_failed")
-    try:
-        metadata = context.root.lstat()
-    except FileNotFoundError:
-        return
-    except OSError:
+    metadata = cleanup_path_metadata(root, "cleanup_root_invalid")
+    if metadata is None:
+        return None
+    parent = cleanup_path_metadata(root.parent, "cleanup_root_invalid")
+    if parent is None:
         fail("cleanup_root_invalid")
     if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or context.root.is_symlink()
+        not stat.S_ISDIR(parent.st_mode)
+        or root.parent.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or root.is_symlink()
         or metadata.st_uid != os.getuid()
         or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_dev != parent.st_dev
     ):
         fail("cleanup_root_invalid")
-    shutil.rmtree(context.root)
+    cluster_root = root / "postgres"
+    cluster = cleanup_path_metadata(cluster_root, "cleanup_cluster_invalid")
+    if cluster is not None and (
+        not stat.S_ISDIR(cluster.st_mode)
+        or cluster_root.is_symlink()
+        or cluster.st_uid != os.getuid()
+        or stat.S_IMODE(cluster.st_mode) != 0o700
+        or cluster.st_dev != metadata.st_dev
+    ):
+        fail("cleanup_cluster_invalid")
+    try:
+        for directory, names, files in os.walk(root, followlinks=False):
+            for name in names + files:
+                item = (pathlib.Path(directory) / name).lstat()
+                if item.st_dev != metadata.st_dev:
+                    fail("cleanup_mount_boundary_invalid")
+    except OSError:
+        fail("cleanup_root_invalid")
+    return metadata
+
+
+def validate_cleanup_root_identity(context, identity):
+    if (
+        not isinstance(identity, dict)
+        or set(identity)
+        != {
+            "schema_version",
+            "kind",
+            "manifest_sha256",
+            "run_id",
+            "root_path",
+            "root_device",
+            "root_inode",
+            "parent_device",
+            "owner_uid",
+        }
+        or identity.get("schema_version") != 1
+        or identity.get("kind") != CLEANUP_ROOT_IDENTITY_KIND
+        or identity.get("manifest_sha256") != context.digest
+        or identity.get("run_id") != context.manifest["run_id"]
+        or identity.get("root_path") != str(context.root)
+        or type(identity.get("root_device")) is not int
+        or identity["root_device"] < 0
+        or type(identity.get("root_inode")) is not int
+        or identity["root_inode"] <= 0
+        or type(identity.get("parent_device")) is not int
+        or identity["parent_device"] < 0
+        or identity["root_device"] != identity["parent_device"]
+        or identity.get("owner_uid") != os.getuid()
+    ):
+        fail("cleanup_root_identity_invalid")
+    return identity
+
+
+def load_cleanup_root_identity(context):
+    path = cleanup_root_identity_path(context)
+    metadata = cleanup_path_metadata(path, "cleanup_root_identity_invalid")
+    if metadata is None:
+        return None
+    require_owned_mode(path, 0o600, "cleanup_root_identity")
+    return validate_cleanup_root_identity(
+        context, load_json(path, "cleanup_root_identity_invalid")
+    )
+
+
+def record_cleanup_root_identity(context):
+    if cleanup_path_metadata(
+        cleanup_root_identity_path(context), "cleanup_root_identity_invalid"
+    ) is not None:
+        fail("cleanup_root_identity_busy")
+    metadata = validate_cleanup_root_directory(context, context.root)
+    parent = cleanup_path_metadata(context.root.parent, "cleanup_root_invalid")
+    if metadata is None or parent is None:
+        fail("cleanup_root_identity_invalid")
+    identity = {
+        "schema_version": 1,
+        "kind": CLEANUP_ROOT_IDENTITY_KIND,
+        "manifest_sha256": context.digest,
+        "run_id": context.manifest["run_id"],
+        "root_path": str(context.root),
+        "root_device": metadata.st_dev,
+        "root_inode": metadata.st_ino,
+        "parent_device": parent.st_dev,
+        "owner_uid": os.getuid(),
+    }
+    validate_cleanup_root_identity(context, identity)
+    write_atomic(
+        cleanup_root_identity_path(context), canonical_json(identity) + "\n"
+    )
+    return identity
+
+
+def cleanup_root_identity_matches(metadata, identity):
+    return (
+        metadata is not None
+        and stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_uid == identity["owner_uid"]
+        and metadata.st_dev == identity["root_device"]
+        and metadata.st_ino == identity["root_inode"]
+    )
+
+
+def load_cleanup_root_progress(context, identity=None):
+    path = cleanup_root_progress_path(context)
+    metadata = cleanup_path_metadata(path, "cleanup_root_progress_invalid")
+    if metadata is None:
+        return None
+    if identity is None:
+        identity = load_cleanup_root_identity(context)
+    if identity is None:
+        fail("cleanup_root_progress_invalid")
+    require_owned_mode(path, 0o600, "cleanup_root_progress")
+    progress = load_json(path, "cleanup_root_progress_invalid")
+    if (
+        not isinstance(progress, dict)
+        or set(progress)
+        != {
+            "schema_version",
+            "kind",
+            "manifest_sha256",
+            "run_id",
+            "root_device",
+            "root_inode",
+            "quarantine_name",
+            "phase",
+        }
+        or progress.get("schema_version") != 1
+        or progress.get("kind") != CLEANUP_ROOT_PROGRESS_KIND
+        or progress.get("manifest_sha256") != context.digest
+        or progress.get("run_id") != context.manifest["run_id"]
+        or type(progress.get("root_device")) is not int
+        or progress["root_device"] < 0
+        or type(progress.get("root_inode")) is not int
+        or progress["root_inode"] <= 0
+        or progress.get("quarantine_name") != cleanup_root_quarantine_name(context)
+        or progress.get("phase") not in {"planned", "quarantined", "deleted"}
+        or progress.get("root_device") != identity["root_device"]
+        or progress.get("root_inode") != identity["root_inode"]
+    ):
+        fail("cleanup_root_progress_invalid")
+    return progress
+
+
+def save_cleanup_root_progress(context, progress, phase):
+    updated = {**progress, "phase": phase}
+    write_atomic(
+        cleanup_root_progress_path(context), canonical_json(updated) + "\n"
+    )
+    return updated
+
+
+def cleanup_root_metadata_matches(metadata, progress):
+    return (
+        metadata is not None
+        and stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and metadata.st_dev == progress["root_device"]
+        and metadata.st_ino == progress["root_inode"]
+    )
+
+
+def remove_cleanup_tree_contents(descriptor, expected_device):
+    try:
+        entries = list(os.scandir(descriptor))
+    except OSError:
+        fail("cleanup_root_delete_failed")
+    for entry in entries:
+        try:
+            before = os.stat(
+                entry.name, dir_fd=descriptor, follow_symlinks=False
+            )
+        except OSError:
+            fail("cleanup_root_swap_detected")
+        if before.st_dev != expected_device:
+            fail("cleanup_mount_boundary_invalid")
+        if stat.S_ISDIR(before.st_mode):
+            try:
+                child = os.open(
+                    entry.name,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=descriptor,
+                )
+            except OSError:
+                fail("cleanup_root_swap_detected")
+            try:
+                opened = os.fstat(child)
+                if (
+                    opened.st_dev != before.st_dev
+                    or opened.st_ino != before.st_ino
+                ):
+                    fail("cleanup_root_swap_detected")
+                remove_cleanup_tree_contents(child, expected_device)
+            finally:
+                os.close(child)
+            try:
+                after = os.stat(
+                    entry.name, dir_fd=descriptor, follow_symlinks=False
+                )
+                if after.st_dev != before.st_dev or after.st_ino != before.st_ino:
+                    fail("cleanup_root_swap_detected")
+                os.rmdir(entry.name, dir_fd=descriptor)
+            except OSError:
+                fail("cleanup_root_swap_detected")
+        else:
+            try:
+                after = os.stat(
+                    entry.name, dir_fd=descriptor, follow_symlinks=False
+                )
+                if after.st_dev != before.st_dev or after.st_ino != before.st_ino:
+                    fail("cleanup_root_swap_detected")
+                os.unlink(entry.name, dir_fd=descriptor)
+            except OSError:
+                fail("cleanup_root_swap_detected")
+
+
+def remove_cleanup_quarantine(context, progress):
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        parent = os.open(context.root.parent, flags)
+    except OSError:
+        fail("cleanup_root_invalid")
+    try:
+        try:
+            before = os.stat(
+                progress["quarantine_name"],
+                dir_fd=parent,
+                follow_symlinks=False,
+            )
+        except OSError:
+            fail("cleanup_root_swap_detected")
+        if not cleanup_root_metadata_matches(before, progress):
+            fail("cleanup_root_swap_detected")
+        try:
+            root = os.open(
+                progress["quarantine_name"], flags, dir_fd=parent
+            )
+        except OSError:
+            fail("cleanup_root_swap_detected")
+        try:
+            opened = os.fstat(root)
+            if not cleanup_root_metadata_matches(opened, progress):
+                fail("cleanup_root_swap_detected")
+            remove_cleanup_tree_contents(root, progress["root_device"])
+        finally:
+            os.close(root)
+        try:
+            after = os.stat(
+                progress["quarantine_name"],
+                dir_fd=parent,
+                follow_symlinks=False,
+            )
+            if not cleanup_root_metadata_matches(after, progress):
+                fail("cleanup_root_swap_detected")
+            os.rmdir(progress["quarantine_name"], dir_fd=parent)
+            os.fsync(parent)
+        except OSError:
+            fail("cleanup_root_swap_detected")
+    finally:
+        os.close(parent)
+
+
+def require_quarantined_cleanup_substrate_inert(context, platform):
+    if not cleanup_postgres_absent(context, platform):
+        fail("cleanup_postgres_active_after_quarantine")
+    if any(
+        not platform.launchd_absent(service["label"])
+        for service in context.manifest["services"].values()
+    ):
+        fail("cleanup_launchd_active_after_quarantine")
+
+
+def guarded_remove_root(context, platform):
+    expected = pathlib.Path(f"/private/tmp/starring-d2-{context.manifest['run_id']}")
+    if context.root != expected or context.root.parent != pathlib.Path("/private/tmp"):
+        fail("cleanup_root_guard_failed")
+    identity = load_cleanup_root_identity(context)
+    root_metadata = cleanup_path_metadata(context.root, "cleanup_root_invalid")
+    quarantined = cleanup_root_quarantine_path(context)
+    quarantine_metadata = cleanup_path_metadata(quarantined, "cleanup_root_invalid")
+    progress = load_cleanup_root_progress(context, identity)
+    if root_metadata is not None and quarantine_metadata is not None:
+        fail("cleanup_root_swap_detected")
+    if (
+        identity is None
+        and (
+            root_metadata is not None
+            or quarantine_metadata is not None
+            or progress is not None
+        )
+    ):
+        fail("cleanup_root_identity_invalid")
+    if identity is None:
+        return
+    if progress is not None and progress["phase"] == "deleted" and (
+        root_metadata is not None or quarantine_metadata is not None
+    ):
+        fail("cleanup_root_swap_detected")
+    if root_metadata is not None:
+        validated = validate_cleanup_root_directory(context, context.root)
+        if not cleanup_root_identity_matches(validated, identity):
+            fail("cleanup_root_swap_detected")
+        if progress is None:
+            progress = {
+                "schema_version": 1,
+                "kind": CLEANUP_ROOT_PROGRESS_KIND,
+                "manifest_sha256": context.digest,
+                "run_id": context.manifest["run_id"],
+                "root_device": identity["root_device"],
+                "root_inode": identity["root_inode"],
+                "quarantine_name": cleanup_root_quarantine_name(context),
+                "phase": "planned",
+            }
+            write_atomic(
+                cleanup_root_progress_path(context),
+                canonical_json(progress) + "\n",
+            )
+        if not cleanup_root_metadata_matches(validated, progress):
+            fail("cleanup_root_swap_detected")
+        if progress["phase"] != "planned":
+            fail("cleanup_root_swap_detected")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            parent = os.open(context.root.parent, flags)
+        except OSError:
+            fail("cleanup_root_invalid")
+        try:
+            try:
+                before = os.stat(
+                    context.root.name, dir_fd=parent, follow_symlinks=False
+                )
+                if not cleanup_root_metadata_matches(before, progress):
+                    fail("cleanup_root_swap_detected")
+                rename_exclusive(
+                    parent,
+                    context.root.name,
+                    parent,
+                    progress["quarantine_name"],
+                )
+                after = os.stat(
+                    progress["quarantine_name"],
+                    dir_fd=parent,
+                    follow_symlinks=False,
+                )
+                if not cleanup_root_metadata_matches(after, progress):
+                    fail("cleanup_root_swap_detected")
+                os.fsync(parent)
+            except OSError:
+                fail("cleanup_root_swap_detected")
+        finally:
+            os.close(parent)
+        require_quarantined_cleanup_substrate_inert(context, platform)
+        progress = save_cleanup_root_progress(context, progress, "quarantined")
+    elif quarantine_metadata is not None:
+        if progress is None or not cleanup_root_metadata_matches(
+            quarantine_metadata, progress
+        ):
+            fail("cleanup_root_swap_detected")
+        if progress["phase"] not in {"planned", "quarantined"}:
+            fail("cleanup_root_swap_detected")
+        validate_cleanup_root_directory(context, quarantined)
+        require_quarantined_cleanup_substrate_inert(context, platform)
+        progress = save_cleanup_root_progress(context, progress, "quarantined")
+    elif progress is not None:
+        if progress["phase"] == "quarantined":
+            save_cleanup_root_progress(context, progress, "deleted")
+            return
+        if progress["phase"] == "deleted":
+            return
+        fail("cleanup_root_loss_unproven")
+    else:
+        fail("cleanup_root_loss_unproven")
+    remove_cleanup_quarantine(context, progress)
+    save_cleanup_root_progress(context, progress, "deleted")
 
 
 def validate_cleanup_mutation_roots(context):
     expected = pathlib.Path(f"/private/tmp/starring-d2-{context.manifest['run_id']}")
     if context.root != expected or context.cluster_root != expected / "postgres":
         fail("cleanup_root_guard_failed")
-    try:
-        root_metadata = context.root.lstat()
-    except FileNotFoundError:
-        return
-    except OSError:
-        fail("cleanup_root_invalid")
+    root_metadata = cleanup_path_metadata(context.root, "cleanup_root_invalid")
+    quarantined = cleanup_root_quarantine_path(context)
+    quarantine_metadata = cleanup_path_metadata(quarantined, "cleanup_root_invalid")
+    identity = load_cleanup_root_identity(context)
+    progress = load_cleanup_root_progress(context, identity)
+    if root_metadata is not None and quarantine_metadata is not None:
+        fail("cleanup_root_swap_detected")
     if (
-        not stat.S_ISDIR(root_metadata.st_mode)
-        or context.root.is_symlink()
-        or root_metadata.st_uid != os.getuid()
-        or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        identity is None
+        and (
+            root_metadata is not None
+            or quarantine_metadata is not None
+            or progress is not None
+        )
     ):
-        fail("cleanup_root_invalid")
-    try:
-        cluster_metadata = context.cluster_root.lstat()
-    except FileNotFoundError:
-        return
-    except OSError:
-        fail("cleanup_cluster_invalid")
-    if (
-        not stat.S_ISDIR(cluster_metadata.st_mode)
-        or context.cluster_root.is_symlink()
-        or cluster_metadata.st_uid != os.getuid()
-        or stat.S_IMODE(cluster_metadata.st_mode) != 0o700
-    ):
-        fail("cleanup_cluster_invalid")
+        fail("cleanup_root_identity_invalid")
+    if root_metadata is not None:
+        validated = validate_cleanup_root_directory(context, context.root)
+        if not cleanup_root_identity_matches(validated, identity):
+            fail("cleanup_root_swap_detected")
+        if progress is not None and progress["phase"] != "planned":
+            fail("cleanup_root_swap_detected")
+    if quarantine_metadata is not None:
+        if progress is None or not cleanup_root_metadata_matches(
+            quarantine_metadata, progress
+        ):
+            fail("cleanup_root_swap_detected")
+        if progress["phase"] not in {"planned", "quarantined"}:
+            fail("cleanup_root_swap_detected")
+        validate_cleanup_root_directory(context, quarantined)
 
 
 def filesystem_entry_present(path, code):
@@ -2350,17 +2787,39 @@ def filesystem_entry_present(path, code):
     return True
 
 
+def cleanup_postgres_absent(context, platform):
+    original = context.cluster_root
+    quarantined = cleanup_root_quarantine_path(context) / "postgres"
+    original_present = filesystem_entry_present(
+        original, "cleanup_cluster_invalid"
+    )
+    quarantine_present = filesystem_entry_present(
+        quarantined, "cleanup_cluster_invalid"
+    )
+    if original_present and quarantine_present:
+        fail("cleanup_root_swap_detected")
+    if original_present:
+        return platform.postgres_absent(original)
+    if quarantine_present:
+        return platform.postgres_absent(
+            quarantined
+        ) and platform.postgres_process_path_absent(original)
+    return platform.postgres_process_path_absent(
+        original
+    ) and platform.postgres_process_path_absent(quarantined)
+
+
 def cleanup_absence(context, platform, expected_snapshot):
-    root_present = filesystem_entry_present(context.root, "cleanup_root_invalid")
-    cluster_present = filesystem_entry_present(
-        context.cluster_root, "cleanup_cluster_invalid"
+    root_present = filesystem_entry_present(
+        context.root, "cleanup_root_invalid"
+    ) or filesystem_entry_present(
+        cleanup_root_quarantine_path(context), "cleanup_root_invalid"
     )
     return {
         "database_absent": not root_present,
-        "postgres_process_absent": not cluster_present
-        or not platform.postgres_running(context.cluster_root),
+        "postgres_process_absent": cleanup_postgres_absent(context, platform),
         "launchd_jobs_absent": all(
-            not platform.launchd_loaded(service["label"])
+            platform.launchd_absent(service["label"])
             for service in context.manifest["services"].values()
         ),
         "keychain_items_absent": all(
@@ -2374,12 +2833,285 @@ def cleanup_absence(context, platform, expected_snapshot):
 
 
 def new_cleanup_evidence(context, absence):
-    return {
+    evidence = {
         "schema_version": 1,
         "manifest_sha256": context.digest,
         "observed_at": utc_now(),
         **absence,
     }
+    return validate_cleanup_evidence(context, evidence)
+
+
+def validate_cleanup_evidence(context, evidence):
+    boolean_fields = {
+        "database_absent",
+        "postgres_process_absent",
+        "launchd_jobs_absent",
+        "keychain_items_absent",
+        "isolated_root_absent",
+        "protected_staging_unchanged",
+    }
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence)
+        != {
+            "schema_version",
+            "manifest_sha256",
+            "observed_at",
+            *boolean_fields,
+        }
+        or evidence.get("schema_version") != 1
+        or evidence.get("manifest_sha256") != context.digest
+        or not isinstance(evidence.get("observed_at"), str)
+        or not EVIDENCE_RECORDED_AT_PATTERN.fullmatch(evidence["observed_at"])
+        or any(evidence.get(field) is not True for field in boolean_fields)
+    ):
+        fail("cleanup_evidence_invalid")
+    return evidence
+
+
+def require_terminal_cleanup_root_progress(context):
+    root = cleanup_path_metadata(context.root, "cleanup_root_invalid")
+    quarantine = cleanup_path_metadata(
+        cleanup_root_quarantine_path(context), "cleanup_root_invalid"
+    )
+    if root is not None or quarantine is not None:
+        fail("cleanup_root_not_deleted")
+    identity = load_cleanup_root_identity(context)
+    progress = load_cleanup_root_progress(context, identity)
+    if identity is None:
+        if progress is not None:
+            fail("cleanup_root_progress_invalid")
+        return None
+    if progress is None:
+        fail("cleanup_root_progress_invalid")
+    if progress["phase"] != "deleted":
+        fail("cleanup_root_progress_not_terminal")
+    return progress
+
+
+def cleanup_journal_rows(context):
+    try:
+        rows = load_lifecycle_journal(context)
+    except BaseException:
+        fail("cleanup_journal_invalid")
+    for row in rows:
+        if row["action"] == "cleanup" and (
+            row["target"] != "run"
+            or row["status"] not in {"intent", "failed", "complete"}
+        ):
+            fail("cleanup_journal_invalid")
+    return rows
+
+
+def ensure_cleanup_journal_complete(context):
+    rows = cleanup_journal_rows(context)
+    cleanup_rows = [
+        (index, row)
+        for index, row in enumerate(rows)
+        if row["action"] == "cleanup" and row["target"] == "run"
+    ]
+    intents = [index for index, row in cleanup_rows if row["status"] == "intent"]
+    if not intents:
+        fail("cleanup_journal_incomplete")
+    last_intent = intents[-1]
+    if (
+        cleanup_rows[-1][0] <= last_intent
+        or cleanup_rows[-1][1]["status"] != "complete"
+    ):
+        append_journal(context, "cleanup", "complete", "run")
+        rows = cleanup_journal_rows(context)
+        cleanup_rows = [
+            (index, row)
+            for index, row in enumerate(rows)
+            if row["action"] == "cleanup" and row["target"] == "run"
+        ]
+        if (
+            cleanup_rows[-1][0] <= last_intent
+            or cleanup_rows[-1][1]["status"] != "complete"
+        ):
+            fail("cleanup_journal_incomplete")
+
+
+def cleanup_keychain_baseline_path(context):
+    return context.artifact_directory / "cleanup-keychain-baseline.json"
+
+
+def validate_cleanup_keychain_baseline(context, baseline):
+    inventory = tuple(keychain_inventory(context))
+    if (
+        not isinstance(baseline, dict)
+        or set(baseline)
+        != {
+            "schema_version",
+            "kind",
+            "manifest_sha256",
+            "run_id",
+            "inventory",
+        }
+        or baseline.get("schema_version") != 1
+        or baseline.get("kind") != CLEANUP_KEYCHAIN_BASELINE_KIND
+        or baseline.get("manifest_sha256") != context.digest
+        or baseline.get("run_id") != context.manifest["run_id"]
+        or not isinstance(baseline.get("inventory"), list)
+        or len(baseline["inventory"]) != len(inventory)
+    ):
+        fail("cleanup_keychain_baseline_invalid")
+    observed_inventory = []
+    identities = {}
+    for entry in baseline["inventory"]:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"service", "account", "identity_sha256"}
+            or not isinstance(entry.get("service"), str)
+            or not isinstance(entry.get("account"), str)
+            or (
+                entry.get("identity_sha256") is not None
+                and (
+                    not isinstance(entry["identity_sha256"], str)
+                    or not DIGEST_PATTERN.fullmatch(entry["identity_sha256"])
+                )
+            )
+        ):
+            fail("cleanup_keychain_baseline_invalid")
+        identity = (entry["service"], entry["account"])
+        if identity in identities:
+            fail("cleanup_keychain_baseline_invalid")
+        observed_inventory.append(identity)
+        identities[identity] = entry["identity_sha256"]
+    if tuple(observed_inventory) != inventory:
+        fail("cleanup_keychain_baseline_invalid")
+    for service in {service for service, _account in inventory}:
+        service_identities = {
+            account: identities[(service, account)]
+            for item_service, account in inventory
+            if item_service == service
+        }
+        if any(value is not None for value in service_identities.values()) and (
+            service_identities.get(OWNER_ACCOUNT) is None
+        ):
+            fail("cleanup_keychain_baseline_invalid")
+    return identities
+
+
+def observe_cleanup_keychain_inventory(context, platform):
+    observed = {}
+    for service, account in keychain_inventory(context):
+        identity = platform.keychain_item_identity(service, account)
+        if identity is not None and (
+            not isinstance(identity, str)
+            or not DIGEST_PATTERN.fullmatch(identity)
+        ):
+            fail("cleanup_keychain_identity_invalid")
+        observed[(service, account)] = identity
+    return observed
+
+
+def load_cleanup_keychain_baseline(context):
+    path = cleanup_keychain_baseline_path(context)
+    if cleanup_path_metadata(path, "cleanup_keychain_baseline_invalid") is None:
+        fail("cleanup_keychain_baseline_invalid")
+    require_owned_mode(path, 0o600, "cleanup_keychain_baseline")
+    return validate_cleanup_keychain_baseline(
+        context, load_json(path, "cleanup_keychain_baseline_invalid")
+    )
+
+
+def load_or_create_cleanup_keychain_baseline(context, platform):
+    path = cleanup_keychain_baseline_path(context)
+    metadata = cleanup_path_metadata(path, "cleanup_keychain_baseline_invalid")
+    if metadata is None:
+        observed = observe_cleanup_keychain_inventory(context, platform)
+        baseline = {
+            "schema_version": 1,
+            "kind": CLEANUP_KEYCHAIN_BASELINE_KIND,
+            "manifest_sha256": context.digest,
+            "run_id": context.manifest["run_id"],
+            "inventory": [
+                {
+                    "service": service,
+                    "account": account,
+                    "identity_sha256": observed[(service, account)],
+                }
+                for service, account in keychain_inventory(context)
+            ],
+        }
+        identities = validate_cleanup_keychain_baseline(context, baseline)
+        for service in {service for service, _account in identities}:
+            if any(
+                identity is not None
+                for (item_service, _account), identity in identities.items()
+                if item_service == service
+            ) and not platform.keychain_owner_matches(
+                service, context.manifest["run_id"]
+            ):
+                fail("cleanup_keychain_ownership_invalid")
+        write_atomic(path, canonical_json(baseline) + "\n")
+    return load_cleanup_keychain_baseline(context)
+
+
+def validate_cleanup_keychain_replay(context, platform, baseline):
+    current = observe_cleanup_keychain_inventory(context, platform)
+    for identity, original in baseline.items():
+        observed = current[identity]
+        if original is None:
+            if observed is not None:
+                fail("cleanup_keychain_identity_drift")
+        elif observed not in {None, original}:
+            fail("cleanup_keychain_identity_drift")
+    for service in {service for service, _account in baseline}:
+        pending = {
+            account
+            for (item_service, account), original in baseline.items()
+            if item_service == service
+            and original is not None
+            and current[(item_service, account)] == original
+        }
+        if pending and (
+            OWNER_ACCOUNT not in pending
+            or not platform.keychain_owner_matches(
+                service, context.manifest["run_id"]
+            )
+        ):
+            fail("cleanup_keychain_ownership_invalid")
+    return current
+
+
+def cleanup_keychain_inventory(context, platform):
+    baseline = load_or_create_cleanup_keychain_baseline(context, platform)
+    for service in sorted({service for service, _account in baseline}):
+        accounts = sorted(
+            (
+                account
+                for (item_service, account), original in baseline.items()
+                if item_service == service and original is not None
+            ),
+            key=lambda account: account == OWNER_ACCOUNT,
+        )
+        for account in accounts:
+            current = validate_cleanup_keychain_replay(
+                context, platform, baseline
+            )
+            target = (service, account)
+            if current[target] is None:
+                continue
+            if not platform.keychain_owner_matches(
+                service, context.manifest["run_id"]
+            ):
+                fail("cleanup_keychain_ownership_invalid")
+            platform.keychain_delete_exact(service, account, baseline[target])
+            if platform.keychain_item_identity(service, account) is not None:
+                fail("cleanup_keychain_delete_unconfirmed")
+    current = validate_cleanup_keychain_replay(context, platform, baseline)
+    if any(identity is not None for identity in current.values()):
+        fail("cleanup_keychain_delete_unconfirmed")
+
+
+def require_cleanup_keychain_baseline_absent(context, platform):
+    baseline = load_cleanup_keychain_baseline(context)
+    current = validate_cleanup_keychain_replay(context, platform, baseline)
+    if any(identity is not None for identity in current.values()):
+        fail("cleanup_keychain_delete_unconfirmed")
 
 
 def cleanup(context, platform, expected_snapshot, from_failure=False):
@@ -2396,33 +3128,48 @@ def cleanup(context, platform, expected_snapshot, from_failure=False):
         platform.postgres_stop(context.cluster_root)
     except BaseException:
         failures.append("postgres")
-    accounts_by_service = {}
-    for service, account in keychain_inventory(context):
-        accounts_by_service.setdefault(service, []).append(account)
-    for service, accounts in accounts_by_service.items():
-        present = [
-            account for account in accounts if platform.keychain_present(service, account)
-        ]
-        if not present:
-            continue
-        if not platform.keychain_owner_matches(service, context.manifest["run_id"]):
-            failures.append(f"keychain_ownership:{service}")
-            continue
-        for account in sorted(present, key=lambda value: value == OWNER_ACCOUNT):
-            try:
-                platform.keychain_delete(service, account)
-            except BaseException:
-                failures.append(f"keychain:{service}")
     try:
-        guarded_remove_root(context)
+        cleanup_keychain_inventory(context, platform)
     except BaseException:
-        failures.append("root")
-    absence = cleanup_absence(context, platform, expected_snapshot)
+        failures.append("keychain")
+    try:
+        postgres_inert = cleanup_postgres_absent(context, platform)
+    except BaseException:
+        failures.append("postgres_observation")
+        postgres_inert = False
+    try:
+        launchd_inert = all(
+            platform.launchd_absent(service["label"])
+            for service in context.manifest["services"].values()
+        )
+    except BaseException:
+        failures.append("launchd_observation")
+        launchd_inert = False
+    if postgres_inert and launchd_inert and not failures:
+        try:
+            guarded_remove_root(context, platform)
+        except BaseException:
+            failures.append("root")
+    else:
+        failures.append("root_removal_blocked")
+    try:
+        absence = cleanup_absence(context, platform, expected_snapshot)
+    except BaseException:
+        failures.append("absence_observation")
+        absence = {
+            "database_absent": False,
+            "postgres_process_absent": False,
+            "launchd_jobs_absent": False,
+            "keychain_items_absent": False,
+            "isolated_root_absent": False,
+            "protected_staging_unchanged": False,
+        }
     if not all(absence.values()):
         failures.append("absence_verification")
     if failures:
         append_journal(context, "cleanup", "failed", "run")
         fail("cleanup_incomplete")
+    require_terminal_cleanup_root_progress(context)
     try:
         release_discord_ownership(context)
     except BaseException:
@@ -2435,6 +3182,7 @@ def cleanup(context, platform, expected_snapshot, from_failure=False):
         canonical_json(evidence) + "\n",
     )
     append_journal(context, "cleanup", "complete", "run")
+    ensure_cleanup_journal_complete(context)
     return {
         "status": "cleaned_after_failure" if from_failure else "cleaned",
         "phase": "cleaned",
@@ -2451,17 +3199,23 @@ def command_cleanup(context, platform):
     state = load_state(context)
     if state["phase"] == "cleaned":
         require_discord_ownership_released(context)
+        require_terminal_cleanup_root_progress(context)
+        require_cleanup_keychain_baseline_absent(context, platform)
         absence = cleanup_absence(context, platform, state["standing_snapshot"])
         if not all(absence.values()):
             fail("cleanup_incomplete")
         path = context.artifact_directory / "cleanup-evidence.json"
         if path.exists() or path.is_symlink():
             require_owned_mode(path, 0o600, "cleanup_evidence")
+            validate_cleanup_evidence(
+                context, load_json(path, "cleanup_evidence_invalid")
+            )
         else:
             write_atomic(
                 path,
                 canonical_json(new_cleanup_evidence(context, absence)) + "\n",
             )
+        ensure_cleanup_journal_complete(context)
         return {
             "status": "already_cleaned",
             "phase": "cleaned",
