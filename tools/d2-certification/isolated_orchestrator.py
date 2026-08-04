@@ -2332,6 +2332,34 @@ def validate_cleanup_mutation_roots(context):
         fail("cleanup_cluster_invalid")
 
 
+def cleanup_absence(context, platform, expected_snapshot):
+    return {
+        "database_absent": not context.root.exists(),
+        "postgres_process_absent": not context.cluster_root.exists()
+        or not platform.postgres_running(context.cluster_root),
+        "launchd_jobs_absent": all(
+            not platform.launchd_loaded(service["label"])
+            for service in context.manifest["services"].values()
+        ),
+        "keychain_items_absent": all(
+            not platform.keychain_present(service, account)
+            for service, account in keychain_inventory(context)
+        ),
+        "isolated_root_absent": not context.root.exists(),
+        "protected_staging_unchanged": standing_snapshot(context, platform)
+        == expected_snapshot,
+    }
+
+
+def new_cleanup_evidence(context, absence):
+    return {
+        "schema_version": 1,
+        "manifest_sha256": context.digest,
+        "observed_at": utc_now(),
+        **absence,
+    }
+
+
 def cleanup(context, platform, expected_snapshot, from_failure=False):
     validate_cleanup_mutation_roots(context)
     append_journal(context, "cleanup", "intent", "run")
@@ -2367,22 +2395,8 @@ def cleanup(context, platform, expected_snapshot, from_failure=False):
         guarded_remove_root(context)
     except BaseException:
         failures.append("root")
-    launchd_absent = all(
-        not platform.launchd_loaded(service["label"])
-        for service in context.manifest["services"].values()
-    )
-    keychain_absent = all(
-        not platform.keychain_present(service, account)
-        for service, account in keychain_inventory(context)
-    )
-    postgres_absent = not context.cluster_root.exists() or not platform.postgres_running(
-        context.cluster_root
-    )
-    root_absent = not context.root.exists()
-    standing_unchanged = standing_snapshot(context, platform) == expected_snapshot
-    if not all(
-        (launchd_absent, keychain_absent, postgres_absent, root_absent, standing_unchanged)
-    ):
+    absence = cleanup_absence(context, platform, expected_snapshot)
+    if not all(absence.values()):
         failures.append("absence_verification")
     if failures:
         append_journal(context, "cleanup", "failed", "run")
@@ -2393,17 +2407,7 @@ def cleanup(context, platform, expected_snapshot, from_failure=False):
         append_journal(context, "cleanup", "failed", "run")
         fail("cleanup_incomplete")
     save_state(context, "cleaned", expected_snapshot)
-    evidence = {
-        "schema_version": 1,
-        "manifest_sha256": context.digest,
-        "observed_at": utc_now(),
-        "database_absent": True,
-        "postgres_process_absent": True,
-        "launchd_jobs_absent": True,
-        "keychain_items_absent": True,
-        "isolated_root_absent": True,
-        "protected_staging_unchanged": True,
-    }
+    evidence = new_cleanup_evidence(context, absence)
     write_atomic(
         context.artifact_directory / "cleanup-evidence.json",
         canonical_json(evidence) + "\n",
@@ -2425,11 +2429,21 @@ def command_cleanup(context, platform):
     state = load_state(context)
     if state["phase"] == "cleaned":
         require_discord_ownership_released(context)
+        absence = cleanup_absence(context, platform, state["standing_snapshot"])
+        if not all(absence.values()):
+            fail("cleanup_incomplete")
+        path = context.artifact_directory / "cleanup-evidence.json"
+        if path.exists() or path.is_symlink():
+            require_owned_mode(path, 0o600, "cleanup_evidence")
+        else:
+            write_atomic(
+                path,
+                canonical_json(new_cleanup_evidence(context, absence)) + "\n",
+            )
         return {
             "status": "already_cleaned",
             "phase": "cleaned",
-            "protected_staging_unchanged": standing_snapshot(context, platform)
-            == state["standing_snapshot"],
+            **absence,
         }
     return cleanup(context, platform, state["standing_snapshot"])
 

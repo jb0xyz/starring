@@ -760,6 +760,36 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertEqual(result["status"], "finalized")
         self.assertEqual(self.platform.destroy_calls, 1)
 
+    def test_cleanup_evidence_write_crash_reproves_absence_and_resumes(self):
+        cleanup_path = self.context.artifact_directory / "cleanup-evidence.json"
+        real_write = ORCHESTRATOR.write_atomic
+        failed = False
+
+        def fail_cleanup_evidence(path, payload, mode=0o600):
+            nonlocal failed
+            if pathlib.Path(path) == cleanup_path and not failed:
+                failed = True
+                raise ORCHESTRATOR.OrchestratorError(
+                    "injected_cleanup_evidence_write_failure"
+                )
+            return real_write(path, payload, mode)
+
+        with mock.patch.object(
+            ORCHESTRATOR, "write_atomic", side_effect=fail_cleanup_evidence
+        ):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "injected_cleanup_evidence_write_failure",
+            ):
+                self.finalize()
+        self.assertEqual(ORCHESTRATOR.load_state(self.context)["phase"], "cleaned")
+        self.assertFalse(cleanup_path.exists())
+        self.assertFalse(FINALIZATION.step_sixteen_evidence_path(self.context).exists())
+        result = self.finalize()
+        self.assertEqual(result["status"], "finalized")
+        self.assertTrue(cleanup_path.is_file())
+        self.assertTrue(FINALIZATION.step_sixteen_evidence_path(self.context).is_file())
+
     def test_total_absence_combines_prefix_scan_and_chrome_guild_deletion(self):
         self.finalize()
         prefix = self.prefix_scan()
