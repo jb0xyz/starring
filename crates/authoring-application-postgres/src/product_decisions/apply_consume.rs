@@ -470,11 +470,10 @@ pub(super) fn validate_runtime_drain_consumption_result(
         || row.requires_commit
         || row.preparation_token.is_some()
         || row.locked_product_projection.is_none()
-        || row
-            .source_deployment_snapshot
-            .as_ref()
-            .map(|value| &value.0)
-            != Some(&serde_json::to_value(&source.source_deployment).map_err(|_| invalid_result())?)
+        || !source_snapshot_matches(
+            row.source_deployment_snapshot.as_ref(),
+            &source.source_deployment,
+        )?
         || row.source_acknowledged_at != Some(source.acknowledged_at()?)
         || !source_projection_matches(row, source)
         || row.source_result_deployment_revision != Some(prepared.source_result_deployment_revision)
@@ -632,6 +631,13 @@ fn decode_snapshot(
     Ok(snapshot)
 }
 
+fn source_snapshot_matches(
+    value: Option<&Json<Value>>,
+    expected: &RuntimeDeploymentSnapshotV1,
+) -> Result<bool, ProductControlPortError> {
+    Ok(decode_snapshot(value)? == *expected)
+}
+
 fn valid_preparation_token(value: &str) -> bool {
     value.len() == 67
         && value.starts_with("v2:")
@@ -665,4 +671,71 @@ fn invalid_result() -> ProductControlPortError {
     ProductControlPortError::Backend(
         "product apply runtime drain consume returned an invalid result".to_string(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use automation_ruleset::{RuleSetContentHash, RuleSetKey, RuleSetVersionId};
+    use automation_runtime_convergence::{
+        ActivationRequestId, BindingRevision, DeploymentId, InstallationId, PromotionId,
+        RuntimeDeploymentIdentityV1, RuntimeDeploymentTargetV1, RuntimeGeneration, TenantId,
+    };
+    use chrono::{SecondsFormat, TimeZone};
+    use discord_model::GuildId;
+    use resource_resolution::ResourceBindingFingerprint;
+
+    use super::*;
+
+    fn requested_snapshot() -> RuntimeDeploymentSnapshotV1 {
+        RuntimeDeployment::request(
+            RuntimeDeploymentIdentityV1 {
+                deployment_id: DeploymentId::parse("deployment-utc-equivalence").unwrap(),
+                tenant_id: TenantId::parse("tenant-utc-equivalence").unwrap(),
+                installation_id: InstallationId::parse("installation-utc-equivalence").unwrap(),
+                promotion_id: PromotionId::parse("a".repeat(64)).unwrap(),
+                activation_request_id: ActivationRequestId::parse("activation-utc-equivalence")
+                    .unwrap(),
+            },
+            RuntimeDeploymentTargetV1 {
+                guild_id: GuildId(42),
+                ruleset_key: RuleSetKey::parse("studyroom").unwrap(),
+                version: RuleSetVersionId::FIRST,
+                content_hash: RuleSetContentHash::parse_hex(&"b".repeat(64)).unwrap(),
+                binding_revision: BindingRevision::new(1).unwrap(),
+                binding_fingerprint: ResourceBindingFingerprint::parse(&"c".repeat(64)).unwrap(),
+            },
+            RuntimeGeneration::new(1).unwrap(),
+            None,
+            Utc.timestamp_opt(1_800_000_000, 123_456_000).unwrap(),
+        )
+        .unwrap()
+        .snapshot()
+    }
+
+    #[test]
+    fn source_snapshot_validation_accepts_equivalent_utc_spellings() {
+        let expected = requested_snapshot();
+        let mut value = serde_json::to_value(&expected).unwrap();
+        let timestamp = value["requested_at"].as_str().unwrap();
+        assert!(timestamp.ends_with('Z'));
+        value["requested_at"] =
+            Value::String(format!("{}+00:00", timestamp.strip_suffix('Z').unwrap()));
+        assert_ne!(value, serde_json::to_value(&expected).unwrap());
+        assert!(source_snapshot_matches(Some(&Json(value)), &expected).unwrap());
+    }
+
+    #[test]
+    fn source_snapshot_validation_rejects_other_instants_and_malformed_values() {
+        let expected = requested_snapshot();
+        let mut different = serde_json::to_value(&expected).unwrap();
+        different["requested_at"] = Value::String(
+            Utc.timestamp_opt(1_800_000_001, 123_456_000)
+                .unwrap()
+                .to_rfc3339_opts(SecondsFormat::Micros, true),
+        );
+        assert!(!source_snapshot_matches(Some(&Json(different)), &expected).unwrap());
+        let mut malformed = serde_json::to_value(&expected).unwrap();
+        malformed["requested_at"] = Value::String("invalid".to_string());
+        assert!(source_snapshot_matches(Some(&Json(malformed)), &expected).is_err());
+    }
 }
