@@ -95,6 +95,8 @@ pub enum D2ProvisionerErrorV1 {
     OnboardingInput,
     #[error("d2_onboarding_failed")]
     Onboarding,
+    #[error("d2_inspection_failed")]
+    Inspection,
 }
 
 impl D2ProvisionerErrorV1 {
@@ -118,6 +120,7 @@ impl D2ProvisionerErrorV1 {
             Self::Cleanup => "d2_cleanup_failed",
             Self::OnboardingInput => "d2_onboarding_input_invalid",
             Self::Onboarding => "d2_onboarding_failed",
+            Self::Inspection => "d2_inspection_failed",
         }
     }
 }
@@ -290,8 +293,8 @@ struct ProtectedStagingV1 {
     mutation_allowed: bool,
 }
 
-struct D2ConfigV1 {
-    run_id: String,
+pub(crate) struct D2ConfigV1 {
+    pub(crate) run_id: String,
     cluster_root: PathBuf,
     socket_directory: PathBuf,
     port: u16,
@@ -299,10 +302,10 @@ struct D2ConfigV1 {
     runtime_service: String,
     postgres_service: String,
     worker_service: String,
-    discord_guild_id: String,
-    discord_application_id: String,
+    pub(crate) discord_guild_id: String,
+    pub(crate) discord_application_id: String,
     discord_hub_channel_id: String,
-    resource_prefix: String,
+    pub(crate) resource_prefix: String,
     external: [KeychainIdentityV1; 3],
 }
 
@@ -590,7 +593,7 @@ async fn quarantine_and_cleanup(
     Ok(())
 }
 
-fn load_config(manifest_path: &Path) -> Result<D2ConfigV1, D2ProvisionerErrorV1> {
+pub(crate) fn load_config(manifest_path: &Path) -> Result<D2ConfigV1, D2ProvisionerErrorV1> {
     if !cfg!(target_os = "macos") {
         return Err(D2ProvisionerErrorV1::UnsupportedPlatform);
     }
@@ -943,6 +946,59 @@ async fn connect_network_and_lock(
         return Err(D2ProvisionerErrorV1::Busy);
     }
     verify_network_database_contract(&mut connection, config).await?;
+    Ok(connection)
+}
+
+pub(crate) async fn connect_inspection_database(
+    config: &D2ConfigV1,
+) -> Result<PgConnection, D2ProvisionerErrorV1> {
+    let keychain =
+        KeychainClientV1::new().map_err(|_| D2ProvisionerErrorV1::UnsupportedPlatform)?;
+    verify_keychain_owner(&keychain, config)?;
+    let value = keychain
+        .read_required_dynamic(&config.postgres_service, ADMIN_ACCOUNT)
+        .map_err(|_| D2ProvisionerErrorV1::Inspection)?;
+    let options =
+        exact_dynamic_connect_options(&value, CLUSTER_ADMIN_ROLE, config.port, ADMIN_DATABASE)
+            .map_err(|_| D2ProvisionerErrorV1::Inspection)?
+            .database(DATABASE_NAME)
+            .application_name("starring-d2-sealed-inspector");
+    let mut connection = PgConnection::connect_with(&options)
+        .await
+        .map_err(|_| D2ProvisionerErrorV1::Inspection)?;
+    verify_network_database_contract(&mut connection, config)
+        .await
+        .map_err(|_| D2ProvisionerErrorV1::Inspection)?;
+    Ok(connection)
+}
+
+pub(crate) async fn connect_inspection_admin_database(
+    config: &D2ConfigV1,
+) -> Result<PgConnection, D2ProvisionerErrorV1> {
+    let keychain =
+        KeychainClientV1::new().map_err(|_| D2ProvisionerErrorV1::UnsupportedPlatform)?;
+    verify_keychain_owner(&keychain, config)?;
+    let value = keychain
+        .read_required_dynamic(&config.postgres_service, ADMIN_ACCOUNT)
+        .map_err(|_| D2ProvisionerErrorV1::Inspection)?;
+    let options =
+        exact_dynamic_connect_options(&value, CLUSTER_ADMIN_ROLE, config.port, ADMIN_DATABASE)
+            .map_err(|_| D2ProvisionerErrorV1::Inspection)?
+            .application_name("starring-d2-sealed-inspector-absence");
+    let mut connection = PgConnection::connect_with(&options)
+        .await
+        .map_err(|_| D2ProvisionerErrorV1::Inspection)?;
+    let exact: bool = sqlx::query_scalar(
+        "SELECT current_setting('data_directory') = $1 AND current_setting('port')::INTEGER = $2 AND current_setting('server_version_num')::INTEGER BETWEEN 160000 AND 169999 AND current_setting('data_checksums') = 'on' AND current_user = session_user AND current_user = 'starring_cluster_admin' AND admin.rolsuper AND admin.rolcanlogin AND NOT admin.rolcreatedb AND NOT admin.rolcreaterole AND NOT admin.rolinherit AND NOT admin.rolreplication AND NOT admin.rolbypassrls AND admin.rolconnlimit = 2 AND admin.rolpassword LIKE 'SCRAM-SHA-256$4096:%' AND pg_catalog.current_database() = 'postgres' AND pg_catalog.inet_client_addr() = '127.0.0.1'::INET AND pg_catalog.inet_server_addr() = '127.0.0.1'::INET AND pg_catalog.inet_server_port() = $2 AND control.system_identifier::TEXT ~ '^[0-9]+$' AND NOT COALESCE((SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid = pg_catalog.pg_backend_pid()), TRUE) FROM pg_catalog.pg_control_system() AS control INNER JOIN pg_catalog.pg_authid AS admin ON admin.rolname = 'starring_cluster_admin'",
+    )
+    .bind(config.cluster_root.to_string_lossy().as_ref())
+    .bind(i32::from(config.port))
+    .fetch_one(&mut connection)
+    .await
+    .map_err(|_| D2ProvisionerErrorV1::Inspection)?;
+    if !exact {
+        return Err(D2ProvisionerErrorV1::Inspection);
+    }
     Ok(connection)
 }
 

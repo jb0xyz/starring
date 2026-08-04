@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use starring_staging_provisioner::{
-    onboard_d2_from_manifest, provision_d2_from_manifest, quarantine_d2_from_manifest,
-    D2ProvisionerErrorV1,
+    inspect_d2_from_manifest, onboard_d2_from_manifest, provision_d2_from_manifest,
+    quarantine_d2_from_manifest, D2InspectionCheckpointV1, D2ProvisionerErrorV1,
 };
 
 #[tokio::main]
@@ -78,6 +78,45 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        "inspect" => {
+            let [_, manifest_flag, manifest_path, checkpoint_flag, checkpoint] =
+                arguments.as_slice()
+            else {
+                eprintln!("{}", D2ProvisionerErrorV1::Arguments.code());
+                return ExitCode::from(64);
+            };
+            let Some(checkpoint) = checkpoint.to_str() else {
+                eprintln!("{}", D2ProvisionerErrorV1::Arguments.code());
+                return ExitCode::from(64);
+            };
+            if manifest_flag != "--manifest" || checkpoint_flag != "--checkpoint" {
+                eprintln!("{}", D2ProvisionerErrorV1::Arguments.code());
+                return ExitCode::from(64);
+            }
+            let checkpoint = match checkpoint.parse::<D2InspectionCheckpointV1>() {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    eprintln!("{}", error.code());
+                    return ExitCode::from(64);
+                }
+            };
+            match inspect_d2_from_manifest(&PathBuf::from(manifest_path), checkpoint).await {
+                Ok(report) => match report.to_json() {
+                    Ok(payload) => {
+                        println!("{payload}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => {
+                        eprintln!("{}", error.code());
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(error) => {
+                    eprintln!("{}", error.code());
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => {
             eprintln!("{}", D2ProvisionerErrorV1::Arguments.code());
             ExitCode::from(64)
@@ -130,7 +169,9 @@ mod tests {
         let source = include_str!("starring-d2-sealed-provisioner.rs");
         assert!(source.contains("provision"));
         assert!(source.contains("quarantine"));
+        assert!(source.contains("inspect"));
         assert!(source.contains("--manifest"));
+        assert!(source.contains("--checkpoint"));
         assert!(source.contains("binding_key"));
         assert!(source.contains("hub_channel_id"));
         assert!(!source.contains(&["--", "password"].concat()));
