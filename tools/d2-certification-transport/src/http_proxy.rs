@@ -81,6 +81,16 @@ enum DeleteResource {
     },
 }
 
+impl DeleteResource {
+    fn unknown_code(&self) -> u64 {
+        match self {
+            Self::Role(_) => 10011,
+            Self::Channel(_) => 10003,
+            Self::Message { .. } => 10008,
+        }
+    }
+}
+
 pub async fn serve(
     config: Config,
     state: Arc<SharedState>,
@@ -279,21 +289,27 @@ async fn proxy_request(
         );
         return Err(ProxyServiceError::Upstream);
     }
-    if status.is_success() {
-        if let Some(resource) = validated.delete_resource {
-            match resource {
-                DeleteResource::Role(id) => {
-                    let _ = state.remove_role(&id);
-                }
-                DeleteResource::Channel(id) => {
-                    let _ = state.remove_channel(&id);
-                }
+    if let Some(resource) = validated.delete_resource {
+        let exact_not_found = status == StatusCode::NOT_FOUND
+            && exact_unknown_resource(&body, resource.unknown_code());
+        if status == StatusCode::NOT_FOUND && !exact_not_found {
+            restore_claim(&state, claim.take());
+            eprintln!("d2_transport_http_failure=resource_delete_confirmation");
+            return Err(ProxyServiceError::Upstream);
+        }
+        if status.is_success() || exact_not_found {
+            let recorded = match resource {
+                DeleteResource::Role(id) => state.remove_role(&id),
+                DeleteResource::Channel(id) => state.remove_channel(&id),
                 DeleteResource::Message {
                     channel_id,
                     message_id,
-                } => {
-                    let _ = state.remove_message(&channel_id, &message_id);
-                }
+                } => state.remove_message(&channel_id, &message_id),
+            };
+            if !recorded {
+                restore_claim(&state, claim.take());
+                eprintln!("d2_transport_http_failure=resource_delete_commit");
+                return Err(ProxyServiceError::Upstream);
             }
         }
     }
@@ -629,6 +645,13 @@ fn extract_response_id(body: &[u8]) -> Option<String> {
     crate::config::valid_snowflake(id).then(|| id.to_owned())
 }
 
+fn exact_unknown_resource(body: &[u8], expected_code: u64) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("code").and_then(serde_json::Value::as_u64))
+        == Some(expected_code)
+}
+
 fn empty_response(status: StatusCode) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
@@ -716,6 +739,26 @@ mod tests {
                                     .body(Full::new(Bytes::new()))
                                     .unwrap()
                             }
+                            "/api/v10/channels/5/messages/16" => {
+                                assert_eq!(request.method(), Method::DELETE);
+                                Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .header("content-type", "application/json")
+                                    .body(Full::new(Bytes::from_static(
+                                        br#"{"message":"Unknown Message","code":10008}"#,
+                                    )))
+                                    .unwrap()
+                            }
+                            "/api/v10/channels/5/messages/17" => {
+                                assert_eq!(request.method(), Method::DELETE);
+                                Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .header("content-type", "application/json")
+                                    .body(Full::new(Bytes::from_static(
+                                        br#"{"message":"Unknown Guild","code":10004}"#,
+                                    )))
+                                    .unwrap()
+                            }
                             _ => panic!("unexpected fake upstream path"),
                         };
                         Ok::<_, Infallible>(response)
@@ -752,6 +795,20 @@ mod tests {
     fn raw_delete_hub_message_request(proxy: SocketAddrV4) -> Vec<u8> {
         format!(
             "DELETE /api/v10/channels/5/messages/15 HTTP/1.1\r\nHost: {proxy}\r\nAuthorization: Bot secret-test-value\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn raw_confirm_missing_hub_message_request(proxy: SocketAddrV4) -> Vec<u8> {
+        format!(
+            "DELETE /api/v10/channels/5/messages/16 HTTP/1.1\r\nHost: {proxy}\r\nAuthorization: Bot secret-test-value\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn raw_mismatched_missing_hub_message_request(proxy: SocketAddrV4) -> Vec<u8> {
+        format!(
+            "DELETE /api/v10/channels/5/messages/17 HTTP/1.1\r\nHost: {proxy}\r\nAuthorization: Bot secret-test-value\r\nConnection: close\r\n\r\n"
         )
         .into_bytes()
     }
@@ -910,11 +967,62 @@ mod tests {
             .unwrap()
             .starts_with("HTTP/1.1 204 No Content\r\n"));
         assert!(!state.owns_message("5", "15"));
+        assert!(state
+            .reserve_resource(ResourceKind::Message {
+                channel_id: "5".to_owned()
+            })
+            .unwrap()
+            .commit("16".to_owned()));
+        let mut confirm_missing = TcpStream::connect(proxy_address).await.unwrap();
+        confirm_missing
+            .write_all(&raw_confirm_missing_hub_message_request(proxy_address))
+            .await
+            .unwrap();
+        let mut confirm_missing_response = Vec::new();
+        confirm_missing
+            .read_to_end(&mut confirm_missing_response)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(confirm_missing_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(!state.owns_message("5", "16"));
+        assert!(state
+            .reserve_resource(ResourceKind::Message {
+                channel_id: "5".to_owned()
+            })
+            .unwrap()
+            .commit("17".to_owned()));
+        let mut mismatched_missing = TcpStream::connect(proxy_address).await.unwrap();
+        mismatched_missing
+            .write_all(&raw_mismatched_missing_hub_message_request(proxy_address))
+            .await
+            .unwrap();
+        let mut mismatched_missing_response = Vec::new();
+        mismatched_missing
+            .read_to_end(&mut mismatched_missing_response)
+            .await
+            .unwrap();
+        assert!(mismatched_missing_response.is_empty());
+        assert!(state.owns_message("5", "17"));
         let snapshot = serde_json::to_value(state.snapshot()).unwrap();
-        assert_eq!(snapshot["effect_http"]["forwarded_requests"], 2);
+        assert_eq!(snapshot["effect_http"]["forwarded_requests"], 4);
         assert_eq!(snapshot["effect_http"]["rejected_requests"], 0);
         assert_eq!(snapshot["effect_http"]["owned_channel_count"], 0);
-        assert_eq!(snapshot["effect_http"]["owned_message_count"], 0);
+        assert_eq!(snapshot["effect_http"]["owned_message_count"], 1);
+        let inventory = serde_json::to_value(state.resource_inventory().unwrap()).unwrap();
+        assert_eq!(inventory["history"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            inventory["history"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["state"] == "deleted")
+                .count(),
+            2
+        );
+        assert_eq!(inventory["active"].as_array().unwrap().len(), 1);
+        assert_eq!(inventory["active"][0]["resource_id"], "17");
         shutdown_tx.send(true).unwrap();
         server.await.unwrap();
         upstream.abort();
@@ -1196,5 +1304,26 @@ mod tests {
             Some(&HeaderValue::from_static("twilight-http"))
         );
         assert!(!forwarded.contains_key(HOST));
+    }
+
+    #[test]
+    fn only_exact_discord_unknown_resource_codes_confirm_deletion() {
+        assert!(exact_unknown_resource(
+            br#"{"message":"Unknown Channel","code":10003}"#,
+            10003
+        ));
+        assert!(exact_unknown_resource(
+            br#"{"message":"Unknown Message","code":10008}"#,
+            10008
+        ));
+        assert!(exact_unknown_resource(
+            br#"{"message":"Unknown Role","code":10011}"#,
+            10011
+        ));
+        assert!(!exact_unknown_resource(
+            br#"{"message":"Unknown Guild","code":10004}"#,
+            10003
+        ));
+        assert!(!exact_unknown_resource(b"", 10008));
     }
 }

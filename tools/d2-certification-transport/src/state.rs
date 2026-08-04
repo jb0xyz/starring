@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -57,6 +57,7 @@ struct StateInner {
     owned_role_ids: BTreeSet<String>,
     owned_channel_ids: BTreeSet<String>,
     owned_message_ids: BTreeSet<(String, String)>,
+    resource_history: BTreeMap<ResourceIdentity, ResourceLifecycleState>,
     pending_role_slots: usize,
     pending_channel_slots: usize,
     pending_message_slots: usize,
@@ -101,6 +102,27 @@ pub enum ResourceKind {
     Role,
     Channel,
     Message { channel_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ResourceIdentity {
+    Role {
+        resource_id: String,
+    },
+    Channel {
+        resource_id: String,
+    },
+    Message {
+        channel_id: String,
+        resource_id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ResourceLifecycleState {
+    Created,
+    Deleted,
 }
 
 pub struct ResourceReservation {
@@ -165,6 +187,56 @@ struct EffectHttpSnapshot {
     owned_message_count: usize,
 }
 
+#[derive(Clone, Serialize)]
+pub struct ResourceInventory {
+    version: u8,
+    kind: &'static str,
+    instance_id: String,
+    run_id: String,
+    guild_id: String,
+    hub_channel_id: String,
+    actor_id: String,
+    bot_user_id: String,
+    history_limit: usize,
+    history: Vec<ResourceInventoryHistoryEntry>,
+    created: Vec<ResourceInventoryIdentity>,
+    deleted: Vec<ResourceInventoryIdentity>,
+    active: Vec<ResourceInventoryIdentity>,
+    digest_sha256: String,
+}
+
+#[derive(Clone, Serialize)]
+struct ResourceInventoryPayload {
+    version: u8,
+    kind: &'static str,
+    instance_id: String,
+    run_id: String,
+    guild_id: String,
+    hub_channel_id: String,
+    actor_id: String,
+    bot_user_id: String,
+    history_limit: usize,
+    history: Vec<ResourceInventoryHistoryEntry>,
+    created: Vec<ResourceInventoryIdentity>,
+    deleted: Vec<ResourceInventoryIdentity>,
+    active: Vec<ResourceInventoryIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct ResourceInventoryIdentity {
+    kind: &'static str,
+    resource_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    channel_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct ResourceInventoryHistoryEntry {
+    #[serde(flatten)]
+    identity: ResourceInventoryIdentity,
+    state: ResourceLifecycleState,
+}
+
 impl SharedState {
     pub fn new(config: &Config) -> Result<Self, StateError> {
         let (partition_tx, _) = broadcast::channel(8);
@@ -209,6 +281,7 @@ impl SharedState {
                 owned_role_ids: BTreeSet::new(),
                 owned_channel_ids: BTreeSet::new(),
                 owned_message_ids: BTreeSet::new(),
+                resource_history: BTreeMap::new(),
                 pending_role_slots: 0,
                 pending_channel_slots: 0,
                 pending_message_slots: 0,
@@ -540,17 +613,19 @@ impl SharedState {
         kind: ResourceKind,
     ) -> Option<ResourceReservation> {
         let mut inner = self.inner.lock().expect("state mutex poisoned");
+        let pending_slots = inner
+            .pending_role_slots
+            .saturating_add(inner.pending_channel_slots)
+            .saturating_add(inner.pending_message_slots);
+        if !self.resource_state_consistent(&inner)
+            || inner.resource_history.len().saturating_add(pending_slots) >= MAX_OWNED_IDENTITIES
+        {
+            return None;
+        }
         let available = match &kind {
-            ResourceKind::Role => {
-                inner.owned_role_ids.len() + inner.pending_role_slots < MAX_OWNED_IDENTITIES
-            }
-            ResourceKind::Channel => {
-                inner.owned_channel_ids.len() + inner.pending_channel_slots < MAX_OWNED_IDENTITIES
-            }
+            ResourceKind::Role | ResourceKind::Channel => true,
             ResourceKind::Message { channel_id } => {
-                (inner.owned_channel_ids.contains(channel_id) || *channel_id == self.hub_channel_id)
-                    && inner.owned_message_ids.len() + inner.pending_message_slots
-                        < MAX_OWNED_IDENTITIES
+                inner.owned_channel_ids.contains(channel_id) || *channel_id == self.hub_channel_id
             }
         };
         if !available {
@@ -569,76 +644,327 @@ impl SharedState {
     }
 
     pub fn owns_role(&self, id: &str) -> bool {
-        self.inner
-            .lock()
-            .expect("state mutex poisoned")
-            .owned_role_ids
-            .contains(id)
+        let inner = self.inner.lock().expect("state mutex poisoned");
+        self.resource_state_consistent(&inner) && inner.owned_role_ids.contains(id)
     }
 
     pub fn owns_channel(&self, id: &str) -> bool {
-        self.inner
-            .lock()
-            .expect("state mutex poisoned")
-            .owned_channel_ids
-            .contains(id)
+        let inner = self.inner.lock().expect("state mutex poisoned");
+        self.resource_state_consistent(&inner) && inner.owned_channel_ids.contains(id)
     }
 
     pub fn admits_message_creation(&self, channel_id: &str) -> bool {
-        channel_id == self.hub_channel_id || self.owns_channel(channel_id)
+        let inner = self.inner.lock().expect("state mutex poisoned");
+        self.resource_state_consistent(&inner)
+            && (channel_id == self.hub_channel_id || inner.owned_channel_ids.contains(channel_id))
     }
 
     pub fn owns_message(&self, channel_id: &str, id: &str) -> bool {
-        self.inner
-            .lock()
-            .expect("state mutex poisoned")
-            .owned_message_ids
-            .contains(&(channel_id.to_owned(), id.to_owned()))
+        let inner = self.inner.lock().expect("state mutex poisoned");
+        self.resource_state_consistent(&inner)
+            && inner
+                .owned_message_ids
+                .contains(&(channel_id.to_owned(), id.to_owned()))
     }
 
     pub fn remove_role(&self, id: &str) -> bool {
-        self.inner
-            .lock()
-            .expect("state mutex poisoned")
-            .owned_role_ids
-            .remove(id)
+        let mut inner = self.inner.lock().expect("state mutex poisoned");
+        if !self.resource_state_consistent(&inner) {
+            return false;
+        }
+        let identity = ResourceIdentity::Role {
+            resource_id: id.to_owned(),
+        };
+        if inner.resource_history.get(&identity) != Some(&ResourceLifecycleState::Created)
+            || !inner.owned_role_ids.remove(id)
+        {
+            return false;
+        }
+        inner
+            .resource_history
+            .insert(identity, ResourceLifecycleState::Deleted);
+        self.resource_state_consistent(&inner)
     }
 
     pub fn remove_channel(&self, id: &str) -> bool {
         let mut inner = self.inner.lock().expect("state mutex poisoned");
-        let removed = inner.owned_channel_ids.remove(id);
-        if removed {
+        if !self.resource_state_consistent(&inner) {
+            return false;
+        }
+        let identity = ResourceIdentity::Channel {
+            resource_id: id.to_owned(),
+        };
+        if inner.resource_history.get(&identity) != Some(&ResourceLifecycleState::Created)
+            || !inner.owned_channel_ids.remove(id)
+        {
+            return false;
+        }
+        inner
+            .resource_history
+            .insert(identity, ResourceLifecycleState::Deleted);
+        let messages = inner
+            .owned_message_ids
+            .iter()
+            .filter(|(channel_id, _)| channel_id == id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for (channel_id, resource_id) in messages {
             inner
                 .owned_message_ids
-                .retain(|(channel_id, _)| channel_id != id);
+                .remove(&(channel_id.clone(), resource_id.clone()));
+            inner.resource_history.insert(
+                ResourceIdentity::Message {
+                    channel_id,
+                    resource_id,
+                },
+                ResourceLifecycleState::Deleted,
+            );
         }
-        removed
+        self.resource_state_consistent(&inner)
     }
 
     pub fn remove_message(&self, channel_id: &str, id: &str) -> bool {
-        self.inner
-            .lock()
-            .expect("state mutex poisoned")
-            .owned_message_ids
-            .remove(&(channel_id.to_owned(), id.to_owned()))
+        let mut inner = self.inner.lock().expect("state mutex poisoned");
+        if !self.resource_state_consistent(&inner) {
+            return false;
+        }
+        let identity = ResourceIdentity::Message {
+            channel_id: channel_id.to_owned(),
+            resource_id: id.to_owned(),
+        };
+        if inner.resource_history.get(&identity) != Some(&ResourceLifecycleState::Created)
+            || !inner
+                .owned_message_ids
+                .remove(&(channel_id.to_owned(), id.to_owned()))
+        {
+            return false;
+        }
+        inner
+            .resource_history
+            .insert(identity, ResourceLifecycleState::Deleted);
+        self.resource_state_consistent(&inner)
     }
 
     fn finish_resource_reservation(&self, kind: ResourceKind, id: Option<String>) -> bool {
         let mut inner = self.inner.lock().expect("state mutex poisoned");
-        match kind {
+        let identity = match kind {
             ResourceKind::Role => {
                 inner.pending_role_slots = inner.pending_role_slots.saturating_sub(1);
-                id.is_none_or(|id| inner.owned_role_ids.insert(id))
+                id.map(|resource_id| ResourceIdentity::Role { resource_id })
             }
             ResourceKind::Channel => {
                 inner.pending_channel_slots = inner.pending_channel_slots.saturating_sub(1);
-                id.is_none_or(|id| inner.owned_channel_ids.insert(id))
+                id.map(|resource_id| ResourceIdentity::Channel { resource_id })
             }
             ResourceKind::Message { channel_id } => {
                 inner.pending_message_slots = inner.pending_message_slots.saturating_sub(1);
-                id.is_none_or(|id| inner.owned_message_ids.insert((channel_id, id)))
+                id.map(|resource_id| ResourceIdentity::Message {
+                    channel_id,
+                    resource_id,
+                })
+            }
+        };
+        let Some(identity) = identity else {
+            return self.resource_state_consistent(&inner);
+        };
+        if !self.resource_state_consistent(&inner)
+            || inner.resource_history.len() >= MAX_OWNED_IDENTITIES
+            || !self.resource_identity_allowed(&identity)
+            || inner.resource_history.contains_key(&identity)
+            || inner
+                .resource_history
+                .keys()
+                .any(|existing| existing.resource_id() == identity.resource_id())
+        {
+            return false;
+        }
+        let state = match &identity {
+            ResourceIdentity::Role { resource_id } => {
+                if !inner.owned_role_ids.insert(resource_id.clone()) {
+                    return false;
+                }
+                ResourceLifecycleState::Created
+            }
+            ResourceIdentity::Channel { resource_id } => {
+                if !inner.owned_channel_ids.insert(resource_id.clone()) {
+                    return false;
+                }
+                ResourceLifecycleState::Created
+            }
+            ResourceIdentity::Message {
+                channel_id,
+                resource_id,
+            } => {
+                let parent_state = if *channel_id == self.hub_channel_id {
+                    Some(ResourceLifecycleState::Created)
+                } else {
+                    inner
+                        .resource_history
+                        .get(&ResourceIdentity::Channel {
+                            resource_id: channel_id.clone(),
+                        })
+                        .copied()
+                };
+                let Some(parent_state) = parent_state else {
+                    return false;
+                };
+                if parent_state == ResourceLifecycleState::Created
+                    && !inner
+                        .owned_message_ids
+                        .insert((channel_id.clone(), resource_id.clone()))
+                {
+                    return false;
+                }
+                parent_state
+            }
+        };
+        inner.resource_history.insert(identity, state);
+        self.resource_state_consistent(&inner)
+    }
+
+    pub fn resource_inventory(&self) -> Option<ResourceInventory> {
+        let inner = self.inner.lock().expect("state mutex poisoned");
+        if !self.resource_state_consistent(&inner) {
+            return None;
+        }
+        let mut history = inner
+            .resource_history
+            .iter()
+            .map(|(identity, state)| ResourceInventoryHistoryEntry {
+                identity: identity.inventory_identity(),
+                state: *state,
+            })
+            .collect::<Vec<_>>();
+        history.sort();
+        let mut active = inner
+            .resource_history
+            .iter()
+            .filter(|(_, state)| **state == ResourceLifecycleState::Created)
+            .map(|(identity, _)| identity.inventory_identity())
+            .collect::<Vec<_>>();
+        active.sort();
+        let mut created = inner
+            .resource_history
+            .keys()
+            .map(ResourceIdentity::inventory_identity)
+            .collect::<Vec<_>>();
+        created.sort();
+        let mut deleted = inner
+            .resource_history
+            .iter()
+            .filter(|(_, state)| **state == ResourceLifecycleState::Deleted)
+            .map(|(identity, _)| identity.inventory_identity())
+            .collect::<Vec<_>>();
+        deleted.sort();
+        let payload = ResourceInventoryPayload {
+            version: 1,
+            kind: "starring.d2.run-owned-resource-inventory.v1",
+            instance_id: self.instance_id.clone(),
+            run_id: self.run_id.clone(),
+            guild_id: self.guild_id.clone(),
+            hub_channel_id: self.hub_channel_id.clone(),
+            actor_id: self.actor_id.clone(),
+            bot_user_id: self.bot_user_id.clone(),
+            history_limit: MAX_OWNED_IDENTITIES,
+            history,
+            created,
+            deleted,
+            active,
+        };
+        let encoded = serde_json::to_vec(&payload).ok()?;
+        Some(ResourceInventory {
+            version: payload.version,
+            kind: payload.kind,
+            instance_id: payload.instance_id,
+            run_id: payload.run_id,
+            guild_id: payload.guild_id,
+            hub_channel_id: payload.hub_channel_id,
+            actor_id: payload.actor_id,
+            bot_user_id: payload.bot_user_id,
+            history_limit: payload.history_limit,
+            history: payload.history,
+            created: payload.created,
+            deleted: payload.deleted,
+            active: payload.active,
+            digest_sha256: hex_sha256(&encoded),
+        })
+    }
+
+    fn resource_identity_allowed(&self, identity: &ResourceIdentity) -> bool {
+        let (resource_id, channel_id) = match identity {
+            ResourceIdentity::Role { resource_id } | ResourceIdentity::Channel { resource_id } => {
+                (resource_id, None)
+            }
+            ResourceIdentity::Message {
+                channel_id,
+                resource_id,
+            } => (resource_id, Some(channel_id)),
+        };
+        crate::config::valid_snowflake(resource_id)
+            && channel_id.is_none_or(|channel_id| crate::config::valid_snowflake(channel_id))
+            && ![
+                self.guild_id.as_str(),
+                self.hub_channel_id.as_str(),
+                self.actor_id.as_str(),
+                self.bot_user_id.as_str(),
+            ]
+            .contains(&resource_id.as_str())
+    }
+
+    fn resource_state_consistent(&self, inner: &StateInner) -> bool {
+        if inner.resource_history.len() > MAX_OWNED_IDENTITIES {
+            return false;
+        }
+        let mut roles = BTreeSet::new();
+        let mut channels = BTreeSet::new();
+        let mut messages = BTreeSet::new();
+        let mut resource_ids = BTreeSet::new();
+        for (identity, state) in &inner.resource_history {
+            if !self.resource_identity_allowed(identity)
+                || !resource_ids.insert(identity.resource_id().to_owned())
+            {
+                return false;
+            }
+            let active = *state == ResourceLifecycleState::Created;
+            match identity {
+                ResourceIdentity::Role { resource_id } => {
+                    if active {
+                        roles.insert(resource_id.clone());
+                    }
+                }
+                ResourceIdentity::Channel { resource_id } => {
+                    if active {
+                        channels.insert(resource_id.clone());
+                    }
+                }
+                ResourceIdentity::Message {
+                    channel_id,
+                    resource_id,
+                } => {
+                    let parent_state = if *channel_id == self.hub_channel_id {
+                        Some(ResourceLifecycleState::Created)
+                    } else {
+                        inner
+                            .resource_history
+                            .get(&ResourceIdentity::Channel {
+                                resource_id: channel_id.clone(),
+                            })
+                            .copied()
+                    };
+                    if parent_state.is_none()
+                        || (active && parent_state != Some(ResourceLifecycleState::Created))
+                    {
+                        return false;
+                    }
+                    if active {
+                        messages.insert((channel_id.clone(), resource_id.clone()));
+                    }
+                }
             }
         }
+        roles == inner.owned_role_ids
+            && channels == inner.owned_channel_ids
+            && messages == inner.owned_message_ids
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -716,6 +1042,39 @@ impl SharedState {
                 owned_role_count: inner.owned_role_ids.len(),
                 owned_channel_count: inner.owned_channel_ids.len(),
                 owned_message_count: inner.owned_message_ids.len(),
+            },
+        }
+    }
+}
+
+impl ResourceIdentity {
+    fn resource_id(&self) -> &str {
+        match self {
+            Self::Role { resource_id }
+            | Self::Channel { resource_id }
+            | Self::Message { resource_id, .. } => resource_id,
+        }
+    }
+
+    fn inventory_identity(&self) -> ResourceInventoryIdentity {
+        match self {
+            Self::Role { resource_id } => ResourceInventoryIdentity {
+                kind: "role",
+                resource_id: resource_id.clone(),
+                channel_id: None,
+            },
+            Self::Channel { resource_id } => ResourceInventoryIdentity {
+                kind: "channel",
+                resource_id: resource_id.clone(),
+                channel_id: None,
+            },
+            Self::Message {
+                channel_id,
+                resource_id,
+            } => ResourceInventoryIdentity {
+                kind: "message",
+                resource_id: resource_id.clone(),
+                channel_id: Some(channel_id.clone()),
             },
         }
     }
@@ -965,7 +1324,7 @@ mod tests {
             .iter()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
         let state = std::sync::Arc::new(state);
-        for id in 1..=MAX_OWNED_IDENTITIES {
+        for id in 100..100 + MAX_OWNED_IDENTITIES {
             assert!(state
                 .reserve_resource(ResourceKind::Role)
                 .unwrap()
@@ -976,6 +1335,39 @@ mod tests {
             serde_json::to_value(state.snapshot()).unwrap()["effect_http"]["owned_role_count"],
             MAX_OWNED_IDENTITIES
         );
+        assert!(state.remove_role("100"));
+        assert!(state.reserve_resource(ResourceKind::Role).is_none());
+        let inventory = serde_json::to_value(state.resource_inventory().unwrap()).unwrap();
+        assert_eq!(inventory["history"].as_array().unwrap().len(), 128);
+        assert_eq!(inventory["active"].as_array().unwrap().len(), 127);
+        assert_eq!(inventory["history"][0]["state"], "deleted");
+    }
+
+    #[test]
+    fn resource_identity_collisions_and_boundary_ownership_fail_closed() {
+        let (_root, state) = state();
+        let state = std::sync::Arc::new(state);
+        assert!(!state
+            .reserve_resource(ResourceKind::Role)
+            .unwrap()
+            .commit("7".to_owned()));
+        assert!(!state
+            .reserve_resource(ResourceKind::Channel)
+            .unwrap()
+            .commit("5".to_owned()));
+        assert!(state
+            .reserve_resource(ResourceKind::Role)
+            .unwrap()
+            .commit("11".to_owned()));
+        assert!(!state
+            .reserve_resource(ResourceKind::Channel)
+            .unwrap()
+            .commit("11".to_owned()));
+        let inventory = serde_json::to_value(state.resource_inventory().unwrap()).unwrap();
+        assert_eq!(inventory["history"].as_array().unwrap().len(), 1);
+        assert_eq!(inventory["active"].as_array().unwrap().len(), 1);
+        assert_eq!(inventory["active"][0]["kind"], "role");
+        assert_eq!(inventory["active"][0]["resource_id"], "11");
     }
 
     #[test]

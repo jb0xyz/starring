@@ -196,6 +196,7 @@ fn execute(value: Value, state: &SharedState) -> Result<CommandOutcome, &'static
         | "disarm_indeterminate"
         | "partition_gateway"
         | "heal_gateway"
+        | "resource_inventory"
         | "snapshot"
         | "shutdown" => &[
             "version",
@@ -237,6 +238,12 @@ fn execute(value: Value, state: &SharedState) -> Result<CommandOutcome, &'static
         "disarm_indeterminate" => changed_response(state.disarm_indeterminate()),
         "partition_gateway" => changed_response(state.partition()),
         "heal_gateway" => changed_response(state.heal()),
+        "resource_inventory" => json!({
+            "ok": true,
+            "resource_inventory": state
+                .resource_inventory()
+                .ok_or("resource_inventory_unavailable")?
+        }),
         "snapshot" => json!({"ok": true, "snapshot": state.snapshot()}),
         "shutdown" => return Ok(CommandOutcome::Shutdown(json!({"ok": true}))),
         _ => return Err("command_unsupported"),
@@ -377,6 +384,88 @@ mod tests {
         request.insert("audit_reason".to_owned(), json!("forbidden"));
         assert_eq!(
             execute(Value::Object(request), &state).err(),
+            Some("request_invalid")
+        );
+    }
+
+    #[test]
+    fn resource_inventory_is_exact_identity_bound_sorted_and_digest_stable() {
+        let (_root, state) = state();
+        let state = Arc::new(state);
+        assert!(state
+            .reserve_resource(crate::state::ResourceKind::Role)
+            .unwrap()
+            .commit("11".to_owned()));
+        assert!(state
+            .reserve_resource(crate::state::ResourceKind::Channel)
+            .unwrap()
+            .commit("12".to_owned()));
+        assert!(state
+            .reserve_resource(crate::state::ResourceKind::Message {
+                channel_id: "12".to_owned()
+            })
+            .unwrap()
+            .commit("13".to_owned()));
+        assert!(state.remove_channel("12"));
+        let request = Value::Object(command("resource_inventory"));
+        let first = match execute(request.clone(), &state).unwrap() {
+            CommandOutcome::Continue(response) => response,
+            CommandOutcome::Shutdown(_) => panic!("unexpected shutdown"),
+        };
+        let second = match execute(request, &state).unwrap() {
+            CommandOutcome::Continue(response) => response,
+            CommandOutcome::Shutdown(_) => panic!("unexpected shutdown"),
+        };
+        assert_eq!(first, second);
+        let inventory = &first["resource_inventory"];
+        assert_eq!(inventory["version"], 1);
+        assert_eq!(
+            inventory["kind"],
+            "starring.d2.run-owned-resource-inventory.v1"
+        );
+        assert_eq!(inventory["history_limit"], 128);
+        assert_eq!(inventory["history"].as_array().unwrap().len(), 3);
+        assert_eq!(inventory["created"].as_array().unwrap().len(), 3);
+        assert_eq!(inventory["deleted"].as_array().unwrap().len(), 2);
+        assert_eq!(inventory["active"].as_array().unwrap().len(), 1);
+        assert_eq!(inventory["created"][0]["kind"], "channel");
+        assert_eq!(inventory["deleted"][0]["kind"], "channel");
+        assert_eq!(inventory["active"][0]["kind"], "role");
+        assert_eq!(inventory["active"][0]["resource_id"], "11");
+        assert_eq!(inventory["history"][0]["kind"], "channel");
+        assert_eq!(inventory["history"][0]["state"], "deleted");
+        assert_eq!(inventory["history"][1]["kind"], "message");
+        assert_eq!(inventory["history"][1]["channel_id"], "12");
+        assert_eq!(inventory["history"][1]["state"], "deleted");
+        assert_eq!(inventory["history"][2]["kind"], "role");
+        let digest = inventory["digest_sha256"].as_str().unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(digest
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')));
+        let serialized = serde_json::to_string(&first).unwrap();
+        assert!(!serialized.contains("secret"));
+        assert!(state.remove_role("11"));
+        let changed = match execute(Value::Object(command("resource_inventory")), &state).unwrap() {
+            CommandOutcome::Continue(response) => response,
+            CommandOutcome::Shutdown(_) => panic!("unexpected shutdown"),
+        };
+        assert_ne!(
+            changed["resource_inventory"]["digest_sha256"],
+            inventory["digest_sha256"]
+        );
+
+        let mut mismatch = command("resource_inventory");
+        mismatch.insert("run_id".to_owned(), json!("d2-other-run"));
+        assert_eq!(
+            execute(Value::Object(mismatch), &state).err(),
+            Some("identity_mismatch")
+        );
+        let mut extra = command("resource_inventory");
+        extra.insert("unexpected".to_owned(), json!(true));
+        assert_eq!(
+            execute(Value::Object(extra), &state).err(),
             Some("request_invalid")
         );
     }
