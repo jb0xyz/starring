@@ -15,12 +15,84 @@ MODULE_PATH = pathlib.Path(__file__).with_name("d2_certification.py")
 SPEC = importlib.util.spec_from_file_location("d2_certification", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+RUN_MODULE_PATH = pathlib.Path(__file__).with_name("d2_run.py")
+RUN_SPEC = importlib.util.spec_from_file_location("d2_run_tests", RUN_MODULE_PATH)
+RUN_MODULE = importlib.util.module_from_spec(RUN_SPEC)
+RUN_SPEC.loader.exec_module(RUN_MODULE)
 
 
 COMMIT = "a" * 40
 DIGEST = "b" * 64
 RUN_ID = "d2-20260801t120000z-0123456789ab"
 TRANSPORT_INSTANCE_ID = "d2ti-0123456789abcdef0123456789abcdef"
+ATTESTATION_ID = "c" * 64
+PROCESS_INSTANCE_OLD = "11111111111111111111111111111111"
+PROCESS_INSTANCE_NEW = "0123456789abcdef0123456789abcdef"
+
+
+def route_identity(deployment_id, process_instance_id, generation, fence, incarnation):
+    return {
+        "deployment_id": deployment_id,
+        "runtime_generation": generation,
+        "route_controller_fencing_token": fence,
+        "route_incarnation": incarnation,
+        "origin_process_instance_id": process_instance_id,
+        "origin_serving_lease_epoch": generation,
+        "origin_serving_revision": generation,
+        "origin_gateway_shard_id": "shard-0",
+        "origin_gateway_owner_lease_epoch": generation,
+        "origin_gateway_owner_revision": generation,
+    }
+
+
+def serving_identity(deployment_id, process_instance_id, generation, lease_epoch):
+    return {
+        "guild_id": "1524810437118525551",
+        "ruleset_key": "studyroom",
+        "tenant_id": "tenant-1",
+        "installation_id": "installation-1",
+        "deployment_id": deployment_id,
+        "attestation_id": ATTESTATION_ID,
+        "process_instance_id": process_instance_id,
+        "runtime_generation": generation,
+        "target_version": generation,
+        "target_content_hash": "d" * 64,
+        "binding_revision": generation,
+        "binding_fingerprint": "e" * 64,
+        "lease_epoch": lease_epoch,
+        "revision": generation,
+    }
+
+
+ROUTE_ID_INITIAL = MODULE.canonical_route_identity_sha256(
+    route_identity("deployment-1", PROCESS_INSTANCE_OLD, 1, 1, 1)
+)
+ROUTE_ID_RECONSTRUCTED = MODULE.canonical_route_identity_sha256(
+    route_identity("deployment-1", PROCESS_INSTANCE_NEW, 1, 2, 2)
+)
+ROUTE_ID_REPLACEMENT = MODULE.canonical_route_identity_sha256(
+    route_identity("deployment-2", PROCESS_INSTANCE_NEW, 2, 3, 3)
+)
+SERVING_ID_INITIAL = MODULE.canonical_serving_identity_sha256(
+    serving_identity("deployment-1", PROCESS_INSTANCE_OLD, 1, 1)
+)
+SERVING_ID_RECONSTRUCTED = MODULE.canonical_serving_identity_sha256(
+    serving_identity("deployment-1", PROCESS_INSTANCE_NEW, 1, 2)
+)
+JOIN_EFFECT_ID = MODULE.canonical_effect_identity_sha256(
+    {
+        "application_id": "1524810437118525552",
+        "interaction_id": "1532677575736819846",
+        "action_index": 0,
+    }
+)
+INDETERMINATE_EFFECT_ID = MODULE.canonical_effect_identity_sha256(
+    {
+        "application_id": "1524810437118525552",
+        "interaction_id": "1532677575736819850",
+        "action_index": 0,
+    }
+)
 
 
 def complete_evidence(manifest):
@@ -28,8 +100,8 @@ def complete_evidence(manifest):
     return {
         1: {
             "database_system_identifier": "7667905772642692043",
-            "migration_count": 117,
-            "migration_head": "202608010002",
+            "migration_count": 125,
+            "migration_head": "202608040004",
             "migration_ledger_sha256": DIGEST,
             "discord_resource_prefix": prefix,
         },
@@ -58,12 +130,12 @@ def complete_evidence(manifest):
             "tunnel_ready": True,
         },
         4: {
-            "oauth_callback_status": 303,
             "me_status": 200,
             "principal_id": "discord:1056857223529250906",
             "installation_id": "installation-1",
             "guild_id": "1524810437118525551",
             "authority_check_status": 204,
+            "public_origin": manifest["cloudflare"]["public_origin"],
         },
         5: {
             "authoring_http_status": 200,
@@ -75,6 +147,7 @@ def complete_evidence(manifest):
             "reasoning_effort": "medium",
             "auth_mode": "chatgpt",
             "one_shot": True,
+            "public_origin": manifest["cloudflare"]["public_origin"],
         },
         6: {
             "generation_encrypted": True,
@@ -90,6 +163,7 @@ def complete_evidence(manifest):
             "preview_state": "pending_approval",
             "approval_state": "approved",
             "apply_state": "runtime_pending",
+            "public_origin": manifest["cloudflare"]["public_origin"],
         },
         8: {
             "pending_observed": True,
@@ -97,23 +171,26 @@ def complete_evidence(manifest):
             "installation_id": "installation-1",
             "promotion_id": DIGEST,
             "deployment_id": "deployment-1",
-            "route_id": "route-1",
-            "attestation_id": "attestation-1",
-            "serving_lease_id": "lease-1",
+            "route_id": ROUTE_ID_INITIAL,
+            "attestation_id": ATTESTATION_ID,
+            "serving_lease_id": SERVING_ID_INITIAL,
+            "public_origin": manifest["cloudflare"]["public_origin"],
         },
         9: {
             "create_interaction_id": "1532677575736819845",
             "join_interaction_id": "1532677575736819846",
             "deployment_id": "deployment-1",
-            "route_id": "route-1",
+            "route_id": ROUTE_ID_INITIAL,
             "instance_id": "instance-1",
             "role_ids": ["1532677575736819847"],
             "channel_ids": ["1532677575736819848"],
             "panel_message_ids": ["1532677575736819849"],
             "ephemeral_count": 2,
+            "transport_instance_id": TRANSPORT_INSTANCE_ID,
         },
         10: {
             "interaction_id": "1532677575736819846",
+            "effect_id": JOIN_EFFECT_ID,
             "delivery_count": 2,
             "external_effect_count": 1,
             "receipt_state": "completed",
@@ -128,10 +205,10 @@ def complete_evidence(manifest):
             "runtime_sha256": manifest["candidates"]["runtime"]["sha256"],
             "ready_after_restart": True,
             "process_identity_joined": True,
-            "process_instance_id": "0123456789abcdef0123456789abcdef",
+            "process_instance_id": PROCESS_INSTANCE_NEW,
             "checkpoint": "live_fresh_lease",
             "deployment_id": "deployment-1",
-            "route_id": "route-1",
+            "route_id": ROUTE_ID_INITIAL,
             "instance_id": "instance-1",
             "canonical_confirmation_sha256": DIGEST,
             "operation_id": (
@@ -148,14 +225,19 @@ def complete_evidence(manifest):
             "route_reconstructed": True,
             "instance_reconstructed": True,
             "deployment_id": "deployment-1",
-            "route_id": "route-1",
+            "source_route_id": ROUTE_ID_INITIAL,
+            "reconstructed_route_id": ROUTE_ID_RECONSTRUCTED,
+            "source_serving_lease_id": SERVING_ID_INITIAL,
+            "reconstructed_serving_lease_id": SERVING_ID_RECONSTRUCTED,
             "instance_id": "instance-1",
             "pinned_ruleset_digest": DIGEST,
+            "probe_interaction_id": "1532677575736819851",
+            "process_instance_id": PROCESS_INSTANCE_NEW,
         },
         13: {
-            "effect_id": "effect-1",
+            "effect_id": INDETERMINATE_EFFECT_ID,
             "interaction_id": "1532677575736819850",
-            "route_id": "route-1",
+            "route_id": ROUTE_ID_RECONSTRUCTED,
             "injected_outcome": "indeterminate",
             "reconciliation_state": "known_success",
             "duplicate_external_effect_count": 0,
@@ -169,22 +251,24 @@ def complete_evidence(manifest):
             "replacement_target_id": "deployment-2",
             "replacement_kind": "rollback",
             "source_deployment_id": "deployment-1",
-            "source_route_id": "route-1",
+            "source_route_id": ROUTE_ID_RECONSTRUCTED,
             "replacement_deployment_id": "deployment-2",
-            "replacement_route_id": "route-2",
+            "replacement_route_id": ROUTE_ID_REPLACEMENT,
             "previous_target_drained": True,
             "replacement_live": True,
             "prior_route_absent": True,
+            "public_origin": manifest["cloudflare"]["public_origin"],
         },
         15: {
             "gateway_disconnected": True,
             "live_lost": True,
             "runtime_ready_status": 503,
             "public_code": "runtime_gateway_disconnected",
-            "route_id": "route-2",
+            "route_id": ROUTE_ID_REPLACEMENT,
             "transport_gateway_partitioned": True,
             "transport_gateway_partition_events": 1,
             "transport_instance_id": TRANSPORT_INSTANCE_ID,
+            "public_origin": manifest["cloudflare"]["public_origin"],
         },
         16: {
             "teardown_started": True,
@@ -306,6 +390,10 @@ class D2CertificationTest(unittest.TestCase):
         return path
 
     def record(self, manifest_path, step, evidence):
+        status, _ = self.record_result(manifest_path, step, evidence)
+        return status
+
+    def record_result(self, manifest_path, step, evidence):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             status = MODULE.main(
@@ -319,7 +407,8 @@ class D2CertificationTest(unittest.TestCase):
                     str(self.write_evidence(step, evidence)),
                 ]
             )
-        return status
+        result = json.loads(output.getvalue()) if output.getvalue() else None
+        return status, result
 
     def test_prepare_derives_isolated_names_and_hashes_without_mutating_staging(self):
         manifest_path = self.prepare()
@@ -451,6 +540,45 @@ class D2CertificationTest(unittest.TestCase):
         self.assertEqual(summary["steps"], 17)
         self.assertRegex(summary["receipt_chain_head_sha256"], r"^[0-9a-f]{64}$")
 
+    def test_coordinator_resumes_from_the_receipt_chain(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence_by_step = complete_evidence(manifest)
+        for completed in range(18):
+            action = RUN_MODULE.next_certification_action(str(manifest_path))
+            self.assertEqual(action["completed_steps"], completed)
+            if completed == 17:
+                self.assertEqual(action["status"], "complete")
+                self.assertEqual(action["steps"], 17)
+                break
+            next_step = completed + 1
+            self.assertEqual(action["step"], next_step)
+            self.assertEqual(action["code"], MODULE.STEP_SPECS[next_step].code)
+            expected_status = (
+                "awaiting_human_boundary"
+                if next_step in RUN_MODULE.HUMAN_BOUNDARIES
+                else "next_step"
+            )
+            self.assertEqual(action["status"], expected_status)
+            self.assertEqual(
+                action["required_evidence_fields"],
+                list(MODULE.STEP_SPECS[next_step].required),
+            )
+            if expected_status == "awaiting_human_boundary":
+                self.assertEqual(
+                    action["boundary"], RUN_MODULE.HUMAN_BOUNDARIES[next_step]
+                )
+            self.assertEqual(self.record(manifest_path, next_step, evidence_by_step[next_step]), 0)
+
+    def test_coordinator_does_not_advance_without_a_receipt(self):
+        manifest_path = self.prepare()
+        before = RUN_MODULE.next_certification_action(str(manifest_path))
+        after = RUN_MODULE.next_certification_action(str(manifest_path))
+        self.assertEqual(before, after)
+        self.assertEqual(before["status"], "next_step")
+        self.assertEqual(before["step"], 1)
+        self.assertEqual(manifest_path.with_name("receipts.jsonl").read_bytes(), b"")
+
     def test_step_eleven_requires_the_fixed_live_fresh_lease_checkpoint(self):
         manifest_path = self.prepare()
         manifest = json.loads(manifest_path.read_text())
@@ -530,6 +658,61 @@ class D2CertificationTest(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("step_out_of_order:expected_1", stderr.getvalue())
 
+    def test_record_exact_replay_is_a_noop(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence = complete_evidence(manifest)[1]
+        first_status, first = self.record_result(manifest_path, 1, evidence)
+        receipts_path = manifest_path.with_name("receipts.jsonl")
+        before = receipts_path.read_bytes()
+        second_status, second = self.record_result(manifest_path, 1, evidence)
+        self.assertEqual((first_status, second_status), (0, 0))
+        self.assertEqual(first["disposition"], "created")
+        self.assertEqual(second["disposition"], "exact_replay")
+        self.assertFalse(first["replayed"])
+        self.assertTrue(second["replayed"])
+        self.assertEqual(first["receipt_sha256"], second["receipt_sha256"])
+        self.assertEqual(receipts_path.read_bytes(), before)
+
+    def test_record_exact_replay_accepts_canonical_key_order(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence = complete_evidence(manifest)[1]
+        self.assertEqual(self.record(manifest_path, 1, evidence), 0)
+        reordered = dict(reversed(tuple(evidence.items())))
+        status, result = self.record_result(manifest_path, 1, reordered)
+        self.assertEqual(status, 0)
+        self.assertEqual(result["disposition"], "exact_replay")
+        self.assertEqual(len(manifest_path.with_name("receipts.jsonl").read_text().splitlines()), 1)
+
+    def test_record_divergent_replay_fails_closed(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence = complete_evidence(manifest)[1]
+        self.assertEqual(self.record(manifest_path, 1, evidence), 0)
+        receipts_path = manifest_path.with_name("receipts.jsonl")
+        before = receipts_path.read_bytes()
+        changed = dict(evidence)
+        changed["migration_count"] += 1
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            status, result = self.record_result(manifest_path, 1, changed)
+        self.assertEqual(status, 1)
+        self.assertIsNone(result)
+        self.assertIn("step_replay_mismatch", stderr.getvalue())
+        self.assertEqual(receipts_path.read_bytes(), before)
+
+    def test_completed_certification_replays_step_seventeen(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence_by_step = complete_evidence(manifest)
+        for step, evidence in evidence_by_step.items():
+            self.assertEqual(self.record(manifest_path, step, evidence), 0)
+        status, result = self.record_result(manifest_path, 17, evidence_by_step[17])
+        self.assertEqual(status, 0)
+        self.assertEqual(result["disposition"], "exact_replay")
+        self.assertEqual(len(manifest_path.with_name("receipts.jsonl").read_text().splitlines()), 17)
+
     def test_record_rejects_secret_keys_and_values(self):
         manifest_path = self.prepare()
         manifest = json.loads(manifest_path.read_text())
@@ -551,6 +734,30 @@ class D2CertificationTest(unittest.TestCase):
             status = self.record(manifest_path, 1, evidence)
         self.assertEqual(status, 1)
         self.assertIn("evidence_fields_invalid", stderr.getvalue())
+
+    def test_record_rejects_duplicate_json_keys(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence = complete_evidence(manifest)[1]
+        raw = json.dumps(evidence)[:-1] + ',"migration_count":125}'
+        evidence_path = self.root / "duplicate-evidence.json"
+        evidence_path.write_text(raw, encoding="utf-8")
+        evidence_path.chmod(0o600)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            status = MODULE.main(
+                [
+                    "record",
+                    "--manifest",
+                    str(manifest_path),
+                    "--step",
+                    "1",
+                    "--evidence",
+                    str(evidence_path),
+                ]
+            )
+        self.assertEqual(status, 1)
+        self.assertIn("json_duplicate_key", stderr.getvalue())
 
     def test_receipt_chain_rejects_post_record_mutation(self):
         manifest_path = self.prepare()
@@ -674,6 +881,16 @@ class D2CertificationTest(unittest.TestCase):
             status = self.record(manifest_path, 17, evidence_by_step[17])
         self.assertEqual(status, 1)
         self.assertIn("step_contract_failed:unresolved_receipt_count", stderr.getvalue())
+
+    def test_step_fourteen_accepts_canonical_replacement_identity(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence_by_step = complete_evidence(manifest)
+        for step in range(1, 15):
+            self.assertEqual(self.record(manifest_path, step, evidence_by_step[step]), 0)
+        receipts = manifest_path.with_name("receipts.jsonl").read_text().splitlines()
+        self.assertEqual(len(receipts), 14)
+        self.assertEqual(json.loads(receipts[-1])["code"], "target_replaced")
 
     def test_manifest_tampering_is_detected(self):
         manifest_path = self.prepare()

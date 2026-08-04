@@ -1177,7 +1177,9 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertNotEqual(result["new_pid"], old_pid)
         self.assertEqual(result["checkpoint"], "live_fresh_lease")
         self.assertEqual(result["deployment_id"], "deployment-1")
-        self.assertEqual(result["route_id"], "route-1")
+        self.assertEqual(
+            result["route_id"], intent["deployment_identity"]["route_id"]
+        )
         self.assertEqual(result["instance_id"], "instance-1")
         self.assertEqual(
             self.platform.signals,

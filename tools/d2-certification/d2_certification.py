@@ -15,6 +15,12 @@ import sys
 import urllib.parse
 import uuid
 
+from d2_evidence import (
+    canonical_effect_identity_sha256,
+    canonical_route_identity_sha256,
+    canonical_serving_identity_sha256,
+)
+
 
 SCHEMA_VERSION = 1
 MAX_JSON_BYTES = 256 * 1024
@@ -89,11 +95,13 @@ CODEX_WORKER_SOURCE_FILES = (
 )
 D2_TOOLCHAIN_SOURCE_FILES = (
     "d2_certification.py",
+    "d2_evidence.py",
     "d2_orchestrator_composition.py",
     "d2_orchestrator_contract.py",
     "d2_orchestrator_platform.py",
     "d2_drained_runtime_restart.py",
     "d2_live_runtime_restart.py",
+    "d2_run.py",
     "isolated_orchestrator.py",
     "product_driver.js",
 )
@@ -171,12 +179,12 @@ STEP_SPECS = {
     4: StepSpec(
         "oauth_authenticated",
         (
-            "oauth_callback_status",
             "me_status",
             "principal_id",
             "installation_id",
             "guild_id",
             "authority_check_status",
+            "public_origin",
         ),
     ),
     5: StepSpec(
@@ -191,6 +199,7 @@ STEP_SPECS = {
             "reasoning_effort",
             "auth_mode",
             "one_shot",
+            "public_origin",
         ),
     ),
     6: StepSpec(
@@ -212,6 +221,7 @@ STEP_SPECS = {
             "preview_state",
             "approval_state",
             "apply_state",
+            "public_origin",
         ),
     ),
     8: StepSpec(
@@ -225,6 +235,7 @@ STEP_SPECS = {
             "route_id",
             "attestation_id",
             "serving_lease_id",
+            "public_origin",
         ),
     ),
     9: StepSpec(
@@ -239,12 +250,14 @@ STEP_SPECS = {
             "channel_ids",
             "panel_message_ids",
             "ephemeral_count",
+            "transport_instance_id",
         ),
     ),
     10: StepSpec(
         "duplicate_interaction_suppressed",
         (
             "interaction_id",
+            "effect_id",
             "delivery_count",
             "external_effect_count",
             "receipt_state",
@@ -282,9 +295,14 @@ STEP_SPECS = {
             "route_reconstructed",
             "instance_reconstructed",
             "deployment_id",
-            "route_id",
+            "source_route_id",
+            "reconstructed_route_id",
+            "source_serving_lease_id",
+            "reconstructed_serving_lease_id",
             "instance_id",
             "pinned_ruleset_digest",
+            "probe_interaction_id",
+            "process_instance_id",
         ),
     ),
     13: StepSpec(
@@ -315,6 +333,7 @@ STEP_SPECS = {
             "previous_target_drained",
             "replacement_live",
             "prior_route_absent",
+            "public_origin",
         ),
     ),
     15: StepSpec(
@@ -328,6 +347,7 @@ STEP_SPECS = {
             "transport_gateway_partitioned",
             "transport_gateway_partition_events",
             "transport_instance_id",
+            "public_origin",
         ),
     ),
     16: StepSpec(
@@ -363,6 +383,15 @@ STEP_SPECS = {
 
 def fail(message):
     raise CertificationError(message)
+
+
+def strict_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail("json_duplicate_key")
+        result[key] = value
+    return result
 
 
 def canonical_json(value):
@@ -886,7 +915,7 @@ def load_json_file(path, label, allow_empty=False):
     if len(raw) > MAX_JSON_BYTES:
         fail(f"{label}_too_large")
     try:
-        return json.loads(raw)
+        return json.loads(raw, object_pairs_hook=strict_json_object)
     except (UnicodeDecodeError, json.JSONDecodeError):
         fail(f"{label}_invalid_json")
 
@@ -1199,6 +1228,17 @@ def require_digest(evidence, *fields):
             fail(f"step_contract_failed:{field}")
 
 
+def require_snowflake_fields(evidence, *fields):
+    for field in fields:
+        value = evidence[field]
+        if (
+            not isinstance(value, str)
+            or not SNOWFLAKE_PATTERN.fullmatch(value)
+            or int(value) > 18446744073709551615
+        ):
+            fail(f"step_contract_failed:{field}")
+
+
 def validate_step_contract(step, evidence, manifest, prior_receipts):
     specification = STEP_SPECS[step]
     require_fields(evidence, specification)
@@ -1267,7 +1307,7 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         ):
             fail("step_contract_failed:cloudflare_route_binding")
     elif step == 4:
-        if evidence["oauth_callback_status"] != 303 or evidence["me_status"] != 200:
+        if evidence["me_status"] != 200:
             fail("step_contract_failed:oauth_status")
         if evidence["authority_check_status"] != 204:
             fail("step_contract_failed:authority_check_status")
@@ -1276,6 +1316,8 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             fail("step_contract_failed:guild_id")
         if evidence["principal_id"] != f"discord:{manifest['discord']['actor_id']}":
             fail("step_contract_failed:principal_id")
+        if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:
+            fail("step_contract_failed:public_origin")
     elif step == 5:
         if evidence["authoring_http_status"] not in (200, 201):
             fail("step_contract_failed:authoring_http_status")
@@ -1289,6 +1331,8 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             for field in ("provider", "model", "reasoning_effort", "auth_mode")
         ):
             fail("step_contract_failed:authoring_model")
+        if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:
+            fail("step_contract_failed:public_origin")
     elif step == 6:
         require_true(evidence, "generation_encrypted")
         if evidence["projection_state"] != "preview_ready":
@@ -1306,7 +1350,8 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         ):
             fail("step_contract_failed:generation")
     elif step == 7:
-        require_identifier(evidence, "installation_id", "promotion_id")
+        require_identifier(evidence, "installation_id")
+        require_digest(evidence, "promotion_id")
         if evidence["installation_id"] != prior_receipts[5]["evidence"]["installation_id"]:
             fail("step_contract_failed:installation_id")
         if (
@@ -1315,13 +1360,18 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             or evidence["apply_state"] != "runtime_pending"
         ):
             fail("step_contract_failed:product_decision_state")
+        if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:
+            fail("step_contract_failed:public_origin")
     elif step == 8:
         require_true(evidence, "pending_observed", "live_observed")
         require_identifier(
             evidence,
             "installation_id",
-            "promotion_id",
             "deployment_id",
+        )
+        require_digest(
+            evidence,
+            "promotion_id",
             "route_id",
             "attestation_id",
             "serving_lease_id",
@@ -1333,15 +1383,20 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             != prior_receipts[6]["evidence"]["promotion_id"]
         ):
             fail("step_contract_failed:deployment_identity")
+        if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:
+            fail("step_contract_failed:public_origin")
     elif step == 9:
         require_identifier(
             evidence,
-            "create_interaction_id",
-            "join_interaction_id",
             "deployment_id",
-            "route_id",
             "instance_id",
         )
+        require_snowflake_fields(
+            evidence, "create_interaction_id", "join_interaction_id"
+        )
+        if evidence["create_interaction_id"] == evidence["join_interaction_id"]:
+            fail("step_contract_failed:interaction_identity")
+        require_digest(evidence, "route_id")
         if (
             evidence["deployment_id"]
             != prior_receipts[7]["evidence"]["deployment_id"]
@@ -1353,11 +1408,28 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             if not isinstance(values, list) or not values:
                 fail(f"step_contract_failed:{field}")
             for value in values:
-                if not isinstance(value, str) or not ID_PATTERN.fullmatch(value):
+                if (
+                    not isinstance(value, str)
+                    or not SNOWFLAKE_PATTERN.fullmatch(value)
+                    or int(value) > 18446744073709551615
+                ):
                     fail(f"step_contract_failed:{field}")
+        all_resource_ids = (
+            evidence["role_ids"]
+            + evidence["channel_ids"]
+            + evidence["panel_message_ids"]
+        )
+        if len(all_resource_ids) != len(set(all_resource_ids)):
+            fail("step_contract_failed:discord_resource_identity")
         require_positive_integer(evidence, "ephemeral_count")
+        if (
+            evidence["transport_instance_id"]
+            != prior_receipts[2]["evidence"]["transport_instance_id"]
+        ):
+            fail("step_contract_failed:transport_instance_id")
     elif step == 10:
-        require_identifier(evidence, "interaction_id")
+        require_snowflake_fields(evidence, "interaction_id")
+        require_digest(evidence, "effect_id")
         if (
             type(evidence["delivery_count"]) is not int
             or evidence["delivery_count"] < 2
@@ -1398,13 +1470,15 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             evidence,
             "checkpoint",
             "deployment_id",
-            "route_id",
             "instance_id",
             "operation_id",
             "installation_id",
         )
         require_digest(
-            evidence, "promotion_id", "canonical_confirmation_sha256"
+            evidence,
+            "promotion_id",
+            "route_id",
+            "canonical_confirmation_sha256",
         )
         require_positive_integer(evidence, "attestation_revision")
         if evidence["checkpoint"] != LIVE_FRESH_LEASE_CHECKPOINT:
@@ -1437,16 +1511,55 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             fail("step_contract_failed:restart_identity")
     elif step == 12:
         require_true(evidence, "route_reconstructed", "instance_reconstructed")
-        require_identifier(evidence, "deployment_id", "route_id", "instance_id")
-        require_digest(evidence, "pinned_ruleset_digest")
-        if any(
-            evidence[field] != prior_receipts[10]["evidence"][field]
-            for field in ("deployment_id", "route_id", "instance_id")
+        require_identifier(
+            evidence,
+            "deployment_id",
+            "instance_id",
+            "probe_interaction_id",
+        )
+        require_digest(
+            evidence,
+            "source_route_id",
+            "reconstructed_route_id",
+            "source_serving_lease_id",
+            "reconstructed_serving_lease_id",
+            "pinned_ruleset_digest",
+        )
+        if (
+            not SNOWFLAKE_PATTERN.fullmatch(evidence["probe_interaction_id"])
+            or int(evidence["probe_interaction_id"]) > 18446744073709551615
+            or not isinstance(evidence["process_instance_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{32}", evidence["process_instance_id"])
+        ):
+            fail("step_contract_failed:reconstruction_probe")
+        if (
+            evidence["deployment_id"] != prior_receipts[10]["evidence"]["deployment_id"]
+            or evidence["source_route_id"] != prior_receipts[10]["evidence"]["route_id"]
+            or evidence["source_serving_lease_id"]
+            != prior_receipts[7]["evidence"]["serving_lease_id"]
+            or evidence["instance_id"] != prior_receipts[10]["evidence"]["instance_id"]
         ):
             fail("step_contract_failed:reconstruction_identity")
+        if (
+            evidence["reconstructed_route_id"] == evidence["source_route_id"]
+            or evidence["reconstructed_serving_lease_id"]
+            == evidence["source_serving_lease_id"]
+        ):
+            fail("step_contract_failed:reconstruction_identity_rotation")
+        if evidence["process_instance_id"] != prior_receipts[10]["evidence"]["process_instance_id"]:
+            fail("step_contract_failed:reconstruction_process_identity")
+        if evidence["probe_interaction_id"] in {
+            prior_receipts[8]["evidence"]["create_interaction_id"],
+            prior_receipts[8]["evidence"]["join_interaction_id"],
+        }:
+            fail("step_contract_failed:reconstruction_probe_interaction")
     elif step == 13:
-        require_identifier(evidence, "effect_id", "interaction_id", "route_id")
-        if evidence["route_id"] != prior_receipts[11]["evidence"]["route_id"]:
+        require_snowflake_fields(evidence, "interaction_id")
+        require_digest(evidence, "effect_id", "route_id")
+        if (
+            evidence["route_id"]
+            != prior_receipts[11]["evidence"]["reconstructed_route_id"]
+        ):
             fail("step_contract_failed:route_id")
         if evidence["interaction_id"] in {
             prior_receipts[8]["evidence"]["create_interaction_id"],
@@ -1480,32 +1593,37 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             evidence,
             "replacement_target_id",
             "source_deployment_id",
-            "source_route_id",
             "replacement_deployment_id",
-            "replacement_route_id",
         )
-        if (
+        require_digest(evidence, "source_route_id", "replacement_route_id")
+        source_identity_matches = (
             evidence["source_deployment_id"]
-            != prior_receipts[11]["evidence"]["deployment_id"]
-            or evidence["source_route_id"]
-            != prior_receipts[11]["evidence"]["route_id"]
-            or evidence["replacement_target_id"]
-            != evidence["replacement_deployment_id"]
-            or evidence["replacement_deployment_id"]
-            == evidence["source_deployment_id"]
-            or evidence["replacement_route_id"] == evidence["source_route_id"]
-        ):
+            == prior_receipts[11]["evidence"]["deployment_id"]
+            and evidence["source_route_id"]
+            == prior_receipts[11]["evidence"]["reconstructed_route_id"]
+        )
+        replacement_identity_rotated = (
+            evidence["replacement_target_id"]
+            == evidence["replacement_deployment_id"]
+            and evidence["replacement_deployment_id"]
+            != evidence["source_deployment_id"]
+            and evidence["replacement_route_id"] != evidence["source_route_id"]
+        )
+        if not source_identity_matches or not replacement_identity_rotated:
             fail("step_contract_failed:replacement_identity")
         if evidence["replacement_kind"] not in ("update", "rollback"):
             fail("step_contract_failed:replacement_kind")
         require_true(
             evidence, "previous_target_drained", "replacement_live", "prior_route_absent"
         )
+        if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:
+            fail("step_contract_failed:public_origin")
     elif step == 15:
         require_true(evidence, "gateway_disconnected", "live_lost")
         if evidence["runtime_ready_status"] != 503:
             fail("step_contract_failed:runtime_ready_status")
-        require_identifier(evidence, "public_code", "route_id")
+        require_identifier(evidence, "public_code")
+        require_digest(evidence, "route_id")
         if evidence["route_id"] != prior_receipts[13]["evidence"]["replacement_route_id"]:
             fail("step_contract_failed:route_id")
         require_true(evidence, "transport_gateway_partitioned")
@@ -1515,6 +1633,8 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             != prior_receipts[2]["evidence"]["transport_instance_id"]
         ):
             fail("step_contract_failed:transport_instance_id")
+        if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:
+            fail("step_contract_failed:public_origin")
     elif step == 16:
         require_true(
             evidence,
@@ -1526,7 +1646,11 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         if not isinstance(deleted, list) or not deleted:
             fail("step_contract_failed:discord_resource_ids_deleted")
         for value in deleted:
-            if not isinstance(value, str) or not ID_PATTERN.fullmatch(value):
+            if (
+                not isinstance(value, str)
+                or not SNOWFLAKE_PATTERN.fullmatch(value)
+                or int(value) > 18446744073709551615
+            ):
                 fail("step_contract_failed:discord_resource_ids_deleted")
         created = set(
             prior_receipts[8]["evidence"]["role_ids"]
@@ -1567,7 +1691,7 @@ def load_receipts_from_handle(handle, manifest, digest):
         if total > MAX_JSON_BYTES * len(STEP_SPECS):
             fail("receipts_too_large")
         try:
-            receipt = json.loads(raw)
+            receipt = json.loads(raw, object_pairs_hook=strict_json_object)
         except (UnicodeDecodeError, json.JSONDecodeError):
             fail("receipt_invalid_json")
         expected_step = len(receipts) + 1
@@ -1625,31 +1749,44 @@ def open_locked_receipts(path, write):
     return handle
 
 
-def command_record(arguments):
-    manifest_path, manifest, digest = load_verified_manifest(arguments.manifest)
-    if arguments.step not in STEP_SPECS:
+def evidence_digest(evidence):
+    validate_json_safety(evidence)
+    return sha256_bytes(canonical_json(evidence).encode("utf-8"))
+
+
+def append_step_receipt(manifest_path, manifest, digest, step, evidence, observed_at=None):
+    if step not in STEP_SPECS:
         fail("step_invalid")
-    evidence_path = require_absolute_path(arguments.evidence, "evidence")
-    require_owned_mode(evidence_path, 0o600, "evidence")
-    evidence = load_json_file(evidence_path, "evidence")
     receipts_path = manifest_path.with_name("receipts.jsonl")
     require_owned_mode(receipts_path, 0o600, "receipts")
     with open_locked_receipts(receipts_path, True) as handle:
         receipts = load_receipts_from_handle(handle, manifest, digest)
         expected_step = len(receipts) + 1
-        if arguments.step != expected_step:
+        if step > expected_step:
             fail(f"step_out_of_order:expected_{expected_step}")
-        validate_step_contract(arguments.step, evidence, manifest, receipts)
+        if step < expected_step:
+            validate_step_contract(step, evidence, manifest, receipts[: step - 1])
+            existing = receipts[step - 1]
+            if evidence_digest(existing["evidence"]) != evidence_digest(evidence):
+                fail("step_replay_mismatch")
+            return existing, True
+        validate_step_contract(step, evidence, manifest, receipts)
+        if observed_at is None:
+            observed_at = (
+                datetime.datetime.now(datetime.timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z")
+            )
+        elif not validate_utc_timestamp(observed_at):
+            fail("receipt_observed_at_invalid")
         receipt = {
             "schema_version": SCHEMA_VERSION,
             "run_id": manifest["run_id"],
             "manifest_sha256": digest,
-            "step": arguments.step,
-            "code": STEP_SPECS[arguments.step].code,
-            "observed_at": datetime.datetime.now(datetime.timezone.utc)
-            .replace(microsecond=0)
-            .isoformat()
-            .replace("+00:00", "Z"),
+            "step": step,
+            "code": STEP_SPECS[step].code,
+            "observed_at": observed_at,
             "previous_sha256": (
                 ZERO_DIGEST if not receipts else receipts[-1]["receipt_sha256"]
             ),
@@ -1665,7 +1802,30 @@ def command_record(arguments):
         handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
-    print(canonical_json({"step": arguments.step, "code": STEP_SPECS[arguments.step].code}))
+    return receipt, False
+
+
+def command_record(arguments):
+    manifest_path, manifest, digest = load_verified_manifest(arguments.manifest)
+    if arguments.step not in STEP_SPECS:
+        fail("step_invalid")
+    evidence_path = require_absolute_path(arguments.evidence, "evidence")
+    require_owned_mode(evidence_path, 0o600, "evidence")
+    evidence = load_json_file(evidence_path, "evidence")
+    receipt, replayed = append_step_receipt(
+        manifest_path, manifest, digest, arguments.step, evidence
+    )
+    print(
+        canonical_json(
+            {
+                "step": arguments.step,
+                "code": STEP_SPECS[arguments.step].code,
+                "disposition": "exact_replay" if replayed else "created",
+                "replayed": replayed,
+                "receipt_sha256": receipt["receipt_sha256"],
+            }
+        )
+    )
 
 
 def command_verify(arguments):

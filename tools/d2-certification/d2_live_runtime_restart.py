@@ -199,11 +199,12 @@ def valid_deployment_identity(value):
     return (
         isinstance(value, dict)
         and set(value) == {"deployment_id", "route_id", "instance_id"}
-        and all(
-            isinstance(value[field], str)
-            and IDENTIFIER_PATTERN.fullmatch(value[field])
-            for field in value
-        )
+        and isinstance(value["deployment_id"], str)
+        and IDENTIFIER_PATTERN.fullmatch(value["deployment_id"])
+        and isinstance(value["route_id"], str)
+        and RECEIPT_DIGEST_PATTERN.fullmatch(value["route_id"])
+        and isinstance(value["instance_id"], str)
+        and IDENTIFIER_PATTERN.fullmatch(value["instance_id"])
     )
 
 
@@ -232,10 +233,12 @@ def valid_prior_live_witness(value):
             "attestation_id",
             "serving_lease_id",
         }
+        and isinstance(value["deployment_id"], str)
+        and IDENTIFIER_PATTERN.fullmatch(value["deployment_id"])
         and all(
             isinstance(value[field], str)
-            and IDENTIFIER_PATTERN.fullmatch(value[field])
-            for field in value
+            and RECEIPT_DIGEST_PATTERN.fullmatch(value[field])
+            for field in ("route_id", "attestation_id", "serving_lease_id")
         )
     )
 
