@@ -680,6 +680,8 @@ def assemble_decision_evidence(browser):
         "approval_state",
         "apply_state",
         "runtime_pending_observed",
+        "preview_completion_challenge_sha256",
+        "chrome_confirmation",
     }
     value = _require_envelope(
         browser, "starring.d2.browser-product-decision-evidence.v1", fields
@@ -697,6 +699,10 @@ def assemble_decision_evidence(browser):
     _require_digest(
         value["target_content_hash"], "decision_target_content_hash_invalid"
     )
+    _require_digest(
+        value["preview_completion_challenge_sha256"],
+        "preview_completion_challenge_invalid",
+    )
     _require_state(value["preview_state"], {"pending_approval"}, "preview_state_invalid")
     _require_state(value["approval_state"], {"approved"}, "approval_state_invalid")
     _require_state(
@@ -704,6 +710,88 @@ def assemble_decision_evidence(browser):
     )
     if value["runtime_pending_observed"] is not True:
         _fail("runtime_pending_observation_missing")
+    confirmation = _require_exact_object(
+        value["chrome_confirmation"],
+        {
+            "schema_version",
+            "kind",
+            "observed_at",
+            "confirmation_surface",
+            "accepted",
+            "installation_id",
+            "promotion_id",
+            "revision",
+            "payload_digest",
+            "target_content_hash",
+            "preview_completion_challenge_sha256",
+            "summary",
+        },
+        "chrome_preview_confirmation_fields_invalid",
+    )
+    if (
+        confirmation["schema_version"] != SCHEMA_VERSION
+        or confirmation["kind"]
+        != "starring.d2.chrome-preview-confirmation.v1"
+        or confirmation["confirmation_surface"] != "chrome_confirm"
+        or confirmation["accepted"] is not True
+    ):
+        _fail("chrome_preview_confirmation_identity_invalid")
+    _require_timestamp(
+        confirmation["observed_at"], "chrome_preview_confirmation_time_invalid"
+    )
+    _require_identifier(
+        confirmation["installation_id"],
+        "chrome_preview_confirmation_installation_invalid",
+    )
+    _require_digest(
+        confirmation["promotion_id"],
+        "chrome_preview_confirmation_promotion_invalid",
+    )
+    _require_positive_integer(
+        confirmation["revision"], "chrome_preview_confirmation_revision_invalid"
+    )
+    _require_digest(
+        confirmation["payload_digest"],
+        "chrome_preview_confirmation_payload_invalid",
+    )
+    _require_digest(
+        confirmation["target_content_hash"],
+        "chrome_preview_confirmation_target_invalid",
+    )
+    _require_digest(
+        confirmation["preview_completion_challenge_sha256"],
+        "chrome_preview_confirmation_challenge_invalid",
+    )
+    summary = _require_exact_object(
+        confirmation["summary"],
+        {
+            "panels",
+            "modals",
+            "rules",
+            "actions",
+            "target_version",
+            "required_approvals",
+        },
+        "chrome_preview_confirmation_summary_invalid",
+    )
+    for field in ("panels", "modals", "rules", "actions"):
+        _require_nonnegative_integer(
+            summary[field], "chrome_preview_confirmation_summary_invalid"
+        )
+    _require_positive_integer(
+        summary["target_version"], "chrome_preview_confirmation_summary_invalid"
+    )
+    if summary["required_approvals"] != 1:
+        _fail("chrome_preview_confirmation_summary_invalid")
+    if (
+        confirmation["installation_id"] != value["installation_id"]
+        or confirmation["promotion_id"] != value["promotion_id"]
+        or confirmation["payload_digest"] != value["payload_digest"]
+        or confirmation["target_content_hash"] != value["target_content_hash"]
+        or confirmation["preview_completion_challenge_sha256"]
+        != value["preview_completion_challenge_sha256"]
+    ):
+        _fail("chrome_preview_confirmation_binding_invalid")
     return {
         "installation_id": value["installation_id"],
         "promotion_id": value["promotion_id"],
@@ -716,6 +804,13 @@ def assemble_decision_evidence(browser):
         "apply_state": "runtime_pending",
         "public_origin": value["public_origin"],
         "decision_observed_at": value["observed_at"],
+        "preview_completion_challenge_sha256": value[
+            "preview_completion_challenge_sha256"
+        ],
+        "confirmation_surface": confirmation["confirmation_surface"],
+        "chrome_confirmation_sha256": hashlib.sha256(
+            canonical_json(confirmation).encode("utf-8")
+        ).hexdigest(),
     }
 
 

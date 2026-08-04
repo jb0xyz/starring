@@ -12,6 +12,7 @@ const LIVE_LOSS_GATEWAY_DISCONNECTED = JSON.parse(
   ),
 );
 const DIGEST = "a".repeat(64);
+const PREVIEW_COMPLETION_CHALLENGE = "d".repeat(64);
 const PROCESS_INSTANCE_ID = "0123456789abcdef0123456789abcdef";
 
 
@@ -77,6 +78,7 @@ function liveOperational(overrides = {}) {
 
 
 function driver(fetchImpl, cookie = "__Host-starring_csrf=csrf-value", options = {}) {
+  const { nativeConfirm = () => true, ...driverOptions } = options;
   const context = {
     URL,
     Error,
@@ -88,6 +90,7 @@ function driver(fetchImpl, cookie = "__Host-starring_csrf=csrf-value", options =
     location: { origin: "https://d2-api.starring.co.kr" },
     setTimeout,
     clearTimeout,
+    confirm: nativeConfirm,
   };
   context.globalThis = context;
   vm.runInNewContext(SOURCE, context, { filename: "product_driver.js" });
@@ -96,7 +99,7 @@ function driver(fetchImpl, cookie = "__Host-starring_csrf=csrf-value", options =
     cookieSource: () => cookie,
     randomUUID: () => "00000000-0000-4000-8000-000000000001",
     sleep: async () => {},
-    ...options,
+    ...driverOptions,
   });
 }
 
@@ -413,10 +416,19 @@ test("certification authoring and decision phases are separated by a public prev
     }),
   ];
   const calls = [];
+  let confirmations = 0;
+  let confirmationPrompt = "";
   const product = driver(async (url, options) => {
     calls.push({ url, options });
     return responses.shift();
-  }, undefined, { now: () => "2026-08-04T12:00:00Z" });
+  }, undefined, {
+    now: () => "2026-08-04T12:00:00Z",
+    nativeConfirm: (value) => {
+      confirmations += 1;
+      confirmationPrompt = value;
+      return true;
+    },
+  });
   const authoring = await product.beginCertificationAuthoring({
     installationId: "installation-1",
     sessionId: "session-1",
@@ -432,23 +444,31 @@ test("certification authoring and decision phases are separated by a public prev
   assert.equal(authoring.authoring_evidence.authoring_disposition, "created");
   assert.equal(authoring.authoring_evidence.worker_request_id, "worker-request-1");
   assert.equal(authoring.authoring_evidence.worker_completion_sha256, "c".repeat(64));
-  let confirmations = 0;
   const decision = await product.completeCertificationDecision({
     installationId: "installation-1",
     sessionId: "session-1",
     authoringGeneration: 1,
     candidateRulesetHash: DIGEST,
-    confirmPreview: async (preview) => {
-      confirmations += 1;
-      assert.equal(preview.target_content_hash, DIGEST);
-      assert.equal(preview.payload_digest, approvalDigest);
-      return true;
-    },
+    previewCompletionChallengeSha256: PREVIEW_COMPLETION_CHALLENGE,
   });
   assert.equal(calls.length, 6);
   assert.equal(confirmations, 1);
+  assert.match(confirmationPrompt, new RegExp(DIGEST));
+  assert.match(confirmationPrompt, new RegExp(approvalDigest));
   assert.equal(decision.product_decision_evidence.target_content_hash, DIGEST);
   assert.equal(decision.product_decision_evidence.payload_digest, approvalDigest);
+  assert.equal(
+    decision.product_decision_evidence.preview_completion_challenge_sha256,
+    PREVIEW_COMPLETION_CHALLENGE,
+  );
+  assert.equal(
+    decision.product_decision_evidence.chrome_confirmation.confirmation_surface,
+    "chrome_confirm",
+  );
+  assert.equal(
+    decision.product_decision_evidence.chrome_confirmation.accepted,
+    true,
+  );
   assert.equal(decision.applied.state, "runtime_pending");
 });
 
@@ -491,19 +511,95 @@ test("certification decision refuses a promotion that does not target the review
   ];
   let confirmations = 0;
   await assert.rejects(
-    driver(async () => responses.shift()).completeCertificationDecision({
+    driver(async () => responses.shift(), undefined, {
+      nativeConfirm: () => {
+        confirmations += 1;
+        return true;
+      },
+    }).completeCertificationDecision({
       installationId: "installation-1",
       sessionId: "session-1",
       authoringGeneration: 1,
       candidateRulesetHash: DIGEST,
-      confirmPreview: async () => {
-        confirmations += 1;
-        return true;
-      },
+      previewCompletionChallengeSha256: PREVIEW_COMPLETION_CHALLENGE,
     }),
     /promotion_candidate_identity_mismatch/,
   );
   assert.equal(confirmations, 0);
+});
+
+
+test("certification decision forbids caller-supplied confirmation overrides", async () => {
+  let calls = 0;
+  await assert.rejects(
+    driver(async () => {
+      calls += 1;
+      return response(500, null);
+    }).completeCertificationDecision({
+      installationId: "installation-1",
+      sessionId: "session-1",
+      authoringGeneration: 1,
+      candidateRulesetHash: DIGEST,
+      previewCompletionChallengeSha256: PREVIEW_COMPLETION_CHALLENGE,
+      confirmPreview: async () => true,
+    }),
+    /preview_confirmation_override_forbidden/,
+  );
+  assert.equal(calls, 0);
+});
+
+
+test("certification decision stops when native Chrome confirmation is declined", async () => {
+  const approvalDigest = "b".repeat(64);
+  const responses = [
+    response(200, {
+      session_id: "session-1",
+      observed_generation: 1,
+      projection: {
+        state: "preview_ready",
+        preview: { revision: 1, receipt: { candidate_ruleset_hash: DIGEST } },
+      },
+    }),
+    response(201, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: approvalDigest,
+      replayed: false,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: approvalDigest,
+      summary: {
+        panels: 1,
+        modals: 1,
+        rules: 4,
+        actions: 15,
+        target_version: 1,
+        required_approvals: 1,
+        target_content_hash: DIGEST,
+      },
+    }),
+  ];
+  let calls = 0;
+  await assert.rejects(
+    driver(async () => {
+      calls += 1;
+      return responses.shift();
+    }, undefined, { nativeConfirm: () => false }).completeCertificationDecision({
+      installationId: "installation-1",
+      sessionId: "session-1",
+      authoringGeneration: 1,
+      candidateRulesetHash: DIGEST,
+      previewCompletionChallengeSha256: PREVIEW_COMPLETION_CHALLENGE,
+    }),
+    /preview_not_approved_by_operator/,
+  );
+  assert.equal(calls, 3);
 });
 
 
@@ -525,7 +621,7 @@ test("certification decision rejects the POST turn shape at the GET session boun
       sessionId: "session-1",
       authoringGeneration: 1,
       candidateRulesetHash: DIGEST,
-      confirmPreview: async () => true,
+      previewCompletionChallengeSha256: PREVIEW_COMPLETION_CHALLENGE,
     }),
     /observed_generation_invalid/,
   );

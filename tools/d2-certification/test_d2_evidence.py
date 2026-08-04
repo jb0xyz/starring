@@ -79,6 +79,32 @@ def envelope(kind, **values):
     }
 
 
+def chrome_confirmation(
+    challenge="d" * 64,
+    payload_digest="a" * 64,
+    target_content_hash="a" * 64,
+):
+    return envelope(
+        "starring.d2.chrome-preview-confirmation.v1",
+        confirmation_surface="chrome_confirm",
+        accepted=True,
+        installation_id=INSTALLATION_ID,
+        promotion_id=PROMOTION_ID,
+        revision=1,
+        payload_digest=payload_digest,
+        target_content_hash=target_content_hash,
+        preview_completion_challenge_sha256=challenge,
+        summary={
+            "panels": 1,
+            "modals": 1,
+            "rules": 4,
+            "actions": 15,
+            "target_version": 1,
+            "required_approvals": 1,
+        },
+    )
+
+
 class D2EvidenceTest(unittest.TestCase):
     def test_canonical_identities_have_stable_domain_separated_digests(self):
         route = route_identity()
@@ -362,6 +388,8 @@ class D2EvidenceTest(unittest.TestCase):
             approval_state="approved",
             apply_state="runtime_pending",
             runtime_pending_observed=True,
+            preview_completion_challenge_sha256="d" * 64,
+            chrome_confirmation=chrome_confirmation(),
         )
         self.assertTrue(
             MODULE.assemble_authoring_evidence(authoring, worker)["one_shot"]
@@ -379,6 +407,13 @@ class D2EvidenceTest(unittest.TestCase):
         self.assertEqual(assembled_decision["authoring_session_id"], "session-1")
         self.assertEqual(assembled_decision["authoring_generation"], 1)
         self.assertEqual(assembled_decision["payload_digest"], "a" * 64)
+        self.assertEqual(
+            assembled_decision["chrome_confirmation_sha256"],
+            hashlib.sha256(
+                MODULE.canonical_json(decision["chrome_confirmation"]).encode("utf-8")
+            ).hexdigest(),
+        )
+        self.assertEqual(assembled_decision["confirmation_surface"], "chrome_confirm")
         fast_live = copy.deepcopy(decision)
         fast_live["apply_state"] = "live"
         self.assertEqual(
@@ -391,6 +426,14 @@ class D2EvidenceTest(unittest.TestCase):
             MODULE.EvidenceContractError, "runtime_pending_observation_missing"
         ):
             MODULE.assemble_decision_evidence(missing_pending)
+        mismatched_confirmation = copy.deepcopy(decision)
+        mismatched_confirmation["chrome_confirmation"][
+            "preview_completion_challenge_sha256"
+        ] = "e" * 64
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError, "chrome_preview_confirmation_binding_invalid"
+        ):
+            MODULE.assemble_decision_evidence(mismatched_confirmation)
 
     def test_interaction_adapter_joins_database_and_transport_resources(self):
         database = envelope(

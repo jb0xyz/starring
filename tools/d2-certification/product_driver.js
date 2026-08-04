@@ -12,6 +12,7 @@
   const AUTHORING_EVIDENCE_KIND = "starring.d2.browser-authoring-evidence.v1";
   const PREVIEW_READY_EVIDENCE_KIND = "starring.d2.browser-preview-ready-evidence.v1";
   const PRODUCT_DECISION_EVIDENCE_KIND = "starring.d2.browser-product-decision-evidence.v1";
+  const CHROME_PREVIEW_CONFIRMATION_KIND = "starring.d2.chrome-preview-confirmation.v1";
   const LIVE_EVIDENCE_KIND = "starring.d2.browser-live-evidence.v1";
   const LIVE_LOSS_EVIDENCE_KIND = "starring.d2.browser-live-loss-evidence.v1";
   const REPLACEMENT_EVIDENCE_KIND = "starring.d2.browser-replacement-evidence.v1";
@@ -940,8 +941,11 @@
     }
 
     async function completeCertificationDecision(input) {
-      if (typeof input.confirmPreview !== "function") {
-        throw new Error("preview_confirmation_required");
+      if (Object.hasOwn(input, "confirmPreview")) {
+        throw new Error("preview_confirmation_override_forbidden");
+      }
+      if (typeof root.confirm !== "function") {
+        throw new Error("native_preview_confirmation_unavailable");
       }
       const installationId = requireResourceId(input.installationId, "installation_id");
       const sessionId = requireResourceId(input.sessionId, "authoring_session_id");
@@ -953,6 +957,10 @@
       const candidateRulesetHash = requireDigest(
         input.candidateRulesetHash,
         "candidate_ruleset_hash",
+      );
+      const previewCompletionChallengeSha256 = requireDigest(
+        input.previewCompletionChallengeSha256,
+        "preview_completion_challenge_sha256",
       );
       const current = await authoringSession(installationId, sessionId);
       const currentProjection = sessionProjectionEvidence(current.body);
@@ -992,7 +1000,7 @@
       ) {
         throw new Error("promotion_candidate_identity_mismatch");
       }
-      const confirmation = Object.freeze({
+      const confirmationPrompt = Object.freeze({
         installation_id: preview.body.installation_id,
         promotion_id: preview.body.promotion_id,
         revision: preview.body.revision,
@@ -1000,9 +1008,26 @@
         target_content_hash: targetContentHash,
         summary: safeSummary,
       });
-      if ((await input.confirmPreview(confirmation)) !== true) {
+      const confirmed = root.confirm(
+        `Approve this Starring product preview?\n\n${JSON.stringify(confirmationPrompt, null, 2)}`,
+      );
+      if (confirmed !== true) {
         throw new Error("preview_not_approved_by_operator");
       }
+      const chromeConfirmation = Object.freeze({
+        schema_version: 1,
+        kind: CHROME_PREVIEW_CONFIRMATION_KIND,
+        observed_at: observedAt(),
+        confirmation_surface: "chrome_confirm",
+        accepted: true,
+        installation_id: preview.body.installation_id,
+        promotion_id: preview.body.promotion_id,
+        revision: preview.body.revision,
+        payload_digest: preview.body.payload_digest,
+        target_content_hash: targetContentHash,
+        preview_completion_challenge_sha256: previewCompletionChallengeSha256,
+        summary: safeSummary,
+      });
       const approved = await approve({
         installationId,
         promotionId: promoted.body.promotion_id,
@@ -1041,6 +1066,8 @@
         approval_state: approved.body.state,
         apply_state: applied.body.state,
         runtime_pending_observed: applied.runtime_pending_observed,
+        preview_completion_challenge_sha256: previewCompletionChallengeSha256,
+        chrome_confirmation: chromeConfirmation,
       });
       return Object.freeze({
         product_decision_evidence: productDecisionEvidence,

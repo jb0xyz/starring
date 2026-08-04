@@ -246,6 +246,9 @@ STEP_SPECS = {
             "apply_state",
             "public_origin",
             "decision_observed_at",
+            "preview_completion_challenge_sha256",
+            "confirmation_surface",
+            "chrome_confirmation_sha256",
         ),
     ),
     8: StepSpec(
@@ -1461,6 +1464,8 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             "promotion_id",
             "payload_digest",
             "target_content_hash",
+            "preview_completion_challenge_sha256",
+            "chrome_confirmation_sha256",
         )
         if evidence["installation_id"] != prior_receipts[5]["evidence"]["installation_id"]:
             fail("step_contract_failed:installation_id")
@@ -1483,6 +1488,8 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             fail("step_contract_failed:public_origin")
         if not validate_utc_timestamp(evidence["decision_observed_at"]):
             fail("step_contract_failed:decision_observed_at")
+        if evidence["confirmation_surface"] != "chrome_confirm":
+            fail("step_contract_failed:confirmation_surface")
     elif step == 8:
         require_true(evidence, "pending_observed", "live_observed")
         require_identifier(

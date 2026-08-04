@@ -555,6 +555,24 @@ class D2RunCoordinatorTest(unittest.TestCase):
             },
         )
 
+    def test_step_seven_action_exposes_the_durable_preview_completion_challenge(self):
+        self.append_prior(6)
+        completion = json.loads(
+            d2_run.coordinator_completion_path(self.manifest_path, 6).read_text(
+                encoding="utf-8"
+            )
+        )
+        action = d2_run.next_certification_action(self.manifest_path)
+        self.assertEqual(action["step"], 7)
+        self.assertEqual(
+            action["preview_completion_challenge_sha256"],
+            d2_run.preview_completion_challenge(
+                self.manifest,
+                self.manifest_digest,
+                completion,
+            ),
+        )
+
     def test_direct_machine_source_advances_and_replays_without_raw_evidence(self):
         source = self.direct_source(1, d2_run.ORCHESTRATOR_BOOTSTRAP_KIND)
         created = d2_run.advance_certification(
@@ -866,7 +884,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
         self.assertEqual(result["disposition"], "created")
         self.assertEqual(self.receipts()[5]["evidence"], final)
 
-    def test_step_seven_must_be_observed_after_step_six_completion(self):
+    def test_step_seven_must_present_the_exact_step_six_completion_challenge(self):
         self.append_prior(6)
         final = self.complete[7]
         completion = json.loads(
@@ -880,6 +898,31 @@ class D2RunCoordinatorTest(unittest.TestCase):
         before = (completed_at - datetime.timedelta(seconds=1)).isoformat(
             timespec="microseconds"
         ).replace("+00:00", "Z")
+        expected_challenge = d2_run.preview_completion_challenge(
+            self.manifest,
+            self.manifest_digest,
+            completion,
+        )
+        confirmation = self.envelope(
+            "starring.d2.chrome-preview-confirmation.v1",
+            observed_at=before,
+            confirmation_surface="chrome_confirm",
+            accepted=True,
+            installation_id=final["installation_id"],
+            promotion_id=final["promotion_id"],
+            revision=1,
+            payload_digest=final["payload_digest"],
+            target_content_hash=final["target_content_hash"],
+            preview_completion_challenge_sha256="f" * 64,
+            summary={
+                "panels": 1,
+                "modals": 1,
+                "rules": 4,
+                "actions": 15,
+                "target_version": 1,
+                "required_approvals": 1,
+            },
+        )
         source = self.envelope(
             "starring.d2.browser-product-decision-evidence.v1",
             observed_at=before,
@@ -894,17 +937,20 @@ class D2RunCoordinatorTest(unittest.TestCase):
             approval_state=final["approval_state"],
             apply_state=final["apply_state"],
             runtime_pending_observed=True,
+            preview_completion_challenge_sha256="f" * 64,
+            chrome_confirmation=confirmation,
         )
         with self.assertRaisesRegex(
             d2_run.CertificationError,
-            "coordinator_product_decision_precedes_preview_completion",
+            "coordinator_preview_completion_challenge_invalid",
         ):
             d2_run.advance_certification(
                 self.manifest_path, 7, [str(self.write_source(source))]
             )
-        source["observed_at"] = (
-            completed_at + datetime.timedelta(seconds=1)
-        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        source["preview_completion_challenge_sha256"] = expected_challenge
+        source["chrome_confirmation"][
+            "preview_completion_challenge_sha256"
+        ] = expected_challenge
         result = d2_run.advance_certification(
             self.manifest_path, 7, [str(self.write_source(source))]
         )
@@ -912,6 +958,12 @@ class D2RunCoordinatorTest(unittest.TestCase):
         self.assertEqual(
             self.receipts()[6]["evidence"]["target_content_hash"],
             final["target_content_hash"],
+        )
+        self.assertEqual(
+            self.receipts()[6]["evidence"][
+                "preview_completion_challenge_sha256"
+            ],
+            expected_challenge,
         )
 
     def test_step_eight_binds_public_live_to_exact_database_runtime_identity(self):

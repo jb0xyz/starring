@@ -588,14 +588,12 @@ def assemble_step_evidence(
                 digest,
                 6,
             )
-            completed_at = datetime.datetime.fromisoformat(
-                completion["observed_at"][:-1] + "+00:00"
-            )
-            decided_at = datetime.datetime.fromisoformat(
-                decision["decision_observed_at"][:-1] + "+00:00"
-            )
-            if decided_at <= completed_at:
-                fail("coordinator_product_decision_precedes_preview_completion")
+            if completion["receipt_sha256"] != prior_receipts[5]["receipt_sha256"]:
+                fail("coordinator_preview_completion_receipt_drift")
+            if decision["preview_completion_challenge_sha256"] != (
+                preview_completion_challenge(manifest, digest, completion)
+            ):
+                fail("coordinator_preview_completion_challenge_invalid")
             return decision
         if step == 8:
             return d2_evidence.assemble_live_evidence(
@@ -799,6 +797,11 @@ def coordinator_record_digest(record):
     return sha256_bytes(canonical_json(record).encode("utf-8"))
 
 
+def preview_completion_challenge(manifest, digest, completion):
+    validate_completion(completion, manifest, digest, 6)
+    return coordinator_record_digest(completion)
+
+
 def coordinator_pending_step(manifest_path, manifest, digest, receipts):
     pending = []
     completed_steps = len(receipts)
@@ -860,11 +863,34 @@ def coordinator_pending_step(manifest_path, manifest, digest, receipts):
 
 def next_certification_action(manifest_path):
     verified_path, manifest, digest = load_verified_manifest(manifest_path)
+    preview_challenge = None
     with coordinator_lock(verified_path, False):
         receipts = load_receipts(verified_path, manifest, digest)
         pending_step = coordinator_pending_step(
             verified_path, manifest, digest, receipts
         )
+        next_step = (
+            pending_step
+            if pending_step is not None
+            else (len(receipts) + 1 if len(receipts) < len(STEP_SPECS) else None)
+        )
+        if next_step == 7:
+            if len(receipts) < 6:
+                fail("coordinator_preview_completion_missing")
+            completion = validate_completion(
+                load_coordinator_record(
+                    coordinator_completion_path(verified_path, 6),
+                    "coordinator_preview_completion",
+                ),
+                manifest,
+                digest,
+                6,
+            )
+            if completion["receipt_sha256"] != receipts[5]["receipt_sha256"]:
+                fail("coordinator_preview_completion_receipt_drift")
+            preview_challenge = preview_completion_challenge(
+                manifest, digest, completion
+            )
     completed_steps = len(receipts)
     chain_head = ZERO_DIGEST if not receipts else receipts[-1]["receipt_sha256"]
     base = {
@@ -887,6 +913,8 @@ def next_certification_action(manifest_path):
         }
         if pending_step in HUMAN_BOUNDARIES:
             result["boundary"] = HUMAN_BOUNDARIES[pending_step]
+        if pending_step == 7:
+            result["preview_completion_challenge_sha256"] = preview_challenge
         return result
     if completed_steps == len(STEP_SPECS):
         return {
@@ -908,6 +936,8 @@ def next_certification_action(manifest_path):
     }
     if step in HUMAN_BOUNDARIES:
         result["boundary"] = HUMAN_BOUNDARIES[step]
+    if step == 7:
+        result["preview_completion_challenge_sha256"] = preview_challenge
     return result
 
 
