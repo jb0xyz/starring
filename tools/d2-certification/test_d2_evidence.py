@@ -220,6 +220,8 @@ class D2EvidenceTest(unittest.TestCase):
                 MODULE.canonical_json(authoring).encode("utf-8")
             ).hexdigest(),
             browser_observed_at=authoring["observed_at"],
+            worker_before_observed_at="2026-08-04T01:02:02Z",
+            worker_after_observed_at="2026-08-04T01:02:04Z",
             model="gpt-5.6-luna",
             provider="codex_chatgpt",
             reasoning_effort="medium",
@@ -244,6 +246,7 @@ class D2EvidenceTest(unittest.TestCase):
             payload_digest="a" * 64,
             installation_id=INSTALLATION_ID,
             authoring_session_id="session-1",
+            generation_created_at=OBSERVED_AT,
         )
         decision = envelope(
             "starring.d2.browser-product-decision-evidence.v1",

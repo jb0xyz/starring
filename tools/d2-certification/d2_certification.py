@@ -202,6 +202,9 @@ STEP_SPECS = {
             "provider",
             "reasoning_effort",
             "auth_mode",
+            "browser_observed_at",
+            "worker_before_observed_at",
+            "worker_after_observed_at",
             "one_shot",
             "public_origin",
         ),
@@ -215,6 +218,7 @@ STEP_SPECS = {
             "payload_digest",
             "installation_id",
             "authoring_session_id",
+            "generation_created_at",
         ),
     ),
     7: StepSpec(
@@ -696,10 +700,10 @@ def validate_utc_timestamp(raw):
     if not isinstance(raw, str) or not UTC_TIMESTAMP_PATTERN.fullmatch(raw):
         return False
     try:
-        datetime.datetime.strptime(raw, "%Y-%m-%dT%H:%M:%SZ")
+        parsed = datetime.datetime.fromisoformat(raw[:-1] + "+00:00")
     except ValueError:
         return False
-    return True
+    return parsed.tzinfo == datetime.timezone.utc
 
 
 def generate_run_id(now=None):
@@ -1368,6 +1372,13 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             fail("step_contract_failed:authoring_model")
         if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:
             fail("step_contract_failed:public_origin")
+        for field in (
+            "browser_observed_at",
+            "worker_before_observed_at",
+            "worker_after_observed_at",
+        ):
+            if not validate_utc_timestamp(evidence[field]):
+                fail(f"step_contract_failed:{field}")
     elif step == 6:
         require_true(evidence, "generation_encrypted")
         if evidence["projection_state"] != "preview_ready":
@@ -1375,6 +1386,8 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         require_positive_integer(evidence, "generation")
         require_digest(evidence, "payload_digest")
         require_identifier(evidence, "installation_id", "authoring_session_id")
+        if not validate_utc_timestamp(evidence["generation_created_at"]):
+            fail("step_contract_failed:generation_created_at")
         if (
             evidence["generation"]
             != prior_receipts[4]["evidence"]["authoring_generation"]
@@ -1384,6 +1397,23 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             != prior_receipts[4]["evidence"]["authoring_session_id"]
         ):
             fail("step_contract_failed:generation")
+        worker_before = datetime.datetime.fromisoformat(
+            prior_receipts[4]["evidence"]["worker_before_observed_at"][:-1]
+            + "+00:00"
+        )
+        generation_created = datetime.datetime.fromisoformat(
+            evidence["generation_created_at"][:-1] + "+00:00"
+        )
+        browser_observed = datetime.datetime.fromisoformat(
+            prior_receipts[4]["evidence"]["browser_observed_at"][:-1]
+            + "+00:00"
+        )
+        worker_after = datetime.datetime.fromisoformat(
+            prior_receipts[4]["evidence"]["worker_after_observed_at"][:-1]
+            + "+00:00"
+        )
+        if not worker_before <= generation_created <= browser_observed <= worker_after:
+            fail("step_contract_failed:authoring_causal_window")
     elif step == 7:
         require_identifier(evidence, "installation_id", "authoring_session_id")
         require_positive_integer(evidence, "authoring_generation")

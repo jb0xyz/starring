@@ -148,6 +148,9 @@ def complete_evidence(manifest):
             "provider": "codex_chatgpt",
             "reasoning_effort": "medium",
             "auth_mode": "chatgpt",
+            "browser_observed_at": "2026-08-04T01:02:03Z",
+            "worker_before_observed_at": "2026-08-04T01:02:02Z",
+            "worker_after_observed_at": "2026-08-04T01:02:04Z",
             "one_shot": True,
             "public_origin": manifest["cloudflare"]["public_origin"],
         },
@@ -158,6 +161,7 @@ def complete_evidence(manifest):
             "payload_digest": DIGEST,
             "installation_id": installation_id,
             "authoring_session_id": "authoring-session-1",
+            "generation_created_at": "2026-08-04T01:02:03Z",
         },
         7: {
             "installation_id": installation_id,

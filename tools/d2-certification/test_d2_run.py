@@ -697,6 +697,8 @@ class D2RunCoordinatorTest(unittest.TestCase):
             manifest_sha256=self.manifest_digest,
             browser_evidence_sha256=browser_digest,
             browser_observed_at=OBSERVED_AT,
+            worker_before_observed_at="2026-08-04T01:02:02Z",
+            worker_after_observed_at="2026-08-04T01:02:04Z",
             provider=final["provider"],
             model=final["model"],
             reasoning_effort=final["reasoning_effort"],

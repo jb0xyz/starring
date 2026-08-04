@@ -186,6 +186,11 @@ def _require_timestamp(value, code):
     return value
 
 
+def _timestamp_value(value, code):
+    _require_timestamp(value, code)
+    return datetime.datetime.fromisoformat(value[:-1] + "+00:00")
+
+
 def _require_public_origin(value, code):
     if not isinstance(value, str) or len(value) > 2048:
         _fail(code)
@@ -430,6 +435,8 @@ def assemble_authoring_evidence(browser, worker):
         "manifest_sha256",
         "browser_evidence_sha256",
         "browser_observed_at",
+        "worker_before_observed_at",
+        "worker_after_observed_at",
         "provider",
         "model",
         "reasoning_effort",
@@ -485,6 +492,19 @@ def assemble_authoring_evidence(browser, worker):
     _require_timestamp(
         execution["browser_observed_at"], "authoring_browser_observed_at_invalid"
     )
+    before_observed_at = _timestamp_value(
+        execution["worker_before_observed_at"],
+        "authoring_worker_before_observed_at_invalid",
+    )
+    browser_observed_at = _timestamp_value(
+        execution["browser_observed_at"], "authoring_browser_observed_at_invalid"
+    )
+    after_observed_at = _timestamp_value(
+        execution["worker_after_observed_at"],
+        "authoring_worker_after_observed_at_invalid",
+    )
+    if not before_observed_at <= browser_observed_at <= after_observed_at:
+        _fail("authoring_worker_time_boundary_invalid")
     if execution["browser_observed_at"] != public["observed_at"]:
         _fail("authoring_browser_timestamp_mismatch")
     expected_browser_digest = hashlib.sha256(
@@ -525,6 +545,9 @@ def assemble_authoring_evidence(browser, worker):
         "provider": execution["provider"],
         "reasoning_effort": execution["reasoning_effort"],
         "auth_mode": execution["auth_mode"],
+        "browser_observed_at": execution["browser_observed_at"],
+        "worker_before_observed_at": execution["worker_before_observed_at"],
+        "worker_after_observed_at": execution["worker_after_observed_at"],
         "one_shot": True,
         "public_origin": public["public_origin"],
     }
@@ -538,6 +561,7 @@ def assemble_preview_evidence(database):
         "payload_digest",
         "installation_id",
         "authoring_session_id",
+        "generation_created_at",
     }
     value = _require_envelope(database, "starring.d2.db-authoring-evidence.v1", fields)
     if value["generation_encrypted"] is not True:
@@ -547,6 +571,7 @@ def assemble_preview_evidence(database):
     _require_digest(value["payload_digest"], "db_payload_digest_invalid")
     _require_identifier(value["installation_id"], "db_installation_id_invalid")
     _require_identifier(value["authoring_session_id"], "db_authoring_session_id_invalid")
+    _require_timestamp(value["generation_created_at"], "db_generation_created_at_invalid")
     return {field: value[field] for field in fields}
 
 

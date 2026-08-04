@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 
 DIRECTORY = pathlib.Path(__file__).parent
@@ -74,8 +75,13 @@ class WorkerAuthoringEvidenceTests(unittest.TestCase):
             digest="b" * 64,
             artifact_directory=artifact,
         )
+        self.utc_patch = mock.patch.object(
+            WORKER, "utc_now", return_value="2026-08-04T12:00:01.123Z"
+        )
+        self.utc_patch.start()
 
     def tearDown(self):
+        self.utc_patch.stop()
         self.temporary.cleanup()
 
     def assert_failure(self, code, operation):
@@ -98,6 +104,12 @@ class WorkerAuthoringEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["settled_requests_delta"], 1)
         self.assertEqual(evidence["worker_instance_id"], health()["instance_id"])
         self.assertNotIn("authoring_session_id", evidence)
+        self.assertEqual(
+            evidence["worker_before_observed_at"], browser()["observed_at"]
+        )
+        self.assertEqual(
+            evidence["worker_after_observed_at"], browser()["observed_at"]
+        )
         replay = WORKER.capture_worker_authoring_checkpoint(
             self.context, health(20, 20), "after", browser()
         )
@@ -178,6 +190,29 @@ class WorkerAuthoringEvidenceTests(unittest.TestCase):
             "browser_authoring_evidence_invalid",
             lambda: WORKER.validate_browser_authoring_evidence(malformed_browser),
         )
+
+    def test_browser_observation_must_fall_inside_worker_request_window(self):
+        self.utc_patch.stop()
+        with mock.patch.object(
+            WORKER,
+            "utc_now",
+            side_effect=[
+                "2026-08-04T12:00:02Z",
+                "2026-08-04T12:00:04Z",
+            ],
+        ):
+            WORKER.capture_worker_authoring_checkpoint(
+                self.context, health(), "before"
+            )
+            stale = browser()
+            stale["observed_at"] = "2026-08-04T12:00:01Z"
+            self.assert_failure(
+                "worker_authoring_time_boundary_invalid",
+                lambda: WORKER.capture_worker_authoring_checkpoint(
+                    self.context, health(8, 8), "after", stale
+                ),
+            )
+        self.utc_patch.start()
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import datetime
 import hashlib
 import pathlib
 import re
@@ -76,6 +77,8 @@ AUTHORING_FIELDS = {
     "manifest_sha256",
     "browser_evidence_sha256",
     "browser_observed_at",
+    "worker_before_observed_at",
+    "worker_after_observed_at",
     "provider",
     "model",
     "reasoning_effort",
@@ -110,6 +113,17 @@ def _require_timestamp(value, code):
     if not isinstance(value, str) or not TIMESTAMP_PATTERN.fullmatch(value):
         fail(code)
     return value
+
+
+def _timestamp_value(value, code):
+    _require_timestamp(value, code)
+    try:
+        parsed = datetime.datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        fail(code)
+    if parsed.tzinfo != datetime.timezone.utc:
+        fail(code)
+    return parsed
 
 
 def _require_counter(value, code):
@@ -312,6 +326,17 @@ def validate_authoring_evidence(context, browser, value):
     _require_timestamp(
         value["browser_observed_at"], "worker_authoring_evidence_invalid"
     )
+    before_observed_at = _timestamp_value(
+        value["worker_before_observed_at"], "worker_authoring_evidence_invalid"
+    )
+    browser_observed_at = _timestamp_value(
+        value["browser_observed_at"], "worker_authoring_evidence_invalid"
+    )
+    after_observed_at = _timestamp_value(
+        value["worker_after_observed_at"], "worker_authoring_evidence_invalid"
+    )
+    if not before_observed_at <= browser_observed_at <= after_observed_at:
+        fail("worker_authoring_time_boundary_invalid")
     _require_digest(value["manifest_sha256"], "worker_authoring_evidence_invalid")
     _require_digest(
         value["browser_evidence_sha256"], "worker_authoring_evidence_invalid"
@@ -407,6 +432,8 @@ def capture_worker_authoring_checkpoint(context, health, checkpoint, browser=Non
         "manifest_sha256": context.digest,
         "browser_evidence_sha256": browser_digest(browser),
         "browser_observed_at": browser["observed_at"],
+        "worker_before_observed_at": before["observed_at"],
+        "worker_after_observed_at": current["observed_at"],
         "provider": current["provider"],
         "model": current["model"],
         "reasoning_effort": current["reasoning_effort"],

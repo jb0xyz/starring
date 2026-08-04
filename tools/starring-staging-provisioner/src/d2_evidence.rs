@@ -178,6 +178,7 @@ struct AuthoringEvidenceV1 {
     payload_digest: String,
     installation_id: String,
     authoring_session_id: String,
+    generation_created_at: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -640,7 +641,7 @@ async fn inspect_authoring(
     scope: &InspectionScopeV1,
 ) -> Result<AuthoringEvidenceV1, D2ProvisionerErrorV1> {
     let row = sqlx::query(
-        "SELECT pg_catalog.count(*) OVER () AS scoped_count, session.session_id, session.current_generation, generation.stage, generation.candidate_hash, generation.safe_turn_projection_digest, pg_catalog.octet_length(generation.snapshot_ciphertext) >= 16 AND pg_catalog.octet_length(generation.snapshot_nonce) BETWEEN 12 AND 32 AS sealed_snapshot_present FROM public.authoring_sessions AS session INNER JOIN public.authoring_session_generations AS generation ON generation.tenant_id = session.tenant_id AND generation.installation_id = session.installation_id AND generation.session_id = session.session_id AND generation.generation = session.current_generation WHERE session.tenant_id = $1 AND session.installation_id = $2 AND session.lifecycle_state = 'active' ORDER BY (generation.stage = 'preview_ready') DESC, session.updated_at DESC, session.session_id COLLATE pg_catalog.\"C\" DESC LIMIT 1",
+        "SELECT pg_catalog.count(*) OVER () AS scoped_count, session.session_id, session.current_generation, generation.stage, generation.candidate_hash, generation.safe_turn_projection_digest, pg_catalog.to_char(generation.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS generation_created_at, pg_catalog.octet_length(generation.snapshot_ciphertext) >= 16 AND pg_catalog.octet_length(generation.snapshot_nonce) BETWEEN 12 AND 32 AS sealed_snapshot_present FROM public.authoring_sessions AS session INNER JOIN public.authoring_session_generations AS generation ON generation.tenant_id = session.tenant_id AND generation.installation_id = session.installation_id AND generation.session_id = session.session_id AND generation.generation = session.current_generation WHERE session.tenant_id = $1 AND session.installation_id = $2 AND session.lifecycle_state = 'active' ORDER BY (generation.stage = 'preview_ready') DESC, session.updated_at DESC, session.session_id COLLATE pg_catalog.\"C\" DESC LIMIT 1",
     )
     .bind(&scope.tenant_id)
     .bind(&scope.installation_id)
@@ -671,6 +672,7 @@ async fn inspect_authoring(
         payload_digest: candidate_ruleset_hash,
         installation_id: scope.installation_id.clone(),
         authoring_session_id,
+        generation_created_at: get(&row, "generation_created_at")?,
     })
 }
 
@@ -1808,10 +1810,12 @@ mod tests {
                     payload_digest: "a".repeat(64),
                     installation_id: "installation:starring-d2-test".to_owned(),
                     authoring_session_id: "session-1".to_owned(),
+                    generation_created_at: "2026-08-04T01:02:03.000000Z".to_owned(),
                 })),
                 vec![
                     "authoring_session_id",
                     "generation",
+                    "generation_created_at",
                     "generation_encrypted",
                     "installation_id",
                     "kind",
