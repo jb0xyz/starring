@@ -220,7 +220,7 @@ export async function createFileMetricsReader(options) {
       throw new MetricsReaderError("invalid_metrics_context");
     }
     const records = (await readRecords(path, backups, context.signal)).filter((record) => (
-      record.metric_schema_version === 2
+      record.metric_schema_version === 3
         && !baseline.has(recordId(record))
         && record.instance_id === context.worker_boundary.instance_id
         && record.worker_source_sha256 === context.worker_boundary.worker_source_sha256

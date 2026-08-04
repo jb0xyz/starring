@@ -15,7 +15,7 @@ function usage() {
 
 function workerMetric(requestId, outcome, statusCode) {
   return {
-    metric_schema_version: 2,
+    metric_schema_version: 3,
     timestamp: "2026-07-17T00:00:00.000Z",
     request_id: requestId,
     ...EXPECTED_IDENTITY,
@@ -41,6 +41,7 @@ function workerMetric(requestId, outcome, statusCode) {
     status_code: statusCode,
     duration_ms: 100,
     usage: outcome === "succeeded" ? usage() : null,
+    completion_sha256: outcome === "succeeded" ? "c".repeat(64) : null,
     error_code: outcome === "succeeded" ? null : "client_disconnected",
   };
 }
@@ -82,6 +83,7 @@ function canaryRaw() {
           status_code: cancelled ? 499 : 200,
           error_code: cancelled ? "client_disconnected" : null,
           request_id: requestId,
+          completion_sha256: cancelled ? null : "c".repeat(64),
           request_ids: [requestId],
           provider: cancelled ? null : EXPECTED_IDENTITY.provider,
           model: cancelled ? null : EXPECTED_IDENTITY.model,
@@ -92,6 +94,7 @@ function canaryRaw() {
           worker_duration_ms: cancelled ? null : 100,
           calls: cancelled ? [] : [{
             request_id: requestId,
+            completion_sha256: "c".repeat(64),
             status_code: 200,
             latency_ms: 100,
             ...EXPECTED_IDENTITY,
@@ -326,6 +329,18 @@ test("response metrics and aggregate usage require an exact join", () => {
   const latency = canaryRaw();
   latency.worker_metrics[0].duration_ms += 1;
   let acceptance = assessRun(latency.plan, latency, summarizeRun(latency));
+  assert.equal(
+    acceptance.gates.find((entry) => entry.name === "worker_metric_correlation").status,
+    "fail",
+  );
+
+  const completionDrift = canaryRaw();
+  completionDrift.worker_metrics[0].completion_sha256 = "d".repeat(64);
+  acceptance = assessRun(
+    completionDrift.plan,
+    completionDrift,
+    summarizeRun(completionDrift),
+  );
   assert.equal(
     acceptance.gates.find((entry) => entry.name === "worker_metric_correlation").status,
     "fail",

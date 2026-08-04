@@ -19,11 +19,12 @@ import {
 
 function metric(requestId, instanceId = "instance-1") {
   return {
-    metric_schema_version: 2,
+    metric_schema_version: 3,
     timestamp: `2026-07-17T00:00:0${requestId.at(-1)}.000Z`,
     request_id: requestId,
     instance_id: instanceId,
     worker_source_sha256: "a".repeat(64),
+    completion_sha256: "c".repeat(64),
   };
 }
 

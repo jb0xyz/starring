@@ -46,6 +46,7 @@ const METRIC_REQUIRED_FIELDS = [
   "status_code",
   "duration_ms",
   "usage",
+  "completion_sha256",
   "error_code",
 ];
 
@@ -136,7 +137,7 @@ function metricShape(metric, raw) {
     || !METRIC_REQUIRED_FIELDS.every((key) => Object.hasOwn(metric, key))) {
     return false;
   }
-  if (metric.metric_schema_version !== 2
+  if (metric.metric_schema_version !== 3
     || metric.instance_id !== raw.worker_boundary?.instance_id
     || metric.worker_source_sha256 !== raw.worker_boundary?.worker_source_sha256
     || metric.provider !== raw.plan.identity.provider
@@ -228,6 +229,8 @@ function metricShape(metric, raw) {
   if (successful) {
     return metric.status_code === 200
       && metric.error_code === null
+      && typeof metric.completion_sha256 === "string"
+      && /^[0-9a-f]{64}$/.test(metric.completion_sha256)
       && validUsage(metric.usage)
       && metric.runner_started
       && metric.runner_settled
@@ -236,6 +239,7 @@ function metricShape(metric, raw) {
       && metric.terminal_stage === "completed";
   }
   return metric.outcome === "failed"
+    && metric.completion_sha256 === null
     && metric.usage === null
     && metric.status_code >= 400
     && metric.status_code <= 599
@@ -281,6 +285,7 @@ function metricCorrelation(raw) {
     const metric = matches[0];
     if (entry.expected_outcome === "cancelled") {
       return metric.outcome === "failed"
+        && metric.completion_sha256 === null
         && metric.status_code === entry.row.status_code
         && metric.error_code === "client_disconnected"
         && metric.frontier_name === entry.row.frontier_name;
@@ -294,6 +299,7 @@ function metricCorrelation(raw) {
       && metric.model === call.model
       && metric.reasoning_effort === call.reasoning_effort
       && metric.frontier_name === call.frontier_name
+      && metric.completion_sha256 === call.completion_sha256
       && metric.duration_ms === call.latency_ms
       && sameUsage(metric.usage, call.usage);
   });

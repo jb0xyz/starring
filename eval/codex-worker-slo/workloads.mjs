@@ -148,6 +148,8 @@ export function validateTransportCompletion(statusCode, body, sequence) {
     throw new WorkloadError("transport_identity_mismatch");
   }
   if (typeof body.request_id !== "string" || body.request_id.length === 0
+    || typeof body.completion_sha256 !== "string"
+    || !/^[0-9a-f]{64}$/.test(body.completion_sha256)
     || !body.tool_call || body.tool_call.name !== "record_slo_probe"
     || typeof body.tool_call.id !== "string"
     || typeof body.tool_call.arguments !== "string") {
@@ -170,6 +172,7 @@ export function validateTransportCompletion(statusCode, body, sequence) {
   }
   return {
     request_id: body.request_id,
+    completion_sha256: body.completion_sha256,
     provider: body.provider,
     model: body.model,
     reasoning_effort: body.reasoning_effort,
@@ -184,6 +187,7 @@ export function validateTransportCompletion(statusCode, body, sequence) {
 function safeProductCall(call) {
   const required = [
     "request_id",
+    "completion_sha256",
     "status_code",
     "latency_ms",
     "provider",
@@ -196,6 +200,8 @@ function safeProductCall(call) {
   ];
   if (!exactKeys(call, required)
     || !validRequestId(call.request_id)
+    || typeof call.completion_sha256 !== "string"
+    || !/^[0-9a-f]{64}$/.test(call.completion_sha256)
     || call.status_code !== 200
     || !Number.isFinite(call.latency_ms)
     || call.latency_ms < 0

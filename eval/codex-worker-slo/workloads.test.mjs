@@ -21,6 +21,7 @@ function usage() {
 function productCall(requestId, frontierName, callUsage = usage()) {
   return {
     request_id: requestId,
+    completion_sha256: "c".repeat(64),
     status_code: 200,
     latency_ms: 12,
     ...EXPECTED_IDENTITY,
@@ -50,6 +51,7 @@ test("transport completion requires exact identity and arguments", () => {
   const body = {
     schema_version: 1,
     request_id: "request-1",
+    completion_sha256: "c".repeat(64),
     ...EXPECTED_IDENTITY,
     tool_call: {
       id: "call-request-1",
@@ -61,7 +63,14 @@ test("transport completion requires exact identity and arguments", () => {
   };
   const valid = validateTransportCompletion(200, body, "run-0001");
   assert.equal(valid.request_id, "request-1");
+  assert.equal(valid.completion_sha256, "c".repeat(64));
   assert.deepEqual(valid.usage, usage());
+  const invalidCompletion = structuredClone(body);
+  invalidCompletion.completion_sha256 = "invalid";
+  assert.throws(
+    () => validateTransportCompletion(200, invalidCompletion, "run-0001"),
+    (error) => error instanceof WorkloadError && error.code === "transport_invalid_response",
+  );
   body.tool_call.arguments = JSON.stringify({
     schema_version: 1,
     sequence: "wrong",
@@ -130,6 +139,12 @@ test("product call evidence retains exact unique request ids with zero-token usa
   delete missingRequestId.calls[0].request_id;
   assert.throws(
     () => validateProductResult(workload, missingRequestId),
+    (error) => error instanceof WorkloadError && error.code === "invalid_product_call",
+  );
+  const missingCompletion = structuredClone(input);
+  delete missingCompletion.calls[0].completion_sha256;
+  assert.throws(
+    () => validateProductResult(workload, missingCompletion),
     (error) => error instanceof WorkloadError && error.code === "invalid_product_call",
   );
 });

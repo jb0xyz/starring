@@ -28,7 +28,7 @@ function usage(input = 10, output = 2) {
 
 function metric(requestId, outcome, statusCode, metricUsage) {
   return {
-    metric_schema_version: 2,
+    metric_schema_version: 3,
     timestamp: "2026-07-17T00:00:00.000Z",
     request_id: requestId,
     ...EXPECTED_IDENTITY,
@@ -54,6 +54,7 @@ function metric(requestId, outcome, statusCode, metricUsage) {
     status_code: statusCode,
     duration_ms: 1,
     usage: metricUsage,
+    completion_sha256: outcome === "succeeded" ? "c".repeat(64) : null,
     error_code: outcome === "failed" ? "client_disconnected" : null,
   };
 }
@@ -230,6 +231,7 @@ function liveFixture(configuration = {}) {
     return new Response(JSON.stringify({
       schema_version: 1,
       request_id: internalRequestId,
+      completion_sha256: "c".repeat(64),
       ...EXPECTED_IDENTITY,
       tool_call: {
         id: `call-${internalRequestId}`,
@@ -584,10 +586,12 @@ test("first unexpected wave outcome stops later waves and never retries", async 
         status_code: 200,
         error_code: null,
         request_id: `fake-${sequence}`,
+        completion_sha256: "c".repeat(64),
         ...plan.identity,
         frontier_name: "record_slo_probe",
         worker_duration_ms: 0,
         calls: [{
+          completion_sha256: "c".repeat(64),
           status_code: 200,
           latency_ms: 0,
           ...plan.identity,

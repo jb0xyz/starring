@@ -84,6 +84,7 @@ function sanitizeWorkerMetric(metric) {
     "status_code",
     "duration_ms",
     "usage",
+    "completion_sha256",
     "error_code",
   ];
   if (!metric || typeof metric !== "object" || Array.isArray(metric)
@@ -432,6 +433,7 @@ function createFakeBoundary(plan) {
 
 function fakeCompleted(sequence, plan) {
   const requestId = `fake-${sequence}`;
+  const completionSha256 = "0".repeat(64);
   return {
     outcome: "completed",
     correct: true,
@@ -440,6 +442,7 @@ function fakeCompleted(sequence, plan) {
     error_code: null,
     request_id: requestId,
     request_ids: [requestId],
+    completion_sha256: completionSha256,
     provider: plan.identity.provider,
     model: plan.identity.model,
     reasoning_effort: plan.identity.reasoning_effort,
@@ -449,6 +452,7 @@ function fakeCompleted(sequence, plan) {
     worker_duration_ms: 0,
     calls: [{
       request_id: requestId,
+      completion_sha256: completionSha256,
       status_code: 200,
       latency_ms: 0,
       provider: plan.identity.provider,
@@ -473,6 +477,7 @@ function fakeCancelled(requestId = null) {
     error_code: "client_cancelled",
     request_id: requestId,
     request_ids: requestId === null ? [] : [requestId],
+    completion_sha256: null,
     provider: null,
     model: null,
     reasoning_effort: null,
@@ -614,6 +619,7 @@ function createLiveTransportExecutor(
           request_ids: [valid.request_id],
           calls: [{
             request_id: valid.request_id,
+            completion_sha256: valid.completion_sha256,
             status_code: 200,
             latency_ms: valid.worker_duration_ms,
             provider: valid.provider,
@@ -659,6 +665,7 @@ function createLiveTransportExecutor(
         request_ids: [valid.request_id],
         calls: [{
           request_id: valid.request_id,
+          completion_sha256: valid.completion_sha256,
           status_code: 200,
           latency_ms: valid.worker_duration_ms,
           provider: valid.provider,
