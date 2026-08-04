@@ -17,6 +17,7 @@ RUNTIME_PROCESS_INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 TRANSPORT_INSTANCE_PATTERN = re.compile(r"^d2ti-[0-9a-f]{32}$")
 SNOWFLAKE_PATTERN = re.compile(r"^[1-9][0-9]{0,19}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+WORKER_INSTANCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TRANSPORT_RESOURCE_HISTORY_LIMIT = 128
 TRANSPORT_RESOURCE_INVENTORY_KIND = "starring.d2.run-owned-resource-inventory.v1"
 DISCORD_RESOURCE_UNKNOWN = {
@@ -671,7 +672,7 @@ class Platform:
             fail("runtime_identity_probe_output_invalid")
         return identity
 
-    def worker_health_status(self, context, timeout_seconds=3):
+    def _worker_health_probe(self, context, timeout_seconds=3):
         port = context.manifest["services"]["worker"]["port"]
         service = context.manifest["keychain_services"]["worker"]
         account = "authoring.bearer-token"
@@ -702,7 +703,7 @@ class Platform:
             timeout=timeout_seconds + 3,
         )
         if result.returncode != 0:
-            return 0
+            return 0, None
         try:
             body, raw_status = result.stdout.rsplit(b"\n", 1)
             status = int(raw_status)
@@ -711,10 +712,10 @@ class Platform:
         if status < 100 or status > 599:
             fail("health_probe_output_invalid")
         if status != 200:
-            return status
+            return status, None
         try:
-            health = json.loads(body)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            health = json.loads(body, object_pairs_hook=strict_json_object)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             fail("worker_health_output_invalid")
         required = {
             "schema_version",
@@ -738,6 +739,7 @@ class Platform:
         if (
             not isinstance(health, dict)
             or set(health) != required
+            or type(health["schema_version"]) is not int
             or health["schema_version"] != 1
             or health["status"] != "ok"
             or any(
@@ -752,7 +754,13 @@ class Platform:
             or not isinstance(health["codex_cli_version"], str)
             or not health["codex_cli_version"]
             or not isinstance(health["instance_id"], str)
-            or not health["instance_id"]
+            or not WORKER_INSTANCE_PATTERN.fullmatch(health["instance_id"])
+            or not isinstance(health["worker_source_sha256"], str)
+            or not DIGEST_PATTERN.fullmatch(health["worker_source_sha256"])
+            or any(
+                type(health[field]) is not int
+                for field in ("concurrency_limit", "queue_capacity", "request_timeout_ms")
+            )
             or any(
                 type(health[field]) is not int or health[field] < 0
                 for field in (
@@ -764,7 +772,17 @@ class Platform:
             )
         ):
             fail("worker_health_identity_invalid")
+        return status, health
+
+    def worker_health_status(self, context, timeout_seconds=3):
+        status, _health = self._worker_health_probe(context, timeout_seconds)
         return status
+
+    def worker_health_snapshot(self, context, timeout_seconds=3):
+        status, health = self._worker_health_probe(context, timeout_seconds)
+        if status != 200 or health is None:
+            fail("worker_health_unready")
+        return health
 
     def transport_health_status(self, context, timeout_seconds=3):
         value = self._transport_control_exchange(

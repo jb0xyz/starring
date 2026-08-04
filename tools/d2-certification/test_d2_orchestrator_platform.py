@@ -99,6 +99,102 @@ class DiscordPlatform(PLATFORM.Platform):
         return self.responses.pop(0)
 
 
+class WorkerPlatform(PLATFORM.Platform):
+    def __init__(self, response):
+        self.response = response
+
+    def run(self, arguments, input_bytes=None, timeout=30, environment=None):
+        return self.response
+
+
+def worker_context():
+    return SimpleNamespace(
+        manifest={
+            "services": {"worker": {"port": 28181}},
+            "keychain_services": {"worker": "starring.d2.worker"},
+            "authoring": {
+                "provider": "codex_chatgpt",
+                "model": "gpt-5.6-luna",
+                "reasoning_effort": "medium",
+                "auth_mode": "chatgpt",
+            },
+            "source_trees": {"codex_worker": {"sha256": "a" * 64}},
+        }
+    )
+
+
+def worker_health(**overrides):
+    value = {
+        "schema_version": 1,
+        "status": "ok",
+        "provider": "codex_chatgpt",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "medium",
+        "auth_mode": "chatgpt",
+        "codex_cli_version": "codex-cli 1.2.3",
+        "instance_id": "worker-0123456789abcdef",
+        "worker_source_sha256": "a" * 64,
+        "concurrency_limit": 1,
+        "queue_capacity": 4,
+        "request_timeout_ms": 55000,
+        "active_requests": 0,
+        "queued_requests": 0,
+        "accepted_requests_total": 7,
+        "settled_requests_total": 7,
+    }
+    value.update(overrides)
+    return value
+
+
+def worker_response(value, status=200):
+    body = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    return subprocess.CompletedProcess([], 0, body + b"\n" + str(status).encode(), b"")
+
+
+class PlatformWorkerHealthTests(unittest.TestCase):
+    def assert_platform_failure(self, code, operation):
+        with self.assertRaisesRegex(CONTRACT.OrchestratorError, f"^{code}$"):
+            operation()
+
+    def test_worker_snapshot_is_exact_and_status_reuses_probe(self):
+        context = worker_context()
+        health = worker_health()
+        platform = WorkerPlatform(worker_response(health))
+        self.assertEqual(platform.worker_health_status(context), 200)
+        self.assertEqual(platform.worker_health_snapshot(context), health)
+
+    def test_worker_snapshot_rejects_duplicate_and_type_confused_fields(self):
+        context = worker_context()
+        duplicate = (
+            b'{"schema_version":1,"schema_version":1}\n200'
+        )
+        invalid = [
+            subprocess.CompletedProcess([], 0, duplicate, b""),
+            worker_response(worker_health(schema_version=True)),
+            worker_response(worker_health(concurrency_limit=True)),
+            worker_response(worker_health(instance_id="worker identity")),
+            worker_response(worker_health(worker_source_sha256="f" * 63)),
+        ]
+        for response in invalid:
+            with self.subTest(response=response.stdout):
+                self.assert_platform_failure(
+                    "worker_health_output_invalid"
+                    if response.stdout == duplicate
+                    else "worker_health_identity_invalid",
+                    lambda response=response: WorkerPlatform(response).worker_health_snapshot(
+                        context
+                    ),
+                )
+
+    def test_worker_snapshot_fails_closed_when_not_ready(self):
+        context = worker_context()
+        platform = WorkerPlatform(worker_response({"error": "unready"}, status=503))
+        self.assertEqual(platform.worker_health_status(context), 503)
+        self.assert_platform_failure(
+            "worker_health_unready", lambda: platform.worker_health_snapshot(context)
+        )
+
+
 class PlatformResourceTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
