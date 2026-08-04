@@ -186,14 +186,7 @@ async fn application_pool(name: &str) -> PgPool {
 }
 
 async fn apply_fresh_migrations(pool: &PgPool) {
-    for migration in MIGRATOR.iter() {
-        let mut transaction = pool.begin().await.unwrap();
-        sqlx::raw_sql(migration.sql.as_ref())
-            .execute(&mut *transaction)
-            .await
-            .unwrap();
-        transaction.commit().await.unwrap();
-    }
+    MIGRATOR.run(pool).await.unwrap();
 }
 
 async fn grant_writer_capability(pool: &PgPool, administrator: &mut PgConnection, role: &str) {
