@@ -262,6 +262,17 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(second["state_sha256"], first["state_sha256"])
         self.assertTrue(state_path.with_name("state.sha256").exists())
 
+    def test_state_rejects_boolean_schema_version(self):
+        state_path, _, _ = self.prepare()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["schema_version"] = True
+        write(state_path, MODULE.canonical_json(state) + "\n", 0o600)
+        digest = MODULE.sha256_bytes(MODULE.canonical_json(state).encode("utf-8"))
+        write(state_path.with_name("state.sha256"), digest + "\n", 0o600)
+        status, _, error = self.invoke(["recheck", "--state", str(state_path)])
+        self.assertEqual(status, 1)
+        self.assertIn("state_schema_invalid", error)
+
     def test_prepare_rejects_wrong_head_and_credential_remote(self):
         arguments, _ = self.prepare_arguments(expected_head="a" * 40)
         status, _, error = self.invoke(arguments)
@@ -534,6 +545,34 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(evidence[1]["kind"], "starring.d3.gate-completed.v1")
         self.assertEqual(evidence[1]["attempt"], 1)
 
+    def test_gate_evidence_rejects_boolean_schema_version(self):
+        state_path, _, _ = self.prepare()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        evidence_path = state_path.with_name("gate-evidence.jsonl")
+        MODULE.append_gate_evidence(
+            evidence_path,
+            state,
+            [],
+            {
+                "kind": "starring.d3.gate-started.v1",
+                "gate_index": 1,
+                "command_sha256": state["gate_command_sha256"][0],
+                "attempt": 1,
+            },
+        )
+        record = json.loads(evidence_path.read_text(encoding="utf-8"))
+        record["schema_version"] = True
+        record.pop("record_sha256")
+        record["record_sha256"] = MODULE.sha256_bytes(
+            MODULE.canonical_json(record).encode("utf-8")
+        )
+        write(evidence_path, MODULE.canonical_json(record) + "\n", 0o600)
+        with self.assertRaisesRegex(
+            MODULE.D3Error,
+            "gate_evidence_identity_invalid",
+        ):
+            MODULE.load_gate_evidence(evidence_path, state)
+
     def test_gate_plan_and_sensitive_command_fail_closed(self):
         state_path, _, _ = self.prepare()
         status, _, error = self.invoke(
@@ -745,6 +784,59 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(status, 1)
         self.assertIn("d2_final_record_fields_invalid", error)
 
+    def test_d2_binding_rejects_boolean_schema_version(self):
+        state_path, _, _ = self.prepare()
+        manifest_path, final_path = self.make_d2(state_path)
+        final = json.loads(final_path.read_text(encoding="utf-8"))
+        final["schema_version"] = True
+        write(final_path, MODULE.canonical_json(final) + "\n", 0o600)
+        status, _, error = self.invoke(
+            [
+                "bind-d2",
+                "--state",
+                str(state_path),
+                "--d2-manifest",
+                str(manifest_path),
+                "--d2-final-record",
+                str(final_path),
+            ]
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("d2_final_record_mismatch", error)
+
+    def test_d2_receipts_reject_boolean_schema_and_step(self):
+        state_path, _, _ = self.prepare()
+        manifest_path, _ = self.make_d2(state_path)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_digest = (
+            manifest_path.with_name("manifest.sha256").read_text().strip()
+        )
+        receipts_path = manifest_path.with_name("receipts.jsonl")
+        receipts = [
+            json.loads(line)
+            for line in receipts_path.read_text(encoding="utf-8").splitlines()
+        ]
+        receipts[0]["schema_version"] = True
+        receipts[0]["step"] = True
+        previous = MODULE.ZERO_DIGEST
+        for receipt in receipts:
+            receipt["previous_sha256"] = previous
+            receipt.pop("receipt_sha256")
+            receipt["receipt_sha256"] = MODULE.sha256_bytes(
+                MODULE.canonical_json(receipt).encode("utf-8")
+            )
+            previous = receipt["receipt_sha256"]
+        write(
+            receipts_path,
+            "".join(MODULE.canonical_json(receipt) + "\n" for receipt in receipts),
+            0o600,
+        )
+        with self.assertRaisesRegex(
+            MODULE.D3Error,
+            "d2_receipt_sequence_invalid",
+        ):
+            MODULE.load_d2_receipts(receipts_path, manifest, manifest_digest)
+
     def complete_prerequisites(self):
         state_path, _, gates = self.prepare()
         status, _, error, observed = self.invoke_gate_plan(state_path, gates)
@@ -777,6 +869,46 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         status, _, error = self.invoke(["recheck", "--state", str(state_path)])
         self.assertEqual(status, 1)
         self.assertIn("pr_base_changed", error)
+
+    def test_sealed_binding_and_recheck_require_canonical_identity(self):
+        state_path = self.complete_prerequisites()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        binding_path = state_path.with_name("d2-binding.json")
+        binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        binding.pop("record_sha256")
+        binding["schema_version"] = True
+        write(
+            binding_path,
+            MODULE.canonical_json(MODULE.seal_record(binding)) + "\n",
+            0o600,
+        )
+        with self.assertRaisesRegex(
+            MODULE.D3Error,
+            "d2_binding_identity_invalid",
+        ):
+            MODULE.load_binding(state_path.parent, state)
+        recheck_path = state_path.with_name("recheck.json")
+        original = json.loads(recheck_path.read_text(encoding="utf-8"))
+        cases = (
+            ("schema_version", True),
+            ("kind", "starring.d3.foreign-recheck.v1"),
+            ("pr_number", 41),
+        )
+        for key, value in cases:
+            with self.subTest(key=key):
+                changed = dict(original)
+                changed.pop("record_sha256")
+                changed[key] = value
+                write(
+                    recheck_path,
+                    MODULE.canonical_json(MODULE.seal_record(changed)) + "\n",
+                    0o600,
+                )
+                with self.assertRaisesRegex(
+                    MODULE.D3Error,
+                    "recheck_identity_invalid",
+                ):
+                    MODULE.load_recheck(state_path.parent, state)
 
     def test_state_rejects_origin_repository_movement(self):
         state_path, _, _ = self.prepare()
@@ -943,6 +1075,18 @@ print(json.dumps(responses[endpoint]))
             self.assertEqual(replay["disposition"], "exact_replay")
             final_path = state_path.with_name("final.json")
             final = json.loads(final_path.read_text(encoding="utf-8"))
+            changed = dict(final)
+            changed.pop("record_sha256")
+            changed["schema_version"] = True
+            write(
+                final_path,
+                MODULE.canonical_json(MODULE.seal_record(changed)) + "\n",
+                0o600,
+            )
+            status, _, error = self.invoke(arguments)
+            self.assertEqual(status, 1)
+            self.assertIn("final_schema_invalid", error)
+            write(final_path, MODULE.canonical_json(final) + "\n", 0o600)
             final["finalized_at"] = "2026-08-04T00:00:00Z"
             write(final_path, MODULE.canonical_json(final) + "\n", 0o600)
             status, _, error = self.invoke(arguments)

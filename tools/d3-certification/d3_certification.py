@@ -203,6 +203,10 @@ def validate_timestamp(value, label):
     return value
 
 
+def valid_schema_version(value):
+    return type(value) is int and value == SCHEMA_VERSION
+
+
 def absolute_path(raw, label):
     path = pathlib.Path(raw)
     if not path.is_absolute() or os.path.realpath(path) != str(path):
@@ -643,7 +647,10 @@ def load_state(raw):
     }
     if not isinstance(manifest, dict) or set(manifest) != expected_fields:
         fail("state_fields_invalid")
-    if manifest["schema_version"] != SCHEMA_VERSION or manifest["kind"] != "starring.d3.exact-tree-state.v1":
+    if (
+        not valid_schema_version(manifest["schema_version"])
+        or manifest["kind"] != "starring.d3.exact-tree-state.v1"
+    ):
         fail("state_schema_invalid")
     if type(manifest["pr_number"]) is not int or manifest["pr_number"] <= 0:
         fail("state_pr_invalid")
@@ -934,7 +941,7 @@ def load_gate_evidence(path, state):
         else:
             fail("gate_evidence_kind_invalid")
         if (
-            record["schema_version"] != SCHEMA_VERSION
+            not valid_schema_version(record["schema_version"])
             or record["merge_commit"] != state["merge_commit"]
             or record["merge_tree"] != state["merge_tree"]
             or record["previous_sha256"] != previous
@@ -1126,9 +1133,10 @@ def load_d2_receipts(path, manifest, manifest_digest):
         if (
             not isinstance(receipt, dict)
             or set(receipt) != fields
-            or receipt["schema_version"] != 1
+            or not valid_schema_version(receipt["schema_version"])
             or receipt["run_id"] != manifest.get("run_id")
             or receipt["manifest_sha256"] != manifest_digest
+            or type(receipt["step"]) is not int
             or receipt["step"] != expected_step
             or expected_step > 17
             or receipt["code"] != D2_STEP_CODES[expected_step - 1]
@@ -1202,7 +1210,10 @@ def command_bind_d2(arguments):
             final_record.get("coordinator_evidence_sha256"),
             "d2_coordinator_evidence_sha256",
         )
-        if final_record != expected_final:
+        if (
+            not valid_schema_version(final_record["schema_version"])
+            or final_record != expected_final
+        ):
             fail("d2_final_record_mismatch")
         verifier = worktree / "tools" / "d2-certification" / "d2_run.py"
         require_regular(verifier, "d2_verifier")
@@ -1321,7 +1332,7 @@ def load_binding(root, state):
     if not isinstance(binding, dict) or set(binding) != required:
         fail("d2_binding_fields_invalid")
     if (
-        binding["schema_version"] != SCHEMA_VERSION
+        not valid_schema_version(binding["schema_version"])
         or binding["kind"] != "starring.d3.d2-binding.v1"
         or binding["merge_commit"] != state["merge_commit"]
         or binding["merge_tree"] != state["merge_tree"]
@@ -1358,6 +1369,10 @@ def load_recheck(root, state):
     if (
         not isinstance(record, dict)
         or set(record) != required
+        or not valid_schema_version(record.get("schema_version"))
+        or record.get("kind") != "starring.d3.pr-recheck.v1"
+        or type(record.get("pr_number")) is not int
+        or record.get("pr_number") != state["pr_number"]
         or record.get("head_commit") != state["expected_head"]
         or record.get("base_commit") != state["expected_base"]
         or record.get("merge_commit") != state["merge_commit"]
@@ -1503,6 +1518,7 @@ def github_pull(repository, state, main_commit):
     head_repository = head.get("repo") if isinstance(head, dict) else None
     if (
         not isinstance(value, dict)
+        or type(value.get("number")) is not int
         or value.get("number") != state["pr_number"]
         or value.get("state") != "closed"
         or value.get("draft") is not False
@@ -1597,6 +1613,8 @@ def command_finalize(arguments):
         if final_path.exists():
             existing = load_json_file(final_path, "final", 0o600)
             verify_sealed_record(existing, "final")
+            if not valid_schema_version(existing.get("schema_version")):
+                fail("final_schema_invalid")
             if set(existing) != set(identity) | {"finalized_at", "record_sha256"}:
                 fail("final_fields_invalid")
             validate_timestamp(existing["finalized_at"], "finalized_at")
