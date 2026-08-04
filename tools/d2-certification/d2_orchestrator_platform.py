@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import pathlib
@@ -11,7 +12,26 @@ from d2_orchestrator_contract import OWNER_ACCOUNT, REQUIRED_PROGRAMS, fail
 
 
 MAX_TRANSPORT_CONTROL_BYTES = 64 * 1024
+MAX_DISCORD_RESPONSE_BYTES = 256 * 1024
 RUNTIME_PROCESS_INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+TRANSPORT_INSTANCE_PATTERN = re.compile(r"^d2ti-[0-9a-f]{32}$")
+SNOWFLAKE_PATTERN = re.compile(r"^[1-9][0-9]{0,19}$")
+DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+TRANSPORT_RESOURCE_HISTORY_LIMIT = 128
+TRANSPORT_RESOURCE_INVENTORY_KIND = "starring.d2.run-owned-resource-inventory.v1"
+DISCORD_RESOURCE_UNKNOWN = {
+    "role": {10011: "Unknown Role"},
+    "channel": {10003: "Unknown Channel"},
+    "message": {10003: "Unknown Channel", 10008: "Unknown Message"},
+}
+DISCORD_RESOURCE_SUCCESS = {
+    ("role", "GET"): 200,
+    ("role", "DELETE"): 204,
+    ("channel", "GET"): 200,
+    ("channel", "DELETE"): 200,
+    ("message", "GET"): 200,
+    ("message", "DELETE"): 204,
+}
 LAUNCHD_DECORATED_EXIT_PATTERN = re.compile(
     r"^(-?[0-9]+): ([A-Z][A-Z0-9_]{0,63})$"
 )
@@ -776,6 +796,17 @@ class Platform:
             ):
                 fail("transport_control_response_invalid")
             return value["snapshot"]
+        if command == "resource_inventory":
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"ok", "resource_inventory"}
+                or value["ok"] is not True
+                or not self._transport_resource_inventory_valid(
+                    context, value["resource_inventory"]
+                )
+            ):
+                fail("transport_control_response_invalid")
+            return value["resource_inventory"]
         if command in {
             "arm_next_duplicate",
             "arm_next_create_role_indeterminate",
@@ -857,10 +888,447 @@ class Platform:
         if response.count(b"\n") != 1 or not response.endswith(b"\n"):
             fail("transport_control_response_invalid")
         try:
-            value = json.loads(response)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            value = json.loads(response, object_pairs_hook=strict_json_object)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             fail("transport_control_response_invalid")
         return value
+
+    def _pinned_transport_instance_id(self, context):
+        path = context.artifact_directory / "step-03-evidence.json"
+        try:
+            metadata = path.lstat()
+            raw = path.read_bytes()
+        except OSError:
+            fail("transport_instance_evidence_absent")
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or path.is_symlink()
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or not raw
+            or len(raw) > MAX_TRANSPORT_CONTROL_BYTES
+        ):
+            fail("transport_instance_evidence_invalid")
+        try:
+            evidence = json.loads(raw, object_pairs_hook=strict_json_object)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            fail("transport_instance_evidence_invalid")
+        instance_id = (
+            evidence.get("transport_instance_id")
+            if isinstance(evidence, dict)
+            else None
+        )
+        if (
+            not isinstance(instance_id, str)
+            or not TRANSPORT_INSTANCE_PATTERN.fullmatch(instance_id)
+        ):
+            fail("transport_instance_evidence_invalid")
+        return instance_id
+
+    def _transport_resource_identity(self, value, history=False):
+        if not isinstance(value, dict):
+            return None
+        kind = value.get("kind")
+        expected = {"kind", "resource_id", "state"} if history else {
+            "kind",
+            "resource_id",
+        }
+        if kind == "message":
+            expected.add("channel_id")
+        if kind not in {"role", "channel", "message"} or set(value) != expected:
+            return None
+        resource_id = value["resource_id"]
+        if not self._discord_snowflake_valid(resource_id):
+            return None
+        channel_id = value.get("channel_id")
+        if kind == "message" and not self._discord_snowflake_valid(channel_id):
+            return None
+        state = value.get("state") if history else None
+        if history and state not in {"created", "deleted"}:
+            return None
+        identity = {"kind": kind, "resource_id": resource_id}
+        if channel_id is not None:
+            identity["channel_id"] = channel_id
+        normalized = dict(identity)
+        if history:
+            normalized["state"] = state
+        return identity, normalized, (kind, resource_id, channel_id or ""), state
+
+    def _transport_resource_inventory_valid(self, context, inventory):
+        required = {
+            "version",
+            "kind",
+            "instance_id",
+            "run_id",
+            "guild_id",
+            "hub_channel_id",
+            "actor_id",
+            "bot_user_id",
+            "history_limit",
+            "history",
+            "created",
+            "deleted",
+            "active",
+            "digest_sha256",
+        }
+        manifest = context.manifest
+        discord = manifest["discord"]
+        if (
+            not isinstance(inventory, dict)
+            or set(inventory) != required
+            or type(inventory["version"]) is not int
+            or inventory["version"] != 1
+            or inventory["kind"] != TRANSPORT_RESOURCE_INVENTORY_KIND
+            or inventory["instance_id"] != self._pinned_transport_instance_id(context)
+            or inventory["run_id"] != manifest["run_id"]
+            or inventory["guild_id"] != discord["guild_id"]
+            or inventory["hub_channel_id"] != discord["hub_channel_id"]
+            or inventory["actor_id"] != discord["actor_id"]
+            or inventory["bot_user_id"] != discord["bot_user_id"]
+            or type(inventory["history_limit"]) is not int
+            or inventory["history_limit"] != TRANSPORT_RESOURCE_HISTORY_LIMIT
+            or not isinstance(inventory["history"], list)
+            or not isinstance(inventory["created"], list)
+            or not isinstance(inventory["deleted"], list)
+            or not isinstance(inventory["active"], list)
+            or not isinstance(inventory["digest_sha256"], str)
+            or not DIGEST_PATTERN.fullmatch(inventory["digest_sha256"])
+            or len(inventory["history"]) > TRANSPORT_RESOURCE_HISTORY_LIMIT
+        ):
+            return False
+        normalized_history = []
+        history_keys = []
+        history_identities = []
+        states = {}
+        for entry in inventory["history"]:
+            parsed = self._transport_resource_identity(entry, history=True)
+            if parsed is None:
+                return False
+            identity, normalized, key, state = parsed
+            normalized_history.append(normalized)
+            history_keys.append(key)
+            history_identities.append(identity)
+            if key in states:
+                return False
+            states[key] = state
+        if history_keys != sorted(history_keys):
+            return False
+        normalized_lists = {}
+        for name in ("created", "deleted", "active"):
+            entries = []
+            keys = []
+            for entry in inventory[name]:
+                parsed = self._transport_resource_identity(entry)
+                if parsed is None:
+                    return False
+                identity, _, key, _ = parsed
+                entries.append(identity)
+                keys.append(key)
+            if keys != sorted(keys) or len(keys) != len(set(keys)):
+                return False
+            normalized_lists[name] = entries
+        expected_deleted = [
+            identity
+            for identity, key in zip(history_identities, history_keys)
+            if states[key] == "deleted"
+        ]
+        expected_active = [
+            identity
+            for identity, key in zip(history_identities, history_keys)
+            if states[key] == "created"
+        ]
+        if (
+            normalized_lists["created"] != history_identities
+            or normalized_lists["deleted"] != expected_deleted
+            or normalized_lists["active"] != expected_active
+        ):
+            return False
+        protected_ids = {
+            discord["guild_id"],
+            discord["hub_channel_id"],
+            discord["application_id"],
+            discord["actor_id"],
+            discord["bot_user_id"],
+        }
+        resource_ids = [identity["resource_id"] for identity in history_identities]
+        if (
+            len(resource_ids) != len(set(resource_ids))
+            or protected_ids.intersection(resource_ids)
+        ):
+            return False
+        channel_states = {
+            identity["resource_id"]: states[key]
+            for identity, key in zip(history_identities, history_keys)
+            if identity["kind"] == "channel"
+        }
+        for identity, key in zip(history_identities, history_keys):
+            if identity["kind"] != "message":
+                continue
+            channel_id = identity["channel_id"]
+            parent_state = (
+                "created"
+                if channel_id == discord["hub_channel_id"]
+                else channel_states.get(channel_id)
+            )
+            if parent_state is None or (
+                states[key] == "created" and parent_state != "created"
+            ):
+                return False
+        payload = {
+            "version": 1,
+            "kind": TRANSPORT_RESOURCE_INVENTORY_KIND,
+            "instance_id": inventory["instance_id"],
+            "run_id": inventory["run_id"],
+            "guild_id": inventory["guild_id"],
+            "hub_channel_id": inventory["hub_channel_id"],
+            "actor_id": inventory["actor_id"],
+            "bot_user_id": inventory["bot_user_id"],
+            "history_limit": TRANSPORT_RESOURCE_HISTORY_LIMIT,
+            "history": normalized_history,
+            "created": normalized_lists["created"],
+            "deleted": normalized_lists["deleted"],
+            "active": normalized_lists["active"],
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=True, separators=(",", ":")
+        ).encode("ascii")
+        return hashlib.sha256(encoded).hexdigest() == inventory["digest_sha256"]
+
+    def _discord_snowflake_valid(self, value):
+        return (
+            isinstance(value, str)
+            and SNOWFLAKE_PATTERN.fullmatch(value) is not None
+            and int(value) <= 18446744073709551615
+        )
+
+    def _manifest_owned_discord_resource(self, context, resource, inventory):
+        if not self._transport_resource_inventory_valid(context, inventory):
+            fail("discord_resource_inventory_invalid")
+        parsed = self._transport_resource_identity(resource)
+        if parsed is None:
+            fail("discord_resource_identity_invalid")
+        identity = parsed[0]
+        if identity not in inventory["created"]:
+            fail("discord_resource_not_manifest_owned")
+        protected_ids = {
+            context.manifest["discord"][field]
+            for field in (
+                "guild_id",
+                "hub_channel_id",
+                "application_id",
+                "actor_id",
+                "bot_user_id",
+            )
+        }
+        if identity["resource_id"] in protected_ids:
+            fail("discord_resource_protected")
+        return identity
+
+    def _discord_resource_url(self, context, resource):
+        guild_id = context.manifest["discord"]["guild_id"]
+        if resource["kind"] == "role":
+            return f"https://discord.com/api/v10/guilds/{guild_id}/roles"
+        if resource["kind"] == "channel":
+            return f"https://discord.com/api/v10/channels/{resource['resource_id']}"
+        return (
+            "https://discord.com/api/v10/channels/"
+            f"{resource['channel_id']}/messages/{resource['resource_id']}"
+        )
+
+    def _discord_resource_delete_url(self, context, resource):
+        if resource["kind"] != "role":
+            return self._discord_resource_url(context, resource)
+        guild_id = context.manifest["discord"]["guild_id"]
+        return (
+            f"https://discord.com/api/v10/guilds/{guild_id}/roles/"
+            f"{resource['resource_id']}"
+        )
+
+    def _discord_request(self, context, method, url, timeout_seconds):
+        if (
+            method not in {"GET", "DELETE"}
+            or not isinstance(url, str)
+            or not url.startswith("https://discord.com/api/v10/")
+            or "?" in url
+            or "#" in url
+            or type(timeout_seconds) is not int
+            or timeout_seconds < 1
+            or timeout_seconds > 30
+        ):
+            fail("discord_resource_request_invalid")
+        identity = context.manifest["external_keychain"]["discord_bot_token"]
+        script = "\n".join(
+            (
+                'method="$1"',
+                'service="$2"',
+                'account="$3"',
+                'url="$4"',
+                'timeout="$5"',
+                'maximum="$6"',
+                'security="$7"',
+                'curl="$8"',
+                'value="$("$security" find-generic-password -s "$service" -a "$account" -w)" || exit 71',
+                'case "$value" in (""|*[!A-Za-z0-9._~-]*) unset value; exit 72;; esac',
+                'response="$({ printf \'header = "Authorization: Bot %s"\\n\' "$value"; } | "$curl" -q --silent --show-error --request "$method" --proto \'=https\' --proto-redir \'=https\' --header \'Accept: application/json\' --header \'User-Agent: Starring-D2-Certification/1\' --max-filesize "$maximum" --write-out \'\\n%{http_code}\' --connect-timeout "$timeout" --max-time "$timeout" --config - "$url")"',
+                'result="$?"',
+                'unset value',
+                'test "$result" -eq 0 || exit "$result"',
+                'printf \'%s\' "$response"',
+            )
+        )
+        result = self.run(
+            [
+                "/bin/zsh",
+                "-c",
+                script,
+                "d2-discord-resource-request",
+                method,
+                identity["service"],
+                identity["account"],
+                url,
+                str(timeout_seconds),
+                str(MAX_DISCORD_RESPONSE_BYTES),
+                REQUIRED_PROGRAMS["security"],
+                REQUIRED_PROGRAMS["curl"],
+            ],
+            timeout=timeout_seconds + 3,
+        )
+        if result.returncode != 0:
+            fail("discord_resource_request_failed")
+        if not result.stdout or len(result.stdout) > MAX_DISCORD_RESPONSE_BYTES + 4:
+            fail("discord_resource_response_invalid")
+        try:
+            body, raw_status = result.stdout.rsplit(b"\n", 1)
+        except ValueError:
+            fail("discord_resource_response_invalid")
+        if re.fullmatch(rb"[1-5][0-9]{2}", raw_status) is None:
+            fail("discord_resource_response_invalid")
+        return int(raw_status), body
+
+    def _discord_json(self, body):
+        if not body or len(body) > MAX_DISCORD_RESPONSE_BYTES:
+            fail("discord_resource_response_invalid")
+        try:
+            return json.loads(body, object_pairs_hook=strict_json_object)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            fail("discord_resource_response_invalid")
+
+    def _discord_unknown_code(self, resource_kind, body):
+        value = self._discord_json(body)
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"message", "code"}
+            or type(value["code"]) is not int
+            or DISCORD_RESOURCE_UNKNOWN[resource_kind].get(value["code"])
+            != value["message"]
+        ):
+            fail("discord_resource_unknown_response_invalid")
+        return value["code"]
+
+    def _discord_success_body_valid(self, context, resource, method, body):
+        if DISCORD_RESOURCE_SUCCESS[(resource["kind"], method)] == 204:
+            return body == b"", True
+        value = self._discord_json(body)
+        if resource["kind"] == "role":
+            if not isinstance(value, list) or len(value) > 512:
+                return False, False
+            role_ids = []
+            for role in value:
+                if not isinstance(role, dict) or not self._discord_snowflake_valid(
+                    role.get("id")
+                ):
+                    return False, False
+                role_ids.append(role["id"])
+            if len(role_ids) != len(set(role_ids)):
+                return False, False
+            return True, resource["resource_id"] in role_ids
+        if not isinstance(value, dict) or value.get("id") != resource["resource_id"]:
+            return False, False
+        if value.get("guild_id") != context.manifest["discord"]["guild_id"]:
+            return False, False
+        if resource["kind"] == "message" and value.get("channel_id") != resource[
+            "channel_id"
+        ]:
+            return False, False
+        return True, True
+
+    def _discord_resource_request_result(self, context, resource, method, timeout_seconds):
+        url = (
+            self._discord_resource_url(context, resource)
+            if method == "GET"
+            else self._discord_resource_delete_url(context, resource)
+        )
+        status, body = self._discord_request(context, method, url, timeout_seconds)
+        expected = DISCORD_RESOURCE_SUCCESS[(resource["kind"], method)]
+        if status == expected:
+            valid, exists = self._discord_success_body_valid(
+                context, resource, method, body
+            )
+            if not valid:
+                fail("discord_resource_success_response_invalid")
+            return status, None, exists if method == "GET" else False
+        if status != 404:
+            fail("discord_resource_status_invalid")
+        code = self._discord_unknown_code(resource["kind"], body)
+        return status, code, False
+
+    def discord_observe_resource(
+        self, context, resource, inventory=None, timeout_seconds=10
+    ):
+        if inventory is None:
+            inventory = self.transport_control(context, "resource_inventory")
+        identity = self._manifest_owned_discord_resource(
+            context, resource, inventory
+        )
+        status, discord_code, exists = self._discord_resource_request_result(
+            context, identity, "GET", timeout_seconds
+        )
+        return {
+            "schema_version": 1,
+            "kind": "starring.d2.discord-resource-observation.v1",
+            "transport_instance_id": inventory["instance_id"],
+            "inventory_digest_sha256": inventory["digest_sha256"],
+            "resource_kind": identity["kind"],
+            "resource_id": identity["resource_id"],
+            "channel_id": identity.get("channel_id"),
+            "http_status": status,
+            "discord_code": discord_code,
+            "exists": exists,
+        }
+
+    def discord_delete_resource(
+        self, context, resource, inventory=None, timeout_seconds=10
+    ):
+        if inventory is None:
+            inventory = self.transport_control(context, "resource_inventory")
+        identity = self._manifest_owned_discord_resource(
+            context, resource, inventory
+        )
+        delete_status, delete_code, _ = self._discord_resource_request_result(
+            context, identity, "DELETE", timeout_seconds
+        )
+        observe_status, observe_code, exists = self._discord_resource_request_result(
+            context, identity, "GET", timeout_seconds
+        )
+        if exists:
+            fail("discord_resource_delete_not_confirmed")
+        return {
+            "schema_version": 1,
+            "kind": "starring.d2.discord-resource-deletion.v1",
+            "transport_instance_id": inventory["instance_id"],
+            "inventory_digest_sha256": inventory["digest_sha256"],
+            "resource_kind": identity["kind"],
+            "resource_id": identity["resource_id"],
+            "channel_id": identity.get("channel_id"),
+            "delete_http_status": delete_status,
+            "delete_discord_code": delete_code,
+            "observe_http_status": observe_status,
+            "observe_discord_code": observe_code,
+            "deleted": delete_status == DISCORD_RESOURCE_SUCCESS[
+                (identity["kind"], "DELETE")
+            ],
+            "exists": False,
+        }
 
     def _transport_snapshot_valid(self, context, snapshot, require_ready=True):
         if not isinstance(snapshot, dict) or set(snapshot) != {
