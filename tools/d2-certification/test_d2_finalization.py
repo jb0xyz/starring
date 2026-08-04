@@ -687,6 +687,16 @@ class D2FinalizationTest(unittest.TestCase):
                 FINALIZATION.local_step16_binding(self.context, teardown),
             )["services_stopped"]
         )
+        binding = FINALIZATION.local_step16_binding(self.context, teardown)
+        for completed_at in (True, 1):
+            invalid_binding = copy.deepcopy(binding)
+            invalid_binding["coordinator_step15_completed_at"] = completed_at
+            with self.subTest(completed_at=completed_at), self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "step16_binding_invalid"
+            ):
+                FINALIZATION.assemble_teardown_evidence(
+                    database, teardown, finalization, invalid_binding
+                )
         for index, values in enumerate(
             (
                 ({}, teardown, finalization),
@@ -1059,6 +1069,19 @@ class D2FinalizationTest(unittest.TestCase):
             ),
             self.step16_mock.return_value,
         )
+        for completed_at in (True, 1):
+            invalid_binding = copy.deepcopy(binding)
+            invalid_binding["coordinator_step16_completed_at"] = completed_at
+            with self.subTest(completed_at=completed_at), self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "step17_binding_invalid"
+            ):
+                FINALIZATION.assemble_absence_evidence(
+                    database,
+                    orchestration,
+                    json.loads(prefix.read_text()),
+                    guild,
+                    invalid_binding,
+                )
         prefix_value = json.loads(prefix.read_text())
         for index, values in enumerate(
             (

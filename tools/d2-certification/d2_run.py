@@ -426,9 +426,7 @@ def finalization_assembler(name):
     return assembler
 
 
-def prior_completion_digest(
-    manifest_path, manifest, digest, step, receipt_sha256
-):
+def prior_completion(manifest_path, manifest, digest, step, receipt_sha256):
     if manifest_path is None:
         fail("coordinator_completion_binding_missing")
     path = coordinator_completion_path(manifest_path, step)
@@ -442,7 +440,7 @@ def prior_completion_digest(
     )
     if completion["receipt_sha256"] != receipt_sha256:
         fail("coordinator_completion_binding_invalid")
-    return sha256_bytes(canonical_json(completion).encode("utf-8"))
+    return completion
 
 
 def step_binding(
@@ -451,7 +449,6 @@ def step_binding(
     manifest,
     digest,
     manifest_path=None,
-    finalization_freeze_intent_sha256=None,
 ):
     if step not in {16, 17}:
         return None
@@ -460,6 +457,16 @@ def step_binding(
     installation_id = prior_receipts[3]["evidence"]["installation_id"]
     if step == 16:
         step15_receipt_sha256 = prior_receipts[14]["receipt_sha256"]
+        step15_completion = prior_completion(
+            manifest_path,
+            manifest,
+            digest,
+            15,
+            step15_receipt_sha256,
+        )
+        freeze_binding = finalization_assembler(
+            "coordinator_certified_teardown_binding"
+        )(manifest_path, manifest, digest)
         created = prior_receipts[8]["evidence"]
         expected = sorted(
             set(
@@ -480,18 +487,24 @@ def step_binding(
                 "evidence"
             ]["reconciliation_inventory_digest_sha256"],
             "expected_discord_resource_ids": expected,
-            "finalization_freeze_intent_sha256": finalization_freeze_intent_sha256,
+            "finalization_freeze_intent_sha256": freeze_binding[
+                "finalization_freeze_intent_sha256"
+            ],
             "certification_step15_receipt_sha256": step15_receipt_sha256,
-            "coordinator_step15_completion_sha256": prior_completion_digest(
-                manifest_path,
-                manifest,
-                digest,
-                15,
-                step15_receipt_sha256,
+            "coordinator_step15_completion_sha256": sha256_bytes(
+                canonical_json(step15_completion).encode("utf-8")
             ),
+            "coordinator_step15_completed_at": step15_completion["observed_at"],
         }
     teardown = prior_receipts[15]["evidence"]
     step16_receipt_sha256 = prior_receipts[15]["receipt_sha256"]
+    step16_completion = prior_completion(
+        manifest_path,
+        manifest,
+        digest,
+        16,
+        step16_receipt_sha256,
+    )
     return {
         "manifest_sha256": digest,
         "run_id": manifest["run_id"],
@@ -501,13 +514,10 @@ def step_binding(
         "precleanup_sha256": teardown["precleanup_sha256"],
         "discord_teardown_sha256": teardown["discord_teardown_sha256"],
         "step16_receipt_sha256": step16_receipt_sha256,
-        "coordinator_step16_completion_sha256": prior_completion_digest(
-            manifest_path,
-            manifest,
-            digest,
-            16,
-            step16_receipt_sha256,
+        "coordinator_step16_completion_sha256": sha256_bytes(
+            canonical_json(step16_completion).encode("utf-8")
         ),
+        "coordinator_step16_completed_at": step16_completion["observed_at"],
     }
 
 
@@ -675,9 +685,6 @@ def assemble_step_evidence(
                     manifest,
                     digest,
                     manifest_path,
-                    values[DISCORD_TEARDOWN_KIND].get(
-                        "finalization_freeze_intent_sha256"
-                    ),
                 ),
             )
         if step == 17:

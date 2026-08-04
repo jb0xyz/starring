@@ -194,6 +194,51 @@ class D2RunCoordinatorTest(unittest.TestCase):
             d2_run.canonical_json(value).encode("utf-8")
         )
 
+    def protected_freeze_intent(self, receipts, completion):
+        artifact_directory = self.manifest_path.parent / "orchestrator"
+        artifact_directory.mkdir(mode=0o700, exist_ok=True)
+        artifact_directory.chmod(0o700)
+        transport_evidence = artifact_directory / "step-03-evidence.json"
+        transport_evidence.write_text(
+            d2_run.canonical_json(
+                {
+                    "transport_instance_id": self.complete[3][
+                        "transport_instance_id"
+                    ]
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        transport_evidence.chmod(0o600)
+        finalization_directory = artifact_directory / "finalization"
+        finalization_directory.mkdir(mode=0o700, exist_ok=True)
+        finalization_directory.chmod(0o700)
+        freeze = {
+            "schema_version": 1,
+            "kind": "starring.d2.finalization-freeze-intent.v1",
+            "recorded_at": completion["observed_at"],
+            "manifest_sha256": self.manifest_digest,
+            "run_id": self.manifest["run_id"],
+            "transport_instance_id": self.complete[3]["transport_instance_id"],
+            "certification_step15_receipt_sha256": receipts[14][
+                "receipt_sha256"
+            ],
+            "coordinator_step15_completion_sha256": self.object_digest(completion),
+            "transport_quiescence_sha256": "a" * 64,
+            "resource_inventory_digest_sha256": self.complete[13][
+                "reconciliation_inventory_digest_sha256"
+            ],
+            "services_to_stop": ["tunnel", "runtime"],
+            "discord_effects_frozen": True,
+        }
+        freeze_path = finalization_directory / "finalization-freeze-intent.json"
+        freeze_path.write_text(
+            d2_run.canonical_json(freeze) + "\n", encoding="utf-8"
+        )
+        freeze_path.chmod(0o600)
+        return freeze
+
     def step_sixteen_sources(self):
         receipts = self.receipts()
         completion = json.loads(
@@ -201,6 +246,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
                 encoding="utf-8"
             )
         )
+        freeze = self.protected_freeze_intent(receipts, completion)
         installation_id = self.complete[4]["installation_id"]
         channel_id = self.complete[9]["channel_ids"][0]
         resources = [
@@ -294,7 +340,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
             "proxy_deletions": proxy_deletions,
             "direct_observations": direct_observations,
             "all_resources_absent": True,
-            "finalization_freeze_intent_sha256": "f" * 64,
+            "finalization_freeze_intent_sha256": self.object_digest(freeze),
             "certification_step15_receipt_sha256": receipts[14]["receipt_sha256"],
             "coordinator_step15_completion_sha256": self.object_digest(completion),
             "freeze_resource_inventory_digest_sha256": self.complete[13][
@@ -1463,6 +1509,44 @@ class D2RunCoordinatorTest(unittest.TestCase):
             )
         self.assertEqual(len(self.receipts()), 15)
 
+    def test_step_sixteen_rejects_self_sourced_freeze_hash(self):
+        self.append_prior(15)
+        database, teardown, finalization = self.step_sixteen_sources()
+        teardown["finalization_freeze_intent_sha256"] = "0" * 64
+        finalization["discord_teardown_sha256"] = self.object_digest(teardown)
+        with self.assertRaisesRegex(
+            d2_run.CertificationError,
+            "coordinator_evidence_assembly_failed:step16_source_evidence_invalid",
+        ):
+            d2_run.advance_certification(
+                self.manifest_path,
+                16,
+                [
+                    str(self.write_source(value))
+                    for value in (database, teardown, finalization)
+                ],
+            )
+        self.assertEqual(len(self.receipts()), 15)
+
+    def test_step_sixteen_rejects_teardown_before_trusted_completion(self):
+        self.append_prior(15)
+        database, teardown, finalization = self.step_sixteen_sources()
+        teardown["recorded_at"] = "2026-08-04T01:02:02Z"
+        finalization["discord_teardown_sha256"] = self.object_digest(teardown)
+        with self.assertRaisesRegex(
+            d2_run.CertificationError,
+            "coordinator_evidence_assembly_failed:step16_source_chronology_invalid",
+        ):
+            d2_run.advance_certification(
+                self.manifest_path,
+                16,
+                [
+                    str(self.write_source(value))
+                    for value in (database, teardown, finalization)
+                ],
+            )
+        self.assertEqual(len(self.receipts()), 15)
+
     def test_step_seventeen_rejects_forged_context_and_prior_digest_chain(self):
         self.append_prior(15)
         step_sixteen = self.step_sixteen_sources()
@@ -1490,6 +1574,37 @@ class D2RunCoordinatorTest(unittest.TestCase):
         orchestration["database_absence_sha256"] = self.object_digest(database)
         orchestration["prefix_scan_sha256"] = self.object_digest(prefix_scan)
         orchestration["guild_deletion_sha256"] = self.object_digest(guild)
+        with self.assertRaisesRegex(
+            d2_run.CertificationError,
+            "coordinator_evidence_assembly_failed:step17_source_evidence_invalid",
+        ):
+            d2_run.advance_certification(
+                self.manifest_path,
+                17,
+                [
+                    str(self.write_source(value))
+                    for value in (database, orchestration, prefix_scan, guild)
+                ],
+            )
+        self.assertEqual(len(self.receipts()), 16)
+
+    def test_step_seventeen_rejects_source_supplied_completion_time(self):
+        self.append_prior(15)
+        step_sixteen = self.step_sixteen_sources()
+        d2_run.advance_certification(
+            self.manifest_path,
+            16,
+            [str(self.write_source(value)) for value in step_sixteen],
+        )
+        database, orchestration, prefix_scan, guild = self.step_seventeen_sources(
+            step_sixteen
+        )
+        completion = datetime.datetime.fromisoformat(
+            orchestration["coordinator_step16_completed_at"].replace("Z", "+00:00")
+        )
+        orchestration["coordinator_step16_completed_at"] = (
+            completion - datetime.timedelta(seconds=1)
+        ).isoformat(timespec="seconds").replace("+00:00", "Z")
         with self.assertRaisesRegex(
             d2_run.CertificationError,
             "coordinator_evidence_assembly_failed:step17_source_evidence_invalid",

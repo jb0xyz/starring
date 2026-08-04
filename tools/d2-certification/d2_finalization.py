@@ -13,6 +13,7 @@ from d2_certification import (
     require_owned_mode,
 )
 from d2_orchestrator_contract import (
+    RunContext,
     append_journal,
     external_keychain_inventory,
     fail,
@@ -845,6 +846,12 @@ def validate_freeze_certification(intent, certification):
 
 
 def certified_teardown_binding(context):
+    _require_owned_directory(
+        context.artifact_directory, "artifact_directory_invalid"
+    )
+    _require_owned_directory(
+        finalization_directory(context), "finalization_directory_invalid"
+    )
     freeze = validate_freeze_intent(
         context,
         _load_private(freeze_intent_path(context), "finalization_freeze_intent"),
@@ -862,6 +869,12 @@ def certified_teardown_binding(context):
             "resource_inventory_digest_sha256"
         ],
     }
+
+
+def coordinator_certified_teardown_binding(manifest_path, manifest, digest):
+    return certified_teardown_binding(
+        RunContext(pathlib.Path(manifest_path), manifest, digest)
+    )
 
 
 def _initial_freeze_boundary(context, platform):
@@ -1538,6 +1551,7 @@ def _validate_step16_binding(value):
         "finalization_freeze_intent_sha256",
         "certification_step15_receipt_sha256",
         "coordinator_step15_completion_sha256",
+        "coordinator_step15_completed_at",
     }
     _require_exact(value, fields, "step16_binding_invalid")
     _require_digest(value["manifest_sha256"], "step16_binding_invalid")
@@ -1556,6 +1570,9 @@ def _validate_step16_binding(value):
     _require_digest(
         value["coordinator_step15_completion_sha256"],
         "step16_binding_invalid",
+    )
+    _require_timestamp(
+        value["coordinator_step15_completed_at"], "step16_binding_invalid"
     )
     if (
         not isinstance(value["run_id"], str)
@@ -1607,6 +1624,13 @@ def assemble_teardown_evidence(database, teardown, finalization, binding):
         or finalization["discord_resource_ids_deleted"] != teardown["resource_ids"]
     ):
         fail("step16_source_evidence_invalid")
+    if _parse_timestamp(
+        binding["coordinator_step15_completed_at"],
+        "step16_source_chronology_invalid",
+    ) > _parse_timestamp(
+        teardown["recorded_at"], "step16_source_chronology_invalid"
+    ):
+        fail("step16_source_chronology_invalid")
     return {
         "teardown_started": True,
         "discord_resource_ids_deleted": teardown["resource_ids"],
@@ -1618,6 +1642,8 @@ def assemble_teardown_evidence(database, teardown, finalization, binding):
 
 
 def local_step16_binding(context, teardown):
+    certification = require_certification_prefix(context)
+    freeze_binding = certified_teardown_binding(context)
     return {
         "manifest_sha256": context.digest,
         "run_id": context.manifest["run_id"],
@@ -1626,18 +1652,19 @@ def local_step16_binding(context, teardown):
         ),
         "transport_instance_id": teardown["transport_instance_id"],
         "expected_discord_resource_ids": teardown["resource_ids"],
-        "reconciliation_inventory_digest_sha256": teardown[
-            "source_inventory_digest_sha256"
+        "reconciliation_inventory_digest_sha256": certification[
+            "reconciliation_inventory_digest_sha256"
         ],
-        "finalization_freeze_intent_sha256": teardown[
+        "finalization_freeze_intent_sha256": freeze_binding[
             "finalization_freeze_intent_sha256"
         ],
-        "certification_step15_receipt_sha256": teardown[
-            "certification_step15_receipt_sha256"
+        "certification_step15_receipt_sha256": certification[
+            "step15_receipt_sha256"
         ],
-        "coordinator_step15_completion_sha256": teardown[
-            "coordinator_step15_completion_sha256"
+        "coordinator_step15_completion_sha256": certification[
+            "step15_completion_sha256"
         ],
+        "coordinator_step15_completed_at": certification["step15_completed_at"],
     }
 
 
@@ -2179,6 +2206,7 @@ def _validate_step17_binding(value):
         "discord_teardown_sha256",
         "step16_receipt_sha256",
         "coordinator_step16_completion_sha256",
+        "coordinator_step16_completed_at",
     }
     _require_exact(value, fields, "step17_binding_invalid")
     _require_digest(value["manifest_sha256"], "step17_binding_invalid")
@@ -2188,6 +2216,9 @@ def _validate_step17_binding(value):
     _require_digest(
         value["coordinator_step16_completion_sha256"],
         "step17_binding_invalid",
+    )
+    _require_timestamp(
+        value["coordinator_step16_completed_at"], "step17_binding_invalid"
     )
     _require_snowflake(value["guild_id"], "step17_binding_invalid")
     if (
@@ -2226,13 +2257,15 @@ def assemble_absence_evidence(database, orchestration, prefix_scan, guild, bindi
         != binding["step16_receipt_sha256"]
         or orchestration["coordinator_step16_completion_sha256"]
         != binding["coordinator_step16_completion_sha256"]
+        or orchestration["coordinator_step16_completed_at"]
+        != binding["coordinator_step16_completed_at"]
         or orchestration["database_absence_sha256"] != _digest(database)
         or orchestration["prefix_scan_sha256"] != _digest(prefix_scan)
         or orchestration["guild_deletion_sha256"] != _digest(guild)
     ):
         fail("step17_source_evidence_invalid")
     if _parse_timestamp(
-        orchestration["coordinator_step16_completed_at"],
+        binding["coordinator_step16_completed_at"],
         "step17_source_evidence_invalid",
     ) >= _parse_timestamp(
         prefix_scan["observed_at"], "step17_source_evidence_invalid"
@@ -2284,6 +2317,9 @@ def local_step17_binding(context, precleanup, teardown, step16_completion):
         "step16_receipt_sha256": step16_completion["step16_receipt_sha256"],
         "coordinator_step16_completion_sha256": step16_completion[
             "step16_completion_sha256"
+        ],
+        "coordinator_step16_completed_at": step16_completion[
+            "step16_completed_at"
         ],
     }
 
