@@ -98,6 +98,7 @@ TRANSPORT_EVIDENCE_KINDS = {
     "duplicate": "starring.d2.transport-duplicate-evidence.v1",
     "reconciliation": "starring.d2.transport-indeterminate-evidence.v1",
     "gateway-loss": "starring.d2.transport-gateway-loss-evidence.v1",
+    "gateway-healed": "starring.d2.transport-gateway-healed-evidence.v1",
 }
 
 
@@ -673,6 +674,8 @@ def transport_control_inventory(context):
             or intent["sequence"] != sequence
             or intent["operation"] != record["operation"]
             or intent["command"] != TRANSPORT_OPERATIONS[record["operation"]]
+            or intent["operation_id"]
+            != f"d2:{context.digest[:16]}:{sequence:04d}:{record['operation']}"
             or not isinstance(intent["recorded_at"], str)
             or not TRANSPORT_RECORDED_AT_PATTERN.fullmatch(intent["recorded_at"])
             or not isinstance(intent["operation_id"], str)
@@ -790,6 +793,37 @@ def validate_transport_control_history(context, records):
         transport_operation_postcondition(
             operation, complete["operation_id"], response, snapshot
         )
+
+
+def gateway_control_completion_bindings(context, expected_operations):
+    records, pending = transport_control_inventory(context)
+    validate_transport_control_history(context, records)
+    if pending is not None:
+        fail("transport_gateway_operation_pending")
+    gateway_records = [
+        record
+        for record in records
+        if record["operation"] in {"partition-gateway", "heal-gateway"}
+    ]
+    if [record["operation"] for record in gateway_records] != list(
+        expected_operations
+    ):
+        fail("transport_gateway_operation_history_invalid")
+    bindings = []
+    for record in gateway_records:
+        complete = record.get("complete")
+        if complete is None:
+            fail("transport_gateway_operation_incomplete")
+        bindings.append(
+            {
+                "operation_id": complete["operation_id"],
+                "completion_sha256": hashlib.sha256(
+                    canonical_json(complete).encode("utf-8")
+                ).hexdigest(),
+                "snapshot": complete["snapshot"],
+            }
+        )
+    return bindings
 
 
 def command_transport_control(context, platform, operation):
@@ -966,6 +1000,17 @@ def require_gateway_loss_certification_boundary(context, platform):
     return snapshot, runtime_status
 
 
+def require_gateway_healed_certification_boundary(context, platform):
+    _state, snapshot = require_candidate_certification_boundary(context, platform)
+    runtime_status = platform.http_status(
+        "http://127.0.0.1:"
+        f"{context.manifest['services']['runtime']['port']}/health/ready"
+    )
+    if runtime_status != 200:
+        fail("gateway_healed_runtime_readiness_invalid")
+    return snapshot, runtime_status
+
+
 def transport_evidence_path(context, checkpoint):
     return context.artifact_directory / "transport-evidence" / f"{checkpoint}.json"
 
@@ -1005,6 +1050,23 @@ def validate_transport_evidence_payload(context, checkpoint, evidence):
             "transport_gateway_partitioned",
             "transport_gateway_partition_events",
             "transport_instance_id",
+            "partition_operation_id",
+            "partition_completion_sha256",
+        },
+        "gateway-healed": {
+            "gateway_connected",
+            "runtime_ready_status",
+            "transport_gateway_partitioned",
+            "transport_gateway_partition_events",
+            "transport_duplicate_armed",
+            "transport_duplicate_claimed",
+            "transport_indeterminate_armed",
+            "transport_indeterminate_claimed",
+            "transport_instance_id",
+            "partition_operation_id",
+            "partition_completion_sha256",
+            "heal_operation_id",
+            "heal_completion_sha256",
         },
     }
     if checkpoint not in TRANSPORT_EVIDENCE_KINDS:
@@ -1066,15 +1128,62 @@ def validate_transport_evidence_payload(context, checkpoint, evidence):
             or not 200 <= evidence["transport_last_upstream_status"] <= 299
         ):
             fail("transport_reconciliation_evidence_invalid")
+    elif checkpoint == "gateway-loss":
+        if (
+            evidence["gateway_disconnected"] is not True
+            or type(evidence["runtime_ready_status"]) is not int
+            or evidence["runtime_ready_status"] != 503
+            or evidence["transport_gateway_partitioned"] is not True
+            or type(evidence["transport_gateway_partition_events"]) is not int
+            or evidence["transport_gateway_partition_events"] != 1
+            or not isinstance(evidence["partition_operation_id"], str)
+            or not TRANSPORT_OPERATION_ID_PATTERN.fullmatch(
+                evidence["partition_operation_id"]
+            )
+            or not evidence["partition_operation_id"].endswith(
+                ":partition-gateway"
+            )
+            or not isinstance(evidence["partition_completion_sha256"], str)
+            or not DIGEST_PATTERN.fullmatch(
+                evidence["partition_completion_sha256"]
+            )
+        ):
+            fail("transport_gateway_loss_evidence_invalid")
     elif (
-        evidence["gateway_disconnected"] is not True
+        evidence["gateway_connected"] is not True
         or type(evidence["runtime_ready_status"]) is not int
-        or evidence["runtime_ready_status"] != 503
-        or evidence["transport_gateway_partitioned"] is not True
+        or evidence["runtime_ready_status"] != 200
+        or evidence["transport_gateway_partitioned"] is not False
         or type(evidence["transport_gateway_partition_events"]) is not int
-        or evidence["transport_gateway_partition_events"] <= 0
+        or evidence["transport_gateway_partition_events"] != 1
+        or not isinstance(evidence["partition_operation_id"], str)
+        or not TRANSPORT_OPERATION_ID_PATTERN.fullmatch(
+            evidence["partition_operation_id"]
+        )
+        or not evidence["partition_operation_id"].endswith(
+            ":partition-gateway"
+        )
+        or not isinstance(evidence["partition_completion_sha256"], str)
+        or not DIGEST_PATTERN.fullmatch(evidence["partition_completion_sha256"])
+        or not isinstance(evidence["heal_operation_id"], str)
+        or not TRANSPORT_OPERATION_ID_PATTERN.fullmatch(
+            evidence["heal_operation_id"]
+        )
+        or not evidence["heal_operation_id"].endswith(":heal-gateway")
+        or evidence["heal_operation_id"] == evidence["partition_operation_id"]
+        or not isinstance(evidence["heal_completion_sha256"], str)
+        or not DIGEST_PATTERN.fullmatch(evidence["heal_completion_sha256"])
+        or any(
+            type(evidence[field]) is not bool or evidence[field]
+            for field in (
+                "transport_duplicate_armed",
+                "transport_duplicate_claimed",
+                "transport_indeterminate_armed",
+                "transport_indeterminate_claimed",
+            )
+        )
     ):
-        fail("transport_gateway_loss_evidence_invalid")
+        fail("transport_gateway_healed_evidence_invalid")
     return evidence
 
 
@@ -1196,7 +1305,7 @@ def reconciliation_transport_evidence(snapshot):
     }
 
 
-def gateway_loss_transport_evidence(snapshot, runtime_status):
+def gateway_loss_transport_evidence(snapshot, runtime_status, partition_binding):
     gateway = snapshot["gateway"]
     return {
         "schema_version": 1,
@@ -1207,6 +1316,37 @@ def gateway_loss_transport_evidence(snapshot, runtime_status):
         "transport_gateway_partitioned": gateway["partitioned"],
         "transport_gateway_partition_events": gateway["partition_events"],
         "transport_instance_id": snapshot["instance_id"],
+        "partition_operation_id": partition_binding["operation_id"],
+        "partition_completion_sha256": partition_binding[
+            "completion_sha256"
+        ],
+    }
+
+
+def gateway_healed_transport_evidence(
+    snapshot, runtime_status, partition_binding, heal_binding
+):
+    gateway = snapshot["gateway"]
+    effect = snapshot["effect_http"]
+    return {
+        "schema_version": 1,
+        "kind": TRANSPORT_EVIDENCE_KINDS["gateway-healed"],
+        "observed_at": utc_now(),
+        "gateway_connected": not gateway["partitioned"],
+        "runtime_ready_status": runtime_status,
+        "transport_gateway_partitioned": gateway["partitioned"],
+        "transport_gateway_partition_events": gateway["partition_events"],
+        "transport_duplicate_armed": gateway["duplicate_armed"],
+        "transport_duplicate_claimed": gateway["duplicate_claimed"],
+        "transport_indeterminate_armed": effect["indeterminate_armed"],
+        "transport_indeterminate_claimed": effect["indeterminate_claimed"],
+        "transport_instance_id": snapshot["instance_id"],
+        "partition_operation_id": partition_binding["operation_id"],
+        "partition_completion_sha256": partition_binding[
+            "completion_sha256"
+        ],
+        "heal_operation_id": heal_binding["operation_id"],
+        "heal_completion_sha256": heal_binding["completion_sha256"],
     }
 
 
@@ -1217,7 +1357,56 @@ def command_transport_evidence(context, platform, checkpoint):
         snapshot, runtime_status = require_gateway_loss_certification_boundary(
             context, platform
         )
-        current = gateway_loss_transport_evidence(snapshot, runtime_status)
+        bindings = gateway_control_completion_bindings(
+            context, ("partition-gateway",)
+        )
+        partition_binding = bindings[0]
+        if (
+            partition_binding["snapshot"]["instance_id"]
+            != snapshot["instance_id"]
+            or partition_binding["snapshot"]["gateway"]["partitioned"]
+            is not True
+            or partition_binding["snapshot"]["gateway"]["partition_events"]
+            != 1
+        ):
+            fail("transport_gateway_partition_binding_invalid")
+        current = gateway_loss_transport_evidence(
+            snapshot, runtime_status, partition_binding
+        )
+    elif checkpoint == "gateway-healed":
+        snapshot, runtime_status = require_gateway_healed_certification_boundary(
+            context, platform
+        )
+        loss_path = transport_evidence_path(context, "gateway-loss")
+        if not loss_path.exists():
+            fail("transport_gateway_loss_evidence_missing")
+        loss = load_private_json(loss_path, "transport_evidence_gateway_loss")
+        validate_transport_evidence_payload(context, "gateway-loss", loss)
+        bindings = gateway_control_completion_bindings(
+            context, ("partition-gateway", "heal-gateway")
+        )
+        partition_binding, heal_binding = bindings
+        if (
+            loss["partition_operation_id"] != partition_binding["operation_id"]
+            or loss["partition_completion_sha256"]
+            != partition_binding["completion_sha256"]
+            or partition_binding["snapshot"]["instance_id"]
+            != snapshot["instance_id"]
+            or partition_binding["snapshot"]["gateway"]["partitioned"]
+            is not True
+            or partition_binding["snapshot"]["gateway"]["partition_events"]
+            != 1
+            or heal_binding["snapshot"]["instance_id"] != snapshot["instance_id"]
+            or heal_binding["snapshot"]["gateway"]["partitioned"] is not False
+            or heal_binding["snapshot"]["gateway"]["partition_events"] != 1
+        ):
+            fail("transport_gateway_heal_binding_invalid")
+        current = gateway_healed_transport_evidence(
+            snapshot,
+            runtime_status,
+            partition_binding,
+            heal_binding,
+        )
     else:
         _state, snapshot = require_candidate_certification_boundary(
             context, platform

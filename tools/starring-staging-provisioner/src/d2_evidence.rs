@@ -194,6 +194,8 @@ struct LiveEvidenceV1 {
 struct InteractionEvidenceV1 {
     create_interaction_id: String,
     join_interaction_id: String,
+    actor_user_id: String,
+    joined_role_id: String,
     deployment_id: String,
     route_identity: RouteIdentityV1,
     instance_id: String,
@@ -752,7 +754,7 @@ async fn inspect_interaction(
     scope: &InspectionScopeV1,
 ) -> Result<InteractionEvidenceV1, D2ProvisionerErrorV1> {
     let create = sqlx::query(
-        "SELECT root.application_id, root.interaction_id, root.deployment_id, root.runtime_generation, root.route_controller_fencing_token, root.route_incarnation, root.origin_process_instance_id, root.origin_serving_lease_epoch, root.origin_serving_revision, root.origin_gateway_shard_id, root.origin_gateway_owner_lease_epoch, root.origin_gateway_owner_revision FROM public.runtime_interaction_receipt_roots_v1 AS root INNER JOIN public.runtime_interaction_receipt_heads_v1 AS head ON head.application_id = root.application_id AND head.interaction_id = root.interaction_id WHERE root.application_id = $1 AND root.tenant_id = $2 AND root.installation_id = $3 AND root.guild_id = $4 AND root.ruleset_key = $5 AND head.state = 'completed' AND EXISTS (SELECT 1 FROM public.runtime_interaction_effect_heads_v1 AS effect WHERE effect.application_id = root.application_id AND effect.interaction_id = root.interaction_id AND effect.action_kind = 'register_instance' AND effect.state IN ('known_succeeded', 'reconciled_succeeded')) ORDER BY root.created_at DESC, root.interaction_id COLLATE pg_catalog.\"C\" DESC LIMIT 1",
+        "SELECT root.application_id, root.interaction_id, root.actor_user_id, root.deployment_id, root.runtime_generation, root.route_controller_fencing_token, root.route_incarnation, root.origin_process_instance_id, root.origin_serving_lease_epoch, root.origin_serving_revision, root.origin_gateway_shard_id, root.origin_gateway_owner_lease_epoch, root.origin_gateway_owner_revision FROM public.runtime_interaction_receipt_roots_v1 AS root INNER JOIN public.runtime_interaction_receipt_heads_v1 AS head ON head.application_id = root.application_id AND head.interaction_id = root.interaction_id WHERE root.application_id = $1 AND root.tenant_id = $2 AND root.installation_id = $3 AND root.guild_id = $4 AND root.ruleset_key = $5 AND head.state = 'completed' AND EXISTS (SELECT 1 FROM public.runtime_interaction_effect_heads_v1 AS effect WHERE effect.application_id = root.application_id AND effect.interaction_id = root.interaction_id AND effect.action_kind = 'register_instance' AND effect.state IN ('known_succeeded', 'reconciled_succeeded')) ORDER BY root.created_at DESC, root.interaction_id COLLATE pg_catalog.\"C\" DESC LIMIT 1",
     )
     .bind(&scope.application_id)
     .bind(&scope.tenant_id)
@@ -766,9 +768,11 @@ async fn inspect_interaction(
     let route = route_from_receipt(&create)?;
     let application_id: String = get(&create, "application_id")?;
     let create_interaction_id: String = get(&create, "interaction_id")?;
-    let join = latest_terminal_receipt(connection, scope, Some("instance")).await?;
+    let actor_user_id: String = get(&create, "actor_user_id")?;
+    let join = latest_completed_instance_join(connection, scope).await?;
     let join_interaction_id: String = get(&join, "interaction_id")?;
     let instance_id: String = get(&join, "instance_id")?;
+    let join_actor_user_id: String = get(&join, "actor_user_id")?;
     if create_interaction_id == join_interaction_id
         || get::<String>(&join, "deployment_id")? != route.deployment_id
     {
@@ -798,6 +802,8 @@ async fn inspect_interaction(
     if role_ids.is_empty() || channel_ids.is_empty() || panel_message_ids.is_empty() {
         return Err(D2ProvisionerErrorV1::Inspection);
     }
+    let (membership_guild_id, membership_user_id, joined_role_id) =
+        successful_role_membership(connection, &application_id, &join_interaction_id).await?;
     let ephemeral_count: i64 = sqlx::query_scalar(
         "SELECT pg_catalog.count(*) FROM public.runtime_interaction_receipt_heads_v1 WHERE application_id = $1 AND interaction_id IN ($2, $3) AND acknowledgement_kind IN ('defer_ephemeral', 'respond_ephemeral') AND acknowledgement_result = 'succeeded'",
     )
@@ -809,17 +815,24 @@ async fn inspect_interaction(
     .map_err(|_| D2ProvisionerErrorV1::Inspection)?;
     if !valid_snowflake(&create_interaction_id)
         || !valid_snowflake(&join_interaction_id)
+        || !valid_snowflake(&actor_user_id)
+        || actor_user_id != join_actor_user_id
+        || membership_guild_id != scope.guild_id
+        || membership_user_id != actor_user_id
+        || !role_ids.contains(&joined_role_id)
         || !valid_identifier(&instance_id)
         || !valid_distinct_snowflakes(&role_ids)
         || !valid_distinct_snowflakes(&channel_ids)
         || !valid_distinct_snowflakes(&panel_message_ids)
-        || ephemeral_count < 1
+        || ephemeral_count != 2
     {
         return Err(D2ProvisionerErrorV1::Inspection);
     }
     Ok(InteractionEvidenceV1 {
         create_interaction_id,
         join_interaction_id,
+        actor_user_id,
+        joined_role_id,
         deployment_id: route.deployment_id.clone(),
         route_identity: route,
         instance_id,
@@ -828,6 +841,90 @@ async fn inspect_interaction(
         panel_message_ids,
         ephemeral_count,
     })
+}
+
+async fn latest_completed_instance_join(
+    connection: &mut PgConnection,
+    scope: &InspectionScopeV1,
+) -> Result<PgRow, D2ProvisionerErrorV1> {
+    sqlx::query(
+        "SELECT root.application_id, root.interaction_id, root.actor_user_id, root.deployment_id, root.instance_id FROM public.runtime_interaction_receipt_roots_v1 AS root INNER JOIN public.runtime_interaction_receipt_heads_v1 AS head ON head.application_id = root.application_id AND head.interaction_id = root.interaction_id WHERE root.application_id = $1 AND root.tenant_id = $2 AND root.installation_id = $3 AND root.guild_id = $4 AND root.ruleset_key = $5 AND root.route_kind = 'instance' AND head.state = 'completed' AND EXISTS (SELECT 1 FROM public.runtime_interaction_effect_heads_v1 AS effect WHERE effect.application_id = root.application_id AND effect.interaction_id = root.interaction_id AND effect.action_kind = 'grant_role' AND effect.output_kind = 'role_membership' AND effect.state IN ('known_succeeded', 'reconciled_succeeded')) ORDER BY root.created_at DESC, root.interaction_id COLLATE pg_catalog.\"C\" DESC LIMIT 1",
+    )
+    .bind(&scope.application_id)
+    .bind(&scope.tenant_id)
+    .bind(&scope.installation_id)
+    .bind(&scope.guild_id)
+    .bind(RULESET_KEY)
+    .fetch_optional(connection)
+    .await
+    .map_err(|_| D2ProvisionerErrorV1::Inspection)?
+    .ok_or(D2ProvisionerErrorV1::Inspection)
+}
+
+async fn successful_role_membership(
+    connection: &mut PgConnection,
+    application_id: &str,
+    interaction_id: &str,
+) -> Result<(String, String, String), D2ProvisionerErrorV1> {
+    let inputs: Vec<Value> = sqlx::query_scalar(
+        "SELECT resolved_input FROM public.runtime_interaction_effect_heads_v1 WHERE application_id = $1 AND interaction_id = $2 AND action_kind = 'grant_role' AND output_kind = 'role_membership' AND state IN ('known_succeeded', 'reconciled_succeeded') ORDER BY action_index",
+    )
+    .bind(application_id)
+    .bind(interaction_id)
+    .fetch_all(connection)
+    .await
+    .map_err(|_| D2ProvisionerErrorV1::Inspection)?;
+    if inputs.len() != 1 {
+        return Err(D2ProvisionerErrorV1::Inspection);
+    }
+    resolved_role_membership_ids(&inputs[0])
+}
+
+fn resolved_role_membership_ids(
+    document: &Value,
+) -> Result<(String, String, String), D2ProvisionerErrorV1> {
+    let object = document
+        .as_object()
+        .filter(|value| value.len() == 1)
+        .ok_or(D2ProvisionerErrorV1::Inspection)?;
+    let references = object
+        .get("references")
+        .and_then(Value::as_array)
+        .filter(|value| value.len() == 3)
+        .ok_or(D2ProvisionerErrorV1::Inspection)?;
+    let mut guild_id = None;
+    let mut user_id = None;
+    let mut role_id = None;
+    for reference in references {
+        let fields = reference
+            .as_object()
+            .filter(|value| value.len() == 2)
+            .ok_or(D2ProvisionerErrorV1::Inspection)?;
+        let slot = fields
+            .get("slot")
+            .and_then(Value::as_str)
+            .ok_or(D2ProvisionerErrorV1::Inspection)?;
+        let id = fields
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| valid_snowflake(value))
+            .ok_or(D2ProvisionerErrorV1::Inspection)?
+            .to_owned();
+        let target = match slot {
+            "guild_id" => &mut guild_id,
+            "user_id" => &mut user_id,
+            "role_id" => &mut role_id,
+            _ => return Err(D2ProvisionerErrorV1::Inspection),
+        };
+        if target.replace(id).is_some() {
+            return Err(D2ProvisionerErrorV1::Inspection);
+        }
+    }
+    Ok((
+        guild_id.ok_or(D2ProvisionerErrorV1::Inspection)?,
+        user_id.ok_or(D2ProvisionerErrorV1::Inspection)?,
+        role_id.ok_or(D2ProvisionerErrorV1::Inspection)?,
+    ))
 }
 
 async fn successful_output_ids(
@@ -1033,26 +1130,6 @@ fn serving_from_receipt(
     };
     validate_serving_identity(&serving, scope)?;
     Ok(serving)
-}
-
-async fn latest_terminal_receipt(
-    connection: &mut PgConnection,
-    scope: &InspectionScopeV1,
-    route_kind: Option<&str>,
-) -> Result<PgRow, D2ProvisionerErrorV1> {
-    sqlx::query(
-        "SELECT pg_catalog.count(*) OVER () AS scoped_terminal_count, root.application_id, root.interaction_id, root.tenant_id, root.installation_id, root.guild_id, root.ruleset_key, root.deployment_id, root.attestation_id, root.runtime_generation, root.target_version, root.target_content_hash, root.binding_revision, root.binding_fingerprint, root.route_controller_fencing_token, root.route_incarnation, root.origin_process_instance_id, root.origin_serving_lease_epoch, root.origin_serving_revision, root.origin_gateway_shard_id, root.origin_gateway_owner_lease_epoch, root.origin_gateway_owner_revision, root.instance_id, root.instance_manifest_digest, head.state AS receipt_state FROM public.runtime_interaction_receipt_roots_v1 AS root INNER JOIN public.runtime_interaction_receipt_heads_v1 AS head ON head.application_id = root.application_id AND head.interaction_id = root.interaction_id WHERE root.application_id = $1 AND root.tenant_id = $2 AND root.installation_id = $3 AND root.guild_id = $4 AND root.ruleset_key = $5 AND head.state IN ('completed', 'failed', 'recovery_required') AND ($6::TEXT IS NULL OR root.route_kind = $6) ORDER BY root.created_at DESC, root.interaction_id COLLATE pg_catalog.\"C\" DESC LIMIT 1",
-    )
-    .bind(&scope.application_id)
-    .bind(&scope.tenant_id)
-    .bind(&scope.installation_id)
-    .bind(&scope.guild_id)
-    .bind(RULESET_KEY)
-    .bind(route_kind)
-    .fetch_optional(&mut *connection)
-    .await
-    .map_err(|_| D2ProvisionerErrorV1::Inspection)?
-    .ok_or(D2ProvisionerErrorV1::Inspection)
 }
 
 fn route_from_receipt(row: &PgRow) -> Result<RouteIdentityV1, D2ProvisionerErrorV1> {
@@ -1450,6 +1527,64 @@ mod tests {
     }
 
     #[test]
+    fn resolved_role_membership_is_exact_and_complete() {
+        let document = serde_json::json!({
+            "references": [
+                {"slot": "guild_id", "id": "1533137713476272288"},
+                {"slot": "role_id", "id": "1533137713476272290"},
+                {"slot": "user_id", "id": "1056857223529250906"}
+            ]
+        });
+        assert_eq!(
+            resolved_role_membership_ids(&document).unwrap(),
+            (
+                "1533137713476272288".to_owned(),
+                "1056857223529250906".to_owned(),
+                "1533137713476272290".to_owned(),
+            )
+        );
+    }
+
+    #[test]
+    fn resolved_role_membership_rejects_ambiguous_or_incomplete_inputs() {
+        let cases = [
+            serde_json::json!({
+                "references": [
+                    {"slot": "guild_id", "id": "1533137713476272288"},
+                    {"slot": "role_id", "id": "1533137713476272290"},
+                    {"slot": "role_id", "id": "1533137713476272291"}
+                ]
+            }),
+            serde_json::json!({
+                "references": [
+                    {"slot": "guild_id", "id": "1533137713476272288"},
+                    {"slot": "role_id", "id": "1533137713476272290"}
+                ]
+            }),
+            serde_json::json!({
+                "references": [
+                    {"slot": "guild_id", "id": "1533137713476272288"},
+                    {"slot": "role_id", "id": "1533137713476272290"},
+                    {"slot": "member_id", "id": "1056857223529250906"}
+                ]
+            }),
+            serde_json::json!({
+                "references": [
+                    {"slot": "guild_id", "id": "1533137713476272288"},
+                    {"slot": "role_id", "id": "not-a-snowflake"},
+                    {"slot": "user_id", "id": "1056857223529250906"}
+                ]
+            }),
+        ];
+        for document in cases {
+            assert_eq!(
+                resolved_role_membership_ids(&document),
+                Err(D2ProvisionerErrorV1::Inspection)
+            );
+        }
+    }
+
+    #[test]
     fn canonical_identity_hashes_match_contract_vectors() {
         let route = RouteIdentityV1 {
             deployment_id: "deployment-1".to_owned(),
@@ -1692,21 +1827,25 @@ mod tests {
                 D2InspectionEvidenceV1::Interaction(Box::new(InteractionEvidenceV1 {
                     create_interaction_id: "1533137713476272288".to_owned(),
                     join_interaction_id: "1533137713476272289".to_owned(),
+                    actor_user_id: "1056857223529250906".to_owned(),
+                    joined_role_id: "1533137713476272290".to_owned(),
                     deployment_id: "deployment-1".to_owned(),
                     route_identity: route.clone(),
                     instance_id: "instance-1".to_owned(),
                     role_ids: vec!["1533137713476272290".to_owned()],
                     channel_ids: vec!["1533137713476272291".to_owned()],
                     panel_message_ids: vec!["1533137713476272292".to_owned()],
-                    ephemeral_count: 1,
+                    ephemeral_count: 2,
                 })),
                 vec![
+                    "actor_user_id",
                     "channel_ids",
                     "create_interaction_id",
                     "deployment_id",
                     "ephemeral_count",
                     "instance_id",
                     "join_interaction_id",
+                    "joined_role_id",
                     "kind",
                     "observed_at",
                     "panel_message_ids",

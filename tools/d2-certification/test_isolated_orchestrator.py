@@ -3499,9 +3499,9 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
 
     def test_gateway_loss_transport_evidence_uses_unready_boundary_without_route(self):
         self.start_candidate_with_discord_resources()
-        gateway = self.platform.transport_state["gateway"]
-        gateway["partitioned"] = True
-        gateway["partition_events"] = 1
+        partition = ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "partition-gateway"
+        )
         self.platform.health_failure = "29091"
         result = ORCHESTRATOR.command_transport_evidence(
             self.context, self.platform, "gateway-loss"
@@ -3513,6 +3513,29 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         self.assertEqual(evidence["runtime_ready_status"], 503)
         self.assertTrue(evidence["transport_gateway_partitioned"])
         self.assertEqual(evidence["transport_gateway_partition_events"], 1)
+        self.assertEqual(
+            evidence["partition_operation_id"], partition["operation_id"]
+        )
+        partition_completion = json.loads(
+            pathlib.Path(partition["evidence"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            evidence["partition_completion_sha256"],
+            hashlib.sha256(
+                CERTIFICATION.canonical_json(partition_completion).encode("utf-8")
+            ).hexdigest(),
+        )
+        loaded, digest = D2_RUN.read_private_json(
+            pathlib.Path(result["evidence"]), "gateway_loss"
+        )
+        self.assertEqual(loaded, evidence)
+        self.assertEqual(
+            digest,
+            hashlib.sha256(pathlib.Path(result["evidence"]).read_bytes()).hexdigest(),
+        )
+        self.assertEqual(
+            loaded["kind"], D2_RUN.STEP_SOURCE_SPECS[15][1]["kind"]
+        )
         self.assertNotIn("route_id", evidence)
         self.assertNotIn("route_identity", evidence)
         self.platform.health_failure = None
@@ -3524,10 +3547,190 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
                 self.context, self.platform, "gateway-loss"
             )
         self.platform.health_failure = "29091"
-        gateway["partition_events"] = True
+        self.platform.transport_state["gateway"]["partition_events"] = True
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError,
             "transport_gateway_loss_evidence_invalid",
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "gateway-loss"
+            )
+
+    def test_gateway_healed_evidence_binds_durable_operations_and_replays(self):
+        self.start_candidate_with_discord_resources()
+        partition = ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "partition-gateway"
+        )
+        self.platform.health_failure = "29091"
+        loss = ORCHESTRATOR.command_transport_evidence(
+            self.context, self.platform, "gateway-loss"
+        )
+        self.platform.health_failure = None
+        heal = ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "heal-gateway"
+        )
+        result = ORCHESTRATOR.command_transport_evidence(
+            self.context, self.platform, "gateway-healed"
+        )
+        path = pathlib.Path(result["evidence"])
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            path,
+            ORCHESTRATOR.transport_evidence_path(self.context, "gateway-healed"),
+        )
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(evidence["partition_operation_id"], partition["operation_id"])
+        self.assertEqual(evidence["heal_operation_id"], heal["operation_id"])
+        self.assertEqual(evidence["transport_gateway_partition_events"], 1)
+        self.assertFalse(evidence["transport_gateway_partitioned"])
+        self.assertTrue(evidence["gateway_connected"])
+        self.assertEqual(evidence["runtime_ready_status"], 200)
+        for field in (
+            "transport_duplicate_armed",
+            "transport_duplicate_claimed",
+            "transport_indeterminate_armed",
+            "transport_indeterminate_claimed",
+        ):
+            self.assertFalse(evidence[field])
+        loss_source = json.loads(
+            pathlib.Path(loss["evidence"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            evidence["partition_completion_sha256"],
+            loss_source["partition_completion_sha256"],
+        )
+        heal_completion = json.loads(
+            pathlib.Path(heal["evidence"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            evidence["heal_completion_sha256"],
+            hashlib.sha256(
+                CERTIFICATION.canonical_json(heal_completion).encode("utf-8")
+            ).hexdigest(),
+        )
+        loaded, _digest = D2_RUN.read_private_json(path, "gateway_healed")
+        self.assertEqual(loaded, evidence)
+        self.assertEqual(
+            loaded["kind"], D2_RUN.STEP_SOURCE_SPECS[15][2]["kind"]
+        )
+        replay = ORCHESTRATOR.command_transport_evidence(
+            self.context, self.platform, "gateway-healed"
+        )
+        self.assertEqual(replay["status"], "exact_replay")
+
+    def test_gateway_healed_evidence_recovers_lost_heal_response(self):
+        self.start_candidate_with_discord_resources()
+        ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "partition-gateway"
+        )
+        self.platform.health_failure = "29091"
+        ORCHESTRATOR.command_transport_evidence(
+            self.context, self.platform, "gateway-loss"
+        )
+        self.platform.health_failure = None
+        original = self.platform.transport_control
+        injected = False
+
+        def lose_heal_response(context, command, fields=None, timeout_seconds=3):
+            nonlocal injected
+            result = original(context, command, fields, timeout_seconds)
+            if command == "heal_gateway" and not injected:
+                injected = True
+                raise ORCHESTRATOR.OrchestratorError("injected_heal_response_loss")
+            return result
+
+        self.platform.transport_control = lose_heal_response
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_heal_response_loss"
+        ):
+            ORCHESTRATOR.command_transport_control(
+                self.context, self.platform, "heal-gateway"
+            )
+        records, pending = ORCHESTRATOR.transport_control_inventory(self.context)
+        self.assertIsNotNone(pending)
+        intent_operation_id = pending["intent"]["operation_id"]
+        self.platform.transport_control = original
+        replayed = ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "heal-gateway"
+        )
+        self.assertEqual(replayed["operation_id"], intent_operation_id)
+        self.assertEqual(replayed["response"], {"changed": False})
+        healed = ORCHESTRATOR.command_transport_evidence(
+            self.context, self.platform, "gateway-healed"
+        )
+        evidence = json.loads(
+            pathlib.Path(healed["evidence"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(evidence["heal_operation_id"], intent_operation_id)
+        records, pending = ORCHESTRATOR.transport_control_inventory(self.context)
+        self.assertIsNone(pending)
+        self.assertEqual(len(records), 2)
+
+    def test_gateway_healed_evidence_rejects_durable_completion_drift(self):
+        self.start_candidate_with_discord_resources()
+        ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "partition-gateway"
+        )
+        self.platform.health_failure = "29091"
+        loss = ORCHESTRATOR.command_transport_evidence(
+            self.context, self.platform, "gateway-loss"
+        )
+        self.platform.health_failure = None
+        ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "heal-gateway"
+        )
+        loss_path = pathlib.Path(loss["evidence"])
+        loss_value = json.loads(loss_path.read_text(encoding="utf-8"))
+        loss_value["partition_completion_sha256"] = "f" * 64
+        loss_path.write_text(json.dumps(loss_value), encoding="utf-8")
+        loss_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "transport_gateway_heal_binding_invalid",
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "gateway-healed"
+            )
+
+    def test_gateway_evidence_rejects_unhealed_armed_and_unrelated_faults(self):
+        self.start_candidate_with_discord_resources()
+        ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "partition-gateway"
+        )
+        self.platform.health_failure = "29091"
+        ORCHESTRATOR.command_transport_evidence(
+            self.context, self.platform, "gateway-loss"
+        )
+        self.platform.health_failure = None
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "transport_gateway_operation_history_invalid",
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "gateway-healed"
+            )
+        ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "heal-gateway"
+        )
+        gateway = self.platform.transport_state["gateway"]
+        gateway["duplicate_armed"] = True
+        gateway["armed_duplicate_operation_id"] = "d2:test:duplicate-armed"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "transport_gateway_healed_evidence_invalid",
+        ):
+            ORCHESTRATOR.command_transport_evidence(
+                self.context, self.platform, "gateway-healed"
+            )
+        gateway["duplicate_armed"] = False
+        gateway["armed_duplicate_operation_id"] = None
+        ORCHESTRATOR.command_transport_control(
+            self.context, self.platform, "partition-gateway"
+        )
+        self.platform.health_failure = "29091"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "transport_gateway_operation_history_invalid",
         ):
             ORCHESTRATOR.command_transport_evidence(
                 self.context, self.platform, "gateway-loss"
