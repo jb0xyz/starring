@@ -553,8 +553,16 @@ def assemble_authoring_evidence(browser, worker):
     }
 
 
-def assemble_preview_evidence(database):
-    fields = {
+def assemble_preview_evidence(browser, database):
+    browser_fields = {
+        "public_origin",
+        "installation_id",
+        "authoring_session_id",
+        "authoring_generation",
+        "projection_state",
+        "candidate_ruleset_hash",
+    }
+    database_fields = {
         "generation_encrypted",
         "projection_state",
         "generation",
@@ -563,16 +571,57 @@ def assemble_preview_evidence(database):
         "authoring_session_id",
         "generation_created_at",
     }
-    value = _require_envelope(database, "starring.d2.db-authoring-evidence.v1", fields)
-    if value["generation_encrypted"] is not True:
+    public = _require_envelope(
+        browser, "starring.d2.browser-preview-ready-evidence.v1", browser_fields
+    )
+    durable = _require_envelope(
+        database, "starring.d2.db-authoring-evidence.v1", database_fields
+    )
+    _require_public_origin(public["public_origin"], "preview_public_origin_invalid")
+    _require_identifier(public["installation_id"], "preview_installation_id_invalid")
+    _require_identifier(
+        public["authoring_session_id"], "preview_authoring_session_id_invalid"
+    )
+    _require_positive_integer(
+        public["authoring_generation"], "preview_authoring_generation_invalid"
+    )
+    _require_state(
+        public["projection_state"], {"preview_ready"}, "preview_projection_state_invalid"
+    )
+    _require_digest(
+        public["candidate_ruleset_hash"], "preview_candidate_ruleset_hash_invalid"
+    )
+    if durable["generation_encrypted"] is not True:
         _fail("db_generation_encrypted_invalid")
-    _require_state(value["projection_state"], {"preview_ready"}, "db_projection_state_invalid")
-    _require_positive_integer(value["generation"], "db_generation_invalid")
-    _require_digest(value["payload_digest"], "db_payload_digest_invalid")
-    _require_identifier(value["installation_id"], "db_installation_id_invalid")
-    _require_identifier(value["authoring_session_id"], "db_authoring_session_id_invalid")
-    _require_timestamp(value["generation_created_at"], "db_generation_created_at_invalid")
-    return {field: value[field] for field in fields}
+    _require_state(
+        durable["projection_state"], {"preview_ready"}, "db_projection_state_invalid"
+    )
+    _require_positive_integer(durable["generation"], "db_generation_invalid")
+    _require_digest(durable["payload_digest"], "db_payload_digest_invalid")
+    _require_identifier(durable["installation_id"], "db_installation_id_invalid")
+    _require_identifier(
+        durable["authoring_session_id"], "db_authoring_session_id_invalid"
+    )
+    _require_timestamp(
+        durable["generation_created_at"], "db_generation_created_at_invalid"
+    )
+    if (
+        public["installation_id"] != durable["installation_id"]
+        or public["authoring_session_id"] != durable["authoring_session_id"]
+        or public["authoring_generation"] != durable["generation"]
+        or public["projection_state"] != durable["projection_state"]
+        or public["candidate_ruleset_hash"] != durable["payload_digest"]
+        or _timestamp_value(
+            durable["generation_created_at"], "db_generation_created_at_invalid"
+        )
+        > _timestamp_value(public["observed_at"], "preview_observed_at_invalid")
+    ):
+        _fail("preview_public_database_identity_mismatch")
+    return {
+        **{field: durable[field] for field in database_fields},
+        "public_origin": public["public_origin"],
+        "preview_observed_at": public["observed_at"],
+    }
 
 
 def assemble_decision_evidence(browser):
@@ -582,6 +631,7 @@ def assemble_decision_evidence(browser):
         "promotion_id",
         "authoring_session_id",
         "authoring_generation",
+        "target_content_hash",
         "payload_digest",
         "preview_state",
         "approval_state",
@@ -601,6 +651,9 @@ def assemble_decision_evidence(browser):
         value["authoring_generation"], "decision_authoring_generation_invalid"
     )
     _require_digest(value["payload_digest"], "decision_payload_digest_invalid")
+    _require_digest(
+        value["target_content_hash"], "decision_target_content_hash_invalid"
+    )
     _require_state(value["preview_state"], {"pending_approval"}, "preview_state_invalid")
     _require_state(value["approval_state"], {"approved"}, "approval_state_invalid")
     _require_state(
@@ -613,11 +666,13 @@ def assemble_decision_evidence(browser):
         "promotion_id": value["promotion_id"],
         "authoring_session_id": value["authoring_session_id"],
         "authoring_generation": value["authoring_generation"],
+        "target_content_hash": value["target_content_hash"],
         "payload_digest": value["payload_digest"],
         "preview_state": value["preview_state"],
         "approval_state": value["approval_state"],
         "apply_state": "runtime_pending",
         "public_origin": value["public_origin"],
+        "decision_observed_at": value["observed_at"],
     }
 
 

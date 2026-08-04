@@ -33,7 +33,9 @@ ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$")
 SNOWFLAKE_PATTERN = re.compile(r"^[1-9][0-9]{0,19}$")
 RUN_ID_PATTERN = re.compile(r"^d2-[0-9]{8}t[0-9]{6}z-[0-9a-f]{12}$")
 MIGRATION_PATTERN = re.compile(r"^[0-9]{12}$")
-UTC_TIMESTAMP_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+UTC_TIMESTAMP_PATTERN = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$"
+)
 TRANSPORT_INSTANCE_PATTERN = re.compile(r"^d2ti-[0-9a-f]{32}$")
 LIVE_FRESH_LEASE_CHECKPOINT = "live_fresh_lease"
 ZERO_DIGEST = "0" * 64
@@ -219,6 +221,8 @@ STEP_SPECS = {
             "installation_id",
             "authoring_session_id",
             "generation_created_at",
+            "public_origin",
+            "preview_observed_at",
         ),
     ),
     7: StepSpec(
@@ -228,11 +232,13 @@ STEP_SPECS = {
             "promotion_id",
             "authoring_session_id",
             "authoring_generation",
+            "target_content_hash",
             "payload_digest",
             "preview_state",
             "approval_state",
             "apply_state",
             "public_origin",
+            "decision_observed_at",
         ),
     ),
     8: StepSpec(
@@ -1388,6 +1394,10 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         require_identifier(evidence, "installation_id", "authoring_session_id")
         if not validate_utc_timestamp(evidence["generation_created_at"]):
             fail("step_contract_failed:generation_created_at")
+        if not validate_utc_timestamp(evidence["preview_observed_at"]):
+            fail("step_contract_failed:preview_observed_at")
+        if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:
+            fail("step_contract_failed:public_origin")
         if (
             evidence["generation"]
             != prior_receipts[4]["evidence"]["authoring_generation"]
@@ -1417,7 +1427,12 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
     elif step == 7:
         require_identifier(evidence, "installation_id", "authoring_session_id")
         require_positive_integer(evidence, "authoring_generation")
-        require_digest(evidence, "promotion_id", "payload_digest")
+        require_digest(
+            evidence,
+            "promotion_id",
+            "payload_digest",
+            "target_content_hash",
+        )
         if evidence["installation_id"] != prior_receipts[5]["evidence"]["installation_id"]:
             fail("step_contract_failed:installation_id")
         if (
@@ -1425,7 +1440,7 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             != prior_receipts[5]["evidence"]["authoring_session_id"]
             or evidence["authoring_generation"]
             != prior_receipts[5]["evidence"]["generation"]
-            or evidence["payload_digest"]
+            or evidence["target_content_hash"]
             != prior_receipts[5]["evidence"]["payload_digest"]
         ):
             fail("step_contract_failed:product_decision_authoring_identity")
@@ -1437,6 +1452,8 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             fail("step_contract_failed:product_decision_state")
         if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:
             fail("step_contract_failed:public_origin")
+        if not validate_utc_timestamp(evidence["decision_observed_at"]):
+            fail("step_contract_failed:decision_observed_at")
     elif step == 8:
         require_true(evidence, "pending_observed", "live_observed")
         require_identifier(

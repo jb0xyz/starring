@@ -248,6 +248,15 @@ class D2EvidenceTest(unittest.TestCase):
             authoring_session_id="session-1",
             generation_created_at=OBSERVED_AT,
         )
+        public_preview = envelope(
+            "starring.d2.browser-preview-ready-evidence.v1",
+            public_origin=ORIGIN,
+            installation_id=INSTALLATION_ID,
+            authoring_session_id="session-1",
+            authoring_generation=1,
+            projection_state="preview_ready",
+            candidate_ruleset_hash="a" * 64,
+        )
         decision = envelope(
             "starring.d2.browser-product-decision-evidence.v1",
             public_origin=ORIGIN,
@@ -255,6 +264,7 @@ class D2EvidenceTest(unittest.TestCase):
             promotion_id=PROMOTION_ID,
             authoring_session_id="session-1",
             authoring_generation=1,
+            target_content_hash="a" * 64,
             payload_digest="a" * 64,
             preview_state="pending_approval",
             approval_state="approved",
@@ -264,7 +274,11 @@ class D2EvidenceTest(unittest.TestCase):
         self.assertTrue(
             MODULE.assemble_authoring_evidence(authoring, worker)["one_shot"]
         )
-        self.assertTrue(MODULE.assemble_preview_evidence(preview)["generation_encrypted"])
+        self.assertTrue(
+            MODULE.assemble_preview_evidence(public_preview, preview)[
+                "generation_encrypted"
+            ]
+        )
         self.assertEqual(
             MODULE.assemble_decision_evidence(decision)["apply_state"],
             "runtime_pending",

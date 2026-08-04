@@ -268,6 +268,7 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
       "public_origin",
       "runtime_pending_observed",
       "schema_version",
+      "target_content_hash",
     ]
   );
   assert.equal(
@@ -295,6 +296,150 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
   assert.equal(Object.hasOwn(evidence.preview.summary, "target_content_hash"), false);
   assert.equal(Object.hasOwn(evidence.preview.summary, "binding_fingerprint"), false);
   assert.equal(Object.hasOwn(evidence.preview.summary, "expires_at"), false);
+});
+
+
+test("certification authoring and decision phases are separated by a public preview identity", async () => {
+  const approvalDigest = "b".repeat(64);
+  const turnBody = {
+    session_id: "session-1",
+    generation: 1,
+    disposition: "created",
+    projection: {
+      state: "preview_ready",
+      preview: { revision: 1, receipt: { candidate_ruleset_hash: DIGEST } },
+    },
+  };
+  const responses = [
+    response(201, turnBody),
+    response(200, turnBody),
+    response(201, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: approvalDigest,
+      replayed: false,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: approvalDigest,
+      summary: {
+        panels: 1,
+        modals: 1,
+        rules: 4,
+        actions: 15,
+        target_version: 1,
+        required_approvals: 1,
+        target_content_hash: DIGEST,
+      },
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 2,
+      state: "approved",
+      replayed: false,
+    }),
+    response(202, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      state: "runtime_pending",
+      replayed: false,
+    }),
+  ];
+  const calls = [];
+  const product = driver(async (url, options) => {
+    calls.push({ url, options });
+    return responses.shift();
+  }, undefined, { now: () => "2026-08-04T12:00:00Z" });
+  const authoring = await product.beginCertificationAuthoring({
+    installationId: "installation-1",
+    sessionId: "session-1",
+    message: "Create the private study room automation",
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(
+    authoring.preview_ready_evidence.kind,
+    "starring.d2.browser-preview-ready-evidence.v1",
+  );
+  assert.equal(authoring.preview_ready_evidence.candidate_ruleset_hash, DIGEST);
+  let confirmations = 0;
+  const decision = await product.completeCertificationDecision({
+    installationId: "installation-1",
+    sessionId: "session-1",
+    authoringGeneration: 1,
+    candidateRulesetHash: DIGEST,
+    confirmPreview: async (preview) => {
+      confirmations += 1;
+      assert.equal(preview.target_content_hash, DIGEST);
+      assert.equal(preview.payload_digest, approvalDigest);
+      return true;
+    },
+  });
+  assert.equal(calls.length, 6);
+  assert.equal(confirmations, 1);
+  assert.equal(decision.product_decision_evidence.target_content_hash, DIGEST);
+  assert.equal(decision.product_decision_evidence.payload_digest, approvalDigest);
+  assert.equal(decision.applied.state, "runtime_pending");
+});
+
+
+test("certification decision refuses a promotion that does not target the reviewed candidate", async () => {
+  const turnBody = {
+    session_id: "session-1",
+    generation: 1,
+    disposition: "created",
+    projection: {
+      state: "preview_ready",
+      preview: { revision: 1, receipt: { candidate_ruleset_hash: DIGEST } },
+    },
+  };
+  const responses = [
+    response(200, turnBody),
+    response(201, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: DIGEST,
+      replayed: false,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: DIGEST,
+      summary: {
+        panels: 1,
+        modals: 1,
+        rules: 4,
+        actions: 15,
+        target_version: 1,
+        required_approvals: 1,
+        target_content_hash: "c".repeat(64),
+      },
+    }),
+  ];
+  let confirmations = 0;
+  await assert.rejects(
+    driver(async () => responses.shift()).completeCertificationDecision({
+      installationId: "installation-1",
+      sessionId: "session-1",
+      authoringGeneration: 1,
+      candidateRulesetHash: DIGEST,
+      confirmPreview: async () => {
+        confirmations += 1;
+        return true;
+      },
+    }),
+    /promotion_candidate_identity_mismatch/,
+  );
+  assert.equal(confirmations, 0);
 });
 
 
@@ -335,6 +480,7 @@ test("one-shot exact replay emits strict redacted evidence when apply is already
         actions: 15,
         target_version: 1,
         required_approvals: 1,
+        target_content_hash: DIGEST,
       },
     }),
     response(200, {
@@ -416,6 +562,7 @@ test("one-shot flow retries only the exact apply command during a runtime drain"
         actions: 15,
         target_version: 2,
         required_approvals: 1,
+        target_content_hash: DIGEST,
       },
     }),
     response(200, {
@@ -1114,6 +1261,7 @@ test("one-shot flow repairs only an invalid working draft candidate once", async
         actions: 15,
         target_version: 1,
         required_approvals: 1,
+        target_content_hash: DIGEST,
       },
     }),
     response(200, {
@@ -1782,6 +1930,7 @@ test("replacement evidence binds one reviewed target transition without retainin
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
+      payload_digest: DIGEST,
       replayed: false,
     }),
     response(200, {
@@ -1797,6 +1946,7 @@ test("replacement evidence binds one reviewed target transition without retainin
         actions: 15,
         target_version: 2,
         required_approvals: 1,
+        target_content_hash: DIGEST,
       },
     }),
     response(200, {

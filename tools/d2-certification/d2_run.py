@@ -69,6 +69,7 @@ GATEWAY_HEALED_KIND = "starring.d2.transport-gateway-healed-evidence.v1"
 DISCORD_INTERACTION_OBSERVATION_KIND = (
     "starring.d2.browser-discord-interaction-observation.v1"
 )
+PREVIEW_READY_KIND = "starring.d2.browser-preview-ready-evidence.v1"
 
 
 def source_spec(kind, mode):
@@ -87,7 +88,10 @@ STEP_SOURCE_SPECS = {
         source_spec("starring.d2.browser-authoring-evidence.v1", "chrome"),
         source_spec("starring.d2.worker-authoring-evidence.v1", "machine"),
     ),
-    6: (source_spec("starring.d2.db-authoring-evidence.v1", "machine"),),
+    6: (
+        source_spec(PREVIEW_READY_KIND, "chrome"),
+        source_spec("starring.d2.db-authoring-evidence.v1", "machine"),
+    ),
     7: (
         source_spec(
             "starring.d2.browser-product-decision-evidence.v1", "chrome"
@@ -566,12 +570,33 @@ def assemble_step_evidence(
             )
         if step == 6:
             return d2_evidence.assemble_preview_evidence(
+                values[PREVIEW_READY_KIND],
                 values["starring.d2.db-authoring-evidence.v1"]
             )
         if step == 7:
-            return d2_evidence.assemble_decision_evidence(
+            decision = d2_evidence.assemble_decision_evidence(
                 values["starring.d2.browser-product-decision-evidence.v1"]
             )
+            if manifest_path is None or len(prior_receipts) != 6:
+                fail("coordinator_preview_completion_missing")
+            completion = validate_completion(
+                load_coordinator_record(
+                    coordinator_completion_path(manifest_path, 6),
+                    "coordinator_preview_completion",
+                ),
+                manifest,
+                digest,
+                6,
+            )
+            completed_at = datetime.datetime.fromisoformat(
+                completion["observed_at"][:-1] + "+00:00"
+            )
+            decided_at = datetime.datetime.fromisoformat(
+                decision["decision_observed_at"][:-1] + "+00:00"
+            )
+            if decided_at <= completed_at:
+                fail("coordinator_product_decision_precedes_preview_completion")
+            return decision
         if step == 8:
             return d2_evidence.assemble_live_evidence(
                 values["starring.d2.browser-live-evidence.v1"],

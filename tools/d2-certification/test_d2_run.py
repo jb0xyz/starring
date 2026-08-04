@@ -763,6 +763,85 @@ class D2RunCoordinatorTest(unittest.TestCase):
                 self.manifest_digest,
             )
 
+    def test_step_six_joins_public_preview_to_exact_encrypted_generation(self):
+        self.append_prior(5)
+        final = self.complete[6]
+        browser = self.envelope(
+            d2_run.PREVIEW_READY_KIND,
+            observed_at=final["preview_observed_at"],
+            public_origin=final["public_origin"],
+            installation_id=final["installation_id"],
+            authoring_session_id=final["authoring_session_id"],
+            authoring_generation=final["generation"],
+            projection_state=final["projection_state"],
+            candidate_ruleset_hash=final["payload_digest"],
+        )
+        database = self.envelope(
+            "starring.d2.db-authoring-evidence.v1",
+            generation_encrypted=final["generation_encrypted"],
+            projection_state=final["projection_state"],
+            generation=final["generation"],
+            payload_digest=final["payload_digest"],
+            installation_id=final["installation_id"],
+            authoring_session_id=final["authoring_session_id"],
+            generation_created_at=final["generation_created_at"],
+        )
+        result = d2_run.advance_certification(
+            self.manifest_path,
+            6,
+            [str(self.write_source(database)), str(self.write_source(browser))],
+        )
+        self.assertEqual(result["disposition"], "created")
+        self.assertEqual(self.receipts()[5]["evidence"], final)
+
+    def test_step_seven_must_be_observed_after_step_six_completion(self):
+        self.append_prior(6)
+        final = self.complete[7]
+        completion = json.loads(
+            d2_run.coordinator_completion_path(self.manifest_path, 6).read_text(
+                encoding="utf-8"
+            )
+        )
+        completed_at = datetime.datetime.fromisoformat(
+            completion["observed_at"][:-1] + "+00:00"
+        )
+        before = (completed_at - datetime.timedelta(seconds=1)).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        source = self.envelope(
+            "starring.d2.browser-product-decision-evidence.v1",
+            observed_at=before,
+            public_origin=final["public_origin"],
+            installation_id=final["installation_id"],
+            promotion_id=final["promotion_id"],
+            authoring_session_id=final["authoring_session_id"],
+            authoring_generation=final["authoring_generation"],
+            target_content_hash=final["target_content_hash"],
+            payload_digest=final["payload_digest"],
+            preview_state=final["preview_state"],
+            approval_state=final["approval_state"],
+            apply_state=final["apply_state"],
+            runtime_pending_observed=True,
+        )
+        with self.assertRaisesRegex(
+            d2_run.CertificationError,
+            "coordinator_product_decision_precedes_preview_completion",
+        ):
+            d2_run.advance_certification(
+                self.manifest_path, 7, [str(self.write_source(source))]
+            )
+        source["observed_at"] = (
+            completed_at + datetime.timedelta(seconds=1)
+        ).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        result = d2_run.advance_certification(
+            self.manifest_path, 7, [str(self.write_source(source))]
+        )
+        self.assertEqual(result["disposition"], "created")
+        self.assertEqual(
+            self.receipts()[6]["evidence"]["target_content_hash"],
+            final["target_content_hash"],
+        )
+
     def test_step_nine_binds_visible_join_to_durable_actor_role_and_resources(self):
         self.append_prior(8)
         database, transport, browser = self.step_nine_sources()

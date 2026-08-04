@@ -162,17 +162,21 @@ def complete_evidence(manifest):
             "installation_id": installation_id,
             "authoring_session_id": "authoring-session-1",
             "generation_created_at": "2026-08-04T01:02:03Z",
+            "public_origin": manifest["cloudflare"]["public_origin"],
+            "preview_observed_at": "2026-08-04T01:02:03Z",
         },
         7: {
             "installation_id": installation_id,
             "promotion_id": DIGEST,
             "authoring_session_id": "authoring-session-1",
             "authoring_generation": 1,
+            "target_content_hash": DIGEST,
             "payload_digest": DIGEST,
             "preview_state": "pending_approval",
             "approval_state": "approved",
             "apply_state": "runtime_pending",
             "public_origin": manifest["cloudflare"]["public_origin"],
+            "decision_observed_at": "2099-08-04T01:02:03Z",
         },
         8: {
             "pending_observed": True,
@@ -676,7 +680,7 @@ class D2CertificationTest(unittest.TestCase):
         mutations = (
             ("authoring_session_id", "authoring-session-other"),
             ("authoring_generation", 2),
-            ("payload_digest", "f" * 64),
+            ("target_content_hash", "f" * 64),
         )
         for field, replacement in mutations:
             evidence = copy.deepcopy(evidence_by_step[7])

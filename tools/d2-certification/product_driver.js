@@ -10,6 +10,7 @@
   const LIVE_RESTART_CONFIRMATION_KIND = "starring.d2.live-runtime-restart-confirmation.v1";
   const AUTHENTICATION_EVIDENCE_KIND = "starring.d2.browser-authentication-evidence.v1";
   const AUTHORING_EVIDENCE_KIND = "starring.d2.browser-authoring-evidence.v1";
+  const PREVIEW_READY_EVIDENCE_KIND = "starring.d2.browser-preview-ready-evidence.v1";
   const PRODUCT_DECISION_EVIDENCE_KIND = "starring.d2.browser-product-decision-evidence.v1";
   const LIVE_EVIDENCE_KIND = "starring.d2.browser-live-evidence.v1";
   const LIVE_LOSS_EVIDENCE_KIND = "starring.d2.browser-live-loss-evidence.v1";
@@ -739,6 +740,194 @@
       });
     }
 
+    async function beginCertificationAuthoring(input) {
+      const turn = await authoringTurn({
+        installationId: input.installationId,
+        sessionId: input.sessionId,
+        expectedGeneration: input.expectedGeneration || 0,
+        message: input.message,
+        idempotencyKey: input.authoringIdempotencyKey,
+        signal: input.signal,
+      });
+      const projection = projectionEvidence(turn.body);
+      if (
+        ![200, 201].includes(turn.status) ||
+        projection.projection_state !== "preview_ready" ||
+        !Number.isSafeInteger(projection.generation) ||
+        projection.generation < 1
+      ) {
+        throw new Error("authoring_not_preview_ready");
+      }
+      const observed = observedAt();
+      const installationId = requireResourceId(input.installationId, "installation_id");
+      const sessionId = requireResourceId(turn.body.session_id, "authoring_session_id");
+      const generation = requireGeneration(
+        turn.body.generation,
+        "authoring_generation",
+        false,
+      );
+      const candidateRulesetHash = requireDigest(
+        projection.candidate_ruleset_hash,
+        "candidate_ruleset_hash",
+      );
+      return Object.freeze({
+        authoring_evidence: Object.freeze({
+          schema_version: 1,
+          kind: AUTHORING_EVIDENCE_KIND,
+          observed_at: observed,
+          public_origin: origin,
+          authoring_http_status: turn.status,
+          authoring_session_id: sessionId,
+          authoring_generation: generation,
+          installation_id: installationId,
+          one_shot: true,
+        }),
+        preview_ready_evidence: Object.freeze({
+          schema_version: 1,
+          kind: PREVIEW_READY_EVIDENCE_KIND,
+          observed_at: observed,
+          public_origin: origin,
+          installation_id: installationId,
+          authoring_session_id: sessionId,
+          authoring_generation: generation,
+          projection_state: projection.projection_state,
+          candidate_ruleset_hash: candidateRulesetHash,
+        }),
+        authoring_http_status: turn.status,
+        authoring: projection,
+      });
+    }
+
+    async function completeCertificationDecision(input) {
+      if (typeof input.confirmPreview !== "function") {
+        throw new Error("preview_confirmation_required");
+      }
+      const installationId = requireResourceId(input.installationId, "installation_id");
+      const sessionId = requireResourceId(input.sessionId, "authoring_session_id");
+      const generation = requireGeneration(
+        input.authoringGeneration,
+        "authoring_generation",
+        false,
+      );
+      const candidateRulesetHash = requireDigest(
+        input.candidateRulesetHash,
+        "candidate_ruleset_hash",
+      );
+      const current = await authoringSession(installationId, sessionId);
+      const currentProjection = projectionEvidence(current.body);
+      if (
+        current.status !== 200 ||
+        currentProjection.projection_state !== "preview_ready" ||
+        currentProjection.generation !== generation ||
+        currentProjection.candidate_ruleset_hash !== candidateRulesetHash
+      ) {
+        throw new Error("authoring_preview_identity_mismatch");
+      }
+      const promoted = await promote({
+        installationId,
+        sessionId,
+        expectedGeneration: generation,
+        idempotencyKey: input.promotionIdempotencyKey,
+      });
+      if (!promoted.body || promoted.body.state !== "pending_approval") {
+        throw new Error("promotion_not_pending_approval");
+      }
+      const preview = await approvalPreview(installationId, promoted.body.promotion_id);
+      if (!preview.body || preview.body.state !== "pending_approval") {
+        throw new Error("approval_preview_not_pending");
+      }
+      const safeSummary = summaryEvidence(preview.body.summary);
+      const targetContentHash = requireDigest(
+        preview.body.summary.target_content_hash,
+        "target_content_hash",
+      );
+      if (
+        promoted.body.payload_digest !== preview.body.payload_digest ||
+        targetContentHash !== candidateRulesetHash
+      ) {
+        throw new Error("promotion_candidate_identity_mismatch");
+      }
+      const confirmation = Object.freeze({
+        installation_id: preview.body.installation_id,
+        promotion_id: preview.body.promotion_id,
+        revision: preview.body.revision,
+        payload_digest: preview.body.payload_digest,
+        target_content_hash: targetContentHash,
+        summary: safeSummary,
+      });
+      if ((await input.confirmPreview(confirmation)) !== true) {
+        throw new Error("preview_not_approved_by_operator");
+      }
+      const approved = await approve({
+        installationId,
+        promotionId: promoted.body.promotion_id,
+        expectedPayloadDigest: preview.body.payload_digest,
+        expectedRevision: preview.body.revision,
+        idempotencyKey: input.approvalIdempotencyKey,
+      });
+      if (!approved.body || approved.body.state !== "approved") {
+        throw new Error("promotion_not_approved");
+      }
+      const applied = await applyWithDrainHandshake({
+        installationId,
+        promotionId: promoted.body.promotion_id,
+        expectedPayloadDigest: preview.body.payload_digest,
+        expectedRevision: approved.body.revision,
+        idempotencyKey: input.applyIdempotencyKey,
+        runtimeDrainAttempts: input.runtimeDrainAttempts,
+        runtimeDrainIntervalMilliseconds: input.runtimeDrainIntervalMilliseconds,
+        signal: input.signal,
+      });
+      if (!applied.body || !["runtime_pending", "live"].includes(applied.body.state)) {
+        throw new Error("promotion_not_applied");
+      }
+      const productDecisionEvidence = Object.freeze({
+        schema_version: 1,
+        kind: PRODUCT_DECISION_EVIDENCE_KIND,
+        observed_at: observedAt(),
+        public_origin: origin,
+        installation_id: requireResourceId(applied.body.installation_id, "installation_id"),
+        promotion_id: requireDigest(applied.body.promotion_id, "promotion_id"),
+        authoring_session_id: sessionId,
+        authoring_generation: generation,
+        target_content_hash: targetContentHash,
+        payload_digest: requireDigest(preview.body.payload_digest, "payload_digest"),
+        preview_state: preview.body.state,
+        approval_state: approved.body.state,
+        apply_state: applied.body.state,
+        runtime_pending_observed: applied.runtime_pending_observed,
+      });
+      return Object.freeze({
+        product_decision_evidence: productDecisionEvidence,
+        promotion_http_status: promoted.status,
+        promotion: decisionEvidence(promoted.body),
+        preview_http_status: preview.status,
+        preview: {
+          installation_id: preview.body.installation_id,
+          promotion_id: preview.body.promotion_id,
+          revision: preview.body.revision,
+          state: preview.body.state,
+          payload_digest: preview.body.payload_digest,
+          target_content_hash: targetContentHash,
+          summary: safeSummary,
+        },
+        approval_http_status: approved.status,
+        approval: decisionEvidence(approved.body),
+        apply_http_status: applied.status,
+        apply_attempts: applied.attempts,
+        runtime_drain_observed: applied.runtime_drain_observed,
+        runtime_pending_observed: applied.runtime_pending_observed,
+        apply_resumed_after_conflict: applied.resumed_after_conflict,
+        apply_status_observations: applied.status_observations,
+        applied: {
+          installation_id: applied.body.installation_id,
+          promotion_id: applied.body.promotion_id,
+          state: applied.body.state,
+          replayed: applied.body.replayed,
+        },
+      });
+    }
+
     async function runOneShotProductFlow(input) {
       if (typeof input.confirmPreview !== "function") {
         throw new Error("preview_confirmation_required");
@@ -812,6 +1001,20 @@
       if (!preview.body || preview.body.state !== "pending_approval") {
         throw new Error("approval_preview_not_pending");
       }
+      const candidateRulesetHash = requireDigest(
+        projectionEvidence(turn.body).candidate_ruleset_hash,
+        "candidate_ruleset_hash",
+      );
+      const targetContentHash = requireDigest(
+        preview.body.summary.target_content_hash,
+        "target_content_hash",
+      );
+      if (
+        promoted.body.payload_digest !== preview.body.payload_digest ||
+        targetContentHash !== candidateRulesetHash
+      ) {
+        throw new Error("promotion_candidate_identity_mismatch");
+      }
       const safeSummary = summaryEvidence(preview.body.summary);
       const confirmation = Object.freeze({
         installation_id: preview.body.installation_id,
@@ -876,6 +1079,7 @@
           "authoring_generation",
           false,
         ),
+        target_content_hash: targetContentHash,
         payload_digest: requireDigest(preview.body.payload_digest, "payload_digest"),
         preview_state: preview.body.state,
         approval_state: approved.body.state,
@@ -1130,6 +1334,8 @@
       deployment,
       operationalDeployment,
       liveRuntimeRestartConfirmation,
+      beginCertificationAuthoring,
+      completeCertificationDecision,
       runOneShotProductFlow,
       waitForLive,
       waitForLiveEvidence: waitForLive,
