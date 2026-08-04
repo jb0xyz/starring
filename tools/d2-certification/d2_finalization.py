@@ -1623,6 +1623,8 @@ def command_finalize_run(
 ):
     require_certification_eligible_teardown(context)
     ensure_finalization_directory(context)
+    if not _external_present(context, platform):
+        fail("external_keychain_identity_absent")
     step_path = step_sixteen_evidence_path(context)
     if step_path.exists():
         precleanup, teardown, _intent, _result, absence = _load_database_artifacts(context)
@@ -1658,6 +1660,8 @@ def command_finalize_run(
             fail("external_keychain_identity_absent")
         return {"status": "exact_replay", "phase": "cleaned", "step": 16}
     _ensure_effect_freeze(context, platform)
+    if not _external_present(context, platform):
+        fail("external_keychain_identity_absent")
     teardown_path = context.artifact_directory / "discord-resource-teardown-evidence.json"
     if not teardown_path.exists():
         teardown_boundary(context, platform, frozen=True)

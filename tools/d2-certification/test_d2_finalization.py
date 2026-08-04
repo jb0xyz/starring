@@ -246,6 +246,54 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertEqual(self.platform.destroy_calls, 0)
         self.assertFalse(FINALIZATION.freeze_intent_path(self.context).exists())
 
+    def test_finalize_requires_external_credentials_before_freeze(self):
+        external = ORCHESTRATOR.external_keychain_inventory(self.context)[0]
+        self.platform.keychain.remove(external)
+        bootouts = list(self.platform.bootouts)
+        existing = set(self.platform.discord_existing)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "external_keychain_identity_absent",
+        ):
+            self.finalize()
+        self.assertEqual(self.platform.bootouts, bootouts)
+        self.assertEqual(self.platform.discord_existing, existing)
+        self.assertEqual(self.platform.destroy_calls, 0)
+        self.assertFalse(FINALIZATION.freeze_intent_path(self.context).exists())
+        self.assertFalse(
+            ORCHESTRATOR.discord_teardown_evidence_path(
+                self.context, frozen=True
+            ).exists()
+        )
+
+    def test_finalize_rechecks_external_credentials_after_freeze(self):
+        external = ORCHESTRATOR.external_keychain_inventory(self.context)[0]
+        existing = set(self.platform.discord_existing)
+        real_bootout = self.platform.launchd_bootout
+        removed = False
+
+        def bootout(label):
+            nonlocal removed
+            real_bootout(label)
+            if not removed:
+                removed = True
+                self.platform.keychain.remove(external)
+
+        self.platform.launchd_bootout = bootout
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "external_keychain_identity_absent",
+        ):
+            self.finalize()
+        self.assertEqual(self.platform.discord_existing, existing)
+        self.assertEqual(self.platform.destroy_calls, 0)
+        self.assertTrue(FINALIZATION.freeze_intent_path(self.context).is_file())
+        self.assertFalse(
+            ORCHESTRATOR.discord_teardown_evidence_path(
+                self.context, frozen=True
+            ).exists()
+        )
+
     def test_existing_freeze_revalidates_step15_completion_before_mutation(self):
         FINALIZATION._ensure_effect_freeze(self.context, self.platform)
         bootouts = list(self.platform.bootouts)
