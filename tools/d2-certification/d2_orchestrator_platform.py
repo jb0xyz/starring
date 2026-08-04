@@ -91,11 +91,18 @@ class Platform:
             listener.close()
 
     def launchd_loaded(self, label):
+        return not self.launchd_absent(label)
+
+    def launchd_absent(self, label):
         result = self.run(
             [REQUIRED_PROGRAMS["launchctl"], "print", f"gui/{os.getuid()}/{label}"],
             timeout=5,
         )
-        return result.returncode == 0
+        if result.returncode == 113:
+            return True
+        if result.returncode == 0:
+            return False
+        fail("launchd_observation_failed")
 
     def launchd_job(self, label):
         result = self.run(
@@ -182,8 +189,10 @@ class Platform:
         try:
             metadata = path.lstat()
             raw = path.read_bytes()
-        except OSError:
+        except FileNotFoundError:
             return None
+        except OSError:
+            fail("postgres_pid_observation_failed")
         if (
             not stat.S_ISREG(metadata.st_mode)
             or path.is_symlink()
@@ -216,6 +225,28 @@ class Platform:
         if result.returncode == 44:
             return False
         fail("keychain_probe_failed")
+
+    def keychain_item_identity(self, service, account):
+        result = self.run(
+            [
+                REQUIRED_PROGRAMS["security"],
+                "find-generic-password",
+                "-s",
+                service,
+                "-a",
+                account,
+            ],
+            timeout=10,
+        )
+        if result.returncode == 44:
+            return None
+        if result.returncode != 0:
+            fail("keychain_probe_failed")
+        if len(result.stdout) + len(result.stderr) > 64 * 1024:
+            fail("keychain_observation_invalid")
+        return hashlib.sha256(
+            result.stdout + b"\x00" + result.stderr
+        ).hexdigest()
 
     def keychain_write_new(self, service, account, value):
         if self.keychain_present(service, account):
@@ -277,6 +308,71 @@ class Platform:
             [REQUIRED_PROGRAMS["pg_ctl"], "-D", cluster_root, "status"], timeout=10
         )
         return result.returncode == 0
+
+    def postgres_absent(self, cluster_root):
+        cluster = pathlib.Path(cluster_root)
+        status_result = self.run(
+            [REQUIRED_PROGRAMS["pg_ctl"], "-D", cluster, "status"], timeout=10
+        )
+        if status_result.returncode == 0:
+            return False
+        if status_result.returncode != 3:
+            fail("postgres_observation_failed")
+        if self.postgres_pid(cluster) is not None:
+            return False
+        process_result = self.run(
+            [pathlib.Path("/bin/ps"), "-axo", "pid=,command="], timeout=10
+        )
+        if (
+            process_result.returncode != 0
+            or process_result.stderr
+            or len(process_result.stdout) > 4 * 1024 * 1024
+        ):
+            fail("postgres_process_observation_failed")
+        try:
+            process_output = process_result.stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            fail("postgres_process_observation_failed")
+        if str(cluster) in process_output:
+            return False
+        open_file_result = self.run(
+            [pathlib.Path("/usr/sbin/lsof"), "-Fn", "+D", cluster], timeout=30
+        )
+        if open_file_result.returncode == 0:
+            return False
+        if (
+            open_file_result.returncode != 1
+            or open_file_result.stdout
+            or open_file_result.stderr
+        ):
+            fail("postgres_open_file_observation_failed")
+        return True
+
+    def postgres_cluster_identity(self, cluster_root):
+        result = self.run(
+            [
+                REQUIRED_PROGRAMS["pg_ctl"].with_name("pg_controldata"),
+                pathlib.Path(cluster_root),
+            ],
+            timeout=10,
+            environment={
+                "LC_ALL": "C",
+                "LANG": "C",
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            },
+        )
+        if result.returncode != 0 or len(result.stdout) > 256 * 1024:
+            fail("postgres_cluster_identity_observation_failed")
+        try:
+            output = result.stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            fail("postgres_cluster_identity_observation_failed")
+        matches = re.findall(
+            r"(?m)^Database system identifier:\s+([1-9][0-9]*)\s*$", output
+        )
+        if len(matches) != 1:
+            fail("postgres_cluster_identity_observation_failed")
+        return matches[0]
 
     def initdb(self, cluster_root):
         result = self.run(

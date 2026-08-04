@@ -3,7 +3,6 @@ import json
 import os
 import pathlib
 import re
-import shutil
 import stat
 
 from d2_certification import canonical_json, require_absolute_path
@@ -26,6 +25,7 @@ from d2_orchestrator_contract import (
 
 
 LEGACY_RECOVERY_KIND = "starring.d2.legacy-substrate-recovery.v1"
+LEGACY_RECOVERY_PROGRESS_KIND = "starring.d2.legacy-substrate-recovery-progress.v1"
 LEGACY_RECOVERY_PHASES = {
     "preparing",
     "prepared",
@@ -373,32 +373,47 @@ def require_registry_unowned(context):
     return hashlib.sha256(canonical_json(registry).encode("utf-8")).hexdigest()
 
 
-def validate_runtime_root(context):
-    if not context.root.exists() and not context.root.is_symlink():
-        return
+def path_metadata(path):
     try:
-        metadata = context.root.lstat()
+        return path.lstat()
+    except FileNotFoundError:
+        return None
     except OSError:
         fail("legacy_substrate_root_invalid")
+
+
+def validate_runtime_root(context, root=None):
+    selected_root = context.root if root is None else pathlib.Path(root)
+    metadata = path_metadata(selected_root)
+    if metadata is None:
+        return None
+    parent = selected_root.parent
+    parent_metadata = path_metadata(parent)
     if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or context.root.is_symlink()
+        parent_metadata is None
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or selected_root.is_symlink()
         or metadata.st_uid != os.getuid()
         or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_dev != parent_metadata.st_dev
     ):
         fail("legacy_substrate_root_invalid")
-    if context.cluster_root.exists() or context.cluster_root.is_symlink():
-        cluster = context.cluster_root.lstat()
+    cluster_root = selected_root / "postgres"
+    cluster = path_metadata(cluster_root)
+    if cluster is not None:
         if (
             not stat.S_ISDIR(cluster.st_mode)
-            or context.cluster_root.is_symlink()
+            or cluster_root.is_symlink()
             or cluster.st_uid != os.getuid()
             or stat.S_IMODE(cluster.st_mode) != 0o700
+            or cluster.st_dev != metadata.st_dev
         ):
             fail("legacy_substrate_cluster_invalid")
     root_device = metadata.st_dev
     try:
-        for directory, names, files in os.walk(context.root, followlinks=False):
+        for directory, names, files in os.walk(selected_root, followlinks=False):
             for name in names + files:
                 path = pathlib.Path(directory) / name
                 item = path.lstat()
@@ -406,15 +421,452 @@ def validate_runtime_root(context):
                     fail("legacy_substrate_mount_boundary_invalid")
     except OSError:
         fail("legacy_substrate_root_invalid")
+    return metadata
+
+
+def load_lifecycle_journal(context):
+    require_owned_regular(
+        context.journal_path,
+        0o600,
+        "legacy_substrate_journal_invalid",
+        8 * 1024 * 1024,
+    )
+    try:
+        raw = context.journal_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        fail("legacy_substrate_journal_invalid")
+    rows = []
+    for sequence, line in enumerate(raw.splitlines(), 1):
+        try:
+            row = json.loads(line, object_pairs_hook=strict_json_object)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            fail("legacy_substrate_journal_invalid")
+        if (
+            not isinstance(row, dict)
+            or set(row)
+            != {
+                "schema_version",
+                "sequence",
+                "recorded_at",
+                "manifest_sha256",
+                "action",
+                "status",
+                "target",
+            }
+            or row.get("schema_version") != 1
+            or row.get("sequence") != sequence
+            or row.get("manifest_sha256") != context.digest
+            or not isinstance(row.get("recorded_at"), str)
+            or not row["recorded_at"]
+            or len(row["recorded_at"]) > 64
+        ):
+            fail("legacy_substrate_journal_invalid")
+        for field in ("action", "status", "target"):
+            require_identity(row.get(field), "legacy_substrate_journal_invalid")
+        rows.append(row)
+    if not rows:
+        fail("legacy_substrate_journal_invalid")
+    return rows
+
+
+def load_database_evidence(context):
+    evidence = load_strict_json(
+        context.artifact_directory / "database-evidence.json",
+        0o600,
+        "legacy_substrate_database_evidence_invalid",
+        1024 * 1024,
+    )
+    required = {
+        "database_system_identifier",
+        "migration_count",
+        "migration_head",
+        "migration_ledger_sha256",
+        "relation_count",
+        "capability_function_count",
+    }
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != required
+        or not isinstance(evidence.get("database_system_identifier"), str)
+        or not re.fullmatch(r"[1-9][0-9]*", evidence["database_system_identifier"])
+        or type(evidence.get("migration_count")) is not int
+        or evidence["migration_count"] <= 0
+        or not isinstance(evidence.get("migration_head"), str)
+        or not re.fullmatch(r"[0-9]{12}", evidence["migration_head"])
+        or not isinstance(evidence.get("migration_ledger_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(evidence["migration_ledger_sha256"])
+        or type(evidence.get("relation_count")) is not int
+        or evidence["relation_count"] <= 0
+        or type(evidence.get("capability_function_count")) is not int
+        or evidence["capability_function_count"] <= 0
+    ):
+        fail("legacy_substrate_database_evidence_invalid")
+    return evidence
+
+
+def historical_provenance(context):
+    rows = load_lifecycle_journal(context)
+    required_prefix = (
+        ("prepare", "intent", "run"),
+        ("root_create", "intent", "isolated_root"),
+        ("root_create", "complete", "isolated_root"),
+        ("initdb", "intent", "cluster"),
+        ("initdb", "complete", "cluster"),
+        ("postgres_configure", "intent", "cluster"),
+        ("postgres_configure", "complete", "cluster"),
+    )
+    observed_prefix = tuple(
+        (row["action"], row["status"], row["target"])
+        for row in rows[: len(required_prefix)]
+    )
+    if observed_prefix != required_prefix or not any(
+        row["action"] == "database_bootstrap"
+        and row["status"] == "complete"
+        and row["target"] == "database"
+        for row in rows
+    ):
+        fail("legacy_substrate_provenance_invalid")
+    historical_rows = [
+        row for row in rows if row["action"] != "legacy_substrate_recovery"
+    ]
+    database = load_database_evidence(context)
+    projection = {
+        "manifest_sha256": context.digest,
+        "journal": historical_rows,
+        "database_evidence": database,
+    }
+    return {
+        "database_system_identifier": database["database_system_identifier"],
+        "provenance_sha256": hashlib.sha256(
+            canonical_json(projection).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def quarantine_name(context):
+    return f".{context.root.name}.legacy-recovery-{context.digest[:16]}"
+
+
+def recovery_progress_path(context):
+    return context.artifact_directory / "legacy-substrate-recovery-progress.json"
+
+
+def quarantine_path(context):
+    return context.root.parent / quarantine_name(context)
+
+
+def load_recovery_progress(context):
+    path = recovery_progress_path(context)
+    if path_metadata(path) is None:
+        return None
+    progress = load_strict_json(
+        path, 0o600, "legacy_substrate_recovery_progress_invalid", 64 * 1024
+    )
+    if (
+        not isinstance(progress, dict)
+        or set(progress)
+        != {
+            "schema_version",
+            "kind",
+            "manifest_sha256",
+            "run_id",
+            "provenance_sha256",
+            "database_system_identifier",
+            "root_device",
+            "root_inode",
+            "quarantine_name",
+            "phase",
+        }
+        or progress.get("schema_version") != 1
+        or progress.get("kind") != LEGACY_RECOVERY_PROGRESS_KIND
+        or progress.get("manifest_sha256") != context.digest
+        or progress.get("run_id") != context.manifest["run_id"]
+        or not isinstance(progress.get("provenance_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(progress["provenance_sha256"])
+        or not isinstance(progress.get("database_system_identifier"), str)
+        or not re.fullmatch(
+            r"[1-9][0-9]*", progress["database_system_identifier"]
+        )
+        or type(progress.get("root_device")) is not int
+        or progress["root_device"] < 0
+        or type(progress.get("root_inode")) is not int
+        or progress["root_inode"] <= 0
+        or progress.get("quarantine_name") != quarantine_name(context)
+        or progress.get("phase") not in {"planned", "quarantined", "deleted"}
+    ):
+        fail("legacy_substrate_recovery_progress_invalid")
+    return progress
+
+
+def save_recovery_progress(context, progress, phase):
+    updated = {**progress, "phase": phase}
+    write_atomic(
+        recovery_progress_path(context), canonical_json(updated) + "\n"
+    )
+    return updated
+
+
+def require_recovery_provenance(context, platform):
+    historical = historical_provenance(context)
+    progress = load_recovery_progress(context)
+    root = context.root
+    quarantined = quarantine_path(context)
+    root_metadata = path_metadata(root)
+    quarantine_metadata = path_metadata(quarantined)
+    if root_metadata is not None and quarantine_metadata is not None:
+        fail("legacy_substrate_recovery_progress_invalid")
+    selected = root if root_metadata is not None else quarantined
+    selected_metadata = root_metadata or quarantine_metadata
+    if selected_metadata is not None:
+        validated = validate_runtime_root(context, selected)
+        observed_identifier = platform.postgres_cluster_identity(
+            selected / "postgres"
+        )
+        if observed_identifier != historical["database_system_identifier"]:
+            fail("legacy_substrate_cluster_identity_mismatch")
+        root_device = validated.st_dev
+        root_inode = validated.st_ino
+    elif progress is not None and progress["phase"] in {"quarantined", "deleted"}:
+        observed_identifier = progress["database_system_identifier"]
+        root_device = progress["root_device"]
+        root_inode = progress["root_inode"]
+    else:
+        fail("legacy_substrate_provenance_invalid")
+    if progress is not None and (
+        progress["provenance_sha256"] != historical["provenance_sha256"]
+        or progress["database_system_identifier"] != observed_identifier
+        or progress["root_device"] != root_device
+        or progress["root_inode"] != root_inode
+    ):
+        fail("legacy_substrate_recovery_progress_invalid")
+    return {
+        **historical,
+        "root_device": root_device,
+        "root_inode": root_inode,
+    }
+
+
+def ensure_recovery_progress(context, provenance):
+    progress = load_recovery_progress(context)
+    if progress is not None:
+        return progress
+    progress = {
+        "schema_version": 1,
+        "kind": LEGACY_RECOVERY_PROGRESS_KIND,
+        "manifest_sha256": context.digest,
+        "run_id": context.manifest["run_id"],
+        "provenance_sha256": provenance["provenance_sha256"],
+        "database_system_identifier": provenance["database_system_identifier"],
+        "root_device": provenance["root_device"],
+        "root_inode": provenance["root_inode"],
+        "quarantine_name": quarantine_name(context),
+        "phase": "planned",
+    }
+    write_atomic(recovery_progress_path(context), canonical_json(progress) + "\n")
+    return progress
+
+
+def metadata_matches(metadata, progress):
+    return (
+        metadata is not None
+        and stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_dev == progress["root_device"]
+        and metadata.st_ino == progress["root_inode"]
+        and metadata.st_uid == os.getuid()
+    )
+
+
+def remove_tree_contents(descriptor, expected_device):
+    try:
+        entries = list(os.scandir(descriptor))
+    except OSError:
+        fail("legacy_substrate_root_delete_failed")
+    for entry in entries:
+        try:
+            before = os.stat(
+                entry.name, dir_fd=descriptor, follow_symlinks=False
+            )
+        except OSError:
+            fail("legacy_substrate_root_swap_detected")
+        if before.st_dev != expected_device:
+            fail("legacy_substrate_mount_boundary_invalid")
+        if stat.S_ISDIR(before.st_mode):
+            try:
+                child = os.open(
+                    entry.name,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=descriptor,
+                )
+            except OSError:
+                fail("legacy_substrate_root_swap_detected")
+            try:
+                opened = os.fstat(child)
+                if (
+                    opened.st_dev != before.st_dev
+                    or opened.st_ino != before.st_ino
+                ):
+                    fail("legacy_substrate_root_swap_detected")
+                remove_tree_contents(child, expected_device)
+            finally:
+                os.close(child)
+            try:
+                after = os.stat(
+                    entry.name, dir_fd=descriptor, follow_symlinks=False
+                )
+                if after.st_dev != before.st_dev or after.st_ino != before.st_ino:
+                    fail("legacy_substrate_root_swap_detected")
+                os.rmdir(entry.name, dir_fd=descriptor)
+            except OSError:
+                fail("legacy_substrate_root_swap_detected")
+        else:
+            try:
+                after = os.stat(
+                    entry.name, dir_fd=descriptor, follow_symlinks=False
+                )
+                if after.st_dev != before.st_dev or after.st_ino != before.st_ino:
+                    fail("legacy_substrate_root_swap_detected")
+                os.unlink(entry.name, dir_fd=descriptor)
+            except OSError:
+                fail("legacy_substrate_root_swap_detected")
+
+
+def remove_quarantined_root(context, progress):
+    parent_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        parent = os.open(context.root.parent, parent_flags)
+    except OSError:
+        fail("legacy_substrate_root_invalid")
+    try:
+        try:
+            before = os.stat(
+                progress["quarantine_name"],
+                dir_fd=parent,
+                follow_symlinks=False,
+            )
+        except OSError:
+            fail("legacy_substrate_root_swap_detected")
+        if not metadata_matches(before, progress):
+            fail("legacy_substrate_root_swap_detected")
+        try:
+            root = os.open(
+                progress["quarantine_name"],
+                parent_flags,
+                dir_fd=parent,
+            )
+        except OSError:
+            fail("legacy_substrate_root_swap_detected")
+        try:
+            opened = os.fstat(root)
+            if not metadata_matches(opened, progress):
+                fail("legacy_substrate_root_swap_detected")
+            remove_tree_contents(root, progress["root_device"])
+        finally:
+            os.close(root)
+        try:
+            after = os.stat(
+                progress["quarantine_name"],
+                dir_fd=parent,
+                follow_symlinks=False,
+            )
+            if not metadata_matches(after, progress):
+                fail("legacy_substrate_root_swap_detected")
+            os.rmdir(progress["quarantine_name"], dir_fd=parent)
+            os.fsync(parent)
+        except OSError:
+            fail("legacy_substrate_root_swap_detected")
+    finally:
+        os.close(parent)
+
+
+def recover_runtime_root(context, provenance, platform):
+    if any(
+        not platform.launchd_absent(service["label"])
+        for service in context.manifest["services"].values()
+    ):
+        fail("legacy_substrate_launchd_active")
+    progress = ensure_recovery_progress(context, provenance)
+    root_metadata = path_metadata(context.root)
+    quarantined = quarantine_path(context)
+    quarantine_metadata = path_metadata(quarantined)
+    if root_metadata is not None and quarantine_metadata is not None:
+        fail("legacy_substrate_root_swap_detected")
+    if root_metadata is not None:
+        validated = validate_runtime_root(context)
+        if not metadata_matches(validated, progress):
+            fail("legacy_substrate_root_swap_detected")
+        parent_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            parent = os.open(context.root.parent, parent_flags)
+        except OSError:
+            fail("legacy_substrate_root_invalid")
+        try:
+            try:
+                before = os.stat(
+                    context.root.name, dir_fd=parent, follow_symlinks=False
+                )
+                if not metadata_matches(before, progress):
+                    fail("legacy_substrate_root_swap_detected")
+                os.rename(
+                    context.root.name,
+                    progress["quarantine_name"],
+                    src_dir_fd=parent,
+                    dst_dir_fd=parent,
+                )
+                after = os.stat(
+                    progress["quarantine_name"],
+                    dir_fd=parent,
+                    follow_symlinks=False,
+                )
+                if not metadata_matches(after, progress):
+                    fail("legacy_substrate_root_swap_detected")
+                os.fsync(parent)
+            except OSError:
+                fail("legacy_substrate_root_swap_detected")
+        finally:
+            os.close(parent)
+        progress = save_recovery_progress(context, progress, "quarantined")
+    elif quarantine_metadata is not None:
+        if not metadata_matches(quarantine_metadata, progress):
+            fail("legacy_substrate_root_swap_detected")
+        progress = save_recovery_progress(context, progress, "quarantined")
+    elif progress["phase"] in {"planned", "quarantined"}:
+        return save_recovery_progress(context, progress, "deleted")
+    if progress["phase"] == "quarantined":
+        cluster_root = quarantined / "postgres"
+        if any(
+            not platform.launchd_absent(service["label"])
+            for service in context.manifest["services"].values()
+        ):
+            fail("legacy_substrate_launchd_active")
+        if not platform.postgres_absent(cluster_root):
+            fail("legacy_substrate_postgres_active")
+        remove_quarantined_root(context, progress)
+        progress = save_recovery_progress(context, progress, "deleted")
+    if path_metadata(context.root) is not None or path_metadata(quarantined) is not None:
+        fail("legacy_substrate_recovery_incomplete")
+    return progress
 
 
 def keychain_state(context, platform):
     inventory = keychain_inventory(context)
-    present = {
-        (service, account)
-        for service, account in inventory
-        if platform.keychain_present(service, account)
-    }
+    identities = {}
+    for service, account in inventory:
+        identity = platform.keychain_item_identity(service, account)
+        if identity is not None:
+            if not isinstance(identity, str) or not DIGEST_PATTERN.fullmatch(identity):
+                fail("legacy_substrate_keychain_identity_invalid")
+            identities[(service, account)] = identity
+    present = set(identities)
     for service in sorted({service for service, _account in inventory}):
         service_present = {
             account for item_service, account in present if item_service == service
@@ -426,21 +878,74 @@ def keychain_state(context, platform):
             )
         ):
             fail("legacy_substrate_keychain_ownership_invalid")
-    return inventory, present
+    return inventory, present, identities
+
+
+def recover_keychain_items(context, platform):
+    inventory, present, baseline = keychain_state(context, platform)
+    deleted = set()
+    services = sorted({service for service, _account in inventory})
+    for service in services:
+        accounts = sorted(
+            (
+                account
+                for item_service, account in present
+                if item_service == service
+            ),
+            key=lambda account: account == OWNER_ACCOUNT,
+        )
+        for account in accounts:
+            current_inventory, current_present, current = keychain_state(
+                context, platform
+            )
+            expected = {
+                identity: value
+                for identity, value in baseline.items()
+                if identity not in deleted
+            }
+            if current_inventory != inventory or current != expected:
+                fail("legacy_substrate_keychain_identity_drift")
+            target = (service, account)
+            if target not in current_present:
+                fail("legacy_substrate_keychain_identity_drift")
+            if not platform.keychain_owner_matches(
+                service, context.manifest["run_id"]
+            ):
+                fail("legacy_substrate_keychain_ownership_invalid")
+            if platform.keychain_item_identity(service, account) != baseline[target]:
+                fail("legacy_substrate_keychain_identity_drift")
+            platform.keychain_delete(service, account)
+            if platform.keychain_item_identity(service, account) is not None:
+                fail("legacy_substrate_keychain_delete_unconfirmed")
+            deleted.add(target)
 
 
 def legacy_substrate_status(context, state, platform):
     validate_runtime_root(context)
+    progress = load_recovery_progress(context)
+    quarantined = quarantine_path(context)
+    quarantine_metadata = path_metadata(quarantined)
+    if quarantine_metadata is not None:
+        if progress is None or not metadata_matches(quarantine_metadata, progress):
+            fail("legacy_substrate_recovery_progress_invalid")
+        if path_metadata(context.root) is not None:
+            fail("legacy_substrate_root_swap_detected")
+        validate_runtime_root(context, quarantined)
     registry_sha256 = require_registry_unowned(context)
-    inventory, present = keychain_state(context, platform)
+    inventory, present, _identities = keychain_state(context, platform)
     current_snapshot = standing_snapshot(context, platform)
     loaded = [
         name
         for name, service in sorted(context.manifest["services"].items())
-        if platform.launchd_loaded(service["label"])
+        if not platform.launchd_absent(service["label"])
     ]
-    postgres_running = context.cluster_root.exists() and platform.postgres_running(
-        context.cluster_root
+    cluster_root = (
+        quarantined / "postgres"
+        if quarantine_metadata is not None
+        else context.cluster_root
+    )
+    postgres_running = path_metadata(cluster_root) is not None and not platform.postgres_absent(
+        cluster_root
     )
     return {
         "status": "observed",
@@ -448,6 +953,7 @@ def legacy_substrate_status(context, state, platform):
         "run_id": context.manifest["run_id"],
         "manifest_sha256": context.digest,
         "runtime_root_present": context.root.exists(),
+        "quarantine_present": quarantine_metadata is not None,
         "postgres_running": postgres_running,
         "loaded_services": loaded,
         "keychain_items_present": len(present),
@@ -470,7 +976,13 @@ def require_inert(context, state, platform):
     return status
 
 
-def recovery_evidence(context, state, observed_status, registry_unchanged):
+def recovery_evidence(
+    context, state, observed_status, registry_unchanged, provenance
+):
+    root_absent = (
+        path_metadata(context.root) is None
+        and path_metadata(quarantine_path(context)) is None
+    )
     return {
         "schema_version": 1,
         "kind": LEGACY_RECOVERY_KIND,
@@ -478,16 +990,115 @@ def recovery_evidence(context, state, observed_status, registry_unchanged):
         "run_id": context.manifest["run_id"],
         "observed_at": utc_now(),
         "recovered_from_phase": state["phase"],
-        "database_absent": not context.root.exists(),
+        "database_absent": root_absent,
         "postgres_process_absent": not observed_status["postgres_running"],
         "launchd_jobs_absent": not observed_status["loaded_services"],
         "keychain_items_absent": observed_status["keychain_items_present"] == 0,
-        "isolated_root_absent": not context.root.exists(),
+        "isolated_root_absent": root_absent,
+        "quarantine_absent": root_absent,
         "protected_staging_unchanged": observed_status[
             "protected_staging_unchanged"
         ],
         "discord_ownership_registry_unchanged": registry_unchanged,
+        "provenance_sha256": provenance["provenance_sha256"],
+        "database_system_identifier": provenance["database_system_identifier"],
+        "root_device": provenance["root_device"],
+        "root_inode": provenance["root_inode"],
+        "keychain_identity_boundary": "metadata-reobserved-before-each-delete",
     }
+
+
+def load_recovery_evidence(context, provenance):
+    evidence = load_strict_json(
+        context.artifact_directory / "legacy-substrate-recovery.json",
+        0o600,
+        "legacy_substrate_recovery_evidence_invalid",
+        256 * 1024,
+    )
+    required = {
+        "schema_version",
+        "kind",
+        "manifest_sha256",
+        "run_id",
+        "observed_at",
+        "recovered_from_phase",
+        "database_absent",
+        "postgres_process_absent",
+        "launchd_jobs_absent",
+        "keychain_items_absent",
+        "isolated_root_absent",
+        "quarantine_absent",
+        "protected_staging_unchanged",
+        "discord_ownership_registry_unchanged",
+        "provenance_sha256",
+        "database_system_identifier",
+        "root_device",
+        "root_inode",
+        "keychain_identity_boundary",
+    }
+    if (
+        not isinstance(evidence, dict)
+        or set(evidence) != required
+        or evidence.get("schema_version") != 1
+        or evidence.get("kind") != LEGACY_RECOVERY_KIND
+        or evidence.get("manifest_sha256") != context.digest
+        or evidence.get("run_id") != context.manifest["run_id"]
+        or not isinstance(evidence.get("observed_at"), str)
+        or not evidence["observed_at"]
+        or evidence.get("recovered_from_phase") not in LEGACY_RECOVERY_PHASES - {"cleaned"}
+        or evidence.get("provenance_sha256") != provenance["provenance_sha256"]
+        or evidence.get("database_system_identifier")
+        != provenance["database_system_identifier"]
+        or evidence.get("root_device") != provenance["root_device"]
+        or evidence.get("root_inode") != provenance["root_inode"]
+        or evidence.get("keychain_identity_boundary")
+        != "metadata-reobserved-before-each-delete"
+        or not all(
+            evidence.get(field) is True
+            for field in (
+                "database_absent",
+                "postgres_process_absent",
+                "launchd_jobs_absent",
+                "keychain_items_absent",
+                "isolated_root_absent",
+                "quarantine_absent",
+                "protected_staging_unchanged",
+                "discord_ownership_registry_unchanged",
+            )
+        )
+    ):
+        fail("legacy_substrate_recovery_evidence_invalid")
+    return evidence
+
+
+def ensure_recovery_journal_complete(context):
+    rows = load_lifecycle_journal(context)
+    for row in rows:
+        if row["action"] == "legacy_substrate_recovery" and (
+            row["target"] != "run"
+            or row["status"] not in {"intent", "failed", "complete"}
+        ):
+            fail("legacy_substrate_recovery_journal_incomplete")
+    recovery_rows = [
+        (index, row)
+        for index, row in enumerate(rows)
+        if row["action"] == "legacy_substrate_recovery"
+        and row["target"] == "run"
+    ]
+    intents = [index for index, row in recovery_rows if row["status"] == "intent"]
+    if not intents:
+        fail("legacy_substrate_recovery_journal_incomplete")
+    last_intent = intents[-1]
+    if (
+        recovery_rows[-1][0] <= last_intent
+        or recovery_rows[-1][1]["status"] != "complete"
+    ):
+        append_journal(context, "legacy_substrate_recovery", "complete", "run")
+        rows = load_lifecycle_journal(context)
+        if rows[-1]["action"] != "legacy_substrate_recovery" or rows[-1][
+            "status"
+        ] != "complete":
+            fail("legacy_substrate_recovery_journal_incomplete")
 
 
 def command_status(context, state, platform):
@@ -509,37 +1120,34 @@ def command_recover(
     if state["phase"] == "cleaned":
         if (
             initial["runtime_root_present"]
+            or initial["quarantine_present"]
             or initial["keychain_items_present"] != 0
         ):
             fail("legacy_substrate_cleaned_state_drift")
+        provenance = require_recovery_provenance(context, platform)
+        evidence = load_recovery_evidence(context, provenance)
+        ensure_recovery_journal_complete(context)
         return {
             "status": "already_recovered",
             "phase": "cleaned",
-            **recovery_evidence(context, state, initial, True),
+            **evidence,
         }
+    provenance = require_recovery_provenance(context, platform)
+    ensure_recovery_progress(context, provenance)
     append_journal(context, "legacy_substrate_recovery", "intent", "run")
     try:
-        inventory, present = keychain_state(context, platform)
-        services = sorted({service for service, _account in inventory})
-        for service in services:
-            accounts = sorted(
-                (
-                    account
-                    for item_service, account in present
-                    if item_service == service
-                ),
-                key=lambda account: account == OWNER_ACCOUNT,
-            )
-            for account in accounts:
-                platform.keychain_delete(service, account)
-        if context.root.exists() or context.root.is_symlink():
-            validate_runtime_root(context)
-            shutil.rmtree(context.root)
+        recover_keychain_items(context, platform)
+        require_inert(context, state, platform)
+        recover_runtime_root(context, provenance, platform)
     except BaseException:
         append_journal(context, "legacy_substrate_recovery", "failed", "run")
         raise
     final = require_inert(context, state, platform)
-    if final["runtime_root_present"] or final["keychain_items_present"] != 0:
+    if (
+        final["runtime_root_present"]
+        or final["quarantine_present"]
+        or final["keychain_items_present"] != 0
+    ):
         append_journal(context, "legacy_substrate_recovery", "failed", "run")
         fail("legacy_substrate_recovery_incomplete")
     evidence = recovery_evidence(
@@ -547,6 +1155,7 @@ def command_recover(
         state,
         final,
         initial["registry_sha256"] == final["registry_sha256"],
+        provenance,
     )
     if not all(
         evidence[field]
@@ -556,6 +1165,7 @@ def command_recover(
             "launchd_jobs_absent",
             "keychain_items_absent",
             "isolated_root_absent",
+            "quarantine_absent",
             "protected_staging_unchanged",
             "discord_ownership_registry_unchanged",
         )

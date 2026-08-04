@@ -17,21 +17,63 @@ class FakePlatform:
     def __init__(self):
         self.loaded = set()
         self.postgres = False
+        self.launchd_error = None
+        self.postgres_error = None
+        self.cluster_identity = "7669853998318333589"
         self.keychain = set()
         self.owner_values = {}
         self.deleted = []
         self.delete_failure = None
+        self.identity_versions = {}
+        self.identity_reads = {}
+        self.replace_identity = None
+        self.replace_identity_at_read = None
+        self.owner_match_reads = {}
+        self.owner_drift_service = None
+        self.owner_drift_at_read = None
 
-    def launchd_loaded(self, label):
-        return label in self.loaded
+    def launchd_absent(self, label):
+        if self.launchd_error is not None:
+            raise OrchestratorError(self.launchd_error)
+        return label not in self.loaded
 
-    def postgres_running(self, cluster_root):
-        return self.postgres
+    def postgres_absent(self, cluster_root):
+        if self.postgres_error is not None:
+            raise OrchestratorError(self.postgres_error)
+        return not self.postgres
+
+    def postgres_cluster_identity(self, cluster_root):
+        return self.cluster_identity
 
     def keychain_present(self, service, account):
         return (service, account) in self.keychain
 
+    def keychain_item_identity(self, service, account):
+        identity = (service, account)
+        if identity not in self.keychain:
+            return None
+        reads = self.identity_reads.get(identity, 0) + 1
+        self.identity_reads[identity] = reads
+        if (
+            identity == self.replace_identity
+            and reads == self.replace_identity_at_read
+        ):
+            self.identity_versions[identity] = (
+                self.identity_versions.get(identity, 0) + 1
+            )
+        version = self.identity_versions.get(identity, 0)
+        return hashlib.sha256(
+            f"{service}\x00{account}\x00{version}".encode("utf-8")
+        ).hexdigest()
+
     def keychain_owner_matches(self, service, expected):
+        reads = self.owner_match_reads.get(service, 0) + 1
+        self.owner_match_reads[service] = reads
+        if (
+            service == self.owner_drift_service
+            and reads == self.owner_drift_at_read
+        ):
+            return False
         return self.owner_values.get(service) == expected
 
     def keychain_delete(self, service, account):
@@ -82,6 +124,7 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
         self.manifest_path = self.run_directory / "manifest.json"
         self.digest = self.write_manifest(self.manifest)
         self.write_state("candidate_started")
+        self.write_historical_provenance()
         self.platform = FakePlatform()
         self.runtime_patch = mock.patch.object(
             recovery, "D2_RUNTIME_ROOT_PARENT", self.runtime_parent
@@ -213,6 +256,48 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
         path.write_text(canonical_json(state) + "\n", encoding="utf-8")
         path.chmod(0o600)
 
+    def write_historical_provenance(self):
+        entries = (
+            ("prepare", "intent", "run"),
+            ("root_create", "intent", "isolated_root"),
+            ("root_create", "complete", "isolated_root"),
+            ("initdb", "intent", "cluster"),
+            ("initdb", "complete", "cluster"),
+            ("postgres_configure", "intent", "cluster"),
+            ("postgres_configure", "complete", "cluster"),
+            ("database_bootstrap", "intent", "database"),
+            ("database_bootstrap", "complete", "database"),
+        )
+        rows = []
+        for sequence, (action, status, target) in enumerate(entries, 1):
+            rows.append(
+                canonical_json(
+                    {
+                        "schema_version": 1,
+                        "sequence": sequence,
+                        "recorded_at": "2026-08-03T17:10:43Z",
+                        "manifest_sha256": self.digest,
+                        "action": action,
+                        "status": status,
+                        "target": target,
+                    }
+                )
+            )
+        journal = self.artifact_directory / "lifecycle.jsonl"
+        journal.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        journal.chmod(0o600)
+        evidence = {
+            "database_system_identifier": "7669853998318333589",
+            "migration_count": 121,
+            "migration_head": "202608030002",
+            "migration_ledger_sha256": "a" * 64,
+            "relation_count": 198,
+            "capability_function_count": 137,
+        }
+        path = self.artifact_directory / "database-evidence.json"
+        path.write_text(canonical_json(evidence) + "\n", encoding="utf-8")
+        path.chmod(0o600)
+
     def recover(self):
         return recovery.command_recover(
             self.context,
@@ -324,6 +409,131 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
             self.recover()
         self.assertTrue(self.root.exists())
 
+    def test_status_allows_insufficient_provenance_but_recovery_fails_closed(self):
+        result = recovery.command_status(self.context, self.state, self.platform)
+        self.assertTrue(result["runtime_root_present"])
+        (self.artifact_directory / "database-evidence.json").unlink()
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_database_evidence_invalid"
+        ):
+            self.recover()
+        self.assertTrue(self.root.exists())
+        self.assertEqual(len(self.platform.keychain), 29)
+
+    def test_recovery_rejects_forged_historical_journal(self):
+        journal = self.artifact_directory / "lifecycle.jsonl"
+        rows = journal.read_text(encoding="utf-8").splitlines()
+        forged = json.loads(rows[2])
+        forged["action"] = "unrelated_create"
+        rows[2] = canonical_json(forged)
+        journal.write_text("\n".join(rows) + "\n", encoding="utf-8")
+        journal.chmod(0o600)
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_provenance_invalid"
+        ):
+            self.recover()
+        self.assertTrue(self.root.exists())
+
+    def test_recovery_rejects_cluster_identity_mismatch(self):
+        self.platform.cluster_identity = "7669853998318333590"
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_cluster_identity_mismatch"
+        ):
+            self.recover()
+        self.assertTrue(self.root.exists())
+
+    def test_status_rejects_runtime_root_on_different_parent_device(self):
+        original = recovery.path_metadata
+
+        def different_device(path):
+            metadata = original(path)
+            if pathlib.Path(path) != self.root or metadata is None:
+                return metadata
+            changed = mock.Mock()
+            changed.st_mode = metadata.st_mode
+            changed.st_uid = metadata.st_uid
+            changed.st_dev = metadata.st_dev + 1
+            changed.st_ino = metadata.st_ino
+            return changed
+
+        with mock.patch.object(
+            recovery, "path_metadata", side_effect=different_device
+        ):
+            with self.assertRaisesRegex(
+                OrchestratorError, "legacy_substrate_root_invalid"
+            ):
+                recovery.command_status(self.context, self.state, self.platform)
+
+    def test_recovery_detects_root_inode_swap_after_quarantine_rename(self):
+        original_rename = recovery.os.rename
+        preserved = self.base / "preserved-root"
+
+        def swap_then_rename(source, target, src_dir_fd=None, dst_dir_fd=None):
+            original_rename(self.root, preserved)
+            self.root.mkdir(mode=0o700)
+            (self.root / "postgres").mkdir(mode=0o700)
+            return original_rename(
+                source,
+                target,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
+
+        with mock.patch.object(recovery.os, "rename", side_effect=swap_then_rename):
+            with self.assertRaisesRegex(
+                OrchestratorError, "legacy_substrate_root_swap_detected"
+            ):
+                self.recover()
+        self.assertTrue(preserved.exists())
+        self.assertTrue(recovery.quarantine_path(self.context).exists())
+
+    def test_recovery_resumes_crash_after_quarantine_rename(self):
+        provenance = recovery.require_recovery_provenance(
+            self.context, self.platform
+        )
+        progress = recovery.ensure_recovery_progress(self.context, provenance)
+        self.assertEqual(progress["phase"], "planned")
+        self.root.rename(recovery.quarantine_path(self.context))
+        result = self.recover()
+        self.assertEqual(result["status"], "recovered")
+        self.assertFalse(recovery.quarantine_path(self.context).exists())
+        saved = recovery.load_recovery_progress(self.context)
+        self.assertEqual(saved["phase"], "deleted")
+
+    def test_recovery_fails_closed_on_launchd_and_postgres_observation_errors(self):
+        self.platform.launchd_error = "launchd_observation_failed"
+        with self.assertRaisesRegex(OrchestratorError, "launchd_observation_failed"):
+            self.recover()
+        self.platform.launchd_error = None
+        self.platform.postgres_error = "postgres_observation_failed"
+        with self.assertRaisesRegex(OrchestratorError, "postgres_observation_failed"):
+            self.recover()
+        self.assertTrue(self.root.exists())
+        self.assertEqual(len(self.platform.keychain), 29)
+
+    def test_recovery_revalidates_keychain_identity_before_delete(self):
+        service = self.manifest["keychain_services"]["api"]
+        target = (service, "database.apply-executor")
+        self.platform.replace_identity = target
+        self.platform.replace_identity_at_read = 4
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_keychain_identity_drift"
+        ):
+            self.recover()
+        self.assertIn(target, self.platform.keychain)
+        self.assertTrue(self.root.exists())
+
+    def test_recovery_revalidates_keychain_owner_before_each_delete(self):
+        service = self.manifest["keychain_services"]["api"]
+        self.platform.owner_drift_service = service
+        self.platform.owner_drift_at_read = 4
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_keychain_ownership_invalid"
+        ):
+            self.recover()
+        self.assertEqual(self.platform.deleted, [])
+        self.assertTrue(self.root.exists())
+
     def test_recovery_records_failure_and_resumes_partial_keychain_cleanup(self):
         service = self.manifest["keychain_services"]["api"]
         failing = (service, "database.authorized-snapshot-reader")
@@ -340,6 +550,56 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
         self.platform.delete_failure = None
         result = self.recover()
         self.assertEqual(result["status"], "recovered")
+
+    def test_cleaned_replay_requires_durable_evidence(self):
+        self.recover()
+        evidence = self.artifact_directory / "legacy-substrate-recovery.json"
+        evidence.unlink()
+        context, cleaned = recovery.load_legacy_context(self.manifest_path)
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_recovery_evidence_invalid"
+        ):
+            recovery.command_recover(
+                context, cleaned, self.platform, self.run_id, self.digest
+            )
+
+    def test_cleaned_replay_rejects_corrupt_durable_evidence(self):
+        self.recover()
+        path = self.artifact_directory / "legacy-substrate-recovery.json"
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+        evidence["quarantine_absent"] = False
+        path.write_text(canonical_json(evidence) + "\n", encoding="utf-8")
+        path.chmod(0o600)
+        context, cleaned = recovery.load_legacy_context(self.manifest_path)
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_recovery_evidence_invalid"
+        ):
+            recovery.command_recover(
+                context, cleaned, self.platform, self.run_id, self.digest
+            )
+
+    def test_cleaned_replay_repairs_incomplete_completion_journal(self):
+        self.recover()
+        journal = self.artifact_directory / "lifecycle.jsonl"
+        rows = journal.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(json.loads(rows[-1])["status"], "complete")
+        journal.write_text("\n".join(rows[:-1]) + "\n", encoding="utf-8")
+        journal.chmod(0o600)
+        context, cleaned = recovery.load_legacy_context(self.manifest_path)
+        result = recovery.command_recover(
+            context, cleaned, self.platform, self.run_id, self.digest
+        )
+        self.assertEqual(result["status"], "already_recovered")
+        repaired = [
+            json.loads(line)
+            for line in journal.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(repaired[-1]["action"], "legacy_substrate_recovery")
+        self.assertEqual(repaired[-1]["status"], "complete")
+        self.assertEqual(
+            result["keychain_identity_boundary"],
+            "metadata-reobserved-before-each-delete",
+        )
 
     def test_loader_rejects_digest_label_root_and_state_tampering(self):
         cases = []

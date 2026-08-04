@@ -107,6 +107,109 @@ class WorkerPlatform(PLATFORM.Platform):
         return self.response
 
 
+class CommandPlatform(PLATFORM.Platform):
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def run(self, arguments, input_bytes=None, timeout=30, environment=None):
+        self.calls.append([str(argument) for argument in arguments])
+        if not self.responses:
+            raise AssertionError("unexpected_platform_command")
+        return self.responses.pop(0)
+
+
+def command_response(returncode, stdout=b"", stderr=b""):
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+class PlatformAbsenceObservationTests(unittest.TestCase):
+    def assert_platform_failure(self, code, operation):
+        with self.assertRaisesRegex(CONTRACT.OrchestratorError, f"^{code}$"):
+            operation()
+
+    def test_launchd_absence_accepts_only_exact_not_found(self):
+        self.assertTrue(CommandPlatform([command_response(113)]).launchd_absent("job"))
+        self.assertFalse(CommandPlatform([command_response(0)]).launchd_absent("job"))
+        self.assert_platform_failure(
+            "launchd_observation_failed",
+            lambda: CommandPlatform([command_response(1)]).launchd_absent("job"),
+        )
+
+    def test_postgres_absence_requires_exact_status_process_and_open_file_absence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = pathlib.Path(temporary)
+            absent = CommandPlatform(
+                [
+                    command_response(3),
+                    command_response(0, b"  7 /usr/bin/python\n"),
+                    command_response(1),
+                ]
+            )
+            self.assertTrue(absent.postgres_absent(cluster))
+            self.assertFalse(
+                CommandPlatform([command_response(0)]).postgres_absent(cluster)
+            )
+            process = CommandPlatform(
+                [
+                    command_response(3),
+                    command_response(0, f"  9 postgres -D {cluster}\n".encode()),
+                ]
+            )
+            self.assertFalse(process.postgres_absent(cluster))
+            open_file = CommandPlatform(
+                [
+                    command_response(3),
+                    command_response(0, b"  7 /usr/bin/python\n"),
+                    command_response(0, b"p9\nf1\n"),
+                ]
+            )
+            self.assertFalse(open_file.postgres_absent(cluster))
+            (cluster / "postmaster.pid").write_text("123\n", encoding="ascii")
+            self.assertFalse(
+                CommandPlatform([command_response(3)]).postgres_absent(cluster)
+            )
+
+    def test_postgres_absence_fails_closed_on_observation_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = pathlib.Path(temporary)
+            self.assert_platform_failure(
+                "postgres_observation_failed",
+                lambda: CommandPlatform([command_response(1)]).postgres_absent(
+                    cluster
+                ),
+            )
+            self.assert_platform_failure(
+                "postgres_process_observation_failed",
+                lambda: CommandPlatform(
+                    [command_response(3), command_response(1)]
+                ).postgres_absent(cluster),
+            )
+            self.assert_platform_failure(
+                "postgres_open_file_observation_failed",
+                lambda: CommandPlatform(
+                    [
+                        command_response(3),
+                        command_response(0),
+                        command_response(2),
+                    ]
+                ).postgres_absent(cluster),
+            )
+
+    def test_postgres_cluster_identity_is_exact(self):
+        output = b"Database system identifier:           7669853998318333589\n"
+        platform = CommandPlatform([command_response(0, output)])
+        self.assertEqual(
+            platform.postgres_cluster_identity(pathlib.Path("/tmp/cluster")),
+            "7669853998318333589",
+        )
+        self.assert_platform_failure(
+            "postgres_cluster_identity_observation_failed",
+            lambda: CommandPlatform([command_response(0, b"invalid\n")])
+            .postgres_cluster_identity(pathlib.Path("/tmp/cluster")),
+        )
+
+
 def worker_context():
     return SimpleNamespace(
         manifest={
