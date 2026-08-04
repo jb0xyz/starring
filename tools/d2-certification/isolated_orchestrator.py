@@ -73,6 +73,11 @@ from d2_finalization import (
     require_certification_eligible_teardown,
 )
 from d2_live_runtime_restart import command_certify_live_runtime_restart
+from d2_legacy_substrate_recovery import (
+    command_recover as command_recover_legacy_substrate,
+    command_status as command_legacy_substrate_status,
+    load_legacy_context,
+)
 from d2_source_contract import (
     publish_bootstrap_source,
     publish_candidate_source,
@@ -2545,13 +2550,30 @@ def build_parser():
     total_absence.add_argument("--manifest", required=True)
     total_absence.add_argument("--prefix-scan-evidence", required=True)
     total_absence.add_argument("--guild-deletion-evidence", required=True)
+    legacy_status = subparsers.add_parser("legacy-substrate-status")
+    legacy_status.add_argument("--manifest", required=True)
+    legacy_recovery = subparsers.add_parser("recover-legacy-substrate")
+    legacy_recovery.add_argument("--manifest", required=True)
+    legacy_recovery.add_argument("--confirm-run-id", required=True)
+    legacy_recovery.add_argument("--confirm-manifest-sha256", required=True)
     return parser
 
 
 def main():
     arguments = build_parser().parse_args()
     try:
-        context = load_context(require_absolute_path(arguments.manifest, "manifest"))
+        if arguments.command in {
+            "legacy-substrate-status",
+            "recover-legacy-substrate",
+        }:
+            context, legacy_state = load_legacy_context(
+                require_absolute_path(arguments.manifest, "manifest")
+            )
+        else:
+            context = load_context(
+                require_absolute_path(arguments.manifest, "manifest")
+            )
+            legacy_state = None
         platform = Platform()
         handlers = {
             "dry-run": command_dry_run,
@@ -2565,7 +2587,19 @@ def main():
             "status": command_status,
         }
         with global_operation_lock():
-            if arguments.command == "onboard":
+            if arguments.command == "legacy-substrate-status":
+                result = command_legacy_substrate_status(
+                    context, legacy_state, platform
+                )
+            elif arguments.command == "recover-legacy-substrate":
+                result = command_recover_legacy_substrate(
+                    context,
+                    legacy_state,
+                    platform,
+                    arguments.confirm_run_id,
+                    arguments.confirm_manifest_sha256,
+                )
+            elif arguments.command == "onboard":
                 result = command_onboard(
                     context, platform, arguments.principal_id, arguments.display_name
                 )

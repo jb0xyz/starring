@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+
+import copy
+import hashlib
+import json
+import pathlib
+import tempfile
+import unittest
+from unittest import mock
+
+import d2_legacy_substrate_recovery as recovery
+from d2_certification import canonical_json
+from d2_orchestrator_contract import OrchestratorError, keychain_inventory
+
+
+class FakePlatform:
+    def __init__(self):
+        self.loaded = set()
+        self.postgres = False
+        self.keychain = set()
+        self.owner_values = {}
+        self.deleted = []
+        self.delete_failure = None
+
+    def launchd_loaded(self, label):
+        return label in self.loaded
+
+    def postgres_running(self, cluster_root):
+        return self.postgres
+
+    def keychain_present(self, service, account):
+        return (service, account) in self.keychain
+
+    def keychain_owner_matches(self, service, expected):
+        return self.owner_values.get(service) == expected
+
+    def keychain_delete(self, service, account):
+        if self.delete_failure == (service, account):
+            raise OrchestratorError("keychain_delete_failed")
+        self.keychain.discard((service, account))
+        self.deleted.append((service, account))
+
+
+class LegacySubstrateRecoveryTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = pathlib.Path(self.temporary.name).resolve()
+        self.runtime_parent = self.base / "runtime"
+        self.runtime_parent.mkdir(mode=0o700)
+        self.release_root = self.base / "release-certifications"
+        self.release_root.mkdir(mode=0o700)
+        self.run_id = "d2-20260803t171032z-fd1232a7b31c"
+        self.run_directory = self.release_root / self.run_id
+        self.run_directory.mkdir(mode=0o700)
+        self.artifact_directory = self.run_directory / "orchestrator"
+        self.artifact_directory.mkdir(mode=0o700)
+        self.root = self.runtime_parent / f"starring-d2-{self.run_id}"
+        self.root.mkdir(mode=0o700)
+        (self.root / "postgres").mkdir(mode=0o700)
+        (self.root / "socket").mkdir(mode=0o700)
+        self.snapshot = {
+            "launchd_loaded": {
+                "local.cloudflared.starring": True,
+                "local.starring.api.staging": True,
+                "local.starring.codex-worker": True,
+                "local.starring.runtime.staging": True,
+            },
+            "plist_sha256": {
+                "local.cloudflared.starring": "1" * 64,
+                "local.starring.api.staging": "2" * 64,
+                "local.starring.codex-worker": "3" * 64,
+                "local.starring.runtime.staging": "4" * 64,
+            },
+            "port_occupied": {
+                "5432": True,
+                "18080": True,
+                "18181": True,
+                "19091": True,
+            },
+        }
+        self.manifest = self.build_manifest()
+        self.manifest_path = self.run_directory / "manifest.json"
+        self.digest = self.write_manifest(self.manifest)
+        self.write_state("candidate_started")
+        self.platform = FakePlatform()
+        self.runtime_patch = mock.patch.object(
+            recovery, "D2_RUNTIME_ROOT_PARENT", self.runtime_parent
+        )
+        self.snapshot_patch = mock.patch.object(
+            recovery, "standing_snapshot", return_value=copy.deepcopy(self.snapshot)
+        )
+        self.registry_patch = mock.patch.object(
+            recovery,
+            "load_discord_ownership_registry",
+            return_value={"schema_version": 1, "kind": "test", "owners": []},
+        )
+        self.runtime_patch.start()
+        self.snapshot_patch.start()
+        self.registry = self.registry_patch.start()
+        self.context, self.state = recovery.load_legacy_context(self.manifest_path)
+        for service, account in keychain_inventory(self.context):
+            self.platform.keychain.add((service, account))
+        for service in self.manifest["keychain_services"].values():
+            self.platform.owner_values[service] = self.run_id
+
+    def tearDown(self):
+        self.registry_patch.stop()
+        self.snapshot_patch.stop()
+        self.runtime_patch.stop()
+        self.temporary.cleanup()
+
+    def build_manifest(self):
+        suffix = self.run_id.rsplit("-", 1)[1]
+        return {
+            "schema_version": 1,
+            "run_id": self.run_id,
+            "commit_sha": "a" * 40,
+            "created_at": "2026-08-03T17:10:32Z",
+            "public_origin": "https://d2-api.starring.co.kr",
+            "cloudflare": {},
+            "authoring": {},
+            "candidates": {"historical": "source-pins-need-not-remain-current"},
+            "source_trees": {"historical": "source-pins-need-not-remain-current"},
+            "discord": {
+                "guild_id": "1533137713476272288",
+                "hub_channel_id": "1533137713476272289",
+                "application_id": "1533144492293754900",
+                "bot_user_id": "1533144492293754901",
+                "actor_id": "1056857223529250906",
+                "resource_prefix": "starring-d2-fd1232a7b31c",
+                "disposable_guild_required": True,
+            },
+            "database": {
+                "cluster_root": str(self.root / "postgres"),
+                "socket_directory": str(self.root / "socket"),
+                "name": "starring_runtime_staging",
+                "port": 55435,
+            },
+            "services": {
+                "api": {
+                    "label": f"local.starring.d2.{suffix}.api",
+                    "port": 28080,
+                },
+                "runtime": {
+                    "label": f"local.starring.d2.{suffix}.runtime",
+                    "port": 29093,
+                },
+                "transport": {
+                    "label": f"local.starring.d2.{suffix}.transport",
+                    "gateway_port": 29105,
+                    "http_port": 29106,
+                },
+                "tunnel": {"label": f"local.starring.d2.{suffix}.tunnel"},
+                "worker": {
+                    "label": f"local.starring.d2.{suffix}.worker",
+                    "port": 28183,
+                },
+            },
+            "keychain_services": {
+                "api": f"starring.d2.{suffix}.api",
+                "runtime": f"starring.d2.{suffix}.runtime",
+                "postgres": f"starring.d2.{suffix}.postgres",
+                "worker": f"starring.d2.{suffix}.worker",
+            },
+            "external_keychain": {
+                "discord_oauth_client_secret": {
+                    "service": "starring.d2.credentials",
+                    "account": "discord.oauth-client-secret",
+                },
+                "discord_bot_token": {
+                    "service": "starring.d2.credentials",
+                    "account": "discord.bot-token",
+                },
+                "tunnel_token": {
+                    "service": "starring.d2.credentials",
+                    "account": "cloudflare.tunnel-token",
+                },
+            },
+            "protected_staging": {
+                "database": "starring_runtime_staging@127.0.0.1:5432",
+                "launchd_labels": [
+                    "local.starring.api.staging",
+                    "local.starring.codex-worker",
+                    "local.starring.runtime.staging",
+                    "local.cloudflared.starring",
+                ],
+                "mutation_allowed": False,
+            },
+            "expected_steps": list(range(1, 18)),
+            "human_boundaries": [],
+        }
+
+    def write_manifest(self, manifest):
+        payload = canonical_json(manifest)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        self.manifest_path.write_text(payload + "\n", encoding="utf-8")
+        self.manifest_path.chmod(0o600)
+        digest_path = self.run_directory / "manifest.sha256"
+        digest_path.write_text(digest + "\n", encoding="ascii")
+        digest_path.chmod(0o600)
+        return digest
+
+    def write_state(self, phase):
+        state = {
+            "schema_version": 1,
+            "manifest_sha256": self.digest,
+            "run_id": self.run_id,
+            "phase": phase,
+            "updated_at": "2026-08-03T17:14:45Z",
+            "standing_snapshot": copy.deepcopy(self.snapshot),
+        }
+        path = self.artifact_directory / "state.json"
+        path.write_text(canonical_json(state) + "\n", encoding="utf-8")
+        path.chmod(0o600)
+
+    def recover(self):
+        return recovery.command_recover(
+            self.context,
+            self.state,
+            self.platform,
+            self.run_id,
+            self.digest,
+        )
+
+    def test_historical_source_pins_do_not_block_status(self):
+        result = recovery.command_status(self.context, self.state, self.platform)
+        self.assertEqual(result["phase"], "candidate_started")
+        self.assertEqual(result["keychain_items_present"], 29)
+        self.assertTrue(result["runtime_root_present"])
+        self.assertFalse(result["postgres_running"])
+        self.assertEqual(result["loaded_services"], [])
+
+    def test_recovery_removes_only_owned_inert_substrate_and_is_idempotent(self):
+        result = self.recover()
+        self.assertEqual(result["status"], "recovered")
+        self.assertFalse(self.root.exists())
+        self.assertEqual(self.platform.keychain, set())
+        for service in self.manifest["keychain_services"].values():
+            deleted = [
+                account
+                for item_service, account in self.platform.deleted
+                if item_service == service
+            ]
+            self.assertEqual(deleted[-1], "lifecycle-owner")
+        state = json.loads((self.artifact_directory / "state.json").read_text())
+        self.assertEqual(state["phase"], "cleaned")
+        evidence = json.loads(
+            (self.artifact_directory / "legacy-substrate-recovery.json").read_text()
+        )
+        self.assertEqual(evidence["kind"], recovery.LEGACY_RECOVERY_KIND)
+        self.assertTrue(evidence["isolated_root_absent"])
+        context, cleaned = recovery.load_legacy_context(self.manifest_path)
+        again = recovery.command_recover(
+            context, cleaned, self.platform, self.run_id, self.digest
+        )
+        self.assertEqual(again["status"], "already_recovered")
+
+    def test_recovery_requires_exact_run_and_digest_confirmation(self):
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_run_confirmation_mismatch"
+        ):
+            recovery.command_recover(
+                self.context, self.state, self.platform, "wrong", self.digest
+            )
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_digest_confirmation_mismatch"
+        ):
+            recovery.command_recover(
+                self.context, self.state, self.platform, self.run_id, "0" * 64
+            )
+        self.assertTrue(self.root.exists())
+        self.assertEqual(len(self.platform.keychain), 29)
+
+    def test_recovery_rejects_active_processes_before_mutation(self):
+        self.platform.postgres = True
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_postgres_active"
+        ):
+            self.recover()
+        self.platform.postgres = False
+        self.platform.loaded.add(self.manifest["services"]["runtime"]["label"])
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_launchd_active"
+        ):
+            self.recover()
+        self.assertEqual(len(self.platform.keychain), 29)
+
+    def test_recovery_rejects_keychain_without_matching_owner(self):
+        service = self.manifest["keychain_services"]["api"]
+        self.platform.owner_values[service] = "another-run"
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_keychain_ownership_invalid"
+        ):
+            self.recover()
+        self.assertEqual(len(self.platform.keychain), 29)
+
+    def test_recovery_rejects_registry_collision(self):
+        self.registry.return_value = {
+            "schema_version": 1,
+            "kind": "test",
+            "owners": [
+                {
+                    "run_id": self.run_id,
+                    "manifest_sha256": "f" * 64,
+                    "manifest_path": "/tmp/other",
+                    "guild_id": "1533137713476272280",
+                    "application_id": "1533144492293754909",
+                    "bot_user_id": "1533144492293754908",
+                }
+            ],
+        }
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_registry_conflict"
+        ):
+            self.recover()
+
+    def test_recovery_rejects_protected_staging_drift(self):
+        changed = copy.deepcopy(self.snapshot)
+        changed["port_occupied"]["5432"] = False
+        recovery.standing_snapshot.return_value = changed
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_protected_staging_drift"
+        ):
+            self.recover()
+        self.assertTrue(self.root.exists())
+
+    def test_recovery_records_failure_and_resumes_partial_keychain_cleanup(self):
+        service = self.manifest["keychain_services"]["api"]
+        failing = (service, "database.authorized-snapshot-reader")
+        self.platform.delete_failure = failing
+        with self.assertRaisesRegex(OrchestratorError, "keychain_delete_failed"):
+            self.recover()
+        rows = [
+            json.loads(line)
+            for line in (self.artifact_directory / "lifecycle.jsonl")
+            .read_text()
+            .splitlines()
+        ]
+        self.assertEqual(rows[-1]["status"], "failed")
+        self.platform.delete_failure = None
+        result = self.recover()
+        self.assertEqual(result["status"], "recovered")
+
+    def test_loader_rejects_digest_label_root_and_state_tampering(self):
+        cases = []
+        digest_manifest = copy.deepcopy(self.manifest)
+        digest_manifest["commit_sha"] = "b" * 40
+        cases.append(("digest", digest_manifest, False))
+        label_manifest = copy.deepcopy(self.manifest)
+        label_manifest["services"]["api"]["label"] = "local.starring.api.staging"
+        cases.append(("label", label_manifest, True))
+        root_manifest = copy.deepcopy(self.manifest)
+        root_manifest["database"]["cluster_root"] = "/private/tmp/other"
+        cases.append(("root", root_manifest, True))
+        for name, manifest, rewrite_digest in cases:
+            with self.subTest(name=name):
+                self.write_manifest(self.manifest)
+                self.write_state("candidate_started")
+                payload = canonical_json(manifest)
+                self.manifest_path.write_text(payload + "\n", encoding="utf-8")
+                self.manifest_path.chmod(0o600)
+                if rewrite_digest:
+                    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+                    path = self.run_directory / "manifest.sha256"
+                    path.write_text(digest + "\n", encoding="ascii")
+                    path.chmod(0o600)
+                    state = json.loads(
+                        (self.artifact_directory / "state.json").read_text()
+                    )
+                    state["manifest_sha256"] = digest
+                    state_path = self.artifact_directory / "state.json"
+                    state_path.write_text(canonical_json(state) + "\n")
+                    state_path.chmod(0o600)
+                with self.assertRaises(OrchestratorError):
+                    recovery.load_legacy_context(self.manifest_path)
+
+    def test_loader_rejects_symlinked_runtime_root(self):
+        target = self.base / "outside"
+        target.mkdir()
+        for child in sorted(self.root.rglob("*"), reverse=True):
+            if child.is_dir():
+                child.rmdir()
+            else:
+                child.unlink()
+        self.root.rmdir()
+        self.root.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_root_invalid"
+        ):
+            recovery.command_status(self.context, self.state, self.platform)
+
+
+if __name__ == "__main__":
+    unittest.main()
