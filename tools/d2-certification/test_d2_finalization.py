@@ -115,6 +115,7 @@ class D2FinalizationTest(unittest.TestCase):
             return_value={
                 "step15_receipt_sha256": "a" * 64,
                 "step15_completion_sha256": "b" * 64,
+                "step15_completed_at": "2026-08-04T01:02:00.000001Z",
             },
         )
         self.certification_mock = self.certification_gate.start()
@@ -244,6 +245,52 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertEqual(self.platform.bootouts, bootouts)
         self.assertEqual(self.platform.destroy_calls, 0)
         self.assertFalse(FINALIZATION.freeze_intent_path(self.context).exists())
+
+    def test_existing_freeze_revalidates_step15_completion_before_mutation(self):
+        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        bootouts = list(self.platform.bootouts)
+        self.certification_mock.side_effect = ORCHESTRATOR.OrchestratorError(
+            "finalization_certification_prefix_incomplete"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "finalization_certification_prefix_incomplete",
+        ):
+            self.finalize()
+        self.assertEqual(self.platform.bootouts, bootouts)
+        self.assertEqual(self.platform.destroy_calls, 0)
+
+    def test_existing_freeze_rejects_step15_completion_and_chronology_drift(self):
+        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        bootouts = list(self.platform.bootouts)
+        self.certification_mock.return_value = {
+            "step15_receipt_sha256": "a" * 64,
+            "step15_completion_sha256": "e" * 64,
+            "step15_completed_at": "2026-08-04T01:02:00.000001Z",
+        }
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "finalization_freeze_certification_invalid",
+        ):
+            self.finalize()
+        self.assertEqual(self.platform.bootouts, bootouts)
+        self.certification_mock.return_value = {
+            "step15_receipt_sha256": "a" * 64,
+            "step15_completion_sha256": "b" * 64,
+            "step15_completed_at": "2026-08-04T01:02:00.000001Z",
+        }
+        path = FINALIZATION.freeze_intent_path(self.context)
+        intent = json.loads(path.read_text())
+        intent["recorded_at"] = "2026-08-04T01:01:59.000001Z"
+        path.write_text(json.dumps(intent), encoding="utf-8")
+        path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "finalization_freeze_chronology_invalid",
+        ):
+            self.finalize()
+        self.assertEqual(self.platform.bootouts, bootouts)
+        self.assertEqual(self.platform.destroy_calls, 0)
 
     def test_finalize_requires_healed_unarmed_transport_before_freeze(self):
         cases = (

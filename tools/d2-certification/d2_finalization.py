@@ -702,6 +702,7 @@ def require_certification_prefix(context):
     return {
         "step15_receipt_sha256": receipts[14]["receipt_sha256"],
         "step15_completion_sha256": _digest(completion),
+        "step15_completed_at": completion["observed_at"],
     }
 
 
@@ -780,6 +781,39 @@ def validate_freeze_intent(context, value):
     return value
 
 
+def validate_freeze_certification(intent, certification):
+    if (
+        not isinstance(certification, dict)
+        or set(certification)
+        != {
+            "step15_receipt_sha256",
+            "step15_completion_sha256",
+            "step15_completed_at",
+        }
+        or intent["certification_step15_receipt_sha256"]
+        != certification["step15_receipt_sha256"]
+        or intent["coordinator_step15_completion_sha256"]
+        != certification["step15_completion_sha256"]
+    ):
+        fail("finalization_freeze_certification_invalid")
+    _require_digest(
+        certification["step15_receipt_sha256"],
+        "finalization_freeze_certification_invalid",
+    )
+    _require_digest(
+        certification["step15_completion_sha256"],
+        "finalization_freeze_certification_invalid",
+    )
+    if _parse_timestamp(
+        certification["step15_completed_at"],
+        "finalization_freeze_certification_invalid",
+    ) > _parse_timestamp(
+        intent["recorded_at"], "finalization_freeze_certification_invalid"
+    ):
+        fail("finalization_freeze_chronology_invalid")
+    return intent
+
+
 def certified_teardown_binding(context):
     freeze = validate_freeze_intent(
         context,
@@ -827,11 +861,13 @@ def _initial_freeze_boundary(context, platform):
 
 def _ensure_effect_freeze(context, platform):
     ensure_finalization_directory(context)
+    certification = require_certification_prefix(context)
     path = freeze_intent_path(context)
     if path.exists():
         intent = validate_freeze_intent(
             context, _load_private(path, "finalization_freeze_intent")
         )
+        validate_freeze_certification(intent, certification)
         if any(
             platform.launchd_loaded(context.manifest["services"][name]["label"])
             for name in FREEZE_STOP_ORDER
@@ -844,7 +880,6 @@ def _ensure_effect_freeze(context, platform):
             quiescence_sha256,
             resource_inventory_digest_sha256,
         ) = _initial_freeze_boundary(context, platform)
-        certification = require_certification_prefix(context)
         intent = {
             "schema_version": 1,
             "kind": FINALIZATION_FREEZE_KIND,
@@ -864,6 +899,7 @@ def _ensure_effect_freeze(context, platform):
             "discord_effects_frozen": True,
         }
         validate_freeze_intent(context, intent)
+        validate_freeze_certification(intent, certification)
         write_atomic(path, canonical_json(intent) + "\n")
     _stop_services(context, platform, FREEZE_STOP_ORDER)
     if any(
