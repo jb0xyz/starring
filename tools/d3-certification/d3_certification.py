@@ -13,6 +13,14 @@ import sys
 import time
 import urllib.parse
 
+from d3_candidate_bundle import (
+    CandidateBundleError,
+    ensure_candidate_bundle,
+    load_candidate_bundle,
+    record_file_identity,
+    validate_d2_manifest_binding,
+)
+
 
 SCHEMA_VERSION = 1
 MAX_JSON_BYTES = 1024 * 1024
@@ -356,6 +364,25 @@ class StateLock:
             self.handle.close()
 
 
+def sanitized_environment(extra=None):
+    environment = {
+        name: os.environ[name]
+        for name in SAFE_ENVIRONMENT_NAMES
+        if name in os.environ
+    }
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["LC_ALL"] = "C"
+    environment["CARGO_INCREMENTAL"] = "0"
+    if extra is not None:
+        if not isinstance(extra, dict) or any(
+            not isinstance(name, str) or not isinstance(value, str)
+            for name, value in extra.items()
+        ):
+            fail("process_environment_invalid")
+        environment.update(extra)
+    return environment
+
+
 def run_process(
     argv,
     cwd,
@@ -365,14 +392,7 @@ def run_process(
     discard=False,
     postgres_database_url=None,
 ):
-    environment = {
-        name: os.environ[name]
-        for name in SAFE_ENVIRONMENT_NAMES
-        if name in os.environ
-    }
-    environment["GIT_TERMINAL_PROMPT"] = "0"
-    environment["LC_ALL"] = "C"
-    environment["CARGO_INCREMENTAL"] = "0"
+    environment = sanitized_environment()
     if postgres_database_url is not None:
         environment["STARRING_TEST_DATABASE_URL"] = postgres_database_url
     try:
@@ -1097,12 +1117,40 @@ def command_run_gates(arguments):
         _, latest, open_attempts = gate_status(records, len(digests))
         if open_attempts or any(index not in latest or latest[index]["exit_code"] != 0 for index in range(1, len(digests) + 1)):
             fail("gate_set_incomplete")
+        gate_chain = records[-1]["record_sha256"]
+
+        def revalidate_candidate_inputs():
+            observed_path, observed_state, _, observed_repo, observed_worktree = load_state(
+                str(state_path)
+            )
+            if (
+                observed_path != state_path
+                or observed_state != state
+                or observed_repo != repo
+                or observed_worktree != worktree
+                or require_gate_completion(root, state) != gate_chain
+            ):
+                fail("candidate_build_state_changed")
+
+        try:
+            bundle, bundle_disposition = ensure_candidate_bundle(
+                state_path,
+                state,
+                worktree,
+                gate_chain,
+                revalidate_candidate_inputs,
+            )
+        except CandidateBundleError as error:
+            fail(str(error))
         return {
             "merge_commit": state["merge_commit"],
             "merge_tree": state["merge_tree"],
             "gates": len(digests),
             "status": "passed",
-            "evidence_chain_head_sha256": records[-1]["record_sha256"],
+            "evidence_chain_head_sha256": gate_chain,
+            "candidate_bundle": str(root / "candidate-bundle" / "bundle.json"),
+            "candidate_bundle_sha256": bundle["record_sha256"],
+            "candidate_bundle_disposition": bundle_disposition,
         }
 
 
@@ -1163,6 +1211,11 @@ def command_bind_d2(arguments):
     state_argument, root = state_lock_target(arguments.state)
     with StateLock(root):
         state_path, state, _, repo, worktree = load_state(str(state_argument))
+        gate_chain = require_gate_completion(root, state)
+        try:
+            candidate_bundle = load_candidate_bundle(root, state, gate_chain)
+        except CandidateBundleError as error:
+            fail(str(error))
         d2_manifest = load_json_file(d2_manifest_path, "d2_manifest", 0o600)
         if not isinstance(d2_manifest, dict):
             fail("d2_manifest_invalid")
@@ -1176,6 +1229,16 @@ def command_bind_d2(arguments):
             fail("d2_commit_mismatch")
         if commit_tree(repo, d2_manifest["commit_sha"], "d2_commit") != state["merge_tree"]:
             fail("d2_tree_mismatch")
+        try:
+            candidate_bundle_file = validate_d2_manifest_binding(
+                d2_manifest,
+                state,
+                worktree,
+                root,
+                candidate_bundle,
+            )
+        except CandidateBundleError as error:
+            fail(str(error))
         receipts = load_d2_receipts(d2_manifest_path.with_name("receipts.jsonl"), d2_manifest, manifest_digest)
         final_record = load_json_file(d2_final_path, "d2_final_record", 0o600)
         expected_final_fields = {
@@ -1231,6 +1294,12 @@ def command_bind_d2(arguments):
             "kind": "starring.d3.d2-binding.v1",
             "merge_commit": state["merge_commit"],
             "merge_tree": state["merge_tree"],
+            "gate_evidence_chain_head_sha256": gate_chain,
+            "candidate_bundle_path": str(
+                root / "candidate-bundle" / "bundle.json"
+            ),
+            "candidate_bundle_record_sha256": candidate_bundle["record_sha256"],
+            "candidate_bundle_file_sha256": candidate_bundle_file["sha256"],
             "run_id": final_record["run_id"],
             "manifest_sha256": manifest_digest,
             "steps": 17,
@@ -1260,6 +1329,23 @@ def command_recheck(arguments):
         state_path, state, _, repo, _ = load_state(str(state_argument))
         gate_chain = require_gate_completion(state_path.parent, state)
         binding = load_binding(state_path.parent, state)
+        try:
+            candidate_bundle = load_candidate_bundle(
+                state_path.parent, state, gate_chain
+            )
+            candidate_bundle_file = record_file_identity(state_path.parent)
+        except CandidateBundleError as error:
+            fail(str(error))
+        if (
+            binding["gate_evidence_chain_head_sha256"] != gate_chain
+            or binding["candidate_bundle_path"]
+            != str(state_path.parent / "candidate-bundle" / "bundle.json")
+            or binding["candidate_bundle_record_sha256"]
+            != candidate_bundle["record_sha256"]
+            or binding["candidate_bundle_file_sha256"]
+            != candidate_bundle_file["sha256"]
+        ):
+            fail("candidate_bundle_binding_mismatch")
         if github_repository_from_remote(repo, state["remote"]) != state["github_repository"]:
             fail("state_github_repository_mismatch")
         head, base, merge = fetch_candidate(
@@ -1285,6 +1371,8 @@ def command_recheck(arguments):
             "merge_commit": merge,
             "merge_tree": state["merge_tree"],
             "gate_evidence_chain_head_sha256": gate_chain,
+            "candidate_bundle_record_sha256": candidate_bundle["record_sha256"],
+            "candidate_bundle_file_sha256": candidate_bundle_file["sha256"],
             "d2_receipt_chain_head_sha256": binding["receipt_chain_head_sha256"],
             "d2_coordinator_evidence_sha256": binding[
                 "coordinator_evidence_sha256"
@@ -1320,6 +1408,10 @@ def load_binding(root, state):
         "kind",
         "merge_commit",
         "merge_tree",
+        "gate_evidence_chain_head_sha256",
+        "candidate_bundle_path",
+        "candidate_bundle_record_sha256",
+        "candidate_bundle_file_sha256",
         "run_id",
         "manifest_sha256",
         "steps",
@@ -1336,10 +1428,21 @@ def load_binding(root, state):
         or binding["kind"] != "starring.d3.d2-binding.v1"
         or binding["merge_commit"] != state["merge_commit"]
         or binding["merge_tree"] != state["merge_tree"]
+        or binding["candidate_bundle_path"]
+        != str(root / "candidate-bundle" / "bundle.json")
         or binding["steps"] != 17
     ):
         fail("d2_binding_identity_invalid")
     validate_digest(binding["manifest_sha256"], "d2_binding_manifest")
+    validate_digest(
+        binding["gate_evidence_chain_head_sha256"], "d2_binding_gate_chain"
+    )
+    validate_digest(
+        binding["candidate_bundle_record_sha256"], "d2_binding_candidate_record"
+    )
+    validate_digest(
+        binding["candidate_bundle_file_sha256"], "d2_binding_candidate_file"
+    )
     validate_digest(binding["receipt_chain_head_sha256"], "d2_binding_chain")
     validate_digest(
         binding["coordinator_evidence_sha256"], "d2_binding_coordinator"
@@ -1361,6 +1464,8 @@ def load_recheck(root, state):
         "merge_commit",
         "merge_tree",
         "gate_evidence_chain_head_sha256",
+        "candidate_bundle_record_sha256",
+        "candidate_bundle_file_sha256",
         "d2_receipt_chain_head_sha256",
         "d2_coordinator_evidence_sha256",
         "verified_at",
@@ -1379,6 +1484,10 @@ def load_recheck(root, state):
         or record.get("merge_tree") != state["merge_tree"]
         or not isinstance(record.get("gate_evidence_chain_head_sha256"), str)
         or not DIGEST_PATTERN.fullmatch(record["gate_evidence_chain_head_sha256"])
+        or not isinstance(record.get("candidate_bundle_record_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(record["candidate_bundle_record_sha256"])
+        or not isinstance(record.get("candidate_bundle_file_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(record["candidate_bundle_file_sha256"])
         or not isinstance(record.get("d2_receipt_chain_head_sha256"), str)
         or not DIGEST_PATTERN.fullmatch(record["d2_receipt_chain_head_sha256"])
         or not isinstance(record.get("d2_coordinator_evidence_sha256"), str)
@@ -1565,8 +1674,21 @@ def command_finalize(arguments):
         gate_chain = require_gate_completion(root, state)
         binding = load_binding(root, state)
         recheck = load_recheck(root, state)
+        try:
+            candidate_bundle = load_candidate_bundle(root, state, gate_chain)
+            candidate_bundle_file = record_file_identity(root)
+        except CandidateBundleError as error:
+            fail(str(error))
         if (
             recheck["gate_evidence_chain_head_sha256"] != gate_chain
+            or recheck["candidate_bundle_record_sha256"]
+            != candidate_bundle["record_sha256"]
+            or recheck["candidate_bundle_file_sha256"]
+            != candidate_bundle_file["sha256"]
+            or binding["candidate_bundle_record_sha256"]
+            != candidate_bundle["record_sha256"]
+            or binding["candidate_bundle_file_sha256"]
+            != candidate_bundle_file["sha256"]
             or recheck["d2_receipt_chain_head_sha256"]
             != binding["receipt_chain_head_sha256"]
             or recheck["d2_coordinator_evidence_sha256"]
@@ -1595,6 +1717,9 @@ def command_finalize(arguments):
             "main_tree": main_tree,
             "gate_count": len(state["gate_command_sha256"]),
             "gate_evidence_chain_head_sha256": gate_chain,
+            "candidate_bundle_path": binding["candidate_bundle_path"],
+            "candidate_bundle_record_sha256": candidate_bundle["record_sha256"],
+            "candidate_bundle_file_sha256": candidate_bundle_file["sha256"],
             "d2_run_id": binding["run_id"],
             "d2_manifest_sha256": binding["manifest_sha256"],
             "d2_receipt_chain_head_sha256": binding["receipt_chain_head_sha256"],

@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -17,6 +18,7 @@ MODULE_PATH = pathlib.Path(__file__).with_name("d3_certification.py")
 SPEC = importlib.util.spec_from_file_location("d3_certification", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+import d3_candidate_bundle as BUNDLE
 
 
 def run(argv, cwd):
@@ -71,6 +73,8 @@ class D3CertificationTests(unittest.TestCase):
         git(self.seed, "config", "user.email", "test@example.com")
         git(self.seed, "config", "user.name", "D3 Test")
         write(self.seed / "base.txt", "base\n")
+        write(self.seed / "Cargo.toml", "workspace manifest\n")
+        write(self.seed / "Cargo.lock", "workspace lockfile\n")
         verifier = """import json
 import pathlib
 import sys
@@ -86,6 +90,20 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             self.seed / "tools" / "d2-certification" / "d2_run.py",
             verifier,
         )
+        for name in BUNDLE.D2_TOOLCHAIN_SOURCE_FILES:
+            path = self.seed / "tools" / "d2-certification" / name
+            if not path.exists():
+                write(path, f"d2 source {name}\n")
+        for name in BUNDLE.CERTIFICATION_TRANSPORT_SOURCE_FILES:
+            write(
+                self.seed / "tools" / "d2-certification-transport" / name,
+                f"transport source {name}\n",
+            )
+        for name in BUNDLE.CODEX_WORKER_SOURCE_FILES:
+            write(
+                self.seed / "tools" / "codex-worker" / name,
+                f"worker source {name}\n",
+            )
         git(self.seed, "add", ".")
         git(self.seed, "commit", "-m", "base")
         self.base = git(self.seed, "rev-parse", "HEAD")
@@ -234,10 +252,95 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 postgres_database_url,
             )
 
-        with mock.patch.object(MODULE, "run_process", side_effect=recording_runner):
+        tool_root = state_path.parent / "candidate-build-tools"
+        tool_root.mkdir(mode=0o700, exist_ok=True)
+        native_arguments = {
+            "clang": ("--version",),
+            "ar": (),
+            "ld": ("-v",),
+        }
+        def resolve_toolchain(_worktree, directories):
+            tools = []
+            for name in ("rustup", "cargo", "rustc"):
+                path = tool_root / name
+                if not path.exists():
+                    write(path, f"fake {name}\n", 0o555)
+                version = f"{name} 1.0.0"
+                if name == "rustc":
+                    version += f"\nhost: {BUNDLE.FIXED_RUST_TARGET}"
+                tools.append(
+                    {
+                        "name": name,
+                        **BUNDLE.file_identity(path, f"fake_{name}"),
+                        "version": version,
+                    }
+                )
+            for name in ("clang", "ar", "ld"):
+                path = BUNDLE.FIXED_DEVELOPER_DIRECTORY / "usr" / "bin" / name
+                tools.append(
+                    {
+                        "name": name,
+                        **BUNDLE.system_file_identity(path, f"fake_{name}"),
+                        "version": " ".join((name, *native_arguments[name]))
+                        or name,
+                    }
+                )
+            toolchain = BUNDLE.seal_record(
+                {
+                    "schema_version": BUNDLE.SCHEMA_VERSION,
+                    "kind": "starring.d3.candidate-build-toolchain.v1",
+                    "rust_target": BUNDLE.FIXED_RUST_TARGET,
+                    "developer_directory": str(BUNDLE.FIXED_DEVELOPER_DIRECTORY),
+                    "directories": directories,
+                    "environment": BUNDLE.toolchain_environment(tools, directories),
+                    "tools": tools,
+                }
+            )
+            return BUNDLE.validate_candidate_toolchain(toolchain)
+
+        def build_candidates(state, worktree, root, recipe, pinned_toolchain):
+            self.build_invocations = getattr(self, "build_invocations", 0) + 1
+            BUNDLE.require_cargo_configuration_absent(worktree)
+            build_root = pathlib.Path(recipe["build_root"])
+            build_root.mkdir(mode=0o700, exist_ok=True)
+            for specification in recipe["artifacts"]:
+                source = pathlib.Path(specification["source"])
+                if source.exists():
+                    source.chmod(0o755)
+                write(
+                    source,
+                    f"candidate {specification['candidate']} {state['merge_commit']}\n",
+                    0o555,
+                )
+            return pinned_toolchain["tools"]
+
+        with mock.patch.object(
+            MODULE, "run_process", side_effect=recording_runner
+        ), mock.patch.object(
+            BUNDLE, "execute_candidate_build", side_effect=build_candidates
+        ), mock.patch.object(
+            BUNDLE, "resolve_candidate_toolchain", side_effect=resolve_toolchain
+        ):
             status, result, error = self.invoke(arguments)
         self.gate_database_urls = database_urls
         return status, result, error, observed
+
+    def remove_candidate_bundle(self, state_path):
+        root = state_path.parent / "candidate-bundle"
+        for path in root.rglob("*"):
+            if path.is_dir():
+                path.chmod(0o700)
+            elif path.is_file():
+                path.chmod(0o600)
+        root.chmod(0o700)
+        shutil.rmtree(root)
+
+    def rewrite_d2_manifest(self, manifest_path, mutation):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        mutation(manifest)
+        write(manifest_path, MODULE.canonical_json(manifest) + "\n", 0o600)
+        digest = MODULE.sha256_bytes(MODULE.canonical_json(manifest).encode("utf-8"))
+        write(manifest_path.with_name("manifest.sha256"), digest + "\n", 0o600)
 
     def test_prepare_pins_merge_parents_tree_and_detached_worktree(self):
         state_path, first, gates = self.prepare()
@@ -356,11 +459,13 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertNotIn(self.postgres_database_url.encode("utf-8"), before)
         self.assertNotIn(b"postgres:postgres", before)
         self.assertTrue(all("command_sha256" in line for line in lines))
+        self.assertEqual(self.build_invocations, 1)
         status, replay, error, observed = self.invoke_gate_plan(state_path, gates)
         self.assertEqual(status, 0, error)
         self.assertEqual(observed, [])
         self.assertEqual(replay["evidence_chain_head_sha256"], result["evidence_chain_head_sha256"])
         self.assertEqual(evidence.read_bytes(), before)
+        self.assertEqual(self.build_invocations, 1)
 
     def test_postgres_gate_secret_is_required_owned_and_test_only(self):
         self.assertEqual(
@@ -573,6 +678,394 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         ):
             MODULE.load_gate_evidence(evidence_path, state)
 
+    def test_candidate_bundle_resumes_from_durable_intent_and_partial_build(self):
+        state_path, _, gates = self.prepare()
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        self.assertEqual(self.build_invocations, 1)
+        self.remove_candidate_bundle(state_path)
+        status, result, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        self.assertEqual(result["candidate_bundle_disposition"], "created")
+        self.assertEqual(self.build_invocations, 2)
+
+    def test_candidate_bundle_rejects_partial_build_under_changed_toolchain(self):
+        state_path, _, gates = self.prepare()
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        self.assertEqual(self.build_invocations, 1)
+        self.remove_candidate_bundle(state_path)
+        cargo = state_path.parent / "candidate-build-tools" / "cargo"
+        cargo.chmod(0o700)
+        write(cargo, "fake cargo changed\n", 0o555)
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_build_toolchain_drift", error)
+        self.assertEqual(self.build_invocations, 1)
+
+    def test_candidate_bundle_recovers_owned_partial_staging(self):
+        state_path, _, gates = self.prepare()
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        intent = json.loads(
+            state_path.with_name("candidate-bundle-intent.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        bundle = state_path.parent / "candidate-bundle"
+        staging = pathlib.Path(intent["staging_path"])
+        bundle.chmod(0o700)
+        bundle.rename(staging)
+        status, result, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        self.assertEqual(result["candidate_bundle_disposition"], "created")
+        self.assertEqual(self.build_invocations, 2)
+        self.assertFalse(staging.exists())
+
+    def test_candidate_bundle_resumes_complete_unpublished_staging(self):
+        state_path, _, gates = self.prepare()
+        status, first, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        intent = json.loads(
+            state_path.with_name("candidate-bundle-intent.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        bundle = state_path.parent / "candidate-bundle"
+        staging = pathlib.Path(intent["staging_path"])
+        bundle.rename(staging)
+        status, replay, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        self.assertEqual(replay["candidate_bundle_disposition"], "exact_replay")
+        self.assertEqual(
+            replay["candidate_bundle_sha256"], first["candidate_bundle_sha256"]
+        )
+        self.assertEqual(self.build_invocations, 1)
+
+    def test_candidate_bundle_recovers_atomic_intent_and_publication_temps(self):
+        for boundary in ("intent", "publication"):
+            with self.subTest(boundary=boundary):
+                output = self.root / f"atomic-{boundary}"
+                output.mkdir(mode=0o700)
+                arguments, gates = self.prepare_arguments(output_root=output)
+                status, prepared, error = self.invoke(arguments)
+                self.assertEqual(status, 0, error)
+                state_path = pathlib.Path(prepared["state"])
+                status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+                self.assertEqual(status, 0, error)
+                intent_path = state_path.with_name("candidate-bundle-intent.json")
+                intent = json.loads(intent_path.read_text(encoding="utf-8"))
+                if boundary == "intent":
+                    self.remove_candidate_bundle(state_path)
+                    temporary = state_path.parent / (
+                        f".candidate-bundle-intent.json.tmp-{intent['staging_nonce']}"
+                    )
+                    intent_path.rename(temporary)
+                else:
+                    bundle = state_path.parent / "candidate-bundle"
+                    staging = pathlib.Path(intent["staging_path"])
+                    bundle.chmod(0o700)
+                    bundle.rename(staging)
+                    publication = staging / "publication.json"
+                    publication.rename(
+                        staging
+                        / f".publication.json.tmp-{intent['staging_nonce']}"
+                    )
+                status, result, error, _ = self.invoke_gate_plan(state_path, gates)
+                self.assertEqual(status, 0, error)
+                self.assertTrue(
+                    pathlib.Path(result["candidate_bundle"]).is_file()
+                )
+
+    def test_candidate_bundle_cleans_partial_atomic_temps(self):
+        state_path, _, gates = self.prepare()
+        partial_intent = state_path.parent / (
+            ".candidate-bundle-intent.json.tmp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        write(partial_intent, '{"schema_version":', 0o600)
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        self.assertFalse(partial_intent.exists())
+        intent = json.loads(
+            state_path.with_name("candidate-bundle-intent.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.remove_candidate_bundle(state_path)
+        staging = pathlib.Path(intent["staging_path"])
+        staging.mkdir(mode=0o700)
+        partial_publication = staging / (
+            f".publication.json.tmp-{intent['staging_nonce']}"
+        )
+        write(partial_publication, '{"schema_version":', 0o400)
+        status, result, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        self.assertTrue(pathlib.Path(result["candidate_bundle"]).is_file())
+        self.assertFalse(staging.exists())
+
+    def test_candidate_bundle_resumes_journaled_discard_after_crash(self):
+        state_path, _, gates = self.prepare()
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        intent = json.loads(
+            state_path.with_name("candidate-bundle-intent.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        bundle = state_path.parent / "candidate-bundle"
+        staging = pathlib.Path(intent["staging_path"])
+        bundle.chmod(0o700)
+        bundle.rename(staging)
+        with mock.patch.object(
+            BUNDLE,
+            "remove_tree_descriptor",
+            side_effect=BUNDLE.CandidateBundleError("injected_discard_crash"),
+        ):
+            status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 1)
+        self.assertIn("injected_discard_crash", error)
+        discard = state_path.parent / (
+            f".candidate-bundle-discard-{intent['staging_nonce']}"
+        )
+        self.assertTrue(discard.is_dir())
+        self.assertTrue(
+            state_path.with_name("candidate-bundle-discard.json").is_file()
+        )
+        status, result, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        self.assertTrue(pathlib.Path(result["candidate_bundle"]).is_file())
+        self.assertFalse(discard.exists())
+        self.assertFalse(
+            state_path.with_name("candidate-bundle-discard.json").exists()
+        )
+
+    def test_candidate_bundle_rejects_foreign_staging_directory(self):
+        state_path, _, gates = self.prepare()
+        foreign = state_path.parent / ".candidate-bundle-staging-ffffffffffffffffffffffffffffffff"
+        foreign.mkdir(mode=0o700)
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_bundle_foreign_staging_present", error)
+
+    def test_candidate_bundle_replay_does_not_depend_on_live_build_tools(self):
+        state_path, _, gates = self.prepare()
+        status, first, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        cargo = state_path.parent / "candidate-build-tools" / "cargo"
+        cargo.chmod(0o755)
+        cargo.write_text("updated cargo\n", encoding="utf-8")
+        cargo.chmod(0o555)
+        status, replay, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        self.assertEqual(replay["candidate_bundle_sha256"], first["candidate_bundle_sha256"])
+        self.assertEqual(self.build_invocations, 1)
+
+    def test_candidate_bundle_rejects_boolean_integer_substitutions(self):
+        cases = ("intent_schema", "record_schema", "artifact_links")
+        for case in cases:
+            with self.subTest(case=case):
+                output = self.root / f"boolean-{case}"
+                output.mkdir(mode=0o700)
+                arguments, gates = self.prepare_arguments(output_root=output)
+                status, prepared, error = self.invoke(arguments)
+                self.assertEqual(status, 0, error)
+                state_path = pathlib.Path(prepared["state"])
+                status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+                self.assertEqual(status, 0, error)
+                if case == "intent_schema":
+                    path = state_path.with_name("candidate-bundle-intent.json")
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    value.pop("record_sha256")
+                    value["schema_version"] = True
+                    write(
+                        path,
+                        BUNDLE.canonical_json(BUNDLE.seal_record(value)) + "\n",
+                        0o600,
+                    )
+                else:
+                    path = state_path.parent / "candidate-bundle" / "bundle.json"
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    value.pop("record_sha256")
+                    if case == "record_schema":
+                        value["schema_version"] = True
+                    else:
+                        value["artifacts"][0]["artifact"]["links"] = True
+                    path.chmod(0o600)
+                    write(
+                        path,
+                        BUNDLE.canonical_json(BUNDLE.seal_record(value)) + "\n",
+                        0o400,
+                    )
+                status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+                self.assertEqual(status, 1)
+                self.assertIn("candidate_bundle", error)
+
+    def test_candidate_bundle_rejects_artifact_and_inventory_drift(self):
+        cases = ("content", "mode", "hardlink", "symlink", "extra")
+        for case in cases:
+            with self.subTest(case=case):
+                output = self.root / f"bundle-{case}"
+                output.mkdir(mode=0o700)
+                arguments, gates = self.prepare_arguments(output_root=output)
+                status, result, error = self.invoke(arguments)
+                self.assertEqual(status, 0, error)
+                state_path = pathlib.Path(result["state"])
+                status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+                self.assertEqual(status, 0, error)
+                bundle = state_path.parent / "candidate-bundle"
+                artifact = bundle / "starring-api"
+                if case == "content":
+                    artifact.chmod(0o755)
+                    artifact.write_text("replacement\n", encoding="utf-8")
+                    artifact.chmod(0o555)
+                elif case == "mode":
+                    artifact.chmod(0o755)
+                elif case == "hardlink":
+                    bundle.chmod(0o755)
+                    original = state_path.parent / "saved-api"
+                    artifact.rename(original)
+                    os.link(original, artifact)
+                    bundle.chmod(0o555)
+                elif case == "symlink":
+                    bundle.chmod(0o755)
+                    original = state_path.parent / "saved-api"
+                    artifact.rename(original)
+                    artifact.symlink_to(original)
+                    bundle.chmod(0o555)
+                else:
+                    bundle.chmod(0o755)
+                    write(bundle / "unexpected", "unexpected\n", 0o444)
+                    bundle.chmod(0o555)
+                status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+                self.assertEqual(status, 1)
+                self.assertIn("candidate_bundle", error)
+
+    def test_candidate_bundle_never_replaces_preexisting_destination(self):
+        state_path, _, gates = self.prepare()
+        bundle = state_path.parent / "candidate-bundle"
+        bundle.mkdir(mode=0o555)
+        sentinel = state_path.parent / "destination-sentinel"
+        write(sentinel, "preserved\n", 0o600)
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_bundle", error)
+        self.assertTrue(bundle.is_dir())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserved\n")
+
+    def test_candidate_bundle_rejects_exact_worktree_source_drift(self):
+        state_path, _, gates = self.prepare()
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        source = (
+            pathlib.Path(state["worktree_path"])
+            / "tools"
+            / "codex-worker"
+            / "worker.mjs"
+        )
+        source.write_text("worker drift\n", encoding="utf-8")
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 1)
+        self.assertIn("worktree_tracked_changes", error)
+
+    def test_candidate_bundle_rejects_tracked_symlinks_and_gitlinks(self):
+        for kind in ("symlink", "gitlink"):
+            with self.subTest(kind=kind):
+                repo = self.root / f"forbidden-{kind}"
+                repo.mkdir()
+                git(repo, "init", "-b", "main")
+                git(repo, "config", "user.email", "test@example.com")
+                git(repo, "config", "user.name", "D3 Test")
+                write(repo / "base", "base\n")
+                git(repo, "add", "base")
+                git(repo, "commit", "-m", "base")
+                if kind == "symlink":
+                    (repo / "linked").symlink_to("base")
+                    git(repo, "add", "linked")
+                else:
+                    commit = git(repo, "rev-parse", "HEAD")
+                    git(
+                        repo,
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        f"160000,{commit},nested",
+                    )
+                git(repo, "commit", "-m", kind)
+                with self.assertRaisesRegex(
+                    BUNDLE.CandidateBundleError,
+                    "candidate_source_git_entry_forbidden",
+                ):
+                    BUNDLE.validate_git_tree_entries(repo)
+
+    def test_candidate_build_rejects_cargo_config_in_worktree_ancestor(self):
+        state_path, _, gates = self.prepare()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        ancestor_config = (
+            pathlib.Path(state["worktree_path"]).parent / ".cargo" / "config.toml"
+        )
+        write(
+            ancestor_config,
+            '[build]\nrustc-wrapper = "/private/tmp/foreign-wrapper"\n',
+            0o600,
+        )
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_build_cargo_config_forbidden", error)
+
+    def test_candidate_build_excludes_foreign_native_toolchain_environment(self):
+        foreign = self.root / "foreign-native-tools"
+        foreign.mkdir(mode=0o700)
+        marker = self.root / "foreign-cc-invoked"
+        foreign_cc = foreign / "cc"
+        write(
+            foreign_cc,
+            "#!/bin/sh\n"
+            f"/usr/bin/touch {shlex.quote(str(marker))}\n"
+            "exit 99\n",
+            0o700,
+        )
+        cargo = self.root / "record-build-environment"
+        observed = self.root / "observed-build-environment"
+        write(
+            cargo,
+            "#!/bin/sh\n"
+            f"/usr/bin/printf '%s\\n' \"$PATH\" \"$DEVELOPER_DIR\" \"$CC\" > {shlex.quote(str(observed))}\n"
+            "/usr/bin/which cc >> " + shlex.quote(str(observed)) + "\n"
+            "cc --version >/dev/null\n",
+            0o700,
+        )
+        clang = BUNDLE.FIXED_DEVELOPER_DIRECTORY / "usr" / "bin" / "clang"
+        environment = {
+            "AR": str(BUNDLE.FIXED_DEVELOPER_DIRECTORY / "usr" / "bin" / "ar"),
+            "CC": str(clang),
+            "CXX": str(clang),
+            "DEVELOPER_DIR": str(BUNDLE.FIXED_DEVELOPER_DIRECTORY),
+            "LD": str(BUNDLE.FIXED_DEVELOPER_DIRECTORY / "usr" / "bin" / "ld"),
+            "RUSTC": str(self.root / "rustc"),
+            BUNDLE.FIXED_RUST_LINKER_ENVIRONMENT: str(clang),
+        }
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PATH": str(foreign) + ":" + os.environ.get("PATH", ""),
+                "DEVELOPER_DIR": str(self.root / "foreign-developer"),
+            },
+        ):
+            BUNDLE.run_build_command(
+                ["cargo", "build"], cargo, environment, self.repo, self.merge
+            )
+        self.assertFalse(marker.exists())
+        self.assertEqual(
+            observed.read_text(encoding="utf-8").splitlines(),
+            [
+                BUNDLE.FIXED_EXECUTABLE_PATH,
+                str(BUNDLE.FIXED_DEVELOPER_DIRECTORY),
+                str(clang),
+                "/usr/bin/cc",
+            ],
+        )
+
     def test_gate_plan_and_sensitive_command_fail_closed(self):
         state_path, _, _ = self.prepare()
         status, _, error = self.invoke(
@@ -661,13 +1154,74 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
     def make_d2(self, state_path):
         state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not (state_path.parent / "candidate-bundle" / "bundle.json").exists():
+            status, _, error, _ = self.invoke_gate_plan(state_path)
+            self.assertEqual(status, 0, error)
+        bundle = json.loads(
+            (state_path.parent / "candidate-bundle" / "bundle.json").read_text(
+                encoding="utf-8"
+            )
+        )
         root = self.root / "d2"
         root.mkdir(mode=0o700)
+        artifacts = {
+            value["candidate"]: value["artifact"] for value in bundle["artifacts"]
+        }
+        worker = next(
+            value["artifact"]
+            for value in bundle["worker"]["files"]
+            if value["name"] == "worker.mjs"
+        )
+        candidates = {
+            name: {"path": value["path"], "sha256": value["sha256"]}
+            for name, value in artifacts.items()
+        }
+        candidates["codex_worker"] = {
+            "path": worker["path"],
+            "sha256": worker["sha256"],
+        }
+        external_root = root / "external"
+        external_root.mkdir(mode=0o700)
+        for name in ("codex", "node", "cloudflared"):
+            path = external_root / name
+            write(path, f"external {name}\n", 0o555)
+            candidates[name] = {
+                "path": str(path),
+                "sha256": BUNDLE.file_identity(path, f"external_{name}")["sha256"],
+            }
         manifest = {
             "schema_version": 1,
             "run_id": "d2-20260804t120000z-123456789abc",
             "commit_sha": state["merge_commit"],
             "discord": {"resource_prefix": "d2-123456789abc"},
+            "candidates": candidates,
+            "source_trees": {
+                "codex_worker": {
+                    "root": bundle["worker"]["root"],
+                    "files": list(BUNDLE.CODEX_WORKER_SOURCE_FILES),
+                    "sha256": bundle["worker"]["sha256"],
+                },
+                "d2_toolchain": {
+                    "root": str(
+                        pathlib.Path(state["worktree_path"])
+                        / "tools"
+                        / "d2-certification"
+                    ),
+                    "files": list(BUNDLE.D2_TOOLCHAIN_SOURCE_FILES),
+                    "sha256": bundle["source_trees"]["d2_toolchain"]["sha256"],
+                },
+                "certification_transport": {
+                    "root": str(
+                        pathlib.Path(state["worktree_path"])
+                        / "tools"
+                        / "d2-certification-transport"
+                    ),
+                    "files": list(BUNDLE.CERTIFICATION_TRANSPORT_SOURCE_FILES),
+                    "sha256": bundle["source_trees"]["certification_transport"][
+                        "sha256"
+                    ],
+                },
+            },
         }
         manifest_path = root / "manifest.json"
         write(manifest_path, MODULE.canonical_json(manifest) + "\n", 0o600)
@@ -784,6 +1338,56 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(status, 1)
         self.assertIn("d2_final_record_fields_invalid", error)
 
+    def test_d2_binding_rejects_candidate_and_source_tree_drift(self):
+        state_path, _, _ = self.prepare()
+        manifest_path, final_path = self.make_d2(state_path)
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        def candidate_path(value):
+            value["candidates"]["api"]["path"] = "/private/tmp/foreign-api"
+
+        def candidate_digest(value):
+            value["candidates"]["api"]["sha256"] = "0" * 64
+
+        mutations = [("candidate_path", candidate_path), ("candidate_digest", candidate_digest)]
+        for name in ("codex_worker", "d2_toolchain", "certification_transport"):
+            mutations.append(
+                (
+                    f"{name}_root",
+                    lambda value, key=name: value["source_trees"][key].__setitem__(
+                        "root", "/private/tmp/foreign-source"
+                    ),
+                )
+            )
+            mutations.append(
+                (
+                    f"{name}_digest",
+                    lambda value, key=name: value["source_trees"][key].__setitem__(
+                        "sha256", "0" * 64
+                    ),
+                )
+            )
+        for label, mutation in mutations:
+            with self.subTest(label=label):
+                changed = json.loads(json.dumps(original))
+                mutation(changed)
+                self.rewrite_d2_manifest(
+                    manifest_path, lambda value, replacement=changed: (value.clear(), value.update(replacement))
+                )
+                status, _, error = self.invoke(
+                    [
+                        "bind-d2",
+                        "--state",
+                        str(state_path),
+                        "--d2-manifest",
+                        str(manifest_path),
+                        "--d2-final-record",
+                        str(final_path),
+                    ]
+                )
+                self.assertEqual(status, 1)
+                self.assertIn("bundle_mismatch", error)
+
     def test_d2_binding_rejects_boolean_schema_version(self):
         state_path, _, _ = self.prepare()
         manifest_path, final_path = self.make_d2(state_path)
@@ -869,6 +1473,39 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         status, _, error = self.invoke(["recheck", "--state", str(state_path)])
         self.assertEqual(status, 1)
         self.assertIn("pr_base_changed", error)
+
+    def test_recheck_rejects_post_binding_bundle_replacement(self):
+        state_path = self.complete_prerequisites()
+        artifact = state_path.parent / "candidate-bundle" / "starring-runtime"
+        artifact.chmod(0o755)
+        artifact.write_text("replaced runtime\n", encoding="utf-8")
+        artifact.chmod(0o555)
+        status, _, error = self.invoke(["recheck", "--state", str(state_path)])
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_bundle_artifact", error)
+
+    def test_finalize_rejects_post_recheck_bundle_mode_drift(self):
+        state_path = self.complete_prerequisites()
+        artifact = state_path.parent / "candidate-bundle" / "starring-runtime"
+        artifact.chmod(0o755)
+        status, _, error = self.invoke(self.finalize_arguments(state_path))
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_bundle_artifact", error)
+
+    def test_finalize_rejects_candidate_bundle_path_drift(self):
+        state_path = self.complete_prerequisites()
+        binding_path = state_path.with_name("d2-binding.json")
+        binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        binding.pop("record_sha256")
+        binding["candidate_bundle_path"] = "/private/tmp/foreign-bundle.json"
+        write(
+            binding_path,
+            MODULE.canonical_json(MODULE.seal_record(binding)) + "\n",
+            0o600,
+        )
+        status, _, error = self.invoke(self.finalize_arguments(state_path))
+        self.assertEqual(status, 1)
+        self.assertIn("d2_binding_identity_invalid", error)
 
     def test_sealed_binding_and_recheck_require_canonical_identity(self):
         state_path = self.complete_prerequisites()
