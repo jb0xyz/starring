@@ -55,14 +55,59 @@ the raw SQLx checksum bytes.
 Every executable candidate and the Codex worker entrypoint must be a canonical,
 same-owner regular file with all write bits removed. Its immediate artifact
 directory must have the same owner and all write bits removed, preventing path
-replacement after manifest verification. Build into a writable directory,
-copy the reviewed artifacts into a dedicated release directory, then remove
-write permission from both files and that directory before `prepare`. The
-Python and Rust source trees are a different boundary: they may remain
-owner-writable for development, but their exact inventory and SHA-256 are
-revalidated at the start of every certification command; group/world-writable
-source files or roots are rejected. They are verified per invocation and are
-not described as immutable artifacts.
+replacement after manifest verification. The Python and Rust source trees are a
+different boundary: they may remain owner-writable for development, but their
+exact inventory and SHA-256 are revalidated at the start of every certification
+command; group/world-writable source files or roots are rejected. They are
+verified per invocation and are not described as immutable artifacts.
+
+## Order
+
+D2 runs between two D3 phases and cannot be run before them.
+
+1. Freeze the branch. Any later commit, and any movement of the base, changes the
+   merge tree and invalidates completed D2 receipts.
+2. Open the release pull request.
+3. `d3_certification.py prepare` pins the repository, pull request, head, base,
+   and GitHub-generated merge candidate, and creates `<D3_STATE>/worktree` as a
+   detached checkout of that merge candidate.
+4. `d3_certification.py run-gates` runs the fixed gate manifest and then builds
+   and seals `<D3_STATE>/candidate-bundle`.
+5. Run D2 against that bundle through all seventeen steps.
+6. `d3_certification.py bind-d2`, then `recheck`, then merge, then `finalize`.
+
+`<D3_STATE>` is the `<output-root>/<run>` directory that holds `state.json`.
+
+## Candidate provisioning
+
+D3 owns candidate provisioning. `run-gates` builds the five release binaries and
+the seven-file Codex worker tree from the exact merge candidate and seals them
+into `<D3_STATE>/candidate-bundle`. That directory is mode `0555`, its binaries
+`0555`, its worker files `0444`, and `bundle.json` and `publication.json` `0400`.
+Do not build or install candidates by hand.
+
+`bind-d2` rejects a manifest whose candidate or source-tree identities do not
+match the sealed bundle exactly:
+
+| Manifest field | Required value |
+| --- | --- |
+| `candidates.api` | `<D3_STATE>/candidate-bundle/starring-api` |
+| `candidates.runtime` | `<D3_STATE>/candidate-bundle/starring-runtime` |
+| `candidates.db_bootstrap` | `<D3_STATE>/candidate-bundle/starring-d2-db-bootstrap` |
+| `candidates.sealed_provisioner` | `<D3_STATE>/candidate-bundle/starring-d2-sealed-provisioner` |
+| `candidates.certification_transport` | `<D3_STATE>/candidate-bundle/d2-certification-transport` |
+| `candidates.codex_worker` | `<D3_STATE>/candidate-bundle/codex-worker/worker.mjs` |
+| `source_trees.codex_worker.root` | `<D3_STATE>/candidate-bundle/codex-worker` |
+| `source_trees.d2_toolchain.root` | `<D3_STATE>/worktree/tools/d2-certification` |
+| `source_trees.certification_transport.root` | `<D3_STATE>/worktree/tools/d2-certification-transport` |
+
+`node`, `codex`, and `cloudflared` are not release artifacts. They remain
+operator-supplied installed executables and are not bound to the sealed bundle.
+
+D2 has no knowledge of the bundle. It accepts whatever `--candidate` paths it is
+given, so a manifest assembled from a hand-installed directory completes all
+seventeen steps and fails only at `bind-d2`, discarding the run and its
+disposable guild. Seal the bundle first.
 
 The current execution boundary is deliberate. `start` reports
 `candidate_services_loaded=true` only after all five services are loaded and
@@ -74,12 +119,13 @@ orchestrator never copies or deletes any of the three external credentials.
 
 The remaining certification work is:
 
-1. Place the dedicated D2 Discord OAuth client secret and bot token in the two
-   manifest-pinned external Keychain identities. The fixed Cloudflare tunnel
-   token must already exist in its third external identity.
-2. Create the disposable Discord guild and dedicated D2 Discord application,
-   select one text channel as `community_hub`, then prepare and start the
-   immutable candidate run.
+1. Create a disposable Discord guild for this run and select one text channel as
+   `community_hub`. The dedicated D2 Discord application and the three external
+   Keychain identities holding its OAuth client secret, its bot token, and the
+   fixed Cloudflare tunnel token are already provisioned and are reused across
+   runs. The guild is not.
+2. Complete steps 3 and 4 of the order above so the sealed bundle exists, then
+   prepare and start the immutable candidate run against that bundle.
 3. Complete OAuth and invoke `onboard` with the authenticated Discord principal.
 4. Load `product_driver.js` into the authenticated same-origin browser and use
    its bounded product driver for authoring, promotion, approval, Apply, and
@@ -110,15 +156,15 @@ python3 tools/d2-certification/d2_certification.py prepare \
   --tunnel-token-keychain starring.d2.credentials:cloudflare.tunnel-token \
   --cloudflare-tunnel-id 57c22e8a-0ec2-4f67-a882-2c355b0348df \
   --public-origin https://d2-api.starring.co.kr \
-  --candidate api=/absolute/immutable/starring-api \
-  --candidate runtime=/absolute/immutable/starring-runtime \
-  --candidate codex_worker=/absolute/immutable/codex-worker/worker.mjs \
-  --candidate codex=/absolute/immutable/codex \
-  --candidate db_bootstrap=/absolute/immutable/starring-d2-db-bootstrap \
-  --candidate sealed_provisioner=/absolute/immutable/starring-d2-sealed-provisioner \
-  --candidate certification_transport=/absolute/immutable/d2-certification-transport \
-  --candidate node=/absolute/immutable/node \
-  --candidate cloudflared=/absolute/immutable/cloudflared \
+  --candidate api="$BUNDLE"/starring-api \
+  --candidate runtime="$BUNDLE"/starring-runtime \
+  --candidate codex_worker="$BUNDLE"/codex-worker/worker.mjs \
+  --candidate db_bootstrap="$BUNDLE"/starring-d2-db-bootstrap \
+  --candidate sealed_provisioner="$BUNDLE"/starring-d2-sealed-provisioner \
+  --candidate certification_transport="$BUNDLE"/d2-certification-transport \
+  --candidate codex=/absolute/installed/codex \
+  --candidate node=/absolute/installed/node \
+  --candidate cloudflared=/absolute/installed/cloudflared \
   --port postgres=55433 \
   --port api=28080 \
   --port runtime=29091 \
@@ -127,45 +173,14 @@ python3 tools/d2-certification/d2_certification.py prepare \
   --port transport_http=29102
 ```
 
-Build the exact local candidates from the candidate commit, then run
-the substrate lifecycle with the immutable manifest:
+`$BUNDLE` is `<D3_STATE>/candidate-bundle`, and `--commit` is the commit whose
+tree equals the pinned merge tree. `bind-d2` compares that tree, not the commit
+identity, so the branch tip is acceptable while the base has not moved.
 
-```text
-cargo build --locked --release -p starring-db-bootstrap \
-  --bin starring-d2-db-bootstrap
-cargo build --locked --release -p starring-staging-provisioner \
-  --bin starring-d2-sealed-provisioner
-cargo build --locked --release \
-  --manifest-path tools/d2-certification-transport/Cargo.toml
-```
+`codex`, `node`, and `cloudflared` are the only hand-supplied executables. Each
+must still be a canonical, same-owner regular file with all write bits removed,
+inside a directory with the same owner and no write bits.
 
-Materialize the reviewed binaries and exact seven-file Codex worker tree in one
-dedicated artifact directory. The source variables below identify reviewed
-build outputs or installed executables:
-
-```text
-install -d -m 0700 /absolute/immutable
-install -d -m 0700 /absolute/immutable/codex-worker
-install -m 0555 "$API_BINARY" /absolute/immutable/starring-api
-install -m 0555 "$RUNTIME_BINARY" /absolute/immutable/starring-runtime
-install -m 0555 "$DB_BOOTSTRAP_BINARY" /absolute/immutable/starring-d2-db-bootstrap
-install -m 0555 "$SEALED_PROVISIONER_BINARY" /absolute/immutable/starring-d2-sealed-provisioner
-install -m 0555 "$CERTIFICATION_TRANSPORT_BINARY" /absolute/immutable/d2-certification-transport
-install -m 0555 "$CODEX_BINARY" /absolute/immutable/codex
-install -m 0555 "$NODE_BINARY" /absolute/immutable/node
-install -m 0555 "$CLOUDFLARED_BINARY" /absolute/immutable/cloudflared
-install -m 0444 tools/codex-worker/admission-registry.mjs /absolute/immutable/codex-worker/
-install -m 0444 tools/codex-worker/codex-runner.mjs /absolute/immutable/codex-worker/
-install -m 0444 tools/codex-worker/metrics-log.mjs /absolute/immutable/codex-worker/
-install -m 0444 tools/codex-worker/protocol.mjs /absolute/immutable/codex-worker/
-install -m 0444 tools/codex-worker/request-timeline.mjs /absolute/immutable/codex-worker/
-install -m 0444 tools/codex-worker/scheduler.mjs /absolute/immutable/codex-worker/
-install -m 0444 tools/codex-worker/worker.mjs /absolute/immutable/codex-worker/
-chmod 0555 /absolute/immutable/codex-worker
-chmod 0555 /absolute/immutable
-```
-
-Use only paths under that sealed directory for every `--candidate` argument.
 Then run the substrate lifecycle with the immutable manifest:
 
 ```text
