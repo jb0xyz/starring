@@ -1,6 +1,7 @@
 /target
 /ai-eval-runs
 .DS_Store
+__pycache__/
 .env*
 /eval/design-harness/node_modules/
 /eval/design-harness/results/
