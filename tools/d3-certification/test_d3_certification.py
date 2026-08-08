@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -41,6 +42,20 @@ def write(path, value, mode=0o644):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value, encoding="utf-8")
     path.chmod(mode)
+
+
+def fixture_system_file_identity(path, _label):
+    encoded = str(path).encode("utf-8")
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "size": len(encoded),
+        "mode": 0o555,
+        "uid": 0,
+        "device": 1,
+        "inode": int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big"),
+        "links": 1,
+    }
 
 
 class D3BootstrapSafetyTests(unittest.TestCase):
@@ -485,6 +500,10 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             BUNDLE, "execute_candidate_build", side_effect=build_candidates
         ), mock.patch.object(
             BUNDLE, "resolve_candidate_toolchain", side_effect=resolve_toolchain
+        ), mock.patch.object(
+            BUNDLE,
+            "system_file_identity",
+            side_effect=fixture_system_file_identity,
         ):
             status, result, error = self.invoke(arguments)
         self.gate_database_urls = database_urls

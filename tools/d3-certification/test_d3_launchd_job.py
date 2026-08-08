@@ -19,6 +19,14 @@ class D3LaunchdJobTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temporary.name).resolve()
         self.root.chmod(0o700)
+        if sys.platform != "darwin":
+            executable_check = mock.patch.object(
+                MODULE,
+                "require_executable",
+                side_effect=lambda path, _label: path,
+            )
+            executable_check.start()
+            self.addCleanup(executable_check.stop)
 
     def tearDown(self):
         self.temporary.cleanup()
