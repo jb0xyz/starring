@@ -103,10 +103,10 @@ class D3GateContainerTests(unittest.TestCase):
         self.assertIn("mode=0700", scratch[0])
         self.assertNotIn(str(MODULE.DOCKER_SOCKET), " ".join(arguments))
 
-    def test_every_gate_prepares_private_runtime_parent_before_work(self):
+    def test_every_gate_prepares_private_scratch_before_work(self):
         setup = (
-            "umask 077 && mkdir -p /scratch/tmp/d2-runtime && "
-            "chmod 0700 /scratch/tmp /scratch/tmp/d2-runtime"
+            "umask 077 && mkdir -p /scratch/tmp && "
+            "chmod 0700 /scratch/tmp"
         )
         expected_work = {
             1: "gate-one",
@@ -128,7 +128,7 @@ class D3GateContainerTests(unittest.TestCase):
                 self.assertEqual(command.count(setup), 1)
                 self.assertLess(command.index(setup), command.index(work))
 
-    def test_gate_exports_created_private_runtime_parent(self):
+    def test_gate_uses_private_tmpfs_for_default_d2_runtime_root(self):
         arguments = self.create_arguments(12, "none")
         environment = {
             arguments[index + 1]
@@ -136,14 +136,24 @@ class D3GateContainerTests(unittest.TestCase):
             if value == "--env"
         }
         self.assertIn("TMPDIR=/scratch/tmp", environment)
-        self.assertIn(
-            "STARRING_D2_TEST_RUNTIME_PARENT=/scratch/tmp/d2-runtime",
-            environment,
+        self.assertFalse(
+            any(
+                value.startswith("STARRING_D2_TEST_RUNTIME_PARENT=")
+                for value in environment
+            )
         )
-        self.assertIn(
-            "mkdir -p /scratch/tmp/d2-runtime",
-            arguments[-1],
-        )
+        tmpfs = [
+            arguments[index + 1]
+            for index, value in enumerate(arguments[:-1])
+            if value == "--tmpfs"
+        ]
+        private_tmp = [value for value in tmpfs if value.startswith("/private/tmp:")]
+        self.assertEqual(len(private_tmp), 1)
+        self.assertIn("noexec", private_tmp[0])
+        self.assertIn("nosuid", private_tmp[0])
+        self.assertIn(f"uid={os.getuid()}", private_tmp[0])
+        self.assertIn(f"gid={os.getgid()}", private_tmp[0])
+        self.assertIn("mode=0700", private_tmp[0])
 
     def test_external_audit_mounts_only_package_projection_and_scratch(self):
         arguments = self.create_arguments(10, "bridge")

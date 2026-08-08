@@ -1132,8 +1132,8 @@ def start_postgres(root, index, attempt, database_url):
 
 def fixed_gate_command(index, command):
     private_scratch = (
-        "umask 077 && mkdir -p /scratch/tmp/d2-runtime && "
-        "chmod 0700 /scratch/tmp /scratch/tmp/d2-runtime"
+        "umask 077 && mkdir -p /scratch/tmp && "
+        "chmod 0700 /scratch/tmp"
     )
     if index == 9:
         selected = (
@@ -1264,7 +1264,6 @@ def create_gate_container(
         "RUSTUP_HOME": "/usr/local/rustup",
         "RUSTUP_TOOLCHAIN": "1.97.0",
         "SHELL": "/bin/sh",
-        "STARRING_D2_TEST_RUNTIME_PARENT": "/scratch/tmp/d2-runtime",
         "TMPDIR": "/scratch/tmp",
         "USER": "starring",
         "XDG_CACHE_HOME": "/scratch/xdg-cache",

@@ -5,7 +5,6 @@ import ctypes
 import datetime
 import fcntl
 import hashlib
-import importlib.util
 import io
 import json
 import os
@@ -23,17 +22,8 @@ from unittest import mock
 
 DIRECTORY = pathlib.Path(__file__).parent
 sys.path.insert(0, str(DIRECTORY))
-CERTIFICATION_SPEC = importlib.util.spec_from_file_location(
-    "d2_certification", DIRECTORY / "d2_certification.py"
-)
-CERTIFICATION = importlib.util.module_from_spec(CERTIFICATION_SPEC)
-sys.modules["d2_certification"] = CERTIFICATION
-CERTIFICATION_SPEC.loader.exec_module(CERTIFICATION)
-ORCHESTRATOR_SPEC = importlib.util.spec_from_file_location(
-    "isolated_orchestrator", DIRECTORY / "isolated_orchestrator.py"
-)
-ORCHESTRATOR = importlib.util.module_from_spec(ORCHESTRATOR_SPEC)
-ORCHESTRATOR_SPEC.loader.exec_module(ORCHESTRATOR)
+import d2_certification as CERTIFICATION
+import isolated_orchestrator as ORCHESTRATOR
 CONTRACT = sys.modules["d2_orchestrator_contract"]
 PLATFORM = sys.modules["d2_orchestrator_platform"]
 DRAINED_RUNTIME_RESTART = sys.modules["d2_drained_runtime_restart"]
@@ -857,6 +847,17 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         for service in context.manifest["services"].values():
             self.platform.loaded.discard(service["label"])
         ORCHESTRATOR.guarded_remove_root(context, self.platform)
+
+    def test_orchestrator_uses_canonical_certification_module(self):
+        self.assertIs(sys.modules["d2_certification"], CERTIFICATION)
+        self.assertIs(
+            CONTRACT.load_verified_manifest,
+            CERTIFICATION.load_verified_manifest,
+        )
+        self.assertIs(
+            ORCHESTRATOR.isolated_runtime_root,
+            CERTIFICATION.isolated_runtime_root,
+        )
 
     def advance_live_clock(self, seconds):
         self.live_clock += seconds
