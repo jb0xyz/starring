@@ -19,6 +19,7 @@ from d2_certification import (
     require_absolute_path,
     require_owned_mode,
     validate_snowflake,
+    validate_utc_timestamp,
 )
 from d2_orchestrator_composition import (
     compose_plists,
@@ -81,9 +82,12 @@ from d2_legacy_substrate_recovery import (
     load_lifecycle_journal,
 )
 from d2_source_contract import (
+    CANDIDATE_KIND,
     publish_bootstrap_source,
     publish_candidate_source,
     publish_onboarding_source,
+    read_private_source,
+    source_path,
 )
 from d2_worker_evidence import capture_worker_authoring_checkpoint
 
@@ -105,6 +109,7 @@ DISCORD_TEARDOWN_ABORT_KIND = "starring.d2.discord-resource-teardown-abort.v1"
 CLEANUP_ROOT_PROGRESS_KIND = "starring.d2.cleanup-root-progress.v1"
 CLEANUP_ROOT_IDENTITY_KIND = "starring.d2.cleanup-root-identity.v1"
 CLEANUP_KEYCHAIN_BASELINE_KIND = "starring.d2.cleanup-keychain-baseline.v1"
+CANDIDATE_START_TRANSITION_KIND = "starring.d2.candidate-start-transition.v1"
 RECONCILIATION_DISCORD_OBSERVATION_KIND = (
     "starring.d2.discord-reconciliation-role-observation.v1"
 )
@@ -530,7 +535,7 @@ def revalidate_candidate_process(context, platform, name, evidence):
             fail("candidate_runtime_health_final_identity_drift")
 
 
-def write_candidate_evidence(context, statuses, platform):
+def build_candidate_evidence(context, statuses, platform):
     manifest = context.manifest
     transport_snapshot = platform.transport_control(context, "snapshot")
     observations = {
@@ -551,7 +556,7 @@ def write_candidate_evidence(context, statuses, platform):
         revalidate_candidate_process(
             context, platform, name, process_identities[name]
         )
-    evidence = {
+    return {
         "api_sha256": manifest["candidates"]["api"]["sha256"],
         "runtime_sha256": manifest["candidates"]["runtime"]["sha256"],
         "codex_worker_sha256": manifest["source_trees"]["codex_worker"]["sha256"],
@@ -575,11 +580,86 @@ def write_candidate_evidence(context, statuses, platform):
         "tunnel_ready": statuses["tunnel"] == 200,
         "process_identities": process_identities,
     }
+
+
+def candidate_start_transition_path(context):
+    return context.artifact_directory / "candidate-start-transition.json"
+
+
+def candidate_start_source_path(context):
+    return source_path(context, 3, "candidate")
+
+
+def candidate_start_commitment_present(context):
+    return os.path.lexists(candidate_start_transition_path(context)) or os.path.lexists(
+        candidate_start_source_path(context)
+    )
+
+
+def digest_json(value):
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def load_candidate_start_transition(context, snapshot):
+    path = candidate_start_transition_path(context)
+    try:
+        require_owned_mode(path, 0o600, "candidate_start_transition")
+    except CertificationError as error:
+        fail(str(error))
+    transition = load_json(path, "candidate_start_transition_invalid")
+    if (
+        not isinstance(transition, dict)
+        or set(transition)
+        != {
+            "schema_version",
+            "kind",
+            "manifest_sha256",
+            "run_id",
+            "observed_at",
+            "evidence_sha256",
+            "standing_snapshot_sha256",
+        }
+        or type(transition["schema_version"]) is not int
+        or transition["schema_version"] != 1
+        or transition["kind"] != CANDIDATE_START_TRANSITION_KIND
+        or transition["manifest_sha256"] != context.digest
+        or transition["run_id"] != context.manifest["run_id"]
+        or not validate_utc_timestamp(transition["observed_at"])
+        or not DIGEST_PATTERN.fullmatch(transition["evidence_sha256"])
+        or not DIGEST_PATTERN.fullmatch(transition["standing_snapshot_sha256"])
+        or transition["standing_snapshot_sha256"] != digest_json(snapshot)
+    ):
+        fail("candidate_start_transition_invalid")
+    evidence = load_step_evidence(context, 3)
+    if transition["evidence_sha256"] != digest_json(evidence):
+        fail("candidate_start_transition_evidence_drift")
+    return transition, evidence
+
+
+def stage_candidate_start_transition(context, evidence, snapshot):
+    if candidate_start_commitment_present(context):
+        fail("candidate_start_transition_reentry_invalid")
     write_atomic(
         context.artifact_directory / "step-03-evidence.json",
         canonical_json(evidence) + "\n",
     )
-    return publish_candidate_source(context, evidence, utc_now())
+    transition = {
+        "schema_version": 1,
+        "kind": CANDIDATE_START_TRANSITION_KIND,
+        "manifest_sha256": context.digest,
+        "run_id": context.manifest["run_id"],
+        "observed_at": utc_now(),
+        "evidence_sha256": digest_json(evidence),
+        "standing_snapshot_sha256": digest_json(snapshot),
+    }
+    write_atomic(
+        candidate_start_transition_path(context),
+        canonical_json(transition) + "\n",
+    )
+    recorded, recorded_evidence = load_candidate_start_transition(context, snapshot)
+    if recorded != transition or recorded_evidence != evidence:
+        fail("candidate_start_transition_replay_drift")
+    return transition
 
 
 def load_step_evidence(context, step):
@@ -604,6 +684,69 @@ def candidate_coordinator_sources(context):
         context, load_step_evidence(context, 3), utc_now()
     )
     return {"1": str(bootstrap), "3": str(candidate)}
+
+
+def candidate_start_result(bootstrap_source, candidate_source, status):
+    return {
+        "status": status,
+        "phase": "candidate_started",
+        "candidate_services_loaded": True,
+        "database_schema_ready": True,
+        "credentials_sealed": True,
+        "coordinator_sources": {
+            "1": str(bootstrap_source),
+            "3": str(candidate_source),
+        },
+    }
+
+
+def recover_candidate_start_transition(context, platform, state):
+    if state["phase"] != "candidate_starting":
+        fail("candidate_start_transition_retirement_required")
+    if not os.path.lexists(candidate_start_transition_path(context)):
+        fail("candidate_start_transition_retirement_required")
+    transition, evidence = load_candidate_start_transition(
+        context, state["standing_snapshot"]
+    )
+    if not platform.postgres_running(context.cluster_root) or any(
+        not platform.launchd_loaded(context.manifest["services"][name]["label"])
+        for name in SERVICE_START_ORDER
+    ):
+        fail("candidate_start_transition_retirement_required")
+    statuses = candidate_health(context, platform, wait=True)
+    if any(status != 200 for status in statuses.values()):
+        fail("candidate_start_transition_recovery_unready")
+    if standing_snapshot(context, platform) != state["standing_snapshot"]:
+        fail("protected_staging_state_changed")
+    try:
+        observed = build_candidate_evidence(context, statuses, platform)
+    except OrchestratorError:
+        fail("candidate_start_transition_retirement_required")
+    if observed != evidence:
+        fail("candidate_start_transition_retirement_required")
+    candidate_path = publish_candidate_source(
+        context, evidence, transition["observed_at"]
+    )
+    source = read_private_source(context, candidate_path, 3, CANDIDATE_KIND)
+    if (
+        source["observed_at"] != transition["observed_at"]
+        or source["evidence"] != evidence
+    ):
+        fail("candidate_start_transition_source_drift")
+    bootstrap_source = publish_bootstrap_source(
+        context, load_step_evidence(context, 1), utc_now()
+    )
+    append_journal(
+        context,
+        "candidate_start_transition",
+        "complete",
+        transition["evidence_sha256"],
+    )
+    append_journal(context, "postgres_start", "complete", "cluster")
+    save_state(context, "candidate_started", state["standing_snapshot"])
+    return candidate_start_result(
+        bootstrap_source, candidate_path, "candidate_start_recovered"
+    )
 
 
 def pinned_transport_instance_id(context):
@@ -652,6 +795,8 @@ def command_start(context, platform):
             "phase": "candidate_started",
             "coordinator_sources": candidate_coordinator_sources(context),
         }
+    if candidate_start_commitment_present(context):
+        return recover_candidate_start_transition(context, platform, state)
     if state["phase"] in {
         "substrate_starting",
         "substrate_started",
@@ -708,21 +853,27 @@ def command_start(context, platform):
             fail("candidate_health_unready")
         if standing_snapshot(context, platform) != state["standing_snapshot"]:
             fail("protected_staging_state_changed")
-        candidate_source = write_candidate_evidence(context, statuses, platform)
+        candidate_evidence = build_candidate_evidence(context, statuses, platform)
+        transition = stage_candidate_start_transition(
+            context, candidate_evidence, state["standing_snapshot"]
+        )
+        candidate_source = publish_candidate_source(
+            context, candidate_evidence, transition["observed_at"]
+        )
+        append_journal(
+            context,
+            "candidate_start_transition",
+            "complete",
+            transition["evidence_sha256"],
+        )
         append_journal(context, "postgres_start", "complete", "cluster")
         save_state(context, "candidate_started", state["standing_snapshot"])
-        return {
-            "status": "candidate_started",
-            "phase": "candidate_started",
-            "candidate_services_loaded": True,
-            "database_schema_ready": True,
-            "credentials_sealed": True,
-            "coordinator_sources": {
-                "1": str(bootstrap_source),
-                "3": str(candidate_source),
-            },
-        }
+        return candidate_start_result(
+            bootstrap_source, candidate_source, "candidate_started"
+        )
     except BaseException:
+        if candidate_start_commitment_present(context):
+            raise
         try:
             rollback_candidate_services(context, platform)
             platform.postgres_stop(context.cluster_root)

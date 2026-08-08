@@ -3182,6 +3182,92 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertIn(label, self.platform.bootouts)
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
+    def test_candidate_start_recovers_crash_after_source_publication(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        real_save_state = ORCHESTRATOR.save_state
+
+        def crash_after_source(context, phase, snapshot):
+            if phase == "candidate_started":
+                raise ORCHESTRATOR.OrchestratorError("injected_after_source_publish")
+            return real_save_state(context, phase, snapshot)
+
+        with mock.patch.object(
+            ORCHESTRATOR, "save_state", side_effect=crash_after_source
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_after_source_publish"
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertEqual(
+            ORCHESTRATOR.load_state(self.context)["phase"], "candidate_starting"
+        )
+        self.assertTrue(ORCHESTRATOR.candidate_start_source_path(self.context).is_file())
+        original_pids = dict(self.platform.pids)
+        recovered = ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertEqual(recovered["status"], "candidate_start_recovered")
+        self.assertEqual(recovered["phase"], "candidate_started")
+        self.assertEqual(self.platform.pids, original_pids)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_candidate_start_recovers_crash_before_source_publication(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "publish_candidate_source",
+            side_effect=ORCHESTRATOR.OrchestratorError(
+                "injected_before_source_publish"
+            ),
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_before_source_publish"
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_transition_path(self.context).is_file()
+        )
+        self.assertFalse(
+            ORCHESTRATOR.candidate_start_source_path(self.context).exists()
+        )
+        original_pids = dict(self.platform.pids)
+        recovered = ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertEqual(recovered["status"], "candidate_start_recovered")
+        self.assertEqual(self.platform.pids, original_pids)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_candidate_start_identity_drift_requires_whole_run_retirement(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        real_save_state = ORCHESTRATOR.save_state
+
+        def crash_after_source(context, phase, snapshot):
+            if phase == "candidate_started":
+                raise ORCHESTRATOR.OrchestratorError("injected_after_source_publish")
+            return real_save_state(context, phase, snapshot)
+
+        with mock.patch.object(
+            ORCHESTRATOR, "save_state", side_effect=crash_after_source
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_after_source_publish"
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        api_label = self.context.manifest["services"]["api"]["label"]
+        prior_pid = self.platform.pids[api_label]
+        replacement_pid = prior_pid + 100
+        prior_start = self.platform.process_start_times[prior_pid]
+        self.platform.pids[api_label] = replacement_pid
+        self.platform.process_start_times[replacement_pid] = (
+            prior_start[0] + 1,
+            prior_start[1],
+        )
+        for _ in range(2):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "candidate_start_transition_retirement_required",
+            ):
+                ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertEqual(
+            ORCHESTRATOR.load_state(self.context)["phase"], "candidate_starting"
+        )
+        self.assertTrue(ORCHESTRATOR.candidate_start_source_path(self.context).is_file())
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
     def test_onboarding_is_manifest_scoped_and_exactly_replayable(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         ORCHESTRATOR.command_start(self.context, self.platform)
