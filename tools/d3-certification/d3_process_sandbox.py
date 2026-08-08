@@ -38,6 +38,7 @@ SANDBOX_PROFILE = " ".join(
         "(deny file-clone)",
         "(deny mach-priv-task-port)",
         "(allow mach-lookup",
+        '(global-name "com.apple.SystemConfiguration.configd")',
         '(global-name "com.apple.system.notification_center")',
         '(global-name "com.apple.system.opendirectoryd.libinfo")',
         '(global-name "com.apple.system.opendirectoryd.membership")',

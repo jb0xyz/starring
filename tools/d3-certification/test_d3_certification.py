@@ -21,6 +21,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 import d3_candidate_bundle as BUNDLE
 import d3_candidate_io as CANDIDATE_IO
+import d3_process_sandbox as PROCESS_SANDBOX
 
 
 def run(argv, cwd):
@@ -125,6 +126,67 @@ class D3BootstrapSafetyTests(unittest.TestCase):
                     {"image_id": "sha256:" + "1" * 64},
                 )
         self.assertFalse((self.root / ".gate-bootstrap-staging").exists())
+
+
+class D3ProcessSandboxTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.temporary.name).resolve()
+        self.root.chmod(0o700)
+        self.worktree = self.root / "worktree"
+        self.worktree.mkdir(mode=0o700)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_networkless_profile_allows_system_configuration_bootstrap(self):
+        self.assertEqual(
+            PROCESS_SANDBOX.SANDBOX_PROFILE.count(
+                '(global-name "com.apple.SystemConfiguration.configd")'
+            ),
+            1,
+        )
+        self.assertNotIn(
+            "network-outbound",
+            PROCESS_SANDBOX.SANDBOX_PROFILE,
+        )
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS Seatbelt")
+    def test_networkless_profile_starts_cargo(self):
+        if not BUNDLE.FIXED_RUSTUP.exists():
+            self.skipTest("fixed rustup unavailable")
+        rustup = BUNDLE.resolve_rustup()
+        cargo = BUNDLE.resolve_rustup_tool(rustup, "cargo", self.worktree)
+        rustc = BUNDLE.resolve_rustup_tool(rustup, "rustc", self.worktree)
+        mutable = self.root / "mutable"
+        mutable.mkdir(mode=0o700)
+        environment = {
+            "CARGO_HOME": str(mutable),
+            "HOME": str(mutable),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C",
+            "PATH": BUNDLE.FIXED_EXECUTABLE_PATH,
+            "RUSTC": str(rustc),
+        }
+        arguments = PROCESS_SANDBOX.sandboxed_argv(
+            [str(cargo), "--version"],
+            mutable,
+            self.worktree,
+            environment,
+            "none",
+        )
+        result = subprocess.run(
+            arguments,
+            cwd=self.worktree,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        self.assertTrue(result.stdout.startswith(b"cargo "))
 
 
 class D3CertificationTests(unittest.TestCase):
