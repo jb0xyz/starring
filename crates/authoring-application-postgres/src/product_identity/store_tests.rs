@@ -228,19 +228,35 @@ async fn private_issuer_core_persists_only_an_opaque_verified_projection() {
     .await
     .unwrap();
     assert_eq!(mismatched_state, (1, 0));
-    let raced_flow = consumed_flow(&store).await;
+    let race_store = PostgresProductIdentityStore {
+        config: PostgresProductIdentityConfig::new(
+            store.config.redirect_uri(),
+            store.config.allowed_return_paths(),
+            ProductIdentityLifetimesV1::new(
+                Duration::from_secs(600),
+                Duration::from_secs(60),
+                Duration::from_secs(300),
+                Duration::from_secs(1),
+                Duration::from_secs(10),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+        ..store.clone()
+    };
+    let raced_flow = consumed_flow(&race_store).await;
     let raced_flow_copy = copy_consumed_flow(&raced_flow);
     let left_user_id = unique_user_id();
     let right_user_id = UserId(left_user_id.0 + 1);
     let (left, right) = join!(
-        store.issue_product_session_core(
+        race_store.issue_product_session_core(
             raced_flow,
             VerifiedIdentityProjection {
                 discord_user_id: left_user_id,
                 display_name: "Race Left",
             },
         ),
-        store.issue_product_session_core(
+        race_store.issue_product_session_core(
             raced_flow_copy,
             VerifiedIdentityProjection {
                 discord_user_id: right_user_id,
