@@ -67,6 +67,64 @@ def canonical_inventory(context, history=None):
     return {**payload, "digest_sha256": hashlib.sha256(encoded).hexdigest()}
 
 
+def transport_snapshot(context, **effect_overrides):
+    effect = {
+        "forwarded_requests": 3,
+        "rejected_requests": 1,
+        "phase": "open",
+        "operation_id": None,
+        "accepted_requests": 3,
+        "active_requests": 1,
+        "completed_requests": 2,
+        "uncertain_requests": 0,
+        "indeterminate_armed": False,
+        "armed_indeterminate_operation_id": None,
+        "indeterminate_claimed": False,
+        "claimed_indeterminate_operation_id": None,
+        "indeterminate_injections": 0,
+        "last_indeterminate_audit_reason_sha256": None,
+        "last_indeterminate_operation_id": None,
+        "last_indeterminate_upstream_status": None,
+        "owned_role_count": 1,
+        "owned_channel_count": 1,
+        "owned_message_count": 1,
+    }
+    effect.update(effect_overrides)
+    return {
+        "version": 4,
+        "ready": True,
+        "run_id": context.manifest["run_id"],
+        "guild_id": context.manifest["discord"]["guild_id"],
+        "hub_channel_id": context.manifest["discord"]["hub_channel_id"],
+        "actor_id": context.manifest["discord"]["actor_id"],
+        "bot_user_id": context.manifest["discord"]["bot_user_id"],
+        "instance_id": INSTANCE_ID,
+        "gateway": {
+            "partitioned": False,
+            "connections": 1,
+            "active_connections": 1,
+            "completed_connections": 0,
+            "clean_close_relays": 0,
+            "relay_failures": 0,
+            "connection_aborts": 0,
+            "ready_rewrites": 1,
+            "partition_events": 0,
+            "identity_rejections": 0,
+            "duplicate_armed": False,
+            "armed_duplicate_operation_id": None,
+            "duplicate_claimed": False,
+            "claimed_duplicate_operation_id": None,
+            "duplicate_injections": 0,
+            "duplicate_failed_attempts": 0,
+            "last_failed_duplicate_operation_id": None,
+            "duplicate_delivery_count": 0,
+            "last_duplicate_interaction_id": None,
+            "last_duplicate_operation_id": None,
+        },
+        "effect_http": effect,
+    }
+
+
 def discord_response(status, body=b""):
     if not isinstance(body, bytes):
         body = json.dumps(body, separators=(",", ":")).encode("utf-8")
@@ -76,10 +134,19 @@ def discord_response(status, body=b""):
 class ExchangePlatform(PLATFORM.Platform):
     def __init__(self, value):
         self.value = value
+        self.calls = []
 
     def _transport_control_exchange(
         self, context, command, fields, timeout_seconds, allow_unavailable
     ):
+        self.calls.append(
+            {
+                "command": command,
+                "fields": copy.deepcopy(fields),
+                "timeout_seconds": timeout_seconds,
+                "allow_unavailable": allow_unavailable,
+            }
+        )
         return copy.deepcopy(self.value)
 
 
@@ -645,6 +712,253 @@ class PlatformResourceTests(unittest.TestCase):
     def assert_platform_failure(self, code, operation):
         with self.assertRaisesRegex(CONTRACT.OrchestratorError, f"^{code}$"):
             operation()
+
+    def test_transport_snapshot_v4_effect_admission_schema_is_exact(self):
+        snapshot = transport_snapshot(self.context)
+        platform = ExchangePlatform({"ok": True, "snapshot": snapshot})
+        self.assertTrue(platform._transport_snapshot_valid(self.context, snapshot))
+        self.assertEqual(platform.transport_health_status(self.context), 200)
+        self.assertEqual(platform.transport_control(self.context, "snapshot"), snapshot)
+        draining = transport_snapshot(
+            self.context,
+            phase="draining",
+            operation_id="d2:0123456789abcdef:finalize-effect-admission",
+        )
+        teardown = transport_snapshot(
+            self.context,
+            phase="teardown_delete_only",
+            operation_id="d2:0123456789abcdef:finalize-effect-admission",
+            active_requests=0,
+            completed_requests=3,
+        )
+        self.assertTrue(
+            platform._transport_snapshot_valid(self.context, draining)
+        )
+        self.assertTrue(platform._transport_snapshot_valid(self.context, teardown))
+
+    def test_transport_snapshot_rejects_effect_admission_schema_and_counter_drift(self):
+        snapshot = transport_snapshot(self.context)
+        cases = []
+        for field, value in (
+            ("version", 3),
+            ("version", True),
+        ):
+            changed = copy.deepcopy(snapshot)
+            changed[field] = value
+            cases.append(changed)
+        extra = copy.deepcopy(snapshot)
+        extra["effect_http"]["unexpected"] = 0
+        cases.append(extra)
+        missing = copy.deepcopy(snapshot)
+        missing["effect_http"].pop("completed_requests")
+        cases.append(missing)
+        for field, value in (
+            ("phase", "closed"),
+            ("phase", []),
+            ("operation_id", "d2:unexpected:open-operation"),
+            ("accepted_requests", True),
+            ("active_requests", -1),
+            ("completed_requests", 3),
+            ("uncertain_requests", -1),
+        ):
+            changed = copy.deepcopy(snapshot)
+            changed["effect_http"][field] = value
+            cases.append(changed)
+        draining_without_operation = copy.deepcopy(snapshot)
+        draining_without_operation["effect_http"]["phase"] = "draining"
+        cases.append(draining_without_operation)
+        draining_bad_operation = copy.deepcopy(snapshot)
+        draining_bad_operation["effect_http"].update(
+            {"phase": "draining", "operation_id": "invalid operation"}
+        )
+        cases.append(draining_bad_operation)
+        for value in cases:
+            with self.subTest(value=value):
+                self.assertFalse(
+                    PLATFORM.Platform()._transport_snapshot_valid(
+                        self.context, value, require_ready=False
+                    )
+                )
+
+    def test_transport_effect_admission_accepts_transition_replay_and_active(self):
+        operation_id = "d2:0123456789abcdef:finalize-effect-admission"
+        cases = (
+            (
+                "close_effect_admission",
+                True,
+                "transitioned",
+                "draining",
+            ),
+            (
+                "close_effect_admission",
+                False,
+                "replayed",
+                "draining",
+            ),
+            (
+                "close_effect_admission",
+                False,
+                "replayed",
+                "teardown_delete_only",
+            ),
+            (
+                "close_effect_admission",
+                False,
+                "conflict",
+                "draining",
+            ),
+            (
+                "enable_teardown_deletes",
+                False,
+                "active_requests",
+                "draining",
+            ),
+            (
+                "enable_teardown_deletes",
+                True,
+                "transitioned",
+                "teardown_delete_only",
+            ),
+            (
+                "enable_teardown_deletes",
+                False,
+                "replayed",
+                "teardown_delete_only",
+            ),
+            (
+                "enable_teardown_deletes",
+                False,
+                "conflict",
+                "open",
+            ),
+        )
+        for operation, changed, disposition, phase in cases:
+            with self.subTest(operation=operation, disposition=disposition, phase=phase):
+                response = {
+                    "ok": True,
+                    "changed": changed,
+                    "disposition": disposition,
+                    "phase": phase,
+                    "operation_id": operation_id,
+                }
+                platform = ExchangePlatform(response)
+                self.assertEqual(
+                    platform.transport_effect_admission(
+                        self.context, operation, operation_id
+                    ),
+                    {key: response[key] for key in response if key != "ok"},
+                )
+                self.assertEqual(
+                    platform.calls,
+                    [
+                        {
+                            "command": operation,
+                            "fields": {"operation_id": operation_id},
+                            "timeout_seconds": 3,
+                            "allow_unavailable": False,
+                        }
+                    ],
+                )
+
+    def test_transport_effect_admission_rejects_invalid_request_and_response(self):
+        operation_id = "d2:0123456789abcdef:finalize-effect-admission"
+        valid = {
+            "ok": True,
+            "changed": True,
+            "disposition": "transitioned",
+            "phase": "draining",
+            "operation_id": operation_id,
+        }
+        for operation, identity in (
+            ("close-admission", operation_id),
+            (None, operation_id),
+            ("close_effect_admission", None),
+            ("close_effect_admission", "short"),
+            ("close_effect_admission", "D2:invalid:operation"),
+        ):
+            with self.subTest(operation=operation, identity=identity):
+                platform = ExchangePlatform(valid)
+                self.assert_platform_failure(
+                    "transport_control_request_invalid",
+                    lambda operation=operation, identity=identity: (
+                        platform.transport_effect_admission(
+                            self.context, operation, identity
+                        )
+                    ),
+                )
+                self.assertEqual(platform.calls, [])
+        responses = []
+        for field, value in (
+            ("ok", False),
+            ("changed", 1),
+            ("disposition", "closed"),
+            ("disposition", []),
+            ("phase", "closed"),
+            ("phase", []),
+            ("operation_id", "d2:0123456789abcdef:other-operation"),
+        ):
+            response = copy.deepcopy(valid)
+            response[field] = value
+            responses.append(response)
+        extra = copy.deepcopy(valid)
+        extra["accepted_requests"] = 0
+        responses.append(extra)
+        changed_replay = copy.deepcopy(valid)
+        changed_replay.update({"disposition": "replayed", "changed": True})
+        responses.append(changed_replay)
+        close_active = copy.deepcopy(valid)
+        close_active.update(
+            {"disposition": "active_requests", "changed": False}
+        )
+        responses.append(close_active)
+        close_wrong_phase = copy.deepcopy(valid)
+        close_wrong_phase["phase"] = "teardown_delete_only"
+        responses.append(close_wrong_phase)
+        for response in responses:
+            with self.subTest(response=response):
+                self.assert_platform_failure(
+                    "transport_control_response_invalid",
+                    lambda response=response: ExchangePlatform(
+                        response
+                    ).transport_effect_admission(
+                        self.context, "close_effect_admission", operation_id
+                    ),
+                )
+        for response in (
+            {
+                **valid,
+                "phase": "draining",
+            },
+            {
+                **valid,
+                "changed": False,
+                "disposition": "active_requests",
+                "phase": "teardown_delete_only",
+            },
+        ):
+            with self.subTest(response=response):
+                self.assert_platform_failure(
+                    "transport_control_response_invalid",
+                    lambda response=response: ExchangePlatform(
+                        response
+                    ).transport_effect_admission(
+                        self.context, "enable_teardown_deletes", operation_id
+                    ),
+                )
+
+    def test_effect_admission_controls_are_sealed_from_transport_control(self):
+        for operation in PLATFORM.TRANSPORT_EFFECT_ADMISSION_OPERATIONS:
+            with self.subTest(operation=operation):
+                platform = ExchangePlatform({"ok": True, "changed": True})
+                self.assert_platform_failure(
+                    "transport_control_request_invalid",
+                    lambda operation=operation: platform.transport_control(
+                        self.context,
+                        operation,
+                        {"operation_id": "d2:0123456789abcdef:forbidden-control"},
+                    ),
+                )
+                self.assertEqual(platform.calls, [])
 
     def test_resource_inventory_is_exact_sorted_digest_and_instance_bound(self):
         platform = ExchangePlatform(

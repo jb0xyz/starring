@@ -370,6 +370,226 @@ class D2FinalizationTest(unittest.TestCase):
             self.platform.bootouts.index(runtime),
         )
 
+    def test_freeze_persists_admission_intents_before_transitions(self):
+        real_transition = self.platform.transport_effect_admission
+        observed = []
+
+        def transition(context, operation, operation_id):
+            if operation == "close_effect_admission":
+                self.assertTrue(
+                    FINALIZATION.effect_admission_freeze_intent_path(
+                        self.context
+                    ).is_file()
+                )
+            else:
+                self.assertTrue(FINALIZATION.freeze_intent_path(self.context).is_file())
+                self.assertTrue(
+                    FINALIZATION.teardown_admission_intent_path(
+                        self.context
+                    ).is_file()
+                )
+            observed.append(operation)
+            return real_transition(context, operation, operation_id)
+
+        with mock.patch.object(
+            self.platform,
+            "transport_effect_admission",
+            side_effect=transition,
+        ):
+            FINALIZATION._ensure_effect_freeze(
+                self.context, self.platform, self.identity_boundary
+            )
+        self.assertEqual(
+            observed,
+            ["close_effect_admission", "enable_teardown_deletes"],
+        )
+
+    def test_freeze_drains_preaccepted_request_after_runtime_suspend(self):
+        runtime = self.context.manifest["services"]["runtime"]["label"]
+        runtime_pid = self.platform.pids[runtime]
+        effect = self.platform.transport_state["effect_http"]
+        effect["accepted_requests"] = 1
+        effect["active_requests"] = 1
+        effect["completed_requests"] = 0
+        real_control = self.platform.transport_control
+        draining_snapshots = 0
+
+        def control(context, command, fields=None, timeout_seconds=3):
+            nonlocal draining_snapshots
+            if (
+                command == "snapshot"
+                and effect["phase"] == "draining"
+                and not FINALIZATION.freeze_intent_path(self.context).exists()
+            ):
+                draining_snapshots += 1
+                self.assertIn(runtime_pid, self.platform.suspended_pids)
+                if draining_snapshots > 1:
+                    effect["active_requests"] = 0
+                    effect["completed_requests"] = 1
+            return real_control(context, command, fields, timeout_seconds)
+
+        with mock.patch.object(
+            self.platform,
+            "transport_control",
+            side_effect=control,
+        ), mock.patch.object(FINALIZATION.time, "sleep"):
+            FINALIZATION._ensure_effect_freeze(
+                self.context, self.platform, self.identity_boundary
+            )
+        freeze = json.loads(
+            FINALIZATION.freeze_intent_path(self.context).read_text()
+        )
+        self.assertGreaterEqual(draining_snapshots, 2)
+        self.assertEqual(freeze["effect_admission_accepted_requests"], 1)
+        self.assertEqual(freeze["effect_admission_active_requests"], 0)
+        self.assertEqual(freeze["effect_admission_completed_requests"], 1)
+
+    def test_freeze_rejects_uncertain_request_completed_during_drain(self):
+        effect = self.platform.transport_state["effect_http"]
+        effect["accepted_requests"] = 1
+        effect["active_requests"] = 1
+        effect["completed_requests"] = 0
+        real_control = self.platform.transport_control
+        draining_snapshots = 0
+
+        def control(context, command, fields=None, timeout_seconds=3):
+            nonlocal draining_snapshots
+            if command == "snapshot" and effect["phase"] == "draining":
+                draining_snapshots += 1
+                if draining_snapshots > 1:
+                    effect["active_requests"] = 0
+                    effect["completed_requests"] = 1
+                    effect["uncertain_requests"] = 1
+            return real_control(context, command, fields, timeout_seconds)
+
+        with mock.patch.object(
+            self.platform,
+            "transport_control",
+            side_effect=control,
+        ), mock.patch.object(FINALIZATION.time, "sleep"), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "finalization_effect_admission_invalid",
+        ):
+            FINALIZATION._ensure_effect_freeze(
+                self.context, self.platform, self.identity_boundary
+            )
+        self.assertTrue(
+            FINALIZATION.effect_admission_freeze_intent_path(
+                self.context
+            ).is_file()
+        )
+        self.assertFalse(FINALIZATION.freeze_intent_path(self.context).exists())
+
+    def test_freeze_recovers_close_after_durable_admission_intent(self):
+        failed = False
+
+        def boundary(context, platform, action, runtime_binding):
+            nonlocal failed
+            if action == "suspend" and not failed:
+                failed = True
+                raise ORCHESTRATOR.OrchestratorError("injected_after_close")
+            return self.identity_boundary(
+                context, platform, action, runtime_binding
+            )
+
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_after_close"
+        ):
+            FINALIZATION._ensure_effect_freeze(
+                self.context, self.platform, boundary
+            )
+        admission = json.loads(
+            FINALIZATION.effect_admission_freeze_intent_path(
+                self.context
+            ).read_text()
+        )
+        self.assertEqual(
+            self.platform.transport_state["effect_http"]["phase"], "draining"
+        )
+        self.assertEqual(
+            self.platform.transport_state["effect_http"]["operation_id"],
+            admission["operation_id"],
+        )
+        FINALIZATION._ensure_effect_freeze(
+            self.context, self.platform, self.identity_boundary
+        )
+        self.assertEqual(
+            self.platform.transport_state["effect_http"]["phase"],
+            "teardown_delete_only",
+        )
+
+    def test_freeze_recovers_lost_teardown_transition_response(self):
+        real_transition = self.platform.transport_effect_admission
+        failed = False
+
+        def transition(context, operation, operation_id):
+            nonlocal failed
+            response = real_transition(context, operation, operation_id)
+            if operation == "enable_teardown_deletes" and not failed:
+                failed = True
+                raise ORCHESTRATOR.OrchestratorError(
+                    "injected_teardown_response_loss"
+                )
+            return response
+
+        with mock.patch.object(
+            self.platform,
+            "transport_effect_admission",
+            side_effect=transition,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_teardown_response_loss"
+        ):
+            FINALIZATION._ensure_effect_freeze(
+                self.context, self.platform, self.identity_boundary
+            )
+        self.assertTrue(
+            FINALIZATION.teardown_admission_intent_path(self.context).is_file()
+        )
+        self.assertEqual(
+            self.platform.transport_state["effect_http"]["phase"],
+            "teardown_delete_only",
+        )
+        FINALIZATION._ensure_effect_freeze(
+            self.context, self.platform, self.identity_boundary
+        )
+
+    def test_frozen_teardown_rejects_admission_phase_drift(self):
+        FINALIZATION._ensure_effect_freeze(
+            self.context, self.platform, self.identity_boundary
+        )
+        effect = self.platform.transport_state["effect_http"]
+        effect["phase"] = "draining"
+        existing = set(self.platform.discord_existing)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "finalization_effect_admission_invalid",
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform, frozen=True
+            )
+        self.assertEqual(self.platform.discord_existing, existing)
+        self.assertEqual(self.platform.proxy_deletions, [])
+
+    def test_frozen_teardown_rejects_admission_counter_regression(self):
+        effect = self.platform.transport_state["effect_http"]
+        effect["accepted_requests"] = 1
+        effect["completed_requests"] = 1
+        FINALIZATION._ensure_effect_freeze(
+            self.context, self.platform, self.identity_boundary
+        )
+        effect["accepted_requests"] = 0
+        effect["completed_requests"] = 0
+        existing = set(self.platform.discord_existing)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "finalization_effect_admission_drift",
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform, frozen=True
+            )
+        self.assertEqual(self.platform.discord_existing, existing)
+        self.assertEqual(self.platform.proxy_deletions, [])
+
     def test_finalize_run_exact_replay_is_non_mutating(self):
         self.finalize()
         bootouts = list(self.platform.bootouts)

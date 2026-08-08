@@ -17,11 +17,15 @@ MAX_TRANSPORT_CONTROL_BYTES = 64 * 1024
 MAX_DISCORD_RESPONSE_BYTES = 256 * 1024
 RUNTIME_PROCESS_INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 TRANSPORT_INSTANCE_PATTERN = re.compile(r"^d2ti-[0-9a-f]{32}$")
+TRANSPORT_OPERATION_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.:-]{7,95}$")
 SNOWFLAKE_PATTERN = re.compile(r"^[1-9][0-9]{0,19}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 WORKER_INSTANCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TRANSPORT_RESOURCE_HISTORY_LIMIT = 128
 TRANSPORT_RESOURCE_INVENTORY_KIND = "starring.d2.run-owned-resource-inventory.v1"
+TRANSPORT_EFFECT_ADMISSION_OPERATIONS = frozenset(
+    {"close_effect_admission", "enable_teardown_deletes"}
+)
 DISCORD_RESOURCE_UNKNOWN = {
     "role": {10011: "Unknown Role"},
     "channel": {10003: "Unknown Channel"},
@@ -1289,7 +1293,71 @@ class Platform:
             fail("transport_control_response_invalid")
         return 200 if value["snapshot"]["ready"] else 503
 
+    def transport_effect_admission(self, context, operation, operation_id):
+        if (
+            not isinstance(operation, str)
+            or operation not in TRANSPORT_EFFECT_ADMISSION_OPERATIONS
+            or not isinstance(operation_id, str)
+            or not TRANSPORT_OPERATION_ID_PATTERN.fullmatch(operation_id)
+        ):
+            fail("transport_control_request_invalid")
+        value = self._transport_control_exchange(
+            context,
+            operation,
+            {"operation_id": operation_id},
+            3,
+            allow_unavailable=False,
+        )
+        if (
+            not isinstance(value, dict)
+            or set(value)
+            != {"ok", "changed", "disposition", "phase", "operation_id"}
+            or value["ok"] is not True
+            or type(value["changed"]) is not bool
+            or not isinstance(value["disposition"], str)
+            or value["disposition"]
+            not in {"transitioned", "replayed", "conflict", "active_requests"}
+            or value["changed"] != (value["disposition"] == "transitioned")
+            or not isinstance(value["phase"], str)
+            or value["phase"] not in {"open", "draining", "teardown_delete_only"}
+            or value["operation_id"] != operation_id
+        ):
+            fail("transport_control_response_invalid")
+        disposition = value["disposition"]
+        phase = value["phase"]
+        if (
+            operation == "close_effect_admission"
+            and (
+                disposition == "active_requests"
+                or disposition == "transitioned"
+                and phase != "draining"
+                or disposition == "replayed"
+                and phase not in {"draining", "teardown_delete_only"}
+                or disposition == "conflict"
+                and phase not in {"draining", "teardown_delete_only"}
+            )
+            or operation == "enable_teardown_deletes"
+            and (
+                disposition in {"transitioned", "replayed"}
+                and phase != "teardown_delete_only"
+                or disposition == "active_requests"
+                and phase != "draining"
+            )
+        ):
+            fail("transport_control_response_invalid")
+        return {
+            "changed": value["changed"],
+            "disposition": disposition,
+            "phase": phase,
+            "operation_id": value["operation_id"],
+        }
+
     def transport_control(self, context, command, fields=None, timeout_seconds=3):
+        if (
+            isinstance(command, str)
+            and command in TRANSPORT_EFFECT_ADMISSION_OPERATIONS
+        ):
+            fail("transport_control_request_invalid")
         value = self._transport_control_exchange(
             context, command, fields or {}, timeout_seconds, allow_unavailable=False
         )
@@ -1926,7 +1994,7 @@ class Platform:
         }:
             return False
         if (
-            snapshot["version"] != 3
+            snapshot["version"] != 4
             or type(snapshot["ready"]) is not bool
             or require_ready
             and snapshot["ready"] is not True
@@ -2035,6 +2103,12 @@ class Platform:
         if not isinstance(effect, dict) or set(effect) != {
             "forwarded_requests",
             "rejected_requests",
+            "phase",
+            "operation_id",
+            "accepted_requests",
+            "active_requests",
+            "completed_requests",
+            "uncertain_requests",
             "indeterminate_armed",
             "armed_indeterminate_operation_id",
             "indeterminate_claimed",
@@ -2056,10 +2130,30 @@ class Platform:
             for field in (
                 "forwarded_requests",
                 "rejected_requests",
+                "accepted_requests",
+                "active_requests",
+                "completed_requests",
+                "uncertain_requests",
                 "indeterminate_injections",
                 "owned_role_count",
                 "owned_channel_count",
                 "owned_message_count",
+            )
+        ):
+            return False
+        if (
+            effect["accepted_requests"]
+            != effect["active_requests"] + effect["completed_requests"]
+            or not isinstance(effect["phase"], str)
+            or effect["phase"] not in {"open", "draining", "teardown_delete_only"}
+            or effect["phase"] == "open"
+            and effect["operation_id"] is not None
+            or effect["phase"] != "open"
+            and (
+                not isinstance(effect["operation_id"], str)
+                or not TRANSPORT_OPERATION_ID_PATTERN.fullmatch(
+                    effect["operation_id"]
+                )
             )
         ):
             return False

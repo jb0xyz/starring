@@ -14,7 +14,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-use crate::state::{valid_operation_id, ArmOutcome, SharedState};
+use crate::state::{
+    valid_operation_id, ArmOutcome, EffectAdmissionOutcome, EffectAdmissionPhase, SharedState,
+};
 use crate::Config;
 
 const MAX_CONTROL_REQUEST_BYTES: usize = 4096;
@@ -183,7 +185,10 @@ fn execute(value: Value, state: &SharedState) -> Result<CommandOutcome, &'static
     let object = value.as_object().ok_or("request_invalid")?;
     let command = string_field(object, "command")?;
     let expected = match command {
-        "arm_next_duplicate" | "arm_next_create_role_indeterminate" => &[
+        "arm_next_duplicate"
+        | "arm_next_create_role_indeterminate"
+        | "close_effect_admission"
+        | "enable_teardown_deletes" => &[
             "version",
             "command",
             "run_id",
@@ -234,6 +239,28 @@ fn execute(value: Value, state: &SharedState) -> Result<CommandOutcome, &'static
             }
             arm_response(state.arm_next_indeterminate(operation_id))
         }
+        "close_effect_admission" => {
+            let operation_id = string_field(object, "operation_id")?;
+            if !valid_operation_id(operation_id) {
+                return Err("target_invalid");
+            }
+            effect_admission_response(
+                state.close_effect_admission(operation_id),
+                state.effect_admission_phase(),
+                operation_id,
+            )
+        }
+        "enable_teardown_deletes" => {
+            let operation_id = string_field(object, "operation_id")?;
+            if !valid_operation_id(operation_id) {
+                return Err("target_invalid");
+            }
+            effect_admission_response(
+                state.enable_teardown_deletes(operation_id),
+                state.effect_admission_phase(),
+                operation_id,
+            )
+        }
         "disarm_duplicate" => changed_response(state.disarm_duplicate()),
         "disarm_indeterminate" => changed_response(state.disarm_indeterminate()),
         "partition_gateway" => changed_response(state.partition()),
@@ -283,6 +310,31 @@ fn arm_response(outcome: ArmOutcome) -> Value {
         }
         ArmOutcome::Busy => json!({"ok": true, "changed": false, "disposition": "busy"}),
     }
+}
+
+fn effect_admission_response(
+    outcome: EffectAdmissionOutcome,
+    phase: EffectAdmissionPhase,
+    operation_id: &str,
+) -> Value {
+    let (changed, disposition) = match outcome {
+        EffectAdmissionOutcome::Transitioned => (true, "transitioned"),
+        EffectAdmissionOutcome::Replayed => (false, "replayed"),
+        EffectAdmissionOutcome::Conflict => (false, "conflict"),
+        EffectAdmissionOutcome::ActiveRequests => (false, "active_requests"),
+    };
+    let phase = match phase {
+        EffectAdmissionPhase::Open => "open",
+        EffectAdmissionPhase::Draining => "draining",
+        EffectAdmissionPhase::TeardownDeleteOnly => "teardown_delete_only",
+    };
+    json!({
+        "ok": true,
+        "changed": changed,
+        "disposition": disposition,
+        "phase": phase,
+        "operation_id": operation_id
+    })
 }
 
 fn error_response(code: &'static str) -> Value {
@@ -385,6 +437,103 @@ mod tests {
         assert_eq!(
             execute(Value::Object(request), &state).err(),
             Some("request_invalid")
+        );
+    }
+
+    #[test]
+    fn effect_admission_control_is_exact_replayable_and_conflict_bound() {
+        let (_root, state) = state();
+        let state = Arc::new(state);
+        let lease = state.begin_effect_request(None).unwrap();
+        let operation_id = "d2:finalization:freeze";
+        let invoke = |command_name: &str, operation: &str| {
+            let mut request = command(command_name);
+            request.insert("operation_id".to_owned(), json!(operation));
+            match execute(Value::Object(request), &state).unwrap() {
+                CommandOutcome::Continue(response) => response,
+                CommandOutcome::Shutdown(_) => panic!("unexpected shutdown"),
+            }
+        };
+        let closed = invoke("close_effect_admission", operation_id);
+        assert_eq!(
+            closed,
+            json!({
+                "ok": true,
+                "changed": true,
+                "disposition": "transitioned",
+                "phase": "draining",
+                "operation_id": operation_id
+            })
+        );
+        let replayed = invoke("close_effect_admission", operation_id);
+        assert_eq!(replayed["changed"], false);
+        assert_eq!(replayed["disposition"], "replayed");
+        assert_eq!(replayed["phase"], "draining");
+        let conflict = invoke("close_effect_admission", "d2:finalization:other");
+        assert_eq!(conflict["changed"], false);
+        assert_eq!(conflict["disposition"], "conflict");
+        assert_eq!(conflict["phase"], "draining");
+        let active = invoke("enable_teardown_deletes", operation_id);
+        assert_eq!(active["changed"], false);
+        assert_eq!(active["disposition"], "active_requests");
+        assert_eq!(active["phase"], "draining");
+        drop(lease);
+        let enabled = invoke("enable_teardown_deletes", operation_id);
+        assert_eq!(enabled["changed"], true);
+        assert_eq!(enabled["disposition"], "transitioned");
+        assert_eq!(enabled["phase"], "teardown_delete_only");
+        let enabled_replay = invoke("enable_teardown_deletes", operation_id);
+        assert_eq!(enabled_replay["changed"], false);
+        assert_eq!(enabled_replay["disposition"], "replayed");
+        assert_eq!(enabled_replay["phase"], "teardown_delete_only");
+        let mut invalid = command("close_effect_admission");
+        invalid.insert("operation_id".to_owned(), json!("INVALID"));
+        assert_eq!(
+            execute(Value::Object(invalid), &state).err(),
+            Some("target_invalid")
+        );
+    }
+
+    #[test]
+    fn concurrent_effect_admission_close_has_one_exact_winner() {
+        let (_root, state) = state();
+        let state = Arc::new(state);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut closes = Vec::new();
+        for operation_id in ["d2:finalization:first", "d2:finalization:second"] {
+            let state = Arc::clone(&state);
+            let barrier = Arc::clone(&barrier);
+            closes.push(std::thread::spawn(move || {
+                let mut request = command("close_effect_admission");
+                request.insert("operation_id".to_owned(), json!(operation_id));
+                barrier.wait();
+                match execute(Value::Object(request), &state).unwrap() {
+                    CommandOutcome::Continue(response) => response,
+                    CommandOutcome::Shutdown(_) => panic!("unexpected shutdown"),
+                }
+            }));
+        }
+        barrier.wait();
+        let responses = closes
+            .into_iter()
+            .map(|close| close.join().unwrap())
+            .collect::<Vec<_>>();
+        let transitioned = responses
+            .iter()
+            .filter(|response| response["disposition"] == "transitioned")
+            .collect::<Vec<_>>();
+        let conflicts = responses
+            .iter()
+            .filter(|response| response["disposition"] == "conflict")
+            .collect::<Vec<_>>();
+        assert_eq!(transitioned.len(), 1);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(transitioned[0]["phase"], "draining");
+        assert_eq!(conflicts[0]["phase"], "draining");
+        let snapshot = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(
+            snapshot["effect_http"]["operation_id"],
+            transitioned[0]["operation_id"]
         );
     }
 
@@ -514,7 +663,7 @@ mod tests {
         let response: Value = serde_json::from_slice(&response).unwrap();
         assert_eq!(response["ok"], true);
         assert_eq!(response["snapshot"]["ready"], false);
-        assert_eq!(response["snapshot"]["version"], 3);
+        assert_eq!(response["snapshot"]["version"], 4);
         assert_eq!(response["snapshot"]["hub_channel_id"], "5");
         let mut stream = UnixStream::connect(&socket).await.unwrap();
         let shutdown = json!({

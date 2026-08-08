@@ -48,6 +48,12 @@ struct StateInner {
     last_duplicate_operation_id: Option<String>,
     forwarded_http_requests: u64,
     rejected_http_requests: u64,
+    effect_admission_phase: EffectAdmissionPhase,
+    effect_admission_operation_id: Option<String>,
+    effect_accepted_requests: u64,
+    effect_active_requests: u64,
+    effect_completed_requests: u64,
+    effect_uncertain_requests: u64,
     indeterminate_arm: Option<TimedArm>,
     indeterminate_claim: Option<IndeterminateTarget>,
     indeterminate_injections: u64,
@@ -61,6 +67,7 @@ struct StateInner {
     pending_role_slots: usize,
     pending_channel_slots: usize,
     pending_message_slots: usize,
+    pending_delete_resources: BTreeSet<ResourceIdentity>,
 }
 
 struct IndeterminateTarget {
@@ -82,6 +89,17 @@ pub struct IndeterminateClaim {
     audit_reason_sha256: String,
 }
 
+pub struct EffectRequestLease {
+    state: ArcState,
+    finished: bool,
+    delete_reservation: Option<ResourceIdentity>,
+}
+
+pub struct ForwardedRequestOutcome {
+    state: ArcState,
+    uncertain: bool,
+}
+
 pub struct DuplicateClaim {
     operation_id: String,
     interaction_id: String,
@@ -92,6 +110,31 @@ pub enum ArmOutcome {
     Armed,
     Replayed,
     Busy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectAdmissionPhase {
+    Open,
+    Draining,
+    TeardownDeleteOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectAdmissionOutcome {
+    Transitioned,
+    Replayed,
+    Conflict,
+    ActiveRequests,
+}
+
+pub enum EffectDeleteResource {
+    Role(String),
+    Channel(String),
+    Message {
+        channel_id: String,
+        message_id: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -174,6 +217,12 @@ struct GatewaySnapshot {
 struct EffectHttpSnapshot {
     forwarded_requests: u64,
     rejected_requests: u64,
+    phase: EffectAdmissionPhase,
+    operation_id: Option<String>,
+    accepted_requests: u64,
+    active_requests: u64,
+    completed_requests: u64,
+    uncertain_requests: u64,
     indeterminate_armed: bool,
     armed_indeterminate_operation_id: Option<String>,
     indeterminate_claimed: bool,
@@ -272,6 +321,12 @@ impl SharedState {
                 last_duplicate_operation_id: None,
                 forwarded_http_requests: 0,
                 rejected_http_requests: 0,
+                effect_admission_phase: EffectAdmissionPhase::Open,
+                effect_admission_operation_id: None,
+                effect_accepted_requests: 0,
+                effect_active_requests: 0,
+                effect_completed_requests: 0,
+                effect_uncertain_requests: 0,
                 indeterminate_arm: None,
                 indeterminate_claim: None,
                 indeterminate_injections: 0,
@@ -285,6 +340,7 @@ impl SharedState {
                 pending_role_slots: 0,
                 pending_channel_slots: 0,
                 pending_message_slots: 0,
+                pending_delete_resources: BTreeSet::new(),
             }),
             partition_tx,
         })
@@ -598,14 +654,118 @@ impl SharedState {
         }
     }
 
-    pub fn record_forwarded_http(&self) {
-        let mut inner = self.inner.lock().expect("state mutex poisoned");
-        inner.forwarded_http_requests = inner.forwarded_http_requests.saturating_add(1);
-    }
-
     pub fn record_rejected_http(&self) {
         let mut inner = self.inner.lock().expect("state mutex poisoned");
         inner.rejected_http_requests = inner.rejected_http_requests.saturating_add(1);
+    }
+
+    pub fn begin_effect_request(
+        self: &std::sync::Arc<Self>,
+        owned_resource_delete: Option<EffectDeleteResource>,
+    ) -> Option<EffectRequestLease> {
+        let mut inner = self.inner.lock().expect("state mutex poisoned");
+        let delete_reservation = match inner.effect_admission_phase {
+            EffectAdmissionPhase::Open => match owned_resource_delete {
+                Some(resource) => Some(self.reserve_effect_delete(&mut inner, resource)?),
+                None => None,
+            },
+            EffectAdmissionPhase::Draining => return None,
+            EffectAdmissionPhase::TeardownDeleteOnly => {
+                Some(self.reserve_effect_delete(&mut inner, owned_resource_delete?)?)
+            }
+        };
+        if inner.effect_accepted_requests == u64::MAX || inner.effect_active_requests == u64::MAX {
+            if let Some(identity) = delete_reservation.as_ref() {
+                inner.pending_delete_resources.remove(identity);
+            }
+            return None;
+        }
+        inner.effect_accepted_requests += 1;
+        inner.effect_active_requests += 1;
+        drop(inner);
+        Some(EffectRequestLease {
+            state: std::sync::Arc::clone(self),
+            finished: false,
+            delete_reservation,
+        })
+    }
+
+    fn reserve_effect_delete(
+        &self,
+        inner: &mut StateInner,
+        resource: EffectDeleteResource,
+    ) -> Option<ResourceIdentity> {
+        let identity = resource.identity();
+        if !self.resource_state_consistent(inner)
+            || !resource_identity_owned(inner, &identity)
+            || !inner.pending_delete_resources.insert(identity.clone())
+        {
+            return None;
+        }
+        Some(identity)
+    }
+
+    pub fn begin_forwarded_request(
+        self: &std::sync::Arc<Self>,
+        mutation: bool,
+    ) -> ForwardedRequestOutcome {
+        let mut inner = self.inner.lock().expect("state mutex poisoned");
+        inner.forwarded_http_requests = inner.forwarded_http_requests.saturating_add(1);
+        drop(inner);
+        ForwardedRequestOutcome {
+            state: std::sync::Arc::clone(self),
+            uncertain: mutation,
+        }
+    }
+
+    pub fn close_effect_admission(&self, operation_id: &str) -> EffectAdmissionOutcome {
+        if !valid_operation_id(operation_id) {
+            return EffectAdmissionOutcome::Conflict;
+        }
+        let mut inner = self.inner.lock().expect("state mutex poisoned");
+        match inner.effect_admission_phase {
+            EffectAdmissionPhase::Open => {
+                inner.effect_admission_phase = EffectAdmissionPhase::Draining;
+                inner.effect_admission_operation_id = Some(operation_id.to_owned());
+                EffectAdmissionOutcome::Transitioned
+            }
+            EffectAdmissionPhase::Draining | EffectAdmissionPhase::TeardownDeleteOnly => {
+                if inner.effect_admission_operation_id.as_deref() == Some(operation_id) {
+                    EffectAdmissionOutcome::Replayed
+                } else {
+                    EffectAdmissionOutcome::Conflict
+                }
+            }
+        }
+    }
+
+    pub fn enable_teardown_deletes(&self, operation_id: &str) -> EffectAdmissionOutcome {
+        if !valid_operation_id(operation_id) {
+            return EffectAdmissionOutcome::Conflict;
+        }
+        let mut inner = self.inner.lock().expect("state mutex poisoned");
+        if inner.effect_admission_operation_id.as_deref() != Some(operation_id) {
+            return EffectAdmissionOutcome::Conflict;
+        }
+        match inner.effect_admission_phase {
+            EffectAdmissionPhase::Open => EffectAdmissionOutcome::Conflict,
+            EffectAdmissionPhase::Draining => {
+                if inner.effect_active_requests != 0 || !inner.pending_delete_resources.is_empty() {
+                    EffectAdmissionOutcome::ActiveRequests
+                } else {
+                    inner.effect_admission_phase = EffectAdmissionPhase::TeardownDeleteOnly;
+                    EffectAdmissionOutcome::Transitioned
+                }
+            }
+            EffectAdmissionPhase::TeardownDeleteOnly => EffectAdmissionOutcome::Replayed,
+        }
+    }
+
+    pub fn effect_admission_phase(&self) -> EffectAdmissionPhase {
+        self.inner
+            .lock()
+            .expect("state mutex poisoned")
+            .effect_admission_phase
     }
 
     pub fn reserve_resource(
@@ -970,8 +1130,17 @@ impl SharedState {
     pub fn snapshot(&self) -> Snapshot {
         let inner = self.inner.lock().expect("state mutex poisoned");
         let now = Instant::now();
+        assert_eq!(
+            inner.effect_accepted_requests,
+            inner
+                .effect_active_requests
+                .checked_add(inner.effect_completed_requests)
+                .expect("effect request counter overflow"),
+            "effect request counter invariant violated"
+        );
+        assert!(inner.effect_uncertain_requests <= inner.forwarded_http_requests);
         Snapshot {
-            version: 3,
+            version: 4,
             ready: self.gateway_listener_ready.load(Ordering::Acquire)
                 && self.effect_http_listener_ready.load(Ordering::Acquire)
                 && inner.gateway_relay_failures == 0
@@ -1019,6 +1188,12 @@ impl SharedState {
             effect_http: EffectHttpSnapshot {
                 forwarded_requests: inner.forwarded_http_requests,
                 rejected_requests: inner.rejected_http_requests,
+                phase: inner.effect_admission_phase,
+                operation_id: inner.effect_admission_operation_id.clone(),
+                accepted_requests: inner.effect_accepted_requests,
+                active_requests: inner.effect_active_requests,
+                completed_requests: inner.effect_completed_requests,
+                uncertain_requests: inner.effect_uncertain_requests,
                 indeterminate_armed: inner
                     .indeterminate_arm
                     .as_ref()
@@ -1080,6 +1255,35 @@ impl ResourceIdentity {
     }
 }
 
+impl EffectDeleteResource {
+    fn identity(self) -> ResourceIdentity {
+        match self {
+            Self::Role(resource_id) => ResourceIdentity::Role { resource_id },
+            Self::Channel(resource_id) => ResourceIdentity::Channel { resource_id },
+            Self::Message {
+                channel_id,
+                message_id,
+            } => ResourceIdentity::Message {
+                channel_id,
+                resource_id: message_id,
+            },
+        }
+    }
+}
+
+fn resource_identity_owned(inner: &StateInner, identity: &ResourceIdentity) -> bool {
+    match identity {
+        ResourceIdentity::Role { resource_id } => inner.owned_role_ids.contains(resource_id),
+        ResourceIdentity::Channel { resource_id } => inner.owned_channel_ids.contains(resource_id),
+        ResourceIdentity::Message {
+            channel_id,
+            resource_id,
+        } => inner
+            .owned_message_ids
+            .contains(&(channel_id.clone(), resource_id.clone())),
+    }
+}
+
 pub struct GatewayConnectionLease {
     state: ArcState,
     finished: bool,
@@ -1125,6 +1329,60 @@ impl GatewayConnectionLease {
 impl Drop for GatewayConnectionLease {
     fn drop(&mut self) {
         self.finish(false, false, true);
+    }
+}
+
+impl EffectRequestLease {
+    fn finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut inner = self.state.inner.lock().expect("state mutex poisoned");
+        if inner.effect_active_requests == 0
+            || inner.effect_completed_requests == u64::MAX
+            || inner.effect_accepted_requests
+                != inner
+                    .effect_active_requests
+                    .saturating_add(inner.effect_completed_requests)
+        {
+            panic!("effect request counter invariant violated");
+        }
+        if self
+            .delete_reservation
+            .take()
+            .is_some_and(|identity| !inner.pending_delete_resources.remove(&identity))
+        {
+            panic!("effect delete reservation invariant violated");
+        }
+        inner.effect_active_requests -= 1;
+        inner.effect_completed_requests += 1;
+        self.finished = true;
+    }
+}
+
+impl ForwardedRequestOutcome {
+    pub fn confirm(mut self) {
+        self.uncertain = false;
+    }
+}
+
+impl Drop for ForwardedRequestOutcome {
+    fn drop(&mut self) {
+        if !self.uncertain {
+            return;
+        }
+        let mut inner = self.state.inner.lock().expect("state mutex poisoned");
+        inner.effect_uncertain_requests = inner
+            .effect_uncertain_requests
+            .checked_add(1)
+            .expect("effect uncertain request counter overflow");
+        self.uncertain = false;
+    }
+}
+
+impl Drop for EffectRequestLease {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -1314,6 +1572,18 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_mutation_outcomes_count_only_unconfirmed_requests() {
+        let (_root, state) = state();
+        let state = std::sync::Arc::new(state);
+        drop(state.begin_forwarded_request(true));
+        state.begin_forwarded_request(true).confirm();
+        drop(state.begin_forwarded_request(false));
+        let snapshot = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(snapshot["effect_http"]["forwarded_requests"], 3);
+        assert_eq!(snapshot["effect_http"]["uncertain_requests"], 1);
+    }
+
+    #[test]
     fn instance_identity_and_resource_reservations_are_bounded() {
         let (_root, state) = state();
         let snapshot = serde_json::to_value(state.snapshot()).unwrap();
@@ -1400,6 +1670,91 @@ mod tests {
     }
 
     #[test]
+    fn effect_admission_drains_preclose_requests_and_never_reopens() {
+        let (_root, state) = state();
+        let state = std::sync::Arc::new(state);
+        let (lease_ready_tx, lease_ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let request_state = std::sync::Arc::clone(&state);
+        let request = std::thread::spawn(move || {
+            let lease = request_state.begin_effect_request(None).unwrap();
+            lease_ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(lease);
+        });
+        lease_ready_rx.recv().unwrap();
+        assert_eq!(
+            state.close_effect_admission("d2:finalization:freeze"),
+            EffectAdmissionOutcome::Transitioned
+        );
+        assert_eq!(
+            state.close_effect_admission("d2:finalization:freeze"),
+            EffectAdmissionOutcome::Replayed
+        );
+        assert_eq!(
+            state.close_effect_admission("d2:finalization:other"),
+            EffectAdmissionOutcome::Conflict
+        );
+        assert!(state.begin_effect_request(None).is_none());
+        assert!(state
+            .begin_effect_request(Some(EffectDeleteResource::Role("11".to_owned())))
+            .is_none());
+        assert_eq!(
+            state.enable_teardown_deletes("d2:finalization:freeze"),
+            EffectAdmissionOutcome::ActiveRequests
+        );
+        let draining = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(draining["effect_http"]["phase"], "draining");
+        assert_eq!(
+            draining["effect_http"]["operation_id"],
+            "d2:finalization:freeze"
+        );
+        assert_eq!(draining["effect_http"]["accepted_requests"], 1);
+        assert_eq!(draining["effect_http"]["active_requests"], 1);
+        assert_eq!(draining["effect_http"]["completed_requests"], 0);
+        release_tx.send(()).unwrap();
+        request.join().unwrap();
+        assert_eq!(
+            state.enable_teardown_deletes("d2:finalization:other"),
+            EffectAdmissionOutcome::Conflict
+        );
+        assert_eq!(
+            state.enable_teardown_deletes("d2:finalization:freeze"),
+            EffectAdmissionOutcome::Transitioned
+        );
+        assert_eq!(
+            state.enable_teardown_deletes("d2:finalization:freeze"),
+            EffectAdmissionOutcome::Replayed
+        );
+        assert!(state.begin_effect_request(None).is_none());
+        assert!(state
+            .reserve_resource(ResourceKind::Role)
+            .unwrap()
+            .commit("11".to_owned()));
+        let deletion = state
+            .begin_effect_request(Some(EffectDeleteResource::Role("11".to_owned())))
+            .unwrap();
+        assert_eq!(
+            state.close_effect_admission("d2:finalization:freeze"),
+            EffectAdmissionOutcome::Replayed
+        );
+        assert!(state
+            .begin_effect_request(Some(EffectDeleteResource::Role("11".to_owned())))
+            .is_none());
+        drop(deletion);
+        let retry = state
+            .begin_effect_request(Some(EffectDeleteResource::Role("11".to_owned())))
+            .unwrap();
+        drop(retry);
+        let snapshot = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(snapshot["version"], 4);
+        assert_eq!(snapshot["effect_http"]["phase"], "teardown_delete_only");
+        assert_eq!(snapshot["effect_http"]["accepted_requests"], 3);
+        assert_eq!(snapshot["effect_http"]["active_requests"], 0);
+        assert_eq!(snapshot["effect_http"]["completed_requests"], 3);
+    }
+
+    #[test]
     fn pinned_hub_admits_only_owned_messages_without_becoming_an_owned_channel() {
         let (_root, state) = state();
         let state = std::sync::Arc::new(state);
@@ -1420,7 +1775,7 @@ mod tests {
         assert!(!state.remove_channel("5"));
         assert!(state.owns_message("5", "13"));
         let snapshot = serde_json::to_value(state.snapshot()).unwrap();
-        assert_eq!(snapshot["version"], 3);
+        assert_eq!(snapshot["version"], 4);
         assert_eq!(snapshot["hub_channel_id"], "5");
         assert_eq!(snapshot["effect_http"]["owned_channel_count"], 0);
         assert_eq!(snapshot["effect_http"]["owned_message_count"], 1);

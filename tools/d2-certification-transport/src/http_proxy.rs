@@ -20,7 +20,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinSet;
 
-use crate::state::{IndeterminateClaim, ResourceKind, ResourceReservation, SharedState};
+use crate::state::{
+    EffectAdmissionPhase, EffectDeleteResource, IndeterminateClaim, ResourceKind,
+    ResourceReservation, SharedState,
+};
 use crate::Config;
 
 const MAX_HTTP_CONNECTIONS: usize = 16;
@@ -72,6 +75,18 @@ struct ValidatedRequest {
     decoded_audit_reason: Option<String>,
 }
 
+struct ValidatedRequestHead {
+    method: Method,
+    path_and_query: String,
+    headers: HeaderMap,
+    create_role: bool,
+    create_channel: bool,
+    create_message_channel: Option<String>,
+    current_user: bool,
+    delete_resource: Option<DeleteResource>,
+    decoded_audit_reason: Option<String>,
+}
+
 enum DeleteResource {
     Role(String),
     Channel(String),
@@ -87,6 +102,20 @@ impl DeleteResource {
             Self::Role(_) => 10011,
             Self::Channel(_) => 10003,
             Self::Message { .. } => 10008,
+        }
+    }
+
+    fn admission_resource(&self) -> EffectDeleteResource {
+        match self {
+            Self::Role(resource_id) => EffectDeleteResource::Role(resource_id.clone()),
+            Self::Channel(resource_id) => EffectDeleteResource::Channel(resource_id.clone()),
+            Self::Message {
+                channel_id,
+                message_id,
+            } => EffectDeleteResource::Message {
+                channel_id: channel_id.clone(),
+                message_id: message_id.clone(),
+            },
         }
     }
 }
@@ -174,22 +203,46 @@ async fn proxy_request(
     state: Arc<SharedState>,
     client: reqwest::Client,
 ) -> Result<Response<Full<Bytes>>, ProxyServiceError> {
-    let validated = match tokio::time::timeout(
-        DOWNSTREAM_BODY_TIMEOUT,
-        validate_request(request, &config, &state),
-    )
-    .await
-    {
-        Ok(Ok(validated)) => validated,
-        Ok(Err(status)) => {
+    let phase = state.effect_admission_phase();
+    if phase == EffectAdmissionPhase::Draining {
+        state.record_rejected_http();
+        return Ok(empty_response(StatusCode::SERVICE_UNAVAILABLE));
+    }
+    let head = match parse_request_head(&request, &config) {
+        Ok(head) => head,
+        Err(status) => {
             state.record_rejected_http();
             return Ok(empty_response(status));
         }
-        Err(_) => {
-            state.record_rejected_http();
-            return Ok(empty_response(StatusCode::REQUEST_TIMEOUT));
-        }
     };
+    if phase != EffectAdmissionPhase::TeardownDeleteOnly {
+        if let Err(status) = validate_method_and_path(&head.method, request.uri(), &config, &state)
+        {
+            state.record_rejected_http();
+            return Ok(empty_response(status));
+        }
+    }
+    let owned_resource_delete = head
+        .delete_resource
+        .as_ref()
+        .map(DeleteResource::admission_resource);
+    let Some(_request_lease) = state.begin_effect_request(owned_resource_delete) else {
+        state.record_rejected_http();
+        return Ok(empty_response(StatusCode::SERVICE_UNAVAILABLE));
+    };
+    let validated =
+        match tokio::time::timeout(DOWNSTREAM_BODY_TIMEOUT, read_request_body(request, head)).await
+        {
+            Ok(Ok(validated)) => validated,
+            Ok(Err(status)) => {
+                state.record_rejected_http();
+                return Ok(empty_response(status));
+            }
+            Err(_) => {
+                state.record_rejected_http();
+                return Ok(empty_response(StatusCode::REQUEST_TIMEOUT));
+            }
+        };
     let mut reservation: Option<ResourceReservation> = if validated.create_role {
         state.reserve_resource(ResourceKind::Role)
     } else if validated.create_channel {
@@ -217,7 +270,7 @@ async fn proxy_request(
     } else {
         None
     };
-    state.record_forwarded_http();
+    let forwarded_outcome = state.begin_forwarded_request(validated.method != Method::GET);
     let upstream_url = format!("{}{}", config.http_upstream(), validated.path_and_query);
     let upstream = match client
         .request(validated.method.clone(), upstream_url)
@@ -313,10 +366,14 @@ async fn proxy_request(
             }
         }
     }
-    if let Some(claim) = claim.take() {
-        if state.finish_indeterminate(claim, Some(status.as_u16())) {
-            return Err(ProxyServiceError::InjectedDisconnect);
-        }
+    let injected_disconnect = claim
+        .take()
+        .is_some_and(|claim| state.finish_indeterminate(claim, Some(status.as_u16())));
+    if !status.is_server_error() {
+        forwarded_outcome.confirm();
+    }
+    if injected_disconnect {
+        return Err(ProxyServiceError::InjectedDisconnect);
     }
     build_response(status, &headers, Bytes::from(body))
 }
@@ -327,49 +384,37 @@ fn restore_claim(state: &SharedState, claim: Option<IndeterminateClaim>) {
     }
 }
 
-async fn validate_request(
-    request: Request<Incoming>,
+fn parse_request_head(
+    request: &Request<Incoming>,
     config: &Config,
-    state: &SharedState,
-) -> Result<ValidatedRequest, StatusCode> {
-    let (parts, mut body) = request.into_parts();
-    validate_uri(&parts.uri, config)?;
-    validate_method_and_path(&parts.method, &parts.uri, config, state)?;
-    validate_headers(&parts.headers, config)?;
-    let mut bytes = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
-        let data = frame.into_data().map_err(|_| StatusCode::BAD_REQUEST)?;
-        if bytes.len().saturating_add(data.len()) > MAX_REQUEST_BODY_BYTES {
-            return Err(StatusCode::PAYLOAD_TOO_LARGE);
-        }
-        bytes.extend_from_slice(&data);
-    }
-    let path_and_query = parts
-        .uri
+) -> Result<ValidatedRequestHead, StatusCode> {
+    validate_uri(request.uri(), config)?;
+    validate_headers(request.headers(), config)?;
+    let method = request.method().clone();
+    let uri = request.uri();
+    let path_and_query = uri
         .path_and_query()
         .map(|value| value.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?
         .to_owned();
-    let create_role = parts.method == Method::POST
-        && parts.uri.path() == format!("/api/v10/guilds/{}/roles", config.guild_id())
-        && parts.uri.query().is_none();
-    let create_channel = parts.method == Method::POST
-        && parts.uri.path() == format!("/api/v10/guilds/{}/channels", config.guild_id())
-        && parts.uri.query().is_none();
-    let create_message_channel = if parts.method == Method::POST && parts.uri.query().is_none() {
-        match parts.uri.path().split('/').collect::<Vec<_>>().as_slice() {
+    let create_role = method == Method::POST
+        && uri.path() == format!("/api/v10/guilds/{}/roles", config.guild_id())
+        && uri.query().is_none();
+    let create_channel = method == Method::POST
+        && uri.path() == format!("/api/v10/guilds/{}/channels", config.guild_id())
+        && uri.query().is_none();
+    let create_message_channel = if method == Method::POST && uri.query().is_none() {
+        match uri.path().split('/').collect::<Vec<_>>().as_slice() {
             ["", "api", "v10", "channels", channel, "messages"] => Some((*channel).to_owned()),
             _ => None,
         }
     } else {
         None
     };
-    let current_user = parts.method == Method::GET
-        && parts.uri.path() == "/api/v10/users/@me"
-        && parts.uri.query().is_none();
-    let delete_resource = if parts.method == Method::DELETE && parts.uri.query().is_none() {
-        match parts.uri.path().split('/').collect::<Vec<_>>().as_slice() {
+    let current_user =
+        method == Method::GET && uri.path() == "/api/v10/users/@me" && uri.query().is_none();
+    let delete_resource = if method == Method::DELETE && uri.query().is_none() {
+        match uri.path().split('/').collect::<Vec<_>>().as_slice() {
             ["", "api", "v10", "guilds", _, "roles", role] => {
                 Some(DeleteResource::Role((*role).to_owned()))
             }
@@ -387,24 +432,51 @@ async fn validate_request(
     } else {
         None
     };
-    let decoded_audit_reason = parts
-        .headers
+    let decoded_audit_reason = request
+        .headers()
         .get("x-audit-log-reason")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| percent_decode_str(value).decode_utf8().ok())
         .map(|value| value.into_owned());
-    let headers = forward_request_headers(&parts.headers);
-    Ok(ValidatedRequest {
-        method: parts.method,
+    let headers = forward_request_headers(request.headers());
+    Ok(ValidatedRequestHead {
+        method,
         path_and_query,
         headers,
-        body: Bytes::from(bytes),
         create_role,
         create_channel,
         create_message_channel,
         current_user,
         delete_resource,
         decoded_audit_reason,
+    })
+}
+
+async fn read_request_body(
+    request: Request<Incoming>,
+    head: ValidatedRequestHead,
+) -> Result<ValidatedRequest, StatusCode> {
+    let (_, mut body) = request.into_parts();
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
+        let data = frame.into_data().map_err(|_| StatusCode::BAD_REQUEST)?;
+        if bytes.len().saturating_add(data.len()) > MAX_REQUEST_BODY_BYTES {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        bytes.extend_from_slice(&data);
+    }
+    Ok(ValidatedRequest {
+        method: head.method,
+        path_and_query: head.path_and_query,
+        headers: head.headers,
+        body: Bytes::from(bytes),
+        create_role: head.create_role,
+        create_channel: head.create_channel,
+        create_message_channel: head.create_message_channel,
+        current_user: head.current_user,
+        delete_resource: head.delete_resource,
+        decoded_audit_reason: head.decoded_audit_reason,
     })
 }
 
@@ -674,7 +746,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::watch;
+    use tokio::sync::{watch, Notify};
 
     use super::*;
 
@@ -771,9 +843,160 @@ mod tests {
         }
     }
 
+    async fn delayed_identity_upstream(
+        address: SocketAddrV4,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    ) {
+        let listener = TcpListener::bind(address).await.unwrap();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    async move {
+                        assert_eq!(request.uri().path(), "/api/v10/users/@me");
+                        started.notify_one();
+                        release.notified().await;
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from_static(br#"{"id":"6"}"#)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    }
+
+    async fn delayed_delete_upstream(
+        address: SocketAddrV4,
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        accepted: Arc<AtomicU64>,
+    ) {
+        let listener = TcpListener::bind(address).await.unwrap();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let accepted = Arc::clone(&accepted);
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let started = Arc::clone(&started);
+                    let release = Arc::clone(&release);
+                    let accepted = Arc::clone(&accepted);
+                    async move {
+                        assert_eq!(request.method(), Method::DELETE);
+                        assert_eq!(request.uri().path(), "/api/v10/channels/5/messages/15");
+                        accepted.fetch_add(1, Ordering::SeqCst);
+                        started.notify_one();
+                        release.notified().await;
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::NO_CONTENT)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    }
+
+    async fn mutation_disconnect_upstream(address: SocketAddrV4, accepted: Arc<Notify>) {
+        let listener = TcpListener::bind(address).await.unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            assert_ne!(count, 0);
+            request.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            if request.len() >= header_end + 4 + 15 {
+                break;
+            }
+        }
+        assert!(request.starts_with(b"POST /api/v10/guilds/7/roles HTTP/1.1\r\n"));
+        assert!(request.ends_with(br#"{"name":"room"}"#));
+        accepted.notify_one();
+    }
+
+    async fn outcome_status_upstream(address: SocketAddrV4) {
+        let listener = TcpListener::bind(address).await.unwrap();
+        let request_index = Arc::new(AtomicU64::new(0));
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let request_index = Arc::clone(&request_index);
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<Incoming>| {
+                    let request_index = Arc::clone(&request_index);
+                    async move {
+                        let index = request_index.fetch_add(1, Ordering::SeqCst);
+                        let status = match index {
+                            0 => {
+                                assert_eq!(request.method(), Method::GET);
+                                assert_eq!(request.uri().path(), "/api/v10/users/@me");
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            }
+                            1 => {
+                                assert_eq!(request.method(), Method::POST);
+                                assert_eq!(request.uri().path(), "/api/v10/guilds/7/roles");
+                                StatusCode::INTERNAL_SERVER_ERROR
+                            }
+                            2 => {
+                                assert_eq!(request.method(), Method::POST);
+                                assert_eq!(request.uri().path(), "/api/v10/guilds/7/roles");
+                                StatusCode::TOO_MANY_REQUESTS
+                            }
+                            3 => {
+                                assert_eq!(request.method(), Method::POST);
+                                assert_eq!(request.uri().path(), "/api/v10/guilds/7/roles");
+                                StatusCode::BAD_REQUEST
+                            }
+                            _ => panic!("unexpected status classification request"),
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from_static(br#"{}"#)))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    }
+
     fn raw_create_role_request(proxy: SocketAddrV4, reason: &str) -> Vec<u8> {
         format!(
             "POST /api/v10/guilds/7/roles HTTP/1.1\r\nHost: {proxy}\r\nAuthorization: Bot secret-test-value\r\nX-Audit-Log-Reason: {reason}\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{{\"name\":\"room\"}}"
+        )
+        .into_bytes()
+    }
+
+    fn raw_create_role_request_head(proxy: SocketAddrV4, reason: &str) -> Vec<u8> {
+        format!(
+            "POST /api/v10/guilds/7/roles HTTP/1.1\r\nHost: {proxy}\r\nAuthorization: Bot secret-test-value\r\nX-Audit-Log-Reason: {reason}\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n"
         )
         .into_bytes()
     }
@@ -873,6 +1096,7 @@ mod tests {
         assert_eq!(snapshot["effect_http"]["indeterminate_injections"], 0);
         assert_eq!(snapshot["effect_http"]["indeterminate_armed"], true);
         assert_eq!(snapshot["effect_http"]["owned_role_count"], 0);
+        assert_eq!(snapshot["effect_http"]["uncertain_requests"], 1);
         let mut stream = TcpStream::connect(proxy_address).await.unwrap();
         stream
             .write_all(&raw_create_role_request(proxy_address, &reason))
@@ -884,6 +1108,7 @@ mod tests {
         let snapshot = serde_json::to_value(state.snapshot()).unwrap();
         assert_eq!(snapshot["effect_http"]["indeterminate_injections"], 1);
         assert_eq!(snapshot["effect_http"]["owned_role_count"], 1);
+        assert_eq!(snapshot["effect_http"]["uncertain_requests"], 1);
         let serialized = serde_json::to_string(&snapshot).unwrap();
         assert!(!serialized.contains("secret-test-value"));
         assert!(!serialized.contains(&reason));
@@ -910,6 +1135,423 @@ mod tests {
         assert_eq!(snapshot["effect_http"]["indeterminate_injections"], 1);
         assert_eq!(snapshot["effect_http"]["indeterminate_armed"], false);
         assert_eq!(snapshot["effect_http"]["owned_role_count"], 2);
+        assert_eq!(snapshot["effect_http"]["uncertain_requests"], 1);
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap();
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn accepted_mutation_disconnect_is_counted_once_as_uncertain() {
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let upstream_address = reserve_address().await;
+        let proxy_address = reserve_address().await;
+        let gateway_address = reserve_address().await;
+        let accepted = Arc::new(Notify::new());
+        let upstream = tokio::spawn(mutation_disconnect_upstream(
+            upstream_address,
+            Arc::clone(&accepted),
+        ));
+        let config = Config::for_test(
+            root.path().to_path_buf(),
+            "7",
+            "5",
+            "8",
+            "6",
+            gateway_address,
+            proxy_address,
+            format!("ws://{gateway_address}"),
+            format!("http://{upstream_address}"),
+        );
+        let state = Arc::new(SharedState::new(&config).unwrap());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_config = config.clone();
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            serve(server_config, server_state, shutdown_rx)
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let reason = format!("starring-effect-v1:{}", "a".repeat(64));
+        let mut request = TcpStream::connect(proxy_address).await.unwrap();
+        request
+            .write_all(&raw_create_role_request(proxy_address, &reason))
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        request.read_to_end(&mut response).await.unwrap();
+        assert!(response.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), accepted.notified())
+            .await
+            .unwrap();
+        upstream.await.unwrap();
+        let snapshot = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(snapshot["effect_http"]["forwarded_requests"], 1);
+        assert_eq!(snapshot["effect_http"]["uncertain_requests"], 1);
+        assert_eq!(snapshot["effect_http"]["accepted_requests"], 1);
+        assert_eq!(snapshot["effect_http"]["active_requests"], 0);
+        assert_eq!(snapshot["effect_http"]["completed_requests"], 1);
+        assert_eq!(snapshot["effect_http"]["owned_role_count"], 0);
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_mutation_server_errors_are_counted_as_uncertain() {
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let upstream_address = reserve_address().await;
+        let proxy_address = reserve_address().await;
+        let gateway_address = reserve_address().await;
+        let upstream = tokio::spawn(outcome_status_upstream(upstream_address));
+        let config = Config::for_test(
+            root.path().to_path_buf(),
+            "7",
+            "5",
+            "8",
+            "6",
+            gateway_address,
+            proxy_address,
+            format!("ws://{gateway_address}"),
+            format!("http://{upstream_address}"),
+        );
+        let state = Arc::new(SharedState::new(&config).unwrap());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_config = config.clone();
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            serve(server_config, server_state, shutdown_rx)
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut get = TcpStream::connect(proxy_address).await.unwrap();
+        get.write_all(&raw_current_user_request(proxy_address))
+            .await
+            .unwrap();
+        let mut get_response = Vec::new();
+        get.read_to_end(&mut get_response).await.unwrap();
+        assert!(get_response.is_empty());
+        let after_get = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(after_get["effect_http"]["forwarded_requests"], 1);
+        assert_eq!(after_get["effect_http"]["uncertain_requests"], 0);
+
+        let reason = format!("starring-effect-v1:{}", "a".repeat(64));
+        let mut server_error = TcpStream::connect(proxy_address).await.unwrap();
+        server_error
+            .write_all(&raw_create_role_request(proxy_address, &reason))
+            .await
+            .unwrap();
+        let mut server_error_response = Vec::new();
+        server_error
+            .read_to_end(&mut server_error_response)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(server_error_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+        let after_server_error = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(after_server_error["effect_http"]["forwarded_requests"], 2);
+        assert_eq!(after_server_error["effect_http"]["uncertain_requests"], 1);
+
+        let mut rate_limited = TcpStream::connect(proxy_address).await.unwrap();
+        rate_limited
+            .write_all(&raw_create_role_request(proxy_address, &reason))
+            .await
+            .unwrap();
+        let mut rate_limited_response = Vec::new();
+        rate_limited
+            .read_to_end(&mut rate_limited_response)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(rate_limited_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 429 Too Many Requests\r\n"));
+
+        let mut rejected = TcpStream::connect(proxy_address).await.unwrap();
+        rejected
+            .write_all(&raw_create_role_request(proxy_address, &reason))
+            .await
+            .unwrap();
+        let mut rejected_response = Vec::new();
+        rejected.read_to_end(&mut rejected_response).await.unwrap();
+        assert!(String::from_utf8(rejected_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 400 Bad Request\r\n"));
+        let complete = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(complete["effect_http"]["forwarded_requests"], 4);
+        assert_eq!(complete["effect_http"]["uncertain_requests"], 1);
+        assert_eq!(complete["effect_http"]["accepted_requests"], 4);
+        assert_eq!(complete["effect_http"]["active_requests"], 0);
+        assert_eq!(complete["effect_http"]["completed_requests"], 4);
+        assert_eq!(complete["effect_http"]["owned_role_count"], 0);
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap();
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn admission_close_drains_preclose_request_and_rejects_new_request() {
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let upstream_address = reserve_address().await;
+        let proxy_address = reserve_address().await;
+        let gateway_address = reserve_address().await;
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let upstream = tokio::spawn(delayed_identity_upstream(
+            upstream_address,
+            Arc::clone(&started),
+            Arc::clone(&release),
+        ));
+        let config = Config::for_test(
+            root.path().to_path_buf(),
+            "7",
+            "5",
+            "8",
+            "6",
+            gateway_address,
+            proxy_address,
+            format!("ws://{gateway_address}"),
+            format!("http://{upstream_address}"),
+        );
+        let state = Arc::new(SharedState::new(&config).unwrap());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_config = config.clone();
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            serve(server_config, server_state, shutdown_rx)
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let first = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(proxy_address).await.unwrap();
+            stream
+                .write_all(&raw_current_user_request(proxy_address))
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            state.close_effect_admission("d2:finalization:freeze"),
+            crate::state::EffectAdmissionOutcome::Transitioned
+        );
+        let draining = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(draining["effect_http"]["phase"], "draining");
+        assert_eq!(draining["effect_http"]["accepted_requests"], 1);
+        assert_eq!(draining["effect_http"]["active_requests"], 1);
+        assert_eq!(draining["effect_http"]["completed_requests"], 0);
+        let mut rejected = TcpStream::connect(proxy_address).await.unwrap();
+        rejected
+            .write_all(&raw_current_user_request(proxy_address))
+            .await
+            .unwrap();
+        let mut rejected_response = Vec::new();
+        rejected.read_to_end(&mut rejected_response).await.unwrap();
+        assert!(String::from_utf8(rejected_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert_eq!(
+            state.enable_teardown_deletes("d2:finalization:freeze"),
+            crate::state::EffectAdmissionOutcome::ActiveRequests
+        );
+        release.notify_one();
+        let first_response = first.await.unwrap();
+        assert!(String::from_utf8(first_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK\r\n"));
+        let drained = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(drained["effect_http"]["accepted_requests"], 1);
+        assert_eq!(drained["effect_http"]["active_requests"], 0);
+        assert_eq!(drained["effect_http"]["completed_requests"], 1);
+        assert_eq!(drained["effect_http"]["rejected_requests"], 1);
+        assert_eq!(
+            state.enable_teardown_deletes("d2:finalization:freeze"),
+            crate::state::EffectAdmissionOutcome::Transitioned
+        );
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap();
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_teardown_delete_is_rejected_before_forward() {
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let upstream_address = reserve_address().await;
+        let proxy_address = reserve_address().await;
+        let gateway_address = reserve_address().await;
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let accepted = Arc::new(AtomicU64::new(0));
+        let upstream = tokio::spawn(delayed_delete_upstream(
+            upstream_address,
+            Arc::clone(&started),
+            Arc::clone(&release),
+            Arc::clone(&accepted),
+        ));
+        let config = Config::for_test(
+            root.path().to_path_buf(),
+            "7",
+            "5",
+            "8",
+            "6",
+            gateway_address,
+            proxy_address,
+            format!("ws://{gateway_address}"),
+            format!("http://{upstream_address}"),
+        );
+        let state = Arc::new(SharedState::new(&config).unwrap());
+        assert!(state
+            .reserve_resource(ResourceKind::Message {
+                channel_id: "5".to_owned()
+            })
+            .unwrap()
+            .commit("15".to_owned()));
+        assert_eq!(
+            state.close_effect_admission("d2:finalization:freeze"),
+            crate::state::EffectAdmissionOutcome::Transitioned
+        );
+        assert_eq!(
+            state.enable_teardown_deletes("d2:finalization:freeze"),
+            crate::state::EffectAdmissionOutcome::Transitioned
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_config = config.clone();
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            serve(server_config, server_state, shutdown_rx)
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let first = tokio::spawn(async move {
+            let mut request = TcpStream::connect(proxy_address).await.unwrap();
+            request
+                .write_all(&raw_delete_hub_message_request(proxy_address))
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            request.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .unwrap();
+        let mut duplicate = TcpStream::connect(proxy_address).await.unwrap();
+        duplicate
+            .write_all(&raw_delete_hub_message_request(proxy_address))
+            .await
+            .unwrap();
+        let mut duplicate_response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            duplicate.read_to_end(&mut duplicate_response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(String::from_utf8(duplicate_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        let reserved = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(reserved["effect_http"]["forwarded_requests"], 1);
+        assert_eq!(reserved["effect_http"]["rejected_requests"], 1);
+        assert_eq!(reserved["effect_http"]["accepted_requests"], 1);
+        assert_eq!(reserved["effect_http"]["active_requests"], 1);
+        assert_eq!(reserved["effect_http"]["completed_requests"], 0);
+        assert_eq!(reserved["effect_http"]["uncertain_requests"], 0);
+        release.notify_one();
+        let first_response = first.await.unwrap();
+        assert!(String::from_utf8(first_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(!state.owns_message("5", "15"));
+        let complete = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(complete["effect_http"]["accepted_requests"], 1);
+        assert_eq!(complete["effect_http"]["active_requests"], 0);
+        assert_eq!(complete["effect_http"]["completed_requests"], 1);
+        assert_eq!(complete["effect_http"]["uncertain_requests"], 0);
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap();
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn request_lease_precedes_downstream_body_wait() {
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let upstream_address = reserve_address().await;
+        let proxy_address = reserve_address().await;
+        let gateway_address = reserve_address().await;
+        let upstream = tokio::spawn(fake_upstream(upstream_address));
+        let config = Config::for_test(
+            root.path().to_path_buf(),
+            "7",
+            "5",
+            "8",
+            "6",
+            gateway_address,
+            proxy_address,
+            format!("ws://{gateway_address}"),
+            format!("http://{upstream_address}"),
+        );
+        let state = Arc::new(SharedState::new(&config).unwrap());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_config = config.clone();
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            serve(server_config, server_state, shutdown_rx)
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let reason = format!("starring-effect-v1:{}", "a".repeat(64));
+        let mut request = TcpStream::connect(proxy_address).await.unwrap();
+        request
+            .write_all(&raw_create_role_request_head(proxy_address, &reason))
+            .await
+            .unwrap();
+        let mut observed = false;
+        for _ in 0..20 {
+            let snapshot = serde_json::to_value(state.snapshot()).unwrap();
+            if snapshot["effect_http"]["active_requests"] == 1 {
+                assert_eq!(snapshot["effect_http"]["accepted_requests"], 1);
+                assert_eq!(snapshot["effect_http"]["completed_requests"], 0);
+                assert_eq!(snapshot["effect_http"]["forwarded_requests"], 0);
+                observed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(observed);
+        assert_eq!(
+            state.close_effect_admission("d2:finalization:freeze"),
+            crate::state::EffectAdmissionOutcome::Transitioned
+        );
+        assert_eq!(
+            state.enable_teardown_deletes("d2:finalization:freeze"),
+            crate::state::EffectAdmissionOutcome::ActiveRequests
+        );
+        request.write_all(br#"{"name":"room"}"#).await.unwrap();
+        let mut response = Vec::new();
+        request.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8(response)
+            .unwrap()
+            .starts_with("HTTP/1.1 201 Created\r\n"));
+        let drained = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(drained["effect_http"]["accepted_requests"], 1);
+        assert_eq!(drained["effect_http"]["active_requests"], 0);
+        assert_eq!(drained["effect_http"]["completed_requests"], 1);
         shutdown_tx.send(true).unwrap();
         server.await.unwrap();
         upstream.abort();
@@ -955,6 +1597,55 @@ mod tests {
             .unwrap()
             .starts_with("HTTP/1.1 201 Created\r\n"));
         assert!(!state.owns_channel("5"));
+        assert!(state.owns_message("5", "15"));
+        assert_eq!(
+            state.close_effect_admission("d2:finalization:freeze"),
+            crate::state::EffectAdmissionOutcome::Transitioned
+        );
+        let mut draining_delete = TcpStream::connect(proxy_address).await.unwrap();
+        draining_delete
+            .write_all(&raw_delete_hub_message_request(proxy_address))
+            .await
+            .unwrap();
+        let mut draining_delete_response = Vec::new();
+        draining_delete
+            .read_to_end(&mut draining_delete_response)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(draining_delete_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(state.owns_message("5", "15"));
+        assert_eq!(
+            state.enable_teardown_deletes("d2:finalization:freeze"),
+            crate::state::EffectAdmissionOutcome::Transitioned
+        );
+        let mut teardown_get = TcpStream::connect(proxy_address).await.unwrap();
+        teardown_get
+            .write_all(&raw_current_user_request(proxy_address))
+            .await
+            .unwrap();
+        let mut teardown_get_response = Vec::new();
+        teardown_get
+            .read_to_end(&mut teardown_get_response)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(teardown_get_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        let mut teardown_create = TcpStream::connect(proxy_address).await.unwrap();
+        teardown_create
+            .write_all(&raw_create_hub_message_request(proxy_address))
+            .await
+            .unwrap();
+        let mut teardown_create_response = Vec::new();
+        teardown_create
+            .read_to_end(&mut teardown_create_response)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(teardown_create_response)
+            .unwrap()
+            .starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
         assert!(state.owns_message("5", "15"));
         let mut delete = TcpStream::connect(proxy_address).await.unwrap();
         delete
@@ -1007,7 +1698,10 @@ mod tests {
         assert!(state.owns_message("5", "17"));
         let snapshot = serde_json::to_value(state.snapshot()).unwrap();
         assert_eq!(snapshot["effect_http"]["forwarded_requests"], 4);
-        assert_eq!(snapshot["effect_http"]["rejected_requests"], 0);
+        assert_eq!(snapshot["effect_http"]["rejected_requests"], 3);
+        assert_eq!(snapshot["effect_http"]["accepted_requests"], 4);
+        assert_eq!(snapshot["effect_http"]["active_requests"], 0);
+        assert_eq!(snapshot["effect_http"]["completed_requests"], 4);
         assert_eq!(snapshot["effect_http"]["owned_channel_count"], 0);
         assert_eq!(snapshot["effect_http"]["owned_message_count"], 1);
         let inventory = serde_json::to_value(state.resource_inventory().unwrap()).unwrap();

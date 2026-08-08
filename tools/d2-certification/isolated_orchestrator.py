@@ -78,6 +78,7 @@ from d2_finalization import (
     command_finalize_run as run_finalize_run,
     command_finalize_total_absence as run_finalize_total_absence,
     freeze_intent_path,
+    require_certified_teardown_snapshot,
     require_certification_eligible_teardown,
     validate_runtime_freeze_binding,
 )
@@ -2066,6 +2067,7 @@ def require_frozen_discord_teardown_boundary(context, platform):
         fail("protected_staging_state_changed")
     snapshot = platform.transport_control(context, "snapshot")
     require_committed_transport_snapshot(context, state, snapshot)
+    require_certified_teardown_snapshot(context, snapshot)
     require_committed_candidate_processes(
         context, platform, state, ("api",)
     )

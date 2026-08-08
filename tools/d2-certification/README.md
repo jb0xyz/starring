@@ -53,6 +53,16 @@ commitment they durably retire the run, operate only on manifest-derived
 identities, and require the standing launchd, plist, and port snapshot to
 remain unchanged.
 
+The transport control snapshot is version 4. Its effect listener reports the
+one-way admission phase (`open`, `draining`, or `teardown_delete_only`), the
+durable finalization operation ID, and accepted, active, completed, and
+uncertain request counters. Accepted requests always equal active plus
+completed requests. A mutation whose upstream outcome or owned-resource
+inventory commit cannot be proved increments the lifetime uncertainty counter;
+finalization requires that counter to be exactly zero. Delete ownership and
+request admission are reserved atomically, so concurrent deletion of the same
+resource cannot be forwarded twice.
+
 The migration-ledger SHA-256 is reproducible. For each successful ledger row
 ordered by version, hash the signed 64-bit version in big-endian form, one
 success byte, the checksum length as an unsigned 64-bit big-endian value, and
@@ -351,11 +361,20 @@ same-filesystem temporary directory; only strict owned `0600` interrupted
 files are recoverable. Any unjournaled PID, failed drain, unexpected temporary
 entry, or identity drift fails closed.
 
-Once `finalize-run` durably commits its validated effect-freeze intent, only
-finalization recovery, total-absence finalization, read-only status, or an
-explicit abort is admitted. Candidate and fault commands return
-`orchestrator_phase_invalid` without inspecting intentionally stopped services
-or creating a retirement marker.
+`finalize-run` first fsyncs an admission-freeze intent while the exact runtime
+and transport generation are still live. It then closes effect admission,
+suspends the bound runtime, waits for every pre-close request to settle, and
+requires zero uncertainty before sealing the transport snapshot and resource
+inventory. Only then does it stop tunnel and runtime, fsync a teardown-admission
+intent, and move the same transport operation into delete-only mode. In that
+mode only atomically reserved, run-owned resource DELETE requests can reach
+Discord. Every replay revalidates the pinned transport instance, operation ID,
+counter monotonicity, durable intent digests, and a drained boundary before
+continuing. Once the validated effect-freeze intent exists, only finalization
+recovery, total-absence finalization, read-only status, or an explicit abort is
+admitted. Candidate and fault commands return `orchestrator_phase_invalid`
+without inspecting intentionally stopped services or creating a retirement
+marker.
 
 Fault injection uses only the manifest-bound orchestrator commands below. Each
 command verifies the pinned transport instance, writes and fsyncs a durable

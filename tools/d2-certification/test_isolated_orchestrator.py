@@ -457,7 +457,7 @@ class FakePlatform:
     def transport_control(self, context, command, fields=None, timeout_seconds=3):
         if self.transport_state is None:
             self.transport_state = {
-                "version": 3,
+                "version": 4,
                 "ready": True,
                 "run_id": context.manifest["run_id"],
                 "guild_id": context.manifest["discord"]["guild_id"],
@@ -490,6 +490,12 @@ class FakePlatform:
                 "effect_http": {
                     "forwarded_requests": 0,
                     "rejected_requests": 0,
+                    "phase": "open",
+                    "operation_id": None,
+                    "accepted_requests": 0,
+                    "active_requests": 0,
+                    "completed_requests": 0,
+                    "uncertain_requests": 0,
                     "indeterminate_armed": False,
                     "armed_indeterminate_operation_id": None,
                     "indeterminate_claimed": False,
@@ -556,6 +562,41 @@ class FakePlatform:
             return {"changed": changed}
         raise AssertionError(command)
 
+    def transport_effect_admission(self, context, operation, operation_id):
+        if self.transport_state is None:
+            self.transport_control(context, "snapshot")
+        effect = self.transport_state["effect_http"]
+        phase = effect["phase"]
+        current = effect["operation_id"]
+        if operation == "close_effect_admission":
+            if phase == "open":
+                effect["phase"] = "draining"
+                effect["operation_id"] = operation_id
+                disposition = "transitioned"
+            elif current == operation_id:
+                disposition = "replayed"
+            else:
+                disposition = "conflict"
+        elif operation == "enable_teardown_deletes":
+            if phase == "draining" and current == operation_id:
+                if effect["active_requests"]:
+                    disposition = "active_requests"
+                else:
+                    effect["phase"] = "teardown_delete_only"
+                    disposition = "transitioned"
+            elif phase == "teardown_delete_only" and current == operation_id:
+                disposition = "replayed"
+            else:
+                disposition = "conflict"
+        else:
+            raise AssertionError(operation)
+        return {
+            "changed": disposition == "transitioned",
+            "disposition": disposition,
+            "phase": effect["phase"],
+            "operation_id": operation_id,
+        }
+
     def resource_inventory(self, context):
         history = sorted(
             (dict(entry) for entry in self.resource_history),
@@ -598,6 +639,8 @@ class FakePlatform:
     def discord_delete_resource_through_transport(
         self, context, resource, inventory=None, timeout_seconds=10
     ):
+        if self.transport_state["effect_http"]["phase"] == "draining":
+            ORCHESTRATOR.fail("transport_effect_admission_closed")
         inventory = inventory or self.resource_inventory(context)
         self.proxy_deletions.append(dict(resource))
         fail_before = (
@@ -1835,7 +1878,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
 
     def test_transport_snapshot_health_is_exact_and_identity_bound(self):
         snapshot = {
-            "version": 3,
+            "version": 4,
             "ready": True,
             "run_id": self.context.manifest["run_id"],
             "guild_id": self.context.manifest["discord"]["guild_id"],
@@ -1868,6 +1911,12 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             "effect_http": {
                 "forwarded_requests": 0,
                 "rejected_requests": 0,
+                "phase": "open",
+                "operation_id": None,
+                "accepted_requests": 0,
+                "active_requests": 0,
+                "completed_requests": 0,
+                "uncertain_requests": 0,
                 "indeterminate_armed": False,
                 "armed_indeterminate_operation_id": None,
                 "indeterminate_claimed": False,

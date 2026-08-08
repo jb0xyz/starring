@@ -4,6 +4,7 @@ import os
 import pathlib
 import re
 import stat
+import time
 
 from d2_certification import (
     canonical_json,
@@ -40,10 +41,14 @@ DATABASE_ABSENCE_KIND = "starring.d2.db-absence-evidence.v1"
 DISCORD_TEARDOWN_KIND = "starring.d2.discord-resource-teardown.v1"
 FINALIZATION_INTENT_KIND = "starring.d2.database-finalization-intent.v1"
 FINALIZATION_FREEZE_KIND = "starring.d2.finalization-freeze-intent.v1"
+EFFECT_ADMISSION_FREEZE_KIND = "starring.d2.effect-admission-freeze-intent.v1"
+TEARDOWN_ADMISSION_KIND = "starring.d2.teardown-admission-intent.v1"
 FINALIZATION_KIND = "starring.d2.orchestrator-finalization-evidence.v1"
 PREFIX_SCAN_KIND = "starring.d2.browser-discord-resource-prefix-scan-evidence.v1"
 ORCHESTRATION_ABSENCE_KIND = "starring.d2.orchestrator-total-absence-evidence.v1"
 GUILD_DELETION_KIND = "starring.d2.browser-discord-guild-deletion-evidence.v1"
+EFFECT_DRAIN_TIMEOUT_SECONDS = 30
+EFFECT_DRAIN_POLL_SECONDS = 0.1
 
 
 def _require_exact(value, fields, code):
@@ -167,6 +172,14 @@ def validate_mutation_roots(context):
 
 def freeze_intent_path(context):
     return finalization_directory(context) / "finalization-freeze-intent.json"
+
+
+def effect_admission_freeze_intent_path(context):
+    return finalization_directory(context) / "effect-admission-freeze-intent.json"
+
+
+def teardown_admission_intent_path(context):
+    return finalization_directory(context) / "teardown-admission-intent.json"
 
 
 def abort_teardown_tombstone_path(context):
@@ -656,9 +669,15 @@ def _pinned_transport_instance_id(context):
     return value
 
 
-def require_transport_quiescent(context, platform, expected_instance_id):
-    snapshot = platform.transport_control(context, "snapshot")
-    if not isinstance(snapshot, dict) or snapshot.get("instance_id") != expected_instance_id:
+def require_transport_quiescent(
+    context, platform, expected_instance_id, snapshot=None
+):
+    snapshot = snapshot or platform.transport_control(context, "snapshot")
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("instance_id") != expected_instance_id
+        or snapshot.get("ready") is not True
+    ):
         fail("transport_instance_changed")
     gateway = snapshot.get("gateway")
     effect = snapshot.get("effect_http")
@@ -761,6 +780,184 @@ def require_certification_step_sixteen(context):
     }
 
 
+def effect_admission_operation_id(context, certification, instance_id, runtime_binding):
+    identity = {
+        "manifest_sha256": context.digest,
+        "run_id": context.manifest["run_id"],
+        "transport_instance_id": instance_id,
+        "step15_receipt_sha256": certification["step15_receipt_sha256"],
+        "step15_completion_sha256": certification["step15_completion_sha256"],
+        "runtime_binding": runtime_binding,
+    }
+    return f"d2:freeze:{_digest(identity)[:48]}"
+
+
+def _effect_http_state(
+    snapshot,
+    expected_instance_id,
+    expected_phase,
+    operation_id,
+    require_drained,
+):
+    if not isinstance(snapshot, dict) or snapshot.get("instance_id") != expected_instance_id:
+        fail("transport_instance_changed")
+    effect = snapshot.get("effect_http")
+    if not isinstance(effect, dict):
+        fail("finalization_effect_admission_invalid")
+    accepted = effect.get("accepted_requests")
+    active = effect.get("active_requests")
+    completed = effect.get("completed_requests")
+    uncertain = effect.get("uncertain_requests")
+    if (
+        effect.get("phase") != expected_phase
+        or effect.get("operation_id") != operation_id
+        or type(accepted) is not int
+        or accepted < 0
+        or type(active) is not int
+        or active < 0
+        or type(completed) is not int
+        or completed < 0
+        or type(uncertain) is not int
+        or uncertain != 0
+        or accepted != active + completed
+        or require_drained
+        and active != 0
+    ):
+        fail("finalization_effect_admission_invalid")
+    return effect
+
+
+def _drain_effect_requests(context, platform, instance_id, phase, operation_id):
+    deadline = time.monotonic() + EFFECT_DRAIN_TIMEOUT_SECONDS
+    accepted = None
+    completed = None
+    while True:
+        snapshot = platform.transport_control(context, "snapshot")
+        effect = _effect_http_state(
+            snapshot,
+            instance_id,
+            phase,
+            operation_id,
+            False,
+        )
+        if accepted is None:
+            accepted = effect["accepted_requests"]
+            completed = effect["completed_requests"]
+        elif (
+            effect["accepted_requests"] != accepted
+            or effect["completed_requests"] < completed
+        ):
+            fail("finalization_effect_admission_drift")
+        else:
+            completed = effect["completed_requests"]
+        if effect["active_requests"] == 0:
+            return snapshot
+        if time.monotonic() >= deadline:
+            fail("finalization_effect_drain_timeout")
+        time.sleep(EFFECT_DRAIN_POLL_SECONDS)
+
+
+def validate_effect_admission_freeze_intent(context, value, certification):
+    fields = {
+        "schema_version",
+        "kind",
+        "recorded_at",
+        "manifest_sha256",
+        "run_id",
+        "transport_instance_id",
+        "certification_step15_receipt_sha256",
+        "coordinator_step15_completion_sha256",
+        "operation_id",
+        "runtime_binding",
+        "initial_phase",
+        "initial_accepted_requests",
+        "initial_active_requests",
+        "initial_completed_requests",
+        "initial_uncertain_requests",
+        "initial_snapshot_sha256",
+    }
+    _require_exact(value, fields, "effect_admission_freeze_intent_invalid")
+    accepted = value["initial_accepted_requests"]
+    active = value["initial_active_requests"]
+    completed = value["initial_completed_requests"]
+    if (
+        value["schema_version"] != 1
+        or value["kind"] != EFFECT_ADMISSION_FREEZE_KIND
+        or value["manifest_sha256"] != context.digest
+        or value["run_id"] != context.manifest["run_id"]
+        or value["transport_instance_id"] != _pinned_transport_instance_id(context)
+        or value["certification_step15_receipt_sha256"]
+        != certification["step15_receipt_sha256"]
+        or value["coordinator_step15_completion_sha256"]
+        != certification["step15_completion_sha256"]
+        or value["initial_phase"] != "open"
+        or type(accepted) is not int
+        or accepted < 0
+        or type(active) is not int
+        or active < 0
+        or type(completed) is not int
+        or completed < 0
+        or type(value["initial_uncertain_requests"]) is not int
+        or value["initial_uncertain_requests"] != 0
+        or accepted != active + completed
+    ):
+        fail("effect_admission_freeze_intent_invalid")
+    validate_runtime_freeze_binding(context, value["runtime_binding"])
+    expected_operation_id = effect_admission_operation_id(
+        context,
+        certification,
+        value["transport_instance_id"],
+        value["runtime_binding"],
+    )
+    if value["operation_id"] != expected_operation_id:
+        fail("effect_admission_freeze_intent_invalid")
+    _require_digest(
+        value["initial_snapshot_sha256"],
+        "effect_admission_freeze_intent_invalid",
+    )
+    _require_timestamp(value["recorded_at"], "effect_admission_freeze_intent_invalid")
+    if _parse_timestamp(
+        certification["step15_completed_at"],
+        "effect_admission_freeze_intent_invalid",
+    ) > _parse_timestamp(value["recorded_at"], "effect_admission_freeze_intent_invalid"):
+        fail("effect_admission_freeze_chronology_invalid")
+    return value
+
+
+def validate_teardown_admission_intent(context, value, freeze, admission):
+    fields = {
+        "schema_version",
+        "kind",
+        "recorded_at",
+        "manifest_sha256",
+        "run_id",
+        "transport_instance_id",
+        "operation_id",
+        "finalization_freeze_intent_sha256",
+        "effect_admission_freeze_intent_sha256",
+        "target_phase",
+    }
+    _require_exact(value, fields, "teardown_admission_intent_invalid")
+    if (
+        value["schema_version"] != 1
+        or value["kind"] != TEARDOWN_ADMISSION_KIND
+        or value["manifest_sha256"] != context.digest
+        or value["run_id"] != context.manifest["run_id"]
+        or value["transport_instance_id"] != freeze["transport_instance_id"]
+        or value["operation_id"] != admission["operation_id"]
+        or value["finalization_freeze_intent_sha256"] != _digest(freeze)
+        or value["effect_admission_freeze_intent_sha256"] != _digest(admission)
+        or value["target_phase"] != "teardown_delete_only"
+    ):
+        fail("teardown_admission_intent_invalid")
+    _require_timestamp(value["recorded_at"], "teardown_admission_intent_invalid")
+    if _parse_timestamp(
+        freeze["recorded_at"], "teardown_admission_intent_invalid"
+    ) > _parse_timestamp(value["recorded_at"], "teardown_admission_intent_invalid"):
+        fail("teardown_admission_chronology_invalid")
+    return value
+
+
 def validate_freeze_intent(context, value):
     fields = {
         "schema_version",
@@ -773,6 +970,13 @@ def validate_freeze_intent(context, value):
         "coordinator_step15_completion_sha256",
         "transport_quiescence_sha256",
         "resource_inventory_digest_sha256",
+        "effect_admission_freeze_intent_sha256",
+        "effect_admission_operation_id",
+        "effect_admission_phase",
+        "effect_admission_accepted_requests",
+        "effect_admission_active_requests",
+        "effect_admission_completed_requests",
+        "effect_admission_uncertain_requests",
         "runtime_binding",
         "services_to_stop",
         "discord_effects_frozen",
@@ -786,6 +990,17 @@ def validate_freeze_intent(context, value):
         or value["transport_instance_id"] != _pinned_transport_instance_id(context)
         or value["services_to_stop"] != list(FREEZE_STOP_ORDER)
         or value["discord_effects_frozen"] is not True
+        or value["effect_admission_phase"] != "draining"
+        or type(value["effect_admission_accepted_requests"]) is not int
+        or value["effect_admission_accepted_requests"] < 0
+        or type(value["effect_admission_active_requests"]) is not int
+        or value["effect_admission_active_requests"] != 0
+        or type(value["effect_admission_completed_requests"]) is not int
+        or value["effect_admission_completed_requests"] < 0
+        or type(value["effect_admission_uncertain_requests"]) is not int
+        or value["effect_admission_uncertain_requests"] != 0
+        or value["effect_admission_accepted_requests"]
+        != value["effect_admission_completed_requests"]
     ):
         fail("finalization_freeze_intent_invalid")
     _require_digest(
@@ -804,6 +1019,15 @@ def validate_freeze_intent(context, value):
         value["resource_inventory_digest_sha256"],
         "finalization_freeze_intent_invalid",
     )
+    _require_digest(
+        value["effect_admission_freeze_intent_sha256"],
+        "finalization_freeze_intent_invalid",
+    )
+    if (
+        not isinstance(value["effect_admission_operation_id"], str)
+        or not value["effect_admission_operation_id"].startswith("d2:freeze:")
+    ):
+        fail("finalization_freeze_intent_invalid")
     validate_runtime_freeze_binding(context, value["runtime_binding"])
     _require_timestamp(value["recorded_at"], "finalization_freeze_intent_invalid")
     return value
@@ -904,7 +1128,7 @@ def validate_runtime_freeze_binding(context, value):
     return value
 
 
-def validate_freeze_certification(intent, certification):
+def validate_freeze_certification(context, intent, certification):
     if (
         not isinstance(certification, dict)
         or set(certification)
@@ -941,10 +1165,31 @@ def validate_freeze_certification(intent, certification):
         intent["recorded_at"], "finalization_freeze_certification_invalid"
     ):
         fail("finalization_freeze_chronology_invalid")
+    admission = validate_effect_admission_freeze_intent(
+        context,
+        _load_private(
+            effect_admission_freeze_intent_path(context),
+            "effect_admission_freeze_intent",
+        ),
+        certification,
+    )
+    if (
+        intent["effect_admission_freeze_intent_sha256"] != _digest(admission)
+        or intent["effect_admission_operation_id"] != admission["operation_id"]
+        or intent["transport_instance_id"] != admission["transport_instance_id"]
+        or intent["runtime_binding"] != admission["runtime_binding"]
+        or intent["effect_admission_accepted_requests"]
+        < admission["initial_accepted_requests"]
+        or intent["effect_admission_completed_requests"]
+        < admission["initial_completed_requests"]
+        or intent["effect_admission_uncertain_requests"]
+        != admission["initial_uncertain_requests"]
+    ):
+        fail("finalization_freeze_certification_invalid")
     return intent
 
 
-def certified_teardown_binding(context):
+def _certified_teardown_records(context):
     _require_owned_directory(
         context.artifact_directory, "artifact_directory_invalid"
     )
@@ -955,7 +1200,30 @@ def certified_teardown_binding(context):
         context,
         _load_private(freeze_intent_path(context), "finalization_freeze_intent"),
     )
-    validate_freeze_certification(freeze, require_certification_prefix(context))
+    certification = require_certification_prefix(context)
+    validate_freeze_certification(context, freeze, certification)
+    admission = validate_effect_admission_freeze_intent(
+        context,
+        _load_private(
+            effect_admission_freeze_intent_path(context),
+            "effect_admission_freeze_intent",
+        ),
+        certification,
+    )
+    teardown_admission = validate_teardown_admission_intent(
+        context,
+        _load_private(
+            teardown_admission_intent_path(context),
+            "teardown_admission_intent",
+        ),
+        freeze,
+        admission,
+    )
+    return freeze, admission, teardown_admission
+
+
+def certified_teardown_binding(context):
+    freeze, _admission, _teardown_admission = _certified_teardown_records(context)
     return {
         "finalization_freeze_intent_sha256": _digest(freeze),
         "certification_step15_receipt_sha256": freeze[
@@ -968,6 +1236,25 @@ def certified_teardown_binding(context):
             "resource_inventory_digest_sha256"
         ],
     }
+
+
+def require_certified_teardown_snapshot(context, snapshot):
+    freeze, admission, _teardown_admission = _certified_teardown_records(context)
+    effect = _effect_http_state(
+        snapshot,
+        freeze["transport_instance_id"],
+        "teardown_delete_only",
+        admission["operation_id"],
+        True,
+    )
+    if (
+        effect["accepted_requests"]
+        < freeze["effect_admission_accepted_requests"]
+        or effect["completed_requests"]
+        < freeze["effect_admission_completed_requests"]
+    ):
+        fail("finalization_effect_admission_drift")
+    return snapshot
 
 
 def coordinator_certified_teardown_binding(manifest_path, manifest, digest):
@@ -990,48 +1277,157 @@ def _initial_freeze_boundary(context, platform):
     instance_id = snapshot.get("instance_id") if isinstance(snapshot, dict) else None
     if instance_id != _pinned_transport_instance_id(context):
         fail("transport_instance_changed")
-    quiescence_sha256 = require_transport_quiescent(context, platform, instance_id)
-    inventory = platform.transport_control(context, "resource_inventory")
+    _effect_http_state(snapshot, instance_id, "open", None, False)
+    quiescence_sha256 = require_transport_quiescent(
+        context, platform, instance_id, snapshot
+    )
+    return state, snapshot, instance_id, quiescence_sha256
+
+
+def _require_effect_transition(response, operation, operation_id):
     if (
-        not isinstance(inventory, dict)
-        or inventory.get("instance_id") != instance_id
-        or not isinstance(inventory.get("digest_sha256"), str)
-        or not DIGEST_PATTERN.fullmatch(inventory["digest_sha256"])
+        not isinstance(response, dict)
+        or set(response) != {"changed", "disposition", "phase", "operation_id"}
+        or type(response["changed"]) is not bool
+        or response["operation_id"] != operation_id
     ):
-        fail("finalization_freeze_inventory_invalid")
-    return state, instance_id, quiescence_sha256, inventory["digest_sha256"]
+        fail("finalization_effect_admission_response_invalid")
+    disposition = response["disposition"]
+    phase = response["phase"]
+    if disposition in {"conflict", "active_requests"}:
+        fail(f"finalization_effect_admission_{disposition}")
+    if disposition not in {"transitioned", "replayed"}:
+        fail("finalization_effect_admission_response_invalid")
+    if response["changed"] is not (disposition == "transitioned"):
+        fail("finalization_effect_admission_response_invalid")
+    if operation == "close_effect_admission":
+        if phase not in {"draining", "teardown_delete_only"}:
+            fail("finalization_effect_admission_response_invalid")
+    elif operation == "enable_teardown_deletes":
+        if phase != "teardown_delete_only":
+            fail("finalization_effect_admission_response_invalid")
+    else:
+        fail("finalization_effect_admission_response_invalid")
+    return response
+
+
+def _ensure_teardown_admission(context, platform, freeze, admission):
+    path = teardown_admission_intent_path(context)
+    if path.exists():
+        intent = validate_teardown_admission_intent(
+            context,
+            _load_private(path, "teardown_admission_intent"),
+            freeze,
+            admission,
+        )
+    else:
+        intent = {
+            "schema_version": 1,
+            "kind": TEARDOWN_ADMISSION_KIND,
+            "recorded_at": utc_now(),
+            "manifest_sha256": context.digest,
+            "run_id": context.manifest["run_id"],
+            "transport_instance_id": freeze["transport_instance_id"],
+            "operation_id": admission["operation_id"],
+            "finalization_freeze_intent_sha256": _digest(freeze),
+            "effect_admission_freeze_intent_sha256": _digest(admission),
+            "target_phase": "teardown_delete_only",
+        }
+        validate_teardown_admission_intent(context, intent, freeze, admission)
+        write_atomic(path, canonical_json(intent) + "\n")
+    snapshot = platform.transport_control(context, "snapshot")
+    phase = (
+        snapshot.get("effect_http", {}).get("phase")
+        if isinstance(snapshot, dict)
+        else None
+    )
+    if phase == "draining":
+        effect = _effect_http_state(
+            snapshot,
+            freeze["transport_instance_id"],
+            "draining",
+            admission["operation_id"],
+            True,
+        )
+    elif phase == "teardown_delete_only":
+        effect = _effect_http_state(
+            snapshot,
+            freeze["transport_instance_id"],
+            "teardown_delete_only",
+            admission["operation_id"],
+            False,
+        )
+    else:
+        fail("finalization_effect_admission_drift")
+    if (
+        effect["accepted_requests"]
+        < freeze["effect_admission_accepted_requests"]
+        or effect["completed_requests"]
+        < freeze["effect_admission_completed_requests"]
+    ):
+        fail("finalization_effect_admission_drift")
+    response = platform.transport_effect_admission(
+        context,
+        "enable_teardown_deletes",
+        admission["operation_id"],
+    )
+    _require_effect_transition(
+        response,
+        "enable_teardown_deletes",
+        admission["operation_id"],
+    )
+    _drain_effect_requests(
+        context,
+        platform,
+        freeze["transport_instance_id"],
+        "teardown_delete_only",
+        admission["operation_id"],
+    )
+    return intent
 
 
 def _ensure_effect_freeze(context, platform, identity_boundary=None):
     ensure_finalization_directory(context)
     certification = require_certification_prefix(context)
+    admission_path = effect_admission_freeze_intent_path(context)
     path = freeze_intent_path(context)
     runtime_label = context.manifest["services"]["runtime"]["label"]
     runtime_loaded = platform.launchd_loaded(runtime_label)
+    runtime_suspended = False
     if path.exists():
         intent = validate_freeze_intent(
             context, _load_private(path, "finalization_freeze_intent")
         )
-        validate_freeze_certification(intent, certification)
-        if any(
-            platform.launchd_loaded(context.manifest["services"][name]["label"])
-            for name in FREEZE_STOP_ORDER
-        ):
-            validate_mutation_roots(context)
+        validate_freeze_certification(context, intent, certification)
+        admission = validate_effect_admission_freeze_intent(
+            context,
+            _load_private(
+                admission_path,
+                "effect_admission_freeze_intent",
+            ),
+            certification,
+        )
+    elif admission_path.exists():
+        admission = validate_effect_admission_freeze_intent(
+            context,
+            _load_private(
+                admission_path,
+                "effect_admission_freeze_intent",
+            ),
+            certification,
+        )
     else:
         if identity_boundary is None or not runtime_loaded:
             fail("finalization_runtime_binding_unavailable")
         runtime_binding = identity_boundary(context, platform, "capture", None)
         validate_runtime_freeze_binding(context, runtime_binding)
-        (
-            _state,
-            instance_id,
-            quiescence_sha256,
-            resource_inventory_digest_sha256,
-        ) = _initial_freeze_boundary(context, platform)
-        intent = {
+        _state, snapshot, instance_id, _quiescence_sha256 = (
+            _initial_freeze_boundary(context, platform)
+        )
+        effect = _effect_http_state(snapshot, instance_id, "open", None, False)
+        admission = {
             "schema_version": 1,
-            "kind": FINALIZATION_FREEZE_KIND,
+            "kind": EFFECT_ADMISSION_FREEZE_KIND,
             "recorded_at": utc_now(),
             "manifest_sha256": context.digest,
             "run_id": context.manifest["run_id"],
@@ -1042,20 +1438,141 @@ def _ensure_effect_freeze(context, platform, identity_boundary=None):
             "coordinator_step15_completion_sha256": certification[
                 "step15_completion_sha256"
             ],
-            "transport_quiescence_sha256": quiescence_sha256,
-            "resource_inventory_digest_sha256": resource_inventory_digest_sha256,
+            "operation_id": effect_admission_operation_id(
+                context,
+                certification,
+                instance_id,
+                runtime_binding,
+            ),
             "runtime_binding": runtime_binding,
+            "initial_phase": "open",
+            "initial_accepted_requests": effect["accepted_requests"],
+            "initial_active_requests": effect["active_requests"],
+            "initial_completed_requests": effect["completed_requests"],
+            "initial_uncertain_requests": effect["uncertain_requests"],
+            "initial_snapshot_sha256": _digest(snapshot),
+        }
+        validate_effect_admission_freeze_intent(
+            context, admission, certification
+        )
+        write_atomic(admission_path, canonical_json(admission) + "\n")
+    if not path.exists():
+        state = load_state(context, {"candidate_started"})
+        validate_mutation_roots(context)
+        if not platform.postgres_running(context.cluster_root) or any(
+            not platform.launchd_loaded(context.manifest["services"][name]["label"])
+            for name in FREEZE_STOP_ORDER + FINAL_STOP_ORDER
+        ):
+            fail("finalization_freeze_state_drift")
+        if standing_snapshot(context, platform) != state["standing_snapshot"]:
+            fail("protected_staging_state_changed")
+        snapshot = platform.transport_control(context, "snapshot")
+        phase = (
+            snapshot.get("effect_http", {}).get("phase")
+            if isinstance(snapshot, dict)
+            else None
+        )
+        if phase == "open":
+            _effect_http_state(
+                snapshot,
+                admission["transport_instance_id"],
+                "open",
+                None,
+                False,
+            )
+        elif phase == "draining":
+            _effect_http_state(
+                snapshot,
+                admission["transport_instance_id"],
+                "draining",
+                admission["operation_id"],
+                False,
+            )
+        else:
+            fail("finalization_effect_admission_drift")
+        response = platform.transport_effect_admission(
+            context,
+            "close_effect_admission",
+            admission["operation_id"],
+        )
+        response = _require_effect_transition(
+            response,
+            "close_effect_admission",
+            admission["operation_id"],
+        )
+        if response["phase"] != "draining":
+            fail("finalization_effect_admission_drift")
+        if identity_boundary is None:
+            fail("finalization_runtime_boundary_unavailable")
+        runtime_binding = admission["runtime_binding"]
+        identity_boundary(context, platform, "suspend", runtime_binding)
+        identity_boundary(context, platform, "checkpoint", runtime_binding)
+        runtime_suspended = True
+        snapshot = _drain_effect_requests(
+            context,
+            platform,
+            admission["transport_instance_id"],
+            "draining",
+            admission["operation_id"],
+        )
+        effect = _effect_http_state(
+            snapshot,
+            admission["transport_instance_id"],
+            "draining",
+            admission["operation_id"],
+            True,
+        )
+        quiescence_sha256 = require_transport_quiescent(
+            context,
+            platform,
+            admission["transport_instance_id"],
+            snapshot,
+        )
+        inventory = platform.transport_control(context, "resource_inventory")
+        if (
+            not isinstance(inventory, dict)
+            or inventory.get("instance_id") != admission["transport_instance_id"]
+            or not isinstance(inventory.get("digest_sha256"), str)
+            or not DIGEST_PATTERN.fullmatch(inventory["digest_sha256"])
+        ):
+            fail("finalization_freeze_inventory_invalid")
+        intent = {
+            "schema_version": 1,
+            "kind": FINALIZATION_FREEZE_KIND,
+            "recorded_at": utc_now(),
+            "manifest_sha256": context.digest,
+            "run_id": context.manifest["run_id"],
+            "transport_instance_id": admission["transport_instance_id"],
+            "certification_step15_receipt_sha256": certification[
+                "step15_receipt_sha256"
+            ],
+            "coordinator_step15_completion_sha256": certification[
+                "step15_completion_sha256"
+            ],
+            "transport_quiescence_sha256": quiescence_sha256,
+            "resource_inventory_digest_sha256": inventory["digest_sha256"],
+            "effect_admission_freeze_intent_sha256": _digest(admission),
+            "effect_admission_operation_id": admission["operation_id"],
+            "effect_admission_phase": "draining",
+            "effect_admission_accepted_requests": effect["accepted_requests"],
+            "effect_admission_active_requests": effect["active_requests"],
+            "effect_admission_completed_requests": effect["completed_requests"],
+            "effect_admission_uncertain_requests": effect[
+                "uncertain_requests"
+            ],
+            "runtime_binding": admission["runtime_binding"],
             "services_to_stop": list(FREEZE_STOP_ORDER),
             "discord_effects_frozen": True,
         }
         validate_freeze_intent(context, intent)
-        validate_freeze_certification(intent, certification)
+        validate_freeze_certification(context, intent, certification)
         write_atomic(path, canonical_json(intent) + "\n")
     if runtime_loaded:
         if identity_boundary is None:
             fail("finalization_runtime_boundary_unavailable")
-        runtime_binding = intent["runtime_binding"]
-        identity_boundary(context, platform, "suspend", runtime_binding)
+        runtime_binding = admission["runtime_binding"]
+        if not runtime_suspended:
+            identity_boundary(context, platform, "suspend", runtime_binding)
         identity_boundary(context, platform, "checkpoint", runtime_binding)
         _stop_services(context, platform, ("tunnel",))
         identity_boundary(context, platform, "checkpoint", runtime_binding)
@@ -1067,6 +1584,7 @@ def _ensure_effect_freeze(context, platform, identity_boundary=None):
         for name in FREEZE_STOP_ORDER
     ):
         fail("finalization_freeze_incomplete")
+    _ensure_teardown_admission(context, platform, intent, admission)
     return intent
 
 
@@ -1231,8 +1749,18 @@ def command_finalize_database(context, platform):
             fail("candidate_service_stop_incomplete")
         precleanup = _load_or_capture_precleanup(context, platform)
         require_live_teardown_inventory(context, platform, teardown)
+        drained_snapshot = _drain_effect_requests(
+            context,
+            platform,
+            freeze["transport_instance_id"],
+            "teardown_delete_only",
+            freeze["effect_admission_operation_id"],
+        )
         if require_transport_quiescent(
-            context, platform, freeze["transport_instance_id"]
+            context,
+            platform,
+            freeze["transport_instance_id"],
+            drained_snapshot,
         ) != freeze["transport_quiescence_sha256"]:
             fail("finalization_transport_quiescence_drift")
         intent = new_destroy_intent(context, precleanup, teardown, freeze)

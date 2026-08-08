@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 import d2_evidence
+import d2_finalization
 import d2_run
 import test_d2_certification
 
@@ -222,6 +223,88 @@ class D2RunCoordinatorTest(unittest.TestCase):
             / "launchd"
             / f"{runtime_service['label']}.plist"
         )
+        runtime_binding = {
+            "launchd": {
+                "pid": runtime_pid,
+                "program": runtime["path"],
+                "plist_path": runtime_plist,
+                "arguments": [runtime["path"]],
+                "runs": 1,
+                "state": "running",
+            },
+            "process": {
+                "pid": runtime_pid,
+                "start_time_seconds": 1_700_000_000,
+                "start_time_microseconds": 1,
+                "uid": os.getuid(),
+                "path": runtime["path"],
+                "sha256": runtime["sha256"],
+                "size": 1,
+                "mode": 0o555,
+                "device": 1,
+                "inode": 1,
+                "links": 1,
+            },
+            "plist": {
+                "path": runtime_plist,
+                "sha256": "f" * 64,
+                "size": 1,
+                "mode": 0o600,
+                "uid": os.getuid(),
+                "device": 1,
+                "inode": 1,
+                "links": 1,
+            },
+            "runtime_health": {
+                "schema_version": 1,
+                "os_pid": runtime_pid,
+                "process_instance_id": "e" * 32,
+            },
+        }
+        certification = {
+            "step15_receipt_sha256": receipts[14]["receipt_sha256"],
+            "step15_completion_sha256": self.object_digest(completion),
+            "step15_completed_at": completion["observed_at"],
+            "reconciliation_inventory_digest_sha256": self.complete[13][
+                "reconciliation_inventory_digest_sha256"
+            ],
+        }
+        context = d2_finalization.RunContext(
+            self.manifest_path, self.manifest, self.manifest_digest
+        )
+        operation_id = d2_finalization.effect_admission_operation_id(
+            context,
+            certification,
+            self.complete[3]["transport_instance_id"],
+            runtime_binding,
+        )
+        admission = {
+            "schema_version": 1,
+            "kind": "starring.d2.effect-admission-freeze-intent.v1",
+            "recorded_at": completion["observed_at"],
+            "manifest_sha256": self.manifest_digest,
+            "run_id": self.manifest["run_id"],
+            "transport_instance_id": self.complete[3]["transport_instance_id"],
+            "certification_step15_receipt_sha256": receipts[14][
+                "receipt_sha256"
+            ],
+            "coordinator_step15_completion_sha256": self.object_digest(completion),
+            "operation_id": operation_id,
+            "runtime_binding": runtime_binding,
+            "initial_phase": "open",
+            "initial_accepted_requests": 0,
+            "initial_active_requests": 0,
+            "initial_completed_requests": 0,
+            "initial_uncertain_requests": 0,
+            "initial_snapshot_sha256": "9" * 64,
+        }
+        admission_path = (
+            finalization_directory / "effect-admission-freeze-intent.json"
+        )
+        admission_path.write_text(
+            d2_run.canonical_json(admission) + "\n", encoding="utf-8"
+        )
+        admission_path.chmod(0o600)
         freeze = {
             "schema_version": 1,
             "kind": "starring.d2.finalization-freeze-intent.v1",
@@ -237,44 +320,14 @@ class D2RunCoordinatorTest(unittest.TestCase):
             "resource_inventory_digest_sha256": self.complete[13][
                 "reconciliation_inventory_digest_sha256"
             ],
-            "runtime_binding": {
-                "launchd": {
-                    "pid": runtime_pid,
-                    "program": runtime["path"],
-                    "plist_path": runtime_plist,
-                    "arguments": [runtime["path"]],
-                    "runs": 1,
-                    "state": "running",
-                },
-                "process": {
-                    "pid": runtime_pid,
-                    "start_time_seconds": 1_700_000_000,
-                    "start_time_microseconds": 1,
-                    "uid": os.getuid(),
-                    "path": runtime["path"],
-                    "sha256": runtime["sha256"],
-                    "size": 1,
-                    "mode": 0o555,
-                    "device": 1,
-                    "inode": 1,
-                    "links": 1,
-                },
-                "plist": {
-                    "path": runtime_plist,
-                    "sha256": "f" * 64,
-                    "size": 1,
-                    "mode": 0o600,
-                    "uid": os.getuid(),
-                    "device": 1,
-                    "inode": 1,
-                    "links": 1,
-                },
-                "runtime_health": {
-                    "schema_version": 1,
-                    "os_pid": runtime_pid,
-                    "process_instance_id": "e" * 32,
-                },
-            },
+            "effect_admission_freeze_intent_sha256": self.object_digest(admission),
+            "effect_admission_operation_id": operation_id,
+            "effect_admission_phase": "draining",
+            "effect_admission_accepted_requests": 0,
+            "effect_admission_active_requests": 0,
+            "effect_admission_completed_requests": 0,
+            "effect_admission_uncertain_requests": 0,
+            "runtime_binding": runtime_binding,
             "services_to_stop": ["tunnel", "runtime"],
             "discord_effects_frozen": True,
         }
@@ -283,6 +336,25 @@ class D2RunCoordinatorTest(unittest.TestCase):
             d2_run.canonical_json(freeze) + "\n", encoding="utf-8"
         )
         freeze_path.chmod(0o600)
+        teardown_admission = {
+            "schema_version": 1,
+            "kind": "starring.d2.teardown-admission-intent.v1",
+            "recorded_at": completion["observed_at"],
+            "manifest_sha256": self.manifest_digest,
+            "run_id": self.manifest["run_id"],
+            "transport_instance_id": self.complete[3]["transport_instance_id"],
+            "operation_id": operation_id,
+            "finalization_freeze_intent_sha256": self.object_digest(freeze),
+            "effect_admission_freeze_intent_sha256": self.object_digest(admission),
+            "target_phase": "teardown_delete_only",
+        }
+        teardown_admission_path = (
+            finalization_directory / "teardown-admission-intent.json"
+        )
+        teardown_admission_path.write_text(
+            d2_run.canonical_json(teardown_admission) + "\n", encoding="utf-8"
+        )
+        teardown_admission_path.chmod(0o600)
         return freeze
 
     def step_sixteen_sources(self):
