@@ -54,7 +54,10 @@ done
 "${prepare[@]}"
 ```
 
-Run the exact pinned gates in the detached worktree. Completed gates replay without execution. A failed or interrupted gate resumes as a new or incomplete durable attempt.
+`run-gates` executes the 29 commands above, in order, in the detached
+worktree. Candidate publication does not begin until all 29 pass. Completed
+gates replay without execution. A failed or interrupted gate resumes as a new
+or incomplete durable attempt.
 
 The PostgreSQL URL file is a dedicated absolute mode-`0600` secret input. It
 must name an explicit loopback port and a `starring_test` or `starring_d3*`
@@ -73,6 +76,76 @@ for gate in "${gates[@]}"; do
 done
 "${run_gates[@]}"
 ```
+
+## Sealed candidate publication
+
+After gate completion, `run-gates` builds five Rust release binaries under
+`<D3_STATE>/candidate-build`. The build uses separate workspace and transport
+target directories and dedicated mode-`0700` `CARGO_HOME`, `HOME`,
+`XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, and `TMPDIR` directories. It seals the
+binaries together with an exact seven-file snapshot of
+`tools/codex-worker`:
+
+```text
+candidate-bundle/                         0555
+  bundle.json                             0400
+  publication.json                        0400
+  starring-api                            0555
+  starring-runtime                        0555
+  starring-d2-db-bootstrap                0555
+  starring-d2-sealed-provisioner          0555
+  d2-certification-transport              0555
+  codex-worker/                           0555
+    admission-registry.mjs                0444
+    codex-runner.mjs                      0444
+    metrics-log.mjs                       0444
+    protocol.mjs                          0444
+    request-timeline.mjs                  0444
+    scheduler.mjs                         0444
+    worker.mjs                            0444
+```
+
+Before building, the tool durably writes mode-`0600`
+`candidate-bundle-intent.json`. The sealed intent binds the merge commit and
+tree, gate-chain head, build recipe and lockfiles, exact source trees,
+toolchain identities, isolated directories, and one staging nonce and path. A
+retry must match that intent exactly.
+
+Publication is crash-recoverable and exclusive. An empty pre-publication
+staging directory is removed. An intent-owned mode-`0700` staging directory
+with a valid publication identity is journaled, discarded, and rebuilt. An
+intent-owned mode-`0555` staging directory is fully verified and published as
+`candidate-bundle`. Foreign or ambiguous staging, an unjournaled discard, and
+identity drift fail closed. A valid final bundle, including one recovered from
+sealed staging, returns `candidate_bundle_disposition=exact_replay` without
+rebuilding; a fresh build and publication returns `created`.
+
+## D2 preparation and binding
+
+D2 does not discover the bundle. After `run-gates`, prepare D2 with the exact
+GitHub-generated merge commit pinned in D3 `state.json` and these bundle
+paths:
+
+| D2 preparation field | Required value |
+| --- | --- |
+| `--commit` | D3 `merge_commit` |
+| `--candidate api=...` | `<D3_STATE>/candidate-bundle/starring-api` |
+| `--candidate runtime=...` | `<D3_STATE>/candidate-bundle/starring-runtime` |
+| `--candidate db_bootstrap=...` | `<D3_STATE>/candidate-bundle/starring-d2-db-bootstrap` |
+| `--candidate sealed_provisioner=...` | `<D3_STATE>/candidate-bundle/starring-d2-sealed-provisioner` |
+| `--candidate certification_transport=...` | `<D3_STATE>/candidate-bundle/d2-certification-transport` |
+| `--candidate codex_worker=...` | `<D3_STATE>/candidate-bundle/codex-worker/worker.mjs` |
+
+`node`, `codex`, and `cloudflared` are not bundle artifacts. Continue to pass
+their operator-supplied installed executable paths to D2 preparation; D3 does
+not build them or bind them to `candidate-bundle`.
+
+`bind-d2` rejects a D2 manifest unless `commit_sha` is the exact pinned merge
+commit and resolves to the pinned merge tree. It also requires the exact path
+and SHA-256 for all five sealed binaries and `codex-worker/worker.mjs`. The
+manifest source-tree identities must match the sealed seven-file worker tree
+and the fixed D2 toolchain and certification-transport inventories in the
+detached worktree. A different commit is rejected even when its tree is equal.
 
 Capture the canonical output of `d2_run.py verify` in an owned mode-`0600` JSON file, then bind its required 17-step coordinator ledger to the D2 manifest, all 17 chained receipts, and the pinned commit tree. Set `umask 077` before redirecting the verifier output so the record is never created with a permissive mode. The low-level receipt verifier is not release authority.
 
