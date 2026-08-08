@@ -216,6 +216,8 @@ FINAL="$ORCH/finalization"
 
 python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" dry-run \
   --manifest "$MANIFEST"
+python3 "$D2_TOOLCHAIN/d2_preflight_evidence.py" \
+  --manifest "$MANIFEST"
 python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" prepare \
   --manifest "$MANIFEST"
 python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" start \
@@ -232,9 +234,16 @@ python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" certify-live-runtime-restart \
 python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" certify-live-runtime-restart \
   --manifest "$MANIFEST" \
   --confirmation-file /absolute/live-runtime-restart-confirmation.json
-python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" restart-drained-runtime \
-  --manifest "$MANIFEST"
 ```
+
+`d2_preflight_evidence.py` must run after the successful dry run and before
+orchestrator `prepare`. Its returned `coordinator_source` is the reviewed step
+2 source. `isolated_orchestrator.py prepare` creates run-owned state, so
+capturing prior-absence evidence afterward is invalid by construction.
+
+`certify-live-runtime-restart` performs the one admitted drained-runtime
+restart internally. Do not invoke standalone `restart-drained-runtime` as an
+additional step in the successful certification sequence.
 
 `start` durably binds the Step 3 evidence and standing snapshot in a pending
 candidate-start transition before publishing the consumable coordinator
@@ -271,10 +280,11 @@ must also resolve that ID as a type-0 text channel in the manifest guild. The
 persisted authority payload digest uses the same canonical revision, binding,
 policy, and TTL identity contract enforced by runtime hydration.
 
-`certify-live-runtime-restart` is the step 11 process boundary and is separate
-from replacement drain recovery. It requires exactly the first ten verified D2
-receipts, binds their prior live witness and the deployment, route, and instance
-from steps 8 and 9, and accepts only the fixed `live_fresh_lease` checkpoint.
+`certify-live-runtime-restart` owns the step 11 process boundary and internally
+performs exactly one replacement drain recovery. It requires exactly the first
+ten verified D2 receipts, binds their prior live witness and the deployment,
+route, and instance from steps 8 and 9, and accepts only the fixed
+`live_fresh_lease` checkpoint.
 Before signaling, it joins the exact old launchd PID to the loopback runtime
 health identity and fsyncs that per-boot process instance ID, launchd run
 count, runtime candidate and plist identity, dependency processes, transport
