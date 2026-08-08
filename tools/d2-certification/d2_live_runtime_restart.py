@@ -18,6 +18,7 @@ from d2_drained_runtime_restart import (
     command_restart_drained_runtime,
     drained_runtime_restart_dependency_snapshot,
     drained_runtime_restart_identity,
+    drained_runtime_restart_inventory,
     require_pinned_transport_snapshot,
     runtime_job_observation,
     runtime_ready_status,
@@ -29,11 +30,17 @@ from d2_orchestrator_contract import (
     fail,
     load_json,
     load_state,
+    read_repaired_journal,
     standing_snapshot,
     utc_now,
     write_atomic,
 )
-from d2_source_contract import publish_live_runtime_restart_source
+from d2_source_contract import (
+    LIVE_RUNTIME_RESTART_KIND,
+    publish_live_runtime_restart_source,
+    read_private_source,
+    source_path,
+)
 
 
 RECORDED_AT_PATTERN = re.compile(
@@ -676,44 +683,8 @@ def require_bound_canonical_confirmation(path, awaiting):
 
 
 def live_runtime_restart_journal_contains(context, status, operation_id):
-    if not context.journal_path.exists():
-        return False
-    metadata = context.journal_path.lstat()
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or context.journal_path.is_symlink()
-        or metadata.st_uid != os.getuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or metadata.st_size > 8 * 1024 * 1024
-    ):
-        fail("journal_invalid")
     found = False
-    try:
-        lines = context.journal_path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
-        fail("journal_invalid")
-    for expected_sequence, line in enumerate(lines, 1):
-        try:
-            receipt = json.loads(line)
-        except json.JSONDecodeError:
-            fail("journal_invalid")
-        if (
-            not isinstance(receipt, dict)
-            or set(receipt)
-            != {
-                "schema_version",
-                "sequence",
-                "recorded_at",
-                "manifest_sha256",
-                "action",
-                "status",
-                "target",
-            }
-            or receipt["schema_version"] != 1
-            or receipt["sequence"] != expected_sequence
-            or receipt["manifest_sha256"] != context.digest
-        ):
-            fail("journal_invalid")
+    for receipt in read_repaired_journal(context):
         if (
             receipt["action"] == "live_runtime_restart"
             and receipt["status"] == status
@@ -868,6 +839,183 @@ def publish_step_11_evidence(context, completion):
         context, evidence, completion["recorded_at"]
     )
     return evidence, path, coordinator_source
+
+
+def require_live_drained_restart_binding(
+    context, intent, shutdown, awaiting, records, pending
+):
+    if not records:
+        if pending is not None or awaiting is not None:
+            fail("live_runtime_restart_drained_chain_invalid")
+        return None
+    if shutdown is None or len(records) != 1:
+        fail("live_runtime_restart_drained_chain_invalid")
+    drained_record = records[0]
+    drained = drained_record.get("complete", drained_record["intent"])
+    if (
+        drained["runtime_identity"] != intent["runtime_identity"]
+        or drained["dependencies"] != intent["dependencies"]
+        or drained["transport_instance_id"] != intent["transport_instance_id"]
+        or drained["standing_snapshot"] != intent["standing_snapshot"]
+        or shutdown["shutdown_observation"] != drained["drain_observation"]
+    ):
+        fail("live_runtime_restart_drained_chain_invalid")
+    if awaiting is None:
+        return drained
+    if pending is not None or "complete" not in drained_record:
+        fail("live_runtime_restart_drained_chain_invalid")
+    if (
+        awaiting["drained_restart_operation_id"] != drained["operation_id"]
+        or awaiting["new_pid"] != drained["new_pid"]
+        or awaiting["new_runs"] != drained["new_runs"]
+        or awaiting["process_instance_id"]
+        != drained["new_runtime_health"]["process_instance_id"]
+    ):
+        fail("live_runtime_restart_drained_chain_invalid")
+    return drained
+
+
+def committed_live_runtime_restart_chain(context):
+    evidence_path = live_runtime_restart_evidence_path(context)
+    coordinator_source_path = source_path(
+        context, 11, "live-runtime-restart"
+    )
+    with d2_run.coordinator_lock(context.manifest_path, False):
+        receipts = d2_run.load_receipts(
+            context.manifest_path, context.manifest, context.digest
+        )
+        pending_step = d2_run.coordinator_pending_step(
+            context.manifest_path,
+            context.manifest,
+            context.digest,
+            receipts,
+        )
+        step_11_receipt_committed = len(receipts) >= 11
+        step_11_started = step_11_receipt_committed or pending_step == 11
+        step_11_completed = step_11_receipt_committed and pending_step != 11
+        live_artifact_present = any(
+            os.path.lexists(path)
+            for path in (
+                live_runtime_restart_directory(context),
+                evidence_path,
+                coordinator_source_path,
+            )
+        )
+        if len(receipts) < 10:
+            if live_artifact_present or step_11_started:
+                fail("live_runtime_restart_committed_chain_invalid")
+            return {"status": "absent", "step_11_committed": False}
+        prerequisites = step_11_prerequisites(context, receipts[:10])
+        intent, shutdown, awaiting, completion = load_live_runtime_restart_records(
+            context, prerequisites
+        )
+        if intent is None:
+            if step_11_started or os.path.lexists(coordinator_source_path):
+                fail("live_runtime_restart_committed_chain_invalid")
+            return {"status": "absent", "step_11_committed": False}
+        records, pending = drained_runtime_restart_inventory(context)
+        drained = require_live_drained_restart_binding(
+            context, intent, shutdown, awaiting, records, pending
+        )
+        if completion is None:
+            if step_11_started or os.path.lexists(coordinator_source_path):
+                fail("live_runtime_restart_committed_chain_invalid")
+            return {
+                "status": "pending",
+                "step_11_committed": False,
+                "operation_id": intent["operation_id"],
+            }
+        expected_evidence = step_11_evidence(completion)
+        evidence_present = os.path.lexists(evidence_path)
+        source_present = os.path.lexists(coordinator_source_path)
+        if source_present and not evidence_present:
+            fail("live_runtime_restart_committed_chain_invalid")
+        if not evidence_present:
+            if step_11_started:
+                fail("live_runtime_restart_committed_chain_invalid")
+            return {
+                "status": "complete_unpublished",
+                "step_11_committed": False,
+                "operation_id": completion["operation_id"],
+            }
+        recorded_evidence = load_json(
+            evidence_path, "live_runtime_restart_step_11_evidence_invalid"
+        )
+        if recorded_evidence != expected_evidence:
+            fail("live_runtime_restart_committed_chain_invalid")
+        if not source_present:
+            if step_11_started:
+                fail("live_runtime_restart_committed_chain_invalid")
+            return {
+                "status": "pending",
+                "step_11_committed": False,
+                "operation_id": completion["operation_id"],
+            }
+        source = read_private_source(
+            context,
+            coordinator_source_path,
+            11,
+            LIVE_RUNTIME_RESTART_KIND,
+        )
+        source_value, source_sha256 = d2_run.read_private_json(
+            coordinator_source_path, "live_runtime_restart_coordinator_source"
+        )
+        if (
+            source["evidence"] != expected_evidence
+            or source["observed_at"] != completion["recorded_at"]
+            or source_value != source
+        ):
+            fail("live_runtime_restart_committed_chain_invalid")
+        if step_11_started:
+            step_11_intent = d2_run.validate_intent(
+                d2_run.load_coordinator_record(
+                    d2_run.coordinator_intent_path(context.manifest_path, 11),
+                    "coordinator_step_11_intent",
+                ),
+                context.manifest,
+                context.digest,
+                11,
+            )
+            if step_11_intent["sources"] != [
+                {
+                    "kind": LIVE_RUNTIME_RESTART_KIND,
+                    "sha256": source_sha256,
+                }
+            ]:
+                fail("live_runtime_restart_committed_chain_invalid")
+        if step_11_receipt_committed:
+            receipt = receipts[10]
+            if receipt["evidence"] != expected_evidence:
+                fail("live_runtime_restart_committed_chain_invalid")
+            if step_11_completed:
+                step_11_completion = d2_run.validate_completion(
+                    d2_run.load_coordinator_record(
+                        d2_run.coordinator_completion_path(
+                            context.manifest_path, 11
+                        ),
+                        "coordinator_step_11_completion",
+                    ),
+                    context.manifest,
+                    context.digest,
+                    11,
+                )
+                if (
+                    step_11_completion["intent_sha256"]
+                    != d2_run.intent_digest(step_11_intent)
+                    or step_11_completion["receipt_sha256"]
+                    != receipt["receipt_sha256"]
+                ):
+                    fail("live_runtime_restart_committed_chain_invalid")
+        status = "pending" if pending_step == 11 else "complete"
+        return {
+            "status": status,
+            "step_11_committed": step_11_completed,
+            "operation_id": completion["operation_id"],
+            "completion": completion,
+            "drained_completion": drained,
+            "step_11_evidence": expected_evidence,
+            "coordinator_source_sha256": source_sha256,
+        }
 
 
 def require_completed_live_runtime_restart(
@@ -1120,7 +1268,9 @@ def certify_live_runtime_restart(
         context, "shutdown_stable", intent["operation_id"]
     )
     if awaiting is None:
-        drained = command_restart_drained_runtime(context, platform)
+        drained = command_restart_drained_runtime(
+            context, platform, intent["old_runs"]
+        )
         if (
             drained.get("status")
             not in {"drained_runtime_restarted", "exact_replay"}

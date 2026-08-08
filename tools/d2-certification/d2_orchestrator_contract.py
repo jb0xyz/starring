@@ -14,8 +14,10 @@ from d2_certification import (
     D2_ORIGIN_SERVICE,
     D2_PUBLIC_ORIGIN,
     fsync_directory,
+    isolated_runtime_root,
     load_verified_manifest,
     sha256_file,
+    validate_utc_timestamp,
 )
 
 
@@ -391,6 +393,147 @@ def validate_identity(value, code):
     return value
 
 
+def strict_journal_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail("journal_invalid")
+        value[key] = item
+    return value
+
+
+def parse_journal_rows(context, raw):
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("journal_invalid")
+    rows = []
+    for sequence, line in enumerate(text.splitlines(), 1):
+        try:
+            row = json.loads(line, object_pairs_hook=strict_journal_object)
+        except json.JSONDecodeError:
+            fail("journal_invalid")
+        if (
+            not isinstance(row, dict)
+            or set(row)
+            != {
+                "schema_version",
+                "sequence",
+                "recorded_at",
+                "manifest_sha256",
+                "action",
+                "status",
+                "target",
+            }
+            or type(row["schema_version"]) is not int
+            or row["schema_version"] != SCHEMA_VERSION
+            or type(row["sequence"]) is not int
+            or row["sequence"] != sequence
+            or row["manifest_sha256"] != context.digest
+            or not validate_utc_timestamp(row["recorded_at"])
+        ):
+            fail("journal_invalid")
+        for field in ("action", "status", "target"):
+            validate_identity(row[field], "journal_invalid")
+        rows.append(row)
+    return rows
+
+
+def journal_file_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def read_repaired_journal_descriptor(context, descriptor):
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.getuid()
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_size > 8 * 1024 * 1024
+    ):
+        fail("journal_invalid")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    raw = bytearray()
+    while len(raw) <= 8 * 1024 * 1024:
+        chunk = os.read(descriptor, 64 * 1024)
+        if not chunk:
+            break
+        raw.extend(chunk)
+    if len(raw) > 8 * 1024 * 1024:
+        fail("journal_invalid")
+    after = os.fstat(descriptor)
+    try:
+        named = os.stat(context.journal_path, follow_symlinks=False)
+    except OSError:
+        fail("journal_invalid")
+    if (
+        journal_file_identity(before) != journal_file_identity(after)
+        or journal_file_identity(after) != journal_file_identity(named)
+        or len(raw) != after.st_size
+    ):
+        fail("journal_invalid")
+    if raw and not raw.endswith(b"\n"):
+        boundary = raw.rfind(b"\n") + 1
+        rows = parse_journal_rows(context, bytes(raw[:boundary]))
+        os.ftruncate(descriptor, boundary)
+        os.fsync(descriptor)
+        truncated = os.fstat(descriptor)
+        try:
+            named = os.stat(context.journal_path, follow_symlinks=False)
+        except OSError:
+            fail("journal_invalid")
+        if (
+            (truncated.st_dev, truncated.st_ino, truncated.st_uid, truncated.st_nlink)
+            != (before.st_dev, before.st_ino, before.st_uid, before.st_nlink)
+            or journal_file_identity(truncated) != journal_file_identity(named)
+            or truncated.st_size != boundary
+        ):
+            fail("journal_invalid")
+        return rows
+    return parse_journal_rows(context, bytes(raw))
+
+
+def read_repaired_journal(context):
+    if not os.path.lexists(context.journal_path):
+        return []
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_descriptor = os.open(context.lock_path, flags)
+    except OSError:
+        fail("journal_invalid")
+    try:
+        lock_metadata = os.fstat(lock_descriptor)
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_uid != os.getuid()
+            or lock_metadata.st_nlink != 1
+            or stat.S_IMODE(lock_metadata.st_mode) != 0o600
+        ):
+            fail("journal_invalid")
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        try:
+            journal_descriptor = os.open(context.journal_path, flags)
+        except OSError:
+            fail("journal_invalid")
+        try:
+            return read_repaired_journal_descriptor(context, journal_descriptor)
+        finally:
+            os.close(journal_descriptor)
+    finally:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
+
+
 @contextlib.contextmanager
 def global_operation_lock():
     descriptor = os.open(
@@ -439,7 +582,7 @@ class RunContext:
 def load_context(raw_manifest):
     manifest_path, manifest, digest = load_verified_manifest(raw_manifest)
     run_id = manifest["run_id"]
-    expected_root = pathlib.Path(f"/private/tmp/starring-d2-{run_id}")
+    expected_root = isolated_runtime_root(run_id)
     database = manifest.get("database")
     services = manifest.get("services")
     keychain = manifest.get("keychain_services")
@@ -678,27 +821,27 @@ def append_journal(context, action, status, target):
         if lock_created:
             fsync_directory(context.artifact_directory, "journal_lock_parent")
         fcntl.flock(descriptor, fcntl.LOCK_EX)
-        sequence = 1
-        if context.journal_path.exists():
-            metadata = context.journal_path.lstat()
-            if not stat.S_ISREG(metadata.st_mode) or context.journal_path.is_symlink():
-                fail("journal_invalid")
-            with context.journal_path.open("r", encoding="utf-8") as handle:
-                sequence += sum(1 for _ in handle)
-        receipt = {
-            "schema_version": SCHEMA_VERSION,
-            "sequence": sequence,
-            "recorded_at": utc_now(),
-            "manifest_sha256": context.digest,
-            "action": validate_identity(action, "journal_action_invalid"),
-            "status": validate_identity(status, "journal_status_invalid"),
-            "target": validate_identity(target, "journal_target_invalid"),
-        }
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         journal_created = not context.journal_path.exists()
+        flags = (
+            os.O_RDWR
+            | os.O_APPEND
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         output = os.open(context.journal_path, flags, 0o600)
         try:
             os.fchmod(output, 0o600)
+            rows = read_repaired_journal_descriptor(context, output)
+            sequence = len(rows) + 1
+            receipt = {
+                "schema_version": SCHEMA_VERSION,
+                "sequence": sequence,
+                "recorded_at": utc_now(),
+                "manifest_sha256": context.digest,
+                "action": validate_identity(action, "journal_action_invalid"),
+                "status": validate_identity(status, "journal_status_invalid"),
+                "target": validate_identity(target, "journal_target_invalid"),
+            }
             payload = (json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
             written = 0
             while written < len(payload):

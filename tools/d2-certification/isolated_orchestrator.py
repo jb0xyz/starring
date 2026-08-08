@@ -15,10 +15,12 @@ from d2_certification import (
     CertificationError,
     STEP_SPECS,
     canonical_json,
+    isolated_runtime_root,
     load_json_file,
     require_absolute_path,
     require_owned_mode,
     validate_snowflake,
+    validate_step_contract,
     validate_utc_timestamp,
 )
 from d2_orchestrator_composition import (
@@ -61,20 +63,31 @@ from d2_orchestrator_contract import (
 )
 from d2_orchestrator_platform import Platform, rename_exclusive
 from d2_drained_runtime_restart import (
-    command_restart_drained_runtime,
+    command_restart_drained_runtime as run_restart_drained_runtime,
     drained_runtime_restart_directory,
+    drained_runtime_restart_identity,
+    drained_runtime_restart_inventory,
     drained_runtime_restart_temporary_directory,
+    require_bound_runtime_generation,
 )
 from d2_finalization import (
     abort_teardown_evidence_path,
     abort_teardown_progress_path,
     abort_teardown_tombstone_path,
     certified_teardown_binding,
-    command_finalize_run,
-    command_finalize_total_absence,
+    command_finalize_run as run_finalize_run,
+    command_finalize_total_absence as run_finalize_total_absence,
+    freeze_intent_path,
     require_certification_eligible_teardown,
+    validate_runtime_freeze_binding,
 )
-from d2_live_runtime_restart import command_certify_live_runtime_restart
+from d2_live_runtime_restart import (
+    committed_live_runtime_restart_chain,
+    command_certify_live_runtime_restart as run_certify_live_runtime_restart,
+    live_runtime_restart_complete_path,
+    live_runtime_restart_directory,
+    live_runtime_restart_intent_path,
+)
 from d2_legacy_substrate_recovery import (
     command_recover as command_recover_legacy_substrate,
     command_status as command_legacy_substrate_status,
@@ -110,6 +123,18 @@ CLEANUP_ROOT_PROGRESS_KIND = "starring.d2.cleanup-root-progress.v1"
 CLEANUP_ROOT_IDENTITY_KIND = "starring.d2.cleanup-root-identity.v1"
 CLEANUP_KEYCHAIN_BASELINE_KIND = "starring.d2.cleanup-keychain-baseline.v1"
 CANDIDATE_START_TRANSITION_KIND = "starring.d2.candidate-start-transition.v1"
+CANDIDATE_START_RETIREMENT_KIND = "starring.d2.candidate-start-retirement.v1"
+CANDIDATE_START_RETIREMENT_REASONS = {
+    "state_drift",
+    "transition_invalid",
+    "candidate_service_drift",
+    "candidate_health_drift",
+    "protected_staging_drift",
+    "candidate_identity_drift",
+    "candidate_source_drift",
+    "explicit_stop",
+    "explicit_cleanup",
+}
 RECONCILIATION_DISCORD_OBSERVATION_KIND = (
     "starring.d2.discord-reconciliation-role-observation.v1"
 )
@@ -511,7 +536,33 @@ def observe_candidate_process(context, platform, name):
     return evidence, ready_status
 
 
-def revalidate_candidate_process(context, platform, name, evidence):
+def revalidate_candidate_process(
+    context, platform, name, evidence, expected_ready_status=200
+):
+    revalidate_candidate_process_identity(
+        context, platform, name, evidence
+    )
+    if type(expected_ready_status) is int:
+        allowed_ready_statuses = (expected_ready_status,)
+    elif (
+        isinstance(expected_ready_status, tuple)
+        and expected_ready_status
+        and all(type(status) is int for status in expected_ready_status)
+    ):
+        allowed_ready_statuses = expected_ready_status
+    else:
+        fail("candidate_ready_status_contract_invalid")
+    if candidate_ready_status(
+        context, platform, name
+    ) not in allowed_ready_statuses:
+        fail(f"candidate_{name}_health_final_unready")
+    if name == "runtime":
+        health = platform.runtime_process_identity(context)
+        if health != evidence["runtime_health"]:
+            fail("candidate_runtime_health_final_identity_drift")
+
+
+def revalidate_candidate_process_identity(context, platform, name, evidence):
     service = context.manifest["services"][name]
     job = platform.launchd_job(service["label"])
     expected_job = {
@@ -527,12 +578,7 @@ def revalidate_candidate_process(context, platform, name, evidence):
         fail(f"candidate_{name}_process_final_identity_drift")
     if candidate_plist_identity(context, name) != evidence["plist"]:
         fail(f"candidate_{name}_plist_final_identity_drift")
-    if candidate_ready_status(context, platform, name) != 200:
-        fail(f"candidate_{name}_health_final_unready")
-    if name == "runtime":
-        health = platform.runtime_process_identity(context)
-        if health != evidence["runtime_health"]:
-            fail("candidate_runtime_health_final_identity_drift")
+    return job
 
 
 def build_candidate_evidence(context, statuses, platform):
@@ -590,14 +636,327 @@ def candidate_start_source_path(context):
     return source_path(context, 3, "candidate")
 
 
+def candidate_start_retirement_path(context):
+    return context.artifact_directory / "candidate-start-retirement.json"
+
+
 def candidate_start_commitment_present(context):
-    return os.path.lexists(candidate_start_transition_path(context)) or os.path.lexists(
-        candidate_start_source_path(context)
+    return (
+        os.path.lexists(candidate_start_transition_path(context))
+        or os.path.lexists(candidate_start_source_path(context))
+        or os.path.lexists(candidate_start_retirement_path(context))
     )
 
 
 def digest_json(value):
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def load_candidate_start_retirement(context):
+    path = candidate_start_retirement_path(context)
+    try:
+        require_owned_mode(path, 0o600, "candidate_start_retirement")
+    except CertificationError as error:
+        fail(str(error))
+    value = load_json(path, "candidate_start_retirement_invalid")
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "schema_version",
+            "kind",
+            "manifest_sha256",
+            "run_id",
+            "observed_at",
+            "transition_sha256",
+            "reason",
+        }
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or value["kind"] != CANDIDATE_START_RETIREMENT_KIND
+        or value["manifest_sha256"] != context.digest
+        or value["run_id"] != context.manifest["run_id"]
+        or not validate_utc_timestamp(value["observed_at"])
+        or not isinstance(value["transition_sha256"], str)
+        or not DIGEST_PATTERN.fullmatch(value["transition_sha256"])
+        or not isinstance(value["reason"], str)
+        or value["reason"] not in CANDIDATE_START_RETIREMENT_REASONS
+    ):
+        fail("candidate_start_retirement_invalid")
+    return value
+
+
+def persist_candidate_start_retirement(context, transition, reason):
+    if reason not in CANDIDATE_START_RETIREMENT_REASONS:
+        fail("candidate_start_retirement_reason_invalid")
+    path = candidate_start_retirement_path(context)
+    if os.path.lexists(path):
+        return load_candidate_start_retirement(context)
+    value = {
+        "schema_version": 1,
+        "kind": CANDIDATE_START_RETIREMENT_KIND,
+        "manifest_sha256": context.digest,
+        "run_id": context.manifest["run_id"],
+        "observed_at": utc_now(),
+        "transition_sha256": (
+            digest_json(transition) if transition is not None else "0" * 64
+        ),
+        "reason": reason,
+    }
+    write_atomic(path, canonical_json(value) + "\n")
+    if load_candidate_start_retirement(context) != value:
+        fail("candidate_start_retirement_replay_drift")
+    return value
+
+
+def retire_candidate_start(context, transition, reason):
+    persist_candidate_start_retirement(context, transition, reason)
+    fail("candidate_start_transition_retirement_required")
+
+
+def persist_candidate_abort_retirement(context, state, reason):
+    if not candidate_start_commitment_present(context):
+        return
+    transition = None
+    if os.path.lexists(candidate_start_transition_path(context)):
+        try:
+            transition, _ = load_candidate_start_transition(
+                context, state["standing_snapshot"]
+            )
+        except OrchestratorError:
+            transition = None
+    persist_candidate_start_retirement(context, transition, reason)
+
+
+def require_candidate_start_not_retired(
+    context, allow_abort_teardown=False
+):
+    if os.path.lexists(candidate_start_retirement_path(context)):
+        load_candidate_start_retirement(context)
+        fail("candidate_start_transition_retirement_required")
+    if (
+        not allow_abort_teardown
+        and os.path.lexists(abort_teardown_tombstone_path(context))
+    ):
+        fail("candidate_start_transition_retirement_required")
+
+
+def finalization_freeze_committed(context):
+    if not os.path.lexists(freeze_intent_path(context)):
+        return False
+    certified_teardown_binding(context)
+    return True
+
+
+def require_finalization_not_started(context):
+    if finalization_freeze_committed(context):
+        fail("orchestrator_phase_invalid")
+
+
+def command_restart_drained_runtime(context, platform):
+    require_candidate_start_not_retired(context)
+    state = load_state(context, {"candidate_started"})
+    require_finalization_not_started(context)
+    _transition, evidence, _source = require_committed_candidate_processes(
+        context, platform, state, ("api",)
+    )
+    require_committed_transport_identity(context, platform, state)
+    try:
+        result = run_restart_drained_runtime(
+            context,
+            platform,
+            evidence["process_identities"]["runtime"]["launchd"]["runs"],
+        )
+    except OrchestratorError as error:
+        require_committed_candidate_processes(
+            context, platform, state, ("api",)
+        )
+        require_committed_transport_identity(context, platform, state)
+        if str(error) in {
+            "drained_runtime_restart_generation_unjournaled",
+            "drained_runtime_restart_process_identity_changed",
+            "drained_runtime_restart_replay_drift",
+            "drained_runtime_restart_sequence_exhausted",
+            "drained_runtime_restart_unjournaled_pid",
+            "transport_instance_changed",
+        }:
+            retire_candidate_start(
+                context, _transition, "candidate_identity_drift"
+            )
+        raise
+    except BaseException:
+        require_committed_candidate_processes(
+            context, platform, state, ("api",)
+        )
+        require_committed_transport_identity(context, platform, state)
+        raise
+    require_committed_candidate_processes(
+        context, platform, state, ("api",)
+    )
+    require_committed_transport_identity(context, platform, state)
+    return result
+
+
+def command_certify_live_runtime_restart(
+    context, platform, confirmation_path=None
+):
+    require_candidate_start_not_retired(context)
+    require_finalization_not_started(context)
+    state = load_state(context, {"candidate_started"})
+    if not os.path.lexists(live_runtime_restart_intent_path(context)):
+        transition, _evidence, _source = require_initial_candidate_commitment(
+            context, platform, state
+        )
+    else:
+        transition, _evidence, _source = require_committed_candidate_processes(
+            context, platform, state, ("api",)
+        )
+    require_committed_transport_identity(context, platform, state)
+    try:
+        result = run_certify_live_runtime_restart(
+            context, platform, confirmation_path
+        )
+    except OrchestratorError as error:
+        require_committed_candidate_processes(
+            context, platform, state, ("api",)
+        )
+        require_committed_transport_identity(context, platform, state)
+        if str(error) in {
+            "transport_instance_changed",
+            "live_runtime_restart_transport_changed",
+        }:
+            retire_candidate_start(
+                context, transition, "candidate_identity_drift"
+            )
+        raise
+    except BaseException:
+        require_committed_candidate_processes(
+            context, platform, state, ("api",)
+        )
+        require_committed_transport_identity(context, platform, state)
+        raise
+    require_committed_candidate_processes(
+        context, platform, state, ("api",)
+    )
+    require_committed_transport_identity(context, platform, state)
+    return result
+
+
+def command_finalize_run(context, platform, teardown_boundary):
+    require_candidate_start_not_retired(context)
+    if not os.path.lexists(freeze_intent_path(context)):
+        state = load_state(context, {"candidate_started"})
+        require_committed_candidate_processes(
+            context, platform, state, ("api",)
+        )
+        require_committed_runtime_generation(context, platform, state)
+        require_committed_transport_identity(context, platform, state)
+
+    def committed_identity_boundary(
+        boundary_context, boundary_platform, action, runtime_binding
+    ):
+        if boundary_context is not context or boundary_platform is not platform:
+            fail("finalization_identity_boundary_invalid")
+        if action not in {"capture", "suspend", "checkpoint"}:
+            fail("finalization_identity_boundary_invalid")
+        boundary_state = load_state(boundary_context, {"candidate_started"})
+        transition, _evidence, _source = require_committed_candidate_processes(
+            boundary_context,
+            boundary_platform,
+            boundary_state,
+            ("api",),
+        )
+        require_committed_transport_identity(
+            boundary_context, boundary_platform, boundary_state
+        )
+        if action == "capture":
+            if runtime_binding is not None:
+                fail("finalization_identity_boundary_invalid")
+            require_committed_runtime_generation(
+                boundary_context, boundary_platform, boundary_state
+            )
+            captured, _ready = observe_candidate_process(
+                boundary_context, boundary_platform, "runtime"
+            )
+            require_committed_runtime_generation(
+                boundary_context, boundary_platform, boundary_state
+            )
+            revalidate_candidate_process(
+                boundary_context,
+                boundary_platform,
+                "runtime",
+                captured,
+            )
+            return captured
+        try:
+            committed_transition, _committed_evidence, _committed_source = (
+                require_committed_runtime_freeze_binding(
+                    boundary_context, boundary_state, runtime_binding
+                )
+            )
+            if committed_transition != transition:
+                fail("candidate_runtime_freeze_binding_drift")
+            revalidate_candidate_process_identity(
+                boundary_context,
+                boundary_platform,
+                "runtime",
+                runtime_binding,
+            )
+        except OrchestratorError:
+            retire_candidate_start(
+                boundary_context, transition, "candidate_identity_drift"
+            )
+        runtime_path = pathlib.Path(
+            boundary_context.manifest["candidates"]["runtime"]["path"]
+        )
+        runtime_pid = runtime_binding["launchd"]["pid"]
+        runtime_process = runtime_binding["process"]
+        try:
+            if action == "suspend":
+                boundary_platform.candidate_process_suspend(
+                    runtime_pid, runtime_path, runtime_process
+                )
+            if not boundary_platform.candidate_process_stopped(
+                runtime_pid, runtime_path, runtime_process
+            ):
+                fail("candidate_runtime_freeze_suspend_incomplete")
+            revalidate_candidate_process_identity(
+                boundary_context,
+                boundary_platform,
+                "runtime",
+                runtime_binding,
+            )
+        except OrchestratorError:
+            retire_candidate_start(
+                boundary_context, transition, "candidate_identity_drift"
+            )
+
+    def certified_cleanup_boundary(boundary_context, boundary_platform):
+        if boundary_context is not context or boundary_platform is not platform:
+            fail("certified_cleanup_boundary_invalid")
+        return command_cleanup_internal(
+            boundary_context, boundary_platform, retire_committed=False
+        )
+
+    return run_finalize_run(
+        context,
+        platform,
+        certified_cleanup_boundary,
+        teardown_boundary,
+        committed_identity_boundary,
+    )
+
+
+def command_finalize_total_absence(
+    context, platform, prefix_scan_evidence_path, guild_deletion_evidence_path
+):
+    require_candidate_start_not_retired(context)
+    return run_finalize_total_absence(
+        context,
+        platform,
+        prefix_scan_evidence_path,
+        guild_deletion_evidence_path,
+    )
 
 
 def load_candidate_start_transition(context, snapshot):
@@ -625,12 +984,18 @@ def load_candidate_start_transition(context, snapshot):
         or transition["manifest_sha256"] != context.digest
         or transition["run_id"] != context.manifest["run_id"]
         or not validate_utc_timestamp(transition["observed_at"])
+        or not isinstance(transition["evidence_sha256"], str)
         or not DIGEST_PATTERN.fullmatch(transition["evidence_sha256"])
+        or not isinstance(transition["standing_snapshot_sha256"], str)
         or not DIGEST_PATTERN.fullmatch(transition["standing_snapshot_sha256"])
         or transition["standing_snapshot_sha256"] != digest_json(snapshot)
     ):
         fail("candidate_start_transition_invalid")
     evidence = load_step_evidence(context, 3)
+    try:
+        validate_step_contract(3, evidence, context.manifest, [])
+    except CertificationError as error:
+        fail(f"candidate_start_transition_evidence_invalid:{error}")
     if transition["evidence_sha256"] != digest_json(evidence):
         fail("candidate_start_transition_evidence_drift")
     return transition, evidence
@@ -676,16 +1041,6 @@ def load_step_evidence(context, step):
     return evidence
 
 
-def candidate_coordinator_sources(context):
-    bootstrap = publish_bootstrap_source(
-        context, load_step_evidence(context, 1), utc_now()
-    )
-    candidate = publish_candidate_source(
-        context, load_step_evidence(context, 3), utc_now()
-    )
-    return {"1": str(bootstrap), "3": str(candidate)}
-
-
 def candidate_start_result(bootstrap_source, candidate_source, status):
     return {
         "status": status,
@@ -700,39 +1055,288 @@ def candidate_start_result(bootstrap_source, candidate_source, status):
     }
 
 
-def recover_candidate_start_transition(context, platform, state):
-    if state["phase"] != "candidate_starting":
-        fail("candidate_start_transition_retirement_required")
-    if not os.path.lexists(candidate_start_transition_path(context)):
-        fail("candidate_start_transition_retirement_required")
-    transition, evidence = load_candidate_start_transition(
-        context, state["standing_snapshot"]
-    )
+def require_committed_candidate_identity(
+    context, platform, state, transition, evidence
+):
     if not platform.postgres_running(context.cluster_root) or any(
         not platform.launchd_loaded(context.manifest["services"][name]["label"])
         for name in SERVICE_START_ORDER
     ):
-        fail("candidate_start_transition_retirement_required")
+        retire_candidate_start(context, transition, "candidate_service_drift")
     statuses = candidate_health(context, platform, wait=True)
     if any(status != 200 for status in statuses.values()):
-        fail("candidate_start_transition_recovery_unready")
+        retire_candidate_start(context, transition, "candidate_health_drift")
     if standing_snapshot(context, platform) != state["standing_snapshot"]:
-        fail("protected_staging_state_changed")
+        retire_candidate_start(context, transition, "protected_staging_drift")
     try:
-        observed = build_candidate_evidence(context, statuses, platform)
+        for name in ("api", "runtime"):
+            revalidate_candidate_process(
+                context,
+                platform,
+                name,
+                evidence["process_identities"][name],
+            )
+        transport_snapshot = platform.transport_control(context, "snapshot")
     except OrchestratorError:
-        fail("candidate_start_transition_retirement_required")
-    if observed != evidence:
-        fail("candidate_start_transition_retirement_required")
-    candidate_path = publish_candidate_source(
-        context, evidence, transition["observed_at"]
-    )
-    source = read_private_source(context, candidate_path, 3, CANDIDATE_KIND)
+        retire_candidate_start(context, transition, "candidate_identity_drift")
+    if transport_snapshot["instance_id"] != evidence["transport_instance_id"]:
+        retire_candidate_start(context, transition, "candidate_identity_drift")
+    if standing_snapshot(context, platform) != state["standing_snapshot"]:
+        retire_candidate_start(context, transition, "protected_staging_drift")
+
+
+def publish_committed_candidate_source(context, transition, evidence):
+    candidate_path = candidate_start_source_path(context)
+    source_present = os.path.lexists(candidate_path)
+    try:
+        candidate_path = publish_candidate_source(
+            context, evidence, transition["observed_at"]
+        )
+        source = read_private_source(context, candidate_path, 3, CANDIDATE_KIND)
+    except OrchestratorError:
+        if source_present or os.path.lexists(candidate_path):
+            retire_candidate_start(
+                context, transition, "candidate_source_drift"
+            )
+        raise
     if (
         source["observed_at"] != transition["observed_at"]
         or source["evidence"] != evidence
     ):
-        fail("candidate_start_transition_source_drift")
+        retire_candidate_start(context, transition, "candidate_source_drift")
+    return candidate_path
+
+
+def read_committed_candidate_source(context, transition, evidence):
+    candidate_path = candidate_start_source_path(context)
+    if not os.path.lexists(candidate_path):
+        retire_candidate_start(context, transition, "candidate_source_drift")
+    try:
+        source = read_private_source(context, candidate_path, 3, CANDIDATE_KIND)
+    except OrchestratorError:
+        retire_candidate_start(context, transition, "candidate_source_drift")
+    if (
+        source["observed_at"] != transition["observed_at"]
+        or source["evidence"] != evidence
+    ):
+        retire_candidate_start(context, transition, "candidate_source_drift")
+    return candidate_path
+
+
+def load_committed_candidate_artifacts(context, state):
+    if not os.path.lexists(candidate_start_transition_path(context)):
+        retire_candidate_start(context, None, "transition_invalid")
+    try:
+        transition, evidence = load_candidate_start_transition(
+            context, state["standing_snapshot"]
+        )
+    except OrchestratorError:
+        retire_candidate_start(context, None, "transition_invalid")
+    candidate_source = read_committed_candidate_source(
+        context, transition, evidence
+    )
+    return transition, evidence, candidate_source
+
+
+def require_committed_candidate_processes(
+    context, platform, state, names
+):
+    if not names or any(name not in {"api", "runtime"} for name in names):
+        fail("candidate_process_selection_invalid")
+    transition, evidence, candidate_source = load_committed_candidate_artifacts(
+        context, state
+    )
+    try:
+        for name in names:
+            revalidate_candidate_process(
+                context,
+                platform,
+                name,
+                evidence["process_identities"][name],
+            )
+    except OrchestratorError:
+        retire_candidate_start(
+            context, transition, "candidate_identity_drift"
+        )
+    return transition, evidence, candidate_source
+
+
+def require_committed_runtime_generation(
+    context, platform, state, expected_ready_status=200
+):
+    transition, evidence, candidate_source = load_committed_candidate_artifacts(
+        context, state
+    )
+    try:
+        records, pending = drained_runtime_restart_inventory(context)
+        live_chain_before = committed_live_runtime_restart_chain(context)
+    except OrchestratorError:
+        retire_candidate_start(
+            context, transition, "candidate_identity_drift"
+        )
+    if pending is not None or live_chain_before["status"] in {
+        "pending",
+        "complete_unpublished",
+    }:
+        fail("candidate_restart_protocol_pending")
+    if not records:
+        try:
+            revalidate_candidate_process(
+                context,
+                platform,
+                "runtime",
+                evidence["process_identities"]["runtime"],
+                expected_ready_status,
+            )
+        except OrchestratorError:
+            retire_candidate_start(
+                context, transition, "candidate_identity_drift"
+            )
+        try:
+            live_chain_after = committed_live_runtime_restart_chain(context)
+        except OrchestratorError:
+            retire_candidate_start(
+                context, transition, "candidate_identity_drift"
+            )
+        if live_chain_after != live_chain_before:
+            retire_candidate_start(
+                context, transition, "candidate_identity_drift"
+            )
+        return transition, evidence, candidate_source
+    if len(records) != 1 or "complete" not in records[0]:
+        retire_candidate_start(
+            context, transition, "candidate_identity_drift"
+        )
+    completion = records[0]["complete"]
+    try:
+        generation = require_bound_runtime_generation(
+            context,
+            platform,
+            drained_runtime_restart_identity(context),
+            completion["new_pid"],
+            completion["new_runs"],
+            "candidate_runtime_generation_drift",
+            expected_ready_status,
+        )
+    except OrchestratorError:
+        retire_candidate_start(
+            context, transition, "candidate_identity_drift"
+        )
+    if (
+        generation["process_identity"]
+        != completion["new_process_identity"]
+        or generation["runtime_health"]
+        != completion["new_runtime_health"]
+    ):
+        retire_candidate_start(
+            context, transition, "candidate_identity_drift"
+        )
+    try:
+        live_chain_after = committed_live_runtime_restart_chain(context)
+    except OrchestratorError:
+        retire_candidate_start(
+            context, transition, "candidate_identity_drift"
+        )
+    if live_chain_after != live_chain_before:
+        retire_candidate_start(
+            context, transition, "candidate_identity_drift"
+        )
+    return transition, evidence, candidate_source
+
+
+def require_committed_runtime_freeze_binding(context, state, binding):
+    validate_runtime_freeze_binding(context, binding)
+    transition, evidence, candidate_source = load_committed_candidate_artifacts(
+        context, state
+    )
+    records, pending = drained_runtime_restart_inventory(context)
+    live_chain = committed_live_runtime_restart_chain(context)
+    if pending is not None or live_chain["status"] in {
+        "pending",
+        "complete_unpublished",
+    }:
+        fail("candidate_restart_protocol_pending")
+    if not records:
+        if binding != evidence["process_identities"]["runtime"]:
+            fail("candidate_runtime_freeze_binding_drift")
+        return transition, evidence, candidate_source
+    if len(records) != 1 or "complete" not in records[0]:
+        fail("candidate_runtime_freeze_binding_drift")
+    completion = records[0]["complete"]
+    launchd = binding["launchd"]
+    if (
+        binding["process"] != completion["new_process_identity"]
+        or binding["runtime_health"] != completion["new_runtime_health"]
+        or launchd["pid"] != completion["new_pid"]
+        or launchd["runs"] != completion["new_runs"]
+    ):
+        fail("candidate_runtime_freeze_binding_drift")
+    return transition, evidence, candidate_source
+
+
+def require_committed_transport_snapshot(context, state, snapshot):
+    transition, evidence, candidate_source = load_committed_candidate_artifacts(
+        context, state
+    )
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("instance_id")
+        != evidence["transport_instance_id"]
+    ):
+        retire_candidate_start(
+            context, transition, "candidate_identity_drift"
+        )
+    return transition, evidence, candidate_source
+
+
+def require_committed_transport_identity(context, platform, state):
+    snapshot = platform.transport_control(context, "snapshot")
+    require_committed_transport_snapshot(context, state, snapshot)
+    return snapshot
+
+
+def require_initial_candidate_commitment(context, platform, state):
+    transition, evidence, candidate_source = load_committed_candidate_artifacts(
+        context, state
+    )
+    require_committed_candidate_identity(
+        context, platform, state, transition, evidence
+    )
+    require_committed_candidate_identity(
+        context, platform, state, transition, evidence
+    )
+    return transition, evidence, candidate_source
+
+
+def candidate_restart_protocol_committed(context):
+    live_chain = committed_live_runtime_restart_chain(context)
+    if live_chain["status"] != "absent":
+        return live_chain["status"]
+    records, _pending = drained_runtime_restart_inventory(context)
+    return "drained" if records else None
+
+
+def recover_candidate_start_transition(context, platform, state):
+    require_candidate_start_not_retired(context)
+    if state["phase"] != "candidate_starting":
+        retire_candidate_start(context, None, "state_drift")
+    if not os.path.lexists(candidate_start_transition_path(context)):
+        retire_candidate_start(context, None, "transition_invalid")
+    try:
+        transition, evidence = load_candidate_start_transition(
+            context, state["standing_snapshot"]
+        )
+    except OrchestratorError:
+        retire_candidate_start(context, None, "transition_invalid")
+    require_committed_candidate_identity(
+        context, platform, state, transition, evidence
+    )
+    candidate_path = publish_committed_candidate_source(
+        context, transition, evidence
+    )
+    require_committed_candidate_identity(
+        context, platform, state, transition, evidence
+    )
     bootstrap_source = publish_bootstrap_source(
         context, load_step_evidence(context, 1), utc_now()
     )
@@ -743,7 +1347,13 @@ def recover_candidate_start_transition(context, platform, state):
         transition["evidence_sha256"],
     )
     append_journal(context, "postgres_start", "complete", "cluster")
+    require_committed_candidate_identity(
+        context, platform, state, transition, evidence
+    )
     save_state(context, "candidate_started", state["standing_snapshot"])
+    require_committed_candidate_identity(
+        context, platform, state, transition, evidence
+    )
     return candidate_start_result(
         bootstrap_source, candidate_path, "candidate_start_recovered"
     )
@@ -778,22 +1388,44 @@ def require_pinned_transport_snapshot(context, snapshot):
 
 def command_start(context, platform):
     state = load_state(context)
+    require_candidate_start_not_retired(context)
+    require_finalization_not_started(context)
+    if state["phase"] in {"cleaned", "onboarding"}:
+        fail("orchestrator_phase_invalid")
     if state["phase"] == "candidate_started":
-        if not platform.postgres_running(context.cluster_root) or any(
-            not platform.launchd_loaded(context.manifest["services"][name]["label"])
-            for name in SERVICE_START_ORDER
-        ):
-            fail("candidate_state_drift")
-        statuses = candidate_health(context, platform, wait=True)
-        if any(status != 200 for status in statuses.values()):
-            fail("candidate_health_unready")
-        require_pinned_transport_snapshot(
-            context, platform.transport_control(context, "snapshot")
+        try:
+            restart_protocol_committed = candidate_restart_protocol_committed(
+                context
+            )
+        except OrchestratorError:
+            transition, _evidence, _source = (
+                load_committed_candidate_artifacts(context, state)
+            )
+            retire_candidate_start(
+                context, transition, "candidate_identity_drift"
+            )
+        if restart_protocol_committed is not None:
+            require_committed_candidate_processes(
+                context, platform, state, ("api",)
+            )
+            if restart_protocol_committed != "pending":
+                require_committed_runtime_generation(context, platform, state)
+            fail("orchestrator_phase_invalid")
+        _transition, _evidence, candidate_source = (
+            require_initial_candidate_commitment(
+                context, platform, state
+            )
+        )
+        bootstrap_source = publish_bootstrap_source(
+            context, load_step_evidence(context, 1), utc_now()
         )
         return {
             "status": "already_started",
             "phase": "candidate_started",
-            "coordinator_sources": candidate_coordinator_sources(context),
+            "coordinator_sources": {
+                "1": str(bootstrap_source),
+                "3": str(candidate_source),
+            },
         }
     if candidate_start_commitment_present(context):
         return recover_candidate_start_transition(context, platform, state)
@@ -854,11 +1486,19 @@ def command_start(context, platform):
         if standing_snapshot(context, platform) != state["standing_snapshot"]:
             fail("protected_staging_state_changed")
         candidate_evidence = build_candidate_evidence(context, statuses, platform)
+        if standing_snapshot(context, platform) != state["standing_snapshot"]:
+            fail("protected_staging_state_changed")
         transition = stage_candidate_start_transition(
             context, candidate_evidence, state["standing_snapshot"]
         )
-        candidate_source = publish_candidate_source(
-            context, candidate_evidence, transition["observed_at"]
+        require_committed_candidate_identity(
+            context, platform, state, transition, candidate_evidence
+        )
+        candidate_source = publish_committed_candidate_source(
+            context, transition, candidate_evidence
+        )
+        require_committed_candidate_identity(
+            context, platform, state, transition, candidate_evidence
         )
         append_journal(
             context,
@@ -867,7 +1507,13 @@ def command_start(context, platform):
             transition["evidence_sha256"],
         )
         append_journal(context, "postgres_start", "complete", "cluster")
+        require_committed_candidate_identity(
+            context, platform, state, transition, candidate_evidence
+        )
         save_state(context, "candidate_started", state["standing_snapshot"])
+        require_committed_candidate_identity(
+            context, platform, state, transition, candidate_evidence
+        )
         return candidate_start_result(
             bootstrap_source, candidate_source, "candidate_started"
         )
@@ -898,6 +1544,7 @@ def command_stop(context, platform):
             "stopped",
         },
     )
+    persist_candidate_abort_retirement(context, state, "explicit_stop")
     failures = []
     for name in SERVICE_STOP_ORDER:
         label = context.manifest["services"][name]["label"]
@@ -936,7 +1583,14 @@ def command_stop(context, platform):
 
 
 def command_onboard(context, platform, principal_id, display_name):
+    require_candidate_start_not_retired(context)
+    require_finalization_not_started(context)
     state = load_state(context, {"candidate_started", "onboarding"})
+    require_committed_candidate_processes(
+        context, platform, state, ("api",)
+    )
+    require_committed_runtime_generation(context, platform, state)
+    require_committed_transport_identity(context, platform, state)
     if not principal_id.startswith("discord:"):
         fail("onboarding_principal_invalid")
     validate_snowflake(principal_id.removeprefix("discord:"), "onboarding_principal")
@@ -966,6 +1620,11 @@ def command_onboard(context, platform, principal_id, display_name):
         evidence = platform.onboard_installation(
             context, principal_id, display_name, installation_id
         )
+        require_committed_candidate_processes(
+            context, platform, state, ("api",)
+        )
+        require_committed_runtime_generation(context, platform, state)
+        require_committed_transport_identity(context, platform, state)
         output = {
             "outcome": evidence["outcome"],
             "installation_id": evidence["installation_id"],
@@ -982,6 +1641,11 @@ def command_onboard(context, platform, principal_id, display_name):
         coordinator_source = publish_onboarding_source(
             context, output, utc_now()
         )
+        require_committed_candidate_processes(
+            context, platform, state, ("api",)
+        )
+        require_committed_runtime_generation(context, platform, state)
+        require_committed_transport_identity(context, platform, state)
         append_journal(context, "installation_onboard", "complete", "installation")
         save_state(context, "candidate_started", state["standing_snapshot"])
         return {
@@ -1238,7 +1902,15 @@ def gateway_control_completion_bindings(context, expected_operations):
 
 
 def command_transport_control(context, platform, operation):
+    require_candidate_start_not_retired(context)
+    require_finalization_not_started(context)
     state = load_state(context, {"candidate_started"})
+    require_committed_candidate_processes(
+        context, platform, state, ("api",)
+    )
+    require_committed_runtime_generation(
+        context, platform, state, expected_ready_status=(200, 503)
+    )
     if not platform.postgres_running(context.cluster_root) or any(
         not platform.launchd_loaded(context.manifest["services"][name]["label"])
         for name in SERVICE_START_ORDER
@@ -1250,7 +1922,7 @@ def command_transport_control(context, platform, operation):
     if command is None:
         fail("transport_operation_invalid")
     pre_snapshot = platform.transport_control(context, "snapshot")
-    require_pinned_transport_snapshot(context, pre_snapshot)
+    require_committed_transport_snapshot(context, state, pre_snapshot)
     records, pending = transport_control_inventory(context)
     validate_transport_control_history(context, records)
     if pending is not None:
@@ -1299,7 +1971,7 @@ def command_transport_control(context, platform, operation):
         )
         response = platform.transport_control(context, command, fields)
     snapshot = platform.transport_control(context, "snapshot")
-    require_pinned_transport_snapshot(context, snapshot)
+    require_committed_transport_snapshot(context, state, snapshot)
     transport_operation_postcondition(operation, operation_id, response, snapshot)
     evidence = {
         "schema_version": 1,
@@ -1316,6 +1988,13 @@ def command_transport_control(context, platform, operation):
         f"{sequence:04d}-{operation}-complete.json"
     )
     write_atomic(evidence_path, canonical_json(evidence) + "\n")
+    require_committed_candidate_processes(
+        context, platform, state, ("api",)
+    )
+    require_committed_runtime_generation(
+        context, platform, state, expected_ready_status=(200, 503)
+    )
+    require_committed_transport_identity(context, platform, state)
     append_journal(
         context, "transport_control", "complete", operation_id.replace(":", "_")
     )
@@ -1329,8 +2008,16 @@ def command_transport_control(context, platform, operation):
     }
 
 
-def require_candidate_certification_boundary(context, platform):
+def require_candidate_certification_boundary(
+    context, platform, allow_abort_teardown=False
+):
+    require_candidate_start_not_retired(context, allow_abort_teardown)
+    require_finalization_not_started(context)
     state = load_state(context, {"candidate_started"})
+    require_committed_candidate_processes(
+        context, platform, state, ("api",)
+    )
+    require_committed_runtime_generation(context, platform, state)
     if not platform.postgres_running(context.cluster_root) or any(
         not platform.launchd_loaded(context.manifest["services"][name]["label"])
         for name in SERVICE_START_ORDER
@@ -1348,12 +2035,21 @@ def require_candidate_certification_boundary(context, platform):
     }:
         fail("candidate_health_unready")
     snapshot = platform.transport_control(context, "snapshot")
-    require_pinned_transport_snapshot(context, snapshot)
+    require_committed_transport_snapshot(context, state, snapshot)
+    require_committed_candidate_processes(
+        context, platform, state, ("api",)
+    )
+    require_committed_runtime_generation(context, platform, state)
+    require_committed_transport_identity(context, platform, state)
     return state, snapshot
 
 
 def require_frozen_discord_teardown_boundary(context, platform):
+    require_candidate_start_not_retired(context)
     state = load_state(context, {"candidate_started"})
+    require_committed_candidate_processes(
+        context, platform, state, ("api",)
+    )
     if not platform.postgres_running(context.cluster_root):
         fail("finalization_freeze_state_drift")
     required = ("transport", "worker", "api")
@@ -1369,7 +2065,11 @@ def require_frozen_discord_teardown_boundary(context, platform):
     if standing_snapshot(context, platform) != state["standing_snapshot"]:
         fail("protected_staging_state_changed")
     snapshot = platform.transport_control(context, "snapshot")
-    require_pinned_transport_snapshot(context, snapshot)
+    require_committed_transport_snapshot(context, state, snapshot)
+    require_committed_candidate_processes(
+        context, platform, state, ("api",)
+    )
+    require_committed_transport_identity(context, platform, state)
     return state, snapshot
 
 
@@ -1392,7 +2092,15 @@ def command_resource_inventory(context, platform):
 
 
 def require_gateway_loss_certification_boundary(context, platform):
+    require_candidate_start_not_retired(context)
+    require_finalization_not_started(context)
     state = load_state(context, {"candidate_started"})
+    require_committed_candidate_processes(
+        context, platform, state, ("api",)
+    )
+    require_committed_runtime_generation(
+        context, platform, state, expected_ready_status=(200, 503)
+    )
     if not platform.postgres_running(context.cluster_root) or any(
         not platform.launchd_loaded(context.manifest["services"][name]["label"])
         for name in SERVICE_START_ORDER
@@ -1401,13 +2109,20 @@ def require_gateway_loss_certification_boundary(context, platform):
     if standing_snapshot(context, platform) != state["standing_snapshot"]:
         fail("protected_staging_state_changed")
     snapshot = platform.transport_control(context, "snapshot")
-    require_pinned_transport_snapshot(context, snapshot)
+    require_committed_transport_snapshot(context, state, snapshot)
     runtime_status = platform.http_status(
         "http://127.0.0.1:"
         f"{context.manifest['services']['runtime']['port']}/health/ready"
     )
     if runtime_status != 503:
         fail("gateway_loss_runtime_readiness_invalid")
+    require_committed_candidate_processes(
+        context, platform, state, ("api",)
+    )
+    require_committed_runtime_generation(
+        context, platform, state, expected_ready_status=(200, 503)
+    )
+    require_committed_transport_identity(context, platform, state)
     return snapshot, runtime_status
 
 
@@ -1762,6 +2477,7 @@ def gateway_healed_transport_evidence(
 
 
 def command_transport_evidence(context, platform, checkpoint):
+    require_candidate_start_not_retired(context)
     if checkpoint not in TRANSPORT_EVIDENCE_KINDS:
         fail("transport_evidence_checkpoint_invalid")
     if checkpoint == "gateway-loss":
@@ -2532,11 +3248,14 @@ def validate_discord_teardown_evidence(
 def command_teardown_discord_resources(context, platform, frozen=False):
     if frozen:
         require_certification_eligible_teardown(context)
-    boundary = (
-        require_frozen_discord_teardown_boundary
-        if frozen
-        else require_candidate_certification_boundary
-    )
+        boundary = require_frozen_discord_teardown_boundary
+    else:
+        def boundary(boundary_context, boundary_platform):
+            return require_candidate_certification_boundary(
+                boundary_context,
+                boundary_platform,
+                allow_abort_teardown=True,
+            )
     _state, snapshot = boundary(context, platform)
     inventory = platform.transport_control(context, "resource_inventory")
     if inventory["instance_id"] != snapshot["instance_id"]:
@@ -2711,7 +3430,7 @@ def cleanup_path_metadata(path, code):
 
 
 def validate_cleanup_root_directory(context, root):
-    expected = pathlib.Path(f"/private/tmp/starring-d2-{context.manifest['run_id']}")
+    expected = isolated_runtime_root(context.manifest["run_id"])
     if context.root != expected or context.root.parent != pathlib.Path("/private/tmp"):
         fail("cleanup_root_guard_failed")
     metadata = cleanup_path_metadata(root, "cleanup_root_invalid")
@@ -3008,7 +3727,7 @@ def require_quarantined_cleanup_substrate_inert(context, platform):
 
 
 def guarded_remove_root(context, platform):
-    expected = pathlib.Path(f"/private/tmp/starring-d2-{context.manifest['run_id']}")
+    expected = isolated_runtime_root(context.manifest["run_id"])
     if context.root != expected or context.root.parent != pathlib.Path("/private/tmp"):
         fail("cleanup_root_guard_failed")
     identity = load_cleanup_root_identity(context)
@@ -3116,7 +3835,7 @@ def guarded_remove_root(context, platform):
 
 
 def validate_cleanup_mutation_roots(context):
-    expected = pathlib.Path(f"/private/tmp/starring-d2-{context.manifest['run_id']}")
+    expected = isolated_runtime_root(context.manifest["run_id"])
     if context.root != expected or context.cluster_root != expected / "postgres":
         fail("cleanup_root_guard_failed")
     root_metadata = cleanup_path_metadata(context.root, "cleanup_root_invalid")
@@ -3569,8 +4288,12 @@ def cleanup(context, platform, expected_snapshot, from_failure=False):
     }
 
 
-def command_cleanup(context, platform):
+def command_cleanup_internal(context, platform, retire_committed):
     state = load_state(context)
+    if retire_committed and state["phase"] != "cleaned":
+        persist_candidate_abort_retirement(
+            context, state, "explicit_cleanup"
+        )
     if state["phase"] == "cleaned":
         require_discord_ownership_released(context)
         require_terminal_cleanup_root_progress(context)
@@ -3596,6 +4319,10 @@ def command_cleanup(context, platform):
             **absence,
         }
     return cleanup(context, platform, state["standing_snapshot"])
+
+
+def command_cleanup(context, platform):
+    return command_cleanup_internal(context, platform, retire_committed=True)
 
 
 def command_status(context, platform):
@@ -3715,6 +4442,25 @@ def main():
             "status": command_status,
         }
         with global_operation_lock():
+            if arguments.command not in {
+                "legacy-substrate-status",
+                "recover-legacy-substrate",
+                "finalize-run",
+                "finalize-total-absence",
+                "stop",
+                "cleanup",
+                "status",
+            } and finalization_freeze_committed(context):
+                fail("orchestrator_phase_invalid")
+            if arguments.command not in {
+                "legacy-substrate-status",
+                "recover-legacy-substrate",
+                "teardown-discord-resources",
+                "stop",
+                "cleanup",
+                "status",
+            }:
+                require_candidate_start_not_retired(context)
             if arguments.command == "legacy-substrate-status":
                 result = command_legacy_substrate_status(
                     context, legacy_state, platform
@@ -3760,7 +4506,6 @@ def main():
                 result = command_finalize_run(
                     context,
                     platform,
-                    command_cleanup,
                     command_teardown_discord_resources,
                 )
             elif arguments.command == "finalize-total-absence":

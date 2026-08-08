@@ -147,10 +147,52 @@ class D2FinalizationTest(unittest.TestCase):
             self.platform,
             ORCHESTRATOR.command_cleanup,
             ORCHESTRATOR.command_teardown_discord_resources,
+            self.identity_boundary,
         )
 
+    def identity_boundary(self, context, platform, action, runtime_binding):
+        self.assertIs(context, self.context)
+        self.assertIs(platform, self.platform)
+        if action == "capture":
+            self.assertIsNone(runtime_binding)
+            return ORCHESTRATOR.observe_candidate_process(
+                context, platform, "runtime"
+            )[0]
+        ORCHESTRATOR.revalidate_candidate_process_identity(
+            context, platform, "runtime", runtime_binding
+        )
+        pid = runtime_binding["launchd"]["pid"]
+        path = pathlib.Path(context.manifest["candidates"]["runtime"]["path"])
+        if action == "suspend":
+            platform.candidate_process_suspend(
+                pid, path, runtime_binding["process"]
+            )
+        elif action != "checkpoint":
+            self.fail("unexpected_identity_action")
+        self.assertTrue(
+            platform.candidate_process_stopped(
+                pid, path, runtime_binding["process"]
+            )
+        )
+
+    def replace_runtime_generation(self):
+        label = self.context.manifest["services"]["runtime"]["label"]
+        old_pid = self.platform.pids[label]
+        self.platform.next_pid += 1
+        new_pid = self.platform.next_pid
+        self.platform.pids[label] = new_pid
+        self.platform.process_start_times[new_pid] = (
+            1_700_000_000 + new_pid,
+            new_pid % 1_000_000,
+        )
+        self.platform.launchd_runs[label] += 1
+        self.platform.runtime_process_instance_ids[label] = f"{new_pid:032x}"
+        return label, old_pid, new_pid
+
     def prepare_certified_teardown(self):
-        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        FINALIZATION._ensure_effect_freeze(
+            self.context, self.platform, self.identity_boundary
+        )
         return ORCHESTRATOR.command_teardown_discord_resources(
             self.context, self.platform, frozen=True
         )
@@ -227,6 +269,106 @@ class D2FinalizationTest(unittest.TestCase):
             FINALIZATION.step_sixteen_evidence_path(self.context),
         ):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_orchestrated_freeze_retires_replacement_after_durable_intent(self):
+        freeze_path = FINALIZATION.freeze_intent_path(self.context)
+        real_write = FINALIZATION.write_atomic
+        replaced = False
+
+        def write_and_replace(path, payload, mode=0o600):
+            nonlocal replaced
+            result = real_write(path, payload, mode)
+            if pathlib.Path(path) == freeze_path and not replaced:
+                replaced = True
+                self.replace_runtime_generation()
+            return result
+
+        bootouts = list(self.platform.bootouts)
+        with mock.patch.object(
+            FINALIZATION, "write_atomic", side_effect=write_and_replace
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_finalize_run(
+                self.context,
+                self.platform,
+                ORCHESTRATOR.command_teardown_discord_resources,
+            )
+        self.assertTrue(replaced)
+        self.assertTrue(freeze_path.is_file())
+        self.assertEqual(self.platform.bootouts, bootouts)
+        self.assertFalse(FINALIZATION.step_sixteen_evidence_path(self.context).exists())
+
+    def test_orchestrated_freeze_retires_replacement_after_suspend(self):
+        real_suspend = self.platform.candidate_process_suspend
+        replaced = False
+
+        def suspend_and_replace(pid, path, identity):
+            nonlocal replaced
+            real_suspend(pid, path, identity)
+            if not replaced:
+                replaced = True
+                self.replace_runtime_generation()
+
+        bootouts = list(self.platform.bootouts)
+        with mock.patch.object(
+            self.platform,
+            "candidate_process_suspend",
+            side_effect=suspend_and_replace,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_finalize_run(
+                self.context,
+                self.platform,
+                ORCHESTRATOR.command_teardown_discord_resources,
+            )
+        self.assertTrue(replaced)
+        self.assertEqual(self.platform.bootouts, bootouts)
+        self.assertFalse(FINALIZATION.step_sixteen_evidence_path(self.context).exists())
+
+    def test_orchestrated_freeze_recovers_exact_suspended_runtime(self):
+        tunnel = self.context.manifest["services"]["tunnel"]["label"]
+        runtime = self.context.manifest["services"]["runtime"]["label"]
+        runtime_pid = self.platform.pids[runtime]
+        real_bootout = self.platform.launchd_bootout
+        failed = False
+
+        def fail_first_tunnel_bootout(label):
+            nonlocal failed
+            if label == tunnel and not failed:
+                failed = True
+                raise ORCHESTRATOR.OrchestratorError(
+                    "injected_post_suspend_crash"
+                )
+            return real_bootout(label)
+
+        self.platform.launchd_bootout = fail_first_tunnel_bootout
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_post_suspend_crash"
+        ):
+            ORCHESTRATOR.command_finalize_run(
+                self.context,
+                self.platform,
+                ORCHESTRATOR.command_teardown_discord_resources,
+            )
+        self.assertTrue(FINALIZATION.freeze_intent_path(self.context).is_file())
+        self.assertIn(runtime_pid, self.platform.suspended_pids)
+        self.assertEqual(self.platform.signals, [(runtime_pid, "SIGSTOP")])
+        self.platform.launchd_bootout = real_bootout
+        result = ORCHESTRATOR.command_finalize_run(
+            self.context,
+            self.platform,
+            ORCHESTRATOR.command_teardown_discord_resources,
+        )
+        self.assertEqual(result["status"], "finalized")
+        self.assertEqual(self.platform.signals, [(runtime_pid, "SIGSTOP")])
+        self.assertLess(
+            self.platform.bootouts.index(tunnel),
+            self.platform.bootouts.index(runtime),
+        )
 
     def test_finalize_run_exact_replay_is_non_mutating(self):
         self.finalize()
@@ -341,7 +483,9 @@ class D2FinalizationTest(unittest.TestCase):
         )
 
     def test_existing_freeze_revalidates_step15_completion_before_mutation(self):
-        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        FINALIZATION._ensure_effect_freeze(
+            self.context, self.platform, self.identity_boundary
+        )
         bootouts = list(self.platform.bootouts)
         self.certification_mock.side_effect = ORCHESTRATOR.OrchestratorError(
             "finalization_certification_prefix_incomplete"
@@ -355,7 +499,9 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertEqual(self.platform.destroy_calls, 0)
 
     def test_frozen_teardown_revalidates_step15_completion_before_delete(self):
-        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        FINALIZATION._ensure_effect_freeze(
+            self.context, self.platform, self.identity_boundary
+        )
         existing = set(self.platform.discord_existing)
         self.certification_mock.side_effect = ORCHESTRATOR.OrchestratorError(
             "finalization_certification_prefix_incomplete"
@@ -376,7 +522,9 @@ class D2FinalizationTest(unittest.TestCase):
         )
 
     def test_existing_freeze_rejects_step15_completion_and_chronology_drift(self):
-        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        FINALIZATION._ensure_effect_freeze(
+            self.context, self.platform, self.identity_boundary
+        )
         bootouts = list(self.platform.bootouts)
         self.certification_mock.return_value = {
             "step15_receipt_sha256": "a" * 64,
@@ -432,7 +580,9 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertFalse(FINALIZATION.freeze_intent_path(self.context).exists())
 
     def test_freeze_rejects_boolean_schema_version(self):
-        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        FINALIZATION._ensure_effect_freeze(
+            self.context, self.platform, self.identity_boundary
+        )
         path = FINALIZATION.freeze_intent_path(self.context)
         intent = json.loads(path.read_text())
         intent["schema_version"] = True
@@ -595,7 +745,9 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertIn(resource_id, self.platform.discord_existing)
 
     def test_certified_teardown_partial_failure_resumes_without_redeleting(self):
-        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        FINALIZATION._ensure_effect_freeze(
+            self.context, self.platform, self.identity_boundary
+        )
         self.platform.proxy_failure_resource_id = "1524810437118525560"
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError, "injected_proxy_delete_failure"
@@ -624,7 +776,9 @@ class D2FinalizationTest(unittest.TestCase):
         self.assertEqual(self.platform.proxy_deletions, deletions)
 
     def test_certified_teardown_rejects_uncertified_progress_source(self):
-        FINALIZATION._ensure_effect_freeze(self.context, self.platform)
+        FINALIZATION._ensure_effect_freeze(
+            self.context, self.platform, self.identity_boundary
+        )
         self.platform.proxy_failure_resource_id = "1524810437118525560"
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError, "injected_proxy_delete_failure"

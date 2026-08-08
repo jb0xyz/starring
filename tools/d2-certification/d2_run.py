@@ -185,6 +185,21 @@ def coordinator_completion_path(manifest_path, step):
     return coordinator_directory(manifest_path) / f"step-{step:02d}-completion.json"
 
 
+def candidate_start_retirement_path(manifest_path):
+    return pathlib.Path(manifest_path).parent / "orchestrator" / "candidate-start-retirement.json"
+
+
+def abort_teardown_tombstone_path(manifest_path):
+    return pathlib.Path(manifest_path).parent / "orchestrator" / "discord-resource-teardown-abort.json"
+
+
+def require_candidate_start_not_retired(manifest_path):
+    if os.path.lexists(
+        candidate_start_retirement_path(manifest_path)
+    ) or os.path.lexists(abort_teardown_tombstone_path(manifest_path)):
+        fail("candidate_start_transition_retirement_required")
+
+
 def path_present(path):
     return os.path.lexists(path)
 
@@ -886,8 +901,10 @@ def coordinator_pending_step(manifest_path, manifest, digest, receipts):
 
 def next_certification_action(manifest_path):
     verified_path, manifest, digest = load_verified_manifest(manifest_path)
+    require_candidate_start_not_retired(verified_path)
     preview_challenge = None
     with coordinator_lock(verified_path, False):
+        require_candidate_start_not_retired(verified_path)
         receipts = load_receipts(verified_path, manifest, digest)
         pending_step = coordinator_pending_step(
             verified_path, manifest, digest, receipts
@@ -914,6 +931,7 @@ def next_certification_action(manifest_path):
             preview_challenge = preview_completion_challenge(
                 manifest, digest, completion
             )
+        require_candidate_start_not_retired(verified_path)
     completed_steps = len(receipts)
     chain_head = ZERO_DIGEST if not receipts else receipts[-1]["receipt_sha256"]
     base = {
@@ -966,9 +984,11 @@ def next_certification_action(manifest_path):
 
 def advance_certification(manifest_path, step, raw_sources):
     verified_path, manifest, digest = load_verified_manifest(manifest_path)
+    require_candidate_start_not_retired(verified_path)
     if step not in STEP_SPECS:
         fail("coordinator_step_invalid")
     with coordinator_lock(verified_path, True):
+        require_candidate_start_not_retired(verified_path)
         receipts = load_receipts(verified_path, manifest, digest)
         completed_steps = len(receipts)
         pending_step = coordinator_pending_step(
@@ -1078,6 +1098,7 @@ def advance_certification(manifest_path, step, raw_sources):
                 fail("coordinator_completion_drift")
         else:
             write_private_json(completion_path, completion)
+        require_candidate_start_not_retired(verified_path)
         return {
             "schema_version": SCHEMA_VERSION,
             "kind": "starring.d2.certification-advance-result.v1",
@@ -1093,7 +1114,9 @@ def advance_certification(manifest_path, step, raw_sources):
 
 def verify_certification(manifest_path):
     verified_path, manifest, digest = load_verified_manifest(manifest_path)
+    require_candidate_start_not_retired(verified_path)
     with coordinator_lock(verified_path, False):
+        require_candidate_start_not_retired(verified_path)
         receipts = load_receipts(verified_path, manifest, digest)
         pending_step = coordinator_pending_step(
             verified_path, manifest, digest, receipts
@@ -1160,6 +1183,8 @@ def verify_certification(manifest_path):
         coordinator_evidence_sha256 = sha256_bytes(
             COORDINATOR_LEDGER_DOMAIN + canonical_json(ledger).encode("utf-8")
         )
+        require_candidate_start_not_retired(verified_path)
+    require_candidate_start_not_retired(verified_path)
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": COORDINATOR_FINAL_KIND,

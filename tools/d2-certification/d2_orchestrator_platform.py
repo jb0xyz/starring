@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -280,7 +281,7 @@ class Platform:
         library.proc_pidpath.restype = ctypes.c_int
         return library
 
-    def _kernel_process_identity(self, pid):
+    def _kernel_process_information(self, pid):
         if type(pid) is not int or pid <= 0 or pid > 2_147_483_647:
             fail("process_identity_pid_invalid")
         if ctypes.sizeof(ProcBsdInfo) != 136:
@@ -296,6 +297,18 @@ class Platform:
         )
         if observed != ctypes.sizeof(information):
             fail("process_identity_bsdinfo_unavailable")
+        if (
+            information.pbi_pid != pid
+            or information.pbi_uid != os.getuid()
+            or information.pbi_start_tvsec <= 0
+            or information.pbi_start_tvusec >= 1_000_000
+        ):
+            fail("process_identity_kernel_invalid")
+        return information
+
+    def _kernel_process_identity(self, pid):
+        information = self._kernel_process_information(pid)
+        library = self._libproc()
         buffer = ctypes.create_string_buffer(PROC_PIDPATHINFO_MAXSIZE)
         path_size = library.proc_pidpath(
             pid, buffer, PROC_PIDPATHINFO_MAXSIZE
@@ -314,11 +327,7 @@ class Platform:
         except UnicodeDecodeError:
             fail("process_identity_path_invalid")
         if (
-            information.pbi_pid != pid
-            or information.pbi_uid != os.getuid()
-            or information.pbi_start_tvsec <= 0
-            or information.pbi_start_tvusec >= 1_000_000
-            or not pathlib.Path(path).is_absolute()
+            not pathlib.Path(path).is_absolute()
             or "\x00" in path
         ):
             fail("process_identity_kernel_invalid")
@@ -431,6 +440,48 @@ class Platform:
             "inode": first.st_ino,
             "links": first.st_nlink,
         }
+
+    def candidate_process_stopped(self, pid, expected_path, expected_identity):
+        if self.candidate_process_identity(pid, expected_path) != expected_identity:
+            fail("candidate_process_suspend_identity_drift")
+        information = self._kernel_process_information(pid)
+        if (
+            information.pbi_pid != expected_identity["pid"]
+            or information.pbi_uid != expected_identity["uid"]
+            or information.pbi_start_tvsec
+            != expected_identity["start_time_seconds"]
+            or information.pbi_start_tvusec
+            != expected_identity["start_time_microseconds"]
+        ):
+            fail("candidate_process_suspend_identity_drift")
+        return information.pbi_status == 4
+
+    def candidate_process_suspend(self, pid, expected_path, expected_identity):
+        if self.candidate_process_stopped(pid, expected_path, expected_identity):
+            return
+        try:
+            os.kill(pid, signal.SIGSTOP)
+        except OSError:
+            fail("candidate_process_suspend_failed")
+        deadline = time.monotonic() + 2
+        while True:
+            information = self._kernel_process_information(pid)
+            if (
+                information.pbi_pid != expected_identity["pid"]
+                or information.pbi_uid != expected_identity["uid"]
+                or information.pbi_start_tvsec
+                != expected_identity["start_time_seconds"]
+                or information.pbi_start_tvusec
+                != expected_identity["start_time_microseconds"]
+            ):
+                fail("candidate_process_suspend_identity_drift")
+            if information.pbi_status == 4:
+                break
+            if time.monotonic() >= deadline:
+                fail("candidate_process_suspend_unconfirmed")
+            time.sleep(0.01)
+        if self.candidate_process_identity(pid, expected_path) != expected_identity:
+            fail("candidate_process_suspend_identity_drift")
 
     def postgres_pid(self, cluster_root):
         path = pathlib.Path(cluster_root) / "postmaster.pid"

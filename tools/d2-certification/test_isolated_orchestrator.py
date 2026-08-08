@@ -120,6 +120,7 @@ class FakePlatform:
         self.http_status_hook = None
         self.http_status_call_counts = {}
         self.signals = []
+        self.suspended_pids = set()
         self.signal_exit_code = 0
         self.signal_failure = False
         self.next_pid = 41000
@@ -344,7 +345,11 @@ class FakePlatform:
             runtime_label = next(
                 (label for label in self.loaded if label.endswith(".runtime")), None
             )
-            if runtime_label is None or self.pids.get(runtime_label) is None:
+            if (
+                runtime_label is None
+                or self.pids.get(runtime_label) is None
+                or self.pids.get(runtime_label) in self.suspended_pids
+            ):
                 return 0
         status = 200
         if self.http_status_hook is not None:
@@ -396,6 +401,19 @@ class FakePlatform:
         if self.process_identity_hook is not None:
             return self.process_identity_hook(pid, path, count, value)
         return value
+
+    def candidate_process_stopped(self, pid, expected_path, expected_identity):
+        if self.candidate_process_identity(pid, expected_path) != expected_identity:
+            ORCHESTRATOR.fail("candidate_process_suspend_identity_drift")
+        return pid in self.suspended_pids
+
+    def candidate_process_suspend(self, pid, expected_path, expected_identity):
+        if self.candidate_process_stopped(pid, expected_path, expected_identity):
+            return
+        self.suspended_pids.add(pid)
+        self.signals.append((pid, "SIGSTOP"))
+        if self.candidate_process_identity(pid, expected_path) != expected_identity:
+            ORCHESTRATOR.fail("candidate_process_suspend_identity_drift")
 
     def worker_health_status(self, context, timeout_seconds=3):
         self.lifecycle_events.append("health:worker")
@@ -669,7 +687,9 @@ class FakePlatform:
     def launchd_bootout(self, label):
         self.bootouts.append(label)
         self.loaded.discard(label)
-        self.pids.pop(label, None)
+        pid = self.pids.pop(label, None)
+        if pid is not None:
+            self.suspended_pids.discard(pid)
         self.programs.pop(label, None)
         self.plist_paths.pop(label, None)
         self.program_arguments.pop(label, None)
@@ -686,6 +706,34 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.registry_path = self.root / "discord-ownership-registry.json"
         self.runtime_root_parent = self.root / "runtime-roots"
         self.runtime_root_parent.mkdir(mode=0o700)
+        self.isolated_root_parent_patch = None
+        test_runtime_parent = os.environ.get("STARRING_D2_TEST_RUNTIME_PARENT")
+        if test_runtime_parent is not None:
+            parent = pathlib.Path(test_runtime_parent)
+            temporary_parent = pathlib.Path(
+                os.environ.get("TMPDIR", "")
+            )
+            try:
+                resolved_parent = parent.resolve(strict=True)
+                resolved_temporary = temporary_parent.resolve(strict=True)
+                metadata = resolved_parent.lstat()
+            except OSError as error:
+                self.fail(f"test_runtime_parent_unavailable:{error.__class__.__name__}")
+            if (
+                resolved_parent != parent
+                or resolved_parent == resolved_temporary
+                or resolved_temporary not in resolved_parent.parents
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                self.fail("test_runtime_parent_invalid")
+            self.isolated_root_parent_patch = mock.patch.object(
+                CERTIFICATION,
+                "D2_ISOLATED_ROOT_PARENT",
+                resolved_parent,
+            )
+            self.isolated_root_parent_patch.start()
         self.registry_patch = mock.patch.object(
             CONTRACT,
             "GLOBAL_DISCORD_OWNERSHIP_REGISTRY_PATH",
@@ -701,7 +749,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.artifact_root = self.root / "immutable-candidates"
         self.artifact_root.mkdir()
         self.run_id = f"d2-20260801t120000z-{secrets.token_hex(6)}"
-        self.isolated_root = pathlib.Path(f"/private/tmp/starring-d2-{self.run_id}")
+        self.isolated_root = CERTIFICATION.isolated_runtime_root(self.run_id)
         self.candidates = {}
         for name in CERTIFICATION.REQUIRED_CANDIDATES:
             path = (
@@ -752,6 +800,8 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.artifact_root.chmod(0o700)
         self.runtime_root_patch.stop()
         self.registry_patch.stop()
+        if self.isolated_root_parent_patch is not None:
+            self.isolated_root_parent_patch.stop()
         self.temporary.cleanup()
 
     def remove_test_root(self, context):
@@ -1017,6 +1067,23 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         path.chmod(0o600)
         return path
 
+    def certify_and_advance_live_restart(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        awaiting = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        result = ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context,
+            self.platform,
+            self.write_live_restart_confirmation(awaiting),
+        )
+        D2_RUN.advance_certification(
+            self.manifest_path, 11, [result["coordinator_source"]]
+        )
+        return result
+
     def test_dry_run_is_read_only_and_binds_dedicated_namespaces(self):
         result = ORCHESTRATOR.command_dry_run(self.context, self.platform)
         self.assertEqual(result["status"], "ready")
@@ -1097,6 +1164,77 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertEqual(self.context.lock_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.context.journal_path.stat().st_mode & 0o777, 0o600)
 
+    def test_cleanup_recovers_a_partial_final_journal_row(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        descriptor = os.open(self.context.journal_path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(descriptor, b'{"schema_version":1,"sequence":')
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+        raw = self.context.journal_path.read_bytes()
+        self.assertTrue(raw.endswith(b"\n"))
+        rows = CONTRACT.parse_journal_rows(self.context, raw)
+        self.assertEqual([row["sequence"] for row in rows], list(range(1, len(rows) + 1)))
+        self.assertEqual(rows[-1]["action"], "cleanup")
+        self.assertEqual(rows[-1]["status"], "complete")
+
+    def test_drained_restart_reader_recovers_a_partial_final_journal_row(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        descriptor = os.open(self.context.journal_path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(descriptor, b'{"schema_version":1,"sequence":')
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        found = DRAINED_RUNTIME_RESTART.drained_runtime_restart_journal_contains(
+            self.context,
+            "complete",
+            "d2:0123456789abcdef:restart-drained-runtime:0001",
+        )
+        self.assertFalse(found)
+        raw = self.context.journal_path.read_bytes()
+        self.assertTrue(raw.endswith(b"\n"))
+        CONTRACT.parse_journal_rows(self.context, raw)
+
+    def test_live_restart_reader_recovers_a_partial_final_journal_row(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        descriptor = os.open(self.context.journal_path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(descriptor, b'{"schema_version":1,"sequence":')
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        found = LIVE_RUNTIME_RESTART.live_runtime_restart_journal_contains(
+            self.context,
+            "complete",
+            "d2:0123456789abcdef:certify-live-runtime-restart",
+        )
+        self.assertFalse(found)
+        raw = self.context.journal_path.read_bytes()
+        self.assertTrue(raw.endswith(b"\n"))
+        CONTRACT.parse_journal_rows(self.context, raw)
+
+    def test_journal_rejects_boolean_integer_fields(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        original = json.loads(
+            self.context.journal_path.read_text(encoding="utf-8").splitlines()[0]
+        )
+        for field in ("schema_version", "sequence"):
+            with self.subTest(field=field):
+                changed = dict(original)
+                changed[field] = True
+                raw = (
+                    json.dumps(changed, sort_keys=True, separators=(",", ":"))
+                    + "\n"
+                ).encode("utf-8")
+                with self.assertRaisesRegex(
+                    CONTRACT.OrchestratorError, "journal_invalid"
+                ):
+                    CONTRACT.parse_journal_rows(self.context, raw)
+
     def test_prepare_start_stop_cleanup_is_idempotent_and_preserves_staging(self):
         prepared = ORCHESTRATOR.command_prepare(self.context, self.platform)
         self.assertEqual(prepared["phase"], "prepared")
@@ -1173,7 +1311,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
                 path: self.platform.process_identity_call_counts[str(path)]
                 for path in (self.candidates["api"], self.candidates["runtime"])
             },
-            {self.candidates["api"]: 3, self.candidates["runtime"]: 3},
+            {self.candidates["api"]: 7, self.candidates["runtime"]: 7},
         )
         self.assertEqual(
             self.platform.start_order,
@@ -1901,15 +2039,20 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             "d2ti-fedcba9876543210fedcba9876543210"
         )
         with self.assertRaisesRegex(
-            ORCHESTRATOR.OrchestratorError, "transport_instance_changed"
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
         ):
             ORCHESTRATOR.command_transport_control(
                 self.context, self.platform, "snapshot"
             )
         with self.assertRaisesRegex(
-            ORCHESTRATOR.OrchestratorError, "transport_instance_changed"
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
         ):
             ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_prepare_failure_runs_manifest_reconstructed_cleanup(self):
@@ -1985,6 +2128,56 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertEqual(result["phase"], "candidate_started")
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
+    def test_live_restart_retires_pre_intent_api_identity_drift(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        api_label = self.context.manifest["services"]["api"]["label"]
+        prior_pid = self.platform.pids[api_label]
+        replacement_pid = prior_pid + 100
+        prior_start = self.platform.process_start_times[prior_pid]
+        self.platform.pids[api_label] = replacement_pid
+        self.platform.process_start_times[replacement_pid] = (
+            prior_start[0] + 1,
+            prior_start[1],
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_live_restart_retires_pre_intent_runtime_identity_drift(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        prior_pid = self.platform.pids[runtime_label]
+        replacement_pid = prior_pid + 100
+        prior_start = self.platform.process_start_times[prior_pid]
+        self.platform.pids[runtime_label] = replacement_pid
+        self.platform.process_start_times[replacement_pid] = (
+            prior_start[0] + 1,
+            prior_start[1],
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_certify_live_runtime_restart(
+                self.context, self.platform
+            )
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
     def test_live_runtime_restart_certifies_step_11_and_exactly_replays(self):
         self.record_prerequisite_receipts()
         ORCHESTRATOR.command_prepare(self.context, self.platform)
@@ -1998,6 +2191,15 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertEqual(awaiting["status"], "awaiting_canonical_confirmation")
         self.assertEqual(awaiting["old_pid"], old_pid)
         self.assertNotEqual(awaiting["new_pid"], old_pid)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "orchestrator_phase_invalid"
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertFalse(
+            os.path.lexists(
+                ORCHESTRATOR.candidate_start_retirement_path(self.context)
+            )
+        )
         intent = json.loads(
             LIVE_RUNTIME_RESTART.live_runtime_restart_intent_path(
                 self.context
@@ -2026,6 +2228,15 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertNotEqual(result["new_pid"], old_pid)
         self.assertEqual(result["checkpoint"], "live_fresh_lease")
         self.assertEqual(result["deployment_id"], "deployment-1")
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "orchestrator_phase_invalid"
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertFalse(
+            os.path.lexists(
+                ORCHESTRATOR.candidate_start_retirement_path(self.context)
+            )
+        )
         self.assertEqual(
             result["route_id"], intent["deployment_identity"]["route_id"]
         )
@@ -2110,12 +2321,15 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         }
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError,
-            "live_runtime_restart_precondition_unready",
+            "candidate_start_transition_retirement_required",
         ):
             ORCHESTRATOR.command_certify_live_runtime_restart(
                 self.context, self.platform
             )
         self.assertEqual(self.platform.signals, [])
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_live_runtime_restart_rejects_local_process_identity_drift(self):
@@ -2288,12 +2502,15 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         evidence_path.chmod(0o600)
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError,
-            "live_runtime_restart_transport_changed",
+            "candidate_start_transition_retirement_required",
         ):
             ORCHESTRATOR.command_certify_live_runtime_restart(
                 self.context, self.platform
             )
         self.assertEqual(self.platform.signals, [])
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_live_runtime_restart_recovers_after_sigterm_before_start(self):
@@ -3050,10 +3267,14 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
 
         self.platform.launchd_start = start_with_dependency_drift
         with self.assertRaisesRegex(
-            ORCHESTRATOR.OrchestratorError, "drained_runtime_restart_dependency_changed"
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
         ):
             ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
         self.assertNotIn(api_label, self.platform.bootouts[-1:])
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_drained_runtime_restart_rechecks_expected_pid_after_ready_wait(self):
@@ -3099,7 +3320,8 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             "d2ti-fedcba9876543210fedcba9876543210"
         )
         with self.assertRaisesRegex(
-            ORCHESTRATOR.OrchestratorError, "transport_instance_changed"
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
         ):
             ORCHESTRATOR.command_restart_drained_runtime(self.context, self.platform)
         self.assertNotIn(runtime_label, self.platform.bootouts[-1:])
@@ -3262,11 +3484,585 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
                 "candidate_start_transition_retirement_required",
             ):
                 ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
+        self.platform.pids[api_label] = prior_pid
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
         self.assertEqual(
             ORCHESTRATOR.load_state(self.context)["phase"], "candidate_starting"
         )
         self.assertTrue(ORCHESTRATOR.candidate_start_source_path(self.context).is_file())
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_candidate_start_rechecks_standing_before_transition_commit(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        protected_label = self.context.manifest["protected_staging"][
+            "launchd_labels"
+        ][0]
+        real_build = ORCHESTRATOR.build_candidate_evidence
+
+        def mutate_standing(context, statuses, platform):
+            evidence = real_build(context, statuses, platform)
+            platform.loaded.remove(protected_label)
+            return evidence
+
+        with mock.patch.object(
+            ORCHESTRATOR, "build_candidate_evidence", side_effect=mutate_standing
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "protected_staging_state_changed",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertFalse(
+            ORCHESTRATOR.candidate_start_transition_path(self.context).exists()
+        )
+        self.assertFalse(
+            ORCHESTRATOR.candidate_start_source_path(self.context).exists()
+        )
+        self.platform.loaded.add(protected_label)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_candidate_start_retires_identity_drift_after_source_publication(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        real_publish = ORCHESTRATOR.publish_candidate_source
+        observed = {}
+
+        def publish_then_replace(context, evidence, observed_at):
+            path = real_publish(context, evidence, observed_at)
+            api_label = context.manifest["services"]["api"]["label"]
+            prior_pid = self.platform.pids[api_label]
+            replacement_pid = prior_pid + 100
+            prior_start = self.platform.process_start_times[prior_pid]
+            self.platform.pids[api_label] = replacement_pid
+            self.platform.process_start_times[replacement_pid] = (
+                prior_start[0] + 1,
+                prior_start[1],
+            )
+            observed.update(label=api_label, pid=prior_pid)
+            return path
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "publish_candidate_source",
+            side_effect=publish_then_replace,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
+        self.platform.pids[observed["label"]] = observed["pid"]
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_candidate_started_source_drift_is_irreversibly_retired(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        path = ORCHESTRATOR.candidate_start_source_path(self.context)
+        original = json.loads(path.read_text(encoding="utf-8"))
+        changed = dict(original)
+        changed["observed_at"] = "2026-08-04T01:02:03Z"
+        path.write_text(
+            ORCHESTRATOR.canonical_json(changed) + "\n", encoding="utf-8"
+        )
+        path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        retirement = json.loads(
+            ORCHESTRATOR.candidate_start_retirement_path(
+                self.context
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(retirement["reason"], "candidate_source_drift")
+        path.write_text(
+            ORCHESTRATOR.canonical_json(original) + "\n", encoding="utf-8"
+        )
+        path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_onboard(
+                self.context,
+                self.platform,
+                "discord:1056857223529250906",
+                "보건",
+            )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_candidate_started_api_replacement_is_irreversibly_retired(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        api_label = self.context.manifest["services"]["api"]["label"]
+        prior_pid = self.platform.pids[api_label]
+        replacement_pid = prior_pid + 100
+        prior_start = self.platform.process_start_times[prior_pid]
+        self.platform.pids[api_label] = replacement_pid
+        self.platform.process_start_times[replacement_pid] = (
+            prior_start[0] + 1,
+            prior_start[1],
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        retirement = json.loads(
+            ORCHESTRATOR.candidate_start_retirement_path(
+                self.context
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(retirement["reason"], "candidate_identity_drift")
+        self.platform.pids[api_label] = prior_pid
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_empty_restart_directory_does_not_bypass_identity_replay(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        LIVE_RUNTIME_RESTART.ensure_live_runtime_restart_directory(self.context)
+        api_label = self.context.manifest["services"]["api"]["label"]
+        prior_pid = self.platform.pids[api_label]
+        replacement_pid = prior_pid + 100
+        prior_start = self.platform.process_start_times[prior_pid]
+        self.platform.pids[api_label] = replacement_pid
+        self.platform.process_start_times[replacement_pid] = (
+            prior_start[0] + 1,
+            prior_start[1],
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_malformed_drained_restart_inventory_retires_candidate_run(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        directory = ORCHESTRATOR.drained_runtime_restart_directory(self.context)
+        directory.mkdir(mode=0o700)
+        intent = directory / "0001-intent.json"
+        intent.write_text("{}\n", encoding="utf-8")
+        intent.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_pending_live_restart_api_drift_retires_at_candidate_boundary(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        api_label = self.context.manifest["services"]["api"]["label"]
+        prior_pid = self.platform.pids[api_label]
+        replacement_pid = prior_pid + 100
+        prior_start = self.platform.process_start_times[prior_pid]
+        self.platform.pids[api_label] = replacement_pid
+        self.platform.process_start_times[replacement_pid] = (
+            prior_start[0] + 1,
+            prior_start[1],
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_resource_inventory(
+                self.context, self.platform
+            )
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_committed_step_11_malformed_intent_retires_at_candidate_boundary(self):
+        self.certify_and_advance_live_restart()
+        path = LIVE_RUNTIME_RESTART.live_runtime_restart_intent_path(
+            self.context
+        )
+        path.write_text("{}\n", encoding="utf-8")
+        path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_resource_inventory(
+                self.context, self.platform
+            )
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_committed_step_11_malformed_completion_retires_before_freeze(self):
+        self.certify_and_advance_live_restart()
+        path = LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+            self.context
+        )
+        path.write_text("{}\n", encoding="utf-8")
+        path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_finalize_run(
+                self.context,
+                self.platform,
+                ORCHESTRATOR.command_teardown_discord_resources,
+            )
+        self.assertFalse(
+            os.path.lexists(ORCHESTRATOR.freeze_intent_path(self.context))
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_committed_step_11_deleted_terminal_chain_retires_on_start(self):
+        self.certify_and_advance_live_restart()
+        LIVE_RUNTIME_RESTART.live_runtime_restart_intent_path(
+            self.context
+        ).unlink()
+        LIVE_RUNTIME_RESTART.live_runtime_restart_complete_path(
+            self.context
+        ).unlink()
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_committed_step_11_source_drift_retires_candidate_run(self):
+        result = self.certify_and_advance_live_restart()
+        path = pathlib.Path(result["coordinator_source"])
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["evidence"]["old_pid"] += 1
+        path.write_text(
+            ORCHESTRATOR.canonical_json(value) + "\n", encoding="utf-8"
+        )
+        path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_resource_inventory(
+                self.context, self.platform
+            )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_restart_commitment_missing_transition_retires_candidate_run(self):
+        self.record_prerequisite_receipts()
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        ORCHESTRATOR.command_certify_live_runtime_restart(
+            self.context, self.platform
+        )
+        transition = ORCHESTRATOR.candidate_start_transition_path(self.context)
+        backup = transition.with_suffix(".backup")
+        transition.rename(backup)
+        try:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "candidate_start_transition_retirement_required",
+            ):
+                ORCHESTRATOR.command_start(self.context, self.platform)
+            self.assertTrue(
+                ORCHESTRATOR.candidate_start_retirement_path(
+                    self.context
+                ).is_file()
+            )
+        finally:
+            backup.rename(transition)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_unjournaled_drained_runtime_generation_retires_candidate_run(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        prior_pid = self.platform.pids[runtime_label]
+        self.platform.next_pid += 1
+        replacement_pid = self.platform.next_pid
+        self.platform.pids[runtime_label] = replacement_pid
+        self.platform.process_start_times[replacement_pid] = (
+            1_700_000_000 + replacement_pid,
+            replacement_pid % 1_000_000,
+        )
+        self.platform.launchd_runs[runtime_label] += 1
+        self.platform.runtime_process_instance_ids[runtime_label] = (
+            f"{replacement_pid:032x}"
+        )
+        self.platform.process_start_times.pop(prior_pid, None)
+        self.platform.exit_launchd(runtime_label)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(
+                self.context, self.platform
+            )
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_second_drained_runtime_sequence_retires_without_relaunch(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.exit_launchd(runtime_label)
+        first = ORCHESTRATOR.command_restart_drained_runtime(
+            self.context, self.platform
+        )
+        start_count = len(self.platform.start_order)
+        self.platform.exit_launchd(runtime_label)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(
+                self.context, self.platform
+            )
+        self.assertEqual(len(self.platform.start_order), start_count)
+        records, pending = ORCHESTRATOR.drained_runtime_restart_inventory(
+            self.context
+        )
+        self.assertIsNone(pending)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["complete"]["new_pid"], first["new_pid"])
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_finalization_freeze_blocks_restart_without_retirement(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        with mock.patch.object(
+            ORCHESTRATOR, "finalization_freeze_committed", return_value=True
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "orchestrator_phase_invalid"
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(
+                self.context, self.platform
+            )
+        self.assertFalse(
+            os.path.lexists(
+                ORCHESTRATOR.candidate_start_retirement_path(self.context)
+            )
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_malformed_candidate_transition_is_irreversibly_retired(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        path = ORCHESTRATOR.candidate_start_transition_path(self.context)
+        original = json.loads(path.read_text(encoding="utf-8"))
+        changed = dict(original)
+        changed["evidence_sha256"] = 7
+        path.write_text(
+            ORCHESTRATOR.canonical_json(changed) + "\n", encoding="utf-8"
+        )
+        path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        path.write_text(
+            ORCHESTRATOR.canonical_json(original) + "\n", encoding="utf-8"
+        )
+        path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_coherent_malformed_candidate_evidence_is_irreversibly_retired(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        evidence_path = self.context.artifact_directory / "step-03-evidence.json"
+        transition_path = ORCHESTRATOR.candidate_start_transition_path(
+            self.context
+        )
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        transition = json.loads(transition_path.read_text(encoding="utf-8"))
+        changed_evidence = dict(evidence)
+        changed_evidence["process_identities"] = 1
+        changed_transition = dict(transition)
+        changed_transition["evidence_sha256"] = ORCHESTRATOR.digest_json(
+            changed_evidence
+        )
+        evidence_path.write_text(
+            ORCHESTRATOR.canonical_json(changed_evidence) + "\n",
+            encoding="utf-8",
+        )
+        evidence_path.chmod(0o600)
+        transition_path.write_text(
+            ORCHESTRATOR.canonical_json(changed_transition) + "\n",
+            encoding="utf-8",
+        )
+        transition_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        evidence_path.write_text(
+            ORCHESTRATOR.canonical_json(evidence) + "\n", encoding="utf-8"
+        )
+        evidence_path.chmod(0o600)
+        transition_path.write_text(
+            ORCHESTRATOR.canonical_json(transition) + "\n",
+            encoding="utf-8",
+        )
+        transition_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_onboarding_phase_rejects_start_without_retiring_recovery(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        state = ORCHESTRATOR.load_state(self.context, {"candidate_started"})
+        ORCHESTRATOR.save_state(
+            self.context, "onboarding", state["standing_snapshot"]
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "orchestrator_phase_invalid"
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertFalse(
+            os.path.lexists(
+                ORCHESTRATOR.candidate_start_retirement_path(self.context)
+            )
+        )
+        result = ORCHESTRATOR.command_onboard(
+            self.context,
+            self.platform,
+            "discord:1056857223529250906",
+            "보건",
+        )
+        self.assertEqual(result["installation_id"], f"installation:{self.context.manifest['discord']['resource_prefix']}")
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_explicit_stop_retires_before_service_mutation(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        with mock.patch.object(
+            self.platform,
+            "launchd_bootout",
+            side_effect=ORCHESTRATOR.OrchestratorError("injected_stop_failure"),
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "candidate_stop_incomplete"
+        ):
+            ORCHESTRATOR.command_stop(self.context, self.platform)
+        retirement = json.loads(
+            ORCHESTRATOR.candidate_start_retirement_path(
+                self.context
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(retirement["reason"], "explicit_stop")
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_explicit_cleanup_retires_before_cleanup_mutation(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "cleanup",
+            side_effect=ORCHESTRATOR.OrchestratorError(
+                "injected_cleanup_failure"
+            ),
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_cleanup_failure"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        retirement = json.loads(
+            ORCHESTRATOR.candidate_start_retirement_path(
+                self.context
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(retirement["reason"], "explicit_cleanup")
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_certified_cleanup_stays_marker_free_and_cleaned_is_terminal(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+
+        def finalize(
+            context,
+            platform,
+            cleanup_boundary,
+            teardown_boundary,
+            identity_boundary,
+        ):
+            self.assertIs(teardown_boundary, ORCHESTRATOR.command_teardown_discord_resources)
+            identity_boundary(context, platform, "capture", None)
+            return cleanup_boundary(context, platform)
+
+        with mock.patch.object(
+            ORCHESTRATOR, "run_finalize_run", side_effect=finalize
+        ):
+            result = ORCHESTRATOR.command_finalize_run(
+                self.context,
+                self.platform,
+                ORCHESTRATOR.command_teardown_discord_resources,
+            )
+        self.assertEqual(result["phase"], "cleaned")
+        self.assertFalse(
+            os.path.lexists(
+                ORCHESTRATOR.candidate_start_retirement_path(self.context)
+            )
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "orchestrator_phase_invalid"
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertFalse(
+            os.path.lexists(
+                ORCHESTRATOR.candidate_start_retirement_path(self.context)
+            )
+        )
 
     def test_onboarding_is_manifest_scoped_and_exactly_replayable(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
@@ -5186,7 +5982,8 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             "d2ti-fedcba9876543210fedcba9876543210"
         )
         with self.assertRaisesRegex(
-            ORCHESTRATOR.OrchestratorError, "transport_instance_changed"
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
         ):
             ORCHESTRATOR.command_transport_evidence(
                 self.context, self.platform, "duplicate"
@@ -5282,9 +6079,13 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             "d2ti-fedcba9876543210fedcba9876543210"
         )
         with self.assertRaisesRegex(
-            ORCHESTRATOR.OrchestratorError, "transport_instance_changed"
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
         ):
             ORCHESTRATOR.command_resource_inventory(self.context, self.platform)
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
 
     def test_resource_commands_fail_closed_on_phase_health_and_standing_drift(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
@@ -5310,9 +6111,13 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             self.context, "candidate_started", state["standing_snapshot"]
         )
         with self.assertRaisesRegex(
-            ORCHESTRATOR.OrchestratorError, "protected_staging_state_changed"
+            ORCHESTRATOR.OrchestratorError,
+            "candidate_start_transition_retirement_required",
         ):
             ORCHESTRATOR.command_resource_inventory(self.context, self.platform)
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).is_file()
+        )
 
     def test_discord_teardown_orders_proxy_deletes_and_writes_redacted_evidence(self):
         inventory = self.start_candidate_with_discord_resources()
@@ -5393,15 +6198,36 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             [resource["kind"] for resource in first_attempt],
             ["message", "message", "channel"],
         )
+        with self.assertRaisesRegex(
+            D2_RUN.CertificationError,
+            "candidate_start_transition_retirement_required",
+        ):
+            D2_RUN.next_certification_action(self.manifest_path)
         self.platform.proxy_failure_resource_id = None
-        result = ORCHESTRATOR.command_teardown_discord_resources(
-            self.context, self.platform
-        )
+        output = io.StringIO()
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "isolated_orchestrator.py",
+                "teardown-discord-resources",
+                "--manifest",
+                str(self.manifest_path),
+            ],
+        ), mock.patch.object(
+            ORCHESTRATOR, "Platform", return_value=self.platform
+        ), contextlib.redirect_stdout(output):
+            self.assertIsNone(ORCHESTRATOR.main())
+        result = json.loads(output.getvalue())
         self.assertEqual(result["status"], "torn_down")
         for resource in first_attempt[:2]:
             self.assertEqual(self.platform.proxy_deletions.count(resource), 1)
         final_progress = json.loads(progress_path.read_text(encoding="utf-8"))
         self.assertEqual(len(final_progress["deletions"]), 6)
+        replay = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform
+        )
+        self.assertEqual(replay["status"], "exact_replay")
 
     def test_discord_teardown_reconciles_delete_with_lost_response(self):
         self.start_candidate_with_discord_resources()

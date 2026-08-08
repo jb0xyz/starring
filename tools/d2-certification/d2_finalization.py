@@ -8,6 +8,7 @@ import stat
 from d2_certification import (
     canonical_json,
     fsync_directory,
+    isolated_runtime_root,
     load_json_file,
     require_absolute_path,
     require_owned_mode,
@@ -29,6 +30,7 @@ FREEZE_STOP_ORDER = ("tunnel", "runtime")
 FINAL_STOP_ORDER = ("api", "worker", "transport")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SNOWFLAKE_PATTERN = re.compile(r"^[1-9][0-9]{0,19}$")
+PROCESS_INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 UTC_PATTERN = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$"
 )
@@ -154,7 +156,7 @@ def ensure_finalization_directory(context):
 
 
 def validate_mutation_roots(context):
-    expected_root = pathlib.Path(f"/private/tmp/starring-d2-{context.manifest['run_id']}")
+    expected_root = isolated_runtime_root(context.manifest["run_id"])
     if context.root != expected_root or context.cluster_root != expected_root / "postgres":
         fail("finalization_mutation_root_invalid")
     _require_owned_directory(context.root, "finalization_mutation_root_invalid")
@@ -771,6 +773,7 @@ def validate_freeze_intent(context, value):
         "coordinator_step15_completion_sha256",
         "transport_quiescence_sha256",
         "resource_inventory_digest_sha256",
+        "runtime_binding",
         "services_to_stop",
         "discord_effects_frozen",
     }
@@ -801,7 +804,103 @@ def validate_freeze_intent(context, value):
         value["resource_inventory_digest_sha256"],
         "finalization_freeze_intent_invalid",
     )
+    validate_runtime_freeze_binding(context, value["runtime_binding"])
     _require_timestamp(value["recorded_at"], "finalization_freeze_intent_invalid")
+    return value
+
+
+def validate_runtime_freeze_binding(context, value):
+    _require_exact(
+        value,
+        {"launchd", "process", "plist", "runtime_health"},
+        "finalization_runtime_binding_invalid",
+    )
+    launchd = _require_exact(
+        value["launchd"],
+        {"pid", "program", "plist_path", "arguments", "runs", "state"},
+        "finalization_runtime_binding_invalid",
+    )
+    process = _require_exact(
+        value["process"],
+        {
+            "pid",
+            "start_time_seconds",
+            "start_time_microseconds",
+            "uid",
+            "path",
+            "sha256",
+            "size",
+            "mode",
+            "device",
+            "inode",
+            "links",
+        },
+        "finalization_runtime_binding_invalid",
+    )
+    plist = _require_exact(
+        value["plist"],
+        {"path", "sha256", "size", "mode", "uid", "device", "inode", "links"},
+        "finalization_runtime_binding_invalid",
+    )
+    health = _require_exact(
+        value["runtime_health"],
+        {"schema_version", "os_pid", "process_instance_id"},
+        "finalization_runtime_binding_invalid",
+    )
+    service = context.manifest["services"]["runtime"]
+    candidate = context.manifest["candidates"]["runtime"]
+    expected_plist = str(context.plist_directory / f"{service['label']}.plist")
+    pid = launchd["pid"]
+    positive_integer_fields = (
+        process["start_time_seconds"],
+        process["size"],
+        process["mode"],
+        process["device"],
+        process["inode"],
+        plist["size"],
+        plist["mode"],
+        plist["device"],
+        plist["inode"],
+    )
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or launchd["program"] != candidate["path"]
+        or launchd["plist_path"] != expected_plist
+        or launchd["arguments"] != [candidate["path"]]
+        or type(launchd["runs"]) is not int
+        or launchd["runs"] <= 0
+        or launchd["state"] != "running"
+        or process["pid"] != pid
+        or any(
+            type(field) is not int or field <= 0
+            for field in positive_integer_fields
+        )
+        or type(process["uid"]) is not int
+        or type(plist["uid"]) is not int
+        or type(process["start_time_microseconds"]) is not int
+        or not 0 <= process["start_time_microseconds"] < 1_000_000
+        or process["uid"] != os.getuid()
+        or process["path"] != candidate["path"]
+        or process["sha256"] != candidate["sha256"]
+        or type(process["links"]) is not int
+        or process["links"] != 1
+        or process["mode"] & 0o222
+        or not process["mode"] & 0o111
+        or plist["path"] != expected_plist
+        or plist["mode"] != 0o600
+        or plist["uid"] != os.getuid()
+        or type(plist["links"]) is not int
+        or plist["links"] != 1
+        or type(health["schema_version"]) is not int
+        or health["schema_version"] != 1
+        or health["os_pid"] != pid
+        or not isinstance(health["process_instance_id"], str)
+        or not PROCESS_INSTANCE_PATTERN.fullmatch(health["process_instance_id"])
+    ):
+        fail("finalization_runtime_binding_invalid")
+    _require_digest(process["sha256"], "finalization_runtime_binding_invalid")
+    _require_digest(plist["sha256"], "finalization_runtime_binding_invalid")
     return value
 
 
@@ -903,10 +1002,12 @@ def _initial_freeze_boundary(context, platform):
     return state, instance_id, quiescence_sha256, inventory["digest_sha256"]
 
 
-def _ensure_effect_freeze(context, platform):
+def _ensure_effect_freeze(context, platform, identity_boundary=None):
     ensure_finalization_directory(context)
     certification = require_certification_prefix(context)
     path = freeze_intent_path(context)
+    runtime_label = context.manifest["services"]["runtime"]["label"]
+    runtime_loaded = platform.launchd_loaded(runtime_label)
     if path.exists():
         intent = validate_freeze_intent(
             context, _load_private(path, "finalization_freeze_intent")
@@ -918,6 +1019,10 @@ def _ensure_effect_freeze(context, platform):
         ):
             validate_mutation_roots(context)
     else:
+        if identity_boundary is None or not runtime_loaded:
+            fail("finalization_runtime_binding_unavailable")
+        runtime_binding = identity_boundary(context, platform, "capture", None)
+        validate_runtime_freeze_binding(context, runtime_binding)
         (
             _state,
             instance_id,
@@ -939,13 +1044,24 @@ def _ensure_effect_freeze(context, platform):
             ],
             "transport_quiescence_sha256": quiescence_sha256,
             "resource_inventory_digest_sha256": resource_inventory_digest_sha256,
+            "runtime_binding": runtime_binding,
             "services_to_stop": list(FREEZE_STOP_ORDER),
             "discord_effects_frozen": True,
         }
         validate_freeze_intent(context, intent)
         validate_freeze_certification(intent, certification)
         write_atomic(path, canonical_json(intent) + "\n")
-    _stop_services(context, platform, FREEZE_STOP_ORDER)
+    if runtime_loaded:
+        if identity_boundary is None:
+            fail("finalization_runtime_boundary_unavailable")
+        runtime_binding = intent["runtime_binding"]
+        identity_boundary(context, platform, "suspend", runtime_binding)
+        identity_boundary(context, platform, "checkpoint", runtime_binding)
+        _stop_services(context, platform, ("tunnel",))
+        identity_boundary(context, platform, "checkpoint", runtime_binding)
+        _stop_services(context, platform, ("runtime",))
+    else:
+        _stop_services(context, platform, ("tunnel",))
     if any(
         platform.launchd_loaded(context.manifest["services"][name]["label"])
         for name in FREEZE_STOP_ORDER
@@ -1669,13 +1785,17 @@ def local_step16_binding(context, teardown):
 
 
 def command_finalize_run(
-    context, platform, cleanup_boundary, teardown_boundary
+    context,
+    platform,
+    cleanup_boundary,
+    teardown_boundary,
+    identity_boundary,
 ):
     require_certification_eligible_teardown(context)
     ensure_finalization_directory(context)
     if not _external_present(context, platform):
         fail("external_keychain_identity_absent")
-    _ensure_effect_freeze(context, platform)
+    _ensure_effect_freeze(context, platform, identity_boundary)
     step_path = step_sixteen_evidence_path(context)
     if step_path.exists():
         precleanup, teardown, _intent, _result, absence = _load_database_artifacts(context)

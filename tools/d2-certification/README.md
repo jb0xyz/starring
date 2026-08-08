@@ -47,9 +47,11 @@ binds the libproc start timestamp and executable path to an `O_NOFOLLOW`
 file-descriptor digest, and runtime must report the same PID through its health
 identity endpoint. Step 3 also pins the transport process instance identity.
 Any transport restart changes that identity and invalidates the certification
-run instead of silently resetting the in-memory fault counters. Stop and
-cleanup are idempotent, operate only on manifest-derived identities, and
-require the standing launchd, plist, and port snapshot to remain unchanged.
+run instead of silently resetting the in-memory fault counters. Direct `stop`
+and `cleanup` are idempotent abort and recovery commands. After candidate-start
+commitment they durably retire the run, operate only on manifest-derived
+identities, and require the standing launchd, plist, and port snapshot to
+remain unchanged.
 
 The migration-ledger SHA-256 is reproducible. For each successful ledger row
 ordered by version, hash the signed 64-bit version in big-endian form, one
@@ -147,7 +149,11 @@ The remaining certification work is:
 Example preparation shape:
 
 ```text
-python3 tools/d2-certification/d2_certification.py prepare \
+D3_STATE=/absolute/d3/output-root/run-id
+BUNDLE="$D3_STATE/candidate-bundle"
+D2_TOOLCHAIN="$D3_STATE/worktree/tools/d2-certification"
+
+python3 "$D2_TOOLCHAIN/d2_certification.py" prepare \
   --output-root "$HOME/Library/Application Support/Starring/release-certifications" \
   --commit "$CANDIDATE_COMMIT" \
   --discord-guild-id "$DISPOSABLE_GUILD_ID" \
@@ -180,6 +186,11 @@ python3 tools/d2-certification/d2_certification.py prepare \
 `$BUNDLE` is `<D3_STATE>/candidate-bundle`, and `--commit` must be the exact
 GitHub-generated merge commit pinned by D3. `bind-d2` rejects a D2 manifest
 that names the branch tip or any other commit, even when its tree is equal.
+Every D2 Python command must use `$D2_TOOLCHAIN` from the same detached D3
+worktree. Preparing from the ordinary branch checkout pins the wrong
+`source_trees.d2_toolchain.root` and cannot bind; running later commands there
+executes a toolchain other than the one D3 binds. Such a run cannot pass
+`bind-d2` even if all seventeen steps complete.
 
 `codex`, `node`, and `cloudflared` are the only hand-supplied executables. Each
 must still be a canonical, same-owner regular file with all write bits removed,
@@ -188,31 +199,58 @@ inside a directory with the same owner and no write bits.
 Then run the substrate lifecycle with the immutable manifest:
 
 ```text
-python3 tools/d2-certification/isolated_orchestrator.py dry-run \
-  --manifest /absolute/run/manifest.json
-python3 tools/d2-certification/isolated_orchestrator.py prepare \
-  --manifest /absolute/run/manifest.json
-python3 tools/d2-certification/isolated_orchestrator.py start \
-  --manifest /absolute/run/manifest.json
-python3 tools/d2-certification/isolated_orchestrator.py onboard \
-  --manifest /absolute/run/manifest.json \
+D2_RUN=/absolute/d2/run
+MANIFEST="$D2_RUN/manifest.json"
+ORCH="$D2_RUN/orchestrator"
+FINAL="$ORCH/finalization"
+
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" dry-run \
+  --manifest "$MANIFEST"
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" prepare \
+  --manifest "$MANIFEST"
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" start \
+  --manifest "$MANIFEST"
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" onboard \
+  --manifest "$MANIFEST" \
   --principal-id discord:<authenticated-user-id> \
   --display-name <authenticated-display-name>
-python3 tools/d2-certification/isolated_orchestrator.py transport-control \
-  --manifest /absolute/run/manifest.json \
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" transport-control \
+  --manifest "$MANIFEST" \
   --operation snapshot
-python3 tools/d2-certification/isolated_orchestrator.py certify-live-runtime-restart \
-  --manifest /absolute/run/manifest.json
-python3 tools/d2-certification/isolated_orchestrator.py certify-live-runtime-restart \
-  --manifest /absolute/run/manifest.json \
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" certify-live-runtime-restart \
+  --manifest "$MANIFEST"
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" certify-live-runtime-restart \
+  --manifest "$MANIFEST" \
   --confirmation-file /absolute/live-runtime-restart-confirmation.json
-python3 tools/d2-certification/isolated_orchestrator.py restart-drained-runtime \
-  --manifest /absolute/run/manifest.json
-python3 tools/d2-certification/isolated_orchestrator.py stop \
-  --manifest /absolute/run/manifest.json
-python3 tools/d2-certification/isolated_orchestrator.py cleanup \
-  --manifest /absolute/run/manifest.json
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" restart-drained-runtime \
+  --manifest "$MANIFEST"
 ```
+
+`start` durably binds the Step 3 evidence and standing snapshot in a pending
+candidate-start transition before publishing the consumable coordinator
+source. An interrupted start adopts the same live API, runtime, plist, health,
+and transport identities and completes without launching replacements. Live
+identity drift during pending publication or recovery makes the run
+retirement-only. Before a runtime-restart protocol begins, a completed-start
+replay verifies the immutable transition and source together with their exact
+process identities, current service health, the pinned transport instance, and
+the standing snapshot. Once a drained or live runtime-restart protocol begins,
+that protocol owns replay and `start` fails non-mutating with
+`orchestrator_phase_invalid`; this keeps the certified Step 11 replacement
+valid. Direct `stop` or `cleanup` after commitment also retires the run:
+certification commands fail with
+`candidate_start_transition_retirement_required`, and the operator must run
+abort cleanup and prepare a new disposable run. The old source is never deleted
+or rebound to replacement processes.
+
+The successful certification path never calls direct `stop`, direct `cleanup`,
+or standalone `teardown-discord-resources`. Those commands are abort-only after
+commitment. Successful teardown goes through `finalize-run` after coordinator
+step 15; it invokes a private certified cleanup boundary and remains eligible
+for steps 16 and 17. Standalone teardown writes a durable abort tombstone before
+the first deletion. The tombstone blocks coordinator status, advance, and
+verify as well as D3 bind, recheck, and finalize, while the same teardown and
+cleanup commands remain available to resume an interrupted abort.
 
 `onboard` creates or exactly replays revision 1 with the single external
 channel binding `community_hub -> discord.hub_channel_id`. Its redacted output
@@ -279,9 +317,15 @@ The browser boundary supplies the authenticated canonical product observation
 without giving the certification tool a reusable product session. The flow performs no direct database
 observation and stores no cookie, token, or session fingerprint. Interrupted
 operations resume from their durable phase, and completed operations replay
-without another signal or a current-lease requirement. The command does not
-append the certification receipt; record the reviewed evidence with
-`d2_certification.py record --step 11`.
+without another signal or a current-lease requirement. The command returns a
+`coordinator_source`; advance the coordinator with that exact source:
+
+```bash
+python3 "$D2_TOOLCHAIN/d2_run.py" advance \
+  --manifest "$MANIFEST" \
+  --step 11 \
+  --source <coordinator_source-returned-by-certify-live-runtime-restart>
+```
 
 `restart-drained-runtime` is available only while the manifest is in
 `candidate_started`. It requires the prior runtime PID and readiness to be
@@ -295,12 +339,23 @@ immutable runtime candidate and plist digests, the exact API, worker,
 transport, and tunnel programs, complete argument vectors, loaded plist paths,
 run counters, plist digests, and process identities, the PostgreSQL
 process identity, the pinned transport instance, and the standing staging
-snapshot. Retrying an interrupted intent resumes the observed new runtime,
-while retrying a completed operation returns an exact replay without starting
-another process. Intent and completion publication uses a separate
+snapshot. Completion seals the stable new launchd PID and run counter together
+with its libproc executable identity, process start timestamp, and exact
+runtime health process-instance identity. Every later active certification
+boundary revalidates that sealed generation. Retrying an interrupted intent
+resumes the observed new runtime, while retrying the sole completed operation
+returns an exact replay without starting another process. A second generation
+is not admitted into the release chain and permanently retires the run. Intent
+and completion publication uses a separate
 same-filesystem temporary directory; only strict owned `0600` interrupted
 files are recoverable. Any unjournaled PID, failed drain, unexpected temporary
 entry, or identity drift fails closed.
+
+Once `finalize-run` durably commits its validated effect-freeze intent, only
+finalization recovery, total-absence finalization, read-only status, or an
+explicit abort is admitted. Candidate and fault commands return
+`orchestrator_phase_invalid` without inspecting intentionally stopped services
+or creating a retirement marker.
 
 Fault injection uses only the manifest-bound orchestrator commands below. Each
 command verifies the pinned transport instance, writes and fsyncs a durable
@@ -312,22 +367,22 @@ replay. A different pending operation, a busy arm, a widened response schema,
 or a changed transport instance fails closed.
 
 ```text
-python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" transport-control \
   --manifest /absolute/run/manifest.json \
   --operation arm-next-duplicate
-python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" transport-control \
   --manifest /absolute/run/manifest.json \
   --operation disarm-duplicate
-python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" transport-control \
   --manifest /absolute/run/manifest.json \
   --operation arm-next-indeterminate
-python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" transport-control \
   --manifest /absolute/run/manifest.json \
   --operation disarm-indeterminate
-python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" transport-control \
   --manifest /absolute/run/manifest.json \
   --operation partition-gateway
-python3 tools/d2-certification/isolated_orchestrator.py transport-control \
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" transport-control \
   --manifest /absolute/run/manifest.json \
   --operation heal-gateway
 ```
@@ -347,18 +402,58 @@ Cleanup reconstructs
 the owned root, labels, and Keychain accounts from the immutable manifest rather
 than trusting the last state write, so it also recovers a prior interrupted run.
 
-Record one reviewed JSON evidence object at a time, then verify the completed
-ledger:
+Use the coordinator for every certification step. `status` returns the next
+required source kinds and execution modes. Repeat `advance` in order for steps
+1 through 15 with the reviewed mode-`0600` sources required by that status:
 
 ```text
-python3 tools/d2-certification/d2_certification.py record \
-  --manifest /absolute/run/manifest.json \
-  --step 1 \
-  --evidence /absolute/reviewed-step-1.json
+python3 "$D2_TOOLCHAIN/d2_run.py" status \
+  --manifest "$MANIFEST"
 
-python3 tools/d2-certification/d2_certification.py verify \
-  --manifest /absolute/run/manifest.json
+python3 "$D2_TOOLCHAIN/d2_run.py" advance \
+  --manifest "$MANIFEST" \
+  --step <1-through-15> \
+  --source /absolute/reviewed-source-1.json \
+  --source /absolute/reviewed-source-2.json
 ```
+
+After coordinator step 15, use the certified finalization path and then advance
+steps 16 and 17 with its exact machine evidence and the two chronological
+browser observations:
+
+```text
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" finalize-run \
+  --manifest "$MANIFEST"
+
+python3 "$D2_TOOLCHAIN/d2_run.py" advance \
+  --manifest "$MANIFEST" \
+  --step 16 \
+  --source "$FINAL/database-precleanup.json" \
+  --source "$ORCH/discord-resource-teardown-evidence.json" \
+  --source "$FINAL/orchestrator-finalization.json"
+
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" finalize-total-absence \
+  --manifest "$MANIFEST" \
+  --prefix-scan-evidence /absolute/prefix-scan.json \
+  --guild-deletion-evidence /absolute/guild-deletion.json
+
+python3 "$D2_TOOLCHAIN/d2_run.py" advance \
+  --manifest "$MANIFEST" \
+  --step 17 \
+  --source "$FINAL/database-absence.json" \
+  --source "$FINAL/orchestrator-total-absence.json" \
+  --source /absolute/prefix-scan.json \
+  --source /absolute/guild-deletion.json
+
+umask 077
+python3 "$D2_TOOLCHAIN/d2_run.py" verify \
+  --manifest "$MANIFEST" > "$D2_RUN/final.json"
+```
+
+Observe zero resource-prefix matches after step 16, then delete the disposable
+guild and save those two browser evidence files in that order. The low-level
+`d2_certification.py record` command does not create coordinator intents or
+completions and must not be used for a D3-bound release run.
 
 The browser driver is installed as `globalThis.StarringD2ProductDriver`. After
 the operator completes OAuth on the exact D2 origin, create one driver and

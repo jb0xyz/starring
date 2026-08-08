@@ -1,4 +1,3 @@
-import json
 import os
 import pathlib
 import plistlib
@@ -17,6 +16,7 @@ from d2_orchestrator_contract import (
     fail,
     load_json,
     load_state,
+    read_repaired_journal,
     standing_snapshot,
     utc_now,
     write_atomic,
@@ -24,6 +24,8 @@ from d2_orchestrator_contract import (
 
 
 TRANSPORT_INSTANCE_PATTERN = re.compile(r"^d2ti-[0-9a-f]{32}$")
+PROCESS_INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 RECORDED_AT_PATTERN = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
 )
@@ -257,6 +259,108 @@ def runtime_ready_status(context, platform):
     )
 
 
+def valid_runtime_process_identity(context, value):
+    return (
+        isinstance(value, dict)
+        and set(value)
+        == {
+            "pid",
+            "start_time_seconds",
+            "start_time_microseconds",
+            "uid",
+            "path",
+            "sha256",
+            "size",
+            "mode",
+            "device",
+            "inode",
+            "links",
+        }
+        and type(value["pid"]) is int
+        and value["pid"] > 0
+        and type(value["start_time_seconds"]) is int
+        and value["start_time_seconds"] > 0
+        and type(value["start_time_microseconds"]) is int
+        and 0 <= value["start_time_microseconds"] < 1_000_000
+        and type(value["uid"]) is int
+        and value["uid"] == os.getuid()
+        and value["path"] == context.manifest["candidates"]["runtime"]["path"]
+        and value["sha256"]
+        == context.manifest["candidates"]["runtime"]["sha256"]
+        and isinstance(value["sha256"], str)
+        and DIGEST_PATTERN.fullmatch(value["sha256"])
+        and type(value["size"]) is int
+        and value["size"] > 0
+        and type(value["mode"]) is int
+        and value["mode"] > 0
+        and value["mode"] & 0o111 != 0
+        and value["mode"] & 0o222 == 0
+        and type(value["device"]) is int
+        and value["device"] >= 0
+        and type(value["inode"]) is int
+        and value["inode"] > 0
+        and value["links"] == 1
+    )
+
+
+def valid_runtime_health_identity(value, expected_pid=None):
+    return (
+        isinstance(value, dict)
+        and set(value)
+        == {"schema_version", "os_pid", "process_instance_id"}
+        and type(value["schema_version"]) is int
+        and value["schema_version"] == 1
+        and type(value["os_pid"]) is int
+        and value["os_pid"] > 0
+        and (expected_pid is None or value["os_pid"] == expected_pid)
+        and isinstance(value["process_instance_id"], str)
+        and PROCESS_INSTANCE_PATTERN.fullmatch(value["process_instance_id"])
+    )
+
+
+def require_bound_runtime_generation(
+    context,
+    platform,
+    identity,
+    expected_pid,
+    expected_runs,
+    code,
+    expected_ready_status=200,
+):
+    if type(expected_ready_status) is int:
+        allowed_ready_statuses = (expected_ready_status,)
+    elif (
+        isinstance(expected_ready_status, tuple)
+        and expected_ready_status
+        and all(type(status) is int for status in expected_ready_status)
+    ):
+        allowed_ready_statuses = expected_ready_status
+    else:
+        fail("runtime_ready_status_contract_invalid")
+    before = runtime_job_observation(platform, identity)
+    ready = runtime_ready_status(context, platform)
+    process = platform.candidate_process_identity(
+        expected_pid, pathlib.Path(identity["candidate_path"])
+    )
+    health = platform.runtime_process_identity(context)
+    after = runtime_job_observation(platform, identity)
+    if (
+        before != after
+        or before["pid"] != expected_pid
+        or before["runs"] != expected_runs
+        or before["state"] != "running"
+        or ready not in allowed_ready_statuses
+        or not valid_runtime_process_identity(context, process)
+        or process["pid"] != expected_pid
+        or not valid_runtime_health_identity(health, expected_pid)
+    ):
+        fail(code)
+    return {
+        "process_identity": process,
+        "runtime_health": health,
+    }
+
+
 def require_drained_runtime(context, platform, identity, allow_absent=False):
     observation = runtime_job_observation(platform, identity)
     if observation["pid"] is not None or runtime_ready_status(context, platform) == 200:
@@ -443,7 +547,18 @@ def validate_drained_runtime_restart_record(context, record, sequence, kind):
         "dependencies",
         "standing_snapshot",
     }
-    expected = common if kind == "intent" else common | {"new_pid", "ready_after_restart"}
+    expected = (
+        common
+        if kind == "intent"
+        else common
+        | {
+            "new_pid",
+            "new_runs",
+            "new_process_identity",
+            "new_runtime_health",
+            "ready_after_restart",
+        }
+    )
     if (
         not isinstance(record, dict)
         or set(record) != expected
@@ -472,6 +587,15 @@ def validate_drained_runtime_restart_record(context, record, sequence, kind):
     if kind == "complete" and (
         type(record["new_pid"]) is not int
         or record["new_pid"] <= 0
+        or type(record["new_runs"]) is not int
+        or record["new_runs"] <= 0
+        or not valid_runtime_process_identity(
+            context, record["new_process_identity"]
+        )
+        or record["new_process_identity"]["pid"] != record["new_pid"]
+        or not valid_runtime_health_identity(
+            record["new_runtime_health"], record["new_pid"]
+        )
         or record["ready_after_restart"] is not True
     ):
         fail("drained_runtime_restart_evidence_invalid")
@@ -544,44 +668,8 @@ def drained_runtime_restart_inventory(context):
 
 
 def drained_runtime_restart_journal_contains(context, status, operation_id):
-    if not context.journal_path.exists():
-        return False
-    metadata = context.journal_path.lstat()
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or context.journal_path.is_symlink()
-        or metadata.st_uid != os.getuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o600
-        or metadata.st_size > 8 * 1024 * 1024
-    ):
-        fail("journal_invalid")
     found = False
-    try:
-        lines = context.journal_path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
-        fail("journal_invalid")
-    for expected_sequence, line in enumerate(lines, 1):
-        try:
-            receipt = json.loads(line)
-        except json.JSONDecodeError:
-            fail("journal_invalid")
-        if (
-            not isinstance(receipt, dict)
-            or set(receipt)
-            != {
-                "schema_version",
-                "sequence",
-                "recorded_at",
-                "manifest_sha256",
-                "action",
-                "status",
-                "target",
-            }
-            or receipt["schema_version"] != 1
-            or receipt["sequence"] != expected_sequence
-            or receipt["manifest_sha256"] != context.digest
-        ):
-            fail("journal_invalid")
+    for receipt in read_repaired_journal(context):
         if (
             receipt["action"] == "drained_runtime_restart"
             and receipt["status"] == status
@@ -666,10 +754,21 @@ def complete_drained_runtime_restart(context, platform, state, intent, current_j
         context, platform, state, intent, expected_pid
     )
     new_pid = final_job["pid"]
+    generation = require_bound_runtime_generation(
+        context,
+        platform,
+        identity,
+        new_pid,
+        final_job["runs"],
+        "drained_runtime_restart_process_identity_changed",
+    )
     completion = {
         **intent,
         "recorded_at": utc_now(),
         "new_pid": new_pid,
+        "new_runs": final_job["runs"],
+        "new_process_identity": generation["process_identity"],
+        "new_runtime_health": generation["runtime_health"],
         "ready_after_restart": True,
     }
     write_drained_runtime_restart_record(
@@ -682,7 +781,9 @@ def complete_drained_runtime_restart(context, platform, state, intent, current_j
     return drained_runtime_restart_result("drained_runtime_restarted", intent, new_pid)
 
 
-def command_restart_drained_runtime(context, platform):
+def command_restart_drained_runtime(context, platform, expected_initial_runs):
+    if type(expected_initial_runs) is not int or expected_initial_runs <= 0:
+        fail("drained_runtime_restart_generation_invalid")
     state = load_state(context, {"candidate_started"})
     recover_drained_runtime_restart_temporary(context)
     if standing_snapshot(context, platform) != state["standing_snapshot"]:
@@ -697,6 +798,8 @@ def command_restart_drained_runtime(context, platform):
         latest = records[-1]["complete"]
         if current_job["pid"] == latest["new_pid"]:
             if (
+                current_job["runs"] != latest["new_runs"]
+                or
                 identity != latest["runtime_identity"]
                 or dependencies != latest["dependencies"]
                 or transport_snapshot["instance_id"]
@@ -713,14 +816,37 @@ def command_restart_drained_runtime(context, platform):
             require_drained_runtime_restart_final_observation(
                 context, platform, state, latest, latest["new_pid"]
             )
+            generation = require_bound_runtime_generation(
+                context,
+                platform,
+                identity,
+                latest["new_pid"],
+                latest["new_runs"],
+                "drained_runtime_restart_replay_drift",
+            )
+            if (
+                generation["process_identity"]
+                != latest["new_process_identity"]
+                or generation["runtime_health"]
+                != latest["new_runtime_health"]
+            ):
+                fail("drained_runtime_restart_replay_drift")
             ensure_drained_runtime_restart_journal(
                 context, "complete", latest["operation_id"]
             )
             return drained_runtime_restart_result("exact_replay", latest, latest["new_pid"])
         if current_job["pid"] is not None:
             fail("drained_runtime_restart_unjournaled_pid")
+        fail("drained_runtime_restart_sequence_exhausted")
     if pending is None:
         drain_observation = require_drained_runtime(context, platform, identity)
+        expected_runs = (
+            records[-1]["complete"]["new_runs"]
+            if records
+            else expected_initial_runs
+        )
+        if drain_observation["runs"] != expected_runs:
+            fail("drained_runtime_restart_generation_unjournaled")
         sequence = len(records) + 1
         if sequence > 9999:
             fail("drained_runtime_restart_evidence_capacity_exhausted")

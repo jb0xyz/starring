@@ -214,6 +214,14 @@ class D2RunCoordinatorTest(unittest.TestCase):
         finalization_directory = artifact_directory / "finalization"
         finalization_directory.mkdir(mode=0o700, exist_ok=True)
         finalization_directory.chmod(0o700)
+        runtime = self.manifest["candidates"]["runtime"]
+        runtime_service = self.manifest["services"]["runtime"]
+        runtime_pid = 4242
+        runtime_plist = str(
+            artifact_directory
+            / "launchd"
+            / f"{runtime_service['label']}.plist"
+        )
         freeze = {
             "schema_version": 1,
             "kind": "starring.d2.finalization-freeze-intent.v1",
@@ -229,6 +237,44 @@ class D2RunCoordinatorTest(unittest.TestCase):
             "resource_inventory_digest_sha256": self.complete[13][
                 "reconciliation_inventory_digest_sha256"
             ],
+            "runtime_binding": {
+                "launchd": {
+                    "pid": runtime_pid,
+                    "program": runtime["path"],
+                    "plist_path": runtime_plist,
+                    "arguments": [runtime["path"]],
+                    "runs": 1,
+                    "state": "running",
+                },
+                "process": {
+                    "pid": runtime_pid,
+                    "start_time_seconds": 1_700_000_000,
+                    "start_time_microseconds": 1,
+                    "uid": os.getuid(),
+                    "path": runtime["path"],
+                    "sha256": runtime["sha256"],
+                    "size": 1,
+                    "mode": 0o555,
+                    "device": 1,
+                    "inode": 1,
+                    "links": 1,
+                },
+                "plist": {
+                    "path": runtime_plist,
+                    "sha256": "f" * 64,
+                    "size": 1,
+                    "mode": 0o600,
+                    "uid": os.getuid(),
+                    "device": 1,
+                    "inode": 1,
+                    "links": 1,
+                },
+                "runtime_health": {
+                    "schema_version": 1,
+                    "os_pid": runtime_pid,
+                    "process_instance_id": "e" * 32,
+                },
+            },
             "services_to_stop": ["tunnel", "runtime"],
             "discord_effects_frozen": True,
         }
@@ -528,6 +574,97 @@ class D2RunCoordinatorTest(unittest.TestCase):
             d2_run.canonical_json(value) + "\n", encoding="utf-8"
         )
         path.chmod(0o600)
+
+    def write_candidate_start_retirement(self):
+        path = d2_run.candidate_start_retirement_path(self.manifest_path)
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        path.parent.chmod(0o700)
+        path.write_text("retired\n", encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def write_abort_teardown_tombstone(self):
+        path = d2_run.abort_teardown_tombstone_path(self.manifest_path)
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        path.parent.chmod(0o700)
+        path.write_text("aborted\n", encoding="utf-8")
+        path.chmod(0o600)
+        return path
+
+    def test_status_rejects_candidate_start_retirement(self):
+        self.write_candidate_start_retirement()
+        with self.assertRaisesRegex(
+            d2_run.CertificationError,
+            "candidate_start_transition_retirement_required",
+        ):
+            d2_run.next_certification_action(self.manifest_path)
+
+    def test_status_rejects_retirement_created_inside_coordinator_lock(self):
+        original = d2_run.coordinator_pending_step
+
+        def retire_during_status(*arguments):
+            result = original(*arguments)
+            self.write_candidate_start_retirement()
+            return result
+
+        with mock.patch.object(
+            d2_run,
+            "coordinator_pending_step",
+            side_effect=retire_during_status,
+        ):
+            with self.assertRaisesRegex(
+                d2_run.CertificationError,
+                "candidate_start_transition_retirement_required",
+            ):
+                d2_run.next_certification_action(self.manifest_path)
+
+    def test_advance_rejects_candidate_start_retirement(self):
+        source = self.direct_source(1, d2_run.ORCHESTRATOR_BOOTSTRAP_KIND)
+        self.write_candidate_start_retirement()
+        with self.assertRaisesRegex(
+            d2_run.CertificationError,
+            "candidate_start_transition_retirement_required",
+        ):
+            d2_run.advance_certification(
+                self.manifest_path, 1, [str(source)]
+            )
+
+    def test_verify_rejects_candidate_start_retirement(self):
+        self.append_prior(17)
+        self.write_candidate_start_retirement()
+        with self.assertRaisesRegex(
+            d2_run.CertificationError,
+            "candidate_start_transition_retirement_required",
+        ):
+            d2_run.verify_certification(self.manifest_path)
+
+    def test_status_rejects_abort_teardown_tombstone(self):
+        self.write_abort_teardown_tombstone()
+        with self.assertRaisesRegex(
+            d2_run.CertificationError,
+            "candidate_start_transition_retirement_required",
+        ):
+            d2_run.next_certification_action(self.manifest_path)
+
+    def test_advance_rejects_abort_teardown_tombstone(self):
+        source = self.direct_source(1, d2_run.ORCHESTRATOR_BOOTSTRAP_KIND)
+        self.write_abort_teardown_tombstone()
+        with self.assertRaisesRegex(
+            d2_run.CertificationError,
+            "candidate_start_transition_retirement_required",
+        ):
+            d2_run.advance_certification(
+                self.manifest_path, 1, [str(source)]
+            )
+
+    def test_verify_rejects_abort_teardown_tombstone(self):
+        self.append_prior(17)
+        self.write_abort_teardown_tombstone()
+        with self.assertRaisesRegex(
+            d2_run.CertificationError,
+            "candidate_start_transition_retirement_required",
+        ):
+            d2_run.verify_certification(self.manifest_path)
 
     def test_status_exposes_exact_source_kinds_and_execution_modes(self):
         action = d2_run.next_certification_action(self.manifest_path)

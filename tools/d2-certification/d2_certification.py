@@ -23,6 +23,7 @@ from d2_evidence import (
 
 
 SCHEMA_VERSION = 1
+D2_ISOLATED_ROOT_PARENT = pathlib.Path("/private/tmp")
 MAX_JSON_BYTES = 256 * 1024
 MAX_STRING_BYTES = 4096
 MAX_COLLECTION_ITEMS = 256
@@ -88,6 +89,10 @@ REQUIRED_PORTS = {
     "transport_gateway",
     "transport_http",
 }
+
+
+def isolated_runtime_root(run_id):
+    return D2_ISOLATED_ROOT_PARENT / f"starring-d2-{run_id}"
 CODEX_WORKER_SOURCE_FILES = (
     "admission-registry.mjs",
     "codex-runner.mjs",
@@ -836,7 +841,7 @@ def build_manifest(arguments):
     )
     suffix = run_id.rsplit("-", 1)[1]
     prefix = f"starring-d2-{run_id[3:11]}-{suffix}"
-    root = pathlib.Path(f"/private/tmp/starring-d2-{run_id}")
+    root = isolated_runtime_root(run_id)
     candidate_manifest = {
         name: {"path": str(path), "sha256": sha256_file(path)}
         for name, path in sorted(candidates.items())
@@ -1079,7 +1084,7 @@ def validate_manifest(manifest):
         fail("manifest_discord_invalid")
     run_id = manifest["run_id"]
     suffix = run_id.rsplit("-", 1)[1]
-    expected_root = pathlib.Path(f"/private/tmp/starring-d2-{run_id}")
+    expected_root = isolated_runtime_root(run_id)
     database = manifest.get("database")
     if database != {
         "name": "starring_runtime_staging",
