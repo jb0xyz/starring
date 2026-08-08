@@ -165,13 +165,15 @@ retry must match that intent exactly.
 
 Candidate Cargo commands are `--frozen`, offline, and use only the sealed
 workspace or transport vendor configuration. The native Rust and Apple linker
-tools, developer directory, environment, lockfiles, and source trees are
-identity-bound before and after the build. `CARGO_BUILD_JOBS=1`; the mutable
+tools, developer directory, canonical SDK root, SDK settings,
+`TargetConditionals.h`, environment, lockfiles, and source trees are identity-
+bound before and after the build. `CARGO_BUILD_JOBS=1`; the mutable
 build tree is capped at 4 GiB and 500,000 entries, must retain at least 2 GiB
 free, and must originate on a filesystem with at least 8 GiB available.
 
 Every native build command runs without network access under a Seatbelt profile
-that permits writes only below its isolated build root. It is launched by a
+that permits writes and clone destinations only below its isolated build root
+while denying hard links. It is launched by a
 unique, deterministic per-command launchd bootstrap job. That job applies an
 8 GiB data/resident-set ceiling, a 4 GiB output-file ceiling, a two-hour CPU
 ceiling, and bounded process and descriptor counts. The tool does not accept

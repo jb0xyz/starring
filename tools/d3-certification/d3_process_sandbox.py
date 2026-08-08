@@ -35,7 +35,7 @@ SANDBOX_PROFILE = " ".join(
         '(literal "/dev/null")',
         ")",
         "(deny file-link)",
-        "(deny file-clone)",
+        '(allow file-clone (subpath (param "STARRING_MUTABLE_ROOT")))',
         "(deny mach-priv-task-port)",
         "(allow mach-lookup",
         '(global-name "com.apple.SystemConfiguration.configd")',

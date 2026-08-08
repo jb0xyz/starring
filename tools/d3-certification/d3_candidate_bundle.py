@@ -57,6 +57,9 @@ SAFE_ENVIRONMENT_NAMES = (
 )
 FIXED_EXECUTABLE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 FIXED_DEVELOPER_DIRECTORY = pathlib.Path("/Library/Developer/CommandLineTools")
+FIXED_SDK_DIRECTORY = FIXED_DEVELOPER_DIRECTORY / "SDKs"
+FIXED_SDK_SETTINGS_NAME = "SDKSettings.json"
+FIXED_SDK_TARGET_CONDITIONALS = pathlib.Path("usr/include/TargetConditionals.h")
 FIXED_RUSTUP = pathlib.Path("/opt/homebrew/opt/rustup/libexec/bin/rustup")
 FIXED_XCODE_SELECT = pathlib.Path("/usr/bin/xcode-select")
 FIXED_XCRUN = pathlib.Path("/usr/bin/xcrun")
@@ -462,6 +465,7 @@ def candidate_build_recipe(state, root, worktree, dependency_snapshot):
             "LD": "{sealed_tool:ld}",
             "PATH": FIXED_EXECUTABLE_PATH,
             "RUSTC": "{sealed_tool:rustc}",
+            "SDKROOT": "{sealed_sdk:path}",
             "STARRING_RUNTIME_BUILD_REVISION": state["merge_commit"],
         },
         "inherited_environment_names": list(SAFE_ENVIRONMENT_NAMES),
@@ -888,6 +892,57 @@ def resolve_native_toolchain(worktree):
     return resolved
 
 
+def resolve_native_sdk(worktree):
+    try:
+        result = subprocess.run(
+            [str(FIXED_XCRUN), "--sdk", "macosx", "--show-sdk-path"],
+            cwd=worktree,
+            env=sanitized_environment(
+                {"DEVELOPER_DIR": str(FIXED_DEVELOPER_DIRECTORY)}
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        fail(f"candidate_build_sdk_unavailable:{error.__class__.__name__}")
+    if result.returncode != 0 or not result.stdout or len(result.stdout) > 4096:
+        fail("candidate_build_sdk_selection_invalid")
+    try:
+        selected = result.stdout.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        fail("candidate_build_sdk_selection_invalid")
+    root = absolute_path(os.path.realpath(selected), "candidate_build_sdk")
+    if (
+        root.parent != FIXED_SDK_DIRECTORY
+        or not root.name.startswith("MacOSX")
+        or root.suffix != ".sdk"
+    ):
+        fail("candidate_build_sdk_selection_invalid")
+    require_system_directory_chain(root)
+    metadata = root.lstat()
+    value = {
+        "root": {
+            "path": str(root),
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "uid": metadata.st_uid,
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+        },
+        "settings": system_file_identity(
+            root / FIXED_SDK_SETTINGS_NAME,
+            "candidate_build_sdk_settings",
+        ),
+        "target_conditionals": system_file_identity(
+            root / FIXED_SDK_TARGET_CONDITIONALS,
+            "candidate_build_sdk_target_conditionals",
+        ),
+    }
+    return validate_sdk_identity(value)
+
+
 def tool_identity(
     path,
     name,
@@ -933,7 +988,7 @@ def rust_target(version):
     return hosts[0]
 
 
-def toolchain_environment(tools, directories):
+def toolchain_environment(tools, directories, sdk):
     by_name = {value["name"]: value for value in tools}
     environment = {
         "AR": by_name["ar"]["path"],
@@ -942,6 +997,7 @@ def toolchain_environment(tools, directories):
         "DEVELOPER_DIR": str(FIXED_DEVELOPER_DIRECTORY),
         "LD": by_name["ld"]["path"],
         "RUSTC": by_name["rustc"]["path"],
+        "SDKROOT": sdk["root"]["path"],
         FIXED_RUST_LINKER_ENVIRONMENT: by_name["clang"]["path"],
     }
     environment.update(
@@ -953,6 +1009,49 @@ def toolchain_environment(tools, directories):
     return environment
 
 
+def validate_sdk_identity(value):
+    if not isinstance(value, dict) or set(value) != {
+        "root",
+        "settings",
+        "target_conditionals",
+    }:
+        fail("candidate_build_sdk_identity_invalid")
+    root = value["root"]
+    if (
+        not isinstance(root, dict)
+        or set(root) != {"path", "mode", "uid", "device", "inode"}
+        or not isinstance(root["path"], str)
+        or any(
+            type(root[name]) is not int
+            for name in ("mode", "uid", "device", "inode")
+        )
+        or root["uid"] != 0
+        or root["mode"] & 0o022
+    ):
+        fail("candidate_build_sdk_identity_invalid")
+    path = absolute_path(root["path"], "candidate_build_sdk")
+    if (
+        path.parent != FIXED_SDK_DIRECTORY
+        or not path.name.startswith("MacOSX")
+        or path.suffix != ".sdk"
+    ):
+        fail("candidate_build_sdk_identity_invalid")
+    expected_files = {
+        "settings": path / FIXED_SDK_SETTINGS_NAME,
+        "target_conditionals": path / FIXED_SDK_TARGET_CONDITIONALS,
+    }
+    for name, expected in expected_files.items():
+        identity = value[name]
+        validate_file_identity_shape(identity, "candidate_build_sdk")
+        if (
+            identity["path"] != str(expected)
+            or identity["uid"] != 0
+            or identity["mode"] & 0o022
+        ):
+            fail("candidate_build_sdk_identity_invalid")
+    return value
+
+
 def validate_candidate_toolchain(value):
     verify_sealed_record(value, "candidate_build_toolchain")
     required = {
@@ -960,6 +1059,7 @@ def validate_candidate_toolchain(value):
         "kind",
         "rust_target",
         "developer_directory",
+        "sdk",
         "directories",
         "environment",
         "tools",
@@ -1019,6 +1119,7 @@ def validate_candidate_toolchain(value):
     ):
         fail("candidate_build_toolchain_invalid")
     rust_target(by_name["rustc"]["version"])
+    sdk = validate_sdk_identity(value["sdk"])
     directories = value["directories"]
     if not isinstance(directories, dict):
         fail("candidate_build_toolchain_invalid")
@@ -1041,7 +1142,7 @@ def validate_candidate_toolchain(value):
             or item["uid"] != os.getuid()
         ):
             fail("candidate_build_toolchain_invalid")
-    if value["environment"] != toolchain_environment(tools, directories):
+    if value["environment"] != toolchain_environment(tools, directories, sdk):
         fail("candidate_build_toolchain_environment_invalid")
     return value
 
@@ -1051,6 +1152,7 @@ def resolve_candidate_toolchain(worktree, directories):
     cargo = resolve_rustup_tool(rustup, "cargo", worktree)
     rustc = resolve_rustup_tool(rustup, "rustc", worktree)
     native = resolve_native_toolchain(worktree)
+    sdk = resolve_native_sdk(worktree)
     tools = [
         tool_identity(rustup, "rustup", worktree, ("--version",)),
         tool_identity(cargo, "cargo", worktree),
@@ -1084,8 +1186,9 @@ def resolve_candidate_toolchain(worktree, directories):
             "kind": "starring.d3.candidate-build-toolchain.v1",
             "rust_target": rust_target(tools[2]["version"]),
             "developer_directory": str(FIXED_DEVELOPER_DIRECTORY),
+            "sdk": sdk,
             "directories": directories,
-            "environment": toolchain_environment(tools, directories),
+            "environment": toolchain_environment(tools, directories, sdk),
             "tools": tools,
         }
     )
@@ -1831,6 +1934,7 @@ def create_candidate_bundle(
             "gate_evidence_chain_head_sha256": gate_chain,
             "recipe": recipe,
             "tools": tools,
+            "sdk": intent["toolchain"]["sdk"],
             "state_root": state_root,
             "bundle_root": {
                 **root_before_seal,
@@ -1948,6 +2052,7 @@ def load_candidate_bundle(root, state, gate_chain, dependency_snapshot):
         "gate_evidence_chain_head_sha256",
         "recipe",
         "tools",
+        "sdk",
         "state_root",
         "bundle_root",
         "source_trees",
@@ -1980,6 +2085,9 @@ def load_candidate_bundle(root, state, gate_chain, dependency_snapshot):
     ] != ["rustup", "cargo", "rustc", "clang", "ar", "ld"]:
         fail("candidate_bundle_tools_invalid")
     if tools != intent["toolchain"]["tools"]:
+        fail("candidate_bundle_toolchain_mismatch")
+    sdk = validate_sdk_identity(record["sdk"])
+    if sdk != intent["toolchain"]["sdk"]:
         fail("candidate_bundle_toolchain_mismatch")
     for value in tools:
         if not isinstance(value, dict) or "version" not in value or "name" not in value:

@@ -24,6 +24,9 @@ import d3_candidate_io as CANDIDATE_IO
 import d3_process_sandbox as PROCESS_SANDBOX
 
 
+FIXTURE_SDK_ROOT = BUNDLE.FIXED_SDK_DIRECTORY / "MacOSX26.5.sdk"
+
+
 def run(argv, cwd):
     result = subprocess.run(
         argv,
@@ -56,6 +59,27 @@ def fixture_system_file_identity(path, _label):
         "device": 1,
         "inode": int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big"),
         "links": 1,
+    }
+
+
+def fixture_sdk_identity():
+    encoded = str(FIXTURE_SDK_ROOT).encode("utf-8")
+    return {
+        "root": {
+            "path": str(FIXTURE_SDK_ROOT),
+            "mode": 0o555,
+            "uid": 0,
+            "device": 1,
+            "inode": int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big"),
+        },
+        "settings": fixture_system_file_identity(
+            FIXTURE_SDK_ROOT / BUNDLE.FIXED_SDK_SETTINGS_NAME,
+            "fixture_sdk_settings",
+        ),
+        "target_conditionals": fixture_system_file_identity(
+            FIXTURE_SDK_ROOT / BUNDLE.FIXED_SDK_TARGET_CONDITIONALS,
+            "fixture_sdk_target_conditionals",
+        ),
     }
 
 
@@ -146,10 +170,81 @@ class D3ProcessSandboxTests(unittest.TestCase):
             ),
             1,
         )
+        self.assertEqual(
+            PROCESS_SANDBOX.SANDBOX_PROFILE.count(
+                '(allow file-clone (subpath (param "STARRING_MUTABLE_ROOT")))'
+            ),
+            1,
+        )
+        self.assertEqual(PROCESS_SANDBOX.SANDBOX_PROFILE.count("file-clone"), 1)
+        self.assertEqual(
+            PROCESS_SANDBOX.SANDBOX_PROFILE.count("(deny file-link)"),
+            1,
+        )
+        self.assertNotIn("(allow file-link", PROCESS_SANDBOX.SANDBOX_PROFILE)
         self.assertNotIn(
             "network-outbound",
             PROCESS_SANDBOX.SANDBOX_PROFILE,
         )
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS Seatbelt")
+    def test_networkless_profile_scopes_clone_and_denies_hard_links(self):
+        if not BUNDLE.FIXED_RUSTUP.exists():
+            self.skipTest("fixed rustup unavailable")
+        rustup = BUNDLE.resolve_rustup()
+        rustc = BUNDLE.resolve_rustup_tool(rustup, "rustc", self.worktree)
+        mutable = self.root / "mutable"
+        mutable.mkdir(mode=0o700)
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o700)
+        source = mutable / "source"
+        write(source, "sealed source\n", 0o600)
+        unreadable = self.root / "unreadable-source"
+        write(unreadable, "outside read boundary\n", 0o600)
+        environment = {
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C",
+            "PATH": BUNDLE.FIXED_EXECUTABLE_PATH,
+            "RUSTC": str(rustc),
+        }
+
+        def contained(argv):
+            arguments = PROCESS_SANDBOX.sandboxed_argv(
+                argv,
+                mutable,
+                self.worktree,
+                environment,
+                "none",
+            )
+            return subprocess.run(
+                arguments,
+                cwd=self.worktree,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+            )
+
+        clone = mutable / "clone"
+        result = contained(["/bin/cp", "-c", str(source), str(clone)])
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+        self.assertEqual(clone.read_bytes(), source.read_bytes())
+        outside_clone = outside / "clone"
+        result = contained(["/bin/cp", "-c", str(source), str(outside_clone)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(outside_clone.exists())
+        hard_link = mutable / "hard-link"
+        result = contained(["/bin/ln", str(source), str(hard_link)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(hard_link.exists())
+        unreadable_clone = mutable / "unreadable-clone"
+        result = contained(
+            ["/bin/cp", "-c", str(unreadable), str(unreadable_clone)]
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(unreadable_clone.exists())
 
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS Seatbelt")
     def test_networkless_profile_starts_cargo(self):
@@ -187,6 +282,97 @@ class D3ProcessSandboxTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
         self.assertTrue(result.stdout.startswith(b"cargo "))
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS Seatbelt")
+    def test_networkless_profile_builds_native_cargo_fixture(self):
+        if not BUNDLE.FIXED_RUSTUP.exists():
+            self.skipTest("fixed rustup unavailable")
+        write(
+            self.worktree / "Cargo.toml",
+            '[package]\nname = "d3-native-fixture"\nversion = "0.1.0"\n'
+            'edition = "2021"\nbuild = "build.rs"\n',
+        )
+        write(
+            self.worktree / "Cargo.lock",
+            'version = 4\n\n[[package]]\nname = "d3-native-fixture"\n'
+            'version = "0.1.0"\n',
+        )
+        write(
+            self.worktree / "build.rs",
+            "use std::env;\n"
+            "use std::path::PathBuf;\n"
+            "use std::process::Command;\n"
+            "fn main() {\n"
+            '    let output = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("probe.o");\n'
+            '    let status = Command::new(env::var_os("CC").unwrap())\n'
+            '        .args(["-c", "probe.c", "-o"])\n'
+            "        .arg(output)\n"
+            "        .status()\n"
+            "        .unwrap();\n"
+            "    assert!(status.success());\n"
+            "}\n",
+        )
+        write(
+            self.worktree / "probe.c",
+            "#include <TargetConditionals.h>\n"
+            "int d3_native_fixture(void) { return TARGET_OS_OSX; }\n",
+        )
+        write(self.worktree / "src" / "lib.rs", "pub fn ready() -> bool { true }\n")
+        rustup = BUNDLE.resolve_rustup()
+        cargo = BUNDLE.resolve_rustup_tool(rustup, "cargo", self.worktree)
+        rustc = BUNDLE.resolve_rustup_tool(rustup, "rustc", self.worktree)
+        native = BUNDLE.resolve_native_toolchain(self.worktree)
+        sdk = BUNDLE.resolve_native_sdk(self.worktree)
+        mutable = self.root / "native-build"
+        mutable.mkdir(mode=0o700)
+        directories = {}
+        for name in ("cargo-home", "home", "tmp", "xdg-cache"):
+            path = mutable / name
+            path.mkdir(mode=0o700)
+            directories[name] = path
+        environment = BUNDLE.sanitized_environment(
+            {
+                "AR": str(native["ar"]),
+                "CARGO_BUILD_JOBS": "1",
+                "CARGO_HOME": str(directories["cargo-home"]),
+                "CARGO_NET_OFFLINE": "true",
+                "CC": str(native["clang"]),
+                "CXX": str(native["clang"]),
+                "DEVELOPER_DIR": str(BUNDLE.FIXED_DEVELOPER_DIRECTORY),
+                "HOME": str(directories["home"]),
+                "LD": str(native["ld"]),
+                "RUSTC": str(rustc),
+                "SDKROOT": sdk["root"]["path"],
+                "TMPDIR": str(directories["tmp"]),
+                "XDG_CACHE_HOME": str(directories["xdg-cache"]),
+                BUNDLE.FIXED_RUST_LINKER_ENVIRONMENT: str(native["clang"]),
+            }
+        )
+        arguments = PROCESS_SANDBOX.sandboxed_argv(
+            [
+                str(cargo),
+                "build",
+                "--offline",
+                "--frozen",
+                "--target-dir",
+                str(mutable / "target"),
+            ],
+            mutable,
+            self.worktree,
+            environment,
+            "none",
+        )
+        result = subprocess.run(
+            arguments,
+            cwd=self.worktree,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
 
 
 class D3CertificationTests(unittest.TestCase):
@@ -491,6 +677,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             "ld": ("-v",),
         }
         def resolve_toolchain(_worktree, directories):
+            sdk = fixture_sdk_identity()
             tools = []
             for name in ("rustup", "cargo", "rustc"):
                 path = tool_root / name
@@ -522,8 +709,11 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                     "kind": "starring.d3.candidate-build-toolchain.v1",
                     "rust_target": BUNDLE.FIXED_RUST_TARGET,
                     "developer_directory": str(BUNDLE.FIXED_DEVELOPER_DIRECTORY),
+                    "sdk": sdk,
                     "directories": directories,
-                    "environment": BUNDLE.toolchain_environment(tools, directories),
+                    "environment": BUNDLE.toolchain_environment(
+                        tools, directories, sdk
+                    ),
                     "tools": tools,
                 }
             )
@@ -1296,6 +1486,24 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertIn("candidate_build_toolchain_drift", error)
         self.assertEqual(self.build_invocations, 1)
 
+    def test_candidate_bundle_rejects_sdk_provenance_mismatch(self):
+        state_path, _, gates = self.prepare()
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        path = state_path.parent / "candidate-bundle" / "bundle.json"
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value.pop("record_sha256")
+        value["sdk"]["settings"]["sha256"] = "0" * 64
+        path.chmod(0o600)
+        write(
+            path,
+            BUNDLE.canonical_json(BUNDLE.seal_record(value)) + "\n",
+            0o400,
+        )
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_bundle_toolchain_mismatch", error)
+
     def test_candidate_bundle_recovers_owned_partial_staging(self):
         state_path, _, gates = self.prepare()
         status, _, error, _ = self.invoke_gate_plan(state_path, gates)
@@ -1623,7 +1831,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         write(
             cargo,
             "#!/bin/sh\n"
-            f"/usr/bin/printf '%s\\n' \"$PATH\" \"$DEVELOPER_DIR\" \"$CC\" > {shlex.quote(str(observed))}\n"
+            f"/usr/bin/printf '%s\\n' \"$PATH\" \"$DEVELOPER_DIR\" \"$SDKROOT\" \"$CC\" > {shlex.quote(str(observed))}\n"
             "/usr/bin/which cc >> " + shlex.quote(str(observed)) + "\n"
             "cc --version >/dev/null\n",
             0o700,
@@ -1644,6 +1852,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             "LD": str(BUNDLE.FIXED_DEVELOPER_DIRECTORY / "usr" / "bin" / "ld"),
             "RUSTC": str(self.root / "rustc"),
             "CARGO_HOME": str(cargo_home),
+            "SDKROOT": str(FIXTURE_SDK_ROOT),
             BUNDLE.FIXED_RUST_LINKER_ENVIRONMENT: str(clang),
         }
         descriptor = BUNDLE.acquire_candidate_build_fence(self.root)
@@ -1653,6 +1862,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 {
                     "PATH": str(foreign) + ":" + os.environ.get("PATH", ""),
                     "DEVELOPER_DIR": str(self.root / "foreign-developer"),
+                    "SDKROOT": str(self.root / "foreign-sdk"),
                 },
             ), mock.patch.object(
                 BUNDLE,
@@ -1685,6 +1895,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             [
                 BUNDLE.FIXED_EXECUTABLE_PATH,
                 str(BUNDLE.FIXED_DEVELOPER_DIRECTORY),
+                str(FIXTURE_SDK_ROOT),
                 str(clang),
                 "/usr/bin/cc",
             ],
