@@ -85,20 +85,21 @@ D2 runs between two D3 phases and cannot be run before them.
    merge tree and invalidates completed D2 receipts.
 2. Open the release pull request.
 3. `d3_certification.py prepare` pins the repository, pull request, head, base,
-   and GitHub-generated merge candidate, and creates `<D3_STATE>/worktree` as a
+   and GitHub-generated merge candidate, and creates `<D3_RUN>/worktree` as a
    detached checkout of that merge candidate.
 4. `d3_certification.py run-gates` runs the fixed gate manifest and then builds
-   and seals `<D3_STATE>/candidate-bundle`.
+   and seals `<D3_RUN>/candidate-bundle`.
 5. Run D2 against that bundle through all seventeen steps.
 6. `d3_certification.py bind-d2`, then `recheck`, then merge, then `finalize`.
 
-`<D3_STATE>` is the `<output-root>/<run>` directory that holds `state.json`.
+`D3_STATE` is the absolute `state.json` path returned by D3 `prepare`, matching
+the D3 runbook. `<D3_RUN>` is the directory containing that file.
 
 ## Candidate provisioning
 
 D3 owns candidate provisioning. `run-gates` builds the five release binaries and
 the seven-file Codex worker tree from the exact merge candidate and seals them
-into `<D3_STATE>/candidate-bundle`. That directory is mode `0555`, its binaries
+into `<D3_RUN>/candidate-bundle`. That directory is mode `0555`, its binaries
 `0555`, its worker files `0444`, and `bundle.json` and `publication.json` `0400`.
 Do not build or install candidates by hand.
 
@@ -107,15 +108,15 @@ match the sealed bundle exactly:
 
 | Manifest field | Required value |
 | --- | --- |
-| `candidates.api` | `<D3_STATE>/candidate-bundle/starring-api` |
-| `candidates.runtime` | `<D3_STATE>/candidate-bundle/starring-runtime` |
-| `candidates.db_bootstrap` | `<D3_STATE>/candidate-bundle/starring-d2-db-bootstrap` |
-| `candidates.sealed_provisioner` | `<D3_STATE>/candidate-bundle/starring-d2-sealed-provisioner` |
-| `candidates.certification_transport` | `<D3_STATE>/candidate-bundle/d2-certification-transport` |
-| `candidates.codex_worker` | `<D3_STATE>/candidate-bundle/codex-worker/worker.mjs` |
-| `source_trees.codex_worker.root` | `<D3_STATE>/candidate-bundle/codex-worker` |
-| `source_trees.d2_toolchain.root` | `<D3_STATE>/worktree/tools/d2-certification` |
-| `source_trees.certification_transport.root` | `<D3_STATE>/worktree/tools/d2-certification-transport` |
+| `candidates.api` | `<D3_RUN>/candidate-bundle/starring-api` |
+| `candidates.runtime` | `<D3_RUN>/candidate-bundle/starring-runtime` |
+| `candidates.db_bootstrap` | `<D3_RUN>/candidate-bundle/starring-d2-db-bootstrap` |
+| `candidates.sealed_provisioner` | `<D3_RUN>/candidate-bundle/starring-d2-sealed-provisioner` |
+| `candidates.certification_transport` | `<D3_RUN>/candidate-bundle/d2-certification-transport` |
+| `candidates.codex_worker` | `<D3_RUN>/candidate-bundle/codex-worker/worker.mjs` |
+| `source_trees.codex_worker.root` | `<D3_RUN>/candidate-bundle/codex-worker` |
+| `source_trees.d2_toolchain.root` | `<D3_RUN>/worktree/tools/d2-certification` |
+| `source_trees.certification_transport.root` | `<D3_RUN>/worktree/tools/d2-certification-transport` |
 
 `node`, `codex`, and `cloudflared` are not release artifacts. They remain
 operator-supplied installed executables and are not bound to the sealed bundle.
@@ -159,9 +160,11 @@ The remaining certification work is:
 Example preparation shape:
 
 ```text
-D3_STATE=/absolute/d3/output-root/run-id
-BUNDLE="$D3_STATE/candidate-bundle"
-D2_TOOLCHAIN="$D3_STATE/worktree/tools/d2-certification"
+D3_STATE=/absolute/d3/output-root/run-id/state.json
+D3_RUN="$(dirname "$D3_STATE")"
+BUNDLE="$D3_RUN/candidate-bundle"
+D2_TOOLCHAIN="$D3_RUN/worktree/tools/d2-certification"
+CANDIDATE_COMMIT="$(jq -er '.merge_commit' "$D3_STATE")"
 
 python3 "$D2_TOOLCHAIN/d2_certification.py" prepare \
   --output-root "$HOME/Library/Application Support/Starring/release-certifications" \
@@ -193,7 +196,7 @@ python3 "$D2_TOOLCHAIN/d2_certification.py" prepare \
   --port transport_http=29102
 ```
 
-`$BUNDLE` is `<D3_STATE>/candidate-bundle`, and `--commit` must be the exact
+`$BUNDLE` is `<D3_RUN>/candidate-bundle`, and `--commit` must be the exact
 GitHub-generated merge commit pinned by D3. `bind-d2` rejects a D2 manifest
 that names the branch tip or any other commit, even when its tree is equal.
 Every D2 Python command must use `$D2_TOOLCHAIN` from the same detached D3
@@ -320,7 +323,10 @@ const confirmation = await product.liveRuntimeRestartConfirmation({
   processInstanceId: "<process_instance_id from phase 1>",
   shutdownBoundary: "<shutdown_boundary from phase 1>",
 });
-copy(JSON.stringify(confirmation));
+window.prompt(
+  "Copy the exact live-runtime-restart confirmation JSON",
+  JSON.stringify(confirmation),
+);
 ```
 
 The second invocation accepts only the exact schema and binds its operation,
@@ -484,22 +490,126 @@ guild and save those two browser evidence files in that order. The low-level
 `d2_certification.py record` command does not create coordinator intents or
 completions and must not be used for a D3-bound release run.
 
+## Certified browser steps 5-7
+
 The browser driver is installed as `globalThis.StarringD2ProductDriver`. After
-the operator completes OAuth on the exact D2 origin, create one driver and
-explicitly invoke the product flow. The natural-language request is used for
-the request only and is omitted from the returned result:
+the operator completes OAuth on the exact D2 origin, create one driver. The
+certified initial product flow is deliberately split across the coordinator's
+step-6 completion boundary. Save only the returned evidence objects below as
+absolute, owner-controlled mode-`0600` JSON files. The natural-language request
+is used for the request only and is omitted from those objects.
+
+Capture the idle worker boundary before authoring:
 
 ```text
-const product = StarringD2ProductDriver.create()
-const productEvidence = await product.runOneShotProductFlow({
-  installationId: "installation:<run-owned-id>",
-  sessionId: "d2-<run-owned-id>",
-  message: "<reviewed one-shot study-room request>",
-  confirmPreview: async preview => window.confirm(
-    JSON.stringify(preview.summary, null, 2)
-  )
-})
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" worker-authoring-evidence \
+  --manifest "$MANIFEST" \
+  --checkpoint before
 ```
+
+In the authenticated same-origin browser, begin authoring without promoting,
+approving, or applying:
+
+```js
+const product = StarringD2ProductDriver.create()
+const installationId = "installation:<run-owned-id>"
+const sessionId = "d2-<run-owned-id>"
+const authoring = await product.beginCertificationAuthoring({
+  installationId,
+  sessionId,
+  message: "<reviewed one-shot study-room request>",
+})
+window.prompt(
+  "Copy the exact step-5 browser authoring evidence JSON",
+  JSON.stringify(authoring.authoring_evidence),
+)
+window.prompt(
+  "Copy the exact step-6 browser preview evidence JSON",
+  JSON.stringify(authoring.preview_ready_evidence),
+)
+```
+
+Each standard browser prompt pauses before the next one and does not depend on
+the optional DevTools `copy()` utility. Copy its complete default value without
+editing it, then save the two objects separately as
+`/absolute/step-05-browser-authoring.json` and
+`/absolute/step-06-browser-preview-ready.json`. Capture the completed worker
+boundary using the exact step-5 browser evidence, then inspect the encrypted
+generation before making a product decision:
+
+```text
+python3 "$D2_TOOLCHAIN/isolated_orchestrator.py" worker-authoring-evidence \
+  --manifest "$MANIFEST" \
+  --checkpoint after \
+  --browser-evidence /absolute/step-05-browser-authoring.json
+
+umask 077
+"$BUNDLE/starring-d2-sealed-provisioner" inspect \
+  --manifest "$MANIFEST" \
+  --checkpoint authoring \
+  > /absolute/step-06-db-authoring.json
+chmod 0600 /absolute/step-06-db-authoring.json
+
+python3 "$D2_TOOLCHAIN/d2_run.py" advance \
+  --manifest "$MANIFEST" \
+  --step 5 \
+  --source /absolute/step-05-browser-authoring.json \
+  --source "$ORCH/worker-authoring/evidence.json"
+
+python3 "$D2_TOOLCHAIN/d2_run.py" advance \
+  --manifest "$MANIFEST" \
+  --step 6 \
+  --source /absolute/step-06-browser-preview-ready.json \
+  --source /absolute/step-06-db-authoring.json
+
+python3 "$D2_TOOLCHAIN/d2_run.py" status \
+  --manifest "$MANIFEST"
+```
+
+The status result for step 7 contains
+`preview_completion_challenge_sha256`. In the same browser driver, bind that
+exact value into a fresh decision command, hash the command, and invoke the
+certification-only decision helper. Do not pass `confirmPreview`; this helper
+requires the native Chrome confirmation surface. Review and accept that prompt
+before it approves and applies the target.
+
+```js
+const decisionCommand = product.createCertificationDecisionCommand({
+  installationId,
+  sessionId,
+  authoringGeneration: authoring.authoring_evidence.authoring_generation,
+  candidateRulesetHash:
+    authoring.preview_ready_evidence.candidate_ruleset_hash,
+  previewCompletionChallengeSha256:
+    "<preview_completion_challenge_sha256 from status>",
+})
+const decisionCommandSha256 =
+  await product.decisionCommandSha256(decisionCommand)
+const decision = await product.completeCertificationDecision({
+  command: decisionCommand,
+  decisionCommandSha256,
+})
+window.prompt(
+  "Copy the exact step-7 browser product-decision evidence JSON",
+  JSON.stringify(decision.product_decision_evidence),
+)
+```
+
+Save the copied object as
+`/absolute/step-07-browser-product-decision.json`, mode `0600`, then advance
+step 7:
+
+```text
+python3 "$D2_TOOLCHAIN/d2_run.py" advance \
+  --manifest "$MANIFEST" \
+  --step 7 \
+  --source /absolute/step-07-browser-product-decision.json
+```
+
+`runOneShotProductFlow` is a non-certification convenience and must not be used
+for certified steps 5-7. It crosses the required step-6 completion boundary and
+does not return the challenge-bound coordinator source contracts. Its only D2
+certification use is inside `runReplacementFlow` for the step 14 replacement.
 
 When an update must drain the currently live runtime, the driver handles the
 public `runtime_drain_required` and `runtime_drain_pending` conflicts as one
