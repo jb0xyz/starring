@@ -23,11 +23,11 @@ class D3LaunchdJobTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def write_result(self, nonce, label):
+    def write_result(self, nonce, label, exit_code=0):
         path = self.root / f".candidate-launchd-result-{nonce}.json"
         path.write_text(
             json.dumps(
-                {"exit_code": 0, "label": label, "nonce": nonce},
+                {"exit_code": exit_code, "label": label, "nonce": nonce},
                 sort_keys=True,
                 separators=(",", ":"),
             ),
@@ -68,12 +68,12 @@ class D3LaunchdJobTests(unittest.TestCase):
         path.chmod(0o600)
         return path, payload
 
-    def test_result_is_identity_checked_and_removed(self):
+    def test_result_is_identity_checked_and_retained(self):
         nonce = "1" * 32
         label = f"co.starring.d3.candidate.{nonce}"
         path = self.write_result(nonce, label)
         self.assertEqual(MODULE.read_result(path, nonce, label), 0)
-        self.assertFalse(path.exists())
+        self.assertTrue(path.exists())
 
     def test_result_hardlink_is_rejected(self):
         nonce = "2" * 32
@@ -132,7 +132,10 @@ class D3LaunchdJobTests(unittest.TestCase):
         )
         self.assertEqual(observed[1][0], ["bootout", MODULE.service_target(label)])
         self.assertGreaterEqual(len(monitored), 1)
-        self.assertFalse(result_path.exists())
+        self.assertTrue(result_path.exists())
+        self.assertTrue(
+            (self.root / f".candidate-launchd-job-{nonce}.plist").exists()
+        )
 
     def test_run_job_recovers_completed_existing_service(self):
         nonce = "4" * 32
@@ -163,8 +166,135 @@ class D3LaunchdJobTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(observed), 1)
         self.assertEqual(observed[0][0], ["bootout", MODULE.service_target(label)])
-        self.assertFalse(result_path.exists())
-        self.assertFalse(plist_path.exists())
+        self.assertTrue(result_path.exists())
+        self.assertTrue(plist_path.exists())
+
+    def test_run_job_replays_completed_failure_without_bootstrap(self):
+        nonce = "6" * 32
+        label = f"co.starring.d3.candidate.{nonce}"
+        result_path = self.write_result(nonce, label, exit_code=19)
+        plist_path, _ = self.write_plist(nonce)
+        with mock.patch.object(
+            MODULE,
+            "service_status",
+            return_value=(False, False),
+        ), mock.patch.object(MODULE, "launchctl") as launchctl:
+            first = MODULE.run_job(
+                ["/usr/bin/true"],
+                self.root,
+                {"PATH": "/usr/bin:/bin"},
+                30,
+                self.root,
+                nonce,
+                lambda: None,
+            )
+            second = MODULE.run_job(
+                ["/usr/bin/true"],
+                self.root,
+                {"PATH": "/usr/bin:/bin"},
+                30,
+                self.root,
+                nonce,
+                lambda: None,
+            )
+        self.assertEqual((first, second), (19, 19))
+        launchctl.assert_not_called()
+        self.assertTrue(result_path.exists())
+        self.assertTrue(plist_path.exists())
+
+    def test_run_job_retains_and_replays_fresh_failure(self):
+        nonce = "9" * 32
+        label = f"co.starring.d3.candidate.{nonce}"
+        service_states = iter(((False, False), (True, True), (False, False)))
+
+        def submit(arguments, operation, allowed=(0,)):
+            if arguments[0] == "bootstrap":
+                self.write_result(nonce, label, exit_code=23)
+            return mock.Mock(returncode=0, stdout=b"", stderr=b"")
+
+        with mock.patch.object(
+            MODULE,
+            "service_status",
+            side_effect=lambda _label: next(service_states),
+        ), mock.patch.object(
+            MODULE,
+            "launchctl",
+            side_effect=submit,
+        ), mock.patch.object(
+            MODULE,
+            "require_executable",
+            side_effect=lambda path, _label: path,
+        ):
+            first = MODULE.run_job(
+                ["/usr/bin/false"],
+                self.root,
+                {"PATH": "/usr/bin:/bin"},
+                30,
+                self.root,
+                nonce,
+                lambda: None,
+            )
+        with mock.patch.object(
+            MODULE,
+            "service_status",
+            return_value=(False, False),
+        ), mock.patch.object(MODULE, "launchctl") as launchctl:
+            replay = MODULE.run_job(
+                ["/usr/bin/false"],
+                self.root,
+                {"PATH": "/usr/bin:/bin"},
+                30,
+                self.root,
+                nonce,
+                lambda: None,
+            )
+        self.assertEqual((first, replay), (23, 23))
+        launchctl.assert_not_called()
+
+    def test_run_job_rejects_completed_result_without_plist(self):
+        nonce = "7" * 32
+        label = f"co.starring.d3.candidate.{nonce}"
+        self.write_result(nonce, label)
+        with mock.patch.object(
+            MODULE,
+            "service_status",
+            return_value=(False, False),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.LaunchdJobError,
+                "candidate_launchd_plist_missing",
+            ):
+                MODULE.run_job(
+                    ["/usr/bin/true"],
+                    self.root,
+                    {"PATH": "/usr/bin:/bin"},
+                    30,
+                    self.root,
+                    nonce,
+                    lambda: None,
+                )
+
+    def test_run_job_rejects_result_with_pending_sibling(self):
+        nonce = "8" * 32
+        label = f"co.starring.d3.candidate.{nonce}"
+        self.write_result(nonce, label)
+        self.write_plist(nonce)
+        pending = self.root / f".candidate-launchd-result-{nonce}.json.pending"
+        pending.write_text("pending", encoding="utf-8")
+        pending.chmod(0o600)
+        with self.assertRaisesRegex(
+            MODULE.LaunchdJobError,
+            "candidate_launchd_result_ambiguous",
+        ):
+            MODULE.run_job(
+                ["/usr/bin/true"],
+                self.root,
+                {"PATH": "/usr/bin:/bin"},
+                30,
+                self.root,
+                nonce,
+                lambda: None,
+            )
 
     def test_run_job_preserves_active_existing_service(self):
         nonce = "5" * 32

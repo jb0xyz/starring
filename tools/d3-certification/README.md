@@ -178,10 +178,13 @@ ceiling, and bounded process and descriptor counts. The tool does not accept
 success until it has durably read the job result and booted out the whole
 launchd coalition, including descendants that changed session or closed file
 descriptors. The persistent `candidate-build.lock`, launchd plist, deterministic
-job label, and exclusive result file make crash behavior explicit: a retry
-rejects an active prior job, consumes a completed durable result, and fails
-closed when service and result state are ambiguous. Sealing occurs only after
-the build fence has been closed and exclusively reacquired.
+job label, and exclusive result file make crash behavior explicit. The launcher
+fsyncs a private pending result and publishes it with a same-directory atomic
+rename. The exact plist and terminal result remain under the isolated build
+root until final retirement, so successful and failed commands replay the same
+exit code without a second bootstrap. A retry rejects an active prior job and
+fails closed when service, plist, pending, or result state is ambiguous. Sealing
+occurs only after the build fence has been closed and exclusively reacquired.
 
 Publication is crash-recoverable and exclusive. An empty pre-publication
 staging directory is removed. An intent-owned mode-`0700` staging directory
@@ -219,10 +222,15 @@ manifest source-tree identities must match the sealed seven-file worker tree
 and the fixed D2 toolchain and certification-transport inventories in the
 detached worktree. A different commit is rejected even when its tree is equal.
 `bind-d2` also pins the canonical D2 manifest path and the device and inode of
-both its run directory and `orchestrator` directory. Keep that evidence tree
-in place through `recheck` and `finalize`. All three commands, including exact
-replays, reject a run containing `candidate-start-retirement.json` or the
-standalone teardown tombstone `discord-resource-teardown-abort.json`.
+both its run directory and `orchestrator` directory. It hashes the complete
+bounded run tree, including relative paths, file contents, modes, ownership,
+inode identity, sizes, and timestamps. Repeated scans and metadata fences reject
+concurrent drift, symlinks, hard-linked files, group/world-writable entries,
+more than 10,000 entries, or more than 64 MiB. Keep that evidence tree in place
+through `recheck` and `finalize`; both recapture the same tree identity. All
+three commands, including exact replays, reject a run containing
+`candidate-start-retirement.json` or the standalone teardown tombstone
+`discord-resource-teardown-abort.json`.
 
 Capture the canonical output of `d2_run.py verify` in an owned mode-`0600` JSON file, then bind its required 17-step coordinator ledger to the D2 manifest, all 17 chained receipts, and the pinned commit tree. Set `umask 077` before redirecting the verifier output so the record is never created with a permissive mode. The low-level receipt verifier is not release authority.
 

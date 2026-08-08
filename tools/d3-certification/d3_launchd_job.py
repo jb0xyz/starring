@@ -46,8 +46,7 @@ LAUNCHER = (
     " view=view[written:]\n"
     "os.fsync(descriptor)\n"
     "os.close(descriptor)\n"
-    "os.link(pending,result,follow_symlinks=False)\n"
-    "os.unlink(pending)\n"
+    "os.rename(pending,result)\n"
     "directory=os.open(os.path.dirname(result),os.O_RDONLY)\n"
     "os.fsync(directory)\n"
     "os.close(directory)\n"
@@ -202,15 +201,6 @@ def read_result(path, nonce, label):
         or value["nonce"] != nonce
     ):
         fail("candidate_launchd_result_invalid")
-    try:
-        path.unlink()
-        descriptor = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except OSError as error:
-        fail(f"candidate_launchd_result_cleanup_failed:{error.__class__.__name__}")
     return value["exit_code"]
 
 
@@ -268,19 +258,6 @@ def require_private_file(path, expected, label):
         or raw != expected
     ):
         fail(f"{label}_invalid")
-
-
-def remove_private_file(path, expected, label):
-    require_private_file(path, expected, label)
-    try:
-        path.unlink()
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except OSError as error:
-        fail(f"{label}_cleanup_failed:{error.__class__.__name__}")
 
 
 def job_plist(label, program_arguments):
@@ -379,6 +356,8 @@ def run_job(argv, cwd, environment, timeout, result_root, nonce, monitor):
     result_exists = os.path.lexists(result_path)
     pending_exists = os.path.lexists(pending_path)
     plist_exists = os.path.lexists(plist_path)
+    if result_exists and pending_exists:
+        fail("candidate_launchd_result_ambiguous")
     if plist_exists:
         require_private_file(plist_path, plist_payload, "candidate_launchd_plist")
     existing_service, existing_active = service_status(label)
@@ -388,27 +367,16 @@ def run_job(argv, cwd, environment, timeout, result_root, nonce, monitor):
         if result_exists:
             terminate_service(label)
             monitor()
-            code = read_result(result_path, nonce, label)
-            remove_private_file(
-                plist_path,
-                plist_payload,
-                "candidate_launchd_plist",
-            )
-            return code
+            return read_result(result_path, nonce, label)
         if existing_active:
             fail("candidate_launchd_job_active")
         terminate_service(label)
         fail("candidate_launchd_result_missing")
     if result_exists:
+        if not plist_exists:
+            fail("candidate_launchd_plist_missing")
         monitor()
-        code = read_result(result_path, nonce, label)
-        if plist_exists:
-            remove_private_file(
-                plist_path,
-                plist_payload,
-                "candidate_launchd_plist",
-            )
-        return code
+        return read_result(result_path, nonce, label)
     if pending_exists:
         fail("candidate_launchd_result_incomplete")
     if not plist_exists:
@@ -437,13 +405,7 @@ def run_job(argv, cwd, environment, timeout, result_root, nonce, monitor):
             time.sleep(POLL_SECONDS)
         terminate_service(label)
         monitor()
-        code = read_result(result_path, nonce, label)
-        remove_private_file(
-            plist_path,
-            plist_payload,
-            "candidate_launchd_plist",
-        )
-        return code
+        return read_result(result_path, nonce, label)
     except BaseException:
         terminate_service(label)
         raise

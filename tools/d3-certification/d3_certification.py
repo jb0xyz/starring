@@ -30,6 +30,8 @@ from d3_candidate_bundle import (
 SCHEMA_VERSION = 1
 MAX_JSON_BYTES = 1024 * 1024
 MAX_PROCESS_OUTPUT_BYTES = 1024 * 1024
+D2_RUN_MAX_ENTRIES = 10000
+D2_RUN_MAX_BYTES = 64 * 1024 * 1024
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,191}$")
@@ -2161,6 +2163,132 @@ def d2_metadata_identity(metadata):
     )
 
 
+def d2_run_tree_identity(root):
+    digest = hashlib.sha256()
+    entries = 0
+    total_bytes = 0
+    try:
+        root_before = root.lstat()
+    except OSError as error:
+        fail(f"d2_run_tree_unavailable:{error.__class__.__name__}")
+    if (
+        not stat.S_ISDIR(root_before.st_mode)
+        or root.is_symlink()
+        or root_before.st_uid != os.getuid()
+        or stat.S_IMODE(root_before.st_mode) & 0o022
+    ):
+        fail("d2_run_tree_entry_invalid")
+    paths = []
+    try:
+        for path in root.rglob("*"):
+            paths.append(path)
+            if len(paths) > D2_RUN_MAX_ENTRIES:
+                fail("d2_run_tree_too_large")
+    except OSError as error:
+        fail(f"d2_run_tree_unavailable:{error.__class__.__name__}")
+    paths.sort(key=lambda path: str(path.relative_to(root)))
+    metadata_fence = []
+    for path in paths:
+        relative = str(path.relative_to(root))
+        try:
+            relative.encode("utf-8")
+        except UnicodeEncodeError:
+            fail("d2_run_tree_entry_invalid")
+        try:
+            before = path.lstat()
+        except OSError as error:
+            fail(f"d2_run_tree_entry_unavailable:{error.__class__.__name__}")
+        mode = stat.S_IMODE(before.st_mode)
+        if (
+            path.is_symlink()
+            or before.st_uid != os.getuid()
+            or mode & 0o022
+            or not relative
+            or "\x00" in relative
+        ):
+            fail("d2_run_tree_entry_invalid")
+        entries += 1
+        if entries > D2_RUN_MAX_ENTRIES:
+            fail("d2_run_tree_too_large")
+        if stat.S_ISDIR(before.st_mode):
+            kind = "directory"
+            size = 0
+        elif stat.S_ISREG(before.st_mode):
+            if before.st_nlink != 1:
+                fail("d2_run_tree_entry_invalid")
+            kind = "file"
+            size = before.st_size
+        else:
+            fail("d2_run_tree_entry_invalid")
+        if total_bytes + size > D2_RUN_MAX_BYTES:
+            fail("d2_run_tree_too_large")
+        header = canonical_json(
+            {
+                "path": relative,
+                "kind": kind,
+                "mode": mode,
+                "uid": before.st_uid,
+                "device": before.st_dev,
+                "inode": before.st_ino,
+                "size": size,
+                "mtime_ns": before.st_mtime_ns,
+                "ctime_ns": before.st_ctime_ns,
+            }
+        ).encode("utf-8")
+        digest.update(len(header).to_bytes(8, "big"))
+        digest.update(header)
+        flags = os.O_RDONLY
+        if kind == "directory" and hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            fail(f"d2_run_tree_entry_unavailable:{error.__class__.__name__}")
+        observed = 0
+        try:
+            if kind == "file":
+                remaining = size
+                while remaining:
+                    chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    observed += len(chunk)
+                    remaining -= len(chunk)
+                    digest.update(chunk)
+                if os.read(descriptor, 1):
+                    fail("d2_run_tree_changed_during_read")
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (
+            observed != size
+            or d2_metadata_identity(before) != d2_metadata_identity(after)
+        ):
+            fail("d2_run_tree_changed_during_read")
+        metadata_fence.append((path, d2_metadata_identity(after)))
+        total_bytes += size
+    for path, identity in metadata_fence:
+        try:
+            final = path.lstat()
+        except OSError:
+            fail("d2_run_tree_changed_during_read")
+        if d2_metadata_identity(final) != identity:
+            fail("d2_run_tree_changed_during_read")
+    try:
+        root_after = root.lstat()
+    except OSError:
+        fail("d2_run_tree_changed_during_read")
+    if d2_metadata_identity(root_before) != d2_metadata_identity(root_after):
+        fail("d2_run_tree_changed_during_read")
+    return {
+        "d2_run_entries": entries,
+        "d2_run_total_bytes": total_bytes,
+        "d2_run_tree_sha256": digest.hexdigest(),
+    }
+
+
 def capture_d2_run_identity(manifest_path, run_id, manifest_digest):
     manifest_path = absolute_path(manifest_path, "d2_manifest")
     if manifest_path.name != "manifest.json":
@@ -2186,6 +2314,7 @@ def capture_d2_run_identity(manifest_path, run_id, manifest_digest):
         abort_teardown_path
     ):
         fail("candidate_start_transition_retirement_required")
+    tree_before = d2_run_tree_identity(run_directory)
     manifest = load_json_file(manifest_path, "d2_manifest", 0o600)
     if (
         not isinstance(manifest, dict)
@@ -2201,23 +2330,54 @@ def capture_d2_run_identity(manifest_path, run_id, manifest_digest):
     orchestrator_after = require_directory(
         orchestrator_directory, "d2_orchestrator_directory", 0o700
     )
+    tree_after = d2_run_tree_identity(run_directory)
+    manifest_final = require_regular(manifest_path, "d2_manifest", 0o600)
+    directory_final = require_directory(
+        run_directory, "d2_run_directory", 0o700
+    )
+    orchestrator_final = require_directory(
+        orchestrator_directory, "d2_orchestrator_directory", 0o700
+    )
+    tree_final = d2_run_tree_identity(run_directory)
+    manifest_sealed = require_regular(manifest_path, "d2_manifest", 0o600)
+    directory_sealed = require_directory(
+        run_directory, "d2_run_directory", 0o700
+    )
+    orchestrator_sealed = require_directory(
+        orchestrator_directory, "d2_orchestrator_directory", 0o700
+    )
     if (
         d2_metadata_identity(manifest_before)
         != d2_metadata_identity(manifest_after)
+        or d2_metadata_identity(manifest_after)
+        != d2_metadata_identity(manifest_final)
+        or d2_metadata_identity(manifest_final)
+        != d2_metadata_identity(manifest_sealed)
         or d2_metadata_identity(directory_before)
         != d2_metadata_identity(directory_after)
+        or d2_metadata_identity(directory_after)
+        != d2_metadata_identity(directory_final)
+        or d2_metadata_identity(directory_final)
+        != d2_metadata_identity(directory_sealed)
         or d2_metadata_identity(orchestrator_before)
         != d2_metadata_identity(orchestrator_after)
+        or d2_metadata_identity(orchestrator_after)
+        != d2_metadata_identity(orchestrator_final)
+        or d2_metadata_identity(orchestrator_final)
+        != d2_metadata_identity(orchestrator_sealed)
+        or tree_before != tree_after
+        or tree_after != tree_final
         or os.path.lexists(retirement_path)
         or os.path.lexists(abort_teardown_path)
     ):
         fail("d2_run_identity_changed")
     return {
         "d2_manifest_path": str(manifest_path),
-        "d2_run_directory_device": directory_after.st_dev,
-        "d2_run_directory_inode": directory_after.st_ino,
-        "d2_orchestrator_directory_device": orchestrator_after.st_dev,
-        "d2_orchestrator_directory_inode": orchestrator_after.st_ino,
+        "d2_run_directory_device": directory_sealed.st_dev,
+        "d2_run_directory_inode": directory_sealed.st_ino,
+        "d2_orchestrator_directory_device": orchestrator_sealed.st_dev,
+        "d2_orchestrator_directory_inode": orchestrator_sealed.st_ino,
+        **tree_final,
     }
 
 
@@ -2235,6 +2395,14 @@ def require_active_d2_binding(binding):
         or binding["d2_orchestrator_directory_device"] < 0
         or type(binding.get("d2_orchestrator_directory_inode")) is not int
         or binding["d2_orchestrator_directory_inode"] <= 0
+        or type(binding.get("d2_run_entries")) is not int
+        or binding["d2_run_entries"] <= 0
+        or binding["d2_run_entries"] > D2_RUN_MAX_ENTRIES
+        or type(binding.get("d2_run_total_bytes")) is not int
+        or binding["d2_run_total_bytes"] <= 0
+        or binding["d2_run_total_bytes"] > D2_RUN_MAX_BYTES
+        or not isinstance(binding.get("d2_run_tree_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(binding["d2_run_tree_sha256"])
     ):
         fail("d2_binding_run_identity_invalid")
     observed = capture_d2_run_identity(
@@ -2490,6 +2658,9 @@ def load_binding(root, state):
         "d2_run_directory_inode",
         "d2_orchestrator_directory_device",
         "d2_orchestrator_directory_inode",
+        "d2_run_entries",
+        "d2_run_total_bytes",
+        "d2_run_tree_sha256",
         "steps",
         "receipt_chain_head_sha256",
         "coordinator_evidence_sha256",
@@ -2510,6 +2681,7 @@ def load_binding(root, state):
     ):
         fail("d2_binding_identity_invalid")
     validate_digest(binding["manifest_sha256"], "d2_binding_manifest")
+    validate_digest(binding["d2_run_tree_sha256"], "d2_binding_run_tree")
     validate_digest(
         binding["gate_evidence_chain_head_sha256"], "d2_binding_gate_chain"
     )

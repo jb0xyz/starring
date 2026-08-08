@@ -1991,6 +1991,114 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertIn("d2_receipt_sequence_invalid", error)
         self.assertEqual(gates, list(MODULE.REQUIRED_GATE_COMMANDS))
 
+    def test_d2_binding_rejects_bound_run_tree_drift(self):
+        state_path, _, _ = self.prepare()
+        manifest_path, final_path = self.make_d2(state_path)
+        status, binding, error = self.invoke(
+            [
+                "bind-d2",
+                "--state",
+                str(state_path),
+                "--d2-manifest",
+                str(manifest_path),
+                "--d2-final-record",
+                str(final_path),
+            ]
+        )
+        self.assertEqual(status, 0, error)
+        write(
+            manifest_path.parent / "orchestrator" / "unbound-evidence.json",
+            "{}\n",
+            0o600,
+        )
+        with self.assertRaisesRegex(
+            MODULE.D3Error,
+            "d2_binding_run_identity_changed",
+        ):
+            MODULE.require_active_d2_binding(binding)
+
+    def test_d2_run_tree_rejects_entry_overflow_during_enumeration(self):
+        root = self.root / "d2-entry-bound"
+        root.mkdir(mode=0o700)
+        for index in range(3):
+            write(root / f"entry-{index}", "x", 0o600)
+        with mock.patch.object(
+            MODULE, "D2_RUN_MAX_ENTRIES", 2
+        ), self.assertRaisesRegex(MODULE.D3Error, "d2_run_tree_too_large"):
+            MODULE.d2_run_tree_identity(root)
+
+    def test_d2_run_tree_rejects_oversized_file_before_read(self):
+        root = self.root / "d2-byte-bound"
+        root.mkdir(mode=0o700)
+        oversized = root / "oversized"
+        with oversized.open("wb") as stream:
+            stream.truncate(MODULE.D2_RUN_MAX_BYTES + 1)
+        oversized.chmod(0o600)
+        with mock.patch.object(
+            MODULE.os, "read", wraps=MODULE.os.read
+        ) as read, self.assertRaisesRegex(
+            MODULE.D3Error, "d2_run_tree_too_large"
+        ):
+            MODULE.d2_run_tree_identity(root)
+        read.assert_not_called()
+
+    def test_d2_run_tree_bounds_a_file_appended_during_read(self):
+        root = self.root / "d2-append-bound"
+        root.mkdir(mode=0o700)
+        target = root / "growing"
+        write(target, "x", 0o600)
+        real_read = MODULE.os.read
+        appended = False
+
+        def append_after_read(descriptor, length):
+            nonlocal appended
+            value = real_read(descriptor, length)
+            if value and not appended:
+                appended = True
+                with target.open("ab") as stream:
+                    stream.write(b"y")
+            return value
+
+        with mock.patch.object(
+            MODULE.os,
+            "read",
+            side_effect=append_after_read,
+        ), self.assertRaisesRegex(
+            MODULE.D3Error, "d2_run_tree_changed_during_read"
+        ):
+            MODULE.d2_run_tree_identity(root)
+
+    def test_d2_run_identity_rejects_entry_added_after_final_tree_scan(self):
+        state_path, _, _ = self.prepare()
+        manifest_path, _final_path = self.make_d2(state_path)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        digest = (manifest_path.parent / "manifest.sha256").read_text(
+            encoding="ascii"
+        ).strip()
+        nested = manifest_path.parent / "orchestrator" / "nested"
+        nested.mkdir(mode=0o700)
+        real_identity = MODULE.d2_run_tree_identity
+        calls = 0
+
+        def raced_identity(root):
+            nonlocal calls
+            value = real_identity(root)
+            calls += 1
+            if calls == 2:
+                write(nested / "late-entry.json", "{}\n", 0o600)
+            return value
+
+        with mock.patch.object(
+            MODULE,
+            "d2_run_tree_identity",
+            side_effect=raced_identity,
+        ), self.assertRaisesRegex(MODULE.D3Error, "d2_run_identity_changed"):
+            MODULE.capture_d2_run_identity(
+                manifest_path,
+                manifest["run_id"],
+                digest,
+            )
+
     def test_d2_binding_rejects_candidate_start_retirement(self):
         state_path, _, _ = self.prepare()
         manifest_path, final_path = self.make_d2(state_path)
