@@ -246,6 +246,23 @@ part of worker maintenance. `local.cloudflared.starring` may carry the product
 API route and is also outside worker ownership. The Codex worker remains a
 private dependency at `127.0.0.1:18181` and must never become a tunnel origin.
 
+The worker is independently degradable. If its startup preflight, exact model
+identity, bearer authentication, capacity admission, timeout, response shape,
+or child-process cleanup fails, the API may keep independently healthy product
+routes available while authoring returns only its stable redacted error.
+Authoring cannot borrow a core database pool, call Codex directly, substitute
+Gemma or another provider, hot-add a recovered worker, or bypass worker
+validation. Repair the worker, prove its exact health contract and idle
+counters, then restart the API so authoring is recomposed deliberately.
+
+For a release candidate, inject worker absence, invalid identity, queue
+saturation, timeout, malformed output, and restart one at a time. Require no
+generation-head advance on failure, exact replay without another model call
+after a committed result, and no orphaned Codex process. Retain only stable
+classifications, worker source and process identities, capacity values,
+monotonic counter deltas, and timing. Never retain the bearer, login material,
+prompt, transcript, tool arguments, or raw model response.
+
 ## Service verification
 
 ```zsh
@@ -278,6 +295,12 @@ worker is available, leave authoring degraded while independently healthy core
 API operations continue, or close the API according to its runbook. Do not
 move port `18181` into Cloudflare, reuse the API's port `18080`, or substitute a
 different provider behind the Luna identity.
+
+A D2 run seals its own worker tree and process identity, uses one unique worker
+credential, and joins worker counters to the one-shot authoring receipt. The
+standing worker and the historical V15 matrix cannot satisfy that gate. D3
+repeats the Node worker checks on the exact GitHub merge-candidate tree; merged
+main is accepted only after its byte-identical tree and push CI are proven.
 
 ## Routine operations
 

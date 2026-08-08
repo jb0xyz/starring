@@ -394,18 +394,21 @@ persistence and Discord I/O.
   `starring-staging-authority-operator`. `codex-worker` is a separate private
   loopback ChatGPT-login Codex service rather than a workspace member.
 
-Persistence is 117 ordered migrations under `/migrations`, ending at
-`202608010002_fix_runtime_interaction_effect_response_tail_scan_v1.sql`,
+Persistence is 125 ordered migrations under `/migrations`, ending at
+`202608040004_refresh_serving_pending_product_drain_readiness_v1.sql`,
 including the
 original instance and RuleSet stores, product-bound activation context and
 terminal states, the authoring promotion journal, atomic Product Apply and
 runtime deployment, runtime convergence, current-versus-historical binding
 separation, artifact integrity, exclusive product-slot ownership, scoped
 installation-authority reads, scoped product-session authentication, durable
-interaction receipts, the per-effect recovery journal, and the additive
-response-tail recovery-scan correction. Migration 117 changes no table or
-capability count; it preserves the function signature, owner, ACL, and security
-attributes while replacing the invalid qualified `greatest` expression.
+interaction receipts, the per-effect recovery journal, the additive
+response-tail recovery-scan correction, runtime-certification status evidence,
+ACK-first effect-plan binding, and fail-closed pending-product drain
+observation and readiness refreshes. The repository manifest remains exactly
+198 owned user-schema relations and 137 capability functions. Migration 117 is
+the historical response-tail repair described by the D1 measurement; the eight
+later migrations do not relabel that historical candidate or measurement.
 
 ## Durable RuleSet Lifecycle
 
@@ -440,9 +443,10 @@ Legacy and manual RuleSet pointers change only through the activation authority
 (`automation-ruleset-activation`). No normal CLI, API, or runtime path calls its
 low-level activation (`activate_if_ready` / `RuleSetStore::activate`) directly;
 guard tests enforce the allowlist. A legacy activation is a durable request
-bound to an immutable target (guild, key, version, content hash); it requires a
-quorum of **distinct** approver identities supplied by its trusted caller (the
-requester cannot self-approve). Its leased apply service re-verifies the target
+bound to an immutable target (guild, key, version, content hash); it requires the
+policy-stored quorum of **distinct** approver identities supplied by its trusted
+caller. The requester may count as one approver, including the supported solo
+quorum-one policy. Its leased apply service re-verifies the target
 and runs a **fresh** readiness check before mutating the pointer, while
 per-request and per-`(guild, key)` CAS converge crashes and concurrent
 execution. A development-only `unsafe-dev-activate` escape is
@@ -554,8 +558,9 @@ Stated as capabilities (durable across the phase numbering):
 - Preallocated instance identity with a complete, owned resource footprint.
 - Resumable, idempotent instance teardown.
 - Live-proven durable RuleSet rollback.
-- Normal-build approval-bound legacy/manual activation authority (two-person,
-  leased, fresh-readiness-at-apply) that rejects product-owned slots.
+- Normal-build approval-bound legacy/manual activation authority (policy-bound
+  distinct quorum, requester participation allowed, leased,
+  fresh-readiness-at-apply) that rejects product-owned slots.
 - PreviewReady-to-approval promotion core: exact inactive publication,
   idempotent durable journal, product-bound approval payload, two-layer journal
   link gate, and no active-pointer mutation during publication or promotion.
@@ -726,6 +731,88 @@ Stated as capabilities (durable across the phase numbering):
   journal and resumes idempotently across a partial final-artifact write.
 - CI guarding the cross-crate safety invariants.
 
+## Backend V1 Release Boundary
+
+The current source inventory is exact at this checkpoint:
+
+| Item | Source contract |
+| --- | --- |
+| Crate manifests | 48 under `crates/` |
+| Workspace Rust tool manifests | 10 under `tools/` |
+| Workspace members | 58 |
+| Total Rust tool manifests | 11, including standalone `d2-certification-transport` |
+| Top-level tool directories | 15 |
+| SQL migrations | 125 |
+| Migration head | `202608040004_refresh_serving_pending_product_drain_readiness_v1.sql` |
+| Owned user-schema relations | 198 |
+| Capability functions | 137 |
+| Application database logins | 20: 15 API and 5 runtime |
+| API pools | 14 mandatory core plus 1 independently admitted writer |
+| Runtime pools | 5, with a default total connection ceiling of 10 |
+| Standing managed Keychain items | 28 |
+| Purpose-separated keyrings | 3 |
+| Final integrated HBA | 15 ordered rules |
+| PostgreSQL release commands | 13 explicit serial suites |
+| D3 ordered local gate commands | 29 exact commands before D2 evidence binding |
+| D2 Keychain boundary | 29 run-owned items plus 3 external read-only items |
+
+This is an implementation and inventory statement, not a Backend V1 release
+certificate. D2 must still produce all 17 ordered disposable-guild receipts on
+the exact candidate tree. D3 must then pass the complete local, Node,
+evaluator, D2 Python, product-driver Node, standalone certification-transport,
+13-command PostgreSQL, and D2 gates on GitHub's exact merge-candidate tree. Its
+canonical `github.com` repository identity and ordered 29-command manifest are
+immutable release inputs. D3 must prove the merged-main tree is identical and
+observe green `checks` and `postgres` push jobs on that main merge commit. D4
+documentation is a required part of that candidate; updating it cannot make D2
+or D3 true.
+
+D2 step 9 binds one manifest actor and the exact created instance across visible
+Chrome observation, completed create and join receipts, one successful created
+role membership in each path, one successful ephemeral acknowledgement per
+receipt, and one-role/one-channel/one-panel transport inventory. Step 15 binds
+one durable partition and one durable heal to the same transport process, exact
+fault counter, the exact public `200/200` product `pending`, operational
+`pending`, runtime `live`, serving `disconnected` projection with
+`runtime_gateway_disconnected` and `retryable=true`, restored readiness, and
+cleared fault arms. Step 16 begins from the sealed step-15 coordinator completion and a
+durable freeze intent; step 17 is chronologically later than step 16 and joins
+database, Chrome prefix, Chrome guild, and orchestrator absence. Standalone
+teardown is an abort path and permanently disqualifies that run.
+
+D2 steps 5–7 are now causally separated. Step 5 binds the one public authoring
+turn and exact Luna worker request to a worker before/after time window. Step 6
+joins that public PreviewReady candidate to the exact encrypted database
+generation and creation time. Only after the step-6 coordinator completion may
+step 7 reload the same session, bind the promotion target content hash to that
+candidate, show the human preview, approve, and Apply. A combined pre-completion
+one-shot result cannot certify these boundaries.
+
+Authoring is independently degradable. General API readiness may remain green
+when the isolated writer or loopback Luna worker is unavailable, but authoring
+must return only its stable redacted failure and may recover only after the
+dependency preflights and a controlled API restart. Runtime ambiguity is not a
+retry hint: an uncorrelatable mutable effect becomes durable
+`recovery_required`, blocks only the affected route, and may be resolved only
+by deterministic observation or exact-preimage bounded compensation.
+
+Routine diagnosis retains redacted projections only. Duplicate receipt health
+is process-local and must be paired with the durable final receipt/effect state
+and external resource observation. Recovery inspection may retain block code,
+action kind, aggregate count, and time bounds. D2 inspection may retain closed
+authoring, route, serving-lease, effect-journal, and resource-inventory
+envelopes plus their canonical digests. It must not retain credentials,
+database URLs, cookies, CSRF values, interaction tokens, prompts, transcripts,
+RuleSet payloads, or raw effect inputs and preimages.
+
+Backend V1 scope is one Mac mini, one canonical Discord shard, one product
+recipe (`starring.private_study_room@1`), synchronous bounded Luna-medium
+authoring, and the existing human preview, approval, and Apply boundaries. It
+does not include a frontend, arbitrary recipes or Discord games, an
+installation-management API, multi-shard serving, multi-host high
+availability, a durable asynchronous authoring queue, full production secret
+isolation, or a high-volume production SLO certificate.
+
 ## What Is Not Yet Built
 
 - A frontend authoring UI. The authenticated conversational authoring API exists,
@@ -866,11 +953,11 @@ Stated as capabilities (durable across the phase numbering):
 ## Next Phase: Prove Commercial Operation
 
 Phase A A1–A6, Phase B B1–B6, and the Phase C source implementation are
-complete. The API has fourteen core pools and one isolated writer pool; the
-retained integrated staging cluster has 20 application credentials, three
-keyrings, 28 total Keychain items, a 15-rule HBA, 117 migration-ledger entries
-through `202608010002`, and authority revision 2
-`community_hub` binding. The live signed-in gate proved one-shot and resumed
+complete. The current source has 125 migrations through `202608040004`, while
+the retained D1 staging evidence is explicitly historical at 117 migrations
+through `202608010002`. That D1 environment had 20 application credentials,
+three keyrings, 28 total Keychain items, a 15-rule HBA, and authority revision
+2 `community_hub` binding. The live signed-in gate proved one-shot and resumed
 multi-turn authoring, three encrypted durable generations, authenticated read,
 and exact PreviewReady promotion. The B6 gate then proved approval, Apply,
 RuntimePending-to-Live convergence, real Discord resource effects, restart

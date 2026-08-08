@@ -10,6 +10,13 @@ not itself evidence that a later source tree, migration, binary, backup, or
 disposable-guild cohort passed. Re-run the applicable blocks and retain a new
 acceptance record for every replacement environment.
 
+The current source contract is 125 migrations through
+`202608040004_refresh_serving_pending_product_drain_readiness_v1.sql`, 198
+owned user-schema relations, 137 capability functions, 20 application roles,
+and the unchanged 28-item standing Keychain and 15-rule final HBA boundaries.
+Dated receipts keep their original counts; they are not evidence for this
+current source tree.
+
 This cutover creates a disposable, dedicated PostgreSQL 16 staging cluster for
 the Starring API and serving runtime on one Mac mini. The runtime can converge
 an exact Requested deployment and serve an admitted route, but process
@@ -184,6 +191,13 @@ items. The application plists reference only their own twenty URLs, the three
 Discord provider items, the authoring-worker item, the two API keyrings, and
 the runtime interaction-token keyring. They never reference the administrator
 URL.
+
+These 28 items are the standing staging inventory. A D2 disposable run uses a
+different manifest-derived boundary: 29 run-owned items, including ownership
+markers, and three external read-only items for Discord OAuth, the dedicated
+bot, and the fixed tunnel. D2 must prove all 29 run-owned items absent during
+cleanup and all three external items preserved. Never point a D2 manifest at a
+standing service/account identity.
 
 The cluster-administrator password is generated only by the one-shot
 provisioner and is never typed or exported. `starring_owner` has no password.
@@ -905,7 +919,7 @@ of cluster-administrator normalization. It creates no migrator login.
     "$STARRING_STAGING_DEDICATED_CLUSTER_ACKNOWLEDGEMENT" \
     >"$STARRING_CUTOVER_EVIDENCE/starring-db-bootstrap.txt"
   grep -E \
-    '^database=starring_runtime_staging owner=starring_owner migrations=121 relations=198 capability_functions=137$' \
+    '^database=starring_runtime_staging owner=starring_owner migrations=125 relations=198 capability_functions=137$' \
     "$STARRING_CUTOVER_EVIDENCE/starring-db-bootstrap.txt" >/dev/null
 )
 ```
@@ -1877,7 +1891,7 @@ in the component runbooks.
 
 This subsection is an archived migration-89 receipt procedure. It is retained
 only to interpret the original nineteen-role cutover evidence and must not be
-run against the current 117-migration source or staging database. Current
+run against the current 125-migration source or staging database. Current
 environments use the complete twenty-role verifier and the additive receipt and
 effect ACL procedures in the runtime operations runbook.
 
@@ -2725,7 +2739,7 @@ The cutover is accepted only when a change record contains all of these facts:
 - exact seven-rule bootstrap HBA and ident proof, final fifteen-rule HBA
   proof, peer-removal proof, and physical replication rejection;
 - immutable bootstrap and provisioner binary SHA-256 values;
-- embedded bootstrap receipt with 121 migrations, 198 relations, and 137
+- embedded bootstrap receipt with 125 migrations, 198 relations, and 137
   capability functions;
 - exact migration ledger diff with no difference;
 - exact database, `public` schema, ledger, relation, routine, and type ownership
@@ -2944,6 +2958,38 @@ Do not delete the failed new cluster, the old-cluster evidence, the
 new administrator/application/keyring Keychain items, or any retained
 provider item until the rollback owner closes the rollback window. Secret
 deletion and archive retention are separate reviewed follow-up operations.
+
+## Phase D release handoff
+
+This infrastructure cutover and its acceptance record precede, but do not
+replace, D2 and D3. Freeze the final PR head and base, fetch GitHub's generated
+merge candidate, and build the API, runtime, database bootstrap, sealed
+provisioner, certification transport, worker tree, and external executables
+from or for that exact tree. Run the 17-step D2 cohort with a new disposable
+database and guild. The create/join receipt must cross-bind Chrome, completed
+database receipts and successful role membership, and the exact transport
+inventory. Gateway loss must include a durable same-instance heal. Teardown
+must freeze only after step 15 and total absence must occur after step 16.
+
+The Git origin must be a canonical `github.com` HTTPS or SSH repository that
+matches the D3 owner and repository. Then run the exact ordered 29-command
+local manifest, including the D2 Python coordinator, product-driver Node,
+standalone certification-transport format/test/Clippy, evaluator, workspace,
+and 13 serial PostgreSQL gates, on that same tree. Any missing, added,
+duplicated, changed, or reordered command invalidates the candidate.
+
+Merge only if the head and base remain unchanged. The resulting `main` tree
+must equal the certified merge-candidate tree, and both `checks` and `postgres`
+push jobs must be green on that exact merge commit. Commit, tree, D2 run, receipt
+chain, PR, merge, and workflow-run identities are retained outside the tracked
+tree in immutable certification evidence; their current value is `pending`
+until the provider and completed D2 run supply it.
+
+The certified scope, if those gates pass, is one Mac mini, one canonical shard,
+and `starring.private_study_room@1`. This runbook does not certify a frontend,
+arbitrary recipes or games, installation administration, multi-shard or
+multi-host availability, a durable asynchronous authoring queue, production
+secret isolation from the logged-in user, or a high-volume production SLO.
 
 ## End state
 

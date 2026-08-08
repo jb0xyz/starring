@@ -320,6 +320,11 @@ removing security, restart, failure, or release gates.
 - [ ] Open one final PR, certify its merge candidate, merge, and certify the
   resulting main merge commit
 
+The D4 documentation slice is prepared against the current source inventory,
+but its checkbox remains open until D2 and D3 provide final external evidence.
+Documentation is not a substitute for a completed disposable-guild receipt
+chain, an exact merge-candidate tree, or merged-main push CI.
+
 ## Phase A: trusted authoring
 
 ### Task A1: Extract the reusable Codex worker client
@@ -1274,6 +1279,27 @@ Evidence records:
 - Restart and injected-failure checkpoints
 - Cleanup result
 
+Each step must be assembled from the least-authoritative evidence needed for
+that assertion. Browser evidence proves only the authenticated public product
+projection. The sealed provisioner supplies read-only repeatable-read
+`authoring`, `live`, `interaction`, `duplicate`, `restart`, `reconciliation`,
+`replacement`, `precleanup`, and `absence` database envelopes. The
+certification transport supplies a bounded,
+sorted Created-to-Deleted resource history and canonical inventory digest for
+manifest-owned roles, channels, and panel messages. Fault evidence is pinned to
+the exact transport process instance. Visible Discord confirmation remains a
+human boundary. No one source can synthesize another source's claim.
+
+The interaction checkpoint requires the manifest actor, distinct create and
+join receipts, the exact created instance and role, one successful role
+membership effect and ephemeral acknowledgement in each path, exact visible
+Chrome observations, and an exact one-role/one-channel/one-panel transport
+inventory. Gateway loss requires one durable partition and one durable heal on
+the same pinned transport instance. Certified teardown starts only after step
+15 completion is sealed, freezes its resource inventory before shutdown and
+deletion, and requires step 17 absence evidence to occur after the exact step
+16 coordinator completion. Standalone teardown is an abort path.
+
 Evidence excludes:
 
 - OAuth or worker tokens
@@ -1302,7 +1328,18 @@ npm --prefix eval/codex-worker-slo run check
 npm --prefix eval/design-harness ci
 npm --prefix eval/design-harness run audit
 npm --prefix eval/design-harness run check
+python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'
+node --test tools/d2-certification/product_driver.test.mjs
+cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check
+cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml
+cargo clippy --locked --manifest-path tools/d2-certification-transport/Cargo.toml --all-targets -- -D warnings
 ```
+
+These sixteen commands and the thirteen serial PostgreSQL commands below form
+one exact ordered 29-command D3 manifest. The manifest is immutable: a missing,
+added, duplicated, changed, or reordered command fails certification. The
+release origin must also be a canonical `github.com` HTTPS or SSH repository
+whose owner and repository exactly match the D3 invocation.
 
 The release PostgreSQL manifest is explicit and serial:
 
@@ -1328,9 +1365,10 @@ storage, effect journals, and recovery belong to
 `automation-runtime-interaction-postgres`. If implementation creates a new
 standalone PostgreSQL test target, add its exact command to this manifest.
 
-Update `.github/workflows/ci.yml` so every command in this manifest is required
-in the PostgreSQL job. Do not rely on an undocumented wildcard or prose claim
-that every integration test ran.
+Update `.github/workflows/ci.yml` so the first 16 commands are required in the
+`checks` job and the 13 PostgreSQL commands are required serially in the
+`postgres` job. Do not rely on an undocumented wildcard or prose claim that
+every integration test ran.
 
 Merge only while the PR base is unchanged. After merge:
 
@@ -1362,6 +1400,28 @@ Work:
   projections
 - Document rollback, shutdown, backup, restore, and failure drills
 - Keep unsupported recipes and remaining limitations explicit
+
+The current source contract to project into the operational documents is 48
+crate manifests, 10 workspace Rust tool manifests, 58 workspace members, 11
+total Rust tool manifests including the standalone certification transport, 15
+top-level tool directories, 125 ordered migrations through
+`202608040004_refresh_serving_pending_product_drain_readiness_v1.sql`, 198
+owned user-schema relations, 137 capability functions, 20 application database
+roles, 14 mandatory API pools plus one independently admitted authoring writer,
+five runtime pools with a default total ceiling of ten connections, 28 standing
+managed Keychain items, three keyrings, and fifteen final HBA rules. D2 owns 29
+temporary Keychain items and references three external items without copying or
+deleting them.
+
+Preserve older measured inventories inside their dated evidence. In
+particular, the D1 candidate remains a 117-migration, 135-function historical
+measurement; it must not be rewritten as if it ran the current tree.
+
+Final run, PR, merge-candidate, merged-main, and CI identities belong in
+immutable external certification evidence. A source document cannot contain
+its own final commit or tree without changing that identity. Until the external
+record supplies them, their factual value is `pending`; no placeholder may be
+interpreted as a pass.
 
 Commit:
 

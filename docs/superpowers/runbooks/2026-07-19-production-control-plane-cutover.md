@@ -12,12 +12,19 @@ The current `starring-api` is a staging control plane. It can authenticate
 product users and carry authoring, promotion, approval, rejection, Apply, and
 status requests through the verified control boundary. The staging runtime can
 converge an exact deployment to Live and serve the supported recipe; B6 proved
-one bounded standing-fixture path. Phase D restart, injected-failure,
-disposable-guild, exact merge-candidate, and merged-main certification remain
-incomplete. Do not connect this slice to a customer guild or advertise
+one bounded standing-fixture path. D1 restart and source-level injected-failure
+cohorts are complete. The D2 disposable-guild sequence, exact D3
+merge-candidate gate, and merged-main certification remain incomplete. Do not
+connect this slice to a customer guild or advertise
 commercial production automation. The current continuation state is recorded
 in the
 [Commercial certification Phase D handoff](../handoffs/2026-08-01-commercial-certification-phase-d-handoff.md).
+
+The current repository contract is 125 ordered migrations through
+`202608040004_refresh_serving_pending_product_drain_readiness_v1.sql`, 198
+owned user-schema relations, and 137 capability functions. Dated D1 evidence at
+117 migrations and 135 functions remains historical and must not be rewritten
+or used as evidence for the current candidate.
 
 ## Required operators and credentials
 
@@ -736,6 +743,25 @@ without starving business work. Until that evidence defines an operational
 margin and alert threshold, the template pool size, 30/10-second core schedule,
 and five-second authoring startup deadlines are staging defaults rather than a
 production SLO.
+
+### Runtime recovery-required boundary
+
+An API process or product status response must never reinterpret a runtime
+`recovery_required` effect as retryable authoring, approval, or Apply work. The
+affected route remains blocked while independently healthy routes retain only
+their own authority. Operators inspect the redacted aggregate through
+`ops/postgres/staging-runtime-interaction-effect-inspection.sql` and the runtime
+runbook. That repeatable-read projection emits only block code, action kind,
+count, and time bounds after verifying the exact 125-entry ledger and schema
+manifest. A zero-row result proves only that snapshot; a nonzero result is not
+permission to edit a receipt or effect table, replay a Discord mutation, or
+delete a resource manually.
+
+Recovery proceeds only through deterministic observation of the journaled
+postimage or bounded compensation with the exact retained preimage. If the
+runtime cannot establish that identity, keep the route closed and escalate the
+stable block code. API rollback, API restart, or a new idempotency key cannot
+clear this state.
 
 Cloudflare Tunnel is a separate service and may be enabled only after local
 readiness is green. Route it to the loopback address, keep its credentials in
@@ -2286,6 +2312,11 @@ recovery procedure.
   listener address, liveness/readiness status codes, and stable redacted exit
   classification
 - backup and restore-drill identifiers
+- redacted duplicate-receipt counter deltas paired with durable final-state and
+  external-resource evidence
+- redacted recovery block groups and the validated migration-ledger identity
+- D2 sealed checkpoint kinds, canonical resource-inventory digest, and
+  Created-to-Deleted aggregate counts for manifest-owned resources only
 
 Do not retain credentials, raw OAuth state, cookies, session or CSRF digests,
 derived comparison tags, raw idempotency keys, RuleSet JSON, or user message

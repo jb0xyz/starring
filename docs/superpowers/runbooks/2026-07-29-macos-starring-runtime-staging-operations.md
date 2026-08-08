@@ -17,6 +17,12 @@ that a particular installation or route is Live. Use the product deployment
 status for the exact installation and promotion before describing customer
 traffic as serving.
 
+The current source contract is 125 migrations through
+`202608040004_refresh_serving_pending_product_drain_readiness_v1.sql`, 198
+owned user-schema relations, and 137 capability functions. Historical D1
+evidence at 117 migrations and 135 functions remains valid only for its dated
+candidate.
+
 ## Fixed operating contract
 
 | Item | Value |
@@ -378,11 +384,11 @@ revision.
 
 ## Backfill C3 interaction effect function ACLs
 
-Use this additive path after migration `202608010002` when an existing
+Use this additive path at migration head `202608040004` when an existing
 credentialed cluster must receive the exact effect-journal capability ACLs
 without rotating its runtime credentials or rerunning either role bootstrap.
 Keep API and runtime unloaded. The script requires cluster-wide zero client
-backends and zero prepared transactions, verifies the exact 117-entry ledger
+backends and zero prepared transactions, verifies the exact 125-entry ledger
 and migration checksum, preserves both role attribute and SCRAM-verifier
 snapshots, and rechecks quiescence before commit.
 
@@ -476,11 +482,11 @@ or token ciphertext as routine operational evidence.
 
 ## Inspect durable interaction effect recovery blocks
 
-Run this read-only inspection after migration `202608010002` is present when
+Run this read-only inspection at migration head `202608040004` when
 an interaction route remains blocked or before deciding whether manual
 recovery is appropriate. The inspection uses one repeatable-read transaction,
 validates PostgreSQL 16, the fixed staging database and dedicated cluster, the
-exact 117-entry migration ledger, and the interaction-effect schema manifest.
+exact 125-entry migration ledger, and the interaction-effect schema manifest.
 It then emits only recovery block code, action kind, aggregate count, and the
 oldest and newest block times. It never emits application, interaction,
 action, or Discord output identifiers, nor digest, correlation,
@@ -610,6 +616,77 @@ supervisor exit is also not ready. Preserve the redacted inspection result,
 repair only the classified dependency or authority, and let the reviewed
 recovery path advance durable state. Escalate any code without a documented
 operator action as a release-blocking protocol defect.
+
+## D2 sealed checkpoints and resource inventory
+
+The following boundary is for the isolated D2 database only. Never pass the
+standing staging manifest to the D2 sealed provisioner. For each applicable
+step, run the exact immutable candidate with one of the closed checkpoints and
+write stdout directly to an owner-controlled mode-`0600` evidence file:
+
+```zsh
+CHECKPOINT=authoring
+"$D2_SEALED_PROVISIONER" inspect \
+  --manifest "$D2_MANIFEST" \
+  --checkpoint "$CHECKPOINT" \
+  >"$D2_EVIDENCE/db-${CHECKPOINT}.json"
+chmod 0600 "$D2_EVIDENCE/db-${CHECKPOINT}.json"
+```
+
+At the corresponding step, replace `authoring` only with `live`, `interaction`,
+`duplicate`, `restart`, `reconciliation`, `replacement`, `precleanup`, or
+`absence`. Do not run future
+checkpoints early merely to fill files. The inspector uses a
+read-only repeatable-read transaction and validates the run, installation,
+database, role, migration, route, serving, receipt, effect, and replacement
+identity required by that checkpoint. Its envelopes are redacted projections;
+they contain no database URL, token, cookie, CSRF value, prompt, transcript,
+RuleSet, effect input, preimage, or response credential.
+
+The certification transport's private control protocol exposes one
+`starring.d2.run-owned-resource-inventory.v1` projection. It is bound to the
+transport process instance, run, guild, hub, actor, and bot; contains at most
+128 sorted role, channel, and message history entries; allows only one
+Created-to-Deleted transition per identity; derives Created, Deleted, and
+Active sets; and seals the canonical projection with SHA-256. The D2 platform
+adapter, not an ad hoc socket client, validates and collects it. Cleanup may
+observe or delete only an identity in its Created set and must retain the
+post-delete observation. A qualifying runtime deletion must also traverse the
+pinned transport so the lifecycle becomes Deleted; out-of-band absence does not
+rewrite the inventory. The final inventory must have zero Active entries. The
+guild, hub, application, actor, and bot identities are protected and can never
+be treated as run-owned child resources.
+
+An inventory is necessary but not sufficient evidence: join it to the sealed
+database checkpoint, public product envelope, fault snapshot, and visible
+Discord observation required by the numbered D2 receipt. A transport restart
+changes the instance identity and invalidates the run instead of creating a new
+empty inventory.
+
+For step 9, the sealed checkpoint must show completed create and join receipts,
+the manifest actor, the created instance, one exact successful membership of
+the created role in each path, and one successful ephemeral acknowledgement per
+receipt. The Chrome observation independently names the same actor,
+interactions, joined role, one role, one channel, and one panel message, and the
+transport inventory must match all three resource identities.
+
+For step 15, one durable partition operation and one durable heal operation
+must belong to the same pinned transport instance. The partition counter is
+exactly one; the public projection is HTTP `200/200`, product `pending`,
+operational `pending`, runtime phase `live`, serving `disconnected`, closed code
+`runtime_gateway_disconnected`, and `retryable=true` while partitioned; the heal
+completion restores readiness 200 with partition false and all duplicate and
+indeterminate arm and claim flags false.
+
+Certified cleanup begins only after the coordinator's step-15 completion is
+durable. It writes a freeze intent, stops ingress and runtime, checks that the
+resource inventory did not change across that boundary, deletes the frozen
+resources, and records step 16 before destroying the remaining run substrate.
+The generic cleanup path validates the root, journal, lock, owner, mode, and
+non-symlink identities before its first mutation. Running standalone Discord
+teardown writes an abort tombstone and permanently disqualifies the run. Step
+17 must occur after the exact step-16 completion and join database absence,
+Chrome prefix absence, Chrome guild deletion, and orchestrator absence.
 
 ## Bootstrap the five database roles
 
