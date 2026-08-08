@@ -58,6 +58,19 @@ def fixture_system_file_identity(path, _label):
     }
 
 
+def fixture_launchd_job(argv, cwd, environment, timeout, *_arguments):
+    return subprocess.run(
+        argv,
+        cwd=cwd,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    ).returncode
+
+
 class D3BootstrapSafetyTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -134,6 +147,14 @@ class D3CertificationTests(unittest.TestCase):
             self.postgres_database_url,
             0o600,
         )
+        if sys.platform != "darwin":
+            candidate_job = mock.patch.object(
+                BUNDLE.launchd_job,
+                "run_job",
+                side_effect=fixture_launchd_job,
+            )
+            candidate_job.start()
+            self.addCleanup(candidate_job.stop)
         self.create_repository()
 
     def tearDown(self):
