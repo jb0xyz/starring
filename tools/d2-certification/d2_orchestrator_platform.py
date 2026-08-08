@@ -642,7 +642,16 @@ class Platform:
         )
         if status_result.returncode == 0:
             return False
-        if status_result.returncode != 3:
+        if status_result.returncode == 4:
+            try:
+                (cluster / "PG_VERSION").lstat()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                fail("postgres_observation_failed")
+            else:
+                fail("postgres_observation_failed")
+        elif status_result.returncode != 3:
             fail("postgres_observation_failed")
         if self.postgres_pid(cluster) is not None:
             return False

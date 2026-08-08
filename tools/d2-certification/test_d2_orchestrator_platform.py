@@ -454,6 +454,29 @@ class PlatformAbsenceObservationTests(unittest.TestCase):
                 CommandPlatform([command_response(3)]).postgres_absent(cluster)
             )
 
+    def test_postgres_absence_accepts_partially_deleted_inert_cluster(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = pathlib.Path(temporary)
+            platform = CommandPlatform(
+                [
+                    command_response(4),
+                    command_response(0, b"  7 /usr/bin/python\n"),
+                    command_response(1),
+                ]
+            )
+            self.assertTrue(platform.postgres_absent(cluster))
+
+    def test_postgres_absence_rejects_status_four_for_marked_cluster(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cluster = pathlib.Path(temporary)
+            (cluster / "PG_VERSION").write_text("16\n", encoding="ascii")
+            self.assert_platform_failure(
+                "postgres_observation_failed",
+                lambda: CommandPlatform([command_response(4)]).postgres_absent(
+                    cluster
+                ),
+            )
+
     def test_postgres_absence_fails_closed_on_observation_errors(self):
         with tempfile.TemporaryDirectory() as temporary:
             cluster = pathlib.Path(temporary)
