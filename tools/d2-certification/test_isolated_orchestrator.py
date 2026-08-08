@@ -3918,12 +3918,14 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         )
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
-    def test_finalization_freeze_blocks_restart_without_retirement(self):
+    def test_effect_admission_intent_blocks_restart_without_retirement(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         ORCHESTRATOR.command_start(self.context, self.platform)
-        with mock.patch.object(
-            ORCHESTRATOR, "finalization_freeze_committed", return_value=True
-        ), self.assertRaisesRegex(
+        path = ORCHESTRATOR.effect_admission_freeze_intent_path(self.context)
+        path.parent.mkdir(mode=0o700)
+        path.write_text("{}\n", encoding="utf-8")
+        path.chmod(0o600)
+        with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError, "orchestrator_phase_invalid"
         ):
             ORCHESTRATOR.command_restart_drained_runtime(
@@ -3934,6 +3936,30 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
                 ORCHESTRATOR.candidate_start_retirement_path(self.context)
             )
         )
+        path.unlink()
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_symlink_effect_admission_intent_blocks_restart(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        path = ORCHESTRATOR.effect_admission_freeze_intent_path(self.context)
+        path.parent.mkdir(mode=0o700)
+        target = self.root / "foreign-effect-admission-intent.json"
+        target.write_text("{}\n", encoding="utf-8")
+        target.chmod(0o600)
+        path.symlink_to(target)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "orchestrator_phase_invalid"
+        ):
+            ORCHESTRATOR.command_restart_drained_runtime(
+                self.context, self.platform
+            )
+        self.assertFalse(
+            os.path.lexists(
+                ORCHESTRATOR.candidate_start_retirement_path(self.context)
+            )
+        )
+        path.unlink()
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_malformed_candidate_transition_is_irreversibly_retired(self):

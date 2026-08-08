@@ -77,6 +77,7 @@ from d2_finalization import (
     certified_teardown_binding,
     command_finalize_run as run_finalize_run,
     command_finalize_total_absence as run_finalize_total_absence,
+    effect_admission_freeze_intent_path,
     freeze_intent_path,
     require_certified_teardown_snapshot,
     require_certification_eligible_teardown,
@@ -743,6 +744,8 @@ def require_candidate_start_not_retired(
 
 
 def finalization_freeze_committed(context):
+    if os.path.lexists(effect_admission_freeze_intent_path(context)):
+        return True
     if not os.path.lexists(freeze_intent_path(context)):
         return False
     certified_teardown_binding(context)
