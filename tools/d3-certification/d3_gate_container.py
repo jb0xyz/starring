@@ -1131,9 +1131,14 @@ def start_postgres(root, index, attempt, database_url):
 
 
 def fixed_gate_command(index, command):
+    private_scratch = (
+        "umask 077 && mkdir -p /scratch/tmp/d2-runtime && "
+        "chmod 0700 /scratch/tmp /scratch/tmp/d2-runtime"
+    )
     if index == 9:
         selected = (
-            "umask 077 && mkdir -p /scratch/package /scratch/npm-cache && "
+            f"{private_scratch} && "
+            "mkdir -p /scratch/package /scratch/npm-cache && "
             "cp -R /npm-cache/. /scratch/npm-cache/ && "
             "cp /workspace/eval/design-harness/package.json "
             "/workspace/eval/design-harness/package-lock.json /scratch/package/ && "
@@ -1141,10 +1146,14 @@ def fixed_gate_command(index, command):
             "--offline --prefix /scratch/package"
         )
     elif index == 10:
-        selected = "npm --prefix eval/design-harness audit --audit-level=high"
+        selected = (
+            f"{private_scratch} && "
+            "npm --prefix eval/design-harness audit --audit-level=high"
+        )
     else:
         selected = (
-            "umask 077 && mkdir -p /scratch/cargo-home && "
+            f"{private_scratch} && "
+            "mkdir -p /scratch/cargo-home && "
             "cp /gate-cargo-config.toml /scratch/cargo-home/config.toml && "
             "chmod 0400 /scratch/cargo-home/config.toml && "
             f"{command}"

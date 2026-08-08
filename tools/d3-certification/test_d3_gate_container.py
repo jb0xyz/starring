@@ -94,8 +94,56 @@ class D3GateContainerTests(unittest.TestCase):
             for index, value in enumerate(arguments[:-1])
             if value == "--tmpfs"
         ]
-        self.assertTrue(any(value.startswith("/scratch:rw") for value in tmpfs))
+        scratch = [value for value in tmpfs if value.startswith("/scratch:rw")]
+        self.assertEqual(len(scratch), 1)
+        self.assertIn("noexec", scratch[0])
+        self.assertIn("nosuid", scratch[0])
+        self.assertIn(f"uid={os.getuid()}", scratch[0])
+        self.assertIn(f"gid={os.getgid()}", scratch[0])
+        self.assertIn("mode=0700", scratch[0])
         self.assertNotIn(str(MODULE.DOCKER_SOCKET), " ".join(arguments))
+
+    def test_every_gate_prepares_private_runtime_parent_before_work(self):
+        setup = (
+            "umask 077 && mkdir -p /scratch/tmp/d2-runtime && "
+            "chmod 0700 /scratch/tmp /scratch/tmp/d2-runtime"
+        )
+        expected_work = {
+            1: "gate-one",
+            9: "mkdir -p /scratch/package /scratch/npm-cache",
+            10: "npm --prefix eval/design-harness audit --audit-level=high",
+            12: "gate-twelve",
+            17: "gate-seventeen",
+        }
+        for index, work in expected_work.items():
+            with self.subTest(index=index):
+                command = MODULE.fixed_gate_command(
+                    index,
+                    {
+                        1: "gate-one",
+                        12: "gate-twelve",
+                        17: "gate-seventeen",
+                    }.get(index, "unused"),
+                )
+                self.assertEqual(command.count(setup), 1)
+                self.assertLess(command.index(setup), command.index(work))
+
+    def test_gate_exports_created_private_runtime_parent(self):
+        arguments = self.create_arguments(12, "none")
+        environment = {
+            arguments[index + 1]
+            for index, value in enumerate(arguments[:-1])
+            if value == "--env"
+        }
+        self.assertIn("TMPDIR=/scratch/tmp", environment)
+        self.assertIn(
+            "STARRING_D2_TEST_RUNTIME_PARENT=/scratch/tmp/d2-runtime",
+            environment,
+        )
+        self.assertIn(
+            "mkdir -p /scratch/tmp/d2-runtime",
+            arguments[-1],
+        )
 
     def test_external_audit_mounts_only_package_projection_and_scratch(self):
         arguments = self.create_arguments(10, "bridge")
