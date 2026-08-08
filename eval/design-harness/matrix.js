@@ -305,13 +305,11 @@ function finalizerIdentity(source) {
 }
 
 function sourceState(root) {
-  const commit = execFileSync('git', ['rev-parse', 'HEAD'], {
-    cwd: root,
+  const commit = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
-  const status = execFileSync('git', ['status', '--porcelain', '--untracked-files=normal'], {
-    cwd: root,
+  const status = execFileSync('git', ['-C', root, 'status', '--porcelain', '--untracked-files=normal'], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();

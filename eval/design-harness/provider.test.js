@@ -18,7 +18,8 @@ const {
 const fixtures = require('./fixtures.json');
 
 function executable(body) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'starring-provider-'));
+  const executableRoot = process.env.CARGO_TARGET_DIR || os.tmpdir();
+  const directory = fs.mkdtempSync(path.join(executableRoot, 'starring-provider-'));
   const file = path.join(directory, 'harness');
   fs.writeFileSync(file, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
   return file;
