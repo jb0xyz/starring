@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import os
 import pathlib
+import plistlib
 import re
 import signal
 import stat
@@ -20,6 +21,7 @@ from d2_certification import (
     validate_snowflake,
 )
 from d2_orchestrator_composition import (
+    compose_plists,
     configure_postgres,
     configure_postgres_bootstrap_network,
     configure_postgres_sealed_network,
@@ -326,9 +328,229 @@ def write_database_evidence(context, database_evidence):
     return publish_bootstrap_source(context, step_one_evidence, utc_now())
 
 
+def candidate_plist_identity(context, name):
+    path = service_plist_path(context, name)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail(f"candidate_{name}_plist_nofollow_unavailable")
+    flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        fail(f"candidate_{name}_plist_unavailable")
+    try:
+        before = os.fstat(descriptor)
+        mode = stat.S_IMODE(before.st_mode)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or before.st_size > 256 * 1024
+            or mode != 0o600
+        ):
+            fail(f"candidate_{name}_plist_identity_invalid")
+        raw = bytearray()
+        while len(raw) <= 256 * 1024:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(descriptor)
+        try:
+            named = os.stat(path, follow_symlinks=False)
+        except OSError:
+            fail(f"candidate_{name}_plist_path_changed")
+    finally:
+        os.close(descriptor)
+    metadata = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_uid,
+        before.st_nlink,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if (
+        len(raw) != before.st_size
+        or metadata
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        or metadata
+        != (
+            named.st_dev,
+            named.st_ino,
+            named.st_mode,
+            named.st_uid,
+            named.st_nlink,
+            named.st_size,
+            named.st_mtime_ns,
+            named.st_ctime_ns,
+        )
+    ):
+        fail(f"candidate_{name}_plist_changed_during_observation")
+    expected = plistlib.dumps(
+        compose_plists(context)[name], fmt=plistlib.FMT_XML, sort_keys=True
+    )
+    if bytes(raw) != expected:
+        fail(f"candidate_{name}_plist_content_mismatch")
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size": len(raw),
+        "mode": mode,
+        "uid": before.st_uid,
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "links": before.st_nlink,
+    }
+
+
+def candidate_ready_status(context, platform, name):
+    service = context.manifest["services"][name]
+    host_header = None
+    if name == "api":
+        host_header = context.manifest["public_origin"].removeprefix("https://")
+    return platform.http_status(
+        f"http://127.0.0.1:{service['port']}/health/ready",
+        host_header=host_header,
+    )
+
+
+def observe_candidate_process(context, platform, name):
+    manifest = context.manifest
+    service = manifest["services"][name]
+    candidate = manifest["candidates"][name]
+    expected_plist = str(service_plist_path(context, name))
+    expected_arguments = [candidate["path"]]
+    first_plist = candidate_plist_identity(context, name)
+    first_job = platform.launchd_job(service["label"])
+    if (
+        not isinstance(first_job, dict)
+        or set(first_job)
+        != {
+            "pid",
+            "program",
+            "plist_path",
+            "arguments",
+            "runs",
+            "state",
+            "last_exit_code",
+        }
+        or type(first_job["pid"]) is not int
+        or first_job["pid"] <= 0
+        or first_job["program"] != candidate["path"]
+        or first_job["plist_path"] != expected_plist
+        or first_job["arguments"] != expected_arguments
+        or type(first_job["runs"]) is not int
+        or first_job["runs"] <= 0
+        or first_job["state"] != "running"
+        or first_job["last_exit_code"] is not None
+    ):
+        fail(f"candidate_{name}_launchd_identity_invalid")
+    first_process = platform.candidate_process_identity(
+        first_job["pid"], pathlib.Path(candidate["path"])
+    )
+    ready_status = candidate_ready_status(context, platform, name)
+    if ready_status != 200:
+        fail(f"candidate_{name}_health_identity_unready")
+    health_identity = None
+    if name == "runtime":
+        health_identity = platform.runtime_process_identity(context)
+        if (
+            not isinstance(health_identity, dict)
+            or health_identity.get("os_pid") != first_job["pid"]
+        ):
+            fail("candidate_runtime_health_identity_mismatch")
+    second_process = platform.candidate_process_identity(
+        first_job["pid"], pathlib.Path(candidate["path"])
+    )
+    second_job = platform.launchd_job(service["label"])
+    second_plist = candidate_plist_identity(context, name)
+    if first_process != second_process:
+        fail(f"candidate_{name}_process_identity_drift")
+    if first_job != second_job:
+        fail(f"candidate_{name}_launchd_identity_drift")
+    if first_plist != second_plist:
+        fail(f"candidate_{name}_plist_identity_drift")
+    if first_process["sha256"] != candidate["sha256"]:
+        fail(f"candidate_{name}_process_digest_mismatch")
+    evidence = {
+        "launchd": {
+            "pid": first_job["pid"],
+            "program": first_job["program"],
+            "plist_path": first_job["plist_path"],
+            "arguments": first_job["arguments"],
+            "runs": first_job["runs"],
+            "state": first_job["state"],
+        },
+        "process": first_process,
+        "plist": first_plist,
+    }
+    if health_identity is not None:
+        evidence["runtime_health"] = health_identity
+    return evidence, ready_status
+
+
+def revalidate_candidate_process(context, platform, name, evidence):
+    service = context.manifest["services"][name]
+    job = platform.launchd_job(service["label"])
+    expected_job = {
+        **evidence["launchd"],
+        "last_exit_code": None,
+    }
+    if job != expected_job:
+        fail(f"candidate_{name}_launchd_final_identity_drift")
+    process = platform.candidate_process_identity(
+        job["pid"], pathlib.Path(context.manifest["candidates"][name]["path"])
+    )
+    if process != evidence["process"]:
+        fail(f"candidate_{name}_process_final_identity_drift")
+    if candidate_plist_identity(context, name) != evidence["plist"]:
+        fail(f"candidate_{name}_plist_final_identity_drift")
+    if candidate_ready_status(context, platform, name) != 200:
+        fail(f"candidate_{name}_health_final_unready")
+    if name == "runtime":
+        health = platform.runtime_process_identity(context)
+        if health != evidence["runtime_health"]:
+            fail("candidate_runtime_health_final_identity_drift")
+
+
 def write_candidate_evidence(context, statuses, platform):
     manifest = context.manifest
     transport_snapshot = platform.transport_control(context, "snapshot")
+    observations = {
+        name: observe_candidate_process(context, platform, name)
+        for name in ("api", "runtime")
+    }
+    process_identities = {
+        "schema_version": 1,
+        "api": observations["api"][0],
+        "runtime": observations["runtime"][0],
+    }
+    if (
+        process_identities["api"]["launchd"]["pid"]
+        == process_identities["runtime"]["launchd"]["pid"]
+    ):
+        fail("candidate_process_pid_collision")
+    for name in ("api", "runtime"):
+        revalidate_candidate_process(
+            context, platform, name, process_identities[name]
+        )
     evidence = {
         "api_sha256": manifest["candidates"]["api"]["sha256"],
         "runtime_sha256": manifest["candidates"]["runtime"]["sha256"],
@@ -342,8 +564,8 @@ def write_candidate_evidence(context, statuses, platform):
         ]["sha256"],
         "api_build_revision": manifest["commit_sha"],
         "runtime_build_revision": manifest["commit_sha"],
-        "api_ready_status": statuses["api"],
-        "runtime_ready_status": statuses["runtime"],
+        "api_ready_status": observations["api"][1],
+        "runtime_ready_status": observations["runtime"][1],
         "worker_ready_status": statuses["worker"],
         "cloudflare_tunnel_id": manifest["cloudflare"]["tunnel_id"],
         "public_origin": manifest["cloudflare"]["public_origin"],
@@ -351,6 +573,7 @@ def write_candidate_evidence(context, statuses, platform):
         "transport_instance_id": transport_snapshot["instance_id"],
         "transport_ready": statuses["transport"] == 200,
         "tunnel_ready": statuses["tunnel"] == 200,
+        "process_identities": process_identities,
     }
     write_atomic(
         context.artifact_directory / "step-03-evidence.json",

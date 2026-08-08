@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 
 import contextlib
+import ctypes
 import datetime
 import fcntl
 import hashlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import plistlib
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -107,6 +110,15 @@ class FakePlatform:
         self.last_exit_codes = {}
         self.runtime_process_instance_ids = {}
         self.runtime_identity_override = None
+        self.process_start_times = {}
+        self.process_identity_sequences = {}
+        self.process_identity_observations = []
+        self.process_identity_hook = None
+        self.process_identity_call_counts = {}
+        self.launchd_job_hook = None
+        self.launchd_job_call_counts = {}
+        self.http_status_hook = None
+        self.http_status_call_counts = {}
         self.signals = []
         self.signal_exit_code = 0
         self.signal_failure = False
@@ -147,7 +159,7 @@ class FakePlatform:
     def launchd_job(self, label):
         if label not in self.loaded:
             return None
-        return {
+        value = {
             "pid": self.pids.get(label),
             "program": self.programs.get(label),
             "plist_path": self.plist_paths.get(label),
@@ -156,6 +168,11 @@ class FakePlatform:
             "state": self.launchd_states.get(label),
             "last_exit_code": self.last_exit_codes.get(label),
         }
+        count = self.launchd_job_call_counts.get(label, 0) + 1
+        self.launchd_job_call_counts[label] = count
+        if self.launchd_job_hook is not None:
+            return self.launchd_job_hook(label, count, value)
+        return value
 
     def exit_launchd(self, label, exit_code=0):
         self.pids.pop(label, None)
@@ -302,6 +319,10 @@ class FakePlatform:
         self.loaded.add(label)
         self.next_pid += 1
         self.pids[label] = self.next_pid
+        self.process_start_times[self.next_pid] = (
+            1_700_000_000 + self.next_pid,
+            self.next_pid % 1_000_000,
+        )
         self.programs[label] = value["ProgramArguments"][0]
         self.plist_paths[label] = str(plist_path)
         self.program_arguments[label] = value["ProgramArguments"]
@@ -315,6 +336,8 @@ class FakePlatform:
 
     def http_status(self, url, timeout_seconds=3, host_header=None):
         self.http_probes.append((url, host_header))
+        count = self.http_status_call_counts.get(url, 0) + 1
+        self.http_status_call_counts[url] = count
         if self.health_failure and self.health_failure in url:
             return 503
         if "127.0.0.1:29091/health/ready" in url:
@@ -323,7 +346,10 @@ class FakePlatform:
             )
             if runtime_label is None or self.pids.get(runtime_label) is None:
                 return 0
-        return 200
+        status = 200
+        if self.http_status_hook is not None:
+            status = self.http_status_hook(url, count, status)
+        return status
 
     def runtime_process_identity(self, context, timeout_seconds=3):
         runtime_label = context.manifest["services"]["runtime"]["label"]
@@ -339,6 +365,37 @@ class FakePlatform:
                 runtime_label
             ],
         }
+
+    def candidate_process_identity(self, pid, expected_path):
+        self.process_identity_observations.append((pid, pathlib.Path(expected_path)))
+        sequence = self.process_identity_sequences.get(pid)
+        if sequence:
+            value = sequence.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            return dict(value)
+        path = pathlib.Path(expected_path)
+        metadata = path.stat()
+        seconds, microseconds = self.process_start_times[pid]
+        value = {
+            "pid": pid,
+            "start_time_seconds": seconds,
+            "start_time_microseconds": microseconds,
+            "uid": metadata.st_uid,
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "size": metadata.st_size,
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "links": metadata.st_nlink,
+        }
+        key = str(path)
+        count = self.process_identity_call_counts.get(key, 0) + 1
+        self.process_identity_call_counts[key] = count
+        if self.process_identity_hook is not None:
+            return self.process_identity_hook(pid, path, count, value)
+        return value
 
     def worker_health_status(self, context, timeout_seconds=3):
         self.lifecycle_events.append("health:worker")
@@ -754,6 +811,30 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         } | {hub_channel_id}
         return self.platform.resource_inventory(self.context)
 
+    def assert_candidate_identity_failure_rolls_back(self, configure, pattern):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        configure()
+        with self.assertRaisesRegex(CONTRACT.OrchestratorError, pattern):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertFalse(self.platform.postgres)
+        self.assertTrue(
+            all(
+                service["label"] not in self.platform.loaded
+                for service in self.context.manifest["services"].values()
+            )
+        )
+        self.assertEqual(
+            CONTRACT.load_state(self.context, {"stopped"})["phase"], "stopped"
+        )
+        self.assertFalse(
+            (self.context.artifact_directory / "step-03-evidence.json").exists()
+        )
+        self.assertFalse(
+            D2_SOURCE_CONTRACT.source_path(
+                self.context, 3, "candidate"
+            ).exists()
+        )
+
     def prepare_manifest(
         self,
         guild_id="1524810437118525551",
@@ -1073,6 +1154,28 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             self.context.manifest["candidates"]["certification_transport"]["sha256"],
         )
         self.assertEqual(
+            set(step_three["process_identities"]),
+            {"schema_version", "api", "runtime"},
+        )
+        self.assertEqual(step_three["process_identities"]["schema_version"], 1)
+        self.assertNotEqual(
+            step_three["process_identities"]["api"]["process"]["pid"],
+            step_three["process_identities"]["runtime"]["process"]["pid"],
+        )
+        self.assertEqual(
+            step_three["process_identities"]["runtime"]["runtime_health"][
+                "os_pid"
+            ],
+            step_three["process_identities"]["runtime"]["process"]["pid"],
+        )
+        self.assertEqual(
+            {
+                path: self.platform.process_identity_call_counts[str(path)]
+                for path in (self.candidates["api"], self.candidates["runtime"])
+            },
+            {self.candidates["api"]: 3, self.candidates["runtime"]: 3},
+        )
+        self.assertEqual(
             self.platform.start_order,
             [
                 self.context.manifest["services"][name]["label"]
@@ -1108,6 +1211,217 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         again = ORCHESTRATOR.command_cleanup(self.context, self.platform)
         self.assertEqual(again["status"], "already_cleaned")
         self.assertEqual(CONTRACT.load_discord_ownership_registry()["owners"], [])
+
+    def test_candidate_start_rejects_foreign_runtime_health_pid_and_rolls_back(self):
+        def configure():
+            self.platform.runtime_identity_override = {
+                "schema_version": 1,
+                "os_pid": 999,
+                "process_instance_id": "f" * 32,
+            }
+
+        self.assert_candidate_identity_failure_rolls_back(
+            configure, "candidate_runtime_health_identity_mismatch"
+        )
+
+    def test_candidate_start_rejects_process_start_drift_and_rolls_back(self):
+        def configure():
+            def hook(_pid, path, count, value):
+                observed = dict(value)
+                if path == self.candidates["api"] and count == 2:
+                    observed["start_time_microseconds"] += 1
+                return observed
+
+            self.platform.process_identity_hook = hook
+
+        self.assert_candidate_identity_failure_rolls_back(
+            configure, "candidate_api_process_identity_drift"
+        )
+
+    def test_candidate_start_rejects_process_digest_and_rolls_back(self):
+        def configure():
+            def hook(_pid, path, _count, value):
+                observed = dict(value)
+                if path == self.candidates["api"]:
+                    observed["sha256"] = "0" * 64
+                return observed
+
+            self.platform.process_identity_hook = hook
+
+        self.assert_candidate_identity_failure_rolls_back(
+            configure, "candidate_api_process_digest_mismatch"
+        )
+
+    def test_candidate_start_rejects_api_runtime_pid_collision(self):
+        api_label = self.context.manifest["services"]["api"]["label"]
+        runtime_label = self.context.manifest["services"]["runtime"]["label"]
+
+        def configure():
+            original = self.platform.launchd_start
+
+            def launch(label, plist_path):
+                original(label, plist_path)
+                if label == runtime_label:
+                    self.platform.pids[label] = self.platform.pids[api_label]
+
+            self.platform.launchd_start = launch
+
+        self.assert_candidate_identity_failure_rolls_back(
+            configure, "candidate_process_pid_collision"
+        )
+
+    def test_candidate_start_rejects_launchd_runs_drift_and_rolls_back(self):
+        api_label = self.context.manifest["services"]["api"]["label"]
+
+        def configure():
+            def hook(label, count, value):
+                observed = dict(value)
+                if label == api_label and count == 2:
+                    observed["runs"] += 1
+                return observed
+
+            self.platform.launchd_job_hook = hook
+
+        self.assert_candidate_identity_failure_rolls_back(
+            configure, "candidate_api_launchd_identity_drift"
+        )
+
+    def test_candidate_start_rejects_identity_window_readiness_loss(self):
+        api_ready = (
+            f"http://127.0.0.1:{self.context.manifest['services']['api']['port']}"
+            "/health/ready"
+        )
+
+        def configure():
+            self.platform.http_status_hook = (
+                lambda url, count, status: 503
+                if url == api_ready and count == 2
+                else status
+            )
+
+        self.assert_candidate_identity_failure_rolls_back(
+            configure, "candidate_api_health_identity_unready"
+        )
+
+    def test_candidate_start_rejects_api_loss_during_runtime_observation(self):
+        api_label = self.context.manifest["services"]["api"]["label"]
+
+        def configure():
+            def hook(_pid, path, count, value):
+                if path == self.candidates["runtime"] and count == 1:
+                    self.platform.exit_launchd(api_label, 1)
+                return value
+
+            self.platform.process_identity_hook = hook
+
+        self.assert_candidate_identity_failure_rolls_back(
+            configure, "candidate_api_launchd_final_identity_drift"
+        )
+
+    def test_candidate_start_rejects_plist_content_drift_and_rolls_back(self):
+        api_label = self.context.manifest["services"]["api"]["label"]
+        api_plist = self.context.plist_directory / f"{api_label}.plist"
+
+        def configure():
+            def hook(_pid, path, count, value):
+                if path == self.candidates["api"] and count == 2:
+                    api_plist.write_bytes(b"foreign plist")
+                    api_plist.chmod(0o600)
+                return value
+
+            self.platform.process_identity_hook = hook
+
+        self.assert_candidate_identity_failure_rolls_back(
+            configure, "candidate_api_plist_content_mismatch"
+        )
+
+    def test_candidate_start_rejects_disappearing_process_and_rolls_back(self):
+        def configure():
+            def hook(_pid, path, count, value):
+                if path == self.candidates["api"] and count == 2:
+                    raise CONTRACT.OrchestratorError(
+                        "process_identity_bsdinfo_unavailable"
+                    )
+                return value
+
+            self.platform.process_identity_hook = hook
+
+        self.assert_candidate_identity_failure_rolls_back(
+            configure, "process_identity_bsdinfo_unavailable"
+        )
+
+    def test_candidate_plist_identity_rejects_mode_links_symlink_and_content(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        api_label = self.context.manifest["services"]["api"]["label"]
+        path = self.context.plist_directory / f"{api_label}.plist"
+        raw = path.read_bytes()
+        baseline = ORCHESTRATOR.candidate_plist_identity(self.context, "api")
+        self.assertEqual(baseline["sha256"], hashlib.sha256(raw).hexdigest())
+        path.chmod(0o644)
+        with self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "candidate_api_plist_identity_invalid"
+        ):
+            ORCHESTRATOR.candidate_plist_identity(self.context, "api")
+        path.chmod(0o600)
+        path.write_bytes(b"foreign plist")
+        with self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "candidate_api_plist_content_mismatch"
+        ):
+            ORCHESTRATOR.candidate_plist_identity(self.context, "api")
+        path.write_bytes(raw)
+        path.chmod(0o600)
+        backup = self.context.plist_directory / "api-plist-backup"
+        backup.write_bytes(raw)
+        backup.chmod(0o600)
+        path.unlink()
+        os.link(backup, path)
+        with self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "candidate_api_plist_identity_invalid"
+        ):
+            ORCHESTRATOR.candidate_plist_identity(self.context, "api")
+        path.unlink()
+        path.symlink_to(backup)
+        with self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "candidate_plist_invalid"
+        ):
+            ORCHESTRATOR.candidate_plist_identity(self.context, "api")
+        path.unlink()
+        backup.unlink()
+        path.write_bytes(raw)
+        path.chmod(0o600)
+
+    def test_candidate_process_rejects_initial_launchd_mapping_drift(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        name = "api"
+        label = self.context.manifest["services"][name]["label"]
+        plist_path = ORCHESTRATOR.service_plist_path(self.context, name)
+        self.platform.launchd_start(label, plist_path)
+        originals = {
+            "program": self.platform.programs[label],
+            "plist_path": self.platform.plist_paths[label],
+            "arguments": list(self.platform.program_arguments[label]),
+            "runs": self.platform.launchd_runs[label],
+            "state": self.platform.launchd_states[label],
+        }
+        mutations = (
+            (self.platform.programs, "/private/tmp/foreign"),
+            (self.platform.plist_paths, "/private/tmp/foreign.plist"),
+            (self.platform.program_arguments, []),
+            (self.platform.launchd_runs, True),
+            (self.platform.launchd_states, "exited"),
+        )
+        fields = ("program", "plist_path", "arguments", "runs", "state")
+        for field, (mapping, replacement) in zip(fields, mutations):
+            with self.subTest(field=field):
+                mapping[label] = replacement
+                with self.assertRaisesRegex(
+                    CONTRACT.OrchestratorError,
+                    "candidate_api_launchd_identity_invalid",
+                ):
+                    ORCHESTRATOR.observe_candidate_process(
+                        self.context, self.platform, name
+                    )
+                mapping[label] = originals[field]
 
     def test_prepare_rejects_other_run_with_same_guild_or_application(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
@@ -3751,6 +4065,17 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
 
 
 class LaunchdPlatformTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.temporary.name).resolve()
+        candidate = self.root / "api"
+        candidate.write_bytes(b"candidate:api")
+        candidate.chmod(0o555)
+        self.candidates = {"api": candidate}
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
     def test_launchd_signal_is_exactly_sigterm_and_manifest_label_scoped(self):
         platform = PLATFORM.Platform()
         success = subprocess.CompletedProcess([], 0, b"", b"")
@@ -3769,6 +4094,176 @@ class LaunchdPlatformTests(unittest.TestCase):
             ORCHESTRATOR.OrchestratorError, "launchd_signal_invalid"
         ):
             platform.launchd_signal("local.starring.d2.test.runtime", "SIGKILL")
+
+    def test_candidate_process_identity_binds_kernel_path_start_and_fd_digest(self):
+        platform = PLATFORM.Platform()
+        candidate = self.candidates["api"]
+        metadata = candidate.stat()
+        kernel = {
+            "pid": 1234,
+            "start_time_seconds": 1_700_000_000,
+            "start_time_microseconds": 123456,
+            "uid": metadata.st_uid,
+            "path": str(candidate),
+        }
+        with mock.patch.object(
+            platform, "_kernel_process_identity", side_effect=[kernel, kernel]
+        ):
+            observed = platform.candidate_process_identity(1234, candidate)
+        self.assertEqual(observed["pid"], 1234)
+        self.assertEqual(observed["path"], str(candidate))
+        self.assertEqual(
+            observed["sha256"], hashlib.sha256(candidate.read_bytes()).hexdigest()
+        )
+        self.assertEqual(observed["inode"], metadata.st_ino)
+
+    def test_candidate_process_identity_rejects_kernel_and_path_races(self):
+        platform = PLATFORM.Platform()
+        candidate = self.candidates["api"]
+        metadata = candidate.stat()
+        kernel = {
+            "pid": 1234,
+            "start_time_seconds": 1_700_000_000,
+            "start_time_microseconds": 123456,
+            "uid": metadata.st_uid,
+            "path": str(candidate),
+        }
+        changed = dict(kernel)
+        changed["start_time_microseconds"] += 1
+        with mock.patch.object(
+            platform, "_kernel_process_identity", side_effect=[kernel, changed]
+        ), self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "process_identity_changed_during_observation"
+        ):
+            platform.candidate_process_identity(1234, candidate)
+        replaced = SimpleNamespace(
+            st_dev=metadata.st_dev,
+            st_ino=metadata.st_ino + 1,
+            st_mode=metadata.st_mode,
+            st_uid=metadata.st_uid,
+            st_nlink=metadata.st_nlink,
+            st_size=metadata.st_size,
+            st_mtime_ns=metadata.st_mtime_ns,
+            st_ctime_ns=metadata.st_ctime_ns,
+        )
+        with mock.patch.object(
+            platform, "_kernel_process_identity", side_effect=[kernel, kernel]
+        ), mock.patch.object(
+            PLATFORM.os, "stat", return_value=replaced
+        ), self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "process_identity_changed_during_observation"
+        ):
+            platform.candidate_process_identity(1234, candidate)
+
+    def test_candidate_process_identity_rejects_symlink_hardlink_and_bad_modes(self):
+        platform = PLATFORM.Platform()
+        directory = self.root / "process-identity-files"
+        directory.mkdir(mode=0o700)
+        regular = directory / "regular"
+        regular.write_bytes(b"candidate")
+        regular.chmod(0o555)
+        symlink = directory / "symlink"
+        symlink.symlink_to(regular)
+        hardlink = directory / "hardlink"
+        os.link(regular, hardlink)
+        writable = directory / "writable"
+        writable.write_bytes(b"candidate")
+        writable.chmod(0o755)
+        non_executable = directory / "non-executable"
+        non_executable.write_bytes(b"candidate")
+        non_executable.chmod(0o444)
+        empty = directory / "empty"
+        empty.write_bytes(b"")
+        empty.chmod(0o555)
+        for path, pattern in (
+            (symlink, "process_identity_executable_unavailable"),
+            (hardlink, "process_identity_executable_invalid"),
+            (writable, "process_identity_executable_invalid"),
+            (non_executable, "process_identity_executable_invalid"),
+            (empty, "process_identity_executable_invalid"),
+        ):
+            with self.subTest(path=path):
+                kernel = {
+                    "pid": 1234,
+                    "start_time_seconds": 1_700_000_000,
+                    "start_time_microseconds": 123456,
+                    "uid": path.lstat().st_uid,
+                    "path": str(path),
+                }
+                with mock.patch.object(
+                    platform,
+                    "_kernel_process_identity",
+                    side_effect=[kernel, kernel],
+                ), self.assertRaisesRegex(CONTRACT.OrchestratorError, pattern):
+                    platform.candidate_process_identity(1234, path)
+
+    def test_kernel_process_identity_rejects_pidinfo_and_pidpath_boundaries(self):
+        platform = PLATFORM.Platform()
+
+        class Libproc:
+            def __init__(
+                self,
+                pidinfo_size=None,
+                path=b"/private/tmp/candidate",
+                pid_value=None,
+                uid=None,
+                seconds=1_700_000_000,
+                microseconds=123456,
+                path_return=None,
+            ):
+                self.pidinfo_size = pidinfo_size
+                self.path = path
+                self.pid_value = pid_value
+                self.uid = uid
+                self.seconds = seconds
+                self.microseconds = microseconds
+                self.path_return = path_return
+
+            def proc_pidinfo(self, pid, _flavor, _arg, pointer, size):
+                if self.pidinfo_size is not None:
+                    return self.pidinfo_size
+                information = ctypes.cast(
+                    pointer, ctypes.POINTER(PLATFORM.ProcBsdInfo)
+                ).contents
+                information.pbi_pid = pid if self.pid_value is None else self.pid_value
+                information.pbi_uid = os.getuid() if self.uid is None else self.uid
+                information.pbi_start_tvsec = self.seconds
+                information.pbi_start_tvusec = self.microseconds
+                return size
+
+            def proc_pidpath(self, _pid, buffer, _size):
+                ctypes.memmove(buffer, self.path + b"\x00", len(self.path) + 1)
+                return len(self.path) if self.path_return is None else self.path_return
+
+        for pid, library, pattern in (
+            (True, Libproc(), "process_identity_pid_invalid"),
+            (2_147_483_648, Libproc(), "process_identity_pid_invalid"),
+            (1234, Libproc(135), "process_identity_bsdinfo_unavailable"),
+            (1234, Libproc(pid_value=4321), "process_identity_kernel_invalid"),
+            (1234, Libproc(uid=os.getuid() + 1), "process_identity_kernel_invalid"),
+            (1234, Libproc(seconds=0), "process_identity_kernel_invalid"),
+            (1234, Libproc(microseconds=1_000_000), "process_identity_kernel_invalid"),
+            (1234, Libproc(path_return=0), "process_identity_path_unavailable"),
+            (
+                1234,
+                Libproc(path_return=PLATFORM.PROC_PIDPATHINFO_MAXSIZE),
+                "process_identity_path_unavailable",
+            ),
+            (1234, Libproc(path=b"relative"), "process_identity_kernel_invalid"),
+            (1234, Libproc(path=b"\xff"), "process_identity_path_invalid"),
+        ):
+            with self.subTest(pid=pid, pattern=pattern), mock.patch.object(
+                platform, "_libproc", return_value=library
+            ), self.assertRaisesRegex(CONTRACT.OrchestratorError, pattern):
+                platform._kernel_process_identity(pid)
+        mismatch = Libproc()
+        mismatch.proc_pidpath = lambda _pid, _buffer, _size: 1
+        with mock.patch.object(
+            platform, "_libproc", return_value=mismatch
+        ), self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "process_identity_path_invalid"
+        ):
+            platform._kernel_process_identity(1234)
 
     def test_launchd_job_observation_binds_program_and_optional_pid(self):
         platform = PLATFORM.Platform()

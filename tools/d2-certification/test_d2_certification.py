@@ -99,6 +99,62 @@ INDETERMINATE_EFFECT_ID = MODULE.canonical_effect_identity_sha256(
 def complete_evidence(manifest):
     prefix = manifest["discord"]["resource_prefix"]
     installation_id = f"installation:{prefix}"
+    process_root = pathlib.Path(manifest["database"]["cluster_root"]).parent
+
+    def process_identity(name, pid):
+        candidate = manifest["candidates"][name]
+        label = manifest["services"][name]["label"]
+        value = {
+            "launchd": {
+                "pid": pid,
+                "program": candidate["path"],
+                "plist_path": str(
+                    process_root
+                    / "orchestrator"
+                    / "launchd"
+                    / f"{label}.plist"
+                ),
+                "arguments": [candidate["path"]],
+                "runs": 1,
+                "state": "running",
+            },
+            "process": {
+                "pid": pid,
+                "start_time_seconds": 1_700_000_000 + pid,
+                "start_time_microseconds": pid,
+                "uid": os.getuid(),
+                "path": candidate["path"],
+                "sha256": candidate["sha256"],
+                "size": 4096,
+                "mode": 0o555,
+                "device": 1,
+                "inode": pid,
+                "links": 1,
+            },
+            "plist": {
+                "path": str(
+                    process_root
+                    / "orchestrator"
+                    / "launchd"
+                    / f"{label}.plist"
+                ),
+                "sha256": ("b" if name == "api" else "c") * 64,
+                "size": 4096,
+                "mode": 0o600,
+                "uid": os.getuid(),
+                "device": 1,
+                "inode": pid + 1000,
+                "links": 1,
+            },
+        }
+        if name == "runtime":
+            value["runtime_health"] = {
+                "schema_version": 1,
+                "os_pid": pid,
+                "process_instance_id": f"{pid:032x}",
+            }
+        return value
+
     return {
         1: {
             "database_system_identifier": "7667905772642692043",
@@ -130,6 +186,11 @@ def complete_evidence(manifest):
             "transport_instance_id": TRANSPORT_INSTANCE_ID,
             "transport_ready": True,
             "tunnel_ready": True,
+            "process_identities": {
+                "schema_version": 1,
+                "api": process_identity("api", 101),
+                "runtime": process_identity("runtime", 102),
+            },
         },
         4: {
             "me_status": 200,
@@ -581,6 +642,91 @@ class D2CertificationTest(unittest.TestCase):
                     MODULE.CertificationError, "cloudflare_tunnel_id_invalid"
                 ):
                     MODULE.validate_cloudflare_tunnel_id(value)
+
+    def test_step_three_process_identity_contract_rejects_nested_drift(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        baseline = complete_evidence(manifest)[3]
+
+        def delete_api(value):
+            del value["process_identities"]["api"]
+
+        def add_service(value):
+            value["process_identities"]["worker"] = {}
+
+        def collide_pids(value):
+            runtime = value["process_identities"]["runtime"]
+            api_pid = value["process_identities"]["api"]["process"]["pid"]
+            runtime["launchd"]["pid"] = api_pid
+            runtime["process"]["pid"] = api_pid
+            runtime["runtime_health"]["os_pid"] = api_pid
+
+        mutations = (
+            lambda value: value["process_identities"].update(schema_version=2),
+            delete_api,
+            add_service,
+            lambda value: value["process_identities"]["api"]["launchd"].update(
+                pid=True
+            ),
+            lambda value: value["process_identities"]["api"]["launchd"].update(
+                program="/private/tmp/foreign"
+            ),
+            lambda value: value["process_identities"]["api"]["launchd"].update(
+                plist_path="/private/tmp/foreign.plist"
+            ),
+            lambda value: value["process_identities"]["api"]["launchd"].update(
+                arguments=[]
+            ),
+            lambda value: value["process_identities"]["api"]["launchd"].update(
+                runs=True
+            ),
+            lambda value: value["process_identities"]["api"]["process"].update(
+                start_time_seconds=0
+            ),
+            lambda value: value["process_identities"]["api"]["process"].update(
+                start_time_seconds=MODULE.UINT64_MAX + 1
+            ),
+            lambda value: value["process_identities"]["api"]["process"].update(
+                start_time_microseconds=1_000_000
+            ),
+            lambda value: value["process_identities"]["api"]["process"].update(
+                uid=True
+            ),
+            lambda value: value["process_identities"]["api"]["process"].update(
+                path="/private/tmp/foreign"
+            ),
+            lambda value: value["process_identities"]["api"]["process"].update(
+                sha256="0" * 64
+            ),
+            lambda value: value["process_identities"]["api"]["process"].update(
+                mode=0o755
+            ),
+            lambda value: value["process_identities"]["api"]["process"].update(
+                links=2
+            ),
+            lambda value: value["process_identities"]["api"]["plist"].update(
+                path=True
+            ),
+            lambda value: value["process_identities"]["api"]["plist"].update(
+                mode=True
+            ),
+            lambda value: value["process_identities"]["runtime"][
+                "runtime_health"
+            ].update(os_pid=999),
+            lambda value: value["process_identities"]["runtime"][
+                "runtime_health"
+            ].update(process_instance_id="foreign"),
+            lambda value: value["process_identities"]["runtime"][
+                "runtime_health"
+            ].update(extra=True),
+            collide_pids,
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                evidence = copy.deepcopy(baseline)
+                mutation(evidence)
+                with self.assertRaises(MODULE.CertificationError):
+                    MODULE.validate_step_contract(3, evidence, manifest, {})
 
     def test_complete_legacy_receipt_chain_is_not_release_authority(self):
         manifest_path = self.prepare()

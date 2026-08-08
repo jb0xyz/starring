@@ -27,6 +27,8 @@ MAX_JSON_BYTES = 256 * 1024
 MAX_STRING_BYTES = 4096
 MAX_COLLECTION_ITEMS = 256
 MAX_NESTING_DEPTH = 8
+INT64_MAX = 9_223_372_036_854_775_807
+UINT64_MAX = 18_446_744_073_709_551_615
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$")
@@ -181,6 +183,7 @@ STEP_SPECS = {
             "transport_instance_id",
             "transport_ready",
             "tunnel_ready",
+            "process_identities",
         ),
     ),
     4: StepSpec(
@@ -1300,6 +1303,152 @@ def require_snowflake_fields(evidence, *fields):
             fail(f"step_contract_failed:{field}")
 
 
+def validate_candidate_process_identities(value, manifest):
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "api", "runtime"}
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+    ):
+        fail("step_contract_failed:process_identities")
+    for name in ("api", "runtime"):
+        identity = value[name]
+        expected_fields = {"launchd", "process", "plist"}
+        if name == "runtime":
+            expected_fields.add("runtime_health")
+        if not isinstance(identity, dict) or set(identity) != expected_fields:
+            fail(f"step_contract_failed:{name}_process_identity")
+        launchd = identity["launchd"]
+        process = identity["process"]
+        plist = identity["plist"]
+        candidate = manifest["candidates"][name]
+        label = manifest["services"][name]["label"]
+        raw_plist_path = plist.get("path") if isinstance(plist, dict) else None
+        if isinstance(raw_plist_path, str):
+            plist_path = pathlib.Path(raw_plist_path)
+            plist_path_valid = (
+                plist_path.is_absolute()
+                and str(plist_path) == os.path.normpath(str(plist_path))
+                and plist_path.name == f"{label}.plist"
+                and plist_path.parent.name == "launchd"
+                and plist_path.parent.parent.name == "orchestrator"
+            )
+        else:
+            plist_path = pathlib.Path()
+            plist_path_valid = False
+        if (
+            not isinstance(launchd, dict)
+            or set(launchd)
+            != {"pid", "program", "plist_path", "arguments", "runs", "state"}
+            or type(launchd["pid"]) is not int
+            or launchd["pid"] <= 0
+            or launchd["pid"] > 2_147_483_647
+            or launchd["program"] != candidate["path"]
+            or launchd["plist_path"] != str(plist_path)
+            or launchd["arguments"] != [candidate["path"]]
+            or type(launchd["runs"]) is not int
+            or launchd["runs"] <= 0
+            or launchd["runs"] > UINT64_MAX
+            or launchd["state"] != "running"
+        ):
+            fail(f"step_contract_failed:{name}_launchd_identity")
+        if (
+            not isinstance(process, dict)
+            or set(process)
+            != {
+                "pid",
+                "start_time_seconds",
+                "start_time_microseconds",
+                "uid",
+                "path",
+                "sha256",
+                "size",
+                "mode",
+                "device",
+                "inode",
+                "links",
+            }
+            or type(process["pid"]) is not int
+            or process["pid"] != launchd["pid"]
+            or process["pid"] > 2_147_483_647
+            or type(process["start_time_seconds"]) is not int
+            or process["start_time_seconds"] <= 0
+            or process["start_time_seconds"] > UINT64_MAX
+            or type(process["start_time_microseconds"]) is not int
+            or not 0 <= process["start_time_microseconds"] < 1_000_000
+            or type(process["uid"]) is not int
+            or process["uid"] != os.getuid()
+            or process["path"] != candidate["path"]
+            or process["sha256"] != candidate["sha256"]
+            or type(process["size"]) is not int
+            or process["size"] <= 0
+            or process["size"] > INT64_MAX
+            or type(process["mode"]) is not int
+            or process["mode"] < 0
+            or process["mode"] > 0o7777
+            or process["mode"] & 0o222
+            or not process["mode"] & 0o111
+            or type(process["device"]) is not int
+            or process["device"] < 0
+            or process["device"] > UINT64_MAX
+            or type(process["inode"]) is not int
+            or process["inode"] <= 0
+            or process["inode"] > UINT64_MAX
+            or type(process["links"]) is not int
+            or process["links"] != 1
+        ):
+            fail(f"step_contract_failed:{name}_process_identity")
+        if (
+            not isinstance(plist, dict)
+            or set(plist)
+            != {
+                "path",
+                "sha256",
+                "size",
+                "mode",
+                "uid",
+                "device",
+                "inode",
+                "links",
+            }
+            or not plist_path_valid
+            or not isinstance(plist["sha256"], str)
+            or not DIGEST_PATTERN.fullmatch(plist["sha256"])
+            or type(plist["size"]) is not int
+            or plist["size"] <= 0
+            or plist["size"] > 256 * 1024
+            or type(plist["mode"]) is not int
+            or plist["mode"] != 0o600
+            or type(plist["uid"]) is not int
+            or plist["uid"] != os.getuid()
+            or type(plist["device"]) is not int
+            or plist["device"] < 0
+            or plist["device"] > UINT64_MAX
+            or type(plist["inode"]) is not int
+            or plist["inode"] <= 0
+            or plist["inode"] > UINT64_MAX
+            or type(plist["links"]) is not int
+            or plist["links"] != 1
+        ):
+            fail(f"step_contract_failed:{name}_plist_identity")
+        if name == "runtime":
+            health = identity["runtime_health"]
+            if (
+                not isinstance(health, dict)
+                or set(health)
+                != {"schema_version", "os_pid", "process_instance_id"}
+                or type(health["schema_version"]) is not int
+                or health["schema_version"] != 1
+                or type(health["os_pid"]) is not int
+                or health["os_pid"] != launchd["pid"]
+                or not isinstance(health["process_instance_id"], str)
+                or not re.fullmatch(r"[0-9a-f]{32}", health["process_instance_id"])
+            ):
+                fail("step_contract_failed:runtime_health_identity")
+    if value["api"]["process"]["pid"] == value["runtime"]["process"]["pid"]:
+        fail("step_contract_failed:process_pid_collision")
+
+
 def validate_step_contract(step, evidence, manifest, prior_receipts):
     specification = STEP_SPECS[step]
     require_fields(evidence, specification)
@@ -1367,6 +1516,9 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             != manifest["cloudflare"]["origin_service"]
         ):
             fail("step_contract_failed:cloudflare_route_binding")
+        validate_candidate_process_identities(
+            evidence["process_identities"], manifest
+        )
     elif step == 4:
         if evidence["me_status"] != 200:
             fail("step_contract_failed:oauth_status")

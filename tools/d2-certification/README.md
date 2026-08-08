@@ -41,11 +41,15 @@ cannot silently fall back to the direct production transport. Controller
 preflight and strict panel reconciliation remain direct and are isolated by the
 dedicated D2 application and guild. Step 3 evidence binds the exact
 candidates, transport source tree, control snapshot readiness, and Cloudflare
-route tuple. It also pins the transport process instance identity. Any transport
-restart changes that identity and invalidates the certification run instead of
-silently resetting the in-memory fault counters. Stop and
-cleanup are idempotent, operate only on manifest-derived identities, and require
-the standing launchd, plist, and port snapshot to remain unchanged.
+route tuple. It also joins the API and runtime launchd PID, program, plist,
+arguments, and run counter to two stable macOS process samples. Each sample
+binds the libproc start timestamp and executable path to an `O_NOFOLLOW`
+file-descriptor digest, and runtime must report the same PID through its health
+identity endpoint. Step 3 also pins the transport process instance identity.
+Any transport restart changes that identity and invalidates the certification
+run instead of silently resetting the in-memory fault counters. Stop and
+cleanup are idempotent, operate only on manifest-derived identities, and
+require the standing launchd, plist, and port snapshot to remain unchanged.
 
 The migration-ledger SHA-256 is reproducible. For each successful ledger row
 ordered by version, hash the signed 64-bit version in big-endian form, one
@@ -173,9 +177,9 @@ python3 tools/d2-certification/d2_certification.py prepare \
   --port transport_http=29102
 ```
 
-`$BUNDLE` is `<D3_STATE>/candidate-bundle`, and `--commit` is the commit whose
-tree equals the pinned merge tree. `bind-d2` compares that tree, not the commit
-identity, so the branch tip is acceptable while the base has not moved.
+`$BUNDLE` is `<D3_STATE>/candidate-bundle`, and `--commit` must be the exact
+GitHub-generated merge commit pinned by D3. `bind-d2` rejects a D2 manifest
+that names the branch tip or any other commit, even when its tree is equal.
 
 `codex`, `node`, and `cloudflared` are the only hand-supplied executables. Each
 must still be a canonical, same-owner regular file with all write bits removed,

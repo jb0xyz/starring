@@ -42,6 +42,35 @@ LAUNCHD_STATE_NORMALIZATION = {
     "exited": "exited",
     "not running": "exited",
 }
+PROC_PIDTBSDINFO = 3
+PROC_PIDPATHINFO_MAXSIZE = 4096
+
+
+class ProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
 
 
 def strict_json_object(pairs):
@@ -228,6 +257,179 @@ class Platform:
             "runs": int(runs_matches[0]),
             "state": state,
             "last_exit_code": last_exit_code,
+        }
+
+    def _libproc(self):
+        try:
+            library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        except OSError:
+            fail("process_identity_libproc_unavailable")
+        library.proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        library.proc_pidinfo.restype = ctypes.c_int
+        library.proc_pidpath.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        library.proc_pidpath.restype = ctypes.c_int
+        return library
+
+    def _kernel_process_identity(self, pid):
+        if type(pid) is not int or pid <= 0 or pid > 2_147_483_647:
+            fail("process_identity_pid_invalid")
+        if ctypes.sizeof(ProcBsdInfo) != 136:
+            fail("process_identity_bsdinfo_abi_invalid")
+        library = self._libproc()
+        information = ProcBsdInfo()
+        observed = library.proc_pidinfo(
+            pid,
+            PROC_PIDTBSDINFO,
+            0,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        )
+        if observed != ctypes.sizeof(information):
+            fail("process_identity_bsdinfo_unavailable")
+        buffer = ctypes.create_string_buffer(PROC_PIDPATHINFO_MAXSIZE)
+        path_size = library.proc_pidpath(
+            pid, buffer, PROC_PIDPATHINFO_MAXSIZE
+        )
+        if path_size <= 0 or path_size >= PROC_PIDPATHINFO_MAXSIZE:
+            fail("process_identity_path_unavailable")
+        raw_path = buffer.value
+        if (
+            not raw_path
+            or path_size != len(raw_path)
+            or buffer.raw[path_size] != 0
+        ):
+            fail("process_identity_path_invalid")
+        try:
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError:
+            fail("process_identity_path_invalid")
+        if (
+            information.pbi_pid != pid
+            or information.pbi_uid != os.getuid()
+            or information.pbi_start_tvsec <= 0
+            or information.pbi_start_tvusec >= 1_000_000
+            or not pathlib.Path(path).is_absolute()
+            or "\x00" in path
+        ):
+            fail("process_identity_kernel_invalid")
+        return {
+            "pid": pid,
+            "start_time_seconds": information.pbi_start_tvsec,
+            "start_time_microseconds": information.pbi_start_tvusec,
+            "uid": information.pbi_uid,
+            "path": path,
+        }
+
+    def candidate_process_identity(self, pid, expected_path):
+        expected = pathlib.Path(expected_path)
+        if not expected.is_absolute() or len(str(expected).encode("utf-8")) > 4096:
+            fail("process_identity_expected_path_invalid")
+        before = self._kernel_process_identity(pid)
+        if before["path"] != str(expected):
+            fail("process_identity_path_mismatch")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if not hasattr(os, "O_NOFOLLOW"):
+            fail("process_identity_nofollow_unavailable")
+        flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        try:
+            descriptor = os.open(expected, flags)
+        except OSError:
+            fail("process_identity_executable_unavailable")
+        try:
+            first = os.fstat(descriptor)
+            mode = stat.S_IMODE(first.st_mode)
+            if (
+                not stat.S_ISREG(first.st_mode)
+                or first.st_uid != os.getuid()
+                or first.st_nlink != 1
+                or first.st_size <= 0
+                or mode & 0o222
+                or not mode & 0o111
+            ):
+                fail("process_identity_executable_invalid")
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                size += len(chunk)
+            second = os.fstat(descriptor)
+            after = self._kernel_process_identity(pid)
+            try:
+                named = os.stat(expected, follow_symlinks=False)
+            except OSError:
+                fail("process_identity_executable_path_changed")
+        finally:
+            os.close(descriptor)
+        if (
+            before != after
+            or size != first.st_size
+            or (
+                first.st_dev,
+                first.st_ino,
+                first.st_mode,
+                first.st_uid,
+                first.st_nlink,
+                first.st_size,
+                first.st_mtime_ns,
+                first.st_ctime_ns,
+            )
+            != (
+                second.st_dev,
+                second.st_ino,
+                second.st_mode,
+                second.st_uid,
+                second.st_nlink,
+                second.st_size,
+                second.st_mtime_ns,
+                second.st_ctime_ns,
+            )
+            or (
+                named.st_dev,
+                named.st_ino,
+                named.st_mode,
+                named.st_uid,
+                named.st_nlink,
+                named.st_size,
+                named.st_mtime_ns,
+                named.st_ctime_ns,
+            )
+            != (
+                second.st_dev,
+                second.st_ino,
+                second.st_mode,
+                second.st_uid,
+                second.st_nlink,
+                second.st_size,
+                second.st_mtime_ns,
+                second.st_ctime_ns,
+            )
+        ):
+            fail("process_identity_changed_during_observation")
+        return {
+            **before,
+            "sha256": digest.hexdigest(),
+            "size": size,
+            "mode": mode,
+            "device": first.st_dev,
+            "inode": first.st_ino,
+            "links": first.st_nlink,
         }
 
     def postgres_pid(self, cluster_root):
