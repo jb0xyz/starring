@@ -208,6 +208,30 @@ def descriptor_digest(descriptor):
     return digest.hexdigest(), size
 
 
+def stable_file_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def named_file_identity(path, label):
+    try:
+        metadata = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        fail(f"{label}_unavailable:{error.__class__.__name__}")
+    if not stat.S_ISREG(metadata.st_mode):
+        fail(f"{label}_identity_invalid")
+    return metadata
+
+
 def file_identity(path, label, expected=None, expected_mode=None):
     descriptor, before = open_regular_snapshot(path, label, expected_mode=expected_mode)
     try:
@@ -358,7 +382,7 @@ def source_tree_digest(root, files, label):
 def copy_snapshot(source, destination, destination_mode, label):
     source = absolute_path(str(source), f"{label}_source")
     source_descriptor, before = open_regular_snapshot(source, f"{label}_source")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -378,15 +402,40 @@ def copy_snapshot(source, destination, destination_mode, label):
             write_all(destination_descriptor, chunk)
         after = os.fstat(source_descriptor)
         if (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_size,
-        ) != (after.st_dev, after.st_ino, after.st_mode, after.st_size) or size != before.st_size:
+            stable_file_identity(before) != stable_file_identity(after)
+            or size != before.st_size
+        ):
             fail(f"{label}_source_changed_during_copy")
+        verified_digest, verified_size = descriptor_digest(source_descriptor)
+        verified = os.fstat(source_descriptor)
+        if (
+            stable_file_identity(after) != stable_file_identity(verified)
+            or verified_size != size
+            or verified_digest != digest.hexdigest()
+        ):
+            fail(f"{label}_source_changed_during_copy")
+        named_source = named_file_identity(source, f"{label}_source")
+        if stable_file_identity(named_source) != stable_file_identity(verified):
+            fail(f"{label}_source_path_changed_during_copy")
         os.fchmod(destination_descriptor, destination_mode)
         os.fsync(destination_descriptor)
+        destination_before_verify = os.fstat(destination_descriptor)
+        destination_digest, destination_size = descriptor_digest(
+            destination_descriptor
+        )
         destination_metadata = os.fstat(destination_descriptor)
+        if (
+            stable_file_identity(destination_before_verify)
+            != stable_file_identity(destination_metadata)
+            or destination_size != size
+            or destination_digest != digest.hexdigest()
+        ):
+            fail(f"{label}_destination_changed_during_copy")
+        named_destination = named_file_identity(destination, f"{label}_destination")
+        if stable_file_identity(named_destination) != stable_file_identity(
+            destination_metadata
+        ):
+            fail(f"{label}_destination_path_changed_during_copy")
     finally:
         os.close(source_descriptor)
         os.close(destination_descriptor)

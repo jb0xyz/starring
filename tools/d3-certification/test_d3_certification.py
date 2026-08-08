@@ -19,6 +19,7 @@ SPEC = importlib.util.spec_from_file_location("d3_certification", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 import d3_candidate_bundle as BUNDLE
+import d3_candidate_io as CANDIDATE_IO
 
 
 def run(argv, cwd):
@@ -40,6 +41,62 @@ def write(path, value, mode=0o644):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value, encoding="utf-8")
     path.chmod(mode)
+
+
+class D3BootstrapSafetyTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.temporary.name).resolve()
+        self.root.chmod(0o700)
+        self.worktree = self.root / "worktree"
+        self.worktree.mkdir(mode=0o700)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_current_and_legacy_staging_are_descriptor_safely_discarded(self):
+        for name in (
+            ".gate-bootstrap-staging",
+            ".gate-bootstrap-staging-0123456789abcdef",
+        ):
+            staging = self.root / name
+            nested = staging / "nested"
+            nested.mkdir(parents=True, mode=0o700)
+            write(nested / "value", "value", 0o600)
+            MODULE.discard_gate_bootstrap_staging(self.root, staging)
+            self.assertFalse(staging.exists())
+
+    def test_staging_symlink_is_rejected_without_touching_target(self):
+        target = self.root / "target"
+        target.mkdir(mode=0o700)
+        write(target / "value", "value", 0o600)
+        staging = self.root / ".gate-bootstrap-staging"
+        staging.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(
+            MODULE.D3Error,
+            "gate_bootstrap_staging_(?:unavailable|identity_invalid)",
+        ):
+            MODULE.discard_gate_bootstrap_staging(self.root, staging)
+        self.assertEqual((target / "value").read_text(encoding="utf-8"), "value")
+
+    def test_prepare_cleans_staging_when_bootstrap_build_fails(self):
+        injected = MODULE.D3Error("injected_bootstrap_failure")
+        with mock.patch.object(
+            MODULE.gate_container,
+            "require_bootstrap_capacity",
+            return_value=10**12,
+        ), mock.patch.object(
+            MODULE,
+            "build_gate_bootstrap",
+            side_effect=injected,
+        ):
+            with self.assertRaisesRegex(MODULE.D3Error, "injected_bootstrap_failure"):
+                MODULE.prepare_gate_bootstrap(
+                    self.root,
+                    self.worktree,
+                    {"image_id": "sha256:" + "1" * 64},
+                )
+        self.assertFalse((self.root / ".gate-bootstrap-staging").exists())
 
 
 class D3CertificationTests(unittest.TestCase):
@@ -182,6 +239,21 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 "fetch_main",
                 side_effect=self.fetch_main_fixture,
             ),
+            mock.patch.object(
+                MODULE,
+                "load_gate_container_runtime",
+                return_value={"record_sha256": "2" * 64},
+            ),
+            mock.patch.object(
+                MODULE,
+                "load_gate_bootstrap_record",
+                return_value={"record_sha256": "4" * 64},
+            ),
+            mock.patch.object(
+                MODULE,
+                "candidate_dependency_snapshot",
+                return_value=getattr(self, "current_dependency_snapshot", {}),
+            ),
         ):
             status = MODULE.main(arguments)
         result = json.loads(stdout.getvalue()) if stdout.getvalue() else None
@@ -206,6 +278,48 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             arguments.extend(["--gate", gate])
         return arguments, gates
 
+    def make_dependency_snapshot(self, dependency_root):
+        if not dependency_root.exists():
+            workspace_vendor = dependency_root / "vendor" / "workspace"
+            transport_vendor = dependency_root / "vendor" / "transport"
+            workspace_vendor.mkdir(mode=0o700, parents=True)
+            transport_vendor.mkdir(mode=0o700)
+            workspace_config = dependency_root / "native-cargo-config.toml"
+            transport_config = dependency_root / "native-transport-cargo-config.toml"
+            write(workspace_config, "workspace\n", 0o400)
+            write(transport_config, "transport\n", 0o400)
+            workspace_vendor.chmod(0o500)
+            transport_vendor.chmod(0o500)
+            (dependency_root / "vendor").chmod(0o500)
+            dependency_root.chmod(0o555)
+        return {
+            "schema_version": 1,
+            "kind": "starring.d3.candidate-dependency-snapshot.v1",
+            "gate_runtime_sha256": "2" * 64,
+            "gate_bootstrap_sha256": "4" * 64,
+            "gate_bootstrap_tree_sha256": "5" * 64,
+            "candidate_builder_implementation_sha256": (
+                BUNDLE.candidate_builder_implementation_sha256()
+            ),
+            "bootstrap_root": str(dependency_root),
+            "workspace": {
+                "vendor_root": str(dependency_root / "vendor" / "workspace"),
+                "cargo_config": BUNDLE.file_identity(
+                    dependency_root / "native-cargo-config.toml",
+                    "test_workspace_cargo_config",
+                    expected_mode=0o400,
+                ),
+            },
+            "transport": {
+                "vendor_root": str(dependency_root / "vendor" / "transport"),
+                "cargo_config": BUNDLE.file_identity(
+                    dependency_root / "native-transport-cargo-config.toml",
+                    "test_transport_cargo_config",
+                    expected_mode=0o400,
+                ),
+            },
+        }
+
     def prepare(self, gates=None):
         arguments, gates = self.prepare_arguments(gates)
         status, result, error = self.invoke(arguments)
@@ -228,6 +342,21 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         outcomes = iter([] if outcomes is None else outcomes)
 
         database_urls = []
+
+        def recording_gate(
+            _root,
+            _worktree,
+            _bootstrap,
+            _toolchain,
+            index,
+            _attempt,
+            command,
+            _timeout,
+            database_url,
+        ):
+            observed.append(command)
+            database_urls.append(database_url if index > 16 else None)
+            return next(outcomes, 0)
 
         def recording_runner(
             argv,
@@ -254,6 +383,10 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
         tool_root = state_path.parent / "candidate-build-tools"
         tool_root.mkdir(mode=0o700, exist_ok=True)
+        dependency_root = state_path.parent / "candidate-test-dependencies"
+        self.current_dependency_snapshot = self.make_dependency_snapshot(
+            dependency_root
+        )
         native_arguments = {
             "clang": ("--version",),
             "ar": (),
@@ -298,7 +431,14 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             )
             return BUNDLE.validate_candidate_toolchain(toolchain)
 
-        def build_candidates(state, worktree, root, recipe, pinned_toolchain):
+        def build_candidates(
+            state,
+            worktree,
+            root,
+            recipe,
+            pinned_toolchain,
+            _fence_descriptor,
+        ):
             self.build_invocations = getattr(self, "build_invocations", 0) + 1
             BUNDLE.require_cargo_configuration_absent(worktree)
             build_root = pathlib.Path(recipe["build_root"])
@@ -316,6 +456,31 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
 
         with mock.patch.object(
             MODULE, "run_process", side_effect=recording_runner
+        ), mock.patch.object(
+            MODULE, "run_sandboxed_gate", side_effect=recording_gate
+        ), mock.patch.object(
+            MODULE,
+            "prepare_gate_bootstrap",
+            return_value=tool_root,
+        ), mock.patch.object(
+            MODULE,
+            "ensure_gate_container_runtime",
+            return_value={
+                "image_id": "sha256:" + "1" * 64,
+                "record_sha256": "2" * 64,
+            },
+        ), mock.patch.object(
+            MODULE,
+            "load_gate_container_runtime",
+            return_value={"record_sha256": "2" * 64},
+        ), mock.patch.object(
+            MODULE,
+            "ensure_gate_bootstrap_record",
+            return_value={"record_sha256": "4" * 64},
+        ), mock.patch.object(
+            MODULE,
+            "load_gate_bootstrap_record",
+            return_value={"record_sha256": "4" * 64},
         ), mock.patch.object(
             BUNDLE, "execute_candidate_build", side_effect=build_candidates
         ), mock.patch.object(
@@ -636,6 +801,8 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 "command_sha256": state["gate_command_sha256"][0],
                 "attempt": 1,
             },
+            "2" * 64,
+            "4" * 64,
         )
         status, result, error, observed = self.invoke_gate_plan(state_path, gates)
         self.assertEqual(status, 0, error)
@@ -664,6 +831,8 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 "command_sha256": state["gate_command_sha256"][0],
                 "attempt": 1,
             },
+            "2" * 64,
+            "4" * 64,
         )
         record = json.loads(evidence_path.read_text(encoding="utf-8"))
         record["schema_version"] = True
@@ -676,7 +845,70 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             MODULE.D3Error,
             "gate_evidence_identity_invalid",
         ):
-            MODULE.load_gate_evidence(evidence_path, state)
+            MODULE.load_gate_evidence(
+                evidence_path,
+                state,
+                "2" * 64,
+                "4" * 64,
+            )
+
+    def test_gate_evidence_rejects_legacy_unisolated_record(self):
+        state_path, _, _ = self.prepare()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        evidence_path = state_path.with_name("gate-evidence.jsonl")
+        record = {
+            "schema_version": 1,
+            "kind": "starring.d3.gate-started.v1",
+            "merge_commit": state["merge_commit"],
+            "merge_tree": state["merge_tree"],
+            "gate_index": 1,
+            "command_sha256": state["gate_command_sha256"][0],
+            "attempt": 1,
+            "observed_at": MODULE.utc_now(),
+            "previous_sha256": MODULE.ZERO_DIGEST,
+        }
+        record["record_sha256"] = MODULE.sha256_bytes(
+            MODULE.canonical_json(record).encode("utf-8")
+        )
+        write(evidence_path, MODULE.canonical_json(record) + "\n", 0o600)
+        with self.assertRaisesRegex(
+            MODULE.D3Error,
+            "gate_evidence_fields_invalid",
+        ):
+            MODULE.load_gate_evidence(
+                evidence_path,
+                state,
+                "2" * 64,
+                "4" * 64,
+            )
+
+    def test_gate_evidence_rejects_changed_container_runtime(self):
+        state_path, _, _ = self.prepare()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        evidence_path = state_path.with_name("gate-evidence.jsonl")
+        MODULE.append_gate_evidence(
+            evidence_path,
+            state,
+            [],
+            {
+                "kind": "starring.d3.gate-started.v1",
+                "gate_index": 1,
+                "command_sha256": state["gate_command_sha256"][0],
+                "attempt": 1,
+            },
+            "2" * 64,
+            "4" * 64,
+        )
+        with self.assertRaisesRegex(
+            MODULE.D3Error,
+            "gate_evidence_identity_invalid",
+        ):
+            MODULE.load_gate_evidence(
+                evidence_path,
+                state,
+                "3" * 64,
+                "4" * 64,
+            )
 
     def test_candidate_bundle_resumes_from_durable_intent_and_partial_build(self):
         state_path, _, gates = self.prepare()
@@ -688,6 +920,265 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(status, 0, error)
         self.assertEqual(result["candidate_bundle_disposition"], "created")
         self.assertEqual(self.build_invocations, 2)
+
+    def test_copy_snapshot_copies_and_revalidates_destination(self):
+        source = self.root / "copy-success-source"
+        destination = self.root / "copy-success-destination"
+        payload = (b"stable candidate payload\n" * 1024) + b"complete\n"
+        source.write_bytes(payload)
+        source.chmod(0o600)
+
+        source_identity, destination_identity = CANDIDATE_IO.copy_snapshot(
+            source,
+            destination,
+            0o400,
+            "copy",
+        )
+
+        self.assertEqual(destination.read_bytes(), payload)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o400)
+        self.assertEqual(source_identity["sha256"], destination_identity["sha256"])
+        self.assertEqual(source_identity["size"], len(payload))
+        self.assertEqual(destination_identity["size"], len(payload))
+
+    def test_copy_snapshot_rejects_torn_same_inode_source(self):
+        source = self.root / "copy-source"
+        destination = self.root / "copy-destination"
+        source.write_bytes(b"A" * (2 * 1024 * 1024))
+        source.chmod(0o600)
+        original_write_all = CANDIDATE_IO.write_all
+        mutated = False
+
+        def mutate_after_first_chunk(descriptor, payload):
+            nonlocal mutated
+            original_write_all(descriptor, payload)
+            if mutated:
+                return
+            mutated = True
+            source_descriptor = os.open(source, os.O_WRONLY)
+            try:
+                os.pwrite(
+                    source_descriptor,
+                    b"B" * (2 * 1024 * 1024),
+                    0,
+                )
+                os.fsync(source_descriptor)
+            finally:
+                os.close(source_descriptor)
+
+        with mock.patch.object(
+            CANDIDATE_IO,
+            "write_all",
+            side_effect=mutate_after_first_chunk,
+        ):
+            with self.assertRaisesRegex(
+                BUNDLE.CandidateBundleError,
+                "copy_source_changed_during_copy",
+            ):
+                CANDIDATE_IO.copy_snapshot(
+                    source,
+                    destination,
+                    0o400,
+                    "copy",
+                )
+
+    def test_copy_snapshot_rejects_atomic_source_replacement(self):
+        source = self.root / "replace-source"
+        replacement = self.root / "replace-source-new"
+        destination = self.root / "replace-destination"
+        source.write_bytes(b"A" * (2 * 1024 * 1024))
+        source.chmod(0o600)
+        replacement.write_bytes(b"B" * (2 * 1024 * 1024))
+        replacement.chmod(0o600)
+        original_write_all = CANDIDATE_IO.write_all
+        replaced = False
+
+        def replace_after_first_chunk(descriptor, payload):
+            nonlocal replaced
+            original_write_all(descriptor, payload)
+            if not replaced:
+                replaced = True
+                os.replace(replacement, source)
+
+        with mock.patch.object(
+            CANDIDATE_IO,
+            "write_all",
+            side_effect=replace_after_first_chunk,
+        ):
+            with self.assertRaisesRegex(
+                BUNDLE.CandidateBundleError,
+                "copy_source_(?:path_)?changed_during_copy",
+            ):
+                CANDIDATE_IO.copy_snapshot(
+                    source,
+                    destination,
+                    0o400,
+                    "copy",
+                )
+
+    def test_candidate_build_fence_blocks_retry_until_holder_releases(self):
+        root = self.root / "build-fence-root"
+        root.mkdir(mode=0o700)
+        descriptor = BUNDLE.acquire_candidate_build_fence(root)
+        holder = os.dup(descriptor)
+        os.close(descriptor)
+        try:
+            with self.assertRaisesRegex(
+                BUNDLE.CandidateBundleError,
+                "candidate_build_writer_active",
+            ):
+                BUNDLE.acquire_candidate_build_fence(root)
+        finally:
+            os.close(holder)
+        recovered = BUNDLE.acquire_candidate_build_fence(root)
+        os.close(recovered)
+
+    def test_candidate_build_delegates_to_deterministic_launchd_job(self):
+        root = self.root / "build-launchd-root"
+        root.mkdir(mode=0o700)
+        descriptor = BUNDLE.acquire_candidate_build_fence(root)
+        try:
+            with (
+                mock.patch.object(
+                    BUNDLE,
+                    "require_candidate_build_capacity",
+                    return_value=(0, 0),
+                ),
+                mock.patch.object(
+                    BUNDLE,
+                    "sandboxed_argv",
+                    side_effect=lambda argv, *_arguments: ["/sandbox", *argv],
+                ),
+                mock.patch.object(
+                    BUNDLE.launchd_job,
+                    "run_job",
+                    return_value=0,
+                ) as invoked,
+            ):
+                first = BUNDLE.run_contained_build_process(
+                    ["/usr/bin/true"],
+                    root,
+                    {"PATH": "/usr/bin:/bin"},
+                    30,
+                    descriptor,
+                    "candidate_test",
+                    root,
+                    "none",
+                )
+                second = BUNDLE.run_contained_build_process(
+                    ["/usr/bin/true"],
+                    root,
+                    {"PATH": "/usr/bin:/bin"},
+                    30,
+                    descriptor,
+                    "candidate_test",
+                    root,
+                    "none",
+                )
+        finally:
+            os.close(descriptor)
+        self.assertEqual(first, 0)
+        self.assertEqual(second, 0)
+        self.assertEqual(invoked.call_count, 2)
+        first_arguments = invoked.call_args_list[0].args
+        second_arguments = invoked.call_args_list[1].args
+        self.assertEqual(first_arguments[0], ["/sandbox", "/usr/bin/true"])
+        self.assertEqual(first_arguments[5], second_arguments[5])
+        self.assertEqual(len(first_arguments[5]), 32)
+
+    def test_candidate_build_maps_launchd_failure(self):
+        root = self.root / "build-launchd-error-root"
+        root.mkdir(mode=0o700)
+        descriptor = BUNDLE.acquire_candidate_build_fence(root)
+        try:
+            with mock.patch.object(
+                BUNDLE,
+                "require_candidate_build_capacity",
+                return_value=(0, 0),
+            ), mock.patch.object(
+                BUNDLE,
+                "sandboxed_argv",
+                side_effect=lambda argv, *_arguments: argv,
+            ), mock.patch.object(
+                BUNDLE.launchd_job,
+                "run_job",
+                side_effect=BUNDLE.launchd_job.LaunchdJobError(
+                    "candidate_launchd_timeout"
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    BUNDLE.CandidateBundleError,
+                    "candidate_test_candidate_launchd_timeout",
+                ):
+                    BUNDLE.run_contained_build_process(
+                        ["/usr/bin/true"],
+                        root,
+                        {"PATH": "/usr/bin:/bin"},
+                        30,
+                        descriptor,
+                        "candidate_test",
+                        root,
+                        "none",
+                    )
+        finally:
+            os.close(descriptor)
+
+    def test_candidate_build_capacity_preserves_baseline_and_reserve(self):
+        root = self.root / "build-capacity-root"
+        root.mkdir(mode=0o700)
+        gibibyte = 1024 * 1024 * 1024
+        with mock.patch.object(
+            BUNDLE,
+            "candidate_build_usage",
+            return_value=(1, gibibyte),
+        ), mock.patch.object(
+            BUNDLE.os,
+            "statvfs",
+            return_value=mock.Mock(f_bavail=7 * gibibyte, f_frsize=1),
+        ):
+            self.assertEqual(
+                BUNDLE.require_candidate_build_capacity(root),
+                (1, gibibyte),
+            )
+        for free in (gibibyte, 6 * gibibyte):
+            with mock.patch.object(
+                BUNDLE,
+                "candidate_build_usage",
+                return_value=(1, gibibyte),
+            ), mock.patch.object(
+                BUNDLE.os,
+                "statvfs",
+                return_value=mock.Mock(f_bavail=free, f_frsize=1),
+            ):
+                with self.assertRaisesRegex(
+                    BUNDLE.CandidateBundleError,
+                    "candidate_build_capacity_insufficient",
+                ):
+                    BUNDLE.require_candidate_build_capacity(root)
+
+    def test_candidate_build_root_is_retired_by_sealed_identity(self):
+        state_path, _, gates = self.prepare()
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        build_root = state_path.parent / "candidate-build"
+        self.assertTrue(build_root.is_dir())
+        self.assertTrue(BUNDLE.retire_candidate_build_root(state_path.parent))
+        self.assertFalse(build_root.exists())
+        self.assertFalse(BUNDLE.retire_candidate_build_root(state_path.parent))
+
+    def test_candidate_build_root_retirement_rejects_replacement(self):
+        state_path, _, gates = self.prepare()
+        status, _, error, _ = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        build_root = state_path.parent / "candidate-build"
+        displaced = state_path.parent / "candidate-build-displaced"
+        build_root.rename(displaced)
+        build_root.mkdir(mode=0o700)
+        with self.assertRaisesRegex(
+            BUNDLE.CandidateBundleError,
+            "candidate_build_retirement_identity_invalid",
+        ):
+            BUNDLE.retire_candidate_build_root(state_path.parent)
 
     def test_candidate_bundle_rejects_partial_build_under_changed_toolchain(self):
         state_path, _, gates = self.prepare()
@@ -1036,6 +1527,13 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             0o700,
         )
         clang = BUNDLE.FIXED_DEVELOPER_DIRECTORY / "usr" / "bin" / "clang"
+        build_root = self.root / "foreign-toolchain-build"
+        cargo_home = build_root / "cargo-home"
+        build_root.mkdir(mode=0o700)
+        cargo_home.mkdir(mode=0o700)
+        dependency_snapshot = self.make_dependency_snapshot(
+            self.root / "foreign-toolchain-dependencies"
+        )
         environment = {
             "AR": str(BUNDLE.FIXED_DEVELOPER_DIRECTORY / "usr" / "bin" / "ar"),
             "CC": str(clang),
@@ -1043,18 +1541,42 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             "DEVELOPER_DIR": str(BUNDLE.FIXED_DEVELOPER_DIRECTORY),
             "LD": str(BUNDLE.FIXED_DEVELOPER_DIRECTORY / "usr" / "bin" / "ld"),
             "RUSTC": str(self.root / "rustc"),
+            "CARGO_HOME": str(cargo_home),
             BUNDLE.FIXED_RUST_LINKER_ENVIRONMENT: str(clang),
         }
-        with mock.patch.dict(
-            os.environ,
-            {
-                "PATH": str(foreign) + ":" + os.environ.get("PATH", ""),
-                "DEVELOPER_DIR": str(self.root / "foreign-developer"),
-            },
-        ):
-            BUNDLE.run_build_command(
-                ["cargo", "build"], cargo, environment, self.repo, self.merge
-            )
+        descriptor = BUNDLE.acquire_candidate_build_fence(self.root)
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "PATH": str(foreign) + ":" + os.environ.get("PATH", ""),
+                    "DEVELOPER_DIR": str(self.root / "foreign-developer"),
+                },
+            ), mock.patch.object(
+                BUNDLE,
+                "require_candidate_build_capacity",
+                return_value=(0, 0),
+            ), mock.patch.object(
+                BUNDLE,
+                "sandboxed_argv",
+                side_effect=lambda argv, *_arguments: argv,
+            ):
+                BUNDLE.run_build_command(
+                    [
+                        "cargo",
+                        "--config",
+                        dependency_snapshot["workspace"]["cargo_config"]["path"],
+                        "build",
+                    ],
+                    cargo,
+                    environment,
+                    self.repo,
+                    self.merge,
+                    dependency_snapshot,
+                    descriptor,
+                )
+        finally:
+            os.close(descriptor)
         self.assertFalse(marker.exists())
         self.assertEqual(
             observed.read_text(encoding="utf-8").splitlines(),
@@ -1065,6 +1587,157 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 "/usr/bin/cc",
             ],
         )
+
+    def test_candidate_recipe_is_offline_and_selects_sealed_configs(self):
+        state_path, _, _ = self.prepare()
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        snapshot = self.make_dependency_snapshot(
+            state_path.parent / "recipe-dependencies"
+        )
+        recipe = BUNDLE.candidate_build_recipe(
+            state,
+            state_path.parent,
+            pathlib.Path(state["worktree_path"]),
+            snapshot,
+        )
+        self.assertNotIn("fetch_commands", recipe)
+        self.assertEqual(recipe["dependency_snapshot"], snapshot)
+        self.assertEqual(len(recipe["commands"]), 5)
+        workspace_config = snapshot["workspace"]["cargo_config"]["path"]
+        transport_config = snapshot["transport"]["cargo_config"]["path"]
+        self.assertTrue(
+            all(command[1:3] == ["--config", workspace_config] for command in recipe["commands"][:4])
+        )
+        self.assertEqual(
+            recipe["commands"][4][1:3],
+            ["--config", transport_config],
+        )
+        self.assertTrue(all("--frozen" in command for command in recipe["commands"]))
+
+    def test_candidate_build_command_is_networkless_offline_and_bootstrap_read_only(self):
+        snapshot = self.make_dependency_snapshot(
+            self.root / "networkless-dependencies"
+        )
+        build_root = self.root / "networkless-build"
+        cargo_home = build_root / "cargo-home"
+        build_root.mkdir(mode=0o700)
+        cargo_home.mkdir(mode=0o700)
+        command = [
+            "cargo",
+            "--config",
+            snapshot["workspace"]["cargo_config"]["path"],
+            "build",
+            "--frozen",
+        ]
+        with mock.patch.object(
+            BUNDLE,
+            "run_contained_build_process",
+            return_value=0,
+        ) as invoked:
+            BUNDLE.run_build_command(
+                command,
+                self.root / "cargo",
+                {"CARGO_HOME": str(cargo_home)},
+                self.repo,
+                self.merge,
+                snapshot,
+            )
+        arguments = invoked.call_args.args
+        keywords = invoked.call_args.kwargs
+        self.assertEqual(arguments[0][1:], command[1:])
+        self.assertEqual(arguments[2]["CARGO_NET_OFFLINE"], "true")
+        self.assertEqual(arguments[7], "none")
+        self.assertEqual(
+            keywords["sandbox_additional_read_roots"],
+            (pathlib.Path(snapshot["bootstrap_root"]),),
+        )
+
+    def test_candidate_dependency_snapshot_rejects_config_vendor_and_builder_drift(self):
+        dependency_root = self.root / "drift-dependencies"
+        snapshot = self.make_dependency_snapshot(dependency_root)
+        workspace_config = dependency_root / "native-cargo-config.toml"
+        workspace_vendor = dependency_root / "vendor" / "workspace"
+        workspace_config.chmod(0o600)
+        with self.assertRaises(BUNDLE.CandidateBundleError):
+            BUNDLE.validate_dependency_snapshot(snapshot)
+        workspace_config.chmod(0o400)
+        workspace_vendor.chmod(0o700)
+        with self.assertRaises(BUNDLE.CandidateBundleError):
+            BUNDLE.validate_dependency_snapshot(snapshot)
+        workspace_vendor.chmod(0o500)
+        changed = json.loads(json.dumps(snapshot))
+        changed["candidate_builder_implementation_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            BUNDLE.CandidateBundleError,
+            "candidate_dependency_snapshot_identity_invalid",
+        ):
+            BUNDLE.validate_dependency_snapshot(changed)
+
+    def test_npm_lock_source_validation_rejects_non_registry_origins(self):
+        lock = self.root / "package-lock.json"
+        for resolved in (
+            "https://example.com/package.tgz",
+            "http://registry.npmjs.org/package.tgz",
+            "https://user:password@registry.npmjs.org/package.tgz",
+            "https://registry.npmjs.org/package.tgz#fragment",
+        ):
+            with self.subTest(resolved=resolved):
+                write(
+                    lock,
+                    json.dumps({"packages": {"node_modules/x": {"resolved": resolved}}}),
+                )
+                with self.assertRaisesRegex(
+                    MODULE.D3Error,
+                    "gate_npm_lock_source_invalid",
+                ):
+                    MODULE.validate_npm_lock_sources(lock)
+
+    def test_vendor_configuration_supports_spaces_and_rejects_toml_escapes(self):
+        raw = (
+            '[source.crates-io]\nreplace-with = "vendored-sources"\n\n'
+            '[source.vendored-sources]\ndirectory = "/stage/vendor"\n'
+        ).encode("utf-8")
+        selected = pathlib.Path("/Users/test/Application Support/vendor")
+        value = MODULE.normalize_vendor_configuration(
+            raw,
+            pathlib.Path("/stage/vendor"),
+            selected,
+        )
+        self.assertIn(f'directory = "{selected}"', value)
+        with self.assertRaisesRegex(
+            MODULE.D3Error,
+            "gate_vendor_configuration_invalid",
+        ):
+            MODULE.normalize_vendor_configuration(
+                raw,
+                pathlib.Path("/stage/vendor"),
+                pathlib.Path('/Users/test/invalid"path'),
+            )
+
+    def test_composite_vendor_configuration_separates_registry_and_git_sources(self):
+        value = MODULE.composite_vendor_configuration(
+            pathlib.Path("/vendor/workspace"),
+            pathlib.Path("/vendor/transport"),
+        )
+        self.assertIn(
+            '[source.crates-io]\nreplace-with = "workspace-vendored-sources"',
+            value,
+        )
+        self.assertIn(
+            f'[source."{MODULE.gate_container.TWILIGHT_SOURCE_KEY}"]',
+            value,
+        )
+        self.assertIn('directory = "/vendor/workspace"', value)
+        self.assertIn('directory = "/vendor/transport"', value)
+        self.assertEqual(value.count("offline = true"), 1)
+        with self.assertRaisesRegex(
+            MODULE.D3Error,
+            "gate_vendor_configuration_invalid",
+        ):
+            MODULE.composite_vendor_configuration(
+                pathlib.Path('/vendor/invalid"path'),
+                pathlib.Path("/vendor/transport"),
+            )
 
     def test_gate_plan_and_sensitive_command_fail_closed(self):
         state_path, _, _ = self.prepare()
@@ -1164,6 +1837,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         )
         root = self.root / "d2"
         root.mkdir(mode=0o700)
+        (root / "orchestrator").mkdir(mode=0o700)
         artifacts = {
             value["candidate"]: value["artifact"] for value in bundle["artifacts"]
         }
@@ -1316,6 +1990,48 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(status, 1)
         self.assertIn("d2_receipt_sequence_invalid", error)
         self.assertEqual(gates, list(MODULE.REQUIRED_GATE_COMMANDS))
+
+    def test_d2_binding_rejects_candidate_start_retirement(self):
+        state_path, _, _ = self.prepare()
+        manifest_path, final_path = self.make_d2(state_path)
+        retirement = manifest_path.parent / "orchestrator" / "candidate-start-retirement.json"
+        write(retirement, "retired\n", 0o600)
+        status, _, error = self.invoke(
+            [
+                "bind-d2",
+                "--state",
+                str(state_path),
+                "--d2-manifest",
+                str(manifest_path),
+                "--d2-final-record",
+                str(final_path),
+            ]
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_start_transition_retirement_required", error)
+
+    def test_d2_binding_rejects_abort_teardown_tombstone(self):
+        state_path, _, _ = self.prepare()
+        manifest_path, final_path = self.make_d2(state_path)
+        tombstone = (
+            manifest_path.parent
+            / "orchestrator"
+            / "discord-resource-teardown-abort.json"
+        )
+        write(tombstone, "aborted\n", 0o600)
+        status, _, error = self.invoke(
+            [
+                "bind-d2",
+                "--state",
+                str(state_path),
+                "--d2-manifest",
+                str(manifest_path),
+                "--d2-final-record",
+                str(final_path),
+            ]
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_start_transition_retirement_required", error)
 
     def test_d2_binding_rejects_the_legacy_receipt_only_final_record(self):
         state_path, _, _ = self.prepare()
@@ -1483,6 +2199,69 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         status, _, error = self.invoke(["recheck", "--state", str(state_path)])
         self.assertEqual(status, 1)
         self.assertIn("candidate_bundle_artifact", error)
+
+    def test_recheck_and_finalize_reject_post_binding_retirement(self):
+        state_path = self.complete_prerequisites()
+        binding = json.loads(
+            state_path.with_name("d2-binding.json").read_text(encoding="utf-8")
+        )
+        manifest_path = pathlib.Path(binding["d2_manifest_path"])
+        retirement = manifest_path.parent / "orchestrator" / "candidate-start-retirement.json"
+        write(retirement, "retired\n", 0o600)
+        status, _, error = self.invoke(["recheck", "--state", str(state_path)])
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_start_transition_retirement_required", error)
+        status, _, error = self.invoke(self.finalize_arguments(state_path))
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_start_transition_retirement_required", error)
+
+    def test_recheck_and_finalize_reject_post_binding_abort_teardown(self):
+        state_path = self.complete_prerequisites()
+        binding = json.loads(
+            state_path.with_name("d2-binding.json").read_text(encoding="utf-8")
+        )
+        manifest_path = pathlib.Path(binding["d2_manifest_path"])
+        tombstone = (
+            manifest_path.parent
+            / "orchestrator"
+            / "discord-resource-teardown-abort.json"
+        )
+        write(tombstone, "aborted\n", 0o600)
+        status, _, error = self.invoke(["recheck", "--state", str(state_path)])
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_start_transition_retirement_required", error)
+        status, _, error = self.invoke(self.finalize_arguments(state_path))
+        self.assertEqual(status, 1)
+        self.assertIn("candidate_start_transition_retirement_required", error)
+
+    def test_recheck_rejects_d2_orchestrator_directory_replacement(self):
+        state_path = self.complete_prerequisites()
+        binding = json.loads(
+            state_path.with_name("d2-binding.json").read_text(encoding="utf-8")
+        )
+        manifest_path = pathlib.Path(binding["d2_manifest_path"])
+        orchestrator = manifest_path.parent / "orchestrator"
+        replaced = manifest_path.parent / "orchestrator-replaced"
+        orchestrator.rename(replaced)
+        orchestrator.mkdir(mode=0o700)
+        status, _, error = self.invoke(["recheck", "--state", str(state_path)])
+        self.assertEqual(status, 1)
+        self.assertIn("d2_binding_run_identity_changed", error)
+
+    def test_finalize_rejects_non_string_d2_manifest_binding_path(self):
+        state_path = self.complete_prerequisites()
+        binding_path = state_path.with_name("d2-binding.json")
+        binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        binding.pop("record_sha256")
+        binding["d2_manifest_path"] = 1
+        write(
+            binding_path,
+            MODULE.canonical_json(MODULE.seal_record(binding)) + "\n",
+            0o600,
+        )
+        status, _, error = self.invoke(self.finalize_arguments(state_path))
+        self.assertEqual(status, 1)
+        self.assertIn("d2_binding_run_identity_invalid", error)
 
     def test_finalize_rejects_post_recheck_bundle_mode_drift(self):
         state_path = self.complete_prerequisites()

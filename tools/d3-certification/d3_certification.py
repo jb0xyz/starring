@@ -6,13 +6,18 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
 import time
 import urllib.parse
 
+import d3_candidate_bundle as candidate_bundle
+import d3_candidate_io as candidate_io
+import d3_gate_container as gate_container
 from d3_candidate_bundle import (
     CandidateBundleError,
     ensure_candidate_bundle,
@@ -91,6 +96,34 @@ REQUIRED_GATE_COMMANDS = (
     "cargo test --locked -p automation-runtime-serving-postgres -- --ignored --test-threads=1",
     "cargo test --locked -p automation-runtime-interaction-postgres -- --ignored --test-threads=1",
     "cargo test --locked -p automation-runtime-panel-postgres -- --ignored --test-threads=1",
+)
+GATE_BOOTSTRAP_WORK_DIRECTORIES = (
+    "cargo-home",
+    "home",
+    "target",
+    "tmp",
+    "xdg-cache",
+    "xdg-config",
+)
+GATE_BOOTSTRAP_DIRECTORIES = (
+    "bin",
+    "git",
+    "node-stage",
+    "npm-cache",
+    "vendor",
+)
+GATE_BOOTSTRAP_FILES = (
+    "cargo-config.toml",
+    "native-cargo-config.toml",
+    "native-transport-cargo-config.toml",
+    "transport-cargo-config.toml",
+)
+GATE_BOOTSTRAP_TEMPORARY_PATHS = (
+    ("node-stage/package-lock.json", 0o400),
+    ("node-stage/package.json", 0o400),
+    ("transport-cargo-vendor-config.txt", 0o600),
+    ("transport-staging-cargo-config.toml", 0o600),
+    ("workspace-cargo-config.toml", 0o600),
 )
 SAFE_ENVIRONMENT_NAMES = (
     "CARGO_HOME",
@@ -920,7 +953,12 @@ def evidence_record_hash(record):
     return observed
 
 
-def load_gate_evidence(path, state):
+def load_gate_evidence(
+    path,
+    state,
+    gate_runtime_sha256,
+    gate_bootstrap_sha256,
+):
     if not path.exists():
         return []
     raw_evidence = read_owned_bytes(
@@ -942,6 +980,8 @@ def load_gate_evidence(path, state):
             "gate_index",
             "command_sha256",
             "attempt",
+            "gate_runtime_sha256",
+            "gate_bootstrap_sha256",
             "observed_at",
             "previous_sha256",
             "record_sha256",
@@ -970,18 +1010,37 @@ def load_gate_evidence(path, state):
             or record["command_sha256"] != state["gate_command_sha256"][record["gate_index"] - 1]
             or type(record["attempt"]) is not int
             or record["attempt"] <= 0
+            or record["gate_runtime_sha256"] != gate_runtime_sha256
+            or record["gate_bootstrap_sha256"] != gate_bootstrap_sha256
         ):
             fail("gate_evidence_identity_invalid")
+        validate_digest(record["gate_runtime_sha256"], "gate_evidence_runtime")
+        validate_digest(record["gate_bootstrap_sha256"], "gate_evidence_bootstrap")
         validate_timestamp(record["observed_at"], "gate_evidence_observed_at")
         previous = evidence_record_hash(record)
         records.append(record)
     return records
 
 
-def append_gate_evidence(path, state, records, value):
+def append_gate_evidence(
+    path,
+    state,
+    records,
+    value,
+    gate_runtime_sha256,
+    gate_bootstrap_sha256,
+):
     record = {
         "schema_version": SCHEMA_VERSION,
         **value,
+        "gate_runtime_sha256": validate_digest(
+            gate_runtime_sha256,
+            "gate_evidence_runtime",
+        ),
+        "gate_bootstrap_sha256": validate_digest(
+            gate_bootstrap_sha256,
+            "gate_evidence_bootstrap",
+        ),
         "merge_commit": state["merge_commit"],
         "merge_tree": state["merge_tree"],
         "observed_at": utc_now(),
@@ -1046,6 +1105,856 @@ def gate_status(records, count):
     return attempts, latest, open_attempts
 
 
+def ensure_private_directory(path):
+    try:
+        path.mkdir(mode=0o700)
+        fsync_directory(path.parent)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        fail(f"gate_sandbox_directory_unavailable:{error.__class__.__name__}")
+    require_directory(path, "gate_sandbox_directory", 0o700)
+    return path
+
+
+def ensure_gate_container_runtime(root):
+    try:
+        identity = gate_container.gate_image_identity()
+        identity["gate_orchestration_sha256"] = gate_orchestration_sha256()
+        gate_container.validate_bind_roundtrip(root, identity["image_id"])
+    except gate_container.GateContainerError as error:
+        fail(str(error))
+    path = root / "gate-container-runtime.json"
+    if path.exists():
+        existing = load_gate_container_runtime(root)
+        if existing != seal_record(identity):
+            fail("gate_container_runtime_changed")
+        return existing
+    record = seal_record(identity)
+    write_new_json(path, record)
+    return record
+
+
+def gate_orchestration_sha256():
+    try:
+        return candidate_bundle.file_identity(
+            pathlib.Path(__file__),
+            "gate_orchestration",
+        )["sha256"]
+    except CandidateBundleError as error:
+        fail(str(error))
+
+
+def load_gate_container_runtime(root):
+    value = load_json_file(
+        root / "gate-container-runtime.json",
+        "gate_container_runtime",
+        0o600,
+    )
+    required = {
+        "schema_version",
+        "kind",
+        "dockerfile_sha256",
+        "image_id",
+        "postgres_image",
+        "gate_orchestration_sha256",
+        "runner_policy_sha256",
+        "runner_implementation_sha256",
+        "daemon_memory_bytes",
+        "tool_versions",
+        "record_sha256",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or not valid_schema_version(value.get("schema_version"))
+        or value.get("kind") != "starring.d3.gate-container-runtime.v1"
+        or not isinstance(value.get("dockerfile_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(value["dockerfile_sha256"])
+        or not isinstance(value.get("image_id"), str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", value["image_id"])
+        or value.get("postgres_image") != gate_container.POSTGRES_IMAGE
+        or not isinstance(value.get("gate_orchestration_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(value["gate_orchestration_sha256"])
+        or value["gate_orchestration_sha256"] != gate_orchestration_sha256()
+        or not isinstance(value.get("runner_policy_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(value["runner_policy_sha256"])
+        or value["runner_policy_sha256"] != gate_container.runner_policy_sha256()
+        or not isinstance(value.get("runner_implementation_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(value["runner_implementation_sha256"])
+        or value["runner_implementation_sha256"]
+        != gate_container.runner_implementation_sha256()
+        or type(value.get("daemon_memory_bytes")) is not int
+        or value["daemon_memory_bytes"] < gate_container.MINIMUM_DAEMON_MEMORY_BYTES
+        or not isinstance(value.get("tool_versions"), list)
+        or len(value["tool_versions"]) != 6
+        or any(not isinstance(item, str) or not item for item in value["tool_versions"])
+    ):
+        fail("gate_container_runtime_invalid")
+    verify_sealed_record(value, "gate_container_runtime")
+    return value
+
+
+def seal_read_only_tree(root):
+    paths = sorted(root.rglob("*"), key=lambda path: len(path.parts), reverse=True)
+    for path in paths:
+        metadata = path.lstat()
+        if path.is_symlink():
+            fail("gate_bootstrap_symlink_forbidden")
+        mode = stat.S_IMODE(metadata.st_mode) & ~0o222
+        if stat.S_ISDIR(metadata.st_mode):
+            mode |= 0o500
+        elif stat.S_ISREG(metadata.st_mode):
+            mode |= 0o400
+        else:
+            fail("gate_bootstrap_entry_invalid")
+        path.chmod(mode)
+    root.chmod(0o555)
+
+
+def gate_bootstrap_tree_identity(root):
+    require_directory(root, "gate_bootstrap", 0o555)
+    digest = hashlib.sha256()
+    entries = 0
+    total_bytes = 0
+    try:
+        paths = sorted(root.rglob("*"), key=lambda path: str(path.relative_to(root)))
+    except OSError as error:
+        fail(f"gate_bootstrap_inventory_unavailable:{error.__class__.__name__}")
+    for path in paths:
+        relative = str(path.relative_to(root))
+        try:
+            before = path.lstat()
+        except OSError as error:
+            fail(f"gate_bootstrap_entry_unavailable:{error.__class__.__name__}")
+        mode = stat.S_IMODE(before.st_mode)
+        if (
+            path.is_symlink()
+            or before.st_uid != os.getuid()
+            or mode & 0o222
+            or "\x00" in relative
+        ):
+            fail("gate_bootstrap_entry_invalid")
+        entries += 1
+        if entries > 500000:
+            fail("gate_bootstrap_inventory_too_large")
+        if stat.S_ISDIR(before.st_mode):
+            kind = "directory"
+            size = 0
+        elif stat.S_ISREG(before.st_mode) and before.st_nlink == 1:
+            kind = "file"
+            size = before.st_size
+        else:
+            fail("gate_bootstrap_entry_invalid")
+        header = canonical_json(
+            {
+                "path": relative,
+                "kind": kind,
+                "mode": mode,
+                "size": size,
+            }
+        ).encode("utf-8")
+        digest.update(len(header).to_bytes(8, "big"))
+        digest.update(header)
+        if kind == "directory":
+            continue
+        total_bytes += size
+        if total_bytes > 4 * 1024 * 1024 * 1024:
+            fail("gate_bootstrap_inventory_too_large")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            fail(f"gate_bootstrap_entry_unavailable:{error.__class__.__name__}")
+        observed = 0
+        try:
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                observed += len(chunk)
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (
+            observed != size
+            or before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_mode != after.st_mode
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or before.st_ctime_ns != after.st_ctime_ns
+        ):
+            fail("gate_bootstrap_changed_during_read")
+    return {
+        "entries": entries,
+        "total_bytes": total_bytes,
+        "tree_sha256": digest.hexdigest(),
+    }
+
+
+def ensure_gate_bootstrap_record(root, bootstrap, runtime):
+    identity = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "starring.d3.gate-bootstrap.v1",
+        "gate_runtime_sha256": runtime["record_sha256"],
+        **gate_bootstrap_tree_identity(bootstrap),
+    }
+    path = root / "gate-bootstrap.json"
+    if path.exists():
+        existing = load_json_file(path, "gate_bootstrap_record", 0o600)
+        verify_sealed_record(existing, "gate_bootstrap_record")
+        if existing != seal_record(identity):
+            fail("gate_bootstrap_changed")
+        return existing
+    record = seal_record(identity)
+    write_new_json(path, record)
+    return record
+
+
+def load_gate_bootstrap_record(root, runtime):
+    record = load_json_file(
+        root / "gate-bootstrap.json",
+        "gate_bootstrap_record",
+        0o600,
+    )
+    required = {
+        "schema_version",
+        "kind",
+        "gate_runtime_sha256",
+        "entries",
+        "total_bytes",
+        "tree_sha256",
+        "record_sha256",
+    }
+    if (
+        not isinstance(record, dict)
+        or set(record) != required
+        or not valid_schema_version(record.get("schema_version"))
+        or record.get("kind") != "starring.d3.gate-bootstrap.v1"
+        or record.get("gate_runtime_sha256") != runtime["record_sha256"]
+        or type(record.get("entries")) is not int
+        or record["entries"] <= 0
+        or type(record.get("total_bytes")) is not int
+        or record["total_bytes"] <= 0
+        or not isinstance(record.get("tree_sha256"), str)
+        or not DIGEST_PATTERN.fullmatch(record["tree_sha256"])
+    ):
+        fail("gate_bootstrap_record_invalid")
+    verify_sealed_record(record, "gate_bootstrap_record")
+    observed = gate_bootstrap_tree_identity(root / "gate-bootstrap")
+    if any(record[key] != observed[key] for key in observed):
+        fail("gate_bootstrap_changed")
+    return record
+
+
+def candidate_dependency_snapshot(root, runtime=None, bootstrap_record=None):
+    selected_runtime = (
+        load_gate_container_runtime(root) if runtime is None else runtime
+    )
+    selected_bootstrap = (
+        load_gate_bootstrap_record(root, selected_runtime)
+        if bootstrap_record is None
+        else bootstrap_record
+    )
+    bootstrap = root / "gate-bootstrap"
+    identity = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "starring.d3.candidate-dependency-snapshot.v1",
+        "gate_runtime_sha256": selected_runtime["record_sha256"],
+        "gate_bootstrap_sha256": selected_bootstrap["record_sha256"],
+        "gate_bootstrap_tree_sha256": selected_bootstrap["tree_sha256"],
+        "candidate_builder_implementation_sha256": (
+            candidate_bundle.candidate_builder_implementation_sha256()
+        ),
+        "bootstrap_root": str(bootstrap),
+        "workspace": {
+            "vendor_root": str(bootstrap / "vendor" / "workspace"),
+            "cargo_config": candidate_bundle.file_identity(
+                bootstrap / "native-cargo-config.toml",
+                "candidate_workspace_cargo_config",
+                expected_mode=0o400,
+            ),
+        },
+        "transport": {
+            "vendor_root": str(bootstrap / "vendor" / "transport"),
+            "cargo_config": candidate_bundle.file_identity(
+                bootstrap / "native-transport-cargo-config.toml",
+                "candidate_transport_cargo_config",
+                expected_mode=0o400,
+            ),
+        },
+    }
+    try:
+        return candidate_bundle.validate_dependency_snapshot(identity)
+    except CandidateBundleError as error:
+        fail(str(error))
+
+
+def make_private_writable_tree(root):
+    for path in root.rglob("*"):
+        metadata = path.lstat()
+        if path.is_symlink():
+            fail("gate_runtime_symlink_forbidden")
+        if stat.S_ISDIR(metadata.st_mode):
+            path.chmod(0o700)
+        elif stat.S_ISREG(metadata.st_mode):
+            path.chmod(0o600)
+        else:
+            fail("gate_runtime_entry_invalid")
+    root.chmod(0o700)
+
+
+def normalize_vendor_configuration(raw, observed_vendor, selected_vendor):
+    if len(raw) > 64 * 1024:
+        fail("gate_vendor_configuration_invalid")
+    try:
+        value = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("gate_vendor_configuration_invalid")
+    observed_vendor_value = str(observed_vendor)
+    selected_vendor_value = str(selected_vendor)
+    if any(
+        character in selected_vendor_value
+        for character in ('"', "\\", "\x00", "\n", "\r")
+    ):
+        fail("gate_vendor_configuration_invalid")
+    sections = {}
+    current = None
+    output = []
+    directory_count = 0
+    for line in value.splitlines():
+        if not line:
+            output.append(line)
+            continue
+        if re.fullmatch(r'\[source\.(?:crates-io|vendored-sources|"[^"]+")\]', line):
+            current = line
+            if current in sections:
+                fail("gate_vendor_configuration_invalid")
+            sections[current] = []
+            output.append(line)
+            continue
+        if current is None or not re.fullmatch(
+            r'(?:replace-with|directory|git|rev|tag|branch) = "[^"\x00]+"',
+            line,
+        ):
+            fail("gate_vendor_configuration_invalid")
+        sections[current].append(line)
+        if line.startswith("directory = "):
+            directory_count += 1
+            if line != f'directory = "{observed_vendor_value}"':
+                fail("gate_vendor_configuration_invalid")
+            line = f'directory = "{selected_vendor_value}"'
+        output.append(line)
+    if (
+        directory_count != 1
+        or "[source.crates-io]" not in sections
+        or "[source.vendored-sources]" not in sections
+        or sections["[source.vendored-sources]"]
+        != [f'directory = "{observed_vendor_value}"']
+        or any(
+            'replace-with = "vendored-sources"' not in lines
+            for section, lines in sections.items()
+            if section != "[source.vendored-sources]"
+        )
+    ):
+        fail("gate_vendor_configuration_invalid")
+    return "\n".join(output).rstrip() + "\n\n[net]\noffline = true\n"
+
+
+def composite_vendor_configuration(workspace_vendor, twilight_vendor):
+    selected = (str(workspace_vendor), str(twilight_vendor))
+    if any(
+        not value
+        or any(character in value for character in ('"', "\\", "\x00", "\n", "\r"))
+        for value in selected
+    ):
+        fail("gate_vendor_configuration_invalid")
+    return (
+        '[source.crates-io]\nreplace-with = "workspace-vendored-sources"\n\n'
+        f'[source."{gate_container.TWILIGHT_SOURCE_KEY}"]\n'
+        f'git = "{gate_container.TWILIGHT_GIT_URL}"\n'
+        f'rev = "{gate_container.TWILIGHT_GIT_REV}"\n'
+        'replace-with = "twilight-vendored-sources"\n\n'
+        '[source.workspace-vendored-sources]\n'
+        f'directory = "{selected[0]}"\n\n'
+        '[source.twilight-vendored-sources]\n'
+        f'directory = "{selected[1]}"\n\n'
+        '[net]\noffline = true\n'
+    )
+
+
+def validate_npm_lock_sources(path):
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        fail(f"gate_npm_lock_unavailable:{error.__class__.__name__}")
+    value = load_json_bytes(raw, "gate_npm_lock")
+    packages = value.get("packages") if isinstance(value, dict) else None
+    if not isinstance(packages, dict):
+        fail("gate_npm_lock_invalid")
+    for package in packages.values():
+        if not isinstance(package, dict):
+            fail("gate_npm_lock_invalid")
+        resolved = package.get("resolved")
+        if resolved is None:
+            continue
+        try:
+            parsed = urllib.parse.urlsplit(resolved)
+        except ValueError:
+            fail("gate_npm_lock_source_invalid")
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "registry.npmjs.org"
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            fail("gate_npm_lock_source_invalid")
+
+
+def prepare_gate_git_projection(staging, worktree):
+    projection = staging / "git"
+    commands = (
+        ["/usr/bin/git", "init", "--bare", str(projection)],
+        [
+            "/usr/bin/git",
+            "--git-dir",
+            str(projection),
+            "fetch",
+            "--no-tags",
+            "--no-recurse-submodules",
+            str(worktree),
+            "HEAD",
+        ],
+        [
+            "/usr/bin/git",
+            "--git-dir",
+            str(projection),
+            "update-ref",
+            "refs/heads/candidate",
+            "FETCH_HEAD",
+        ],
+        [
+            "/usr/bin/git",
+            "--git-dir",
+            str(projection),
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/candidate",
+        ],
+        [
+            "/usr/bin/git",
+            "--git-dir",
+            str(projection),
+            "--work-tree",
+            str(worktree),
+            "read-tree",
+            "HEAD",
+        ],
+    )
+    for index, command in enumerate(commands):
+        run_process(
+            command,
+            worktree,
+            f"gate_git_projection_{index}",
+            timeout=120,
+            discard=True,
+        )
+    projected = run_process(
+        [
+            "/usr/bin/git",
+            "--git-dir",
+            str(projection),
+            "--work-tree",
+            str(worktree),
+            "rev-parse",
+            "HEAD",
+        ],
+        worktree,
+        "gate_git_projection_identity",
+        timeout=30,
+    )[1]
+    expected = git(worktree, ["rev-parse", "HEAD"], "gate_git_source_identity")
+    if projected != expected:
+        fail("gate_git_projection_identity_mismatch")
+    status = run_process(
+        [
+            "/usr/bin/git",
+            "--git-dir",
+            str(projection),
+            "--work-tree",
+            str(worktree),
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+        ],
+        worktree,
+        "gate_git_projection_status",
+        timeout=120,
+    )[1]
+    if status:
+        fail("gate_git_projection_dirty")
+
+
+def discard_owned_directory(parent, path, label):
+    if path.parent != parent:
+        fail(f"{label}_path_invalid")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        before = path.lstat()
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"{label}_unavailable:{error.__class__.__name__}")
+    try:
+        observed = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or path.is_symlink()
+            or before.st_uid != os.getuid()
+            or (before.st_dev, before.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            fail(f"{label}_identity_invalid")
+        os.fchmod(descriptor, 0o700)
+        candidate_io.remove_tree_descriptor(descriptor)
+    except candidate_io.CandidateBundleError as error:
+        fail(str(error))
+    finally:
+        os.close(descriptor)
+    try:
+        path.rmdir()
+    except OSError as error:
+        fail(f"{label}_cleanup_failed:{error.__class__.__name__}")
+    fsync_directory(parent)
+
+
+def discard_gate_bootstrap_staging(root, staging):
+    if not os.path.lexists(staging):
+        return
+    if (
+        staging.parent != root
+        or staging.name != ".gate-bootstrap-staging"
+        and re.fullmatch(r"\.gate-bootstrap-staging-[0-9a-f]{16}", staging.name)
+        is None
+    ):
+        fail("gate_bootstrap_staging_path_invalid")
+    discard_owned_directory(root, staging, "gate_bootstrap_staging")
+
+
+def require_gate_bootstrap_layout(bootstrap):
+    require_directory(bootstrap, "gate_bootstrap", 0o555)
+    expected = {*GATE_BOOTSTRAP_DIRECTORIES, *GATE_BOOTSTRAP_FILES}
+    try:
+        inventory = {path.name for path in bootstrap.iterdir()}
+    except OSError as error:
+        fail(f"gate_bootstrap_inventory_unavailable:{error.__class__.__name__}")
+    if inventory != expected:
+        fail("gate_bootstrap_inventory_invalid")
+    for name in GATE_BOOTSTRAP_DIRECTORIES:
+        metadata = require_directory(bootstrap / name, f"gate_bootstrap_{name}")
+        if stat.S_IMODE(metadata.st_mode) & 0o222:
+            fail(f"gate_bootstrap_{name}_mode_invalid")
+    for name in GATE_BOOTSTRAP_FILES:
+        require_regular(bootstrap / name, f"gate_bootstrap_{name}", 0o400)
+    expected_nested = {
+        "bin": {"git", "promptfoo"},
+        "node-stage": {"node_modules"},
+        "vendor": {"transport", "workspace"},
+    }
+    for name, expected_inventory in expected_nested.items():
+        try:
+            observed = {path.name for path in (bootstrap / name).iterdir()}
+        except OSError as error:
+            fail(
+                f"gate_bootstrap_{name}_inventory_unavailable:"
+                f"{error.__class__.__name__}"
+            )
+        if observed != expected_inventory:
+            fail(f"gate_bootstrap_{name}_inventory_invalid")
+    return bootstrap
+
+
+def discard_gate_bootstrap_temporary_file(staging, relative, mode):
+    path = staging / relative
+    if staging not in path.parents or ".." in pathlib.PurePath(relative).parts:
+        fail("gate_bootstrap_temporary_path_invalid")
+    try:
+        candidate_io.unlink_owned_regular(path, mode)
+    except candidate_io.CandidateBundleError as error:
+        fail(str(error))
+
+
+def prepare_gate_bootstrap(root, worktree, runtime):
+    bootstrap = root / "gate-bootstrap"
+    if bootstrap.exists():
+        return require_gate_bootstrap_layout(bootstrap)
+    staging = root / ".gate-bootstrap-staging"
+    try:
+        stale = sorted(
+            path
+            for path in root.iterdir()
+            if path.name == ".gate-bootstrap-staging"
+            or re.fullmatch(
+                r"\.gate-bootstrap-staging-[0-9a-f]{16}",
+                path.name,
+            )
+        )
+    except OSError as error:
+        fail(f"gate_bootstrap_staging_inventory_unavailable:{error.__class__.__name__}")
+    if len(stale) > 32:
+        fail("gate_bootstrap_staging_inventory_invalid")
+    for path in stale:
+        discard_gate_bootstrap_staging(root, path)
+    try:
+        gate_container.require_bootstrap_capacity(root)
+    except gate_container.GateContainerError as error:
+        fail(str(error))
+    staging.mkdir(mode=0o700)
+    fsync_directory(root)
+    try:
+        return build_gate_bootstrap(
+            root,
+            worktree,
+            runtime,
+            bootstrap,
+            staging,
+        )
+    except BaseException:
+        discard_gate_bootstrap_staging(root, staging)
+        raise
+
+
+def build_gate_bootstrap(root, worktree, runtime, bootstrap, staging):
+    for name in GATE_BOOTSTRAP_WORK_DIRECTORIES:
+        ensure_private_directory(staging / name)
+    ensure_private_directory(staging / "npm-cache")
+    node_stage = ensure_private_directory(staging / "node-stage")
+    bin_directory = ensure_private_directory(staging / "bin")
+    prepare_gate_git_projection(staging, worktree)
+    try:
+        gate_container.validate_cargo_lock_sources(
+            root,
+            worktree,
+            runtime["image_id"],
+        )
+        gate_container.fetch_cargo_vendor(
+            root,
+            worktree,
+            staging,
+            runtime["image_id"],
+        )
+        gate_container.materialize_workspace_vendor(
+            root,
+            worktree,
+            staging,
+            runtime["image_id"],
+        )
+        transport_vendor_raw = read_owned_bytes(
+            staging / "transport-cargo-vendor-config.txt",
+            "gate_transport_vendor_configuration",
+            0o600,
+            64 * 1024,
+        )
+        workspace_staging_config = composite_vendor_configuration(
+            pathlib.Path("/stage/vendor/workspace"),
+            pathlib.Path("/stage/vendor/transport"),
+        )
+        transport_staging_config = normalize_vendor_configuration(
+            transport_vendor_raw,
+            pathlib.Path("/stage/vendor/transport"),
+            pathlib.Path("/stage/vendor/transport"),
+        )
+        write_new_file(
+            staging / "workspace-cargo-config.toml",
+            workspace_staging_config,
+        )
+        write_new_file(
+            staging / "transport-staging-cargo-config.toml",
+            transport_staging_config,
+        )
+        gate_container.verify_cargo_vendor(
+            root,
+            worktree,
+            staging,
+            runtime["image_id"],
+        )
+        for name in ("package.json", "package-lock.json"):
+            source = worktree / "eval" / "design-harness" / name
+            destination = node_stage / name
+            shutil.copyfile(source, destination)
+            destination.chmod(0o400)
+        validate_npm_lock_sources(node_stage / "package-lock.json")
+        try:
+            gate_container.install_node_dependencies(
+                root,
+                staging,
+                runtime["image_id"],
+            )
+        except gate_container.GateContainerError as error:
+            fail(str(error))
+    except gate_container.GateContainerError as error:
+        fail(str(error))
+    cargo_config = composite_vendor_configuration(
+        pathlib.Path("/vendor/workspace"),
+        pathlib.Path("/vendor/transport"),
+    )
+    write_new_file(staging / "cargo-config.toml", cargo_config)
+    transport_cargo_config = normalize_vendor_configuration(
+        transport_vendor_raw,
+        pathlib.Path("/stage/vendor/transport"),
+        pathlib.Path("/vendor/transport"),
+    )
+    write_new_file(
+        staging / "transport-cargo-config.toml",
+        transport_cargo_config,
+    )
+    native_cargo_config = composite_vendor_configuration(
+        bootstrap / "vendor" / "workspace",
+        bootstrap / "vendor" / "transport",
+    )
+    write_new_file(staging / "native-cargo-config.toml", native_cargo_config)
+    native_transport_cargo_config = normalize_vendor_configuration(
+        transport_vendor_raw,
+        pathlib.Path("/stage/vendor/transport"),
+        bootstrap / "vendor" / "transport",
+    )
+    write_new_file(
+        staging / "native-transport-cargo-config.toml",
+        native_transport_cargo_config,
+    )
+    promptfoo = (
+        "#!/bin/sh\n"
+        'exec /usr/local/bin/node '
+        '/node_modules/promptfoo/dist/src/entrypoint.js "$@"\n'
+    )
+    promptfoo_path = bin_directory / "promptfoo"
+    write_new_file(promptfoo_path, promptfoo)
+    promptfoo_path.chmod(0o555)
+    git_wrapper = (
+        "#!/bin/sh\n"
+        'if [ "$1" = "-C" ] && [ "$(readlink -f -- "$2")" = "/workspace" ]; then\n'
+        "  shift 2\n"
+        '  exec /usr/bin/git --git-dir=/git --work-tree=/workspace "$@"\n'
+        "fi\n"
+        'exec /usr/bin/git "$@"\n'
+    )
+    git_path = bin_directory / "git"
+    write_new_file(git_path, git_wrapper)
+    git_path.chmod(0o555)
+    for name in GATE_BOOTSTRAP_WORK_DIRECTORIES:
+        discard_owned_directory(
+            staging,
+            staging / name,
+            f"gate_bootstrap_work_{name}",
+        )
+    for relative, mode in GATE_BOOTSTRAP_TEMPORARY_PATHS:
+        discard_gate_bootstrap_temporary_file(staging, relative, mode)
+    seal_read_only_tree(staging)
+    try:
+        staging.rename(bootstrap)
+    except OSError as error:
+        fail(f"gate_bootstrap_publish_failed:{error.__class__.__name__}")
+    fsync_directory(root)
+    return require_gate_bootstrap_layout(bootstrap)
+
+
+def initialize_gate_run(root, index, attempt, bootstrap, worktree):
+    runs = ensure_private_directory(root / "gate-runs")
+    path = runs / f"gate-{index:02d}-attempt-{attempt}-{secrets.token_hex(8)}"
+    path.mkdir(mode=0o700)
+    fsync_directory(runs)
+    cwd = worktree
+    if index in (9, 10):
+        projection = ensure_private_directory(path / "worktree")
+        package = ensure_private_directory(
+            ensure_private_directory(projection / "eval") / "design-harness"
+        )
+        for name in ("package.json", "package-lock.json"):
+            shutil.copyfile(
+                worktree / "eval" / "design-harness" / name,
+                package / name,
+            )
+            (package / name).chmod(0o400)
+        cwd = projection
+    return path, cwd
+
+
+def remove_gate_run(root, path):
+    runs = root / "gate-runs"
+    require_directory(runs, "gate_runs", 0o700)
+    if path.parent != runs or not path.name.startswith("gate-"):
+        fail("gate_run_path_invalid")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"gate_run_cleanup_unavailable:{error.__class__.__name__}")
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            fail("gate_run_cleanup_identity_invalid")
+        candidate_io.remove_tree_descriptor(descriptor)
+    except candidate_io.CandidateBundleError as error:
+        fail(str(error))
+    finally:
+        os.close(descriptor)
+    try:
+        path.rmdir()
+    except OSError as error:
+        fail(f"gate_run_cleanup_failed:{error.__class__.__name__}")
+    fsync_directory(runs)
+
+
+def run_sandboxed_gate(
+    root,
+    worktree,
+    bootstrap,
+    runtime,
+    index,
+    attempt,
+    command,
+    timeout,
+    database_url,
+):
+    run_root, cwd = initialize_gate_run(
+        root, index, attempt, bootstrap, worktree
+    )
+    try:
+        try:
+            return_code = gate_container.run_gate(
+                root,
+                cwd,
+                bootstrap,
+                runtime,
+                index,
+                attempt,
+                command,
+                timeout,
+                database_url,
+            )
+        except gate_container.GateContainerError as error:
+            fail(str(error))
+        return return_code
+    finally:
+        remove_gate_run(root, run_root)
+
+
 def command_run_gates(arguments):
     digests = gate_digests(arguments.gate)
     state_argument, root = state_lock_target(arguments.state)
@@ -1057,8 +1966,29 @@ def command_run_gates(arguments):
             arguments.postgres_database_url_file
         )
         validate_worktree(state, repo, worktree)
+        try:
+            candidate_bundle.require_cargo_configuration_absent(worktree)
+            runtime = ensure_gate_container_runtime(root)
+            bootstrap = prepare_gate_bootstrap(root, worktree, runtime)
+            bootstrap_record = ensure_gate_bootstrap_record(
+                root,
+                bootstrap,
+                runtime,
+            )
+            dependency_snapshot = candidate_dependency_snapshot(
+                root,
+                runtime,
+                bootstrap_record,
+            )
+        except CandidateBundleError as error:
+            fail(str(error))
         evidence_path = root / "gate-evidence.jsonl"
-        records = load_gate_evidence(evidence_path, state)
+        records = load_gate_evidence(
+            evidence_path,
+            state,
+            runtime["record_sha256"],
+            bootstrap_record["record_sha256"],
+        )
         attempts, latest, open_attempts = gate_status(records, len(digests))
         for index, command in enumerate(arguments.gate, start=1):
             prior = latest.get(index)
@@ -1079,21 +2009,23 @@ def command_run_gates(arguments):
                         "command_sha256": digests[index - 1],
                         "attempt": attempt,
                     },
+                    runtime["record_sha256"],
+                    bootstrap_record["record_sha256"],
                 )
             started = time.monotonic_ns()
             try:
-                return_code, _ = run_process(
-                    ["/bin/zsh", "-f", "-c", command],
+                return_code = run_sandboxed_gate(
+                    root,
                     worktree,
-                    f"gate_{index}",
-                    allowed=tuple(range(256)),
-                    timeout=arguments.timeout_seconds,
-                    discard=True,
-                    postgres_database_url=(
-                        postgres_database_url if index > 16 else None
-                    ),
+                    bootstrap,
+                    runtime,
+                    index,
+                    attempt,
+                    command,
+                    arguments.timeout_seconds,
+                    postgres_database_url,
                 )
-            except D3Error:
+            except (D3Error, CandidateBundleError):
                 return_code = 255
             duration_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
             completion = append_gate_evidence(
@@ -1108,12 +2040,21 @@ def command_run_gates(arguments):
                     "exit_code": return_code,
                     "duration_ms": duration_ms,
                 },
+                runtime["record_sha256"],
+                bootstrap_record["record_sha256"],
             )
             validate_worktree(state, repo, worktree)
             if return_code != 0:
                 fail(f"gate_failed:{index}:{return_code}")
             latest[index] = completion
-        records = load_gate_evidence(evidence_path, state)
+        if ensure_gate_container_runtime(root) != runtime:
+            fail("gate_container_runtime_changed")
+        records = load_gate_evidence(
+            evidence_path,
+            state,
+            runtime["record_sha256"],
+            bootstrap_record["record_sha256"],
+        )
         _, latest, open_attempts = gate_status(records, len(digests))
         if open_attempts or any(index not in latest or latest[index]["exit_code"] != 0 for index in range(1, len(digests) + 1)):
             fail("gate_set_incomplete")
@@ -1129,6 +2070,7 @@ def command_run_gates(arguments):
                 or observed_repo != repo
                 or observed_worktree != worktree
                 or require_gate_completion(root, state) != gate_chain
+                or candidate_dependency_snapshot(root) != dependency_snapshot
             ):
                 fail("candidate_build_state_changed")
 
@@ -1138,6 +2080,7 @@ def command_run_gates(arguments):
                 state,
                 worktree,
                 gate_chain,
+                dependency_snapshot,
                 revalidate_candidate_inputs,
             )
         except CandidateBundleError as error:
@@ -1205,6 +2148,105 @@ def load_d2_receipts(path, manifest, manifest_digest):
     return receipts
 
 
+def d2_metadata_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def capture_d2_run_identity(manifest_path, run_id, manifest_digest):
+    manifest_path = absolute_path(manifest_path, "d2_manifest")
+    if manifest_path.name != "manifest.json":
+        fail("d2_manifest_path_invalid")
+    run_directory = manifest_path.parent
+    directory_before = require_directory(
+        run_directory, "d2_run_directory", 0o700
+    )
+    orchestrator_directory = run_directory / "orchestrator"
+    orchestrator_before = require_directory(
+        orchestrator_directory, "d2_orchestrator_directory", 0o700
+    )
+    manifest_before = require_regular(
+        manifest_path, "d2_manifest", 0o600
+    )
+    retirement_path = (
+        orchestrator_directory / "candidate-start-retirement.json"
+    )
+    abort_teardown_path = (
+        orchestrator_directory / "discord-resource-teardown-abort.json"
+    )
+    if os.path.lexists(retirement_path) or os.path.lexists(
+        abort_teardown_path
+    ):
+        fail("candidate_start_transition_retirement_required")
+    manifest = load_json_file(manifest_path, "d2_manifest", 0o600)
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("run_id") != run_id
+        or sha256_bytes(canonical_json(manifest).encode("utf-8"))
+        != manifest_digest
+    ):
+        fail("d2_manifest_binding_drift")
+    manifest_after = require_regular(manifest_path, "d2_manifest", 0o600)
+    directory_after = require_directory(
+        run_directory, "d2_run_directory", 0o700
+    )
+    orchestrator_after = require_directory(
+        orchestrator_directory, "d2_orchestrator_directory", 0o700
+    )
+    if (
+        d2_metadata_identity(manifest_before)
+        != d2_metadata_identity(manifest_after)
+        or d2_metadata_identity(directory_before)
+        != d2_metadata_identity(directory_after)
+        or d2_metadata_identity(orchestrator_before)
+        != d2_metadata_identity(orchestrator_after)
+        or os.path.lexists(retirement_path)
+        or os.path.lexists(abort_teardown_path)
+    ):
+        fail("d2_run_identity_changed")
+    return {
+        "d2_manifest_path": str(manifest_path),
+        "d2_run_directory_device": directory_after.st_dev,
+        "d2_run_directory_inode": directory_after.st_ino,
+        "d2_orchestrator_directory_device": orchestrator_after.st_dev,
+        "d2_orchestrator_directory_inode": orchestrator_after.st_ino,
+    }
+
+
+def require_active_d2_binding(binding):
+    raw_path = binding.get("d2_manifest_path")
+    if not isinstance(raw_path, str):
+        fail("d2_binding_run_identity_invalid")
+    path = absolute_path(raw_path, "d2_manifest")
+    if (
+        type(binding.get("d2_run_directory_device")) is not int
+        or binding["d2_run_directory_device"] < 0
+        or type(binding.get("d2_run_directory_inode")) is not int
+        or binding["d2_run_directory_inode"] <= 0
+        or type(binding.get("d2_orchestrator_directory_device")) is not int
+        or binding["d2_orchestrator_directory_device"] < 0
+        or type(binding.get("d2_orchestrator_directory_inode")) is not int
+        or binding["d2_orchestrator_directory_inode"] <= 0
+    ):
+        fail("d2_binding_run_identity_invalid")
+    observed = capture_d2_run_identity(
+        path,
+        binding.get("run_id"),
+        binding.get("manifest_sha256"),
+    )
+    if any(binding.get(key) != value for key, value in observed.items()):
+        fail("d2_binding_run_identity_changed")
+    return observed
+
+
 def command_bind_d2(arguments):
     d2_manifest_path = absolute_path(arguments.d2_manifest, "d2_manifest")
     d2_final_path = absolute_path(arguments.d2_final_record, "d2_final_record")
@@ -1213,7 +2255,13 @@ def command_bind_d2(arguments):
         state_path, state, _, repo, worktree = load_state(str(state_argument))
         gate_chain = require_gate_completion(root, state)
         try:
-            candidate_bundle = load_candidate_bundle(root, state, gate_chain)
+            dependency_snapshot = candidate_dependency_snapshot(root)
+            bundle_record = load_candidate_bundle(
+                root,
+                state,
+                gate_chain,
+                dependency_snapshot,
+            )
         except CandidateBundleError as error:
             fail(str(error))
         d2_manifest = load_json_file(d2_manifest_path, "d2_manifest", 0o600)
@@ -1225,6 +2273,11 @@ def command_bind_d2(arguments):
         observed_manifest_digest = sha256_bytes(canonical_json(d2_manifest).encode("utf-8"))
         if manifest_digest != observed_manifest_digest:
             fail("d2_manifest_digest_mismatch")
+        d2_run_identity = capture_d2_run_identity(
+            d2_manifest_path,
+            d2_manifest.get("run_id"),
+            manifest_digest,
+        )
         if d2_manifest.get("commit_sha") != state["merge_commit"]:
             fail("d2_commit_mismatch")
         if commit_tree(repo, d2_manifest["commit_sha"], "d2_commit") != state["merge_tree"]:
@@ -1235,7 +2288,7 @@ def command_bind_d2(arguments):
                 state,
                 worktree,
                 root,
-                candidate_bundle,
+                bundle_record,
             )
         except CandidateBundleError as error:
             fail(str(error))
@@ -1298,10 +2351,11 @@ def command_bind_d2(arguments):
             "candidate_bundle_path": str(
                 root / "candidate-bundle" / "bundle.json"
             ),
-            "candidate_bundle_record_sha256": candidate_bundle["record_sha256"],
+            "candidate_bundle_record_sha256": bundle_record["record_sha256"],
             "candidate_bundle_file_sha256": candidate_bundle_file["sha256"],
             "run_id": final_record["run_id"],
             "manifest_sha256": manifest_digest,
+            **d2_run_identity,
             "steps": 17,
             "receipt_chain_head_sha256": final_record["receipt_chain_head_sha256"],
             "coordinator_evidence_sha256": final_record[
@@ -1317,9 +2371,12 @@ def command_bind_d2(arguments):
             validate_timestamp(existing["verified_at"], "d2_binding_verified_at")
             if {key: existing.get(key) for key in identity} != identity:
                 fail("d2_binding_replay_mismatch")
+            require_active_d2_binding(existing)
             return {**existing, "disposition": "exact_replay"}
+        require_active_d2_binding(identity)
         binding = seal_record({**identity, "verified_at": utc_now()})
         write_new_json(binding_path, binding)
+        require_active_d2_binding(binding)
         return {**binding, "disposition": "created"}
 
 
@@ -1330,8 +2387,12 @@ def command_recheck(arguments):
         gate_chain = require_gate_completion(state_path.parent, state)
         binding = load_binding(state_path.parent, state)
         try:
-            candidate_bundle = load_candidate_bundle(
-                state_path.parent, state, gate_chain
+            dependency_snapshot = candidate_dependency_snapshot(state_path.parent)
+            bundle_record = load_candidate_bundle(
+                state_path.parent,
+                state,
+                gate_chain,
+                dependency_snapshot,
             )
             candidate_bundle_file = record_file_identity(state_path.parent)
         except CandidateBundleError as error:
@@ -1341,7 +2402,7 @@ def command_recheck(arguments):
             or binding["candidate_bundle_path"]
             != str(state_path.parent / "candidate-bundle" / "bundle.json")
             or binding["candidate_bundle_record_sha256"]
-            != candidate_bundle["record_sha256"]
+            != bundle_record["record_sha256"]
             or binding["candidate_bundle_file_sha256"]
             != candidate_bundle_file["sha256"]
         ):
@@ -1361,6 +2422,7 @@ def command_recheck(arguments):
             fail("pr_merge_parents_changed")
         if commit_tree(repo, merge, "recheck_merge") != state["merge_tree"]:
             fail("pr_merge_tree_changed")
+        require_active_d2_binding(binding)
         record_path = state_path.parent / "recheck.json"
         identity = {
             "schema_version": SCHEMA_VERSION,
@@ -1371,7 +2433,7 @@ def command_recheck(arguments):
             "merge_commit": merge,
             "merge_tree": state["merge_tree"],
             "gate_evidence_chain_head_sha256": gate_chain,
-            "candidate_bundle_record_sha256": candidate_bundle["record_sha256"],
+            "candidate_bundle_record_sha256": bundle_record["record_sha256"],
             "candidate_bundle_file_sha256": candidate_bundle_file["sha256"],
             "d2_receipt_chain_head_sha256": binding["receipt_chain_head_sha256"],
             "d2_coordinator_evidence_sha256": binding[
@@ -1386,15 +2448,24 @@ def command_recheck(arguments):
             validate_timestamp(existing["verified_at"], "recheck_verified_at")
             if {key: existing.get(key) for key in identity} != identity:
                 fail("recheck_replay_mismatch")
+            require_active_d2_binding(binding)
             return {**existing, "disposition": "exact_replay"}
         record = seal_record({**identity, "verified_at": utc_now()})
         write_new_json(record_path, record)
+        require_active_d2_binding(binding)
         return {**record, "disposition": "created"}
 
 
 def require_gate_completion(root, state):
     path = root / "gate-evidence.jsonl"
-    records = load_gate_evidence(path, state)
+    runtime = load_gate_container_runtime(root)
+    bootstrap = load_gate_bootstrap_record(root, runtime)
+    records = load_gate_evidence(
+        path,
+        state,
+        runtime["record_sha256"],
+        bootstrap["record_sha256"],
+    )
     _, latest, open_attempts = gate_status(records, len(state["gate_command_sha256"]))
     if open_attempts or any(index not in latest or latest[index]["exit_code"] != 0 for index in range(1, len(state["gate_command_sha256"]) + 1)):
         fail("gate_set_incomplete")
@@ -1414,6 +2485,11 @@ def load_binding(root, state):
         "candidate_bundle_file_sha256",
         "run_id",
         "manifest_sha256",
+        "d2_manifest_path",
+        "d2_run_directory_device",
+        "d2_run_directory_inode",
+        "d2_orchestrator_directory_device",
+        "d2_orchestrator_directory_inode",
         "steps",
         "receipt_chain_head_sha256",
         "coordinator_evidence_sha256",
@@ -1450,6 +2526,7 @@ def load_binding(root, state):
     validate_digest(binding["final_record_sha256"], "d2_binding_final")
     validate_timestamp(binding["verified_at"], "d2_binding_verified_at")
     verify_sealed_record(binding, "d2_binding")
+    require_active_d2_binding(binding)
     return binding
 
 
@@ -1675,18 +2752,24 @@ def command_finalize(arguments):
         binding = load_binding(root, state)
         recheck = load_recheck(root, state)
         try:
-            candidate_bundle = load_candidate_bundle(root, state, gate_chain)
+            dependency_snapshot = candidate_dependency_snapshot(root)
+            bundle_record = load_candidate_bundle(
+                root,
+                state,
+                gate_chain,
+                dependency_snapshot,
+            )
             candidate_bundle_file = record_file_identity(root)
         except CandidateBundleError as error:
             fail(str(error))
         if (
             recheck["gate_evidence_chain_head_sha256"] != gate_chain
             or recheck["candidate_bundle_record_sha256"]
-            != candidate_bundle["record_sha256"]
+            != bundle_record["record_sha256"]
             or recheck["candidate_bundle_file_sha256"]
             != candidate_bundle_file["sha256"]
             or binding["candidate_bundle_record_sha256"]
-            != candidate_bundle["record_sha256"]
+            != bundle_record["record_sha256"]
             or binding["candidate_bundle_file_sha256"]
             != candidate_bundle_file["sha256"]
             or recheck["d2_receipt_chain_head_sha256"]
@@ -1706,6 +2789,7 @@ def command_finalize(arguments):
             github_run(repository, run_id, main_commit, state["base_ref"])
             for run_id in run_ids
         ]
+        require_active_d2_binding(binding)
         final_path = root / "final.json"
         identity = {
             "schema_version": SCHEMA_VERSION,
@@ -1718,7 +2802,7 @@ def command_finalize(arguments):
             "gate_count": len(state["gate_command_sha256"]),
             "gate_evidence_chain_head_sha256": gate_chain,
             "candidate_bundle_path": binding["candidate_bundle_path"],
-            "candidate_bundle_record_sha256": candidate_bundle["record_sha256"],
+            "candidate_bundle_record_sha256": bundle_record["record_sha256"],
             "candidate_bundle_file_sha256": candidate_bundle_file["sha256"],
             "d2_run_id": binding["run_id"],
             "d2_manifest_sha256": binding["manifest_sha256"],
@@ -1745,9 +2829,19 @@ def command_finalize(arguments):
             validate_timestamp(existing["finalized_at"], "finalized_at")
             if {key: existing.get(key) for key in identity} != identity:
                 fail("finalize_replay_mismatch")
+            require_active_d2_binding(binding)
+            try:
+                candidate_bundle.retire_candidate_build_root(root)
+            except CandidateBundleError as error:
+                fail(str(error))
             return {**existing, "disposition": "exact_replay"}
         record = seal_record({**identity, "finalized_at": utc_now()})
         write_new_json(final_path, record)
+        require_active_d2_binding(binding)
+        try:
+            candidate_bundle.retire_candidate_build_root(root)
+        except CandidateBundleError as error:
+            fail(str(error))
         return {**record, "disposition": "created"}
 
 

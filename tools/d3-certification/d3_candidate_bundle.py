@@ -1,8 +1,12 @@
+import fcntl
 import os
 import pathlib
 import secrets
 import stat
 import subprocess
+import time
+
+import d3_launchd_job as launchd_job
 
 from d3_candidate_io import (
     CandidateBundleError,
@@ -28,10 +32,18 @@ from d3_candidate_io import (
     write_new_file,
     write_new_file_atomic,
 )
+from d3_process_sandbox import ProcessSandboxError, sandboxed_argv
 
 
 SCHEMA_VERSION = 1
 MAX_GIT_TREE_BYTES = 16 * 1024 * 1024
+BUILD_FENCE_NAME = "candidate-build.lock"
+MAX_CANDIDATE_BUILD_BYTES = 4 * 1024 * 1024 * 1024
+MAX_CANDIDATE_BUILD_ENTRIES = 500000
+MINIMUM_CANDIDATE_BUILD_FREE_BYTES = 8 * 1024 * 1024 * 1024
+MINIMUM_CANDIDATE_BUILD_REMAINING_BYTES = 2 * 1024 * 1024 * 1024
+CANDIDATE_BUILD_MONITOR_SECONDS = 1.0
+CANDIDATE_BUILD_JOBS = "1"
 SAFE_ENVIRONMENT_NAMES = (
     "CARGO_HOME",
     "HOME",
@@ -298,20 +310,124 @@ def validate_recipe_lockfiles(recipe):
         fail("candidate_build_lockfile_drift")
 
 
-def candidate_build_recipe(state, root, worktree):
+def digest_valid(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def candidate_builder_implementation_sha256():
+    directory = pathlib.Path(__file__).resolve().parent
+    identities = []
+    for name in (
+        "d3_candidate_bundle.py",
+        "d3_candidate_io.py",
+        "d3_launchd_job.py",
+        "d3_process_sandbox.py",
+    ):
+        identity = file_identity(
+            directory / name,
+            f"candidate_builder_{name}",
+        )
+        identities.append(
+            {
+                "name": name,
+                "sha256": identity["sha256"],
+                "size": identity["size"],
+            }
+        )
+    return sha256_bytes(canonical_json(identities).encode("utf-8"))
+
+
+def validate_dependency_snapshot(value):
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "kind",
+        "gate_runtime_sha256",
+        "gate_bootstrap_sha256",
+        "gate_bootstrap_tree_sha256",
+        "candidate_builder_implementation_sha256",
+        "bootstrap_root",
+        "workspace",
+        "transport",
+    }:
+        fail("candidate_dependency_snapshot_fields_invalid")
+    if (
+        not schema_version_valid(value["schema_version"])
+        or value["kind"] != "starring.d3.candidate-dependency-snapshot.v1"
+        or not digest_valid(value["gate_runtime_sha256"])
+        or not digest_valid(value["gate_bootstrap_sha256"])
+        or not digest_valid(value["gate_bootstrap_tree_sha256"])
+        or value["candidate_builder_implementation_sha256"]
+        != candidate_builder_implementation_sha256()
+    ):
+        fail("candidate_dependency_snapshot_identity_invalid")
+    bootstrap = absolute_path(
+        value["bootstrap_root"],
+        "candidate_dependency_bootstrap_root",
+    )
+    require_directory(bootstrap, "candidate_dependency_bootstrap_root", 0o555)
+    vendor_parent = bootstrap / "vendor"
+    require_directory(vendor_parent, "candidate_dependency_vendor_root", 0o500)
+    expected = {
+        "workspace": (
+            vendor_parent / "workspace",
+            bootstrap / "native-cargo-config.toml",
+        ),
+        "transport": (
+            vendor_parent / "transport",
+            bootstrap / "native-transport-cargo-config.toml",
+        ),
+    }
+    for name, (vendor, configuration) in expected.items():
+        item = value[name]
+        if not isinstance(item, dict) or set(item) != {
+            "vendor_root",
+            "cargo_config",
+        }:
+            fail("candidate_dependency_snapshot_fields_invalid")
+        if item["vendor_root"] != str(vendor):
+            fail("candidate_dependency_snapshot_identity_invalid")
+        require_directory(vendor, f"candidate_dependency_{name}_vendor", 0o500)
+        observed = file_identity(
+            configuration,
+            f"candidate_dependency_{name}_config",
+            expected_mode=0o400,
+        )
+        if item["cargo_config"] != observed:
+            fail("candidate_dependency_snapshot_changed")
+    return value
+
+
+def candidate_build_recipe(state, root, worktree, dependency_snapshot):
+    validate_dependency_snapshot(dependency_snapshot)
     build_root = root / "candidate-build"
     workspace_target = build_root / "workspace-target"
     transport_target = build_root / "transport-target"
+    workspace_config = dependency_snapshot["workspace"]["cargo_config"]["path"]
+    transport_config = dependency_snapshot["transport"]["cargo_config"]["path"]
     commands = tuple(
-        tuple(
-            str(workspace_target) if value == "{workspace_target}" else value
-            for value in command
+        (
+            command[0],
+            "--config",
+            workspace_config,
+            *(
+                str(workspace_target) if value == "{workspace_target}" else value
+                for value in command[1:]
+            ),
         )
         for command in WORKSPACE_RELEASE_COMMANDS
     ) + (
-        tuple(
-            str(transport_target) if value == "{transport_target}" else value
-            for value in TRANSPORT_RELEASE_COMMAND
+        (
+            TRANSPORT_RELEASE_COMMAND[0],
+            "--config",
+            transport_config,
+            *(
+                str(transport_target) if value == "{transport_target}" else value
+                for value in TRANSPORT_RELEASE_COMMAND[1:]
+            ),
         ),
     )
     lockfiles = (
@@ -331,16 +447,7 @@ def candidate_build_recipe(state, root, worktree):
         "cwd": str(worktree),
         "build_root": str(build_root),
         "commands": [list(command) for command in commands],
-        "fetch_commands": [
-            [
-                "cargo",
-                "fetch",
-                "--locked",
-                "--manifest-path",
-                value["manifest_path"],
-            ]
-            for value in lockfiles
-        ],
+        "dependency_snapshot": dependency_snapshot,
         "lockfiles": list(lockfiles),
         "isolated_environment": isolated_environment,
         "environment": {
@@ -468,6 +575,203 @@ def sanitized_environment(extra=None):
     if extra is not None:
         environment.update(extra)
     return environment
+
+
+def acquire_candidate_build_fence(root):
+    root = absolute_path(str(root), "candidate_build_fence_root")
+    require_directory(root, "candidate_build_fence_root", 0o700)
+    path = root / BUILD_FENCE_NAME
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    created = False
+    try:
+        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            fail(f"candidate_build_fence_unavailable:{error.__class__.__name__}")
+    except OSError as error:
+        fail(f"candidate_build_fence_unavailable:{error.__class__.__name__}")
+    try:
+        if created:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            fsync_directory(root)
+        metadata = os.fstat(descriptor)
+        try:
+            named = os.stat(path, follow_symlinks=False)
+        except OSError as error:
+            fail(f"candidate_build_fence_unavailable:{error.__class__.__name__}")
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or (metadata.st_dev, metadata.st_ino)
+            != (named.st_dev, named.st_ino)
+        ):
+            fail("candidate_build_fence_identity_invalid")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fail("candidate_build_writer_active")
+        except OSError as error:
+            fail(f"candidate_build_fence_lock_failed:{error.__class__.__name__}")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def candidate_build_usage(root):
+    stack = [pathlib.Path(root)]
+    entries = 0
+    total_bytes = 0
+    while stack:
+        current = stack.pop()
+        try:
+            iterator = os.scandir(current)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            fail(f"candidate_build_monitor_unavailable:{error.__class__.__name__}")
+        with iterator:
+            for entry in iterator:
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    fail(
+                        f"candidate_build_monitor_unavailable:"
+                        f"{error.__class__.__name__}"
+                    )
+                entries += 1
+                if entries > MAX_CANDIDATE_BUILD_ENTRIES:
+                    fail("candidate_build_resource_limit_exceeded")
+                if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(
+                    metadata.st_mode
+                ):
+                    stack.append(pathlib.Path(entry.path))
+                else:
+                    total_bytes += metadata.st_size
+                    if total_bytes > MAX_CANDIDATE_BUILD_BYTES:
+                        fail("candidate_build_resource_limit_exceeded")
+    return entries, total_bytes
+
+
+def require_candidate_build_capacity(root):
+    build_root = pathlib.Path(root)
+    usage = candidate_build_usage(build_root)
+    try:
+        filesystem = os.statvfs(build_root)
+        free = filesystem.f_bavail * filesystem.f_frsize
+    except OSError as error:
+        fail(f"candidate_build_capacity_unavailable:{error.__class__.__name__}")
+    if (
+        free < MINIMUM_CANDIDATE_BUILD_REMAINING_BYTES
+        or free + usage[1] < MINIMUM_CANDIDATE_BUILD_FREE_BYTES
+    ):
+        fail("candidate_build_capacity_insufficient")
+    return usage
+
+
+def candidate_build_monitor(root):
+    last_checked = 0.0
+
+    def monitor():
+        nonlocal last_checked
+        observed = time.monotonic()
+        if observed - last_checked < CANDIDATE_BUILD_MONITOR_SECONDS:
+            return
+        require_candidate_build_capacity(root)
+        last_checked = observed
+
+    return monitor
+
+
+def candidate_build_job_nonce(argv, cwd, environment, mutable_root, label):
+    return sha256_bytes(
+        canonical_json(
+            {
+                "argv": list(argv),
+                "cwd": str(cwd),
+                "environment": dict(environment),
+                "label": label,
+                "mutable_root": str(mutable_root),
+            }
+        ).encode("utf-8")
+    )[:32]
+
+
+def run_contained_build_process(
+    argv,
+    cwd,
+    environment,
+    timeout,
+    fence_descriptor,
+    label,
+    sandbox_mutable_root,
+    sandbox_network_scope,
+    sandbox_additional_mutable_roots=(),
+    sandbox_additional_read_roots=(),
+    sandbox_local_tcp_port=None,
+    sandbox_worktree=None,
+    stdout_path=None,
+):
+    try:
+        contained_argv = sandboxed_argv(
+            list(argv),
+            sandbox_mutable_root,
+            cwd if sandbox_worktree is None else sandbox_worktree,
+            environment,
+            sandbox_network_scope,
+            sandbox_additional_mutable_roots,
+            sandbox_additional_read_roots,
+            sandbox_local_tcp_port,
+        )
+    except ProcessSandboxError as error:
+        fail(f"{label}_sandbox_invalid:{error}")
+    if stdout_path is not None:
+        fail(f"{label}_output_unsupported")
+    if fence_descriptor is None:
+        fail(f"{label}_fence_missing")
+    try:
+        fence = os.fstat(fence_descriptor)
+    except OSError as error:
+        fail(f"{label}_fence_unavailable:{error.__class__.__name__}")
+    if (
+        not stat.S_ISREG(fence.st_mode)
+        or fence.st_uid != os.getuid()
+        or fence.st_nlink != 1
+        or stat.S_IMODE(fence.st_mode) != 0o600
+    ):
+        fail(f"{label}_fence_invalid")
+    mutable = pathlib.Path(sandbox_mutable_root)
+    require_candidate_build_capacity(mutable)
+    monitor = candidate_build_monitor(mutable)
+    try:
+        nonce = candidate_build_job_nonce(
+            contained_argv,
+            cwd,
+            environment,
+            mutable,
+            label,
+        )
+        return launchd_job.run_job(
+            contained_argv,
+            cwd,
+            environment,
+            timeout,
+            mutable.parent,
+            nonce,
+            monitor,
+        )
+    except launchd_job.LaunchdJobError as error:
+        fail(f"{label}_{error}")
 
 
 def resolve_rustup():
@@ -812,51 +1116,38 @@ def require_cargo_configuration_absent(worktree):
             fail("candidate_build_cargo_config_forbidden")
 
 
-def run_build_command(command, cargo, build_environment, worktree, revision):
-    try:
-        result = subprocess.run(
-            [str(cargo), *command[1:]],
-            cwd=worktree,
-            env=sanitized_environment(
-                {
-                    **build_environment,
-                    "CARGO_NET_OFFLINE": "true",
-                    "STARRING_RUNTIME_BUILD_REVISION": revision,
-                }
-            ),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=7200,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        fail(f"candidate_build_unavailable:{error.__class__.__name__}")
-    if result.returncode != 0:
-        fail(f"candidate_build_failed:{result.returncode}")
-
-
-def run_fetch_command(command, cargo, build_environment, worktree, revision):
-    try:
-        result = subprocess.run(
-            [str(cargo), *command[1:]],
-            cwd=worktree,
-            env=sanitized_environment(
-                {
-                    **build_environment,
-                    "STARRING_RUNTIME_BUILD_REVISION": revision,
-                }
-            ),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=7200,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        fail(f"candidate_fetch_unavailable:{error.__class__.__name__}")
-    if result.returncode != 0:
-        fail(f"candidate_fetch_failed:{result.returncode}")
+def run_build_command(
+    command,
+    cargo,
+    build_environment,
+    worktree,
+    revision,
+    dependency_snapshot,
+    fence_descriptor=None,
+):
+    validate_dependency_snapshot(dependency_snapshot)
+    return_code = run_contained_build_process(
+        [str(cargo), *command[1:]],
+        worktree,
+        sanitized_environment(
+            {
+                **build_environment,
+                "CARGO_BUILD_JOBS": CANDIDATE_BUILD_JOBS,
+                "CARGO_NET_OFFLINE": "true",
+                "STARRING_RUNTIME_BUILD_REVISION": revision,
+            }
+        ),
+        7200,
+        fence_descriptor,
+        "candidate_build",
+        pathlib.Path(build_environment["CARGO_HOME"]).parent,
+        "none",
+        sandbox_additional_read_roots=(
+            pathlib.Path(dependency_snapshot["bootstrap_root"]),
+        ),
+    )
+    if return_code != 0:
+        fail(f"candidate_build_failed:{return_code}")
 
 
 def require_isolated_cargo_configuration_absent(toolchain):
@@ -884,7 +1175,9 @@ def require_isolated_cargo_configuration_absent(toolchain):
         fail("candidate_build_isolated_config_forbidden")
 
 
-def execute_candidate_build(state, worktree, root, recipe, toolchain):
+def execute_candidate_build(
+    state, worktree, root, recipe, toolchain, fence_descriptor
+):
     require_cargo_configuration_absent(worktree)
     validate_candidate_toolchain(toolchain)
     validate_build_directories(toolchain["directories"], recipe, True)
@@ -897,16 +1190,8 @@ def execute_candidate_build(state, worktree, root, recipe, toolchain):
     tools = toolchain["tools"]
     cargo = pathlib.Path(tools[1]["path"])
     build_environment = toolchain["environment"]
-    require_isolated_cargo_configuration_absent(toolchain)
-    validate_recipe_lockfiles(recipe)
-    for command in recipe["fetch_commands"]:
-        run_fetch_command(
-            command,
-            cargo,
-            build_environment,
-            worktree,
-            state["merge_commit"],
-        )
+    dependency_snapshot = recipe["dependency_snapshot"]
+    validate_dependency_snapshot(dependency_snapshot)
     require_isolated_cargo_configuration_absent(toolchain)
     validate_recipe_lockfiles(recipe)
     for command in recipe["commands"]:
@@ -916,7 +1201,12 @@ def execute_candidate_build(state, worktree, root, recipe, toolchain):
             build_environment,
             worktree,
             state["merge_commit"],
+            dependency_snapshot,
+            fence_descriptor,
         )
+        validate_dependency_snapshot(dependency_snapshot)
+        require_isolated_cargo_configuration_absent(toolchain)
+        validate_recipe_lockfiles(recipe)
     require_isolated_cargo_configuration_absent(toolchain)
     validate_recipe_lockfiles(recipe)
     if resolve_candidate_toolchain(worktree, toolchain["directories"]) != toolchain:
@@ -965,6 +1255,74 @@ def validate_intent(value, state, gate_chain, recipe, source_trees):
     ):
         fail("candidate_bundle_intent_mismatch")
     return nonce
+
+
+def retire_candidate_build_root(root):
+    selected_root = absolute_path(str(root), "candidate_build_retirement_root")
+    require_directory(selected_root, "candidate_build_retirement_root", 0o700)
+    intent = read_json(
+        selected_root / "candidate-bundle-intent.json",
+        "candidate_bundle_intent",
+        0o600,
+    )
+    verify_sealed_record(intent, "candidate_bundle_intent")
+    recipe = intent.get("recipe")
+    toolchain = intent.get("toolchain")
+    validate_candidate_toolchain(toolchain)
+    validate_build_directories(toolchain["directories"], recipe, False)
+    build_root = absolute_path(recipe["build_root"], "candidate_build_root")
+    if build_root.parent != selected_root:
+        fail("candidate_build_retirement_path_invalid")
+    expected = toolchain["directories"]["build_root"]
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    parent = os.open(selected_root, flags)
+    try:
+        try:
+            descriptor = os.open(build_root.name, flags, dir_fd=parent)
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            fail(
+                f"candidate_build_retirement_unavailable:"
+                f"{error.__class__.__name__}"
+            )
+        try:
+            observed = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(observed.st_mode)
+                or (
+                    observed.st_dev,
+                    observed.st_ino,
+                    observed.st_uid,
+                    stat.S_IMODE(observed.st_mode),
+                )
+                != (
+                    expected["device"],
+                    expected["inode"],
+                    expected["uid"],
+                    expected["mode"],
+                )
+            ):
+                fail("candidate_build_retirement_identity_invalid")
+            os.fchmod(descriptor, 0o700)
+            remove_tree_descriptor(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.rmdir(build_root.name, dir_fd=parent)
+            os.fsync(parent)
+        except OSError as error:
+            fail(
+                f"candidate_build_retirement_cleanup_failed:"
+                f"{error.__class__.__name__}"
+            )
+    finally:
+        os.close(parent)
+    return True
 
 
 def intent_temporary_paths(root):
@@ -1556,9 +1914,9 @@ def validate_source_tree_record(value, expected, label):
         fail(f"{label}_identity_mismatch")
 
 
-def load_candidate_bundle(root, state, gate_chain):
+def load_candidate_bundle(root, state, gate_chain, dependency_snapshot):
     worktree = pathlib.Path(state["worktree_path"])
-    recipe = candidate_build_recipe(state, root, worktree)
+    recipe = candidate_build_recipe(state, root, worktree, dependency_snapshot)
     source_trees = exact_source_trees(worktree)
     intent = read_json(root / "candidate-bundle-intent.json", "candidate_bundle_intent", 0o600)
     validate_intent(intent, state, gate_chain, recipe, source_trees)
@@ -1710,16 +2068,26 @@ def load_candidate_bundle(root, state, gate_chain):
     return record
 
 
-def ensure_candidate_bundle(state_path, state, worktree, gate_chain, revalidate):
+def ensure_candidate_bundle(
+    state_path,
+    state,
+    worktree,
+    gate_chain,
+    dependency_snapshot,
+    revalidate,
+):
     root = state_path.parent
     root_identity = directory_identity(root, "candidate_bundle_state_root", 0o700)
-    recipe = candidate_build_recipe(state, root, worktree)
+    recipe = candidate_build_recipe(state, root, worktree, dependency_snapshot)
     source_trees = exact_source_trees(worktree)
     intent_path = root / "candidate-bundle-intent.json"
     bundle_root = root / "candidate-bundle"
     recover_intent_temporary(root, state, gate_chain, recipe, source_trees)
     if bundle_root.exists():
-        return load_candidate_bundle(root, state, gate_chain), "exact_replay"
+        return (
+            load_candidate_bundle(root, state, gate_chain, dependency_snapshot),
+            "exact_replay",
+        )
     if intent_path.exists():
         existing = read_json(intent_path, "candidate_bundle_intent", 0o600)
         validate_intent(existing, state, gate_chain, recipe, source_trees)
@@ -1743,28 +2111,53 @@ def ensure_candidate_bundle(state_path, state, worktree, gate_chain, revalidate)
         )
     recover_candidate_staging(root, state, worktree, gate_chain, recipe, source_trees, intent)
     if bundle_root.exists():
-        return load_candidate_bundle(root, state, gate_chain), "exact_replay"
-    validate_build_directories(intent["toolchain"]["directories"], recipe, True)
-    current_toolchain = resolve_candidate_toolchain(
-        worktree, intent["toolchain"]["directories"]
+        return (
+            load_candidate_bundle(root, state, gate_chain, dependency_snapshot),
+            "exact_replay",
+        )
+    fence_descriptor = acquire_candidate_build_fence(root)
+    try:
+        validate_build_directories(intent["toolchain"]["directories"], recipe, True)
+        current_toolchain = resolve_candidate_toolchain(
+            worktree, intent["toolchain"]["directories"]
+        )
+        if current_toolchain != intent["toolchain"]:
+            fail("candidate_build_toolchain_drift")
+        tools = execute_candidate_build(
+            state,
+            worktree,
+            root,
+            recipe,
+            intent["toolchain"],
+            fence_descriptor,
+        )
+        os.close(fence_descriptor)
+        fence_descriptor = None
+        fence_descriptor = acquire_candidate_build_fence(root)
+        if (
+            directory_identity(root, "candidate_bundle_state_root", 0o700)
+            != root_identity
+        ):
+            fail("candidate_bundle_state_root_changed")
+        revalidate()
+        after_sources = exact_source_trees(worktree)
+        if after_sources != source_trees:
+            fail("candidate_bundle_source_changed")
+        if (
+            directory_identity(root, "candidate_bundle_state_root", 0o700)
+            != root_identity
+        ):
+            fail("candidate_bundle_state_root_changed")
+        create_candidate_bundle(
+            state, root, worktree, gate_chain, recipe, tools, source_trees, intent
+        )
+    finally:
+        if fence_descriptor is not None:
+            os.close(fence_descriptor)
+    return (
+        load_candidate_bundle(root, state, gate_chain, dependency_snapshot),
+        "created",
     )
-    if current_toolchain != intent["toolchain"]:
-        fail("candidate_build_toolchain_drift")
-    tools = execute_candidate_build(
-        state, worktree, root, recipe, intent["toolchain"]
-    )
-    if directory_identity(root, "candidate_bundle_state_root", 0o700) != root_identity:
-        fail("candidate_bundle_state_root_changed")
-    revalidate()
-    after_sources = exact_source_trees(worktree)
-    if after_sources != source_trees:
-        fail("candidate_bundle_source_changed")
-    if directory_identity(root, "candidate_bundle_state_root", 0o700) != root_identity:
-        fail("candidate_bundle_state_root_changed")
-    create_candidate_bundle(
-        state, root, worktree, gate_chain, recipe, tools, source_trees, intent
-    )
-    return load_candidate_bundle(root, state, gate_chain), "created"
 
 
 def record_file_identity(root):
