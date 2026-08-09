@@ -17,6 +17,7 @@ sys.path.insert(0, str(DIRECTORY))
 
 import d2_orchestrator_contract as CONTRACT
 import d2_orchestrator_platform as PLATFORM
+import d2_worker_evidence as WORKER_EVIDENCE
 
 
 INSTANCE_ID = "d2ti-0123456789abcdef0123456789abcdef"
@@ -618,6 +619,8 @@ def worker_health(**overrides):
         "queued_requests": 0,
         "accepted_requests_total": 7,
         "settled_requests_total": 7,
+        "last_successful_request_id": None,
+        "last_successful_completion_sha256": None,
     }
     value.update(overrides)
     return value
@@ -636,9 +639,21 @@ class PlatformWorkerHealthTests(unittest.TestCase):
     def test_worker_snapshot_is_exact_and_status_reuses_probe(self):
         context = worker_context()
         health = worker_health()
+        self.assertEqual(set(health), WORKER_EVIDENCE.HEALTH_FIELDS)
         platform = WorkerPlatform(worker_response(health))
         self.assertEqual(platform.worker_health_status(context), 200)
         self.assertEqual(platform.worker_health_snapshot(context), health)
+
+    def test_worker_snapshot_accepts_last_successful_completion_identity(self):
+        context = worker_context()
+        health = worker_health(
+            last_successful_request_id="worker-request-7",
+            last_successful_completion_sha256="b" * 64,
+        )
+        self.assertEqual(
+            WorkerPlatform(worker_response(health)).worker_health_snapshot(context),
+            health,
+        )
 
     def test_worker_snapshot_rejects_duplicate_and_type_confused_fields(self):
         context = worker_context()
@@ -651,6 +666,28 @@ class PlatformWorkerHealthTests(unittest.TestCase):
             worker_response(worker_health(concurrency_limit=True)),
             worker_response(worker_health(instance_id="worker identity")),
             worker_response(worker_health(worker_source_sha256="f" * 63)),
+            worker_response(worker_health(last_successful_request_id="request-7")),
+            worker_response(
+                worker_health(last_successful_completion_sha256="b" * 64)
+            ),
+            worker_response(
+                worker_health(
+                    last_successful_request_id="request 7",
+                    last_successful_completion_sha256="b" * 64,
+                )
+            ),
+            worker_response(
+                worker_health(
+                    last_successful_request_id="request-7",
+                    last_successful_completion_sha256="b" * 63,
+                )
+            ),
+            worker_response(
+                worker_health(
+                    last_successful_request_id=True,
+                    last_successful_completion_sha256="b" * 64,
+                )
+            ),
         ]
         for response in invalid:
             with self.subTest(response=response.stdout):
@@ -661,6 +698,20 @@ class PlatformWorkerHealthTests(unittest.TestCase):
                     lambda response=response: WorkerPlatform(response).worker_health_snapshot(
                         context
                     ),
+                )
+
+    def test_worker_snapshot_rejects_missing_or_extra_fields(self):
+        context = worker_context()
+        missing = worker_health()
+        missing.pop("last_successful_request_id")
+        extra = worker_health(unexpected="value")
+        for health in (missing, extra):
+            with self.subTest(health=health):
+                self.assert_platform_failure(
+                    "worker_health_identity_invalid",
+                    lambda health=health: WorkerPlatform(
+                        worker_response(health)
+                    ).worker_health_snapshot(context),
                 )
 
     def test_worker_snapshot_fails_closed_when_not_ready(self):

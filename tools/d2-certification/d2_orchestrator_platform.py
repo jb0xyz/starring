@@ -21,6 +21,7 @@ TRANSPORT_OPERATION_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.:-]{7,95}$")
 SNOWFLAKE_PATTERN = re.compile(r"^[1-9][0-9]{0,19}$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 WORKER_INSTANCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+WORKER_REQUEST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{0,191}$")
 TRANSPORT_RESOURCE_HISTORY_LIMIT = 128
 TRANSPORT_RESOURCE_INVENTORY_KIND = "starring.d2.run-owned-resource-inventory.v1"
 TRANSPORT_EFFECT_ADMISSION_OPERATIONS = frozenset(
@@ -1226,6 +1227,8 @@ class Platform:
             "queued_requests",
             "accepted_requests_total",
             "settled_requests_total",
+            "last_successful_request_id",
+            "last_successful_completion_sha256",
         }
         manifest = context.manifest
         if (
@@ -1260,6 +1263,23 @@ class Platform:
                     "queued_requests",
                     "accepted_requests_total",
                     "settled_requests_total",
+                )
+            )
+            or (health["last_successful_request_id"] is None)
+            != (health["last_successful_completion_sha256"] is None)
+            or (
+                health["last_successful_request_id"] is not None
+                and (
+                    not isinstance(health["last_successful_request_id"], str)
+                    or not WORKER_REQUEST_PATTERN.fullmatch(
+                        health["last_successful_request_id"]
+                    )
+                    or not isinstance(
+                        health["last_successful_completion_sha256"], str
+                    )
+                    or not DIGEST_PATTERN.fullmatch(
+                        health["last_successful_completion_sha256"]
+                    )
                 )
             )
         ):
