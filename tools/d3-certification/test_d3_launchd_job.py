@@ -259,6 +259,149 @@ class D3LaunchdJobTests(unittest.TestCase):
         self.assertEqual((first, replay), (23, 23))
         launchctl.assert_not_called()
 
+    def test_run_job_accepts_result_published_during_inactive_observation(self):
+        nonce = "a" * 32
+        label = f"co.starring.d3.candidate.{nonce}"
+        observations = 0
+
+        def status(_label):
+            nonlocal observations
+            observations += 1
+            if observations == 2:
+                self.write_result(nonce, label)
+            return False, False
+
+        with mock.patch.object(
+            MODULE,
+            "service_status",
+            side_effect=status,
+        ), mock.patch.object(
+            MODULE,
+            "launchctl",
+            return_value=mock.Mock(returncode=0, stdout=b"", stderr=b""),
+        ), mock.patch.object(
+            MODULE,
+            "require_executable",
+            side_effect=lambda path, _label: path,
+        ):
+            code = MODULE.run_job(
+                ["/usr/bin/true"],
+                self.root,
+                {"PATH": "/usr/bin:/bin"},
+                30,
+                self.root,
+                nonce,
+                lambda: None,
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(observations, 3)
+
+    def test_run_job_recovers_result_published_during_existing_service_check(self):
+        nonce = "b" * 32
+        label = f"co.starring.d3.candidate.{nonce}"
+        self.write_plist(nonce)
+        service_states = iter(((True, False), (True, True), (False, False)))
+        observations = 0
+
+        def status(_label):
+            nonlocal observations
+            observations += 1
+            if observations == 1:
+                self.write_result(nonce, label)
+            return next(service_states)
+
+        with mock.patch.object(
+            MODULE,
+            "service_status",
+            side_effect=status,
+        ), mock.patch.object(
+            MODULE,
+            "launchctl",
+            return_value=mock.Mock(returncode=0, stdout=b"", stderr=b""),
+        ):
+            code = MODULE.run_job(
+                ["/usr/bin/true"],
+                self.root,
+                {"PATH": "/usr/bin:/bin"},
+                30,
+                self.root,
+                nonce,
+                lambda: None,
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(observations, 3)
+
+    def test_run_job_rejects_ambiguous_publish_during_observation(self):
+        nonce = "c" * 32
+        label = f"co.starring.d3.candidate.{nonce}"
+        observations = 0
+
+        def status(_label):
+            nonlocal observations
+            observations += 1
+            if observations == 2:
+                self.write_result(nonce, label)
+                pending = self.root / f".candidate-launchd-result-{nonce}.json.pending"
+                pending.write_text("pending", encoding="utf-8")
+                pending.chmod(0o600)
+            return False, False
+
+        with mock.patch.object(
+            MODULE,
+            "service_status",
+            side_effect=status,
+        ), mock.patch.object(
+            MODULE,
+            "launchctl",
+            return_value=mock.Mock(returncode=0, stdout=b"", stderr=b""),
+        ), mock.patch.object(
+            MODULE,
+            "require_executable",
+            side_effect=lambda path, _label: path,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.LaunchdJobError,
+                "candidate_launchd_result_ambiguous",
+            ):
+                MODULE.run_job(
+                    ["/usr/bin/true"],
+                    self.root,
+                    {"PATH": "/usr/bin:/bin"},
+                    30,
+                    self.root,
+                    nonce,
+                    lambda: None,
+                )
+
+    def test_run_job_rejects_inactive_service_without_result(self):
+        nonce = "d" * 32
+        with mock.patch.object(
+            MODULE,
+            "service_status",
+            return_value=(False, False),
+        ), mock.patch.object(
+            MODULE,
+            "launchctl",
+            return_value=mock.Mock(returncode=0, stdout=b"", stderr=b""),
+        ), mock.patch.object(
+            MODULE,
+            "require_executable",
+            side_effect=lambda path, _label: path,
+        ):
+            with self.assertRaisesRegex(
+                MODULE.LaunchdJobError,
+                "candidate_launchd_result_missing",
+            ):
+                MODULE.run_job(
+                    ["/usr/bin/true"],
+                    self.root,
+                    {"PATH": "/usr/bin:/bin"},
+                    30,
+                    self.root,
+                    nonce,
+                    lambda: None,
+                )
+
     def test_run_job_rejects_completed_result_without_plist(self):
         nonce = "7" * 32
         label = f"co.starring.d3.candidate.{nonce}"

@@ -160,6 +160,14 @@ def terminate_service(label):
         time.sleep(POLL_SECONDS)
 
 
+def result_presence(result_path, pending_path):
+    result_exists = os.path.lexists(result_path)
+    pending_exists = os.path.lexists(pending_path)
+    if result_exists and pending_exists:
+        fail("candidate_launchd_result_ambiguous")
+    return result_exists, pending_exists
+
+
 def read_result(path, nonce, label):
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -353,14 +361,12 @@ def run_job(argv, cwd, environment, timeout, result_root, nonce, monitor):
         *argv,
     ]
     plist_payload = job_plist(label, program_arguments)
-    result_exists = os.path.lexists(result_path)
-    pending_exists = os.path.lexists(pending_path)
+    result_exists, pending_exists = result_presence(result_path, pending_path)
     plist_exists = os.path.lexists(plist_path)
-    if result_exists and pending_exists:
-        fail("candidate_launchd_result_ambiguous")
     if plist_exists:
         require_private_file(plist_path, plist_payload, "candidate_launchd_plist")
     existing_service, existing_active = service_status(label)
+    result_exists, pending_exists = result_presence(result_path, pending_path)
     if existing_service:
         if not plist_exists:
             fail("candidate_launchd_plist_missing")
@@ -395,10 +401,18 @@ def run_job(argv, cwd, environment, timeout, result_root, nonce, monitor):
             "candidate_launchd_bootstrap",
         )
         deadline = time.monotonic() + timeout
-        while not os.path.lexists(result_path):
+        while True:
+            result_exists, pending_exists = result_presence(result_path, pending_path)
+            if result_exists:
+                break
             monitor()
             observed_service, observed_active = service_status(label)
+            result_exists, pending_exists = result_presence(result_path, pending_path)
+            if result_exists:
+                break
             if not observed_service or not observed_active:
+                if pending_exists:
+                    fail("candidate_launchd_result_incomplete")
                 fail("candidate_launchd_result_missing")
             if time.monotonic() >= deadline:
                 fail("candidate_launchd_timeout")
