@@ -1187,6 +1187,52 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertEqual(path.read_text(encoding="utf-8"), "{}\n")
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_registry_atomic_write_accepts_exact_shared_runtime_parent(self):
+        shared_parent = pathlib.Path("/private/tmp")
+        path = shared_parent / f"starring-d2-registry-{secrets.token_hex(12)}.json"
+        try:
+            with (
+                mock.patch.object(
+                    CONTRACT, "GLOBAL_DISCORD_OWNERSHIP_REGISTRY_PATH", path
+                ),
+                mock.patch.object(
+                    CONTRACT, "D2_RUNTIME_ROOT_PARENT", shared_parent
+                ),
+            ):
+                CONTRACT.write_discord_ownership_registry(
+                    CONTRACT.empty_discord_ownership_registry()
+                )
+                self.assertEqual(
+                    CONTRACT.load_discord_ownership_registry()["owners"], []
+                )
+            metadata = path.lstat()
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual(metadata.st_uid, os.getuid())
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_nlink, 1)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_shared_runtime_parent_rejects_non_sticky_owned_directory(self):
+        path = self.runtime_root_parent / "registry.json"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "atomic_parent_invalid"
+        ):
+            CONTRACT.write_atomic(
+                path, "{}\n", shared_runtime_parent=True
+            )
+        self.assertFalse(path.exists())
+
+    def test_shared_atomic_write_rejects_a_different_parent_before_creation(self):
+        path = self.root / "wrong-shared-parent" / "registry.json"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "atomic_parent_invalid"
+        ):
+            CONTRACT.write_atomic(
+                path, "{}\n", shared_runtime_parent=True
+            )
+        self.assertFalse(path.parent.exists())
+
     def test_first_journal_append_fsyncs_artifact_lock_and_entry_directories(self):
         observed = []
         real_fsync_directory = CONTRACT.fsync_directory

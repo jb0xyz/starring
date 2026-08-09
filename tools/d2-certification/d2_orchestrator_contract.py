@@ -126,8 +126,52 @@ def utc_now():
     )
 
 
-def write_atomic(path, payload, mode=0o600):
+def fsync_shared_runtime_parent(path, label):
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        fail(f"{label}_unavailable:{error.__class__.__name__}")
+    if (
+        path != D2_RUNTIME_ROOT_PARENT
+        or not stat.S_ISDIR(metadata.st_mode)
+        or path.is_symlink()
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o1777
+    ):
+        fail(f"{label}_invalid")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"{label}_open_failed:{error.__class__.__name__}")
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != 0
+            or stat.S_IMODE(opened.st_mode) != 0o1777
+            or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+        ):
+            fail(f"{label}_identity_changed")
+        os.fsync(descriptor)
+    except OSError as error:
+        fail(f"{label}_fsync_failed:{error.__class__.__name__}")
+    finally:
+        os.close(descriptor)
+
+
+def write_atomic(path, payload, mode=0o600, shared_runtime_parent=False):
     parent_created = not path.parent.exists()
+    if shared_runtime_parent and (
+        path.parent != D2_RUNTIME_ROOT_PARENT or parent_created
+    ):
+        fail("atomic_parent_invalid")
+    if shared_runtime_parent:
+        fsync_shared_runtime_parent(path.parent, "atomic_parent")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     if parent_created:
         fsync_directory(path.parent.parent, "atomic_parent_parent")
@@ -150,7 +194,10 @@ def write_atomic(path, payload, mode=0o600):
     finally:
         os.close(descriptor)
     os.replace(temporary, path)
-    fsync_directory(path.parent, "atomic_parent")
+    if shared_runtime_parent:
+        fsync_shared_runtime_parent(path.parent, "atomic_parent")
+    else:
+        fsync_directory(path.parent, "atomic_parent")
 
 
 def load_json(path, code):
@@ -273,12 +320,14 @@ def load_discord_ownership_registry():
 
 def write_discord_ownership_registry(registry):
     validate_discord_ownership_registry(registry)
+    path = GLOBAL_DISCORD_OWNERSHIP_REGISTRY_PATH
     write_atomic(
-        GLOBAL_DISCORD_OWNERSHIP_REGISTRY_PATH,
+        path,
         json.dumps(
             registry, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         )
         + "\n",
+        shared_runtime_parent=path.parent == D2_RUNTIME_ROOT_PARENT,
     )
 
 
