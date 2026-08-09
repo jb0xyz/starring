@@ -2985,6 +2985,14 @@ chain, PR, merge, and workflow-run identities are retained outside the tracked
 tree in immutable certification evidence; their current value is `pending`
 until the provider and completed D2 run supply it.
 
+The authoritative terminal artifact is the D3 terminal record
+`<D3_RUN>/final.json`, created only by
+`tools/d3-certification/d3_certification.py finalize`; `<D3_RUN>` is the
+directory containing the returned D3 `state.json`. It owns the completed D2,
+D3, D4, PR, merged-main, and CI result. Do not edit tracked plan checkboxes or
+replace tracked `pending` values after merge; doing so would create a tree
+different from the one that artifact certifies.
+
 The certified scope, if those gates pass, is one Mac mini, one canonical shard,
 and `starring.private_study_room@1`. This runbook does not certify a frontend,
 arbitrary recipes or games, installation administration, multi-shard or

@@ -240,3 +240,10 @@ health projection, restart and failure cohorts, load and soak SLOs,
 backup/restore, non-interactive reboot, D2 disposable-database E2E, CI
 merge-candidate certification, and merged-main certification remain Phase C
 and Phase D work.
+
+Later scope classification: this dated stop boundary records everything that
+was still open at B6. The current authoritative completion plan assigns the
+exact disposable-guild, external-failure recovery, merge-candidate, and
+merged-main cohorts to Backend V1 D1-D4. Sustained load and soak,
+disaster-recovery restore, and non-interactive host reboot are separate
+production-rollout certificates. This note changes no B6 result or claim.

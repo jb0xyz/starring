@@ -117,6 +117,8 @@ The missing production connections are:
 - Multi-host high availability
 - Non-Discord adapters
 - A durable asynchronous authoring job queue
+- High-volume load and soak certification, disaster-recovery restore
+  certification, and host-reboot deployment certification
 
 The initial authoring endpoint is synchronous and bounded. A durable
 asynchronous queue is added only when measured queueing, disconnect loss,
@@ -324,6 +326,16 @@ The D4 documentation slice is prepared against the current source inventory,
 but its checkbox remains open until D2 and D3 provide final external evidence.
 Documentation is not a substitute for a completed disposable-guild receipt
 chain, an exact merge-candidate tree, or merged-main push CI.
+
+This tracked ledger is the immutable pre-certification plan snapshot. Because
+the terminal evidence can exist only after this exact tree is merged, it must
+not be edited afterward to flip D2, D3, D4, or final-PR checkboxes. The sealed
+`<D3_RUN>/final.json` produced by `d3_certification.py finalize` is the
+authoritative D3 terminal completion record for those four entries. `<D3_RUN>`
+is the directory containing the absolute `state.json` path returned by
+`prepare`. A valid record proves that the exact D4 source and operations slice
+was inside the certified tree; absent that record, the open boxes remain
+factually correct.
 
 ## Phase A: trusted authoring
 
@@ -1422,6 +1434,19 @@ immutable external certification evidence. A source document cannot contain
 its own final commit or tree without changing that identity. Until the external
 record supplies them, their factual value is `pending`; no placeholder may be
 interpreted as a pass.
+
+The authoritative external record is the D3 terminal record
+`<D3_RUN>/final.json`, created only by
+`tools/d3-certification/d3_certification.py finalize`; `<D3_RUN>` is the
+directory containing the returned D3 `state.json`. It owns the terminal D2,
+D3, D4, final-PR, merged-main, and CI result. The tracked checkboxes and
+`pending` table are deliberately not modified after merge.
+
+Backend V1 certifies the included single-host, single-shard, low-initial-volume
+product scope. High-volume load and soak, disaster-recovery restore, and
+host-reboot deployment certification remain separate production-rollout gates;
+their runbooks and bounded behavior are part of V1, but D1-D4 do not claim that
+those external cohorts have passed.
 
 Commit:
 

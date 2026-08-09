@@ -155,3 +155,10 @@ includes:
   operations closure, merge-candidate CI, and merged-main CI
 
 No result in this document is a commercial release certificate.
+
+Later scope classification: this dated list records everything that was still
+open at C3. The current authoritative completion plan assigns bounded restart
+and injected failure to D1, the exact disposable-guild external-failure and
+recovery path to D2, and exact-tree release evidence to D3. Sustained load and
+soak, disaster-recovery restore, and non-interactive host reboot are separate
+production-rollout certificates. This note changes no C3 result or claim.

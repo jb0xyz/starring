@@ -276,7 +276,11 @@ deployment, receipt, effect journal, route, or Discord resource.
 
 Final identities are external evidence because a tracked document cannot bind
 its own final tree without changing that tree. The machine-updated release
-record must fill these fields from immutable run and GitHub evidence:
+record is
+the D3 terminal record `<D3_RUN>/final.json`, created only by
+`tools/d3-certification/d3_certification.py finalize`. `<D3_RUN>` is the
+directory containing the absolute D3 `state.json` path returned by `prepare`.
+It must fill these fields from immutable run and GitHub evidence:
 
 | External evidence field | Authoritative source | Current value |
 | --- | --- | --- |
@@ -288,7 +292,11 @@ record must fill these fields from immutable run and GitHub evidence:
 | one Actions run ID containing green `checks` and `postgres` push jobs | GitHub Actions | pending |
 
 `pending` means no certificate exists. It must never be replaced by a guessed
-or locally synthesized identity.
+or locally synthesized identity. This tracked handoff and the plan checkboxes
+are the immutable pre-certification snapshot. Do not edit them after merge to
+replace `pending` or flip D2, D3, D4, or final-PR boxes; a valid sealed
+D3 terminal record supersedes that snapshot as the sole terminal completion
+record.
 
 ## Explicit non-claims and support limits
 
@@ -300,6 +308,10 @@ or locally synthesized identity.
 - This certificate is scoped to one Mac mini, one canonical shard, and
   `starring.private_study_room@1`. It does not certify full production secret
   isolation from the logged-in user boundary or a high-volume production SLO.
+- Sustained load and soak, disaster-recovery restore, non-interactive host
+  reboot, and public-ingress capacity are separate production-rollout
+  certificates. Their bounded code paths and runbooks are part of Backend V1,
+  but Phase D does not claim those external cohorts passed.
 - B6 proves a bounded standing-fixture path, not D2 cleanup or commercial
   certification.
 - The Luna V15 232/232 matrix proves bounded serial authoring quality for its

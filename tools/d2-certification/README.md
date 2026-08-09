@@ -30,7 +30,8 @@ and per-run Keychain ownership markers. Start launches PostgreSQL and invokes
 the immutable `starring-d2-db-bootstrap` candidate, which reuses the production
 SQLx bootstrap library and records the exact migration ledger. It then invokes
 the immutable sealed provisioner, creates or exactly replays 20 application
-database credentials, three application keyrings, one worker bearer credential,
+database credentials, one cluster-administrator credential, three application
+keyrings, one worker bearer credential,
 activates the 20 application roles, changes PostgreSQL from socket-only
 bootstrap access to role-specific loopback SCRAM access, verifies replay after
 the sealed restart, and starts the certification transport, worker, API,
@@ -52,6 +53,14 @@ and `cleanup` are idempotent abort and recovery commands. After candidate-start
 commitment they durably retire the run, operate only on manifest-derived
 identities, and require the standing launchd, plist, and port snapshot to
 remain unchanged.
+
+The complete run-owned Keychain boundary is 25 secret items and four lifecycle
+ownership markers. The secret items are the 20 application database
+credentials, one cluster-administrator credential, three purpose-separated
+keyrings, and one worker bearer credential. Together with the four markers,
+that is exactly 29 run-owned items. The dedicated Discord OAuth secret, Discord
+bot token, and Cloudflare tunnel token are three external read-only items; the
+orchestrator must preserve them and never copy, rotate, or delete them.
 
 The transport control snapshot is version 4. Its effect listener reports the
 one-way admission phase (`open`, `draining`, or `teardown_delete_only`), the

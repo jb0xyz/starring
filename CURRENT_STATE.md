@@ -301,9 +301,11 @@ database transactions. An unresolved or uncorrelatable mutable non-response
 effect is recorded as `recovery_required` and blocks the affected route instead
 of being guessed or blindly replayed. An unrecoverable response tail closes
 only the exact receipt without inventing delivery. Phase C remains a
-source-level hardening checkpoint, not a commercial release certificate; the
-complete restart, live fault, load, restore, and disposable-guild cohorts remain
-Phase D work.
+source-level hardening checkpoint, not a commercial release certificate. D1
+completed the bounded restart and injected-failure cohorts; D2 still owns the
+exact disposable-guild external failure and recovery certificate. Sustained
+load, disaster-recovery restore, and host reboot are separate
+production-rollout cohorts.
 
 The active authoring provider is `codex_chatgpt`, pinned to
 `gpt-5.6-luna` with `medium` reasoning effort and ChatGPT authentication. The
@@ -767,6 +769,14 @@ observe green `checks` and `postgres` push jobs on that main merge commit. D4
 documentation is a required part of that candidate; updating it cannot make D2
 or D3 true.
 
+After merge, the authoritative terminal status is the sealed D3 terminal record
+`<D3_RUN>/final.json`, created by
+`tools/d3-certification/d3_certification.py finalize`; `<D3_RUN>` is the
+directory containing the returned D3 `state.json`. The tracked plan checkboxes
+and `pending` evidence table are an immutable pre-certification snapshot and
+are not edited afterward, because that would create a different, uncertified
+tree.
+
 D2 step 9 binds one manifest actor and the exact created instance across visible
 Chrome observation, completed create and join receipts, one successful created
 role membership in each path, one successful ephemeral acknowledgement per
@@ -818,23 +828,25 @@ isolation, or a high-volume production SLO certificate.
 - A frontend authoring UI. The authenticated conversational authoring API exists,
   but the current user surfaces are the product HTTP contract and the separate
   CLI/evaluation edge.
-- A commercial release certificate for `tools/starring-api`. Its fourteen core
-  pools plus isolated writer pool and staging capability inventory exist, but
-  non-interactive reboot, restored-environment, backup/restore, failure,
-  concurrency, saturation, soak, and public-ingress drills remain release work.
+- A high-volume or disaster-recovery production deployment certificate for
+  `tools/starring-api`. Its fourteen core pools plus isolated writer pool and
+  staging capability inventory exist, but non-interactive reboot,
+  restored-environment backup/restore, sustained load, saturation, soak, and
+  public-ingress capacity drills remain post-Backend-V1 rollout work.
 - Production credential and operational certification beyond the integrated
   staging cluster. Staging has 20 pairwise-distinct application database
   credentials, three purpose-separated keyrings, 28 total Keychain items,
   fixed function allowlists, restrictive grants, and a 15-rule HBA;
   restored-cluster reconciliation,
   production secret-account isolation, rotation, and whole-process negative
-  capability evidence remain release blockers.
-- Commercial runtime certification beyond the completed Phase C source
+  capability evidence remain production-rollout blockers.
+- Backend V1 runtime certification beyond the completed Phase C source
   candidate. The receipt, preflight, effect-journal, reconciliation,
   compensation, route-admission, and recovery-supervisor boundaries exist, but
-  D1 restart and injected-failure cohorts are complete while the exact release
-  tree still needs the disposable-guild, load, restore, merge-candidate, and
-  merged-main cohorts.
+  D1 restart and injected-failure cohorts are complete while the exact Backend
+  V1 tree still needs the disposable-guild, merge-candidate, and merged-main
+  cohorts. Load, restore, and host-reboot cohorts belong to the separate
+  production-rollout certificate.
 - An administrative / management API.
 - Broader multi-process lease/ownership beyond the single per-request lease.
 - A dedicated live teardown-retry progress and degraded-health projection. The
@@ -870,9 +882,10 @@ isolation, or a high-volume production SLO certificate.
   successor.
 - Apply can durably reach `RuntimePending`, and the exact staging runtime can
   advance it to real Live with a certified panel and fresh serving lease.
-  Commercial operation still requires the exact candidate to pass the Phase D
-  disposable-guild, load, restore, merge-candidate, CI, and merged-main
-  certification gates.
+  Backend V1 still requires the exact candidate to pass the Phase D
+  disposable-guild, merge-candidate, CI, and merged-main certification gates.
+  Load, restore, and host-reboot evidence remain separate production-rollout
+  gates.
 - The `automation-panel-installation-postgres` ignored tests share a guild
   constant and must run serially (`--test-threads=1`); CI does this. A cleaner
   per-test isolation is deferred.
@@ -893,15 +906,18 @@ isolation, or a high-volume production SLO certificate.
   or three consecutive failed sweeps fails closed. A present teardown target
   without the exact persisted registration identity is treated as a conflict,
   never adopted by instance ID or resource manifest alone.
-- Layer 2's functional product/runtime staging execution is proven, but its
-  commercial failure, load, recovery, and release maturity is not certified
-  here. Layer 1's live end-to-end maturity remains uncertified.
+- Layer 2's functional product/runtime staging execution is proven, but the
+  exact Backend V1 disposable-guild recovery and release tree are not yet
+  certified. Its high-volume load and disaster-recovery operating envelopes
+  remain a separate production-rollout certificate. Layer 1's live end-to-end
+  maturity remains uncertified.
 - The first recipe checkpoint does not certify commercial readiness. Custom
   copy, naming, and controls now have a passing repeated V4 acceptance matrix,
   and the authenticated API, identity boundary, and A6 live authoring path are
-  proven. B6 also proves one exact live Discord execution and restart path, but
-  concurrent load, throughput, soak recovery, high availability, and external
-  Discord failure recovery remain uncertified.
+  proven. B6 also proves one exact live Discord execution and restart path.
+  D2 still owns the exact external Discord failure and recovery certificate;
+  concurrent load, throughput, soak recovery, and high availability remain
+  outside the Backend V1 certificate.
 - V4 structurally removes the V3 identity defect in which three full-detail
   repetitions produced one RuleSet and one compiled-plan identity but two
   input-intent and semantic-intent hash variants. The deterministic identity
@@ -975,11 +991,13 @@ green. D2 and D3 remain required.
 
 The accepted next sequence is:
 
-1. **Phase D — commercial certification:** run the final disposable-guild E2E,
-   backup/restore and non-interactive reboot drills, concurrency, saturation and
-   soak measurement, complete local gates, final PR and merge-candidate CI,
-   merged-main CI, and source-of-truth/runbook closure.
-2. After the commercial certificate, add typed multi-turn preference
+1. **Phase D — Backend V1 certification:** run the final disposable-guild E2E,
+   complete local gates, final PR and merge-candidate CI, merged-main CI, and
+   source-of-truth/runbook closure.
+2. Run the separate production-rollout certificate for restored-environment
+   backup/restore, non-interactive host reboot, concurrency, saturation, load,
+   soak, and public-ingress capacity before claiming those operating envelopes.
+3. After the Backend V1 certificate, add typed multi-turn preference
    accumulation and typed-planner handoff, then consider broader recipes or the
    separate `StatefulSpec` runtime arc.
 
