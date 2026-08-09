@@ -5524,6 +5524,23 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         D2IsolatedOrchestratorTest.start_candidate_with_discord_resources
     )
 
+    def start_candidate_with_study_room_resources(self):
+        self.start_candidate_with_discord_resources()
+        retained = {
+            "1524810437118525560",
+            "1524810437118525570",
+            "1524810437118525571",
+            "1524810437118525580",
+        }
+        self.platform.resource_history = [
+            resource
+            for resource in self.platform.resource_history
+            if resource["resource_id"] in retained
+        ]
+        hub_channel_id = self.context.manifest["discord"]["hub_channel_id"]
+        self.platform.discord_existing = retained | {hub_channel_id}
+        return self.platform.resource_inventory(self.context)
+
     def test_discord_resource_command_parsers_require_manifest(self):
         for command in ("resource-inventory", "teardown-discord-resources"):
             arguments = ORCHESTRATOR.build_parser().parse_args(
@@ -5559,7 +5576,7 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         )
 
     def test_interaction_transport_evidence_projects_exact_active_inventory(self):
-        inventory = self.start_candidate_with_discord_resources()
+        inventory = self.start_candidate_with_study_room_resources()
         result = ORCHESTRATOR.command_transport_evidence(
             self.context, self.platform, "interaction"
         )
@@ -5611,13 +5628,13 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             self.context, self.platform, "interaction"
         )
         self.assertEqual(replay["status"], "exact_replay")
-        self.platform.resource_history.append(
-            {
-                "kind": "role",
-                "resource_id": "1524810437118525590",
-                "state": "created",
-            }
+        role = next(
+            resource
+            for resource in self.platform.resource_history
+            if resource["kind"] == "role"
         )
+        self.platform.discord_existing.discard(role["resource_id"])
+        role["resource_id"] = "1524810437118525590"
         self.platform.discord_existing.add("1524810437118525590")
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError, "transport_evidence_replay_drift"
@@ -5627,7 +5644,7 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             )
 
     def test_duplicate_transport_evidence_is_counter_and_interaction_bound(self):
-        inventory = self.start_candidate_with_discord_resources()
+        inventory = self.start_candidate_with_study_room_resources()
         gateway = self.platform.transport_state["gateway"]
         gateway["last_duplicate_interaction_id"] = "1532677575736819846"
         gateway["duplicate_injections"] = 1
@@ -5671,6 +5688,43 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             ORCHESTRATOR.command_transport_evidence(
                 self.context, self.platform, "duplicate"
             )
+
+    def test_interaction_and_duplicate_require_exact_study_room_inventory(self):
+        self.start_candidate_with_study_room_resources()
+        gateway = self.platform.transport_state["gateway"]
+        gateway["last_duplicate_interaction_id"] = "1532677575736819846"
+        gateway["duplicate_injections"] = 1
+        gateway["duplicate_delivery_count"] = 2
+        removed = self.platform.resource_history.pop(2)
+        self.platform.discord_existing.discard(removed["resource_id"])
+        for checkpoint in ("interaction", "duplicate"):
+            with self.subTest(checkpoint=checkpoint, panel_count=1):
+                with self.assertRaisesRegex(
+                    ORCHESTRATOR.OrchestratorError,
+                    f"transport_{checkpoint}_inventory_invalid",
+                ):
+                    ORCHESTRATOR.command_transport_evidence(
+                        self.context, self.platform, checkpoint
+                    )
+        self.platform.resource_history.append(removed)
+        self.platform.discord_existing.add(removed["resource_id"])
+        extra = {
+            "kind": "message",
+            "resource_id": "1524810437118525590",
+            "channel_id": self.context.manifest["discord"]["hub_channel_id"],
+            "state": "created",
+        }
+        self.platform.resource_history.append(extra)
+        self.platform.discord_existing.add(extra["resource_id"])
+        for checkpoint in ("interaction", "duplicate"):
+            with self.subTest(checkpoint=checkpoint, panel_count=3):
+                with self.assertRaisesRegex(
+                    ORCHESTRATOR.OrchestratorError,
+                    f"transport_{checkpoint}_inventory_invalid",
+                ):
+                    ORCHESTRATOR.command_transport_evidence(
+                        self.context, self.platform, checkpoint
+                    )
 
     def test_reconciliation_transport_evidence_excludes_interaction_and_raw_snapshot(self):
         self.start_candidate_with_discord_resources()

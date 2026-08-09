@@ -1305,7 +1305,7 @@ human boundary. No one source can synthesize another source's claim.
 The interaction checkpoint requires the manifest actor, distinct create and
 join receipts, the exact created instance and role, one successful role
 membership effect and ephemeral acknowledgement in each path, exact visible
-Chrome observations, and an exact one-role/one-channel/one-panel transport
+Chrome observations, and an exact one-role/one-channel/two-panel transport
 inventory. Gateway loss requires one durable partition and one durable heal on
 the same pinned transport instance. Certified teardown starts only after step
 15 completion is sealed, freezes its resource inventory before shutdown and

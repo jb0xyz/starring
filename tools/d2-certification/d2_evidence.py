@@ -1072,10 +1072,15 @@ def assemble_interaction_evidence(database, transport):
     route_id = canonical_route_identity_sha256(durable["route_identity"])
     if durable["route_identity"]["deployment_id"] != durable["deployment_id"]:
         _fail("interaction_route_deployment_mismatch")
-    for field in ("role_ids", "channel_ids", "panel_message_ids"):
+    expected_cardinality = {
+        "role_ids": 1,
+        "channel_ids": 1,
+        "panel_message_ids": 2,
+    }
+    for field, cardinality in expected_cardinality.items():
         durable_ids = _require_snowflake_list(durable[field], f"interaction_{field}_invalid")
         inventory_ids = _require_snowflake_list(inventory[field], f"transport_{field}_invalid")
-        if len(durable_ids) != 1:
+        if len(durable_ids) != cardinality:
             _fail(f"interaction_{field}_cardinality_invalid")
         if durable_ids != inventory_ids:
             _fail(f"interaction_{field}_mismatch")
@@ -1130,6 +1135,7 @@ def assemble_observed_interaction_evidence(
         "join_response_observed",
         "private_channel_observed",
         "role_assignment_observed",
+        "welcome_panel_observed",
         "join_panel_observed",
         "confirmation_surface",
     }
@@ -1179,6 +1185,7 @@ def assemble_observed_interaction_evidence(
         "join_response_observed",
         "private_channel_observed",
         "role_assignment_observed",
+        "welcome_panel_observed",
         "join_panel_observed",
     ):
         if visible[field] is not True:
@@ -1238,10 +1245,17 @@ def assemble_duplicate_evidence(database, transport):
         injected["inventory_digest_sha256"],
         "duplicate_inventory_digest_invalid",
     )
-    for field in ("role_ids", "channel_ids", "panel_message_ids"):
-        _require_snowflake_list(
+    expected_cardinality = {
+        "role_ids": 1,
+        "channel_ids": 1,
+        "panel_message_ids": 2,
+    }
+    for field, cardinality in expected_cardinality.items():
+        values = _require_snowflake_list(
             injected[field], f"duplicate_{field}_invalid"
         )
+        if len(values) != cardinality:
+            _fail(f"duplicate_{field}_cardinality_invalid")
     resource_ids = (
         injected["role_ids"]
         + injected["channel_ids"]

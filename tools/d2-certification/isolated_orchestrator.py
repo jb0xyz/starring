@@ -2214,20 +2214,14 @@ def validate_transport_evidence_payload(context, checkpoint, evidence):
         fail("transport_evidence_invalid")
     if checkpoint == "interaction":
         _require_transport_inventory_projection(evidence)
-        for field in ("role_ids", "channel_ids", "panel_message_ids"):
-            values = evidence[field]
-            if (
-                not isinstance(values, list)
-                or not values
-                or len(values) > 128
-                or values != sorted(values)
-                or len(values) != len(set(values))
-            ):
-                fail("transport_interaction_inventory_invalid")
-            for value in values:
-                validate_snowflake(value, f"transport_{field}")
+        _require_study_room_transport_inventory(
+            evidence, "transport_interaction_inventory_invalid"
+        )
     elif checkpoint == "duplicate":
         _require_transport_inventory_projection(evidence)
+        _require_study_room_transport_inventory(
+            evidence, "transport_duplicate_inventory_invalid"
+        )
         validate_snowflake(evidence["interaction_id"], "transport_interaction_id")
         validate_snowflake(
             evidence["transport_last_duplicate_interaction_id"],
@@ -2343,6 +2337,9 @@ def interaction_transport_evidence(context, platform, snapshot):
             if resource["kind"] == "message"
         ),
     }
+    _require_study_room_transport_inventory(
+        values, "transport_interaction_inventory_invalid"
+    )
     return {
         "schema_version": 1,
         "kind": TRANSPORT_EVIDENCE_KINDS["interaction"],
@@ -2377,6 +2374,20 @@ def _require_transport_inventory_projection(evidence):
         fail("transport_inventory_projection_invalid")
 
 
+def _require_study_room_transport_inventory(evidence, code):
+    expected_cardinality = {
+        "role_ids": 1,
+        "channel_ids": 1,
+        "panel_message_ids": 2,
+    }
+    if any(
+        not isinstance(evidence.get(field), list)
+        or len(evidence[field]) != cardinality
+        for field, cardinality in expected_cardinality.items()
+    ):
+        fail(code)
+
+
 def duplicate_transport_evidence(context, platform, snapshot):
     gateway = snapshot["gateway"]
     interaction_id = gateway["last_duplicate_interaction_id"]
@@ -2387,7 +2398,7 @@ def duplicate_transport_evidence(context, platform, snapshot):
         or inventory["active"] != inventory["created"]
     ):
         fail("transport_duplicate_inventory_invalid")
-    return {
+    evidence = {
         "schema_version": 1,
         "kind": TRANSPORT_EVIDENCE_KINDS["duplicate"],
         "observed_at": utc_now(),
@@ -2416,6 +2427,10 @@ def duplicate_transport_evidence(context, platform, snapshot):
         "inventory_digest_sha256": inventory["digest_sha256"],
         "transport_instance_id": snapshot["instance_id"],
     }
+    _require_study_room_transport_inventory(
+        evidence, "transport_duplicate_inventory_invalid"
+    )
+    return evidence
 
 
 def reconciliation_transport_evidence(snapshot):

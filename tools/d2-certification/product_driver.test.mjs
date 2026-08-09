@@ -129,13 +129,14 @@ test("Discord interaction observation is canonical and exact", () => {
     createInteractionId: "1524810437118525560",
     joinInteractionId: "1524810437118525561",
     joinedRoleId: "1524810437118525570",
-    roleIds: ["1524810437118525571", "1524810437118525570"],
+    roleIds: ["1524810437118525570"],
     channelIds: ["1524810437118525580"],
-    panelMessageIds: ["1524810437118525590"],
+    panelMessageIds: ["1524810437118525591", "1524810437118525590"],
     createResponseObserved: true,
     joinResponseObserved: true,
     privateChannelObserved: true,
     roleAssignmentObserved: true,
+    welcomePanelObserved: true,
     joinPanelObserved: true,
   });
   assert.deepEqual(
@@ -150,13 +151,14 @@ test("Discord interaction observation is canonical and exact", () => {
       create_interaction_id: "1524810437118525560",
       join_interaction_id: "1524810437118525561",
       joined_role_id: "1524810437118525570",
-      role_ids: ["1524810437118525570", "1524810437118525571"],
+      role_ids: ["1524810437118525570"],
       channel_ids: ["1524810437118525580"],
-      panel_message_ids: ["1524810437118525590"],
+      panel_message_ids: ["1524810437118525590", "1524810437118525591"],
       create_response_observed: true,
       join_response_observed: true,
       private_channel_observed: true,
       role_assignment_observed: true,
+      welcome_panel_observed: true,
       join_panel_observed: true,
       confirmation_surface: "chrome_discord_web",
     },
@@ -177,11 +179,12 @@ test("Discord interaction observation rejects weak or ambiguous confirmation", (
     joinedRoleId: "1524810437118525570",
     roleIds: ["1524810437118525570"],
     channelIds: ["1524810437118525580"],
-    panelMessageIds: ["1524810437118525590"],
+    panelMessageIds: ["1524810437118525590", "1524810437118525591"],
     createResponseObserved: true,
     joinResponseObserved: true,
     privateChannelObserved: true,
     roleAssignmentObserved: true,
+    welcomePanelObserved: true,
     joinPanelObserved: true,
   };
   assert.throws(
@@ -201,6 +204,13 @@ test("Discord interaction observation rejects weak or ambiguous confirmation", (
   assert.throws(
     () => product.discordInteractionObservation({
       ...valid,
+      welcomePanelObserved: false,
+    }),
+    /discord_interaction_observation_invalid/,
+  );
+  assert.throws(
+    () => product.discordInteractionObservation({
+      ...valid,
       joinPanelObserved: false,
     }),
     /discord_interaction_observation_invalid/,
@@ -212,6 +222,22 @@ test("Discord interaction observation rejects weak or ambiguous confirmation", (
     }),
     /discord_joined_role_invalid/,
   );
+  for (const panelMessageIds of [
+    ["1524810437118525590"],
+    [
+      "1524810437118525590",
+      "1524810437118525591",
+      "1524810437118525592",
+    ],
+  ]) {
+    assert.throws(
+      () => product.discordInteractionObservation({
+        ...valid,
+        panelMessageIds,
+      }),
+      /discord_interaction_observation_invalid/,
+    );
+  }
 });
 
 

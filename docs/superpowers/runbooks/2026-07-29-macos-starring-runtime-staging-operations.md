@@ -667,8 +667,9 @@ For step 9, the sealed checkpoint must show completed create and join receipts,
 the manifest actor, the created instance, one exact successful membership of
 the created role in each path, and one successful ephemeral acknowledgement per
 receipt. The Chrome observation independently names the same actor,
-interactions, joined role, one role, one channel, and one panel message, and the
-transport inventory must match all three resource identities.
+interactions, joined role, one role, one channel, affirmatively observed welcome
+panel, and affirmatively observed hub join panel, and the transport inventory
+must match all four resource identities.
 
 For step 15, one durable partition operation and one durable heal operation
 must belong to the same pinned transport instance. The partition counter is

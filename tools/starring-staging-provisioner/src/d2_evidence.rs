@@ -854,11 +854,12 @@ async fn inspect_interaction(
         "instance_state",
     )
     .await?;
-    if role_ids.len() != 1
-        || channel_ids.len() != 1
-        || panel_message_ids.len() != 1
-        || registered_instance_ids.len() != 1
-        || registered_instance_ids[0] != instance_id
+    if !exact_interaction_resource_cardinality(
+        &role_ids,
+        &channel_ids,
+        &panel_message_ids,
+        &registered_instance_ids,
+    ) || registered_instance_ids[0] != instance_id
     {
         return Err(D2ProvisionerErrorV1::Inspection);
     }
@@ -1451,6 +1452,18 @@ fn exact_authoring_scope(scoped_count: i64) -> bool {
     scoped_count == 1
 }
 
+fn exact_interaction_resource_cardinality(
+    role_ids: &[String],
+    channel_ids: &[String],
+    panel_message_ids: &[String],
+    registered_instance_ids: &[String],
+) -> bool {
+    role_ids.len() == 1
+        && channel_ids.len() == 1
+        && panel_message_ids.len() == 2
+        && registered_instance_ids.len() == 1
+}
+
 #[cfg(test)]
 fn cleanup_blocking_effect_state(state: &str) -> bool {
     matches!(
@@ -1593,6 +1606,34 @@ mod tests {
                 Err(D2ProvisionerErrorV1::Arguments)
             );
         }
+    }
+
+    #[test]
+    fn interaction_resource_cardinality_matches_private_study_room() {
+        let roles = vec!["1533137713476272290".to_owned()];
+        let channels = vec!["1533137713476272291".to_owned()];
+        let panels = vec![
+            "1533137713476272292".to_owned(),
+            "1533137713476272293".to_owned(),
+        ];
+        let instances = vec!["instance-1".to_owned()];
+        assert!(exact_interaction_resource_cardinality(
+            &roles, &channels, &panels, &instances,
+        ));
+        assert!(!exact_interaction_resource_cardinality(
+            &roles,
+            &channels,
+            &panels[..1],
+            &instances,
+        ));
+        let mut extra_panels = panels.clone();
+        extra_panels.push("1533137713476272294".to_owned());
+        assert!(!exact_interaction_resource_cardinality(
+            &roles,
+            &channels,
+            &extra_panels,
+            &instances,
+        ));
     }
 
     #[test]
@@ -1931,7 +1972,10 @@ mod tests {
                     instance_id: "instance-1".to_owned(),
                     role_ids: vec!["1533137713476272290".to_owned()],
                     channel_ids: vec!["1533137713476272291".to_owned()],
-                    panel_message_ids: vec!["1533137713476272292".to_owned()],
+                    panel_message_ids: vec![
+                        "1533137713476272292".to_owned(),
+                        "1533137713476272293".to_owned(),
+                    ],
                     ephemeral_count: 2,
                 })),
                 vec![

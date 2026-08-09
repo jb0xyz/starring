@@ -137,12 +137,12 @@ prompts, transcripts, or RuleSet JSON.
 Step 9 is an exact three-source join. Chrome supplies the visible manifest
 guild, prefix, actor, distinct create and join interaction IDs, joined role,
 resource inventory, and affirmative create-response, join-response, private
-channel, role-assignment, and join-panel observations. The sealed database
+channel, role-assignment, welcome-panel, and hub-join-panel observations. The sealed database
 checkpoint independently requires completed create and join receipts, the same
 manifest actor, one successful created-role membership in each path, the exact
 created instance, and one successful ephemeral acknowledgement per receipt.
-The transport inventory must match the one role, one channel, and one panel
-message exactly.
+The transport inventory must match the one role, one channel, welcome panel,
+and hub join panel exactly.
 
 Step 15 is complete only after one durable partition operation causes the
 strict public `200/200`, product `pending`, operational `pending`, runtime

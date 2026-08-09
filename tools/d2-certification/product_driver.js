@@ -441,11 +441,15 @@
       );
       const resourceIds = [...roleIds, ...channelIds, ...panelMessageIds];
       if (
+        roleIds.length !== 1 ||
+        channelIds.length !== 1 ||
+        panelMessageIds.length !== 2 ||
         new Set(resourceIds).size !== resourceIds.length ||
         input.createResponseObserved !== true ||
         input.joinResponseObserved !== true ||
         input.privateChannelObserved !== true ||
         input.roleAssignmentObserved !== true ||
+        input.welcomePanelObserved !== true ||
         input.joinPanelObserved !== true
       ) {
         throw new Error("discord_interaction_observation_invalid");
@@ -483,6 +487,7 @@
         join_response_observed: true,
         private_channel_observed: true,
         role_assignment_observed: true,
+        welcome_panel_observed: true,
         join_panel_observed: true,
         confirmation_surface: "chrome_discord_web",
       });

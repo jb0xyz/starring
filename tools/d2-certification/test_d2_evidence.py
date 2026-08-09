@@ -473,14 +473,20 @@ class D2EvidenceTest(unittest.TestCase):
             instance_id="instance-1",
             role_ids=["1532677575736819847"],
             channel_ids=["1532677575736819848"],
-            panel_message_ids=["1532677575736819849"],
+            panel_message_ids=[
+                "1532677575736819849",
+                "1532677575736819854",
+            ],
             ephemeral_count=2,
         )
         transport = envelope(
             "starring.d2.transport-resource-evidence.v1",
             role_ids=["1532677575736819847"],
             channel_ids=["1532677575736819848"],
-            panel_message_ids=["1532677575736819849"],
+            panel_message_ids=[
+                "1532677575736819849",
+                "1532677575736819854",
+            ],
             inventory_digest_sha256="b" * 64,
             transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
         )
@@ -490,6 +496,25 @@ class D2EvidenceTest(unittest.TestCase):
         drifted["role_ids"] = ["1532677575736819852"]
         with self.assertRaisesRegex(MODULE.EvidenceContractError, "interaction_role_ids_mismatch"):
             MODULE.assemble_interaction_evidence(database, drifted)
+        for panel_message_ids in (
+            ["1532677575736819849"],
+            [
+                "1532677575736819849",
+                "1532677575736819854",
+                "1532677575736819855",
+            ],
+        ):
+            changed_database = copy.deepcopy(database)
+            changed_transport = copy.deepcopy(transport)
+            changed_database["panel_message_ids"] = panel_message_ids
+            changed_transport["panel_message_ids"] = panel_message_ids
+            with self.assertRaisesRegex(
+                MODULE.EvidenceContractError,
+                "interaction_panel_message_ids_cardinality_invalid",
+            ):
+                MODULE.assemble_interaction_evidence(
+                    changed_database, changed_transport
+                )
 
     def test_interaction_adapter_requires_exact_visible_discord_observation(self):
         database = envelope(
@@ -503,14 +528,20 @@ class D2EvidenceTest(unittest.TestCase):
             instance_id="instance-1",
             role_ids=["1532677575736819847"],
             channel_ids=["1532677575736819848"],
-            panel_message_ids=["1532677575736819849"],
+            panel_message_ids=[
+                "1532677575736819849",
+                "1532677575736819854",
+            ],
             ephemeral_count=2,
         )
         transport = envelope(
             "starring.d2.transport-resource-evidence.v1",
             role_ids=["1532677575736819847"],
             channel_ids=["1532677575736819848"],
-            panel_message_ids=["1532677575736819849"],
+            panel_message_ids=[
+                "1532677575736819849",
+                "1532677575736819854",
+            ],
             inventory_digest_sha256="b" * 64,
             transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
         )
@@ -524,11 +555,15 @@ class D2EvidenceTest(unittest.TestCase):
             joined_role_id="1532677575736819847",
             role_ids=["1532677575736819847"],
             channel_ids=["1532677575736819848"],
-            panel_message_ids=["1532677575736819849"],
+            panel_message_ids=[
+                "1532677575736819849",
+                "1532677575736819854",
+            ],
             create_response_observed=True,
             join_response_observed=True,
             private_channel_observed=True,
             role_assignment_observed=True,
+            welcome_panel_observed=True,
             join_panel_observed=True,
             confirmation_surface="chrome_discord_web",
         )
@@ -547,6 +582,7 @@ class D2EvidenceTest(unittest.TestCase):
             "join_interaction_id": "1532677575736819850",
             "joined_role_id": "1532677575736819851",
             "role_ids": ["1532677575736819851"],
+            "welcome_panel_observed": False,
             "join_panel_observed": False,
             "confirmation_surface": "manual_text",
         }
@@ -576,7 +612,10 @@ class D2EvidenceTest(unittest.TestCase):
             transport_last_duplicate_interaction_id="1532677575736819846",
             role_ids=["1532677575736819847"],
             channel_ids=["1532677575736819848"],
-            panel_message_ids=["1532677575736819849"],
+            panel_message_ids=[
+                "1532677575736819849",
+                "1532677575736819854",
+            ],
             inventory_digest_sha256="b" * 64,
             transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
         )
@@ -589,6 +628,21 @@ class D2EvidenceTest(unittest.TestCase):
             MODULE.EvidenceContractError, "duplicate_transport_outcome_invalid"
         ):
             MODULE.assemble_duplicate_evidence(database, drifted)
+        for panel_message_ids in (
+            ["1532677575736819849"],
+            [
+                "1532677575736819849",
+                "1532677575736819854",
+                "1532677575736819855",
+            ],
+        ):
+            changed = copy.deepcopy(transport)
+            changed["panel_message_ids"] = panel_message_ids
+            with self.assertRaisesRegex(
+                MODULE.EvidenceContractError,
+                "duplicate_panel_message_ids_cardinality_invalid",
+            ):
+                MODULE.assemble_duplicate_evidence(database, changed)
 
     def test_reconstruction_adapter_requires_rotated_process_bound_identity(self):
         database = envelope(

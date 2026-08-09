@@ -780,7 +780,8 @@ tree.
 D2 step 9 binds one manifest actor and the exact created instance across visible
 Chrome observation, completed create and join receipts, one successful created
 role membership in each path, one successful ephemeral acknowledgement per
-receipt, and one-role/one-channel/one-panel transport inventory. Step 15 binds
+receipt, affirmatively observed welcome and hub join panels, and
+one-role/one-channel/two-panel transport inventory. Step 15 binds
 one durable partition and one durable heal to the same transport process, exact
 fault counter, the exact public `200/200` product `pending`, operational
 `pending`, runtime `live`, serving `disconnected` projection with

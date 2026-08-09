@@ -280,7 +280,10 @@ def complete_evidence(manifest):
             "instance_id": "instance-1",
             "role_ids": ["1532677575736819847"],
             "channel_ids": ["1532677575736819848"],
-            "panel_message_ids": ["1532677575736819849"],
+            "panel_message_ids": [
+                "1532677575736819849",
+                "1532677575736819854",
+            ],
             "ephemeral_count": 2,
             "inventory_digest_sha256": DIGEST,
             "transport_instance_id": TRANSPORT_INSTANCE_ID,
@@ -296,7 +299,10 @@ def complete_evidence(manifest):
             "transport_last_duplicate_interaction_id": "1532677575736819846",
             "role_ids": ["1532677575736819847"],
             "channel_ids": ["1532677575736819848"],
-            "panel_message_ids": ["1532677575736819849"],
+            "panel_message_ids": [
+                "1532677575736819849",
+                "1532677575736819854",
+            ],
             "inventory_digest_sha256": DIGEST,
             "transport_instance_id": TRANSPORT_INSTANCE_ID,
         },
@@ -392,6 +398,7 @@ def complete_evidence(manifest):
                 "1532677575736819848",
                 "1532677575736819849",
                 "1532677575736819852",
+                "1532677575736819854",
             ],
             "database_drop_requested": True,
             "services_stopped": True,
@@ -859,6 +866,32 @@ class D2CertificationTest(unittest.TestCase):
                 stderr.getvalue(),
             )
         self.assertEqual(self.record(manifest_path, 7, evidence_by_step[7]), 0)
+
+    def test_step_nine_requires_both_study_room_panels(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence_by_step = complete_evidence(manifest)
+        for step in range(1, 9):
+            self.assertEqual(
+                self.record(manifest_path, step, evidence_by_step[step]), 0
+            )
+        for panel_message_ids in (
+            ["1532677575736819849"],
+            [
+                "1532677575736819849",
+                "1532677575736819854",
+                "1532677575736819855",
+            ],
+        ):
+            evidence = copy.deepcopy(evidence_by_step[9])
+            evidence["panel_message_ids"] = panel_message_ids
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(self.record(manifest_path, 9, evidence), 1)
+            self.assertIn(
+                "step_contract_failed:panel_message_ids", stderr.getvalue()
+            )
+        self.assertEqual(self.record(manifest_path, 9, evidence_by_step[9]), 0)
 
     def test_record_rejects_out_of_order_step(self):
         manifest_path = self.prepare()

@@ -124,6 +124,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
             join_response_observed=True,
             private_channel_observed=True,
             role_assignment_observed=True,
+            welcome_panel_observed=True,
             join_panel_observed=True,
             confirmation_surface="chrome_discord_web",
         )
@@ -380,6 +381,11 @@ class D2RunCoordinatorTest(unittest.TestCase):
                 "kind": "message",
                 "resource_id": self.complete[9]["panel_message_ids"][0],
                 "channel_id": channel_id,
+            },
+            {
+                "kind": "message",
+                "resource_id": self.complete[9]["panel_message_ids"][1],
+                "channel_id": self.manifest["discord"]["hub_channel_id"],
             },
             {
                 "kind": "role",

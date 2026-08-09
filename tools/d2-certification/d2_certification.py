@@ -1753,9 +1753,14 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             or evidence["route_id"] != prior_receipts[7]["evidence"]["route_id"]
         ):
             fail("step_contract_failed:interaction_target_identity")
-        for field in ("role_ids", "channel_ids", "panel_message_ids"):
+        expected_cardinality = {
+            "role_ids": 1,
+            "channel_ids": 1,
+            "panel_message_ids": 2,
+        }
+        for field, cardinality in expected_cardinality.items():
             values = evidence[field]
-            if not isinstance(values, list) or len(values) != 1:
+            if not isinstance(values, list) or len(values) != cardinality:
                 fail(f"step_contract_failed:{field}")
             for value in values:
                 if (
