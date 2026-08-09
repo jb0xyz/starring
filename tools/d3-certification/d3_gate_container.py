@@ -123,7 +123,7 @@ RUNNER_POLICY = {
         "writable_mounts": [
             f"/scratch:tmpfs:{GATE_SCRATCH_SIZE}",
             "/tmp:tmpfs:512m",
-            "/private/tmp:tmpfs:512m",
+            "/private/tmp:tmpfs:512m:uid=0:gid=0:mode=01777",
             "/run:tmpfs:16m",
         ],
         "cargo_target": f"owned-gate-attempt-disposable-tmpfs-volume:{GATE_TARGET_SIZE}",
@@ -594,7 +594,7 @@ def common_container_arguments(name, labels, image_id, user, network):
         "--tmpfs",
         f"/tmp:rw,noexec,nosuid,size=512m,uid={os.getuid()},gid={os.getgid()},mode=0700",
         "--tmpfs",
-        f"/private/tmp:rw,noexec,nosuid,size=512m,uid={os.getuid()},gid={os.getgid()},mode=0700",
+        "/private/tmp:rw,noexec,nosuid,size=512m,uid=0,gid=0,mode=1777",
         "--tmpfs",
         f"/run:rw,noexec,nosuid,size=16m,uid={os.getuid()},gid={os.getgid()},mode=0700",
         "--tmpfs",

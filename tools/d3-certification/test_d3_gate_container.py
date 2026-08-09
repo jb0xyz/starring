@@ -151,9 +151,17 @@ class D3GateContainerTests(unittest.TestCase):
         self.assertEqual(len(private_tmp), 1)
         self.assertIn("noexec", private_tmp[0])
         self.assertIn("nosuid", private_tmp[0])
-        self.assertIn(f"uid={os.getuid()}", private_tmp[0])
-        self.assertIn(f"gid={os.getgid()}", private_tmp[0])
-        self.assertIn("mode=0700", private_tmp[0])
+        self.assertIn("uid=0", private_tmp[0])
+        self.assertIn("gid=0", private_tmp[0])
+        self.assertIn("mode=1777", private_tmp[0])
+        user_index = arguments.index("--user")
+        self.assertEqual(
+            arguments[user_index + 1], f"{os.getuid()}:{os.getgid()}"
+        )
+        self.assertIn(
+            "/private/tmp:tmpfs:512m:uid=0:gid=0:mode=01777",
+            MODULE.RUNNER_POLICY["common"]["writable_mounts"],
+        )
 
     def test_external_audit_mounts_only_package_projection_and_scratch(self):
         arguments = self.create_arguments(10, "bridge")

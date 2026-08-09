@@ -1213,6 +1213,34 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         finally:
             path.unlink(missing_ok=True)
 
+    def test_shared_runtime_parent_validation_fsyncs_opened_identity(self):
+        shared_parent = pathlib.Path("/private/tmp")
+        metadata = SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o1777,
+            st_uid=0,
+            st_dev=41,
+            st_ino=73,
+        )
+        descriptor = 19
+        with (
+            mock.patch.object(CONTRACT, "D2_RUNTIME_ROOT_PARENT", shared_parent),
+            mock.patch.object(pathlib.Path, "lstat", return_value=metadata),
+            mock.patch.object(pathlib.Path, "is_symlink", return_value=False),
+            mock.patch.object(CONTRACT.os, "open", return_value=descriptor) as opened,
+            mock.patch.object(CONTRACT.os, "fstat", return_value=metadata),
+            mock.patch.object(CONTRACT.os, "fsync") as fsynced,
+            mock.patch.object(CONTRACT.os, "close") as closed,
+        ):
+            CONTRACT.fsync_shared_runtime_parent(shared_parent, "atomic_parent")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        opened.assert_called_once_with(shared_parent, flags)
+        fsynced.assert_called_once_with(descriptor)
+        closed.assert_called_once_with(descriptor)
+
     def test_shared_runtime_parent_rejects_non_sticky_owned_directory(self):
         path = self.runtime_root_parent / "registry.json"
         with self.assertRaisesRegex(
