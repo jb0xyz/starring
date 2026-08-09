@@ -187,6 +187,68 @@ class D3ProcessSandboxTests(unittest.TestCase):
             PROCESS_SANDBOX.SANDBOX_PROFILE,
         )
 
+    def test_networkless_profile_limits_notification_center_to_read(self):
+        self.assertEqual(
+            PROCESS_SANDBOX.SANDBOX_PROFILE.count(
+                '(allow ipc-posix-shm-read-data '
+                '(ipc-posix-name "apple.shm.notification_center") )'
+            ),
+            1,
+        )
+        self.assertNotIn(
+            "ipc-posix-shm-write",
+            PROCESS_SANDBOX.SANDBOX_PROFILE,
+        )
+        self.assertNotIn(
+            "(allow ipc-posix-shm ",
+            PROCESS_SANDBOX.SANDBOX_PROFILE,
+        )
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS Seatbelt")
+    def test_networkless_profile_reads_notification_center_shared_memory(self):
+        if not BUNDLE.FIXED_RUSTUP.exists():
+            self.skipTest("fixed rustup unavailable")
+        rustup = BUNDLE.resolve_rustup()
+        rustc = BUNDLE.resolve_rustup_tool(rustup, "rustc", self.worktree)
+        mutable = self.root / "mutable"
+        mutable.mkdir(mode=0o700)
+        environment = {
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C",
+            "PATH": BUNDLE.FIXED_EXECUTABLE_PATH,
+            "RUSTC": str(rustc),
+        }
+        script = (
+            "import ctypes,os\n"
+            "library=ctypes.CDLL(None,use_errno=True)\n"
+            "library.shm_open.argtypes="
+            "[ctypes.c_char_p,ctypes.c_int,ctypes.c_uint]\n"
+            "library.shm_open.restype=ctypes.c_int\n"
+            "descriptor=library.shm_open("
+            'b"apple.shm.notification_center",os.O_RDONLY,0)\n'
+            "if descriptor < 0:\n"
+            '    raise OSError(ctypes.get_errno(),"shm_open failed")\n'
+            "os.close(descriptor)\n"
+        )
+        arguments = PROCESS_SANDBOX.sandboxed_argv(
+            ["/usr/bin/python3", "-I", "-c", script],
+            mutable,
+            self.worktree,
+            environment,
+            "none",
+        )
+        result = subprocess.run(
+            arguments,
+            cwd=self.worktree,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
+
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS Seatbelt")
     def test_networkless_profile_scopes_clone_and_denies_hard_links(self):
         if not BUNDLE.FIXED_RUSTUP.exists():

@@ -173,7 +173,10 @@ free, and must originate on a filesystem with at least 8 GiB available.
 
 Every native build command runs without network access under a Seatbelt profile
 that permits writes and clone destinations only below its isolated build root
-while denying hard links. It is launched by a
+while denying hard links. The profile grants read-only access to the scoped
+macOS notification-center shared-memory object required when Cargo excludes its
+registry cache from backups, without granting shared-memory creation or writes.
+It is launched by a
 unique, deterministic per-command launchd bootstrap job. That job applies an
 8 GiB data/resident-set ceiling, a 4 GiB output-file ceiling, a two-hour CPU
 ceiling, and bounded process and descriptor counts. The tool does not accept
