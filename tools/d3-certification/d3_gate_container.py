@@ -31,6 +31,9 @@ MINIMUM_DAEMON_MEMORY_BYTES = 17 * 1024 * 1024 * 1024
 MAX_BOOTSTRAP_BYTES = 4 * 1024 * 1024 * 1024
 MAX_BOOTSTRAP_ENTRIES = 500000
 MINIMUM_BOOTSTRAP_FREE_BYTES = 8 * 1024 * 1024 * 1024
+MINIMUM_BOOTSTRAP_START_FREE_BYTES = (
+    MINIMUM_BOOTSTRAP_FREE_BYTES + MAX_BOOTSTRAP_BYTES
+)
 TWILIGHT_GIT_URL = "https://github.com/twilight-rs/twilight.git"
 TWILIGHT_GIT_REV = "b4ce13b727e7731b917576ad977300ab6926bb6b"
 TWILIGHT_SOURCE_KEY = f"git+{TWILIGHT_GIT_URL}?rev={TWILIGHT_GIT_REV}"
@@ -172,6 +175,7 @@ RUNNER_POLICY = {
         "maximum_host_staging_bytes": MAX_BOOTSTRAP_BYTES,
         "maximum_host_staging_entries": MAX_BOOTSTRAP_ENTRIES,
         "minimum_host_free_bytes": MINIMUM_BOOTSTRAP_FREE_BYTES,
+        "minimum_host_start_free_bytes": MINIMUM_BOOTSTRAP_START_FREE_BYTES,
     },
 }
 
@@ -1004,6 +1008,17 @@ def require_bootstrap_capacity(root):
     except OSError as error:
         fail(f"gate_bootstrap_capacity_unavailable:{error.__class__.__name__}")
     if free < MINIMUM_BOOTSTRAP_FREE_BYTES:
+        fail("gate_bootstrap_capacity_insufficient")
+    return free
+
+
+def require_bootstrap_start_capacity(root):
+    canonical_directory(root, "gate_container_state_root", 0o700)
+    try:
+        free = shutil.disk_usage(root).free
+    except OSError as error:
+        fail(f"gate_bootstrap_capacity_unavailable:{error.__class__.__name__}")
+    if free < MINIMUM_BOOTSTRAP_START_FREE_BYTES:
         fail("gate_bootstrap_capacity_insufficient")
     return free
 

@@ -838,8 +838,22 @@ def command_prepare(arguments):
     digests = gate_digests(arguments.gate)
     github_repository = github_repository_from_remote(repo, remote)
     validate_release_transport(repo, remote)
-    root = create_state_root(output_root, state_name(arguments.pr_number, expected_head, expected_base))
+    name = state_name(arguments.pr_number, expected_head, expected_base)
+    pending_root = output_root / name
+    root_existed = os.path.lexists(pending_root)
+    if not root_existed:
+        try:
+            gate_container.require_bootstrap_start_capacity(output_root)
+        except gate_container.GateContainerError as error:
+            fail(str(error))
+    elif not (pending_root / "state.json").exists():
+        try:
+            gate_container.require_bootstrap_start_capacity(pending_root)
+        except gate_container.GateContainerError as error:
+            fail(str(error))
+    root = create_state_root(output_root, name)
     with StateLock(root):
+        state_path = root / "state.json"
         intent_path = root / "prepare-intent.json"
         intent = {
             "schema_version": SCHEMA_VERSION,
@@ -858,7 +872,6 @@ def command_prepare(arguments):
                 fail("prepare_replay_mismatch")
         else:
             write_new_json(intent_path, intent)
-        state_path = root / "state.json"
         if state_path.exists():
             digest_path = root / "state.sha256"
             if not digest_path.exists():
@@ -1696,8 +1709,12 @@ def discard_gate_bootstrap_temporary_file(staging, relative, mode):
 
 def prepare_gate_bootstrap(root, worktree, runtime):
     bootstrap = root / "gate-bootstrap"
-    if bootstrap.exists():
+    if os.path.lexists(bootstrap):
         return require_gate_bootstrap_layout(bootstrap)
+    try:
+        gate_container.require_bootstrap_start_capacity(root)
+    except gate_container.GateContainerError as error:
+        fail(str(error))
     staging = root / ".gate-bootstrap-staging"
     try:
         stale = sorted(
@@ -1715,10 +1732,6 @@ def prepare_gate_bootstrap(root, worktree, runtime):
         fail("gate_bootstrap_staging_inventory_invalid")
     for path in stale:
         discard_gate_bootstrap_staging(root, path)
-    try:
-        gate_container.require_bootstrap_capacity(root)
-    except gate_container.GateContainerError as error:
-        fail(str(error))
     staging.mkdir(mode=0o700)
     fsync_directory(root)
     try:
@@ -1968,6 +1981,14 @@ def command_run_gates(arguments):
             arguments.postgres_database_url_file
         )
         validate_worktree(state, repo, worktree)
+        bootstrap_path = root / "gate-bootstrap"
+        if os.path.lexists(bootstrap_path):
+            require_gate_bootstrap_layout(bootstrap_path)
+        else:
+            try:
+                gate_container.require_bootstrap_start_capacity(root)
+            except gate_container.GateContainerError as error:
+                fail(str(error))
         try:
             candidate_bundle.require_cargo_configuration_absent(worktree)
             runtime = ensure_gate_container_runtime(root)

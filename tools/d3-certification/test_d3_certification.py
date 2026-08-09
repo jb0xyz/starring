@@ -136,7 +136,7 @@ class D3BootstrapSafetyTests(unittest.TestCase):
         injected = MODULE.D3Error("injected_bootstrap_failure")
         with mock.patch.object(
             MODULE.gate_container,
-            "require_bootstrap_capacity",
+            "require_bootstrap_start_capacity",
             return_value=10**12,
         ), mock.patch.object(
             MODULE,
@@ -150,6 +150,28 @@ class D3BootstrapSafetyTests(unittest.TestCase):
                     {"image_id": "sha256:" + "1" * 64},
                 )
         self.assertFalse((self.root / ".gate-bootstrap-staging").exists())
+
+    def test_capacity_failure_preserves_existing_staging(self):
+        staging = self.root / ".gate-bootstrap-staging"
+        staging.mkdir(mode=0o700)
+        write(staging / "value", "value", 0o600)
+        with mock.patch.object(
+            MODULE.gate_container,
+            "require_bootstrap_start_capacity",
+            side_effect=MODULE.gate_container.GateContainerError(
+                "gate_bootstrap_capacity_insufficient"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                MODULE.D3Error,
+                "gate_bootstrap_capacity_insufficient",
+            ):
+                MODULE.prepare_gate_bootstrap(
+                    self.root,
+                    self.worktree,
+                    {"image_id": "sha256:" + "1" * 64},
+                )
+        self.assertEqual((staging / "value").read_text(encoding="utf-8"), "value")
 
 
 class D3ProcessSandboxTests(unittest.TestCase):
@@ -451,6 +473,10 @@ class D3CertificationTests(unittest.TestCase):
         self.postgres_database_url_file = self.root / "postgres-database-url"
         self.github_repository = "owner/repository"
         self.github_remote_url = "https://github.com/owner/repository.git"
+        self.bootstrap_start_capacity_error = None
+        self.bootstrap_start_capacity_failure_at = None
+        self.bootstrap_start_capacity_paths = []
+        self.fetch_candidate_calls = 0
         self.output.mkdir(mode=0o700)
         write(
             self.postgres_database_url_file,
@@ -529,6 +555,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         git(self.repo, "remote", "set-url", "origin", self.github_remote_url)
 
     def fetch_candidate_fixture(self, repo, remote, base_ref, pr_number, prefix):
+        self.fetch_candidate_calls += 1
         self.assertEqual(repo, self.repo)
         self.assertEqual(remote, "origin")
         self.assertEqual(base_ref, "main")
@@ -569,6 +596,18 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         )
         return git(repo, "rev-parse", base_remote_ref)
 
+    def require_bootstrap_start_capacity_fixture(self, root):
+        self.bootstrap_start_capacity_paths.append(pathlib.Path(root))
+        if self.bootstrap_start_capacity_error is not None and (
+            self.bootstrap_start_capacity_failure_at is None
+            or len(self.bootstrap_start_capacity_paths)
+            == self.bootstrap_start_capacity_failure_at
+        ):
+            raise MODULE.gate_container.GateContainerError(
+                self.bootstrap_start_capacity_error
+            )
+        return MODULE.gate_container.MINIMUM_BOOTSTRAP_START_FREE_BYTES
+
     def invoke(self, arguments):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -599,6 +638,11 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 MODULE,
                 "candidate_dependency_snapshot",
                 return_value=getattr(self, "current_dependency_snapshot", {}),
+            ),
+            mock.patch.object(
+                MODULE.gate_container,
+                "require_bootstrap_start_capacity",
+                side_effect=self.require_bootstrap_start_capacity_fixture,
             ),
         ):
             status = MODULE.main(arguments)
@@ -672,7 +716,24 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(status, 0, error)
         return pathlib.Path(result["state"]), result, gates
 
-    def invoke_gate_plan(self, state_path, gates=None, outcomes=None):
+    def create_gate_bootstrap_layout(self, root):
+        bootstrap = root / "gate-bootstrap"
+        bootstrap.mkdir(mode=0o700)
+        for name in MODULE.GATE_BOOTSTRAP_DIRECTORIES:
+            (bootstrap / name).mkdir(mode=0o700)
+        for name in MODULE.GATE_BOOTSTRAP_FILES:
+            write(bootstrap / name, f"{name}\n", 0o400)
+        for name in ("git", "promptfoo"):
+            write(bootstrap / "bin" / name, name, 0o555)
+        (bootstrap / "node-stage" / "node_modules").mkdir(mode=0o500)
+        for name in ("transport", "workspace"):
+            (bootstrap / "vendor" / name).mkdir(mode=0o500)
+        for name in MODULE.GATE_BOOTSTRAP_DIRECTORIES:
+            (bootstrap / name).chmod(0o500)
+        bootstrap.chmod(0o555)
+        return bootstrap
+
+    def run_gates_arguments(self, state_path, gates=None):
         gates = list(MODULE.REQUIRED_GATE_COMMANDS if gates is None else gates)
         arguments = [
             "run-gates",
@@ -683,6 +744,10 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         ]
         for gate in gates:
             arguments.extend(["--gate", gate])
+        return arguments, gates
+
+    def invoke_gate_plan(self, state_path, gates=None, outcomes=None):
+        arguments, gates = self.run_gates_arguments(state_path, gates)
         original = MODULE.run_process
         observed = []
         outcomes = iter([] if outcomes is None else outcomes)
@@ -883,6 +948,116 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(second["disposition"], "exact_replay")
         self.assertEqual(second["state_sha256"], first["state_sha256"])
         self.assertTrue(state_path.with_name("state.sha256").exists())
+
+    def test_prepare_capacity_failure_precedes_state_and_fetch_mutation(self):
+        arguments, _ = self.prepare_arguments()
+        pending = self.output / MODULE.state_name(42, self.head, self.base)
+        self.bootstrap_start_capacity_error = "gate_bootstrap_capacity_insufficient"
+        status, result, error = self.invoke(arguments)
+        self.assertEqual(status, 1)
+        self.assertIsNone(result)
+        self.assertEqual(error.strip(), "gate_bootstrap_capacity_insufficient")
+        self.assertEqual(self.bootstrap_start_capacity_paths, [self.output])
+        self.assertEqual(self.fetch_candidate_calls, 0)
+        self.assertFalse(os.path.lexists(pending))
+        pending.mkdir(mode=0o700)
+        self.bootstrap_start_capacity_paths.clear()
+        status, result, error = self.invoke(arguments)
+        self.assertEqual(status, 1)
+        self.assertIsNone(result)
+        self.assertEqual(error.strip(), "gate_bootstrap_capacity_insufficient")
+        self.assertEqual(self.bootstrap_start_capacity_paths, [pending])
+        self.assertEqual(self.fetch_candidate_calls, 0)
+        self.assertEqual(list(pending.iterdir()), [])
+
+    def test_completed_prepare_replays_without_start_capacity(self):
+        state_path, first, gates = self.prepare()
+        self.bootstrap_start_capacity_paths.clear()
+        self.bootstrap_start_capacity_error = "gate_bootstrap_capacity_insufficient"
+        arguments, _ = self.prepare_arguments(gates)
+        status, replay, error = self.invoke(arguments)
+        self.assertEqual(status, 0, error)
+        self.assertEqual(replay["disposition"], "exact_replay")
+        self.assertEqual(replay["state_sha256"], first["state_sha256"])
+        self.assertEqual(pathlib.Path(replay["state"]), state_path)
+        self.assertEqual(self.bootstrap_start_capacity_paths, [])
+
+    def test_run_gates_rechecks_capacity_before_runtime_mutation(self):
+        state_path, _, gates = self.prepare()
+        root = state_path.parent
+        self.bootstrap_start_capacity_paths.clear()
+        self.bootstrap_start_capacity_error = "gate_bootstrap_capacity_insufficient"
+        arguments, _ = self.run_gates_arguments(state_path, gates)
+        with mock.patch.object(MODULE, "ensure_gate_container_runtime") as ensure:
+            status, result, error = self.invoke(arguments)
+        self.assertEqual(status, 1)
+        self.assertIsNone(result)
+        self.assertEqual(error.strip(), "gate_bootstrap_capacity_insufficient")
+        ensure.assert_not_called()
+        self.assertEqual(self.bootstrap_start_capacity_paths, [root])
+        self.assertFalse((root / "gate-container-runtime.json").exists())
+        self.assertFalse((root / ".gate-bootstrap-staging").exists())
+        self.assertFalse((root / "gate-evidence.jsonl").exists())
+
+    def test_bootstrap_rechecks_capacity_before_staging_mutation(self):
+        state_path, _, gates = self.prepare()
+        root = state_path.parent
+        self.bootstrap_start_capacity_paths.clear()
+        self.bootstrap_start_capacity_error = "gate_bootstrap_capacity_insufficient"
+        self.bootstrap_start_capacity_failure_at = 2
+        arguments, _ = self.run_gates_arguments(state_path, gates)
+        runtime = {
+            "image_id": "sha256:" + "1" * 64,
+            "record_sha256": "2" * 64,
+        }
+        with mock.patch.object(
+            MODULE,
+            "ensure_gate_container_runtime",
+            return_value=runtime,
+        ) as ensure:
+            status, result, error = self.invoke(arguments)
+        self.assertEqual(status, 1)
+        self.assertIsNone(result)
+        self.assertEqual(error.strip(), "gate_bootstrap_capacity_insufficient")
+        ensure.assert_called_once_with(root)
+        self.assertEqual(self.bootstrap_start_capacity_paths, [root, root])
+        self.assertFalse((root / "gate-bootstrap").exists())
+        self.assertFalse((root / ".gate-bootstrap-staging").exists())
+        self.assertFalse((root / "gate-evidence.jsonl").exists())
+
+    def test_valid_bootstrap_bypasses_start_capacity_for_gate_replay(self):
+        state_path, _, gates = self.prepare()
+        self.create_gate_bootstrap_layout(state_path.parent)
+        self.bootstrap_start_capacity_paths.clear()
+        self.bootstrap_start_capacity_error = "gate_bootstrap_capacity_insufficient"
+        status, result, error, observed = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        self.assertEqual(result["gates"], len(gates))
+        self.assertEqual(observed, gates)
+        self.assertEqual(self.bootstrap_start_capacity_paths, [])
+        status, replay, error, observed = self.invoke_gate_plan(state_path, gates)
+        self.assertEqual(status, 0, error)
+        self.assertEqual(replay["candidate_bundle_disposition"], "exact_replay")
+        self.assertEqual(observed, [])
+        self.assertEqual(self.bootstrap_start_capacity_paths, [])
+
+    def test_invalid_bootstrap_cannot_bypass_capacity_preflight(self):
+        state_path, _, gates = self.prepare()
+        root = state_path.parent
+        target = self.root / "foreign-bootstrap"
+        target.mkdir(mode=0o700)
+        (root / "gate-bootstrap").symlink_to(target, target_is_directory=True)
+        self.bootstrap_start_capacity_paths.clear()
+        self.bootstrap_start_capacity_error = "gate_bootstrap_capacity_insufficient"
+        arguments, _ = self.run_gates_arguments(state_path, gates)
+        with mock.patch.object(MODULE, "ensure_gate_container_runtime") as ensure:
+            status, _, error = self.invoke(arguments)
+        self.assertEqual(status, 1)
+        self.assertIn("gate_bootstrap", error)
+        ensure.assert_not_called()
+        self.assertEqual(self.bootstrap_start_capacity_paths, [])
+        self.assertFalse((root / "gate-container-runtime.json").exists())
+        self.assertFalse((root / "gate-evidence.jsonl").exists())
 
     def test_state_rejects_boolean_schema_version(self):
         state_path, _, _ = self.prepare()

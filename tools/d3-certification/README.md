@@ -93,7 +93,8 @@ are verified with offline Cargo metadata. npm packages are accepted only from
 the registry named in the checked lockfile. Temporary homes, targets, package
 files, and staging configuration are removed before the exact bootstrap
 inventory is sealed read-only and tree-hashed. Bootstrap staging is capped at 4
-GiB and 500,000 entries and requires at least 8 GiB host free space.
+GiB and 500,000 entries. Starting a new bootstrap requires at least 12 GiB host
+free space, and materialization must retain at least 8 GiB free throughout.
 
 Each gate attempt gets a new non-root container with a read-only root
 filesystem, all capabilities dropped, `no-new-privileges`, no Docker socket,

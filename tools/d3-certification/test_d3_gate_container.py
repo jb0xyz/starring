@@ -162,6 +162,10 @@ class D3GateContainerTests(unittest.TestCase):
             "/private/tmp:tmpfs:512m:uid=0:gid=0:mode=01777",
             MODULE.RUNNER_POLICY["common"]["writable_mounts"],
         )
+        self.assertEqual(
+            MODULE.RUNNER_POLICY["bootstrap"]["minimum_host_start_free_bytes"],
+            MODULE.MINIMUM_BOOTSTRAP_START_FREE_BYTES,
+        )
 
     def test_external_audit_mounts_only_package_projection_and_scratch(self):
         arguments = self.create_arguments(10, "bridge")
@@ -477,6 +481,10 @@ class D3GateContainerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 34)
 
     def test_bootstrap_usage_and_capacity_limits_fail_closed(self):
+        self.assertEqual(
+            MODULE.MINIMUM_BOOTSTRAP_START_FREE_BYTES,
+            MODULE.MINIMUM_BOOTSTRAP_FREE_BYTES + MODULE.MAX_BOOTSTRAP_BYTES,
+        )
         monitored = self.root / "monitored"
         monitored.mkdir()
         (monitored / "large").write_bytes(b"1234")
@@ -496,6 +504,42 @@ class D3GateContainerTests(unittest.TestCase):
                 "gate_bootstrap_capacity_insufficient",
             ):
                 MODULE.require_bootstrap_capacity(self.root)
+        with mock.patch.object(
+            MODULE.shutil,
+            "disk_usage",
+            return_value=shutil._ntuple_diskusage(
+                2 * MODULE.MINIMUM_BOOTSTRAP_START_FREE_BYTES,
+                MODULE.MINIMUM_BOOTSTRAP_START_FREE_BYTES,
+                MODULE.MINIMUM_BOOTSTRAP_START_FREE_BYTES,
+            ),
+        ):
+            self.assertEqual(
+                MODULE.require_bootstrap_capacity(self.root),
+                MODULE.MINIMUM_BOOTSTRAP_START_FREE_BYTES,
+            )
+            self.assertEqual(
+                MODULE.require_bootstrap_start_capacity(self.root),
+                MODULE.MINIMUM_BOOTSTRAP_START_FREE_BYTES,
+            )
+        below_start = MODULE.MINIMUM_BOOTSTRAP_START_FREE_BYTES - 1
+        with mock.patch.object(
+            MODULE.shutil,
+            "disk_usage",
+            return_value=shutil._ntuple_diskusage(
+                2 * MODULE.MINIMUM_BOOTSTRAP_START_FREE_BYTES,
+                MODULE.MINIMUM_BOOTSTRAP_START_FREE_BYTES + 1,
+                below_start,
+            ),
+        ):
+            self.assertEqual(
+                MODULE.require_bootstrap_capacity(self.root),
+                below_start,
+            )
+            with self.assertRaisesRegex(
+                MODULE.GateContainerError,
+                "gate_bootstrap_capacity_insufficient",
+            ):
+                MODULE.require_bootstrap_start_capacity(self.root)
 
     def test_bind_probe_cleanup_is_exclusive_and_rejects_hardlinks(self):
         probe = self.root / ".gate-container-bind-probe-0123456789abcdef"
