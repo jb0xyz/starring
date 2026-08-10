@@ -81,17 +81,19 @@ def envelope(kind, **values):
 
 def chrome_confirmation(
     challenge="d" * 64,
-    payload_digest="a" * 64,
-    target_content_hash="a" * 64,
+    payload_digest="b" * 64,
+    candidate_ruleset_hash="a" * 64,
+    target_content_hash="d" * 64,
 ):
     return envelope(
-        "starring.d2.chrome-preview-confirmation.v1",
+        "starring.d2.chrome-preview-confirmation.v2",
         confirmation_surface="chrome_confirm",
         accepted=True,
         installation_id=INSTALLATION_ID,
         promotion_id=PROMOTION_ID,
         revision=1,
         payload_digest=payload_digest,
+        candidate_ruleset_hash=candidate_ruleset_hash,
         target_content_hash=target_content_hash,
         preview_completion_challenge_sha256=challenge,
         decision_command_sha256="f" * 64,
@@ -246,6 +248,7 @@ class D2EvidenceTest(unittest.TestCase):
         self.assertEqual(evidence["deployment_revision"], 11)
         self.assertEqual(evidence["convergence_attempt"], 1)
         self.assertEqual(evidence["process_instance_id"], PROCESS_NEW)
+        self.assertEqual(evidence["target_content_hash"], "d" * 64)
         self.assertEqual(evidence["public_observed_at"], OBSERVED_AT)
         self.assertEqual(evidence["database_observed_at"], "2026-08-04T01:02:04Z")
         drifted = copy.deepcopy(database)
@@ -377,14 +380,15 @@ class D2EvidenceTest(unittest.TestCase):
             worker_completion_sha256="b" * 64,
         )
         decision = envelope(
-            "starring.d2.browser-product-decision-evidence.v1",
+            "starring.d2.browser-product-decision-evidence.v2",
             public_origin=ORIGIN,
             installation_id=INSTALLATION_ID,
             promotion_id=PROMOTION_ID,
             authoring_session_id="session-1",
             authoring_generation=1,
-            target_content_hash="a" * 64,
-            payload_digest="a" * 64,
+            candidate_ruleset_hash="a" * 64,
+            target_content_hash="d" * 64,
+            payload_digest="b" * 64,
             preview_state="pending_approval",
             approval_state="approved",
             apply_state="runtime_pending",
@@ -396,11 +400,10 @@ class D2EvidenceTest(unittest.TestCase):
         self.assertTrue(
             MODULE.assemble_authoring_evidence(authoring, worker)["one_shot"]
         )
-        self.assertTrue(
-            MODULE.assemble_preview_evidence(public_preview, preview)[
-                "generation_encrypted"
-            ]
-        )
+        assembled_preview = MODULE.assemble_preview_evidence(public_preview, preview)
+        self.assertTrue(assembled_preview["generation_encrypted"])
+        self.assertEqual(assembled_preview["candidate_ruleset_hash"], "a" * 64)
+        self.assertNotIn("payload_digest", assembled_preview)
         self.assertEqual(
             MODULE.assemble_decision_evidence(decision)["apply_state"],
             "runtime_pending",
@@ -408,7 +411,9 @@ class D2EvidenceTest(unittest.TestCase):
         assembled_decision = MODULE.assemble_decision_evidence(decision)
         self.assertEqual(assembled_decision["authoring_session_id"], "session-1")
         self.assertEqual(assembled_decision["authoring_generation"], 1)
-        self.assertEqual(assembled_decision["payload_digest"], "a" * 64)
+        self.assertEqual(assembled_decision["candidate_ruleset_hash"], "a" * 64)
+        self.assertEqual(assembled_decision["target_content_hash"], "d" * 64)
+        self.assertEqual(assembled_decision["payload_digest"], "b" * 64)
         self.assertEqual(assembled_decision["decision_command_sha256"], "f" * 64)
         self.assertEqual(
             assembled_decision["chrome_confirmation_sha256"],
@@ -445,6 +450,38 @@ class D2EvidenceTest(unittest.TestCase):
             MODULE.EvidenceContractError, "chrome_preview_confirmation_binding_invalid"
         ):
             MODULE.assemble_decision_evidence(mismatched_command)
+        mismatched_candidate = copy.deepcopy(decision)
+        mismatched_candidate["chrome_confirmation"]["candidate_ruleset_hash"] = (
+            "e" * 64
+        )
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError, "chrome_preview_confirmation_binding_invalid"
+        ):
+            MODULE.assemble_decision_evidence(mismatched_candidate)
+        invalid_candidate = copy.deepcopy(decision)
+        invalid_candidate["candidate_ruleset_hash"] = True
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError, "decision_candidate_ruleset_hash_invalid"
+        ):
+            MODULE.assemble_decision_evidence(invalid_candidate)
+        missing_candidate = copy.deepcopy(decision)
+        del missing_candidate["candidate_ruleset_hash"]
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError, "fields_invalid"
+        ):
+            MODULE.assemble_decision_evidence(missing_candidate)
+        legacy_decision = copy.deepcopy(decision)
+        legacy_decision["kind"] = "starring.d2.browser-product-decision-evidence.v1"
+        with self.assertRaisesRegex(MODULE.EvidenceContractError, "identity_invalid"):
+            MODULE.assemble_decision_evidence(legacy_decision)
+        legacy_confirmation = copy.deepcopy(decision)
+        legacy_confirmation["chrome_confirmation"]["kind"] = (
+            "starring.d2.chrome-preview-confirmation.v1"
+        )
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError, "chrome_preview_confirmation_identity_invalid"
+        ):
+            MODULE.assemble_decision_evidence(legacy_confirmation)
         for field, path in (
             ("schema_version", None),
             ("revision", None),

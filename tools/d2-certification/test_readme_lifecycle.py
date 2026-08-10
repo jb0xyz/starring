@@ -105,6 +105,14 @@ class ReadmeLifecycleTests(unittest.TestCase):
             section,
         )
         self.assertIn("mode-`0600` JSON files", section)
+        for identity in (
+            "candidate_ruleset_hash",
+            "payload_digest",
+            "target_content_hash",
+        ):
+            self.assertIn(identity, section)
+        self.assertIn("MUST NOT be compared", section)
+        self.assertIn("durable live serving identity", section)
         self.assertNotIn("confirmPreview:", section)
         self.assertNotIn("JSON.stringify(authoring)", section)
         self.assertNotIn("JSON.stringify(decision)", section)

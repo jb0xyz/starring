@@ -224,7 +224,7 @@ def complete_evidence(manifest):
             "projection_state": "preview_ready",
             "generation": 1,
             "generation_count": 1,
-            "payload_digest": DIGEST,
+            "candidate_ruleset_hash": DIGEST,
             "worker_request_id": "worker-request-1",
             "worker_completion_sha256": "b" * 64,
             "installation_id": installation_id,
@@ -238,8 +238,9 @@ def complete_evidence(manifest):
             "promotion_id": DIGEST,
             "authoring_session_id": "authoring-session-1",
             "authoring_generation": 1,
-            "target_content_hash": DIGEST,
-            "payload_digest": DIGEST,
+            "candidate_ruleset_hash": DIGEST,
+            "target_content_hash": "d" * 64,
+            "payload_digest": "a" * 64,
             "preview_state": "pending_approval",
             "approval_state": "approved",
             "apply_state": "runtime_pending",
@@ -262,6 +263,7 @@ def complete_evidence(manifest):
             "deployment_revision": 11,
             "convergence_attempt": 1,
             "process_instance_id": PROCESS_INSTANCE_OLD,
+            "target_content_hash": "d" * 64,
             "public_observed_at": "2099-08-04T01:02:10Z",
             "database_observed_at": "2099-08-04T01:02:15Z",
             "public_last_heartbeat_at": "2099-08-04T01:02:04Z",
@@ -853,7 +855,7 @@ class D2CertificationTest(unittest.TestCase):
         mutations = (
             ("authoring_session_id", "authoring-session-other"),
             ("authoring_generation", 2),
-            ("target_content_hash", "f" * 64),
+            ("candidate_ruleset_hash", "f" * 64),
         )
         for field, replacement in mutations:
             evidence = copy.deepcopy(evidence_by_step[7])
@@ -866,6 +868,20 @@ class D2CertificationTest(unittest.TestCase):
                 stderr.getvalue(),
             )
         self.assertEqual(self.record(manifest_path, 7, evidence_by_step[7]), 0)
+
+    def test_step_eight_binds_the_live_registry_target_to_the_reviewed_target(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence_by_step = complete_evidence(manifest)
+        for step in range(1, 8):
+            self.assertEqual(self.record(manifest_path, step, evidence_by_step[step]), 0)
+        drifted = copy.deepcopy(evidence_by_step[8])
+        drifted["target_content_hash"] = "f" * 64
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(self.record(manifest_path, 8, drifted), 1)
+        self.assertIn("step_contract_failed:deployment_identity", stderr.getvalue())
+        self.assertEqual(self.record(manifest_path, 8, evidence_by_step[8]), 0)
 
     def test_step_nine_requires_both_study_room_panels(self):
         manifest_path = self.prepare()

@@ -231,7 +231,7 @@ STEP_SPECS = {
             "projection_state",
             "generation",
             "generation_count",
-            "payload_digest",
+            "candidate_ruleset_hash",
             "worker_request_id",
             "worker_completion_sha256",
             "installation_id",
@@ -248,6 +248,7 @@ STEP_SPECS = {
             "promotion_id",
             "authoring_session_id",
             "authoring_generation",
+            "candidate_ruleset_hash",
             "target_content_hash",
             "payload_digest",
             "preview_state",
@@ -275,6 +276,7 @@ STEP_SPECS = {
             "deployment_revision",
             "convergence_attempt",
             "process_instance_id",
+            "target_content_hash",
             "public_observed_at",
             "database_observed_at",
             "public_last_heartbeat_at",
@@ -1575,7 +1577,7 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
         require_positive_integer(evidence, "generation")
         if evidence["generation"] != 1 or evidence["generation_count"] != 1:
             fail("step_contract_failed:generation_count")
-        require_digest(evidence, "payload_digest")
+        require_digest(evidence, "candidate_ruleset_hash")
         require_identifier(evidence, "worker_request_id")
         require_digest(evidence, "worker_completion_sha256")
         require_identifier(evidence, "installation_id", "authoring_session_id")
@@ -1622,6 +1624,7 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             evidence,
             "promotion_id",
             "payload_digest",
+            "candidate_ruleset_hash",
             "target_content_hash",
             "preview_completion_challenge_sha256",
             "decision_command_sha256",
@@ -1634,8 +1637,8 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             != prior_receipts[5]["evidence"]["authoring_session_id"]
             or evidence["authoring_generation"]
             != prior_receipts[5]["evidence"]["generation"]
-            or evidence["target_content_hash"]
-            != prior_receipts[5]["evidence"]["payload_digest"]
+            or evidence["candidate_ruleset_hash"]
+            != prior_receipts[5]["evidence"]["candidate_ruleset_hash"]
         ):
             fail("step_contract_failed:product_decision_authoring_identity")
         if (
@@ -1663,6 +1666,7 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             "route_id",
             "attestation_id",
             "serving_lease_id",
+            "target_content_hash",
         )
         require_positive_integer(
             evidence,
@@ -1724,6 +1728,8 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             != prior_receipts[6]["evidence"]["installation_id"]
             or evidence["promotion_id"]
             != prior_receipts[6]["evidence"]["promotion_id"]
+            or evidence["target_content_hash"]
+            != prior_receipts[6]["evidence"]["target_content_hash"]
         ):
             fail("step_contract_failed:deployment_identity")
         if evidence["public_origin"] != manifest["cloudflare"]["public_origin"]:

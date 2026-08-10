@@ -11,8 +11,11 @@
   const AUTHENTICATION_EVIDENCE_KIND = "starring.d2.browser-authentication-evidence.v1";
   const AUTHORING_EVIDENCE_KIND = "starring.d2.browser-authoring-evidence.v1";
   const PREVIEW_READY_EVIDENCE_KIND = "starring.d2.browser-preview-ready-evidence.v1";
-  const PRODUCT_DECISION_EVIDENCE_KIND = "starring.d2.browser-product-decision-evidence.v1";
-  const CHROME_PREVIEW_CONFIRMATION_KIND = "starring.d2.chrome-preview-confirmation.v1";
+  const CERTIFICATION_PRODUCT_DECISION_EVIDENCE_KIND =
+    "starring.d2.browser-product-decision-evidence.v2";
+  const ONE_SHOT_PRODUCT_DECISION_EVIDENCE_KIND =
+    "starring.d2.browser-one-shot-product-decision-evidence.v1";
+  const CHROME_PREVIEW_CONFIRMATION_KIND = "starring.d2.chrome-preview-confirmation.v2";
   const CERTIFICATION_DECISION_COMMAND_KIND = "starring.d2.certification-decision-command.v1";
   const CERTIFICATION_DECISION_COMMAND_DIGEST_DOMAIN = "starring.d2.certification-decision-command-sha256.v1\u0000";
   const LIVE_EVIDENCE_KIND = "starring.d2.browser-live-evidence.v1";
@@ -1125,17 +1128,23 @@
         preview.body.summary.target_content_hash,
         "target_content_hash",
       );
-      if (
-        promoted.body.payload_digest !== preview.body.payload_digest ||
-        targetContentHash !== candidateRulesetHash
-      ) {
-        throw new Error("promotion_candidate_identity_mismatch");
+      const promotedPayloadDigest = requireDigest(
+        promoted.body.payload_digest,
+        "promoted_payload_digest",
+      );
+      const previewPayloadDigest = requireDigest(
+        preview.body.payload_digest,
+        "preview_payload_digest",
+      );
+      if (promotedPayloadDigest !== previewPayloadDigest) {
+        throw new Error("promotion_preview_payload_mismatch");
       }
       const confirmationPrompt = Object.freeze({
         installation_id: preview.body.installation_id,
         promotion_id: preview.body.promotion_id,
         revision: preview.body.revision,
-        payload_digest: preview.body.payload_digest,
+        payload_digest: previewPayloadDigest,
+        candidate_ruleset_hash: candidateRulesetHash,
         target_content_hash: targetContentHash,
         preview_completion_challenge_sha256: previewCompletionChallengeSha256,
         decision_command_sha256: decisionCommandDigest,
@@ -1156,7 +1165,8 @@
         installation_id: preview.body.installation_id,
         promotion_id: preview.body.promotion_id,
         revision: preview.body.revision,
-        payload_digest: preview.body.payload_digest,
+        payload_digest: previewPayloadDigest,
+        candidate_ruleset_hash: candidateRulesetHash,
         target_content_hash: targetContentHash,
         preview_completion_challenge_sha256: previewCompletionChallengeSha256,
         decision_command_sha256: decisionCommandDigest,
@@ -1165,7 +1175,7 @@
       const approved = await approve({
         installationId,
         promotionId: promoted.body.promotion_id,
-        expectedPayloadDigest: preview.body.payload_digest,
+        expectedPayloadDigest: previewPayloadDigest,
         expectedRevision: preview.body.revision,
         idempotencyKey: command.approval_idempotency_key,
       });
@@ -1175,7 +1185,7 @@
       const applied = await applyWithDrainHandshake({
         installationId,
         promotionId: promoted.body.promotion_id,
-        expectedPayloadDigest: preview.body.payload_digest,
+        expectedPayloadDigest: previewPayloadDigest,
         expectedRevision: approved.body.revision,
         idempotencyKey: command.apply_idempotency_key,
         runtimeDrainAttempts: input.runtimeDrainAttempts,
@@ -1187,15 +1197,16 @@
       }
       const productDecisionEvidence = Object.freeze({
         schema_version: 1,
-        kind: PRODUCT_DECISION_EVIDENCE_KIND,
+        kind: CERTIFICATION_PRODUCT_DECISION_EVIDENCE_KIND,
         observed_at: observedAt(),
         public_origin: origin,
         installation_id: requireResourceId(applied.body.installation_id, "installation_id"),
         promotion_id: requireDigest(applied.body.promotion_id, "promotion_id"),
         authoring_session_id: sessionId,
         authoring_generation: generation,
+        candidate_ruleset_hash: candidateRulesetHash,
         target_content_hash: targetContentHash,
-        payload_digest: requireDigest(preview.body.payload_digest, "payload_digest"),
+        payload_digest: previewPayloadDigest,
         preview_state: preview.body.state,
         approval_state: approved.body.state,
         apply_state: applied.body.state,
@@ -1214,7 +1225,8 @@
           promotion_id: preview.body.promotion_id,
           revision: preview.body.revision,
           state: preview.body.state,
-          payload_digest: preview.body.payload_digest,
+          payload_digest: previewPayloadDigest,
+          candidate_ruleset_hash: candidateRulesetHash,
           target_content_hash: targetContentHash,
           summary: safeSummary,
         },
@@ -1255,6 +1267,10 @@
       ) {
         throw new Error("authoring_not_preview_ready");
       }
+      let candidateRulesetHash = requireDigest(
+        projectionEvidence(turn.body).candidate_ruleset_hash,
+        "candidate_ruleset_hash",
+      );
       let promoted;
       try {
         promoted = await promote({
@@ -1294,6 +1310,10 @@
           throw new Error("authoring_finalization_not_preview_ready");
         }
         turn = finalized;
+        candidateRulesetHash = requireDigest(
+          projectionEvidence(turn.body).candidate_ruleset_hash,
+          "candidate_ruleset_hash",
+        );
         promoted = await promote({
           installationId: input.installationId,
           sessionId: input.sessionId,
@@ -1308,26 +1328,29 @@
       if (!preview.body || preview.body.state !== "pending_approval") {
         throw new Error("approval_preview_not_pending");
       }
-      const candidateRulesetHash = requireDigest(
-        projectionEvidence(turn.body).candidate_ruleset_hash,
-        "candidate_ruleset_hash",
-      );
       const targetContentHash = requireDigest(
         preview.body.summary.target_content_hash,
         "target_content_hash",
       );
-      if (
-        promoted.body.payload_digest !== preview.body.payload_digest ||
-        targetContentHash !== candidateRulesetHash
-      ) {
-        throw new Error("promotion_candidate_identity_mismatch");
+      const promotedPayloadDigest = requireDigest(
+        promoted.body.payload_digest,
+        "promoted_payload_digest",
+      );
+      const previewPayloadDigest = requireDigest(
+        preview.body.payload_digest,
+        "preview_payload_digest",
+      );
+      if (promotedPayloadDigest !== previewPayloadDigest) {
+        throw new Error("promotion_preview_payload_mismatch");
       }
       const safeSummary = summaryEvidence(preview.body.summary);
       const confirmation = Object.freeze({
         installation_id: preview.body.installation_id,
         promotion_id: preview.body.promotion_id,
         revision: preview.body.revision,
-        payload_digest: preview.body.payload_digest,
+        payload_digest: previewPayloadDigest,
+        candidate_ruleset_hash: candidateRulesetHash,
+        target_content_hash: targetContentHash,
         summary: safeSummary,
       });
       if ((await input.confirmPreview(confirmation)) !== true) {
@@ -1336,7 +1359,7 @@
       const approved = await approve({
         installationId: input.installationId,
         promotionId: promoted.body.promotion_id,
-        expectedPayloadDigest: preview.body.payload_digest,
+        expectedPayloadDigest: previewPayloadDigest,
         expectedRevision: preview.body.revision,
         idempotencyKey: input.approvalIdempotencyKey,
       });
@@ -1346,7 +1369,7 @@
       const applied = await applyWithDrainHandshake({
         installationId: input.installationId,
         promotionId: promoted.body.promotion_id,
-        expectedPayloadDigest: preview.body.payload_digest,
+        expectedPayloadDigest: previewPayloadDigest,
         expectedRevision: approved.body.revision,
         idempotencyKey: input.applyIdempotencyKey,
         runtimeDrainAttempts: input.runtimeDrainAttempts,
@@ -1372,7 +1395,7 @@
       });
       const productDecisionEvidence = Object.freeze({
         schema_version: 1,
-        kind: PRODUCT_DECISION_EVIDENCE_KIND,
+        kind: ONE_SHOT_PRODUCT_DECISION_EVIDENCE_KIND,
         observed_at: observedAt(),
         public_origin: origin,
         installation_id: requireResourceId(applied.body.installation_id, "installation_id"),
@@ -1386,8 +1409,9 @@
           "authoring_generation",
           false,
         ),
+        candidate_ruleset_hash: candidateRulesetHash,
         target_content_hash: targetContentHash,
-        payload_digest: requireDigest(preview.body.payload_digest, "payload_digest"),
+        payload_digest: previewPayloadDigest,
         preview_state: preview.body.state,
         approval_state: approved.body.state,
         apply_state: applied.body.state,
@@ -1406,7 +1430,9 @@
           promotion_id: preview.body.promotion_id,
           revision: preview.body.revision,
           state: preview.body.state,
-          payload_digest: preview.body.payload_digest,
+          payload_digest: previewPayloadDigest,
+          candidate_ruleset_hash: candidateRulesetHash,
+          target_content_hash: targetContentHash,
           summary: safeSummary,
         },
         approval_http_status: approved.status,

@@ -582,6 +582,14 @@ certification-only decision helper. Do not pass `confirmPreview`; this helper
 requires the native Chrome confirmation surface. Review and accept that prompt
 before it approves and applies the target.
 
+The confirmation deliberately shows three different SHA-256 identities. The
+authoring `candidate_ruleset_hash`, promotion `payload_digest`, and registry
+`target_content_hash` use different domains and MUST NOT be compared as if they
+were interchangeable. Step 6 binds the candidate identity into the decision
+command, step 7 binds all three identities into the visible Chrome confirmation,
+and step 8 requires the durable live serving identity to retain the exact
+reviewed registry target.
+
 ```js
 const decisionCommand = product.createCertificationDecisionCommand({
   installationId,

@@ -661,7 +661,12 @@ def assemble_preview_evidence(browser, database):
     ):
         _fail("preview_public_database_identity_mismatch")
     return {
-        **{field: durable[field] for field in database_fields},
+        **{
+            field: durable[field]
+            for field in database_fields
+            if field != "payload_digest"
+        },
+        "candidate_ruleset_hash": durable["payload_digest"],
         "public_origin": public["public_origin"],
         "preview_observed_at": public["observed_at"],
     }
@@ -674,6 +679,7 @@ def assemble_decision_evidence(browser):
         "promotion_id",
         "authoring_session_id",
         "authoring_generation",
+        "candidate_ruleset_hash",
         "target_content_hash",
         "payload_digest",
         "preview_state",
@@ -685,7 +691,7 @@ def assemble_decision_evidence(browser):
         "chrome_confirmation",
     }
     value = _require_envelope(
-        browser, "starring.d2.browser-product-decision-evidence.v1", fields
+        browser, "starring.d2.browser-product-decision-evidence.v2", fields
     )
     _require_public_origin(value["public_origin"], "browser_public_origin_invalid")
     _require_identifier(value["installation_id"], "decision_installation_id_invalid")
@@ -697,6 +703,9 @@ def assemble_decision_evidence(browser):
         value["authoring_generation"], "decision_authoring_generation_invalid"
     )
     _require_digest(value["payload_digest"], "decision_payload_digest_invalid")
+    _require_digest(
+        value["candidate_ruleset_hash"], "decision_candidate_ruleset_hash_invalid"
+    )
     _require_digest(
         value["target_content_hash"], "decision_target_content_hash_invalid"
     )
@@ -726,6 +735,7 @@ def assemble_decision_evidence(browser):
             "promotion_id",
             "revision",
             "payload_digest",
+            "candidate_ruleset_hash",
             "target_content_hash",
             "preview_completion_challenge_sha256",
             "decision_command_sha256",
@@ -737,7 +747,7 @@ def assemble_decision_evidence(browser):
         type(confirmation["schema_version"]) is not int
         or confirmation["schema_version"] != SCHEMA_VERSION
         or confirmation["kind"]
-        != "starring.d2.chrome-preview-confirmation.v1"
+        != "starring.d2.chrome-preview-confirmation.v2"
         or confirmation["confirmation_surface"] != "chrome_confirm"
         or confirmation["accepted"] is not True
     ):
@@ -759,6 +769,10 @@ def assemble_decision_evidence(browser):
     _require_digest(
         confirmation["payload_digest"],
         "chrome_preview_confirmation_payload_invalid",
+    )
+    _require_digest(
+        confirmation["candidate_ruleset_hash"],
+        "chrome_preview_confirmation_candidate_invalid",
     )
     _require_digest(
         confirmation["target_content_hash"],
@@ -800,6 +814,8 @@ def assemble_decision_evidence(browser):
         confirmation["installation_id"] != value["installation_id"]
         or confirmation["promotion_id"] != value["promotion_id"]
         or confirmation["payload_digest"] != value["payload_digest"]
+        or confirmation["candidate_ruleset_hash"]
+        != value["candidate_ruleset_hash"]
         or confirmation["target_content_hash"] != value["target_content_hash"]
         or confirmation["preview_completion_challenge_sha256"]
         != value["preview_completion_challenge_sha256"]
@@ -812,6 +828,7 @@ def assemble_decision_evidence(browser):
         "promotion_id": value["promotion_id"],
         "authoring_session_id": value["authoring_session_id"],
         "authoring_generation": value["authoring_generation"],
+        "candidate_ruleset_hash": value["candidate_ruleset_hash"],
         "target_content_hash": value["target_content_hash"],
         "payload_digest": value["payload_digest"],
         "preview_state": value["preview_state"],
@@ -1024,6 +1041,7 @@ def assemble_live_evidence(browser, database):
         "deployment_revision": durable["deployment_revision"],
         "convergence_attempt": durable["convergence_attempt"],
         "process_instance_id": durable["process_instance_id"],
+        "target_content_hash": serving_identity["target_content_hash"],
         "public_observed_at": public["observed_at"],
         "database_observed_at": durable["observed_at"],
         "public_last_heartbeat_at": public["last_heartbeat_at"],

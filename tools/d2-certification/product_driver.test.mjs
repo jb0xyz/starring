@@ -13,6 +13,8 @@ const LIVE_LOSS_GATEWAY_DISCONNECTED = JSON.parse(
   ),
 );
 const DIGEST = "a".repeat(64);
+const APPROVAL_PAYLOAD_DIGEST = "b".repeat(64);
+const TARGET_CONTENT_HASH = "c".repeat(64);
 const PREVIEW_COMPLETION_CHALLENGE = "d".repeat(64);
 const PROCESS_INSTANCE_ID = "0123456789abcdef0123456789abcdef";
 
@@ -263,7 +265,7 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
-      payload_digest: DIGEST,
+      payload_digest: APPROVAL_PAYLOAD_DIGEST,
       replayed: false,
     }),
     response(200, {
@@ -271,7 +273,7 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
-      payload_digest: DIGEST,
+      payload_digest: APPROVAL_PAYLOAD_DIGEST,
       summary: {
         panels: 1,
         modals: 1,
@@ -279,7 +281,7 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
         actions: 15,
         target_version: 1,
         required_approvals: 1,
-        target_content_hash: DIGEST,
+        target_content_hash: TARGET_CONTENT_HASH,
         binding_fingerprint: DIGEST,
         expires_at: "2026-08-01T12:00:00Z",
       },
@@ -308,6 +310,9 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
     message: "Create the private study room automation",
     confirmPreview: async (preview) => {
       assert.equal(preview.promotion_id, DIGEST);
+      assert.equal(preview.payload_digest, APPROVAL_PAYLOAD_DIGEST);
+      assert.equal(preview.candidate_ruleset_hash, DIGEST);
+      assert.equal(preview.target_content_hash, TARGET_CONTENT_HASH);
       assert.deepEqual(
         { ...preview.summary },
         {
@@ -355,6 +360,7 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
       "approval_state",
       "authoring_generation",
       "authoring_session_id",
+      "candidate_ruleset_hash",
       "installation_id",
       "kind",
       "observed_at",
@@ -369,12 +375,20 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
   );
   assert.equal(
     evidence.product_decision_evidence.kind,
-    "starring.d2.browser-product-decision-evidence.v1"
+    "starring.d2.browser-one-shot-product-decision-evidence.v1"
   );
   assert.equal(evidence.product_decision_evidence.preview_state, "pending_approval");
   assert.equal(evidence.product_decision_evidence.authoring_session_id, "session-1");
   assert.equal(evidence.product_decision_evidence.authoring_generation, 1);
-  assert.equal(evidence.product_decision_evidence.payload_digest, DIGEST);
+  assert.equal(evidence.product_decision_evidence.candidate_ruleset_hash, DIGEST);
+  assert.equal(
+    evidence.product_decision_evidence.target_content_hash,
+    TARGET_CONTENT_HASH,
+  );
+  assert.equal(
+    evidence.product_decision_evidence.payload_digest,
+    APPROVAL_PAYLOAD_DIGEST,
+  );
   assert.equal(evidence.product_decision_evidence.approval_state, "approved");
   assert.equal(evidence.product_decision_evidence.apply_state, "runtime_pending");
   assert.equal(evidence.product_decision_evidence.runtime_pending_observed, true);
@@ -396,7 +410,7 @@ test("one-shot flow uses product boundaries and returns no prompt or full previe
 
 
 test("certification authoring and decision phases are separated by a public preview identity", async () => {
-  const approvalDigest = "b".repeat(64);
+  const approvalDigest = APPROVAL_PAYLOAD_DIGEST;
   const turnBody = {
     session_id: "session-1",
     generation: 1,
@@ -439,7 +453,7 @@ test("certification authoring and decision phases are separated by a public prev
         actions: 15,
         target_version: 1,
         required_approvals: 1,
-        target_content_hash: DIGEST,
+        target_content_hash: TARGET_CONTENT_HASH,
       },
     }),
     response(200, {
@@ -495,9 +509,18 @@ test("certification authoring and decision phases are separated by a public prev
   assert.equal(confirmations, 1);
   assert.match(confirmationPrompt, new RegExp(DIGEST));
   assert.match(confirmationPrompt, new RegExp(approvalDigest));
+  assert.match(confirmationPrompt, new RegExp(TARGET_CONTENT_HASH));
   assert.match(confirmationPrompt, new RegExp(PREVIEW_COMPLETION_CHALLENGE));
   assert.match(confirmationPrompt, new RegExp(commandDigest));
-  assert.equal(decision.product_decision_evidence.target_content_hash, DIGEST);
+  assert.equal(
+    decision.product_decision_evidence.kind,
+    "starring.d2.browser-product-decision-evidence.v2",
+  );
+  assert.equal(decision.product_decision_evidence.candidate_ruleset_hash, DIGEST);
+  assert.equal(
+    decision.product_decision_evidence.target_content_hash,
+    TARGET_CONTENT_HASH,
+  );
   assert.equal(decision.product_decision_evidence.payload_digest, approvalDigest);
   assert.equal(
     decision.product_decision_evidence.preview_completion_challenge_sha256,
@@ -510,6 +533,18 @@ test("certification authoring and decision phases are separated by a public prev
   assert.equal(
     decision.product_decision_evidence.chrome_confirmation.accepted,
     true,
+  );
+  assert.equal(
+    decision.product_decision_evidence.chrome_confirmation.kind,
+    "starring.d2.chrome-preview-confirmation.v2",
+  );
+  assert.equal(
+    decision.product_decision_evidence.chrome_confirmation.candidate_ruleset_hash,
+    DIGEST,
+  );
+  assert.equal(
+    decision.product_decision_evidence.chrome_confirmation.target_content_hash,
+    TARGET_CONTENT_HASH,
   );
   assert.equal(
     decision.product_decision_evidence.decision_command_sha256,
@@ -659,7 +694,7 @@ test("certification decision resumes with the same command after committed respo
               actions: 15,
               target_version: 1,
               required_approvals: 1,
-              target_content_hash: DIGEST,
+              target_content_hash: TARGET_CONTENT_HASH,
             },
           });
         }
@@ -743,7 +778,7 @@ test("certification decision resumes with the same command after committed respo
 });
 
 
-test("certification decision refuses a promotion that does not target the reviewed candidate", async () => {
+test("certification decision refuses a promotion whose preview payload identity drifts", async () => {
   const turnBody = {
     session_id: "session-1",
     observed_generation: 1,
@@ -759,7 +794,7 @@ test("certification decision refuses a promotion that does not target the review
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
-      payload_digest: DIGEST,
+      payload_digest: APPROVAL_PAYLOAD_DIGEST,
       replayed: false,
     }),
     response(200, {
@@ -767,7 +802,7 @@ test("certification decision refuses a promotion that does not target the review
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
-      payload_digest: DIGEST,
+      payload_digest: "e".repeat(64),
       summary: {
         panels: 1,
         modals: 1,
@@ -775,7 +810,7 @@ test("certification decision refuses a promotion that does not target the review
         actions: 15,
         target_version: 1,
         required_approvals: 1,
-        target_content_hash: "c".repeat(64),
+        target_content_hash: TARGET_CONTENT_HASH,
       },
     }),
   ];
@@ -792,7 +827,95 @@ test("certification decision refuses a promotion that does not target the review
       command,
       decisionCommandSha256: await product.decisionCommandSha256(command),
     }),
-    /promotion_candidate_identity_mismatch/,
+    /promotion_preview_payload_mismatch/,
+  );
+  assert.equal(confirmations, 0);
+});
+
+
+test("certification decision rejects current authoring candidate drift before promotion", async () => {
+  let calls = 0;
+  let confirmations = 0;
+  const product = driver(async () => {
+    calls += 1;
+    return response(200, {
+      session_id: "session-1",
+      observed_generation: 1,
+      projection: {
+        state: "preview_ready",
+        preview: {
+          revision: 1,
+          receipt: { candidate_ruleset_hash: "e".repeat(64) },
+        },
+      },
+    });
+  }, undefined, {
+    nativeConfirm: () => {
+      confirmations += 1;
+      return true;
+    },
+  });
+  const command = certificationDecisionCommand(product);
+  await assert.rejects(
+    product.completeCertificationDecision({
+      command,
+      decisionCommandSha256: await product.decisionCommandSha256(command),
+    }),
+    /authoring_preview_identity_mismatch/,
+  );
+  assert.equal(calls, 1);
+  assert.equal(confirmations, 0);
+});
+
+
+test("one-shot flow rejects promotion preview payload drift before confirmation", async () => {
+  const responses = [
+    response(201, {
+      session_id: "session-1",
+      generation: 1,
+      disposition: "created",
+      projection: {
+        state: "preview_ready",
+        preview: { revision: 1, receipt: { candidate_ruleset_hash: DIGEST } },
+      },
+    }),
+    response(201, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: APPROVAL_PAYLOAD_DIGEST,
+      replayed: false,
+    }),
+    response(200, {
+      installation_id: "installation-1",
+      promotion_id: DIGEST,
+      revision: 1,
+      state: "pending_approval",
+      payload_digest: "e".repeat(64),
+      summary: {
+        panels: 1,
+        modals: 1,
+        rules: 4,
+        actions: 15,
+        target_version: 1,
+        required_approvals: 1,
+        target_content_hash: TARGET_CONTENT_HASH,
+      },
+    }),
+  ];
+  let confirmations = 0;
+  await assert.rejects(
+    driver(async () => responses.shift()).runOneShotProductFlow({
+      installationId: "installation-1",
+      sessionId: "session-1",
+      message: "Update the study room automation",
+      confirmPreview: async () => {
+        confirmations += 1;
+        return true;
+      },
+    }),
+    /promotion_preview_payload_mismatch/,
   );
   assert.equal(confirmations, 0);
 });
@@ -847,7 +970,7 @@ test("certification decision stops when native Chrome confirmation is declined",
         actions: 15,
         target_version: 1,
         required_approvals: 1,
-        target_content_hash: DIGEST,
+        target_content_hash: TARGET_CONTENT_HASH,
       },
     }),
   ];
@@ -913,7 +1036,7 @@ test("one-shot exact replay emits strict redacted evidence when apply is already
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
-      payload_digest: DIGEST,
+      payload_digest: APPROVAL_PAYLOAD_DIGEST,
       replayed: true,
     }),
     response(200, {
@@ -921,7 +1044,7 @@ test("one-shot exact replay emits strict redacted evidence when apply is already
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
-      payload_digest: DIGEST,
+      payload_digest: APPROVAL_PAYLOAD_DIGEST,
       summary: {
         panels: 1,
         modals: 1,
@@ -929,7 +1052,7 @@ test("one-shot exact replay emits strict redacted evidence when apply is already
         actions: 15,
         target_version: 1,
         required_approvals: 1,
-        target_content_hash: DIGEST,
+        target_content_hash: TARGET_CONTENT_HASH,
       },
     }),
     response(200, {
@@ -961,7 +1084,15 @@ test("one-shot exact replay emits strict redacted evidence when apply is already
   assert.equal(evidence.product_decision_evidence.apply_state, "live");
   assert.equal(evidence.product_decision_evidence.authoring_session_id, "session-replay");
   assert.equal(evidence.product_decision_evidence.authoring_generation, 4);
-  assert.equal(evidence.product_decision_evidence.payload_digest, DIGEST);
+  assert.equal(evidence.product_decision_evidence.candidate_ruleset_hash, DIGEST);
+  assert.equal(
+    evidence.product_decision_evidence.target_content_hash,
+    TARGET_CONTENT_HASH,
+  );
+  assert.equal(
+    evidence.product_decision_evidence.payload_digest,
+    APPROVAL_PAYLOAD_DIGEST,
+  );
   assert.equal(evidence.product_decision_evidence.runtime_pending_observed, false);
   assert.equal(evidence.runtime_pending_observed, false);
   const serialized = JSON.stringify({
@@ -995,7 +1126,7 @@ test("one-shot flow retries only the exact apply command during a runtime drain"
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
-      payload_digest: DIGEST,
+      payload_digest: APPROVAL_PAYLOAD_DIGEST,
       replayed: false,
     }),
     response(200, {
@@ -1003,7 +1134,7 @@ test("one-shot flow retries only the exact apply command during a runtime drain"
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
-      payload_digest: DIGEST,
+      payload_digest: APPROVAL_PAYLOAD_DIGEST,
       summary: {
         panels: 1,
         modals: 1,
@@ -1011,7 +1142,7 @@ test("one-shot flow retries only the exact apply command during a runtime drain"
         actions: 15,
         target_version: 2,
         required_approvals: 1,
-        target_content_hash: DIGEST,
+        target_content_hash: TARGET_CONTENT_HASH,
       },
     }),
     response(200, {
@@ -1072,9 +1203,9 @@ test("one-shot flow retries only the exact apply command during a runtime drain"
   assert.equal(new Set(applyCalls.map((call) => call.options.headers["idempotency-key"])).size, 1);
   assert.match(applyCalls[0].options.headers["idempotency-key"], /^d2\.apply\./);
   assert.deepEqual(applyCalls.map((call) => call.body), [
-    { expected_payload_digest: DIGEST, expected_revision: 2 },
-    { expected_payload_digest: DIGEST, expected_revision: 2 },
-    { expected_payload_digest: DIGEST, expected_revision: 2 },
+    { expected_payload_digest: APPROVAL_PAYLOAD_DIGEST, expected_revision: 2 },
+    { expected_payload_digest: APPROVAL_PAYLOAD_DIGEST, expected_revision: 2 },
+    { expected_payload_digest: APPROVAL_PAYLOAD_DIGEST, expected_revision: 2 },
   ]);
   assert.equal(evidence.apply_attempts, 3);
   assert.equal(evidence.runtime_drain_observed, true);
@@ -1670,7 +1801,10 @@ test("one-shot flow repairs only an invalid working draft candidate once", async
       disposition: "created",
       projection: {
         state: "preview_ready",
-        preview: { revision: 22, receipt: { candidate_ruleset_hash: DIGEST } },
+        preview: {
+          revision: 22,
+          receipt: { candidate_ruleset_hash: "f".repeat(64) },
+        },
       },
     }),
     response(422, {
@@ -1694,7 +1828,7 @@ test("one-shot flow repairs only an invalid working draft candidate once", async
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
-      payload_digest: DIGEST,
+      payload_digest: APPROVAL_PAYLOAD_DIGEST,
       replayed: false,
     }),
     response(200, {
@@ -1702,7 +1836,7 @@ test("one-shot flow repairs only an invalid working draft candidate once", async
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
-      payload_digest: DIGEST,
+      payload_digest: APPROVAL_PAYLOAD_DIGEST,
       summary: {
         panels: 1,
         modals: 1,
@@ -1710,7 +1844,7 @@ test("one-shot flow repairs only an invalid working draft candidate once", async
         actions: 15,
         target_version: 1,
         required_approvals: 1,
-        target_content_hash: DIGEST,
+        target_content_hash: TARGET_CONTENT_HASH,
       },
     }),
     response(200, {
@@ -1747,6 +1881,15 @@ test("one-shot flow repairs only an invalid working draft candidate once", async
   );
   assert.equal(evidence.authoring.generation, 2);
   assert.equal(evidence.authoring.preview_revision, 22);
+  assert.equal(evidence.product_decision_evidence.candidate_ruleset_hash, DIGEST);
+  assert.equal(
+    evidence.product_decision_evidence.target_content_hash,
+    TARGET_CONTENT_HASH,
+  );
+  assert.equal(
+    evidence.product_decision_evidence.payload_digest,
+    APPROVAL_PAYLOAD_DIGEST,
+  );
   assert.equal(evidence.applied.state, "runtime_pending");
   const serialized = JSON.stringify(evidence);
   assert.equal(serialized.includes("working_draft"), false);
@@ -2404,7 +2547,7 @@ test("replacement evidence binds one reviewed target transition without retainin
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
-      payload_digest: DIGEST,
+      payload_digest: APPROVAL_PAYLOAD_DIGEST,
       replayed: false,
     }),
     response(200, {
@@ -2412,7 +2555,7 @@ test("replacement evidence binds one reviewed target transition without retainin
       promotion_id: DIGEST,
       revision: 1,
       state: "pending_approval",
-      payload_digest: DIGEST,
+      payload_digest: APPROVAL_PAYLOAD_DIGEST,
       summary: {
         panels: 1,
         modals: 1,
@@ -2420,7 +2563,7 @@ test("replacement evidence binds one reviewed target transition without retainin
         actions: 15,
         target_version: 2,
         required_approvals: 1,
-        target_content_hash: DIGEST,
+        target_content_hash: TARGET_CONTENT_HASH,
       },
     }),
     response(200, {
@@ -2439,6 +2582,7 @@ test("replacement evidence binds one reviewed target transition without retainin
     response(200, liveDeployment()),
     response(200, liveOperational()),
   ];
+  let reviewedPreview = null;
   const evidence = await driver(async () => responses.shift(), undefined, {
     now: () => "2026-08-04T11:00:20Z",
   }).runReplacementFlow({
@@ -2447,7 +2591,10 @@ test("replacement evidence binds one reviewed target transition without retainin
     replacementKind: "update",
     sessionId: "session-replacement",
     message: "Do not retain this replacement prompt",
-    confirmPreview: async () => true,
+    confirmPreview: async (preview) => {
+      reviewedPreview = preview;
+      return true;
+    },
     liveAttempts: 1,
     liveIntervalMilliseconds: 100,
   });
@@ -2457,5 +2604,8 @@ test("replacement evidence binds one reviewed target transition without retainin
   assert.equal(evidence.replacement_kind, "update");
   assert.equal(evidence.pending_observed, true);
   assert.equal(evidence.live_observed, true);
+  assert.equal(reviewedPreview.candidate_ruleset_hash, DIGEST);
+  assert.equal(reviewedPreview.target_content_hash, TARGET_CONTENT_HASH);
+  assert.equal(reviewedPreview.payload_digest, APPROVAL_PAYLOAD_DIGEST);
   assert.equal(JSON.stringify(evidence).includes("replacement prompt"), false);
 });

@@ -100,7 +100,7 @@ STEP_SOURCE_SPECS = {
     ),
     7: (
         source_spec(
-            "starring.d2.browser-product-decision-evidence.v1", "chrome"
+            "starring.d2.browser-product-decision-evidence.v2", "chrome"
         ),
     ),
     8: (
@@ -606,7 +606,7 @@ def assemble_step_evidence(
             )
         if step == 7:
             decision = d2_evidence.assemble_decision_evidence(
-                values["starring.d2.browser-product-decision-evidence.v1"]
+                values["starring.d2.browser-product-decision-evidence.v2"]
             )
             if manifest_path is None or len(prior_receipts) != 6:
                 fail("coordinator_preview_completion_missing")

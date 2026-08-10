@@ -809,6 +809,15 @@ class D2RunCoordinatorTest(unittest.TestCase):
             {"kind": d2_run.GATEWAY_HEALED_KIND, "mode": "machine"},
         )
         self.assertEqual(
+            d2_run.STEP_SOURCE_SPECS[7],
+            (
+                {
+                    "kind": "starring.d2.browser-product-decision-evidence.v2",
+                    "mode": "chrome",
+                },
+            ),
+        )
+        self.assertEqual(
             d2_run.STEP_SOURCE_SPECS[9][0],
             {
                 "kind": d2_run.DISCORD_INTERACTION_OBSERVATION_KIND,
@@ -1120,7 +1129,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
             authoring_session_id=final["authoring_session_id"],
             authoring_generation=final["generation"],
             projection_state=final["projection_state"],
-            candidate_ruleset_hash=final["payload_digest"],
+            candidate_ruleset_hash=final["candidate_ruleset_hash"],
             worker_request_id=final["worker_request_id"],
             worker_completion_sha256=final["worker_completion_sha256"],
         )
@@ -1130,7 +1139,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
             projection_state=final["projection_state"],
             generation=final["generation"],
             generation_count=final["generation_count"],
-            payload_digest=final["payload_digest"],
+            payload_digest=final["candidate_ruleset_hash"],
             worker_request_id=final["worker_request_id"],
             worker_completion_sha256=final["worker_completion_sha256"],
             installation_id=final["installation_id"],
@@ -1165,7 +1174,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
             completion,
         )
         confirmation = self.envelope(
-            "starring.d2.chrome-preview-confirmation.v1",
+            "starring.d2.chrome-preview-confirmation.v2",
             observed_at=before,
             confirmation_surface="chrome_confirm",
             accepted=True,
@@ -1173,6 +1182,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
             promotion_id=final["promotion_id"],
             revision=1,
             payload_digest=final["payload_digest"],
+            candidate_ruleset_hash=final["candidate_ruleset_hash"],
             target_content_hash=final["target_content_hash"],
             preview_completion_challenge_sha256="f" * 64,
             decision_command_sha256=final["decision_command_sha256"],
@@ -1186,13 +1196,14 @@ class D2RunCoordinatorTest(unittest.TestCase):
             },
         )
         source = self.envelope(
-            "starring.d2.browser-product-decision-evidence.v1",
+            "starring.d2.browser-product-decision-evidence.v2",
             observed_at=before,
             public_origin=final["public_origin"],
             installation_id=final["installation_id"],
             promotion_id=final["promotion_id"],
             authoring_session_id=final["authoring_session_id"],
             authoring_generation=final["authoring_generation"],
+            candidate_ruleset_hash=final["candidate_ruleset_hash"],
             target_content_hash=final["target_content_hash"],
             payload_digest=final["payload_digest"],
             preview_state=final["preview_state"],
@@ -1265,6 +1276,20 @@ class D2RunCoordinatorTest(unittest.TestCase):
                 self.receipts(),
                 self.manifest,
                 self.manifest_digest,
+            )
+
+    def test_step_eight_rejects_a_live_registry_target_not_reviewed_at_step_seven(self):
+        self.append_prior(7)
+        browser, database = self.step_eight_sources()
+        database["serving_identity"]["target_content_hash"] = "f" * 64
+        with self.assertRaisesRegex(
+            d2_run.CertificationError,
+            "step_contract_failed:deployment_identity",
+        ):
+            d2_run.advance_certification(
+                self.manifest_path,
+                8,
+                [str(self.write_source(database)), str(self.write_source(browser))],
             )
 
     def test_step_nine_binds_visible_join_to_durable_actor_role_and_resources(self):
