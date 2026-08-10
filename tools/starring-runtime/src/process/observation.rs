@@ -6,10 +6,13 @@ use std::time::{Duration, Instant};
 use automation_runtime_controller::{
     RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2,
     RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimeObserveWriterFenceV1,
-    RuntimeWriterFenceObservationV1,
+    RuntimeObservedIngressOpenAcknowledgementV2, RuntimeWriterFenceObservationV1,
 };
 use automation_runtime_worker::{
-    RuntimeEmptyOpenAcknowledgementRefreshInputV2, RuntimeIngressOpenAcknowledgementPortV2,
+    RuntimeEmptyOpenAcknowledgementRefreshInputV2,
+    RuntimeIngressOpenAcknowledgementObservationErrorClassV2,
+    RuntimeIngressOpenAcknowledgementPortV2,
+    RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
     RuntimeOpenProductionObservationInputV2, RuntimeStartupRecoveryObservationPortV2,
     RuntimeWriterFenceObservationPortV1,
 };
@@ -36,6 +39,7 @@ use crate::closed_recovery::{
     RuntimeClosedRecoverySupervisedEmptyOpenProcessV2,
     RuntimeClosedRecoverySupervisedServingOpenProcessV2,
 };
+use crate::database::classify_runtime_execution_observation_error_v2;
 use crate::discord::{
     RuntimeDiscordGatewaySupervisorV1, RuntimeDiscordGatewayTerminalV1,
     RuntimeDiscordProcessHandoffFailureV2, RuntimeDiscordProcessHandoffV2,
@@ -58,10 +62,10 @@ use crate::maintenance_ingress_gate::{
     RuntimeMaintenanceIngressGateStageV2,
 };
 use crate::{
-    RuntimeClosedRecoveryProcessCleanupFailureV2, RuntimeGatewayOwnerStartupWatchdogExitV1,
-    RuntimeGatewayReadyObservationErrorV1, RuntimeMutationFinalizerHandoffStateV1,
-    RuntimePausedConnectedProcessShutdownErrorV1, RuntimeProcessGatewayOwnerCommitFailureV2,
-    RuntimeRegistryRecoveryObservationErrorV1,
+    RuntimeClosedRecoveryProcessCleanupFailureV2, RuntimeDatabaseCompositionErrorV1,
+    RuntimeGatewayOwnerStartupWatchdogExitV1, RuntimeGatewayReadyObservationErrorV1,
+    RuntimeMutationFinalizerHandoffStateV1, RuntimePausedConnectedProcessShutdownErrorV1,
+    RuntimeProcessGatewayOwnerCommitFailureV2, RuntimeRegistryRecoveryObservationErrorV1,
 };
 
 use super::connected::{
@@ -79,6 +83,8 @@ use super::{
 const INGRESS_ACKNOWLEDGEMENT_LEASE_V2: Duration = Duration::from_secs(10);
 const INGRESS_ACKNOWLEDGEMENT_REFRESH_ADVANCE_V2: Duration = Duration::from_secs(5);
 const INGRESS_ACKNOWLEDGEMENT_SAFETY_MARGIN_V2: Duration = Duration::from_secs(2);
+const INGRESS_ACKNOWLEDGEMENT_DATABASE_RETRY_DELAY_V3: Duration = Duration::from_millis(25);
+const INGRESS_ACKNOWLEDGEMENT_DATABASE_MAX_ATTEMPTS_V3: usize = 3;
 
 pub(crate) struct RuntimeExactIngressAcknowledgementReobservationV3 {
     receipt: automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2,
@@ -1386,6 +1392,179 @@ pub(super) async fn collect_recovery_resume_database_evidence_v2(
     })
 }
 
+fn ingress_acknowledgement_database_retry_wake_v3(
+    failed_attempts: usize,
+    observed_at: Instant,
+    deadline: Instant,
+) -> Result<Instant, RuntimeProcessProductionHandoffFailureV2> {
+    if observed_at >= deadline {
+        return Err(RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed);
+    }
+    if failed_attempts >= INGRESS_ACKNOWLEDGEMENT_DATABASE_MAX_ATTEMPTS_V3 {
+        return Err(RuntimeProcessProductionHandoffFailureV2::Database);
+    }
+    let wake = observed_at
+        .checked_add(INGRESS_ACKNOWLEDGEMENT_DATABASE_RETRY_DELAY_V3)
+        .unwrap_or(deadline)
+        .min(deadline);
+    if wake >= deadline {
+        Err(RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed)
+    } else {
+        Ok(wake)
+    }
+}
+
+async fn wait_for_ingress_acknowledgement_database_retry_v3(
+    failed_attempts: usize,
+    deadline: Instant,
+) -> Result<(), RuntimeProcessProductionHandoffFailureV2> {
+    let wake =
+        ingress_acknowledgement_database_retry_wake_v3(failed_attempts, Instant::now(), deadline)?;
+    tokio::time::sleep_until(tokio::time::Instant::from_std(wake)).await;
+    Ok(())
+}
+
+fn map_ingress_acknowledgement_database_observation_failure_v3(
+    error: RuntimeDatabaseCompositionErrorV1,
+) -> RuntimeProcessProductionHandoffFailureV2 {
+    match error {
+        RuntimeDatabaseCompositionErrorV1::Unavailable { .. }
+        | RuntimeDatabaseCompositionErrorV1::ReadinessUnavailable { .. }
+        | RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut
+        | RuntimeDatabaseCompositionErrorV1::ReadinessAuthorityMismatch { .. }
+        | RuntimeDatabaseCompositionErrorV1::AuthorityMismatch => {
+            RuntimeProcessProductionHandoffFailureV2::Database
+        }
+        RuntimeDatabaseCompositionErrorV1::InvalidConfiguration
+        | RuntimeDatabaseCompositionErrorV1::ConnectionConfiguration { .. }
+        | RuntimeDatabaseCompositionErrorV1::UnsafeTransport { .. }
+        | RuntimeDatabaseCompositionErrorV1::IdentityVerification
+        | RuntimeDatabaseCompositionErrorV1::ReadinessRejected { .. }
+        | RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut => {
+            RuntimeProcessProductionHandoffFailureV2::ProtocolViolation
+        }
+    }
+}
+
+async fn collect_ingress_acknowledgement_database_evidence_until_v3<R, E, RF, RFut, WF, WFut, C>(
+    mut verify_readiness: RF,
+    mut observe_writer: WF,
+    classify_writer_error: C,
+    operation_cutoff: Instant,
+) -> Result<
+    (
+        R,
+        automation_runtime_controller::RuntimeWriterFenceGenerationV1,
+    ),
+    RuntimeProcessProductionHandoffFailureV2,
+>
+where
+    RF: FnMut() -> RFut,
+    RFut: Future<Output = Result<R, RuntimeDatabaseCompositionErrorV1>>,
+    WF: FnMut() -> WFut,
+    WFut: Future<Output = Result<RuntimeWriterFenceObservationV1, E>>,
+    C: Fn(&E) -> RuntimeIngressOpenAcknowledgementObservationErrorClassV2,
+{
+    let mut failed_attempts = 0usize;
+    loop {
+        if Instant::now() >= operation_cutoff {
+            return Err(RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed);
+        }
+        let readiness = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(operation_cutoff),
+            verify_readiness(),
+        )
+        .await
+        .map_err(|_| RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed)?;
+        let readiness = match readiness {
+            Ok(readiness) => readiness,
+            Err(error) if error.retryable_readiness_v2() => {
+                failed_attempts = failed_attempts.saturating_add(1);
+                wait_for_ingress_acknowledgement_database_retry_v3(
+                    failed_attempts,
+                    operation_cutoff,
+                )
+                .await?;
+                continue;
+            }
+            Err(error) => {
+                return Err(map_ingress_acknowledgement_database_observation_failure_v3(
+                    error,
+                ));
+            }
+        };
+        let writer = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(operation_cutoff),
+            observe_writer(),
+        )
+        .await;
+        let writer = match writer {
+            Ok(Ok(writer)) => writer,
+            Ok(Err(error))
+                if matches!(
+                    classify_writer_error(&error),
+                    RuntimeIngressOpenAcknowledgementObservationErrorClassV2::Retryable,
+                ) =>
+            {
+                failed_attempts = failed_attempts.saturating_add(1);
+                wait_for_ingress_acknowledgement_database_retry_v3(
+                    failed_attempts,
+                    operation_cutoff,
+                )
+                .await?;
+                continue;
+            }
+            Ok(Err(error)) => {
+                return Err(match classify_writer_error(&error) {
+                    RuntimeIngressOpenAcknowledgementObservationErrorClassV2::Retryable
+                    | RuntimeIngressOpenAcknowledgementObservationErrorClassV2::AuthorityLost => {
+                        RuntimeProcessProductionHandoffFailureV2::Database
+                    }
+                    RuntimeIngressOpenAcknowledgementObservationErrorClassV2::ProtocolViolation => {
+                        RuntimeProcessProductionHandoffFailureV2::ProtocolViolation
+                    }
+                });
+            }
+            Err(_) => {
+                return Err(RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed);
+            }
+        };
+        let RuntimeWriterFenceObservationV1::Open { generation, .. } = writer else {
+            return Err(RuntimeProcessProductionHandoffFailureV2::Database);
+        };
+        return Ok((readiness, generation));
+    }
+}
+
+pub(super) async fn collect_recovery_resume_database_evidence_until_v3(
+    foundation: &RuntimeProcessFoundationV1,
+    operation_cutoff: Instant,
+) -> Result<RuntimeRecoveryResumeDatabaseEvidenceV2, RuntimeProcessProductionHandoffFailureV2> {
+    let (readiness, writer_fence_generation) =
+        collect_ingress_acknowledgement_database_evidence_until_v3(
+            || async {
+                foundation
+                    .databases
+                    .verify_readiness_refresh_until_v2(operation_cutoff)
+                    .await
+                    .map(|readiness| readiness.into_exact_capability_receipts())
+            },
+            || {
+                foundation
+                    .databases
+                    .execution()
+                    .observe_writer_fence(RuntimeObserveWriterFenceV1)
+            },
+            classify_runtime_execution_observation_error_v2,
+            operation_cutoff,
+        )
+        .await?;
+    Ok(RuntimeRecoveryResumeDatabaseEvidenceV2 {
+        readiness,
+        writer_fence_generation,
+    })
+}
+
 fn maintenance_gate_is_closed_v2(snapshot: RuntimeMaintenanceIngressGateSnapshotV2) -> bool {
     snapshot.stage() == RuntimeMaintenanceIngressGateStageV2::Closed
         && snapshot.active_permit_count() == 0
@@ -1468,22 +1647,23 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
             }
         };
         let open_generation = maintenance_ingress.generation();
+        let initial_acknowledgement_observation_started_at = Instant::now();
+        let initial_acknowledgement_cutoff =
+            initial_acknowledgement_observation_started_at + Duration::from_secs(5);
         let predecessor_authorization = self
             .lifecycle
             .authorize_ingress_acknowledgement_predecessor_observation_v2();
-        let predecessor_observation = match self
-            .foundation
-            .databases
-            .execution()
-            .observe_ingress_open_acknowledgement_predecessor(&predecessor_authorization)
-            .await
+        let predecessor_observation = match observe_ingress_acknowledgement_predecessor_until_v3(
+            self.foundation.databases.execution(),
+            &predecessor_authorization,
+            initial_acknowledgement_cutoff,
+        )
+        .await
         {
             Ok(observation) => observation,
-            Err(_) => {
+            Err(transition) => {
                 drop(maintenance_ingress);
-                return Err(self
-                    .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Database)
-                    .await);
+                return Err(self.cleanup_transition_v2(transition).await);
             }
         };
         let predecessor = match predecessor_authorization.accept(predecessor_observation) {
@@ -1530,11 +1710,10 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                 return Err(process.cleanup_transition_v2(transition).await);
             }
         };
-        let initial_acknowledgement_observation_started_at = Instant::now();
         let acknowledgement = execute_ingress_acknowledgement_v2(
             &mut ingress_acknowledgement,
             authority,
-            initial_acknowledgement_observation_started_at + Duration::from_secs(5),
+            initial_acknowledgement_cutoff,
             foundation.lifecycle_timing_v2(),
         )
         .await;
@@ -1697,7 +1876,12 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                 .await);
         }
         current_owner.database_now = acknowledgement_database_now;
-        let database = match collect_recovery_resume_database_evidence_v2(&self.foundation).await {
+        let database = match collect_recovery_resume_database_evidence_until_v3(
+            &self.foundation,
+            acknowledgement_schedule.safety_deadline,
+        )
+        .await
+        {
             Ok(database) => database,
             Err(transition) => {
                 drop(maintenance_ingress);
@@ -1742,11 +1926,12 @@ impl RuntimeAdmissionAcknowledgingProcessV2 {
                 .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation)
                 .await);
         }
-        let final_acknowledgement = match exact_reobserve_ingress_acknowledgement_v2(
+        let final_acknowledgement = match exact_reobserve_ingress_acknowledgement_until_v3(
             self.foundation.databases.execution(),
             self.lifecycle
                 .authorize_ingress_acknowledgement_predecessor_observation_v2(),
             accepted.receipt(),
+            acknowledgement_schedule.safety_deadline,
         )
         .await
         {
@@ -2126,22 +2311,73 @@ pub(super) fn map_production_lifecycle_failure_v2(
     }
 }
 
-pub(super) async fn exact_reobserve_ingress_acknowledgement_v2<P>(
+async fn observe_ingress_acknowledgement_database_until_v3<O, E, F, Fut, C>(
+    mut observe: F,
+    classify: C,
+    operation_cutoff: Instant,
+) -> Result<O, RuntimeProcessProductionHandoffFailureV2>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<O, E>>,
+    C: Fn(&E) -> RuntimeIngressOpenAcknowledgementObservationErrorClassV2,
+{
+    let mut failed_attempts = 0usize;
+    loop {
+        if Instant::now() >= operation_cutoff {
+            return Err(RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed);
+        }
+        let observation =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(operation_cutoff), observe())
+                .await;
+        match observation {
+            Ok(Ok(observation)) => return Ok(observation),
+            Ok(Err(error)) => match classify(&error) {
+                RuntimeIngressOpenAcknowledgementObservationErrorClassV2::Retryable => {
+                    failed_attempts = failed_attempts.saturating_add(1);
+                    wait_for_ingress_acknowledgement_database_retry_v3(
+                        failed_attempts,
+                        operation_cutoff,
+                    )
+                    .await?;
+                }
+                RuntimeIngressOpenAcknowledgementObservationErrorClassV2::AuthorityLost => {
+                    return Err(RuntimeProcessProductionHandoffFailureV2::Database);
+                }
+                RuntimeIngressOpenAcknowledgementObservationErrorClassV2::ProtocolViolation => {
+                    return Err(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation);
+                }
+            },
+            Err(_) => {
+                return Err(RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed);
+            }
+        }
+    }
+}
+
+pub(super) async fn observe_ingress_acknowledgement_predecessor_until_v3<P>(
     port: &P,
-    authorization:
-        automation_runtime_worker::RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
+    authorization: &RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
+    operation_cutoff: Instant,
+) -> Result<RuntimeObservedIngressOpenAcknowledgementV2, RuntimeProcessProductionHandoffFailureV2>
+where
+    P: RuntimeIngressOpenAcknowledgementPortV2,
+{
+    observe_ingress_acknowledgement_database_until_v3(
+        || port.observe_ingress_open_acknowledgement_predecessor(authorization),
+        P::classify_observation_error,
+        operation_cutoff,
+    )
+    .await
+}
+
+fn accept_exact_ingress_acknowledgement_reobservation_v3(
+    authorization: RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
+    observation: RuntimeObservedIngressOpenAcknowledgementV2,
     expected: &automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2,
 ) -> Result<
     RuntimeExactIngressAcknowledgementReobservationV3,
     RuntimeProcessProductionHandoffFailureV2,
->
-where
-    P: RuntimeIngressOpenAcknowledgementPortV2,
-{
-    let observation = port
-        .observe_ingress_open_acknowledgement_predecessor(&authorization)
-        .await
-        .map_err(|_| RuntimeProcessProductionHandoffFailureV2::Database)?;
+> {
     let predecessor = authorization
         .accept(observation)
         .map_err(|_| RuntimeProcessProductionHandoffFailureV2::ProtocolViolation)?;
@@ -2159,6 +2395,27 @@ where
     Ok(RuntimeExactIngressAcknowledgementReobservationV3 {
         receipt: current.clone(),
     })
+}
+
+pub(super) async fn exact_reobserve_ingress_acknowledgement_until_v3<P>(
+    port: &P,
+    authorization: RuntimeIngressOpenAcknowledgementPredecessorObservationAuthorizationV2,
+    expected: &automation_runtime_controller::RuntimeIngressOpenAcknowledgementReceiptV2,
+    operation_cutoff: Instant,
+) -> Result<
+    RuntimeExactIngressAcknowledgementReobservationV3,
+    RuntimeProcessProductionHandoffFailureV2,
+>
+where
+    P: RuntimeIngressOpenAcknowledgementPortV2,
+{
+    let observation = observe_ingress_acknowledgement_predecessor_until_v3(
+        port,
+        &authorization,
+        operation_cutoff,
+    )
+    .await?;
+    accept_exact_ingress_acknowledgement_reobservation_v3(authorization, observation, expected)
 }
 
 pub(super) fn ingress_acknowledgement_schedule_v2(
@@ -2273,7 +2530,11 @@ impl RuntimeEmptyOpenProcessV2 {
         if let Err(transition) = self.revalidate_v2() {
             return Err(self.cleanup_transition_v2(transition).await);
         }
-        let database = collect_recovery_resume_database_evidence_v2(&self.foundation).await;
+        let database = collect_recovery_resume_database_evidence_until_v3(
+            &self.foundation,
+            self.acknowledgement_schedule.safety_deadline,
+        )
+        .await;
         if let Some(transition) =
             production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
         {
@@ -2330,12 +2591,12 @@ impl RuntimeEmptyOpenProcessV2 {
         let final_authorization = self
             .lifecycle
             .authorize_ingress_acknowledgement_predecessor_observation_v2();
-        let predecessor_observation = self
-            .foundation
-            .databases
-            .execution()
-            .observe_ingress_open_acknowledgement_predecessor(&predecessor_authorization)
-            .await;
+        let predecessor_observation = observe_ingress_acknowledgement_predecessor_until_v3(
+            self.foundation.databases.execution(),
+            &predecessor_authorization,
+            self.acknowledgement_schedule.safety_deadline,
+        )
+        .await;
         if let Some(transition) =
             production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
         {
@@ -2343,10 +2604,8 @@ impl RuntimeEmptyOpenProcessV2 {
         }
         let predecessor_observation = match predecessor_observation {
             Ok(observation) => observation,
-            Err(_) => {
-                return Err(self
-                    .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Database)
-                    .await);
+            Err(transition) => {
+                return Err(self.cleanup_transition_v2(transition).await);
             }
         };
         let predecessor = match predecessor_authorization.accept(predecessor_observation) {
@@ -2539,10 +2798,11 @@ impl RuntimeEmptyOpenProcessV2 {
             return Err(process.cleanup_transition_v2(transition).await);
         }
         let final_observation_started_at = Instant::now();
-        let final_observation = exact_reobserve_ingress_acknowledgement_v2(
+        let final_observation = exact_reobserve_ingress_acknowledgement_until_v3(
             foundation.databases.execution(),
             final_authorization,
             &accepted_receipt,
+            acknowledgement_schedule.safety_deadline,
         )
         .await;
         let schedule = final_observation.as_ref().ok().and_then(|observation| {

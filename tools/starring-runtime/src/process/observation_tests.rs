@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::future::{pending, ready};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -8,8 +9,8 @@ use automation_runtime_worker::RuntimeGatewayClosedTransitionErrorV2;
 use super::*;
 use crate::gateway_owner_startup_watchdog::RuntimeGatewayOwnerClosedRecoveryCommitErrorV2;
 use crate::{
-    RuntimeDatabasePoolShutdownErrorV1, RuntimeDiscordGatewayShutdownFailureV1,
-    RuntimeOwnerHeldProcessShutdownErrorV1,
+    DatabaseCapabilityV1, RuntimeDatabasePoolShutdownErrorV1,
+    RuntimeDiscordGatewayShutdownFailureV1, RuntimeOwnerHeldProcessShutdownErrorV1,
 };
 
 #[test]
@@ -84,6 +85,301 @@ fn ingress_acknowledgement_schedule_keeps_the_pre_observation_monotonic_anchor()
         ),
         None
     );
+}
+
+#[test]
+fn ingress_acknowledgement_database_retry_is_attempt_and_deadline_bounded() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_secs(1);
+    assert_eq!(
+        ingress_acknowledgement_database_retry_wake_v3(1, now, deadline),
+        Ok(now + INGRESS_ACKNOWLEDGEMENT_DATABASE_RETRY_DELAY_V3)
+    );
+    assert_eq!(
+        ingress_acknowledgement_database_retry_wake_v3(
+            INGRESS_ACKNOWLEDGEMENT_DATABASE_MAX_ATTEMPTS_V3,
+            now,
+            deadline,
+        ),
+        Err(RuntimeProcessProductionHandoffFailureV2::Database)
+    );
+    assert_eq!(
+        ingress_acknowledgement_database_retry_wake_v3(1, deadline, deadline),
+        Err(RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed)
+    );
+    assert_eq!(
+        ingress_acknowledgement_database_retry_wake_v3(
+            1,
+            deadline - INGRESS_ACKNOWLEDGEMENT_DATABASE_RETRY_DELAY_V3,
+            deadline,
+        ),
+        Err(RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed)
+    );
+}
+
+#[derive(Clone, Copy)]
+enum FakeIngressAcknowledgementObservationErrorV2 {
+    Retryable,
+    AuthorityLost,
+    ProtocolViolation,
+}
+
+fn classify_fake_ingress_acknowledgement_observation_error_v3(
+    error: &FakeIngressAcknowledgementObservationErrorV2,
+) -> RuntimeIngressOpenAcknowledgementObservationErrorClassV2 {
+    match error {
+        FakeIngressAcknowledgementObservationErrorV2::Retryable => {
+            RuntimeIngressOpenAcknowledgementObservationErrorClassV2::Retryable
+        }
+        FakeIngressAcknowledgementObservationErrorV2::AuthorityLost => {
+            RuntimeIngressOpenAcknowledgementObservationErrorClassV2::AuthorityLost
+        }
+        FakeIngressAcknowledgementObservationErrorV2::ProtocolViolation => {
+            RuntimeIngressOpenAcknowledgementObservationErrorClassV2::ProtocolViolation
+        }
+    }
+}
+
+async fn run_fake_ingress_acknowledgement_observation_v3(
+    outcomes: Vec<Result<u64, FakeIngressAcknowledgementObservationErrorV2>>,
+) -> (Result<u64, RuntimeProcessProductionHandoffFailureV2>, usize) {
+    let outcomes = Arc::new(Mutex::new(VecDeque::from(outcomes)));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let result = observe_ingress_acknowledgement_database_until_v3(
+        || {
+            calls.fetch_add(1, Ordering::AcqRel);
+            let outcome = outcomes
+                .lock()
+                .expect("fake ingress acknowledgement outcomes")
+                .pop_front()
+                .expect("fake ingress acknowledgement outcome");
+            ready(outcome)
+        },
+        classify_fake_ingress_acknowledgement_observation_error_v3,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    (result, calls.load(Ordering::Acquire))
+}
+
+#[tokio::test]
+async fn ingress_acknowledgement_database_retry_recovers_retryable_observation() {
+    let (result, calls) = run_fake_ingress_acknowledgement_observation_v3(vec![
+        Err(FakeIngressAcknowledgementObservationErrorV2::Retryable),
+        Ok(7),
+    ])
+    .await;
+    assert_eq!(result, Ok(7));
+    assert_eq!(calls, 2);
+}
+
+#[tokio::test]
+async fn ingress_acknowledgement_database_retry_exhausts_exactly_three_attempts() {
+    let (result, calls) = run_fake_ingress_acknowledgement_observation_v3(vec![
+        Err(FakeIngressAcknowledgementObservationErrorV2::Retryable),
+        Err(FakeIngressAcknowledgementObservationErrorV2::Retryable),
+        Err(FakeIngressAcknowledgementObservationErrorV2::Retryable),
+    ])
+    .await;
+    assert_eq!(
+        result,
+        Err(RuntimeProcessProductionHandoffFailureV2::Database)
+    );
+    assert_eq!(calls, 3);
+}
+
+#[tokio::test]
+async fn ingress_acknowledgement_database_retry_fails_closed_without_retrying_terminal_errors() {
+    for (error, expected) in [
+        (
+            FakeIngressAcknowledgementObservationErrorV2::AuthorityLost,
+            RuntimeProcessProductionHandoffFailureV2::Database,
+        ),
+        (
+            FakeIngressAcknowledgementObservationErrorV2::ProtocolViolation,
+            RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+        ),
+    ] {
+        let (result, calls) =
+            run_fake_ingress_acknowledgement_observation_v3(vec![Err(error)]).await;
+        assert_eq!(result, Err(expected));
+        assert_eq!(calls, 1);
+    }
+}
+
+#[tokio::test]
+async fn ingress_acknowledgement_database_retry_is_clipped_by_the_absolute_deadline() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let result = observe_ingress_acknowledgement_database_until_v3(
+        || {
+            calls.fetch_add(1, Ordering::AcqRel);
+            pending::<Result<u64, FakeIngressAcknowledgementObservationErrorV2>>()
+        },
+        classify_fake_ingress_acknowledgement_observation_error_v3,
+        Instant::now() + Duration::from_millis(10),
+    )
+    .await;
+    assert_eq!(
+        result,
+        Err(RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed)
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+}
+
+fn fake_open_writer_observation_v2(
+    generation: u64,
+) -> automation_runtime_controller::RuntimeWriterFenceObservationV1 {
+    automation_runtime_controller::RuntimeWriterFenceObservationV1::Open {
+        generation: automation_runtime_controller::RuntimeWriterFenceGenerationV1::new(
+            NonZeroU64::new(generation).unwrap(),
+        ),
+        observed_database_now: chrono::DateTime::from_timestamp(100, 0).unwrap(),
+    }
+}
+
+async fn run_fake_ingress_acknowledgement_database_evidence_v3(
+    readiness_outcomes: Vec<Result<u64, RuntimeDatabaseCompositionErrorV1>>,
+    writer_outcomes: Vec<
+        Result<
+            automation_runtime_controller::RuntimeWriterFenceObservationV1,
+            FakeIngressAcknowledgementObservationErrorV2,
+        >,
+    >,
+) -> (
+    Result<
+        (
+            u64,
+            automation_runtime_controller::RuntimeWriterFenceGenerationV1,
+        ),
+        RuntimeProcessProductionHandoffFailureV2,
+    >,
+    usize,
+    usize,
+) {
+    let readiness_outcomes = Arc::new(Mutex::new(VecDeque::from(readiness_outcomes)));
+    let writer_outcomes = Arc::new(Mutex::new(VecDeque::from(writer_outcomes)));
+    let readiness_calls = Arc::new(AtomicUsize::new(0));
+    let writer_calls = Arc::new(AtomicUsize::new(0));
+    let result = collect_ingress_acknowledgement_database_evidence_until_v3(
+        || {
+            readiness_calls.fetch_add(1, Ordering::AcqRel);
+            let outcome = readiness_outcomes
+                .lock()
+                .expect("fake readiness outcomes")
+                .pop_front()
+                .expect("fake readiness outcome");
+            ready(outcome)
+        },
+        || {
+            writer_calls.fetch_add(1, Ordering::AcqRel);
+            let outcome = writer_outcomes
+                .lock()
+                .expect("fake writer outcomes")
+                .pop_front()
+                .expect("fake writer outcome");
+            ready(outcome)
+        },
+        classify_fake_ingress_acknowledgement_observation_error_v3,
+        Instant::now() + Duration::from_secs(1),
+    )
+    .await;
+    (
+        result,
+        readiness_calls.load(Ordering::Acquire),
+        writer_calls.load(Ordering::Acquire),
+    )
+}
+
+#[tokio::test]
+async fn ingress_acknowledgement_readiness_retry_recovers_before_observing_writer() {
+    let (result, readiness_calls, writer_calls) =
+        run_fake_ingress_acknowledgement_database_evidence_v3(
+            vec![
+                Err(RuntimeDatabaseCompositionErrorV1::Unavailable {
+                    capability: DatabaseCapabilityV1::Serving,
+                }),
+                Ok(2),
+            ],
+            vec![Ok(fake_open_writer_observation_v2(3))],
+        )
+        .await;
+    assert_eq!(result.unwrap().0, 2);
+    assert_eq!(readiness_calls, 2);
+    assert_eq!(writer_calls, 1);
+}
+
+#[tokio::test]
+async fn ingress_acknowledgement_writer_retry_recollects_the_full_readiness_set() {
+    let (result, readiness_calls, writer_calls) =
+        run_fake_ingress_acknowledgement_database_evidence_v3(
+            vec![Ok(1), Ok(2)],
+            vec![
+                Err(FakeIngressAcknowledgementObservationErrorV2::Retryable),
+                Ok(fake_open_writer_observation_v2(3)),
+            ],
+        )
+        .await;
+    let (readiness, generation) = result.unwrap();
+    assert_eq!(readiness, 2);
+    assert_eq!(generation.get(), 3);
+    assert_eq!(readiness_calls, 2);
+    assert_eq!(writer_calls, 2);
+}
+
+#[tokio::test]
+async fn ingress_acknowledgement_composite_observation_preserves_terminal_classes() {
+    let (readiness_result, readiness_calls, writer_calls) =
+        run_fake_ingress_acknowledgement_database_evidence_v3(
+            vec![Err(RuntimeDatabaseCompositionErrorV1::InvalidConfiguration)],
+            Vec::new(),
+        )
+        .await;
+    assert_eq!(
+        readiness_result,
+        Err(RuntimeProcessProductionHandoffFailureV2::ProtocolViolation)
+    );
+    assert_eq!(readiness_calls, 1);
+    assert_eq!(writer_calls, 0);
+
+    for (error, expected) in [
+        (
+            FakeIngressAcknowledgementObservationErrorV2::AuthorityLost,
+            RuntimeProcessProductionHandoffFailureV2::Database,
+        ),
+        (
+            FakeIngressAcknowledgementObservationErrorV2::ProtocolViolation,
+            RuntimeProcessProductionHandoffFailureV2::ProtocolViolation,
+        ),
+    ] {
+        let (result, readiness_calls, writer_calls) =
+            run_fake_ingress_acknowledgement_database_evidence_v3(vec![Ok(1)], vec![Err(error)])
+                .await;
+        assert_eq!(result, Err(expected));
+        assert_eq!(readiness_calls, 1);
+        assert_eq!(writer_calls, 1);
+    }
+}
+
+#[tokio::test]
+async fn ingress_acknowledgement_composite_observation_is_deadline_bounded() {
+    let writer_calls = Arc::new(AtomicUsize::new(0));
+    let result = collect_ingress_acknowledgement_database_evidence_until_v3(
+        pending::<Result<u64, RuntimeDatabaseCompositionErrorV1>>,
+        || {
+            writer_calls.fetch_add(1, Ordering::AcqRel);
+            ready(Ok::<_, FakeIngressAcknowledgementObservationErrorV2>(
+                fake_open_writer_observation_v2(1),
+            ))
+        },
+        classify_fake_ingress_acknowledgement_observation_error_v3,
+        Instant::now() + Duration::from_millis(10),
+    )
+    .await;
+    assert_eq!(
+        result,
+        Err(RuntimeProcessProductionHandoffFailureV2::OperationDeadlineElapsed)
+    );
+    assert_eq!(writer_calls.load(Ordering::Acquire), 0);
 }
 
 const FAKE_PROCESS_CLEANUP_EVENTS_V2: [&str; 8] = [

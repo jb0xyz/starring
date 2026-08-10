@@ -16,8 +16,8 @@ use automation_runtime_execution_postgres::PostgresPreparedRuntimeCertificationV
 use automation_runtime_worker::{
     RuntimeCertificationAbortOutcomeV2, RuntimeCertificationFinalizationOutcomeV2,
     RuntimeCertificationRecoveryResolutionV2, RuntimeCertificationReservationProposalV2,
-    RuntimeCommittedCertificationV2, RuntimeIngressOpenAcknowledgementPortV2,
-    RuntimeReservedCertificationV2, RuntimeRouteLifecycleV2, RuntimeRouteWitnessV2,
+    RuntimeCommittedCertificationV2, RuntimeReservedCertificationV2, RuntimeRouteLifecycleV2,
+    RuntimeRouteWitnessV2,
 };
 use chrono::{DateTime, Utc};
 use tokio::task::JoinSet;
@@ -55,15 +55,16 @@ use crate::serving_heartbeat_monitor::{
 
 use super::certification_finalizer::RuntimeReservedCertificationFinalizerSlotV2;
 use super::observation::{
-    collect_recovery_resume_database_evidence_v2, exact_reobserve_ingress_acknowledgement_v2,
-    execute_ingress_acknowledgement_v2, finish_production_handoff_transition_v2,
-    ingress_acknowledgement_schedule_v2, shutdown_certification_frozen_serving_open_process_v2,
-    shutdown_orphaned_admission_process_v2, shutdown_orphaned_empty_open_process_v2,
-    shutdown_process_without_lifecycle_v2, shutdown_refreshing_empty_open_process_v2,
-    shutdown_refreshing_serving_open_process_v2, shutdown_serving_open_process_v2,
-    RuntimeEmptyOpenMonitorV2, RuntimeExactIngressAcknowledgementReobservationV3,
-    RuntimeIngressAcknowledgementCleanupV2, RuntimeIngressAcknowledgementScheduleV2,
-    RuntimeLifecycleLostRegistryObservationV2,
+    collect_recovery_resume_database_evidence_until_v3,
+    exact_reobserve_ingress_acknowledgement_until_v3, execute_ingress_acknowledgement_v2,
+    finish_production_handoff_transition_v2, ingress_acknowledgement_schedule_v2,
+    observe_ingress_acknowledgement_predecessor_until_v3,
+    shutdown_certification_frozen_serving_open_process_v2, shutdown_orphaned_admission_process_v2,
+    shutdown_orphaned_empty_open_process_v2, shutdown_process_without_lifecycle_v2,
+    shutdown_refreshing_empty_open_process_v2, shutdown_refreshing_serving_open_process_v2,
+    shutdown_serving_open_process_v2, RuntimeEmptyOpenMonitorV2,
+    RuntimeExactIngressAcknowledgementReobservationV3, RuntimeIngressAcknowledgementCleanupV2,
+    RuntimeIngressAcknowledgementScheduleV2, RuntimeLifecycleLostRegistryObservationV2,
     RuntimeProcessIngressAcknowledgementExecutionFailureV2, RuntimeProcessProductionHandoffErrorV2,
     RuntimeProcessProductionHandoffFailureV2,
 };
@@ -1666,18 +1667,19 @@ async fn publish_preopen_acknowledgement_v2(
             },
         );
     }
-    let database = match collect_recovery_resume_database_evidence_v2(foundation).await {
-        Ok(database) => database,
-        Err(_) => {
-            return Err(
-                RuntimeServingCertificationAcknowledgementFailureV2::Normal {
-                    lifecycle: Box::new(lifecycle),
-                    opening,
-                    transition: RuntimeServingCertificationFailureV2::Database.transition_v2(),
-                },
-            );
-        }
-    };
+    let database =
+        match collect_recovery_resume_database_evidence_until_v3(foundation, deadline).await {
+            Ok(database) => database,
+            Err(transition) => {
+                return Err(
+                    RuntimeServingCertificationAcknowledgementFailureV2::Normal {
+                        lifecycle: Box::new(lifecycle),
+                        opening,
+                        transition,
+                    },
+                );
+            }
+        };
     let (readiness, writer_fence_generation) = database.into_parts_v2();
     let finalizer_accepting = foundation
         .process_finalizer_health_v2()
@@ -1700,19 +1702,20 @@ async fn publish_preopen_acknowledgement_v2(
         lifecycle.authorize_ingress_acknowledgement_predecessor_observation_v2();
     let final_authorization =
         lifecycle.authorize_ingress_acknowledgement_predecessor_observation_v2();
-    let predecessor_observation = match foundation
-        .databases
-        .execution()
-        .observe_ingress_open_acknowledgement_predecessor(&predecessor_authorization)
-        .await
+    let predecessor_observation = match observe_ingress_acknowledgement_predecessor_until_v3(
+        foundation.databases.execution(),
+        &predecessor_authorization,
+        deadline,
+    )
+    .await
     {
         Ok(observation) => observation,
-        Err(_) => {
+        Err(transition) => {
             return Err(
                 RuntimeServingCertificationAcknowledgementFailureV2::Normal {
                     lifecycle: Box::new(lifecycle),
                     opening,
-                    transition: RuntimeServingCertificationFailureV2::Database.transition_v2(),
+                    transition,
                 },
             );
         }
@@ -1841,21 +1844,21 @@ async fn publish_preopen_acknowledgement_v2(
         }
     };
     let observation_started_at = Instant::now();
-    let exact = match exact_reobserve_ingress_acknowledgement_v2(
+    let exact = match exact_reobserve_ingress_acknowledgement_until_v3(
         foundation.databases.execution(),
         final_authorization,
         &accepted_receipt,
+        deadline,
     )
     .await
     {
         Ok(exact) => exact,
-        Err(_) => {
+        Err(transition) => {
             return Err(
                 RuntimeServingCertificationAcknowledgementFailureV2::Normal {
                     lifecycle: Box::new(lifecycle),
                     opening,
-                    transition: RuntimeServingCertificationFailureV2::Acknowledgement
-                        .transition_v2(),
+                    transition,
                 },
             );
         }

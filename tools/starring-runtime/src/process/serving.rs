@@ -2,9 +2,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::{Duration, Instant};
 
 use automation_runtime_controller::RuntimeIngressOpenAcknowledgementLeaseDurationV2;
-use automation_runtime_worker::{
-    RuntimeIngressOpenAcknowledgementPortV2, RuntimeServingOpenSupervisorConfigV2,
-};
+use automation_runtime_worker::RuntimeServingOpenSupervisorConfigV2;
 use chrono::{DateTime, Utc};
 
 use crate::closed_recovery::{
@@ -28,11 +26,12 @@ use crate::runtime_controller::{
 };
 
 use super::observation::{
-    collect_recovery_resume_database_evidence_v2, exact_reobserve_ingress_acknowledgement_v2,
-    execute_ingress_acknowledgement_v2, finish_production_handoff_transition_v2,
-    ingress_acknowledgement_schedule_v2, maintenance_gate_is_open_v2,
-    map_empty_open_shutdown_cause_v2, map_production_lifecycle_failure_v2,
-    map_worker_production_handoff_failure_v2, production_open_shutdown_failure_v2,
+    collect_recovery_resume_database_evidence_until_v3,
+    exact_reobserve_ingress_acknowledgement_until_v3, execute_ingress_acknowledgement_v2,
+    finish_production_handoff_transition_v2, ingress_acknowledgement_schedule_v2,
+    maintenance_gate_is_open_v2, map_empty_open_shutdown_cause_v2,
+    map_production_lifecycle_failure_v2, map_worker_production_handoff_failure_v2,
+    observe_ingress_acknowledgement_predecessor_until_v3, production_open_shutdown_failure_v2,
     shutdown_orphaned_admission_process_v2, shutdown_orphaned_empty_open_process_v2,
     shutdown_orphaned_ingress_acknowledgement_v2, shutdown_process_without_lifecycle_v2,
     shutdown_refreshing_serving_open_process_v2, shutdown_serving_open_process_v2,
@@ -80,7 +79,11 @@ impl RuntimeEmptyOpenProcessV2 {
                 .expect("serving slot work capacity must remain nonzero"),
         )
         .expect("serving slot work capacity must remain bounded");
-        let database = collect_recovery_resume_database_evidence_v2(&self.foundation).await;
+        let database = collect_recovery_resume_database_evidence_until_v3(
+            &self.foundation,
+            self.acknowledgement_schedule.safety_deadline,
+        )
+        .await;
         if let Some(transition) =
             production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
         {
@@ -133,12 +136,12 @@ impl RuntimeEmptyOpenProcessV2 {
         let predecessor_authorization = self
             .lifecycle
             .authorize_ingress_acknowledgement_predecessor_observation_v2();
-        let predecessor_observation = self
-            .foundation
-            .databases
-            .execution()
-            .observe_ingress_open_acknowledgement_predecessor(&predecessor_authorization)
-            .await;
+        let predecessor_observation = observe_ingress_acknowledgement_predecessor_until_v3(
+            self.foundation.databases.execution(),
+            &predecessor_authorization,
+            self.acknowledgement_schedule.safety_deadline,
+        )
+        .await;
         if let Some(transition) =
             production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
         {
@@ -146,10 +149,8 @@ impl RuntimeEmptyOpenProcessV2 {
         }
         let predecessor_observation = match predecessor_observation {
             Ok(observation) => observation,
-            Err(_) => {
-                return Err(self
-                    .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Database)
-                    .await);
+            Err(transition) => {
+                return Err(self.cleanup_transition_v2(transition).await);
             }
         };
         let ingress_acknowledgement_predecessor =
@@ -378,7 +379,11 @@ impl RuntimeServingOpenProcessV2 {
         {
             return Err(self.cleanup_transition_v2(transition).await);
         }
-        let database = collect_recovery_resume_database_evidence_v2(&self.foundation).await;
+        let database = collect_recovery_resume_database_evidence_until_v3(
+            &self.foundation,
+            self.acknowledgement_schedule.safety_deadline,
+        )
+        .await;
         if let Some(transition) =
             production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
         {
@@ -439,12 +444,12 @@ impl RuntimeServingOpenProcessV2 {
         let final_authorization = self
             .lifecycle
             .authorize_ingress_acknowledgement_predecessor_observation_v2();
-        let predecessor_observation = self
-            .foundation
-            .databases
-            .execution()
-            .observe_ingress_open_acknowledgement_predecessor(&predecessor_authorization)
-            .await;
+        let predecessor_observation = observe_ingress_acknowledgement_predecessor_until_v3(
+            self.foundation.databases.execution(),
+            &predecessor_authorization,
+            self.acknowledgement_schedule.safety_deadline,
+        )
+        .await;
         if let Some(transition) =
             production_open_shutdown_failure_v2(&self.foundation.shutdown_observer_v1())
         {
@@ -452,10 +457,8 @@ impl RuntimeServingOpenProcessV2 {
         }
         let predecessor_observation = match predecessor_observation {
             Ok(observation) => observation,
-            Err(_) => {
-                return Err(self
-                    .cleanup_transition_v2(RuntimeProcessProductionHandoffFailureV2::Database)
-                    .await);
+            Err(transition) => {
+                return Err(self.cleanup_transition_v2(transition).await);
             }
         };
         let predecessor = match predecessor_authorization.accept(predecessor_observation) {
@@ -663,10 +666,11 @@ impl RuntimeServingOpenProcessV2 {
             return Err(process.cleanup_transition_v2(transition).await);
         }
         let final_observation_started_at = Instant::now();
-        let final_observation = exact_reobserve_ingress_acknowledgement_v2(
+        let final_observation = exact_reobserve_ingress_acknowledgement_until_v3(
             foundation.databases.execution(),
             final_authorization,
             &accepted_receipt,
+            acknowledgement_schedule.safety_deadline,
         )
         .await;
         let schedule = final_observation.as_ref().ok().and_then(|observation| {

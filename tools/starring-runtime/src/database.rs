@@ -84,9 +84,11 @@ use automation_runtime_worker::{
     RuntimeAuthorizedPendingDrainAcknowledgementV2, RuntimeAuthorizedPendingDrainClaimV2,
     RuntimeAuthorizedPendingDrainSuccessionAcknowledgementV3, RuntimeCapabilityReadinessKindV2,
     RuntimeCapabilityReadinessReceiptV2, RuntimeCapabilityReadinessSetV2,
-    RuntimePendingDrainAcknowledgementExecutionPortV2, RuntimePendingDrainAcknowledgementReceiptV2,
-    RuntimePendingDrainClaimExecutionPortV2, RuntimePendingDrainClaimReceiptV2,
-    RuntimePendingDrainNoCandidateReceiptV2, RuntimePendingDrainNoCandidateRecorderPortV2,
+    RuntimeIngressOpenAcknowledgementObservationErrorClassV2,
+    RuntimeIngressOpenAcknowledgementPortV2, RuntimePendingDrainAcknowledgementExecutionPortV2,
+    RuntimePendingDrainAcknowledgementReceiptV2, RuntimePendingDrainClaimExecutionPortV2,
+    RuntimePendingDrainClaimReceiptV2, RuntimePendingDrainNoCandidateReceiptV2,
+    RuntimePendingDrainNoCandidateRecorderPortV2,
     RuntimePendingDrainSuccessionAcknowledgementExecutionPortV3,
     RuntimePendingDrainSuccessionAcknowledgementReceiptV3,
     RuntimeSelectedPendingDrainNoCandidateV2,
@@ -214,6 +216,21 @@ impl RuntimeDatabaseCompositionErrorV1 {
             | Self::AuthorityMismatch => None,
         }
     }
+
+    pub(crate) const fn retryable_readiness_v2(self) -> bool {
+        matches!(
+            self,
+            Self::Unavailable { .. } | Self::ReadinessUnavailable { .. } | Self::ReadinessTimedOut
+        )
+    }
+}
+
+pub(crate) fn classify_runtime_execution_observation_error_v2(
+    error: &RuntimeExecutionPersistenceErrorV1,
+) -> RuntimeIngressOpenAcknowledgementObservationErrorClassV2 {
+    <PostgresRuntimeExecutionV1 as RuntimeIngressOpenAcknowledgementPortV2>::classify_observation_error(
+        error,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -2854,6 +2871,13 @@ mod tests {
             }
         );
         assert_eq!(transient.context(), Some("panel"));
+        assert!(transient.retryable_readiness_v2());
+        assert!(RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut.retryable_readiness_v2());
+        assert!(RuntimeDatabaseCompositionErrorV1::Unavailable {
+            capability: DatabaseCapabilityV1::Serving,
+        }
+        .retryable_readiness_v2());
+        assert!(!authority.retryable_readiness_v2());
         let rejected =
             interaction_readiness_error(RuntimeInteractionPersistenceErrorV1::PersistenceCorrupt);
         assert_eq!(
@@ -2862,5 +2886,6 @@ mod tests {
                 capability: DatabaseCapabilityV1::Interaction,
             }
         );
+        assert!(!rejected.retryable_readiness_v2());
     }
 }

@@ -552,6 +552,8 @@ fn database_readiness_retains_five_exact_receipts_without_serialization() {
             "RuntimeCapabilityReadinessKindV2",
             "RuntimeCapabilityReadinessReceiptV2",
             "RuntimeCapabilityReadinessSetV2",
+            "RuntimeIngressOpenAcknowledgementObservationErrorClassV2",
+            "RuntimeIngressOpenAcknowledgementPortV2",
             "RuntimePendingDrainAcknowledgementExecutionPortV2",
             "RuntimePendingDrainAcknowledgementReceiptV2",
             "RuntimePendingDrainClaimExecutionPortV2",
@@ -2119,7 +2121,10 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 );
             let allowed_observation_process_tests = path
                 == Path::new("src/process/observation_tests.rs")
-                && identifier == "automation_runtime_worker";
+                && matches!(
+                    identifier,
+                    "automation_runtime_controller" | "automation_runtime_worker"
+                );
             let allowed_process_identity = path == Path::new("src/process_identity.rs")
                 && identifier == "automation_runtime_convergence";
             let allowed_controller_identity = path == Path::new("src/controller_identity.rs")
@@ -2201,6 +2206,8 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
             let allowed_ordinary_barrier_v3 = matches!(
                 identifier,
                 "RuntimeClosedRecoveryOrdinaryBarrierCompletionAuthorityV3"
+                    | "INGRESS_ACKNOWLEDGEMENT_DATABASE_MAX_ATTEMPTS_V3"
+                    | "INGRESS_ACKNOWLEDGEMENT_DATABASE_RETRY_DELAY_V3"
                     | "RuntimeClosedRecoveryServingAcknowledgementRefreshTransitionV3"
                     | "RuntimeDiscordOrdinaryBarrierFailureV3"
                     | "RuntimeDiscordOrdinaryBarrierPauseOutcomeV3"
@@ -2216,6 +2223,7 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
                 path if path == Path::new("src/closed_recovery.rs")
                     || path == Path::new("src/process.rs")
                     || path == Path::new("src/process/observation.rs")
+                    || path == Path::new("src/process/observation_tests.rs")
                     || path == Path::new("src/process/serving.rs")
                     || path == Path::new("src/process/serving_certification.rs")
             );
@@ -2284,13 +2292,13 @@ fn gateway_v3_authority_is_confined_and_explicit_resume_is_mandatory() {
         process_observation
             .matches("automation_runtime_controller")
             .count(),
-        8
+        10
     );
     assert!(process_observation.contains(concat!(
         "use automation_runtime_controller::{\n",
         "    RuntimeGatewayOwnerLeaseReceiptV1, RuntimeGatewayReadyAttestationV2,\n",
         "    RuntimeIngressOpenAcknowledgementLeaseDurationV2, RuntimeObserveWriterFenceV1,\n",
-        "    RuntimeWriterFenceObservationV1,\n",
+        "    RuntimeObservedIngressOpenAcknowledgementV2, RuntimeWriterFenceObservationV1,\n",
         "};"
     )));
     assert!(process_observation.contains(
@@ -2732,6 +2740,11 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         .find(|(path, _)| path == Path::new("src/process/observation.rs"))
         .map(|(_, source)| source.as_str())
         .unwrap();
+    let process_serving = sources
+        .iter()
+        .find(|(path, _)| path == Path::new("src/process/serving.rs"))
+        .map(|(_, source)| source.as_str())
+        .unwrap();
     let process_supervisor = sources
         .iter()
         .find(|(path, _)| path == Path::new("src/process_supervisor.rs"))
@@ -2892,7 +2905,7 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         .find(".authorize_ingress_acknowledgement_predecessor_observation_v2()")
         .unwrap();
     let predecessor_observation = enter_empty_open
-        .find(".observe_ingress_open_acknowledgement_predecessor(&predecessor_authorization)")
+        .find("observe_ingress_acknowledgement_predecessor_until_v3(")
         .unwrap();
     let predecessor_accept = enter_empty_open
         .find("predecessor_authorization.accept(predecessor_observation)")
@@ -2918,7 +2931,7 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         .find(".observe_current_owner_v2()")
         .unwrap();
     let final_acknowledgement_reobservation = enter_empty_open
-        .find("exact_reobserve_ingress_acknowledgement_v2(")
+        .find("exact_reobserve_ingress_acknowledgement_until_v3(")
         .unwrap();
     let open_transition = enter_empty_open
         .find(".into_empty_open_v2(observation)")
@@ -2941,12 +2954,12 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         .unwrap();
     assert!(
         gate_open < gate_commit
-            && gate_commit < predecessor_authorization
+            && gate_commit < initial_acknowledgement_anchor
+            && initial_acknowledgement_anchor < predecessor_authorization
             && predecessor_authorization < predecessor_observation
             && predecessor_observation < predecessor_accept
             && predecessor_accept < acknowledgement_authorization
-            && acknowledgement_authorization < initial_acknowledgement_anchor
-            && initial_acknowledgement_anchor < acknowledgement_lane
+            && acknowledgement_authorization < acknowledgement_lane
             && acknowledgement_lane < initial_acknowledgement_schedule
             && initial_acknowledgement_schedule < acknowledgement_safety_arm
             && acknowledgement_safety_arm < owner_reobservation
@@ -3009,6 +3022,14 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         empty_open,
         "async fn refresh_acknowledgement_with_owner_v2(",
     );
+    let enter_serving_open = braced_declaration(
+        process_serving,
+        "pub(crate) async fn enter_serving_open_v2(",
+    );
+    let serving_refresh = braced_declaration(
+        process_serving,
+        "async fn refresh_acknowledgement_with_ready_v3(",
+    );
     assert!(refresh.contains("refresh.into_ingress_acknowledgement_authority_v2()"));
     assert_eq!(
         refresh
@@ -3020,7 +3041,7 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         .find("let final_observation_started_at = Instant::now()")
         .unwrap();
     let final_observation = refresh
-        .find("exact_reobserve_ingress_acknowledgement_v2(")
+        .find("exact_reobserve_ingress_acknowledgement_until_v3(")
         .unwrap();
     let schedule = refresh
         .find("ingress_acknowledgement_schedule_v2(")
@@ -3047,6 +3068,13 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
         "const CAPABILITY_READINESS_CONTROL_CAPACITY_V2: usize = 1;",
         "const CAPABILITY_READINESS_CADENCE_V2: Duration = Duration::from_secs(1);",
         "const CAPABILITY_READINESS_VERIFY_TIMEOUT_V2: Duration = Duration::from_secs(5);",
+        "const CAPABILITY_READINESS_TRANSIENT_GRACE_V2: Duration = Duration::from_secs(5);",
+        "RuntimeCapabilityReadinessProbeFailureClassV2::Retryable",
+        "RuntimeCapabilityReadinessProbeFailureClassV2::AuthorityLost",
+        "RuntimeCapabilityReadinessProbeFailureClassV2::ProtocolViolation",
+        "retryable_episode_started_at",
+        "capability_readiness_periodic_deadline_v2(",
+        "elapsed >= config.transient_grace",
         "mpsc::channel(CAPABILITY_READINESS_CONTROL_CAPACITY_V2)",
         "tokio::select! {\n        biased;\n        changed = shutdown.changed()",
         "invalidation.invalidate_readiness_v2();",
@@ -3056,12 +3084,41 @@ fn maintenance_ingress_gate_is_counted_linear_fail_closed_and_confined() {
             "capability readiness supervisor: {required}"
         );
     }
-    assert_eq!(
-        capability_readiness_supervisor
-            .matches("invalidation.invalidate_readiness_v2();")
-            .count(),
-        3
-    );
+    assert!(!capability_readiness_supervisor.contains("self.verify_v2().await.is_ok()"));
+    for required in [
+        "const INGRESS_ACKNOWLEDGEMENT_DATABASE_RETRY_DELAY_V3: Duration = Duration::from_millis(25);",
+        "const INGRESS_ACKNOWLEDGEMENT_DATABASE_MAX_ATTEMPTS_V3: usize = 3;",
+        "collect_recovery_resume_database_evidence_until_v3(",
+        "observe_ingress_acknowledgement_predecessor_until_v3(",
+        "exact_reobserve_ingress_acknowledgement_until_v3(",
+        "observe_ingress_acknowledgement_database_until_v3(",
+        "RuntimeIngressOpenAcknowledgementObservationErrorClassV2::Retryable",
+        "RuntimeIngressOpenAcknowledgementObservationErrorClassV2::AuthorityLost",
+        "RuntimeIngressOpenAcknowledgementObservationErrorClassV2::ProtocolViolation",
+    ] {
+        assert!(process_observation.contains(required), "process observation: {required}");
+    }
+    for operation in [
+        "collect_recovery_resume_database_evidence_until_v3(",
+        "observe_ingress_acknowledgement_predecessor_until_v3(",
+    ] {
+        for transition in [
+            enter_empty_open,
+            refresh,
+            enter_serving_open,
+            serving_refresh,
+        ] {
+            assert_eq!(transition.matches(operation).count(), 1, "{operation}");
+        }
+    }
+    for transition in [enter_empty_open, refresh, serving_refresh] {
+        assert_eq!(
+            transition
+                .matches("exact_reobserve_ingress_acknowledgement_until_v3(")
+                .count(),
+            1
+        );
+    }
     for forbidden in [
         "interaction",
         "route",
@@ -4047,6 +4104,28 @@ fn serving_certification_is_linear_supervised_bounded_and_fail_closed() {
         assert!(serving.contains(required), "{required}");
     }
     let orchestration = braced_declaration(certification, "async fn execute_certification_v2(");
+    let preopen_acknowledgement = braced_declaration(
+        certification,
+        "async fn publish_preopen_acknowledgement_v2(",
+    );
+    for helper in [
+        "collect_recovery_resume_database_evidence_until_v3(",
+        "observe_ingress_acknowledgement_predecessor_until_v3(",
+        "exact_reobserve_ingress_acknowledgement_until_v3(",
+    ] {
+        assert_eq!(
+            preopen_acknowledgement.matches(helper).count(),
+            1,
+            "{helper}"
+        );
+    }
+    for forbidden in [
+        "collect_recovery_resume_database_evidence_v2(",
+        ".observe_ingress_open_acknowledgement_predecessor(",
+        "exact_reobserve_ingress_acknowledgement_v2(",
+    ] {
+        assert!(!preopen_acknowledgement.contains(forbidden), "{forbidden}");
+    }
     let ordered = [
         "remove_readiness_v2",
         "begin_close_v2",
@@ -5485,12 +5564,21 @@ fn closed_recovery_composition_is_private_fixed_order_and_non_authorizing() {
         process_observation,
         "async fn collect_recovery_resume_database_evidence_v2(",
     );
+    let bounded_resume_database = braced_declaration(
+        process_observation,
+        "async fn collect_recovery_resume_database_evidence_until_v3(",
+    );
     for method in [
         "verify_readiness_refresh_until_v2",
         "into_exact_capability_receipts",
     ] {
-        assert_eq!(process_observation.matches(method).count(), 1, "{method}");
+        assert_eq!(process_observation.matches(method).count(), 2, "{method}");
         assert_eq!(resume_database.matches(method).count(), 1, "{method}");
+        assert_eq!(
+            bounded_resume_database.matches(method).count(),
+            1,
+            "{method}"
+        );
     }
     for (path, source) in sources.iter().filter(|(path, _)| path.starts_with("src")) {
         for method in [

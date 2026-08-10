@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
+use std::io::Write;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
@@ -7,15 +8,37 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout_at, Instant as TokioInstant, MissedTickBehavior};
 
-use crate::database::RuntimeDatabaseReadinessProbeV2;
+use crate::database::{RuntimeDatabaseCompositionErrorV1, RuntimeDatabaseReadinessProbeV2};
 use crate::process_supervisor::RuntimeProcessInvalidationTriggerV1;
 use crate::RuntimeShutdownCauseV1;
 
 const CAPABILITY_READINESS_CONTROL_CAPACITY_V2: usize = 1;
 const CAPABILITY_READINESS_CADENCE_V2: Duration = Duration::from_secs(1);
 const CAPABILITY_READINESS_VERIFY_TIMEOUT_V2: Duration = Duration::from_secs(5);
+const CAPABILITY_READINESS_TRANSIENT_GRACE_V2: Duration = Duration::from_secs(5);
 
-type RuntimeCapabilityReadinessProbeFutureV2<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+type RuntimeCapabilityReadinessProbeFutureV2<'a> =
+    Pin<Box<dyn Future<Output = RuntimeCapabilityReadinessProbeDispositionV2> + Send + 'a>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeCapabilityReadinessProbeDispositionV2 {
+    Available,
+    Failed(RuntimeCapabilityReadinessProbeFailureV2),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeCapabilityReadinessProbeFailureV2 {
+    class: RuntimeCapabilityReadinessProbeFailureClassV2,
+    code: &'static str,
+    context: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeCapabilityReadinessProbeFailureClassV2 {
+    Retryable,
+    AuthorityLost,
+    ProtocolViolation,
+}
 
 pub(crate) trait RuntimeCapabilityReadinessProbePortV2:
     Clone + Send + Sync + 'static
@@ -25,7 +48,94 @@ pub(crate) trait RuntimeCapabilityReadinessProbePortV2:
 
 impl RuntimeCapabilityReadinessProbePortV2 for RuntimeDatabaseReadinessProbeV2 {
     fn verify_capability_readiness_v2(&self) -> RuntimeCapabilityReadinessProbeFutureV2<'_> {
-        Box::pin(async move { self.verify_v2().await.is_ok() })
+        Box::pin(async move {
+            match self.verify_v2().await {
+                Ok(_) => RuntimeCapabilityReadinessProbeDispositionV2::Available,
+                Err(error) => RuntimeCapabilityReadinessProbeDispositionV2::Failed(
+                    capability_readiness_database_failure_v2(error),
+                ),
+            }
+        })
+    }
+}
+
+fn capability_readiness_database_failure_v2(
+    error: RuntimeDatabaseCompositionErrorV1,
+) -> RuntimeCapabilityReadinessProbeFailureV2 {
+    let class = match error {
+        RuntimeDatabaseCompositionErrorV1::Unavailable { .. }
+        | RuntimeDatabaseCompositionErrorV1::ReadinessUnavailable { .. }
+        | RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut => {
+            RuntimeCapabilityReadinessProbeFailureClassV2::Retryable
+        }
+        RuntimeDatabaseCompositionErrorV1::ReadinessAuthorityMismatch { .. }
+        | RuntimeDatabaseCompositionErrorV1::AuthorityMismatch => {
+            RuntimeCapabilityReadinessProbeFailureClassV2::AuthorityLost
+        }
+        RuntimeDatabaseCompositionErrorV1::InvalidConfiguration
+        | RuntimeDatabaseCompositionErrorV1::ConnectionConfiguration { .. }
+        | RuntimeDatabaseCompositionErrorV1::UnsafeTransport { .. }
+        | RuntimeDatabaseCompositionErrorV1::IdentityVerification
+        | RuntimeDatabaseCompositionErrorV1::ReadinessRejected { .. }
+        | RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut => {
+            RuntimeCapabilityReadinessProbeFailureClassV2::ProtocolViolation
+        }
+    };
+    RuntimeCapabilityReadinessProbeFailureV2 {
+        class,
+        code: error.code(),
+        context: error.context(),
+    }
+}
+
+fn capability_readiness_timeout_failure_v2() -> RuntimeCapabilityReadinessProbeFailureV2 {
+    RuntimeCapabilityReadinessProbeFailureV2 {
+        class: RuntimeCapabilityReadinessProbeFailureClassV2::Retryable,
+        code: "runtime_capability_readiness_probe_timed_out",
+        context: None,
+    }
+}
+
+fn capability_readiness_periodic_deadline_v2(
+    attempt_started_at: Instant,
+    verify_timeout: Duration,
+    retryable_episode_started_at: Option<Instant>,
+    transient_grace: Duration,
+) -> Instant {
+    let verify_deadline = attempt_started_at + verify_timeout;
+    retryable_episode_started_at
+        .map(|started_at| started_at + transient_grace)
+        .map_or(verify_deadline, |episode_deadline| {
+            verify_deadline.min(episode_deadline)
+        })
+}
+
+fn emit_capability_readiness_status_v2(
+    status: &'static str,
+    failure: RuntimeCapabilityReadinessProbeFailureV2,
+    attempts: u64,
+    elapsed: Duration,
+) {
+    let mut stderr = std::io::stderr().lock();
+    if let Some(context) = failure.context {
+        let _write_result = writeln!(
+            stderr,
+            "starring_runtime_status={status} component=capability_readiness stage=periodic class={:?} code={} context={} attempts={} elapsed_milliseconds={}",
+            failure.class,
+            failure.code,
+            context,
+            attempts,
+            elapsed.as_millis(),
+        );
+    } else {
+        let _write_result = writeln!(
+            stderr,
+            "starring_runtime_status={status} component=capability_readiness stage=periodic class={:?} code={} attempts={} elapsed_milliseconds={}",
+            failure.class,
+            failure.code,
+            attempts,
+            elapsed.as_millis(),
+        );
     }
 }
 
@@ -45,6 +155,7 @@ impl RuntimeCapabilityReadinessInvalidationPortV2 for RuntimeProcessInvalidation
 struct RuntimeCapabilityReadinessSupervisorConfigV2 {
     cadence: Duration,
     verify_timeout: Duration,
+    transient_grace: Duration,
 }
 
 impl RuntimeCapabilityReadinessSupervisorConfigV2 {
@@ -52,6 +163,7 @@ impl RuntimeCapabilityReadinessSupervisorConfigV2 {
         Self {
             cadence: CAPABILITY_READINESS_CADENCE_V2,
             verify_timeout: CAPABILITY_READINESS_VERIFY_TIMEOUT_V2,
+            transient_grace: CAPABILITY_READINESS_TRANSIENT_GRACE_V2,
         }
     }
 }
@@ -382,7 +494,7 @@ impl<P> Debug for RuntimeCapabilityReadinessSupervisorV2<P> {
 
 enum RuntimeCapabilityReadinessProbeAttemptV2 {
     Available,
-    Unavailable,
+    Failed(RuntimeCapabilityReadinessProbeFailureV2),
     TimedOut,
     Shutdown,
 }
@@ -398,6 +510,9 @@ where
     if shutdown.borrow().is_some() {
         return RuntimeCapabilityReadinessProbeAttemptV2::Shutdown;
     }
+    if Instant::now() >= deadline {
+        return RuntimeCapabilityReadinessProbeAttemptV2::TimedOut;
+    }
     let verification = timeout_at(
         TokioInstant::from_std(deadline),
         probe.verify_capability_readiness_v2(),
@@ -411,8 +526,12 @@ where
         }
         result = &mut verification => {
             match result {
-                Ok(true) => RuntimeCapabilityReadinessProbeAttemptV2::Available,
-                Ok(false) => RuntimeCapabilityReadinessProbeAttemptV2::Unavailable,
+                Ok(RuntimeCapabilityReadinessProbeDispositionV2::Available) => {
+                    RuntimeCapabilityReadinessProbeAttemptV2::Available
+                }
+                Ok(RuntimeCapabilityReadinessProbeDispositionV2::Failed(failure)) => {
+                    RuntimeCapabilityReadinessProbeAttemptV2::Failed(failure)
+                }
                 Err(_) => RuntimeCapabilityReadinessProbeAttemptV2::TimedOut,
             }
         }
@@ -450,7 +569,7 @@ where
         RuntimeCapabilityReadinessProbeAttemptV2::Available => {
             let _delivered = request.response.send(Ok(())).is_ok();
         }
-        RuntimeCapabilityReadinessProbeAttemptV2::Unavailable => {
+        RuntimeCapabilityReadinessProbeAttemptV2::Failed(_) => {
             invalidation.invalidate_readiness_v2();
             let _delivered = request
                 .response
@@ -481,6 +600,9 @@ where
     let mut cadence =
         tokio::time::interval_at(TokioInstant::now() + config.cadence, config.cadence);
     cadence.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut retryable_episode_started_at = None;
+    let mut retryable_attempts = 0u64;
+    let mut retryable_failure = None;
     loop {
         tokio::select! {
             biased;
@@ -490,11 +612,91 @@ where
             }
             _ = cadence.tick() => {}
         }
-        let deadline = Instant::now() + config.verify_timeout;
-        match verify_capability_readiness_until_v2(&request.probe, &mut shutdown, deadline).await {
-            RuntimeCapabilityReadinessProbeAttemptV2::Available => {}
-            RuntimeCapabilityReadinessProbeAttemptV2::Unavailable
-            | RuntimeCapabilityReadinessProbeAttemptV2::TimedOut => {
+        let attempt_started_at = Instant::now();
+        if let (Some(started_at), Some(failure)) = (retryable_episode_started_at, retryable_failure)
+        {
+            let elapsed = attempt_started_at.saturating_duration_since(started_at);
+            if elapsed >= config.transient_grace {
+                emit_capability_readiness_status_v2(
+                    "runtime_capability_readiness_retry_exhausted",
+                    failure,
+                    retryable_attempts,
+                    elapsed,
+                );
+                invalidation.invalidate_readiness_v2();
+                return RuntimeCapabilityReadinessSupervisorExitV2::ReadinessLost;
+            }
+        }
+        let deadline = capability_readiness_periodic_deadline_v2(
+            attempt_started_at,
+            config.verify_timeout,
+            retryable_episode_started_at,
+            config.transient_grace,
+        );
+        let result =
+            verify_capability_readiness_until_v2(&request.probe, &mut shutdown, deadline).await;
+        match result {
+            RuntimeCapabilityReadinessProbeAttemptV2::Available => {
+                if let (Some(started_at), Some(failure)) = (
+                    retryable_episode_started_at.take(),
+                    retryable_failure.take(),
+                ) {
+                    emit_capability_readiness_status_v2(
+                        "runtime_capability_readiness_recovered",
+                        failure,
+                        retryable_attempts,
+                        Instant::now().saturating_duration_since(started_at),
+                    );
+                }
+                retryable_attempts = 0;
+            }
+            RuntimeCapabilityReadinessProbeAttemptV2::Failed(failure)
+                if failure.class == RuntimeCapabilityReadinessProbeFailureClassV2::Retryable =>
+            {
+                let started_at = *retryable_episode_started_at.get_or_insert(attempt_started_at);
+                retryable_attempts = retryable_attempts.saturating_add(1);
+                retryable_failure = Some(failure);
+                let elapsed = Instant::now().saturating_duration_since(started_at);
+                if retryable_attempts == 1 {
+                    emit_capability_readiness_status_v2(
+                        "runtime_capability_readiness_retrying",
+                        failure,
+                        retryable_attempts,
+                        elapsed,
+                    );
+                }
+                if elapsed >= config.transient_grace {
+                    emit_capability_readiness_status_v2(
+                        "runtime_capability_readiness_retry_exhausted",
+                        failure,
+                        retryable_attempts,
+                        elapsed,
+                    );
+                    invalidation.invalidate_readiness_v2();
+                    return RuntimeCapabilityReadinessSupervisorExitV2::ReadinessLost;
+                }
+            }
+            RuntimeCapabilityReadinessProbeAttemptV2::Failed(failure) => {
+                emit_capability_readiness_status_v2(
+                    "runtime_capability_readiness_terminal",
+                    failure,
+                    1,
+                    Instant::now().saturating_duration_since(attempt_started_at),
+                );
+                invalidation.invalidate_readiness_v2();
+                return RuntimeCapabilityReadinessSupervisorExitV2::ReadinessLost;
+            }
+            RuntimeCapabilityReadinessProbeAttemptV2::TimedOut => {
+                let failure = capability_readiness_timeout_failure_v2();
+                let started_at = *retryable_episode_started_at.get_or_insert(attempt_started_at);
+                retryable_attempts = retryable_attempts.saturating_add(1);
+                let elapsed = Instant::now().saturating_duration_since(started_at);
+                emit_capability_readiness_status_v2(
+                    "runtime_capability_readiness_retry_exhausted",
+                    failure,
+                    retryable_attempts,
+                    elapsed,
+                );
                 invalidation.invalidate_readiness_v2();
                 return RuntimeCapabilityReadinessSupervisorExitV2::ReadinessLost;
             }
@@ -522,7 +724,8 @@ mod tests {
 
     struct FakeProbeStateV2 {
         calls: AtomicUsize,
-        outcomes: Mutex<VecDeque<bool>>,
+        completions: AtomicUsize,
+        outcomes: Mutex<VecDeque<RuntimeCapabilityReadinessProbeDispositionV2>>,
         permits: Semaphore,
     }
 
@@ -531,13 +734,14 @@ mod tests {
             Self {
                 state: Arc::new(FakeProbeStateV2 {
                     calls: AtomicUsize::new(0),
+                    completions: AtomicUsize::new(0),
                     outcomes: Mutex::new(VecDeque::new()),
                     permits: Semaphore::new(0),
                 }),
             }
         }
 
-        fn release_v2(&self, outcome: bool) {
+        fn release_v2(&self, outcome: RuntimeCapabilityReadinessProbeDispositionV2) {
             self.state
                 .outcomes
                 .lock()
@@ -548,6 +752,10 @@ mod tests {
 
         fn calls_v2(&self) -> usize {
             self.state.calls.load(Ordering::Acquire)
+        }
+
+        fn completions_v2(&self) -> usize {
+            self.state.completions.load(Ordering::Acquire)
         }
     }
 
@@ -562,12 +770,15 @@ mod tests {
                     .await
                     .expect("fake probe permit");
                 permit.forget();
-                self.state
+                let outcome = self
+                    .state
                     .outcomes
                     .lock()
                     .expect("fake probe outcomes")
                     .pop_front()
-                    .expect("fake probe outcome")
+                    .expect("fake probe outcome");
+                self.state.completions.fetch_add(1, Ordering::AcqRel);
+                outcome
             })
         }
     }
@@ -599,7 +810,20 @@ mod tests {
         RuntimeCapabilityReadinessSupervisorConfigV2 {
             cadence: Duration::from_millis(10),
             verify_timeout: Duration::from_millis(40),
+            transient_grace: Duration::from_millis(20),
         }
+    }
+
+    fn fake_failure_v2(
+        class: RuntimeCapabilityReadinessProbeFailureClassV2,
+    ) -> RuntimeCapabilityReadinessProbeDispositionV2 {
+        RuntimeCapabilityReadinessProbeDispositionV2::Failed(
+            RuntimeCapabilityReadinessProbeFailureV2 {
+                class,
+                code: "fake_capability_readiness_failure",
+                context: Some("fake"),
+            },
+        )
     }
 
     async fn wait_for_calls_v2(probe: &FakeProbeV2, expected: usize) {
@@ -610,6 +834,75 @@ mod tests {
         })
         .await
         .expect("fake probe calls");
+    }
+
+    async fn wait_for_completions_v2(probe: &FakeProbeV2, expected: usize) {
+        timeout_at(TokioInstant::now() + Duration::from_secs(1), async {
+            while probe.completions_v2() < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fake probe completions");
+    }
+
+    #[test]
+    fn database_probe_failures_preserve_retry_authority_and_protocol_classes() {
+        use crate::DatabaseCapabilityV1;
+
+        let capability = DatabaseCapabilityV1::Serving;
+        let cases = [
+            (
+                RuntimeDatabaseCompositionErrorV1::Unavailable { capability },
+                RuntimeCapabilityReadinessProbeFailureClassV2::Retryable,
+            ),
+            (
+                RuntimeDatabaseCompositionErrorV1::ReadinessUnavailable { capability },
+                RuntimeCapabilityReadinessProbeFailureClassV2::Retryable,
+            ),
+            (
+                RuntimeDatabaseCompositionErrorV1::ReadinessTimedOut,
+                RuntimeCapabilityReadinessProbeFailureClassV2::Retryable,
+            ),
+            (
+                RuntimeDatabaseCompositionErrorV1::ReadinessAuthorityMismatch { capability },
+                RuntimeCapabilityReadinessProbeFailureClassV2::AuthorityLost,
+            ),
+            (
+                RuntimeDatabaseCompositionErrorV1::AuthorityMismatch,
+                RuntimeCapabilityReadinessProbeFailureClassV2::AuthorityLost,
+            ),
+            (
+                RuntimeDatabaseCompositionErrorV1::InvalidConfiguration,
+                RuntimeCapabilityReadinessProbeFailureClassV2::ProtocolViolation,
+            ),
+            (
+                RuntimeDatabaseCompositionErrorV1::ConnectionConfiguration { capability },
+                RuntimeCapabilityReadinessProbeFailureClassV2::ProtocolViolation,
+            ),
+            (
+                RuntimeDatabaseCompositionErrorV1::UnsafeTransport { capability },
+                RuntimeCapabilityReadinessProbeFailureClassV2::ProtocolViolation,
+            ),
+            (
+                RuntimeDatabaseCompositionErrorV1::IdentityVerification,
+                RuntimeCapabilityReadinessProbeFailureClassV2::ProtocolViolation,
+            ),
+            (
+                RuntimeDatabaseCompositionErrorV1::ReadinessRejected { capability },
+                RuntimeCapabilityReadinessProbeFailureClassV2::ProtocolViolation,
+            ),
+            (
+                RuntimeDatabaseCompositionErrorV1::StartupCleanupTimedOut,
+                RuntimeCapabilityReadinessProbeFailureClassV2::ProtocolViolation,
+            ),
+        ];
+        for (error, class) in cases {
+            let failure = capability_readiness_database_failure_v2(error);
+            assert_eq!(failure.class, class);
+            assert_eq!(failure.code, error.code());
+            assert_eq!(failure.context, error.context());
+        }
     }
 
     #[tokio::test]
@@ -627,9 +920,11 @@ mod tests {
         wait_for_calls_v2(&probe, 1).await;
         activation_task.abort();
         let _joined = activation_task.await;
-        probe.release_v2(true);
+        probe.release_v2(RuntimeCapabilityReadinessProbeDispositionV2::Available);
         wait_for_calls_v2(&probe, 2).await;
-        probe.release_v2(false);
+        probe.release_v2(fake_failure_v2(
+            RuntimeCapabilityReadinessProbeFailureClassV2::ProtocolViolation,
+        ));
         let exit = supervisor.terminal_observer_v2().wait_v2().await;
         assert_eq!(
             exit,
@@ -654,7 +949,9 @@ mod tests {
         supervisor
             .shutdown_handle_v2()
             .seal_until_v2(Instant::now() + Duration::from_secs(1));
-        probe.release_v2(false);
+        probe.release_v2(fake_failure_v2(
+            RuntimeCapabilityReadinessProbeFailureClassV2::ProtocolViolation,
+        ));
         let activation_result = activation_task.await.expect("activation task");
         assert_eq!(
             activation_result,
@@ -675,7 +972,7 @@ mod tests {
             invalidation.clone(),
             test_config_v2(),
         );
-        probe.release_v2(true);
+        probe.release_v2(RuntimeCapabilityReadinessProbeDispositionV2::Available);
         supervisor
             .activate_until_v2(probe.clone(), Instant::now() + Duration::from_secs(1))
             .await
@@ -684,7 +981,9 @@ mod tests {
         supervisor
             .shutdown_handle_v2()
             .seal_until_v2(Instant::now() + Duration::from_secs(1));
-        probe.release_v2(false);
+        probe.release_v2(fake_failure_v2(
+            RuntimeCapabilityReadinessProbeFailureClassV2::ProtocolViolation,
+        ));
         let exit = supervisor
             .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
             .await;
@@ -700,7 +999,7 @@ mod tests {
             invalidation.clone(),
             test_config_v2(),
         );
-        probe.release_v2(true);
+        probe.release_v2(RuntimeCapabilityReadinessProbeDispositionV2::Available);
         supervisor
             .activate_until_v2(probe.clone(), Instant::now() + Duration::from_secs(1))
             .await
@@ -715,15 +1014,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_periodic_failure_has_no_retry_grace() {
+    async fn periodic_retryable_failure_recovers_without_invalidation() {
         let probe = FakeProbeV2::new();
         let invalidation = FakeInvalidationV2::new();
         let mut supervisor = RuntimeCapabilityReadinessSupervisorV2::start_dormant_with_config_v2(
             invalidation.clone(),
             test_config_v2(),
         );
-        probe.release_v2(true);
-        probe.release_v2(false);
+        probe.release_v2(RuntimeCapabilityReadinessProbeDispositionV2::Available);
+        probe.release_v2(fake_failure_v2(
+            RuntimeCapabilityReadinessProbeFailureClassV2::Retryable,
+        ));
+        probe.release_v2(RuntimeCapabilityReadinessProbeDispositionV2::Available);
+        supervisor
+            .activate_until_v2(probe.clone(), Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("activation");
+        wait_for_completions_v2(&probe, 3).await;
+        assert_eq!(invalidation.count_v2(), 0);
+        let exit = supervisor
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert_eq!(exit, RuntimeCapabilityReadinessSupervisorExitV2::Commanded);
+    }
+
+    #[tokio::test]
+    async fn periodic_success_resets_the_retryable_episode() {
+        let probe = FakeProbeV2::new();
+        let invalidation = FakeInvalidationV2::new();
+        let mut supervisor = RuntimeCapabilityReadinessSupervisorV2::start_dormant_with_config_v2(
+            invalidation.clone(),
+            test_config_v2(),
+        );
+        for outcome in [
+            RuntimeCapabilityReadinessProbeDispositionV2::Available,
+            fake_failure_v2(RuntimeCapabilityReadinessProbeFailureClassV2::Retryable),
+            RuntimeCapabilityReadinessProbeDispositionV2::Available,
+            fake_failure_v2(RuntimeCapabilityReadinessProbeFailureClassV2::Retryable),
+            RuntimeCapabilityReadinessProbeDispositionV2::Available,
+        ] {
+            probe.release_v2(outcome);
+        }
+        supervisor
+            .activate_until_v2(probe.clone(), Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("activation");
+        wait_for_completions_v2(&probe, 5).await;
+        assert_eq!(invalidation.count_v2(), 0);
+        let exit = supervisor
+            .shutdown_until_v2(Instant::now() + Duration::from_secs(1))
+            .await;
+        assert_eq!(exit, RuntimeCapabilityReadinessSupervisorExitV2::Commanded);
+    }
+
+    #[tokio::test]
+    async fn periodic_retryable_exhaustion_invalidates_once() {
+        let probe = FakeProbeV2::new();
+        let invalidation = FakeInvalidationV2::new();
+        let mut config = test_config_v2();
+        config.cadence = Duration::from_millis(20);
+        config.transient_grace = Duration::from_millis(5);
+        let mut supervisor = RuntimeCapabilityReadinessSupervisorV2::start_dormant_with_config_v2(
+            invalidation.clone(),
+            config,
+        );
+        probe.release_v2(RuntimeCapabilityReadinessProbeDispositionV2::Available);
+        probe.release_v2(fake_failure_v2(
+            RuntimeCapabilityReadinessProbeFailureClassV2::Retryable,
+        ));
         supervisor
             .activate_until_v2(probe.clone(), Instant::now() + Duration::from_secs(1))
             .await
@@ -733,9 +1091,38 @@ mod tests {
             exit,
             RuntimeCapabilityReadinessSupervisorExitV2::ReadinessLost
         );
-        tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(probe.calls_v2(), 2);
+        assert_eq!(probe.completions_v2(), 2);
         assert_eq!(invalidation.count_v2(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_periodic_failure_has_no_retry_grace() {
+        for class in [
+            RuntimeCapabilityReadinessProbeFailureClassV2::AuthorityLost,
+            RuntimeCapabilityReadinessProbeFailureClassV2::ProtocolViolation,
+        ] {
+            let probe = FakeProbeV2::new();
+            let invalidation = FakeInvalidationV2::new();
+            let mut supervisor =
+                RuntimeCapabilityReadinessSupervisorV2::start_dormant_with_config_v2(
+                    invalidation.clone(),
+                    test_config_v2(),
+                );
+            probe.release_v2(RuntimeCapabilityReadinessProbeDispositionV2::Available);
+            probe.release_v2(fake_failure_v2(class));
+            supervisor
+                .activate_until_v2(probe.clone(), Instant::now() + Duration::from_secs(1))
+                .await
+                .expect("activation");
+            let exit = supervisor.terminal_observer_v2().wait_v2().await;
+            assert_eq!(
+                exit,
+                RuntimeCapabilityReadinessSupervisorExitV2::ReadinessLost
+            );
+            assert_eq!(probe.calls_v2(), 2);
+            assert_eq!(invalidation.count_v2(), 1);
+        }
     }
 
     #[tokio::test]
@@ -763,14 +1150,40 @@ mod tests {
     }
 
     #[test]
-    fn production_contract_is_one_second_by_five_seconds() {
+    fn production_contract_is_one_second_by_five_seconds_with_bounded_transient_grace() {
         assert_eq!(CAPABILITY_READINESS_CONTROL_CAPACITY_V2, 1);
         assert_eq!(
             RuntimeCapabilityReadinessSupervisorConfigV2::production_v2(),
             RuntimeCapabilityReadinessSupervisorConfigV2 {
                 cadence: Duration::from_secs(1),
                 verify_timeout: Duration::from_secs(5),
+                transient_grace: Duration::from_secs(5),
             }
+        );
+    }
+
+    #[test]
+    fn periodic_probe_deadline_never_exceeds_the_retryable_episode_grace() {
+        let started_at = Instant::now();
+        let retry_started_at = started_at + Duration::from_secs(1);
+        let retry_attempt_started_at = started_at + Duration::from_secs(4);
+        assert_eq!(
+            capability_readiness_periodic_deadline_v2(
+                retry_attempt_started_at,
+                Duration::from_secs(5),
+                Some(retry_started_at),
+                Duration::from_secs(5),
+            ),
+            started_at + Duration::from_secs(6)
+        );
+        assert_eq!(
+            capability_readiness_periodic_deadline_v2(
+                retry_attempt_started_at,
+                Duration::from_secs(1),
+                Some(retry_started_at),
+                Duration::from_secs(5),
+            ),
+            started_at + Duration::from_secs(5)
         );
     }
 
