@@ -122,6 +122,14 @@ class D2EvidenceTest(unittest.TestCase):
             "6331228ee20481970db9de58c384c5393dfd8b95f90826b495dba79c10c30ba2",
         )
         self.assertEqual(
+            MODULE.canonical_route_lineage_sha256(route),
+            "c14ffb360c6b51ae1cd67f3ba6dd3b0ed672d8f6cb6134a717a034c26612b69a",
+        )
+        self.assertEqual(
+            MODULE.canonical_serving_lease_sha256(serving),
+            "519fcaf7fb2d34311f9a6d43b174732290e0e1199c9b9e38f89cfbf6ccdb64d6",
+        )
+        self.assertEqual(
             MODULE.canonical_effect_identity_sha256(effect),
             "ffd64eff508caa4add5553394011dac57fe0a7126cbc21b9a476444b6d761d7a",
         )
@@ -140,12 +148,93 @@ class D2EvidenceTest(unittest.TestCase):
             len(
                 {
                     MODULE.canonical_route_identity_sha256(route),
+                    MODULE.canonical_route_lineage_sha256(route),
                     MODULE.canonical_serving_identity_sha256(serving),
+                    MODULE.canonical_serving_lease_sha256(serving),
                     MODULE.canonical_effect_identity_sha256(effect),
                 }
             ),
-            3,
+            5,
         )
+
+    def test_temporal_identity_digests_ignore_only_renewal_revisions(self):
+        self.assertEqual(
+            set(MODULE.ROUTE_LINEAGE_FIELDS),
+            set(MODULE.ROUTE_IDENTITY_FIELDS) - set(MODULE.ROUTE_RENEWAL_FIELDS),
+        )
+        self.assertEqual(
+            set(MODULE.SERVING_LEASE_FIELDS),
+            set(MODULE.SERVING_IDENTITY_FIELDS) - {"revision"},
+        )
+        route = route_identity()
+        advanced_route = copy.deepcopy(route)
+        advanced_route["origin_serving_revision"] += 11
+        advanced_route["origin_gateway_owner_revision"] += 17
+        self.assertNotEqual(
+            MODULE.canonical_route_identity_sha256(route),
+            MODULE.canonical_route_identity_sha256(advanced_route),
+        )
+        self.assertEqual(
+            MODULE.canonical_route_lineage_sha256(route),
+            MODULE.canonical_route_lineage_sha256(advanced_route),
+        )
+        route_drift = {
+            "deployment_id": "deployment-2",
+            "runtime_generation": route["runtime_generation"] + 1,
+            "route_controller_fencing_token": route[
+                "route_controller_fencing_token"
+            ]
+            + 1,
+            "route_incarnation": route["route_incarnation"] + 1,
+            "origin_process_instance_id": PROCESS_OLD,
+            "origin_serving_lease_epoch": route["origin_serving_lease_epoch"]
+            + 1,
+            "origin_gateway_shard_id": "shard-1",
+            "origin_gateway_owner_lease_epoch": route[
+                "origin_gateway_owner_lease_epoch"
+            ]
+            + 1,
+        }
+        for field, value in route_drift.items():
+            with self.subTest(field=field):
+                changed = copy.deepcopy(route)
+                changed[field] = value
+                self.assertNotEqual(
+                    MODULE.canonical_route_lineage_sha256(route),
+                    MODULE.canonical_route_lineage_sha256(changed),
+                )
+        for field in (
+            "origin_serving_revision",
+            "origin_gateway_owner_revision",
+        ):
+            with self.subTest(invalid_counter=field), self.assertRaises(
+                MODULE.EvidenceContractError
+            ):
+                invalid = copy.deepcopy(route)
+                invalid[field] = 0
+                MODULE.canonical_route_lineage_sha256(invalid)
+
+        serving = serving_identity()
+        advanced_serving = copy.deepcopy(serving)
+        advanced_serving["revision"] += 23
+        self.assertNotEqual(
+            MODULE.canonical_serving_identity_sha256(serving),
+            MODULE.canonical_serving_identity_sha256(advanced_serving),
+        )
+        self.assertEqual(
+            MODULE.canonical_serving_lease_sha256(serving),
+            MODULE.canonical_serving_lease_sha256(advanced_serving),
+        )
+        changed_serving = copy.deepcopy(serving)
+        changed_serving["lease_epoch"] += 1
+        self.assertNotEqual(
+            MODULE.canonical_serving_lease_sha256(serving),
+            MODULE.canonical_serving_lease_sha256(changed_serving),
+        )
+        invalid_serving = copy.deepcopy(serving)
+        invalid_serving["revision"] = 0
+        with self.assertRaises(MODULE.EvidenceContractError):
+            MODULE.canonical_serving_lease_sha256(invalid_serving)
 
     def test_canonical_identity_rejects_shape_and_type_drift(self):
         invalid_route = route_identity()
@@ -156,7 +245,9 @@ class D2EvidenceTest(unittest.TestCase):
         invalid_effect["action_index"] = 256
         for function, value in (
             (MODULE.canonical_route_identity_sha256, invalid_route),
+            (MODULE.canonical_route_lineage_sha256, invalid_route),
             (MODULE.canonical_serving_identity_sha256, invalid_serving),
+            (MODULE.canonical_serving_lease_sha256, invalid_serving),
             (MODULE.canonical_effect_identity_sha256, invalid_effect),
         ):
             with self.subTest(function=function.__name__), self.assertRaises(
@@ -240,11 +331,16 @@ class D2EvidenceTest(unittest.TestCase):
             serving_identity=serving_identity(),
         )
         evidence = MODULE.assemble_live_evidence(browser, database)
-        self.assertEqual(evidence["route_id"], MODULE.canonical_route_identity_sha256(route_identity()))
+        self.assertEqual(
+            evidence["route_id"],
+            MODULE.canonical_route_lineage_sha256(route_identity()),
+        )
         self.assertEqual(
             evidence["serving_lease_id"],
-            MODULE.canonical_serving_identity_sha256(serving_identity()),
+            MODULE.canonical_serving_lease_sha256(serving_identity()),
         )
+        self.assertEqual(evidence["route_serving_revision"], 1)
+        self.assertEqual(evidence["route_gateway_owner_revision"], 7)
         self.assertEqual(evidence["deployment_revision"], 11)
         self.assertEqual(evidence["convergence_attempt"], 1)
         self.assertEqual(evidence["process_instance_id"], PROCESS_NEW)
@@ -499,6 +595,9 @@ class D2EvidenceTest(unittest.TestCase):
                     MODULE.assemble_decision_evidence(boolean_integer)
 
     def test_interaction_adapter_joins_database_and_transport_resources(self):
+        interaction_route = route_identity()
+        interaction_route["origin_serving_revision"] = 12
+        interaction_route["origin_gateway_owner_revision"] = 34
         database = envelope(
             "starring.d2.db-interaction-evidence.v1",
             create_interaction_id="1532677575736819845",
@@ -506,7 +605,7 @@ class D2EvidenceTest(unittest.TestCase):
             actor_user_id="1056857223529250906",
             joined_role_id="1532677575736819847",
             deployment_id="deployment-1",
-            route_identity=route_identity(),
+            route_identity=interaction_route,
             instance_id="instance-1",
             role_ids=["1532677575736819847"],
             channel_ids=["1532677575736819848"],
@@ -528,7 +627,12 @@ class D2EvidenceTest(unittest.TestCase):
             transport_instance_id="d2ti-0123456789abcdef0123456789abcdef",
         )
         evidence = MODULE.assemble_interaction_evidence(database, transport)
-        self.assertEqual(evidence["route_id"], MODULE.canonical_route_identity_sha256(route_identity()))
+        self.assertEqual(
+            evidence["route_id"],
+            MODULE.canonical_route_lineage_sha256(route_identity()),
+        )
+        self.assertEqual(evidence["route_serving_revision"], 12)
+        self.assertEqual(evidence["route_gateway_owner_revision"], 34)
         drifted = copy.deepcopy(transport)
         drifted["role_ids"] = ["1532677575736819852"]
         with self.assertRaisesRegex(MODULE.EvidenceContractError, "interaction_role_ids_mismatch"):
@@ -704,12 +808,25 @@ class D2EvidenceTest(unittest.TestCase):
             evidence["source_serving_lease_id"],
             evidence["reconstructed_serving_lease_id"],
         )
+        self.assertEqual(evidence["source_route_serving_revision"], 1)
+        self.assertEqual(evidence["source_route_gateway_owner_revision"], 7)
+        self.assertEqual(evidence["reconstructed_route_serving_revision"], 2)
+        self.assertEqual(
+            evidence["reconstructed_route_gateway_owner_revision"], 7
+        )
         unrotated = copy.deepcopy(database)
         unrotated["reconstructed_route_identity"] = copy.deepcopy(
             unrotated["source_route_identity"]
         )
         with self.assertRaises(MODULE.EvidenceContractError):
             MODULE.assemble_reconstruction_evidence(unrotated)
+        mismatched = copy.deepcopy(database)
+        mismatched["source_serving_identity"]["revision"] += 1
+        with self.assertRaisesRegex(
+            MODULE.EvidenceContractError,
+            "reconstruction_route_serving_identity_mismatch",
+        ):
+            MODULE.assemble_reconstruction_evidence(mismatched)
 
     def test_reconciliation_adapter_requires_fault_and_durable_witnesses(self):
         interaction_id = "1532677575736819850"
@@ -753,6 +870,8 @@ class D2EvidenceTest(unittest.TestCase):
         self.assertEqual(evidence["reconciliation_state"], "known_success")
         self.assertEqual(evidence["output_role_id"], "1532677575736819852")
         self.assertEqual(evidence["reconciliation_inventory_digest_sha256"], "b" * 64)
+        self.assertEqual(evidence["route_serving_revision"], 1)
+        self.assertEqual(evidence["route_gateway_owner_revision"], 7)
         unsafe = copy.deepcopy(database)
         unsafe["unsafe_deletion_count"] = 1
         with self.assertRaisesRegex(MODULE.EvidenceContractError, "reconciliation_safety_invalid"):

@@ -94,6 +94,8 @@ class D2RunCoordinatorTest(unittest.TestCase):
                 1,
                 1,
                 1,
+                final["route_serving_revision"],
+                final["route_gateway_owner_revision"],
             ),
             instance_id=final["instance_id"],
             role_ids=final["role_ids"],
@@ -178,6 +180,8 @@ class D2RunCoordinatorTest(unittest.TestCase):
                 1,
                 1,
                 1,
+                final["route_serving_revision"],
+                final["route_gateway_owner_revision"],
             ),
             serving_identity={
                 **test_d2_certification.serving_identity(
@@ -185,6 +189,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
                     test_d2_certification.PROCESS_INSTANCE_OLD,
                     1,
                     1,
+                    final["route_serving_revision"],
                 ),
                 "installation_id": final["installation_id"],
             },
@@ -1251,7 +1256,7 @@ class D2RunCoordinatorTest(unittest.TestCase):
         self.assertEqual(result["disposition"], "created")
         expected = dict(self.complete[8])
         expected["serving_lease_id"] = (
-            d2_evidence.canonical_serving_identity_sha256(
+            d2_evidence.canonical_serving_lease_sha256(
                 database["serving_identity"]
             )
         )
@@ -1295,6 +1300,23 @@ class D2RunCoordinatorTest(unittest.TestCase):
     def test_step_nine_binds_visible_join_to_durable_actor_role_and_resources(self):
         self.append_prior(8)
         database, transport, browser = self.step_nine_sources()
+        _, live_database = self.step_eight_sources()
+        self.assertNotEqual(
+            d2_evidence.canonical_route_identity_sha256(
+                live_database["route_identity"]
+            ),
+            d2_evidence.canonical_route_identity_sha256(
+                database["route_identity"]
+            ),
+        )
+        self.assertEqual(
+            d2_evidence.canonical_route_lineage_sha256(
+                live_database["route_identity"]
+            ),
+            d2_evidence.canonical_route_lineage_sha256(
+                database["route_identity"]
+            ),
+        )
         result = d2_run.advance_certification(
             self.manifest_path,
             9,
@@ -1335,6 +1357,67 @@ class D2RunCoordinatorTest(unittest.TestCase):
                         self.manifest_digest,
                     )
 
+    def test_step_twelve_binds_advanced_source_to_rotated_reconstruction(self):
+        self.append_prior(11)
+        final = self.complete[12]
+        database = self.envelope(
+            "starring.d2.db-reconstruction-evidence.v1",
+            route_reconstructed=True,
+            instance_reconstructed=True,
+            deployment_id=final["deployment_id"],
+            source_route_identity=test_d2_certification.route_identity(
+                "deployment-1",
+                test_d2_certification.PROCESS_INSTANCE_OLD,
+                1,
+                1,
+                1,
+                final["source_route_serving_revision"],
+                final["source_route_gateway_owner_revision"],
+            ),
+            reconstructed_route_identity=test_d2_certification.route_identity(
+                "deployment-1",
+                test_d2_certification.PROCESS_INSTANCE_NEW,
+                1,
+                2,
+                2,
+                final["reconstructed_route_serving_revision"],
+                final["reconstructed_route_gateway_owner_revision"],
+                serving_lease_epoch=2,
+                gateway_owner_lease_epoch=2,
+            ),
+            source_serving_identity={
+                **test_d2_certification.serving_identity(
+                    "deployment-1",
+                    test_d2_certification.PROCESS_INSTANCE_OLD,
+                    1,
+                    1,
+                    final["source_route_serving_revision"],
+                ),
+                "installation_id": self.complete[8]["installation_id"],
+            },
+            reconstructed_serving_identity={
+                **test_d2_certification.serving_identity(
+                    "deployment-1",
+                    test_d2_certification.PROCESS_INSTANCE_NEW,
+                    1,
+                    2,
+                    final["reconstructed_route_serving_revision"],
+                ),
+                "installation_id": self.complete[8]["installation_id"],
+            },
+            instance_id=final["instance_id"],
+            pinned_ruleset_digest=final["pinned_ruleset_digest"],
+            probe_interaction_id=final["probe_interaction_id"],
+            process_instance_id=final["process_instance_id"],
+        )
+        result = d2_run.advance_certification(
+            self.manifest_path,
+            12,
+            [str(self.write_source(database))],
+        )
+        self.assertEqual(result["disposition"], "created")
+        self.assertEqual(self.receipts()[11]["evidence"], final)
+
     def test_step_thirteen_correlates_database_effect_with_transport_digest(self):
         self.append_prior(12)
         interaction_id = "1532677575736819850"
@@ -1354,6 +1437,10 @@ class D2RunCoordinatorTest(unittest.TestCase):
                 1,
                 2,
                 2,
+                self.complete[13]["route_serving_revision"],
+                self.complete[13]["route_gateway_owner_revision"],
+                serving_lease_epoch=2,
+                gateway_owner_lease_epoch=2,
             ),
             output_role_id=output_role_id,
             reconciliation_state="known_success",
@@ -1430,6 +1517,74 @@ class D2RunCoordinatorTest(unittest.TestCase):
                 self.manifest,
                 self.manifest_digest,
             )
+
+    def test_step_fourteen_accepts_initial_attestation_revisions_by_lineage(self):
+        self.append_prior(13)
+        final = self.complete[14]
+        browser = self.envelope(
+            "starring.d2.browser-replacement-evidence.v1",
+            public_origin=final["public_origin"],
+            installation_id=final["installation_id"],
+            source_promotion_id=final["source_promotion_id"],
+            replacement_promotion_id=final["replacement_promotion_id"],
+            replacement_kind=final["replacement_kind"],
+            preview_state="pending_approval",
+            approval_state="approved",
+            apply_state="runtime_pending",
+            pending_observed=True,
+            live_observed=True,
+            product_state="live",
+            operational_state="live",
+            runtime_phase="live",
+            serving_state="fresh",
+            drain_conflict_observed=True,
+            drain_attempts=1,
+        )
+        source_route = test_d2_certification.route_identity(
+            "deployment-1",
+            test_d2_certification.PROCESS_INSTANCE_NEW,
+            1,
+            2,
+            2,
+            1,
+            1,
+            serving_lease_epoch=2,
+            gateway_owner_lease_epoch=2,
+        )
+        self.assertLess(
+            source_route["origin_serving_revision"],
+            self.complete[13]["route_serving_revision"],
+        )
+        self.assertLess(
+            source_route["origin_gateway_owner_revision"],
+            self.complete[13]["route_gateway_owner_revision"],
+        )
+        database = self.envelope(
+            "starring.d2.db-replacement-evidence.v1",
+            installation_id=final["installation_id"],
+            source_promotion_id=final["source_promotion_id"],
+            replacement_promotion_id=final["replacement_promotion_id"],
+            source_deployment_id=final["source_deployment_id"],
+            source_route_identity=source_route,
+            replacement_deployment_id=final["replacement_deployment_id"],
+            replacement_route_identity=test_d2_certification.route_identity(
+                "deployment-2",
+                test_d2_certification.PROCESS_INSTANCE_NEW,
+                2,
+                3,
+                3,
+            ),
+            previous_target_drained=True,
+            replacement_live=True,
+            prior_route_absent=True,
+        )
+        result = d2_run.advance_certification(
+            self.manifest_path,
+            14,
+            [str(self.write_source(database)), str(self.write_source(browser))],
+        )
+        self.assertEqual(result["disposition"], "created")
+        self.assertEqual(self.receipts()[13]["evidence"], final)
 
     def test_step_fifteen_binds_prior_step_fourteen_identity(self):
         self.append_prior(14)

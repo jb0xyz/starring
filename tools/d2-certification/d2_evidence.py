@@ -50,6 +50,13 @@ ROUTE_IDENTITY_FIELDS = (
     "origin_gateway_owner_lease_epoch",
     "origin_gateway_owner_revision",
 )
+ROUTE_RENEWAL_FIELDS = (
+    "origin_serving_revision",
+    "origin_gateway_owner_revision",
+)
+ROUTE_LINEAGE_FIELDS = tuple(
+    field for field in ROUTE_IDENTITY_FIELDS if field not in ROUTE_RENEWAL_FIELDS
+)
 SERVING_IDENTITY_FIELDS = (
     "guild_id",
     "ruleset_key",
@@ -65,6 +72,9 @@ SERVING_IDENTITY_FIELDS = (
     "binding_fingerprint",
     "lease_epoch",
     "revision",
+)
+SERVING_LEASE_FIELDS = tuple(
+    field for field in SERVING_IDENTITY_FIELDS if field != "revision"
 )
 EFFECT_IDENTITY_FIELDS = (
     "application_id",
@@ -259,6 +269,22 @@ def _identity_digest(value, fields, validator, kind):
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def _projected_identity_digest(
+    value, source_fields, projected_fields, validator, kind
+):
+    identity = _require_exact_object(
+        value, source_fields, "identity_fields_invalid"
+    )
+    validator(identity)
+    projected = {field: identity[field] for field in projected_fields}
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": kind,
+        "identity": projected,
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
 def _validate_route_identity(identity):
     _require_identifier(identity["deployment_id"], "route_deployment_id_invalid")
     _require_positive_integer(identity["runtime_generation"], "route_generation_invalid")
@@ -293,6 +319,16 @@ def canonical_route_identity_sha256(identity):
     )
 
 
+def canonical_route_lineage_sha256(identity):
+    return _projected_identity_digest(
+        identity,
+        ROUTE_IDENTITY_FIELDS,
+        ROUTE_LINEAGE_FIELDS,
+        _validate_route_identity,
+        "starring.d2.route-lineage.v1",
+    )
+
+
 def _validate_serving_identity(identity):
     _require_snowflake(identity["guild_id"], "serving_guild_id_invalid")
     for field in (
@@ -324,6 +360,16 @@ def canonical_serving_identity_sha256(identity):
         SERVING_IDENTITY_FIELDS,
         _validate_serving_identity,
         "starring.d2.serving-identity.v1",
+    )
+
+
+def canonical_serving_lease_sha256(identity):
+    return _projected_identity_digest(
+        identity,
+        SERVING_IDENTITY_FIELDS,
+        SERVING_LEASE_FIELDS,
+        _validate_serving_identity,
+        "starring.d2.serving-lease.v1",
     )
 
 
@@ -987,8 +1033,8 @@ def assemble_live_evidence(browser, database):
     database_observed_at = _timestamp_value(
         durable["observed_at"], "live_database_observed_at_invalid"
     )
-    route_id = canonical_route_identity_sha256(durable["route_identity"])
-    serving_id = canonical_serving_identity_sha256(durable["serving_identity"])
+    route_id = canonical_route_lineage_sha256(durable["route_identity"])
+    serving_id = canonical_serving_lease_sha256(durable["serving_identity"])
     if durable["route_identity"]["deployment_id"] != durable["deployment_id"]:
         _fail("live_route_deployment_mismatch")
     if durable["serving_identity"]["deployment_id"] != durable["deployment_id"]:
@@ -1036,6 +1082,10 @@ def assemble_live_evidence(browser, database):
         "promotion_id": public["promotion_id"],
         "deployment_id": durable["deployment_id"],
         "route_id": route_id,
+        "route_serving_revision": route_identity["origin_serving_revision"],
+        "route_gateway_owner_revision": route_identity[
+            "origin_gateway_owner_revision"
+        ],
         "attestation_id": durable["attestation_id"],
         "serving_lease_id": serving_id,
         "deployment_revision": durable["deployment_revision"],
@@ -1087,7 +1137,7 @@ def assemble_interaction_evidence(database, transport):
     _require_snowflake(durable["joined_role_id"], "interaction_joined_role_id_invalid")
     _require_identifier(durable["deployment_id"], "interaction_deployment_id_invalid")
     _require_identifier(durable["instance_id"], "interaction_instance_id_invalid")
-    route_id = canonical_route_identity_sha256(durable["route_identity"])
+    route_id = canonical_route_lineage_sha256(durable["route_identity"])
     if durable["route_identity"]["deployment_id"] != durable["deployment_id"]:
         _fail("interaction_route_deployment_mismatch")
     expected_cardinality = {
@@ -1125,6 +1175,12 @@ def assemble_interaction_evidence(database, transport):
         "joined_role_id": durable["joined_role_id"],
         "deployment_id": durable["deployment_id"],
         "route_id": route_id,
+        "route_serving_revision": durable["route_identity"][
+            "origin_serving_revision"
+        ],
+        "route_gateway_owner_revision": durable["route_identity"][
+            "origin_gateway_owner_revision"
+        ],
         "instance_id": durable["instance_id"],
         "role_ids": durable["role_ids"],
         "channel_ids": durable["channel_ids"],
@@ -1324,14 +1380,14 @@ def assemble_reconstruction_evidence(database):
     _require_digest(value["pinned_ruleset_digest"], "pinned_ruleset_digest_invalid")
     _require_snowflake(value["probe_interaction_id"], "probe_interaction_id_invalid")
     _require_process_instance(value["process_instance_id"], "reconstruction_process_invalid")
-    source_route_id = canonical_route_identity_sha256(value["source_route_identity"])
-    reconstructed_route_id = canonical_route_identity_sha256(
+    source_route_id = canonical_route_lineage_sha256(value["source_route_identity"])
+    reconstructed_route_id = canonical_route_lineage_sha256(
         value["reconstructed_route_identity"]
     )
-    source_serving_id = canonical_serving_identity_sha256(
+    source_serving_id = canonical_serving_lease_sha256(
         value["source_serving_identity"]
     )
-    reconstructed_serving_id = canonical_serving_identity_sha256(
+    reconstructed_serving_id = canonical_serving_lease_sha256(
         value["reconstructed_serving_identity"]
     )
     for field in (
@@ -1349,6 +1405,20 @@ def assemble_reconstruction_evidence(database):
         != value["process_instance_id"]
     ):
         _fail("reconstruction_route_process_mismatch")
+    for prefix in ("source", "reconstructed"):
+        route_identity = value[f"{prefix}_route_identity"]
+        serving_identity = value[f"{prefix}_serving_identity"]
+        if (
+            route_identity["origin_process_instance_id"]
+            != serving_identity["process_instance_id"]
+            or route_identity["runtime_generation"]
+            != serving_identity["runtime_generation"]
+            or route_identity["origin_serving_lease_epoch"]
+            != serving_identity["lease_epoch"]
+            or route_identity["origin_serving_revision"]
+            != serving_identity["revision"]
+        ):
+            _fail("reconstruction_route_serving_identity_mismatch")
     if (
         source_route_id == reconstructed_route_id
         or source_serving_id == reconstructed_serving_id
@@ -1360,6 +1430,18 @@ def assemble_reconstruction_evidence(database):
         "deployment_id": value["deployment_id"],
         "source_route_id": source_route_id,
         "reconstructed_route_id": reconstructed_route_id,
+        "source_route_serving_revision": value["source_route_identity"][
+            "origin_serving_revision"
+        ],
+        "source_route_gateway_owner_revision": value["source_route_identity"][
+            "origin_gateway_owner_revision"
+        ],
+        "reconstructed_route_serving_revision": value[
+            "reconstructed_route_identity"
+        ]["origin_serving_revision"],
+        "reconstructed_route_gateway_owner_revision": value[
+            "reconstructed_route_identity"
+        ]["origin_gateway_owner_revision"],
         "source_serving_lease_id": source_serving_id,
         "reconstructed_serving_lease_id": reconstructed_serving_id,
         "instance_id": value["instance_id"],
@@ -1412,7 +1494,7 @@ def assemble_reconciliation_evidence(database, transport, discord):
     if durable["effect_identity"]["interaction_id"] != interaction_id:
         _fail("reconciliation_effect_interaction_mismatch")
     effect_id = canonical_effect_identity_sha256(durable["effect_identity"])
-    route_id = canonical_route_identity_sha256(durable["route_identity"])
+    route_id = canonical_route_lineage_sha256(durable["route_identity"])
     _require_snowflake(durable["output_role_id"], "reconciliation_output_role_id_invalid")
     _require_state(
         durable["reconciliation_state"],
@@ -1469,6 +1551,12 @@ def assemble_reconciliation_evidence(database, transport, discord):
         "effect_id": effect_id,
         "interaction_id": interaction_id,
         "route_id": route_id,
+        "route_serving_revision": durable["route_identity"][
+            "origin_serving_revision"
+        ],
+        "route_gateway_owner_revision": durable["route_identity"][
+            "origin_gateway_owner_revision"
+        ],
         "injected_outcome": injected["injected_outcome"],
         "reconciliation_state": durable["reconciliation_state"],
         "duplicate_external_effect_count": durable["duplicate_external_effect_count"],
@@ -1553,8 +1641,8 @@ def assemble_replacement_evidence(browser, database):
     for field in ("previous_target_drained", "replacement_live", "prior_route_absent"):
         if durable[field] is not True:
             _fail(f"replacement_{field}_invalid")
-    source_route_id = canonical_route_identity_sha256(durable["source_route_identity"])
-    replacement_route_id = canonical_route_identity_sha256(
+    source_route_id = canonical_route_lineage_sha256(durable["source_route_identity"])
+    replacement_route_id = canonical_route_lineage_sha256(
         durable["replacement_route_identity"]
     )
     if durable["source_route_identity"]["deployment_id"] != durable["source_deployment_id"]:

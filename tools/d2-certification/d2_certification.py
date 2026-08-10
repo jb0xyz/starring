@@ -17,8 +17,8 @@ import uuid
 
 from d2_evidence import (
     canonical_effect_identity_sha256,
-    canonical_route_identity_sha256,
-    canonical_serving_identity_sha256,
+    canonical_route_lineage_sha256,
+    canonical_serving_lease_sha256,
 )
 
 
@@ -271,6 +271,8 @@ STEP_SPECS = {
             "promotion_id",
             "deployment_id",
             "route_id",
+            "route_serving_revision",
+            "route_gateway_owner_revision",
             "attestation_id",
             "serving_lease_id",
             "deployment_revision",
@@ -295,6 +297,8 @@ STEP_SPECS = {
             "joined_role_id",
             "deployment_id",
             "route_id",
+            "route_serving_revision",
+            "route_gateway_owner_revision",
             "instance_id",
             "role_ids",
             "channel_ids",
@@ -352,6 +356,10 @@ STEP_SPECS = {
             "deployment_id",
             "source_route_id",
             "reconstructed_route_id",
+            "source_route_serving_revision",
+            "source_route_gateway_owner_revision",
+            "reconstructed_route_serving_revision",
+            "reconstructed_route_gateway_owner_revision",
             "source_serving_lease_id",
             "reconstructed_serving_lease_id",
             "instance_id",
@@ -366,6 +374,8 @@ STEP_SPECS = {
             "effect_id",
             "interaction_id",
             "route_id",
+            "route_serving_revision",
+            "route_gateway_owner_revision",
             "injected_outcome",
             "reconciliation_state",
             "duplicate_external_effect_count",
@@ -1672,6 +1682,8 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             evidence,
             "deployment_revision",
             "convergence_attempt",
+            "route_serving_revision",
+            "route_gateway_owner_revision",
         )
         if (
             not isinstance(evidence["process_instance_id"], str)
@@ -1753,12 +1765,24 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             fail("step_contract_failed:interaction_actor_identity")
         require_digest(evidence, "route_id")
         require_digest(evidence, "inventory_digest_sha256")
+        require_positive_integer(
+            evidence,
+            "route_serving_revision",
+            "route_gateway_owner_revision",
+        )
         if (
             evidence["deployment_id"]
             != prior_receipts[7]["evidence"]["deployment_id"]
             or evidence["route_id"] != prior_receipts[7]["evidence"]["route_id"]
         ):
             fail("step_contract_failed:interaction_target_identity")
+        if (
+            evidence["route_serving_revision"]
+            < prior_receipts[7]["evidence"]["route_serving_revision"]
+            or evidence["route_gateway_owner_revision"]
+            < prior_receipts[7]["evidence"]["route_gateway_owner_revision"]
+        ):
+            fail("step_contract_failed:interaction_route_revision_rollback")
         expected_cardinality = {
             "role_ids": 1,
             "channel_ids": 1,
@@ -1897,6 +1921,13 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             "reconstructed_serving_lease_id",
             "pinned_ruleset_digest",
         )
+        require_positive_integer(
+            evidence,
+            "source_route_serving_revision",
+            "source_route_gateway_owner_revision",
+            "reconstructed_route_serving_revision",
+            "reconstructed_route_gateway_owner_revision",
+        )
         if (
             not SNOWFLAKE_PATTERN.fullmatch(evidence["probe_interaction_id"])
             or int(evidence["probe_interaction_id"]) > 18446744073709551615
@@ -1912,6 +1943,13 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             or evidence["instance_id"] != prior_receipts[10]["evidence"]["instance_id"]
         ):
             fail("step_contract_failed:reconstruction_identity")
+        if (
+            evidence["source_route_serving_revision"]
+            < prior_receipts[8]["evidence"]["route_serving_revision"]
+            or evidence["source_route_gateway_owner_revision"]
+            < prior_receipts[8]["evidence"]["route_gateway_owner_revision"]
+        ):
+            fail("step_contract_failed:reconstruction_source_revision_rollback")
         if (
             evidence["reconstructed_route_id"] == evidence["source_route_id"]
             or evidence["reconstructed_serving_lease_id"]
@@ -1933,11 +1971,27 @@ def validate_step_contract(step, evidence, manifest, prior_receipts):
             "route_id",
             "reconciliation_inventory_digest_sha256",
         )
+        require_positive_integer(
+            evidence,
+            "route_serving_revision",
+            "route_gateway_owner_revision",
+        )
         if (
             evidence["route_id"]
             != prior_receipts[11]["evidence"]["reconstructed_route_id"]
         ):
             fail("step_contract_failed:route_id")
+        if (
+            evidence["route_serving_revision"]
+            < prior_receipts[11]["evidence"][
+                "reconstructed_route_serving_revision"
+            ]
+            or evidence["route_gateway_owner_revision"]
+            < prior_receipts[11]["evidence"][
+                "reconstructed_route_gateway_owner_revision"
+            ]
+        ):
+            fail("step_contract_failed:reconciliation_route_revision_rollback")
         if evidence["interaction_id"] in {
             prior_receipts[8]["evidence"]["create_interaction_id"],
             prior_receipts[8]["evidence"]["join_interaction_id"],

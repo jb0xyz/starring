@@ -671,6 +671,15 @@ interactions, joined role, one role, one channel, affirmatively observed welcome
 panel, and affirmatively observed hub join panel, and the transport inventory
 must match all four resource identities.
 
+Across timed checkpoints, compare the receipt-level route lineage rather than
+the complete raw route snapshot. Serving heartbeats and gateway-owner renewals
+legitimately increase their two revision counters; Step 9, the Step 12 source,
+and Step 13 must carry non-regressing values while retaining the same stable
+deployment, generation, fence, incarnation, process, lease epochs, and shard.
+Step 14 uses its attestation's initial revision projection, so it is joined by
+stable lineage without a counter-order comparison. The sealed source digest
+still binds every raw field, and any stable-field drift remains a hard stop.
+
 For step 15, one durable partition operation and one durable heal operation
 must belong to the same pinned transport instance. The partition counter is
 exactly one; the public projection is HTTP `200/200`, product `pending`,

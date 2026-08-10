@@ -166,6 +166,30 @@ The remaining certification work is:
 7. Run the redacted PostgreSQL and Discord absence probes before recording
    step 17.
 
+Cross-time route joins use a domain-separated route-lineage digest rather than
+the full point-in-time route snapshot. The lineage contains the deployment,
+runtime generation, controller fence, route incarnation, process instance,
+serving lease epoch, gateway shard, and gateway-owner lease epoch. It excludes
+only `origin_serving_revision` and `origin_gateway_owner_revision`, because
+normal serving heartbeats and gateway-owner renewals advance those counters.
+The complete raw route remains exact-shape validated and is still sealed by
+the coordinator-source digest. Steps 8 and 9 carry both counters separately;
+Step 9 requires each to be no lower than Step 8. Step 12 applies the same rule
+from the Step 9 route to its old-lineage source, while Step 13 applies it from
+the reconstructed route to the later reconciliation receipt. A process,
+generation, fence, incarnation, epoch, shard, or deployment change remains a
+lineage mismatch. Counters are not ordered across a controlled reconstruction
+or replacement, and Step 14 compares only lineage because its attestation
+source intentionally projects the route's initial revisions.
+
+The receipt-level serving-lease digest follows the same split: it binds every
+serving field except the heartbeat-renewed `revision`. The full serving object
+is still validated and source-hash sealed, and reconstruction requires each
+route/serving pair to agree on process, runtime generation, serving epoch, and
+serving revision. These receipt semantics apply only to fresh runs that pin
+this exact D2 toolchain; a run created by an earlier toolchain is never resumed
+under the new identity domains.
+
 Example preparation shape:
 
 ```text

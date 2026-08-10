@@ -31,22 +31,47 @@ PROCESS_INSTANCE_OLD = "11111111111111111111111111111111"
 PROCESS_INSTANCE_NEW = "0123456789abcdef0123456789abcdef"
 
 
-def route_identity(deployment_id, process_instance_id, generation, fence, incarnation):
+def route_identity(
+    deployment_id,
+    process_instance_id,
+    generation,
+    fence,
+    incarnation,
+    serving_revision=None,
+    gateway_owner_revision=None,
+    serving_lease_epoch=None,
+    gateway_owner_lease_epoch=None,
+):
+    serving_revision = generation if serving_revision is None else serving_revision
+    gateway_owner_revision = (
+        generation if gateway_owner_revision is None else gateway_owner_revision
+    )
+    serving_lease_epoch = (
+        generation if serving_lease_epoch is None else serving_lease_epoch
+    )
+    gateway_owner_lease_epoch = (
+        generation
+        if gateway_owner_lease_epoch is None
+        else gateway_owner_lease_epoch
+    )
     return {
         "deployment_id": deployment_id,
         "runtime_generation": generation,
         "route_controller_fencing_token": fence,
         "route_incarnation": incarnation,
         "origin_process_instance_id": process_instance_id,
-        "origin_serving_lease_epoch": generation,
-        "origin_serving_revision": generation,
+        "origin_serving_lease_epoch": serving_lease_epoch,
+        "origin_serving_revision": serving_revision,
         "origin_gateway_shard_id": "shard-0",
-        "origin_gateway_owner_lease_epoch": generation,
-        "origin_gateway_owner_revision": generation,
+        "origin_gateway_owner_lease_epoch": gateway_owner_lease_epoch,
+        "origin_gateway_owner_revision": gateway_owner_revision,
     }
 
 
-def serving_identity(deployment_id, process_instance_id, generation, lease_epoch):
+def serving_identity(
+    deployment_id, process_instance_id, generation, lease_epoch, revision=None
+):
+    revision = lease_epoch if revision is None else revision
     return {
         "guild_id": "1524810437118525551",
         "ruleset_key": "studyroom",
@@ -61,24 +86,26 @@ def serving_identity(deployment_id, process_instance_id, generation, lease_epoch
         "binding_revision": generation,
         "binding_fingerprint": "e" * 64,
         "lease_epoch": lease_epoch,
-        "revision": generation,
+        "revision": revision,
     }
 
 
-ROUTE_ID_INITIAL = MODULE.canonical_route_identity_sha256(
+ROUTE_ID_INITIAL = MODULE.canonical_route_lineage_sha256(
     route_identity("deployment-1", PROCESS_INSTANCE_OLD, 1, 1, 1)
 )
-ROUTE_ID_RECONSTRUCTED = MODULE.canonical_route_identity_sha256(
-    route_identity("deployment-1", PROCESS_INSTANCE_NEW, 1, 2, 2)
+ROUTE_ID_RECONSTRUCTED = MODULE.canonical_route_lineage_sha256(
+    route_identity(
+        "deployment-1",
+        PROCESS_INSTANCE_NEW,
+        1,
+        2,
+        2,
+        serving_lease_epoch=2,
+        gateway_owner_lease_epoch=2,
+    )
 )
-ROUTE_ID_REPLACEMENT = MODULE.canonical_route_identity_sha256(
+ROUTE_ID_REPLACEMENT = MODULE.canonical_route_lineage_sha256(
     route_identity("deployment-2", PROCESS_INSTANCE_NEW, 2, 3, 3)
-)
-SERVING_ID_INITIAL = MODULE.canonical_serving_identity_sha256(
-    serving_identity("deployment-1", PROCESS_INSTANCE_OLD, 1, 1)
-)
-SERVING_ID_RECONSTRUCTED = MODULE.canonical_serving_identity_sha256(
-    serving_identity("deployment-1", PROCESS_INSTANCE_NEW, 1, 2)
 )
 JOIN_EFFECT_ID = MODULE.canonical_effect_identity_sha256(
     {
@@ -99,6 +126,18 @@ INDETERMINATE_EFFECT_ID = MODULE.canonical_effect_identity_sha256(
 def complete_evidence(manifest):
     prefix = manifest["discord"]["resource_prefix"]
     installation_id = f"installation:{prefix}"
+    serving_id_initial = MODULE.canonical_serving_lease_sha256(
+        {
+            **serving_identity("deployment-1", PROCESS_INSTANCE_OLD, 1, 1),
+            "installation_id": installation_id,
+        }
+    )
+    serving_id_reconstructed = MODULE.canonical_serving_lease_sha256(
+        {
+            **serving_identity("deployment-1", PROCESS_INSTANCE_NEW, 1, 2),
+            "installation_id": installation_id,
+        }
+    )
     process_root = pathlib.Path(manifest["database"]["cluster_root"]).parent
 
     def process_identity(name, pid):
@@ -258,8 +297,10 @@ def complete_evidence(manifest):
             "promotion_id": DIGEST,
             "deployment_id": "deployment-1",
             "route_id": ROUTE_ID_INITIAL,
+            "route_serving_revision": 7,
+            "route_gateway_owner_revision": 25,
             "attestation_id": ATTESTATION_ID,
-            "serving_lease_id": SERVING_ID_INITIAL,
+            "serving_lease_id": serving_id_initial,
             "deployment_revision": 11,
             "convergence_attempt": 1,
             "process_instance_id": PROCESS_INSTANCE_OLD,
@@ -279,6 +320,8 @@ def complete_evidence(manifest):
             "joined_role_id": "1532677575736819847",
             "deployment_id": "deployment-1",
             "route_id": ROUTE_ID_INITIAL,
+            "route_serving_revision": 12,
+            "route_gateway_owner_revision": 34,
             "instance_id": "instance-1",
             "role_ids": ["1532677575736819847"],
             "channel_ids": ["1532677575736819848"],
@@ -336,8 +379,12 @@ def complete_evidence(manifest):
             "deployment_id": "deployment-1",
             "source_route_id": ROUTE_ID_INITIAL,
             "reconstructed_route_id": ROUTE_ID_RECONSTRUCTED,
-            "source_serving_lease_id": SERVING_ID_INITIAL,
-            "reconstructed_serving_lease_id": SERVING_ID_RECONSTRUCTED,
+            "source_route_serving_revision": 12,
+            "source_route_gateway_owner_revision": 34,
+            "reconstructed_route_serving_revision": 2,
+            "reconstructed_route_gateway_owner_revision": 7,
+            "source_serving_lease_id": serving_id_initial,
+            "reconstructed_serving_lease_id": serving_id_reconstructed,
             "instance_id": "instance-1",
             "pinned_ruleset_digest": DIGEST,
             "probe_interaction_id": "1532677575736819851",
@@ -347,6 +394,8 @@ def complete_evidence(manifest):
             "effect_id": INDETERMINATE_EFFECT_ID,
             "interaction_id": "1532677575736819850",
             "route_id": ROUTE_ID_RECONSTRUCTED,
+            "route_serving_revision": 5,
+            "route_gateway_owner_revision": 10,
             "injected_outcome": "indeterminate",
             "reconciliation_state": "known_success",
             "duplicate_external_effect_count": 0,
@@ -1169,6 +1218,65 @@ class D2CertificationTest(unittest.TestCase):
         receipts = manifest_path.with_name("receipts.jsonl").read_text().splitlines()
         self.assertEqual(len(receipts), 14)
         self.assertEqual(json.loads(receipts[-1])["code"], "target_replaced")
+
+    def test_temporal_route_counters_advance_without_changing_lineage(self):
+        manifest_path = self.prepare()
+        manifest = json.loads(manifest_path.read_text())
+        evidence = complete_evidence(manifest)
+
+        def prior(last_step):
+            return [
+                {"evidence": copy.deepcopy(evidence[step])}
+                for step in range(1, last_step + 1)
+            ]
+
+        MODULE.validate_step_contract(9, evidence[9], manifest, prior(8))
+        MODULE.validate_step_contract(12, evidence[12], manifest, prior(11))
+        MODULE.validate_step_contract(13, evidence[13], manifest, prior(12))
+        equal_step_nine = copy.deepcopy(evidence[9])
+        equal_step_nine["route_serving_revision"] = evidence[8][
+            "route_serving_revision"
+        ]
+        equal_step_nine["route_gateway_owner_revision"] = evidence[8][
+            "route_gateway_owner_revision"
+        ]
+        MODULE.validate_step_contract(9, equal_step_nine, manifest, prior(8))
+        equal_step_thirteen = copy.deepcopy(evidence[13])
+        equal_step_thirteen["route_serving_revision"] = evidence[12][
+            "reconstructed_route_serving_revision"
+        ]
+        equal_step_thirteen["route_gateway_owner_revision"] = evidence[12][
+            "reconstructed_route_gateway_owner_revision"
+        ]
+        MODULE.validate_step_contract(
+            13, equal_step_thirteen, manifest, prior(12)
+        )
+        changed_lineage = copy.deepcopy(evidence[9])
+        changed_lineage["route_id"] = ROUTE_ID_RECONSTRUCTED
+        with self.assertRaisesRegex(
+            MODULE.CertificationError, "interaction_target_identity"
+        ):
+            MODULE.validate_step_contract(
+                9, changed_lineage, manifest, prior(8)
+            )
+
+        rollback_cases = (
+            (9, "route_serving_revision", 6, 8),
+            (9, "route_gateway_owner_revision", 24, 8),
+            (12, "source_route_serving_revision", 11, 11),
+            (12, "source_route_gateway_owner_revision", 33, 11),
+            (13, "route_serving_revision", 1, 12),
+            (13, "route_gateway_owner_revision", 6, 12),
+        )
+        for step, field, value, prior_step in rollback_cases:
+            with self.subTest(step=step, field=field), self.assertRaisesRegex(
+                MODULE.CertificationError, "revision_rollback"
+            ):
+                changed = copy.deepcopy(evidence[step])
+                changed[field] = value
+                MODULE.validate_step_contract(
+                    step, changed, manifest, prior(prior_step)
+                )
 
     def test_manifest_tampering_is_detected(self):
         manifest_path = self.prepare()
