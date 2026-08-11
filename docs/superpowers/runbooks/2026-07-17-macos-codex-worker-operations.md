@@ -23,7 +23,7 @@ authentication and product-level admission remain the backend's responsibility.
 | listen address | `127.0.0.1:18181` |
 | model | `gpt-5.6-luna` |
 | reasoning effort | `medium` |
-| Codex CLI version | `codex-cli 0.146.0-alpha.3.1` |
+| Codex CLI version | `codex-cli 0.147.0-alpha.6.5` |
 | active request limit | `2` |
 | queue capacity | `8` |
 | request timeout | `55000 ms` |
@@ -48,7 +48,7 @@ cd /Users/jungbogeon/starring
 test -x /opt/homebrew/opt/node@24/bin/node
 test -x /Applications/ChatGPT.app/Contents/Resources/codex
 test -f tools/codex-worker/worker.mjs
-/Applications/ChatGPT.app/Contents/Resources/codex --version | grep -Fx 'codex-cli 0.146.0-alpha.3.1'
+/Applications/ChatGPT.app/Contents/Resources/codex --version | grep -Fx 'codex-cli 0.147.0-alpha.6.5'
 /Applications/ChatGPT.app/Contents/Resources/codex login status
 security find-generic-password -s com.starring.llm-api-key -a llm-api >/dev/null
 plutil -lint ops/macos/local.starring.codex-worker.plist
@@ -89,7 +89,7 @@ lsof -nP -iTCP:18181 -sTCP:LISTEN
 API_KEY="$(security find-generic-password -s com.starring.llm-api-key -a llm-api -w)"
 printf 'Authorization: Bearer %s\n' "${API_KEY}" \
   | curl -fsS http://127.0.0.1:18181/health -H @- \
-  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and .codex_cli_version == "codex-cli 0.146.0-alpha.3.1" and (.instance_id | type) == "string" and (.instance_id | length) > 0 and (.worker_source_sha256 | test("^[0-9a-f]{64}$")) and .concurrency_limit == 2 and .queue_capacity == 8 and .request_timeout_ms == 55000 and .active_requests == 0 and .queued_requests == 0 and (.accepted_requests_total | type) == "number" and (.settled_requests_total | type) == "number" and .accepted_requests_total == .settled_requests_total'
+  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and .codex_cli_version == "codex-cli 0.147.0-alpha.6.5" and (.instance_id | type) == "string" and (.instance_id | length) > 0 and (.worker_source_sha256 | test("^[0-9a-f]{64}$")) and .concurrency_limit == 2 and .queue_capacity == 8 and .request_timeout_ms == 55000 and .active_requests == 0 and .queued_requests == 0 and (.accepted_requests_total | type) == "number" and (.settled_requests_total | type) == "number" and .accepted_requests_total == .settled_requests_total'
 ```
 
 The listener output must show `127.0.0.1:18181`. Stop immediately if it shows
@@ -163,7 +163,7 @@ this point; health requests do not increment completion counters.
 lsof -nP -iTCP:18181 -sTCP:LISTEN
 printf 'Authorization: Bearer %s\n' "${API_KEY}" \
   | curl -fsS http://127.0.0.1:18181/health -H @- \
-  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and .codex_cli_version == "codex-cli 0.146.0-alpha.3.1" and (.instance_id | type) == "string" and (.instance_id | length) > 0 and (.worker_source_sha256 | test("^[0-9a-f]{64}$")) and .concurrency_limit == 1 and .queue_capacity == 0 and .request_timeout_ms == 55000 and .active_requests == 0 and .queued_requests == 0 and .accepted_requests_total == .settled_requests_total'
+  | jq -e '.status == "ok" and .provider == "codex_chatgpt" and .model == "gpt-5.6-luna" and .reasoning_effort == "medium" and .auth_mode == "chatgpt" and .codex_cli_version == "codex-cli 0.147.0-alpha.6.5" and (.instance_id | type) == "string" and (.instance_id | length) > 0 and (.worker_source_sha256 | test("^[0-9a-f]{64}$")) and .concurrency_limit == 1 and .queue_capacity == 0 and .request_timeout_ms == 55000 and .active_requests == 0 and .queued_requests == 0 and .accepted_requests_total == .settled_requests_total'
 test -z "$(git status --porcelain --untracked-files=normal)"
 ```
 

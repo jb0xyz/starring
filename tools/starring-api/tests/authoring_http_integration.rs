@@ -48,7 +48,7 @@ const SESSION: &str = "sssssssssssssssssssssssssssssssssssssssssss";
 const CSRF: &str = "ccccccccccccccccccccccccccccccccccccccccccc";
 const IDEMPOTENCY: &str = "iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii";
 const WORKER_COMPLETION_SHA256: &str =
-    "ff2ed5390bd860fb5170ca1c96e22fda41990dc4be5e275eac4bcf334600ebe1";
+    "d3a2504e11fc38b3f8b58633c99cc1eebe73f2704c62d1989279c85943b9f81f";
 
 #[derive(Clone)]
 struct Evidence {
@@ -431,7 +431,7 @@ async fn worker_health(State(state): State<Arc<WorkerState>>) -> AxumResponse {
         "model": "gpt-5.6-luna",
         "reasoning_effort": "medium",
         "auth_mode": "chatgpt",
-        "codex_cli_version": "codex-cli 0.146.0-alpha.3.1",
+        "codex_cli_version": "codex-cli 0.147.0-alpha.6.5",
         "instance_id": "authoring-http-integration",
         "worker_source_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "concurrency_limit": 1,
@@ -486,7 +486,7 @@ async fn worker_completion(
         "model": "gpt-5.6-luna",
         "reasoning_effort": "medium",
         "auth_mode": "chatgpt",
-        "codex_cli_version": "codex-cli 0.146.0-alpha.3.1",
+        "codex_cli_version": "codex-cli 0.147.0-alpha.6.5",
         "tool_call": {
             "id": "call-request-1",
             "name": frontier,

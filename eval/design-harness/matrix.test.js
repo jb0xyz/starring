@@ -53,7 +53,7 @@ function worker(
     model: 'gpt-5.6-luna',
     reasoning_effort: 'medium',
     auth_mode: 'chatgpt',
-    codex_cli_version: 'codex-cli 0.146.0-alpha.3.1',
+    codex_cli_version: 'codex-cli 0.147.0-alpha.6.5',
     concurrency_limit: 1,
     queue_capacity: 0,
     request_timeout_ms: 55000,

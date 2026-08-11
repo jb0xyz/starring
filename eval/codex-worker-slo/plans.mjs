@@ -5,7 +5,7 @@ const IDENTITY = Object.freeze({
   model: "gpt-5.6-luna",
   reasoning_effort: "medium",
   auth_mode: "chatgpt",
-  codex_cli_version: "codex-cli 0.146.0-alpha.3.1",
+  codex_cli_version: "codex-cli 0.147.0-alpha.6.5",
 });
 
 const ROUTINE_PROFILE = Object.freeze({

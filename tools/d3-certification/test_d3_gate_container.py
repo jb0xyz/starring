@@ -103,6 +103,32 @@ class D3GateContainerTests(unittest.TestCase):
         self.assertIn("mode=0700", scratch[0])
         self.assertNotIn(str(MODULE.DOCKER_SOCKET), " ".join(arguments))
 
+    def test_secret_scan_uses_sealed_git_projection(self):
+        secret_scan = self.create_arguments(1, "none")
+        ordinary = self.create_arguments(2, "none")
+        scan_environment = {
+            secret_scan[index + 1]
+            for index, value in enumerate(secret_scan[:-1])
+            if value == "--env"
+        }
+        ordinary_environment = {
+            ordinary[index + 1]
+            for index, value in enumerate(ordinary[:-1])
+            if value == "--env"
+        }
+        self.assertIn("GIT_DIR=/git", scan_environment)
+        self.assertIn("GIT_WORK_TREE=/workspace", scan_environment)
+        self.assertNotIn("GIT_DIR=/git", ordinary_environment)
+        self.assertNotIn("GIT_WORK_TREE=/workspace", ordinary_environment)
+        self.assertEqual(
+            MODULE.RUNNER_POLICY["tracked_secret_scan"],
+            {
+                "gate": 1,
+                "git_dir": "/git",
+                "git_work_tree": "/workspace",
+            },
+        )
+
     def test_every_gate_prepares_private_scratch_before_work(self):
         setup = (
             "umask 077 && mkdir -p /scratch/tmp && "
@@ -110,10 +136,10 @@ class D3GateContainerTests(unittest.TestCase):
         )
         expected_work = {
             1: "gate-one",
-            9: "mkdir -p /scratch/package /scratch/npm-cache",
-            10: "npm --prefix eval/design-harness audit --audit-level=high",
-            12: "gate-twelve",
-            17: "gate-seventeen",
+            10: "mkdir -p /scratch/package /scratch/npm-cache",
+            11: "npm --prefix eval/design-harness audit --audit-level=high",
+            13: "gate-thirteen",
+            19: "gate-nineteen",
         }
         for index, work in expected_work.items():
             with self.subTest(index=index):
@@ -121,15 +147,15 @@ class D3GateContainerTests(unittest.TestCase):
                     index,
                     {
                         1: "gate-one",
-                        12: "gate-twelve",
-                        17: "gate-seventeen",
+                        13: "gate-thirteen",
+                        19: "gate-nineteen",
                     }.get(index, "unused"),
                 )
                 self.assertEqual(command.count(setup), 1)
                 self.assertLess(command.index(setup), command.index(work))
 
     def test_gate_uses_private_tmpfs_for_default_d2_runtime_root(self):
-        arguments = self.create_arguments(12, "none")
+        arguments = self.create_arguments(13, "none")
         environment = {
             arguments[index + 1]
             for index, value in enumerate(arguments[:-1])
@@ -168,7 +194,7 @@ class D3GateContainerTests(unittest.TestCase):
         )
 
     def test_external_audit_mounts_only_package_projection_and_scratch(self):
-        arguments = self.create_arguments(10, "bridge")
+        arguments = self.create_arguments(11, "bridge")
         self.assertIn("bridge", arguments)
         mounts = [
             arguments[index + 1]
@@ -188,7 +214,7 @@ class D3GateContainerTests(unittest.TestCase):
         self.assertIn("/sys/fs/cgroup/memory.events", arguments[-1])
 
     def test_offline_install_uses_read_only_projection_and_bounded_scratch(self):
-        arguments = self.create_arguments(9, "none")
+        arguments = self.create_arguments(10, "none")
         mounts = [
             arguments[index + 1]
             for index, value in enumerate(arguments[:-1])
@@ -563,7 +589,7 @@ class D3GateContainerTests(unittest.TestCase):
 
     def test_database_gate_uses_only_postgres_network_namespace(self):
         network = "container:starring-d3-owned-postgres"
-        arguments = self.create_arguments(17, network)
+        arguments = self.create_arguments(19, network)
         network_index = arguments.index("--network")
         self.assertEqual(arguments[network_index + 1], network)
         self.assertNotIn("--publish", arguments)
@@ -573,12 +599,12 @@ class D3GateContainerTests(unittest.TestCase):
         calls = []
         expected = (
             (
-                MODULE.container_name(self.root, 17, 1, "gate"),
-                MODULE.container_labels(self.root, 17, 1, "gate"),
+                MODULE.container_name(self.root, 19, 1, "gate"),
+                MODULE.container_labels(self.root, 19, 1, "gate"),
             ),
             (
-                MODULE.container_name(self.root, 17, 1, "postgres"),
-                MODULE.container_labels(self.root, 17, 1, "postgres"),
+                MODULE.container_name(self.root, 19, 1, "postgres"),
+                MODULE.container_labels(self.root, 19, 1, "postgres"),
             ),
         )
 
@@ -604,7 +630,7 @@ class D3GateContainerTests(unittest.TestCase):
                     self.source,
                     self.bootstrap,
                     {"image_id": self.image_id},
-                    17,
+                    19,
                     1,
                     "true",
                     30,

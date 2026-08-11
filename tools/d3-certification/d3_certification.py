@@ -69,6 +69,7 @@ REQUIRED_ACTIONS_WORKFLOW = {
 }
 REQUIRED_ACTIONS_JOBS = ("checks", "postgres")
 REQUIRED_GATE_COMMANDS = (
+    "python3 tools/ci/scan_tracked_secrets.py",
     "cargo fmt --all -- --check",
     "cargo build --locked --workspace --all-targets",
     "cargo test --locked --workspace",
@@ -81,6 +82,7 @@ REQUIRED_GATE_COMMANDS = (
     "npm --prefix eval/design-harness run audit",
     "npm --prefix eval/design-harness run check",
     "python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'",
+    "python3 -m unittest discover -s tools/d3-certification -p 'test_*.py'",
     "node --test tools/d2-certification/product_driver.test.mjs",
     "cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check",
     "cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml",
@@ -586,6 +588,31 @@ def commit_parents(repo, sha, label):
     for index, parent in enumerate(parents):
         validate_sha(parent, f"{label}_parent_{index}")
     return parents
+
+
+def git_file_identity(repo, commit, path, label):
+    validate_sha(commit, f"{label}_commit")
+    if path != REQUIRED_ACTIONS_WORKFLOW["path"]:
+        fail(f"{label}_path_invalid")
+    raw = git(repo, ["ls-tree", "-z", commit, "--", path], f"{label}_entry")
+    entries = raw.split(b"\0")
+    if len(entries) != 2 or entries[1] != b"":
+        fail(f"{label}_entry_invalid")
+    try:
+        metadata, observed_path = entries[0].split(b"\t", 1)
+        mode, kind, object_sha = metadata.decode("ascii").split(" ")
+        observed_path = observed_path.decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        fail(f"{label}_entry_invalid")
+    if mode != "100644" or kind != "blob" or observed_path != path:
+        fail(f"{label}_entry_invalid")
+    validate_sha(object_sha, f"{label}_blob")
+    content = git(repo, ["cat-file", "blob", object_sha], f"{label}_content")
+    return {
+        "path": path,
+        "git_blob_sha": object_sha,
+        "sha256": sha256_bytes(content),
+    }
 
 
 def validate_gate(command):
@@ -1531,6 +1558,29 @@ def validate_npm_lock_sources(path):
             fail("gate_npm_lock_source_invalid")
 
 
+def gate_git_wrapper(workspace="/workspace", projection="/git"):
+    workspace = pathlib.Path(workspace)
+    projection = pathlib.Path(projection)
+    if not workspace.is_absolute() or not projection.is_absolute():
+        fail("gate_git_wrapper_path_invalid")
+    workspace_literal = shlex.quote(str(workspace))
+    projection_literal = shlex.quote(str(projection))
+    return (
+        "#!/bin/sh\n"
+        'if [ "$1" = "-C" ] && '
+        f'[ "$(/usr/bin/readlink -f -- "$2")" = {workspace_literal} ]; then\n'
+        "  shift 2\n"
+        f"  exec /usr/bin/git --git-dir={projection_literal} "
+        f"--work-tree={workspace_literal} \"$@\"\n"
+        "fi\n"
+        f'if [ "$(/usr/bin/readlink -f -- .)" = {workspace_literal} ]; then\n'
+        f"  exec /usr/bin/git --git-dir={projection_literal} "
+        f"--work-tree={workspace_literal} \"$@\"\n"
+        "fi\n"
+        'exec /usr/bin/git "$@"\n'
+    )
+
+
 def prepare_gate_git_projection(staging, worktree):
     projection = staging / "git"
     commands = (
@@ -1853,16 +1903,8 @@ def build_gate_bootstrap(root, worktree, runtime, bootstrap, staging):
     promptfoo_path = bin_directory / "promptfoo"
     write_new_file(promptfoo_path, promptfoo)
     promptfoo_path.chmod(0o555)
-    git_wrapper = (
-        "#!/bin/sh\n"
-        'if [ "$1" = "-C" ] && [ "$(readlink -f -- "$2")" = "/workspace" ]; then\n'
-        "  shift 2\n"
-        '  exec /usr/bin/git --git-dir=/git --work-tree=/workspace "$@"\n'
-        "fi\n"
-        'exec /usr/bin/git "$@"\n'
-    )
     git_path = bin_directory / "git"
-    write_new_file(git_path, git_wrapper)
+    write_new_file(git_path, gate_git_wrapper())
     git_path.chmod(0o555)
     for name in GATE_BOOTSTRAP_WORK_DIRECTORIES:
         discard_owned_directory(
@@ -1887,7 +1929,7 @@ def initialize_gate_run(root, index, attempt, bootstrap, worktree):
     path.mkdir(mode=0o700)
     fsync_directory(runs)
     cwd = worktree
-    if index in (9, 10):
+    if index in (10, 11):
         projection = ensure_private_directory(path / "worktree")
         package = ensure_private_directory(
             ensure_private_directory(projection / "eval") / "design-harness"
@@ -2611,6 +2653,7 @@ def command_recheck(arguments):
             fail("pr_merge_parents_changed")
         if commit_tree(repo, merge, "recheck_merge") != state["merge_tree"]:
             fail("pr_merge_tree_changed")
+        pull_request = github_pull_recheck(state["github_repository"], state)
         require_active_d2_binding(binding)
         record_path = state_path.parent / "recheck.json"
         identity = {
@@ -2621,6 +2664,7 @@ def command_recheck(arguments):
             "base_commit": base,
             "merge_commit": merge,
             "merge_tree": state["merge_tree"],
+            "pull_request": pull_request,
             "gate_evidence_chain_head_sha256": gate_chain,
             "candidate_bundle_record_sha256": bundle_record["record_sha256"],
             "candidate_bundle_file_sha256": candidate_bundle_file["sha256"],
@@ -2723,6 +2767,92 @@ def load_binding(root, state):
     return binding
 
 
+def validate_recheck_pull_request(value, state, verified_at):
+    required = {
+        "number",
+        "state",
+        "draft",
+        "merged",
+        "base_ref",
+        "base_sha",
+        "head_sha",
+        "repository",
+        "author",
+        "approvals",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != required
+        or value.get("number") != state["pr_number"]
+        or value.get("state") != "open"
+        or value.get("draft") is not False
+        or value.get("merged") is not False
+        or value.get("base_ref") != state["base_ref"]
+        or value.get("base_sha") != state["expected_base"]
+        or value.get("head_sha") != state["expected_head"]
+        or value.get("repository") != state["github_repository"]
+    ):
+        fail("recheck_pull_request_invalid")
+    author = github_actor(value["author"], "recheck_pull_request_author")
+    approvals = value["approvals"]
+    if not isinstance(approvals, list) or not approvals or len(approvals) > 10000:
+        fail("recheck_pull_request_approvals_invalid")
+    verified_time = datetime.datetime.fromisoformat(
+        verified_at[:-1] + "+00:00"
+    )
+    reviewer_ids = set()
+    reviewer_logins = set()
+    prior_order = None
+    for approval in approvals:
+        if not isinstance(approval, dict) or set(approval) != {
+            "id",
+            "state",
+            "submitted_at",
+            "commit_sha",
+            "reviewer",
+            "repository_permission",
+            "repository_role_name",
+        }:
+            fail("recheck_pull_request_approvals_invalid")
+        review_id = approval.get("id")
+        submitted_at = validate_timestamp(
+            approval.get("submitted_at"), "recheck_review_submitted_at"
+        )
+        reviewer = github_actor(
+            approval.get("reviewer"), "recheck_pull_request_reviewer"
+        )
+        folded_login = reviewer["login"].casefold()
+        order = (reviewer["id"], review_id)
+        if (
+            type(review_id) is not int
+            or review_id <= 0
+            or approval.get("state") != "APPROVED"
+            or approval.get("commit_sha") != state["expected_head"]
+            or approval.get("repository_permission")
+            not in ("admin", "maintain", "write")
+            or not isinstance(approval.get("repository_role_name"), str)
+            or not 1 <= len(approval["repository_role_name"]) <= 100
+            or any(
+                character.isspace() and character not in " "
+                for character in approval["repository_role_name"]
+            )
+            or reviewer["type"] != "User"
+            or folded_login.endswith("[bot]")
+            or reviewer["id"] == author["id"]
+            or folded_login == author["login"].casefold()
+            or reviewer["id"] in reviewer_ids
+            or folded_login in reviewer_logins
+            or datetime.datetime.fromisoformat(submitted_at[:-1] + "+00:00")
+            > verified_time
+            or (prior_order is not None and order <= prior_order)
+        ):
+            fail("recheck_pull_request_approvals_invalid")
+        reviewer_ids.add(reviewer["id"])
+        reviewer_logins.add(folded_login)
+        prior_order = order
+    return value
+
+
 def load_recheck(root, state):
     record = load_json_file(root / "recheck.json", "recheck", 0o600)
     required = {
@@ -2733,6 +2863,7 @@ def load_recheck(root, state):
         "base_commit",
         "merge_commit",
         "merge_tree",
+        "pull_request",
         "gate_evidence_chain_head_sha256",
         "candidate_bundle_record_sha256",
         "candidate_bundle_file_sha256",
@@ -2764,12 +2895,13 @@ def load_recheck(root, state):
         or not DIGEST_PATTERN.fullmatch(record["d2_coordinator_evidence_sha256"])
     ):
         fail("recheck_identity_invalid")
-    validate_timestamp(record["verified_at"], "recheck_verified_at")
+    verified_at = validate_timestamp(record["verified_at"], "recheck_verified_at")
+    validate_recheck_pull_request(record["pull_request"], state, verified_at)
     verify_sealed_record(record, "recheck")
     return record
 
 
-def github_run(repository, run_id, main_commit, base_ref):
+def github_run(repository, run_id, main_commit, base_ref, workflow_file):
     if type(run_id) is not int or run_id <= 0 or run_id > 9223372036854775807:
         fail("actions_run_id_invalid")
     _, raw = run_process(
@@ -2870,6 +3002,7 @@ def github_run(repository, run_id, main_commit, base_ref):
         "workflow_id": workflow_id,
         "workflow_name": workflow["name"],
         "workflow_path": workflow["path"],
+        "workflow_file": workflow_file,
         "head_branch": value["head_branch"],
         "head_sha": value["head_sha"],
         "event": "push",
@@ -2880,7 +3013,133 @@ def github_run(repository, run_id, main_commit, base_ref):
     }
 
 
-def github_pull(repository, state, main_commit):
+def github_actor(value, label):
+    if not isinstance(value, dict):
+        fail(f"{label}_invalid")
+    actor_id = value.get("id")
+    login = value.get("login")
+    actor_type = value.get("type")
+    if (
+        type(actor_id) is not int
+        or actor_id <= 0
+        or not isinstance(login, str)
+        or not 1 <= len(login) <= 100
+        or not all(
+            character.isascii()
+            and (character.isalnum() or character in "-[]")
+            for character in login
+        )
+        or not isinstance(actor_type, str)
+        or actor_type not in ("User", "Bot", "Mannequin")
+    ):
+        fail(f"{label}_invalid")
+    return {"id": actor_id, "login": login, "type": actor_type}
+
+
+def pull_request_approvals(pages, state, author, approved_before):
+    validate_timestamp(approved_before, "pull_request_approval_deadline")
+    if not isinstance(pages, list) or len(pages) > 100:
+        fail("pull_request_reviews_invalid")
+    reviews = []
+    for page in pages:
+        if not isinstance(page, list) or len(page) > 100:
+            fail("pull_request_reviews_invalid")
+        reviews.extend(page)
+    if len(reviews) > 10000:
+        fail("pull_request_reviews_invalid")
+    identities = {}
+    logins = {}
+    review_ids = set()
+    decisions = {}
+    allowed_states = {
+        "APPROVED",
+        "CHANGES_REQUESTED",
+        "COMMENTED",
+        "DISMISSED",
+        "PENDING",
+    }
+    for review in reviews:
+        if not isinstance(review, dict):
+            fail("pull_request_reviews_invalid")
+        review_id = review.get("id")
+        review_state = review.get("state")
+        if (
+            type(review_id) is not int
+            or review_id <= 0
+            or review_id in review_ids
+            or not isinstance(review_state, str)
+            or review_state not in allowed_states
+        ):
+            fail("pull_request_reviews_invalid")
+        review_ids.add(review_id)
+        reviewer = github_actor(review.get("user"), "pull_request_reviewer")
+        submitted_at = review.get("submitted_at")
+        if review_state == "PENDING":
+            if submitted_at is not None:
+                fail("pull_request_reviews_invalid")
+        else:
+            submitted_at = validate_timestamp(
+                submitted_at, "pull_request_review_submitted_at"
+            )
+        commit_sha = validate_sha(
+            review.get("commit_id"), "pull_request_review_commit"
+        )
+        prior_identity = identities.setdefault(reviewer["id"], reviewer)
+        if prior_identity != reviewer:
+            fail("pull_request_reviewer_identity_invalid")
+        folded_login = reviewer["login"].casefold()
+        prior_id = logins.setdefault(folded_login, reviewer["id"])
+        if prior_id != reviewer["id"]:
+            fail("pull_request_reviewer_identity_invalid")
+        if review_state in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            ordering = (
+                datetime.datetime.fromisoformat(submitted_at[:-1] + "+00:00"),
+                review_id,
+            )
+            prior = decisions.get(reviewer["id"])
+            if prior is None or ordering > prior[0]:
+                decisions[reviewer["id"]] = (
+                    ordering,
+                    {
+                        "id": review_id,
+                        "state": review_state,
+                        "submitted_at": submitted_at,
+                        "commit_sha": commit_sha,
+                        "reviewer": reviewer,
+                    },
+                )
+    approval_deadline = datetime.datetime.fromisoformat(
+        approved_before[:-1] + "+00:00"
+    )
+    approvals = []
+    for _, review in decisions.values():
+        reviewer = review["reviewer"]
+        is_bot = (
+            reviewer["type"] != "User"
+            or reviewer["login"].casefold().endswith("[bot]")
+        )
+        is_author = (
+            reviewer["id"] == author["id"]
+            or reviewer["login"].casefold() == author["login"].casefold()
+        )
+        submitted_time = datetime.datetime.fromisoformat(
+            review["submitted_at"][:-1] + "+00:00"
+        )
+        if (
+            review["state"] == "APPROVED"
+            and review["commit_sha"] == state["expected_head"]
+            and submitted_time <= approval_deadline
+            and not is_bot
+            and not is_author
+        ):
+            approvals.append(review)
+    approvals.sort(key=lambda review: (review["reviewer"]["id"], review["id"]))
+    if not approvals:
+        fail("pull_request_approval_required")
+    return approvals
+
+
+def github_pull_common(repository, state, identity_error):
     _, raw = run_process(
         [
             "gh",
@@ -2895,14 +3154,15 @@ def github_pull(repository, state, main_commit):
     head = value.get("head") if isinstance(value, dict) else None
     base_repository = base.get("repo") if isinstance(base, dict) else None
     head_repository = head.get("repo") if isinstance(head, dict) else None
+    author = github_actor(
+        value.get("user") if isinstance(value, dict) else None,
+        "pull_request_author",
+    )
     if (
         not isinstance(value, dict)
         or type(value.get("number")) is not int
         or value.get("number") != state["pr_number"]
-        or value.get("state") != "closed"
         or value.get("draft") is not False
-        or value.get("merged") is not True
-        or value.get("merge_commit_sha") != main_commit
         or not isinstance(base, dict)
         or base.get("ref") != state["base_ref"]
         or base.get("sha") != state["expected_base"]
@@ -2913,8 +3173,129 @@ def github_pull(repository, state, main_commit):
         or not isinstance(head_repository, dict)
         or head_repository.get("full_name") != repository
     ):
+        fail(identity_error)
+    return value, author
+
+
+def github_review_pages(repository, state):
+    _, raw_reviews = run_process(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{repository}/pulls/{state['pr_number']}/reviews?per_page=100",
+        ],
+        pathlib.Path.cwd(),
+        f"pull_request_reviews_{state['pr_number']}",
+    )
+    return load_json_bytes(raw_reviews, "pull_request_reviews")
+
+
+def authorized_pull_request_approvals(repository, approvals):
+    authorized = []
+    for approval in approvals:
+        reviewer = approval["reviewer"]
+        _, raw = run_process(
+            [
+                "gh",
+                "api",
+                f"repos/{repository}/collaborators/{reviewer['login']}/permission",
+            ],
+            pathlib.Path.cwd(),
+            f"pull_request_reviewer_permission_{reviewer['id']}",
+        )
+        value = load_json_bytes(raw, "pull_request_reviewer_permission")
+        permission = value.get("permission") if isinstance(value, dict) else None
+        role_name = value.get("role_name") if isinstance(value, dict) else None
+        permission_actor = github_actor(
+            value.get("user") if isinstance(value, dict) else None,
+            "pull_request_permission_user",
+        )
+        if (
+            permission not in ("admin", "maintain", "write", "triage", "read", "none")
+            or not isinstance(role_name, str)
+            or not 1 <= len(role_name) <= 100
+            or any(character.isspace() and character not in " " for character in role_name)
+            or permission_actor != reviewer
+        ):
+            fail("pull_request_reviewer_permission_invalid")
+        if permission in ("admin", "maintain", "write"):
+            authorized.append(
+                {
+                    **approval,
+                    "repository_permission": permission,
+                    "repository_role_name": role_name,
+                }
+            )
+    if not authorized:
+        fail("pull_request_approval_required")
+    return authorized
+
+
+def require_open_pull_request(value):
+    if (
+        value.get("state") != "open"
+        or value.get("merged") is not False
+        or value.get("merged_at") is not None
+    ):
+        fail("pull_request_recheck_identity_invalid")
+
+
+def github_pull_recheck(repository, state):
+    value, author = github_pull_common(
+        repository, state, "pull_request_recheck_identity_invalid"
+    )
+    require_open_pull_request(value)
+    approvals = authorized_pull_request_approvals(
+        repository,
+        pull_request_approvals(
+            github_review_pages(repository, state),
+            state,
+            author,
+            utc_now(),
+        ),
+    )
+    confirmed_value, confirmed_author = github_pull_common(
+        repository, state, "pull_request_recheck_identity_invalid"
+    )
+    require_open_pull_request(confirmed_value)
+    if confirmed_author != author:
+        fail("pull_request_recheck_identity_invalid")
+    return {
+        "number": state["pr_number"],
+        "state": "open",
+        "draft": False,
+        "merged": False,
+        "base_ref": state["base_ref"],
+        "base_sha": state["expected_base"],
+        "head_sha": state["expected_head"],
+        "repository": repository,
+        "author": author,
+        "approvals": approvals,
+    }
+
+
+def github_pull(repository, state, main_commit):
+    value, author = github_pull_common(
+        repository, state, "pull_request_merge_identity_invalid"
+    )
+    if (
+        value.get("state") != "closed"
+        or value.get("merged") is not True
+        or value.get("merge_commit_sha") != main_commit
+    ):
         fail("pull_request_merge_identity_invalid")
     merged_at = validate_timestamp(value.get("merged_at"), "pull_request_merged_at")
+    approvals = authorized_pull_request_approvals(
+        repository,
+        pull_request_approvals(
+            github_review_pages(repository, state),
+            state,
+            author,
+            merged_at,
+        ),
+    )
     return {
         "number": state["pr_number"],
         "state": "closed",
@@ -2926,7 +3307,263 @@ def github_pull(repository, state, main_commit):
         "base_sha": state["expected_base"],
         "head_sha": state["expected_head"],
         "repository": repository,
+        "author": author,
+        "approvals": approvals,
     }
+
+
+def validate_final_approval_records(approvals, state, author, merged_at):
+    if not isinstance(approvals, list) or not approvals or len(approvals) > 10000:
+        fail("final_pull_request_approvals_invalid")
+    merged_time = datetime.datetime.fromisoformat(merged_at[:-1] + "+00:00")
+    review_ids = set()
+    reviewer_ids = set()
+    reviewer_logins = set()
+    prior_order = None
+    required = {
+        "id",
+        "state",
+        "submitted_at",
+        "commit_sha",
+        "reviewer",
+        "repository_permission",
+        "repository_role_name",
+    }
+    for approval in approvals:
+        if not isinstance(approval, dict) or set(approval) != required:
+            fail("final_pull_request_approvals_invalid")
+        review_id = approval.get("id")
+        if type(review_id) is not int or review_id <= 0:
+            fail("final_pull_request_approvals_invalid")
+        submitted_at = validate_timestamp(
+            approval.get("submitted_at"), "final_review_submitted_at"
+        )
+        reviewer = github_actor(
+            approval.get("reviewer"), "final_pull_request_reviewer"
+        )
+        folded_login = reviewer["login"].casefold()
+        role_name = approval.get("repository_role_name")
+        order = (reviewer["id"], review_id)
+        if (
+            review_id in review_ids
+            or approval.get("state") != "APPROVED"
+            or approval.get("commit_sha") != state["expected_head"]
+            or reviewer["type"] != "User"
+            or folded_login.endswith("[bot]")
+            or reviewer["id"] == author["id"]
+            or folded_login == author["login"].casefold()
+            or reviewer["id"] in reviewer_ids
+            or folded_login in reviewer_logins
+            or approval.get("repository_permission")
+            not in ("admin", "maintain", "write")
+            or not isinstance(role_name, str)
+            or not 1 <= len(role_name) <= 100
+            or any(
+                character.isspace() and character not in " "
+                for character in role_name
+            )
+            or datetime.datetime.fromisoformat(submitted_at[:-1] + "+00:00")
+            > merged_time
+            or (prior_order is not None and order <= prior_order)
+        ):
+            fail("final_pull_request_approvals_invalid")
+        review_ids.add(review_id)
+        reviewer_ids.add(reviewer["id"])
+        reviewer_logins.add(folded_login)
+        prior_order = order
+    return approvals
+
+
+def validate_terminal_final_replay(
+    record,
+    state,
+    gate_chain,
+    binding,
+    recheck,
+    bundle_record,
+    bundle_file,
+    repo,
+    repository,
+    run_ids,
+):
+    verify_sealed_record(record, "final")
+    required = {
+        "schema_version",
+        "kind",
+        "pr_number",
+        "merge_commit",
+        "merge_tree",
+        "main_commit",
+        "main_tree",
+        "gate_count",
+        "gate_evidence_chain_head_sha256",
+        "candidate_bundle_path",
+        "candidate_bundle_record_sha256",
+        "candidate_bundle_file_sha256",
+        "d2_run_id",
+        "d2_manifest_sha256",
+        "d2_receipt_chain_head_sha256",
+        "d2_coordinator_evidence_sha256",
+        "d2_binding_sha256",
+        "rechecked_head_commit",
+        "rechecked_base_commit",
+        "recheck_sha256",
+        "github_repository",
+        "pull_request",
+        "actions_runs",
+        "status",
+        "finalized_at",
+        "record_sha256",
+    }
+    if not valid_schema_version(record.get("schema_version")):
+        fail("final_schema_invalid")
+    if set(record) != required:
+        fail("final_fields_invalid")
+    validate_timestamp(record["finalized_at"], "finalized_at")
+    local_identity = {
+        "kind": "starring.d3.exact-tree-certification.v1",
+        "pr_number": state["pr_number"],
+        "merge_commit": state["merge_commit"],
+        "merge_tree": state["merge_tree"],
+        "main_tree": state["merge_tree"],
+        "gate_count": len(state["gate_command_sha256"]),
+        "gate_evidence_chain_head_sha256": gate_chain,
+        "candidate_bundle_path": binding["candidate_bundle_path"],
+        "candidate_bundle_record_sha256": bundle_record["record_sha256"],
+        "candidate_bundle_file_sha256": bundle_file["sha256"],
+        "d2_run_id": binding["run_id"],
+        "d2_manifest_sha256": binding["manifest_sha256"],
+        "d2_receipt_chain_head_sha256": binding["receipt_chain_head_sha256"],
+        "d2_coordinator_evidence_sha256": binding[
+            "coordinator_evidence_sha256"
+        ],
+        "d2_binding_sha256": binding["record_sha256"],
+        "rechecked_head_commit": recheck["head_commit"],
+        "rechecked_base_commit": recheck["base_commit"],
+        "recheck_sha256": recheck["record_sha256"],
+        "github_repository": repository,
+        "status": "passed",
+    }
+    if any(record.get(key) != value for key, value in local_identity.items()):
+        fail("finalize_replay_mismatch")
+    main_commit = validate_sha(record.get("main_commit"), "final_main_commit")
+    if commit_tree(repo, main_commit, "final_replay_main") != record["main_tree"]:
+        fail("finalize_replay_mismatch")
+    pull_request = record.get("pull_request")
+    pull_fields = {
+        "number",
+        "state",
+        "draft",
+        "merged",
+        "merged_at",
+        "merge_commit_sha",
+        "base_ref",
+        "base_sha",
+        "head_sha",
+        "repository",
+        "author",
+        "approvals",
+    }
+    if (
+        not isinstance(pull_request, dict)
+        or set(pull_request) != pull_fields
+        or pull_request.get("number") != state["pr_number"]
+        or pull_request.get("state") != "closed"
+        or pull_request.get("draft") is not False
+        or pull_request.get("merged") is not True
+        or pull_request.get("merge_commit_sha") != main_commit
+        or pull_request.get("base_ref") != state["base_ref"]
+        or pull_request.get("base_sha") != state["expected_base"]
+        or pull_request.get("head_sha") != state["expected_head"]
+        or pull_request.get("repository") != repository
+        or pull_request.get("author") != recheck["pull_request"]["author"]
+        or not isinstance(pull_request.get("approvals"), list)
+    ):
+        fail("finalize_replay_mismatch")
+    merged_at = validate_timestamp(
+        pull_request["merged_at"], "final_pull_request_merged_at"
+    )
+    if datetime.datetime.fromisoformat(
+        recheck["verified_at"][:-1] + "+00:00"
+    ) >= datetime.datetime.fromisoformat(merged_at[:-1] + "+00:00"):
+        fail("finalize_replay_mismatch")
+    validated_approvals = validate_final_approval_records(
+        pull_request["approvals"],
+        state,
+        pull_request["author"],
+        merged_at,
+    )
+    approvals = {
+        approval.get("id"): approval
+        for approval in validated_approvals
+    }
+    if any(
+        approvals.get(approval["id"]) != approval
+        for approval in recheck["pull_request"]["approvals"]
+    ):
+        fail("finalize_replay_mismatch")
+    actions_runs = record.get("actions_runs")
+    if not isinstance(actions_runs, list) or len(actions_runs) != 1:
+        fail("finalize_replay_mismatch")
+    actions_run = actions_runs[0]
+    run_fields = {
+        "id",
+        "run_attempt",
+        "workflow_id",
+        "workflow_name",
+        "workflow_path",
+        "workflow_file",
+        "head_branch",
+        "head_sha",
+        "event",
+        "repository",
+        "status",
+        "conclusion",
+        "jobs",
+    }
+    expected_workflow_file = git_file_identity(
+        repo,
+        main_commit,
+        REQUIRED_ACTIONS_WORKFLOW["path"],
+        "final_replay_workflow_file",
+    )
+    if (
+        not isinstance(actions_run, dict)
+        or set(actions_run) != run_fields
+        or actions_run.get("id") != run_ids[0]
+        or type(actions_run.get("run_attempt")) is not int
+        or actions_run["run_attempt"] <= 0
+        or type(actions_run.get("workflow_id")) is not int
+        or actions_run["workflow_id"] <= 0
+        or actions_run.get("workflow_name") != REQUIRED_ACTIONS_WORKFLOW["name"]
+        or actions_run.get("workflow_path") != REQUIRED_ACTIONS_WORKFLOW["path"]
+        or actions_run.get("workflow_file") != expected_workflow_file
+        or actions_run.get("head_branch") != state["base_ref"]
+        or actions_run.get("head_sha") != main_commit
+        or actions_run.get("event") != "push"
+        or actions_run.get("repository") != repository
+        or actions_run.get("status") != "completed"
+        or actions_run.get("conclusion") != "success"
+    ):
+        fail("finalize_replay_mismatch")
+    jobs = actions_run.get("jobs")
+    if (
+        not isinstance(jobs, list)
+        or [job.get("name") for job in jobs if isinstance(job, dict)]
+        != list(REQUIRED_ACTIONS_JOBS)
+        or any(
+            set(job) != {"id", "name", "status", "conclusion"}
+            or type(job.get("id")) is not int
+            or job["id"] <= 0
+            or job.get("status") != "completed"
+            or job.get("conclusion") != "success"
+            for job in jobs
+            if isinstance(job, dict)
+        )
+        or any(not isinstance(job, dict) for job in jobs)
+    ):
+        fail("finalize_replay_mismatch")
+    return record
 
 
 def command_finalize(arguments):
@@ -2973,17 +3610,70 @@ def command_finalize(arguments):
             fail("recheck_certification_binding_mismatch")
         if github_repository_from_remote(repo, state["remote"]) != repository:
             fail("github_repository_mismatch")
+        final_path = root / "final.json"
+        if final_path.exists():
+            existing = validate_terminal_final_replay(
+                load_json_file(final_path, "final", 0o600),
+                state,
+                gate_chain,
+                binding,
+                recheck,
+                bundle_record,
+                candidate_bundle_file,
+                repo,
+                repository,
+                run_ids,
+            )
+            require_active_d2_binding(binding)
+            try:
+                candidate_bundle.retire_candidate_build_root(root)
+            except CandidateBundleError as error:
+                fail(str(error))
+            return {**existing, "disposition": "exact_replay"}
         main_commit = fetch_main(repo, state["remote"], state["base_ref"])
         main_tree = commit_tree(repo, main_commit, "finalize_main")
         if main_tree != state["merge_tree"]:
             fail("main_tree_mismatch")
         pull_request = github_pull(repository, state, main_commit)
+        sealed_pull_request = recheck["pull_request"]
+        if datetime.datetime.fromisoformat(
+            recheck["verified_at"][:-1] + "+00:00"
+        ) >= datetime.datetime.fromisoformat(
+            pull_request["merged_at"][:-1] + "+00:00"
+        ):
+            fail("pull_request_recheck_not_before_merge")
+        current_approvals = {
+            approval["id"]: approval
+            for approval in pull_request["approvals"]
+        }
+        if (
+            pull_request["author"] != sealed_pull_request["author"]
+            or any(
+                current_approvals.get(approval["id"]) != approval
+                for approval in sealed_pull_request["approvals"]
+            )
+        ):
+            fail("pull_request_recheck_approval_invalid")
+        workflow_file = git_file_identity(
+            repo,
+            main_commit,
+            REQUIRED_ACTIONS_WORKFLOW["path"],
+            "actions_workflow_file",
+        )
         runs = [
-            github_run(repository, run_id, main_commit, state["base_ref"])
+            github_run(
+                repository,
+                run_id,
+                main_commit,
+                state["base_ref"],
+                workflow_file,
+            )
             for run_id in run_ids
         ]
         require_active_d2_binding(binding)
-        final_path = root / "final.json"
+        final_pull_request = github_pull(repository, state, main_commit)
+        if final_pull_request != pull_request:
+            fail("pull_request_final_snapshot_changed")
         identity = {
             "schema_version": SCHEMA_VERSION,
             "kind": "starring.d3.exact-tree-certification.v1",
@@ -3012,22 +3702,6 @@ def command_finalize(arguments):
             "actions_runs": runs,
             "status": "passed",
         }
-        if final_path.exists():
-            existing = load_json_file(final_path, "final", 0o600)
-            verify_sealed_record(existing, "final")
-            if not valid_schema_version(existing.get("schema_version")):
-                fail("final_schema_invalid")
-            if set(existing) != set(identity) | {"finalized_at", "record_sha256"}:
-                fail("final_fields_invalid")
-            validate_timestamp(existing["finalized_at"], "finalized_at")
-            if {key: existing.get(key) for key in identity} != identity:
-                fail("finalize_replay_mismatch")
-            require_active_d2_binding(binding)
-            try:
-                candidate_bundle.retire_candidate_build_root(root)
-            except CandidateBundleError as error:
-                fail(str(error))
-            return {**existing, "disposition": "exact_replay"}
         record = seal_record({**identity, "finalized_at": utc_now()})
         write_new_json(final_path, record)
         require_active_d2_binding(binding)

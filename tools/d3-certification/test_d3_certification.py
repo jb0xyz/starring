@@ -492,8 +492,18 @@ class D3CertificationTests(unittest.TestCase):
             candidate_job.start()
             self.addCleanup(candidate_job.stop)
         self.create_repository()
+        self.install_fake_gh(
+            self.merge,
+            pull_overrides={
+                "state": "open",
+                "merged": False,
+                "merged_at": None,
+            },
+        )
 
     def tearDown(self):
+        if hasattr(self, "previous_path"):
+            os.environ["PATH"] = self.previous_path
         self.temporary.cleanup()
 
     def create_repository(self):
@@ -504,6 +514,10 @@ class D3CertificationTests(unittest.TestCase):
         write(self.seed / "base.txt", "base\n")
         write(self.seed / "Cargo.toml", "workspace manifest\n")
         write(self.seed / "Cargo.lock", "workspace lockfile\n")
+        write(
+            self.seed / ".github" / "workflows" / "ci.yml",
+            "name: CI\non: [push]\n",
+        )
         verifier = """import json
 import pathlib
 import sys
@@ -766,7 +780,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             database_url,
         ):
             observed.append(command)
-            database_urls.append(database_url if index > 16 else None)
+            database_urls.append(database_url if index > 18 else None)
             return next(outcomes, 0)
 
         def recording_runner(
@@ -1115,6 +1129,34 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                     self.github_repository,
                 )
 
+    def test_gate_git_wrapper_routes_plain_and_explicit_workspace_git(self):
+        staging = self.root / "wrapper-staging"
+        staging.mkdir(mode=0o700)
+        MODULE.prepare_gate_git_projection(staging, self.repo)
+        workspace = self.root / "wrapper-workspace"
+        workspace.mkdir(mode=0o700)
+        wrapper = self.root / "wrapper-git"
+        write(
+            wrapper,
+            MODULE.gate_git_wrapper(workspace, staging / "git"),
+            0o700,
+        )
+        self.assertEqual(
+            run([str(wrapper), "rev-parse", "--show-toplevel"], workspace),
+            str(workspace),
+        )
+        self.assertIn(
+            "Cargo.toml",
+            run([str(wrapper), "ls-files"], workspace).splitlines(),
+        )
+        self.assertEqual(
+            run(
+                [str(wrapper), "-C", str(workspace), "rev-parse", "HEAD"],
+                self.root,
+            ),
+            self.base,
+        )
+
     def test_prepare_rejects_git_transport_rewrites_and_overrides(self):
         overrides = (
             (f"url.{self.remote.as_uri()}.insteadOf", self.github_remote_url),
@@ -1139,9 +1181,9 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         status, result, error, observed = self.invoke_gate_plan(state_path, gates)
         self.assertEqual(status, 0, error)
         self.assertEqual(observed, list(MODULE.REQUIRED_GATE_COMMANDS))
-        self.assertEqual(self.gate_database_urls[:16], [None] * 16)
+        self.assertEqual(self.gate_database_urls[:18], [None] * 18)
         self.assertEqual(
-            self.gate_database_urls[16:],
+            self.gate_database_urls[18:],
             [self.postgres_database_url] * 13,
         )
         self.assertEqual(result["gates"], len(MODULE.REQUIRED_GATE_COMMANDS))
@@ -1229,6 +1271,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(
             MODULE.REQUIRED_GATE_COMMANDS,
             (
+                "python3 tools/ci/scan_tracked_secrets.py",
                 "cargo fmt --all -- --check",
                 "cargo build --locked --workspace --all-targets",
                 "cargo test --locked --workspace",
@@ -1241,6 +1284,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 "npm --prefix eval/design-harness run audit",
                 "npm --prefix eval/design-harness run check",
                 "python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'",
+                "python3 -m unittest discover -s tools/d3-certification -p 'test_*.py'",
                 "node --test tools/d2-certification/product_driver.test.mjs",
                 "cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check",
                 "cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml",
@@ -1273,9 +1317,11 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             documented.append(parts[0])
         self.assertEqual(tuple(documented), MODULE.REQUIRED_GATE_COMMANDS)
 
-    def test_prepare_rejects_each_missing_d2_standalone_gate(self):
+    def test_prepare_rejects_each_missing_certification_gate(self):
         standalone = (
+            "python3 tools/ci/scan_tracked_secrets.py",
             "python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'",
+            "python3 -m unittest discover -s tools/d3-certification -p 'test_*.py'",
             "node --test tools/d2-certification/product_driver.test.mjs",
             "cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check",
             "cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml",
@@ -2848,6 +2894,21 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(status, 1)
         self.assertIn("pr_base_changed", error)
 
+    def test_recheck_seals_exact_head_approval_and_replays_exactly(self):
+        state_path = self.complete_prerequisites()
+        recheck = json.loads(
+            state_path.with_name("recheck.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(recheck["pull_request"]["state"], "open")
+        self.assertEqual(recheck["pull_request"]["head_sha"], self.head)
+        self.assertEqual(
+            [approval["id"] for approval in recheck["pull_request"]["approvals"]],
+            [401],
+        )
+        status, replay, error = self.invoke(["recheck", "--state", str(state_path)])
+        self.assertEqual(status, 0, error)
+        self.assertEqual(replay["disposition"], "exact_replay")
+
     def test_recheck_rejects_post_binding_bundle_replacement(self):
         state_path = self.complete_prerequisites()
         artifact = state_path.parent / "candidate-bundle" / "starring-runtime"
@@ -3004,6 +3065,8 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         workflow_overrides=None,
         jobs=None,
         pull_overrides=None,
+        reviews=None,
+        reviewer_permissions=None,
     ):
         directory = self.root / "bin"
         directory.mkdir(exist_ok=True)
@@ -3033,13 +3096,15 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         }
         if workflow_overrides:
             workflow_value.update(workflow_overrides)
+        self.fake_merged_at = MODULE.utc_now()
         pull_value = {
             "number": 42,
             "state": "closed",
             "draft": False,
             "merged": True,
-            "merged_at": "2026-08-04T12:00:00Z",
+            "merged_at": self.fake_merged_at,
             "merge_commit_sha": head_sha,
+            "user": {"id": 100, "login": "pull-author", "type": "User"},
             "base": {
                 "ref": "main",
                 "sha": self.base,
@@ -3052,6 +3117,25 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         }
         if pull_overrides:
             pull_value.update(pull_overrides)
+        if reviews is None:
+            reviews = [
+                {
+                    "id": 401,
+                    "state": "APPROVED",
+                    "submitted_at": "2026-08-04T11:00:00Z",
+                    "commit_id": self.head,
+                    "user": {
+                        "id": 200,
+                        "login": "human-reviewer",
+                        "type": "User",
+                    },
+                }
+            ]
+        if reviewer_permissions is None:
+            reviewer_permissions = {
+                "human-reviewer": ("write", "write"),
+                "second-reviewer": ("write", "maintain"),
+            }
         if jobs is None:
             jobs = [
                 {
@@ -3077,6 +3161,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             ]
         responses = {
             "repos/owner/repository/pulls/42": pull_value,
+            "repos/owner/repository/pulls/42/reviews?per_page=100": [reviews],
             "repos/owner/repository/actions/runs/101": run_value,
             "repos/owner/repository/actions/workflows/202": workflow_value,
             "repos/owner/repository/actions/runs/101/jobs?filter=latest&per_page=100": {
@@ -3084,6 +3169,18 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 "jobs": jobs,
             },
         }
+        for review in reviews:
+            reviewer = review.get("user") if isinstance(review, dict) else None
+            login = reviewer.get("login") if isinstance(reviewer, dict) else None
+            permission = reviewer_permissions.get(login)
+            if permission is not None:
+                responses[
+                    f"repos/owner/repository/collaborators/{login}/permission"
+                ] = {
+                    "permission": permission[0],
+                    "role_name": permission[1],
+                    "user": reviewer,
+                }
         body = f"""#!{sys.executable}
 import json
 import sys
@@ -3127,18 +3224,52 @@ print(json.dumps(responses[endpoint]))
                     "state": "closed",
                     "draft": False,
                     "merged": True,
-                    "merged_at": "2026-08-04T12:00:00Z",
+                    "merged_at": self.fake_merged_at,
                     "merge_commit_sha": self.merge,
                     "base_ref": "main",
                     "base_sha": self.base,
                     "head_sha": self.head,
                     "repository": self.github_repository,
+                    "author": {
+                        "id": 100,
+                        "login": "pull-author",
+                        "type": "User",
+                    },
+                    "approvals": [
+                        {
+                            "id": 401,
+                            "state": "APPROVED",
+                            "submitted_at": "2026-08-04T11:00:00Z",
+                            "commit_sha": self.head,
+                            "reviewer": {
+                                "id": 200,
+                                "login": "human-reviewer",
+                                "type": "User",
+                            },
+                            "repository_permission": "write",
+                            "repository_role_name": "write",
+                        }
+                    ],
                 },
             )
             self.assertEqual(result["actions_runs"][0]["id"], 101)
             self.assertEqual(
                 result["actions_runs"][0]["workflow_path"],
                 ".github/workflows/ci.yml",
+            )
+            workflow_file = result["actions_runs"][0]["workflow_file"]
+            self.assertEqual(workflow_file["path"], ".github/workflows/ci.yml")
+            self.assertEqual(
+                workflow_file["git_blob_sha"],
+                git(
+                    self.repo,
+                    "rev-parse",
+                    f"{self.merge}:.github/workflows/ci.yml",
+                ),
+            )
+            self.assertEqual(
+                workflow_file["sha256"],
+                MODULE.sha256_bytes(b"name: CI\non: [push]\n"),
             )
             self.assertEqual(
                 [job["name"] for job in result["actions_runs"][0]["jobs"]],
@@ -3169,6 +3300,151 @@ print(json.dumps(responses[endpoint]))
         finally:
             os.environ["PATH"] = self.previous_path
 
+    def test_finalize_rechecks_pull_snapshot_after_slow_validations(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        self.install_fake_gh(self.merge)
+        original = MODULE.github_pull
+
+        def superseded(repository, state, main_commit):
+            value = original(repository, state, main_commit)
+            changed = json.loads(json.dumps(value))
+            changed["approvals"][0]["id"] = 999
+            return changed
+
+        cases = (
+            ("dismissed", MODULE.D3Error("pull_request_approval_required")),
+            ("superseded", None),
+            ("permission_revoked", MODULE.D3Error("pull_request_approval_required")),
+        )
+        try:
+            for name, second_error in cases:
+                with self.subTest(name=name):
+                    calls = [0]
+
+                    def snapshot(repository, state, main_commit):
+                        calls[0] += 1
+                        if calls[0] == 2 and second_error is not None:
+                            raise second_error
+                        if calls[0] == 2 and name == "superseded":
+                            return superseded(repository, state, main_commit)
+                        return original(repository, state, main_commit)
+
+                    with mock.patch.object(MODULE, "github_pull", side_effect=snapshot):
+                        status, _, error = self.invoke(
+                            self.finalize_arguments(state_path)
+                        )
+                    self.assertEqual(status, 1)
+                    self.assertEqual(calls[0], 2)
+                    if name == "superseded":
+                        self.assertIn("pull_request_final_snapshot_changed", error)
+                    else:
+                        self.assertIn("pull_request_approval_required", error)
+                    self.assertFalse(state_path.with_name("final.json").exists())
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_terminal_replay_finishes_retirement_after_permission_revocation(self):
+        state_path = self.complete_prerequisites()
+        root = state_path.parent
+        build_root = root / "candidate-build"
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        self.install_fake_gh(self.merge)
+        with mock.patch.object(
+            MODULE.candidate_bundle,
+            "retire_candidate_build_root",
+            side_effect=MODULE.CandidateBundleError("injected_retirement_failure"),
+        ):
+            status, _, error = self.invoke(self.finalize_arguments(state_path))
+        self.assertEqual(status, 1)
+        self.assertIn("injected_retirement_failure", error)
+        self.assertTrue(state_path.with_name("final.json").is_file())
+        self.assertTrue(build_root.is_dir())
+        self.install_fake_gh(
+            self.merge,
+            reviewer_permissions={"human-reviewer": ("read", "read")},
+        )
+        try:
+            with mock.patch.object(
+                MODULE,
+                "github_pull",
+                side_effect=AssertionError("terminal replay queried pull request"),
+            ), mock.patch.object(
+                MODULE,
+                "github_run",
+                side_effect=AssertionError("terminal replay queried actions"),
+            ):
+                status, replay, error = self.invoke(
+                    self.finalize_arguments(state_path)
+                )
+            self.assertEqual(status, 0, error)
+            self.assertEqual(replay["disposition"], "exact_replay")
+            self.assertFalse(build_root.exists())
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_terminal_replay_rejects_noncanonical_final_approvals(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        self.install_fake_gh(self.merge)
+        try:
+            status, _, error = self.invoke(self.finalize_arguments(state_path))
+            self.assertEqual(status, 0, error)
+            final_path = state_path.with_name("final.json")
+            original = json.loads(final_path.read_text(encoding="utf-8"))
+
+            def malformed(value):
+                value["pull_request"]["approvals"][0].pop(
+                    "repository_role_name"
+                )
+
+            def duplicate(value):
+                value["pull_request"]["approvals"].append(
+                    json.loads(
+                        json.dumps(value["pull_request"]["approvals"][0])
+                    )
+                )
+
+            def stale(value):
+                value["pull_request"]["approvals"][0]["commit_sha"] = self.base
+
+            def post_merge(value):
+                value["pull_request"]["approvals"][0][
+                    "submitted_at"
+                ] = "9999-12-31T23:59:59Z"
+
+            def unhashable(value):
+                value["pull_request"]["approvals"][0]["id"] = []
+
+            for name, mutation in (
+                ("malformed", malformed),
+                ("duplicate", duplicate),
+                ("stale", stale),
+                ("post_merge", post_merge),
+                ("unhashable", unhashable),
+            ):
+                with self.subTest(name=name):
+                    changed = json.loads(json.dumps(original))
+                    changed.pop("record_sha256")
+                    mutation(changed)
+                    write(
+                        final_path,
+                        MODULE.canonical_json(MODULE.seal_record(changed)) + "\n",
+                        0o600,
+                    )
+                    status, _, error = self.invoke(
+                        self.finalize_arguments(state_path)
+                    )
+                    self.assertEqual(status, 1)
+                    self.assertIn("final_pull_request_approvals_invalid", error)
+            write(
+                final_path,
+                MODULE.canonical_json(original) + "\n",
+                0o600,
+            )
+        finally:
+            os.environ["PATH"] = self.previous_path
+
     def test_finalize_rejects_unmerged_or_drifted_pull_request(self):
         cases = (
             {"state": "open", "merged": False, "merged_at": None},
@@ -3187,6 +3463,319 @@ print(json.dumps(responses[endpoint]))
                     self.assertIn("pull_request_merge_identity_invalid", error)
         finally:
             os.environ["PATH"] = self.previous_path
+
+    def test_finalize_rejects_missing_stale_bot_self_or_revoked_approval(self):
+        approved = {
+            "id": 401,
+            "state": "APPROVED",
+            "submitted_at": "2026-08-04T11:00:00Z",
+            "commit_id": self.head,
+            "user": {"id": 200, "login": "human-reviewer", "type": "User"},
+        }
+        cases = (
+            ("missing", []),
+            (
+                "self",
+                [{**approved, "user": {"id": 100, "login": "pull-author", "type": "User"}}],
+            ),
+            (
+                "bot_type",
+                [{**approved, "user": {"id": 200, "login": "review-app[bot]", "type": "Bot"}}],
+            ),
+            (
+                "bot_login",
+                [{**approved, "user": {"id": 200, "login": "review-app[bot]", "type": "User"}}],
+            ),
+            ("stale_head", [{**approved, "commit_id": self.base}]),
+            (
+                "post_merge",
+                [{**approved, "submitted_at": "9999-12-31T23:59:59Z"}],
+            ),
+            (
+                "dismissed",
+                [
+                    approved,
+                    {
+                        **approved,
+                        "id": 402,
+                        "state": "DISMISSED",
+                        "submitted_at": "2026-08-04T11:30:00Z",
+                    },
+                ],
+            ),
+            (
+                "changes_requested",
+                [
+                    approved,
+                    {
+                        **approved,
+                        "id": 402,
+                        "state": "CHANGES_REQUESTED",
+                        "submitted_at": "2026-08-04T11:30:00Z",
+                    },
+                ],
+            ),
+        )
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        try:
+            for name, reviews in cases:
+                with self.subTest(name=name):
+                    self.install_fake_gh(self.merge, reviews=reviews)
+                    status, _, error = self.invoke(self.finalize_arguments(state_path))
+                    self.assertEqual(status, 1)
+                    self.assertIn("pull_request_approval_required", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_review_normalization_uses_latest_decision_per_reviewer(self):
+        reviews = [
+            {
+                "id": 401,
+                "state": "APPROVED",
+                "submitted_at": "2026-08-04T10:00:00Z",
+                "commit_id": self.head,
+                "user": {"id": 200, "login": "human-reviewer", "type": "User"},
+            },
+            {
+                "id": 402,
+                "state": "COMMENTED",
+                "submitted_at": "2026-08-04T10:30:00Z",
+                "commit_id": self.head,
+                "user": {"id": 200, "login": "human-reviewer", "type": "User"},
+            },
+            {
+                "id": 403,
+                "state": "APPROVED",
+                "submitted_at": "2026-08-04T11:00:00Z",
+                "commit_id": self.head,
+                "user": {"id": 200, "login": "human-reviewer", "type": "User"},
+            },
+            {
+                "id": 404,
+                "state": "PENDING",
+                "submitted_at": None,
+                "commit_id": self.head,
+                "user": {"id": 200, "login": "human-reviewer", "type": "User"},
+            },
+        ]
+        approvals = MODULE.pull_request_approvals(
+            [reviews],
+            {"expected_head": self.head},
+            {"id": 100, "login": "pull-author", "type": "User"},
+            "2026-08-04T12:00:00Z",
+        )
+        self.assertEqual(len(approvals), 1)
+        self.assertEqual(approvals[0]["id"], 403)
+
+    def test_finalize_rejects_duplicate_review_evidence(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        review = {
+            "id": 401,
+            "state": "APPROVED",
+            "submitted_at": "2026-08-04T11:00:00Z",
+            "commit_id": self.head,
+            "user": {"id": 200, "login": "human-reviewer", "type": "User"},
+        }
+        self.install_fake_gh(self.merge, reviews=[review, review])
+        try:
+            status, _, error = self.invoke(self.finalize_arguments(state_path))
+            self.assertEqual(status, 1)
+            self.assertIn("pull_request_reviews_invalid", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_recheck_rejects_missing_stale_bot_self_or_revoked_approval(self):
+        state_path = self.complete_prerequisites()
+        state_path.with_name("recheck.json").unlink()
+        approved = {
+            "id": 401,
+            "state": "APPROVED",
+            "submitted_at": "2026-08-04T11:00:00Z",
+            "commit_id": self.head,
+            "user": {"id": 200, "login": "human-reviewer", "type": "User"},
+        }
+        cases = (
+            ("missing", []),
+            (
+                "self",
+                [{**approved, "user": {"id": 100, "login": "pull-author", "type": "User"}}],
+            ),
+            (
+                "bot",
+                [{**approved, "user": {"id": 200, "login": "review-app[bot]", "type": "Bot"}}],
+            ),
+            ("stale_head", [{**approved, "commit_id": self.base}]),
+            (
+                "dismissed",
+                [
+                    approved,
+                    {
+                        **approved,
+                        "id": 402,
+                        "state": "DISMISSED",
+                        "submitted_at": "2026-08-04T11:30:00Z",
+                    },
+                ],
+            ),
+        )
+        for name, reviews in cases:
+            with self.subTest(name=name):
+                self.install_fake_gh(
+                    self.merge,
+                    pull_overrides={
+                        "state": "open",
+                        "merged": False,
+                        "merged_at": None,
+                    },
+                    reviews=reviews,
+                )
+                status, _, error = self.invoke(
+                    ["recheck", "--state", str(state_path)]
+                )
+                self.assertEqual(status, 1)
+                self.assertIn("pull_request_approval_required", error)
+
+    def test_finalize_requires_sealed_recheck_approval_to_remain_effective(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        reviews = [
+            {
+                "id": 401,
+                "state": "DISMISSED",
+                "submitted_at": "2026-08-04T11:00:00Z",
+                "commit_id": self.head,
+                "user": {"id": 200, "login": "human-reviewer", "type": "User"},
+            },
+            {
+                "id": 402,
+                "state": "APPROVED",
+                "submitted_at": "2026-08-04T11:30:00Z",
+                "commit_id": self.head,
+                "user": {"id": 300, "login": "second-reviewer", "type": "User"},
+            },
+        ]
+        self.install_fake_gh(self.merge, reviews=reviews)
+        try:
+            status, _, error = self.invoke(self.finalize_arguments(state_path))
+            self.assertEqual(status, 1)
+            self.assertIn("pull_request_recheck_approval_invalid", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_recheck_rejects_reviewer_without_write_permission(self):
+        state_path = self.complete_prerequisites()
+        state_path.with_name("recheck.json").unlink()
+        self.install_fake_gh(
+            self.merge,
+            pull_overrides={
+                "state": "open",
+                "merged": False,
+                "merged_at": None,
+            },
+            reviewer_permissions={"human-reviewer": ("read", "triage")},
+        )
+        status, _, error = self.invoke(["recheck", "--state", str(state_path)])
+        self.assertEqual(status, 1)
+        self.assertIn("pull_request_approval_required", error)
+
+    def test_finalize_rejects_reviewer_permission_revocation(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        self.install_fake_gh(
+            self.merge,
+            reviewer_permissions={"human-reviewer": ("read", "read")},
+        )
+        try:
+            status, _, error = self.invoke(self.finalize_arguments(state_path))
+            self.assertEqual(status, 1)
+            self.assertIn("pull_request_approval_required", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_recheck_rejects_merge_during_review_collection(self):
+        author = {"id": 100, "login": "pull-author", "type": "User"}
+        open_pull = {"state": "open", "merged": False, "merged_at": None}
+        merged_pull = {
+            "state": "closed",
+            "merged": True,
+            "merged_at": MODULE.utc_now(),
+        }
+        approval = {
+            "id": 401,
+            "state": "APPROVED",
+            "submitted_at": "2026-08-04T11:00:00Z",
+            "commit_sha": self.head,
+            "reviewer": {"id": 200, "login": "human-reviewer", "type": "User"},
+            "repository_permission": "write",
+            "repository_role_name": "write",
+        }
+        with mock.patch.object(
+            MODULE,
+            "github_pull_common",
+            side_effect=((open_pull, author), (merged_pull, author)),
+        ), mock.patch.object(
+            MODULE,
+            "github_review_pages",
+            return_value=[[]],
+        ), mock.patch.object(
+            MODULE,
+            "pull_request_approvals",
+            return_value=[approval],
+        ), mock.patch.object(
+            MODULE,
+            "authorized_pull_request_approvals",
+            return_value=[approval],
+        ):
+            with self.assertRaisesRegex(
+                MODULE.D3Error, "pull_request_recheck_identity_invalid"
+            ):
+                MODULE.github_pull_recheck(
+                    self.github_repository,
+                    {
+                        "pr_number": 42,
+                        "base_ref": "main",
+                        "expected_base": self.base,
+                        "expected_head": self.head,
+                    },
+                )
+
+    def test_finalize_requires_recheck_before_merge_timestamp(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        self.install_fake_gh(self.merge)
+        recheck_path = state_path.with_name("recheck.json")
+        recheck = json.loads(recheck_path.read_text(encoding="utf-8"))
+        recheck.pop("record_sha256")
+        recheck["verified_at"] = self.fake_merged_at
+        write(
+            recheck_path,
+            MODULE.canonical_json(MODULE.seal_record(recheck)) + "\n",
+            0o600,
+        )
+        try:
+            status, _, error = self.invoke(self.finalize_arguments(state_path))
+            self.assertEqual(status, 1)
+            self.assertIn("pull_request_recheck_not_before_merge", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_recheck_rejects_closed_or_draft_pull_request(self):
+        state_path = self.complete_prerequisites()
+        state_path.with_name("recheck.json").unlink()
+        cases = (
+            {"state": "closed", "merged": True},
+            {"state": "open", "merged": False, "merged_at": None, "draft": True},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.install_fake_gh(self.merge, pull_overrides=overrides)
+                status, _, error = self.invoke(
+                    ["recheck", "--state", str(state_path)]
+                )
+                self.assertEqual(status, 1)
+                self.assertIn("pull_request_recheck_identity_invalid", error)
 
     def test_finalize_rejects_repository_other_than_pinned_origin(self):
         state_path = self.complete_prerequisites()

@@ -1224,7 +1224,9 @@ test("startup requires verified ChatGPT login identity", async () => {
       port: 0,
       metricsPath: join(directory, "metrics-version.jsonl"),
       runner: fakeRunner({
-        verify: async () => verification({ codex_cli_version: "codex-cli 0.145.0" }),
+        verify: async () => verification({
+          codex_cli_version: "codex-cli 0.146.0-alpha.3.1",
+        }),
       }),
     }),
     (error) => error.code === "invalid_codex_version",
@@ -1275,7 +1277,8 @@ test("ChatGPT startup verification accepts the Codex status stream", () => {
     false,
   );
   assert.equal(isSupportedCodexVersion(VERSION), true);
-  assert.equal(isSupportedCodexVersion("codex-cli 0.145.0"), false);
+  assert.equal(VERSION, "codex-cli 0.147.0-alpha.6.5");
+  assert.equal(isSupportedCodexVersion("codex-cli 0.146.0-alpha.3.1"), false);
 });
 
 test("Codex identity drift fails closed before and after execution", async () => {
@@ -1306,7 +1309,7 @@ test("Codex identity drift fails closed before and after execution", async () =>
     captureProcess: captureIdentities([
       {},
       {},
-      { version: "codex-cli 0.145.0" },
+      { version: "codex-cli 0.146.0-alpha.3.1" },
     ]),
     executeCodex: async () => {
       executions += 1;

@@ -317,7 +317,7 @@ Cloudflare origin or public route. The retired `local.llm-api` and
 Interactive CLI startup now defaults to Intent Recipe mode and fails closed
 before network access when its bindings are absent. Adaptive and Typed Plan
 remain explicit legacy rollback modes only. The current exact Codex CLI pin is
-`codex-cli 0.146.0-alpha.3.1`; a bundled-CLI update changes this identity,
+`codex-cli 0.147.0-alpha.6.5`; a bundled-CLI update changes this identity,
 closes model admission, and requires an explicit tested pin advance and worker
 restart.
 
@@ -326,7 +326,7 @@ capacity, timeout, and monotonic accepted and settled completion counters. The
 Luna V4 matrix requires a dedicated one-active, zero-queue worker and proves
 that every phase counter delta equals that phase's reported model calls; another
 valid completion request invalidates the cohort instead of contaminating it.
-The current 2026-07-17 clean-source matrix at
+The most recent completed 2026-07-17 clean-source matrix at
 `7f138b308644f954cd38ceee78768f3d6b7bf551` passed all 232/232 Promptfoo rows
 and executed the exact 298 model/tool calls with zero provider errors, repair
 attempts, or retries. Every request, route, and adjudication identity class was
@@ -336,7 +336,10 @@ revision 15, and registry digest
 The earlier normalizer-12 certificate remains immutable historical evidence;
 two interrupted normalizer-13 and normalizer-14 runs are diagnostic only and
 are not pooled into this result.
-This certifies the bounded single-worker authoring cohort, not commercial
+That matrix remains immutable historical evidence for its prior Codex CLI and
+worker-source identity. The `0.147.0-alpha.6.5` pin advance requires a fresh
+clean-source matrix and cannot continue or certify from the earlier result.
+It certifies the bounded single-worker authoring cohort, not commercial
 concurrency, soak behavior, high availability, or live Discord execution.
 
 The current Luna V4 evidence and continuation state are recorded in

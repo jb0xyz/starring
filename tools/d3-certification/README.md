@@ -28,6 +28,7 @@ Prepare a state directory from the current GitHub-generated merge ref. `origin` 
 D3_OUTPUT_ROOT="$HOME/Library/Application Support/Starring/d3-certifications"
 install -d -m 0700 "$D3_OUTPUT_ROOT"
 gates=(
+  'python3 tools/ci/scan_tracked_secrets.py'
   'cargo fmt --all -- --check'
   'cargo build --locked --workspace --all-targets'
   'cargo test --locked --workspace'
@@ -40,6 +41,7 @@ gates=(
   'npm --prefix eval/design-harness run audit'
   'npm --prefix eval/design-harness run check'
   "python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'"
+  "python3 -m unittest discover -s tools/d3-certification -p 'test_*.py'"
   'node --test tools/d2-certification/product_driver.test.mjs'
   'cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check'
   'cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml'
@@ -76,10 +78,12 @@ Set `D3_STATE` to the absolute `state` value returned by `prepare`. The run
 root referred to below as `<D3_RUN>` is the directory containing that
 `state.json` file.
 
-`run-gates` executes the 29 commands above, in order, in the detached
-worktree. Candidate publication does not begin until all 29 pass. Completed
+`run-gates` executes the 31 commands above, in order, in the detached
+worktree. Candidate publication does not begin until all 31 pass. Completed
 gates replay without execution. A failed or interrupted gate resumes as a new
-or incomplete durable attempt.
+or incomplete durable attempt. Gate 1 routes both plain Git commands used by
+the tracked-secret scanner and explicit `git -C /workspace` commands through
+the sealed read-only `/git` projection rather than the host worktree pointer.
 
 Before the first attempt, `run-gates` creates a bounded bootstrap while network
 access is available. Both Cargo lockfiles are first checked in a networkless
@@ -105,12 +109,12 @@ is removed with the attempt. Cargo uses one build job, no incremental state,
 and `debug=0` for dev and test artifacts; debug assertions remain enabled.
 Docker's OOM state and the child cgroup `memory.events` OOM counter are checked
 separately, so an OOM in a descendant cannot be mistaken for an ordinary tool
-exit. Gates are offline except the explicitly networked npm audit in gate 10.
+exit. Gates are offline except the explicitly networked npm audit in gate 11.
 
 The PostgreSQL URL file remains a dedicated absolute mode-`0600` policy input.
 It must name an explicit loopback port and a `starring_test` or `starring_d3*`
 database with credentials, but those credentials and that server are not used
-by a gate. For each of gates 17 through 29, the runner derives only the approved
+by a gate. For each of gates 19 through 31, the runner derives only the approved
 database name, generates a fresh random password, and starts a digest-pinned,
 read-only PostgreSQL container with tmpfs storage, no published ports, and no
 host mounts. The gate container joins only that PostgreSQL container's network
@@ -247,14 +251,14 @@ python3 tools/d3-certification/d3_certification.py bind-d2 \
   --d2-final-record /absolute/d2/run/final.json
 ```
 
-Re-fetch the PR head, base, and generated merge ref immediately before merge. This command requires the gates and D2 binding to be complete.
+Re-fetch the PR head, base, and generated merge ref immediately before merge. This command requires the gates and D2 binding to be complete, the PR to remain open and non-draft, and at least one effective human approval of the exact pinned head. The approver must currently have GitHub `write` or `admin` base permission; GitHub maps the `maintain` role to `write`. D3 verifies the collaborator-permission response against the reviewer's stable actor identity and seals both `permission` and `role_name` with the normalized approval set in `recheck.json`. It reads the PR again after collecting reviews and permissions so a merge during collection fails closed. No approval is required by `prepare`, `run-gates`, or `bind-d2`.
 
 ```sh
 python3 tools/d3-certification/d3_certification.py recheck \
   --state "$D3_STATE"
 ```
 
-After an independent merge, bind the fetched `origin/main` tree, the closed and merged frozen pull request, and one successful post-merge Actions run. The PR's repository, base ref and SHA, head SHA, and merge commit must match the pinned state and fetched `main` exactly. The repository argument must exactly equal the owner/repository identity pinned from `origin`. The GitHub CLI must already be authenticated without inline credentials.
+After an independent merge, bind the fetched `origin/main` tree, the closed and merged frozen pull request, and one successful post-merge Actions run. The PR's repository, author, base ref and SHA, head SHA, and merge commit must match the pinned state and fetched `main` exactly, and the sealed recheck timestamp must be strictly earlier than GitHub's merge timestamp. At least one effective approval must come from a human GitHub user other than the PR author, must target the exact pinned head commit, must retain `write` or `admin` base permission, and must predate the merge. Reviews are normalized by stable reviewer identity: a reviewer's latest approval, changes-request, or dismissal is authoritative, while comments and unsubmitted pending reviews do not replace a decision. Bot, self, stale-head, dismissed, superseded, and read-only outsider approvals do not satisfy the requirement. Every approval and permission identity sealed by `recheck` must still be the same effective approval at finalization; a replacement approval from another reviewer cannot mask dismissal, permission loss, or supersession of the sealed review. After the Actions and final D2 checks complete, `finalize` takes a second PR/review/permission snapshot and requires it to be exactly equal to the first before writing `final.json`. A dismissal, superseding review, or permission change during those slower checks therefore fails closed. The repository argument must exactly equal the owner/repository identity pinned from `origin`. The GitHub CLI must already be authenticated without inline credentials.
 
 ```sh
 python3 tools/d3-certification/d3_certification.py finalize \
@@ -263,18 +267,22 @@ python3 tools/d3-certification/d3_certification.py finalize \
   --actions-run-id RUN_ID
 ```
 
-`final.json` is the terminal D3 record. A passing record requires the frozen PR to be closed and merged into the fetched `main` commit, exact merge-tree equality on `main`, the complete canonical gate evidence chain, the same D2 receipt chain observed during pre-merge recheck, and successful `checks` and `postgres` jobs in the exact `CI` push workflow run against that commit.
+`final.json` is the terminal D3 record. A passing record requires the frozen PR to be reviewed, closed, and merged into the fetched `main` commit, exact merge-tree equality on `main`, the complete canonical gate evidence chain, the same D2 receipt chain observed during pre-merge recheck, and successful `checks` and `postgres` jobs in the exact `CI` push workflow run against that commit. The terminal record includes the workflow file's Git blob identity and SHA-256 from that exact commit; this is an explicit audit binding in addition to the enclosing Git tree identity. These GitHub values are point-in-time certification evidence captured immediately before terminal record creation, not a claim that mutable review or collaborator state can never change afterward.
 
 After creating or exactly replaying a valid terminal record, `finalize` retires
 `candidate-build` through the device, inode, owner, and mode sealed in the
 intent. Removal is descriptor-relative and fails closed on replacement; the
-sealed candidate bundle and all certification evidence remain. Replaying
-`finalize` also completes an interrupted retirement.
+sealed candidate bundle and all certification evidence remain. Once a valid
+`final.json` exists, replay validates that sealed record against the current
+state, gate chain, D2 binding, recheck, candidate bundle, local commit tree,
+workflow blob, and supplied Actions run identity without consulting mutable
+GitHub APIs. It then completes an interrupted retirement even if a reviewer is
+later removed or loses permission.
 
 ## Boundaries and limitations
 
 The bootstrap needs registry network access only when it is first created, and
-gate 10 intentionally reaches the npm registry for its live audit. Registry
+gate 11 intentionally reaches the npm registry for its live audit. Registry
 availability and the content addressed by the lockfiles therefore remain
 external inputs until the bootstrap is sealed. No gate stdout or stderr is
 retained, so the evidence proves command identity, result, duration, runner,

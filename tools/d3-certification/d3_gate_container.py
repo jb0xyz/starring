@@ -132,7 +132,7 @@ RUNNER_POLICY = {
         "cargo_target": f"owned-gate-attempt-disposable-tmpfs-volume:{GATE_TARGET_SIZE}",
     },
     "ordinary": {
-        "gates": [[1, 8], [11, 16]],
+        "gates": [[1, 9], [12, 18]],
         "network": "none",
         "read_only_mounts": [
             "/workspace",
@@ -143,7 +143,7 @@ RUNNER_POLICY = {
         ],
     },
     "offline_install": {
-        "gate": 9,
+        "gate": 10,
         "network": "none",
         "source": "isolated-package-projection",
         "candidate_worktree_mounted": False,
@@ -152,14 +152,19 @@ RUNNER_POLICY = {
         "audit": False,
     },
     "audit": {
-        "gate": 10,
+        "gate": 11,
         "network": "bridge",
         "command": "npm --prefix eval/design-harness audit --audit-level=high",
         "read_only_mounts": ["/workspace"],
         "registry": "https://registry.npmjs.org/",
     },
+    "tracked_secret_scan": {
+        "gate": 1,
+        "git_dir": "/git",
+        "git_work_tree": "/workspace",
+    },
     "postgres": {
-        "gates": [17, 29],
+        "gates": [19, 31],
         "server_network": "none",
         "gate_network": "container:postgres",
         "published_ports": False,
@@ -1150,7 +1155,7 @@ def fixed_gate_command(index, command):
         "umask 077 && mkdir -p /scratch/tmp && "
         "chmod 0700 /scratch/tmp"
     )
-    if index == 9:
+    if index == 10:
         selected = (
             f"{private_scratch} && "
             "mkdir -p /scratch/package /scratch/npm-cache && "
@@ -1160,7 +1165,7 @@ def fixed_gate_command(index, command):
             "npm ci --ignore-scripts --bin-links=false --install-links=false "
             "--offline --prefix /scratch/package"
         )
-    elif index == 10:
+    elif index == 11:
         selected = (
             f"{private_scratch} && "
             "npm --prefix eval/design-harness audit --audit-level=high"
@@ -1201,7 +1206,7 @@ def create_gate_container(
     labels = container_labels(root, index, attempt, "gate")
     remove_owned_container(name, labels)
     cache = None
-    if index not in (9, 10):
+    if index not in (10, 11):
         cache = ensure_gate_cache(root, index, attempt)
     arguments = common_container_arguments(
         name,
@@ -1218,14 +1223,14 @@ def create_gate_container(
             mount_argument(source, "/workspace", True),
         )
     )
-    if index == 9:
+    if index == 10:
         arguments.extend(
             (
                 "--mount",
                 mount_argument(bootstrap / "npm-cache", "/npm-cache", True),
             )
         )
-    elif index != 10:
+    elif index != 11:
         arguments.extend(
             (
                 "--mount",
@@ -1235,7 +1240,7 @@ def create_gate_container(
                     bootstrap
                     / (
                         "transport-cargo-config.toml"
-                        if 14 <= index <= 16
+                        if 16 <= index <= 18
                         else "cargo-config.toml"
                     ),
                     "/gate-cargo-config.toml",
@@ -1268,10 +1273,10 @@ def create_gate_container(
         "NODE_PATH": "/node_modules",
         "NPM_CONFIG_BIN_LINKS": "false",
         "NPM_CONFIG_CACHE": "/scratch/npm-cache",
-        "NPM_CONFIG_AUDIT": "true" if index == 10 else "false",
+        "NPM_CONFIG_AUDIT": "true" if index == 11 else "false",
         "NPM_CONFIG_FUND": "false",
         "NPM_CONFIG_INSTALL_LINKS": "false",
-        "NPM_CONFIG_OFFLINE": "false" if index == 10 else "true",
+        "NPM_CONFIG_OFFLINE": "false" if index == 11 else "true",
         "NPM_CONFIG_REGISTRY": "https://registry.npmjs.org/",
         "NPM_CONFIG_UPDATE_NOTIFIER": "false",
         "PATH": "/bootstrap-bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin",
@@ -1284,6 +1289,9 @@ def create_gate_container(
         "XDG_CACHE_HOME": "/scratch/xdg-cache",
         "XDG_CONFIG_HOME": "/scratch/xdg-config",
     }
+    if index == 1:
+        environment["GIT_DIR"] = "/git"
+        environment["GIT_WORK_TREE"] = "/workspace"
     if database_url is not None:
         environment["STARRING_TEST_DATABASE_URL"] = database_url
     for key, value in sorted(environment.items()):
@@ -1318,8 +1326,8 @@ def run_gate(root, source, bootstrap, runtime, index, attempt, command, timeout,
     cleanup_gate_attempt(root, index, attempt, owned)
     try:
         selected_database_url = None
-        network = "bridge" if index == 10 else "none"
-        if index > 16:
+        network = "bridge" if index == 11 else "none"
+        if index > 18:
             postgres = start_postgres(root, index, attempt, database_url)
             network = f"container:{postgres_name}"
             selected_database_url = postgres[2]
