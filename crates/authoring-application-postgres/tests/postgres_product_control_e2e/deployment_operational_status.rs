@@ -228,6 +228,27 @@ async fn load_operational_status(
         .unwrap()
 }
 
+async fn wait_for_database_time_at_or_after(pool: &PgPool, threshold: SystemTime) {
+    let threshold: DateTime<Utc> = threshold.into();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let reached = sqlx::query_scalar::<_, bool>(
+                "SELECT pg_catalog.clock_timestamp() >= $1",
+            )
+            .bind(threshold)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if reached {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("PostgreSQL clock must reach the bounded serving lease expiry");
+}
+
 fn assert_live_attestation(
     observation: &authoring_application::DeploymentOperationalObservationV2,
     seed: &OperationalLiveSeed,
@@ -654,7 +675,11 @@ async fn operational_status_reports_naturally_expired_serving_lease() {
     )
     .unwrap();
     let seed = seed_operational_live(&pool, &runtime, Duration::from_millis(1500)).await;
-    tokio::time::sleep(Duration::from_millis(1800)).await;
+    let observation_not_before = seed
+        .lease_expires_at
+        .checked_add(Duration::from_millis(300))
+        .unwrap();
+    wait_for_database_time_at_or_after(&pool, observation_not_before).await;
     let status = load_operational_status(&pool, &seed.fixture).await;
     assert_eq!(status.status(), &DeploymentStatusV1::Pending);
     let observation = status.deployment().unwrap();

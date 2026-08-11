@@ -327,22 +327,23 @@ Luna V4 matrix requires a dedicated one-active, zero-queue worker and proves
 that every phase counter delta equals that phase's reported model calls; another
 valid completion request invalidates the cohort instead of contaminating it.
 The immediately prior exact source commit
-`bdf7eeecc6f9a6d14e8856689400b05ac52af860` completed the authoritative
+`f6f11d801c0a58eba2e7764cdc073f769ca1e511` completed the authoritative
 2026-08-11 clean-source matrix with `codex-cli 0.147.0-alpha.6.5`. It passed all
-232/232 Promptfoo rows and 2,442/2,442 component assertions and executed the
-exact 298 model calls and 298 model tool calls with zero provider errors,
-repair attempts, or retries. Every request, route, and adjudication identity
-class was stable. The certified catalog identity is extractor revision 16,
-normalizer revision 15, and registry digest
+232/232 Promptfoo rows, 2,442/2,442 component assertions, and 33/33 acceptance
+checks, and executed the exact 298 model calls and 298 model tool calls with
+zero provider errors, repair attempts, or retries. Every request, route, and
+adjudication identity class was stable. The certified catalog identity is
+extractor revision 16, normalizer revision 15, and registry digest
 `fc66223bee4c1ec2e3dd2535a4a4ad1dae6a17f3b896b1a29a6998cde4d8535c`.
 The earlier normalizer-12 certificate remains immutable historical evidence;
 two interrupted normalizer-13 and normalizer-14 runs are diagnostic only and
 are not pooled into this result.
-The `bdf7eee` matrix is immutable immediately-prior evidence for that exact
-source, worker, and tooling identity. Any candidate containing the D3 Gate 14
-isolation correction is a different source tree and requires a fresh
-clean-source exact-head matrix; it cannot continue or relabel the `bdf7eee`
-result as current release evidence.
+The `f6f11d8` matrix and exact-head GitHub Actions run `31511995466`, whose
+`checks` and `postgres` jobs both passed, are immutable immediately-prior
+evidence for that exact source, worker, and tooling identity. The subsequent
+Gate 24 PostgreSQL clock-boundary test correction changes candidate source and
+requires a fresh clean-source exact-head matrix, CI, and D3 run; it cannot
+continue or relabel the `f6f11d8` results as current release evidence.
 It certifies the bounded single-worker authoring cohort, not commercial
 concurrency, soak behavior, high availability, or live Discord execution.
 
@@ -529,12 +530,13 @@ in-flight legacy activation.
   878 tests, the CLI gate passed 82 tests plus its dependency guard, and the
   JavaScript gate passed 106 tests. Relevant clippy `-D warnings` and formatting
   gates also passed. The exact resumable repeated Luna matrix is implemented.
-  Immediately-prior source `bdf7eee` passed live at 232/232 samples,
-  2,442/2,442 component assertions, and 298/298 planned model calls without a
-  retry. That exact source also passed GitHub Actions run `31501930236`, with
-  both `checks` and `postgres` green. The Gate 14 isolation correction changes
-  the candidate source, so its fresh exact-head matrix and CI remain pending;
-  CI remains separate from the local live-model certificate.
+  Immediately-prior source `f6f11d8` passed live at 232/232 samples,
+  2,442/2,442 component assertions, 298/298 planned model and tool calls, and
+  33/33 acceptance checks without a retry. That exact source also passed
+  GitHub Actions run `31511995466`, with both `checks` and `postgres` green.
+  The subsequent Gate 24 PostgreSQL clock-boundary test correction changes the
+  candidate source, so its fresh exact-head matrix and CI remain pending; CI
+  remains separate from the local live-model certificate.
 - **Live certification**: Layer 2 manual runbooks (real bot, guild, PostgreSQL)
   prove its end-to-end lifecycle; they are never wired into CI. The Luna V4
   authoring cohort did not run a live Discord integration.
@@ -788,10 +790,20 @@ approval sealed by the pre-merge recheck to remain the same effective approval
 with the same permission identity. It takes a first closed-and-merged PR,
 review, and permission snapshot at finalization, repeats that post-merge
 snapshot after the slower Actions and final D2 checks, and requires the two
-post-merge snapshots to be exactly equal. The Gate 14 isolation correction is
-new candidate source, so its exact-head matrix, D2, D3, approval, merge, and CI
-certificate remain pending. D4 documentation is a required part of that
-candidate; updating it cannot make D2 or D3 true.
+post-merge snapshots to be exactly equal. The immediately-prior `f6f11d8` D3
+run pinned state `d3-pr-30-e57588940c23` and passed Gates 1–23 on their first
+attempts. Gate 24 then exited 101 without retained command output. A first
+exact-condition diagnostic passed; a later diagnostic reproduced exit 101 in
+`operational_status_reports_naturally_expired_serving_lease` with
+`Authentication(Backend(Unavailable))`. The affected test inferred a
+PostgreSQL timestamp boundary from a fixed Tokio monotonic-clock wait. The
+correction removes that cross-clock assumption with a bounded PostgreSQL-clock
+poll and a 300 ms margin; its targeted test passed 10/10 and the complete Gate
+24 suite passed 182/182 twice against independent fresh PostgreSQL databases.
+This correction is new candidate source, so a fresh exact-head matrix, CI, D3,
+D2, approval, merge, and merged-main certificate remain pending. D4
+documentation is a required part of that candidate; updating it cannot make D2
+or D3 true.
 
 After merge, the authoritative terminal status is the sealed D3 terminal record
 `<D3_RUN>/final.json`, created by

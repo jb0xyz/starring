@@ -21,13 +21,28 @@ and recover per-action effects.
 Phase D is not complete. D1 restart and failure cohorts are accepted. D2 has
 not yet passed its unique disposable-database and disposable-guild 17-step
 sequence. D3 has not certified an exact GitHub merge candidate or merged-main
-tree. The immediately prior exact source `bdf7eee` has an authoritative
+tree. The immediately prior exact source `f6f11d8` has an authoritative
 `codex-cli 0.147.0-alpha.6.5` matrix with 232/232 rows, 2,442/2,442 component
-assertions, and 298 model calls plus 298 model tool calls without retries, but
-the Gate 14 isolation correction changes candidate source. That immutable
-matrix is immediately-prior historical evidence only; a fresh exact-head
-matrix and the complete release certificate remain pending. These facts
-prohibit a commercial-ready or production-certified claim.
+assertions, 298 model calls plus 298 model tool calls without retries, and 33/33
+acceptance checks. Exact-head GitHub Actions run `31511995466` also passed both
+`checks` and `postgres`. The subsequent Gate 24 PostgreSQL clock-boundary test
+correction changes candidate source, so those immutable results are
+immediately-prior historical evidence only; a fresh exact-head matrix, CI, D3,
+and the complete release certificate remain pending. These facts prohibit a
+commercial-ready or production-certified claim.
+
+The `f6f11d8` D3 run pinned state `d3-pr-30-e57588940c23` and passed Gates
+1–23 on their first attempts. Gate 24 then exited 101 without retained command
+output. A first exact-condition diagnostic passed; a later diagnostic
+reproduced exit 101 in
+`operational_status_reports_naturally_expired_serving_lease` with
+`Authentication(Backend(Unavailable))`. The affected test inferred a
+PostgreSQL timestamp boundary from a fixed Tokio monotonic-clock wait. The
+correction removes that cross-clock assumption with a bounded PostgreSQL-clock
+poll plus a 300 ms margin. Its targeted test passed 10/10 and the complete Gate
+24 suite passed 182/182 twice against independent fresh PostgreSQL databases.
+This validates the correction only; it does not resume or certify the
+superseded `f6f11d8` run.
 
 ## Fixed safety boundary
 
@@ -342,11 +357,12 @@ making any later tracked-document edit part of the certified tree.
   but Phase D does not claim those external cohorts passed.
 - B6 proves a bounded standing-fixture path, not D2 cleanup or commercial
   certification.
-- The Luna V4 `bdf7eee` 232/232 matrix proves bounded serial authoring quality
-  for its exact `0.147.0-alpha.6.5` source, worker, and tooling identities. It
-  is immutable immediately-prior evidence, not evidence for the candidate that
-  contains the Gate 14 isolation correction, concurrency, soak, quota behavior,
-  or Discord execution.
+- The Luna V4 `f6f11d8` 232/232, 2,442/2,442, 298/298, and 33/33 matrix proves
+  bounded serial authoring quality for its exact `0.147.0-alpha.6.5` source,
+  worker, and tooling identities. Together with exact-head Actions run
+  `31511995466`, it is immutable immediately-prior evidence, not evidence for
+  the candidate containing the Gate 24 PostgreSQL clock-boundary correction,
+  concurrency, soak, quota behavior, or Discord execution.
 - Phase C tests and the migration-117 regression do not replace live fault
   injection.
 - Public Cloudflare reachability is not product readiness and does not weaken
