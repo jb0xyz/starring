@@ -74,6 +74,7 @@ function counters(overrides = {}) {
     compile_attempts: 0,
     compile_successes: 0,
     commits: 0,
+    finalizations: 0,
     rollbacks: 0,
     conflicts: 0,
     stale_revision_rejections: 0,
@@ -143,6 +144,7 @@ function observability(modelCalls = 1, toolCalls = 1) {
     intent_compile_attempts: 0,
     intent_compile_successes: 0,
     intent_commits: 0,
+    intent_finalizations: 0,
     intent_rollbacks: 0,
     intent_conflicts: 0,
     intent_stale_revision_rejections: 0,
@@ -516,10 +518,17 @@ test('report observability is strict and sequential request durations fit inside
   );
 
   const missing = JSON.parse(report());
-  delete missing.observability.intent_compiled_operations;
+  delete missing.observability.intent_finalizations;
   assert.match(
     checks.intentReceipt(JSON.stringify(missing), context()).reason,
     /observability has invalid fields/,
+  );
+
+  const missingTurnFinalizations = JSON.parse(report());
+  delete missingTurnFinalizations.turns[0].intent_counters.finalizations;
+  assert.match(
+    checks.intentReceipt(JSON.stringify(missingTurnFinalizations), context()).reason,
+    /turns\[0\]\.intent_counters has invalid fields/,
   );
 
   const invalidMap = JSON.parse(report());

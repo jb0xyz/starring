@@ -562,6 +562,7 @@ function observability(value, location) {
     'intent_compile_attempts',
     'intent_compile_successes',
     'intent_commits',
+    'intent_finalizations',
     'intent_rollbacks',
     'intent_conflicts',
     'intent_stale_revision_rejections',
@@ -595,6 +596,7 @@ function observability(value, location) {
     'intent_compile_attempts',
     'intent_compile_successes',
     'intent_commits',
+    'intent_finalizations',
     'intent_rollbacks',
     'intent_conflicts',
     'intent_stale_revision_rejections',
@@ -823,6 +825,7 @@ function parseReport(output) {
       'compile_attempts',
       'compile_successes',
       'commits',
+      'finalizations',
       'rollbacks',
       'conflicts',
       'stale_revision_rejections',
@@ -883,6 +886,7 @@ function parseReport(output) {
       'compile_attempts',
       'compile_successes',
       'commits',
+      'finalizations',
       'rollbacks',
       'conflicts',
       'stale_revision_rejections',
@@ -1643,6 +1647,7 @@ function intentNoMutationFallback(output, context) {
         || counters.compile_attempts !== 0
         || counters.compile_successes !== 0
         || counters.commits !== 0
+        || counters.finalizations !== 0
         || counters.rollbacks !== 0
         || counters.conflicts !== 0) {
         failures.push(`${turn.id} fallback mutated or compiled the canonical Draft`);
@@ -1726,6 +1731,7 @@ function intentAdjudicationDecision(output, context) {
           || counters.compile_attempts !== 0
           || counters.compile_successes !== 0
           || counters.commits !== 0
+          || counters.finalizations !== 0
           || counters.rollbacks !== 0
           || counters.conflicts !== 0) {
           failures.push(`${turn.id} terminal route compiled or mutated canonical state`);
@@ -1783,6 +1789,7 @@ function normalizerDiscussionTurn(turn, location, failures) {
     || counters.compile_attempts !== 0
     || counters.compile_successes !== 0
     || counters.commits !== 0
+    || counters.finalizations !== 0
     || fallbackRoutes.length !== 1
     || fallbackRoutes[0][0] !== 'discussion'
     || fallbackRoutes[0][1] !== 1

@@ -458,6 +458,7 @@ fn intent_observability_delta(before: &Observability, after: &Observability) -> 
         "compile_attempts": after.intent_compile_attempts.saturating_sub(before.intent_compile_attempts),
         "compile_successes": after.intent_compile_successes.saturating_sub(before.intent_compile_successes),
         "commits": after.intent_commits.saturating_sub(before.intent_commits),
+        "finalizations": after.intent_finalizations.saturating_sub(before.intent_finalizations),
         "rollbacks": after.intent_rollbacks.saturating_sub(before.intent_rollbacks),
         "conflicts": after.intent_conflicts.saturating_sub(before.intent_conflicts),
         "stale_revision_rejections": after.intent_stale_revision_rejections.saturating_sub(before.intent_stale_revision_rejections),
@@ -498,8 +499,8 @@ mod tests {
     };
 
     use super::{
-        intent_report, report, served_model_from_metrics, turn_report, IntentPersistenceEvidence,
-        IntentReportMetadata, TurnReportInput,
+        intent_report, intent_turn_report, report, served_model_from_metrics, turn_report,
+        IntentPersistenceEvidence, IntentReportMetadata, IntentTurnReportInput, TurnReportInput,
     };
 
     #[test]
@@ -737,5 +738,40 @@ mod tests {
             document["observability_delta"]["distinct_mutation_tools"][0],
             "add_modal"
         );
+    }
+
+    #[test]
+    fn intent_turn_report_records_finalization_delta() {
+        let session = DesignSession::new(());
+        let before = session.draft().clone();
+        let before_observability = session.observability().clone();
+        let mut after_observability = before_observability.clone();
+        after_observability.intent_finalizations = 2;
+        let status = IntentRecipeStatusV2::Empty {
+            expected_revision: 0,
+        };
+        let outcome = BurstOutcome::Ready {
+            summary: "Ready".to_string(),
+        };
+
+        let document = intent_turn_report(IntentTurnReportInput {
+            id: "finalize",
+            input: "Finalize it",
+            before: &before,
+            after: session.draft(),
+            status_before: &status,
+            status_after: &status,
+            observability_before: &before_observability,
+            observability_after: &after_observability,
+            outcome: &outcome,
+            route_decision: None,
+            burst_elapsed: Duration::from_millis(5),
+            elapsed: Duration::from_millis(7),
+            model_call_metrics: &[],
+            restart_after: false,
+            restart_performed: false,
+        });
+
+        assert_eq!(document["intent_counters"]["finalizations"], 2);
     }
 }

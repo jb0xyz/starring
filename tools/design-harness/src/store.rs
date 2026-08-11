@@ -938,6 +938,7 @@ mod tests {
             "intent_compile_attempts",
             "intent_compile_successes",
             "intent_commits",
+            "intent_finalizations",
             "intent_rollbacks",
             "intent_conflicts",
             "intent_stale_revision_rejections",
@@ -961,6 +962,7 @@ mod tests {
         assert_eq!(migrated.schema_version, SESSION_SNAPSHOT_VERSION);
         assert_eq!(migrated_value["intent_recipe"], serde_json::Value::Null);
         assert_eq!(migrated.observability.intent_route_calls, 0);
+        assert_eq!(migrated.observability.intent_finalizations, 0);
         assert!(migrated.observability.intent_fallback_routes.is_empty());
     }
 
