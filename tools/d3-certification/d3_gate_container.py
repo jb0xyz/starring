@@ -27,6 +27,7 @@ GATE_BUILD_JOBS = "1"
 GATE_CHILD_OOM_EXIT = 247
 GATE_PROFILE_DEV_DEBUG = "0"
 GATE_PROFILE_TEST_DEBUG = "0"
+D3_SELF_TEST_GATE = 14
 MINIMUM_DAEMON_MEMORY_BYTES = 17 * 1024 * 1024 * 1024
 MAX_BOOTSTRAP_BYTES = 4 * 1024 * 1024 * 1024
 MAX_BOOTSTRAP_ENTRIES = 500000
@@ -162,6 +163,14 @@ RUNNER_POLICY = {
         "gate": 1,
         "git_dir": "/git",
         "git_work_tree": "/workspace",
+    },
+    "self_test": {
+        "gate": D3_SELF_TEST_GATE,
+        "cargo_home": "empty-owned-scratch",
+        "git": "system-unwrapped",
+        "temporary_execution": (
+            f"owned-gate-attempt-disposable-target-volume:{GATE_TARGET_SIZE}"
+        ),
     },
     "postgres": {
         "gates": [19, 31],
@@ -1170,6 +1179,13 @@ def fixed_gate_command(index, command):
             f"{private_scratch} && "
             "npm --prefix eval/design-harness audit --audit-level=high"
         )
+    elif index == D3_SELF_TEST_GATE:
+        selected = (
+            f"{private_scratch} && "
+            "mkdir -p /scratch/cargo-home /scratch/target/d3-self-test-tmp && "
+            "chmod 0700 /scratch/cargo-home /scratch/target/d3-self-test-tmp && "
+            f"{command}"
+        )
     else:
         selected = (
             f"{private_scratch} && "
@@ -1292,6 +1308,11 @@ def create_gate_container(
     if index == 1:
         environment["GIT_DIR"] = "/git"
         environment["GIT_WORK_TREE"] = "/workspace"
+    if index == D3_SELF_TEST_GATE:
+        environment["PATH"] = (
+            "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin:/bootstrap-bin"
+        )
+        environment["TMPDIR"] = "/scratch/target/d3-self-test-tmp"
     if database_url is not None:
         environment["STARRING_TEST_DATABASE_URL"] = database_url
     for key, value in sorted(environment.items()):

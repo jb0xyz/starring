@@ -1258,6 +1258,13 @@ Acceptance:
 
 ### Task D2: Run the final disposable-guild product E2E
 
+Execution begins only after Task D3 `prepare` has pinned GitHub's generated
+merge candidate and `run-gates` has passed all 31 commands and published its
+sealed `candidate-bundle`. Prepare D2 with that exact D3 `merge_commit` and only
+the bundle's API, runtime, database-bootstrap, sealed-provisioner,
+certification-transport, and Codex-worker artifacts. D2 must not manually build,
+discover, or substitute candidate artifacts.
+
 Sequence:
 
 1. Create a unique disposable test database and Discord resource prefix
@@ -1325,10 +1332,11 @@ Evidence excludes:
 
 Create the final PR, update it onto the current main base, fetch the
 GitHub-generated merge candidate, and record its commit and tree identities.
-Run the complete local, PostgreSQL, and disposable-guild gates on that exact
-merge-candidate checkout:
+Use D3 `prepare`, then run the complete 31-command local and PostgreSQL manifest
+on that exact detached merge-candidate checkout:
 
 ```sh
+python3 tools/ci/scan_tracked_secrets.py
 cargo fmt --all -- --check
 cargo build --locked --workspace --all-targets
 cargo test --locked --workspace
@@ -1341,14 +1349,15 @@ npm --prefix eval/design-harness ci
 npm --prefix eval/design-harness run audit
 npm --prefix eval/design-harness run check
 python3 -m unittest discover -s tools/d2-certification -p 'test_*.py'
+python3 -m unittest discover -s tools/d3-certification -p 'test_*.py'
 node --test tools/d2-certification/product_driver.test.mjs
 cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check
 cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml
 cargo clippy --locked --manifest-path tools/d2-certification-transport/Cargo.toml --all-targets -- -D warnings
 ```
 
-These sixteen commands and the thirteen serial PostgreSQL commands below form
-one exact ordered 29-command D3 manifest. The manifest is immutable: a missing,
+These eighteen commands and the thirteen serial PostgreSQL commands below form
+one exact ordered 31-command D3 manifest. The manifest is immutable: a missing,
 added, duplicated, changed, or reordered command fails certification. The
 release origin must also be a canonical `github.com` HTTPS or SSH repository
 whose owner and repository exactly match the D3 invocation.
@@ -1377,20 +1386,42 @@ storage, effect journals, and recovery belong to
 `automation-runtime-interaction-postgres`. If implementation creates a new
 standalone PostgreSQL test target, add its exact command to this manifest.
 
-Update `.github/workflows/ci.yml` so the first 16 commands are required in the
+Update `.github/workflows/ci.yml` so the first 18 commands are required in the
 `checks` job and the 13 PostgreSQL commands are required serially in the
 `postgres` job. Do not rely on an undocumented wildcard or prose claim that
 every integration test ran.
 
-Merge only while the PR base is unchanged. After merge:
+All 31 commands must pass before `run-gates` builds and publishes its sealed
+`candidate-bundle`. Task D2 then prepares and executes its 17-step cohort using
+only that exact bundle and pinned D3 merge commit. After the completed D2 run is
+verified, D3 `bind-d2` must bind the exact D2 manifest, final record, receipt
+chain, commit tree, and bundle artifact identities. No manual candidate build
+or same-tree substitute is admissible.
+
+Immediately before merge, require and seal at least one effective approval of
+the exact pinned head by a human reviewer other than the PR author who
+currently has `write` or `admin` base permission. The sealed pre-merge record
+must bind the normalized review and stable permission identity. Merge only
+while the PR base, head, review, and permission snapshot remain unchanged.
+After merge:
 
 - Record the resulting main merge commit and tree identities
 - Require the merged tree identity to equal the certified merge-candidate tree
 - Rerun merge-candidate certification if the tree differs
-- Require `checks` and `postgres` push CI on the resulting main merge commit
+- Require `checks` and `postgres` jobs in the exact `CI` push run on the
+  resulting main merge commit
+- Bind `.github/workflows/ci.yml` by its Git blob identity and SHA-256 from that
+  exact commit
+- Require every approval sealed by the pre-merge recheck to remain the same
+  effective approval with the same permission identity
+- Compare the first closed-and-merged PR, review, and permission snapshot taken
+  by finalization with a second post-merge snapshot after the Actions and final
+  D2 checks, and require those two finalization snapshots to be exactly equal
 
 The non-CI Phase D evidence applies to the certified tree. Push CI applies to
-the exact main merge commit that owns that identical tree.
+the exact main merge commit that owns that identical tree. Terminal replay
+validates the sealed review, permission, workflow, Actions-run, candidate, and
+evidence bindings; it does not certify a later source or documentation edit.
 
 ### Task D4: Update source-of-truth and operations
 

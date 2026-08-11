@@ -7,7 +7,8 @@ is not the D3 release certificate.
 
 ## Boundary
 
-The measured command was the fixed Gate 2 command:
+The measured command was the then-fixed Gate 2 command. In the current
+31-command manifest it is Gate 3, after the tracked-secret scan and formatting:
 
 ```text
 cargo build --locked --workspace --all-targets
@@ -61,4 +62,5 @@ tmpfs, and a 16 GiB container were rejected because this Mac's Colima VM has an
 18 GiB allocation and the host free-space boundary is tighter than the sparse
 VM disk reports.
 
-The final exact-tree D3 run must still pass all 29 gates with the 8 GiB policy.
+The final exact-tree D3 run must still pass all 31 gates, including the
+tracked-secret scan and D3 self-tests, with the 8 GiB policy.

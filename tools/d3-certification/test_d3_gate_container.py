@@ -139,6 +139,7 @@ class D3GateContainerTests(unittest.TestCase):
             10: "mkdir -p /scratch/package /scratch/npm-cache",
             11: "npm --prefix eval/design-harness audit --audit-level=high",
             13: "gate-thirteen",
+            14: "gate-fourteen",
             19: "gate-nineteen",
         }
         for index, work in expected_work.items():
@@ -148,11 +149,68 @@ class D3GateContainerTests(unittest.TestCase):
                     {
                         1: "gate-one",
                         13: "gate-thirteen",
+                        14: "gate-fourteen",
                         19: "gate-nineteen",
                     }.get(index, "unused"),
                 )
                 self.assertEqual(command.count(setup), 1)
                 self.assertLess(command.index(setup), command.index(work))
+
+    def test_d3_self_test_uses_empty_cargo_home_and_owned_executable_target(self):
+        arguments = self.create_arguments(MODULE.D3_SELF_TEST_GATE, "none")
+        environment = {
+            arguments[index + 1]
+            for index, value in enumerate(arguments[:-1])
+            if value == "--env"
+        }
+        self.assertIn("CARGO_HOME=/scratch/cargo-home", environment)
+        self.assertIn(
+            "PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin:/bootstrap-bin",
+            environment,
+        )
+        self.assertIn(
+            "TMPDIR=/scratch/target/d3-self-test-tmp",
+            environment,
+        )
+        command = arguments[-1]
+        self.assertIn("mkdir -p /scratch/cargo-home", command)
+        self.assertIn("/scratch/target/d3-self-test-tmp", command)
+        self.assertNotIn(
+            "cp /gate-cargo-config.toml /scratch/cargo-home/config.toml",
+            command,
+        )
+        mounts = [
+            arguments[index + 1]
+            for index, value in enumerate(arguments[:-1])
+            if value == "--mount"
+        ]
+        self.assertTrue(
+            any(
+                "type=volume" in value and "dst=/scratch/target" in value
+                for value in mounts
+            )
+        )
+        scratch = [
+            arguments[index + 1]
+            for index, value in enumerate(arguments[:-1])
+            if value == "--tmpfs"
+            and arguments[index + 1].startswith("/scratch:rw")
+        ]
+        self.assertEqual(len(scratch), 1)
+        self.assertIn("noexec", scratch[0])
+        self.assertNotIn(str(MODULE.DOCKER_SOCKET), " ".join(arguments))
+        self.assertEqual(
+            MODULE.RUNNER_POLICY["self_test"],
+            {
+                "gate": MODULE.D3_SELF_TEST_GATE,
+                "cargo_home": "empty-owned-scratch",
+                "git": "system-unwrapped",
+                "temporary_execution": (
+                    "owned-gate-attempt-disposable-target-volume:"
+                    f"{MODULE.GATE_TARGET_SIZE}"
+                ),
+            },
+        )
 
     def test_gate_uses_private_tmpfs_for_default_d2_runtime_root(self):
         arguments = self.create_arguments(13, "none")

@@ -84,6 +84,10 @@ gates replay without execution. A failed or interrupted gate resumes as a new
 or incomplete durable attempt. Gate 1 routes both plain Git commands used by
 the tracked-secret scanner and explicit `git -C /workspace` commands through
 the sealed read-only `/git` projection rather than the host worktree pointer.
+Gate 14 runs the D3 self-tests with an empty private Cargo home and places only
+their executable temporary fixtures under the attempt-owned disposable target
+volume. It uses the image's unwrapped Git so the outer gate projection cannot
+intercept fixture repositories; the shared scratch tmpfs remains `noexec`.
 
 Before the first attempt, `run-gates` creates a bounded bootstrap while network
 access is available. Both Cargo lockfiles are first checked in a networkless

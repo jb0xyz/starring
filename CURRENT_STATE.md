@@ -326,19 +326,23 @@ capacity, timeout, and monotonic accepted and settled completion counters. The
 Luna V4 matrix requires a dedicated one-active, zero-queue worker and proves
 that every phase counter delta equals that phase's reported model calls; another
 valid completion request invalidates the cohort instead of contaminating it.
-The most recent completed 2026-07-17 clean-source matrix at
-`7f138b308644f954cd38ceee78768f3d6b7bf551` passed all 232/232 Promptfoo rows
-and executed the exact 298 model/tool calls with zero provider errors, repair
-attempts, or retries. Every request, route, and adjudication identity class was
-stable. The certified catalog identity is extractor revision 16, normalizer
-revision 15, and registry digest
+The immediately prior exact source commit
+`bdf7eeecc6f9a6d14e8856689400b05ac52af860` completed the authoritative
+2026-08-11 clean-source matrix with `codex-cli 0.147.0-alpha.6.5`. It passed all
+232/232 Promptfoo rows and 2,442/2,442 component assertions and executed the
+exact 298 model calls and 298 model tool calls with zero provider errors,
+repair attempts, or retries. Every request, route, and adjudication identity
+class was stable. The certified catalog identity is extractor revision 16,
+normalizer revision 15, and registry digest
 `fc66223bee4c1ec2e3dd2535a4a4ad1dae6a17f3b896b1a29a6998cde4d8535c`.
 The earlier normalizer-12 certificate remains immutable historical evidence;
 two interrupted normalizer-13 and normalizer-14 runs are diagnostic only and
 are not pooled into this result.
-That matrix remains immutable historical evidence for its prior Codex CLI and
-worker-source identity. The `0.147.0-alpha.6.5` pin advance requires a fresh
-clean-source matrix and cannot continue or certify from the earlier result.
+The `bdf7eee` matrix is immutable immediately-prior evidence for that exact
+source, worker, and tooling identity. Any candidate containing the D3 Gate 14
+isolation correction is a different source tree and requires a fresh
+clean-source exact-head matrix; it cannot continue or relabel the `bdf7eee`
+result as current release evidence.
 It certifies the bounded single-worker authoring cohort, not commercial
 concurrency, soak behavior, high availability, or live Discord execution.
 
@@ -524,12 +528,13 @@ in-flight legacy activation.
   checkpoint, the independently audited `design-harness` library target passed
   878 tests, the CLI gate passed 82 tests plus its dependency guard, and the
   JavaScript gate passed 106 tests. Relevant clippy `-D warnings` and formatting
-  gates also passed. The exact resumable repeated Luna matrix is implemented,
-  statically verified, and passed live at 232/232 samples and 298/298 planned
-  model calls.
-  The clean evidence source also passed GitHub Actions CI run 31: the complete
-  workspace checks and PostgreSQL integration job were both green. CI remains
-  separate from the local live-model certificate.
+  gates also passed. The exact resumable repeated Luna matrix is implemented.
+  Immediately-prior source `bdf7eee` passed live at 232/232 samples,
+  2,442/2,442 component assertions, and 298/298 planned model calls without a
+  retry. That exact source also passed GitHub Actions run `31501930236`, with
+  both `checks` and `postgres` green. The Gate 14 isolation correction changes
+  the candidate source, so its fresh exact-head matrix and CI remain pending;
+  CI remains separate from the local live-model certificate.
 - **Live certification**: Layer 2 manual runbooks (real bot, guild, PostgreSQL)
   prove its end-to-end lifecycle; they are never wired into CI. The Luna V4
   authoring cohort did not run a live Discord integration.
@@ -758,19 +763,35 @@ The current source inventory is exact at this checkpoint:
 | Purpose-separated keyrings | 3 |
 | Final integrated HBA | 15 ordered rules |
 | PostgreSQL release commands | 13 explicit serial suites |
-| D3 ordered local gate commands | 29 exact commands before D2 evidence binding |
+| D3 ordered local gate commands | 31 exact commands before D2 preparation and evidence binding |
 | D2 Keychain boundary | 29 run-owned items plus 3 external read-only items |
 
 This is an implementation and inventory statement, not a Backend V1 release
-certificate. D2 must still produce all 17 ordered disposable-guild receipts on
-the exact candidate tree. D3 must then pass the complete local, Node,
-evaluator, D2 Python, product-driver Node, standalone certification-transport,
-13-command PostgreSQL, and D2 gates on GitHub's exact merge-candidate tree. Its
-canonical `github.com` repository identity and ordered 29-command manifest are
-immutable release inputs. D3 must prove the merged-main tree is identical and
-observe green `checks` and `postgres` push jobs on that main merge commit. D4
-documentation is a required part of that candidate; updating it cannot make D2
-or D3 true.
+certificate. D3 must first `prepare` against GitHub's exact merge-candidate tree
+and pass the immutable 31-command manifest, including the tracked-secret scan,
+complete local, Node, evaluator, D2 and D3 Python, product-driver Node,
+standalone certification-transport, and 13 serial PostgreSQL gates. Only then
+may `run-gates` publish the sealed `candidate-bundle`. D2 preparation must use
+the pinned D3 merge commit and the exact API, runtime, database-bootstrap,
+sealed-provisioner, certification-transport, and Codex-worker artifacts from
+that bundle; manually built or substituted candidate artifacts are forbidden.
+D2 must produce all 17 ordered disposable-guild receipts from that bundle, and
+D3 `bind-d2` must bind the completed D2 evidence before recheck. Its canonical
+`github.com` repository identity and ordered manifest are immutable release
+inputs. Immediately before merge, D3 requires an effective exact-head approval
+from a human reviewer other than the PR author who currently has `write` or
+`admin` base permission, and seals the normalized review and permission
+identity. D3 must then prove the merged-main tree is identical, observe green
+`checks` and `postgres` jobs in the exact `CI` push run on that commit, and bind
+the workflow file's Git blob identity and SHA-256. Finalization requires every
+approval sealed by the pre-merge recheck to remain the same effective approval
+with the same permission identity. It takes a first closed-and-merged PR,
+review, and permission snapshot at finalization, repeats that post-merge
+snapshot after the slower Actions and final D2 checks, and requires the two
+post-merge snapshots to be exactly equal. The Gate 14 isolation correction is
+new candidate source, so its exact-head matrix, D2, D3, approval, merge, and CI
+certificate remain pending. D4 documentation is a required part of that
+candidate; updating it cannot make D2 or D3 true.
 
 After merge, the authoritative terminal status is the sealed D3 terminal record
 `<D3_RUN>/final.json`, created by
@@ -778,7 +799,10 @@ After merge, the authoritative terminal status is the sealed D3 terminal record
 directory containing the returned D3 `state.json`. The tracked plan checkboxes
 and `pending` evidence table are an immutable pre-certification snapshot and
 are not edited afterward, because that would create a different, uncertified
-tree.
+tree. Exact replay of an existing terminal record validates its sealed state,
+gate chain, D2 binding, candidate bundle, local tree, workflow blob, and Actions
+run identity; it does not turn a post-certification document edit into certified
+source.
 
 D2 step 9 binds one manifest actor and the exact created instance across visible
 Chrome observation, completed create and join receipts, one successful created
@@ -995,9 +1019,11 @@ green. D2 and D3 remain required.
 
 The accepted next sequence is:
 
-1. **Phase D — Backend V1 certification:** run the final disposable-guild E2E,
-   complete local gates, final PR and merge-candidate CI, merged-main CI, and
-   source-of-truth/runbook closure.
+1. **Phase D — Backend V1 certification:** D3-prepare the exact merge candidate,
+   pass all 31 gates and publish its sealed bundle, run and bind the 17-step D2
+   disposable-guild E2E from only that bundle, then complete recheck, review,
+   merge, exact merged-main CI, finalization, and source-of-truth/runbook
+   closure.
 2. Run the separate production-rollout certificate for restored-environment
    backup/restore, non-interactive host reboot, concurrency, saturation, load,
    soak, and public-ingress capacity before claiming those operating envelopes.

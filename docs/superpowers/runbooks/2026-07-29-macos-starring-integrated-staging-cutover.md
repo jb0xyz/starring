@@ -2963,27 +2963,42 @@ deletion and archive retention are separate reviewed follow-up operations.
 
 This infrastructure cutover and its acceptance record precede, but do not
 replace, D2 and D3. Freeze the final PR head and base, fetch GitHub's generated
-merge candidate, and build the API, runtime, database bootstrap, sealed
-provisioner, certification transport, worker tree, and external executables
-from or for that exact tree. Run the 17-step D2 cohort with a new disposable
-database and guild. The create/join receipt must cross-bind Chrome, completed
-database receipts and successful role membership, and the exact transport
-inventory. Gateway loss must include a durable same-instance heal. Teardown
-must freeze only after step 15 and total absence must occur after step 16.
+merge candidate through D3 `prepare`, and run the exact ordered 31-command local
+manifest, including the tracked-secret scan, D2 Python coordinator, D3
+self-tests, product-driver Node, standalone certification-transport
+format/test/Clippy, evaluator, workspace, and 13 serial PostgreSQL gates. Any
+missing, added, duplicated, changed, or reordered command invalidates the
+candidate. Only a successful `run-gates` may build and publish the sealed D3
+`candidate-bundle`; do not manually build or substitute D2 candidate artifacts.
 
 The Git origin must be a canonical `github.com` HTTPS or SSH repository that
-matches the D3 owner and repository. Then run the exact ordered 29-command
-local manifest, including the D2 Python coordinator, product-driver Node,
-standalone certification-transport format/test/Clippy, evaluator, workspace,
-and 13 serial PostgreSQL gates, on that same tree. Any missing, added,
-duplicated, changed, or reordered command invalidates the candidate.
+matches the D3 owner and repository. Prepare D2 with the pinned D3 merge commit
+and only the API, runtime, database-bootstrap, sealed-provisioner,
+certification-transport, and Codex-worker artifacts from that exact bundle.
+Then run the 17-step D2 cohort with a new disposable database and guild. The
+create/join receipt must cross-bind Chrome, completed database receipts and
+successful role membership, and the exact transport inventory. Gateway loss
+must include a durable same-instance heal. Teardown must freeze only after step
+15 and total absence must occur after step 16. After D2 verification, D3
+`bind-d2` must bind that exact 17-step receipt chain, commit tree, and bundle
+identities before pre-merge `recheck`.
 
-Merge only if the head and base remain unchanged. The resulting `main` tree
-must equal the certified merge-candidate tree, and both `checks` and `postgres`
-push jobs must be green on that exact merge commit. Commit, tree, D2 run, receipt
-chain, PR, merge, and workflow-run identities are retained outside the tracked
-tree in immutable certification evidence; their current value is `pending`
-until the provider and completed D2 run supply it.
+Immediately before merge, D3 must seal an effective approval of the exact
+pinned head by a human reviewer other than the PR author who currently has
+`write` or `admin` base permission, together with the normalized review and
+stable permission identity. Merge only if the head, base, review, and permission
+snapshot remain unchanged. The resulting `main` tree must equal the certified
+merge-candidate tree, and both `checks` and `postgres` jobs must be green in the
+exact `CI` push run on that merge commit. Finalization binds the workflow file's
+Git blob identity and SHA-256 and requires every approval sealed by the
+pre-merge recheck to remain the same effective approval with the same permission
+identity. It compares the first closed-and-merged PR, review, and permission
+snapshot taken at finalization with a second post-merge snapshot after the
+slower Actions and final D2 checks; those two finalization snapshots must be
+exactly equal. Commit, tree, D2 run, receipt chain, PR, review, permission,
+merge, workflow-blob, and workflow-run identities are retained outside the
+tracked tree in immutable certification evidence; their current value is
+`pending` until the provider and completed D2 run supply it.
 
 The authoritative terminal artifact is the D3 terminal record
 `<D3_RUN>/final.json`, created only by
@@ -2991,7 +3006,9 @@ The authoritative terminal artifact is the D3 terminal record
 directory containing the returned D3 `state.json`. It owns the completed D2,
 D3, D4, PR, merged-main, and CI result. Do not edit tracked plan checkboxes or
 replace tracked `pending` values after merge; doing so would create a tree
-different from the one that artifact certifies.
+different from the one that artifact certifies. Exact terminal replay validates
+the sealed candidate, gate, D2, review, permission, workflow, and Actions-run
+bindings; it does not certify a later tracked-document edit.
 
 The certified scope, if those gates pass, is one Mac mini, one canonical shard,
 and `starring.private_study_room@1`. This runbook does not certify a frontend,

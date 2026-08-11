@@ -2,7 +2,7 @@
 
 Date: 2026-08-01 KST
 
-Source-of-truth refresh: 2026-08-04 KST
+Source-of-truth refresh: 2026-08-12 KST
 
 Status: Phase D in progress; not a commercial release certificate
 
@@ -21,7 +21,13 @@ and recover per-action effects.
 Phase D is not complete. D1 restart and failure cohorts are accepted. D2 has
 not yet passed its unique disposable-database and disposable-guild 17-step
 sequence. D3 has not certified an exact GitHub merge candidate or merged-main
-tree. These facts prohibit a commercial-ready or production-certified claim.
+tree. The immediately prior exact source `bdf7eee` has an authoritative
+`codex-cli 0.147.0-alpha.6.5` matrix with 232/232 rows, 2,442/2,442 component
+assertions, and 298 model calls plus 298 model tool calls without retries, but
+the Gate 14 isolation correction changes candidate source. That immutable
+matrix is immediately-prior historical evidence only; a fresh exact-head
+matrix and the complete release certificate remain pending. These facts
+prohibit a commercial-ready or production-certified claim.
 
 ## Fixed safety boundary
 
@@ -61,6 +67,7 @@ tree. These facts prohibit a commercial-ready or production-certified claim.
 | Keyrings | 3: product action, snapshot envelope, interaction-token envelope |
 | Final integrated HBA | 15 rules |
 | PostgreSQL CI manifest | 13 explicit serial commands |
+| D3 local gate manifest | 31 exact commands, including tracked-secret scan and D3 self-tests |
 | D2 Keychain boundary | 29 run-owned items plus 3 external read-only items |
 
 The 117-migration and 135-function values below belong to the immutable D1
@@ -231,15 +238,27 @@ deployment, receipt, effect journal, route, or Discord resource.
 
 1. Require a canonical `github.com` HTTPS or SSH origin whose owner and
    repository exactly match the D3 invocation. Freeze the final PR head and
-   current `main` base, fetch GitHub's generated merge candidate, and build
-   every immutable D2 artifact from that exact tree.
-2. Create a unique disposable database, resource prefix, application, guild,
+   current `main` base, then use D3 `prepare` to fetch and pin GitHub's generated
+   merge candidate and tree. Do not build D2 candidate artifacts manually.
+2. Run the immutable ordered 31-command D3 manifest on that detached exact
+   merge-candidate tree: tracked-secret scan, formatting, workspace build and
+   tests, Clippy, unsafe-dev smoke build, Codex-worker checks, SLO checks,
+   Promptfoo install/audit/check, the standalone D2 Python coordinator, D3
+   self-tests, product-driver Node, certification-transport format/test/Clippy,
+   and all 13 serial PostgreSQL commands. A changed, missing, added, duplicated,
+   or reordered command invalidates the gate. Only a successful `run-gates` may
+   build and publish the sealed D3 `candidate-bundle`.
+3. Prepare D2 with the exact D3 `merge_commit` and only the API, runtime,
+   database-bootstrap, sealed-provisioner, certification-transport, and
+   Codex-worker artifacts from that sealed bundle. D2 must not discover,
+   rebuild, or substitute them. Then create a unique disposable database,
+   resource prefix, application, guild,
    and `community_hub`; prove no prior owner, smoke process, standing port,
    launchd label, Keychain service, or protected resource is reused.
-3. Start only the manifest-bound database, transport, worker, API, runtime, and
+4. Start only the manifest-bound database, transport, worker, API, runtime, and
    tunnel. Complete OAuth once and record the strict redacted authentication
    envelope.
-4. Run the 17 D2 steps in order: substrate identity; absence of a prior owner;
+5. Run the 17 D2 steps in order: substrate identity; absence of a prior owner;
    exact services; OAuth; one-shot authoring bounded by one exact worker request;
    public PreviewReady joined to its encrypted generation; then, only after the
    step-6 coordinator completion, reload, confirm, promote, approve, and Apply;
@@ -247,30 +266,35 @@ deployment, receipt, effect journal, route, or Discord resource.
    delivery with one effect; runtime restart; route and instance reconstruction;
    one indeterminate effect with reconciliation; drain and replacement;
    gateway partition with Live loss; resource teardown; and total absence.
-5. Before each receipt, join the browser envelope, sealed read-only database
+6. Before each receipt, join the browser envelope, sealed read-only database
    checkpoint, transport resource inventory, fault snapshot, and visible
    Discord observation required by that step. Never infer a receipt from
    process readiness or a single evidence source.
-6. For teardown, first seal step 15 and write the durable freeze intent. Delete
+7. For teardown, first seal step 15 and write the durable freeze intent. Delete
    only identities present in that frozen manifest-bound Created
    inventory, accept only the exact success or provider-not-found result, mark
    them Deleted, delete the disposable guild through the human boundary, then
    require zero unresolved operations, receipts, journals, routes, instances,
    roles, channels, messages, run-owned Keychain items, launchd jobs, database,
-   and run root. The retained B6 guild and installation do not satisfy D2.
-7. On the same exact merge-candidate tree, run the immutable ordered D3 command
-   manifest: formatting, workspace build and
-   tests, Clippy, unsafe-dev smoke build, Codex-worker checks, SLO checks,
-   Promptfoo install/audit/check, the standalone D2 Python coordinator,
-   product-driver Node, and certification-transport format/test/Clippy suites,
-   plus all 13 serial PostgreSQL commands. Bind the completed D2 cohort after
-   those 29 commands as separate evidence. A changed,
-   missing, added, duplicated, or reordered command invalidates the gate.
-8. Merge only while the PR base and head remain frozen. Require the resulting
-   `main` tree to equal the certified merge-candidate tree byte-for-byte, then
-   require green `checks` and `postgres` push jobs on that exact main merge
-   commit. Any base, head, tree, or evidence drift restarts candidate
-   certification.
+   and run root. The retained B6 guild and installation do not satisfy D2. After
+   D2 verification produces its complete 17-step final record, run D3
+   `bind-d2`; it must bind that exact receipt chain, merge commit and tree, and
+   sealed-bundle artifact identities before recheck.
+8. Before merge, seal a D3 `recheck.json` snapshot containing at least one
+   effective approval of the exact pinned head by a human reviewer other than
+   the PR author who currently has `write` or `admin` base permission, together
+   with that stable review and permission identity. Merge only while the PR
+   base, head, review, and permission snapshot remain frozen. Require the
+   resulting `main` tree to equal the certified merge-candidate tree
+   byte-for-byte, then require green `checks` and `postgres` jobs in the exact
+   `CI` push run on that main merge commit. Bind that commit's workflow Git blob
+   identity and SHA-256. Finalization must first verify that every approval
+   sealed by `recheck.json` remains the same effective approval with the same
+   permission identity. It then compares its first closed-and-merged PR,
+   review, and permission snapshot with a second post-merge snapshot taken
+   after the slower Actions and final D2 checks; those two finalization
+   snapshots must be exactly equal. Any base, head, tree, review, permission,
+   workflow, or evidence drift restarts candidate certification.
 9. Mark D2, D3, D4, and the final PR ledger entries complete only after every
    condition above is true.
 
@@ -288,15 +312,19 @@ It must fill these fields from immutable run and GitHub evidence:
 | PR number, head commit, and base commit | GitHub PR metadata | pending |
 | merge-candidate commit and tree | GitHub `refs/pull/<n>/merge` | pending |
 | D2 certified commit and tree | immutable D2 manifest | pending |
+| exact-head human review and base permission snapshot | D3 pre-merge recheck | pending |
 | merged-main commit and tree | GitHub merge result | pending |
 | one Actions run ID containing green `checks` and `postgres` push jobs | GitHub Actions | pending |
+| exact merged-commit workflow Git blob identity and SHA-256 | D3 finalization | pending |
 
 `pending` means no certificate exists. It must never be replaced by a guessed
 or locally synthesized identity. This tracked handoff and the plan checkboxes
 are the immutable pre-certification snapshot. Do not edit them after merge to
 replace `pending` or flip D2, D3, D4, or final-PR boxes; a valid sealed
 D3 terminal record supersedes that snapshot as the sole terminal completion
-record.
+record. Exact terminal replay validates the sealed gate chain, D2 binding,
+candidate bundle, local tree, workflow blob, and Actions run identity without
+making any later tracked-document edit part of the certified tree.
 
 ## Explicit non-claims and support limits
 
@@ -314,9 +342,11 @@ record.
   but Phase D does not claim those external cohorts passed.
 - B6 proves a bounded standing-fixture path, not D2 cleanup or commercial
   certification.
-- The Luna V15 232/232 matrix proves bounded serial authoring quality for its
-  pinned source and worker, not current-CLI equivalence, concurrency, soak,
-  quota behavior, or Discord execution.
+- The Luna V4 `bdf7eee` 232/232 matrix proves bounded serial authoring quality
+  for its exact `0.147.0-alpha.6.5` source, worker, and tooling identities. It
+  is immutable immediately-prior evidence, not evidence for the candidate that
+  contains the Gate 14 isolation correction, concurrency, soak, quota behavior,
+  or Discord execution.
 - Phase C tests and the migration-117 regression do not replace live fault
   injection.
 - Public Cloudflare reachability is not product readiness and does not weaken
