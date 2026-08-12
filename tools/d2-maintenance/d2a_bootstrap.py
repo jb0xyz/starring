@@ -2938,7 +2938,11 @@ def command_identity(argv):
         return "cargo_version"
     if pathlib.Path(argv[0]).name == "rustc" and argv[1:] == ["--version", "--verbose"]:
         return "rustc_verbose_version"
-    if pathlib.Path(argv[0]).name == "otool" and len(argv) == 3 and argv[1] == "-L":
+    if (
+        pathlib.Path(argv[0]).name in {"otool", "llvm-otool"}
+        and len(argv) == 3
+        and argv[1] == "-L"
+    ):
         absolute_normal_path(argv[2], "issuer_linkage_input", must_exist=True)
         return "issuer_linkage"
     if pathlib.Path(argv[0]).name == "git" and len(argv) >= 5 and argv[1] == "-C":

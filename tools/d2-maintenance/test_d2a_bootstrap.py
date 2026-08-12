@@ -724,6 +724,10 @@ class BootstrapFixture:
             }
             for name in ("clang", "ld", "ar", "ranlib", "otool")
         }
+        # CommandLineTools exposes `otool` as a selector whose resolved binary
+        # is named `llvm-otool`; the subprocess allowlist must accept the
+        # already sealed resolved identity used by the real bootstrap.
+        tools["otool"]["resolved_path"] = "/fixture/llvm-otool"
         return {
             "fixed_tools": {
                 name: {
