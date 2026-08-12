@@ -1621,7 +1621,7 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
                 path: self.platform.process_identity_call_counts[str(path)]
                 for path in (self.candidates["api"], self.candidates["runtime"])
             },
-            {self.candidates["api"]: 7, self.candidates["runtime"]: 7},
+            {self.candidates["api"]: 9, self.candidates["runtime"]: 9},
         )
         self.assertEqual(
             self.platform.start_order,
@@ -3887,6 +3887,201 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         )
         self.assertTrue(ORCHESTRATOR.candidate_start_source_path(self.context).is_file())
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_candidate_start_final_boundary_waits_for_protected_port_restart(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        original_standing_snapshot = ORCHESTRATOR.standing_snapshot
+        observations = 0
+
+        def transient_then_exact(context, platform):
+            nonlocal observations
+            observations += 1
+            snapshot = original_standing_snapshot(context, platform)
+            if observations in {2, 3}:
+                snapshot = copy.deepcopy(snapshot)
+                snapshot["port_occupied"]["19091"] = False
+            return snapshot
+
+        expected_starts = [
+            self.context.manifest["services"][name]["label"]
+            for name in ORCHESTRATOR.SERVICE_START_ORDER
+        ]
+        with mock.patch.object(
+            ORCHESTRATOR, "standing_snapshot", side_effect=transient_then_exact
+        ), mock.patch.object(
+            ORCHESTRATOR.time, "monotonic", side_effect=(0.0, 0.0, 0.0)
+        ), mock.patch.object(ORCHESTRATOR.time, "sleep") as sleep:
+            result = ORCHESTRATOR.command_start(self.context, self.platform)
+
+        self.assertEqual(result["phase"], "candidate_started")
+        self.assertEqual(self.platform.start_order, expected_starts)
+        self.assertTrue(
+            ORCHESTRATOR.candidate_start_transition_path(self.context).is_file()
+        )
+        sleep.assert_called_once_with(
+            ORCHESTRATOR.CANDIDATE_START_FINAL_BOUNDARY_RETRY_INTERVAL_SECONDS
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_candidate_start_final_boundary_exhaustion_rolls_back(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        original_standing_snapshot = ORCHESTRATOR.standing_snapshot
+        observations = 0
+
+        def persistently_transient(context, platform):
+            nonlocal observations
+            observations += 1
+            snapshot = original_standing_snapshot(context, platform)
+            if observations > 1:
+                snapshot = copy.deepcopy(snapshot)
+                snapshot["port_occupied"]["19091"] = False
+            return snapshot
+
+        with mock.patch.object(
+            ORCHESTRATOR, "standing_snapshot", side_effect=persistently_transient
+        ), mock.patch.object(
+            ORCHESTRATOR.time,
+            "monotonic",
+            side_effect=(0.0, 0.0, 10.0),
+        ), mock.patch.object(ORCHESTRATOR.time, "sleep") as sleep:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "protected_staging_state_changed",
+            ):
+                ORCHESTRATOR.command_start(self.context, self.platform)
+
+        self.assertEqual(
+            ORCHESTRATOR.load_state(self.context, {"stopped"})["phase"],
+            "stopped",
+        )
+        self.assertFalse(self.platform.postgres)
+        self.assertFalse(
+            ORCHESTRATOR.candidate_start_transition_path(self.context).exists()
+        )
+        sleep.assert_called_once_with(
+            ORCHESTRATOR.CANDIDATE_START_FINAL_BOUNDARY_RETRY_INTERVAL_SECONDS
+        )
+        self.assertEqual(observations, 3)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_candidate_start_final_boundary_never_retries_static_standing_drift(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        original_standing_snapshot = ORCHESTRATOR.standing_snapshot
+        observations = 0
+
+        def static_drift(context, platform):
+            nonlocal observations
+            observations += 1
+            snapshot = original_standing_snapshot(context, platform)
+            if observations == 2:
+                snapshot = copy.deepcopy(snapshot)
+                label = sorted(snapshot["launchd_loaded"])[0]
+                snapshot["launchd_loaded"][label] = False
+            return snapshot
+
+        with mock.patch.object(
+            ORCHESTRATOR, "standing_snapshot", side_effect=static_drift
+        ), mock.patch.object(ORCHESTRATOR.time, "sleep") as sleep:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "protected_staging_state_changed",
+            ):
+                ORCHESTRATOR.command_start(self.context, self.platform)
+
+        sleep.assert_not_called()
+        self.assertFalse(
+            ORCHESTRATOR.candidate_start_transition_path(self.context).exists()
+        )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_candidate_start_final_boundary_rejects_candidate_restart_during_wait(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        original_standing_snapshot = ORCHESTRATOR.standing_snapshot
+        observations = 0
+
+        def transient_then_exact(context, platform):
+            nonlocal observations
+            observations += 1
+            snapshot = original_standing_snapshot(context, platform)
+            if observations in {2, 3}:
+                snapshot = copy.deepcopy(snapshot)
+                snapshot["port_occupied"]["19091"] = False
+            return snapshot
+
+        worker_label = self.context.manifest["services"]["worker"]["label"]
+
+        def replace_worker_on_retry(label, count, job):
+            if label == worker_label and count == 4:
+                job = dict(job)
+                job["pid"] += 100
+            return job
+
+        self.platform.launchd_job_hook = replace_worker_on_retry
+        with mock.patch.object(
+            ORCHESTRATOR, "standing_snapshot", side_effect=transient_then_exact
+        ), mock.patch.object(
+            ORCHESTRATOR.time, "monotonic", side_effect=(0.0, 0.0, 0.0)
+        ), mock.patch.object(ORCHESTRATOR.time, "sleep") as sleep:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "candidate_worker_launchd_final_identity_drift",
+            ):
+                ORCHESTRATOR.command_start(self.context, self.platform)
+
+        sleep.assert_called_once()
+        self.assertFalse(
+            ORCHESTRATOR.candidate_start_transition_path(self.context).exists()
+        )
+        self.platform.launchd_job_hook = None
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_candidate_start_final_boundary_rejects_health_drift_during_wait(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        original_standing_snapshot = ORCHESTRATOR.standing_snapshot
+        observations = 0
+
+        def transient_then_exact(context, platform):
+            nonlocal observations
+            observations += 1
+            snapshot = original_standing_snapshot(context, platform)
+            if observations in {2, 3}:
+                snapshot = copy.deepcopy(snapshot)
+                snapshot["port_occupied"]["19091"] = False
+            return snapshot
+
+        def fail_worker_after_admission(_seconds):
+            self.platform.health_failure = "worker"
+
+        with mock.patch.object(
+            ORCHESTRATOR, "standing_snapshot", side_effect=transient_then_exact
+        ), mock.patch.object(
+            ORCHESTRATOR.time, "monotonic", side_effect=(0.0, 0.0, 0.0)
+        ), mock.patch.object(
+            ORCHESTRATOR.time, "sleep", side_effect=fail_worker_after_admission
+        ) as sleep:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "candidate_health_unready"
+            ):
+                ORCHESTRATOR.command_start(self.context, self.platform)
+
+        sleep.assert_called_once()
+        self.assertFalse(
+            ORCHESTRATOR.candidate_start_transition_path(self.context).exists()
+        )
+        self.platform.health_failure = None
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_candidate_start_standing_classifier_rejects_new_listener(self):
+        expected = ORCHESTRATOR.standing_snapshot(self.context, self.platform)
+        expected = copy.deepcopy(expected)
+        expected["port_occupied"]["19091"] = False
+        observed = copy.deepcopy(expected)
+        observed["port_occupied"]["19091"] = True
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "protected_staging_state_changed",
+        ):
+            ORCHESTRATOR.classify_candidate_start_standing(expected, observed)
 
     def test_candidate_start_rechecks_standing_before_transition_commit(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
@@ -7407,6 +7602,71 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         lifecycle_path.chmod(0o600)
         return lifecycle_path
 
+    def prepare_bootstrap_stopped_rollback(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        self.platform.health_failure = str(
+            self.context.manifest["services"]["runtime"]["port"]
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "candidate_health_unready"
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.platform.health_failure = None
+        state = ORCHESTRATOR.load_state(self.context, {"stopped"})
+        rows, _raw = ORCHESTRATOR.read_strict_journal_snapshot(self.context)
+        self.assertEqual(
+            (rows[-1]["action"], rows[-1]["status"], rows[-1]["target"]),
+            ("candidate_start", "rolled_back", "run"),
+        )
+        self.write_d2a_session_lifecycle(
+            "not_issued", origin="bootstrap", process_group_id=None
+        )
+        return state
+
+    def remove_prepare_complete_journal_row(self):
+        rows, _raw = ORCHESTRATOR.read_strict_journal_snapshot(self.context)
+        filtered = [
+            row
+            for row in rows
+            if (row["action"], row["status"], row["target"])
+            != ("prepare", "complete", "run")
+        ]
+        self.assertEqual(len(filtered), len(rows) - 1)
+        rewritten = b"".join(
+            (
+                ORCHESTRATOR.canonical_json({**row, "sequence": sequence})
+                + "\n"
+            ).encode("utf-8")
+            for sequence, row in enumerate(filtered, start=1)
+        )
+        self.context.journal_path.write_bytes(rewritten)
+        self.context.journal_path.chmod(0o600)
+
+    def assert_prestart_cleanup_rejected_without_mutation(self):
+        state = self.context.state_path.read_bytes()
+        journal = self.context.journal_path.read_bytes()
+        keychain = set(self.platform.keychain)
+        keychain_deletes = list(self.platform.keychain_deletes)
+        bootouts = list(self.platform.bootouts)
+        registry = self.registry_path.read_bytes()
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "transition_d2a_teardown_fence",
+            side_effect=AssertionError("fence mutation must not be reached"),
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertFalse(
+            ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
+        )
+        self.assertEqual(self.context.state_path.read_bytes(), state)
+        self.assertEqual(self.context.journal_path.read_bytes(), journal)
+        self.assertEqual(self.platform.keychain, keychain)
+        self.assertEqual(self.platform.keychain_deletes, keychain_deletes)
+        self.assertEqual(self.platform.bootouts, bootouts)
+        self.assertEqual(self.registry_path.read_bytes(), registry)
+
     def prepare_audited_quarantined_recovery_fixture(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         ORCHESTRATOR.command_start(self.context, self.platform)
@@ -8880,10 +9140,11 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         fixture = self.prepare_audited_preissuer_rollback_fixture()
         bootstrap_before = fixture["bootstrap_path"].read_bytes()
 
-        with self.assertRaisesRegex(
-            ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
-        ):
-            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        # Production reaches this historical-only command because ordinary
+        # source-exact manifest loading rejects the old controller tree first.
+        # This unit fixture already holds a constructed context, so calling the
+        # modern direct cleanup function here would bypass that source gate and
+        # correctly admit the exact stopped rollback.
         self.assertFalse(
             ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
         )
@@ -8921,6 +9182,53 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         self.assertEqual(replay["status"], "exact_replay")
         self.assertEqual(replay["cleanup_status"], "already_cleaned")
         self.assertEqual(self.context.journal_path.read_bytes(), first_journal)
+
+    def test_audited_recovery_rechecks_bootstrap_after_intent_before_fence(self):
+        fixture = self.prepare_audited_preissuer_rollback_fixture()
+        journal_before = self.context.journal_path.read_bytes()
+        state_before = self.context.state_path.read_bytes()
+        keychain_before = set(self.platform.keychain)
+        original = ORCHESTRATOR.load_or_create_audited_recovery_intent
+
+        def mutate_bootstrap_after_intent(context, expected):
+            result = original(context, expected)
+            bootstrap_state = json.loads(
+                fixture["bootstrap_path"].read_text(encoding="utf-8")
+            )
+            bootstrap_state["updated_at"] = "2026-08-12T05:13:01Z"
+            fixture["bootstrap_path"].write_text(
+                ORCHESTRATOR.canonical_json(bootstrap_state) + "\n",
+                encoding="utf-8",
+            )
+            fixture["bootstrap_path"].chmod(0o600)
+            return result
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "load_or_create_audited_recovery_intent",
+            side_effect=mutate_bootstrap_after_intent,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_recovery_replay_drift",
+        ):
+            self.run_audited_preissuer_rollback_recovery(fixture)
+
+        self.assertTrue(
+            ORCHESTRATOR.audited_preissuer_rollback_intent_path(
+                self.context
+            ).exists()
+        )
+        self.assertFalse(
+            ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
+        )
+        self.assertFalse(
+            ORCHESTRATOR.audited_preissuer_rollback_evidence_path(
+                self.context
+            ).exists()
+        )
+        self.assertEqual(self.context.journal_path.read_bytes(), journal_before)
+        self.assertEqual(self.context.state_path.read_bytes(), state_before)
+        self.assertEqual(self.platform.keychain, keychain_before)
 
     def test_audited_recovery_rejects_dirty_current_source_before_intent(self):
         fixture = self.prepare_audited_preissuer_rollback_fixture()
@@ -9130,6 +9438,143 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         )
         self.assertEqual(
             arguments.command, "recover-audited-preissuer-rollback"
+        )
+
+    def test_audited_recovery_busy_bootstrap_lock_fails_before_context_or_intent(self):
+        lock_path = self.root / "bootstrap-global.lock"
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            argv = [
+                "isolated_orchestrator.py",
+                "recover-audited-preissuer-rollback",
+                "--manifest",
+                str(self.context.manifest_path),
+                "--bootstrap-state",
+                str(self.root / "bootstrap.json"),
+                "--confirm-current-commit",
+                "a" * 40,
+                "--confirm-current-tree",
+                "b" * 40,
+                "--confirm-run-id",
+                self.context.manifest["run_id"],
+                "--confirm-manifest-sha256",
+                self.context.digest,
+            ]
+            stderr = io.StringIO()
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                ORCHESTRATOR,
+                "D2A_BOOTSTRAP_GLOBAL_LOCK_PATH",
+                lock_path,
+            ), mock.patch.object(
+                ORCHESTRATOR,
+                "load_audited_recovery_context",
+                side_effect=AssertionError("context load must not be reached"),
+            ), contextlib.redirect_stderr(stderr), self.assertRaises(
+                SystemExit
+            ) as raised:
+                ORCHESTRATOR.main()
+            self.assertEqual(raised.exception.code, 1)
+            self.assertEqual(
+                json.loads(stderr.getvalue())["code"],
+                "audited_recovery_bootstrap_lock_busy",
+            )
+            self.assertFalse(
+                ORCHESTRATOR.audited_preissuer_rollback_intent_path(
+                    self.context
+                ).exists()
+            )
+            self.assertFalse(
+                ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
+            )
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def test_audited_recovery_holds_bootstrap_lock_outside_global_d2_lock(self):
+        events = []
+
+        def acquire_bootstrap():
+            events.append("bootstrap:enter")
+            return 123
+
+        def release_bootstrap(descriptor):
+            self.assertEqual(descriptor, 123)
+            events.append("bootstrap:exit")
+
+        def load_context(_path):
+            self.assertEqual(events, ["bootstrap:enter"])
+            events.append("context:load")
+            return self.context, {}
+
+        @contextlib.contextmanager
+        def global_lock():
+            events.append("global:enter")
+            try:
+                yield
+            finally:
+                events.append("global:exit")
+
+        def command(*_arguments):
+            self.assertEqual(
+                events,
+                ["bootstrap:enter", "context:load", "global:enter"],
+            )
+            events.append("command")
+            return {"status": "ok"}
+
+        argv = [
+            "isolated_orchestrator.py",
+            "recover-audited-preissuer-rollback",
+            "--manifest",
+            str(self.context.manifest_path),
+            "--bootstrap-state",
+            str(self.root / "bootstrap.json"),
+            "--confirm-current-commit",
+            "a" * 40,
+            "--confirm-current-tree",
+            "b" * 40,
+            "--confirm-run-id",
+            self.context.manifest["run_id"],
+            "--confirm-manifest-sha256",
+            self.context.digest,
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            ORCHESTRATOR,
+            "acquire_audited_preissuer_bootstrap_lock",
+            side_effect=acquire_bootstrap,
+        ), mock.patch.object(
+            ORCHESTRATOR,
+            "release_audited_preissuer_bootstrap_lock",
+            side_effect=release_bootstrap,
+        ), mock.patch.object(
+            ORCHESTRATOR,
+            "load_audited_recovery_context",
+            side_effect=load_context,
+        ), mock.patch.object(
+            ORCHESTRATOR,
+            "Platform",
+            return_value=self.platform,
+        ), mock.patch.object(
+            ORCHESTRATOR,
+            "global_operation_lock",
+            global_lock,
+        ), mock.patch.object(
+            ORCHESTRATOR,
+            "command_recover_audited_preissuer_rollback",
+            side_effect=command,
+        ), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(ORCHESTRATOR.main())
+        self.assertEqual(
+            events,
+            [
+                "bootstrap:enter",
+                "context:load",
+                "global:enter",
+                "command",
+                "global:exit",
+                "bootstrap:exit",
+            ],
         )
 
     def test_d2a_active_quarantined_or_missing_lifecycle_blocks_before_mutation(self):
@@ -9428,6 +9873,235 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             )
         )
         self.assertEqual(fence["status"], "closed")
+
+    def test_bootstrap_stopped_rollback_cleanup_closes_fence_and_replays(self):
+        self.prepare_bootstrap_stopped_rollback()
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["status"], "cleaned")
+        self.assertEqual(result["phase"], "cleaned")
+        self.assertTrue(all(result[field] for field in (
+            "database_absent",
+            "postgres_process_absent",
+            "launchd_jobs_absent",
+            "keychain_items_absent",
+            "isolated_root_absent",
+            "protected_staging_unchanged",
+        )))
+        fence = json.loads(
+            ORCHESTRATOR.d2a_teardown_fence_path(self.context).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(fence["status"], "closed")
+        self.assertEqual(self.platform.proxy_deletions, [])
+        replay = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(replay["status"], "already_cleaned")
+        self.assertTrue(all(replay[field] for field in (
+            "database_absent",
+            "postgres_process_absent",
+            "launchd_jobs_absent",
+            "keychain_items_absent",
+            "isolated_root_absent",
+            "protected_staging_unchanged",
+        )))
+
+    def test_bootstrap_prepared_cleanup_accepts_crash_before_prepare_complete(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        self.remove_prepare_complete_journal_row()
+        self.write_d2a_session_lifecycle(
+            "not_issued", origin="bootstrap", process_group_id=None
+        )
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+
+    def test_bootstrap_stopped_cleanup_accepts_missing_prepare_complete(self):
+        self.prepare_bootstrap_stopped_rollback()
+        self.remove_prepare_complete_journal_row()
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+
+    def test_bootstrap_stopped_cleanup_accepts_crash_before_first_delimiter(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        state = ORCHESTRATOR.load_state(self.context, {"prepared"})
+        ORCHESTRATOR.save_state(
+            self.context, "stopped", state["standing_snapshot"]
+        )
+        self.write_d2a_session_lifecycle(
+            "not_issued", origin="bootstrap", process_group_id=None
+        )
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+
+    def test_bootstrap_stopped_cleanup_accepts_terminal_interrupted_recovery(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        state = ORCHESTRATOR.load_state(self.context, {"prepared"})
+        ORCHESTRATOR.save_state(
+            self.context, "substrate_starting", state["standing_snapshot"]
+        )
+        protected_label = self.context.manifest["protected_staging"][
+            "launchd_labels"
+        ][0]
+        self.platform.loaded.remove(protected_label)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "protected_staging_state_changed",
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.platform.loaded.add(protected_label)
+        self.assertEqual(
+            ORCHESTRATOR.load_state(self.context, {"stopped"})["phase"],
+            "stopped",
+        )
+        rows, _raw = ORCHESTRATOR.read_strict_journal_snapshot(self.context)
+        self.assertEqual(
+            (rows[-1]["action"], rows[-1]["status"], rows[-1]["target"]),
+            ("interrupted_start", "recovered", "run"),
+        )
+        self.write_d2a_session_lifecycle(
+            "not_issued", origin="bootstrap", process_group_id=None
+        )
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+
+    def test_bootstrap_stopped_cleanup_accepts_terminal_attempt_prefix(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        state = ORCHESTRATOR.load_state(self.context, {"prepared"})
+        ORCHESTRATOR.append_journal(
+            self.context, "postgres_start", "intent", "cluster"
+        )
+        ORCHESTRATOR.append_journal(
+            self.context, "database_bootstrap", "intent", "database"
+        )
+        # Model a crash after rollback saved `stopped` but before it appended
+        # the delimiter that would follow this reachable journal prefix.
+        ORCHESTRATOR.save_state(
+            self.context, "stopped", state["standing_snapshot"]
+        )
+        self.write_d2a_session_lifecycle(
+            "not_issued", origin="bootstrap", process_group_id=None
+        )
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+
+    def test_bootstrap_stopped_cleanup_rejects_rollback_failure_journal(self):
+        self.prepare_bootstrap_stopped_rollback()
+        ORCHESTRATOR.append_journal(
+            self.context, "candidate_start", "rollback_failed", "run"
+        )
+        self.assert_prestart_cleanup_rejected_without_mutation()
+
+    def test_bootstrap_stopped_cleanup_accepts_empty_interrupted_fragment(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        state = ORCHESTRATOR.load_state(self.context, {"prepared"})
+        # `command_start` saves this phase immediately before its first journal
+        # append. Model a process loss in that exact durability gap.
+        ORCHESTRATOR.save_state(
+            self.context, "substrate_starting", state["standing_snapshot"]
+        )
+        self.platform.health_failure = str(
+            self.context.manifest["services"]["runtime"]["port"]
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "candidate_health_unready"
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.platform.health_failure = None
+        self.write_d2a_session_lifecycle(
+            "not_issued", origin="bootstrap", process_group_id=None
+        )
+        rows, _raw = ORCHESTRATOR.read_strict_journal_snapshot(self.context)
+        self.assertIn(
+            ("interrupted_start", "recovered", "run"),
+            [
+                (row["action"], row["status"], row["target"])
+                for row in rows
+            ],
+        )
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+
+    def test_bootstrap_stopped_cleanup_does_not_repair_torn_journal(self):
+        self.prepare_bootstrap_stopped_rollback()
+        original = self.context.journal_path.read_bytes()
+        self.context.journal_path.write_bytes(original[:-1])
+        torn = self.context.journal_path.read_bytes()
+        self.assertFalse(torn.endswith(b"\n"))
+        self.assert_prestart_cleanup_rejected_without_mutation()
+        self.assertEqual(self.context.journal_path.read_bytes(), torn)
+
+    def test_bootstrap_stopped_cleanup_rejects_each_inert_boundary_drift(self):
+        self.prepare_bootstrap_stopped_rollback()
+
+        commitment = ORCHESTRATOR.candidate_start_transition_path(self.context)
+        commitment.write_text("{}\n", encoding="utf-8")
+        commitment.chmod(0o600)
+        self.assert_prestart_cleanup_rejected_without_mutation()
+        commitment.unlink()
+
+        candidate_label = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.loaded.add(candidate_label)
+        self.assert_prestart_cleanup_rejected_without_mutation()
+        self.platform.loaded.remove(candidate_label)
+
+        self.platform.postgres = True
+        self.platform.postgres_process_pid = 49001
+        self.assert_prestart_cleanup_rejected_without_mutation()
+        self.platform.postgres = False
+        self.platform.postgres_process_pid = None
+
+        protected_label = self.context.manifest["protected_staging"][
+            "launchd_labels"
+        ][0]
+        self.platform.loaded.remove(protected_label)
+        self.assert_prestart_cleanup_rejected_without_mutation()
+        self.platform.loaded.add(protected_label)
+
+        forbidden = self.context.artifact_directory / "unexpected-post-start.json"
+        forbidden.write_text("{}\n", encoding="utf-8")
+        forbidden.chmod(0o600)
+        self.assert_prestart_cleanup_rejected_without_mutation()
+        forbidden.unlink()
+
+        owner_service, _account = ORCHESTRATOR.owner_identities(self.context)[0]
+        self.platform.owner_values[owner_service] = "different-run"
+        self.assert_prestart_cleanup_rejected_without_mutation()
+        self.platform.owner_values[owner_service] = self.context.manifest["run_id"]
+
+    def test_bootstrap_stopped_cleanup_rereads_before_fence_mutation(self):
+        self.prepare_bootstrap_stopped_rollback()
+        real_observe = ORCHESTRATOR.observe_bootstrap_prestart_cleanup_boundary
+        calls = 0
+
+        def drift_after_first_observation(context, platform, lifecycle):
+            nonlocal calls
+            observed = real_observe(context, platform, lifecycle)
+            calls += 1
+            if calls == 1:
+                state = ORCHESTRATOR.load_state(context, {"stopped"})
+                ORCHESTRATOR.save_state(
+                    context, "stopped", state["standing_snapshot"]
+                )
+            return observed
+
+        journal = self.context.journal_path.read_bytes()
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "observe_bootstrap_prestart_cleanup_boundary",
+            side_effect=drift_after_first_observation,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(calls, 2)
+        self.assertFalse(
+            ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
+        )
+        self.assertEqual(self.context.journal_path.read_bytes(), journal)
+        self.assertFalse(any(
+            json.loads(line)["action"] == "cleanup"
+            for line in journal.splitlines()
+        ))
+        self.assertEqual(self.platform.keychain_deletes, [])
 
     def test_bootstrap_sentinel_after_candidate_start_uses_full_teardown(self):
         self.start_candidate_with_discord_resources()

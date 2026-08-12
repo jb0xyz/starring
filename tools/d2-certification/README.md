@@ -323,7 +323,16 @@ candidate-start transition before publishing the consumable coordinator
 source. An interrupted start adopts the same live API, runtime, plist, health,
 and transport identities and completes without launching replacements. Live
 identity drift during pending publication or recovery makes the run
-retirement-only. Before a runtime-restart protocol begins, a completed-start
+retirement-only. Immediately before that first commitment, `start` pins all
+five candidate launchd generations and plists, the API/runtime kernel
+identities, and the transport instance, then requires two complete health and
+protected-standing observations. Only an expected-occupied protected port
+that is momentarily absent is eligible for a bounded ten-second retry-admission
+window; protected label/plist drift, a new listener, or any candidate identity,
+state, commitment, transport, or health drift fails immediately and rolls the
+uncommitted start back. This tolerates a separately managed protected service
+restarting without masking a candidate restart or changing the protected
+static contract. Before a runtime-restart protocol begins, a completed-start
 replay verifies the immutable transition and source together with their exact
 process identities, current service health, the pinned transport instance, and
 the standing snapshot. Once a drained or live runtime-restart protocol begins,
@@ -335,6 +344,24 @@ certification commands fail with
 abort cleanup and prepare a new disposable run. The old source is never deleted
 or rebound to replacement processes.
 
+Before issuer handoff, automated cleanup also admits the exact uncommitted
+rollback produced by a failed `start`. The bootstrap lifecycle must remain the
+`direct-onboard`/`not_issued` sentinel with no process group, the canonical
+journal must contain the fixed prepare body, at most one prepare-complete row,
+and only reachable exact start fragments. Besides a completed rollback, the
+parser admits the precise stopped power-loss cuts before a recovery delimiter,
+after an interrupted-start recovery delimiter, or at an exact terminal start
+prefix; a prepared cut immediately before its final journal append is also
+reachable. No candidate commitment, post-start artifact, cleanup artifact, run
+launchd job, or PostgreSQL process may exist. The sealed root, run ownership,
+owner Keychain identities, generated plists, and protected staging snapshot
+must all remain exact. The controller repeats that complete read-only boundary
+and requires byte/identity equality immediately before it publishes the closed
+teardown fence. A rollback-failure row, torn, duplicated, or ambiguous journal,
+lifecycle or state drift, unexpected artifact, live process, ownership drift,
+or protected-staging drift leaves the fence absent and performs no cleanup
+mutation.
+
 The successful certification path never calls direct `stop`, direct `cleanup`,
 or standalone `teardown-discord-resources`. Those commands are abort-only after
 commitment. Successful teardown goes through `finalize-run` after coordinator
@@ -344,10 +371,11 @@ the first deletion. The tombstone blocks coordinator status, advance, and
 verify as well as D3 bind, recheck, and finalize, while the same teardown and
 cleanup commands remain available to resume an interrupted abort.
 
-One historical automated-maintenance run is explicitly allowlisted for
-`recover-audited-preissuer-rollback`. Its candidate start failed and completely
-rolled back before the issuer took over the bootstrap `not_issued` sentinel,
-but the then-current cleanup gate did not admit the resulting `stopped` phase.
+Historical automated-maintenance runs may be explicitly allowlisted for
+`recover-audited-preissuer-rollback`. Each such candidate start failed and
+completely rolled back before the issuer took over the bootstrap `not_issued`
+sentinel, but its embedded controller predates normal admission of the
+resulting `stopped` phase.
 Normal manifest loading and bootstrap `resume` remain source-exact and are not
 relaxed. The repair command instead validates the canonical historical
 manifest, immutable candidates and worker tree, exact bootstrap/state/journal/
@@ -370,13 +398,16 @@ python3 tools/d2-certification/isolated_orchestrator.py \
   --confirm-manifest-sha256 <historical-manifest-sha256>
 ```
 
-Under the global D2 lock it fsyncs an immutable, secret-free recovery intent,
-closes the pre-start teardown fence, invokes the existing scoped cleanup
-primitive, rechecks total absence and current source identity, and writes final
-evidence. Interrupted executions replay only from that exact intent and source
-revision. Any other run, same-as-historical source, dirty or differently
+The command takes the fixed bootstrap lock before the global D2 lock and holds
+both for the complete operation. It fsyncs an immutable, secret-free recovery
+intent, re-reads the exact allowlisted bootstrap state before closing the
+pre-start teardown fence, invokes the existing scoped cleanup primitive,
+rechecks total absence and current source identity, and writes final evidence.
+Interrupted executions replay only from that exact intent and source revision.
+A busy or invalid bootstrap lock, bootstrap-state drift, any other
+recovery-command run identity, same-as-historical source, dirty or differently
 confirmed source, ambiguous journal, active service/process, artifact,
-commitment, or protected-staging drift fails before the intent is created.
+commitment, or protected-staging drift fails before cleanup is authorized.
 
 A second, separate repair boundary exists only for quarantined run
 `d2-20260812t082042z-c52d220457d1`:

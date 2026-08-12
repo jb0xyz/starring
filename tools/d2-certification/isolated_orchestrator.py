@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import contextlib
 import datetime
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -68,6 +70,9 @@ D2A_LIFECYCLE_TIMESTAMP = re.compile(
 )
 D2A_MARKER_MAXIMUM_BYTES = 64 * 1024
 D2A_SYSCTL_PATH = pathlib.Path("/usr/sbin/sysctl")
+D2A_BOOTSTRAP_GLOBAL_LOCK_PATH = pathlib.Path(
+    "/private/tmp/starring-d2a-bootstrap.lock"
+)
 D2A_SYSCTL_BOOT_TIME = re.compile(
     rb"^\{ sec = ([1-9][0-9]*), usec = (0|[1-9][0-9]{0,5}) \} "
     rb"[A-Z][a-z]{2} [A-Z][a-z]{2} [ 0-9][0-9] "
@@ -78,6 +83,8 @@ DISCORD_TEARDOWN_FINAL_BOUNDARY_RETRY_INTERVAL_SECONDS = 0.25
 DISCORD_TEARDOWN_FINAL_BOUNDARY_TRANSIENT_ERRORS = frozenset(
     {"candidate_health_unready", "transport_control_unavailable"}
 )
+CANDIDATE_START_FINAL_BOUNDARY_RETRY_ADMISSION_SECONDS = 10.0
+CANDIDATE_START_FINAL_BOUNDARY_RETRY_INTERVAL_SECONDS = 0.25
 
 from d2_certification import (
     COMMIT_PATTERN,
@@ -413,7 +420,7 @@ AUDITED_BOOTSTRAP_STATE_FIELDS = tuple(
     )
 )
 
-# Historical identity of the sole run affected by the pre-issuer rollback
+# Historical identities of runs affected by the pre-issuer rollback
 # cleanup authorization bug.  This allowlist never authorizes a current source
 # revision; the operator must separately confirm the clean current HEAD/tree,
 # which is durably recorded in the recovery intent.
@@ -441,7 +448,31 @@ AUDITED_PREISSUER_ROLLBACK_ALLOWLIST = {
         "journal_rows": 43,
         "taint_sha256": "eef9fdbc5cab11b38f3b2d23d55597316c626db064f623cfb465f0fb958c28ee",
         "lifecycle_sha256": "9c88a096a7b6b57775a6329a429cf98c4d62eb3dacdd2275888c9b19dd98dd53",
-    }
+    },
+    (
+        "d2-20260812t142249z-3fcb48aff24c",
+        "45f59caad3d667296e1616445624ca606383abb4151597ac489717f8a52229cd",
+    ): {
+        "manifest_commit_sha": "722b98c12523201b406e6a634df2f0dde1c1be83",
+        "historical_d2_toolchain_sha256": "0f9782f2a816dee641ce9f7d7755ddbdc3b2a9b7321434d410718c1bb58874db",
+        "historical_transport_sha256": "79aa836e039687ddcb2b91305d2def26798dcec72de5703734416e6864e1a1a9",
+        "historical_worker_sha256": "39421ca38caeaec5c3f1889f0e09118ebbe815e169a63da5daa7333ec1a2312d",
+        "bootstrap_id": "d2ab-65c025de4738bf8b8f86a8b7e22c801b",
+        "bootstrap_state_sha256": "bea5e6f257049d606de29e80931578f2b27da0cfcd57a0ed931a87c79b5c33ed",
+        "bootstrap_config_sha256": "34988a102c346be941246d48622b742fc9d17c1c837d396fbca2b5077243da10",
+        "candidate_spec_sha256": "ebbb63d6de8e68cc840b8f4fff157d4d9f6973380914a18c974b30296171a1c0",
+        "candidate_provenance_sha256": "181a07543b1b167d71275b1959ea2ffa507c14cfd91b0b036956b3e7b772c490",
+        "candidate_dependency_record_sha256": "25523c5b7d5c6db57a440324c31c33a58e841c07c4c84593afbe6d8e32cfb421",
+        "candidate_dependency_tree_sha256": "1ac4e636067f59abc9d339b9f3d4414a53b535ce7be5004e8681036438df581b",
+        "source_tree_sha": "e58f909a608ee2ef7f709e7d631d2e0826350a5b",
+        "issuer_sha256": "4fa454c9eac214662e79ad34f16ad4916c2e9fa1bb4f77cd97d357851f464dc8",
+        "issuer_source_sha256": "ef611156cbbfda1df2494761a3dcf73bb73615198e194a6369f21770284e2185",
+        "orchestrator_state_sha256": "546cd25eadb2a279cdc8d0b12580bf24663713a6e3eb80125ff274097096169a",
+        "journal_sha256": "36d56f39aeb26c800be765eb455006e81537cd576f473d463980b902c5648733",
+        "journal_rows": 43,
+        "taint_sha256": "fea9becaf35120120e6471f005dc438e767a9d1fc07ddfbcb2071d6b82dcddfe",
+        "lifecycle_sha256": "5003d9d4f6aca908b62c5b32489a17a3a329a746a9136e4981d41a7be24df36f",
+    },
 }
 AUDITED_PREISSUER_ROLLBACK_INTENT_FIELDS = tuple(
     sorted(
@@ -1213,6 +1244,180 @@ def build_candidate_evidence(context, statuses, platform):
         "tunnel_ready": statuses["tunnel"] == 200,
         "process_identities": process_identities,
     }
+
+
+def candidate_start_precommit_paths(context):
+    return (
+        context.artifact_directory / "step-03-evidence.json",
+        candidate_start_transition_path(context),
+        candidate_start_source_path(context),
+        candidate_start_retirement_path(context),
+    )
+
+
+def require_candidate_start_precommit_state(
+    context, platform, expected_state
+):
+    if (
+        load_state(context, {"candidate_starting"}) != expected_state
+        or any(
+            os.path.lexists(path)
+            for path in candidate_start_precommit_paths(context)
+        )
+        or not platform.postgres_running(context.cluster_root)
+    ):
+        fail("candidate_start_final_state_drift")
+
+
+def pin_candidate_launchd_jobs(context, platform):
+    plists = compose_plists(context)
+    pinned = {}
+    for name in SERVICE_START_ORDER:
+        service = context.manifest["services"][name]
+        arguments = [str(value) for value in plists[name]["ProgramArguments"]]
+        plist_identity = candidate_plist_identity(context, name)
+        job = platform.launchd_job(service["label"])
+        if (
+            not isinstance(job, dict)
+            or set(job)
+            != {
+                "pid",
+                "program",
+                "plist_path",
+                "arguments",
+                "runs",
+                "state",
+                "last_exit_code",
+            }
+            or type(job["pid"]) is not int
+            or job["pid"] <= 0
+            or job["program"] != arguments[0]
+            or job["plist_path"] != str(service_plist_path(context, name))
+            or job["arguments"] != arguments
+            or type(job["runs"]) is not int
+            or job["runs"] <= 0
+            or job["state"] != "running"
+            or job["last_exit_code"] is not None
+        ):
+            fail(f"candidate_{name}_launchd_final_identity_drift")
+        pinned[name] = {
+            "job": job,
+            "plist": plist_identity,
+        }
+    if len({value["job"]["pid"] for value in pinned.values()}) != len(pinned):
+        fail("candidate_launchd_pid_collision")
+    return pinned
+
+
+def revalidate_candidate_launchd_jobs(context, platform, pinned):
+    if set(pinned) != set(SERVICE_START_ORDER):
+        fail("candidate_launchd_final_identity_invalid")
+    for name in SERVICE_START_ORDER:
+        service = context.manifest["services"][name]
+        if (
+            platform.launchd_job(service["label"]) != pinned[name]["job"]
+            or candidate_plist_identity(context, name) != pinned[name]["plist"]
+        ):
+            fail(f"candidate_{name}_launchd_final_identity_drift")
+
+
+def classify_candidate_start_standing(expected, observed):
+    fields = {"launchd_loaded", "plist_sha256", "port_occupied"}
+    if (
+        not isinstance(expected, dict)
+        or not isinstance(observed, dict)
+        or set(expected) != fields
+        or set(observed) != fields
+        or observed["launchd_loaded"] != expected["launchd_loaded"]
+        or observed["plist_sha256"] != expected["plist_sha256"]
+        or not isinstance(expected["port_occupied"], dict)
+        or not isinstance(observed["port_occupied"], dict)
+        or set(observed["port_occupied"])
+        != set(expected["port_occupied"])
+    ):
+        fail("protected_staging_state_changed")
+    transient = False
+    for port, expected_occupied in expected["port_occupied"].items():
+        observed_occupied = observed["port_occupied"][port]
+        if (
+            type(expected_occupied) is not bool
+            or type(observed_occupied) is not bool
+        ):
+            fail("protected_staging_state_changed")
+        if observed_occupied == expected_occupied:
+            continue
+        # A protected port recorded as occupied may be momentarily absent
+        # while its separately managed launchd job restarts.  The inverse
+        # transition can only be an unexpected new listener and is never
+        # retryable.
+        if expected_occupied is True and observed_occupied is False:
+            transient = True
+            continue
+        fail("protected_staging_state_changed")
+    return "protected_port_transient" if transient else "exact"
+
+
+def observe_candidate_start_final_boundary(
+    context, platform, expected_state, evidence, pinned_jobs
+):
+    require_candidate_start_precommit_state(context, platform, expected_state)
+    revalidate_candidate_launchd_jobs(context, platform, pinned_jobs)
+    for name in ("api", "runtime"):
+        revalidate_candidate_process(
+            context,
+            platform,
+            name,
+            evidence["process_identities"][name],
+        )
+    transport = platform.transport_control(context, "snapshot")
+    if transport["instance_id"] != evidence["transport_instance_id"]:
+        fail("transport_instance_changed")
+    statuses = candidate_health(context, platform, wait=False)
+    if statuses != {
+        "worker": 200,
+        "transport": 200,
+        "api": 200,
+        "runtime": 200,
+        "tunnel": 200,
+    }:
+        fail("candidate_health_unready")
+    classification = classify_candidate_start_standing(
+        expected_state["standing_snapshot"],
+        standing_snapshot(context, platform),
+    )
+    return classification
+
+
+def require_candidate_start_final_boundary(
+    context, platform, expected_state, evidence, pinned_jobs
+):
+    """Retry admission only for an absent, normally-occupied protected port."""
+    deadline = (
+        time.monotonic()
+        + CANDIDATE_START_FINAL_BOUNDARY_RETRY_ADMISSION_SECONDS
+    )
+    retry = False
+    while True:
+        if retry and time.monotonic() >= deadline:
+            fail("protected_staging_state_changed")
+        first = observe_candidate_start_final_boundary(
+            context, platform, expected_state, evidence, pinned_jobs
+        )
+        second = observe_candidate_start_final_boundary(
+            context, platform, expected_state, evidence, pinned_jobs
+        )
+        if first == "exact" and second == "exact":
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail("protected_staging_state_changed")
+        time.sleep(
+            min(
+                CANDIDATE_START_FINAL_BOUNDARY_RETRY_INTERVAL_SECONDS,
+                remaining,
+            )
+        )
+        retry = True
 
 
 def candidate_start_transition_path(context):
@@ -2064,7 +2269,9 @@ def command_start(context, platform):
         replay = platform.provision_credentials(context)
         if replay["outcome"] != "exact_replay":
             fail("sealed_replay_required")
-        save_state(context, "candidate_starting", state["standing_snapshot"])
+        starting_state = save_state(
+            context, "candidate_starting", state["standing_snapshot"]
+        )
         for name in SERVICE_START_ORDER:
             label = context.manifest["services"][name]["label"]
             append_journal(context, "launchd_start", "intent", label)
@@ -2074,11 +2281,15 @@ def command_start(context, platform):
         statuses = candidate_health(context, platform, wait=True)
         if any(status != 200 for status in statuses.values()):
             fail("candidate_health_unready")
-        if standing_snapshot(context, platform) != state["standing_snapshot"]:
-            fail("protected_staging_state_changed")
         candidate_evidence = build_candidate_evidence(context, statuses, platform)
-        if standing_snapshot(context, platform) != state["standing_snapshot"]:
-            fail("protected_staging_state_changed")
+        pinned_jobs = pin_candidate_launchd_jobs(context, platform)
+        require_candidate_start_final_boundary(
+            context,
+            platform,
+            starting_state,
+            candidate_evidence,
+            pinned_jobs,
+        )
         transition = stage_candidate_start_transition(
             context, candidate_evidence, state["standing_snapshot"]
         )
@@ -4249,6 +4460,319 @@ def complete_d2a_teardown(context, automated):
         transition_d2a_teardown_fence(context, "closed")
 
 
+def bootstrap_prestart_cleanup_forbidden_paths(context):
+    return (
+        candidate_start_transition_path(context),
+        candidate_start_source_path(context),
+        candidate_start_retirement_path(context),
+        context.artifact_directory / "step-03-evidence.json",
+        context.artifact_directory / "onboarding-evidence.json",
+        context.artifact_directory / "transport-evidence",
+        discord_teardown_progress_path(context),
+        discord_teardown_progress_path(context, frozen=True),
+        discord_teardown_evidence_path(context),
+        discord_teardown_evidence_path(context, frozen=True),
+        abort_teardown_tombstone_path(context),
+        effect_admission_freeze_intent_path(context),
+        freeze_intent_path(context),
+        cleanup_keychain_baseline_path(context),
+        cleanup_root_progress_path(context),
+        context.artifact_directory / "cleanup-evidence.json",
+        audited_preissuer_rollback_intent_path(context),
+        audited_preissuer_rollback_evidence_path(context),
+    )
+
+
+def bootstrap_prestart_cleanup_state(context):
+    fields = tuple(sorted({
+        "schema_version",
+        "manifest_sha256",
+        "run_id",
+        "phase",
+        "updated_at",
+        "standing_snapshot",
+    }))
+    state = load_strict_d2a_marker(
+        context.state_path,
+        "manual_recovery_required",
+        fields,
+        sorted_canonical=True,
+    )
+    if (
+        type(state.get("schema_version")) is not int
+        or state.get("schema_version") != 1
+        or state.get("manifest_sha256") != context.digest
+        or state.get("run_id") != context.manifest["run_id"]
+        or state.get("phase") not in {"prepared", "stopped"}
+        or not validate_utc_timestamp(state.get("updated_at"))
+        or not isinstance(state.get("standing_snapshot"), dict)
+    ):
+        fail("manual_recovery_required")
+    return state
+
+
+def validate_bootstrap_prestart_cleanup_journal(context, rows, phase):
+    if any(not validate_utc_timestamp(row["recorded_at"]) for row in rows):
+        fail("manual_recovery_required")
+    prepared_prefix = [
+        ("discord_ownership", "complete", "identity"),
+        ("prepare", "intent", "run"),
+        ("root_create", "intent", "isolated_root"),
+        ("root_create", "complete", "isolated_root"),
+        ("initdb", "intent", "cluster"),
+        ("initdb", "complete", "cluster"),
+        ("postgres_configure", "intent", "cluster"),
+        ("postgres_configure", "complete", "cluster"),
+        ("tunnel_runner_write", "intent", "tunnel"),
+        ("tunnel_runner_write", "complete", "tunnel"),
+    ]
+    for name in ("api", "runtime", "worker", "transport", "tunnel"):
+        label = context.manifest["services"][name]["label"]
+        prepared_prefix.extend((
+            ("plist_write", "intent", label),
+            ("plist_write", "complete", label),
+        ))
+    for service, _account in owner_identities(context):
+        prepared_prefix.extend((
+            ("keychain_owner_create", "intent", service),
+            ("keychain_owner_create", "complete", service),
+        ))
+    observed_prefix = [
+        (row["action"], row["status"], row["target"])
+        for row in rows[:len(prepared_prefix)]
+    ]
+    if observed_prefix != prepared_prefix:
+        fail("manual_recovery_required")
+    tail = rows[len(prepared_prefix):]
+    if tail and (
+        tail[0]["action"], tail[0]["status"], tail[0]["target"]
+    ) == ("prepare", "complete", "run"):
+        tail = tail[1:]
+    if phase == "prepared":
+        if tail:
+            fail("manual_recovery_required")
+        return
+
+    attempt_prefix = [("postgres_start", "intent", "cluster")]
+    attempt_prefix.extend((
+        ("database_bootstrap", "intent", "database"),
+        ("database_bootstrap", "complete", "database"),
+    ))
+    for name in SERVICE_START_ORDER:
+        label = context.manifest["services"][name]["label"]
+        attempt_prefix.extend((
+            ("launchd_start", "intent", label),
+            ("launchd_start", "complete", label),
+        ))
+
+    fragment = []
+    for row in tail:
+        observed = (row["action"], row["status"], row["target"])
+        interrupted = observed == ("interrupted_start", "recovered", "run")
+        rolled_back = observed == ("candidate_start", "rolled_back", "run")
+        if interrupted or rolled_back:
+            if fragment != attempt_prefix[:len(fragment)]:
+                fail("manual_recovery_required")
+            # `substrate_starting` is durable before its first journal row, so
+            # a crash in that narrow gap legitimately recovers an empty
+            # fragment. A normal rolled-back exception is inside the journaled
+            # start body and therefore always has at least its postgres intent.
+            if rolled_back and not fragment:
+                fail("manual_recovery_required")
+            fragment = []
+            continue
+        if (
+            observed == ("candidate_start", "rollback_failed", "run")
+            or row["action"] == "candidate_start_transition"
+        ):
+            fail("manual_recovery_required")
+        fragment.append(observed)
+        if fragment != attempt_prefix[:len(fragment)]:
+            fail("manual_recovery_required")
+    # A stopped state is durable before either rollback delimiter is appended.
+    # Therefore an empty tail, a terminal recovered delimiter, or any exact
+    # terminal attempt prefix is a reachable power-loss boundary.  The
+    # caller separately proves every candidate job and PostgreSQL process is
+    # absent before authorizing cleanup.
+
+
+def bootstrap_prestart_artifact_inventory(context):
+    required = {
+        "state.json",
+        "lifecycle.jsonl",
+        "lifecycle.lock",
+        "cleanup-root-identity.json",
+        "launchd",
+        "keychain-plan.json",
+        "run-tunnel.zsh",
+    }
+    allowed = required | {
+        "database-evidence.json",
+        "step-01-evidence.json",
+        "preflight-absence-evidence.json",
+        "coordinator-sources",
+    }
+    try:
+        entries = {entry.name: entry for entry in context.artifact_directory.iterdir()}
+    except OSError:
+        fail("manual_recovery_required")
+    if not required.issubset(entries) or not set(entries).issubset(allowed):
+        fail("manual_recovery_required")
+
+    inventory = {}
+    for name, path in entries.items():
+        try:
+            metadata = path.lstat()
+        except OSError:
+            fail("manual_recovery_required")
+        expected_mode = 0o700 if name in {
+            "launchd", "coordinator-sources", "run-tunnel.zsh"
+        } else 0o600
+        expected_kind = stat.S_ISDIR if name in {
+            "launchd", "coordinator-sources"
+        } else stat.S_ISREG
+        if (
+            not expected_kind(metadata.st_mode)
+            or path.is_symlink()
+            or metadata.st_uid != os.getuid()
+            or (
+                stat.S_ISREG(metadata.st_mode)
+                and metadata.st_nlink != 1
+            )
+            or stat.S_IMODE(metadata.st_mode) != expected_mode
+        ):
+            fail("manual_recovery_required")
+        inventory[name] = d2a_marker_identity(metadata)
+
+    expected_plists = {
+        f"{context.manifest['services'][name]['label']}.plist"
+        for name in SERVICE_START_ORDER
+    }
+    try:
+        plist_entries = {
+            entry.name: entry for entry in context.plist_directory.iterdir()
+        }
+    except OSError:
+        fail("manual_recovery_required")
+    if set(plist_entries) != expected_plists:
+        fail("manual_recovery_required")
+    inventory["launchd_entries"] = {
+        name: candidate_plist_identity(
+            context,
+            next(
+                service_name
+                for service_name in SERVICE_START_ORDER
+                if context.manifest["services"][service_name]["label"] + ".plist"
+                == name
+            ),
+        )
+        for name in sorted(plist_entries)
+    }
+
+    coordinator = context.artifact_directory / "coordinator-sources"
+    if coordinator.name in entries:
+        try:
+            source_entries = {
+                entry.name: entry for entry in coordinator.iterdir()
+            }
+        except OSError:
+            fail("manual_recovery_required")
+        if not set(source_entries).issubset(
+            {"step-01-bootstrap.json", "step-02-prior-absence.json"}
+        ):
+            fail("manual_recovery_required")
+        inventory["coordinator_entries"] = {}
+        for name, path in sorted(source_entries.items()):
+            try:
+                metadata = path.lstat()
+            except OSError:
+                fail("manual_recovery_required")
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or path.is_symlink()
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                fail("manual_recovery_required")
+            inventory["coordinator_entries"][name] = d2a_marker_identity(metadata)
+    return inventory
+
+
+def observe_bootstrap_prestart_cleanup_boundary(context, platform, lifecycle):
+    require_audited_manifest_unchanged(context)
+    observed_lifecycle = require_d2a_session_revoked(context)
+    taint = load_strict_d2a_marker(
+        d2a_taint_path(context),
+        "manual_recovery_required",
+        D2A_TAINT_FIELDS,
+    )
+    state = bootstrap_prestart_cleanup_state(context)
+    rows, journal_raw = read_strict_journal_snapshot(context)
+    validate_bootstrap_prestart_cleanup_journal(context, rows, state["phase"])
+    receipts_raw = audited_private_file_bytes(
+        context.manifest_path.with_name("receipts.jsonl"),
+        {0o600},
+        8 * 1024 * 1024,
+        "manual_recovery_required",
+        allow_empty=True,
+    )
+    if receipts_raw:
+        fail("manual_recovery_required")
+    validate_cleanup_mutation_roots(context)
+    artifact_inventory = bootstrap_prestart_artifact_inventory(context)
+    root_identity = load_cleanup_root_identity(context)
+    root_metadata = validate_cleanup_root_directory(context, context.root)
+    registry = require_discord_ownership_claimed(context)
+    keychain_snapshot = observe_cleanup_keychain_inventory(context, platform)
+    for service, account in owner_identities(context):
+        identity = keychain_snapshot[(service, account)]
+        if (
+            not isinstance(identity, str)
+            or DIGEST_PATTERN.fullmatch(identity) is None
+            or not platform.keychain_owner_matches(
+                service, context.manifest["run_id"]
+            )
+        ):
+            fail("manual_recovery_required")
+    try:
+        services_absent = candidate_launchd_absent(context, platform)
+        postgres_absent = cleanup_postgres_absent(context, platform)
+        protected_unchanged = (
+            standing_snapshot(context, platform) == state["standing_snapshot"]
+        )
+    except BaseException:
+        fail("manual_recovery_required")
+    if (
+        observed_lifecycle != lifecycle
+        or root_identity is None
+        or not cleanup_root_identity_matches(root_metadata, root_identity)
+        or not (context.cluster_root / "PG_VERSION").is_file()
+        or candidate_start_commitment_present(context)
+        or not services_absent
+        or not postgres_absent
+        or not protected_unchanged
+        or os.path.lexists(d2a_teardown_fence_path(context))
+        or any(
+            os.path.lexists(path)
+            for path in bootstrap_prestart_cleanup_forbidden_paths(context)
+        )
+    ):
+        fail("manual_recovery_required")
+    return {
+        "taint": taint,
+        "lifecycle": observed_lifecycle,
+        "state": state,
+        "journal_raw": journal_raw,
+        "receipts_raw": receipts_raw,
+        "root_identity": root_identity,
+        "root_metadata": d2a_marker_identity(root_metadata),
+        "artifact_inventory": artifact_inventory,
+        "discord_ownership": registry,
+        "keychain_snapshot": keychain_snapshot,
+    }
+
+
 def close_bootstrap_prestart_teardown_fence(context, platform, lifecycle):
     if not (
         lifecycle.get("origin") == "bootstrap"
@@ -4261,34 +4785,17 @@ def close_bootstrap_prestart_teardown_fence(context, platform, lifecycle):
     ):
         fail("manual_recovery_required")
     try:
-        state = load_state(context, {"prepared"})
+        initial = observe_bootstrap_prestart_cleanup_boundary(
+            context, platform, lifecycle
+        )
+        # The fence is the first cleanup-authorizing mutation. Re-read every
+        # mutable semantic boundary immediately before publishing it.
+        final = observe_bootstrap_prestart_cleanup_boundary(
+            context, platform, lifecycle
+        )
     except BaseException:
         fail("manual_recovery_required")
-    mutation_paths = (
-        candidate_start_transition_path(context),
-        candidate_start_source_path(context),
-        candidate_start_retirement_path(context),
-        context.artifact_directory / "step-03-evidence.json",
-        context.artifact_directory / "onboarding-evidence.json",
-        context.artifact_directory / "transport-evidence",
-        discord_teardown_progress_path(context),
-        discord_teardown_progress_path(context, frozen=True),
-        discord_teardown_evidence_path(context),
-        discord_teardown_evidence_path(context, frozen=True),
-        abort_teardown_tombstone_path(context),
-    )
-    try:
-        services_absent = candidate_launchd_absent(context, platform)
-        postgres_absent = not platform.postgres_running(context.cluster_root)
-    except BaseException:
-        fail("manual_recovery_required")
-    if (
-        state["phase"] != "prepared"
-        or candidate_start_commitment_present(context)
-        or not services_absent
-        or not postgres_absent
-        or any(os.path.lexists(path) for path in mutation_paths)
-    ):
+    if initial != final:
         fail("manual_recovery_required")
     transition_d2a_teardown_fence(context, "closed")
 
@@ -5781,6 +6288,90 @@ def audited_preissuer_rollback_evidence_path(context):
     return context.artifact_directory / "audited-preissuer-rollback-recovery.json"
 
 
+def audited_preissuer_bootstrap_lock_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+    )
+
+
+def acquire_audited_preissuer_bootstrap_lock(path=None):
+    """Exclude bootstrap state mutation for the complete special recovery.
+
+    The bootstrap controller takes this fixed lock before the global D2 lock.
+    This continuation follows that same order so an ordinary resume cannot
+    rewrite the allowlisted bootstrap state between validation and cleanup.
+    """
+    lock_path = require_absolute_path(
+        str(D2A_BOOTSTRAP_GLOBAL_LOCK_PATH if path is None else path),
+        "audited_recovery_bootstrap_lock",
+    )
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail("audited_recovery_bootstrap_lock_invalid")
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError:
+        fail("audited_recovery_bootstrap_lock_unavailable")
+    locked = False
+    try:
+        before = os.fstat(descriptor)
+        try:
+            named_before = os.stat(lock_path, follow_symlinks=False)
+        except OSError:
+            fail("audited_recovery_bootstrap_lock_invalid")
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_size != 0
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or audited_preissuer_bootstrap_lock_identity(before)
+            != audited_preissuer_bootstrap_lock_identity(named_before)
+        ):
+            fail("audited_recovery_bootstrap_lock_invalid")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fail("audited_recovery_bootstrap_lock_busy")
+        except OSError:
+            fail("audited_recovery_bootstrap_lock_unavailable")
+        locked = True
+        after = os.fstat(descriptor)
+        try:
+            named_after = os.stat(lock_path, follow_symlinks=False)
+        except OSError:
+            fail("audited_recovery_bootstrap_lock_invalid")
+        if (
+            audited_preissuer_bootstrap_lock_identity(after)
+            != audited_preissuer_bootstrap_lock_identity(before)
+            or audited_preissuer_bootstrap_lock_identity(after)
+            != audited_preissuer_bootstrap_lock_identity(named_after)
+        ):
+            fail("audited_recovery_bootstrap_lock_invalid")
+        return descriptor
+    except BaseException:
+        if locked:
+            with contextlib.suppress(OSError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
+        raise
+
+
+def release_audited_preissuer_bootstrap_lock(descriptor):
+    with contextlib.suppress(OSError):
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+    with contextlib.suppress(OSError):
+        os.close(descriptor)
+
+
 def audited_private_file_bytes(
     path, modes, maximum_bytes, code, *, allow_empty=False
 ):
@@ -6306,11 +6897,11 @@ def close_audited_preissuer_rollback_teardown_fence(
 ):
     """Close the teardown fence only for the allowlisted stopped rollback.
 
-    Normal cleanup deliberately remains limited to the prepared pre-issuer
-    sentinel.  This gate is reachable only after the explicit recovery command
-    has durably published its exact intent under the global operation lock.
-    Every mutable historical boundary is re-read without journal repair before
-    the first cleanup-authorizing mutation.
+    This gate remains necessary for old source-exact bundles whose embedded
+    controller predates normal stopped-rollback admission. It is reachable only
+    after the explicit recovery command has durably published its exact intent
+    under the global operation lock. Every mutable historical boundary is
+    re-read without journal repair before the first cleanup-authorizing mutation.
     """
     intent_path = audited_preissuer_rollback_intent_path(context)
     observed_intent = load_strict_d2a_marker(
@@ -6358,6 +6949,15 @@ def close_audited_preissuer_rollback_teardown_fence(
     require_audited_recovery_inert_boundary(
         context, platform, state, lifecycle
     )
+    bootstrap_path, bootstrap_state, bootstrap_sha256 = audited_bootstrap_state(
+        context, expected_intent["bootstrap_state_path"]
+    )
+    if (
+        bootstrap_path != pathlib.Path(expected_intent["bootstrap_state_path"])
+        or bootstrap_state.get("bootstrap_id") != expected_intent["bootstrap_id"]
+        or bootstrap_sha256 != expected_intent["bootstrap_state_sha256"]
+    ):
+        fail("audited_recovery_replay_drift")
     if os.path.lexists(d2a_teardown_fence_path(context)):
         fail("audited_recovery_fence_invalid")
     transition_d2a_teardown_fence(context, "closed")
@@ -6718,8 +7318,9 @@ def command_recover_audited_preissuer_rollback(
     if not os.path.lexists(d2a_teardown_fence_path(context)):
         # The intent is the first durable recovery mutation.  Re-prove the
         # current clean source and historical immutable observations after it,
-        # then use the audited-only stopped-rollback fence gate.  General
-        # cleanup never accepts a stopped bootstrap sentinel.
+        # then use the allowlisted historical stopped-rollback fence gate. A
+        # current controller can admit its own exact rollback, but that does not
+        # relax source-exact loading for this older bundle.
         third_revision = current_clean_recovery_source()
         third_observations = validate_audited_source_observations(
             context, observe_audited_recovery_source_trees(context.manifest)
@@ -8902,7 +9503,12 @@ def build_parser():
 
 def main():
     arguments = build_parser().parse_args()
+    audited_bootstrap_lock_descriptor = None
     try:
+        if arguments.command == "recover-audited-preissuer-rollback":
+            audited_bootstrap_lock_descriptor = (
+                acquire_audited_preissuer_bootstrap_lock()
+            )
         audited_source_observations = None
         if arguments.command in {
             "legacy-substrate-status",
@@ -9060,6 +9666,11 @@ def main():
             file=sys.stderr,
         )
         raise SystemExit(130)
+    finally:
+        if audited_bootstrap_lock_descriptor is not None:
+            release_audited_preissuer_bootstrap_lock(
+                audited_bootstrap_lock_descriptor
+            )
 
 
 if __name__ == "__main__":
