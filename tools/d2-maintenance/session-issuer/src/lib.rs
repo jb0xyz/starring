@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::TcpStream;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
@@ -3761,6 +3761,11 @@ fn validate_launchd_binding(
     service: &CandidateServiceBinding,
     job: &LaunchdJob,
 ) -> Result<(), IssuerError> {
+    // A GUI-domain launchd job caps the live value reported by `launchctl print`
+    // at 60 seconds even though the sealed plist retains ExitTimeOut=90.  Bind
+    // both representations: validate_service_plist checks the sealed 90-second
+    // source value and this check pins the effective live value.
+    const GUI_LAUNCHD_EFFECTIVE_EXIT_TIMEOUT_SECONDS: u64 = 60;
     let mut expected_environment = service.environment.clone();
     expected_environment.insert("XPC_SERVICE_NAME".to_string(), service.label.clone());
     let mut observed_environment = job.environment.clone();
@@ -3778,7 +3783,7 @@ fn validate_launchd_binding(
         || job.stderr_path != service.log_path
         || job.umask != "77"
         || job.minimum_runtime != 30
-        || job.exit_timeout != 90
+        || job.exit_timeout != GUI_LAUNCHD_EFFECTIVE_EXIT_TIMEOUT_SECONDS
         || job.soft_maxfiles != 2048
         || job.hard_maxfiles != 4096
         || job.state != "running"
@@ -4037,6 +4042,17 @@ fn validate_tunnel_runner(run: &ValidatedRun) -> Result<(), IssuerError> {
 
 fn validate_api_loopback_ready(run: &ValidatedRun) -> Result<(), IssuerError> {
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], run.api_port));
+    let host = run
+        .public_origin
+        .strip_prefix("https://")
+        .ok_or(IssuerError::CandidateServiceInactive)?;
+    validate_api_loopback_ready_at(address, host)
+}
+
+fn validate_api_loopback_ready_at(
+    address: std::net::SocketAddr,
+    host: &str,
+) -> Result<(), IssuerError> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))
         .map_err(|_| IssuerError::CandidateServiceInactive)?;
     stream
@@ -4045,17 +4061,10 @@ fn validate_api_loopback_ready(run: &ValidatedRun) -> Result<(), IssuerError> {
     stream
         .set_write_timeout(Some(Duration::from_secs(3)))
         .map_err(|_| IssuerError::CandidateServiceInactive)?;
-    let host = run
-        .public_origin
-        .strip_prefix("https://")
-        .ok_or(IssuerError::CandidateServiceInactive)?;
     let request =
         format!("GET /health/ready HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
-        .map_err(|_| IssuerError::CandidateServiceInactive)?;
-    stream
-        .shutdown(Shutdown::Write)
         .map_err(|_| IssuerError::CandidateServiceInactive)?;
     let mut response = Vec::new();
     let mut buffer = [0_u8; 2_048];
@@ -5110,7 +5119,7 @@ mod tests {
                  \tenvironment = {{\n{environment}\t}}\n\n\
                  \tumask = 77\n\
                  \tminimum runtime = 30\n\
-                 \texit timeout = 90\n\
+                 \texit timeout = 60\n\
                  \truns = 1\n\
                  \tpid = 1234\n\
                  \tlast exit code = (never exited)\n\
@@ -5127,12 +5136,60 @@ mod tests {
             )
         };
         let exact = parse_launchd_job(&render(None)).unwrap();
+        assert_eq!(worker.expected_plist["ExitTimeOut"], 90);
+        assert_eq!(exact.exit_timeout, 60);
         assert_eq!(validate_launchd_binding(worker, &exact), Ok(()));
         let drifted = parse_launchd_job(&render(Some("/tmp/untrusted-codex"))).unwrap();
         assert_eq!(
             validate_launchd_binding(worker, &drifted),
             Err(IssuerError::CandidateServiceInactive)
         );
+    }
+
+    #[test]
+    fn api_loopback_probe_keeps_the_request_side_open_until_the_response() {
+        use std::io::{ErrorKind, Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    return false;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let mut trailing = [0_u8; 1];
+            match stream.read(&mut trailing) {
+                Ok(0) => false,
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                    true
+                }
+                _ => false,
+            }
+        });
+
+        assert_eq!(
+            validate_api_loopback_ready_at(address, "d2-api.starring.co.kr"),
+            Ok(())
+        );
+        assert!(server.join().unwrap());
     }
 
     #[cfg(target_os = "macos")]
