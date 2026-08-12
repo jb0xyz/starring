@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -521,6 +521,8 @@ struct LaunchdJob {
 
 pub struct GlobalOperationLock {
     file: File,
+    _directory_anchor: Option<File>,
+    _run_directory_anchor: Option<File>,
 }
 
 impl Drop for GlobalOperationLock {
@@ -550,16 +552,200 @@ pub fn acquire_global_operation_lock() -> Result<GlobalOperationLock, IssuerErro
 pub fn acquire_run_coordinator_lock(
     run: &ValidatedRun,
 ) -> Result<GlobalOperationLock, IssuerError> {
-    let directory = run.run_directory.join("coordinator");
-    require_owned_directory(&directory, run.uid, 0o700, IssuerError::D2OperationBusy)?;
-    let path = directory.join("coordinator.lock");
-    let (lock, created) = acquire_owned_exclusive_lock(&path, run.uid)?;
-    if created {
-        File::open(&directory)
-            .and_then(|handle| handle.sync_all())
-            .map_err(|_| IssuerError::D2OperationBusy)?;
+    // The commercial coordinator creates this directory lazily on its first
+    // operation. Direct onboarding is deliberately earlier than that first
+    // commercial step, so the issuer must perform the same create-once
+    // transition while it still holds the global D2 operation lock.
+    acquire_run_coordinator_lock_with_hook(&run.run_directory, run.uid, || {})
+}
+
+fn acquire_run_coordinator_lock_with_hook<F>(
+    run_directory: &Path,
+    uid: u32,
+    after_directory_open: F,
+) -> Result<GlobalOperationLock, IssuerError>
+where
+    F: FnOnce(),
+{
+    let error = IssuerError::D2OperationBusy;
+    let run_anchor = open_owned_directory(run_directory, uid, 0o700, error)?;
+    let created_directory =
+        unsafe { libc::mkdirat(run_anchor.as_raw_fd(), c"coordinator".as_ptr(), 0o700) };
+    let created_directory = if created_directory == 0 {
+        true
+    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
+        false
+    } else {
+        return Err(error);
+    };
+    let directory_anchor = open_owned_directory_at(&run_anchor, c"coordinator", uid, 0o700, error)?;
+    if created_directory {
+        run_anchor.sync_all().map_err(|_| error)?;
     }
-    Ok(lock)
+    after_directory_open();
+
+    let (file, created_lock) = open_owned_lock_at(&directory_anchor, uid, error)?;
+    if created_lock {
+        directory_anchor.sync_all().map_err(|_| error)?;
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(error);
+    }
+
+    // The lock is useful only while the two named directory entries still
+    // resolve to the exact inodes opened above. Reopen through the anchored
+    // parent descriptors, never through a path that can follow an exchanged
+    // intermediate symlink.
+    let named_run_directory = open_owned_directory(run_directory, uid, 0o700, error)?;
+    if directory_identity(&named_run_directory.metadata().map_err(|_| error)?)
+        != directory_identity(&run_anchor.metadata().map_err(|_| error)?)
+    {
+        return Err(error);
+    }
+    let named_directory = open_owned_directory_at(&run_anchor, c"coordinator", uid, 0o700, error)?;
+    if directory_identity(&named_directory.metadata().map_err(|_| error)?)
+        != directory_identity(&directory_anchor.metadata().map_err(|_| error)?)
+    {
+        return Err(error);
+    }
+    let named_lock = open_existing_lock_at(&directory_anchor, uid, error)?;
+    if file_identity_tuple(&named_lock.metadata().map_err(|_| error)?)
+        != file_identity_tuple(&file.metadata().map_err(|_| error)?)
+    {
+        return Err(error);
+    }
+    Ok(GlobalOperationLock {
+        file,
+        _directory_anchor: Some(directory_anchor),
+        _run_directory_anchor: Some(run_anchor),
+    })
+}
+
+fn open_owned_directory(
+    path: &Path,
+    uid: u32,
+    mode: u32,
+    error: IssuerError,
+) -> Result<File, IssuerError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| error)?;
+    let opened = file.metadata().map_err(|_| error)?;
+    let named = path.symlink_metadata().map_err(|_| error)?;
+    if !valid_owned_directory_metadata(&opened, uid, mode)
+        || directory_identity(&opened) != directory_identity(&named)
+    {
+        return Err(error);
+    }
+    Ok(file)
+}
+
+fn open_owned_directory_at(
+    parent: &File,
+    name: &CStr,
+    uid: u32,
+    mode: u32,
+    error: IssuerError,
+) -> Result<File, IssuerError> {
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(error);
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    if !valid_owned_directory_metadata(&file.metadata().map_err(|_| error)?, uid, mode) {
+        return Err(error);
+    }
+    Ok(file)
+}
+
+fn valid_owned_directory_metadata(metadata: &fs::Metadata, uid: u32, mode: u32) -> bool {
+    metadata.file_type().is_dir()
+        && !metadata.file_type().is_symlink()
+        && metadata.uid() == uid
+        && metadata.permissions().mode() & 0o777 == mode
+}
+
+fn directory_identity(metadata: &fs::Metadata) -> (u64, u64, u32, u32, u64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mode(),
+        metadata.uid(),
+        metadata.nlink(),
+    )
+}
+
+fn open_owned_lock_at(
+    directory: &File,
+    uid: u32,
+    error: IssuerError,
+) -> Result<(File, bool), IssuerError> {
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"coordinator.lock".as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    let (file, created) = if descriptor >= 0 {
+        (unsafe { File::from_raw_fd(descriptor) }, true)
+    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
+        (open_existing_lock_at(directory, uid, error)?, false)
+    } else {
+        return Err(error);
+    };
+    if created {
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|_| error)?;
+        file.sync_all().map_err(|_| error)?;
+    }
+    validate_lock_metadata(&file.metadata().map_err(|_| error)?, uid, error)?;
+    Ok((file, created))
+}
+
+fn open_existing_lock_at(
+    directory: &File,
+    uid: u32,
+    error: IssuerError,
+) -> Result<File, IssuerError> {
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"coordinator.lock".as_ptr(),
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(error);
+    }
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    validate_lock_metadata(&file.metadata().map_err(|_| error)?, uid, error)?;
+    Ok(file)
+}
+
+fn validate_lock_metadata(
+    metadata: &fs::Metadata,
+    uid: u32,
+    error: IssuerError,
+) -> Result<(), IssuerError> {
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != uid
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn acquire_owned_exclusive_lock(
@@ -605,7 +791,14 @@ fn acquire_owned_exclusive_lock(
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(IssuerError::D2OperationBusy);
     }
-    Ok((GlobalOperationLock { file }, created))
+    Ok((
+        GlobalOperationLock {
+            file,
+            _directory_anchor: None,
+            _run_directory_anchor: None,
+        },
+        created,
+    ))
 }
 
 pub fn disable_core_dumps() -> Result<(), IssuerError> {
@@ -4472,6 +4665,78 @@ fn current_home(uid: u32) -> Result<PathBuf, IssuerError> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn coordinator_directory_is_created_once_and_hostile_paths_are_rejected() {
+        struct RemoveDirectoryOnDrop(PathBuf);
+        impl Drop for RemoveDirectoryOnDrop {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let mut nonce = [0_u8; 8];
+        getrandom::fill(&mut nonce).unwrap();
+        let run_directory = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "starring-d2-coordinator-test-{}-{}",
+            std::process::id(),
+            u64::from_ne_bytes(nonce)
+        ));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&run_directory)
+            .unwrap();
+        let _cleanup = RemoveDirectoryOnDrop(run_directory.clone());
+        let uid = current_uid().unwrap();
+
+        let first_lock =
+            acquire_run_coordinator_lock_with_hook(&run_directory, uid, || {}).unwrap();
+        let coordinator = run_directory.join("coordinator");
+        let metadata = coordinator.symlink_metadata().unwrap();
+        assert!(metadata.file_type().is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert_eq!(metadata.uid(), uid);
+        drop(first_lock);
+        drop(acquire_run_coordinator_lock_with_hook(&run_directory, uid, || {}).unwrap());
+
+        let relocated = run_directory.join("coordinator-relocated");
+        let replacement = coordinator.clone();
+        let race = acquire_run_coordinator_lock_with_hook(&run_directory, uid, || {
+            fs::rename(&replacement, &relocated).unwrap();
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&replacement)
+                .unwrap();
+        });
+        assert!(matches!(race, Err(IssuerError::D2OperationBusy)));
+        fs::remove_dir(&coordinator).unwrap();
+        fs::rename(&relocated, &coordinator).unwrap();
+
+        fs::remove_file(coordinator.join("coordinator.lock")).unwrap();
+        fs::remove_dir(&coordinator).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&coordinator)
+            .unwrap();
+        fs::set_permissions(&coordinator, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            acquire_run_coordinator_lock_with_hook(&run_directory, uid, || {}),
+            Err(IssuerError::D2OperationBusy)
+        ));
+
+        fs::remove_dir(&coordinator).unwrap();
+        let redirected = run_directory.join("redirected");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&redirected)
+            .unwrap();
+        std::os::unix::fs::symlink(&redirected, &coordinator).unwrap();
+        assert!(matches!(
+            acquire_run_coordinator_lock_with_hook(&run_directory, uid, || {}),
+            Err(IssuerError::D2OperationBusy)
+        ));
+    }
 
     fn valid_manifest() -> Manifest {
         serde_json::from_value(json!({
