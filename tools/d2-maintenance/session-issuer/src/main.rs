@@ -982,6 +982,14 @@ async fn run_child(child: &[String], input: ChildInput<'_>) -> Result<Vec<u8>, I
     if encoded.len() > MAX_CHILD_INPUT_BYTES {
         return Err(IssuerError::Child);
     }
+    run_child_encoded(child, &encoded, CHILD_TIMEOUT).await
+}
+
+async fn run_child_encoded(
+    child: &[String],
+    encoded: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, IssuerError> {
     let runner_parent = Path::new(&child[1])
         .parent()
         .ok_or(IssuerError::ChildRunner)?;
@@ -998,40 +1006,77 @@ async fn run_child(child: &[String], input: ChildInput<'_>) -> Result<Vec<u8>, I
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut process = command.spawn().map_err(|_| IssuerError::Child)?;
+    let deadline = tokio::time::Instant::now() + timeout;
     let stdout = process.stdout.take().ok_or(IssuerError::Child)?;
     let stderr = process.stderr.take().ok_or(IssuerError::Child)?;
     let stdout_task = tokio::spawn(read_bounded(stdout, MAX_CHILD_OUTPUT_BYTES));
     let stderr_task = tokio::spawn(read_bounded(stderr, 0));
-    let mut stdin = process.stdin.take().ok_or(IssuerError::Child)?;
-    if stdin.write_all(&encoded).await.is_err()
-        || stdin.write_all(b"\n").await.is_err()
-        || stdin.shutdown().await.is_err()
+    let stdin = process.stdin.take().ok_or(IssuerError::Child)?;
+    let write_failure = match tokio::time::timeout_at(
+        deadline,
+        write_child_input_and_close(stdin, encoded),
+    )
+    .await
     {
-        let _ = process.kill().await;
-        let _ = process.wait().await;
-        return Err(IssuerError::Child);
+        Ok(Ok(())) => None,
+        Ok(Err(_)) => Some(IssuerError::Child),
+        Err(_) => Some(IssuerError::ChildTimeout),
+    };
+    if let Some(error) = write_failure {
+        terminate_child_and_capture_tasks(&mut process, stdout_task, stderr_task).await;
+        return Err(error);
     }
 
-    let disposition = tokio::select! {
-        status = process.wait() => {
-            match status {
-                Ok(status) if status.success() => Ok(()),
-                _ => Err(IssuerError::Child),
-            }
+    let status = match tokio::time::timeout_at(deadline, process.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => {
+            terminate_child_and_capture_tasks(&mut process, stdout_task, stderr_task).await;
+            return Err(IssuerError::Child);
         }
-        _ = tokio::time::sleep(CHILD_TIMEOUT) => Err(IssuerError::ChildTimeout),
+        Err(_) => {
+            terminate_child_and_capture_tasks(&mut process, stdout_task, stderr_task).await;
+            return Err(IssuerError::ChildTimeout);
+        }
     };
-    if disposition.is_err() {
-        let _ = process.kill().await;
-        let _ = process.wait().await;
-    }
     let stdout = stdout_task.await.map_err(|_| IssuerError::Child)??;
     let _stderr = stderr_task.await.map_err(|_| IssuerError::Child)??;
-    disposition?;
+    if !status.success() {
+        return Err(IssuerError::Child);
+    }
     if stdout.exceeded {
         return Err(IssuerError::EvidenceTooLarge);
     }
     Ok(stdout.bytes)
+}
+
+async fn terminate_child_and_capture_tasks(
+    process: &mut tokio::process::Child,
+    stdout_task: tokio::task::JoinHandle<Result<Capture, IssuerError>>,
+    stderr_task: tokio::task::JoinHandle<Result<Capture, IssuerError>>,
+) {
+    let _ = process.kill().await;
+    let _ = process.wait().await;
+    stdout_task.abort();
+    stderr_task.abort();
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+}
+
+async fn write_child_input_and_close(
+    mut stdin: tokio::process::ChildStdin,
+    input: &[u8],
+) -> Result<(), IssuerError> {
+    stdin
+        .write_all(input)
+        .await
+        .map_err(|_| IssuerError::Child)?;
+    stdin
+        .write_all(b"\n")
+        .await
+        .map_err(|_| IssuerError::Child)?;
+    stdin.shutdown().await.map_err(|_| IssuerError::Child)?;
+    drop(stdin);
+    Ok(())
 }
 
 async fn read_bounded<R>(mut reader: R, maximum: usize) -> Result<Capture, IssuerError>
@@ -1160,6 +1205,73 @@ mod tests {
         )
         .await;
         assert!(matches!(disposition, LifecycleDisposition::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn headless_child_observes_input_eof_before_wait_timeout() {
+        let input = ChildInput {
+            schema_version: 1,
+            session: "session",
+            csrf: "csrf",
+            public_origin: "https://d2-api.starring.co.kr",
+            principal_id: "discord:1",
+            guild_id: "2",
+            installation_id: "installation:test",
+            run_id: "run",
+            manifest_sha256: "digest",
+            operation: "auth-smoke",
+            authoring_session_id: None,
+            scenario: None,
+            scenario_sha256: None,
+        };
+        let child = ["/bin/cat".to_string(), "/dev/stdin".to_string()];
+        let output = tokio::time::timeout(Duration::from_secs(1), run_child(&child, input))
+            .await
+            .expect("child must observe stdin EOF before the test timeout")
+            .expect("child must exit successfully after stdin EOF");
+        let output: Value = serde_json::from_slice(&output).expect("child output JSON");
+        assert_eq!(output["operation"], "auth-smoke");
+    }
+
+    #[tokio::test]
+    async fn non_consuming_child_input_write_uses_deadline_and_reaps_child() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "starring-d2-session-issuer-non-reader-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create non-reader test directory");
+        let script = directory.join("non-reader.sh");
+        let pid_path = directory.join("child.pid");
+        std::fs::write(
+            &script,
+            b"printf '%s\\n' \"$$\" > \"$1\"\nexec /bin/sleep 30\n",
+        )
+        .expect("write non-reader child script");
+        let child = [
+            "/bin/sh".to_string(),
+            script.to_str().expect("UTF-8 script path").to_string(),
+            pid_path.to_str().expect("UTF-8 PID path").to_string(),
+        ];
+        let oversized_input = vec![b'x'; 4 * 1024 * 1024];
+
+        let result = run_child_encoded(&child, &oversized_input, Duration::from_secs(1)).await;
+        let pid = std::fs::read_to_string(&pid_path)
+            .expect("non-reader records its PID before sleeping")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("recorded child PID");
+        // SAFETY: signal zero performs a read-only existence check for the recorded PID.
+        let kill_result = unsafe { libc::kill(pid, 0) };
+        let kill_error = std::io::Error::last_os_error().raw_os_error();
+        std::fs::remove_dir_all(&directory).expect("remove non-reader test directory");
+
+        assert!(matches!(result, Err(IssuerError::ChildTimeout)));
+        assert_eq!(kill_result, -1);
+        assert_eq!(kill_error, Some(libc::ESRCH));
     }
 
     #[tokio::test]

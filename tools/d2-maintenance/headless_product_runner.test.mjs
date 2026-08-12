@@ -62,6 +62,28 @@ function response(status, body, { redirected = false } = {}) {
 }
 
 
+function abortableNever(signal, label) {
+  return new Promise((_, reject) => {
+    const rejectOnAbort = () => reject(new Error(`${label} ${SESSION} ${CSRF}`));
+    if (signal.aborted) {
+      rejectOnAbort();
+    } else {
+      signal.addEventListener("abort", rejectOnAbort, { once: true });
+    }
+  });
+}
+
+
+function responseWithHangingBody(status, signal, label) {
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    redirected: false,
+    text: () => abortableNever(signal, label),
+  };
+}
+
+
 function scenario(overrides = {}) {
   return {
     schema_version: 1,
@@ -104,7 +126,14 @@ function fakeProductServer(options = {}) {
   const fetchImpl = async (resource, init) => {
     const url = new URL(resource);
     const headers = Object.fromEntries(init.headers.entries());
-    requests.push({ url, method: init.method, headers, redirect: init.redirect, body: init.body });
+    requests.push({
+      url,
+      method: init.method,
+      headers,
+      redirect: init.redirect,
+      body: init.body,
+      signal: init.signal,
+    });
     if (options.throwSecret === true) {
       throw new Error(`transport ${SESSION} ${CSRF}`);
     }
@@ -114,12 +143,24 @@ function fakeProductServer(options = {}) {
     }
     firstRequest = false;
     if (url.pathname === "/v1/logout" && init.method === "POST") {
+      if (options.hangAt === "logout-fetch") {
+        return abortableNever(init.signal, "logout fetch");
+      }
       loggedOut = true;
+      if (options.hangAt === "logout-body") {
+        return responseWithHangingBody(204, init.signal, "logout body");
+      }
       return response(options.logoutStatus || 204, null);
     }
     if (url.pathname === "/v1/me") {
       if (loggedOut) {
         const status = options.postLogoutStatus || 401;
+        if (options.hangAt === "post-logout-fetch") {
+          return abortableNever(init.signal, "post-logout fetch");
+        }
+        if (options.hangAt === "post-logout-body") {
+          return responseWithHangingBody(status, init.signal, "post-logout body");
+        }
         return response(status, status === 200 ? { principal_id: PRINCIPAL } : {
           error: { code: "unauthenticated", retryable: false, request_id: "request-logout" },
         });
@@ -480,6 +521,57 @@ test("logout is incomplete unless the same credential is rejected by /v1/me", as
   await assert.rejects(
     executeHeadless(input(), dependencies(server)),
     (error) => error.code === "post_logout_session_active",
+  );
+});
+
+
+test("logout and post-logout fetches and bodies each have an independent stable timeout", async () => {
+  const cases = [
+    ["logout-fetch", "network_request_failed"],
+    ["logout-body", "response_body_invalid"],
+    ["post-logout-fetch", "network_request_failed"],
+    ["post-logout-body", "response_body_invalid"],
+  ];
+  for (const [hangAt, expectedCode] of cases) {
+    const server = fakeProductServer({ hangAt });
+    let observed;
+    try {
+      await executeHeadless(input(), {
+        ...dependencies(server),
+        requestTimeoutMilliseconds: 10,
+      });
+    } catch (error) {
+      observed = error;
+    }
+    assert.equal(observed.code, expectedCode, hangAt);
+    assert.ok(!String(observed).includes(SESSION), hangAt);
+    assert.ok(!String(observed.stack).includes(SESSION), hangAt);
+    assert.ok(!String(observed.stack).includes(CSRF), hangAt);
+    assert.equal(
+      server.requests.filter((request) => request.signal.aborted).length,
+      1,
+      hangAt,
+    );
+  }
+});
+
+
+test("successful logout clears both request timers", async () => {
+  const server = fakeProductServer();
+  await executeHeadless(input(), {
+    ...dependencies(server),
+    requestTimeoutMilliseconds: 10,
+  });
+  const logoutRequests = server.requests.slice(-2);
+  assert.deepEqual(
+    logoutRequests.map((request) => request.url.pathname),
+    ["/v1/logout", "/v1/me"],
+  );
+  assert.notEqual(logoutRequests[0].signal, logoutRequests[1].signal);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(
+    logoutRequests.map((request) => request.signal.aborted),
+    [false, false],
   );
 });
 

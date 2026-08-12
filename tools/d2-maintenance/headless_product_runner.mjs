@@ -8,6 +8,9 @@ const MAX_INPUT_BYTES = 64 * 1024;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_RESPONSE_BYTES = 512 * 1024;
 const MAX_SCENARIO_MESSAGE_BYTES = 16 * 1024;
+const DEFAULT_REQUEST_TIMEOUT_MILLISECONDS = 15000;
+const MINIMUM_REQUEST_TIMEOUT_MILLISECONDS = 10;
+const MAXIMUM_REQUEST_TIMEOUT_MILLISECONDS = 30000;
 const PRODUCT_DRIVER_URL = new URL("../d2-certification/product_driver.js", import.meta.url);
 const D2_ORIGIN = "https://d2-api.starring.co.kr";
 const SESSION_SECRET = /^[A-Za-z0-9_-]{43}$/;
@@ -512,8 +515,48 @@ async function consumeBoundedResponse(response) {
 }
 
 
-async function verifyLogout(fetchImpl, input) {
-  const logout = await fetchImpl(`${input.public_origin}/v1/logout`, {
+function logoutRequestTimeoutMilliseconds(value) {
+  return Number.isInteger(value) &&
+    value >= MINIMUM_REQUEST_TIMEOUT_MILLISECONDS &&
+    value <= MAXIMUM_REQUEST_TIMEOUT_MILLISECONDS
+    ? value
+    : DEFAULT_REQUEST_TIMEOUT_MILLISECONDS;
+}
+
+
+async function fetchAndConsumeWithTimeout(fetchImpl, resource, options, timeoutMilliseconds) {
+  const controller = new AbortController();
+  let phase = "request";
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(new Error("logout_request_timeout"));
+      reject(new RunnerFailure(
+        phase === "body" ? "response_body_invalid" : "network_request_failed",
+      ));
+    }, timeoutMilliseconds);
+  });
+  try {
+    return await Promise.race([
+      (async () => {
+        const response = await fetchImpl(resource, {
+          ...options,
+          signal: controller.signal,
+        });
+        phase = "body";
+        await consumeBoundedResponse(response);
+        return response;
+      })(),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+
+async function verifyLogout(fetchImpl, input, timeoutMilliseconds) {
+  const logout = await fetchAndConsumeWithTimeout(fetchImpl, `${input.public_origin}/v1/logout`, {
     method: "POST",
     headers: {
       accept: "application/json",
@@ -523,19 +566,17 @@ async function verifyLogout(fetchImpl, input) {
     credentials: "same-origin",
     cache: "no-store",
     redirect: "error",
-  });
-  await consumeBoundedResponse(logout);
+  }, timeoutMilliseconds);
   if (logout.status !== 204) {
     fail("logout_status_invalid");
   }
-  const after = await fetchImpl(`${input.public_origin}/v1/me`, {
+  const after = await fetchAndConsumeWithTimeout(fetchImpl, `${input.public_origin}/v1/me`, {
     method: "GET",
     headers: { accept: "application/json" },
     credentials: "same-origin",
     cache: "no-store",
     redirect: "error",
-  });
-  await consumeBoundedResponse(after);
+  }, timeoutMilliseconds);
   if (after.status !== 401) {
     fail("post_logout_session_active");
   }
@@ -784,7 +825,11 @@ export async function executeHeadless(rawInput, dependencies = {}) {
 
   let logoutStatuses;
   try {
-    logoutStatuses = await verifyLogout(credentialedFetch, input);
+    logoutStatuses = await verifyLogout(
+      credentialedFetch,
+      input,
+      logoutRequestTimeoutMilliseconds(dependencies.requestTimeoutMilliseconds),
+    );
   } catch (error) {
     throw sanitizeFailure(error, "logout_verification_failed");
   }
