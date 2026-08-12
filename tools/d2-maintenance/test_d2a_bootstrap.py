@@ -53,6 +53,7 @@ class FakeExecutor:
         change_toolchain_after_build=False,
         source_drift_at_snapshot=None,
         preexisting_lifecycle=None,
+        direct_onboard_error_code=None,
     ):
         self.fixture = fixture
         self.fail_once = dict(fail_once or {})
@@ -65,6 +66,7 @@ class FakeExecutor:
         self.change_toolchain_after_build = change_toolchain_after_build
         self.source_drift_at_snapshot = source_drift_at_snapshot
         self.preexisting_lifecycle = preexisting_lifecycle
+        self.direct_onboard_error_code = direct_onboard_error_code
         self.source_snapshot_count = 0
         self.issuer_lock_acquired = False
         self.calls = []
@@ -268,6 +270,13 @@ class FakeExecutor:
                 },
             )
         if identity == "direct_onboard":
+            if self.direct_onboard_error_code is not None:
+                return self.completed(
+                    argv,
+                    None,
+                    1,
+                    f"error: {self.direct_onboard_error_code}\n".encode("ascii"),
+                )
             if self.probe_issuer_lock:
                 descriptor = os.open(self.fixture.issuer_lock_path, os.O_RDWR | os.O_CREAT, 0o600)
                 try:
@@ -1373,6 +1382,72 @@ class D2ABootstrapTests(unittest.TestCase):
 
                 self.fixture.cleanup()
                 self.fixture = BootstrapFixture(self)
+
+    def test_direct_onboarding_allowlisted_diagnostic_is_durable_and_secret_safe(self):
+        executor = FakeExecutor(
+            self.fixture,
+            direct_onboard_error_code="api_loopback_response_empty",
+        )
+        result = self.fixture.controller(executor).run(
+            self.fixture.config_path,
+            self.fixture.candidate_spec_path,
+            "auth-smoke",
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "api_loopback_response_empty")
+        state = json.loads(pathlib.Path(result["state"]).read_bytes())
+        self.assertEqual(state["last_error"], "api_loopback_response_empty")
+        self.assertNotIn("error:", pathlib.Path(result["state"]).read_text())
+        self.assertTrue(result["discord_teardown_complete"])
+        self.assertTrue(result["cleanup_complete"])
+
+    def test_direct_onboarding_unknown_or_multiline_stderr_remains_flattened(self):
+        for diagnostic in (
+            b"error: not_allowlisted\n",
+            b"error: api_loopback_response_empty\nuntrusted detail\n",
+            b"error: api_loopback_response_empty",
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                executor = FakeExecutor(
+                    self.fixture,
+                    fail_once={"direct_onboard": 1},
+                    secret_stderr=diagnostic,
+                )
+                result = self.fixture.controller(executor).run(
+                    self.fixture.config_path,
+                    self.fixture.candidate_spec_path,
+                    "auth-smoke",
+                )
+                self.assertEqual(result["error_code"], "direct_onboard_failed")
+                state_payload = pathlib.Path(result["state"]).read_bytes()
+                self.assertNotIn(diagnostic.rstrip(b"\n"), state_payload)
+                self.fixture.cleanup()
+                self.fixture = BootstrapFixture(self)
+
+    def test_direct_onboarding_diagnostic_requires_exact_exit_and_empty_stdout(self):
+        diagnostic = b"error: api_loopback_status_invalid\n"
+        for completed in (
+            subprocess.CompletedProcess(
+                ["issuer"], 1, stdout=b"unexpected\n", stderr=diagnostic
+            ),
+            subprocess.CompletedProcess(
+                ["issuer"], 2, stdout=b"", stderr=diagnostic
+            ),
+        ):
+            with self.subTest(returncode=completed.returncode, stdout=completed.stdout):
+                with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                    BOOTSTRAP.parse_child_json(completed, "direct_onboard")
+                self.assertEqual(raised.exception.code, "direct_onboard_failed")
+
+        successful = subprocess.CompletedProcess(
+            ["issuer"],
+            0,
+            stdout=b'{"outcome":"fresh"}\n',
+            stderr=diagnostic,
+        )
+        with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+            BOOTSTRAP.parse_child_json(successful, "direct_onboard")
+        self.assertEqual(raised.exception.code, "direct_onboard_output_invalid")
 
     def test_teardown_failure_forbids_cleanup_and_resume_only_recovers(self):
         executor = FakeExecutor(

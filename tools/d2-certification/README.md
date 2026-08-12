@@ -318,6 +318,40 @@ the first deletion. The tombstone blocks coordinator status, advance, and
 verify as well as D3 bind, recheck, and finalize, while the same teardown and
 cleanup commands remain available to resume an interrupted abort.
 
+One historical automated-maintenance run is explicitly allowlisted for
+`recover-audited-preissuer-rollback`. Its candidate start failed and completely
+rolled back before the issuer took over the bootstrap `not_issued` sentinel,
+but the then-current cleanup gate did not admit the resulting `stopped` phase.
+Normal manifest loading and bootstrap `resume` remain source-exact and are not
+relaxed. The repair command instead validates the canonical historical
+manifest, immutable candidates and worker tree, exact bootstrap/state/journal/
+taint/lifecycle identity, empty receipts, absence of candidate commitment and
+post-start artifacts, all run launchd jobs and PostgreSQL processes absent, and
+the protected staging snapshot unchanged. It observes—without rebinding—the
+historical versus current controller and transport source hashes.
+
+The repository must be a clean committed HEAD. The operator supplies the exact
+current commit and tree as well as the historical run and manifest digest:
+
+```text
+python3 tools/d2-certification/isolated_orchestrator.py \
+  recover-audited-preissuer-rollback \
+  --manifest /absolute/historical-run/manifest.json \
+  --bootstrap-state /absolute/bootstrap-state.json \
+  --confirm-current-commit <clean-current-HEAD> \
+  --confirm-current-tree <clean-current-HEAD-tree> \
+  --confirm-run-id <historical-run-id> \
+  --confirm-manifest-sha256 <historical-manifest-sha256>
+```
+
+Under the global D2 lock it fsyncs an immutable, secret-free recovery intent,
+closes the pre-start teardown fence, invokes the existing scoped cleanup
+primitive, rechecks total absence and current source identity, and writes final
+evidence. Interrupted executions replay only from that exact intent and source
+revision. Any other run, same-as-historical source, dirty or differently
+confirmed source, ambiguous journal, active service/process, artifact,
+commitment, or protected-staging drift fails before the intent is created.
+
 `onboard` creates or exactly replays revision 1 with the single external
 channel binding `community_hub -> discord.hub_channel_id`. Its redacted output
 and `onboarding-evidence.json` both retain `binding_key: community_hub` and the

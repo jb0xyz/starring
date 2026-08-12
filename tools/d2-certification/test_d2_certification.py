@@ -1248,6 +1248,48 @@ class D2CertificationTest(unittest.TestCase):
         ):
             MODULE.validate_candidate_files(manifest)
 
+    def test_audited_recovery_loader_observes_but_does_not_rebind_source_drift(self):
+        manifest_path = self.prepare()
+        original = MODULE.source_tree_digest
+
+        def source_tree_digest(root, files, label):
+            if label == "source_tree_d2_toolchain":
+                return "0" * 64
+            if label == "source_tree_certification_transport":
+                return "1" * 64
+            return original(root, files, label)
+
+        with mock.patch.object(
+            MODULE, "source_tree_digest", side_effect=source_tree_digest
+        ):
+            _path, manifest, digest, observations = (
+                MODULE.load_audited_recovery_manifest(manifest_path)
+            )
+            self.assertEqual(digest, MODULE.manifest_digest(manifest))
+            self.assertFalse(
+                observations["d2_toolchain"]["matches_historical"]
+            )
+            self.assertFalse(
+                observations["certification_transport"]["matches_historical"]
+            )
+            self.assertTrue(
+                observations["codex_worker"]["matches_historical"]
+            )
+            with self.assertRaisesRegex(
+                MODULE.CertificationError,
+                "source_tree_(?:d2_toolchain|certification_transport)_digest_mismatch",
+            ):
+                MODULE.load_verified_manifest(manifest_path)
+
+    def test_audited_recovery_loader_requires_canonical_historical_manifest(self):
+        manifest_path = self.prepare()
+        manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+        manifest_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            MODULE.CertificationError, "audited_recovery_manifest_invalid"
+        ):
+            MODULE.load_audited_recovery_manifest(manifest_path)
+
     def test_evidence_and_run_directory_require_exact_owned_modes(self):
         manifest_path = self.prepare()
         manifest = json.loads(manifest_path.read_text())

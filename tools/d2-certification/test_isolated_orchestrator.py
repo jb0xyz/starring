@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import contextlib
+import copy
 import ctypes
 import datetime
 import fcntl
@@ -1334,6 +1335,19 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         raw = self.context.journal_path.read_bytes()
         self.assertTrue(raw.endswith(b"\n"))
         CONTRACT.parse_journal_rows(self.context, raw)
+
+    def test_audited_recovery_journal_reader_never_repairs_partial_input(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        descriptor = os.open(self.context.journal_path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(descriptor, b'{"schema_version":1,"sequence":')
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        raw = self.context.journal_path.read_bytes()
+        with self.assertRaisesRegex(CONTRACT.OrchestratorError, "journal_invalid"):
+            CONTRACT.read_strict_journal_snapshot(self.context)
+        self.assertEqual(self.context.journal_path.read_bytes(), raw)
 
     def test_journal_rejects_boolean_integer_fields(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
@@ -6437,6 +6451,459 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         )
         lifecycle_path.chmod(0o600)
         return lifecycle_path
+
+    def prepare_audited_preissuer_rollback_fixture(self, rolled_back=True):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        if rolled_back:
+            self.platform.health_failure = str(
+                self.context.manifest["services"]["runtime"]["port"]
+            )
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "candidate_health_unready"
+            ):
+                ORCHESTRATOR.command_start(self.context, self.platform)
+            self.platform.health_failure = None
+        self.write_d2a_session_lifecycle(
+            "not_issued", origin="bootstrap", process_group_id=None
+        )
+        bundle = pathlib.Path(
+            self.context.manifest["candidates"]["api"]["path"]
+        ).parent
+        bundle.chmod(0o755)
+        try:
+            candidate_spec_path = bundle / "candidate-spec.json"
+            candidate_spec_path.write_text("{}\n", encoding="utf-8")
+            candidate_spec_path.chmod(0o400)
+            candidate_provenance_path = bundle / "provenance.json"
+            candidate_provenance_path.write_text("{}\n", encoding="utf-8")
+            candidate_provenance_path.chmod(0o400)
+        finally:
+            bundle.chmod(0o555)
+        config_path = self.root / "audited-recovery-config.json"
+        config_path.write_text("{}\n", encoding="utf-8")
+        config_path.chmod(0o600)
+        bootstrap_root = self.root / "bootstrap-states"
+        bootstrap_root.mkdir(mode=0o700)
+        bootstrap_path = bootstrap_root / (
+            f"bootstrap-{self.context.manifest['run_id']}.json"
+        )
+        tool_digests = {
+            "issuer_sha256": "a" * 64,
+            "issuer_source_sha256": "b" * 64,
+            "runner_sha256": "c" * 64,
+            "product_driver_sha256": "d" * 64,
+            "scenario_sha256": "e" * 64,
+        }
+        bootstrap_state = {
+            "schema_version": 1,
+            "kind": "starring.d2a.bootstrap-state.v1",
+            "bootstrap_id": "d2ab-" + "1" * 32,
+            "status": "recovery_required",
+            "phase": "cleanup",
+            "operation": "one-shot",
+            "config_path": str(config_path),
+            "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+            "candidate_spec_path": str(candidate_spec_path),
+            "candidate_spec_sha256": hashlib.sha256(
+                candidate_spec_path.read_bytes()
+            ).hexdigest(),
+            "candidate_provenance_path": str(candidate_provenance_path),
+            "candidate_provenance_sha256": hashlib.sha256(
+                candidate_provenance_path.read_bytes()
+            ).hexdigest(),
+            "candidate_dependency_record_sha256": "2" * 64,
+            "candidate_dependency_tree_sha256": "3" * 64,
+            "source_commit_sha": self.context.manifest["commit_sha"],
+            "source_tree_sha": "4" * 40,
+            "run_id": self.context.manifest["run_id"],
+            "manifest_path": str(self.context.manifest_path),
+            "manifest_sha256": self.context.digest,
+            "onboarding_evidence_path": None,
+            "onboarding_evidence_sha256": None,
+            "resource_prefix": self.context.manifest["discord"]["resource_prefix"],
+            "tool_digests": tool_digests,
+            "issuer_build_environment": {},
+            "records": [],
+            "last_session_operation": "direct-onboard",
+            "candidate_started": False,
+            "discord_teardown_complete": True,
+            "cleanup_complete": False,
+            "postconditions_complete": False,
+            "persistent_sandbox_retained": True,
+            "release_eligible": False,
+            "last_error": "start_failed",
+            "updated_at": "2026-08-12T05:13:00Z",
+        }
+        bootstrap_path.write_text(
+            ORCHESTRATOR.canonical_json(bootstrap_state) + "\n",
+            encoding="utf-8",
+        )
+        bootstrap_path.chmod(0o600)
+        state_raw = self.context.state_path.read_bytes()
+        journal_rows, journal_raw = ORCHESTRATOR.read_strict_journal_snapshot(
+            self.context
+        )
+        taint_path = ORCHESTRATOR.d2a_taint_path(self.context)
+        lifecycle_path = ORCHESTRATOR.d2a_session_lifecycle_path(self.context)
+        observations = {}
+        for name, tree in self.context.manifest["source_trees"].items():
+            changed = name in {"d2_toolchain", "certification_transport"}
+            observed = (
+                ("f" if name == "d2_toolchain" else "9") * 64
+                if changed
+                else tree["sha256"]
+            )
+            observations[name] = {
+                "root": tree["root"],
+                "historical_sha256": tree["sha256"],
+                "observed_sha256": observed,
+                "matches_historical": not changed,
+            }
+        revision = {
+            "repository_root": str(
+                ORCHESTRATOR.AUDITED_RECOVERY_REPOSITORY_ROOT
+            ),
+            "commit_sha": "b" * 40,
+            "tree_sha": "c" * 40,
+            "git_path": str(ORCHESTRATOR.AUDITED_RECOVERY_GIT_PATH),
+            "git_sha256": "8" * 64,
+        }
+        allowlist = {
+            "manifest_commit_sha": self.context.manifest["commit_sha"],
+            "historical_d2_toolchain_sha256": self.context.manifest[
+                "source_trees"
+            ]["d2_toolchain"]["sha256"],
+            "historical_transport_sha256": self.context.manifest[
+                "source_trees"
+            ]["certification_transport"]["sha256"],
+            "historical_worker_sha256": self.context.manifest["source_trees"][
+                "codex_worker"
+            ]["sha256"],
+            "bootstrap_id": bootstrap_state["bootstrap_id"],
+            "bootstrap_state_sha256": hashlib.sha256(
+                bootstrap_path.read_bytes()
+            ).hexdigest(),
+            "bootstrap_config_sha256": bootstrap_state["config_sha256"],
+            "candidate_spec_sha256": bootstrap_state["candidate_spec_sha256"],
+            "candidate_provenance_sha256": bootstrap_state[
+                "candidate_provenance_sha256"
+            ],
+            "candidate_dependency_record_sha256": bootstrap_state[
+                "candidate_dependency_record_sha256"
+            ],
+            "candidate_dependency_tree_sha256": bootstrap_state[
+                "candidate_dependency_tree_sha256"
+            ],
+            "source_tree_sha": bootstrap_state["source_tree_sha"],
+            "issuer_sha256": tool_digests["issuer_sha256"],
+            "issuer_source_sha256": tool_digests["issuer_source_sha256"],
+            "orchestrator_state_sha256": hashlib.sha256(state_raw).hexdigest(),
+            "journal_sha256": hashlib.sha256(journal_raw).hexdigest(),
+            "journal_rows": len(journal_rows),
+            "taint_sha256": hashlib.sha256(taint_path.read_bytes()).hexdigest(),
+            "lifecycle_sha256": hashlib.sha256(
+                lifecycle_path.read_bytes()
+            ).hexdigest(),
+        }
+        return {
+            "bootstrap_path": bootstrap_path,
+            "observations": observations,
+            "revision": revision,
+            "allowlist": allowlist,
+        }
+
+    def run_audited_preissuer_rollback_recovery(
+        self, fixture, *, observations=None, revision=None, confirmations=None
+    ):
+        selected_observations = observations or fixture["observations"]
+        selected_revision = revision or fixture["revision"]
+        selected_confirmations = {
+            "commit": selected_revision["commit_sha"],
+            "tree": selected_revision["tree_sha"],
+            "run_id": self.context.manifest["run_id"],
+            "manifest_sha256": self.context.digest,
+            **(confirmations or {}),
+        }
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "AUDITED_PREISSUER_ROLLBACK_ALLOWLIST",
+            {
+                (self.context.manifest["run_id"], self.context.digest): fixture[
+                    "allowlist"
+                ]
+            },
+        ), mock.patch.object(
+            ORCHESTRATOR,
+            "current_clean_recovery_source",
+            return_value=selected_revision,
+        ), mock.patch.object(
+            ORCHESTRATOR,
+            "observe_audited_recovery_source_trees",
+            return_value=selected_observations,
+        ):
+            return ORCHESTRATOR.command_recover_audited_preissuer_rollback(
+                self.context,
+                self.platform,
+                selected_observations,
+                str(fixture["bootstrap_path"]),
+                selected_confirmations["commit"],
+                selected_confirmations["tree"],
+                selected_confirmations["run_id"],
+                selected_confirmations["manifest_sha256"],
+            )
+
+    def test_audited_preissuer_rollback_recovery_succeeds_and_replays_exactly(self):
+        fixture = self.prepare_audited_preissuer_rollback_fixture()
+        bootstrap_before = fixture["bootstrap_path"].read_bytes()
+
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertFalse(
+            ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
+        )
+
+        first = self.run_audited_preissuer_rollback_recovery(fixture)
+
+        self.assertEqual(first["status"], "recovered")
+        self.assertEqual(first["phase"], "cleaned")
+        self.assertTrue(first["source_drift_observed"])
+        self.assertTrue(first["protected_staging_unchanged"])
+        self.assertEqual(self.platform.proxy_deletions, [])
+        self.assertEqual(fixture["bootstrap_path"].read_bytes(), bootstrap_before)
+        intent_path = ORCHESTRATOR.audited_preissuer_rollback_intent_path(
+            self.context
+        )
+        evidence_path = ORCHESTRATOR.audited_preissuer_rollback_evidence_path(
+            self.context
+        )
+        self.assertEqual(intent_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(evidence_path.stat().st_mode & 0o777, 0o600)
+        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            intent["current_source"]["commit_sha"],
+            fixture["revision"]["commit_sha"],
+        )
+        self.assertFalse(
+            intent["current_source"]["source_trees"]["d2_toolchain"][
+                "matches_historical"
+            ]
+        )
+        first_journal = self.context.journal_path.read_bytes()
+
+        replay = self.run_audited_preissuer_rollback_recovery(fixture)
+
+        self.assertEqual(replay["status"], "exact_replay")
+        self.assertEqual(replay["cleanup_status"], "already_cleaned")
+        self.assertEqual(self.context.journal_path.read_bytes(), first_journal)
+
+    def test_audited_recovery_rejects_dirty_current_source_before_intent(self):
+        fixture = self.prepare_audited_preissuer_rollback_fixture()
+        state_before = self.context.state_path.read_bytes()
+        journal_before = self.context.journal_path.read_bytes()
+
+        def dirty_source():
+            ORCHESTRATOR.fail("audited_recovery_source_dirty")
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "AUDITED_PREISSUER_ROLLBACK_ALLOWLIST",
+            {
+                (self.context.manifest["run_id"], self.context.digest): fixture[
+                    "allowlist"
+                ]
+            },
+        ), mock.patch.object(
+            ORCHESTRATOR,
+            "current_clean_recovery_source",
+            side_effect=dirty_source,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "audited_recovery_source_dirty"
+        ):
+            ORCHESTRATOR.command_recover_audited_preissuer_rollback(
+                self.context,
+                self.platform,
+                fixture["observations"],
+                str(fixture["bootstrap_path"]),
+                fixture["revision"]["commit_sha"],
+                fixture["revision"]["tree_sha"],
+                self.context.manifest["run_id"],
+                self.context.digest,
+            )
+        self.assertFalse(
+            ORCHESTRATOR.audited_preissuer_rollback_intent_path(
+                self.context
+            ).exists()
+        )
+        self.assertFalse(ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists())
+        self.assertEqual(self.context.state_path.read_bytes(), state_before)
+        self.assertEqual(self.context.journal_path.read_bytes(), journal_before)
+
+    def test_audited_recovery_requires_all_exact_operator_confirmations(self):
+        fixture = self.prepare_audited_preissuer_rollback_fixture()
+        cases = (
+            {"commit": "0" * 40},
+            {"tree": "0" * 40},
+            {"run_id": "d2-20260812t000000z-000000000000"},
+            {"manifest_sha256": "0" * 64},
+        )
+        for confirmations in cases:
+            with self.subTest(confirmations=confirmations), self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "audited_recovery_confirmation_mismatch",
+            ):
+                self.run_audited_preissuer_rollback_recovery(
+                    fixture, confirmations=confirmations
+                )
+            self.assertFalse(
+                ORCHESTRATOR.audited_preissuer_rollback_intent_path(
+                    self.context
+                ).exists()
+            )
+            self.assertFalse(
+                ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
+            )
+
+    def test_audited_recovery_rejects_current_source_equal_to_historical(self):
+        fixture = self.prepare_audited_preissuer_rollback_fixture()
+        observations = copy.deepcopy(fixture["observations"])
+        for observation in observations.values():
+            observation["observed_sha256"] = observation["historical_sha256"]
+            observation["matches_historical"] = True
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_recovery_source_not_changed",
+        ):
+            self.run_audited_preissuer_rollback_recovery(
+                fixture, observations=observations
+            )
+        self.assertFalse(
+            ORCHESTRATOR.audited_preissuer_rollback_intent_path(
+                self.context
+            ).exists()
+        )
+
+    def test_audited_recovery_rejects_non_rollback_or_committed_state(self):
+        with self.subTest(boundary="not_stopped_rollback"):
+            fixture = self.prepare_audited_preissuer_rollback_fixture(
+                rolled_back=False
+            )
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "audited_recovery_"
+            ):
+                self.run_audited_preissuer_rollback_recovery(fixture)
+            self.assertFalse(
+                ORCHESTRATOR.audited_preissuer_rollback_intent_path(
+                    self.context
+                ).exists()
+            )
+
+    def test_audited_recovery_rejects_candidate_commitment_before_mutation(self):
+        fixture = self.prepare_audited_preissuer_rollback_fixture()
+        transition = ORCHESTRATOR.candidate_start_transition_path(self.context)
+        transition.write_text("{}\n", encoding="utf-8")
+        transition.chmod(0o600)
+        journal_before = self.context.journal_path.read_bytes()
+
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "audited_recovery_boundary_invalid"
+        ):
+            self.run_audited_preissuer_rollback_recovery(fixture)
+
+        self.assertFalse(
+            ORCHESTRATOR.audited_preissuer_rollback_intent_path(
+                self.context
+            ).exists()
+        )
+        self.assertFalse(ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists())
+        self.assertEqual(self.context.journal_path.read_bytes(), journal_before)
+
+    def test_audited_recovery_rejects_live_service_postgres_or_protected_drift(self):
+        fixture = self.prepare_audited_preissuer_rollback_fixture()
+        candidate_label = self.context.manifest["services"]["transport"]["label"]
+        protected_label = self.context.manifest["protected_staging"][
+            "launchd_labels"
+        ][0]
+        cases = ("candidate_service", "postgres", "protected")
+        for case in cases:
+            with self.subTest(case=case):
+                if case == "candidate_service":
+                    self.platform.loaded.add(candidate_label)
+                elif case == "postgres":
+                    self.platform.postgres = True
+                else:
+                    self.platform.loaded.remove(protected_label)
+                with self.assertRaisesRegex(
+                    ORCHESTRATOR.OrchestratorError,
+                    "audited_recovery_boundary_invalid",
+                ):
+                    self.run_audited_preissuer_rollback_recovery(fixture)
+                self.assertFalse(
+                    ORCHESTRATOR.audited_preissuer_rollback_intent_path(
+                        self.context
+                    ).exists()
+                )
+                self.assertFalse(
+                    ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
+                )
+                self.platform.loaded.discard(candidate_label)
+                self.platform.postgres = False
+                self.platform.loaded.add(protected_label)
+
+    def test_audited_recovery_invalid_lifecycle_never_mutates_cleanup_state(self):
+        fixture = self.prepare_audited_preissuer_rollback_fixture()
+        lifecycle_path = ORCHESTRATOR.d2a_session_lifecycle_path(self.context)
+        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        lifecycle["process_group_id"] = 12345
+        lifecycle_path.write_text(
+            json.dumps(lifecycle, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        lifecycle_path.chmod(0o600)
+        fixture["allowlist"]["lifecycle_sha256"] = hashlib.sha256(
+            lifecycle_path.read_bytes()
+        ).hexdigest()
+        journal_before = self.context.journal_path.read_bytes()
+        state_before = self.context.state_path.read_bytes()
+        keychain_before = set(self.platform.keychain)
+
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+        ):
+            self.run_audited_preissuer_rollback_recovery(fixture)
+
+        self.assertFalse(
+            ORCHESTRATOR.audited_preissuer_rollback_intent_path(
+                self.context
+            ).exists()
+        )
+        self.assertFalse(ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists())
+        self.assertEqual(self.context.journal_path.read_bytes(), journal_before)
+        self.assertEqual(self.context.state_path.read_bytes(), state_before)
+        self.assertEqual(self.platform.keychain, keychain_before)
+
+    def test_audited_recovery_parser_requires_explicit_identity_confirmations(self):
+        arguments = ORCHESTRATOR.build_parser().parse_args(
+            [
+                "recover-audited-preissuer-rollback",
+                "--manifest",
+                str(self.context.manifest_path),
+                "--bootstrap-state",
+                str(self.root / "bootstrap.json"),
+                "--confirm-current-commit",
+                "a" * 40,
+                "--confirm-current-tree",
+                "b" * 40,
+                "--confirm-run-id",
+                self.context.manifest["run_id"],
+                "--confirm-manifest-sha256",
+                self.context.digest,
+            ]
+        )
+        self.assertEqual(
+            arguments.command, "recover-audited-preissuer-rollback"
+        )
 
     def test_d2a_active_quarantined_or_missing_lifecycle_blocks_before_mutation(self):
         for status in (None, "active", "quarantined"):

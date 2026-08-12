@@ -1221,7 +1221,7 @@ def validate_manifest(manifest):
     return manifest
 
 
-def validate_candidate_files(manifest):
+def observe_audited_recovery_source_trees(manifest):
     for name, candidate in manifest["candidates"].items():
         path = require_absolute_path(candidate["path"], f"candidate_{name}")
         require_immutable_candidate(path, name)
@@ -1243,6 +1243,7 @@ def validate_candidate_files(manifest):
     validate_certification_transport_inventory(
         expected_roots["certification_transport"]
     )
+    observations = {}
     for name in sorted(expected_roots):
         tree = manifest["source_trees"][name]
         if pathlib.Path(tree["root"]) != expected_roots[name]:
@@ -1250,8 +1251,67 @@ def validate_candidate_files(manifest):
         observed = source_tree_digest(
             expected_roots[name], expected_files[name], f"source_tree_{name}"
         )
-        if observed != tree["sha256"]:
+        observations[name] = {
+            "root": str(expected_roots[name]),
+            "historical_sha256": tree["sha256"],
+            "observed_sha256": observed,
+            "matches_historical": observed == tree["sha256"],
+        }
+    # The immutable worker bundle is not a mutable recovery tool.  It must
+    # remain byte-for-byte equal to the historical manifest even when the
+    # checked-out D2 controller or transport sources changed later.
+    if not observations["codex_worker"]["matches_historical"]:
+        fail("source_tree_codex_worker_digest_mismatch")
+    return observations
+
+
+def validate_candidate_files(manifest):
+    observations = observe_audited_recovery_source_trees(manifest)
+    for name, observation in observations.items():
+        if not observation["matches_historical"]:
             fail(f"source_tree_{name}_digest_mismatch")
+
+
+def load_audited_recovery_manifest(path):
+    """Load a historical manifest without rebinding it to current sources.
+
+    This is intentionally narrower than ``load_verified_manifest``: immutable
+    candidate artifacts and the bundled worker tree still have to match, while
+    current D2-controller and transport source digests are returned as an
+    explicit observation instead of being silently accepted as the historical
+    identity.  Callers must separately authorize that drift before mutation.
+    """
+    manifest_path = require_absolute_path(path, "manifest")
+    run_directory = require_owned_mode(
+        manifest_path.parent, 0o700, "run_directory", directory=True
+    )
+    manifest_metadata = require_owned_mode(manifest_path, 0o600, "manifest")
+    digest_path = manifest_path.with_name("manifest.sha256")
+    digest_metadata = require_owned_mode(digest_path, 0o600, "manifest_digest")
+    if (
+        run_directory.st_uid != os.getuid()
+        or manifest_metadata.st_nlink != 1
+        or digest_metadata.st_nlink != 1
+        or manifest_metadata.st_size <= 0
+        or manifest_metadata.st_size > MAX_JSON_BYTES
+        or digest_metadata.st_size != 65
+    ):
+        fail("audited_recovery_manifest_invalid")
+    try:
+        raw = manifest_path.read_bytes()
+        digest_raw = digest_path.read_bytes()
+        manifest = json.loads(raw, object_pairs_hook=strict_json_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        fail("audited_recovery_manifest_invalid")
+    validate_manifest(manifest)
+    if type(manifest.get("schema_version")) is not int:
+        fail("audited_recovery_manifest_invalid")
+    canonical = (canonical_json(manifest) + "\n").encode("utf-8")
+    digest = manifest_digest(manifest)
+    if raw != canonical or digest_raw != (digest + "\n").encode("ascii"):
+        fail("audited_recovery_manifest_invalid")
+    observations = observe_audited_recovery_source_trees(manifest)
+    return manifest_path, manifest, digest, observations
 
 
 def load_verified_manifest(path):

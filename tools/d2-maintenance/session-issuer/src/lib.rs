@@ -135,6 +135,18 @@ pub enum IssuerError {
     IsolatedRuntime,
     #[error("candidate_service_inactive")]
     CandidateServiceInactive,
+    #[error("api_loopback_origin_invalid")]
+    ApiLoopbackOrigin,
+    #[error("api_loopback_connect_failed")]
+    ApiLoopbackConnect,
+    #[error("api_loopback_write_failed")]
+    ApiLoopbackWrite,
+    #[error("api_loopback_read_failed")]
+    ApiLoopbackRead,
+    #[error("api_loopback_response_empty")]
+    ApiLoopbackResponseEmpty,
+    #[error("api_loopback_status_invalid")]
+    ApiLoopbackStatus,
     #[error("keychain_identity_invalid")]
     KeychainIdentity,
     #[error("keychain_secret_unavailable")]
@@ -183,6 +195,20 @@ pub enum IssuerError {
     ProcessIsolation,
     #[error("session_lifecycle_invalid")]
     SessionLifecycle,
+    #[error("session_lifecycle_binary_invalid")]
+    SessionLifecycleBinary,
+    #[error("session_lifecycle_source_invalid")]
+    SessionLifecycleSource,
+    #[error("session_lifecycle_boot_identity_invalid")]
+    SessionLifecycleBootIdentity,
+    #[error("session_lifecycle_existing_marker_invalid")]
+    SessionLifecycleExistingMarker,
+    #[error("session_lifecycle_handoff_invalid")]
+    SessionLifecycleHandoff,
+    #[error("session_lifecycle_reentry_invalid")]
+    SessionLifecycleReentry,
+    #[error("session_lifecycle_cas_failed")]
+    SessionLifecycleCas,
     #[error("manual_recovery_required")]
     ManualRecoveryRequired,
     #[error("d2a_teardown_fence_invalid")]
@@ -898,32 +924,42 @@ pub struct SessionLifecycle {
 impl SessionLifecycle {
     pub fn begin(run: &ValidatedRun, operation: Operation) -> Result<Self, IssuerError> {
         let process_group_id = require_dedicated_process_session()?;
-        let boot_identity = current_boot_identity()?;
-        let issuer_sha256 = current_issuer_sha256(IssuerError::SessionLifecycle)?;
+        let boot_identity =
+            current_boot_identity().map_err(|_| IssuerError::SessionLifecycleBootIdentity)?;
+        let issuer_sha256 = current_issuer_sha256(IssuerError::SessionLifecycleBinary)?;
         let issuer_source_sha256 = issuer_source_digest();
+        if !valid_digest(&issuer_source_sha256) {
+            return Err(IssuerError::SessionLifecycleSource);
+        }
         let path = run.run_directory.join(SESSION_LIFECYCLE_NAME);
         let expected = match path.symlink_metadata() {
             Ok(_) => {
-                let snapshot = read_session_lifecycle_snapshot(&path, run.uid)?;
-                validate_session_lifecycle_marker(&snapshot.marker, run)?;
-                if snapshot.marker.issuer_sha256 != issuer_sha256
-                    || snapshot.marker.issuer_source_sha256 != issuer_source_sha256
-                {
-                    return Err(IssuerError::SessionLifecycle);
+                let snapshot = read_session_lifecycle_snapshot(&path, run.uid)
+                    .map_err(|_| IssuerError::SessionLifecycleExistingMarker)?;
+                validate_session_lifecycle_marker(&snapshot.marker, run)
+                    .map_err(|_| IssuerError::SessionLifecycleExistingMarker)?;
+                if snapshot.marker.issuer_sha256 != issuer_sha256 {
+                    return Err(IssuerError::SessionLifecycleBinary);
                 }
-                require_lifecycle_operation_handoff(Some(&snapshot.marker), operation)?;
+                if snapshot.marker.issuer_source_sha256 != issuer_source_sha256 {
+                    return Err(IssuerError::SessionLifecycleSource);
+                }
+                require_lifecycle_operation_handoff(Some(&snapshot.marker), operation)
+                    .map_err(|_| IssuerError::SessionLifecycleHandoff)?;
                 require_safe_lifecycle_reentry(
                     &snapshot.marker,
                     &boot_identity,
                     process_group_absent,
-                )?;
+                )
+                .map_err(|_| IssuerError::SessionLifecycleReentry)?;
                 Some(snapshot)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                require_lifecycle_operation_handoff(None, operation)?;
+                require_lifecycle_operation_handoff(None, operation)
+                    .map_err(|_| IssuerError::SessionLifecycleHandoff)?;
                 None
             }
-            Err(_) => return Err(IssuerError::SessionLifecycle),
+            Err(_) => return Err(IssuerError::SessionLifecycleExistingMarker),
         };
         let marker = SessionLifecycleMarker {
             schema_version: 1,
@@ -950,7 +986,8 @@ impl SessionLifecycle {
             run.uid,
             &marker,
             expected.as_ref(),
-        )?;
+        )
+        .map_err(|_| IssuerError::SessionLifecycleCas)?;
         Ok(Self {
             path,
             uid: run.uid,
@@ -4045,7 +4082,7 @@ fn validate_api_loopback_ready(run: &ValidatedRun) -> Result<(), IssuerError> {
     let host = run
         .public_origin
         .strip_prefix("https://")
-        .ok_or(IssuerError::CandidateServiceInactive)?;
+        .ok_or(IssuerError::ApiLoopbackOrigin)?;
     validate_api_loopback_ready_at(address, host)
 }
 
@@ -4054,24 +4091,24 @@ fn validate_api_loopback_ready_at(
     host: &str,
 ) -> Result<(), IssuerError> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(3))
-        .map_err(|_| IssuerError::CandidateServiceInactive)?;
+        .map_err(|_| IssuerError::ApiLoopbackConnect)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
-        .map_err(|_| IssuerError::CandidateServiceInactive)?;
+        .map_err(|_| IssuerError::ApiLoopbackRead)?;
     stream
         .set_write_timeout(Some(Duration::from_secs(3)))
-        .map_err(|_| IssuerError::CandidateServiceInactive)?;
+        .map_err(|_| IssuerError::ApiLoopbackWrite)?;
     let request =
         format!("GET /health/ready HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
-        .map_err(|_| IssuerError::CandidateServiceInactive)?;
+        .map_err(|_| IssuerError::ApiLoopbackWrite)?;
     let mut response = Vec::new();
     let mut buffer = [0_u8; 2_048];
     while response.len() <= 16 * 1024 {
         let read = stream
             .read(&mut buffer)
-            .map_err(|_| IssuerError::CandidateServiceInactive)?;
+            .map_err(|_| IssuerError::ApiLoopbackRead)?;
         if read == 0 {
             break;
         }
@@ -4081,14 +4118,17 @@ fn validate_api_loopback_ready_at(
         }
     }
     if response.len() > 16 * 1024 {
-        return Err(IssuerError::CandidateServiceInactive);
+        return Err(IssuerError::ApiLoopbackRead);
+    }
+    if response.is_empty() {
+        return Err(IssuerError::ApiLoopbackResponseEmpty);
     }
     let first_line = response
         .split(|byte| *byte == b'\n')
         .next()
         .and_then(|line| line.strip_suffix(b"\r"));
     if !matches!(first_line, Some(b"HTTP/1.1 200 OK" | b"HTTP/1.0 200 OK")) {
-        return Err(IssuerError::CandidateServiceInactive);
+        return Err(IssuerError::ApiLoopbackStatus);
     }
     Ok(())
 }
@@ -5192,6 +5232,50 @@ mod tests {
         assert!(server.join().unwrap());
     }
 
+    #[test]
+    fn api_loopback_probe_reports_empty_and_non_ready_responses_exactly() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        fn serve(response: &'static [u8]) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 512];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                if !response.is_empty() {
+                    stream.write_all(response).unwrap();
+                }
+            });
+            (address, server)
+        }
+
+        let (address, server) = serve(b"");
+        assert_eq!(
+            validate_api_loopback_ready_at(address, "d2-api.starring.co.kr"),
+            Err(IssuerError::ApiLoopbackResponseEmpty)
+        );
+        server.join().unwrap();
+
+        let (address, server) = serve(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(
+            validate_api_loopback_ready_at(address, "d2-api.starring.co.kr"),
+            Err(IssuerError::ApiLoopbackStatus)
+        );
+        server.join().unwrap();
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn plist_conversion_preserves_the_complete_dictionary() {
@@ -5952,6 +6036,63 @@ mod tests {
             IssuerError::ProcessIsolation.to_string(),
             "issuer_process_isolation_required"
         );
+    }
+
+    #[test]
+    fn stable_diagnostics_are_allowlisted_secret_free_codes() {
+        for (error, expected) in [
+            (
+                IssuerError::ApiLoopbackOrigin,
+                "api_loopback_origin_invalid",
+            ),
+            (
+                IssuerError::ApiLoopbackConnect,
+                "api_loopback_connect_failed",
+            ),
+            (IssuerError::ApiLoopbackWrite, "api_loopback_write_failed"),
+            (IssuerError::ApiLoopbackRead, "api_loopback_read_failed"),
+            (
+                IssuerError::ApiLoopbackResponseEmpty,
+                "api_loopback_response_empty",
+            ),
+            (
+                IssuerError::ApiLoopbackStatus,
+                "api_loopback_status_invalid",
+            ),
+            (
+                IssuerError::SessionLifecycleBinary,
+                "session_lifecycle_binary_invalid",
+            ),
+            (
+                IssuerError::SessionLifecycleSource,
+                "session_lifecycle_source_invalid",
+            ),
+            (
+                IssuerError::SessionLifecycleBootIdentity,
+                "session_lifecycle_boot_identity_invalid",
+            ),
+            (
+                IssuerError::SessionLifecycleExistingMarker,
+                "session_lifecycle_existing_marker_invalid",
+            ),
+            (
+                IssuerError::SessionLifecycleHandoff,
+                "session_lifecycle_handoff_invalid",
+            ),
+            (
+                IssuerError::SessionLifecycleReentry,
+                "session_lifecycle_reentry_invalid",
+            ),
+            (
+                IssuerError::SessionLifecycleCas,
+                "session_lifecycle_cas_failed",
+            ),
+        ] {
+            assert_eq!(error.to_string(), expected);
+            assert!(expected
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_'));
+        }
     }
 
     #[test]

@@ -71,16 +71,21 @@ D2A_SYSCTL_BOOT_TIME = re.compile(
 )
 
 from d2_certification import (
+    COMMIT_PATTERN,
     CertificationError,
     STEP_SPECS,
     canonical_json,
+    fsync_directory,
     isolated_runtime_root,
     load_json_file,
+    observe_audited_recovery_source_trees,
     require_absolute_path,
     require_owned_mode,
+    sha256_file,
     validate_snowflake,
     validate_step_contract,
     validate_utc_timestamp,
+    write_new_file,
 )
 from d2_orchestrator_composition import (
     compose_plists,
@@ -103,11 +108,13 @@ from d2_orchestrator_contract import (
     fail,
     global_operation_lock,
     keychain_inventory,
+    load_audited_recovery_context,
     load_json,
     load_context,
     load_state,
     owner_identities,
     release_discord_ownership,
+    read_strict_journal_snapshot,
     require_discord_ownership_available,
     require_discord_ownership_claimed,
     require_discord_ownership_released,
@@ -206,6 +213,128 @@ TRANSPORT_EVIDENCE_KINDS = {
     "gateway-loss": "starring.d2.transport-gateway-loss-evidence.v1",
     "gateway-healed": "starring.d2.transport-gateway-healed-evidence.v1",
 }
+
+AUDITED_PREISSUER_ROLLBACK_INTENT_KIND = (
+    "starring.d2.audited-preissuer-rollback-recovery-intent.v1"
+)
+AUDITED_PREISSUER_ROLLBACK_EVIDENCE_KIND = (
+    "starring.d2.audited-preissuer-rollback-recovery.v1"
+)
+AUDITED_RECOVERY_GIT_PATH = pathlib.Path("/usr/bin/git")
+AUDITED_RECOVERY_REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[2]
+AUDITED_BOOTSTRAP_STATE_FIELDS = tuple(
+    sorted(
+        {
+            "schema_version",
+            "kind",
+            "bootstrap_id",
+            "status",
+            "phase",
+            "operation",
+            "config_path",
+            "config_sha256",
+            "candidate_spec_path",
+            "candidate_spec_sha256",
+            "candidate_provenance_path",
+            "candidate_provenance_sha256",
+            "candidate_dependency_record_sha256",
+            "candidate_dependency_tree_sha256",
+            "source_commit_sha",
+            "source_tree_sha",
+            "run_id",
+            "manifest_path",
+            "manifest_sha256",
+            "onboarding_evidence_path",
+            "onboarding_evidence_sha256",
+            "resource_prefix",
+            "tool_digests",
+            "issuer_build_environment",
+            "records",
+            "last_session_operation",
+            "candidate_started",
+            "discord_teardown_complete",
+            "cleanup_complete",
+            "postconditions_complete",
+            "persistent_sandbox_retained",
+            "release_eligible",
+            "last_error",
+            "updated_at",
+        }
+    )
+)
+
+# Historical identity of the sole run affected by the pre-issuer rollback
+# cleanup authorization bug.  This allowlist never authorizes a current source
+# revision; the operator must separately confirm the clean current HEAD/tree,
+# which is durably recorded in the recovery intent.
+AUDITED_PREISSUER_ROLLBACK_ALLOWLIST = {
+    (
+        "d2-20260812t051209z-24ff1c8acd61",
+        "5c5b387843ef5eaa8265f56ab5afaea01477c4e74866725ae3a1b12fd516351a",
+    ): {
+        "manifest_commit_sha": "ec9c9e1d5340b5e3681fa846f33cc68102a526d4",
+        "historical_d2_toolchain_sha256": "a45dea01b7a82be133edb2af7fb58105480592250d5d8648f2c6131fd36d673f",
+        "historical_transport_sha256": "a0351a4da7926b67941acb244a895a4140065f5dac9392699d5700bc054a9c6a",
+        "historical_worker_sha256": "39421ca38caeaec5c3f1889f0e09118ebbe815e169a63da5daa7333ec1a2312d",
+        "bootstrap_id": "d2ab-69011c2016465efe179b3ca5a283247e",
+        "bootstrap_state_sha256": "6de083f61148698b7612ed2e00ce50a4a73ad0f95ab0b450a87714f1be391513",
+        "bootstrap_config_sha256": "34988a102c346be941246d48622b742fc9d17c1c837d396fbca2b5077243da10",
+        "candidate_spec_sha256": "64a9136252bb6f51ae44190f531c2c8816a3d3b8e5edcd05d6679740e5ad1558",
+        "candidate_provenance_sha256": "e84b7a42e68fc6232f4c10297801e6816a17677a61ebc1c27ced7df7dbd61699",
+        "candidate_dependency_record_sha256": "25523c5b7d5c6db57a440324c31c33a58e841c07c4c84593afbe6d8e32cfb421",
+        "candidate_dependency_tree_sha256": "1ac4e636067f59abc9d339b9f3d4414a53b535ce7be5004e8681036438df581b",
+        "source_tree_sha": "ca53ff3c8cf56c5c6b42523eea39b50b31b7a254",
+        "issuer_sha256": "598377b6bdc4bdf80f9faa680d91656886cdee0bee3df9262e88f3eff02fc06d",
+        "issuer_source_sha256": "6b4e6cefdbe789508283a72363a7a22d21fdfe9a5b840efe0c85e1abd552fdb1",
+        "orchestrator_state_sha256": "5fc656c2bafb480d87781715287ba8b44b7f5aaeeb4a4dff9a7ecc55b09af1d2",
+        "journal_sha256": "d7855e3bbaaf2157bcdf97612f5697efe89c80893d9c01e74de512cb0d323c08",
+        "journal_rows": 43,
+        "taint_sha256": "eef9fdbc5cab11b38f3b2d23d55597316c626db064f623cfb465f0fb958c28ee",
+        "lifecycle_sha256": "9c88a096a7b6b57775a6329a429cf98c4d62eb3dacdd2275888c9b19dd98dd53",
+    }
+}
+AUDITED_PREISSUER_ROLLBACK_INTENT_FIELDS = tuple(
+    sorted(
+        {
+            "schema_version",
+            "kind",
+            "run_id",
+            "manifest_sha256",
+            "bootstrap_id",
+            "bootstrap_state_path",
+            "bootstrap_state_sha256",
+            "historical_manifest_commit_sha",
+            "historical_source_trees",
+            "current_source",
+            "orchestrator_state_sha256",
+            "baseline_journal_sha256",
+            "baseline_journal_rows",
+            "taint_sha256",
+            "lifecycle_sha256",
+            "created_at",
+        }
+    )
+)
+AUDITED_PREISSUER_ROLLBACK_EVIDENCE_FIELDS = tuple(
+    sorted(
+        {
+            "schema_version",
+            "kind",
+            "run_id",
+            "manifest_sha256",
+            "intent_sha256",
+            "observed_at",
+            "database_absent",
+            "postgres_process_absent",
+            "launchd_jobs_absent",
+            "keychain_items_absent",
+            "isolated_root_absent",
+            "protected_staging_unchanged",
+            "teardown_fence_sha256",
+            "cleanup_evidence_sha256",
+        }
+    )
+)
 
 
 def command_dry_run(context, platform):
@@ -4885,6 +5014,992 @@ def command_cleanup(context, platform):
     return command_cleanup_internal(context, platform, retire_committed=True)
 
 
+def audited_preissuer_rollback_intent_path(context):
+    return context.artifact_directory / "audited-preissuer-rollback-recovery-intent.json"
+
+
+def audited_preissuer_rollback_evidence_path(context):
+    return context.artifact_directory / "audited-preissuer-rollback-recovery.json"
+
+
+def audited_private_file_bytes(
+    path, modes, maximum_bytes, code, *, allow_empty=False
+):
+    path = require_absolute_path(str(path), code)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError:
+        fail(code)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) not in modes
+            or (before.st_size <= 0 and not allow_empty)
+            or before.st_size > maximum_bytes
+        ):
+            fail(code)
+        raw = bytearray()
+        while len(raw) <= maximum_bytes:
+            chunk = os.read(descriptor, min(64 * 1024, maximum_bytes + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(descriptor)
+        try:
+            named = os.stat(path, follow_symlinks=False)
+        except OSError:
+            fail(code)
+    finally:
+        os.close(descriptor)
+    if (
+        len(raw) != before.st_size
+        or len(raw) > maximum_bytes
+        or d2a_marker_identity(before) != d2a_marker_identity(after)
+        or d2a_marker_identity(after) != d2a_marker_identity(named)
+    ):
+        fail(code)
+    return bytes(raw)
+
+
+def require_audited_manifest_unchanged(context):
+    manifest_raw = audited_private_file_bytes(
+        context.manifest_path,
+        {0o600},
+        256 * 1024,
+        "audited_recovery_manifest_changed",
+    )
+    digest_raw = audited_private_file_bytes(
+        context.manifest_path.with_name("manifest.sha256"),
+        {0o600},
+        1024,
+        "audited_recovery_manifest_changed",
+    )
+    if (
+        manifest_raw != (canonical_json(context.manifest) + "\n").encode("utf-8")
+        or digest_raw != (context.digest + "\n").encode("ascii")
+    ):
+        fail("audited_recovery_manifest_changed")
+
+
+def audited_bootstrap_state(context, raw_state_path):
+    state_path = require_absolute_path(raw_state_path, "audited_recovery_bootstrap_state")
+    if state_path.name != f"bootstrap-{context.manifest['run_id']}.json":
+        fail("audited_recovery_bootstrap_state_invalid")
+    try:
+        parent = state_path.parent.lstat()
+        resolved = state_path.resolve(strict=True)
+    except OSError:
+        fail("audited_recovery_bootstrap_state_invalid")
+    if (
+        resolved != state_path
+        or not stat.S_ISDIR(parent.st_mode)
+        or state_path.parent.is_symlink()
+        or parent.st_uid != os.getuid()
+        or stat.S_IMODE(parent.st_mode) != 0o700
+    ):
+        fail("audited_recovery_bootstrap_state_invalid")
+    state = load_strict_d2a_marker(
+        state_path,
+        "audited_recovery_bootstrap_state_invalid",
+        AUDITED_BOOTSTRAP_STATE_FIELDS,
+        sorted_canonical=True,
+    )
+    raw = audited_private_file_bytes(
+        state_path, {0o600}, D2A_MARKER_MAXIMUM_BYTES, "audited_recovery_bootstrap_state_invalid"
+    )
+    if (
+        type(state.get("schema_version")) is not int
+        or state.get("schema_version") != 1
+        or state.get("kind") != "starring.d2a.bootstrap-state.v1"
+        or state.get("status") != "recovery_required"
+        or state.get("phase") != "cleanup"
+        or state.get("operation") != "one-shot"
+        or state.get("run_id") != context.manifest["run_id"]
+        or state.get("manifest_path") != str(context.manifest_path)
+        or state.get("manifest_sha256") != context.digest
+        or state.get("source_commit_sha") != context.manifest["commit_sha"]
+        or not isinstance(state.get("source_tree_sha"), str)
+        or COMMIT_PATTERN.fullmatch(state["source_tree_sha"]) is None
+        or state.get("candidate_started") is not False
+        or state.get("discord_teardown_complete") is not True
+        or state.get("cleanup_complete") is not False
+        or state.get("postconditions_complete") is not False
+        or state.get("records") != []
+        or state.get("onboarding_evidence_path") is not None
+        or state.get("onboarding_evidence_sha256") is not None
+        or state.get("last_session_operation") != "direct-onboard"
+        or state.get("last_error") != "start_failed"
+        or state.get("persistent_sandbox_retained") is not True
+        or state.get("release_eligible") is not False
+        or not validate_utc_timestamp(state.get("updated_at"))
+        or not isinstance(state.get("bootstrap_id"), str)
+        or not re.fullmatch(r"d2ab-[0-9a-f]{32}", state["bootstrap_id"])
+        or state.get("resource_prefix")
+        != context.manifest["discord"]["resource_prefix"]
+    ):
+        fail("audited_recovery_bootstrap_state_invalid")
+    tool_digests = state.get("tool_digests")
+    if (
+        not isinstance(tool_digests, dict)
+        or any(not valid_d2a_digest(value) for value in tool_digests.values())
+        or any(
+            field not in tool_digests
+            for field in (
+                "issuer_sha256",
+                "issuer_source_sha256",
+                "runner_sha256",
+                "product_driver_sha256",
+                "scenario_sha256",
+            )
+        )
+    ):
+        fail("audited_recovery_bootstrap_state_invalid")
+    for field, mode, maximum in (
+        ("config_path", 0o600, 256 * 1024),
+        ("candidate_spec_path", 0o400, 256 * 1024),
+        ("candidate_provenance_path", 0o400, 1024 * 1024),
+    ):
+        recorded_digest = state.get(field.replace("_path", "_sha256"))
+        if not valid_d2a_digest(recorded_digest):
+            fail("audited_recovery_bootstrap_state_invalid")
+        payload = audited_private_file_bytes(
+            pathlib.Path(state[field]),
+            {mode},
+            maximum,
+            "audited_recovery_bootstrap_dependency_invalid",
+        )
+        if hashlib.sha256(payload).hexdigest() != recorded_digest:
+            fail("audited_recovery_bootstrap_dependency_invalid")
+    bundle = pathlib.Path(context.manifest["candidates"]["api"]["path"]).parent
+    if (
+        pathlib.Path(state["candidate_spec_path"]) != bundle / "candidate-spec.json"
+        or pathlib.Path(state["candidate_provenance_path"]) != bundle / "provenance.json"
+    ):
+        fail("audited_recovery_bootstrap_state_invalid")
+    return state_path, state, hashlib.sha256(raw).hexdigest()
+
+
+def audited_orchestrator_state(context):
+    fields = tuple(
+        sorted(
+            {
+                "schema_version",
+                "manifest_sha256",
+                "run_id",
+                "phase",
+                "updated_at",
+                "standing_snapshot",
+            }
+        )
+    )
+    state = load_strict_d2a_marker(
+        context.state_path,
+        "audited_recovery_orchestrator_state_invalid",
+        fields,
+        sorted_canonical=True,
+    )
+    raw = audited_private_file_bytes(
+        context.state_path,
+        {0o600},
+        D2A_MARKER_MAXIMUM_BYTES,
+        "audited_recovery_orchestrator_state_invalid",
+    )
+    if (
+        type(state.get("schema_version")) is not int
+        or state.get("schema_version") != 1
+        or state.get("manifest_sha256") != context.digest
+        or state.get("run_id") != context.manifest["run_id"]
+        or state.get("phase") not in {"stopped", "cleaned"}
+        or not validate_utc_timestamp(state.get("updated_at"))
+        or not isinstance(state.get("standing_snapshot"), dict)
+    ):
+        fail("audited_recovery_orchestrator_state_invalid")
+    return state, hashlib.sha256(raw).hexdigest()
+
+
+def audited_git_executable_sha256():
+    for parent in (pathlib.Path("/usr"), pathlib.Path("/usr/bin")):
+        try:
+            metadata = parent.lstat()
+        except OSError:
+            fail("audited_recovery_git_invalid")
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or parent.is_symlink()
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            fail("audited_recovery_git_invalid")
+    try:
+        metadata = AUDITED_RECOVERY_GIT_PATH.lstat()
+    except OSError:
+        fail("audited_recovery_git_invalid")
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or AUDITED_RECOVERY_GIT_PATH.is_symlink()
+        or metadata.st_uid != 0
+        or metadata.st_nlink < 1
+        or not stat.S_IMODE(metadata.st_mode) & 0o111
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        fail("audited_recovery_git_invalid")
+    return sha256_file(AUDITED_RECOVERY_GIT_PATH)
+
+
+def audited_git_command(arguments, allow_dirty_exit=False):
+    try:
+        completed = subprocess.run(
+            [str(AUDITED_RECOVERY_GIT_PATH), "-C", str(AUDITED_RECOVERY_REPOSITORY_ROOT), *arguments],
+            cwd="/",
+            env={
+                "GIT_CONFIG_GLOBAL": "/dev/null",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TERMINAL_PROMPT": "0",
+                "HOME": "/",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            },
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        fail("audited_recovery_git_invalid")
+    if (
+        len(completed.stdout) > 1024 * 1024
+        or len(completed.stderr) > 1024 * 1024
+        or completed.stderr
+        or completed.returncode not in ({0, 1} if allow_dirty_exit else {0})
+    ):
+        fail("audited_recovery_git_invalid")
+    return completed
+
+
+def current_clean_recovery_source():
+    root = AUDITED_RECOVERY_REPOSITORY_ROOT
+    try:
+        metadata = root.lstat()
+        resolved = root.resolve(strict=True)
+    except OSError:
+        fail("audited_recovery_source_invalid")
+    if (
+        root != resolved
+        or not stat.S_ISDIR(metadata.st_mode)
+        or root.is_symlink()
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        fail("audited_recovery_source_invalid")
+    git_sha256 = audited_git_executable_sha256()
+
+    def text(arguments):
+        raw = audited_git_command(arguments).stdout
+        try:
+            value = raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            fail("audited_recovery_git_invalid")
+        if not value or "\n" in value:
+            fail("audited_recovery_git_invalid")
+        return value
+
+    if pathlib.Path(text(["rev-parse", "--show-toplevel"])) != root:
+        fail("audited_recovery_source_invalid")
+    commit_sha = text(["rev-parse", "--verify", "HEAD"])
+    tree_sha = text(["rev-parse", "--verify", "HEAD^{tree}"])
+    if (
+        COMMIT_PATTERN.fullmatch(commit_sha) is None
+        or COMMIT_PATTERN.fullmatch(tree_sha) is None
+    ):
+        fail("audited_recovery_source_invalid")
+    status = audited_git_command(
+        ["status", "--porcelain=v1", "--untracked-files=all"]
+    )
+    unstaged = audited_git_command(
+        ["diff", "--no-ext-diff", "--quiet"], allow_dirty_exit=True
+    )
+    staged = audited_git_command(
+        ["diff", "--cached", "--no-ext-diff", "--quiet"],
+        allow_dirty_exit=True,
+    )
+    if status.stdout or unstaged.returncode != 0 or staged.returncode != 0:
+        fail("audited_recovery_source_dirty")
+    return {
+        "repository_root": str(root),
+        "commit_sha": commit_sha,
+        "tree_sha": tree_sha,
+        "git_path": str(AUDITED_RECOVERY_GIT_PATH),
+        "git_sha256": git_sha256,
+    }
+
+
+def validate_audited_source_observations(context, observations):
+    if not isinstance(observations, dict) or set(observations) != {
+        "codex_worker",
+        "d2_toolchain",
+        "certification_transport",
+    }:
+        fail("audited_recovery_source_observation_invalid")
+    for name, observation in observations.items():
+        historical = context.manifest["source_trees"][name]
+        if (
+            not isinstance(observation, dict)
+            or set(observation)
+            != {
+                "root",
+                "historical_sha256",
+                "observed_sha256",
+                "matches_historical",
+            }
+            or observation.get("root") != historical["root"]
+            or observation.get("historical_sha256") != historical["sha256"]
+            or not valid_d2a_digest(observation.get("observed_sha256"))
+            or type(observation.get("matches_historical")) is not bool
+            or observation["matches_historical"]
+            != (observation["observed_sha256"] == historical["sha256"])
+        ):
+            fail("audited_recovery_source_observation_invalid")
+    if not observations["codex_worker"]["matches_historical"]:
+        fail("audited_recovery_source_observation_invalid")
+    return observations
+
+
+def audited_recovery_journal(context, baseline_rows, baseline_sha256):
+    rows, raw = read_strict_journal_snapshot(context)
+    if len(rows) < baseline_rows:
+        fail("audited_recovery_journal_invalid")
+    lines = raw.splitlines(keepends=True)
+    prefix = b"".join(lines[:baseline_rows])
+    if hashlib.sha256(prefix).hexdigest() != baseline_sha256:
+        fail("audited_recovery_journal_invalid")
+    baseline_last = rows[baseline_rows - 1]
+    if any(
+        baseline_last.get(field) != expected
+        for field, expected in (
+            ("action", "candidate_start"),
+            ("status", "rolled_back"),
+            ("target", "run"),
+        )
+    ):
+        fail("audited_recovery_journal_invalid")
+    if any(
+        row["action"] != "cleanup"
+        or row["status"] not in {"intent", "failed", "complete"}
+        or row["target"] != "run"
+        for row in rows[baseline_rows:]
+    ):
+        fail("audited_recovery_journal_invalid")
+    return rows, raw
+
+
+def audited_recovery_forbidden_paths(context):
+    return (
+        candidate_start_transition_path(context),
+        candidate_start_source_path(context),
+        candidate_start_retirement_path(context),
+        context.artifact_directory / "step-03-evidence.json",
+        context.artifact_directory / "onboarding-evidence.json",
+        context.artifact_directory / "transport-evidence",
+        discord_teardown_progress_path(context),
+        discord_teardown_progress_path(context, frozen=True),
+        discord_teardown_evidence_path(context),
+        discord_teardown_evidence_path(context, frozen=True),
+        abort_teardown_tombstone_path(context),
+        effect_admission_freeze_intent_path(context),
+        freeze_intent_path(context),
+    )
+
+
+def require_audited_preissuer_artifact_boundary(context, intent_exists):
+    receipts = audited_private_file_bytes(
+        context.manifest_path.with_name("receipts.jsonl"),
+        {0o600},
+        8 * 1024 * 1024,
+        "audited_recovery_artifact_invalid",
+        allow_empty=True,
+    )
+    if receipts:
+        fail("audited_recovery_artifact_invalid")
+    coordinator = context.artifact_directory / "coordinator-sources"
+    try:
+        metadata = coordinator.lstat()
+        entries = {entry.name: entry for entry in coordinator.iterdir()}
+    except OSError:
+        fail("audited_recovery_artifact_invalid")
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or coordinator.is_symlink()
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or not set(entries).issubset(
+            {"step-01-bootstrap.json", "step-02-prior-absence.json"}
+        )
+    ):
+        fail("audited_recovery_artifact_invalid")
+    for path in entries.values():
+        audited_private_file_bytes(
+            path,
+            {0o600},
+            D2A_MARKER_MAXIMUM_BYTES,
+            "audited_recovery_artifact_invalid",
+        )
+    try:
+        artifact_entries = tuple(context.artifact_directory.iterdir())
+    except OSError:
+        fail("audited_recovery_artifact_invalid")
+    if any(
+        entry.name.startswith("step-")
+        and entry.name != "step-01-evidence.json"
+        for entry in artifact_entries
+    ):
+        fail("audited_recovery_artifact_invalid")
+    if not intent_exists and any(
+        os.path.lexists(path)
+        for path in (
+            cleanup_keychain_baseline_path(context),
+            cleanup_root_progress_path(context),
+            context.artifact_directory / "cleanup-evidence.json",
+            audited_preissuer_rollback_evidence_path(context),
+        )
+    ):
+        fail("audited_recovery_artifact_invalid")
+
+
+def require_audited_recovery_inert_boundary(context, platform, state, lifecycle):
+    if (
+        lifecycle.get("origin") != "bootstrap"
+        or lifecycle.get("operation") != "direct-onboard"
+        or lifecycle.get("status") != "not_issued"
+        or lifecycle.get("process_group_id") is not None
+        or lifecycle.get("session_revoked") is not False
+        or lifecycle.get("revoked_at") is not None
+        or lifecycle.get("quarantined_at") is not None
+        or candidate_start_commitment_present(context)
+        or any(os.path.lexists(path) for path in audited_recovery_forbidden_paths(context))
+    ):
+        fail("audited_recovery_boundary_invalid")
+    try:
+        launchd_absent = all(
+            platform.launchd_absent(service["label"])
+            for service in context.manifest["services"].values()
+        )
+        postgres_absent = cleanup_postgres_absent(context, platform)
+        protected_unchanged = (
+            standing_snapshot(context, platform) == state["standing_snapshot"]
+        )
+    except BaseException:
+        fail("audited_recovery_boundary_invalid")
+    if not launchd_absent or not postgres_absent or not protected_unchanged:
+        fail("audited_recovery_boundary_invalid")
+    return {
+        "launchd_jobs_absent": True,
+        "postgres_process_absent": True,
+        "protected_staging_unchanged": True,
+    }
+
+
+def close_audited_preissuer_rollback_teardown_fence(
+    context, platform, expected_intent, allowlist
+):
+    """Close the teardown fence only for the allowlisted stopped rollback.
+
+    Normal cleanup deliberately remains limited to the prepared pre-issuer
+    sentinel.  This gate is reachable only after the explicit recovery command
+    has durably published its exact intent under the global operation lock.
+    Every mutable historical boundary is re-read without journal repair before
+    the first cleanup-authorizing mutation.
+    """
+    intent_path = audited_preissuer_rollback_intent_path(context)
+    observed_intent = load_strict_d2a_marker(
+        intent_path,
+        "audited_recovery_intent_invalid",
+        AUDITED_PREISSUER_ROLLBACK_INTENT_FIELDS,
+        sorted_canonical=True,
+    )
+    if observed_intent != expected_intent:
+        fail("audited_recovery_intent_invalid")
+    state, state_sha256 = audited_orchestrator_state(context)
+    if (
+        state["phase"] != "stopped"
+        or state_sha256 != allowlist["orchestrator_state_sha256"]
+    ):
+        fail("audited_recovery_orchestrator_state_invalid")
+    rows, journal_raw = audited_recovery_journal(
+        context, allowlist["journal_rows"], allowlist["journal_sha256"]
+    )
+    if (
+        len(rows) != allowlist["journal_rows"]
+        or hashlib.sha256(journal_raw).hexdigest() != allowlist["journal_sha256"]
+    ):
+        fail("audited_recovery_journal_invalid")
+    taint_raw = audited_private_file_bytes(
+        d2a_taint_path(context),
+        {0o600},
+        D2A_MARKER_MAXIMUM_BYTES,
+        "audited_recovery_taint_invalid",
+    )
+    lifecycle_raw = audited_private_file_bytes(
+        d2a_session_lifecycle_path(context),
+        {0o600},
+        D2A_MARKER_MAXIMUM_BYTES,
+        "audited_recovery_lifecycle_invalid",
+    )
+    if (
+        hashlib.sha256(taint_raw).hexdigest() != allowlist["taint_sha256"]
+        or hashlib.sha256(lifecycle_raw).hexdigest()
+        != allowlist["lifecycle_sha256"]
+    ):
+        fail("audited_recovery_replay_drift")
+    lifecycle = require_d2a_session_revoked(context)
+    require_audited_preissuer_artifact_boundary(context, True)
+    require_audited_recovery_inert_boundary(
+        context, platform, state, lifecycle
+    )
+    if os.path.lexists(d2a_teardown_fence_path(context)):
+        fail("audited_recovery_fence_invalid")
+    transition_d2a_teardown_fence(context, "closed")
+
+
+def validate_audited_recovery_allowlist(
+    context,
+    bootstrap_state,
+    bootstrap_state_sha256,
+    orchestrator_state_sha256,
+    observations,
+    journal_raw,
+    taint_sha256,
+    lifecycle_sha256,
+):
+    entry = AUDITED_PREISSUER_ROLLBACK_ALLOWLIST.get(
+        (context.manifest["run_id"], context.digest)
+    )
+    if entry is None:
+        fail("audited_recovery_identity_not_allowlisted")
+    actual = {
+        "manifest_commit_sha": context.manifest["commit_sha"],
+        "historical_d2_toolchain_sha256": observations["d2_toolchain"]["historical_sha256"],
+        "historical_transport_sha256": observations["certification_transport"]["historical_sha256"],
+        "historical_worker_sha256": observations["codex_worker"]["historical_sha256"],
+        "bootstrap_id": bootstrap_state["bootstrap_id"],
+        "bootstrap_state_sha256": bootstrap_state_sha256,
+        "bootstrap_config_sha256": bootstrap_state["config_sha256"],
+        "candidate_spec_sha256": bootstrap_state["candidate_spec_sha256"],
+        "candidate_provenance_sha256": bootstrap_state["candidate_provenance_sha256"],
+        "candidate_dependency_record_sha256": bootstrap_state["candidate_dependency_record_sha256"],
+        "candidate_dependency_tree_sha256": bootstrap_state["candidate_dependency_tree_sha256"],
+        "source_tree_sha": bootstrap_state["source_tree_sha"],
+        "issuer_sha256": bootstrap_state["tool_digests"]["issuer_sha256"],
+        "issuer_source_sha256": bootstrap_state["tool_digests"]["issuer_source_sha256"],
+        "orchestrator_state_sha256": orchestrator_state_sha256,
+        "journal_sha256": hashlib.sha256(journal_raw).hexdigest(),
+        "journal_rows": len(journal_raw.splitlines()),
+        "taint_sha256": taint_sha256,
+        "lifecycle_sha256": lifecycle_sha256,
+    }
+    if actual != entry:
+        fail("audited_recovery_identity_not_allowlisted")
+    return entry
+
+
+def audited_recovery_current_source(context, observations, revision):
+    validate_audited_source_observations(context, observations)
+    if (
+        not isinstance(revision, dict)
+        or set(revision)
+        != {"repository_root", "commit_sha", "tree_sha", "git_path", "git_sha256"}
+        or revision.get("repository_root") != str(AUDITED_RECOVERY_REPOSITORY_ROOT)
+        or revision.get("git_path") != str(AUDITED_RECOVERY_GIT_PATH)
+        or COMMIT_PATTERN.fullmatch(revision.get("commit_sha", "")) is None
+        or COMMIT_PATTERN.fullmatch(revision.get("tree_sha", "")) is None
+        or not valid_d2a_digest(revision.get("git_sha256"))
+    ):
+        fail("audited_recovery_source_invalid")
+    if revision["commit_sha"] == context.manifest["commit_sha"] or not any(
+        not observations[name]["matches_historical"]
+        for name in ("d2_toolchain", "certification_transport")
+    ):
+        fail("audited_recovery_source_not_changed")
+    return {**revision, "source_trees": observations}
+
+
+def audited_recovery_intent(
+    context,
+    bootstrap_state_path,
+    bootstrap_state,
+    bootstrap_state_sha256,
+    source_record,
+    allowlist,
+    created_at,
+):
+    return {
+        "schema_version": 1,
+        "kind": AUDITED_PREISSUER_ROLLBACK_INTENT_KIND,
+        "run_id": context.manifest["run_id"],
+        "manifest_sha256": context.digest,
+        "bootstrap_id": bootstrap_state["bootstrap_id"],
+        "bootstrap_state_path": str(bootstrap_state_path),
+        "bootstrap_state_sha256": bootstrap_state_sha256,
+        "historical_manifest_commit_sha": context.manifest["commit_sha"],
+        "historical_source_trees": {
+            name: context.manifest["source_trees"][name]["sha256"]
+            for name in sorted(context.manifest["source_trees"])
+        },
+        "current_source": source_record,
+        "orchestrator_state_sha256": allowlist["orchestrator_state_sha256"],
+        "baseline_journal_sha256": allowlist["journal_sha256"],
+        "baseline_journal_rows": allowlist["journal_rows"],
+        "taint_sha256": allowlist["taint_sha256"],
+        "lifecycle_sha256": allowlist["lifecycle_sha256"],
+        "created_at": created_at,
+    }
+
+
+def load_or_create_audited_recovery_intent(context, expected):
+    path = audited_preissuer_rollback_intent_path(context)
+    if os.path.lexists(path):
+        observed = load_strict_d2a_marker(
+            path,
+            "audited_recovery_intent_invalid",
+            AUDITED_PREISSUER_ROLLBACK_INTENT_FIELDS,
+            sorted_canonical=True,
+        )
+        if not validate_utc_timestamp(observed.get("created_at")):
+            fail("audited_recovery_intent_invalid")
+        replay_expected = {**expected, "created_at": observed["created_at"]}
+        if observed != replay_expected:
+            fail("audited_recovery_intent_invalid")
+        return path, observed
+    try:
+        write_new_file(path, canonical_json(expected) + "\n")
+        fsync_directory(context.artifact_directory, "audited_recovery_intent_parent")
+    except (OSError, CertificationError):
+        fail("audited_recovery_intent_write_failed")
+    observed = load_strict_d2a_marker(
+        path,
+        "audited_recovery_intent_invalid",
+        AUDITED_PREISSUER_ROLLBACK_INTENT_FIELDS,
+        sorted_canonical=True,
+    )
+    if observed != expected:
+        fail("audited_recovery_intent_invalid")
+    return path, observed
+
+
+def audited_recovery_evidence(
+    context, intent_sha256, fence_sha256, cleanup_evidence_sha256, observed_at
+):
+    return {
+        "schema_version": 1,
+        "kind": AUDITED_PREISSUER_ROLLBACK_EVIDENCE_KIND,
+        "run_id": context.manifest["run_id"],
+        "manifest_sha256": context.digest,
+        "intent_sha256": intent_sha256,
+        "observed_at": observed_at,
+        "database_absent": True,
+        "postgres_process_absent": True,
+        "launchd_jobs_absent": True,
+        "keychain_items_absent": True,
+        "isolated_root_absent": True,
+        "protected_staging_unchanged": True,
+        "teardown_fence_sha256": fence_sha256,
+        "cleanup_evidence_sha256": cleanup_evidence_sha256,
+    }
+
+
+def validate_audited_recovery_evidence(context, evidence, expected):
+    if (
+        not isinstance(evidence, dict)
+        or tuple(sorted(evidence)) != AUDITED_PREISSUER_ROLLBACK_EVIDENCE_FIELDS
+        or type(evidence.get("schema_version")) is not int
+        or evidence.get("schema_version") != 1
+        or evidence.get("kind") != AUDITED_PREISSUER_ROLLBACK_EVIDENCE_KIND
+        or not validate_utc_timestamp(evidence.get("observed_at"))
+        or evidence != {**expected, "observed_at": evidence["observed_at"]}
+    ):
+        fail("audited_recovery_evidence_invalid")
+    return evidence
+
+
+def command_recover_audited_preissuer_rollback(
+    context,
+    platform,
+    initial_observations,
+    bootstrap_state_path,
+    confirmed_current_commit,
+    confirmed_current_tree,
+    confirmed_run_id,
+    confirmed_manifest_sha256,
+):
+    if (
+        COMMIT_PATTERN.fullmatch(confirmed_current_commit or "") is None
+        or COMMIT_PATTERN.fullmatch(confirmed_current_tree or "") is None
+        or confirmed_run_id != context.manifest["run_id"]
+        or confirmed_manifest_sha256 != context.digest
+    ):
+        fail("audited_recovery_confirmation_mismatch")
+    require_audited_manifest_unchanged(context)
+    observations = validate_audited_source_observations(
+        context, initial_observations
+    )
+    revision = current_clean_recovery_source()
+    if (
+        revision["commit_sha"] != confirmed_current_commit
+        or revision["tree_sha"] != confirmed_current_tree
+    ):
+        fail("audited_recovery_confirmation_mismatch")
+    source_record = audited_recovery_current_source(
+        context, observations, revision
+    )
+    bootstrap_path, bootstrap_state, bootstrap_sha256 = audited_bootstrap_state(
+        context, bootstrap_state_path
+    )
+    state, state_sha256 = audited_orchestrator_state(context)
+    rows, journal_raw = read_strict_journal_snapshot(context)
+    taint_raw = audited_private_file_bytes(
+        d2a_taint_path(context),
+        {0o600},
+        D2A_MARKER_MAXIMUM_BYTES,
+        "audited_recovery_taint_invalid",
+    )
+    lifecycle_raw = audited_private_file_bytes(
+        d2a_session_lifecycle_path(context),
+        {0o600},
+        D2A_MARKER_MAXIMUM_BYTES,
+        "audited_recovery_lifecycle_invalid",
+    )
+    taint_sha256 = hashlib.sha256(taint_raw).hexdigest()
+    lifecycle_sha256 = hashlib.sha256(lifecycle_raw).hexdigest()
+    intent_path = audited_preissuer_rollback_intent_path(context)
+    evidence_path = audited_preissuer_rollback_evidence_path(context)
+    intent_exists = os.path.lexists(intent_path)
+    allowlist = AUDITED_PREISSUER_ROLLBACK_ALLOWLIST.get(
+        (context.manifest["run_id"], context.digest)
+    )
+    if allowlist is None:
+        fail("audited_recovery_identity_not_allowlisted")
+    if intent_exists:
+        audited_recovery_journal(
+            context, allowlist["journal_rows"], allowlist["journal_sha256"]
+        )
+        if state["phase"] == "stopped" and state_sha256 != allowlist["orchestrator_state_sha256"]:
+            fail("audited_recovery_orchestrator_state_invalid")
+        if (
+            bootstrap_sha256 != allowlist["bootstrap_state_sha256"]
+            or taint_sha256 != allowlist["taint_sha256"]
+            or lifecycle_sha256 != allowlist["lifecycle_sha256"]
+        ):
+            fail("audited_recovery_replay_drift")
+    else:
+        if state["phase"] != "stopped":
+            fail("audited_recovery_boundary_invalid")
+        allowlist = validate_audited_recovery_allowlist(
+            context,
+            bootstrap_state,
+            bootstrap_sha256,
+            state_sha256,
+            observations,
+            journal_raw,
+            taint_sha256,
+            lifecycle_sha256,
+        )
+        if os.path.lexists(d2a_teardown_fence_path(context)) or os.path.lexists(evidence_path):
+            fail("audited_recovery_boundary_invalid")
+    rows, _journal_raw = audited_recovery_journal(
+        context, allowlist["journal_rows"], allowlist["journal_sha256"]
+    )
+    if not intent_exists and len(rows) != allowlist["journal_rows"]:
+        fail("audited_recovery_journal_invalid")
+    lifecycle = require_d2a_session_revoked(context)
+    require_audited_preissuer_artifact_boundary(context, intent_exists)
+    require_audited_recovery_inert_boundary(context, platform, state, lifecycle)
+    if os.path.lexists(d2a_teardown_fence_path(context)):
+        fence = validate_d2a_teardown_fence(
+            context,
+            load_strict_d2a_marker(
+                d2a_teardown_fence_path(context),
+                "audited_recovery_fence_invalid",
+                D2A_TEARDOWN_FENCE_FIELDS,
+                sorted_canonical=True,
+            ),
+        )
+        if not intent_exists or fence["status"] != "closed":
+            fail("audited_recovery_fence_invalid")
+    # Re-read every mutable source input immediately before the first durable
+    # recovery mutation.  The working tree must still be the exact confirmed
+    # clean commit/tree, and candidate/source observations must be unchanged.
+    second_revision = current_clean_recovery_source()
+    second_observations = validate_audited_source_observations(
+        context, observe_audited_recovery_source_trees(context.manifest)
+    )
+    if second_revision != revision or second_observations != observations:
+        fail("audited_recovery_source_changed")
+    require_audited_manifest_unchanged(context)
+    expected_intent = audited_recovery_intent(
+        context,
+        bootstrap_path,
+        bootstrap_state,
+        bootstrap_sha256,
+        source_record,
+        allowlist,
+        utc_now(),
+    )
+    intent_path, intent = load_or_create_audited_recovery_intent(
+        context, expected_intent
+    )
+    intent_raw = audited_private_file_bytes(
+        intent_path,
+        {0o600},
+        D2A_MARKER_MAXIMUM_BYTES,
+        "audited_recovery_intent_invalid",
+    )
+    intent_sha256 = hashlib.sha256(intent_raw).hexdigest()
+    if os.path.lexists(evidence_path):
+        if state["phase"] != "cleaned" or not os.path.lexists(
+            d2a_teardown_fence_path(context)
+        ):
+            fail("audited_recovery_evidence_invalid")
+        cleanup_evidence_path = context.artifact_directory / "cleanup-evidence.json"
+        validate_cleanup_evidence(
+            context,
+            load_json(cleanup_evidence_path, "cleanup_evidence_invalid"),
+        )
+        absence = cleanup_absence(
+            context, platform, state["standing_snapshot"]
+        )
+        if not all(absence.values()):
+            fail("audited_recovery_incomplete")
+        fence_raw = audited_private_file_bytes(
+            d2a_teardown_fence_path(context),
+            {0o600},
+            D2A_MARKER_MAXIMUM_BYTES,
+            "audited_recovery_fence_invalid",
+        )
+        cleanup_evidence_raw = audited_private_file_bytes(
+            cleanup_evidence_path,
+            {0o600},
+            D2A_MARKER_MAXIMUM_BYTES,
+            "audited_recovery_evidence_invalid",
+        )
+        expected_evidence = audited_recovery_evidence(
+            context,
+            intent_sha256,
+            hashlib.sha256(fence_raw).hexdigest(),
+            hashlib.sha256(cleanup_evidence_raw).hexdigest(),
+            utc_now(),
+        )
+        evidence = load_strict_d2a_marker(
+            evidence_path,
+            "audited_recovery_evidence_invalid",
+            AUDITED_PREISSUER_ROLLBACK_EVIDENCE_FIELDS,
+            sorted_canonical=True,
+        )
+        validate_audited_recovery_evidence(context, evidence, expected_evidence)
+        final_revision = current_clean_recovery_source()
+        final_observations = validate_audited_source_observations(
+            context, observe_audited_recovery_source_trees(context.manifest)
+        )
+        if final_revision != revision or final_observations != observations:
+            fail("audited_recovery_source_changed")
+        require_audited_manifest_unchanged(context)
+        return {
+            "status": "exact_replay",
+            "phase": "cleaned",
+            "run_id": context.manifest["run_id"],
+            "manifest_sha256": context.digest,
+            "intent": str(intent_path),
+            "evidence": str(evidence_path),
+            **absence,
+            "source_drift_observed": True,
+            "cleanup_status": "already_cleaned",
+        }
+    if not os.path.lexists(d2a_teardown_fence_path(context)):
+        # The intent is the first durable recovery mutation.  Re-prove the
+        # current clean source and historical immutable observations after it,
+        # then use the audited-only stopped-rollback fence gate.  General
+        # cleanup never accepts a stopped bootstrap sentinel.
+        third_revision = current_clean_recovery_source()
+        third_observations = validate_audited_source_observations(
+            context, observe_audited_recovery_source_trees(context.manifest)
+        )
+        if third_revision != revision or third_observations != observations:
+            fail("audited_recovery_source_changed")
+        require_audited_manifest_unchanged(context)
+        close_audited_preissuer_rollback_teardown_fence(
+            context, platform, intent, allowlist
+        )
+    require_d2a_cleanup_fence(context, platform)
+    cleanup_result = command_cleanup_internal(
+        context, platform, retire_committed=False
+    )
+    validate_cleanup_evidence(
+        context,
+        load_json(
+            context.artifact_directory / "cleanup-evidence.json",
+            "cleanup_evidence_invalid",
+        ),
+    )
+    final_state = load_state(context, {"cleaned"})
+    absence = cleanup_absence(context, platform, final_state["standing_snapshot"])
+    if not all(absence.values()):
+        fail("audited_recovery_incomplete")
+    final_revision = current_clean_recovery_source()
+    final_observations = validate_audited_source_observations(
+        context, observe_audited_recovery_source_trees(context.manifest)
+    )
+    if final_revision != revision or final_observations != observations:
+        fail("audited_recovery_source_changed")
+    require_audited_manifest_unchanged(context)
+    fence_raw = audited_private_file_bytes(
+        d2a_teardown_fence_path(context),
+        {0o600},
+        D2A_MARKER_MAXIMUM_BYTES,
+        "audited_recovery_fence_invalid",
+    )
+    cleanup_evidence_raw = audited_private_file_bytes(
+        context.artifact_directory / "cleanup-evidence.json",
+        {0o600},
+        D2A_MARKER_MAXIMUM_BYTES,
+        "audited_recovery_evidence_invalid",
+    )
+    expected_evidence = audited_recovery_evidence(
+        context,
+        intent_sha256,
+        hashlib.sha256(fence_raw).hexdigest(),
+        hashlib.sha256(cleanup_evidence_raw).hexdigest(),
+        utc_now(),
+    )
+    write_atomic(evidence_path, canonical_json(expected_evidence) + "\n")
+    evidence = load_strict_d2a_marker(
+        evidence_path,
+        "audited_recovery_evidence_invalid",
+        AUDITED_PREISSUER_ROLLBACK_EVIDENCE_FIELDS,
+        sorted_canonical=True,
+    )
+    if evidence != expected_evidence:
+        fail("audited_recovery_evidence_invalid")
+    return {
+        "status": "recovered",
+        "phase": "cleaned",
+        "run_id": context.manifest["run_id"],
+        "manifest_sha256": context.digest,
+        "intent": str(intent_path),
+        "evidence": str(evidence_path),
+        **absence,
+        "source_drift_observed": True,
+        "cleanup_status": cleanup_result["status"],
+    }
+
+
 def command_status(context, platform):
     state = load_state(context)
     return {
@@ -4971,12 +6086,22 @@ def build_parser():
     legacy_recovery.add_argument("--manifest", required=True)
     legacy_recovery.add_argument("--confirm-run-id", required=True)
     legacy_recovery.add_argument("--confirm-manifest-sha256", required=True)
+    audited_recovery = subparsers.add_parser(
+        "recover-audited-preissuer-rollback"
+    )
+    audited_recovery.add_argument("--manifest", required=True)
+    audited_recovery.add_argument("--bootstrap-state", required=True)
+    audited_recovery.add_argument("--confirm-current-commit", required=True)
+    audited_recovery.add_argument("--confirm-current-tree", required=True)
+    audited_recovery.add_argument("--confirm-run-id", required=True)
+    audited_recovery.add_argument("--confirm-manifest-sha256", required=True)
     return parser
 
 
 def main():
     arguments = build_parser().parse_args()
     try:
+        audited_source_observations = None
         if arguments.command in {
             "legacy-substrate-status",
             "recover-legacy-substrate",
@@ -4984,6 +6109,11 @@ def main():
             context, legacy_state = load_legacy_context(
                 require_absolute_path(arguments.manifest, "manifest")
             )
+        elif arguments.command == "recover-audited-preissuer-rollback":
+            context, audited_source_observations = load_audited_recovery_context(
+                require_absolute_path(arguments.manifest, "manifest")
+            )
+            legacy_state = None
         else:
             context = load_context(
                 require_absolute_path(arguments.manifest, "manifest")
@@ -5005,6 +6135,7 @@ def main():
             if arguments.command not in {
                 "legacy-substrate-status",
                 "recover-legacy-substrate",
+                "recover-audited-preissuer-rollback",
                 "finalize-run",
                 "finalize-total-absence",
                 "stop",
@@ -5015,6 +6146,7 @@ def main():
             if arguments.command not in {
                 "legacy-substrate-status",
                 "recover-legacy-substrate",
+                "recover-audited-preissuer-rollback",
                 "teardown-discord-resources",
                 "stop",
                 "cleanup",
@@ -5030,6 +6162,17 @@ def main():
                     context,
                     legacy_state,
                     platform,
+                    arguments.confirm_run_id,
+                    arguments.confirm_manifest_sha256,
+                )
+            elif arguments.command == "recover-audited-preissuer-rollback":
+                result = command_recover_audited_preissuer_rollback(
+                    context,
+                    platform,
+                    audited_source_observations,
+                    arguments.bootstrap_state,
+                    arguments.confirm_current_commit,
+                    arguments.confirm_current_tree,
                     arguments.confirm_run_id,
                     arguments.confirm_manifest_sha256,
                 )

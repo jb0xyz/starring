@@ -322,6 +322,21 @@ RESULT_FIELDS = {
     "total_local_absence",
     "protected_staging_unchanged",
 }
+DIRECT_ONBOARD_ISSUER_ERROR_CODES = frozenset({
+    "api_loopback_origin_invalid",
+    "api_loopback_connect_failed",
+    "api_loopback_write_failed",
+    "api_loopback_read_failed",
+    "api_loopback_response_empty",
+    "api_loopback_status_invalid",
+    "session_lifecycle_binary_invalid",
+    "session_lifecycle_source_invalid",
+    "session_lifecycle_boot_identity_invalid",
+    "session_lifecycle_existing_marker_invalid",
+    "session_lifecycle_handoff_invalid",
+    "session_lifecycle_reentry_invalid",
+    "session_lifecycle_cas_failed",
+})
 PHASES = {
     "building_issuer",
     "initialized",
@@ -3013,6 +3028,16 @@ def parse_child_json(completed, label):
     if getattr(completed, "process_group_quiescent", True) is not True:
         fail(f"{label}_process_group_active")
     if type(returncode) is not int or returncode != 0:
+        if label == "direct_onboard" and returncode == 1 and not stdout:
+            try:
+                diagnostic = stderr.decode("ascii")
+            except UnicodeDecodeError:
+                diagnostic = ""
+            prefix = "error: "
+            if diagnostic.startswith(prefix) and diagnostic.endswith("\n"):
+                code = diagnostic[len(prefix):-1]
+                if "\n" not in code and code in DIRECT_ONBOARD_ISSUER_ERROR_CODES:
+                    fail(code)
         fail(f"{label}_failed")
     if not stdout or len(stdout) > MAX_OUTPUT_BYTES or stderr:
         fail(f"{label}_output_invalid")

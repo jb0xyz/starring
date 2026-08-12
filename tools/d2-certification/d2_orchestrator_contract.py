@@ -15,6 +15,7 @@ from d2_certification import (
     D2_PUBLIC_ORIGIN,
     fsync_directory,
     isolated_runtime_root,
+    load_audited_recovery_manifest,
     load_verified_manifest,
     sha256_file,
     validate_utc_timestamp,
@@ -583,6 +584,84 @@ def read_repaired_journal(context):
         os.close(lock_descriptor)
 
 
+def read_strict_journal_snapshot(context):
+    """Read the journal without repairing or otherwise mutating it."""
+    if not os.path.lexists(context.journal_path):
+        return [], b""
+    lock_flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_descriptor = os.open(context.lock_path, lock_flags)
+    except OSError:
+        fail("journal_invalid")
+    try:
+        lock_metadata = os.fstat(lock_descriptor)
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_uid != os.getuid()
+            or lock_metadata.st_nlink != 1
+            or stat.S_IMODE(lock_metadata.st_mode) != 0o600
+        ):
+            fail("journal_invalid")
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        try:
+            descriptor = os.open(
+                context.journal_path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError:
+            fail("journal_invalid")
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_size > 8 * 1024 * 1024
+            ):
+                fail("journal_invalid")
+            raw = bytearray()
+            while len(raw) <= 8 * 1024 * 1024:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            after = os.fstat(descriptor)
+            try:
+                named = os.stat(context.journal_path, follow_symlinks=False)
+            except OSError:
+                fail("journal_invalid")
+            if (
+                len(raw) > 8 * 1024 * 1024
+                or len(raw) != before.st_size
+                or journal_file_identity(before) != journal_file_identity(after)
+                or journal_file_identity(after) != journal_file_identity(named)
+                or (raw and not raw.endswith(b"\n"))
+            ):
+                fail("journal_invalid")
+            rows = parse_journal_rows(context, bytes(raw))
+            canonical = b"".join(
+                (
+                    json.dumps(
+                        row,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                for row in rows
+            )
+            if canonical != bytes(raw):
+                fail("journal_invalid")
+            return rows, bytes(raw)
+        finally:
+            os.close(descriptor)
+    finally:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
+
+
 @contextlib.contextmanager
 def global_operation_lock():
     descriptor = os.open(
@@ -628,8 +707,7 @@ class RunContext:
         self.postgres_log = self.log_directory / "postgres.log"
 
 
-def load_context(raw_manifest):
-    manifest_path, manifest, digest = load_verified_manifest(raw_manifest)
+def context_from_verified_manifest(manifest_path, manifest, digest):
     run_id = manifest["run_id"]
     expected_root = isolated_runtime_root(run_id)
     database = manifest.get("database")
@@ -733,6 +811,20 @@ def load_context(raw_manifest):
         ):
             fail("artifact_directory_invalid")
     return context
+
+
+def load_context(raw_manifest):
+    return context_from_verified_manifest(*load_verified_manifest(raw_manifest))
+
+
+def load_audited_recovery_context(raw_manifest):
+    manifest_path, manifest, digest, observations = load_audited_recovery_manifest(
+        raw_manifest
+    )
+    return (
+        context_from_verified_manifest(manifest_path, manifest, digest),
+        observations,
+    )
 
 
 def keychain_inventory(context):

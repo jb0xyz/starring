@@ -135,6 +135,14 @@ digest, or CSRF value is written to the lifecycle file. Core dumps are disabled
 before credentials enter memory and that limit is inherited by the Node
 process.
 
+Issuer failures remain secret-free and machine diagnosable. The fixed error
+line distinguishes API loopback origin, connect, write, read, empty-response,
+and non-ready-status failures, and lifecycle binary, source, boot-identity,
+existing-marker, handoff, reentry, and CAS failures. The bootstrap retains one
+of those codes only when the failed direct-onboard child writes exactly one
+allowlisted `error: <code>` line. Unknown, malformed, multiline, or successful
+stderr is rejected without being copied into state or results.
+
 Run the runner unit tests with:
 
 ```sh

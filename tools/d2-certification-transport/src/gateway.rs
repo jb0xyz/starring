@@ -28,6 +28,11 @@ enum GatewayConnectionTerminal {
     Shutdown,
 }
 
+enum GatewayConnectionError {
+    Setup,
+    Relay,
+}
+
 #[derive(Debug, Error)]
 pub enum GatewayError {
     #[error("gateway_bind_failed")]
@@ -59,7 +64,7 @@ pub async fn serve(
                 }
             }
             joined = connections.join_next(), if !connections.is_empty() => {
-                if gateway_task_failed(joined) {
+                if gateway_task_panicked(joined) {
                     return Err(GatewayError::Connection);
                 }
             }
@@ -87,15 +92,15 @@ pub async fn serve(
                     {
                         Ok(GatewayConnectionTerminal::CleanClose) => {
                             connection.complete_clean_close();
-                            Ok(())
                         }
                         Ok(GatewayConnectionTerminal::Partitioned | GatewayConnectionTerminal::Shutdown) => {
                             connection.complete();
-                            Ok(())
                         }
-                        Err(()) => {
+                        Err(GatewayConnectionError::Setup) => {
+                            connection.complete();
+                        }
+                        Err(GatewayConnectionError::Relay) => {
                             connection.fail();
-                            Err(())
                         }
                     }
                 });
@@ -105,7 +110,7 @@ pub async fn serve(
     let drained = tokio::time::timeout(GATEWAY_CONNECTION_DRAIN_TIMEOUT, async {
         let mut failed = false;
         while let Some(joined) = connections.join_next().await {
-            failed |= gateway_task_failed(Some(joined));
+            failed |= gateway_task_panicked(Some(joined));
         }
         failed
     })
@@ -121,8 +126,8 @@ pub async fn serve(
     }
 }
 
-fn gateway_task_failed(joined: Option<Result<Result<(), ()>, tokio::task::JoinError>>) -> bool {
-    !matches!(joined, Some(Ok(Ok(()))))
+fn gateway_task_panicked(joined: Option<Result<(), tokio::task::JoinError>>) -> bool {
+    !matches!(joined, Some(Ok(())))
 }
 
 async fn proxy_connection(
@@ -130,16 +135,16 @@ async fn proxy_connection(
     config: Config,
     state: Arc<SharedState>,
     mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<GatewayConnectionTerminal, ()> {
+) -> Result<GatewayConnectionTerminal, GatewayConnectionError> {
     let downstream = tokio::time::timeout(
         GATEWAY_HANDSHAKE_TIMEOUT,
         tokio_tungstenite::accept_async_with_config(stream, Some(websocket_config())),
     )
     .await
-    .map_err(|_| ())?
-    .map_err(|_| ())?;
+    .map_err(|_| GatewayConnectionError::Setup)?
+    .map_err(|_| GatewayConnectionError::Setup)?;
     if state.is_partitioned() {
-        return Err(());
+        return Ok(GatewayConnectionTerminal::Partitioned);
     }
     let (upstream, _) = tokio::time::timeout(
         GATEWAY_CONNECT_TIMEOUT,
@@ -150,8 +155,8 @@ async fn proxy_connection(
         ),
     )
     .await
-    .map_err(|_| ())?
-    .map_err(|_| ())?;
+    .map_err(|_| GatewayConnectionError::Setup)?
+    .map_err(|_| GatewayConnectionError::Setup)?;
     let mut partition_rx = state.subscribe_partition();
     let (mut downstream_write, mut downstream_read) = downstream.split();
     let (mut upstream_write, mut upstream_read) = upstream.split();
@@ -171,7 +176,7 @@ async fn proxy_connection(
                         ),
                     );
                     if !matches!(downstream, Ok(Ok(()))) || !matches!(upstream, Ok(Ok(()))) {
-                        return Err(());
+                        return Err(GatewayConnectionError::Relay);
                     }
                     return Ok(GatewayConnectionTerminal::Shutdown);
                 }
@@ -188,15 +193,15 @@ async fn proxy_connection(
                     ),
                 );
                 if !matches!(downstream, Ok(Ok(()))) || !matches!(upstream, Ok(Ok(()))) {
-                    return Err(());
+                    return Err(GatewayConnectionError::Relay);
                 }
                 return Ok(GatewayConnectionTerminal::Partitioned);
             }
             message = downstream_read.next() => {
                 let Some(message) = message else {
-                    return Err(());
+                    return Err(GatewayConnectionError::Relay);
                 };
-                let message = message.map_err(|_| ())?;
+                let message = message.map_err(|_| GatewayConnectionError::Relay)?;
                 let terminal = message.is_close();
                 if terminal {
                     tokio::time::timeout(
@@ -204,25 +209,25 @@ async fn proxy_connection(
                         downstream_write.flush(),
                     )
                     .await
-                    .map_err(|_| ())?
-                    .map_err(|_| ())?;
+                    .map_err(|_| GatewayConnectionError::Relay)?
+                    .map_err(|_| GatewayConnectionError::Relay)?;
                 }
                 tokio::time::timeout(
                     GATEWAY_RELAY_WRITE_TIMEOUT,
                     upstream_write.send(message),
                 )
                 .await
-                .map_err(|_| ())?
-                .map_err(|_| ())?;
+                .map_err(|_| GatewayConnectionError::Relay)?
+                .map_err(|_| GatewayConnectionError::Relay)?;
                 if terminal {
                     return Ok(GatewayConnectionTerminal::CleanClose);
                 }
             }
             message = upstream_read.next() => {
                 let Some(message) = message else {
-                    return Err(());
+                    return Err(GatewayConnectionError::Relay);
                 };
-                let message = message.map_err(|_| ())?;
+                let message = message.map_err(|_| GatewayConnectionError::Relay)?;
                 let terminal = message.is_close();
                 if terminal {
                     tokio::time::timeout(
@@ -230,29 +235,35 @@ async fn proxy_connection(
                         upstream_write.flush(),
                     )
                     .await
-                    .map_err(|_| ())?
-                    .map_err(|_| ())?;
+                    .map_err(|_| GatewayConnectionError::Relay)?
+                    .map_err(|_| GatewayConnectionError::Relay)?;
                 }
                 let (message, duplicate) = transform_upstream_message(message, &config, &state);
                 if let Some(claim) = duplicate {
                     let delivered = tokio::time::timeout(GATEWAY_RELAY_WRITE_TIMEOUT, async {
-                        downstream_write.send(message.clone()).await.map_err(|_| ())?;
+                        downstream_write
+                            .send(message.clone())
+                            .await
+                            .map_err(|_| GatewayConnectionError::Relay)?;
                         if !state.record_duplicate_delivery(&claim) {
-                            return Err(());
+                            return Err(GatewayConnectionError::Relay);
                         }
-                        downstream_write.send(message).await.map_err(|_| ())?;
+                        downstream_write
+                            .send(message)
+                            .await
+                            .map_err(|_| GatewayConnectionError::Relay)?;
                         if !state.record_duplicate_delivery(&claim) {
-                            return Err(());
+                            return Err(GatewayConnectionError::Relay);
                         }
-                        Ok::<(), ()>(())
+                        Ok::<(), GatewayConnectionError>(())
                     })
                     .await;
                     if !matches!(delivered, Ok(Ok(()))) {
                         let _ = state.abort_duplicate(claim);
-                        return Err(());
+                        return Err(GatewayConnectionError::Relay);
                     }
                     if !state.finish_duplicate(claim) {
-                        return Err(());
+                        return Err(GatewayConnectionError::Relay);
                     }
                 } else {
                     tokio::time::timeout(
@@ -260,15 +271,15 @@ async fn proxy_connection(
                         downstream_write.send(message),
                     )
                     .await
-                    .map_err(|_| ())?
-                    .map_err(|_| ())?;
+                    .map_err(|_| GatewayConnectionError::Relay)?
+                    .map_err(|_| GatewayConnectionError::Relay)?;
                 }
                 if terminal {
                     return Ok(GatewayConnectionTerminal::CleanClose);
                 }
             }
             _ = tokio::time::sleep(GATEWAY_RELAY_IDLE_TIMEOUT) => {
-                return Err(());
+                return Err(GatewayConnectionError::Relay);
             }
         }
     }
@@ -642,21 +653,68 @@ mod tests {
         let server =
             tokio::spawn(async move { serve(server_config, server_state, shutdown_rx).await });
         wait_for_gateway_listener(&state).await;
-        let (downstream, _) = tokio_tungstenite::connect_async(config.gateway_proxy_url())
+        let (mut downstream, _) = tokio_tungstenite::connect_async(config.gateway_proxy_url())
             .await
             .unwrap();
-        drop(downstream);
         upstream.await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), downstream.next())
+            .await
+            .unwrap();
         wait_for_gateway_completion(&state, 1).await;
         let snapshot = serde_json::to_value(state.snapshot()).unwrap();
         assert_eq!(snapshot["ready"], false);
         assert_eq!(snapshot["gateway"]["relay_failures"], 1);
         assert_eq!(snapshot["gateway"]["clean_close_relays"], 0);
-        drop(shutdown_tx);
-        assert!(matches!(
-            server.await.unwrap(),
-            Err(GatewayError::Connection)
-        ));
+        assert!(!server.is_finished());
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_setup_failures_are_retryable_without_removing_readiness() {
+        let root = TempDir::new().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let unavailable_upstream = reserve_address().await;
+        let gateway_address = reserve_address().await;
+        let http_address = reserve_address().await;
+        let config = Config::for_test(
+            root.path().to_path_buf(),
+            "7",
+            "5",
+            "8",
+            "6",
+            gateway_address,
+            http_address,
+            format!("ws://{unavailable_upstream}"),
+            format!("http://{http_address}"),
+        );
+        let state = Arc::new(SharedState::new(&config).unwrap());
+        state.mark_effect_http_listener_ready();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_config = config.clone();
+        let server_state = Arc::clone(&state);
+        let server =
+            tokio::spawn(async move { serve(server_config, server_state, shutdown_rx).await });
+        wait_for_gateway_listener(&state).await;
+
+        for completed in 1..=2 {
+            let (mut downstream, _) = tokio_tungstenite::connect_async(config.gateway_proxy_url())
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(1), downstream.next())
+                .await
+                .unwrap();
+            wait_for_gateway_completion(&state, completed).await;
+            assert!(!server.is_finished());
+        }
+
+        let snapshot = serde_json::to_value(state.snapshot()).unwrap();
+        assert_eq!(snapshot["ready"], true);
+        assert_eq!(snapshot["gateway"]["completed_connections"], 2);
+        assert_eq!(snapshot["gateway"]["relay_failures"], 0);
+        assert_eq!(snapshot["gateway"]["connection_aborts"], 0);
+        shutdown_tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
