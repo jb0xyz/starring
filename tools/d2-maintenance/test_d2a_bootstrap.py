@@ -1196,41 +1196,36 @@ class D2ABootstrapTests(unittest.TestCase):
             BOOTSTRAP.canonical_json(intent["current_source"]).encode("utf-8")
         ).hexdigest()
 
-        to_source = copy.deepcopy(intent["current_source"])
-        to_source["commit_sha"] = "c" * 40
-        to_source["tree_sha"] = "d" * 40
-        audit_configuration = {
-            "login_keychain_path": (
-                BOOTSTRAP.AUDITED_QUARANTINED_LOGIN_KEYCHAIN_PATH
-            ),
-            "login_keychain_policy_kind": (
-                BOOTSTRAP.AUDITED_QUARANTINED_LOGIN_KEYCHAIN_POLICY_KIND
-            ),
-            "login_keychain_policy_sha256": (
-                BOOTSTRAP.AUDITED_QUARANTINED_LOGIN_KEYCHAIN_POLICY_SHA256
-            ),
-            "login_keychain_policy_verified": True,
+        transition_v1_to_source = copy.deepcopy(intent["current_source"])
+        transition_v1_to_source["commit_sha"] = "1" * 40
+        transition_v1_to_source["tree_sha"] = "2" * 40
+        transition_v1_audit_configuration = (
+            BOOTSTRAP.audited_recovery_transition_audit_configuration()
+        )
+        transition_v1_to_file_sha256 = {
+            path: hashlib.sha256(("v1:" + path).encode()).hexdigest()
+            for path in BOOTSTRAP.AUDITED_QUARANTINED_CHANGED_PATHS
         }
-        transition_base = {
+        transition_v1_base = {
             "schema_version": 1,
-            "kind": BOOTSTRAP.AUDITED_QUARANTINED_SOURCE_INTERLOCK_KIND,
+            "kind": BOOTSTRAP.AUDITED_QUARANTINED_SOURCE_INTERLOCK_V1_KIND,
             "run_id": state["run_id"],
             "manifest_sha256": state["manifest_sha256"],
             "intent_sha256": intent_sha,
             "from_source": intent["current_source"],
-            "to_source": to_source,
+            "to_source": transition_v1_to_source,
             "parent_commit_sha": "a" * 40,
             "parent_count": 1,
             "changed_paths": BOOTSTRAP.AUDITED_QUARANTINED_CHANGED_PATHS,
             "file_sha256": {
                 path: {
                     "from_sha256": BOOTSTRAP.AUDITED_QUARANTINED_CHANGED_PATH_FROM_SHA256[path],
-                    "to_sha256": hashlib.sha256(path.encode()).hexdigest(),
+                    "to_sha256": transition_v1_to_file_sha256[path],
                 }
                 for path in BOOTSTRAP.AUDITED_QUARANTINED_CHANGED_PATHS
             },
-            "reason_codes": BOOTSTRAP.AUDITED_QUARANTINED_REASON_CODES,
-            "audit_configuration": audit_configuration,
+            "reason_codes": BOOTSTRAP.AUDITED_QUARANTINED_REASON_CODES_V1,
+            "audit_configuration": transition_v1_audit_configuration,
             "bootstrap_state_semantic_sha256": incident[
                 "bootstrap_state_semantic_sha256"
             ],
@@ -1256,6 +1251,63 @@ class D2ABootstrapTests(unittest.TestCase):
             "reconciliation_marker_absent": True,
             "recovery_evidence_absent": True,
             "created_at": "2026-08-12T09:00:00Z",
+        }
+        transition_v1_interlock_path = (
+            BOOTSTRAP.audited_recovery_source_interlock_v1_path(state)
+        )
+        write_file(transition_v1_interlock_path, transition_v1_base, 0o600)
+        transition_v1_interlock_sha = hashlib.sha256(
+            transition_v1_interlock_path.read_bytes()
+        ).hexdigest()
+        transition_v1 = {
+            **transition_v1_base,
+            "kind": BOOTSTRAP.AUDITED_QUARANTINED_SOURCE_TRANSITION_V1_KIND,
+            "interlock_sha256": transition_v1_interlock_sha,
+        }
+        transition_v1_path = BOOTSTRAP.audited_recovery_source_transition_v1_path(
+            state
+        )
+        write_file(transition_v1_path, transition_v1, 0o600)
+        transition_v1_sha = hashlib.sha256(
+            transition_v1_path.read_bytes()
+        ).hexdigest()
+        incident.update({
+            "source_transition_v1_interlock_sha256": (
+                transition_v1_interlock_sha
+            ),
+            "source_transition_v1_sha256": transition_v1_sha,
+            "source_transition_v1_commit_sha": "1" * 40,
+            "source_transition_v1_tree_sha": "2" * 40,
+            "source_transition_v1_to_file_sha256": (
+                transition_v1_to_file_sha256
+            ),
+        })
+
+        to_source = copy.deepcopy(transition_v1_to_source)
+        to_source["commit_sha"] = "c" * 40
+        to_source["tree_sha"] = "d" * 40
+        audit_configuration = (
+            BOOTSTRAP.audited_recovery_transition_audit_configuration(
+                incident["source_transition_v2_static_sql_sha256"]
+            )
+        )
+        transition_base = {
+            **transition_v1_base,
+            "schema_version": 2,
+            "kind": BOOTSTRAP.AUDITED_QUARANTINED_SOURCE_INTERLOCK_KIND,
+            "from_source": transition_v1_to_source,
+            "to_source": to_source,
+            "parent_commit_sha": "1" * 40,
+            "file_sha256": {
+                path: {
+                    "from_sha256": transition_v1_to_file_sha256[path],
+                    "to_sha256": hashlib.sha256(path.encode()).hexdigest(),
+                }
+                for path in BOOTSTRAP.AUDITED_QUARANTINED_CHANGED_PATHS
+            },
+            "reason_codes": BOOTSTRAP.AUDITED_QUARANTINED_REASON_CODES,
+            "audit_configuration": audit_configuration,
+            "previous_source_transition_sha256": transition_v1_sha,
         }
         interlock_path = BOOTSTRAP.audited_recovery_source_interlock_path(state)
         write_file(interlock_path, transition_base, 0o600)
@@ -1301,7 +1353,12 @@ class D2ABootstrapTests(unittest.TestCase):
             "authority_version_count": 0,
             "runtime_slot_writer_fence_count": 0,
             **audit_configuration,
-            **audit_tools,
+            **{
+                **audit_tools,
+                "static_sql_sha256": audit_configuration[
+                    "static_sql_sha256"
+                ],
+            },
         }
         write_file(paths["database_absence"], database, 0o600)
         database_sha = hashlib.sha256(
@@ -2147,7 +2204,7 @@ class D2ABootstrapTests(unittest.TestCase):
             value = {field: None for field in artifact_fields[name]}
             value.update(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2 if name == "source_transition" else 1,
                     "kind": BOOTSTRAP.AUDITED_QUARANTINED_RECOVERY_KINDS[name],
                     "run_id": state["run_id"],
                     "manifest_sha256": state["manifest_sha256"],
@@ -2253,10 +2310,18 @@ class D2ABootstrapTests(unittest.TestCase):
             state_path, state
         )
         interlock_path = BOOTSTRAP.audited_recovery_source_interlock_path(state)
+        interlock_v1_path = (
+            BOOTSTRAP.audited_recovery_source_interlock_v1_path(state)
+        )
+        transition_v1_path = (
+            BOOTSTRAP.audited_recovery_source_transition_v1_path(state)
+        )
         coordinator = interlock_path.parent
         original = {
             path: path.read_bytes()
             for path in (
+                interlock_v1_path,
+                transition_v1_path,
                 interlock_path,
                 paths["source_transition"],
                 paths["database_absence"],
@@ -2288,7 +2353,7 @@ class D2ABootstrapTests(unittest.TestCase):
         ):
             transition = json.loads(paths["source_transition"].read_bytes())
             self.assertEqual(
-                transition["from_source"]["commit_sha"], "a" * 40
+                transition["from_source"]["commit_sha"], "1" * 40
             )
             self.assertEqual(
                 transition["to_source"]["commit_sha"], "c" * 40
@@ -2296,6 +2361,14 @@ class D2ABootstrapTests(unittest.TestCase):
             self.assertIs(validate(), output)
 
             for missing, expected in (
+                (
+                    interlock_v1_path,
+                    "audited_recovery_source_interlock_v1_path_invalid",
+                ),
+                (
+                    transition_v1_path,
+                    "audited_recovery_source_transition_v1_path_invalid",
+                ),
                 (interlock_path, "audited_recovery_source_interlock_path_invalid"),
                 (
                     paths["source_transition"],
@@ -2309,11 +2382,44 @@ class D2ABootstrapTests(unittest.TestCase):
                     self.assertEqual(raised.exception.code, expected)
                     restore()
 
+            interlock_v1 = json.loads(interlock_v1_path.read_bytes())
+            interlock_v1["reason_codes"] = interlock_v1["reason_codes"][:-1]
+            write_file(interlock_v1_path, interlock_v1, 0o600)
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate()
+            self.assertEqual(
+                raised.exception.code,
+                "audited_recovery_source_transition_invalid",
+            )
+            restore()
+
             interlock = json.loads(interlock_path.read_bytes())
             interlock["reason_codes"] = interlock["reason_codes"][:-1]
             write_file(interlock_path, interlock, 0o600)
             with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
                 validate()
+            self.assertEqual(
+                raised.exception.code,
+                "audited_recovery_source_transition_invalid",
+            )
+            restore()
+
+            interlock = json.loads(interlock_path.read_bytes())
+            transition = json.loads(paths["source_transition"].read_bytes())
+            interlock["previous_source_transition_sha256"] = "0" * 64
+            transition["previous_source_transition_sha256"] = "0" * 64
+            write_file(interlock_path, interlock, 0o600)
+            transition["interlock_sha256"] = hashlib.sha256(
+                interlock_path.read_bytes()
+            ).hexdigest()
+            write_file(paths["source_transition"], transition, 0o600)
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate({
+                    **output,
+                    "source_transition_sha256": hashlib.sha256(
+                        paths["source_transition"].read_bytes()
+                    ).hexdigest(),
+                })
             self.assertEqual(
                 raised.exception.code,
                 "audited_recovery_source_transition_invalid",
@@ -2344,6 +2450,17 @@ class D2ABootstrapTests(unittest.TestCase):
                         validate()
                     self.assertEqual(raised.exception.code, expected)
                     restore()
+
+            database = json.loads(paths["database_absence"].read_bytes())
+            database["static_sql_sha256"] = incident["static_sql_sha256"]
+            write_file(paths["database_absence"], database, 0o600)
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate()
+            self.assertEqual(
+                raised.exception.code,
+                "audited_recovery_database_absence_invalid",
+            )
+            restore()
 
             extra = write_file(coordinator / "unexpected", b"x", 0o600)
             with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
@@ -2416,7 +2533,14 @@ class D2ABootstrapTests(unittest.TestCase):
 
         with mock.patch.object(BOOTSTRAP.subprocess, "run", side_effect=run):
             BOOTSTRAP.validate_audited_source_transition_git(
-                transition, current, tree, self.fixture.root
+                transition,
+                current,
+                tree,
+                self.fixture.root,
+                expected_parent_commit=parent,
+                expected_from_file_sha256=(
+                    BOOTSTRAP.AUDITED_QUARANTINED_CHANGED_PATH_FROM_SHA256
+                ),
             )
         self.assertFalse(responses)
         for environment in observed_environments:

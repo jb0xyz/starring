@@ -45,8 +45,9 @@ SELECT pg_catalog.concat_ws('|',
  ((SELECT pg_catalog.count(*) FROM public.product_control_plane_identity
    WHERE singleton AND database_identity <> '00000000-0000-0000-0000-000000000000'::uuid) = 1)::text,
  pg_catalog.current_database(), current_user, session_user,
- pg_catalog.inet_server_addr()::text, pg_catalog.inet_server_port()::text,
- pg_catalog.inet_client_addr()::text,
+ pg_catalog.host(pg_catalog.inet_server_addr()),
+ pg_catalog.inet_server_port()::text,
+ pg_catalog.host(pg_catalog.inet_client_addr()),
  (SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid = pg_catalog.pg_backend_pid())::text,
  pg_catalog.current_setting('data_directory'),
  (SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_activity
@@ -1463,6 +1464,11 @@ class Platform:
             self._quarantined_recovery_login_keychain_identity()
         )
         return evidence
+
+    def quarantined_recovery_static_sql_sha256(self):
+        return hashlib.sha256(
+            QUARANTINED_RECOVERY_SQL.encode("utf-8")
+        ).hexdigest()
 
     def audit_quarantined_no_issue_database(self, context, expected):
         """Prove zero issue/onboarding rows without exposing the admin URL."""
