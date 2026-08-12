@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import selectors
 import signal
 import socket
 import stat
@@ -16,6 +17,63 @@ from d2_orchestrator_contract import OWNER_ACCOUNT, REQUIRED_PROGRAMS, fail
 MAX_TRANSPORT_CONTROL_BYTES = 64 * 1024
 MAX_DISCORD_RESPONSE_BYTES = 256 * 1024
 MAX_LAUNCHD_OVERRIDE_OUTPUT_BYTES = 256 * 1024
+QUARANTINED_RECOVERY_OUTPUT_BYTES = 4096
+QUARANTINED_RECOVERY_TIMEOUT_SECONDS = 15
+QUARANTINED_RECOVERY_ZSH = pathlib.Path("/bin/zsh")
+QUARANTINED_RECOVERY_SECURITY = pathlib.Path("/usr/bin/security")
+QUARANTINED_RECOVERY_PSQL = pathlib.Path(
+    "/opt/homebrew/Cellar/postgresql@16/16.14/bin/psql"
+)
+QUARANTINED_RECOVERY_SQL = """BEGIN ISOLATION LEVEL SERIALIZABLE;
+SET LOCAL lock_timeout = '3000ms';
+SET LOCAL statement_timeout = '10000ms';
+SET LOCAL idle_in_transaction_session_timeout = '10000ms';
+LOCK TABLE public.product_oauth_flows, public.product_auth_sessions,
+ public.product_principals, public.product_tenants,
+ public.automation_installations,
+ public.automation_installation_authority_versions,
+ public.runtime_slot_writer_fences_v2,
+ public.product_control_plane_identity IN ACCESS EXCLUSIVE MODE;
+SELECT pg_catalog.concat_ws('|',
+ (SELECT system_identifier::text FROM pg_catalog.pg_control_system()),
+ ((SELECT pg_catalog.count(*) FROM public.product_control_plane_identity
+   WHERE singleton AND database_identity <> '00000000-0000-0000-0000-000000000000'::uuid) = 1)::text,
+ pg_catalog.current_database(), current_user, session_user,
+ pg_catalog.inet_server_addr()::text, pg_catalog.inet_server_port()::text,
+ pg_catalog.inet_client_addr()::text,
+ (SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid = pg_catalog.pg_backend_pid())::text,
+ pg_catalog.current_setting('data_directory'),
+ (SELECT pg_catalog.count(*) FROM pg_catalog.pg_stat_activity
+  WHERE datname = pg_catalog.current_database()
+    AND pid <> pg_catalog.pg_backend_pid())::text,
+ (SELECT pg_catalog.count(*) FROM public.product_oauth_flows)::text,
+ (SELECT pg_catalog.count(*) FROM public.product_auth_sessions)::text,
+ (SELECT pg_catalog.count(*) FROM public.product_principals)::text,
+ (SELECT pg_catalog.count(*) FROM public.product_tenants)::text,
+ (SELECT pg_catalog.count(*) FROM public.automation_installations)::text,
+ (SELECT pg_catalog.count(*) FROM public.automation_installation_authority_versions)::text,
+ (SELECT pg_catalog.count(*) FROM public.runtime_slot_writer_fences_v2)::text,
+ (SELECT pg_catalog.count(*) FROM public.product_principals
+  WHERE principal_id = 'discord:1056857223529250906'
+     OR discord_user_id = '1056857223529250906')::text,
+ (SELECT pg_catalog.count(*) FROM public.product_tenants
+  WHERE tenant_id = 'tenant:starring-d2-20260812-c52d220457d1')::text,
+ (SELECT pg_catalog.count(*) FROM public.automation_installations
+  WHERE installation_id = 'installation:starring-d2-20260812-c52d220457d1'
+     OR tenant_id = 'tenant:starring-d2-20260812-c52d220457d1'
+     OR (discord_application_id = '1533144492293754900'
+         AND discord_guild_id = '1536845588954353676')
+     OR (discord_guild_id = '1536845588954353676'
+         AND ruleset_key = 'studyroom'))::text,
+ (SELECT pg_catalog.count(*)
+  FROM public.automation_installation_authority_versions
+  WHERE installation_id = 'installation:starring-d2-20260812-c52d220457d1'
+     OR tenant_id = 'tenant:starring-d2-20260812-c52d220457d1'
+     OR created_by_principal_id = 'discord:1056857223529250906')::text,
+ (SELECT pg_catalog.count(*) FROM public.runtime_slot_writer_fences_v2
+  WHERE slot_guild_id = '1536845588954353676'
+    AND slot_ruleset_key = 'studyroom')::text);
+COMMIT;"""
 RUNTIME_PROCESS_INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 TRANSPORT_INSTANCE_PATTERN = re.compile(r"^d2ti-[0-9a-f]{32}$")
 TRANSPORT_OPERATION_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.:-]{7,95}$")
@@ -159,6 +217,175 @@ class Platform:
             fail("platform_command_timeout")
         except OSError:
             fail("platform_command_unavailable")
+
+    def _terminate_recovery_process_group(self, process):
+        """Reap a secret-leaf command and every descendant in its new session."""
+        # On Darwin, signalling a process group whose only member is an
+        # unreaped zombie can return EPERM.  Reap an already-exited direct
+        # child first, then probe for independently surviving descendants.
+        if process.poll() is not None:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return
+            except OSError:
+                fail("quarantined_recovery_audit_reap_failed")
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            fail("quarantined_recovery_audit_reap_failed")
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                fail("quarantined_recovery_audit_reap_failed")
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                fail("quarantined_recovery_audit_reap_failed")
+        # The direct shell may exit while a descendant deliberately retains the
+        # process group.  Kill the group once more and prove ESRCH before the
+        # orchestrator releases either recovery lock.
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        except OSError:
+            fail("quarantined_recovery_audit_reap_failed")
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            fail("quarantined_recovery_audit_reap_failed")
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return
+            except OSError:
+                fail("quarantined_recovery_audit_reap_failed")
+            if time.monotonic() >= deadline:
+                fail("quarantined_recovery_audit_reap_failed")
+            time.sleep(0.01)
+
+    def _run_quarantined_recovery_secret_leaf(self, arguments):
+        """Run the Keychain/psql leaf with bounded output and pgrp lifetime.
+
+        Callers never receive stderr.  In particular, a Keychain value or
+        libpq diagnostic can never be copied into an exception or durable log.
+        """
+        try:
+            selector = selectors.DefaultSelector()
+        except BaseException:
+            fail("quarantined_recovery_audit_unavailable")
+        # Allocate every Python-side buffer before spawning the session.  Once
+        # Popen succeeds there must be no instruction outside the termination
+        # guard: even an asynchronous BaseException at the first setup step
+        # must reap the shell and every descendant in its process group.
+        output = bytearray()
+        discarded_stderr_bytes = 0
+        process = None
+        try:
+            try:
+                process = subprocess.Popen(
+                    [str(argument) for argument in arguments],
+                    cwd="/",
+                    env={
+                        "HOME": "/",
+                        "ZDOTDIR": "/",
+                        "LANG": "C",
+                        "LC_ALL": "C",
+                        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                        "PGSSLMODE": "disable",
+                    },
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+            except OSError:
+                fail("quarantined_recovery_audit_unavailable")
+            try:
+                for stream, name in (
+                    (process.stdout, "stdout"), (process.stderr, "stderr")
+                ):
+                    os.set_blocking(stream.fileno(), False)
+                    selector.register(stream, selectors.EVENT_READ, name)
+                deadline = time.monotonic() + QUARANTINED_RECOVERY_TIMEOUT_SECONDS
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    for key, _mask in selector.select(min(remaining, 0.25)):
+                        try:
+                            chunk = os.read(key.fileobj.fileno(), 4096)
+                        except BlockingIOError:
+                            continue
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        if key.data == "stdout":
+                            output.extend(chunk)
+                            if len(output) > QUARANTINED_RECOVERY_OUTPUT_BYTES:
+                                raise BufferError
+                        else:
+                            discarded_stderr_bytes += len(chunk)
+                            if discarded_stderr_bytes > QUARANTINED_RECOVERY_OUTPUT_BYTES:
+                                raise BufferError
+                        # stderr is deliberately drained, bounded, and discarded.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError
+                try:
+                    returncode = process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired as error:
+                    raise TimeoutError from error
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    raise RuntimeError("group_observation")
+                else:
+                    raise RuntimeError("descendant_survived")
+            except (TimeoutError, BufferError, RuntimeError):
+                self._terminate_recovery_process_group(process)
+                fail("quarantined_recovery_audit_failed")
+        finally:
+            try:
+                if process is not None:
+                    try:
+                        os.killpg(process.pid, 0)
+                    except ProcessLookupError:
+                        pass
+                    except OSError:
+                        self._terminate_recovery_process_group(process)
+                    else:
+                        self._terminate_recovery_process_group(process)
+            finally:
+                try:
+                    selector.close()
+                except BaseException:
+                    pass
+                finally:
+                    if process is not None:
+                        for stream in (process.stdout, process.stderr):
+                            if stream is not None:
+                                try:
+                                    stream.close()
+                                except BaseException:
+                                    pass
+        if returncode != 0:
+            fail("quarantined_recovery_audit_failed")
+        return bytes(output)
 
     def executable(self, path):
         try:
@@ -1096,6 +1323,249 @@ class Platform:
             timeout=5,
         )
         return result.returncode == 0
+
+    def _quarantined_recovery_tool_sha256(self, path):
+        policy = {
+            QUARANTINED_RECOVERY_ZSH: (0, 0o755),
+            QUARANTINED_RECOVERY_SECURITY: (0, 0o755),
+            QUARANTINED_RECOVERY_PSQL: (os.getuid(), 0o555),
+        }.get(path)
+        if policy is None or not hasattr(os, "O_NOFOLLOW"):
+            fail("quarantined_recovery_audit_tool_invalid")
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != policy[0]
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != policy[1]
+                or metadata.st_size <= 0
+                or metadata.st_size > 64 * 1024 * 1024
+            ):
+                fail("quarantined_recovery_audit_tool_invalid")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            named = os.stat(path, follow_symlinks=False)
+        except OSError:
+            fail("quarantined_recovery_audit_tool_invalid")
+        finally:
+            if "descriptor" in locals():
+                os.close(descriptor)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+            value.st_gid, value.st_nlink, value.st_size, value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if identity(metadata) != identity(after) or identity(after) != identity(named):
+            fail("quarantined_recovery_audit_tool_invalid")
+        return digest.hexdigest()
+
+    def _quarantined_recovery_psql_ancestry(self):
+        expected = (
+            (pathlib.Path("/opt"), 0, 0o755),
+            (pathlib.Path("/opt/homebrew"), os.getuid(), 0o755),
+            (pathlib.Path("/opt/homebrew/Cellar"), os.getuid(), 0o775),
+            (pathlib.Path("/opt/homebrew/Cellar/postgresql@16"), os.getuid(), 0o755),
+            (pathlib.Path("/opt/homebrew/Cellar/postgresql@16/16.14"), os.getuid(), 0o755),
+            (pathlib.Path("/opt/homebrew/Cellar/postgresql@16/16.14/bin"), os.getuid(), 0o755),
+        )
+        identities = []
+        try:
+            for path, uid, mode in expected:
+                metadata = path.lstat()
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or path.is_symlink()
+                    or metadata.st_uid != uid
+                    or stat.S_IMODE(metadata.st_mode) != mode
+                    or metadata.st_mode & stat.S_IWOTH
+                ):
+                    fail("quarantined_recovery_audit_tool_invalid")
+                identities.append((
+                    metadata.st_dev, metadata.st_ino, metadata.st_mode,
+                    metadata.st_uid, metadata.st_gid, metadata.st_nlink,
+                    metadata.st_mtime_ns, metadata.st_ctime_ns,
+                ))
+        except OSError:
+            fail("quarantined_recovery_audit_tool_invalid")
+        return tuple(identities)
+
+    def audit_quarantined_no_issue_database(self, context, expected):
+        """Prove zero issue/onboarding rows without exposing the admin URL."""
+        required = {
+            "run_id",
+            "manifest_sha256",
+            "database_system_identifier",
+            "zsh_sha256",
+            "security_sha256",
+            "psql_sha256",
+            "static_sql_sha256",
+        }
+        database = context.manifest.get("database", {})
+        discord = context.manifest.get("discord", {})
+        if (
+            not isinstance(expected, dict)
+            or set(expected) != required
+            or expected["run_id"] != "d2-20260812t082042z-c52d220457d1"
+            or expected["run_id"] != context.manifest.get("run_id")
+            or expected["manifest_sha256"]
+            != "a522e5c316f58f54df8c0ea69ab0f6aebb9ed85e7bb6ce45a2c02b5e63823338"
+            or expected["manifest_sha256"] != context.digest
+            or expected["database_system_identifier"] != "7673057195867924427"
+            or database
+            != {
+                "cluster_root": "/private/tmp/starring-d2-d2-20260812t082042z-c52d220457d1/postgres",
+                "name": "starring_runtime_staging",
+                "port": 55433,
+                "socket_directory": "/private/tmp/starring-d2-d2-20260812t082042z-c52d220457d1/socket",
+            }
+            or discord.get("actor_id") != "1056857223529250906"
+            or discord.get("application_id") != "1533144492293754900"
+            or discord.get("guild_id") != "1536845588954353676"
+            or discord.get("resource_prefix")
+            != "starring-d2-20260812-c52d220457d1"
+        ):
+            fail("quarantined_recovery_audit_identity_invalid")
+        try:
+            selector = REQUIRED_PROGRAMS["psql"]
+            if selector.resolve(strict=True) != QUARANTINED_RECOVERY_PSQL:
+                fail("quarantined_recovery_audit_tool_invalid")
+        except OSError:
+            fail("quarantined_recovery_audit_tool_invalid")
+        ancestry = self._quarantined_recovery_psql_ancestry()
+        psql = QUARANTINED_RECOVERY_PSQL
+        observed_tools = {
+            "zsh_sha256": self._quarantined_recovery_tool_sha256(
+                QUARANTINED_RECOVERY_ZSH
+            ),
+            "security_sha256": self._quarantined_recovery_tool_sha256(
+                QUARANTINED_RECOVERY_SECURITY
+            ),
+            "psql_sha256": self._quarantined_recovery_tool_sha256(psql),
+            "static_sql_sha256": hashlib.sha256(
+                QUARANTINED_RECOVERY_SQL.encode("utf-8")
+            ).hexdigest(),
+        }
+        if any(expected[name] != value for name, value in observed_tools.items()):
+            fail("quarantined_recovery_audit_tool_invalid")
+        service = context.manifest["keychain_services"]["postgres"]
+        if service != "starring.d2.c52d220457d1.postgres":
+            fail("quarantined_recovery_audit_identity_invalid")
+        script = "\n".join(
+            (
+                "setopt NO_XTRACE PIPE_FAIL",
+                "umask 077",
+                'service="$1"',
+                'account="$2"',
+                'security="$3"',
+                'psql="$4"',
+                'sql="$5"',
+                'url="$("$security" find-generic-password -s "$service" -a "$account" -w 2>/dev/null)" || exit 71',
+                "prefix='postgresql://starring_cluster_admin:'",
+                "suffix='@127.0.0.1:55433/postgres?sslmode=disable'",
+                'case "$url" in ("$prefix"*"$suffix") ;; (*) unset url; exit 72;; esac',
+                'password="${url#$prefix}"',
+                'password="${password%$suffix}"',
+                "unset url prefix suffix",
+                'test "${#password}" -eq 43 || { unset password; exit 72; }',
+                'case "$password" in (*[!A-Za-z0-9_-]*) unset password; exit 72;; esac',
+                'result="$({ builtin printf -- \'%s\\n\' "$password"; } | "$psql" -W --no-psqlrc --host=127.0.0.1 --port=55433 --username=starring_cluster_admin --dbname=starring_runtime_staging --set=ON_ERROR_STOP=1 --tuples-only --no-align --quiet --command="$sql" 2>/dev/null)"',
+                'status="$?"',
+                "unset password sql",
+                'test "$status" -eq 0 || { unset result; exit 73; }',
+                'builtin printf -- \'%s\\n\' "$result"',
+                "unset result",
+            )
+        )
+        raw = self._run_quarantined_recovery_secret_leaf(
+            [
+                QUARANTINED_RECOVERY_ZSH,
+                "-f",
+                "-c",
+                script,
+                "d2-quarantined-no-issue-audit",
+                service,
+                "database.cluster-admin",
+                QUARANTINED_RECOVERY_SECURITY,
+                psql,
+                QUARANTINED_RECOVERY_SQL,
+            ]
+        )
+        if any(
+            expected[name]
+            != self._quarantined_recovery_tool_sha256(path)
+            for name, path in (
+                ("zsh_sha256", QUARANTINED_RECOVERY_ZSH),
+                ("security_sha256", QUARANTINED_RECOVERY_SECURITY),
+                ("psql_sha256", psql),
+            )
+        ):
+            fail("quarantined_recovery_audit_tool_invalid")
+        if self._quarantined_recovery_psql_ancestry() != ancestry:
+            fail("quarantined_recovery_audit_tool_invalid")
+        try:
+            text = raw.decode("ascii")
+        except UnicodeDecodeError:
+            fail("quarantined_recovery_audit_output_invalid")
+        lines = [line for line in text.splitlines() if line]
+        if len(lines) != 1:
+            fail("quarantined_recovery_audit_output_invalid")
+        fields = lines[0].split("|")
+        if (
+            len(fields) != 23
+            or fields[0] != expected["database_system_identifier"]
+            or fields[1:11]
+            != [
+                "true",
+                "starring_runtime_staging",
+                "starring_cluster_admin",
+                "starring_cluster_admin",
+                "127.0.0.1",
+                "55433",
+                "127.0.0.1",
+                "false",
+                database["cluster_root"],
+                "0",
+            ]
+            or any(value != "0" for value in fields[11:])
+        ):
+            fail("quarantined_recovery_database_not_empty")
+        return {
+            "database_name": "starring_runtime_staging",
+            "database_system_identifier": expected["database_system_identifier"],
+            "control_plane_identity": "run_owned_cluster_admin_tcp_v1",
+            "topology_verified": True,
+            "tables_locked": True,
+            "locked_tables": [
+                "public.product_oauth_flows",
+                "public.product_auth_sessions",
+                "public.product_principals",
+                "public.product_tenants",
+                "public.automation_installations",
+                "public.automation_installation_authority_versions",
+                "public.runtime_slot_writer_fences_v2",
+                "public.product_control_plane_identity",
+            ],
+            "transaction_committed": True,
+            "process_group_quiescent": True,
+            "oauth_flow_count": 0,
+            "auth_session_count": 0,
+            "principal_count": 0,
+            "tenant_count": 0,
+            "installation_count": 0,
+            "authority_version_count": 0,
+            "runtime_slot_writer_fence_count": 0,
+            **observed_tools,
+        }
 
     def launchd_start(self, label, plist_path):
         if self.launchd_loaded(label):

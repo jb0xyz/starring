@@ -345,6 +345,31 @@ Even a previously completed resume replays the idempotent cleanup observer and
 the live launchd/PostgreSQL/protected-standing status checks before reporting
 total local absence; the stored terminal flags alone are never trusted.
 
+Ordinary `resume` never accepts an issuer-origin `quarantined` lifecycle.  The
+single audited no-issuance incident recovery is a separate command whose
+explicit confirmations bind the clean recovery source, run, and manifest:
+
+```sh
+python3 tools/d2-maintenance/d2a_bootstrap.py \
+  recover-audited-quarantined-no-issue \
+  --state /absolute/private/d2a-bootstrap-runs/bootstrap-d2-....json \
+  --confirm-current-commit <40-lowercase-hex> \
+  --confirm-current-tree <40-lowercase-hex> \
+  --confirm-run-id d2-.... \
+  --confirm-manifest-sha256 <64-lowercase-hex>
+```
+
+This command is limited to the exact allowlisted failed direct-onboarding run.
+It delegates the database no-issuance proof, Discord reconciliation, and local
+cleanup to the audited orchestrator path, then independently validates the
+canonical secret-free evidence and the command's fresh audited postcondition
+observation.  Only then
+does it durably record Discord teardown, cleanup, and postcondition completion.
+The original failed product outcome and `direct_onboard_failed` error remain in
+bootstrap state, and the original quarantined lifecycle remains historical
+evidence.  Repeating the audited command performs an exact evidence replay and
+fresh absence observation; it never reruns onboarding or a product operation.
+
 Discord teardown transitions a private `d2a-teardown-fence.json` from open to
 `closing` under the same global D2 lock used for lifecycle validation, then to
 `closed` only after successful run-owned teardown. Cleanup independently

@@ -25,6 +25,7 @@ DIRECTORY = pathlib.Path(__file__).parent
 sys.path.insert(0, str(DIRECTORY))
 import d2_certification as CERTIFICATION
 import isolated_orchestrator as ORCHESTRATOR
+COMPOSITION = sys.modules["d2_orchestrator_composition"]
 CONTRACT = sys.modules["d2_orchestrator_contract"]
 PLATFORM = sys.modules["d2_orchestrator_platform"]
 DRAINED_RUNTIME_RESTART = sys.modules["d2_drained_runtime_restart"]
@@ -131,6 +132,8 @@ class FakePlatform:
         self.worker_settled_requests = 0
         self.worker_active_requests = 0
         self.worker_queued_requests = 0
+        self.quarantined_database_audits = 0
+        self.quarantined_database_override = None
 
     def run(self, arguments, input_bytes=None, timeout=30, environment=None):
         executable = pathlib.Path(arguments[0]).name
@@ -267,6 +270,45 @@ class FakePlatform:
         self.postgres = False
         self.postgres_tcp = False
         self.postgres_process_pid = None
+
+    def audit_quarantined_no_issue_database(self, context, expected):
+        self.quarantined_database_audits += 1
+        evidence = {
+            "database_name": context.manifest["database"]["name"],
+            "database_system_identifier": expected["database_system_identifier"],
+            "control_plane_identity": "run_owned_cluster_admin_tcp_v1",
+            "topology_verified": True,
+            "tables_locked": True,
+            "locked_tables": [
+                "public.product_oauth_flows",
+                "public.product_auth_sessions",
+                "public.product_principals",
+                "public.product_tenants",
+                "public.automation_installations",
+                "public.automation_installation_authority_versions",
+                "public.runtime_slot_writer_fences_v2",
+                "public.product_control_plane_identity",
+            ],
+            "transaction_committed": True,
+            "process_group_quiescent": True,
+            "oauth_flow_count": 0,
+            "auth_session_count": 0,
+            "principal_count": 0,
+            "tenant_count": 0,
+            "installation_count": 0,
+            "authority_version_count": 0,
+            "runtime_slot_writer_fence_count": 0,
+            **{
+                name: expected[name]
+                for name in (
+                    "zsh_sha256", "security_sha256", "psql_sha256",
+                    "static_sql_sha256",
+                )
+            },
+        }
+        if self.quarantined_database_override is not None:
+            evidence.update(self.quarantined_database_override)
+        return evidence
 
     def bootstrap_database(self, context):
         if self.bootstrap_failure:
@@ -2001,6 +2043,63 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             tunnel_environment["STARRING_D2_CLOUDFLARE_ORIGIN_SERVICE"],
             CERTIFICATION.D2_ORIGIN_SERVICE,
         )
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_sealed_hba_allows_only_the_session_issuer_roles_on_the_run_socket(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        COMPOSITION.configure_postgres_sealed_network(self.context)
+        runtime_roles = ",".join(COMPOSITION.RUNTIME_DATABASE_ROLES)
+        api_roles = ",".join(COMPOSITION.API_DATABASE_ROLES)
+        issuer_roles = ",".join(COMPOSITION.D2A_SESSION_ISSUER_DATABASE_ROLES)
+        lines = (self.context.cluster_root / "pg_hba.conf").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        self.assertEqual(
+            COMPOSITION.D2A_SESSION_ISSUER_DATABASE_ROLES,
+            (
+                "starring_identity_oauth",
+                "starring_identity_issuer",
+                "starring_identity_security",
+            ),
+        )
+        self.assertEqual(
+            lines,
+            [
+                f"hostnossl starring_runtime_staging {runtime_roles} 127.0.0.1/32 scram-sha-256",
+                f"host all {runtime_roles} 0.0.0.0/0 reject",
+                f"host all {runtime_roles} ::0/0 reject",
+                f"local all {runtime_roles} reject",
+                f"hostnossl starring_runtime_staging {api_roles} 127.0.0.1/32 scram-sha-256",
+                f"host all {api_roles} 0.0.0.0/0 reject",
+                f"host all {api_roles} ::0/0 reject",
+                f"local starring_runtime_staging {issuer_roles} scram-sha-256",
+                f"local all {api_roles} reject",
+                "hostnossl postgres,starring_runtime_staging starring_cluster_admin 127.0.0.1/32 scram-sha-256",
+                "host all all 0.0.0.0/0 reject",
+                "host all all ::0/0 reject",
+                "local all all reject",
+                "host replication all 0.0.0.0/0 reject",
+                "host replication all ::0/0 reject",
+                "local replication all reject",
+            ],
+        )
+        local_scram = [
+            line
+            for line in lines
+            if line.startswith("local ") and line.endswith(" scram-sha-256")
+        ]
+        self.assertEqual(
+            local_scram,
+            [f"local starring_runtime_staging {issuer_roles} scram-sha-256"],
+        )
+        socket_roles = set(local_scram[0].split()[2].split(","))
+        self.assertEqual(
+            socket_roles,
+            set(COMPOSITION.D2A_SESSION_ISSUER_DATABASE_ROLES),
+        )
+        self.assertTrue(socket_roles.isdisjoint(COMPOSITION.RUNTIME_DATABASE_ROLES))
+        self.assertNotIn("starring_identity_session", socket_roles)
+        self.assertNotIn("starring_cluster_admin", socket_roles)
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_transport_snapshot_health_is_exact_and_identity_bound(self):
@@ -5219,6 +5318,189 @@ class LaunchdPlatformTests(unittest.TestCase):
         ):
             platform.launchd_signal("local.starring.d2.test.runtime", "SIGKILL")
 
+    def test_quarantined_recovery_secret_leaf_never_places_secret_in_argv_or_env(self):
+        platform = PLATFORM.Platform()
+        secret = "S" * 43
+        context = SimpleNamespace(
+            digest="a522e5c316f58f54df8c0ea69ab0f6aebb9ed85e7bb6ce45a2c02b5e63823338",
+            manifest={
+                "run_id": "d2-20260812t082042z-c52d220457d1",
+                "database": {
+                    "cluster_root": "/private/tmp/starring-d2-d2-20260812t082042z-c52d220457d1/postgres",
+                    "name": "starring_runtime_staging",
+                    "port": 55433,
+                    "socket_directory": "/private/tmp/starring-d2-d2-20260812t082042z-c52d220457d1/socket",
+                },
+                "discord": {
+                    "actor_id": "1056857223529250906",
+                    "application_id": "1533144492293754900",
+                    "guild_id": "1536845588954353676",
+                    "resource_prefix": "starring-d2-20260812-c52d220457d1",
+                },
+                "keychain_services": {
+                    "postgres": "starring.d2.c52d220457d1.postgres"
+                },
+            },
+        )
+        expected = {
+            "run_id": context.manifest["run_id"],
+            "manifest_sha256": context.digest,
+            "database_system_identifier": "7673057195867924427",
+            "zsh_sha256": "1" * 64,
+            "security_sha256": "2" * 64,
+            "psql_sha256": "3" * 64,
+            "static_sql_sha256": hashlib.sha256(
+                PLATFORM.QUARANTINED_RECOVERY_SQL.encode()
+            ).hexdigest(),
+        }
+        captured = {}
+
+        def secret_leaf(arguments):
+            captured["arguments"] = [str(value) for value in arguments]
+            return (
+                "7673057195867924427|true|starring_runtime_staging|"
+                "starring_cluster_admin|starring_cluster_admin|127.0.0.1|"
+                "55433|127.0.0.1|false|/private/tmp/starring-d2-"
+                "d2-20260812t082042z-c52d220457d1/postgres|0|"
+                + "|".join("0" for _ in range(12))
+                + "\n"
+            ).encode()
+
+        tool_values = iter(("1" * 64, "2" * 64, "3" * 64) * 2)
+        with mock.patch.object(
+            platform, "_quarantined_recovery_tool_sha256",
+            side_effect=lambda _path: next(tool_values),
+        ), mock.patch.object(
+            platform, "_quarantined_recovery_psql_ancestry", return_value=((1,),)
+        ), mock.patch.object(
+            platform, "_run_quarantined_recovery_secret_leaf", side_effect=secret_leaf
+        ), mock.patch.object(
+            PLATFORM.pathlib.Path, "resolve", return_value=PLATFORM.QUARANTINED_RECOVERY_PSQL
+        ):
+            evidence = platform.audit_quarantined_no_issue_database(
+                context, expected
+            )
+        serialized = "\x00".join(captured["arguments"])
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn("PGPASSWORD", serialized)
+        self.assertEqual(
+            captured["arguments"][:3],
+            [str(PLATFORM.QUARANTINED_RECOVERY_ZSH), "-f", "-c"],
+        )
+        self.assertIn("builtin printf --", captured["arguments"][3])
+        self.assertTrue(evidence["process_group_quiescent"])
+        self.assertEqual(evidence["oauth_flow_count"], 0)
+
+    def test_quarantined_recovery_zsh_ignores_malicious_user_zshenv(self):
+        zdotdir = self.root / "malicious-zdotdir"
+        zdotdir.mkdir()
+        captured = self.root / "captured-secret"
+        (zdotdir / ".zshenv").write_text(
+            "function printf { print -r -- $3 > "
+            + repr(str(captured))
+            + "; builtin printf \"$@\"; }\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                str(PLATFORM.QUARANTINED_RECOVERY_ZSH), "-f", "-c",
+                "builtin printf -- '%s\\n' \"$1\"", "audit", "secret-value",
+            ],
+            cwd="/",
+            env={
+                "HOME": str(zdotdir), "ZDOTDIR": str(zdotdir),
+                "LANG": "C", "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"secret-value\n")
+        self.assertFalse(captured.exists())
+        platform = PLATFORM.Platform()
+        self.assertEqual(
+            platform._run_quarantined_recovery_secret_leaf([
+                str(PLATFORM.QUARANTINED_RECOVERY_ZSH), "-f", "-c",
+                "builtin printf -- '%s|%s|%s\\n' "
+                '"$HOME" "$ZDOTDIR" "$PGSSLMODE"',
+            ]),
+            b"/|/|disable\n",
+        )
+
+    def test_quarantined_recovery_runner_caps_output_and_reaps_group(self):
+        platform = PLATFORM.Platform()
+        with mock.patch.object(
+            PLATFORM, "QUARANTINED_RECOVERY_OUTPUT_BYTES", 16
+        ), mock.patch.object(
+            platform, "_terminate_recovery_process_group", wraps=platform._terminate_recovery_process_group
+        ) as terminate, self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "quarantined_recovery_audit_failed"
+        ):
+            platform._run_quarantined_recovery_secret_leaf(
+                ["/bin/zsh", "-c", "printf '%04096d' 0; /bin/sleep 30"]
+            )
+        self.assertGreaterEqual(terminate.call_count, 1)
+
+    def test_quarantined_recovery_runner_reaps_on_baseexception_and_close_failure(self):
+        platform = PLATFORM.Platform()
+
+        class InterruptingSelector:
+            def get_map(self):
+                raise KeyboardInterrupt
+
+            def register(self, *_arguments):
+                return None
+
+            def close(self):
+                raise RuntimeError("close_failed")
+
+        with mock.patch.object(
+            PLATFORM.selectors, "DefaultSelector", return_value=InterruptingSelector()
+        ), mock.patch.object(
+            platform, "_terminate_recovery_process_group",
+            wraps=platform._terminate_recovery_process_group,
+        ) as terminate, self.assertRaises(KeyboardInterrupt):
+            platform._run_quarantined_recovery_secret_leaf(
+                ["/bin/zsh", "-c", "/bin/sleep 30"]
+            )
+        self.assertGreaterEqual(terminate.call_count, 1)
+
+    def test_quarantined_recovery_runner_reaps_on_first_post_spawn_baseexception(self):
+        platform = PLATFORM.Platform()
+        with mock.patch.object(
+            PLATFORM.os, "set_blocking", side_effect=KeyboardInterrupt
+        ), mock.patch.object(
+            platform, "_terminate_recovery_process_group",
+            wraps=platform._terminate_recovery_process_group,
+        ) as terminate, self.assertRaises(KeyboardInterrupt):
+            platform._run_quarantined_recovery_secret_leaf(
+                ["/bin/zsh", "-c", "/bin/sleep 30"]
+            )
+        self.assertGreaterEqual(terminate.call_count, 1)
+
+    def test_quarantined_recovery_selector_constructor_failure_never_spawns(self):
+        platform = PLATFORM.Platform()
+        with mock.patch.object(
+            PLATFORM.selectors, "DefaultSelector", side_effect=RuntimeError("boom")
+        ), mock.patch.object(PLATFORM.subprocess, "Popen") as popen, self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "quarantined_recovery_audit_unavailable"
+        ):
+            platform._run_quarantined_recovery_secret_leaf(["/bin/zsh", "-c", "true"])
+        popen.assert_not_called()
+
+    def test_quarantined_recovery_runner_timeout_kills_term_ignoring_group(self):
+        platform = PLATFORM.Platform()
+        with mock.patch.object(
+            PLATFORM, "QUARANTINED_RECOVERY_TIMEOUT_SECONDS", 0.1
+        ), self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "quarantined_recovery_audit_failed"
+        ):
+            platform._run_quarantined_recovery_secret_leaf([
+                "/bin/zsh", "-c", "trap '' TERM; /bin/sleep 30 & wait"
+            ])
+
     def test_candidate_process_identity_binds_kernel_path_start_and_fd_digest(self):
         platform = PLATFORM.Platform()
         candidate = self.candidates["api"]
@@ -6553,6 +6835,610 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         )
         lifecycle_path.chmod(0o600)
         return lifecycle_path
+
+    def prepare_audited_quarantined_recovery_fixture(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_start(self.context, self.platform)
+        bundle = pathlib.Path(
+            self.context.manifest["candidates"]["api"]["path"]
+        ).parent
+        bundle.chmod(0o755)
+        try:
+            candidate_spec_path = bundle / "candidate-spec.json"
+            candidate_spec_path.write_text("{}\n", encoding="utf-8")
+            candidate_spec_path.chmod(0o400)
+            candidate_provenance_path = bundle / "provenance.json"
+            candidate_provenance_path.write_text("{}\n", encoding="utf-8")
+            candidate_provenance_path.chmod(0o400)
+        finally:
+            bundle.chmod(0o555)
+        config_path = self.root / "quarantined-recovery-config.json"
+        config_path.write_text("{}\n", encoding="utf-8")
+        config_path.chmod(0o600)
+        bootstrap_root = self.root / "quarantined-bootstrap-states"
+        bootstrap_root.mkdir(mode=0o700)
+        bootstrap_path = bootstrap_root / (
+            f"bootstrap-{self.context.manifest['run_id']}.json"
+        )
+        tool_digests = {
+            "issuer_sha256": "a" * 64,
+            "issuer_source_sha256": "b" * 64,
+            "runner_sha256": "c" * 64,
+            "product_driver_sha256": "d" * 64,
+            "scenario_sha256": "e" * 64,
+        }
+        lifecycle_path = self.write_d2a_session_lifecycle(
+            "quarantined", origin="issuer", process_group_id=31359
+        )
+        lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        lifecycle.update({
+            "operation": "direct-onboard",
+            "boot_identity": "darwin-boottime:1786435163:174871",
+            "started_at": "2026-08-12T08:21:11.229463000Z",
+            "session_revoked": False,
+            "revoked_at": None,
+            "quarantined_at": "2026-08-12T08:21:12.175186000Z",
+        })
+        lifecycle_path.write_text(
+            json.dumps(lifecycle, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        lifecycle_path.chmod(0o600)
+        taint_path = ORCHESTRATOR.d2a_taint_path(self.context)
+        bootstrap_state = {
+            "schema_version": 1,
+            "kind": "starring.d2a.bootstrap-state.v1",
+            "bootstrap_id": "d2ab-" + "7" * 32,
+            "status": "recovery_required",
+            "phase": "direct_onboard",
+            "operation": "one-shot",
+            "config_path": str(config_path),
+            "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+            "candidate_spec_path": str(candidate_spec_path),
+            "candidate_spec_sha256": hashlib.sha256(
+                candidate_spec_path.read_bytes()
+            ).hexdigest(),
+            "candidate_provenance_path": str(candidate_provenance_path),
+            "candidate_provenance_sha256": hashlib.sha256(
+                candidate_provenance_path.read_bytes()
+            ).hexdigest(),
+            "candidate_dependency_record_sha256": "2" * 64,
+            "candidate_dependency_tree_sha256": "3" * 64,
+            "source_commit_sha": self.context.manifest["commit_sha"],
+            "source_tree_sha": "4" * 40,
+            "run_id": self.context.manifest["run_id"],
+            "manifest_path": str(self.context.manifest_path),
+            "manifest_sha256": self.context.digest,
+            "onboarding_evidence_path": None,
+            "onboarding_evidence_sha256": None,
+            "resource_prefix": self.context.manifest["discord"]["resource_prefix"],
+            "tool_digests": tool_digests,
+            "issuer_build_environment": {},
+            "records": [],
+            "last_session_operation": "direct-onboard",
+            "candidate_started": True,
+            "discord_teardown_complete": False,
+            "cleanup_complete": False,
+            "postconditions_complete": False,
+            "persistent_sandbox_retained": True,
+            "release_eligible": False,
+            "last_error": "direct_onboard_failed",
+            "updated_at": "2026-08-12T08:21:12Z",
+        }
+        bootstrap_path.write_text(
+            ORCHESTRATOR.canonical_json(bootstrap_state) + "\n",
+            encoding="utf-8",
+        )
+        bootstrap_path.chmod(0o600)
+        observations = {}
+        for name, tree in self.context.manifest["source_trees"].items():
+            changed = name in {"d2_toolchain", "certification_transport"}
+            observations[name] = {
+                "root": tree["root"],
+                "historical_sha256": tree["sha256"],
+                "observed_sha256": ("f" * 64 if changed else tree["sha256"]),
+                "matches_historical": not changed,
+            }
+        revision = {
+            "repository_root": str(ORCHESTRATOR.AUDITED_RECOVERY_REPOSITORY_ROOT),
+            "commit_sha": "b" * 40,
+            "tree_sha": "c" * 40,
+            "git_path": str(ORCHESTRATOR.AUDITED_RECOVERY_GIT_PATH),
+            "git_sha256": "8" * 64,
+        }
+        state_raw = self.context.state_path.read_bytes()
+        journal_rows, journal_raw = ORCHESTRATOR.read_strict_journal_snapshot(
+            self.context
+        )
+        transition_path = ORCHESTRATOR.candidate_start_transition_path(
+            self.context
+        )
+        database_path = self.context.artifact_directory / "database-evidence.json"
+        step_three_path = self.context.artifact_directory / "step-03-evidence.json"
+        plist_sha256 = {
+            name: hashlib.sha256(
+                ORCHESTRATOR.service_plist_path(self.context, name).read_bytes()
+            ).hexdigest()
+            for name in ORCHESTRATOR.SERVICE_START_ORDER
+        }
+        service_identities = {}
+        candidate_names = {
+            "api": "api", "runtime": "runtime", "transport": "certification_transport",
+            "worker": "node", "tunnel": "cloudflared",
+        }
+        for name in ORCHESTRATOR.SERVICE_START_ORDER:
+            label = self.context.manifest["services"][name]["label"]
+            job = self.platform.launchd_job(label)
+            candidate_name = candidate_names[name]
+            candidate = pathlib.Path(
+                self.context.manifest["candidates"][candidate_name]["path"]
+            )
+            identity = self.platform.candidate_process_identity(job["pid"], candidate)
+            service_identities[name] = {
+                "pid": job["pid"], "process_group_id": job["pid"],
+                "program": job["program"], "arguments": job["arguments"],
+                "candidate": candidate_name,
+                "start_time_seconds": identity["start_time_seconds"],
+                "start_time_microseconds": identity["start_time_microseconds"],
+                "device": identity["device"], "inode": identity["inode"],
+                "size": identity["size"],
+            }
+        inventory = self.platform.resource_inventory(self.context)
+        allowlist = {
+            "manifest_commit_sha": self.context.manifest["commit_sha"],
+            "historical_d2_toolchain_sha256": self.context.manifest["source_trees"]["d2_toolchain"]["sha256"],
+            "historical_transport_sha256": self.context.manifest["source_trees"]["certification_transport"]["sha256"],
+            "historical_worker_sha256": self.context.manifest["source_trees"]["codex_worker"]["sha256"],
+            "bootstrap_id": bootstrap_state["bootstrap_id"],
+            "bootstrap_state_sha256": hashlib.sha256(bootstrap_path.read_bytes()).hexdigest(),
+            "bootstrap_semantic_sha256": (
+                ORCHESTRATOR.audited_quarantined_bootstrap_semantic_sha256(
+                    bootstrap_state
+                )
+            ),
+            "bootstrap_config_sha256": bootstrap_state["config_sha256"],
+            "candidate_spec_sha256": bootstrap_state["candidate_spec_sha256"],
+            "candidate_provenance_sha256": bootstrap_state["candidate_provenance_sha256"],
+            "candidate_dependency_record_sha256": bootstrap_state["candidate_dependency_record_sha256"],
+            "candidate_dependency_tree_sha256": bootstrap_state["candidate_dependency_tree_sha256"],
+            "source_tree_sha": bootstrap_state["source_tree_sha"],
+            "issuer_sha256": tool_digests["issuer_sha256"],
+            "issuer_source_sha256": tool_digests["issuer_source_sha256"],
+            "orchestrator_state_sha256": hashlib.sha256(state_raw).hexdigest(),
+            "journal_sha256": hashlib.sha256(journal_raw).hexdigest(),
+            "journal_rows": len(journal_rows),
+            "taint_sha256": hashlib.sha256(taint_path.read_bytes()).hexdigest(),
+            "lifecycle_sha256": hashlib.sha256(
+                lifecycle_path.read_bytes()
+            ).hexdigest(),
+            "candidate_start_transition_sha256": hashlib.sha256(transition_path.read_bytes()).hexdigest(),
+            "database_evidence_sha256": hashlib.sha256(database_path.read_bytes()).hexdigest(),
+            "step_03_evidence_sha256": hashlib.sha256(step_three_path.read_bytes()).hexdigest(),
+            "database_system_identifier": "7673057195867924427",
+            "transport_instance_id": inventory["instance_id"],
+            "empty_transport_inventory_sha256": inventory["digest_sha256"],
+            "safe_after": "2026-08-12T08:23:13Z",
+            "zsh_sha256": "1" * 64, "security_sha256": "2" * 64,
+            "psql_sha256": "3" * 64, "static_sql_sha256": "4" * 64,
+            "receipts_sha256": "a" * 64,
+            "coordinator_lock_sha256": "b" * 64,
+            "coordinator_source_sha256": {"fixture": "c" * 64},
+            "plist_sha256": plist_sha256,
+            "tunnel_script_sha256": hashlib.sha256(
+                (self.context.artifact_directory / "run-tunnel.zsh").read_bytes()
+            ).hexdigest(),
+        }
+        return {
+            "bootstrap_path": bootstrap_path, "bootstrap_before": bootstrap_path.read_bytes(),
+            "lifecycle_path": lifecycle_path,
+            "lifecycle_before": lifecycle_path.read_bytes(),
+            "observations": observations, "revision": revision,
+            "allowlist": allowlist, "service_identities": service_identities,
+        }
+
+    def run_audited_quarantined_recovery(self, fixture):
+        key = (self.context.manifest["run_id"], self.context.digest)
+        with mock.patch.object(
+            ORCHESTRATOR, "AUDITED_QUARANTINED_NO_ISSUE_ALLOWLIST",
+            {key: fixture["allowlist"]},
+        ), mock.patch.object(
+            ORCHESTRATOR, "AUDITED_QUARANTINED_SERVICE_IDENTITIES",
+            fixture["service_identities"],
+        ), mock.patch.object(
+            ORCHESTRATOR, "current_clean_recovery_source",
+            return_value=fixture["revision"],
+        ), mock.patch.object(
+            ORCHESTRATOR, "observe_audited_recovery_source_trees",
+            return_value=fixture["observations"],
+        ), mock.patch.object(
+            ORCHESTRATOR, "require_audited_quarantined_coordinator_baseline",
+            return_value={
+                name: fixture["allowlist"][name]
+                for name in (
+                    "receipts_sha256", "coordinator_lock_sha256",
+                    "coordinator_source_sha256",
+                )
+            },
+        ), mock.patch.object(
+            ORCHESTRATOR.os, "getpgid", side_effect=lambda pid: pid
+        ), mock.patch.object(
+            ORCHESTRATOR.os, "killpg", side_effect=ProcessLookupError
+        ):
+            return ORCHESTRATOR.command_recover_audited_quarantined_no_issue(
+                self.context, self.platform, fixture["observations"],
+                str(fixture["bootstrap_path"]), fixture["revision"]["commit_sha"],
+                fixture["revision"]["tree_sha"], self.context.manifest["run_id"],
+                self.context.digest,
+            )
+
+    def test_audited_quarantined_no_issue_recovery_succeeds_and_exact_replays(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        first = self.run_audited_quarantined_recovery(fixture)
+        self.assertEqual(first["status"], "recovered")
+        self.assertEqual(first["phase"], "cleaned")
+        self.assertEqual(first["postconditions"], {
+            "status": "observed", "phase": "cleaned", "postgres_running": False,
+            "candidate_launchd_jobs_loaded": 0,
+            "candidate_launchd_overrides_absent": True,
+            "protected_staging_unchanged": True,
+        })
+        self.assertTrue(first["database_absence"]["process_group_quiescent"])
+        self.assertEqual(self.platform.quarantined_database_audits, 1)
+        self.assertEqual(fixture["bootstrap_path"].read_bytes(), fixture["bootstrap_before"])
+        self.assertEqual(
+            fixture["lifecycle_path"].read_bytes(), fixture["lifecycle_before"]
+        )
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        for path in paths.values():
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        lifecycle_digest = fixture["allowlist"]["lifecycle_sha256"]
+        self.assertEqual(
+            json.loads(paths["evidence"].read_text())["lifecycle_sha256"],
+            lifecycle_digest,
+        )
+        journal_before = self.context.journal_path.read_bytes()
+        replay_bootstrap = json.loads(
+            fixture["bootstrap_path"].read_text(encoding="utf-8")
+        )
+        replay_bootstrap.update({
+            "status": "failed", "phase": "complete",
+            "discord_teardown_complete": False, "cleanup_complete": False,
+            "postconditions_complete": False,
+            "updated_at": "2026-08-12T09:00:00Z",
+        })
+        fixture["bootstrap_path"].write_text(
+            ORCHESTRATOR.canonical_json(replay_bootstrap) + "\n",
+            encoding="utf-8",
+        )
+        replay = self.run_audited_quarantined_recovery(fixture)
+        self.assertEqual(replay["status"], "exact_replay")
+        self.assertEqual(replay["cleanup_status"], "already_cleaned")
+        self.assertEqual(self.platform.quarantined_database_audits, 1)
+        self.assertEqual(self.context.journal_path.read_bytes(), journal_before)
+        self.assertEqual(
+            fixture["lifecycle_path"].read_bytes(), fixture["lifecycle_before"]
+        )
+
+    def test_audited_quarantined_recovery_rejects_nonzero_database_before_marker(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        self.platform.quarantined_database_override = {"auth_session_count": 1}
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_database_evidence_invalid",
+        ):
+            self.run_audited_quarantined_recovery(fixture)
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        self.assertTrue(paths["intent"].is_file())
+        self.assertFalse(paths["database_absence"].exists())
+        self.assertTrue(self.platform.postgres)
+        self.assertFalse(ORCHESTRATOR.d2a_teardown_fence_path(self.context).read_text().find('"status":"closing"') < 0)
+
+    def test_audited_quarantined_recovery_rejects_replacement_before_intent(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        bootouts_before = list(self.platform.bootouts)
+        api_label = self.context.manifest["services"]["api"]["label"]
+        self.platform.programs[api_label] = "/tmp/replacement"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_service_identity_invalid",
+        ):
+            self.run_audited_quarantined_recovery(fixture)
+        self.assertFalse(
+            ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)["intent"].exists()
+        )
+        self.assertEqual(self.platform.bootouts, bootouts_before)
+
+    def test_audited_quarantined_recovery_rejects_nonempty_transport_before_intent(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        self.platform.resource_history = [{
+            "kind": "role", "resource_id": "1524810437118525580",
+            "state": "created",
+        }]
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_transport_inventory_invalid",
+        ):
+            self.run_audited_quarantined_recovery(fixture)
+        self.assertFalse(
+            ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)["intent"].exists()
+        )
+
+    def test_audited_quarantined_recovery_rejects_transport_lost_before_reconciliation(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        original = ORCHESTRATOR.audited_quarantined_stop_exact
+        transport_label = self.context.manifest["services"]["transport"]["label"]
+
+        def lose_transport_after_tunnel(context, platform, name, allowlist):
+            value = original(context, platform, name, allowlist)
+            if name == "tunnel":
+                platform.loaded.discard(transport_label)
+            return value
+
+        with mock.patch.object(
+            ORCHESTRATOR, "audited_quarantined_stop_exact",
+            side_effect=lose_transport_after_tunnel,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_transport_absent_before_reconciliation",
+        ):
+            self.run_audited_quarantined_recovery(fixture)
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        self.assertTrue(paths["intent"].is_file())
+        self.assertFalse(paths["database_absence"].exists())
+        self.assertFalse(paths["reconciliation"].exists())
+
+    def test_audited_quarantined_recovery_rejects_live_service_group_after_bootout(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        with mock.patch.object(
+            ORCHESTRATOR, "AUDITED_QUARANTINED_SERVICE_IDENTITIES",
+            fixture["service_identities"],
+        ), mock.patch.object(
+            ORCHESTRATOR.os, "getpgid", side_effect=lambda pid: pid
+        ), mock.patch.object(
+            ORCHESTRATOR.os, "killpg", return_value=None
+        ), mock.patch.object(ORCHESTRATOR.time, "sleep", return_value=None), mock.patch.object(
+            ORCHESTRATOR.time, "monotonic", side_effect=(0, 0, 11)
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_service_process_present",
+        ):
+            ORCHESTRATOR.audited_quarantined_stop_exact(
+                self.context, self.platform, "tunnel", fixture["allowlist"]
+            )
+
+    def assert_audited_quarantined_resume_after_boundary(self, boundary):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        crashed = False
+        stack = contextlib.ExitStack()
+
+        def once(code):
+            nonlocal crashed
+            if not crashed:
+                crashed = True
+                raise RuntimeError(code)
+
+        if boundary == "intent":
+            original = ORCHESTRATOR.audited_write_once_marker
+
+            def write(path, expected, fields, code):
+                value = original(path, expected, fields, code)
+                if path == paths["intent"]:
+                    once("injected_intent_crash")
+                return value
+
+            stack.enter_context(mock.patch.object(
+                ORCHESTRATOR, "audited_write_once_marker", side_effect=write
+            ))
+        elif boundary == "closing":
+            original = ORCHESTRATOR.transition_d2a_teardown_fence
+
+            def transition(context, status):
+                value = original(context, status)
+                if status == "closing":
+                    once("injected_closing_crash")
+                return value
+
+            stack.enter_context(mock.patch.object(
+                ORCHESTRATOR, "transition_d2a_teardown_fence",
+                side_effect=transition,
+            ))
+        elif boundary in {"tunnel", "partial_producer"}:
+            original = ORCHESTRATOR.audited_quarantined_stop_exact
+            target = "tunnel" if boundary == "tunnel" else "runtime"
+
+            def stop(context, platform, name, allowlist):
+                value = original(context, platform, name, allowlist)
+                if name == target:
+                    once(f"injected_{boundary}_crash")
+                return value
+
+            stack.enter_context(mock.patch.object(
+                ORCHESTRATOR, "audited_quarantined_stop_exact",
+                side_effect=stop,
+            ))
+        elif boundary == "drain":
+            original = ORCHESTRATOR.audited_quarantined_drain_transport
+
+            def drain(context, platform):
+                value = original(context, platform)
+                once("injected_drain_crash")
+                return value
+
+            stack.enter_context(mock.patch.object(
+                ORCHESTRATOR, "audited_quarantined_drain_transport",
+                side_effect=drain,
+            ))
+        else:
+            self.fail(f"unsupported boundary: {boundary}")
+        with stack, self.assertRaisesRegex(RuntimeError, f"injected_{boundary}_crash"):
+            self.run_audited_quarantined_recovery(fixture)
+        self.assertTrue(paths["intent"].is_file())
+        self.assertFalse(paths["reconciliation"].exists())
+        if boundary == "intent":
+            self.assertFalse(
+                ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
+            )
+        result = self.run_audited_quarantined_recovery(fixture)
+        self.assertEqual(result["status"], "recovered")
+        self.assertEqual(result["phase"], "cleaned")
+        self.assertEqual(
+            fixture["lifecycle_path"].read_bytes(), fixture["lifecycle_before"]
+        )
+
+    def test_audited_quarantined_recovery_resumes_after_intent_crash(self):
+        self.assert_audited_quarantined_resume_after_boundary("intent")
+
+    def test_audited_quarantined_recovery_resumes_after_closing_crash(self):
+        self.assert_audited_quarantined_resume_after_boundary("closing")
+
+    def test_audited_quarantined_recovery_resumes_after_tunnel_stop_crash(self):
+        self.assert_audited_quarantined_resume_after_boundary("tunnel")
+
+    def test_audited_quarantined_recovery_resumes_after_transport_drain_crash(self):
+        self.assert_audited_quarantined_resume_after_boundary("drain")
+
+    def test_audited_quarantined_recovery_resumes_after_partial_producer_stop(self):
+        self.assert_audited_quarantined_resume_after_boundary("partial_producer")
+
+    def test_audited_quarantined_recovery_parser_requires_all_confirmations(self):
+        arguments = ORCHESTRATOR.build_parser().parse_args([
+            "recover-audited-quarantined-no-issue", "--manifest", str(self.manifest_path),
+            "--bootstrap-state", str(self.root / "bootstrap.json"),
+            "--confirm-current-commit", "a" * 40, "--confirm-current-tree", "b" * 40,
+            "--confirm-run-id", self.context.manifest["run_id"],
+            "--confirm-manifest-sha256", self.context.digest,
+        ])
+        self.assertEqual(arguments.command, "recover-audited-quarantined-no-issue")
+
+    def test_audited_quarantined_recovery_nests_exclusive_coordinator_lock(self):
+        events = []
+
+        @contextlib.contextmanager
+        def global_lock():
+            events.append("global:enter")
+            try:
+                yield
+            finally:
+                events.append("global:exit")
+
+        @contextlib.contextmanager
+        def coordinator_lock(path, exclusive):
+            self.assertEqual(path, self.context.manifest_path)
+            self.assertTrue(exclusive)
+            events.append("coordinator:enter")
+            try:
+                yield
+            finally:
+                events.append("coordinator:exit")
+
+        def command(*_arguments):
+            self.assertEqual(events, ["global:enter", "coordinator:enter"])
+            return {"status": "ok"}
+
+        argv = [
+            "isolated_orchestrator.py", "recover-audited-quarantined-no-issue",
+            "--manifest", str(self.context.manifest_path), "--bootstrap-state",
+            str(self.root / "bootstrap.json"), "--confirm-current-commit", "a" * 40,
+            "--confirm-current-tree", "b" * 40, "--confirm-run-id",
+            self.context.manifest["run_id"], "--confirm-manifest-sha256",
+            self.context.digest,
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            ORCHESTRATOR, "global_operation_lock", global_lock
+        ), mock.patch.object(
+            ORCHESTRATOR.d2_run, "coordinator_lock", coordinator_lock
+        ), mock.patch.object(
+            ORCHESTRATOR, "load_audited_recovery_context",
+            return_value=(self.context, {}),
+        ), mock.patch.object(
+            ORCHESTRATOR, "Platform", return_value=self.platform
+        ), mock.patch.object(
+            ORCHESTRATOR, "command_recover_audited_quarantined_no_issue",
+            side_effect=command,
+        ), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(ORCHESTRATOR.main())
+        self.assertEqual(events, [
+            "global:enter", "coordinator:enter", "coordinator:exit", "global:exit"
+        ])
+
+    def test_audited_quarantined_recovery_resumes_after_database_marker_crash(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        original = ORCHESTRATOR.audited_write_once_marker
+        crashed = False
+
+        def crash_after_database(path, expected, fields, code):
+            nonlocal crashed
+            value = original(path, expected, fields, code)
+            if path.name.endswith("database-absence.json") and not crashed:
+                crashed = True
+                raise RuntimeError("injected_database_marker_crash")
+            return value
+
+        with mock.patch.object(
+            ORCHESTRATOR, "audited_write_once_marker",
+            side_effect=crash_after_database,
+        ), self.assertRaisesRegex(RuntimeError, "injected_database_marker_crash"):
+            self.run_audited_quarantined_recovery(fixture)
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        self.assertTrue(paths["database_absence"].is_file())
+        self.assertFalse(paths["reconciliation"].exists())
+        self.assertTrue(self.platform.postgres)
+        result = self.run_audited_quarantined_recovery(fixture)
+        self.assertEqual(result["status"], "recovered")
+        self.assertEqual(self.platform.quarantined_database_audits, 1)
+
+    def test_audited_quarantined_recovery_resumes_cleanup_after_postgres_stop_crash(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        original_stop = self.platform.postgres_stop
+        crashed = False
+
+        def crash_after_stop(cluster_root):
+            nonlocal crashed
+            original_stop(cluster_root)
+            if not crashed:
+                crashed = True
+                raise RuntimeError("injected_postgres_stop_crash")
+
+        self.platform.postgres_stop = crash_after_stop
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+        ):
+            self.run_audited_quarantined_recovery(fixture)
+        self.platform.postgres_stop = original_stop
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        self.assertTrue(paths["reconciliation"].is_file())
+        self.assertFalse(self.platform.postgres)
+        result = self.run_audited_quarantined_recovery(fixture)
+        self.assertEqual(result["status"], "recovered")
+        self.assertEqual(result["cleanup_status"], "cleaned")
+
+    def test_audited_quarantined_recovery_resumes_prior_boot_before_cleanup_intent(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        original_cleanup = ORCHESTRATOR.command_cleanup_internal
+        with mock.patch.object(
+            ORCHESTRATOR, "command_cleanup_internal",
+            side_effect=RuntimeError("injected_pre_cleanup_crash"),
+        ), self.assertRaisesRegex(RuntimeError, "injected_pre_cleanup_crash"):
+            self.run_audited_quarantined_recovery(fixture)
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        self.assertTrue(paths["reconciliation"].is_file())
+        self.assertEqual(
+            json.loads(ORCHESTRATOR.d2a_teardown_fence_path(self.context).read_text())["status"],
+            "closed",
+        )
+        self.platform.postgres_stop(self.context.cluster_root)
+        self.assertFalse(any(
+            row.get("action") == "cleanup"
+            for row in ORCHESTRATOR.load_lifecycle_journal(self.context)
+        ))
+        with mock.patch.object(
+            ORCHESTRATOR, "command_cleanup_internal", original_cleanup
+        ):
+            result = self.run_audited_quarantined_recovery(fixture)
+        self.assertEqual(result["status"], "recovered")
+        self.assertTrue(result["postgres_process_absent"])
 
     def prepare_audited_preissuer_rollback_fixture(self, rolled_back=True):
         ORCHESTRATOR.command_prepare(self.context, self.platform)

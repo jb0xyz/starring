@@ -12,7 +12,10 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 import unicodedata
+
+import d2_run
 
 
 D2A_TAINT_FIELDS = (
@@ -335,6 +338,170 @@ AUDITED_PREISSUER_ROLLBACK_EVIDENCE_FIELDS = tuple(
         }
     )
 )
+
+AUDITED_QUARANTINED_NO_ISSUE_INTENT_KIND = (
+    "starring.d2.audited-quarantined-no-issue-recovery-intent.v1"
+)
+AUDITED_QUARANTINED_NO_ISSUE_RECONCILIATION_KIND = (
+    "starring.d2.audited-quarantined-no-issue-reconciliation.v1"
+)
+AUDITED_QUARANTINED_NO_ISSUE_DATABASE_KIND = (
+    "starring.d2.audited-quarantined-no-issue-database-absence.v1"
+)
+AUDITED_QUARANTINED_NO_ISSUE_EVIDENCE_KIND = (
+    "starring.d2.audited-quarantined-no-issue-recovery.v1"
+)
+AUDITED_QUARANTINED_NO_ISSUE_OPERATION_ID = (
+    "audited-quarantine-recovery:c52d220457d1"
+)
+AUDITED_QUARANTINED_NO_ISSUE_ALLOWLIST = {
+    (
+        "d2-20260812t082042z-c52d220457d1",
+        "a522e5c316f58f54df8c0ea69ab0f6aebb9ed85e7bb6ce45a2c02b5e63823338",
+    ): {
+        "manifest_commit_sha": "ab9b36f25f52ad1e3d82aee1a4dba12b00080e83",
+        "historical_d2_toolchain_sha256": "4a903d58c433d09d99f3ac359b14fdcf8189c3574600f0ebaa0c4db03621b976",
+        "historical_transport_sha256": "79aa836e039687ddcb2b91305d2def26798dcec72de5703734416e6864e1a1a9",
+        "historical_worker_sha256": "39421ca38caeaec5c3f1889f0e09118ebbe815e169a63da5daa7333ec1a2312d",
+        "bootstrap_id": "d2ab-734673ef116c48fa3fc51ec0b13e02fc",
+        "bootstrap_state_sha256": "49bf6c2fc87ee24fadec3d49707c8b2a438590a091eac7e2f96155155e507c85",
+        "bootstrap_semantic_sha256": "e9497355f1d7e97f3dd3245f95c96a24bf70f774ea72989b37750c7b912ab952",
+        "bootstrap_config_sha256": "34988a102c346be941246d48622b742fc9d17c1c837d396fbca2b5077243da10",
+        "candidate_spec_sha256": "e931caed786f96caba8c13c421b8adcbe67dfde50f3101944dd8ebc2a5dcb074",
+        "candidate_provenance_sha256": "7c1454e10462febaf05e96626c22ebdf3a5b2810733cd150290e2088a0d6ce16",
+        "candidate_dependency_record_sha256": "25523c5b7d5c6db57a440324c31c33a58e841c07c4c84593afbe6d8e32cfb421",
+        "candidate_dependency_tree_sha256": "1ac4e636067f59abc9d339b9f3d4414a53b535ce7be5004e8681036438df581b",
+        "source_tree_sha": "b6dfe75f129f6fd8d6e796260359437ed5a27e82",
+        "issuer_sha256": "769d2b16a3c85f578a0b470c07bd0aaf13aa9bf51a8dd646153a28d48b1ca5cb",
+        "issuer_source_sha256": "69743522a2961c06547efc3221035e8f166e69a603188879ff92a5155614b234",
+        "orchestrator_state_sha256": "ad80ebfbf5b2d3fa1424709b8ee07a5cf7859d6966df3ab1c6c7ed0183482016",
+        "journal_sha256": "94167d8dcbe70e4c2e065472bdcc52b1bdabe77b2409e9985cdd5254480e0cd3",
+        "journal_rows": 44,
+        "taint_sha256": "0addc12e7574d261aaaa4978b7f9214b274ada5e371432e447d3b67a07b3cdac",
+        "lifecycle_sha256": "a1de160581e7da4475f4b722b90a802ad8c4ef22009a99e57adfe3c64d940f55",
+        "candidate_start_transition_sha256": "e6dbdfdeba98f8b0a7273a9319281ed36e9045e2b8862431706fcf81aa45d35f",
+        "database_evidence_sha256": "47c3f2a24f5c62db72cf0310745b5026d6973455263b379af0a61d0a8354ce12",
+        "step_03_evidence_sha256": "c739fdc3fc8f6efe5b9c66a8ad308902b0afeb6fbd9265e2ae190e1cdc163893",
+        "database_system_identifier": "7673057195867924427",
+        "transport_instance_id": "d2ti-f3616791d71f2fdd92ceb1ec14b60cd5",
+        "empty_transport_inventory_sha256": "74f1658b2a815d8100552f69b0b58d6eaefae99e76be80e2297c8d9f6cf1ebc4",
+        "safe_after": "2026-08-12T08:23:13Z",
+        "zsh_sha256": "1f473d234dd65157f530b4f676686517ec97fe9aa64c76d82f2611674cc44314",
+        "security_sha256": "2d2578ef40e1524f0572133e0e838479439027d51bb693a9ddfb57f20bb69e87",
+        "psql_sha256": "880f676c397eb38415a83c25900a755502254f186dd7c9e18cb96b2c943b557b",
+        "static_sql_sha256": "56cfdd24f7f8f50b73c0fc1decc8a38a4bff34fc4b1832f152fb8d5b2872607d",
+        "receipts_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "coordinator_lock_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "coordinator_source_sha256": {
+            "step-01-bootstrap.json": "08cec720eeef40c6bce9c6a40ad0dac8fa0cecc7901b7d70ff6d61f71d29c5af",
+            "step-02-prior-absence.json": "cade6176cde4ded6e03e612bce126c63ee707aa58f1500f2f3659888277c824e",
+            "step-03-candidate.json": "44b8865ff2b6431f068c0b58ca61f7a29dc61131408b6ccc8de633c54b5564c9",
+        },
+        "tunnel_script_sha256": "526c9b27c65a350a754221abae92450d052306872dc166503d9aff1127ce19a4",
+        "plist_sha256": {
+            "api": "b3eb9bf355855f40eef980fe9bf0132bbcf46f22b3457b57dc4c690be77c82a5",
+            "runtime": "8918a467ec404418df5d89e3c44035c5b4aef0d14e8b0f2b0b210fd8ea66488a",
+            "transport": "0a738931d2dde05d41aec4e9076fa6de4a35d5733fdaf711e9e78fa33fd15126",
+            "tunnel": "14cdc74f88231b638c7ef0505c8ee267744a4f9313af203a81f72716f6177386",
+            "worker": "38e60569fa74051fcc79f2e346da802fe8b9c6b72da2818e959332301ef9860a",
+        },
+    }
+}
+
+AUDITED_QUARANTINED_SERVICE_IDENTITIES = {
+    "transport": {
+        "pid": 30996, "process_group_id": 30996,
+        "program": "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/d2-certification-transport",
+        "arguments": [
+            "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/d2-certification-transport",
+            "--root", "/private/tmp/starring-d2-d2-20260812t082042z-c52d220457d1",
+            "--run-id", "d2-20260812t082042z-c52d220457d1",
+            "--guild-id", "1536845588954353676", "--hub-channel-id", "1536845619266846792",
+            "--actor-id", "1056857223529250906", "--bot-user-id", "1533144492293754900",
+            "--gateway-listen", "127.0.0.1:29101", "--http-listen", "127.0.0.1:29102",
+        ],
+        "candidate": "certification_transport", "start_time_seconds": 1786522855,
+        "start_time_microseconds": 426871, "device": 16777230, "inode": 48539870,
+        "size": 5854464,
+    },
+    "worker": {
+        "pid": 31004, "process_group_id": 31004,
+        "program": "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/node",
+        "arguments": [
+            "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/node",
+            "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/codex-worker/worker.mjs",
+        ],
+        "candidate": "node", "start_time_seconds": 1786522855,
+        "start_time_microseconds": 969142, "device": 16777230, "inode": 48539879,
+        "size": 292386560,
+    },
+    "api": {
+        "pid": 31105, "process_group_id": 31105,
+        "program": "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/starring-api",
+        "arguments": ["/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/starring-api"],
+        "candidate": "api", "start_time_seconds": 1786522860,
+        "start_time_microseconds": 212847, "device": 16777230, "inode": 48539866,
+        "size": 29124432,
+    },
+    "runtime": {
+        "pid": 31113, "process_group_id": 31113,
+        "program": "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/starring-runtime",
+        "arguments": ["/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/starring-runtime"],
+        "candidate": "runtime", "start_time_seconds": 1786522860,
+        "start_time_microseconds": 239860, "device": 16777230, "inode": 48539867,
+        "size": 28613808,
+    },
+    "tunnel": {
+        "pid": 31121, "process_group_id": 31121, "program": "/bin/zsh",
+        "arguments": [
+            "/bin/zsh",
+            "/Users/jungbogeon/Library/Application Support/Starring/release-certifications/d2-20260812t082042z-c52d220457d1/orchestrator/run-tunnel.zsh",
+        ],
+        "candidate": "cloudflared", "start_time_seconds": 1786522860,
+        "start_time_microseconds": 262639, "device": 16777230, "inode": 48539880,
+        "size": 38238338,
+    },
+}
+
+AUDITED_QUARANTINED_INTENT_FIELDS = tuple(sorted({
+    "schema_version", "kind", "run_id", "manifest_sha256", "bootstrap_id",
+    "bootstrap_state_path", "baseline_bootstrap_state_sha256",
+    "historical_manifest_commit_sha", "historical_source_trees", "current_source",
+    "orchestrator_state_sha256", "baseline_journal_sha256", "baseline_journal_rows",
+    "taint_sha256", "lifecycle_sha256", "candidate_start_transition_sha256",
+    "database_evidence_sha256", "step_03_evidence_sha256", "transport_instance_id",
+    "pre_intent_transport_inventory_sha256", "effect_admission_operation_id",
+    "database_system_identifier", "safe_after", "service_identities", "audit_tools",
+    "receipts_sha256", "coordinator_lock_sha256", "coordinator_source_sha256",
+    "plist_sha256", "tunnel_script_sha256",
+    "created_at",
+}))
+AUDITED_QUARANTINED_RECONCILIATION_FIELDS = tuple(sorted({
+    "schema_version", "kind", "run_id", "manifest_sha256", "intent_sha256",
+    "observed_at", "lifecycle_sha256", "transport_instance_id",
+    "pre_intent_transport_inventory_sha256", "effect_admission_operation_id",
+    "effect_admission_status", "producer_launchd_jobs_absent",
+    "issuer_process_group_absent", "post_drain_transport_inventory_sha256",
+    "database_absence_sha256", "final_transport_inventory_sha256",
+    "postgres_running", "protected_staging_unchanged",
+}))
+AUDITED_QUARANTINED_DATABASE_FIELDS = tuple(sorted({
+    "schema_version", "kind", "run_id", "manifest_sha256", "intent_sha256",
+    "post_drain_transport_inventory_sha256", "observed_at", "database_name",
+    "database_system_identifier", "control_plane_identity", "topology_verified",
+    "tables_locked", "locked_tables", "transaction_committed",
+    "process_group_quiescent", "oauth_flow_count", "auth_session_count",
+    "principal_count", "tenant_count", "installation_count",
+    "authority_version_count", "runtime_slot_writer_fence_count", "zsh_sha256",
+    "security_sha256", "psql_sha256", "static_sql_sha256",
+}))
+AUDITED_QUARANTINED_EVIDENCE_FIELDS = tuple(sorted({
+    "schema_version", "kind", "run_id", "manifest_sha256", "intent_sha256",
+    "reconciliation_sha256", "database_absence_sha256", "observed_at",
+    "lifecycle_sha256", "teardown_fence_sha256", "cleanup_evidence_sha256",
+    "database_absent", "postgres_process_absent", "launchd_jobs_absent",
+    "keychain_items_absent", "isolated_root_absent", "protected_staging_unchanged",
+}))
 
 
 def candidate_launchd_labels(context):
@@ -5091,7 +5258,7 @@ def require_audited_manifest_unchanged(context):
         fail("audited_recovery_manifest_changed")
 
 
-def audited_bootstrap_state(context, raw_state_path):
+def audited_bootstrap_state(context, raw_state_path, quarantined_recovery=False):
     state_path = require_absolute_path(raw_state_path, "audited_recovery_bootstrap_state")
     if state_path.name != f"bootstrap-{context.manifest['run_id']}.json":
         fail("audited_recovery_bootstrap_state_invalid")
@@ -5114,6 +5281,13 @@ def audited_bootstrap_state(context, raw_state_path):
         AUDITED_BOOTSTRAP_STATE_FIELDS,
         sorted_canonical=True,
     )
+    baseline_quarantined = (
+        state.get("status") == "recovery_required"
+        and state.get("phase") == "direct_onboard"
+    )
+    replay_quarantined = (
+        state.get("status") == "failed" and state.get("phase") == "complete"
+    )
     raw = audited_private_file_bytes(
         state_path, {0o600}, D2A_MARKER_MAXIMUM_BYTES, "audited_recovery_bootstrap_state_invalid"
     )
@@ -5121,8 +5295,15 @@ def audited_bootstrap_state(context, raw_state_path):
         type(state.get("schema_version")) is not int
         or state.get("schema_version") != 1
         or state.get("kind") != "starring.d2a.bootstrap-state.v1"
-        or state.get("status") != "recovery_required"
-        or state.get("phase") != "cleanup"
+        or (
+            not quarantined_recovery
+            and (
+                state.get("status") != "recovery_required"
+                or state.get("phase") != "cleanup"
+            )
+        )
+        or quarantined_recovery
+        and not (baseline_quarantined or replay_quarantined)
         or state.get("operation") != "one-shot"
         or state.get("run_id") != context.manifest["run_id"]
         or state.get("manifest_path") != str(context.manifest_path)
@@ -5130,15 +5311,17 @@ def audited_bootstrap_state(context, raw_state_path):
         or state.get("source_commit_sha") != context.manifest["commit_sha"]
         or not isinstance(state.get("source_tree_sha"), str)
         or COMMIT_PATTERN.fullmatch(state["source_tree_sha"]) is None
-        or state.get("candidate_started") is not False
-        or state.get("discord_teardown_complete") is not True
+        or state.get("candidate_started") is not quarantined_recovery
+        or state.get("discord_teardown_complete")
+        is not (False if quarantined_recovery else True)
         or state.get("cleanup_complete") is not False
         or state.get("postconditions_complete") is not False
         or state.get("records") != []
         or state.get("onboarding_evidence_path") is not None
         or state.get("onboarding_evidence_sha256") is not None
         or state.get("last_session_operation") != "direct-onboard"
-        or state.get("last_error") != "start_failed"
+        or state.get("last_error")
+        != ("direct_onboard_failed" if quarantined_recovery else "start_failed")
         or state.get("persistent_sandbox_retained") is not True
         or state.get("release_eligible") is not False
         or not validate_utc_timestamp(state.get("updated_at"))
@@ -5146,6 +5329,15 @@ def audited_bootstrap_state(context, raw_state_path):
         or not re.fullmatch(r"d2ab-[0-9a-f]{32}", state["bootstrap_id"])
         or state.get("resource_prefix")
         != context.manifest["discord"]["resource_prefix"]
+    ):
+        fail("audited_recovery_bootstrap_state_invalid")
+    if quarantined_recovery and any(
+        state.get(name) is not False
+        for name in (
+            "discord_teardown_complete",
+            "cleanup_complete",
+            "postconditions_complete",
+        )
     ):
         fail("audited_recovery_bootstrap_state_invalid")
     tool_digests = state.get("tool_digests")
@@ -5187,6 +5379,17 @@ def audited_bootstrap_state(context, raw_state_path):
     ):
         fail("audited_recovery_bootstrap_state_invalid")
     return state_path, state, hashlib.sha256(raw).hexdigest()
+
+
+def audited_quarantined_bootstrap_semantic_sha256(state):
+    mutable_completion_fields = {
+        "status", "phase", "discord_teardown_complete", "cleanup_complete",
+        "postconditions_complete", "updated_at",
+    }
+    return hashlib.sha256(canonical_json({
+        name: value for name, value in state.items()
+        if name not in mutable_completion_fields
+    }).encode("utf-8")).hexdigest()
 
 
 def audited_orchestrator_state(context):
@@ -5265,6 +5468,7 @@ def audited_git_command(arguments, allow_dirty_exit=False):
                 "GIT_CONFIG_GLOBAL": "/dev/null",
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_TERMINAL_PROMPT": "0",
+                "GIT_OPTIONAL_LOCKS": "0",
                 "HOME": "/",
                 "LANG": "C",
                 "LC_ALL": "C",
@@ -5999,6 +6203,807 @@ def command_recover_audited_preissuer_rollback(
     }
 
 
+def audited_quarantined_recovery_paths(context):
+    return {
+        "intent": context.artifact_directory
+        / "audited-quarantined-no-issue-recovery-intent.json",
+        "database_absence": context.artifact_directory
+        / "audited-quarantined-no-issue-database-absence.json",
+        "reconciliation": context.artifact_directory
+        / "audited-quarantined-no-issue-reconciliation.json",
+        "evidence": context.artifact_directory
+        / "audited-quarantined-no-issue-recovery.json",
+    }
+
+
+def audited_quarantined_marker(path, fields, code):
+    return load_strict_d2a_marker(
+        path, code, fields, sorted_canonical=True
+    )
+
+
+def audited_write_once_marker(path, expected, fields, code):
+    if os.path.lexists(path):
+        observed = audited_quarantined_marker(path, fields, code)
+        timestamp = "created_at" if "created_at" in expected else "observed_at"
+        if not validate_utc_timestamp(observed.get(timestamp)):
+            fail(code)
+        if observed != {**expected, timestamp: observed[timestamp]}:
+            fail(code)
+        return observed
+    try:
+        write_new_file(path, canonical_json(expected) + "\n")
+        fsync_directory(path.parent, f"{code}_parent")
+    except (OSError, CertificationError):
+        fail(f"{code}_write_failed")
+    observed = audited_quarantined_marker(path, fields, code)
+    if observed != expected:
+        fail(code)
+    return observed
+
+
+def audited_quarantined_state(context):
+    fields = tuple(sorted({
+        "schema_version", "manifest_sha256", "run_id", "phase", "updated_at",
+        "standing_snapshot",
+    }))
+    state = load_strict_d2a_marker(
+        context.state_path,
+        "audited_quarantined_orchestrator_state_invalid",
+        fields,
+        sorted_canonical=True,
+    )
+    raw = audited_private_file_bytes(
+        context.state_path, {0o600}, D2A_MARKER_MAXIMUM_BYTES,
+        "audited_quarantined_orchestrator_state_invalid",
+    )
+    if (
+        state.get("schema_version") != 1
+        or state.get("manifest_sha256") != context.digest
+        or state.get("run_id") != context.manifest["run_id"]
+        or state.get("phase") not in {"candidate_started", "cleaned"}
+        or not validate_utc_timestamp(state.get("updated_at"))
+        or not isinstance(state.get("standing_snapshot"), dict)
+    ):
+        fail("audited_quarantined_orchestrator_state_invalid")
+    return state, hashlib.sha256(raw).hexdigest()
+
+
+def audited_quarantined_journal(context, allowlist):
+    rows, raw = read_strict_journal_snapshot(context)
+    baseline_rows = allowlist["journal_rows"]
+    if len(rows) < baseline_rows:
+        fail("audited_quarantined_journal_invalid")
+    lines = raw.splitlines(keepends=True)
+    if hashlib.sha256(b"".join(lines[:baseline_rows])).hexdigest() != allowlist[
+        "journal_sha256"
+    ]:
+        fail("audited_quarantined_journal_invalid")
+    if any(
+        row.get("action") != "cleanup"
+        or row.get("status") not in {"intent", "failed", "complete"}
+        or row.get("target") != "run"
+        for row in rows[baseline_rows:]
+    ):
+        fail("audited_quarantined_journal_invalid")
+    return rows, raw
+
+
+def require_audited_quarantined_lifecycle(context, allowlist):
+    taint_raw = audited_private_file_bytes(
+        d2a_taint_path(context), {0o600}, D2A_MARKER_MAXIMUM_BYTES,
+        "audited_quarantined_taint_invalid",
+    )
+    lifecycle_raw = audited_private_file_bytes(
+        d2a_session_lifecycle_path(context), {0o600}, D2A_MARKER_MAXIMUM_BYTES,
+        "audited_quarantined_lifecycle_invalid",
+    )
+    if (
+        hashlib.sha256(taint_raw).hexdigest() != allowlist["taint_sha256"]
+        or hashlib.sha256(lifecycle_raw).hexdigest()
+        != allowlist["lifecycle_sha256"]
+    ):
+        fail("audited_quarantined_lifecycle_drift")
+    taint = load_strict_d2a_marker(
+        d2a_taint_path(context), "audited_quarantined_taint_invalid",
+        D2A_TAINT_FIELDS,
+    )
+    lifecycle = load_strict_d2a_marker(
+        d2a_session_lifecycle_path(context),
+        "audited_quarantined_lifecycle_invalid", D2A_SESSION_LIFECYCLE_FIELDS,
+    )
+    if (
+        taint.get("run_id") != context.manifest["run_id"]
+        or taint.get("manifest_sha256") != context.digest
+        or taint.get("release_eligible") is not False
+        or lifecycle
+        != {
+            "schema_version": 1,
+            "kind": "starring.d2a.session-lifecycle.v1",
+            "run_id": context.manifest["run_id"],
+            "manifest_sha256": context.digest,
+            "operation": "direct-onboard",
+            "origin": "issuer",
+            "issuer_sha256": allowlist["issuer_sha256"],
+            "issuer_source_sha256": allowlist["issuer_source_sha256"],
+            "uid": os.getuid(),
+            "boot_identity": "darwin-boottime:1786435163:174871",
+            "process_group_id": 31359,
+            "started_at": "2026-08-12T08:21:11.229463000Z",
+            "status": "quarantined",
+            "session_revoked": False,
+            "revoked_at": None,
+            "quarantined_at": "2026-08-12T08:21:12.175186000Z",
+        }
+    ):
+        fail("audited_quarantined_lifecycle_invalid")
+    try:
+        now = datetime.datetime.strptime(utc_now(), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc
+        )
+        safe_after = datetime.datetime.strptime(
+            allowlist["safe_after"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        fail("audited_quarantined_safe_after_invalid")
+    if now < safe_after:
+        fail("audited_quarantined_safe_after_not_elapsed")
+    if lifecycle["boot_identity"] == current_darwin_boot_identity():
+        try:
+            os.killpg(lifecycle["process_group_id"], 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            fail("audited_quarantined_process_group_present")
+        else:
+            fail("audited_quarantined_process_group_present")
+    return lifecycle
+
+
+def require_empty_audited_transport_inventory(context, platform, allowlist):
+    inventory = platform.transport_control(context, "resource_inventory")
+    if (
+        inventory.get("instance_id") != allowlist["transport_instance_id"]
+        or inventory.get("digest_sha256")
+        != allowlist["empty_transport_inventory_sha256"]
+        or inventory.get("history") != []
+        or inventory.get("created") != []
+        or inventory.get("deleted") != []
+        or inventory.get("active") != []
+    ):
+        fail("audited_quarantined_transport_inventory_invalid")
+    return inventory
+
+
+def require_audited_quarantined_coordinator_baseline(context, allowlist):
+    receipts = audited_private_file_bytes(
+        context.manifest_path.with_name("receipts.jsonl"), {0o600}, 1024,
+        "audited_quarantined_receipts_invalid", allow_empty=True,
+    )
+    coordinator = context.run_directory / "coordinator"
+    try:
+        metadata = coordinator.lstat()
+        entries = {path.name: path for path in coordinator.iterdir()}
+    except OSError:
+        fail("audited_quarantined_coordinator_invalid")
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or coordinator.is_symlink()
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or set(entries) != {"coordinator.lock"}
+        or hashlib.sha256(receipts).hexdigest() != allowlist["receipts_sha256"]
+    ):
+        fail("audited_quarantined_coordinator_invalid")
+    lock_raw = audited_private_file_bytes(
+        entries["coordinator.lock"], {0o600}, 1024,
+        "audited_quarantined_coordinator_invalid", allow_empty=True,
+    )
+    if hashlib.sha256(lock_raw).hexdigest() != allowlist["coordinator_lock_sha256"]:
+        fail("audited_quarantined_coordinator_invalid")
+    source_directory = context.artifact_directory / "coordinator-sources"
+    try:
+        source_metadata = source_directory.lstat()
+        source_entries = {
+            path.name: path for path in source_directory.iterdir()
+        }
+    except OSError:
+        fail("audited_quarantined_coordinator_source_invalid")
+    expected = allowlist["coordinator_source_sha256"]
+    if (
+        not stat.S_ISDIR(source_metadata.st_mode)
+        or source_directory.is_symlink()
+        or source_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(source_metadata.st_mode) != 0o700
+        or set(source_entries) != set(expected)
+    ):
+        fail("audited_quarantined_coordinator_source_invalid")
+    for name, digest in expected.items():
+        raw = audited_private_file_bytes(
+            source_entries[name], {0o600}, D2A_MARKER_MAXIMUM_BYTES,
+            "audited_quarantined_coordinator_source_invalid",
+        )
+        if hashlib.sha256(raw).hexdigest() != digest:
+            fail("audited_quarantined_coordinator_source_invalid")
+    return {
+        "receipts_sha256": allowlist["receipts_sha256"],
+        "coordinator_lock_sha256": allowlist["coordinator_lock_sha256"],
+        "coordinator_source_sha256": expected,
+    }
+
+
+def audited_quarantined_service_identity(context, platform, name, allowlist):
+    label = context.manifest["services"][name]["label"]
+    job = platform.launchd_job(label)
+    if job is None:
+        return False
+    expected = AUDITED_QUARANTINED_SERVICE_IDENTITIES[name]
+    expected_job = {
+        "pid": expected["pid"], "program": expected["program"],
+        "plist_path": str(service_plist_path(context, name)),
+        "arguments": expected["arguments"], "runs": 1, "state": "running",
+        "last_exit_code": None,
+    }
+    plist_raw = audited_private_file_bytes(
+        service_plist_path(context, name), {0o600}, 256 * 1024,
+        "audited_quarantined_plist_invalid",
+    )
+    if name == "tunnel":
+        tunnel_script = context.artifact_directory / "run-tunnel.zsh"
+        tunnel_raw = audited_private_file_bytes(
+            tunnel_script, {0o700}, 64 * 1024,
+            "audited_quarantined_tunnel_script_invalid",
+        )
+        if hashlib.sha256(tunnel_raw).hexdigest() != allowlist[
+            "tunnel_script_sha256"
+        ]:
+            fail("audited_quarantined_tunnel_script_invalid")
+    candidate = context.manifest["candidates"][expected["candidate"]]
+    process = platform.candidate_process_identity(
+        expected["pid"], pathlib.Path(candidate["path"])
+    )
+    try:
+        process_group_id = os.getpgid(expected["pid"])
+    except OSError:
+        fail("audited_quarantined_service_identity_invalid")
+    expected_process = {
+        "pid": expected["pid"], "path": candidate["path"],
+        "sha256": candidate["sha256"], "size": expected["size"],
+        "mode": 0o555, "uid": os.getuid(), "device": expected["device"],
+        "inode": expected["inode"], "links": 1,
+        "start_time_seconds": expected["start_time_seconds"],
+        "start_time_microseconds": expected["start_time_microseconds"],
+    }
+    if (
+        job != expected_job
+        or process_group_id != expected["process_group_id"]
+        or process != expected_process
+        or hashlib.sha256(plist_raw).hexdigest()
+        != allowlist["plist_sha256"][name]
+    ):
+        fail("audited_quarantined_service_identity_invalid")
+    return True
+
+
+def audited_quarantined_stop_exact(context, platform, name, allowlist):
+    label = context.manifest["services"][name]["label"]
+    if audited_quarantined_service_identity(context, platform, name, allowlist):
+        platform.launchd_bootout(label)
+    if not platform.launchd_absent(label):
+        fail("audited_quarantined_service_stop_incomplete")
+    identity = AUDITED_QUARANTINED_SERVICE_IDENTITIES[name]
+    expected_pid = identity["pid"]
+    expected_process_group_id = identity["process_group_id"]
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            os.killpg(expected_process_group_id, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            fail("audited_quarantined_service_process_present")
+        if time.monotonic() >= deadline:
+            fail("audited_quarantined_service_process_present")
+        time.sleep(0.05)
+
+
+def audited_quarantined_drain_transport(context, platform):
+    operation_id = AUDITED_QUARANTINED_NO_ISSUE_OPERATION_ID
+    response = platform.transport_effect_admission(
+        context, "close_effect_admission", operation_id
+    )
+    if response["disposition"] not in {"transitioned", "replayed"}:
+        fail("audited_quarantined_effect_admission_invalid")
+    deadline = time.monotonic() + 10
+    while True:
+        snapshot = platform.transport_control(context, "snapshot")
+        effect = snapshot["effect_http"]
+        if (
+            effect.get("phase") == "draining"
+            and effect.get("operation_id") == operation_id
+            and effect.get("active_requests") == 0
+            and effect.get("uncertain_requests") == 0
+            and effect.get("accepted_requests")
+            == effect.get("completed_requests")
+        ):
+            return snapshot
+        if time.monotonic() >= deadline:
+            fail("audited_quarantined_effect_drain_incomplete")
+        time.sleep(0.1)
+
+
+def audited_quarantined_postconditions(context, platform, state):
+    labels = candidate_launchd_labels(context)
+    loaded = sum(1 for label in labels if platform.launchd_loaded(label))
+    result = {
+        "status": "observed", "phase": "cleaned",
+        "postgres_running": context.cluster_root.exists()
+        and platform.postgres_running(context.cluster_root),
+        "candidate_launchd_jobs_loaded": loaded,
+        "candidate_launchd_overrides_absent": platform.launchd_overrides_absent(labels),
+        "protected_staging_unchanged": standing_snapshot(context, platform)
+        == state["standing_snapshot"],
+    }
+    if result != {
+        "status": "observed", "phase": "cleaned", "postgres_running": False,
+        "candidate_launchd_jobs_loaded": 0,
+        "candidate_launchd_overrides_absent": True,
+        "protected_staging_unchanged": True,
+    }:
+        fail("audited_quarantined_postconditions_invalid")
+    return result
+
+
+def audited_quarantined_database_payload(
+    context, allowlist, intent_sha256, inventory_sha256, observed_at
+):
+    return {
+        "schema_version": 1,
+        "kind": AUDITED_QUARANTINED_NO_ISSUE_DATABASE_KIND,
+        "run_id": context.manifest["run_id"],
+        "manifest_sha256": context.digest,
+        "intent_sha256": intent_sha256,
+        "post_drain_transport_inventory_sha256": inventory_sha256,
+        "observed_at": observed_at,
+        "database_name": "starring_runtime_staging",
+        "database_system_identifier": allowlist["database_system_identifier"],
+        "control_plane_identity": "run_owned_cluster_admin_tcp_v1",
+        "topology_verified": True,
+        "tables_locked": True,
+        "locked_tables": [
+            "public.product_oauth_flows",
+            "public.product_auth_sessions",
+            "public.product_principals",
+            "public.product_tenants",
+            "public.automation_installations",
+            "public.automation_installation_authority_versions",
+            "public.runtime_slot_writer_fences_v2",
+            "public.product_control_plane_identity",
+        ],
+        "transaction_committed": True,
+        "process_group_quiescent": True,
+        "oauth_flow_count": 0,
+        "auth_session_count": 0,
+        "principal_count": 0,
+        "tenant_count": 0,
+        "installation_count": 0,
+        "authority_version_count": 0,
+        "runtime_slot_writer_fence_count": 0,
+        "zsh_sha256": allowlist["zsh_sha256"],
+        "security_sha256": allowlist["security_sha256"],
+        "psql_sha256": allowlist["psql_sha256"],
+        "static_sql_sha256": allowlist["static_sql_sha256"],
+    }
+
+
+def audited_quarantined_database_projection(database_marker):
+    excluded = {
+        "schema_version", "kind", "run_id", "manifest_sha256", "intent_sha256",
+        "post_drain_transport_inventory_sha256", "observed_at",
+    }
+    return {
+        name: database_marker[name]
+        for name in database_marker
+        if name not in excluded
+    }
+
+
+def command_recover_audited_quarantined_no_issue(
+    context,
+    platform,
+    initial_observations,
+    bootstrap_state_path,
+    confirmed_current_commit,
+    confirmed_current_tree,
+    confirmed_run_id,
+    confirmed_manifest_sha256,
+):
+    if (
+        COMMIT_PATTERN.fullmatch(confirmed_current_commit or "") is None
+        or COMMIT_PATTERN.fullmatch(confirmed_current_tree or "") is None
+        or confirmed_run_id != context.manifest["run_id"]
+        or confirmed_manifest_sha256 != context.digest
+    ):
+        fail("audited_quarantined_confirmation_mismatch")
+    allowlist = AUDITED_QUARANTINED_NO_ISSUE_ALLOWLIST.get(
+        (context.manifest["run_id"], context.digest)
+    )
+    if allowlist is None:
+        fail("audited_quarantined_identity_not_allowlisted")
+    paths = audited_quarantined_recovery_paths(context)
+    intent_exists = os.path.lexists(paths["intent"])
+    require_audited_manifest_unchanged(context)
+    coordinator_baseline = require_audited_quarantined_coordinator_baseline(
+        context, allowlist
+    )
+    observations = validate_audited_source_observations(
+        context, initial_observations
+    )
+    revision = current_clean_recovery_source()
+    if (
+        revision["commit_sha"] != confirmed_current_commit
+        or revision["tree_sha"] != confirmed_current_tree
+    ):
+        fail("audited_quarantined_confirmation_mismatch")
+    source_record = audited_recovery_current_source(
+        context, observations, revision
+    )
+    bootstrap_path, bootstrap_state, bootstrap_sha256 = audited_bootstrap_state(
+        context, bootstrap_state_path, quarantined_recovery=True
+    )
+    if audited_quarantined_bootstrap_semantic_sha256(
+        bootstrap_state
+    ) != allowlist["bootstrap_semantic_sha256"]:
+        fail("audited_recovery_bootstrap_state_invalid")
+    state, state_sha256 = audited_quarantined_state(context)
+    rows, journal_raw = audited_quarantined_journal(context, allowlist)
+    require_audited_quarantined_lifecycle(context, allowlist)
+    for name, expected in (
+        ("candidate-start-transition.json", allowlist["candidate_start_transition_sha256"]),
+        ("database-evidence.json", allowlist["database_evidence_sha256"]),
+        ("step-03-evidence.json", allowlist["step_03_evidence_sha256"]),
+    ):
+        raw = audited_private_file_bytes(
+            context.artifact_directory / name, {0o600}, 1024 * 1024,
+            "audited_quarantined_historical_artifact_invalid",
+        )
+        if hashlib.sha256(raw).hexdigest() != expected:
+            fail("audited_quarantined_historical_artifact_invalid")
+    if not intent_exists:
+        if (
+            bootstrap_sha256 != allowlist["bootstrap_state_sha256"]
+            or state_sha256 != allowlist["orchestrator_state_sha256"]
+            or state["phase"] != "candidate_started"
+            or len(rows) != allowlist["journal_rows"]
+            or hashlib.sha256(journal_raw).hexdigest()
+            != allowlist["journal_sha256"]
+            or any(os.path.lexists(paths[name]) for name in (
+                "database_absence", "reconciliation", "evidence"
+            ))
+            or os.path.lexists(d2a_teardown_fence_path(context))
+            or not platform.postgres_running(context.cluster_root)
+            or standing_snapshot(context, platform) != state["standing_snapshot"]
+        ):
+            fail("audited_quarantined_boundary_invalid")
+        for name in SERVICE_START_ORDER:
+            if not audited_quarantined_service_identity(
+                context, platform, name, allowlist
+            ):
+                fail("audited_quarantined_boundary_invalid")
+        initial_inventory = require_empty_audited_transport_inventory(
+            context, platform, allowlist
+        )
+    else:
+        initial_inventory = {
+            "digest_sha256": allowlist["empty_transport_inventory_sha256"]
+        }
+    # Re-read all mutable source inputs immediately before the first mutation.
+    second_revision = current_clean_recovery_source()
+    second_observations = validate_audited_source_observations(
+        context, observe_audited_recovery_source_trees(context.manifest)
+    )
+    if second_revision != revision or second_observations != observations:
+        fail("audited_quarantined_source_changed")
+    require_audited_manifest_unchanged(context)
+    expected_intent = {
+        "schema_version": 1,
+        "kind": AUDITED_QUARANTINED_NO_ISSUE_INTENT_KIND,
+        "run_id": context.manifest["run_id"],
+        "manifest_sha256": context.digest,
+        "bootstrap_id": allowlist["bootstrap_id"],
+        "bootstrap_state_path": str(bootstrap_path),
+        "baseline_bootstrap_state_sha256": allowlist["bootstrap_state_sha256"],
+        "historical_manifest_commit_sha": allowlist["manifest_commit_sha"],
+        "historical_source_trees": {
+            name: context.manifest["source_trees"][name]["sha256"]
+            for name in sorted(context.manifest["source_trees"])
+        },
+        "current_source": source_record,
+        "orchestrator_state_sha256": allowlist["orchestrator_state_sha256"],
+        "baseline_journal_sha256": allowlist["journal_sha256"],
+        "baseline_journal_rows": allowlist["journal_rows"],
+        "taint_sha256": allowlist["taint_sha256"],
+        "lifecycle_sha256": allowlist["lifecycle_sha256"],
+        "candidate_start_transition_sha256": allowlist["candidate_start_transition_sha256"],
+        "database_evidence_sha256": allowlist["database_evidence_sha256"],
+        "step_03_evidence_sha256": allowlist["step_03_evidence_sha256"],
+        "transport_instance_id": allowlist["transport_instance_id"],
+        "pre_intent_transport_inventory_sha256": initial_inventory["digest_sha256"],
+        "effect_admission_operation_id": AUDITED_QUARANTINED_NO_ISSUE_OPERATION_ID,
+        "database_system_identifier": allowlist["database_system_identifier"],
+        "safe_after": allowlist["safe_after"],
+        "service_identities": AUDITED_QUARANTINED_SERVICE_IDENTITIES,
+        "audit_tools": {
+            name: allowlist[name] for name in (
+                "zsh_sha256", "security_sha256", "psql_sha256",
+                "static_sql_sha256",
+            )
+        },
+        "plist_sha256": allowlist["plist_sha256"],
+        "tunnel_script_sha256": allowlist["tunnel_script_sha256"],
+        **coordinator_baseline,
+        "created_at": utc_now(),
+    }
+    intent = audited_write_once_marker(
+        paths["intent"], expected_intent, AUDITED_QUARANTINED_INTENT_FIELDS,
+        "audited_quarantined_intent_invalid",
+    )
+    intent_raw = audited_private_file_bytes(
+        paths["intent"], {0o600}, D2A_MARKER_MAXIMUM_BYTES,
+        "audited_quarantined_intent_invalid",
+    )
+    intent_sha256 = hashlib.sha256(intent_raw).hexdigest()
+    # From this point a partial stop is accepted only through the exact intent.
+    require_audited_quarantined_lifecycle(context, allowlist)
+    fence_path = d2a_teardown_fence_path(context)
+    if not os.path.lexists(fence_path):
+        transition_d2a_teardown_fence(context, "closing")
+    fence = validate_d2a_teardown_fence(
+        context,
+        load_strict_d2a_marker(
+            fence_path, "audited_quarantined_fence_invalid",
+            D2A_TEARDOWN_FENCE_FIELDS, sorted_canonical=True,
+        ),
+    )
+    reconciliation_exists = os.path.lexists(paths["reconciliation"])
+    if not reconciliation_exists:
+        if fence["status"] != "closing":
+            fail("audited_quarantined_fence_invalid")
+        # Close public ingress before waiting for Discord effect admission to drain.
+        audited_quarantined_stop_exact(
+            context, platform, "tunnel", allowlist
+        )
+        if not audited_quarantined_service_identity(
+            context, platform, "transport", allowlist
+        ):
+            fail("audited_quarantined_transport_absent_before_reconciliation")
+        audited_quarantined_drain_transport(context, platform)
+        for name in ("runtime", "api", "worker"):
+            audited_quarantined_stop_exact(context, platform, name, allowlist)
+        require_audited_quarantined_lifecycle(context, allowlist)
+        if any(
+            not platform.launchd_absent(
+                context.manifest["services"][name]["label"]
+            )
+            for name in ("tunnel", "runtime", "api", "worker")
+        ):
+            fail("audited_quarantined_producer_stop_incomplete")
+        inventory_a = require_empty_audited_transport_inventory(
+            context, platform, allowlist
+        )
+        if (
+            not platform.postgres_running(context.cluster_root)
+            or standing_snapshot(context, platform) != state["standing_snapshot"]
+        ):
+            fail("audited_quarantined_database_boundary_invalid")
+        expected_database = audited_quarantined_database_payload(
+            context, allowlist, intent_sha256, inventory_a["digest_sha256"], utc_now()
+        )
+        if not os.path.lexists(paths["database_absence"]):
+            observed_database = platform.audit_quarantined_no_issue_database(
+                context,
+                {
+                    "run_id": context.manifest["run_id"],
+                    "manifest_sha256": context.digest,
+                    "database_system_identifier": allowlist["database_system_identifier"],
+                    "zsh_sha256": allowlist["zsh_sha256"],
+                    "security_sha256": allowlist["security_sha256"],
+                    "psql_sha256": allowlist["psql_sha256"],
+                    "static_sql_sha256": allowlist["static_sql_sha256"],
+                },
+            )
+            if observed_database != audited_quarantined_database_projection(
+                expected_database
+            ):
+                fail("audited_quarantined_database_evidence_invalid")
+        database_marker = audited_write_once_marker(
+            paths["database_absence"], expected_database,
+            AUDITED_QUARANTINED_DATABASE_FIELDS,
+            "audited_quarantined_database_evidence_invalid",
+        )
+        database_raw = audited_private_file_bytes(
+            paths["database_absence"], {0o600}, D2A_MARKER_MAXIMUM_BYTES,
+            "audited_quarantined_database_evidence_invalid",
+        )
+        database_sha256 = hashlib.sha256(database_raw).hexdigest()
+        inventory_b = require_empty_audited_transport_inventory(
+            context, platform, allowlist
+        )
+        expected_reconciliation = {
+            "schema_version": 1,
+            "kind": AUDITED_QUARANTINED_NO_ISSUE_RECONCILIATION_KIND,
+            "run_id": context.manifest["run_id"], "manifest_sha256": context.digest,
+            "intent_sha256": intent_sha256, "observed_at": utc_now(),
+            "lifecycle_sha256": allowlist["lifecycle_sha256"],
+            "transport_instance_id": allowlist["transport_instance_id"],
+            "pre_intent_transport_inventory_sha256": allowlist["empty_transport_inventory_sha256"],
+            "effect_admission_operation_id": AUDITED_QUARANTINED_NO_ISSUE_OPERATION_ID,
+            "effect_admission_status": "drained",
+            "producer_launchd_jobs_absent": True,
+            "issuer_process_group_absent": True,
+            "post_drain_transport_inventory_sha256": inventory_a["digest_sha256"],
+            "database_absence_sha256": database_sha256,
+            "final_transport_inventory_sha256": inventory_b["digest_sha256"],
+            "postgres_running": True, "protected_staging_unchanged": True,
+        }
+        reconciliation = audited_write_once_marker(
+            paths["reconciliation"], expected_reconciliation,
+            AUDITED_QUARANTINED_RECONCILIATION_FIELDS,
+            "audited_quarantined_reconciliation_invalid",
+        )
+    else:
+        database_marker = audited_quarantined_marker(
+            paths["database_absence"], AUDITED_QUARANTINED_DATABASE_FIELDS,
+            "audited_quarantined_database_evidence_invalid",
+        )
+        expected_database = audited_quarantined_database_payload(
+            context, allowlist, intent_sha256,
+            allowlist["empty_transport_inventory_sha256"],
+            database_marker.get("observed_at"),
+        )
+        if database_marker != expected_database:
+            fail("audited_quarantined_database_evidence_invalid")
+        database_raw = audited_private_file_bytes(
+            paths["database_absence"], {0o600}, D2A_MARKER_MAXIMUM_BYTES,
+            "audited_quarantined_database_evidence_invalid",
+        )
+        database_sha256 = hashlib.sha256(database_raw).hexdigest()
+        reconciliation = audited_quarantined_marker(
+            paths["reconciliation"], AUDITED_QUARANTINED_RECONCILIATION_FIELDS,
+            "audited_quarantined_reconciliation_invalid",
+        )
+        expected_reconciliation = {
+            **reconciliation,
+            "schema_version": 1,
+            "kind": AUDITED_QUARANTINED_NO_ISSUE_RECONCILIATION_KIND,
+            "run_id": context.manifest["run_id"], "manifest_sha256": context.digest,
+            "intent_sha256": intent_sha256,
+            "lifecycle_sha256": allowlist["lifecycle_sha256"],
+            "transport_instance_id": allowlist["transport_instance_id"],
+            "pre_intent_transport_inventory_sha256": allowlist["empty_transport_inventory_sha256"],
+            "effect_admission_operation_id": AUDITED_QUARANTINED_NO_ISSUE_OPERATION_ID,
+            "effect_admission_status": "drained", "producer_launchd_jobs_absent": True,
+            "issuer_process_group_absent": True,
+            "post_drain_transport_inventory_sha256": allowlist["empty_transport_inventory_sha256"],
+            "database_absence_sha256": database_sha256,
+            "final_transport_inventory_sha256": allowlist["empty_transport_inventory_sha256"],
+            "postgres_running": True, "protected_staging_unchanged": True,
+        }
+        if reconciliation != expected_reconciliation:
+            fail("audited_quarantined_reconciliation_invalid")
+    reconciliation_raw = audited_private_file_bytes(
+        paths["reconciliation"], {0o600}, D2A_MARKER_MAXIMUM_BYTES,
+        "audited_quarantined_reconciliation_invalid",
+    )
+    reconciliation_sha256 = hashlib.sha256(reconciliation_raw).hexdigest()
+    require_audited_quarantined_lifecycle(context, allowlist)
+    labels = candidate_launchd_labels(context)
+    if state["phase"] != "cleaned":
+        audited_quarantined_stop_exact(context, platform, "transport", allowlist)
+        cleanup_progress_present = (
+            fence["status"] == "closed"
+            and (
+                any(
+                    row.get("action") == "cleanup"
+                    and row.get("status") == "intent"
+                    and row.get("target") == "run"
+                    for row in rows[allowlist["journal_rows"] :]
+                )
+                or os.path.lexists(cleanup_keychain_baseline_path(context))
+                or os.path.lexists(cleanup_root_progress_path(context))
+            )
+        )
+        postgres_running = platform.postgres_running(context.cluster_root)
+        postgres_reboot_absent = (
+            fence["status"] == "closed"
+            and not postgres_running
+            and platform.postgres_process_path_absent(context.cluster_root)
+            and load_cleanup_root_identity(context) is not None
+        )
+        if (
+            any(not platform.launchd_absent(label) for label in labels)
+            or not platform.launchd_overrides_absent(labels)
+            or (
+                not postgres_running
+                and not cleanup_progress_present
+                and not postgres_reboot_absent
+            )
+            or standing_snapshot(context, platform) != state["standing_snapshot"]
+        ):
+            fail("audited_quarantined_reconciliation_boundary_invalid")
+        if fence["status"] == "closing":
+            transition_d2a_teardown_fence(context, "closed")
+    elif fence["status"] != "closed":
+        # Cleanup is allowed to finish before the final evidence write, but a
+        # cleaned state can never exist before the reconciliation or fence.
+        fail("audited_quarantined_cleaned_boundary_invalid")
+    fence = validate_d2a_teardown_fence(
+        context,
+        load_strict_d2a_marker(
+            fence_path, "audited_quarantined_fence_invalid",
+            D2A_TEARDOWN_FENCE_FIELDS, sorted_canonical=True,
+        ),
+    )
+    if fence["status"] != "closed":
+        fail("audited_quarantined_fence_invalid")
+    cleanup_result = command_cleanup_internal(
+        context, platform, retire_committed=False
+    )
+    final_state = load_state(context, {"cleaned"})
+    absence = cleanup_absence(context, platform, final_state["standing_snapshot"])
+    if not all(absence.values()):
+        fail("audited_quarantined_cleanup_incomplete")
+    require_audited_quarantined_lifecycle(context, allowlist)
+    final_revision = current_clean_recovery_source()
+    final_observations = validate_audited_source_observations(
+        context, observe_audited_recovery_source_trees(context.manifest)
+    )
+    if final_revision != revision or final_observations != observations:
+        fail("audited_quarantined_source_changed")
+    fence_raw = audited_private_file_bytes(
+        fence_path, {0o600}, D2A_MARKER_MAXIMUM_BYTES,
+        "audited_quarantined_fence_invalid",
+    )
+    cleanup_path = context.artifact_directory / "cleanup-evidence.json"
+    cleanup_raw = audited_private_file_bytes(
+        cleanup_path, {0o600}, D2A_MARKER_MAXIMUM_BYTES,
+        "audited_quarantined_cleanup_evidence_invalid",
+    )
+    expected_evidence = {
+        "schema_version": 1, "kind": AUDITED_QUARANTINED_NO_ISSUE_EVIDENCE_KIND,
+        "run_id": context.manifest["run_id"], "manifest_sha256": context.digest,
+        "intent_sha256": intent_sha256,
+        "reconciliation_sha256": reconciliation_sha256,
+        "database_absence_sha256": database_sha256, "observed_at": utc_now(),
+        "lifecycle_sha256": allowlist["lifecycle_sha256"],
+        "teardown_fence_sha256": hashlib.sha256(fence_raw).hexdigest(),
+        "cleanup_evidence_sha256": hashlib.sha256(cleanup_raw).hexdigest(),
+        **absence,
+    }
+    evidence = audited_write_once_marker(
+        paths["evidence"], expected_evidence, AUDITED_QUARANTINED_EVIDENCE_FIELDS,
+        "audited_quarantined_evidence_invalid",
+    )
+    postconditions = audited_quarantined_postconditions(
+        context, platform, final_state
+    )
+    return {
+        "status": "exact_replay" if intent_exists and os.path.lexists(paths["evidence"])
+        and cleanup_result["status"] == "already_cleaned" else "recovered",
+        "phase": "cleaned", "run_id": context.manifest["run_id"],
+        "manifest_sha256": context.digest, "intent": str(paths["intent"]),
+        "reconciliation": str(paths["reconciliation"]),
+        "database_absence_evidence": str(paths["database_absence"]),
+        "evidence": str(paths["evidence"]),
+        "transport_instance_id": allowlist["transport_instance_id"],
+        "transport_inventory_sha256": allowlist["empty_transport_inventory_sha256"],
+        "database_absence_sha256": database_sha256,
+        "database_absence": audited_quarantined_database_projection(database_marker),
+        **absence, "source_drift_observed": True,
+        "cleanup_status": cleanup_result["status"], "postconditions": postconditions,
+    }
+
+
 def command_status(context, platform):
     state = load_state(context)
     labels = candidate_launchd_labels(context)
@@ -6098,6 +7103,17 @@ def build_parser():
     audited_recovery.add_argument("--confirm-current-tree", required=True)
     audited_recovery.add_argument("--confirm-run-id", required=True)
     audited_recovery.add_argument("--confirm-manifest-sha256", required=True)
+    quarantined_recovery = subparsers.add_parser(
+        "recover-audited-quarantined-no-issue"
+    )
+    quarantined_recovery.add_argument("--manifest", required=True)
+    quarantined_recovery.add_argument("--bootstrap-state", required=True)
+    quarantined_recovery.add_argument("--confirm-current-commit", required=True)
+    quarantined_recovery.add_argument("--confirm-current-tree", required=True)
+    quarantined_recovery.add_argument("--confirm-run-id", required=True)
+    quarantined_recovery.add_argument(
+        "--confirm-manifest-sha256", required=True
+    )
     return parser
 
 
@@ -6112,7 +7128,10 @@ def main():
             context, legacy_state = load_legacy_context(
                 require_absolute_path(arguments.manifest, "manifest")
             )
-        elif arguments.command == "recover-audited-preissuer-rollback":
+        elif arguments.command in {
+            "recover-audited-preissuer-rollback",
+            "recover-audited-quarantined-no-issue",
+        }:
             context, audited_source_observations = load_audited_recovery_context(
                 require_absolute_path(arguments.manifest, "manifest")
             )
@@ -6139,6 +7158,7 @@ def main():
                 "legacy-substrate-status",
                 "recover-legacy-substrate",
                 "recover-audited-preissuer-rollback",
+                "recover-audited-quarantined-no-issue",
                 "finalize-run",
                 "finalize-total-absence",
                 "stop",
@@ -6150,6 +7170,7 @@ def main():
                 "legacy-substrate-status",
                 "recover-legacy-substrate",
                 "recover-audited-preissuer-rollback",
+                "recover-audited-quarantined-no-issue",
                 "teardown-discord-resources",
                 "stop",
                 "cleanup",
@@ -6179,6 +7200,18 @@ def main():
                     arguments.confirm_run_id,
                     arguments.confirm_manifest_sha256,
                 )
+            elif arguments.command == "recover-audited-quarantined-no-issue":
+                with d2_run.coordinator_lock(context.manifest_path, True):
+                    result = command_recover_audited_quarantined_no_issue(
+                        context,
+                        platform,
+                        audited_source_observations,
+                        arguments.bootstrap_state,
+                        arguments.confirm_current_commit,
+                        arguments.confirm_current_tree,
+                        arguments.confirm_run_id,
+                        arguments.confirm_manifest_sha256,
+                    )
             elif arguments.command == "onboard":
                 result = command_onboard(
                     context, platform, arguments.principal_id, arguments.display_name

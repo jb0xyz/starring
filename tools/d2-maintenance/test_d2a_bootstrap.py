@@ -55,6 +55,8 @@ class FakeExecutor:
         preexisting_lifecycle=None,
         direct_onboard_error_code=None,
         candidate_launchd_overrides_absent=True,
+        quarantined_direct_onboard=False,
+        audited_recovery_tamper=None,
     ):
         self.fixture = fixture
         self.fail_once = dict(fail_once or {})
@@ -71,6 +73,8 @@ class FakeExecutor:
         self.candidate_launchd_overrides_absent = (
             candidate_launchd_overrides_absent
         )
+        self.quarantined_direct_onboard = quarantined_direct_onboard
+        self.audited_recovery_tamper = audited_recovery_tamper
         self.source_snapshot_count = 0
         self.issuer_lock_acquired = False
         self.calls = []
@@ -109,6 +113,35 @@ class FakeExecutor:
             (json.dumps(lifecycle, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
         )
         path.chmod(0o600)
+
+    def write_quarantined_lifecycle(self):
+        taint = json.loads(
+            self.fixture.manifest_path.with_name("d2a-taint.json").read_bytes()
+        )
+        lifecycle = {
+            "schema_version": 1,
+            "kind": "starring.d2a.session-lifecycle.v1",
+            "run_id": self.fixture.run_id,
+            "manifest_sha256": self.fixture.manifest_sha256,
+            "operation": "direct-onboard",
+            "origin": "issuer",
+            "issuer_sha256": taint["issuer_sha256"],
+            "issuer_source_sha256": taint["issuer_source_sha256"],
+            "uid": os.getuid(),
+            "boot_identity": "darwin-boottime:1:0",
+            "process_group_id": 2_000_000_000,
+            "started_at": "2026-08-12T00:00:00.000000000Z",
+            "status": "quarantined",
+            "session_revoked": False,
+            "revoked_at": None,
+            "quarantined_at": "2026-08-12T00:00:01.000000000Z",
+        }
+        write_file(
+            self.fixture.manifest_path.with_name("d2a-session-lifecycle.json"),
+            lifecycle,
+            0o600,
+            sort_keys=False,
+        )
 
     def __call__(self, argv):
         identity = BOOTSTRAP.command_identity(argv)
@@ -274,6 +307,11 @@ class FakeExecutor:
                 },
             )
         if identity == "direct_onboard":
+            if self.quarantined_direct_onboard:
+                self.write_quarantined_lifecycle()
+                return self.completed(
+                    argv, None, 1, b"untrusted issuer failure\n"
+                )
             if self.direct_onboard_error_code is not None:
                 return self.completed(
                     argv,
@@ -362,6 +400,44 @@ class FakeExecutor:
                     "keychain_items_absent": True,
                     "isolated_root_absent": True,
                     "protected_staging_unchanged": True,
+                },
+            )
+        if identity == "recover_audited_quarantined_no_issue":
+            return self.completed(
+                argv,
+                {
+                    "status": "exact_replay"
+                    if self.audited_recovery_tamper == "replay"
+                    else "recovered",
+                    "phase": "cleaned",
+                    "run_id": self.fixture.run_id,
+                    "manifest_sha256": self.fixture.manifest_sha256,
+                    "intent": "fixture",
+                    "reconciliation": "fixture",
+                    "database_absence_evidence": "fixture",
+                    "evidence": "fixture",
+                    "transport_instance_id": "d2ti-" + "a" * 32,
+                    "transport_inventory_sha256": "b" * 64,
+                    "database_absence_sha256": "c" * 64,
+                    "database_absence": {},
+                    "database_absent": True,
+                    "postgres_process_absent": True,
+                    "launchd_jobs_absent": True,
+                    "keychain_items_absent": True,
+                    "isolated_root_absent": True,
+                    "protected_staging_unchanged": True,
+                    "source_drift_observed": True,
+                    "cleanup_status": "already_cleaned"
+                    if self.audited_recovery_tamper == "replay"
+                    else "cleaned",
+                    "postconditions": {
+                        "status": "observed",
+                        "phase": "cleaned",
+                        "postgres_running": False,
+                        "candidate_launchd_jobs_loaded": 0,
+                        "candidate_launchd_overrides_absent": True,
+                        "protected_staging_unchanged": True,
+                    },
                 },
             )
         if identity == "status":
@@ -797,7 +873,23 @@ class BootstrapFixture:
             "public_origin": self.config["cloudflare"]["public_origin"],
             "cloudflare": {},
             "candidates": candidate_entries,
-            "source_trees": {},
+            "source_trees": {
+                "certification_transport": {
+                    "files": [],
+                    "root": str(self.certification_root.parent / "d2-certification-transport"),
+                    "sha256": "1" * 64,
+                },
+                "codex_worker": {
+                    "files": sorted(BOOTSTRAP.CODEX_WORKER_FILES),
+                    "root": str(self.candidate_bundle / "codex-worker"),
+                    "sha256": "2" * 64,
+                },
+                "d2_toolchain": {
+                    "files": [],
+                    "root": str(self.certification_root),
+                    "sha256": "3" * 64,
+                },
+            },
             "database": {
                 "name": "starring_runtime_staging",
                 "cluster_root": f"/private/tmp/starring-d2-{self.run_id}/postgres",
@@ -885,6 +977,339 @@ class D2ABootstrapTests(unittest.TestCase):
 
     def tearDown(self):
         self.fixture.cleanup()
+
+    def create_quarantined_direct_onboard_failure(self):
+        executor = FakeExecutor(
+            self.fixture,
+            quarantined_direct_onboard=True,
+        )
+        result = self.fixture.controller(executor).run(
+            self.fixture.config_path,
+            self.fixture.candidate_spec_path,
+            "auth-smoke",
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "manual_recovery_required")
+        state_path = pathlib.Path(result["state"])
+        state = json.loads(state_path.read_bytes())
+        self.assertEqual(state["status"], "recovery_required")
+        self.assertEqual(state["phase"], "direct_onboard")
+        self.assertEqual(state["last_error"], "direct_onboard_failed")
+        self.assertTrue(state["candidate_started"])
+        self.assertFalse(state["discord_teardown_complete"])
+        self.assertFalse(state["cleanup_complete"])
+        self.assertFalse(state["postconditions_complete"])
+        return state_path, state
+
+    def audited_incident_overrides(self, state_path, state):
+        lifecycle = self.fixture.manifest_path.with_name(
+            "d2a-session-lifecycle.json"
+        )
+        return {
+            **BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            "run_id": state["run_id"],
+            "manifest_sha256": state["manifest_sha256"],
+            "bootstrap_state_sha256": hashlib.sha256(
+                state_path.read_bytes()
+            ).hexdigest(),
+            "bootstrap_state_semantic_sha256": (
+                BOOTSTRAP.audited_recovery_bootstrap_semantic_sha256(state)
+            ),
+            "lifecycle_sha256": hashlib.sha256(
+                lifecycle.read_bytes()
+            ).hexdigest(),
+            "transport_instance_id": "d2ti-" + "a" * 32,
+            "empty_transport_inventory_sha256": "b" * 64,
+        }
+
+    def audited_recovery_output(self, state):
+        paths = BOOTSTRAP.audited_recovery_artifact_paths(state)
+        return {
+            "status": "recovered",
+            "phase": "cleaned",
+            "run_id": state["run_id"],
+            "manifest_sha256": state["manifest_sha256"],
+            "intent": str(paths["intent"]),
+            "reconciliation": str(paths["reconciliation"]),
+            "database_absence_evidence": str(paths["database_absence"]),
+            "evidence": str(paths["evidence"]),
+            "transport_instance_id": "d2ti-" + "a" * 32,
+            "transport_inventory_sha256": "b" * 64,
+            "database_absence_sha256": "c" * 64,
+            "database_absence": {},
+            "database_absent": True,
+            "postgres_process_absent": True,
+            "launchd_jobs_absent": True,
+            "keychain_items_absent": True,
+            "isolated_root_absent": True,
+            "protected_staging_unchanged": True,
+            "source_drift_observed": True,
+            "cleanup_status": "cleaned",
+            "postconditions": {
+                "status": "observed",
+                "phase": "cleaned",
+                "postgres_running": False,
+                "candidate_launchd_jobs_loaded": 0,
+                "candidate_launchd_overrides_absent": True,
+                "protected_staging_unchanged": True,
+            },
+        }
+
+    def write_audited_recovery_artifacts(self, state_path, state):
+        incident = self.audited_incident_overrides(state_path, state)
+        artifact_root = self.fixture.manifest_path.parent / "orchestrator"
+        historical_inputs = {
+            "candidate_start_transition_sha256": artifact_root
+            / "candidate-start-transition.json",
+            "database_evidence_sha256": artifact_root / "database-evidence.json",
+            "step_03_evidence_sha256": artifact_root / "step-03-evidence.json",
+        }
+        for field, path in historical_inputs.items():
+            write_file(path, {"fixture": field}, 0o600)
+            incident[field] = hashlib.sha256(path.read_bytes()).hexdigest()
+        write_file(
+            self.fixture.manifest_path.with_name("receipts.jsonl"), b"", 0o600
+        )
+        coordinator_lock = (
+            self.fixture.manifest_path.parent
+            / "coordinator"
+            / "coordinator.lock"
+        )
+        write_file(coordinator_lock, b"", 0o600)
+        coordinator_root = artifact_root / "coordinator-sources"
+        coordinator_digests = {}
+        for name in (
+            "step-01-bootstrap.json",
+            "step-02-prior-absence.json",
+            "step-03-candidate.json",
+        ):
+            path = write_file(coordinator_root / name, {"fixture": name}, 0o600)
+            coordinator_digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        incident["receipts_sha256"] = hashlib.sha256(b"").hexdigest()
+        incident["coordinator_lock_sha256"] = hashlib.sha256(b"").hexdigest()
+        incident["coordinator_source_sha256"] = coordinator_digests
+        plist_digests = {}
+        suffix = state["run_id"].rsplit("-", 1)[1]
+        for name in ("api", "runtime", "transport", "tunnel", "worker"):
+            path = write_file(
+                artifact_root
+                / "launchd"
+                / f"local.starring.d2.{suffix}.{name}.plist",
+                {"fixture": name},
+                0o600,
+            )
+            plist_digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        tunnel_script = write_file(
+            artifact_root / "run-tunnel.zsh", b"fixture tunnel\n", 0o700
+        )
+        incident["plist_sha256"] = plist_digests
+        incident["tunnel_script_sha256"] = hashlib.sha256(
+            tunnel_script.read_bytes()
+        ).hexdigest()
+        taint = self.fixture.manifest_path.with_name("d2a-taint.json")
+        incident["taint_sha256"] = hashlib.sha256(taint.read_bytes()).hexdigest()
+
+        manifest = json.loads(self.fixture.manifest_path.read_bytes())
+        historical_source_trees = {
+            name: record["sha256"]
+            for name, record in manifest["source_trees"].items()
+        }
+        observations = {
+            name: {
+                "root": record["root"],
+                "historical_sha256": record["sha256"],
+                "observed_sha256": record["sha256"]
+                if name == "codex_worker"
+                else ("4" if name == "d2_toolchain" else "5") * 64,
+                "matches_historical": name == "codex_worker",
+            }
+            for name, record in manifest["source_trees"].items()
+        }
+        audit_tools = {
+            name: incident[name]
+            for name in (
+                "zsh_sha256",
+                "security_sha256",
+                "psql_sha256",
+                "static_sql_sha256",
+            )
+        }
+        paths = BOOTSTRAP.audited_recovery_artifact_paths(state)
+        intent = {
+            "schema_version": 1,
+            "kind": BOOTSTRAP.AUDITED_QUARANTINED_RECOVERY_KINDS["intent"],
+            "run_id": state["run_id"],
+            "manifest_sha256": state["manifest_sha256"],
+            "bootstrap_id": state["bootstrap_id"],
+            "bootstrap_state_path": str(state_path),
+            "baseline_bootstrap_state_sha256": incident["bootstrap_state_sha256"],
+            "historical_manifest_commit_sha": manifest["commit_sha"],
+            "historical_source_trees": historical_source_trees,
+            "current_source": {
+                "repository_root": str(self.fixture.root),
+                "commit_sha": "c" * 40,
+                "tree_sha": "d" * 40,
+                "git_path": str(BOOTSTRAP.FIXED_GIT),
+                "git_sha256": "6" * 64,
+                "source_trees": observations,
+            },
+            "orchestrator_state_sha256": incident["orchestrator_state_sha256"],
+            "baseline_journal_sha256": incident["journal_sha256"],
+            "baseline_journal_rows": incident["journal_rows"],
+            "taint_sha256": incident["taint_sha256"],
+            "lifecycle_sha256": incident["lifecycle_sha256"],
+            "candidate_start_transition_sha256": incident[
+                "candidate_start_transition_sha256"
+            ],
+            "database_evidence_sha256": incident["database_evidence_sha256"],
+            "step_03_evidence_sha256": incident["step_03_evidence_sha256"],
+            "transport_instance_id": incident["transport_instance_id"],
+            "pre_intent_transport_inventory_sha256": incident[
+                "empty_transport_inventory_sha256"
+            ],
+            "effect_admission_operation_id": (
+                f"audited-quarantine-recovery:{state['run_id'].rsplit('-', 1)[1]}"
+            ),
+            "database_system_identifier": incident["database_system_identifier"],
+            "safe_after": incident["safe_after"],
+            "service_identities": BOOTSTRAP.AUDITED_QUARANTINED_SERVICE_IDENTITIES,
+            "audit_tools": audit_tools,
+            "receipts_sha256": incident["receipts_sha256"],
+            "coordinator_lock_sha256": incident["coordinator_lock_sha256"],
+            "coordinator_source_sha256": incident[
+                "coordinator_source_sha256"
+            ],
+            "plist_sha256": incident["plist_sha256"],
+            "tunnel_script_sha256": incident["tunnel_script_sha256"],
+            "created_at": "2026-08-12T09:00:00Z",
+        }
+        write_file(paths["intent"], intent, 0o600)
+        intent_sha = hashlib.sha256(paths["intent"].read_bytes()).hexdigest()
+
+        database = {
+            "schema_version": 1,
+            "kind": BOOTSTRAP.AUDITED_QUARANTINED_RECOVERY_KINDS[
+                "database_absence"
+            ],
+            "run_id": state["run_id"],
+            "manifest_sha256": state["manifest_sha256"],
+            "intent_sha256": intent_sha,
+            "post_drain_transport_inventory_sha256": incident[
+                "empty_transport_inventory_sha256"
+            ],
+            "observed_at": "2026-08-12T09:00:01Z",
+            "database_name": "starring_runtime_staging",
+            "database_system_identifier": incident["database_system_identifier"],
+            "control_plane_identity": "run_owned_cluster_admin_tcp_v1",
+            "topology_verified": True,
+            "tables_locked": True,
+            "locked_tables": BOOTSTRAP.AUDITED_QUARANTINED_LOCKED_TABLES,
+            "transaction_committed": True,
+            "process_group_quiescent": True,
+            "oauth_flow_count": 0,
+            "auth_session_count": 0,
+            "principal_count": 0,
+            "tenant_count": 0,
+            "installation_count": 0,
+            "authority_version_count": 0,
+            "runtime_slot_writer_fence_count": 0,
+            **audit_tools,
+        }
+        write_file(paths["database_absence"], database, 0o600)
+        database_sha = hashlib.sha256(
+            paths["database_absence"].read_bytes()
+        ).hexdigest()
+
+        reconciliation = {
+            "schema_version": 1,
+            "kind": BOOTSTRAP.AUDITED_QUARANTINED_RECOVERY_KINDS[
+                "reconciliation"
+            ],
+            "run_id": state["run_id"],
+            "manifest_sha256": state["manifest_sha256"],
+            "intent_sha256": intent_sha,
+            "observed_at": "2026-08-12T09:00:02Z",
+            "lifecycle_sha256": incident["lifecycle_sha256"],
+            "transport_instance_id": incident["transport_instance_id"],
+            "pre_intent_transport_inventory_sha256": incident[
+                "empty_transport_inventory_sha256"
+            ],
+            "effect_admission_operation_id": intent[
+                "effect_admission_operation_id"
+            ],
+            "effect_admission_status": "drained",
+            "producer_launchd_jobs_absent": True,
+            "issuer_process_group_absent": True,
+            "post_drain_transport_inventory_sha256": incident[
+                "empty_transport_inventory_sha256"
+            ],
+            "database_absence_sha256": database_sha,
+            "final_transport_inventory_sha256": incident[
+                "empty_transport_inventory_sha256"
+            ],
+            "postgres_running": True,
+            "protected_staging_unchanged": True,
+        }
+        write_file(paths["reconciliation"], reconciliation, 0o600)
+        reconciliation_sha = hashlib.sha256(
+            paths["reconciliation"].read_bytes()
+        ).hexdigest()
+
+        fence_path = self.fixture.manifest_path.with_name(
+            "d2a-teardown-fence.json"
+        )
+        write_file(
+            fence_path,
+            {
+                "schema_version": 1,
+                "kind": "starring.d2a.teardown-fence.v1",
+                "run_id": state["run_id"],
+                "manifest_sha256": state["manifest_sha256"],
+                "status": "closed",
+                "updated_at": "2026-08-12T09:00:03Z",
+            },
+            0o600,
+        )
+        cleanup_path = artifact_root / "cleanup-evidence.json"
+        cleanup = {
+            "schema_version": 1,
+            "manifest_sha256": state["manifest_sha256"],
+            "observed_at": "2026-08-12T09:00:04Z",
+            **{
+                field: True
+                for field in BOOTSTRAP.AUDITED_QUARANTINED_ABSENCE_FIELDS
+            },
+        }
+        write_file(cleanup_path, cleanup, 0o600)
+        evidence = {
+            "schema_version": 1,
+            "kind": BOOTSTRAP.AUDITED_QUARANTINED_RECOVERY_KINDS["evidence"],
+            "run_id": state["run_id"],
+            "manifest_sha256": state["manifest_sha256"],
+            "intent_sha256": intent_sha,
+            "reconciliation_sha256": reconciliation_sha,
+            "database_absence_sha256": database_sha,
+            "observed_at": "2026-08-12T09:00:05Z",
+            "lifecycle_sha256": incident["lifecycle_sha256"],
+            "teardown_fence_sha256": hashlib.sha256(
+                fence_path.read_bytes()
+            ).hexdigest(),
+            "cleanup_evidence_sha256": hashlib.sha256(
+                cleanup_path.read_bytes()
+            ).hexdigest(),
+            **{
+                field: True
+                for field in BOOTSTRAP.AUDITED_QUARANTINED_ABSENCE_FIELDS
+            },
+        }
+        write_file(paths["evidence"], evidence, 0o600)
+        output = self.audited_recovery_output(state)
+        output["database_absence_sha256"] = database_sha
+        output["database_absence"] = {
+            field: database[field]
+            for field in BOOTSTRAP.AUDITED_QUARANTINED_DATABASE_PROJECTION_FIELDS
+        }
+        return incident, output, paths
 
     def test_exact_private_input_schemas_modes_and_links(self):
         _path, config, _digest = BOOTSTRAP.read_private_json(self.fixture.config_path, "sandbox_config")
@@ -1344,6 +1769,418 @@ class D2ABootstrapTests(unittest.TestCase):
         self.assertFalse(result["cleanup_complete"])
         failed_at = executor.calls.index("d2a_one_shot")
         self.assertEqual(executor.calls[failed_at + 1 :], [])
+
+    def test_ordinary_resume_remains_blocked_for_quarantined_no_issue_run(self):
+        state_path, _state = self.create_quarantined_direct_onboard_failure()
+        resume_executor = FakeExecutor(self.fixture)
+        resumed = self.fixture.controller(resume_executor).resume(state_path)
+        self.assertEqual(resumed["status"], "failed")
+        self.assertEqual(resumed["error_code"], "manual_recovery_required")
+        self.assertFalse(resumed["discord_teardown_complete"])
+        self.assertFalse(resumed["cleanup_complete"])
+        self.assertFalse(resumed["total_local_absence"])
+        self.assertEqual(resume_executor.calls, [])
+        state = json.loads(state_path.read_bytes())
+        self.assertEqual(state["status"], "recovery_required")
+        self.assertEqual(state["phase"], "direct_onboard")
+        self.assertEqual(state["last_error"], "direct_onboard_failed")
+
+    def test_audited_quarantined_recovery_rejects_bootstrap_state_mutation(self):
+        state_path, state = self.create_quarantined_direct_onboard_failure()
+        incident = self.audited_incident_overrides(state_path, state)
+        state["candidate_dependency_record_sha256"] = "f" * 64
+        BOOTSTRAP.write_state(state_path, state)
+        executor = FakeExecutor(self.fixture)
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ):
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                self.fixture.controller(
+                    executor
+                ).recover_audited_quarantined_no_issue(
+                    state_path,
+                    "c" * 40,
+                    "d" * 40,
+                    state["run_id"],
+                    state["manifest_sha256"],
+                )
+        self.assertEqual(
+            raised.exception.code,
+            "audited_recovery_bootstrap_state_invalid",
+        )
+        self.assertEqual(executor.calls, [])
+
+    def test_audited_recovery_rejects_terminal_semantic_state_mutation(self):
+        state_path, state = self.create_quarantined_direct_onboard_failure()
+        incident = self.audited_incident_overrides(state_path, state)
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ), mock.patch.object(
+            BOOTSTRAP,
+            "validate_audited_quarantined_recovery_output",
+            side_effect=lambda value, *_args: value,
+        ):
+            first = self.fixture.controller(
+                FakeExecutor(self.fixture)
+            ).recover_audited_quarantined_no_issue(
+                state_path, "c" * 40, "d" * 40,
+                state["run_id"], state["manifest_sha256"],
+            )
+        self.assertTrue(first["total_local_absence"])
+
+        terminal = json.loads(state_path.read_bytes())
+        terminal["candidate_dependency_record_sha256"] = "f" * 64
+        BOOTSTRAP.write_state(state_path, terminal)
+        executor = FakeExecutor(self.fixture, audited_recovery_tamper="replay")
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ):
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                self.fixture.controller(
+                    executor
+                ).recover_audited_quarantined_no_issue(
+                    state_path, "c" * 40, "d" * 40,
+                    state["run_id"], state["manifest_sha256"],
+                )
+        self.assertEqual(
+            raised.exception.code,
+            "audited_recovery_bootstrap_state_invalid",
+        )
+        self.assertEqual(executor.calls, [])
+
+    def test_audited_quarantined_recovery_succeeds_and_replays_without_normal_status(self):
+        state_path, state = self.create_quarantined_direct_onboard_failure()
+        lifecycle_path = self.fixture.manifest_path.with_name(
+            "d2a-session-lifecycle.json"
+        )
+        lifecycle_before = lifecycle_path.read_bytes()
+        incident = self.audited_incident_overrides(state_path, state)
+        first_executor = FakeExecutor(self.fixture)
+        controller = self.fixture.controller(first_executor)
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ), mock.patch.object(
+            BOOTSTRAP,
+            "validate_audited_quarantined_recovery_output",
+            side_effect=lambda value, *_args: value,
+        ):
+            result = controller.recover_audited_quarantined_no_issue(
+                state_path,
+                "c" * 40,
+                "d" * 40,
+                state["run_id"],
+                state["manifest_sha256"],
+            )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "direct_onboard_failed")
+        self.assertTrue(result["discord_teardown_complete"])
+        self.assertTrue(result["cleanup_complete"])
+        self.assertTrue(result["total_local_absence"])
+        persisted = json.loads(state_path.read_bytes())
+        self.assertEqual(persisted["status"], "failed")
+        self.assertEqual(persisted["phase"], "complete")
+        self.assertEqual(persisted["last_error"], "direct_onboard_failed")
+        self.assertTrue(persisted["candidate_started"])
+        self.assertEqual(lifecycle_path.read_bytes(), lifecycle_before)
+        self.assertEqual(
+            first_executor.calls,
+            [
+                "source_root",
+                "source_commit",
+                "source_tree",
+                "source_status",
+                "recover_audited_quarantined_no_issue",
+            ],
+        )
+        recovery_argv = first_executor.argv_calls[-1]
+        self.assertEqual(
+            recovery_argv[3:],
+            [
+                "--manifest",
+                str(self.fixture.manifest_path),
+                "--bootstrap-state",
+                str(state_path),
+                "--confirm-current-commit",
+                "c" * 40,
+                "--confirm-current-tree",
+                "d" * 40,
+                "--confirm-run-id",
+                state["run_id"],
+                "--confirm-manifest-sha256",
+                state["manifest_sha256"],
+            ],
+        )
+
+        replay_executor = FakeExecutor(
+            self.fixture,
+            audited_recovery_tamper="replay",
+        )
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ), mock.patch.object(
+            BOOTSTRAP,
+            "validate_audited_quarantined_recovery_output",
+            side_effect=lambda value, *_args: value,
+        ):
+            replay = self.fixture.controller(
+                replay_executor
+            ).recover_audited_quarantined_no_issue(
+                state_path,
+                "c" * 40,
+                "d" * 40,
+                state["run_id"],
+                state["manifest_sha256"],
+            )
+        self.assertEqual(replay["error_code"], "direct_onboard_failed")
+        self.assertTrue(replay["total_local_absence"])
+        self.assertNotIn("status", replay_executor.calls)
+        self.assertEqual(lifecycle_path.read_bytes(), lifecycle_before)
+
+    def test_audited_recovery_failed_replay_clears_stale_absence_and_can_retry(self):
+        state_path, state = self.create_quarantined_direct_onboard_failure()
+        incident = self.audited_incident_overrides(state_path, state)
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ), mock.patch.object(
+            BOOTSTRAP,
+            "validate_audited_quarantined_recovery_output",
+            side_effect=lambda value, *_args: value,
+        ):
+            first = self.fixture.controller(
+                FakeExecutor(self.fixture)
+            ).recover_audited_quarantined_no_issue(
+                state_path, "c" * 40, "d" * 40,
+                state["run_id"], state["manifest_sha256"],
+            )
+        self.assertTrue(first["total_local_absence"])
+
+        failing_executor = FakeExecutor(
+            self.fixture,
+            fail_once={"recover_audited_quarantined_no_issue": 1},
+        )
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ):
+            failed = self.fixture.controller(
+                failing_executor
+            ).recover_audited_quarantined_no_issue(
+                state_path, "c" * 40, "d" * 40,
+                state["run_id"], state["manifest_sha256"],
+            )
+        self.assertEqual(
+            failed["error_code"],
+            "recover_audited_quarantined_no_issue_failed",
+        )
+        self.assertFalse(failed["discord_teardown_complete"])
+        self.assertFalse(failed["cleanup_complete"])
+        self.assertFalse(failed["total_local_absence"])
+        persisted = json.loads(state_path.read_bytes())
+        self.assertEqual(persisted["status"], "failed")
+        self.assertEqual(persisted["phase"], "complete")
+        self.assertEqual(persisted["last_error"], "direct_onboard_failed")
+
+        retry_executor = FakeExecutor(
+            self.fixture,
+            audited_recovery_tamper="replay",
+        )
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ), mock.patch.object(
+            BOOTSTRAP,
+            "validate_audited_quarantined_recovery_output",
+            side_effect=lambda value, *_args: value,
+        ):
+            retry = self.fixture.controller(
+                retry_executor
+            ).recover_audited_quarantined_no_issue(
+                state_path, "c" * 40, "d" * 40,
+                state["run_id"], state["manifest_sha256"],
+            )
+        self.assertEqual(retry["error_code"], "direct_onboard_failed")
+        self.assertTrue(retry["total_local_absence"])
+
+    def test_audited_recovery_rejects_unknown_output_and_missing_evidence(self):
+        state_path, state = self.create_quarantined_direct_onboard_failure()
+        incident = self.audited_incident_overrides(state_path, state)
+        output = self.audited_recovery_output(state)
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ):
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                BOOTSTRAP.validate_audited_quarantined_recovery_output(
+                    {**output, "unexpected": True},
+                    state,
+                    state_path,
+                    "c" * 40,
+                    "d" * 40,
+                    self.fixture.root,
+                )
+        self.assertEqual(raised.exception.code, "audited_recovery_output_invalid")
+
+        manifest = json.loads(self.fixture.manifest_path.read_bytes())
+        historical = {
+            name: record["sha256"]
+            for name, record in manifest["source_trees"].items()
+        }
+        artifact_fields = {
+            "intent": BOOTSTRAP.AUDITED_QUARANTINED_INTENT_FIELDS,
+            "database_absence": BOOTSTRAP.AUDITED_QUARANTINED_DATABASE_ABSENCE_FIELDS,
+            "reconciliation": BOOTSTRAP.AUDITED_QUARANTINED_RECONCILIATION_FIELDS,
+        }
+
+        def missing_evidence(_path, label):
+            name = label.removeprefix("audited_recovery_")
+            if name == "evidence":
+                raise BOOTSTRAP.BootstrapError(
+                    "audited_recovery_evidence_unavailable"
+                )
+            value = {field: None for field in artifact_fields[name]}
+            value.update(
+                {
+                    "schema_version": 1,
+                    "kind": BOOTSTRAP.AUDITED_QUARANTINED_RECOVERY_KINDS[name],
+                    "run_id": state["run_id"],
+                    "manifest_sha256": state["manifest_sha256"],
+                }
+            )
+            return pathlib.Path(_path), value, "f" * 64
+
+        lifecycle = json.loads(
+            self.fixture.manifest_path.with_name(
+                "d2a-session-lifecycle.json"
+            ).read_bytes()
+        )
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ), mock.patch.object(
+            BOOTSTRAP,
+            "recovery_manifest_bindings",
+            return_value=(manifest, historical),
+        ), mock.patch.object(
+            BOOTSTRAP,
+            "read_quarantined_recovery_lifecycle",
+            return_value=(lifecycle, incident["lifecycle_sha256"]),
+        ), mock.patch.object(
+            BOOTSTRAP,
+            "read_canonical_private_json",
+            side_effect=missing_evidence,
+        ):
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                BOOTSTRAP.validate_audited_quarantined_recovery_output(
+                    output,
+                    state,
+                    state_path,
+                    "c" * 40,
+                    "d" * 40,
+                    self.fixture.root,
+                )
+        self.assertEqual(
+            raised.exception.code,
+            "audited_recovery_evidence_unavailable",
+        )
+
+    def test_audited_recovery_validates_all_artifacts_and_rejects_mutation(self):
+        state_path, state = self.create_quarantined_direct_onboard_failure()
+        incident, output, paths = self.write_audited_recovery_artifacts(
+            state_path, state
+        )
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ):
+            self.assertIs(
+                BOOTSTRAP.validate_audited_quarantined_recovery_output(
+                    output,
+                    state,
+                    state_path,
+                    "c" * 40,
+                    "d" * 40,
+                    self.fixture.root,
+                ),
+                output,
+            )
+
+            evidence = json.loads(paths["evidence"].read_bytes())
+            evidence["unexpected"] = True
+            write_file(paths["evidence"], evidence, 0o600)
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                BOOTSTRAP.validate_audited_quarantined_recovery_output(
+                    output,
+                    state,
+                    state_path,
+                    "c" * 40,
+                    "d" * 40,
+                    self.fixture.root,
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "audited_recovery_evidence_invalid",
+            )
+
+            paths["evidence"].unlink()
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                BOOTSTRAP.validate_audited_quarantined_recovery_output(
+                    output,
+                    state,
+                    state_path,
+                    "c" * 40,
+                    "d" * 40,
+                    self.fixture.root,
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "audited_recovery_evidence_path_invalid",
+            )
+
+    def test_audited_recovery_rejects_tunnel_script_mode_mismatch(self):
+        state_path, state = self.create_quarantined_direct_onboard_failure()
+        incident, output, _paths = self.write_audited_recovery_artifacts(
+            state_path, state
+        )
+        tunnel_script = (
+            self.fixture.manifest_path.parent / "orchestrator" / "run-tunnel.zsh"
+        )
+        self.assertEqual(stat.S_IMODE(tunnel_script.stat().st_mode), 0o700)
+        tunnel_script.chmod(0o600)
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ):
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                BOOTSTRAP.validate_audited_quarantined_recovery_output(
+                    output,
+                    state,
+                    state_path,
+                    "c" * 40,
+                    "d" * 40,
+                    self.fixture.root,
+                )
+        self.assertEqual(
+            raised.exception.code,
+            "audited_recovery_run_tunnel_invalid",
+        )
 
     def test_direct_onboarding_failure_and_evidence_tamper_both_cleanup(self):
         for options, expected in (
@@ -2082,6 +2919,42 @@ class D2ABootstrapTests(unittest.TestCase):
         self.assertIsNone(result["source_revision"])
         self.assertIsNone(result["candidate_dependencies"])
         self.assertIsNone(result["issuer_toolchain"])
+
+    def test_audited_recovery_cli_requires_all_exact_confirmations(self):
+        state = "/absolute/bootstrap-d2-20260812t082042z-c52d220457d1.json"
+        arguments = BOOTSTRAP.parser().parse_args(
+            [
+                "recover-audited-quarantined-no-issue",
+                "--state",
+                state,
+                "--confirm-current-commit",
+                "c" * 40,
+                "--confirm-current-tree",
+                "d" * 40,
+                "--confirm-run-id",
+                "d2-20260812t082042z-c52d220457d1",
+                "--confirm-manifest-sha256",
+                "e" * 64,
+            ]
+        )
+        self.assertEqual(arguments.command, BOOTSTRAP.AUDITED_QUARANTINED_RECOVERY_COMMAND)
+        self.assertEqual(arguments.state, state)
+        self.assertEqual(arguments.confirm_current_commit, "c" * 40)
+        self.assertEqual(arguments.confirm_current_tree, "d" * 40)
+        self.assertEqual(
+            arguments.confirm_run_id,
+            "d2-20260812t082042z-c52d220457d1",
+        )
+        self.assertEqual(arguments.confirm_manifest_sha256, "e" * 64)
+        with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+            BOOTSTRAP.parser().parse_args(
+                [
+                    "recover-audited-quarantined-no-issue",
+                    "--state",
+                    state,
+                ]
+            )
+        self.assertEqual(raised.exception.code, "cli_invalid")
 
     def test_boolean_schema_versions_are_rejected(self):
         for validator, value, expected in (

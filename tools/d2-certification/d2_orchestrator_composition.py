@@ -44,6 +44,11 @@ API_DATABASE_ROLES = (
     "starring_operational_deployment_status_reader",
     "starring_authoring_session_writer",
 )
+D2A_SESSION_ISSUER_DATABASE_ROLES = (
+    "starring_identity_oauth",
+    "starring_identity_issuer",
+    "starring_identity_security",
+)
 
 
 def environment_base():
@@ -393,6 +398,7 @@ def configure_postgres_sealed_network(context):
     network = "listen_addresses = '127.0.0.1'\n"
     runtime_roles = ",".join(RUNTIME_DATABASE_ROLES)
     api_roles = ",".join(API_DATABASE_ROLES)
+    session_issuer_roles = ",".join(D2A_SESSION_ISSUER_DATABASE_ROLES)
     hba = "\n".join(
         (
             f"hostnossl starring_runtime_staging {runtime_roles} 127.0.0.1/32 scram-sha-256",
@@ -402,6 +408,7 @@ def configure_postgres_sealed_network(context):
             f"hostnossl starring_runtime_staging {api_roles} 127.0.0.1/32 scram-sha-256",
             f"host all {api_roles} 0.0.0.0/0 reject",
             f"host all {api_roles} ::0/0 reject",
+            f"local starring_runtime_staging {session_issuer_roles} scram-sha-256",
             f"local all {api_roles} reject",
             "hostnossl postgres,starring_runtime_staging starring_cluster_admin 127.0.0.1/32 scram-sha-256",
             "host all all 0.0.0.0/0 reject",

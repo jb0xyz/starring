@@ -259,6 +259,219 @@ BOOT_IDENTITY = re.compile(r"^darwin-boottime:[0-9]+:[0-9]+$")
 SESSION_LIFECYCLE_TIMESTAMP = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}Z$"
 )
+AUDITED_QUARANTINED_RECOVERY_COMMAND = (
+    "recover-audited-quarantined-no-issue"
+)
+AUDITED_QUARANTINED_RECOVERY_FILENAMES = {
+    "intent": "audited-quarantined-no-issue-recovery-intent.json",
+    "reconciliation": "audited-quarantined-no-issue-reconciliation.json",
+    "database_absence": "audited-quarantined-no-issue-database-absence.json",
+    "evidence": "audited-quarantined-no-issue-recovery.json",
+}
+AUDITED_QUARANTINED_RECOVERY_KINDS = {
+    "intent": "starring.d2.audited-quarantined-no-issue-recovery-intent.v1",
+    "reconciliation": "starring.d2.audited-quarantined-no-issue-reconciliation.v1",
+    "database_absence": "starring.d2.audited-quarantined-no-issue-database-absence.v1",
+    "evidence": "starring.d2.audited-quarantined-no-issue-recovery.v1",
+}
+AUDITED_QUARANTINED_INTENT_FIELDS = {
+    "schema_version", "kind", "run_id", "manifest_sha256", "bootstrap_id",
+    "bootstrap_state_path", "baseline_bootstrap_state_sha256",
+    "historical_manifest_commit_sha", "historical_source_trees",
+    "current_source", "orchestrator_state_sha256",
+    "baseline_journal_sha256", "baseline_journal_rows", "taint_sha256",
+    "lifecycle_sha256", "candidate_start_transition_sha256",
+    "database_evidence_sha256", "step_03_evidence_sha256",
+    "transport_instance_id", "pre_intent_transport_inventory_sha256",
+    "effect_admission_operation_id", "database_system_identifier",
+    "safe_after", "service_identities", "audit_tools", "created_at",
+    "receipts_sha256", "coordinator_lock_sha256", "coordinator_source_sha256",
+    "plist_sha256", "tunnel_script_sha256",
+}
+AUDITED_QUARANTINED_RECONCILIATION_FIELDS = {
+    "schema_version", "kind", "run_id", "manifest_sha256", "intent_sha256",
+    "observed_at", "lifecycle_sha256", "transport_instance_id",
+    "pre_intent_transport_inventory_sha256", "effect_admission_operation_id",
+    "effect_admission_status", "producer_launchd_jobs_absent",
+    "issuer_process_group_absent", "post_drain_transport_inventory_sha256",
+    "database_absence_sha256", "final_transport_inventory_sha256",
+    "postgres_running", "protected_staging_unchanged",
+}
+AUDITED_QUARANTINED_DATABASE_ABSENCE_FIELDS = {
+    "schema_version", "kind", "run_id", "manifest_sha256", "intent_sha256",
+    "observed_at", "post_drain_transport_inventory_sha256", "database_name",
+    "database_system_identifier", "control_plane_identity", "topology_verified",
+    "tables_locked", "locked_tables", "transaction_committed",
+    "process_group_quiescent", "zsh_sha256", "security_sha256",
+    "psql_sha256", "static_sql_sha256", "oauth_flow_count",
+    "auth_session_count", "principal_count", "tenant_count",
+    "installation_count", "authority_version_count",
+    "runtime_slot_writer_fence_count",
+}
+AUDITED_QUARANTINED_DATABASE_PROJECTION_FIELDS = {
+    "database_name", "database_system_identifier", "control_plane_identity",
+    "topology_verified", "tables_locked", "locked_tables", "transaction_committed",
+    "process_group_quiescent", "zsh_sha256", "security_sha256",
+    "psql_sha256", "static_sql_sha256",
+    "oauth_flow_count", "auth_session_count", "principal_count", "tenant_count",
+    "installation_count", "authority_version_count",
+    "runtime_slot_writer_fence_count",
+}
+AUDITED_QUARANTINED_EVIDENCE_FIELDS = {
+    "schema_version", "kind", "run_id", "manifest_sha256", "intent_sha256",
+    "reconciliation_sha256", "database_absence_sha256", "observed_at",
+    "lifecycle_sha256", "teardown_fence_sha256", "cleanup_evidence_sha256",
+    "database_absent", "postgres_process_absent", "launchd_jobs_absent",
+    "keychain_items_absent", "isolated_root_absent",
+    "protected_staging_unchanged",
+}
+AUDITED_QUARANTINED_OUTPUT_FIELDS = {
+    "status", "phase", "run_id", "manifest_sha256", "intent",
+    "reconciliation", "database_absence_evidence", "evidence", "transport_instance_id",
+    "transport_inventory_sha256", "database_absence_sha256",
+    "database_absence", "postconditions", "database_absent", "postgres_process_absent",
+    "launchd_jobs_absent", "keychain_items_absent", "isolated_root_absent",
+    "protected_staging_unchanged", "source_drift_observed", "cleanup_status",
+}
+AUDITED_QUARANTINED_ABSENCE_FIELDS = {
+    "database_absent", "postgres_process_absent", "launchd_jobs_absent",
+    "keychain_items_absent", "isolated_root_absent",
+    "protected_staging_unchanged",
+}
+TRANSPORT_INSTANCE_ID = re.compile(r"^d2ti-[0-9a-f]{32}$")
+DATABASE_SYSTEM_IDENTIFIER = re.compile(r"^[1-9][0-9]{0,19}$")
+SAFE_RECOVERY_TIMESTAMP = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$"
+)
+AUDITED_QUARANTINED_LOCKED_TABLES = [
+    "public.product_oauth_flows",
+    "public.product_auth_sessions",
+    "public.product_principals",
+    "public.product_tenants",
+    "public.automation_installations",
+    "public.automation_installation_authority_versions",
+    "public.runtime_slot_writer_fences_v2",
+    "public.product_control_plane_identity",
+]
+AUDITED_QUARANTINED_INCIDENT = {
+    "run_id": "d2-20260812t082042z-c52d220457d1",
+    "manifest_sha256": "a522e5c316f58f54df8c0ea69ab0f6aebb9ed85e7bb6ce45a2c02b5e63823338",
+    "bootstrap_state_sha256": "49bf6c2fc87ee24fadec3d49707c8b2a438590a091eac7e2f96155155e507c85",
+    "bootstrap_state_semantic_sha256": "e9497355f1d7e97f3dd3245f95c96a24bf70f774ea72989b37750c7b912ab952",
+    "orchestrator_state_sha256": "ad80ebfbf5b2d3fa1424709b8ee07a5cf7859d6966df3ab1c6c7ed0183482016",
+    "journal_sha256": "94167d8dcbe70e4c2e065472bdcc52b1bdabe77b2409e9985cdd5254480e0cd3",
+    "journal_rows": 44,
+    "taint_sha256": "0addc12e7574d261aaaa4978b7f9214b274ada5e371432e447d3b67a07b3cdac",
+    "lifecycle_sha256": "a1de160581e7da4475f4b722b90a802ad8c4ef22009a99e57adfe3c64d940f55",
+    "candidate_start_transition_sha256": "e6dbdfdeba98f8b0a7273a9319281ed36e9045e2b8862431706fcf81aa45d35f",
+    "database_evidence_sha256": "47c3f2a24f5c62db72cf0310745b5026d6973455263b379af0a61d0a8354ce12",
+    "step_03_evidence_sha256": "c739fdc3fc8f6efe5b9c66a8ad308902b0afeb6fbd9265e2ae190e1cdc163893",
+    "transport_instance_id": "d2ti-f3616791d71f2fdd92ceb1ec14b60cd5",
+    "empty_transport_inventory_sha256": "74f1658b2a815d8100552f69b0b58d6eaefae99e76be80e2297c8d9f6cf1ebc4",
+    "database_system_identifier": "7673057195867924427",
+    "safe_after": "2026-08-12T08:23:13Z",
+    "zsh_sha256": "1f473d234dd65157f530b4f676686517ec97fe9aa64c76d82f2611674cc44314",
+    "security_sha256": "2d2578ef40e1524f0572133e0e838479439027d51bb693a9ddfb57f20bb69e87",
+    "psql_sha256": "880f676c397eb38415a83c25900a755502254f186dd7c9e18cb96b2c943b557b",
+    "static_sql_sha256": "56cfdd24f7f8f50b73c0fc1decc8a38a4bff34fc4b1832f152fb8d5b2872607d",
+    "receipts_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "coordinator_lock_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "coordinator_source_sha256": {
+        "step-01-bootstrap.json": "08cec720eeef40c6bce9c6a40ad0dac8fa0cecc7901b7d70ff6d61f71d29c5af",
+        "step-02-prior-absence.json": "cade6176cde4ded6e03e612bce126c63ee707aa58f1500f2f3659888277c824e",
+        "step-03-candidate.json": "44b8865ff2b6431f068c0b58ca61f7a29dc61131408b6ccc8de633c54b5564c9",
+    },
+    "plist_sha256": {
+        "api": "b3eb9bf355855f40eef980fe9bf0132bbcf46f22b3457b57dc4c690be77c82a5",
+        "runtime": "8918a467ec404418df5d89e3c44035c5b4aef0d14e8b0f2b0b210fd8ea66488a",
+        "transport": "0a738931d2dde05d41aec4e9076fa6de4a35d5733fdaf711e9e78fa33fd15126",
+        "tunnel": "14cdc74f88231b638c7ef0505c8ee267744a4f9313af203a81f72716f6177386",
+        "worker": "38e60569fa74051fcc79f2e346da802fe8b9c6b72da2818e959332301ef9860a",
+    },
+    "tunnel_script_sha256": "526c9b27c65a350a754221abae92450d052306872dc166503d9aff1127ce19a4",
+}
+AUDITED_QUARANTINED_SERVICE_IDENTITIES = {
+    "transport": {
+        "pid": 30996,
+        "process_group_id": 30996,
+        "program": "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/d2-certification-transport",
+        "arguments": [
+            "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/d2-certification-transport",
+            "--root", "/private/tmp/starring-d2-d2-20260812t082042z-c52d220457d1",
+            "--run-id", "d2-20260812t082042z-c52d220457d1",
+            "--guild-id", "1536845588954353676",
+            "--hub-channel-id", "1536845619266846792",
+            "--actor-id", "1056857223529250906",
+            "--bot-user-id", "1533144492293754900",
+            "--gateway-listen", "127.0.0.1:29101",
+            "--http-listen", "127.0.0.1:29102",
+        ],
+        "candidate": "certification_transport",
+        "start_time_seconds": 1786522855,
+        "start_time_microseconds": 426871,
+        "device": 16777230,
+        "inode": 48539870,
+        "size": 5854464,
+    },
+    "worker": {
+        "pid": 31004,
+        "process_group_id": 31004,
+        "program": "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/node",
+        "arguments": [
+            "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/node",
+            "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/codex-worker/worker.mjs",
+        ],
+        "candidate": "node",
+        "start_time_seconds": 1786522855,
+        "start_time_microseconds": 969142,
+        "device": 16777230,
+        "inode": 48539879,
+        "size": 292386560,
+    },
+    "api": {
+        "pid": 31105,
+        "process_group_id": 31105,
+        "program": "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/starring-api",
+        "arguments": [
+            "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/starring-api"
+        ],
+        "candidate": "api",
+        "start_time_seconds": 1786522860,
+        "start_time_microseconds": 212847,
+        "device": 16777230,
+        "inode": 48539866,
+        "size": 29124432,
+    },
+    "runtime": {
+        "pid": 31113,
+        "process_group_id": 31113,
+        "program": "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/starring-runtime",
+        "arguments": [
+            "/Users/jungbogeon/Library/Application Support/Starring/d2a-candidates/candidate-20260812T080002Z-ab9b36f25f52-eae50f9a5847/starring-runtime"
+        ],
+        "candidate": "runtime",
+        "start_time_seconds": 1786522860,
+        "start_time_microseconds": 239860,
+        "device": 16777230,
+        "inode": 48539867,
+        "size": 28613808,
+    },
+    "tunnel": {
+        "pid": 31121,
+        "process_group_id": 31121,
+        "program": "/bin/zsh",
+        "arguments": [
+            "/bin/zsh",
+            "/Users/jungbogeon/Library/Application Support/Starring/release-certifications/d2-20260812t082042z-c52d220457d1/orchestrator/run-tunnel.zsh",
+        ],
+        "candidate": "cloudflared",
+        "start_time_seconds": 1786522860,
+        "start_time_microseconds": 262639,
+        "device": 16777230,
+        "inode": 48539880,
+        "size": 38238338,
+    },
+}
 ISSUER_BUILD_LIFECYCLE_FIELDS = {
     "schema_version", "kind", "build_id", "status", "source_commit",
     "source_tree", "target_dir", "process_group_id",
@@ -940,13 +1153,31 @@ def read_private_json(raw_path, label):
     return read_owned_json(raw_path, label, 0o600, MAX_INPUT_BYTES)
 
 
+def read_canonical_private_json(raw_path, label):
+    path = absolute_normal_path(raw_path, label, must_exist=True)
+    raw = private_file_bytes(path, label)
+    if len(raw) > MAX_INPUT_BYTES:
+        fail(f"{label}_invalid")
+    try:
+        value = json.loads(
+            raw,
+            object_pairs_hook=strict_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        fail(f"{label}_invalid")
+    if raw != (canonical_json(value) + "\n").encode("utf-8"):
+        fail(f"{label}_invalid")
+    return path, value, sha256_bytes(raw)
+
+
 def read_immutable_json(raw_path, label, maximum=MAX_INPUT_BYTES):
     return read_owned_json(raw_path, label, 0o400, maximum)
 
 
-def private_file_bytes(path, label, allow_empty=False):
+def private_file_bytes(path, label, allow_empty=False, mode=0o600):
     path = absolute_normal_path(path, label, must_exist=True)
-    expected = require_owned(path, label, 0o600, allow_empty=allow_empty)
+    expected = require_owned(path, label, mode, allow_empty=allow_empty)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -958,7 +1189,7 @@ def private_file_bytes(path, label, allow_empty=False):
             (before.st_dev, before.st_ino) != (expected.st_dev, expected.st_ino)
             or not stat.S_ISREG(before.st_mode)
             or before.st_uid != os.getuid()
-            or stat.S_IMODE(before.st_mode) != 0o600
+            or stat.S_IMODE(before.st_mode) != mode
             or before.st_nlink != 1
         ):
             fail(f"{label}_invalid")
@@ -969,11 +1200,25 @@ def private_file_bytes(path, label, allow_empty=False):
                 break
             raw += chunk
         after = os.fstat(descriptor)
+        try:
+            named = os.stat(path, follow_symlinks=False)
+        except OSError:
+            fail(f"{label}_invalid")
+        identity = lambda item: (
+            item.st_dev,
+            item.st_ino,
+            item.st_uid,
+            item.st_gid,
+            item.st_mode,
+            item.st_nlink,
+            item.st_size,
+            item.st_mtime_ns,
+        )
         if (
             (not allow_empty and not raw)
             or len(raw) > MAX_OUTPUT_BYTES
-            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            or identity(before) != identity(after)
+            or identity(after) != identity(named)
         ):
             fail(f"{label}_invalid")
         return raw
@@ -2431,12 +2676,627 @@ def publish_issuer_binary(source, destination):
     return digest
 
 
-def load_state(path):
-    path, value, _digest = read_private_json(path, "bootstrap_state")
+def load_state_with_digest(path):
+    path, value, digest = read_private_json(path, "bootstrap_state")
     validate_state(value)
     if path.name != f"bootstrap-{value['run_id']}.json":
         fail("bootstrap_state_invalid")
+    return path, value, digest
+
+
+def load_state(path):
+    path, value, _digest = load_state_with_digest(path)
     return path, value
+
+
+def recovery_manifest_bindings(state):
+    manifest_path = pathlib.Path(state["manifest_path"])
+    _path, manifest, _raw_digest = read_canonical_private_json(
+        manifest_path, "manifest"
+    )
+    if (
+        not isinstance(manifest, dict)
+        or set(manifest) != D2A.COMMERCIAL_MANIFEST_FIELDS
+        or type(manifest.get("schema_version")) is not int
+        or manifest.get("schema_version") != 1
+        or manifest.get("certification_class") != D2A.COMMERCIAL_CLASS
+        or manifest.get("run_id") != state["run_id"]
+        or manifest.get("commit_sha") != state["source_commit_sha"]
+        or manifest.get("database", {}).get("name")
+        != "starring_runtime_staging"
+    ):
+        fail("audited_recovery_manifest_invalid")
+    source_trees = manifest.get("source_trees")
+    if (
+        not isinstance(source_trees, dict)
+        or set(source_trees)
+        != {"codex_worker", "d2_toolchain", "certification_transport"}
+        or any(
+            not isinstance(source_trees[name], dict)
+            or not DIGEST.fullmatch(source_trees[name].get("sha256", ""))
+            for name in source_trees
+        )
+    ):
+        fail("audited_recovery_manifest_invalid")
+    observed = sha256_bytes(canonical_json(manifest).encode("utf-8"))
+    if observed != state["manifest_sha256"]:
+        fail("audited_recovery_manifest_invalid")
+    digest_raw = private_file_bytes(
+        manifest_path.with_name("manifest.sha256"),
+        "audited_recovery_manifest_digest",
+    )
+    if digest_raw != (observed + "\n").encode("ascii"):
+        fail("audited_recovery_manifest_invalid")
+    return manifest, {
+        name: source_trees[name]["sha256"] for name in sorted(source_trees)
+    }
+
+
+def valid_recovery_timestamp(value):
+    if not isinstance(value, str) or SAFE_RECOVERY_TIMESTAMP.fullmatch(value) is None:
+        return False
+    try:
+        datetime.datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        return False
+    return True
+
+
+def audited_recovery_artifact_paths(state):
+    root = pathlib.Path(state["manifest_path"]).parent / "orchestrator"
+    return {
+        name: root / filename
+        for name, filename in AUDITED_QUARANTINED_RECOVERY_FILENAMES.items()
+    }
+
+
+def audited_recovery_bootstrap_semantic_sha256(state):
+    mutable = {
+        "status",
+        "phase",
+        "discord_teardown_complete",
+        "cleanup_complete",
+        "postconditions_complete",
+        "updated_at",
+    }
+    return sha256_bytes(
+        canonical_json(
+            {name: value for name, value in state.items() if name not in mutable}
+        ).encode("utf-8")
+    )
+
+
+def read_quarantined_recovery_lifecycle(state):
+    path = pathlib.Path(state["manifest_path"]).with_name(
+        "d2a-session-lifecycle.json"
+    )
+    raw = private_file_bytes(path, "audited_recovery_lifecycle")
+    try:
+        lifecycle = json.loads(
+            raw,
+            object_pairs_hook=strict_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        fail("audited_recovery_lifecycle_invalid")
+    digest = sha256_bytes(raw)
+    expected_raw = (
+        json.dumps(
+            lifecycle,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    if (
+        not isinstance(lifecycle, dict)
+        or tuple(lifecycle) != SESSION_LIFECYCLE_FIELDS
+        or raw != expected_raw
+        or sha256_bytes(raw) != digest
+        or type(lifecycle.get("schema_version")) is not int
+        or lifecycle.get("schema_version") != 1
+        or lifecycle.get("kind") != "starring.d2a.session-lifecycle.v1"
+        or lifecycle.get("run_id") != state["run_id"]
+        or lifecycle.get("manifest_sha256") != state["manifest_sha256"]
+        or lifecycle.get("operation") != "direct-onboard"
+        or lifecycle.get("origin") != "issuer"
+        or lifecycle.get("issuer_sha256")
+        != state["tool_digests"]["issuer_sha256"]
+        or lifecycle.get("issuer_source_sha256")
+        != state["tool_digests"]["issuer_source_sha256"]
+        or lifecycle.get("uid") != os.getuid()
+        or not valid_boot_identity(lifecycle.get("boot_identity"))
+        or type(lifecycle.get("process_group_id")) is not int
+        or not 1 < lifecycle["process_group_id"] <= 2_147_483_647
+        or SESSION_LIFECYCLE_TIMESTAMP.fullmatch(
+            lifecycle.get("started_at", "")
+        )
+        is None
+        or lifecycle.get("status") != "quarantined"
+        or lifecycle.get("session_revoked") is not False
+        or lifecycle.get("revoked_at") is not None
+        or SESSION_LIFECYCLE_TIMESTAMP.fullmatch(
+            lifecycle.get("quarantined_at", "")
+        )
+        is None
+    ):
+        fail("audited_recovery_lifecycle_invalid")
+    return lifecycle, digest
+
+
+def validate_audited_recovery_source(
+    value,
+    manifest,
+    historical_source_trees,
+    current_commit,
+    current_tree,
+    source_root,
+):
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "repository_root",
+            "commit_sha",
+            "tree_sha",
+            "git_path",
+            "git_sha256",
+            "source_trees",
+        }
+        or value.get("repository_root") != str(source_root)
+        or value.get("commit_sha") != current_commit
+        or value.get("tree_sha") != current_tree
+        or value.get("git_path") != str(FIXED_GIT)
+        or DIGEST.fullmatch(value.get("git_sha256", "")) is None
+    ):
+        fail("audited_recovery_intent_invalid")
+    observations = value.get("source_trees")
+    if not isinstance(observations, dict) or set(observations) != set(
+        historical_source_trees
+    ):
+        fail("audited_recovery_intent_invalid")
+    for name, observation in observations.items():
+        historical = manifest["source_trees"][name]
+        if (
+            not isinstance(observation, dict)
+            or set(observation)
+            != {
+                "root",
+                "historical_sha256",
+                "observed_sha256",
+                "matches_historical",
+            }
+            or observation.get("root") != historical["root"]
+            or observation.get("historical_sha256")
+            != historical_source_trees[name]
+            or DIGEST.fullmatch(observation.get("observed_sha256", ""))
+            is None
+            or type(observation.get("matches_historical")) is not bool
+            or observation["matches_historical"]
+            != (
+                observation["observed_sha256"]
+                == observation["historical_sha256"]
+            )
+        ):
+            fail("audited_recovery_intent_invalid")
+    if (
+        observations["codex_worker"]["matches_historical"] is not True
+        or all(
+            observations[name]["matches_historical"]
+            for name in ("d2_toolchain", "certification_transport")
+        )
+    ):
+        fail("audited_recovery_intent_invalid")
+
+
+def validate_audited_quarantined_recovery_output(
+    value,
+    state,
+    state_path,
+    current_commit,
+    current_tree,
+    source_root,
+):
+    if not isinstance(value, dict) or set(value) != AUDITED_QUARANTINED_OUTPUT_FIELDS:
+        fail("audited_recovery_output_invalid")
+    paths = audited_recovery_artifact_paths(state)
+    expected_paths = {name: str(path) for name, path in paths.items()}
+    if (
+        value.get("status") not in {"recovered", "exact_replay"}
+        or value.get("phase") != "cleaned"
+        or value.get("run_id") != state["run_id"]
+        or value.get("manifest_sha256") != state["manifest_sha256"]
+        or value.get("intent") != expected_paths["intent"]
+        or value.get("reconciliation") != expected_paths["reconciliation"]
+        or value.get("database_absence_evidence")
+        != expected_paths["database_absence"]
+        or value.get("evidence") != expected_paths["evidence"]
+        or TRANSPORT_INSTANCE_ID.fullmatch(
+            value.get("transport_instance_id", "")
+        )
+        is None
+        or DIGEST.fullmatch(value.get("transport_inventory_sha256", ""))
+        is None
+        or value.get("transport_inventory_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["empty_transport_inventory_sha256"]
+        or DIGEST.fullmatch(value.get("database_absence_sha256", ""))
+        is None
+        or value.get("source_drift_observed") is not True
+        or value.get("cleanup_status")
+        != ("cleaned" if value["status"] == "recovered" else "already_cleaned")
+        or any(value.get(field) is not True for field in AUDITED_QUARANTINED_ABSENCE_FIELDS)
+    ):
+        fail("audited_recovery_output_invalid")
+
+    manifest, historical_source_trees = recovery_manifest_bindings(state)
+    lifecycle, lifecycle_sha256 = read_quarantined_recovery_lifecycle(state)
+    artifacts = {}
+    artifact_digests = {}
+    fields = {
+        "intent": AUDITED_QUARANTINED_INTENT_FIELDS,
+        "reconciliation": AUDITED_QUARANTINED_RECONCILIATION_FIELDS,
+        "database_absence": AUDITED_QUARANTINED_DATABASE_ABSENCE_FIELDS,
+        "evidence": AUDITED_QUARANTINED_EVIDENCE_FIELDS,
+    }
+    for name in ("intent", "database_absence", "reconciliation", "evidence"):
+        _path, artifact, digest = read_canonical_private_json(
+            paths[name], f"audited_recovery_{name}"
+        )
+        if (
+            not isinstance(artifact, dict)
+            or set(artifact) != fields[name]
+            or type(artifact.get("schema_version")) is not int
+            or artifact.get("schema_version") != 1
+            or artifact.get("kind") != AUDITED_QUARANTINED_RECOVERY_KINDS[name]
+            or artifact.get("run_id") != state["run_id"]
+            or artifact.get("manifest_sha256") != state["manifest_sha256"]
+        ):
+            fail(f"audited_recovery_{name}_invalid")
+        artifacts[name] = artifact
+        artifact_digests[name] = digest
+
+    intent = artifacts["intent"]
+    digest_fields = {
+        "baseline_bootstrap_state_sha256",
+        "orchestrator_state_sha256",
+        "baseline_journal_sha256",
+        "taint_sha256",
+        "lifecycle_sha256",
+        "candidate_start_transition_sha256",
+        "database_evidence_sha256",
+        "step_03_evidence_sha256",
+        "pre_intent_transport_inventory_sha256",
+    }
+    if (
+        intent.get("bootstrap_id") != state["bootstrap_id"]
+        or intent.get("bootstrap_state_path") != str(state_path)
+        or intent.get("baseline_bootstrap_state_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["bootstrap_state_sha256"]
+        or intent.get("historical_manifest_commit_sha")
+        != manifest["commit_sha"]
+        or intent.get("historical_source_trees") != historical_source_trees
+        or any(
+            DIGEST.fullmatch(intent.get(field, "")) is None
+            for field in digest_fields
+        )
+        or intent.get("orchestrator_state_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["orchestrator_state_sha256"]
+        or intent.get("baseline_journal_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["journal_sha256"]
+        or intent.get("baseline_journal_rows")
+        != AUDITED_QUARANTINED_INCIDENT["journal_rows"]
+        or intent.get("taint_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["taint_sha256"]
+        or intent.get("lifecycle_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["lifecycle_sha256"]
+        or intent.get("lifecycle_sha256") != lifecycle_sha256
+        or intent.get("candidate_start_transition_sha256")
+        != AUDITED_QUARANTINED_INCIDENT[
+            "candidate_start_transition_sha256"
+        ]
+        or intent.get("database_evidence_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["database_evidence_sha256"]
+        or intent.get("step_03_evidence_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["step_03_evidence_sha256"]
+        or intent.get("transport_instance_id")
+        != AUDITED_QUARANTINED_INCIDENT["transport_instance_id"]
+        or intent.get("transport_instance_id") != value["transport_instance_id"]
+        or intent.get("pre_intent_transport_inventory_sha256")
+        != AUDITED_QUARANTINED_INCIDENT[
+            "empty_transport_inventory_sha256"
+        ]
+        or intent.get("effect_admission_operation_id")
+        != f"audited-quarantine-recovery:{state['run_id'].rsplit('-', 1)[1]}"
+        or intent.get("database_system_identifier")
+        != AUDITED_QUARANTINED_INCIDENT["database_system_identifier"]
+        or intent.get("safe_after")
+        != AUDITED_QUARANTINED_INCIDENT["safe_after"]
+        or intent.get("service_identities")
+        != AUDITED_QUARANTINED_SERVICE_IDENTITIES
+        or intent.get("audit_tools")
+        != {
+            field: AUDITED_QUARANTINED_INCIDENT[field]
+            for field in (
+                "zsh_sha256",
+                "security_sha256",
+                "psql_sha256",
+                "static_sql_sha256",
+            )
+        }
+        or intent.get("receipts_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["receipts_sha256"]
+        or intent.get("coordinator_lock_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["coordinator_lock_sha256"]
+        or intent.get("coordinator_source_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["coordinator_source_sha256"]
+        or intent.get("plist_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["plist_sha256"]
+        or intent.get("tunnel_script_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["tunnel_script_sha256"]
+        or not valid_recovery_timestamp(intent.get("created_at"))
+    ):
+        fail("audited_recovery_intent_invalid")
+    validate_audited_recovery_source(
+        intent.get("current_source"),
+        manifest,
+        historical_source_trees,
+        current_commit,
+        current_tree,
+        source_root,
+    )
+    fixed_inputs = {
+        "candidate_start_transition_sha256": paths["intent"].parent
+        / "candidate-start-transition.json",
+        "database_evidence_sha256": paths["intent"].parent
+        / "database-evidence.json",
+        "step_03_evidence_sha256": paths["intent"].parent
+        / "step-03-evidence.json",
+        "taint_sha256": pathlib.Path(state["manifest_path"]).with_name(
+            "d2a-taint.json"
+        ),
+        "receipts_sha256": pathlib.Path(state["manifest_path"]).with_name(
+            "receipts.jsonl"
+        ),
+        "coordinator_lock_sha256": pathlib.Path(state["manifest_path"]).parent
+        / "coordinator"
+        / "coordinator.lock",
+    }
+    for field, path in fixed_inputs.items():
+        if (
+            sha256_bytes(
+                private_file_bytes(
+                    path,
+                    f"audited_recovery_{field}",
+                    allow_empty=field
+                    in {"receipts_sha256", "coordinator_lock_sha256"},
+                )
+            )
+            != intent[field]
+        ):
+            fail("audited_recovery_intent_invalid")
+    coordinator_directory = pathlib.Path(state["manifest_path"]).parent / "coordinator"
+    require_owned(
+        coordinator_directory,
+        "audited_recovery_coordinator_directory",
+        0o700,
+        directory=True,
+    )
+    try:
+        if {path.name for path in coordinator_directory.iterdir()} != {
+            "coordinator.lock"
+        }:
+            fail("audited_recovery_intent_invalid")
+    except OSError:
+        fail("audited_recovery_intent_invalid")
+    coordinator_root = paths["intent"].parent / "coordinator-sources"
+    require_owned(
+        coordinator_root,
+        "audited_recovery_coordinator_source_directory",
+        0o700,
+        directory=True,
+    )
+    try:
+        coordinator_entries = {
+            path.name: path for path in coordinator_root.iterdir()
+        }
+    except OSError:
+        fail("audited_recovery_intent_invalid")
+    if set(coordinator_entries) != set(
+        AUDITED_QUARANTINED_INCIDENT["coordinator_source_sha256"]
+    ):
+        fail("audited_recovery_intent_invalid")
+    for name, expected_digest in AUDITED_QUARANTINED_INCIDENT[
+        "coordinator_source_sha256"
+    ].items():
+        if sha256_bytes(
+            private_file_bytes(
+                coordinator_entries[name], "audited_recovery_coordinator_source"
+            )
+        ) != expected_digest:
+            fail("audited_recovery_intent_invalid")
+    launchd_root = paths["intent"].parent / "launchd"
+    require_owned(
+        launchd_root,
+        "audited_recovery_launchd_directory",
+        0o700,
+        directory=True,
+    )
+    suffix = state["run_id"].rsplit("-", 1)[1]
+    expected_plists = {
+        f"local.starring.d2.{suffix}.{name}.plist"
+        for name in AUDITED_QUARANTINED_INCIDENT["plist_sha256"]
+    }
+    try:
+        if {path.name for path in launchd_root.iterdir()} != expected_plists:
+            fail("audited_recovery_intent_invalid")
+    except OSError:
+        fail("audited_recovery_intent_invalid")
+    for name, expected_digest in AUDITED_QUARANTINED_INCIDENT[
+        "plist_sha256"
+    ].items():
+        plist = launchd_root / f"local.starring.d2.{suffix}.{name}.plist"
+        if sha256_bytes(
+            private_file_bytes(plist, "audited_recovery_launchd_plist")
+        ) != expected_digest:
+            fail("audited_recovery_intent_invalid")
+    if sha256_bytes(
+        private_file_bytes(
+            paths["intent"].parent / "run-tunnel.zsh",
+            "audited_recovery_run_tunnel",
+            mode=0o700,
+        )
+    ) != AUDITED_QUARANTINED_INCIDENT["tunnel_script_sha256"]:
+        fail("audited_recovery_intent_invalid")
+
+    database = artifacts["database_absence"]
+    count_fields = {
+        "oauth_flow_count",
+        "auth_session_count",
+        "principal_count",
+        "tenant_count",
+        "installation_count",
+        "authority_version_count",
+        "runtime_slot_writer_fence_count",
+    }
+    database_tool_digests = {
+        "zsh_sha256", "security_sha256", "psql_sha256", "static_sql_sha256"
+    }
+    if (
+        database.get("intent_sha256") != artifact_digests["intent"]
+        or database.get("post_drain_transport_inventory_sha256")
+        != artifacts["reconciliation"].get(
+            "post_drain_transport_inventory_sha256"
+        )
+        or database.get("post_drain_transport_inventory_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["empty_transport_inventory_sha256"]
+        or database.get("database_name") != manifest["database"]["name"]
+        or database.get("database_system_identifier")
+        != intent["database_system_identifier"]
+        or DATABASE_SYSTEM_IDENTIFIER.fullmatch(
+            database.get("database_system_identifier", "")
+        )
+        is None
+        or database.get("control_plane_identity")
+        != "run_owned_cluster_admin_tcp_v1"
+        or any(
+            database.get(field) is not True
+            for field in (
+                "topology_verified",
+                "tables_locked",
+                "transaction_committed",
+                "process_group_quiescent",
+            )
+        )
+        or database.get("locked_tables") != AUDITED_QUARANTINED_LOCKED_TABLES
+        or any(type(database.get(field)) is not int or database[field] != 0 for field in count_fields)
+        or any(DIGEST.fullmatch(database.get(field, "")) is None for field in database_tool_digests)
+        or any(
+            database.get(field) != AUDITED_QUARANTINED_INCIDENT[field]
+            for field in database_tool_digests
+        )
+        or any(
+            database.get(field) != intent["audit_tools"].get(field)
+            for field in database_tool_digests
+        )
+        or not valid_recovery_timestamp(database.get("observed_at"))
+    ):
+        fail("audited_recovery_database_absence_invalid")
+
+    reconciliation = artifacts["reconciliation"]
+    if (
+        reconciliation.get("intent_sha256") != artifact_digests["intent"]
+        or reconciliation.get("lifecycle_sha256") != lifecycle_sha256
+        or reconciliation.get("transport_instance_id")
+        != value["transport_instance_id"]
+        or reconciliation.get("pre_intent_transport_inventory_sha256")
+        != intent["pre_intent_transport_inventory_sha256"]
+        or reconciliation.get("effect_admission_operation_id")
+        != intent["effect_admission_operation_id"]
+        or reconciliation.get("effect_admission_status") != "drained"
+        or reconciliation.get("producer_launchd_jobs_absent") is not True
+        or reconciliation.get("issuer_process_group_absent") is not True
+        or reconciliation.get("postgres_running") is not True
+        or reconciliation.get("protected_staging_unchanged") is not True
+        or reconciliation.get("database_absence_sha256")
+        != artifact_digests["database_absence"]
+        or reconciliation.get("final_transport_inventory_sha256")
+        != value["transport_inventory_sha256"]
+        or reconciliation.get("post_drain_transport_inventory_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["empty_transport_inventory_sha256"]
+        or not valid_recovery_timestamp(reconciliation.get("observed_at"))
+    ):
+        fail("audited_recovery_reconciliation_invalid")
+
+    fence_path = pathlib.Path(state["manifest_path"]).with_name(
+        "d2a-teardown-fence.json"
+    )
+    _path, fence, fence_sha256 = read_canonical_private_json(
+        fence_path, "audited_recovery_teardown_fence"
+    )
+    cleanup_path = paths["evidence"].parent / "cleanup-evidence.json"
+    _path, cleanup, cleanup_sha256 = read_canonical_private_json(
+        cleanup_path, "audited_recovery_cleanup_evidence"
+    )
+    if fence != {
+        "kind": "starring.d2a.teardown-fence.v1",
+        "manifest_sha256": state["manifest_sha256"],
+        "run_id": state["run_id"],
+        "schema_version": 1,
+        "status": "closed",
+        "updated_at": fence.get("updated_at"),
+    } or not valid_recovery_timestamp(fence.get("updated_at")):
+        fail("audited_recovery_teardown_fence_invalid")
+    if (
+        not isinstance(cleanup, dict)
+        or set(cleanup)
+        != {
+            "schema_version",
+            "manifest_sha256",
+            "observed_at",
+            *AUDITED_QUARANTINED_ABSENCE_FIELDS,
+        }
+        or type(cleanup.get("schema_version")) is not int
+        or cleanup.get("schema_version") != 1
+        or cleanup.get("manifest_sha256") != state["manifest_sha256"]
+        or not valid_recovery_timestamp(cleanup.get("observed_at"))
+        or any(cleanup.get(field) is not True for field in AUDITED_QUARANTINED_ABSENCE_FIELDS)
+    ):
+        fail("audited_recovery_cleanup_evidence_invalid")
+
+    evidence = artifacts["evidence"]
+    if (
+        evidence.get("intent_sha256") != artifact_digests["intent"]
+        or evidence.get("reconciliation_sha256")
+        != artifact_digests["reconciliation"]
+        or evidence.get("database_absence_sha256")
+        != artifact_digests["database_absence"]
+        or evidence.get("lifecycle_sha256") != lifecycle_sha256
+        or evidence.get("teardown_fence_sha256") != fence_sha256
+        or evidence.get("cleanup_evidence_sha256") != cleanup_sha256
+        or any(evidence.get(field) is not True for field in AUDITED_QUARANTINED_ABSENCE_FIELDS)
+        or not valid_recovery_timestamp(evidence.get("observed_at"))
+        or value["database_absence_sha256"]
+        != artifact_digests["database_absence"]
+        or value.get("database_absence")
+        != {
+            field: database[field]
+            for field in AUDITED_QUARANTINED_DATABASE_PROJECTION_FIELDS
+        }
+    ):
+        fail("audited_recovery_evidence_invalid")
+
+    expected_postconditions = {
+        "status": "observed",
+        "phase": "cleaned",
+        "postgres_running": False,
+        "candidate_launchd_jobs_loaded": 0,
+        "candidate_launchd_overrides_absent": True,
+        "protected_staging_unchanged": True,
+    }
+    if value.get("postconditions") != expected_postconditions:
+        fail("audited_recovery_postconditions_invalid")
+    return value
 
 
 def require_tool(path, label, mode, maximum):
@@ -3001,6 +3861,35 @@ def command_identity(argv):
         "dry-run", "prepare", "start", "teardown-discord-resources", "cleanup", "status"
     }:
         return argv[2].replace("-", "_")
+    if (
+        script == "isolated_orchestrator.py"
+        and len(argv) > 2
+        and argv[2] == AUDITED_QUARANTINED_RECOVERY_COMMAND
+    ):
+        flags = (
+            "--manifest",
+            "--bootstrap-state",
+            "--confirm-current-commit",
+            "--confirm-current-tree",
+            "--confirm-run-id",
+            "--confirm-manifest-sha256",
+        )
+        if len(argv) != 15 or tuple(argv[3::2]) != flags:
+            fail("subprocess_contract_invalid")
+        absolute_normal_path(
+            argv[4], "audited_recovery_manifest", must_exist=True
+        )
+        absolute_normal_path(
+            argv[6], "audited_recovery_bootstrap_state", must_exist=True
+        )
+        if (
+            COMMIT.fullmatch(argv[8]) is None
+            or COMMIT.fullmatch(argv[10]) is None
+            or RUN_ID.fullmatch(argv[12]) is None
+            or DIGEST.fullmatch(argv[14]) is None
+        ):
+            fail("subprocess_contract_invalid")
+        return "recover_audited_quarantined_no_issue"
     if script == "d2a.py" and len(argv) > 2 and argv[2] in {"run", "verify"}:
         if argv[2] == "verify":
             return "d2a_verify"
@@ -4293,6 +5182,176 @@ class BootstrapController:
         with bootstrap_lock(self.lock_path):
             return self.resume_locked(state_path)
 
+    def recover_audited_quarantined_no_issue_locked(
+        self,
+        state_path,
+        confirmed_current_commit,
+        confirmed_current_tree,
+        confirmed_run_id,
+        confirmed_manifest_sha256,
+    ):
+        state_path, state, loaded_state_sha256 = load_state_with_digest(
+            state_path
+        )
+        original_error = state["last_error"]
+        completion_flags = tuple(
+            state[field]
+            for field in (
+                "discord_teardown_complete",
+                "cleanup_complete",
+                "postconditions_complete",
+            )
+        )
+        prior_complete = (
+            state["status"] == "failed"
+            and state["phase"] == "complete"
+            and completion_flags == (True, True, True)
+        )
+        replay_pending = (
+            state["status"] == "failed"
+            and state["phase"] == "complete"
+            and completion_flags == (False, False, False)
+        )
+        if (
+            state["run_id"] != AUDITED_QUARANTINED_INCIDENT["run_id"]
+            or state["manifest_sha256"]
+            != AUDITED_QUARANTINED_INCIDENT["manifest_sha256"]
+            or original_error != "direct_onboard_failed"
+            or state["candidate_started"] is not True
+            or state["last_session_operation"] != "direct-onboard"
+            or state["onboarding_evidence_path"] is not None
+            or state["onboarding_evidence_sha256"] is not None
+            or state["records"]
+            or (state["status"], state["phase"])
+            not in {
+                ("recovery_required", "direct_onboard"),
+                ("failed", "complete"),
+            }
+            or not (
+                completion_flags == (False, False, False)
+                or prior_complete
+            )
+            or audited_recovery_bootstrap_semantic_sha256(state)
+            != AUDITED_QUARANTINED_INCIDENT[
+                "bootstrap_state_semantic_sha256"
+            ]
+        ):
+            fail("audited_recovery_bootstrap_state_invalid")
+        if (
+            not prior_complete
+            and not replay_pending
+            and loaded_state_sha256
+            != AUDITED_QUARANTINED_INCIDENT["bootstrap_state_sha256"]
+        ):
+            fail("audited_recovery_bootstrap_state_invalid")
+        if (
+            not isinstance(confirmed_current_commit, str)
+            or COMMIT.fullmatch(confirmed_current_commit) is None
+            or not isinstance(confirmed_current_tree, str)
+            or COMMIT.fullmatch(confirmed_current_tree) is None
+            or confirmed_run_id != state["run_id"]
+            or confirmed_manifest_sha256 != state["manifest_sha256"]
+        ):
+            fail("audited_recovery_confirmation_mismatch")
+        try:
+            current_source = self.source_revision(
+                {
+                    "commit_sha": confirmed_current_commit,
+                    "source_tree_sha": confirmed_current_tree,
+                }
+            )
+        except BootstrapError:
+            fail("audited_recovery_confirmation_mismatch")
+        if current_source != {
+            "commit": confirmed_current_commit,
+            "tree": confirmed_current_tree,
+            "clean": True,
+        }:
+            fail("audited_recovery_confirmation_mismatch")
+
+        # The first invocation must present the byte-exact incident state to
+        # the audited orchestrator.  A replay first clears historical success
+        # flags so a failed live revalidation can never report stale absence.
+        if prior_complete:
+            self.save(
+                state_path,
+                state,
+                discord_teardown_complete=False,
+                cleanup_complete=False,
+                postconditions_complete=False,
+            )
+        try:
+            ensure_resume_taint(state)
+            manifest = pathlib.Path(state["manifest_path"])
+            output = self.orchestrator(
+                AUDITED_QUARANTINED_RECOVERY_COMMAND,
+                manifest,
+                "--bootstrap-state",
+                str(state_path),
+                "--confirm-current-commit",
+                confirmed_current_commit,
+                "--confirm-current-tree",
+                confirmed_current_tree,
+                "--confirm-run-id",
+                confirmed_run_id,
+                "--confirm-manifest-sha256",
+                confirmed_manifest_sha256,
+            )
+            validate_audited_quarantined_recovery_output(
+                output,
+                state,
+                state_path,
+                confirmed_current_commit,
+                confirmed_current_tree,
+                self.source_root,
+            )
+            self.validate_postconditions(output["postconditions"], state)
+        except BaseException as error:
+            code = (
+                error.code
+                if isinstance(error, BootstrapError)
+                else "audited_recovery_failed"
+            )
+            return self.result(
+                state_path,
+                state,
+                status="failed",
+                error_code=code,
+            )
+        self.save(
+            state_path,
+            state,
+            phase="complete",
+            status="failed",
+            last_error=original_error,
+            discord_teardown_complete=True,
+            cleanup_complete=True,
+            postconditions_complete=True,
+        )
+        return self.result(
+            state_path,
+            state,
+            status="failed",
+            error_code=original_error,
+        )
+
+    def recover_audited_quarantined_no_issue(
+        self,
+        state_path,
+        confirmed_current_commit,
+        confirmed_current_tree,
+        confirmed_run_id,
+        confirmed_manifest_sha256,
+    ):
+        with bootstrap_lock(self.lock_path):
+            return self.recover_audited_quarantined_no_issue_locked(
+                state_path,
+                confirmed_current_commit,
+                confirmed_current_tree,
+                confirmed_run_id,
+                confirmed_manifest_sha256,
+            )
+
 
 class SafeArgumentParser(argparse.ArgumentParser):
     def error(self, _message):
@@ -4308,6 +5367,14 @@ def parser():
     run.add_argument("--operation", required=True, choices=sorted(D2A.ALLOWED_OPERATIONS))
     resume = commands.add_parser("resume")
     resume.add_argument("--state", required=True)
+    audited_recovery = commands.add_parser(
+        AUDITED_QUARANTINED_RECOVERY_COMMAND
+    )
+    audited_recovery.add_argument("--state", required=True)
+    audited_recovery.add_argument("--confirm-current-commit", required=True)
+    audited_recovery.add_argument("--confirm-current-tree", required=True)
+    audited_recovery.add_argument("--confirm-run-id", required=True)
+    audited_recovery.add_argument("--confirm-manifest-sha256", required=True)
     return root
 
 
@@ -4341,8 +5408,16 @@ def main(argv=None):
         controller = BootstrapController()
         if arguments.command == "run":
             result = controller.run(arguments.sandbox_config, arguments.candidate_spec, arguments.operation)
-        else:
+        elif arguments.command == "resume":
             result = controller.resume(arguments.state)
+        else:
+            result = controller.recover_audited_quarantined_no_issue(
+                arguments.state,
+                arguments.confirm_current_commit,
+                arguments.confirm_current_tree,
+                arguments.confirm_run_id,
+                arguments.confirm_manifest_sha256,
+            )
     except BootstrapError as error:
         result = error_result(error.code)
     except KeyboardInterrupt:

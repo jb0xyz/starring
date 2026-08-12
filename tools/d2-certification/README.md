@@ -44,9 +44,11 @@ the immutable sealed provisioner, creates or exactly replays 20 application
 database credentials, one cluster-administrator credential, three application
 keyrings, one worker bearer credential,
 activates the 20 application roles, changes PostgreSQL from socket-only
-bootstrap access to role-specific loopback SCRAM access, verifies replay after
-the sealed restart, and starts the certification transport, worker, API,
-runtime, and tunnel in that order. The transport owns two loopback listeners
+bootstrap access to role-specific loopback SCRAM access plus an exact
+three-role SCRAM exception on the run-owned socket for the non-listening D2A
+session issuer, verifies replay after the sealed restart, and starts the
+certification transport, worker, API, runtime, and tunnel in that order. The
+transport owns two loopback listeners
 and a manifest-owned `0600` Unix control socket. Runtime uses its explicit
 `loopback_proxy_v1` mode, so Discord gateway and interaction-effect traffic
 cannot silently fall back to the direct production transport. Controller
@@ -354,6 +356,54 @@ evidence. Interrupted executions replay only from that exact intent and source
 revision. Any other run, same-as-historical source, dirty or differently
 confirmed source, ambiguous journal, active service/process, artifact,
 commitment, or protected-staging drift fails before the intent is created.
+
+A second, separate repair boundary exists only for quarantined run
+`d2-20260812t082042z-c52d220457d1`:
+`recover-audited-quarantined-no-issue`. It does not make the run issuable and
+does not relax normal bootstrap resume or manifest loading. The command
+requires the exact allowlisted manifest and historical bytes, a clean current
+repository revision confirmed on the command line, the untouched initial
+bootstrap state or its narrowly defined post-recovery replay shape, the
+original immutable issuer/quarantine lifecycle, an elapsed session-safe
+deadline, empty receipts and coordinator state, and the exact live launchd,
+process-group, transport, PostgreSQL, candidate, plist, and tunnel-script
+identities. It holds the global operation lock and the run's exclusive
+coordinator lock for the complete validation, recovery, and replay boundary.
+
+The first durable mutation is an immutable, hash-bound recovery intent. The
+recovery then closes the teardown fence, stops the exact tunnel process, drains
+effect admission, and stops the exact runtime, API, and worker processes. With
+the transport still present but draining, it proves two exact empty transport
+inventories around a database audit. That audit obtains the run-owned cluster
+administrator URL from Keychain inside a fixed no-startup-files zsh process,
+passes only the password over an anonymous pipe to fixed `psql`, and never puts
+the secret in arguments, environment, files, output, evidence, or errors. A
+bounded process-group supervisor reaps the shell and every descendant on
+success, timeout, output overflow, or interruption. The serializable database
+transaction takes access-exclusive locks and proves the seven issue,
+authentication, onboarding, authority, and writer-fence tables are all empty,
+as well as verifying the exact database and cluster identity.
+
+Only after the database-absence marker and reconciliation marker are durably
+written does recovery stop the exact transport, close the special fence, and
+invoke the existing idempotent cleanup. The original lifecycle bytes are never
+rewritten; final recovery evidence is separate and secret-free. Every replay
+revalidates current absence and protected staging, accepts only the same
+deterministic operation and durable markers, and resumes safely after any
+recorded boundary. Its output includes fresh postconditions so the bootstrap
+wrapper need not call ordinary `status`, which remains intentionally blocked
+by the historical source-tree mismatch.
+
+```text
+python3 tools/d2-certification/isolated_orchestrator.py \
+  recover-audited-quarantined-no-issue \
+  --manifest /absolute/quarantined-run/manifest.json \
+  --bootstrap-state /absolute/bootstrap-state.json \
+  --confirm-current-commit <clean-current-HEAD> \
+  --confirm-current-tree <clean-current-HEAD-tree> \
+  --confirm-run-id d2-20260812t082042z-c52d220457d1 \
+  --confirm-manifest-sha256 a522e5c316f58f54df8c0ea69ab0f6aebb9ed85e7bb6ce45a2c02b5e63823338
+```
 
 `onboard` creates or exactly replays revision 1 with the single external
 channel binding `community_hub -> discord.hub_channel_id`. Its redacted output
