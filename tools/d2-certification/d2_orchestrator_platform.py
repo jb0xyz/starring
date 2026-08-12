@@ -11,7 +11,7 @@ import stat
 import subprocess
 import time
 
-from d2_orchestrator_contract import OWNER_ACCOUNT, REQUIRED_PROGRAMS, fail
+from d2_orchestrator_contract import REQUIRED_PROGRAMS, fail
 
 
 MAX_TRANSPORT_CONTROL_BYTES = 64 * 1024
@@ -21,6 +21,12 @@ QUARANTINED_RECOVERY_OUTPUT_BYTES = 4096
 QUARANTINED_RECOVERY_TIMEOUT_SECONDS = 15
 QUARANTINED_RECOVERY_ZSH = pathlib.Path("/bin/zsh")
 QUARANTINED_RECOVERY_SECURITY = pathlib.Path("/usr/bin/security")
+QUARANTINED_RECOVERY_LOGIN_KEYCHAIN = pathlib.Path(
+    "/Users/jungbogeon/Library/Keychains/login.keychain-db"
+)
+QUARANTINED_RECOVERY_LOGIN_KEYCHAIN_POLICY_KIND = (
+    "starring.d2.keychain-path-policy.v1"
+)
 QUARANTINED_RECOVERY_PSQL = pathlib.Path(
     "/opt/homebrew/Cellar/postgresql@16/16.14/bin/psql"
 )
@@ -1399,6 +1405,65 @@ class Platform:
             fail("quarantined_recovery_audit_tool_invalid")
         return tuple(identities)
 
+    def _quarantined_recovery_login_keychain_identity(self):
+        path = QUARANTINED_RECOVERY_LOGIN_KEYCHAIN
+        expected = (
+            (pathlib.Path("/"), 0, 0, 0o755, True, None),
+            (pathlib.Path("/Users"), 0, 80, 0o755, True, None),
+            (pathlib.Path("/Users/jungbogeon"), os.getuid(), 20, 0o750, True, None),
+            (pathlib.Path("/Users/jungbogeon/Library"), os.getuid(), 20, 0o700, True, None),
+            (pathlib.Path("/Users/jungbogeon/Library/Keychains"), os.getuid(), 20, 0o755, True, None),
+            (path, os.getuid(), 20, 0o644, False, 1),
+        )
+        policy = []
+        try:
+            for component, uid, gid, mode, directory, nlink in expected:
+                metadata = component.lstat()
+                if (
+                    component.is_symlink()
+                    or metadata.st_uid != uid
+                    or metadata.st_gid != gid
+                    or stat.S_IMODE(metadata.st_mode) != mode
+                    or metadata.st_mode & stat.S_IWOTH
+                    or (directory and not stat.S_ISDIR(metadata.st_mode))
+                    or (not directory and not stat.S_ISREG(metadata.st_mode))
+                    or (nlink is not None and metadata.st_nlink != nlink)
+                    or (not directory and metadata.st_size <= 0)
+                ):
+                    fail("quarantined_recovery_login_keychain_invalid")
+                entry = {
+                    "path": str(component),
+                    "mode": stat.S_IMODE(metadata.st_mode),
+                    "uid": metadata.st_uid,
+                    "gid": metadata.st_gid,
+                    "type": "directory" if directory else "regular",
+                }
+                if nlink is not None:
+                    entry["nlink"] = nlink
+                policy.append(entry)
+        except OSError:
+            fail("quarantined_recovery_login_keychain_invalid")
+        policy_sha256 = hashlib.sha256(
+            json.dumps(
+                policy, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return policy_sha256, {
+            "login_keychain_path": str(path),
+            "login_keychain_policy_kind": (
+                QUARANTINED_RECOVERY_LOGIN_KEYCHAIN_POLICY_KIND
+            ),
+            "login_keychain_policy_sha256": policy_sha256,
+            "login_keychain_policy_verified": True,
+        }
+
+    def quarantined_recovery_login_keychain_policy(self):
+        _policy_sha256, evidence = (
+            self._quarantined_recovery_login_keychain_identity()
+        )
+        return evidence
+
     def audit_quarantined_no_issue_database(self, context, expected):
         """Prove zero issue/onboarding rows without exposing the admin URL."""
         required = {
@@ -1442,6 +1507,9 @@ class Platform:
         except OSError:
             fail("quarantined_recovery_audit_tool_invalid")
         ancestry = self._quarantined_recovery_psql_ancestry()
+        login_keychain_policy_sha256, login_keychain_identity = (
+            self._quarantined_recovery_login_keychain_identity()
+        )
         psql = QUARANTINED_RECOVERY_PSQL
         observed_tools = {
             "zsh_sha256": self._quarantined_recovery_tool_sha256(
@@ -1469,7 +1537,8 @@ class Platform:
                 'security="$3"',
                 'psql="$4"',
                 'sql="$5"',
-                'url="$("$security" find-generic-password -s "$service" -a "$account" -w 2>/dev/null)" || exit 71',
+                'login_keychain="$6"',
+                'url="$("$security" find-generic-password -s "$service" -a "$account" -w "$login_keychain" 2>/dev/null)" || exit 71',
                 "prefix='postgresql://starring_cluster_admin:'",
                 "suffix='@127.0.0.1:55433/postgres?sslmode=disable'",
                 'case "$url" in ("$prefix"*"$suffix") ;; (*) unset url; exit 72;; esac',
@@ -1479,9 +1548,10 @@ class Platform:
                 'test "${#password}" -eq 43 || { unset password; exit 72; }',
                 'case "$password" in (*[!A-Za-z0-9_-]*) unset password; exit 72;; esac',
                 'result="$({ builtin printf -- \'%s\\n\' "$password"; } | "$psql" -W --no-psqlrc --host=127.0.0.1 --port=55433 --username=starring_cluster_admin --dbname=starring_runtime_staging --set=ON_ERROR_STOP=1 --tuples-only --no-align --quiet --command="$sql" 2>/dev/null)"',
-                'status="$?"',
+                'psql_status="$?"',
                 "unset password sql",
-                'test "$status" -eq 0 || { unset result; exit 73; }',
+                'test "$psql_status" -eq 0 || { unset result psql_status; exit 73; }',
+                "unset psql_status login_keychain",
                 'builtin printf -- \'%s\\n\' "$result"',
                 "unset result",
             )
@@ -1498,6 +1568,7 @@ class Platform:
                 QUARANTINED_RECOVERY_SECURITY,
                 psql,
                 QUARANTINED_RECOVERY_SQL,
+                QUARANTINED_RECOVERY_LOGIN_KEYCHAIN,
             ]
         )
         if any(
@@ -1512,6 +1583,14 @@ class Platform:
             fail("quarantined_recovery_audit_tool_invalid")
         if self._quarantined_recovery_psql_ancestry() != ancestry:
             fail("quarantined_recovery_audit_tool_invalid")
+        final_policy_sha256, final_keychain_identity = (
+            self._quarantined_recovery_login_keychain_identity()
+        )
+        if (
+            final_policy_sha256 != login_keychain_policy_sha256
+            or final_keychain_identity != login_keychain_identity
+        ):
+            fail("quarantined_recovery_login_keychain_changed")
         try:
             text = raw.decode("ascii")
         except UnicodeDecodeError:
@@ -1565,6 +1644,7 @@ class Platform:
             "authority_version_count": 0,
             "runtime_slot_writer_fence_count": 0,
             **observed_tools,
+            **login_keychain_identity,
         }
 
     def launchd_start(self, label, plist_path):
