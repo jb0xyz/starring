@@ -11,7 +11,7 @@ import stat
 import subprocess
 import time
 
-from d2_orchestrator_contract import REQUIRED_PROGRAMS, fail
+from d2_orchestrator_contract import OWNER_ACCOUNT, REQUIRED_PROGRAMS, fail
 
 
 MAX_TRANSPORT_CONTROL_BYTES = 64 * 1024
@@ -858,6 +858,25 @@ class Platform:
             ctypes.POINTER(ctypes.c_void_p),
         ]
         security.SecKeychainFindGenericPassword.restype = ctypes.c_int32
+        if hasattr(security, "SecKeychainOpen"):
+            security.SecKeychainOpen.argtypes = [
+                ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            security.SecKeychainOpen.restype = ctypes.c_int32
+        if hasattr(security, "SecKeychainGetPath"):
+            security.SecKeychainGetPath.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.c_char_p,
+            ]
+            security.SecKeychainGetPath.restype = ctypes.c_int32
+        if hasattr(security, "SecKeychainItemCopyKeychain"):
+            security.SecKeychainItemCopyKeychain.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            security.SecKeychainItemCopyKeychain.restype = ctypes.c_int32
         security.SecKeychainItemCreatePersistentReference.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_void_p),
@@ -871,15 +890,83 @@ class Platform:
         core_foundation.CFDataGetBytePtr.restype = ctypes.c_void_p
         core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
         core_foundation.CFRelease.restype = None
+        if hasattr(core_foundation, "CFEqual"):
+            core_foundation.CFEqual.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            core_foundation.CFEqual.restype = ctypes.c_bool
         return security, core_foundation
 
-    def _keychain_item_reference(self, service, account):
+    def _keychain_path(self, security, keychain):
+        length = ctypes.c_uint32(4096)
+        buffer = ctypes.create_string_buffer(length.value)
+        status = security.SecKeychainGetPath(
+            keychain, ctypes.byref(length), buffer
+        )
+        if status != 0 or length.value <= 0 or length.value >= len(buffer):
+            fail("audited_keychain_path_invalid")
+        try:
+            return pathlib.Path(buffer.raw[:length.value].decode("utf-8"))
+        except UnicodeDecodeError:
+            fail("audited_keychain_path_invalid")
+
+    def _open_audited_keychain(self):
         security, core_foundation = self._keychain_frameworks()
+        if any(
+            not hasattr(security, name)
+            for name in (
+                "SecKeychainOpen", "SecKeychainGetPath",
+                "SecKeychainItemCopyKeychain",
+            )
+        ) or not hasattr(core_foundation, "CFEqual"):
+            fail("audited_keychain_framework_unavailable")
+        keychain = ctypes.c_void_p()
+        status = security.SecKeychainOpen(
+            os.fsencode(QUARANTINED_RECOVERY_LOGIN_KEYCHAIN),
+            ctypes.byref(keychain),
+        )
+        if status != 0 or not keychain.value:
+            if keychain.value:
+                core_foundation.CFRelease(keychain)
+            fail("audited_keychain_open_failed")
+        if self._keychain_path(security, keychain) != (
+            QUARANTINED_RECOVERY_LOGIN_KEYCHAIN
+        ):
+            core_foundation.CFRelease(keychain)
+            fail("audited_keychain_path_invalid")
+        return security, core_foundation, keychain
+
+    def _require_item_keychain(
+        self, security, core_foundation, item, expected_keychain
+    ):
+        item_keychain = ctypes.c_void_p()
+        status = security.SecKeychainItemCopyKeychain(
+            item, ctypes.byref(item_keychain)
+        )
+        if status != 0 or not item_keychain.value:
+            if item_keychain.value:
+                core_foundation.CFRelease(item_keychain)
+            fail("audited_keychain_item_keychain_invalid")
+        try:
+            if (
+                not core_foundation.CFEqual(item_keychain, expected_keychain)
+                or self._keychain_path(security, item_keychain)
+                != QUARANTINED_RECOVERY_LOGIN_KEYCHAIN
+            ):
+                fail("audited_keychain_item_keychain_invalid")
+        finally:
+            core_foundation.CFRelease(item_keychain)
+
+    def _keychain_item_reference(
+        self, service, account, *, frameworks=None, keychain=None
+    ):
+        if frameworks is None:
+            security, core_foundation = self._keychain_frameworks()
+        else:
+            security, core_foundation = frameworks
         service_bytes = service.encode("utf-8")
         account_bytes = account.encode("utf-8")
         item = ctypes.c_void_p()
         status = security.SecKeychainFindGenericPassword(
-            None,
+            keychain,
             len(service_bytes),
             service_bytes,
             len(account_bytes),
@@ -896,7 +983,145 @@ class Platform:
             if item.value:
                 core_foundation.CFRelease(item)
             fail("keychain_reference_observation_failed")
+        if keychain is not None:
+            self._require_item_keychain(
+                security, core_foundation, item, keychain
+            )
         return security, core_foundation, item
+
+    def _audited_keychain_identities_on_handle(
+        self, security, core_foundation, keychain, identities
+    ):
+        observed = {}
+        for service, account in identities:
+            found = self._keychain_item_reference(
+                service,
+                account,
+                frameworks=(security, core_foundation),
+                keychain=keychain,
+            )
+            if found is None:
+                observed[(service, account)] = None
+                continue
+            _security, _core_foundation, item = found
+            try:
+                observed[(service, account)] = self._keychain_reference_identity(
+                    security, core_foundation, item
+                )
+            finally:
+                core_foundation.CFRelease(item)
+        return observed
+
+    def _require_audited_keychain_anchors_on_handle(
+        self, security, core_foundation, keychain, anchors
+    ):
+        if (
+            not isinstance(anchors, tuple)
+            or len(anchors) != 3
+            or len({(service, account) for service, account, _ in anchors}) != 3
+            or any(
+                not isinstance(service, str)
+                or not isinstance(account, str)
+                or not isinstance(identity, str)
+                or DIGEST_PATTERN.fullmatch(identity) is None
+                for service, account, identity in anchors
+            )
+        ):
+            fail("audited_keychain_anchor_invalid")
+        identities = tuple((service, account) for service, account, _ in anchors)
+        observed = self._audited_keychain_identities_on_handle(
+            security, core_foundation, keychain, identities
+        )
+        if any(
+            observed[(service, account)] != identity
+            for service, account, identity in anchors
+        ):
+            fail("audited_keychain_anchor_invalid")
+
+    def audited_keychain_item_identities(self, identities, anchors):
+        identities = tuple(identities)
+        if len(identities) != len(set(identities)) or any(
+            not isinstance(identity, tuple)
+            or len(identity) != 2
+            or not all(isinstance(value, str) for value in identity)
+            for identity in identities
+        ):
+            fail("audited_keychain_inventory_invalid")
+        anchor_names = {(service, account) for service, account, _ in anchors}
+        if anchor_names.intersection(identities):
+            fail("audited_keychain_inventory_invalid")
+        security, core_foundation, keychain = self._open_audited_keychain()
+        try:
+            self._require_audited_keychain_anchors_on_handle(
+                security, core_foundation, keychain, anchors
+            )
+            return self._audited_keychain_identities_on_handle(
+                security, core_foundation, keychain, identities
+            )
+        finally:
+            core_foundation.CFRelease(keychain)
+
+    def audited_keychain_owner_matches(self, service, expected):
+        result = self.run(
+            [
+                REQUIRED_PROGRAMS["security"],
+                "find-generic-password",
+                "-w",
+                "-s",
+                service,
+                "-a",
+                OWNER_ACCOUNT,
+                QUARANTINED_RECOVERY_LOGIN_KEYCHAIN,
+            ],
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return False
+        value = result.stdout.rstrip(b"\r\n")
+        return value == expected.encode("ascii")
+
+    def audited_keychain_delete_exact(
+        self, service, account, expected_identity, anchors
+    ):
+        if (
+            not isinstance(expected_identity, str)
+            or DIGEST_PATTERN.fullmatch(expected_identity) is None
+            or (service, account) in {
+                (anchor_service, anchor_account)
+                for anchor_service, anchor_account, _identity in anchors
+            }
+        ):
+            fail("audited_keychain_reference_identity_invalid")
+        security, core_foundation, keychain = self._open_audited_keychain()
+        try:
+            self._require_audited_keychain_anchors_on_handle(
+                security, core_foundation, keychain, anchors
+            )
+            found = self._keychain_item_reference(
+                service,
+                account,
+                frameworks=(security, core_foundation),
+                keychain=keychain,
+            )
+            if found is None:
+                fail("audited_keychain_reference_identity_drift")
+            _security, _core_foundation, item = found
+            try:
+                if self._keychain_reference_identity(
+                    security, core_foundation, item
+                ) != expected_identity:
+                    fail("audited_keychain_reference_identity_drift")
+                if security.SecKeychainItemDelete(item) != 0:
+                    fail("audited_keychain_reference_delete_failed")
+            finally:
+                core_foundation.CFRelease(item)
+        finally:
+            core_foundation.CFRelease(keychain)
+        observed = self.audited_keychain_item_identities(
+            ((service, account),), anchors
+        )
+        if observed[(service, account)] is not None:
+            fail("audited_keychain_reference_delete_failed")
 
     def _keychain_reference_identity(self, security, core_foundation, item):
         persistent = ctypes.c_void_p()

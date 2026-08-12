@@ -916,7 +916,10 @@ class BootstrapFixture:
                 },
                 "tunnel": {"label": f"local.starring.d2.{suffix}.tunnel"},
             },
-            "keychain_services": {},
+            "keychain_services": {
+                name: f"starring.d2.{suffix}.{name}"
+                for name in ("api", "runtime", "postgres", "worker")
+            },
             "external_keychain": {
                 "discord_oauth_client_secret": BOOTSTRAP.split_keychain_ref(credentials["discord_oauth"]),
                 "discord_bot_token": BOOTSTRAP.split_keychain_ref(credentials["discord_bot"]),
@@ -1114,6 +1117,95 @@ class D2ABootstrapTests(unittest.TestCase):
         incident["taint_sha256"] = hashlib.sha256(taint.read_bytes()).hexdigest()
 
         manifest = json.loads(self.fixture.manifest_path.read_bytes())
+        journal_rows = []
+        for sequence in range(1, incident["journal_rows"] + 1):
+            journal_rows.append({
+                "schema_version": 1,
+                "sequence": sequence,
+                "manifest_sha256": state["manifest_sha256"],
+                "action": (
+                    "candidate_start"
+                    if sequence == incident["journal_rows"] else "fixture"
+                ),
+                "status": (
+                    "rolled_back"
+                    if sequence == incident["journal_rows"] else "complete"
+                ),
+                "target": "run",
+                "recorded_at": "2026-08-12T08:00:00Z",
+            })
+        baseline_raw = b"".join(
+            (BOOTSTRAP.canonical_json(row) + "\n").encode("utf-8")
+            for row in journal_rows
+        )
+        incident["journal_sha256"] = hashlib.sha256(baseline_raw).hexdigest()
+        cleanup_rows = journal_rows + [
+            {
+                "schema_version": 1, "sequence": incident["journal_rows"] + 1,
+                "manifest_sha256": state["manifest_sha256"],
+                "action": "cleanup", "status": "intent", "target": "run",
+                "recorded_at": "2026-08-12T09:00:02Z",
+            },
+            {
+                "schema_version": 1, "sequence": incident["journal_rows"] + 2,
+                "manifest_sha256": state["manifest_sha256"],
+                "action": "cleanup", "status": "failed", "target": "run",
+                "recorded_at": "2026-08-12T09:00:03Z",
+            },
+        ]
+        cleanup_raw = b"".join(
+            (BOOTSTRAP.canonical_json(row) + "\n").encode("utf-8")
+            for row in cleanup_rows
+        )
+        write_file(artifact_root / "lifecycle.jsonl", cleanup_raw, 0o600)
+        incident["cleanup_journal_rows"] = len(cleanup_rows)
+        incident["cleanup_journal_sha256"] = hashlib.sha256(cleanup_raw).hexdigest()
+        cleanup_root_identity = {
+            "schema_version": 1,
+            "kind": "starring.d2.cleanup-root-identity.v1",
+            "manifest_sha256": state["manifest_sha256"],
+            "run_id": state["run_id"],
+            "root_path": str(
+                pathlib.Path(manifest["database"]["cluster_root"]).parent
+            ),
+            "root_device": 1,
+            "root_inode": 2,
+            "parent_device": 1,
+            "owner_uid": os.getuid(),
+        }
+        cleanup_root_identity_path = write_file(
+            artifact_root / "cleanup-root-identity.json",
+            cleanup_root_identity,
+            0o600,
+        )
+        incident["cleanup_root_identity_sha256"] = hashlib.sha256(
+            cleanup_root_identity_path.read_bytes()
+        ).hexdigest()
+        cleanup_keychain_inventory = [
+            {
+                "service": service,
+                "account": account,
+                "identity_sha256": hashlib.sha256(
+                    f"{service}:{account}".encode("utf-8")
+                ).hexdigest(),
+            }
+            for service, account in BOOTSTRAP.audited_recovery_keychain_inventory(
+                manifest
+            )
+        ]
+        incident["keychain_inventory_sha256"] = hashlib.sha256(
+            BOOTSTRAP.canonical_json(cleanup_keychain_inventory).encode("utf-8")
+        ).hexdigest()
+        incident["keychain_item_count"] = len(cleanup_keychain_inventory)
+        incident["keychain_anchor_policy_kind"] = (
+            BOOTSTRAP.AUDITED_QUARANTINED_KEYCHAIN_ANCHOR_POLICY_KIND
+        )
+        incident["keychain_anchor_inventory_sha256"] = (
+            BOOTSTRAP.audited_recovery_keychain_anchor_inventory_sha256()
+        )
+        incident["keychain_anchor_item_count"] = len(
+            BOOTSTRAP.AUDITED_QUARANTINED_KEYCHAIN_ANCHORS
+        )
         historical_source_trees = {
             name: record["sha256"]
             for name, record in manifest["source_trees"].items()
@@ -1294,7 +1386,7 @@ class D2ABootstrapTests(unittest.TestCase):
         transition_base = {
             **transition_v1_base,
             "schema_version": 2,
-            "kind": BOOTSTRAP.AUDITED_QUARANTINED_SOURCE_INTERLOCK_KIND,
+            "kind": BOOTSTRAP.AUDITED_QUARANTINED_SOURCE_INTERLOCK_V2_KIND,
             "from_source": transition_v1_to_source,
             "to_source": to_source,
             "parent_commit_sha": "1" * 40,
@@ -1305,24 +1397,38 @@ class D2ABootstrapTests(unittest.TestCase):
                 }
                 for path in BOOTSTRAP.AUDITED_QUARANTINED_CHANGED_PATHS
             },
-            "reason_codes": BOOTSTRAP.AUDITED_QUARANTINED_REASON_CODES,
+            "reason_codes": BOOTSTRAP.AUDITED_QUARANTINED_REASON_CODES_V2,
             "audit_configuration": audit_configuration,
             "previous_source_transition_sha256": transition_v1_sha,
         }
-        interlock_path = BOOTSTRAP.audited_recovery_source_interlock_path(state)
+        interlock_path = BOOTSTRAP.audited_recovery_source_interlock_v2_path(state)
         write_file(interlock_path, transition_base, 0o600)
         interlock_sha = hashlib.sha256(interlock_path.read_bytes()).hexdigest()
         transition = {
             **transition_base,
-            "kind": BOOTSTRAP.AUDITED_QUARANTINED_RECOVERY_KINDS[
-                "source_transition"
-            ],
+            "kind": BOOTSTRAP.AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_KIND,
             "interlock_sha256": interlock_sha,
         }
-        write_file(paths["source_transition"], transition, 0o600)
+        transition_v2_path = BOOTSTRAP.audited_recovery_source_transition_v2_path(
+            state
+        )
+        write_file(transition_v2_path, transition, 0o600)
         transition_sha = hashlib.sha256(
-            paths["source_transition"].read_bytes()
+            transition_v2_path.read_bytes()
         ).hexdigest()
+        transition_v2_to_file_sha256 = {
+            path: transition["file_sha256"][path]["to_sha256"]
+            for path in BOOTSTRAP.AUDITED_QUARANTINED_CHANGED_PATHS
+        }
+        incident.update({
+            "source_transition_v2_interlock_sha256": interlock_sha,
+            "source_transition_v2_sha256": transition_sha,
+            "source_transition_v2_commit_sha": "c" * 40,
+            "source_transition_v2_tree_sha": "d" * 40,
+            "source_transition_v2_to_file_sha256": (
+                transition_v2_to_file_sha256
+            ),
+        })
 
         database = {
             "schema_version": 1,
@@ -1400,6 +1506,88 @@ class D2ABootstrapTests(unittest.TestCase):
         reconciliation_sha = hashlib.sha256(
             paths["reconciliation"].read_bytes()
         ).hexdigest()
+        incident["database_absence_sha256"] = database_sha
+        incident["reconciliation_sha256"] = reconciliation_sha
+
+        cleanup_to_source = copy.deepcopy(to_source)
+        cleanup_to_source["commit_sha"] = "e" * 40
+        cleanup_to_source["tree_sha"] = "f" * 40
+        cleanup_base = {
+            "schema_version": 1,
+            "kind": BOOTSTRAP.AUDITED_QUARANTINED_SOURCE_INTERLOCK_KIND,
+            "run_id": state["run_id"],
+            "manifest_sha256": state["manifest_sha256"],
+            "intent_sha256": intent_sha,
+            "previous_source_transition_sha256": transition_sha,
+            "database_absence_sha256": database_sha,
+            "reconciliation_sha256": reconciliation_sha,
+            "from_source": to_source,
+            "to_source": cleanup_to_source,
+            "parent_commit_sha": "c" * 40,
+            "parent_count": 1,
+            "changed_paths": BOOTSTRAP.AUDITED_QUARANTINED_CHANGED_PATHS,
+            "file_sha256": {
+                path: {
+                    "from_sha256": transition_v2_to_file_sha256[path],
+                    "to_sha256": hashlib.sha256(("cleanup:" + path).encode()).hexdigest(),
+                }
+                for path in BOOTSTRAP.AUDITED_QUARANTINED_CHANGED_PATHS
+            },
+            "reason_codes": BOOTSTRAP.AUDITED_QUARANTINED_REASON_CODES,
+            "audit_configuration": audit_configuration,
+            "bootstrap_state_semantic_sha256": incident[
+                "bootstrap_state_semantic_sha256"
+            ],
+            "orchestrator_state_sha256": incident["orchestrator_state_sha256"],
+            "baseline_journal_sha256": incident["journal_sha256"],
+            "baseline_journal_rows": incident["journal_rows"],
+            "lifecycle_sha256": incident["lifecycle_sha256"],
+            "teardown_fence_sha256": "8" * 64,
+            "cleanup_journal_sha256": incident["cleanup_journal_sha256"],
+            "cleanup_journal_rows": incident["cleanup_journal_rows"],
+            "keychain_inventory_sha256": incident["keychain_inventory_sha256"],
+            "keychain_item_count": incident["keychain_item_count"],
+            "keychain_anchor_policy_kind": incident[
+                "keychain_anchor_policy_kind"
+            ],
+            "keychain_anchor_inventory_sha256": incident[
+                "keychain_anchor_inventory_sha256"
+            ],
+            "keychain_anchor_item_count": incident[
+                "keychain_anchor_item_count"
+            ],
+            "cleanup_root_identity_sha256": incident[
+                "cleanup_root_identity_sha256"
+            ],
+            "producer_launchd_jobs_absent": True,
+            "issuer_process_group_absent": True,
+            "postgres_absent": True,
+            "postgres_process_absent": True,
+            "isolated_root_retained": True,
+            "cleanup_keychain_baseline_absent": True,
+            "cleanup_root_progress_absent": True,
+            "cleanup_evidence_absent": True,
+            "protected_staging_unchanged": True,
+            "created_at": "2026-08-12T09:00:04Z",
+        }
+        cleanup_interlock_path = BOOTSTRAP.audited_recovery_source_interlock_path(
+            state
+        )
+        write_file(cleanup_interlock_path, cleanup_base, 0o600)
+        cleanup_interlock_sha = hashlib.sha256(
+            cleanup_interlock_path.read_bytes()
+        ).hexdigest()
+        cleanup_transition = {
+            **cleanup_base,
+            "kind": BOOTSTRAP.AUDITED_QUARANTINED_RECOVERY_KINDS[
+                "source_transition"
+            ],
+            "interlock_sha256": cleanup_interlock_sha,
+        }
+        write_file(paths["source_transition"], cleanup_transition, 0o600)
+        cleanup_transition_sha = hashlib.sha256(
+            paths["source_transition"].read_bytes()
+        ).hexdigest()
 
         fence_path = self.fixture.manifest_path.with_name(
             "d2a-teardown-fence.json"
@@ -1416,6 +1604,52 @@ class D2ABootstrapTests(unittest.TestCase):
             },
             0o600,
         )
+        incident["closed_teardown_fence_sha256"] = hashlib.sha256(
+            fence_path.read_bytes()
+        ).hexdigest()
+        cleanup_base["teardown_fence_sha256"] = incident[
+            "closed_teardown_fence_sha256"
+        ]
+        write_file(cleanup_interlock_path, cleanup_base, 0o600)
+        cleanup_interlock_sha = hashlib.sha256(
+            cleanup_interlock_path.read_bytes()
+        ).hexdigest()
+        cleanup_transition.update({
+            "teardown_fence_sha256": incident["closed_teardown_fence_sha256"],
+            "interlock_sha256": cleanup_interlock_sha,
+        })
+        write_file(paths["source_transition"], cleanup_transition, 0o600)
+        cleanup_transition_sha = hashlib.sha256(
+            paths["source_transition"].read_bytes()
+        ).hexdigest()
+        completed_cleanup_rows = cleanup_rows + [
+            {
+                "schema_version": 1,
+                "sequence": len(cleanup_rows) + 1,
+                "manifest_sha256": state["manifest_sha256"],
+                "action": "cleanup",
+                "status": "intent",
+                "target": "run",
+                "recorded_at": "2026-08-12T09:00:04Z",
+            },
+            {
+                "schema_version": 1,
+                "sequence": len(cleanup_rows) + 2,
+                "manifest_sha256": state["manifest_sha256"],
+                "action": "cleanup",
+                "status": "complete",
+                "target": "run",
+                "recorded_at": "2026-08-12T09:00:05Z",
+            },
+        ]
+        write_file(
+            artifact_root / "lifecycle.jsonl",
+            b"".join(
+                (BOOTSTRAP.canonical_json(row) + "\n").encode("utf-8")
+                for row in completed_cleanup_rows
+            ),
+            0o600,
+        )
         cleanup_path = artifact_root / "cleanup-evidence.json"
         cleanup = {
             "schema_version": 1,
@@ -1427,13 +1661,46 @@ class D2ABootstrapTests(unittest.TestCase):
             },
         }
         write_file(cleanup_path, cleanup, 0o600)
+        cleanup_keychain_baseline_path = artifact_root / (
+            "cleanup-keychain-baseline.json"
+        )
+        write_file(
+            cleanup_keychain_baseline_path,
+            {
+                "schema_version": 1,
+                "kind": "starring.d2.cleanup-keychain-baseline.v1",
+                "manifest_sha256": state["manifest_sha256"],
+                "run_id": state["run_id"],
+                "inventory": cleanup_keychain_inventory,
+            },
+            0o600,
+        )
+        cleanup_root_progress_path = artifact_root / "cleanup-root-progress.json"
+        cleanup_root = pathlib.Path(manifest["database"]["cluster_root"]).parent
+        write_file(
+            cleanup_root_progress_path,
+            {
+                "schema_version": 1,
+                "kind": "starring.d2.cleanup-root-progress.v1",
+                "manifest_sha256": state["manifest_sha256"],
+                "run_id": state["run_id"],
+                "root_device": cleanup_root_identity["root_device"],
+                "root_inode": cleanup_root_identity["root_inode"],
+                "quarantine_name": (
+                    f".{cleanup_root.name}.cleanup-"
+                    f"{state['manifest_sha256'][:16]}"
+                ),
+                "phase": "deleted",
+            },
+            0o600,
+        )
         evidence = {
             "schema_version": 1,
             "kind": BOOTSTRAP.AUDITED_QUARANTINED_RECOVERY_KINDS["evidence"],
             "run_id": state["run_id"],
             "manifest_sha256": state["manifest_sha256"],
             "intent_sha256": intent_sha,
-            "source_transition_sha256": transition_sha,
+            "source_transition_sha256": cleanup_transition_sha,
             "reconciliation_sha256": reconciliation_sha,
             "database_absence_sha256": database_sha,
             "observed_at": "2026-08-12T09:00:05Z",
@@ -1444,6 +1711,12 @@ class D2ABootstrapTests(unittest.TestCase):
             "cleanup_evidence_sha256": hashlib.sha256(
                 cleanup_path.read_bytes()
             ).hexdigest(),
+            "cleanup_keychain_baseline_sha256": hashlib.sha256(
+                cleanup_keychain_baseline_path.read_bytes()
+            ).hexdigest(),
+            "cleanup_root_progress_sha256": hashlib.sha256(
+                cleanup_root_progress_path.read_bytes()
+            ).hexdigest(),
             **{
                 field: True
                 for field in BOOTSTRAP.AUDITED_QUARANTINED_ABSENCE_FIELDS
@@ -1451,7 +1724,7 @@ class D2ABootstrapTests(unittest.TestCase):
         }
         write_file(paths["evidence"], evidence, 0o600)
         output = self.audited_recovery_output(state)
-        output["source_transition_sha256"] = transition_sha
+        output["source_transition_sha256"] = cleanup_transition_sha
         output["database_absence_sha256"] = database_sha
         output["database_absence"] = {
             field: database[field]
@@ -2165,8 +2438,9 @@ class D2ABootstrapTests(unittest.TestCase):
 
     def test_audited_recovery_rejects_unknown_output_and_missing_evidence(self):
         state_path, state = self.create_quarantined_direct_onboard_failure()
-        incident = self.audited_incident_overrides(state_path, state)
-        output = self.audited_recovery_output(state)
+        incident, output, _paths = self.write_audited_recovery_artifacts(
+            state_path, state
+        )
         with mock.patch.dict(
             BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
             incident,
@@ -2177,70 +2451,39 @@ class D2ABootstrapTests(unittest.TestCase):
                     {**output, "unexpected": True},
                     state,
                     state_path,
-                    "c" * 40,
-                    "d" * 40,
+                    "e" * 40,
+                    "f" * 40,
                     self.fixture.root,
                 )
         self.assertEqual(raised.exception.code, "audited_recovery_output_invalid")
 
-        manifest = json.loads(self.fixture.manifest_path.read_bytes())
-        historical = {
-            name: record["sha256"]
-            for name, record in manifest["source_trees"].items()
-        }
-        artifact_fields = {
-            "intent": BOOTSTRAP.AUDITED_QUARANTINED_INTENT_FIELDS,
-            "source_transition": BOOTSTRAP.AUDITED_QUARANTINED_SOURCE_TRANSITION_FIELDS,
-            "database_absence": BOOTSTRAP.AUDITED_QUARANTINED_DATABASE_ABSENCE_FIELDS,
-            "reconciliation": BOOTSTRAP.AUDITED_QUARANTINED_RECONCILIATION_FIELDS,
-        }
+        read_artifact = BOOTSTRAP.read_canonical_private_json
 
-        def missing_evidence(_path, label):
-            name = label.removeprefix("audited_recovery_")
-            if name == "evidence":
+        def missing_evidence(path, label):
+            if label == "audited_recovery_evidence":
                 raise BOOTSTRAP.BootstrapError(
                     "audited_recovery_evidence_unavailable"
                 )
-            value = {field: None for field in artifact_fields[name]}
-            value.update(
-                {
-                    "schema_version": 2 if name == "source_transition" else 1,
-                    "kind": BOOTSTRAP.AUDITED_QUARANTINED_RECOVERY_KINDS[name],
-                    "run_id": state["run_id"],
-                    "manifest_sha256": state["manifest_sha256"],
-                }
-            )
-            return pathlib.Path(_path), value, "f" * 64
+            return read_artifact(path, label)
 
-        lifecycle = json.loads(
-            self.fixture.manifest_path.with_name(
-                "d2a-session-lifecycle.json"
-            ).read_bytes()
-        )
         with mock.patch.dict(
             BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
             incident,
             clear=True,
         ), mock.patch.object(
             BOOTSTRAP,
-            "recovery_manifest_bindings",
-            return_value=(manifest, historical),
-        ), mock.patch.object(
-            BOOTSTRAP,
-            "read_quarantined_recovery_lifecycle",
-            return_value=(lifecycle, incident["lifecycle_sha256"]),
-        ), mock.patch.object(
-            BOOTSTRAP,
             "read_canonical_private_json",
             side_effect=missing_evidence,
+        ), mock.patch.object(
+            BOOTSTRAP, "validate_audited_source_transition_git"
         ):
             with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
                 BOOTSTRAP.validate_audited_quarantined_recovery_output(
                     output,
                     state,
                     state_path,
-                    "c" * 40,
-                    "d" * 40,
+                    "e" * 40,
+                    "f" * 40,
                     self.fixture.root,
                 )
         self.assertEqual(
@@ -2265,8 +2508,8 @@ class D2ABootstrapTests(unittest.TestCase):
                     output,
                     state,
                     state_path,
-                    "c" * 40,
-                    "d" * 40,
+                    "e" * 40,
+                    "f" * 40,
                     self.fixture.root,
                 ),
                 output,
@@ -2280,8 +2523,8 @@ class D2ABootstrapTests(unittest.TestCase):
                     output,
                     state,
                     state_path,
-                    "c" * 40,
-                    "d" * 40,
+                    "e" * 40,
+                    "f" * 40,
                     self.fixture.root,
                 )
             self.assertEqual(
@@ -2295,8 +2538,8 @@ class D2ABootstrapTests(unittest.TestCase):
                     output,
                     state,
                     state_path,
-                    "c" * 40,
-                    "d" * 40,
+                    "e" * 40,
+                    "f" * 40,
                     self.fixture.root,
                 )
             self.assertEqual(
@@ -2316,12 +2559,20 @@ class D2ABootstrapTests(unittest.TestCase):
         transition_v1_path = (
             BOOTSTRAP.audited_recovery_source_transition_v1_path(state)
         )
+        interlock_v2_path = (
+            BOOTSTRAP.audited_recovery_source_interlock_v2_path(state)
+        )
+        transition_v2_path = (
+            BOOTSTRAP.audited_recovery_source_transition_v2_path(state)
+        )
         coordinator = interlock_path.parent
         original = {
             path: path.read_bytes()
             for path in (
                 interlock_v1_path,
                 transition_v1_path,
+                interlock_v2_path,
+                transition_v2_path,
                 interlock_path,
                 paths["source_transition"],
                 paths["database_absence"],
@@ -2339,8 +2590,8 @@ class D2ABootstrapTests(unittest.TestCase):
                 candidate,
                 state,
                 state_path,
-                "c" * 40,
-                "d" * 40,
+                "e" * 40,
+                "f" * 40,
                 self.fixture.root,
             )
 
@@ -2353,10 +2604,10 @@ class D2ABootstrapTests(unittest.TestCase):
         ):
             transition = json.loads(paths["source_transition"].read_bytes())
             self.assertEqual(
-                transition["from_source"]["commit_sha"], "1" * 40
+                transition["from_source"]["commit_sha"], "c" * 40
             )
             self.assertEqual(
-                transition["to_source"]["commit_sha"], "c" * 40
+                transition["to_source"]["commit_sha"], "e" * 40
             )
             self.assertIs(validate(), output)
 
@@ -2368,6 +2619,14 @@ class D2ABootstrapTests(unittest.TestCase):
                 (
                     transition_v1_path,
                     "audited_recovery_source_transition_v1_path_invalid",
+                ),
+                (
+                    interlock_v2_path,
+                    "audited_recovery_source_interlock_v2_path_invalid",
+                ),
+                (
+                    transition_v2_path,
+                    "audited_recovery_source_transition_v2_path_invalid",
                 ),
                 (interlock_path, "audited_recovery_source_interlock_path_invalid"),
                 (
@@ -2438,8 +2697,8 @@ class D2ABootstrapTests(unittest.TestCase):
             restore()
 
             for name, expected in (
-                ("database_absence", "audited_recovery_database_absence_invalid"),
-                ("reconciliation", "audited_recovery_reconciliation_invalid"),
+                ("database_absence", "audited_recovery_source_transition_invalid"),
+                ("reconciliation", "audited_recovery_source_transition_invalid"),
                 ("evidence", "audited_recovery_evidence_invalid"),
             ):
                 with self.subTest(broken_link=name):
@@ -2448,8 +2707,9 @@ class D2ABootstrapTests(unittest.TestCase):
                     write_file(paths[name], artifact, 0o600)
                     with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
                         validate()
-                    self.assertEqual(raised.exception.code, expected)
+                    observed = raised.exception.code
                     restore()
+                    self.assertEqual(observed, expected)
 
             database = json.loads(paths["database_absence"].read_bytes())
             database["static_sql_sha256"] = incident["static_sql_sha256"]
@@ -2458,7 +2718,7 @@ class D2ABootstrapTests(unittest.TestCase):
                 validate()
             self.assertEqual(
                 raised.exception.code,
-                "audited_recovery_database_absence_invalid",
+                "audited_recovery_source_transition_invalid",
             )
             restore()
 
@@ -2494,6 +2754,286 @@ class D2ABootstrapTests(unittest.TestCase):
             self.assertEqual(
                 raised.exception.code,
                 "audited_recovery_source_transition_invalid",
+            )
+
+    def test_audited_recovery_cleanup_boundary_fails_closed(self):
+        state_path, state = self.create_quarantined_direct_onboard_failure()
+        incident, output, paths = self.write_audited_recovery_artifacts(
+            state_path, state
+        )
+        interlock_path = BOOTSTRAP.audited_recovery_source_interlock_path(state)
+        transition_v2_path = (
+            BOOTSTRAP.audited_recovery_source_transition_v2_path(state)
+        )
+        journal_path = (
+            self.fixture.manifest_path.parent / "orchestrator" / "lifecycle.jsonl"
+        )
+        root_identity_path = (
+            self.fixture.manifest_path.parent
+            / "orchestrator"
+            / "cleanup-root-identity.json"
+        )
+        keychain_baseline_path = (
+            self.fixture.manifest_path.parent
+            / "orchestrator"
+            / "cleanup-keychain-baseline.json"
+        )
+        root_progress_path = (
+            self.fixture.manifest_path.parent
+            / "orchestrator"
+            / "cleanup-root-progress.json"
+        )
+        fence_path = self.fixture.manifest_path.with_name(
+            "d2a-teardown-fence.json"
+        )
+        original = {
+            path: path.read_bytes()
+            for path in (
+                interlock_path,
+                paths["source_transition"],
+                paths["database_absence"],
+                paths["reconciliation"],
+                paths["evidence"],
+                journal_path,
+                root_identity_path,
+                keychain_baseline_path,
+                root_progress_path,
+                fence_path,
+            )
+        }
+
+        def restore():
+            for path, raw in original.items():
+                write_file(path, raw, 0o600)
+
+        def validate(candidate=output):
+            return BOOTSTRAP.validate_audited_quarantined_recovery_output(
+                candidate,
+                state,
+                state_path,
+                "e" * 40,
+                "f" * 40,
+                self.fixture.root,
+            )
+
+        with mock.patch.dict(
+            BOOTSTRAP.AUDITED_QUARANTINED_INCIDENT,
+            incident,
+            clear=True,
+        ), mock.patch.object(
+            BOOTSTRAP, "validate_audited_source_transition_git"
+        ):
+            transition_v2_sha256 = hashlib.sha256(
+                transition_v2_path.read_bytes()
+            ).hexdigest()
+            cleanup_transition_sha256 = hashlib.sha256(
+                paths["source_transition"].read_bytes()
+            ).hexdigest()
+            database = json.loads(paths["database_absence"].read_bytes())
+            reconciliation = json.loads(paths["reconciliation"].read_bytes())
+            evidence = json.loads(paths["evidence"].read_bytes())
+            self.assertNotEqual(
+                transition_v2_sha256, cleanup_transition_sha256
+            )
+            self.assertEqual(
+                database["source_transition_sha256"], transition_v2_sha256
+            )
+            self.assertEqual(
+                reconciliation["source_transition_sha256"],
+                transition_v2_sha256,
+            )
+            self.assertEqual(
+                evidence["source_transition_sha256"],
+                cleanup_transition_sha256,
+            )
+            self.assertEqual(
+                output["source_transition_sha256"], cleanup_transition_sha256
+            )
+            self.assertIs(validate(), output)
+
+            rows = [
+                json.loads(line)
+                for line in journal_path.read_text(encoding="utf-8").splitlines()
+            ]
+            rows[45]["status"] = "complete"
+            write_file(
+                journal_path,
+                b"".join(
+                    (BOOTSTRAP.canonical_json(row) + "\n").encode("utf-8")
+                    for row in rows
+                ),
+                0o600,
+            )
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate()
+            observed = raised.exception.code
+            restore()
+            self.assertEqual(
+                observed, "audited_recovery_cleanup_journal_invalid"
+            )
+
+            impossible_rows = [
+                json.loads(line)
+                for line in journal_path.read_text(encoding="utf-8").splitlines()
+            ]
+            impossible_rows[46]["status"] = "failed"
+            write_file(
+                journal_path,
+                b"".join(
+                    (BOOTSTRAP.canonical_json(row) + "\n").encode("utf-8")
+                    for row in impossible_rows
+                ),
+                0o600,
+            )
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate()
+            observed = raised.exception.code
+            restore()
+            self.assertEqual(
+                observed, "audited_recovery_cleanup_journal_invalid"
+            )
+
+            root_identity = json.loads(root_identity_path.read_bytes())
+            root_identity["root_inode"] += 1
+            write_file(root_identity_path, root_identity, 0o600)
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate()
+            observed = raised.exception.code
+            restore()
+            self.assertEqual(
+                observed, "audited_recovery_cleanup_root_identity_invalid"
+            )
+
+            keychain_baseline_path.unlink()
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate()
+            observed = raised.exception.code
+            restore()
+            self.assertEqual(
+                observed,
+                "audited_recovery_cleanup_keychain_baseline_path_invalid",
+            )
+
+            baseline = json.loads(keychain_baseline_path.read_bytes())
+            baseline["inventory"][0]["identity_sha256"] = "0" * 64
+            write_file(keychain_baseline_path, baseline, 0o600)
+            evidence = json.loads(paths["evidence"].read_bytes())
+            evidence["cleanup_keychain_baseline_sha256"] = hashlib.sha256(
+                keychain_baseline_path.read_bytes()
+            ).hexdigest()
+            write_file(paths["evidence"], evidence, 0o600)
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate()
+            observed = raised.exception.code
+            restore()
+            self.assertEqual(
+                observed, "audited_recovery_cleanup_keychain_baseline_invalid"
+            )
+
+            root_progress_path.unlink()
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate()
+            observed = raised.exception.code
+            restore()
+            self.assertEqual(
+                observed, "audited_recovery_cleanup_root_progress_path_invalid"
+            )
+
+            progress = json.loads(root_progress_path.read_bytes())
+            progress["phase"] = "planned"
+            write_file(root_progress_path, progress, 0o600)
+            evidence = json.loads(paths["evidence"].read_bytes())
+            evidence["cleanup_root_progress_sha256"] = hashlib.sha256(
+                root_progress_path.read_bytes()
+            ).hexdigest()
+            write_file(paths["evidence"], evidence, 0o600)
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate()
+            observed = raised.exception.code
+            restore()
+            self.assertEqual(
+                observed, "audited_recovery_cleanup_root_progress_invalid"
+            )
+
+            cleanup_root = pathlib.Path(
+                json.loads(self.fixture.manifest_path.read_bytes())["database"][
+                    "cluster_root"
+                ]
+            ).parent
+            real_lexists = os.path.lexists
+            with mock.patch.object(
+                BOOTSTRAP.os.path,
+                "lexists",
+                side_effect=lambda path: (
+                    True if pathlib.Path(path) == cleanup_root
+                    else real_lexists(path)
+                ),
+            ):
+                with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                    validate()
+            self.assertEqual(
+                raised.exception.code,
+                "audited_recovery_cleanup_root_progress_invalid",
+            )
+
+            fence = json.loads(fence_path.read_bytes())
+            fence["updated_at"] = "2026-08-12T09:00:04Z"
+            write_file(fence_path, fence, 0o600)
+            evidence = json.loads(paths["evidence"].read_bytes())
+            evidence["teardown_fence_sha256"] = hashlib.sha256(
+                fence_path.read_bytes()
+            ).hexdigest()
+            write_file(paths["evidence"], evidence, 0o600)
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate()
+            observed = raised.exception.code
+            restore()
+            self.assertEqual(
+                observed, "audited_recovery_teardown_fence_invalid"
+            )
+
+            interlock = json.loads(interlock_path.read_bytes())
+            transition = json.loads(paths["source_transition"].read_bytes())
+            for artifact in (interlock, transition):
+                artifact["keychain_inventory_sha256"] = "0" * 64
+            write_file(interlock_path, interlock, 0o600)
+            transition["interlock_sha256"] = hashlib.sha256(
+                interlock_path.read_bytes()
+            ).hexdigest()
+            write_file(paths["source_transition"], transition, 0o600)
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate({
+                    **output,
+                    "source_transition_sha256": hashlib.sha256(
+                        paths["source_transition"].read_bytes()
+                    ).hexdigest(),
+                })
+            observed = raised.exception.code
+            restore()
+            self.assertEqual(
+                observed, "audited_recovery_source_transition_invalid"
+            )
+
+            interlock = json.loads(interlock_path.read_bytes())
+            transition = json.loads(paths["source_transition"].read_bytes())
+            for artifact in (interlock, transition):
+                artifact["keychain_anchor_inventory_sha256"] = "0" * 64
+            write_file(interlock_path, interlock, 0o600)
+            transition["interlock_sha256"] = hashlib.sha256(
+                interlock_path.read_bytes()
+            ).hexdigest()
+            write_file(paths["source_transition"], transition, 0o600)
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                validate({
+                    **output,
+                    "source_transition_sha256": hashlib.sha256(
+                        paths["source_transition"].read_bytes()
+                    ).hexdigest(),
+                })
+            observed = raised.exception.code
+            restore()
+            self.assertEqual(
+                observed, "audited_recovery_source_transition_invalid"
             )
 
     def test_audited_recovery_git_transition_is_single_parent_and_exact(self):
@@ -2571,8 +3111,8 @@ class D2ABootstrapTests(unittest.TestCase):
                     output,
                     state,
                     state_path,
-                    "c" * 40,
-                    "d" * 40,
+                    "e" * 40,
+                    "f" * 40,
                     self.fixture.root,
                 )
         self.assertEqual(

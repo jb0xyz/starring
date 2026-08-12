@@ -88,8 +88,16 @@ class FakePlatform:
         self.keychain_writes = []
         self.keychain_deletes = []
         self.keychain_identity_versions = {}
+        self.audited_anchor_identities = {
+            (service, account): identity
+            for service, account, identity
+            in ORCHESTRATOR.AUDITED_QUARANTINED_RECOVERY_KEYCHAIN_ANCHORS
+        }
         self.keychain_replace_at_delete = None
         self.keychain_crash_after_delete = None
+        self.default_keychain_search_excludes_login = False
+        self.fail_generic_keychain_calls = False
+        self.generic_keychain_calls = []
         self.owner_values = {}
         self.bootouts = []
         self.initdb_failure = False
@@ -187,9 +195,20 @@ class FakePlatform:
         self.last_exit_codes[label] = exit_code
 
     def keychain_present(self, service, account):
+        self.generic_keychain_calls.append(("present", service, account))
+        if self.fail_generic_keychain_calls:
+            ORCHESTRATOR.fail("generic_keychain_call_forbidden")
+        if self.default_keychain_search_excludes_login:
+            return False
         return (service, account) in self.keychain
 
     def keychain_item_identity(self, service, account):
+        self.generic_keychain_calls.append(("identity", service, account))
+        if self.fail_generic_keychain_calls:
+            ORCHESTRATOR.fail("generic_keychain_call_forbidden")
+        return self._fixed_keychain_item_identity(service, account)
+
+    def _fixed_keychain_item_identity(self, service, account):
         identity = (service, account)
         if identity not in self.keychain:
             return None
@@ -207,6 +226,9 @@ class FakePlatform:
             self.owner_values[service] = value.decode("ascii")
 
     def keychain_delete_exact(self, service, account, expected_identity):
+        self.generic_keychain_calls.append(("delete", service, account))
+        if self.fail_generic_keychain_calls:
+            ORCHESTRATOR.fail("generic_keychain_call_forbidden")
         identity = (service, account)
         if self.keychain_item_identity(service, account) != expected_identity:
             ORCHESTRATOR.fail("keychain_reference_identity_drift")
@@ -223,7 +245,55 @@ class FakePlatform:
             ORCHESTRATOR.fail("injected_keychain_delete_crash")
 
     def keychain_owner_matches(self, service, expected):
+        self.generic_keychain_calls.append(
+            ("owner", service, ORCHESTRATOR.OWNER_ACCOUNT)
+        )
+        if self.fail_generic_keychain_calls:
+            ORCHESTRATOR.fail("generic_keychain_call_forbidden")
+        if self.default_keychain_search_excludes_login:
+            return False
         return self.owner_values.get(service) == expected
+
+    def audited_keychain_item_identities(self, identities, anchors):
+        expected_anchors = {
+            (service, account): identity
+            for service, account, identity in anchors
+        }
+        if len(expected_anchors) != 3 or any(
+            name not in self.keychain
+            or self.audited_anchor_identities.get(name) != expected_identity
+            for name, expected_identity in expected_anchors.items()
+        ):
+            ORCHESTRATOR.fail("audited_keychain_anchor_invalid")
+        observed = {}
+        for identity in identities:
+            if identity in expected_anchors:
+                ORCHESTRATOR.fail("audited_keychain_inventory_invalid")
+            observed[identity] = self._fixed_keychain_item_identity(*identity)
+        return observed
+
+    def audited_keychain_owner_matches(self, service, expected):
+        return self.owner_values.get(service) == expected
+
+    def audited_keychain_delete_exact(
+        self, service, account, expected_identity, anchors
+    ):
+        self.audited_keychain_item_identities((), anchors)
+        identity = (service, account)
+        if self._fixed_keychain_item_identity(*identity) != expected_identity:
+            ORCHESTRATOR.fail("audited_keychain_reference_identity_drift")
+        if self.keychain_replace_at_delete == identity:
+            self.keychain_identity_versions[identity] = (
+                self.keychain_identity_versions.get(identity, 0) + 1
+            )
+            return
+        self.keychain.discard(identity)
+        self.keychain_deletes.append(identity)
+        if account == ORCHESTRATOR.OWNER_ACCOUNT:
+            self.owner_values.pop(service, None)
+        if self.keychain_crash_after_delete == identity:
+            ORCHESTRATOR.fail("injected_keychain_delete_crash")
+        self.audited_keychain_item_identities((), anchors)
 
     def postgres_running(self, cluster_root):
         return self.postgres
@@ -5186,6 +5256,80 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         ):
             ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
+    def test_audited_cleanup_artifact_digests_require_canonical_json(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        baseline_path = ORCHESTRATOR.cleanup_keychain_baseline_path(
+            self.context
+        )
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        expected_inventory_sha256 = hashlib.sha256(
+            json.dumps(
+                baseline["inventory"], ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        baseline_path.write_text(
+            json.dumps(baseline, indent=2) + "\n", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_cleanup_keychain_boundary_invalid",
+        ):
+            ORCHESTRATOR.audited_cleanup_keychain_baseline_sha256(
+                self.context, expected_inventory_sha256
+            )
+        baseline_path.write_text(
+            ORCHESTRATOR.canonical_json(baseline) + "\n", encoding="utf-8"
+        )
+        progress_path = ORCHESTRATOR.cleanup_root_progress_path(self.context)
+        progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        duplicate = (
+            '{"schema_version":1,"schema_version":1,'
+            + ORCHESTRATOR.canonical_json(progress)[1:]
+            + "\n"
+        )
+        progress_path.write_text(duplicate, encoding="utf-8")
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_cleanup_root_progress_invalid",
+        ):
+            ORCHESTRATOR.audited_cleanup_root_progress_sha256(self.context)
+
+    def test_cleanup_artifact_validators_reject_boolean_schema_versions(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        baseline_path = ORCHESTRATOR.cleanup_keychain_baseline_path(
+            self.context
+        )
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_keychain_baseline_invalid"
+        ):
+            ORCHESTRATOR.validate_cleanup_keychain_baseline(
+                self.context, {**baseline, "schema_version": True}
+            )
+        progress = ORCHESTRATOR.load_cleanup_root_progress(self.context)
+        progress_path = ORCHESTRATOR.cleanup_root_progress_path(self.context)
+        progress_path.write_text(
+            ORCHESTRATOR.canonical_json({
+                **progress, "schema_version": True,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_root_progress_invalid"
+        ):
+            ORCHESTRATOR.load_cleanup_root_progress(self.context)
+        evidence_path = self.context.artifact_directory / "cleanup-evidence.json"
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_evidence_invalid"
+        ):
+            ORCHESTRATOR.validate_cleanup_evidence(
+                self.context, {**evidence, "schema_version": True}
+            )
+
     def test_cleaned_replay_reconstructs_only_missing_cleanup_evidence(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
@@ -5557,6 +5701,68 @@ class LaunchdPlatformTests(unittest.TestCase):
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=5, check=False,
             )
+
+    def test_audited_keychain_reference_uses_explicit_handle_and_item_binding(self):
+        platform = PLATFORM.Platform()
+        security = SimpleNamespace(
+            SecKeychainFindGenericPassword=mock.Mock(),
+            SecKeychainItemCopyKeychain=mock.Mock(),
+            SecKeychainGetPath=mock.Mock(),
+        )
+        core_foundation = SimpleNamespace(
+            CFEqual=mock.Mock(return_value=True),
+            CFRelease=mock.Mock(),
+        )
+        keychain = ctypes.c_void_p(101)
+        path_bytes = os.fsencode(PLATFORM.QUARANTINED_RECOVERY_LOGIN_KEYCHAIN)
+
+        def find(_keychain, *_arguments):
+            _arguments[-1]._obj.value = 202
+            return 0
+
+        def copy_keychain(_item, output):
+            output._obj.value = 303
+            return 0
+
+        def get_path(_keychain, length, output):
+            ctypes.memmove(output, path_bytes, len(path_bytes))
+            length._obj.value = len(path_bytes)
+            return 0
+
+        security.SecKeychainFindGenericPassword.side_effect = find
+        security.SecKeychainItemCopyKeychain.side_effect = copy_keychain
+        security.SecKeychainGetPath.side_effect = get_path
+        found = platform._keychain_item_reference(
+            "service",
+            "account",
+            frameworks=(security, core_foundation),
+            keychain=keychain,
+        )
+        self.assertIs(
+            security.SecKeychainFindGenericPassword.call_args.args[0],
+            keychain,
+        )
+        self.assertNotEqual(
+            security.SecKeychainFindGenericPassword.call_args.args[0], None
+        )
+        security.SecKeychainItemCopyKeychain.assert_called_once()
+        core_foundation.CFEqual.assert_called_once()
+        core_foundation.CFRelease(found[2])
+
+    def test_audited_keychain_owner_lookup_is_explicit_positional(self):
+        platform = PLATFORM.Platform()
+        result = subprocess.CompletedProcess(
+            [], 0, b"d2-20260812t082042z-c52d220457d1\n", b""
+        )
+        with mock.patch.object(platform, "run", return_value=result) as run:
+            self.assertTrue(platform.audited_keychain_owner_matches(
+                "starring.d2.test", "d2-20260812t082042z-c52d220457d1"
+            ))
+        arguments = run.call_args.args[0]
+        self.assertEqual(
+            arguments[-1], PLATFORM.QUARANTINED_RECOVERY_LOGIN_KEYCHAIN
+        )
+        self.assertNotIn("-k", arguments)
 
     def test_quarantined_recovery_zsh_ignores_malicious_user_zshenv(self):
         zdotdir = self.root / "malicious-zdotdir"
@@ -7360,16 +7566,141 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         v1_transition_sha256 = hashlib.sha256(
             paths["source_transition"].read_bytes()
         ).hexdigest()
-        git_facts = {
+        v2_source = {
+            **revision,
+            "commit_sha": "f" * 40,
+            "tree_sha": "6" * 40,
+            "source_trees": observations,
+        }
+        v2_to_file_sha256 = {
+            path: "3" * 64
+            for path in ORCHESTRATOR.AUDITED_QUARANTINED_RECOVERY_CHANGED_PATHS
+        }
+        v2_interlock = {
+            **v1_interlock,
+            "schema_version": 2,
+            "kind": (
+                ORCHESTRATOR
+                .AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_INTERLOCK_KIND
+            ),
+            "previous_source_transition_sha256": v1_transition_sha256,
+            "from_source": previous_source,
+            "to_source": v2_source,
             "parent_commit_sha": previous_source["commit_sha"],
+            "file_sha256": {
+                path: {
+                    "from_sha256": v1_to_file_sha256[path],
+                    "to_sha256": v2_to_file_sha256[path],
+                }
+                for path in ORCHESTRATOR.AUDITED_QUARANTINED_RECOVERY_CHANGED_PATHS
+            },
+            "reason_codes": list(
+                ORCHESTRATOR.AUDITED_QUARANTINED_RECOVERY_V2_REASON_CODES
+            ),
+            "audit_configuration": (
+                ORCHESTRATOR.audited_quarantined_v2_audit_configuration()
+            ),
+            "created_at": "2026-08-12T11:00:00Z",
+        }
+        paths["source_transition_v2_interlock"].write_text(
+            ORCHESTRATOR.canonical_json(v2_interlock) + "\n", encoding="utf-8"
+        )
+        paths["source_transition_v2_interlock"].chmod(0o600)
+        v2_interlock_sha256 = hashlib.sha256(
+            paths["source_transition_v2_interlock"].read_bytes()
+        ).hexdigest()
+        v2_transition = {
+            **v2_interlock,
+            "kind": ORCHESTRATOR.AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_KIND,
+            "interlock_sha256": v2_interlock_sha256,
+        }
+        paths["source_transition_v2"].write_text(
+            ORCHESTRATOR.canonical_json(v2_transition) + "\n", encoding="utf-8"
+        )
+        paths["source_transition_v2"].chmod(0o600)
+        v2_transition_sha256 = hashlib.sha256(
+            paths["source_transition_v2"].read_bytes()
+        ).hexdigest()
+        observed_at = "2026-08-12T11:01:27Z"
+        database = ORCHESTRATOR.audited_quarantined_database_payload(
+            self.context, allowlist, hashlib.sha256(intent_path.read_bytes()).hexdigest(),
+            v2_transition_sha256, allowlist["empty_transport_inventory_sha256"],
+            observed_at, ORCHESTRATOR.audited_quarantined_v2_audit_configuration(),
+        )
+        paths["database_absence"].write_text(
+            ORCHESTRATOR.canonical_json(database) + "\n", encoding="utf-8"
+        )
+        paths["database_absence"].chmod(0o600)
+        database_sha256 = hashlib.sha256(
+            paths["database_absence"].read_bytes()
+        ).hexdigest()
+        reconciliation = {
+            "schema_version": 1,
+            "kind": ORCHESTRATOR.AUDITED_QUARANTINED_NO_ISSUE_RECONCILIATION_KIND,
+            "run_id": self.context.manifest["run_id"],
+            "manifest_sha256": self.context.digest,
+            "intent_sha256": hashlib.sha256(intent_path.read_bytes()).hexdigest(),
+            "observed_at": observed_at,
+            "source_transition_sha256": v2_transition_sha256,
+            "lifecycle_sha256": allowlist["lifecycle_sha256"],
+            "transport_instance_id": allowlist["transport_instance_id"],
+            "pre_intent_transport_inventory_sha256": allowlist[
+                "empty_transport_inventory_sha256"
+            ],
+            "effect_admission_operation_id": (
+                ORCHESTRATOR.AUDITED_QUARANTINED_NO_ISSUE_OPERATION_ID
+            ),
+            "effect_admission_status": "drained",
+            "producer_launchd_jobs_absent": True,
+            "issuer_process_group_absent": True,
+            "post_drain_transport_inventory_sha256": allowlist[
+                "empty_transport_inventory_sha256"
+            ],
+            "database_absence_sha256": database_sha256,
+            "final_transport_inventory_sha256": allowlist[
+                "empty_transport_inventory_sha256"
+            ],
+            "postgres_running": True,
+            "protected_staging_unchanged": True,
+        }
+        paths["reconciliation"].write_text(
+            ORCHESTRATOR.canonical_json(reconciliation) + "\n", encoding="utf-8"
+        )
+        paths["reconciliation"].chmod(0o600)
+        reconciliation_sha256 = hashlib.sha256(
+            paths["reconciliation"].read_bytes()
+        ).hexdigest()
+        ORCHESTRATOR.transition_d2a_teardown_fence(self.context, "closed")
+        closed_fence_sha256 = hashlib.sha256(
+            ORCHESTRATOR.d2a_teardown_fence_path(self.context).read_bytes()
+        ).hexdigest()
+        self.platform.launchd_bootout(
+            self.context.manifest["services"]["transport"]["label"]
+        )
+        self.platform.postgres_stop(self.context.cluster_root)
+        ORCHESTRATOR.append_journal(self.context, "cleanup", "intent", "run")
+        ORCHESTRATOR.append_journal(self.context, "cleanup", "failed", "run")
+        cleanup_rows, cleanup_journal_raw = (
+            ORCHESTRATOR.read_strict_journal_snapshot(self.context)
+        )
+        root_identity_sha256 = hashlib.sha256(
+            ORCHESTRATOR.cleanup_root_identity_path(self.context).read_bytes()
+        ).hexdigest()
+        _keychain_inventory, keychain_inventory_sha256 = (
+            ORCHESTRATOR.audited_quarantined_cleanup_keychain_inventory(
+                self.context, self.platform
+            )
+        )
+        git_facts = {
+            "parent_commit_sha": v2_source["commit_sha"],
             "parent_count": 1,
             "changed_paths": list(
                 ORCHESTRATOR.AUDITED_QUARANTINED_RECOVERY_CHANGED_PATHS
             ),
             "file_sha256": {
                 path: {
-                    "from_sha256": v1_to_file_sha256[path],
-                    "to_sha256": "3" * 64,
+                    "from_sha256": v2_to_file_sha256[path],
+                    "to_sha256": "4" * 64,
                 }
                 for path in ORCHESTRATOR.AUDITED_QUARANTINED_RECOVERY_CHANGED_PATHS
             },
@@ -7382,9 +7713,22 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             "allowlist": allowlist, "service_identities": service_identities,
             "intent_source": intent_source,
             "previous_source": previous_source,
+            "v2_source": v2_source,
             "v1_to_file_sha256": v1_to_file_sha256,
+            "v2_to_file_sha256": v2_to_file_sha256,
             "v1_interlock_sha256": v1_interlock_sha256,
             "v1_transition_sha256": v1_transition_sha256,
+            "v2_interlock_sha256": v2_interlock_sha256,
+            "v2_transition_sha256": v2_transition_sha256,
+            "database_sha256": database_sha256,
+            "reconciliation_sha256": reconciliation_sha256,
+            "closed_fence_sha256": closed_fence_sha256,
+            "cleanup_journal_sha256": hashlib.sha256(
+                cleanup_journal_raw
+            ).hexdigest(),
+            "cleanup_journal_rows": len(cleanup_rows),
+            "root_identity_sha256": root_identity_sha256,
+            "keychain_inventory_sha256": keychain_inventory_sha256,
             "intent_sha256": hashlib.sha256(intent_path.read_bytes()).hexdigest(),
             "fence_sha256": fence_sha256,
             "git_facts": git_facts,
@@ -7392,50 +7736,39 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
 
     def run_audited_quarantined_recovery(self, fixture):
         key = (self.context.manifest["run_id"], self.context.digest)
-        with mock.patch.object(
-            ORCHESTRATOR, "AUDITED_QUARANTINED_NO_ISSUE_ALLOWLIST",
-            {key: fixture["allowlist"]},
-        ), mock.patch.object(
-            ORCHESTRATOR, "AUDITED_QUARANTINED_SERVICE_IDENTITIES",
-            fixture["service_identities"],
-        ), mock.patch.object(
-            ORCHESTRATOR, "AUDITED_QUARANTINED_RECOVERY_INTENT_SHA256",
-            fixture["intent_sha256"],
-        ), mock.patch.object(
-            ORCHESTRATOR, "AUDITED_QUARANTINED_RECOVERY_FROM_COMMIT",
-            fixture["intent_source"]["commit_sha"],
-        ), mock.patch.object(
-            ORCHESTRATOR, "AUDITED_QUARANTINED_RECOVERY_FROM_TREE",
-            fixture["intent_source"]["tree_sha"],
-        ), mock.patch.object(
-            ORCHESTRATOR,
-            "AUDITED_QUARANTINED_RECOVERY_V1_INTERLOCK_SHA256",
-            fixture["v1_interlock_sha256"],
-        ), mock.patch.object(
-            ORCHESTRATOR,
-            "AUDITED_QUARANTINED_RECOVERY_V1_TRANSITION_SHA256",
-            fixture["v1_transition_sha256"],
-        ), mock.patch.object(
-            ORCHESTRATOR, "AUDITED_QUARANTINED_RECOVERY_V1_TO_COMMIT",
-            fixture["previous_source"]["commit_sha"],
-        ), mock.patch.object(
-            ORCHESTRATOR, "AUDITED_QUARANTINED_RECOVERY_V1_TO_TREE",
-            fixture["previous_source"]["tree_sha"],
-        ), mock.patch.object(
-            ORCHESTRATOR, "AUDITED_QUARANTINED_RECOVERY_V1_TO_FILE_SHA256",
-            fixture["v1_to_file_sha256"],
-        ), mock.patch.object(
-            ORCHESTRATOR,
-            "AUDITED_QUARANTINED_RECOVERY_CLOSING_FENCE_SHA256",
-            fixture["fence_sha256"],
-        ), mock.patch.object(
+        constants = {
+            "AUDITED_QUARANTINED_NO_ISSUE_ALLOWLIST": {key: fixture["allowlist"]},
+            "AUDITED_QUARANTINED_SERVICE_IDENTITIES": fixture["service_identities"],
+            "AUDITED_QUARANTINED_RECOVERY_INTENT_SHA256": fixture["intent_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_FROM_COMMIT": fixture["intent_source"]["commit_sha"],
+            "AUDITED_QUARANTINED_RECOVERY_FROM_TREE": fixture["intent_source"]["tree_sha"],
+            "AUDITED_QUARANTINED_RECOVERY_V1_INTERLOCK_SHA256": fixture["v1_interlock_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_V1_TRANSITION_SHA256": fixture["v1_transition_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_V1_TO_COMMIT": fixture["previous_source"]["commit_sha"],
+            "AUDITED_QUARANTINED_RECOVERY_V1_TO_TREE": fixture["previous_source"]["tree_sha"],
+            "AUDITED_QUARANTINED_RECOVERY_V1_TO_FILE_SHA256": fixture["v1_to_file_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_V2_INTERLOCK_SHA256": fixture["v2_interlock_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_V2_TRANSITION_SHA256": fixture["v2_transition_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_DATABASE_SHA256": fixture["database_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_RECONCILIATION_SHA256": fixture["reconciliation_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_V2_TO_COMMIT": fixture["v2_source"]["commit_sha"],
+            "AUDITED_QUARANTINED_RECOVERY_V2_TO_TREE": fixture["v2_source"]["tree_sha"],
+            "AUDITED_QUARANTINED_RECOVERY_V2_TO_FILE_SHA256": fixture["v2_to_file_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_CLOSED_FENCE_SHA256": fixture["closed_fence_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_CLEANUP_JOURNAL_SHA256": fixture["cleanup_journal_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_CLEANUP_JOURNAL_ROWS": fixture["cleanup_journal_rows"],
+            "AUDITED_QUARANTINED_RECOVERY_ROOT_IDENTITY_SHA256": fixture["root_identity_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_KEYCHAIN_INVENTORY_SHA256": fixture["keychain_inventory_sha256"],
+            "AUDITED_QUARANTINED_RECOVERY_CLOSING_FENCE_SHA256": fixture["fence_sha256"],
+        }
+        with mock.patch.multiple(ORCHESTRATOR, **constants), mock.patch.object(
             ORCHESTRATOR, "audited_quarantined_source_transition_git_facts",
             side_effect=lambda revision, parent_commit, from_file_sha256: (
                 fixture["git_facts"]
                 if (
                     revision == fixture["revision"]
-                    and parent_commit == fixture["previous_source"]["commit_sha"]
-                    and from_file_sha256 == fixture["v1_to_file_sha256"]
+                    and parent_commit == fixture["v2_source"]["commit_sha"]
+                    and from_file_sha256 == fixture["v2_to_file_sha256"]
                 )
                 else self.fail("unexpected source transition git boundary")
             ),
@@ -7455,7 +7788,8 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
                 )
             } | {
                 "source_transition_interlock_present": True,
-                "source_transition_v2_interlock_present": False,
+                "source_transition_v2_interlock_present": True,
+                "cleanup_transition_interlock_present": False,
             },
         ), mock.patch.object(
             ORCHESTRATOR.os, "getpgid", side_effect=lambda pid: pid
@@ -7481,7 +7815,7 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             "protected_staging_unchanged": True,
         })
         self.assertTrue(first["database_absence"]["process_group_quiescent"])
-        self.assertEqual(self.platform.quarantined_database_audits, 1)
+        self.assertEqual(self.platform.quarantined_database_audits, 0)
         self.assertEqual(fixture["bootstrap_path"].read_bytes(), fixture["bootstrap_before"])
         self.assertEqual(
             fixture["lifecycle_path"].read_bytes(), fixture["lifecycle_before"]
@@ -7512,81 +7846,122 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         replay = self.run_audited_quarantined_recovery(fixture)
         self.assertEqual(replay["status"], "exact_replay")
         self.assertEqual(replay["cleanup_status"], "already_cleaned")
-        self.assertEqual(self.platform.quarantined_database_audits, 1)
+        self.assertEqual(self.platform.quarantined_database_audits, 0)
         self.assertEqual(self.context.journal_path.read_bytes(), journal_before)
         self.assertEqual(
             fixture["lifecycle_path"].read_bytes(), fixture["lifecycle_before"]
         )
 
+    def test_audited_cleanup_uses_fixed_keychain_when_default_search_excludes_it(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        self.platform.default_keychain_search_excludes_login = True
+        self.platform.generic_keychain_calls.clear()
+        self.platform.fail_generic_keychain_calls = True
+        result = self.run_audited_quarantined_recovery(fixture)
+        self.assertEqual(result["status"], "recovered")
+        self.assertTrue(result["keychain_items_absent"])
+        self.assertTrue(all(
+            anchor in self.platform.keychain
+            for anchor in ORCHESTRATOR.external_keychain_inventory(self.context)
+        ))
+        self.assertFalse(any(
+            identity in self.platform.keychain
+            for identity in ORCHESTRATOR.keychain_inventory(self.context)
+        ))
+        self.assertEqual(self.platform.generic_keychain_calls, [])
+        replay = self.run_audited_quarantined_recovery(fixture)
+        self.assertEqual(replay["status"], "exact_replay")
+        self.assertEqual(self.platform.generic_keychain_calls, [])
+
+    def test_audited_cleanup_rejects_fixed_keychain_anchor_drift_before_p3(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        anchor = ORCHESTRATOR.external_keychain_inventory(self.context)[0]
+        self.platform.keychain.remove(anchor)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "audited_keychain_anchor_invalid"
+        ):
+            self.run_audited_quarantined_recovery(fixture)
+        self.assertFalse(paths["cleanup_transition_interlock"].exists())
+        self.assertFalse(paths["cleanup_transition"].exists())
+
+    def test_audited_cleanup_rejects_fixed_keychain_anchor_identity_drift(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        anchor = ORCHESTRATOR.external_keychain_inventory(self.context)[0]
+        self.platform.audited_anchor_identities[anchor] = "f" * 64
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "audited_keychain_anchor_invalid"
+        ):
+            self.run_audited_quarantined_recovery(fixture)
+        self.assertFalse(paths["cleanup_transition_interlock"].exists())
+        self.assertFalse(paths["cleanup_transition"].exists())
+
     def test_audited_quarantined_recovery_rejects_nonzero_database_before_marker(self):
         fixture = self.prepare_audited_quarantined_recovery_fixture()
-        self.platform.quarantined_database_override = {"auth_session_count": 1}
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        database = json.loads(paths["database_absence"].read_text())
+        database["auth_session_count"] = 1
+        paths["database_absence"].write_text(
+            ORCHESTRATOR.canonical_json(database) + "\n", encoding="utf-8"
+        )
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError,
             "audited_quarantined_database_evidence_invalid",
         ):
             self.run_audited_quarantined_recovery(fixture)
-        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
         self.assertTrue(paths["intent"].is_file())
-        self.assertFalse(paths["database_absence"].exists())
-        self.assertTrue(self.platform.postgres)
-        self.assertFalse(ORCHESTRATOR.d2a_teardown_fence_path(self.context).read_text().find('"status":"closing"') < 0)
+        self.assertFalse(paths["cleanup_transition_interlock"].exists())
+        self.assertFalse(paths["cleanup_transition"].exists())
 
     def test_audited_quarantined_recovery_rejects_transport_replacement_before_interlock(self):
         fixture = self.prepare_audited_quarantined_recovery_fixture()
         bootouts_before = list(self.platform.bootouts)
-        transport_label = self.context.manifest["services"]["transport"]["label"]
-        self.platform.programs[transport_label] = "/tmp/replacement"
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        transition = json.loads(paths["source_transition_v2"].read_text())
+        transition["to_source"]["tree_sha"] = "f" * 40
+        paths["source_transition_v2"].write_text(
+            ORCHESTRATOR.canonical_json(transition) + "\n", encoding="utf-8"
+        )
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError,
-            "audited_quarantined_service_identity_invalid",
+            "audited_quarantined_historical_source_transition_v2_invalid",
         ):
             self.run_audited_quarantined_recovery(fixture)
-        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
         self.assertTrue(paths["intent"].exists())
-        self.assertFalse(paths["source_transition_v2_interlock"].exists())
-        self.assertFalse(paths["source_transition_v2"].exists())
+        self.assertFalse(paths["cleanup_transition_interlock"].exists())
+        self.assertFalse(paths["cleanup_transition"].exists())
         self.assertEqual(self.platform.bootouts, bootouts_before)
 
     def test_audited_quarantined_recovery_rejects_nonempty_transport_before_interlock(self):
         fixture = self.prepare_audited_quarantined_recovery_fixture()
-        self.platform.resource_history = [{
-            "kind": "role", "resource_id": "1524810437118525580",
-            "state": "created",
-        }]
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        reconciliation = json.loads(paths["reconciliation"].read_text())
+        reconciliation["final_transport_inventory_sha256"] = "f" * 64
+        paths["reconciliation"].write_text(
+            ORCHESTRATOR.canonical_json(reconciliation) + "\n", encoding="utf-8"
+        )
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError,
-            "audited_quarantined_transport_inventory_invalid",
+            "audited_quarantined_reconciliation_invalid",
         ):
             self.run_audited_quarantined_recovery(fixture)
-        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
         self.assertTrue(paths["intent"].exists())
-        self.assertFalse(paths["source_transition_v2_interlock"].exists())
-        self.assertFalse(paths["source_transition_v2"].exists())
+        self.assertFalse(paths["cleanup_transition_interlock"].exists())
+        self.assertFalse(paths["cleanup_transition"].exists())
 
     def test_audited_quarantined_recovery_rejects_transport_lost_before_reconciliation(self):
         fixture = self.prepare_audited_quarantined_recovery_fixture()
-        original = ORCHESTRATOR.audited_quarantined_stop_exact
-        transport_label = self.context.manifest["services"]["transport"]["label"]
-
-        def lose_transport_after_tunnel(context, platform, name, allowlist):
-            value = original(context, platform, name, allowlist)
-            if name == "tunnel":
-                platform.loaded.discard(transport_label)
-            return value
-
-        with mock.patch.object(
-            ORCHESTRATOR, "audited_quarantined_stop_exact",
-            side_effect=lose_transport_after_tunnel,
-        ), self.assertRaisesRegex(
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        paths["reconciliation"].unlink()
+        with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError,
-            "audited_quarantined_transport_absent_before_reconciliation",
+            "audited_quarantined_source_transition_baseline_invalid",
         ):
             self.run_audited_quarantined_recovery(fixture)
-        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
         self.assertTrue(paths["intent"].is_file())
-        self.assertFalse(paths["database_absence"].exists())
         self.assertFalse(paths["reconciliation"].exists())
+        self.assertFalse(paths["cleanup_transition_interlock"].exists())
 
     def test_audited_quarantined_recovery_rejects_live_service_group_after_bootout(self):
         fixture = self.prepare_audited_quarantined_recovery_fixture()
@@ -7624,7 +7999,7 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
 
             def write(path, expected, fields, code):
                 value = original(path, expected, fields, code)
-                if path == paths["source_transition_v2_interlock"]:
+                if path == paths["cleanup_transition_interlock"]:
                     once("injected_interlock_crash")
                 return value
 
@@ -7636,45 +8011,19 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
 
             def write(path, expected, fields, code):
                 value = original(path, expected, fields, code)
-                if path == paths["source_transition_v2"]:
+                if path == paths["cleanup_transition"]:
                     once("injected_source_transition_crash")
                 return value
 
             stack.enter_context(mock.patch.object(
                 ORCHESTRATOR, "audited_write_once_marker", side_effect=write
             ))
-        elif boundary in {"tunnel", "partial_producer"}:
-            original = ORCHESTRATOR.audited_quarantined_stop_exact
-            target = "tunnel" if boundary == "tunnel" else "runtime"
-
-            def stop(context, platform, name, allowlist):
-                value = original(context, platform, name, allowlist)
-                if name == target:
-                    once(f"injected_{boundary}_crash")
-                return value
-
-            stack.enter_context(mock.patch.object(
-                ORCHESTRATOR, "audited_quarantined_stop_exact",
-                side_effect=stop,
-            ))
-        elif boundary == "drain":
-            original = ORCHESTRATOR.audited_quarantined_drain_transport
-
-            def drain(context, platform):
-                value = original(context, platform)
-                once("injected_drain_crash")
-                return value
-
-            stack.enter_context(mock.patch.object(
-                ORCHESTRATOR, "audited_quarantined_drain_transport",
-                side_effect=drain,
-            ))
         else:
             self.fail(f"unsupported boundary: {boundary}")
         with stack, self.assertRaisesRegex(RuntimeError, f"injected_{boundary}_crash"):
             self.run_audited_quarantined_recovery(fixture)
         self.assertTrue(paths["intent"].is_file())
-        self.assertFalse(paths["reconciliation"].exists())
+        self.assertTrue(paths["reconciliation"].exists())
         if boundary in {"interlock", "source_transition"}:
             self.assertTrue(
                 ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
@@ -7705,7 +8054,7 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             "audited_quarantined_v1_source_transition_invalid",
         ):
             self.run_audited_quarantined_recovery(fixture)
-        self.assertFalse(paths["source_transition_v2_interlock"].exists())
+        self.assertFalse(paths["cleanup_transition_interlock"].exists())
 
     def test_audited_quarantined_recovery_rejects_v2_without_interlock(self):
         fixture = self.prepare_audited_quarantined_recovery_fixture()
@@ -7714,10 +8063,10 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         paths["source_transition_v2"].chmod(0o600)
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError,
-            "audited_quarantined_source_transition_v2_invalid",
+            "audited_quarantined_historical_source_transition_v2_invalid",
         ):
             self.run_audited_quarantined_recovery(fixture)
-        self.assertFalse(paths["database_absence"].exists())
+        self.assertFalse(paths["cleanup_transition_interlock"].exists())
 
     def test_audited_quarantined_recovery_coordinator_sets_are_exact(self):
         fixture = self.prepare_audited_quarantined_recovery_fixture()
@@ -7740,16 +8089,17 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             self.context, allowlist
         )
         self.assertTrue(before["source_transition_interlock_present"])
-        self.assertFalse(before["source_transition_v2_interlock_present"])
-        paths["source_transition_v2_interlock"].write_text(
+        self.assertTrue(before["source_transition_v2_interlock_present"])
+        self.assertFalse(before["cleanup_transition_interlock_present"])
+        paths["cleanup_transition_interlock"].write_text(
             "{}\n", encoding="utf-8"
         )
-        paths["source_transition_v2_interlock"].chmod(0o600)
+        paths["cleanup_transition_interlock"].chmod(0o600)
         after = ORCHESTRATOR.require_audited_quarantined_coordinator_baseline(
             self.context, allowlist
         )
-        self.assertTrue(after["source_transition_v2_interlock_present"])
-        extra = paths["source_transition_v2_interlock"].with_name("extra")
+        self.assertTrue(after["cleanup_transition_interlock_present"])
+        extra = paths["cleanup_transition_interlock"].with_name("extra")
         extra.write_bytes(b"")
         extra.chmod(0o600)
         with self.assertRaisesRegex(
@@ -7763,22 +8113,6 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
     def test_audited_quarantined_recovery_rejects_v2_interlock_mutation(self):
         fixture = self.prepare_audited_quarantined_recovery_fixture()
         paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
-        original = ORCHESTRATOR.audited_write_once_marker
-        crashed = False
-
-        def crash_after_transition(path, expected, fields, code):
-            nonlocal crashed
-            value = original(path, expected, fields, code)
-            if path == paths["source_transition_v2"] and not crashed:
-                crashed = True
-                raise RuntimeError("injected_v2_transition_crash")
-            return value
-
-        with mock.patch.object(
-            ORCHESTRATOR, "audited_write_once_marker",
-            side_effect=crash_after_transition,
-        ), self.assertRaisesRegex(RuntimeError, "injected_v2_transition_crash"):
-            self.run_audited_quarantined_recovery(fixture)
         interlock = json.loads(
             paths["source_transition_v2_interlock"].read_text()
         )
@@ -7788,37 +8122,61 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             ORCHESTRATOR.OrchestratorError,
-            "audited_quarantined_source_transition_v2",
+            "audited_quarantined_historical_source_transition_v2_invalid",
         ):
             self.run_audited_quarantined_recovery(fixture)
-        self.assertFalse(paths["database_absence"].exists())
+        self.assertFalse(paths["cleanup_transition_interlock"].exists())
 
     def test_audited_quarantined_recovery_binds_database_to_v2(self):
         fixture = self.prepare_audited_quarantined_recovery_fixture()
         result = self.run_audited_quarantined_recovery(fixture)
         paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
-        transition_raw = paths["source_transition_v2"].read_bytes()
-        transition_sha256 = hashlib.sha256(transition_raw).hexdigest()
+        transition_v2_sha256 = hashlib.sha256(
+            paths["source_transition_v2"].read_bytes()
+        ).hexdigest()
+        cleanup_transition_sha256 = hashlib.sha256(
+            paths["cleanup_transition"].read_bytes()
+        ).hexdigest()
+        cleanup_transition = json.loads(paths["cleanup_transition"].read_text())
         database = json.loads(paths["database_absence"].read_text())
         reconciliation = json.loads(paths["reconciliation"].read_text())
         evidence = json.loads(paths["evidence"].read_text())
-        self.assertEqual(result["source_transition"], str(paths["source_transition_v2"]))
-        self.assertEqual(result["source_transition_sha256"], transition_sha256)
-        for marker in (database, reconciliation, evidence):
-            self.assertEqual(marker["source_transition_sha256"], transition_sha256)
+        self.assertEqual(result["source_transition"], str(paths["cleanup_transition"]))
+        self.assertEqual(
+            result["source_transition_sha256"], cleanup_transition_sha256
+        )
+        for marker in (database, reconciliation):
+            self.assertEqual(
+                marker["source_transition_sha256"], transition_v2_sha256
+            )
+        self.assertEqual(
+            evidence["source_transition_sha256"], cleanup_transition_sha256
+        )
+        self.assertEqual(
+            cleanup_transition["keychain_anchor_inventory_sha256"],
+            ORCHESTRATOR.AUDITED_QUARANTINED_RECOVERY_KEYCHAIN_ANCHOR_INVENTORY_SHA256,
+        )
+        self.assertEqual(cleanup_transition["keychain_anchor_item_count"], 3)
+        self.assertEqual(
+            evidence["cleanup_keychain_baseline_sha256"],
+            hashlib.sha256(
+                ORCHESTRATOR.cleanup_keychain_baseline_path(
+                    self.context
+                ).read_bytes()
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            evidence["cleanup_root_progress_sha256"],
+            hashlib.sha256(
+                ORCHESTRATOR.cleanup_root_progress_path(
+                    self.context
+                ).read_bytes()
+            ).hexdigest(),
+        )
         self.assertEqual(
             database["static_sql_sha256"],
             ORCHESTRATOR.AUDITED_QUARANTINED_RECOVERY_V2_STATIC_SQL_SHA256,
         )
-
-    def test_audited_quarantined_recovery_resumes_after_tunnel_stop_crash(self):
-        self.assert_audited_quarantined_resume_after_boundary("tunnel")
-
-    def test_audited_quarantined_recovery_resumes_after_transport_drain_crash(self):
-        self.assert_audited_quarantined_resume_after_boundary("drain")
-
-    def test_audited_quarantined_recovery_resumes_after_partial_producer_stop(self):
-        self.assert_audited_quarantined_resume_after_boundary("partial_producer")
 
     def test_audited_quarantined_recovery_parser_requires_all_confirmations(self):
         arguments = ORCHESTRATOR.build_parser().parse_args([
@@ -7881,31 +8239,109 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             "global:enter", "coordinator:enter", "coordinator:exit", "global:exit"
         ])
 
-    def test_audited_quarantined_recovery_resumes_after_database_marker_crash(self):
+    def test_audited_quarantined_recovery_rechecks_database_after_p3(self):
         fixture = self.prepare_audited_quarantined_recovery_fixture()
-        original = ORCHESTRATOR.audited_write_once_marker
-        crashed = False
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        original = ORCHESTRATOR.audited_quarantined_cleanup_transition_boundary
+        calls = 0
+        database_raw = paths["database_absence"].read_bytes()
 
-        def crash_after_database(path, expected, fields, code):
-            nonlocal crashed
-            value = original(path, expected, fields, code)
-            if path.name.endswith("database-absence.json") and not crashed:
-                crashed = True
-                raise RuntimeError("injected_database_marker_crash")
+        def mutate_after_p3(*arguments, **keywords):
+            nonlocal calls
+            value = original(*arguments, **keywords)
+            calls += 1
+            if calls == 2:
+                paths["database_absence"].write_bytes(b"{}\n")
             return value
 
         with mock.patch.object(
-            ORCHESTRATOR, "audited_write_once_marker",
-            side_effect=crash_after_database,
-        ), self.assertRaisesRegex(RuntimeError, "injected_database_marker_crash"):
+            ORCHESTRATOR, "audited_quarantined_cleanup_transition_boundary",
+            side_effect=mutate_after_p3,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_database_evidence_invalid",
+        ):
             self.run_audited_quarantined_recovery(fixture)
-        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
-        self.assertTrue(paths["database_absence"].is_file())
-        self.assertFalse(paths["reconciliation"].exists())
-        self.assertTrue(self.platform.postgres)
+        self.assertTrue(paths["cleanup_transition_interlock"].is_file())
+        self.assertFalse(paths["cleanup_transition"].exists())
+        paths["database_absence"].write_bytes(database_raw)
         result = self.run_audited_quarantined_recovery(fixture)
         self.assertEqual(result["status"], "recovered")
-        self.assertEqual(self.platform.quarantined_database_audits, 1)
+
+    def test_audited_cleanup_rechecks_immutable_chain_before_final_evidence(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        original_cleanup = ORCHESTRATOR.command_cleanup_internal
+        database_raw = paths["database_absence"].read_bytes()
+
+        def cleanup_then_drift(*arguments, **keywords):
+            result = original_cleanup(*arguments, **keywords)
+            paths["database_absence"].write_bytes(b"{}\n")
+            return result
+
+        with mock.patch.object(
+            ORCHESTRATOR, "command_cleanup_internal",
+            side_effect=cleanup_then_drift,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_database_evidence_invalid",
+        ):
+            self.run_audited_quarantined_recovery(fixture)
+        self.assertFalse(paths["evidence"].exists())
+        paths["database_absence"].write_bytes(database_raw)
+        result = self.run_audited_quarantined_recovery(fixture)
+        self.assertEqual(result["status"], "exact_replay")
+
+    def test_audited_cleanup_evidence_dependency_must_be_canonical(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        original_cleanup = ORCHESTRATOR.command_cleanup_internal
+
+        def cleanup_then_reencode(*arguments, **keywords):
+            result = original_cleanup(*arguments, **keywords)
+            cleanup_path = (
+                self.context.artifact_directory / "cleanup-evidence.json"
+            )
+            value = json.loads(cleanup_path.read_text(encoding="utf-8"))
+            cleanup_path.write_text(
+                json.dumps(value, indent=2) + "\n", encoding="utf-8"
+            )
+            return result
+
+        with mock.patch.object(
+            ORCHESTRATOR, "command_cleanup_internal",
+            side_effect=cleanup_then_reencode,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_cleanup_evidence_invalid",
+        ):
+            self.run_audited_quarantined_recovery(fixture)
+        self.assertFalse(paths["evidence"].exists())
+
+    def test_audited_cleanup_rejects_fence_drift_after_t3(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        original_cleanup = ORCHESTRATOR.command_cleanup_internal
+
+        def cleanup_then_drift_fence(*arguments, **keywords):
+            result = original_cleanup(*arguments, **keywords)
+            fence_path = ORCHESTRATOR.d2a_teardown_fence_path(self.context)
+            fence = json.loads(fence_path.read_text(encoding="utf-8"))
+            fence["updated_at"] = "2026-08-12T23:59:59Z"
+            fence_path.write_text(
+                ORCHESTRATOR.canonical_json(fence) + "\n", encoding="utf-8"
+            )
+            return result
+
+        with mock.patch.object(
+            ORCHESTRATOR, "command_cleanup_internal",
+            side_effect=cleanup_then_drift_fence,
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_fence_invalid",
+        ):
+            self.run_audited_quarantined_recovery(fixture)
+        self.assertFalse(paths["evidence"].exists())
 
     def test_audited_quarantined_recovery_resumes_cleanup_after_postgres_stop_crash(self):
         fixture = self.prepare_audited_quarantined_recovery_fixture()
@@ -7947,16 +8383,100 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             "closed",
         )
         self.platform.postgres_stop(self.context.cluster_root)
-        self.assertFalse(any(
-            row.get("action") == "cleanup"
-            for row in ORCHESTRATOR.load_lifecycle_journal(self.context)
-        ))
+        self.assertEqual(
+            len(ORCHESTRATOR.load_lifecycle_journal(self.context)),
+            fixture["cleanup_journal_rows"],
+        )
         with mock.patch.object(
             ORCHESTRATOR, "command_cleanup_internal", original_cleanup
         ):
             result = self.run_audited_quarantined_recovery(fixture)
         self.assertEqual(result["status"], "recovered")
         self.assertTrue(result["postgres_process_absent"])
+
+    def test_audited_quarantined_recovery_replays_cleanup_intent_before_baseline(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        original = ORCHESTRATOR.load_or_create_audited_cleanup_keychain_baseline
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "load_or_create_audited_cleanup_keychain_baseline",
+            side_effect=RuntimeError("injected_pre_baseline_crash"),
+        ), self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+        ):
+            self.run_audited_quarantined_recovery(fixture)
+        self.assertFalse(
+            ORCHESTRATOR.cleanup_keychain_baseline_path(self.context).exists()
+        )
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "load_or_create_audited_cleanup_keychain_baseline",
+            original,
+        ):
+            result = self.run_audited_quarantined_recovery(fixture)
+        self.assertEqual(result["status"], "recovered")
+        self.assertTrue(result["keychain_items_absent"])
+
+    def test_audited_quarantined_replay_rejects_impossible_cleanup_marker_dag(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "command_cleanup_internal",
+            side_effect=RuntimeError("injected_pre_cleanup_crash"),
+        ), self.assertRaisesRegex(RuntimeError, "injected_pre_cleanup_crash"):
+            self.run_audited_quarantined_recovery(fixture)
+        transition = json.loads(paths["cleanup_transition"].read_text())
+        state = ORCHESTRATOR.load_state(self.context, {"candidate_started"})
+        baseline_path = ORCHESTRATOR.cleanup_keychain_baseline_path(self.context)
+        baseline_path.write_text("{}\n", encoding="utf-8")
+        baseline_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_cleanup_replay_journal_invalid",
+        ):
+            ORCHESTRATOR.validate_audited_quarantined_cleanup_replay_journal(
+                self.context, fixture["allowlist"], paths, transition, state
+            )
+        baseline_path.unlink()
+        progress_path = ORCHESTRATOR.cleanup_root_progress_path(self.context)
+        progress_path.write_text("{}\n", encoding="utf-8")
+        progress_path.chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_cleanup_replay_journal_invalid",
+        ):
+            ORCHESTRATOR.validate_audited_quarantined_cleanup_replay_journal(
+                self.context, fixture["allowlist"], paths, transition, state
+            )
+        progress_path.unlink()
+        paths["evidence"].write_text("{}\n", encoding="utf-8")
+        paths["evidence"].chmod(0o600)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_cleanup_replay_journal_invalid",
+        ):
+            ORCHESTRATOR.validate_audited_quarantined_cleanup_replay_journal(
+                self.context, fixture["allowlist"], paths, transition, state
+            )
+
+    def test_final_evidence_replay_rejects_missing_cleanup_evidence_without_mutation(self):
+        fixture = self.prepare_audited_quarantined_recovery_fixture()
+        first = self.run_audited_quarantined_recovery(fixture)
+        self.assertEqual(first["status"], "recovered")
+        paths = ORCHESTRATOR.audited_quarantined_recovery_paths(self.context)
+        cleanup_evidence = self.context.artifact_directory / "cleanup-evidence.json"
+        cleanup_evidence.unlink()
+        journal_before = self.context.journal_path.read_bytes()
+        final_evidence_before = paths["evidence"].read_bytes()
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError,
+            "audited_quarantined_cleanup_replay_journal_invalid",
+        ):
+            self.run_audited_quarantined_recovery(fixture)
+        self.assertFalse(cleanup_evidence.exists())
+        self.assertEqual(self.context.journal_path.read_bytes(), journal_before)
+        self.assertEqual(paths["evidence"].read_bytes(), final_evidence_before)
 
     def prepare_audited_preissuer_rollback_fixture(self, rolled_back=True):
         ORCHESTRATOR.command_prepare(self.context, self.platform)

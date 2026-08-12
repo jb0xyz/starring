@@ -265,7 +265,7 @@ AUDITED_QUARANTINED_RECOVERY_COMMAND = (
 AUDITED_QUARANTINED_RECOVERY_FILENAMES = {
     "intent": "audited-quarantined-no-issue-recovery-intent.json",
     "source_transition": (
-        "audited-quarantined-no-issue-recovery-source-transition-v2.json"
+        "audited-quarantined-no-issue-recovery-cleanup-transition.json"
     ),
     "reconciliation": "audited-quarantined-no-issue-reconciliation.json",
     "database_absence": "audited-quarantined-no-issue-database-absence.json",
@@ -274,7 +274,7 @@ AUDITED_QUARANTINED_RECOVERY_FILENAMES = {
 AUDITED_QUARANTINED_RECOVERY_KINDS = {
     "intent": "starring.d2.audited-quarantined-no-issue-recovery-intent.v1",
     "source_transition": (
-        "starring.d2.audited-quarantined-no-issue-recovery-source-transition.v2"
+        "starring.d2.audited-quarantined-no-issue-recovery-cleanup-transition.v1"
     ),
     "reconciliation": "starring.d2.audited-quarantined-no-issue-reconciliation.v1",
     "database_absence": "starring.d2.audited-quarantined-no-issue-database-absence.v1",
@@ -293,12 +293,25 @@ AUDITED_QUARANTINED_SOURCE_INTERLOCK_V1_KIND = (
     "starring.d2.audited-quarantined-no-issue-recovery-source-transition-"
     "interlock.v1"
 )
-AUDITED_QUARANTINED_SOURCE_INTERLOCK_FILENAME = (
+AUDITED_QUARANTINED_SOURCE_INTERLOCK_V2_FILENAME = (
     "audited-quarantined-no-issue-recovery-source-transition-v2-interlock.json"
 )
-AUDITED_QUARANTINED_SOURCE_INTERLOCK_KIND = (
+AUDITED_QUARANTINED_SOURCE_INTERLOCK_V2_KIND = (
     "starring.d2.audited-quarantined-no-issue-recovery-source-transition-"
     "interlock.v2"
+)
+AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_FILENAME = (
+    "audited-quarantined-no-issue-recovery-source-transition-v2.json"
+)
+AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_KIND = (
+    "starring.d2.audited-quarantined-no-issue-recovery-source-transition.v2"
+)
+AUDITED_QUARANTINED_SOURCE_INTERLOCK_FILENAME = (
+    "audited-quarantined-no-issue-recovery-cleanup-transition-interlock.json"
+)
+AUDITED_QUARANTINED_SOURCE_INTERLOCK_KIND = (
+    "starring.d2.audited-quarantined-no-issue-recovery-cleanup-transition-"
+    "interlock.v1"
 )
 AUDITED_QUARANTINED_INTENT_FIELDS = {
     "schema_version", "kind", "run_id", "manifest_sha256", "bootstrap_id",
@@ -354,6 +367,7 @@ AUDITED_QUARANTINED_EVIDENCE_FIELDS = {
     "source_transition_sha256",
     "reconciliation_sha256", "database_absence_sha256", "observed_at",
     "lifecycle_sha256", "teardown_fence_sha256", "cleanup_evidence_sha256",
+    "cleanup_keychain_baseline_sha256", "cleanup_root_progress_sha256",
     "database_absent", "postgres_process_absent", "launchd_jobs_absent",
     "keychain_items_absent", "isolated_root_absent",
     "protected_staging_unchanged",
@@ -388,9 +402,34 @@ AUDITED_QUARANTINED_SOURCE_TRANSITION_V1_FIELDS = {
     *AUDITED_QUARANTINED_SOURCE_TRANSITION_V1_BASE_FIELDS,
     "interlock_sha256",
 }
-AUDITED_QUARANTINED_SOURCE_TRANSITION_BASE_FIELDS = {
+AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_BASE_FIELDS = {
     *AUDITED_QUARANTINED_SOURCE_TRANSITION_V1_BASE_FIELDS,
     "previous_source_transition_sha256",
+}
+AUDITED_QUARANTINED_SOURCE_INTERLOCK_V2_FIELDS = set(
+    AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_BASE_FIELDS
+)
+AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_FIELDS = {
+    *AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_BASE_FIELDS,
+    "interlock_sha256",
+}
+AUDITED_QUARANTINED_SOURCE_TRANSITION_BASE_FIELDS = {
+    "schema_version", "kind", "run_id", "manifest_sha256", "intent_sha256",
+    "previous_source_transition_sha256", "database_absence_sha256",
+    "reconciliation_sha256", "from_source", "to_source",
+    "parent_commit_sha", "parent_count", "changed_paths", "file_sha256",
+    "reason_codes", "audit_configuration", "bootstrap_state_semantic_sha256",
+    "orchestrator_state_sha256", "baseline_journal_sha256",
+    "baseline_journal_rows", "lifecycle_sha256", "teardown_fence_sha256",
+    "cleanup_journal_sha256", "cleanup_journal_rows",
+    "producer_launchd_jobs_absent", "issuer_process_group_absent",
+    "postgres_absent", "postgres_process_absent", "keychain_inventory_sha256",
+    "keychain_item_count", "keychain_anchor_policy_kind",
+    "keychain_anchor_inventory_sha256", "keychain_anchor_item_count",
+    "cleanup_root_identity_sha256",
+    "isolated_root_retained", "cleanup_keychain_baseline_absent",
+    "cleanup_root_progress_absent", "cleanup_evidence_absent",
+    "protected_staging_unchanged", "created_at",
 }
 AUDITED_QUARANTINED_SOURCE_INTERLOCK_FIELDS = set(
     AUDITED_QUARANTINED_SOURCE_TRANSITION_BASE_FIELDS
@@ -423,8 +462,11 @@ AUDITED_QUARANTINED_REASON_CODES_V1 = [
     "explicit_login_keychain_lookup_required",
     "zsh_readonly_status_assignment_fixed",
 ]
-AUDITED_QUARANTINED_REASON_CODES = [
+AUDITED_QUARANTINED_REASON_CODES_V2 = [
     "postgres_inet_host_address_normalization_required",
+]
+AUDITED_QUARANTINED_REASON_CODES = [
+    "cleanup_keychain_owner_account_import_required",
 ]
 AUDITED_QUARANTINED_LOGIN_KEYCHAIN_PATH = (
     "/Users/jungbogeon/Library/Keychains/login.keychain-db"
@@ -438,6 +480,56 @@ AUDITED_QUARANTINED_LOGIN_KEYCHAIN_POLICY_SHA256 = (
 AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_STATIC_SQL_SHA256 = (
     "669c4adf949acd954a44ba1205ff19de18664f599ca830efc5d60367710ec5e8"
 )
+AUDITED_QUARANTINED_KEYCHAIN_ANCHOR_POLICY_KIND = (
+    "starring.d2.keychain-persistent-reference-anchor-policy.v1"
+)
+AUDITED_QUARANTINED_KEYCHAIN_ANCHORS = [
+    {
+        "service": "starring.d2.credentials",
+        "account": "discord.bot-token",
+        "identity_sha256": (
+            "967a3764ce452acf80391d8cf151d23d6f9de65f171ddceeba3e0f9109e3ad8d"
+        ),
+    },
+    {
+        "service": "starring.d2.credentials",
+        "account": "discord.oauth-client-secret",
+        "identity_sha256": (
+            "5552c98317f8c54368423fc3cbf2ab9dbd38db7d15ec8934aa0de1db3d645b05"
+        ),
+    },
+    {
+        "service": "starring.d2.credentials",
+        "account": "cloudflare.tunnel-token",
+        "identity_sha256": (
+            "b307682daf62b6f5df76512dbb679ca6b1b8b4817f5616404eefd4820e21dc7f"
+        ),
+    },
+]
+AUDITED_QUARANTINED_KEYCHAIN_ANCHOR_INVENTORY_SHA256 = (
+    "a89603986948be5df6498edcdfb98ec3c9e28c130af7182c832cbeda173e4b08"
+)
+AUDITED_QUARANTINED_KEYCHAIN_ACCOUNTS = {
+    "api": (
+        "database.oauth-flow-writer", "database.session-issuer",
+        "database.session-api", "database.security-revoker",
+        "database.installation-authority-reader",
+        "database.authorized-snapshot-reader", "database.promotion-executor",
+        "database.decision-reader", "database.approval-executor",
+        "database.rejection-executor", "database.apply-executor",
+        "database.cancellation-executor", "database.deployment-status-reader",
+        "database.operational-deployment-status-reader",
+        "database.authoring-session-writer", "keyring.product-action",
+        "keyring.snapshot-envelope", "lifecycle-owner",
+    ),
+    "runtime": (
+        "database.execution", "database.exact-target", "database.panel",
+        "database.serving", "database.interaction",
+        "interaction.token-envelope-keyring", "lifecycle-owner",
+    ),
+    "postgres": ("database.cluster-admin", "lifecycle-owner"),
+    "worker": ("authoring.bearer-token", "lifecycle-owner"),
+}
 AUDITED_QUARANTINED_ABSENCE_FIELDS = {
     "database_absent", "postgres_process_absent", "launchd_jobs_absent",
     "keychain_items_absent", "isolated_root_absent",
@@ -484,6 +576,57 @@ AUDITED_QUARANTINED_INCIDENT = {
     "source_transition_v2_static_sql_sha256": (
         AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_STATIC_SQL_SHA256
     ),
+    "source_transition_v2_interlock_sha256": (
+        "ab387a6e14beeccfb7ec94f4af7f694e2eb93553da723e3c16ed6a82faad54ca"
+    ),
+    "source_transition_v2_sha256": (
+        "4a843deda6ff27e82e0bdebe739b1c838b0eca24fff2a39d3118cf4726b0d22b"
+    ),
+    "database_absence_sha256": (
+        "c76600c617e1abfdfbb83d5e10eb390a24e37b6ee05f78fbd10ecce204e6087d"
+    ),
+    "reconciliation_sha256": (
+        "66e27795c9d8276a6ee49547f9d39f8c9649aa74e2c98f5d893bd6be9528286a"
+    ),
+    "source_transition_v2_commit_sha": (
+        "894a87c74d3db4ce06e314f87d11eb1d2d1392ec"
+    ),
+    "source_transition_v2_tree_sha": (
+        "dd7a71c3d967e8c1df66f60aff5e40d72fb67c4f"
+    ),
+    "source_transition_v2_to_file_sha256": {
+        "tools/d2-certification/d2_orchestrator_platform.py":
+            "ce0f277ca87c0a2303f4a0226dc91bc9f33a131af6ecc0165e01421e692476e3",
+        "tools/d2-certification/isolated_orchestrator.py":
+            "38a76c0c5a9f0e0687dab99fdb459114d2d496d60a077e9f0c794d3e36ce3522",
+        "tools/d2-certification/test_isolated_orchestrator.py":
+            "996af253cf454de7b55619b63660a2cb335cd8a90a87b3c3031cdec53ef23595",
+        "tools/d2-maintenance/d2a_bootstrap.py":
+            "0ee3db8d635fe69a98fc0a3e41c67dc646d703bc4e1468e19c028cbc460ced40",
+        "tools/d2-maintenance/test_d2a_bootstrap.py":
+            "8cde2461d64af080a6cc8418a01b16b21df417764a16c4cb39d1d209ad50ed79",
+    },
+    "closed_teardown_fence_sha256": (
+        "712b23bd7edf50c5c56a334557185d21af738891dc88dd2d56450886ac4e24a1"
+    ),
+    "cleanup_journal_sha256": (
+        "3bfa38faa428a18aee1b92cb8eb04f868693650e3da4ab3c4f548efb1df14b3b"
+    ),
+    "cleanup_journal_rows": 46,
+    "cleanup_root_identity_sha256": (
+        "a1ca6a17183f71ea88478671033bc9247facf13c8d0524a6e8b559845f546fa3"
+    ),
+    "keychain_inventory_sha256": (
+        "8f0cb1f256b4ee59c4842b35d3a0409f604d90170728bfb7afcaad14847e90ae"
+    ),
+    "keychain_item_count": 29,
+    "keychain_anchor_policy_kind": (
+        AUDITED_QUARANTINED_KEYCHAIN_ANCHOR_POLICY_KIND
+    ),
+    "keychain_anchor_inventory_sha256": (
+        AUDITED_QUARANTINED_KEYCHAIN_ANCHOR_INVENTORY_SHA256
+    ),
+    "keychain_anchor_item_count": 3,
     "bootstrap_state_sha256": "49bf6c2fc87ee24fadec3d49707c8b2a438590a091eac7e2f96155155e507c85",
     "bootstrap_state_semantic_sha256": "e9497355f1d7e97f3dd3245f95c96a24bf70f774ea72989b37750c7b912ab952",
     "orchestrator_state_sha256": "ad80ebfbf5b2d3fa1424709b8ee07a5cf7859d6966df3ab1c6c7ed0183482016",
@@ -2895,11 +3038,27 @@ def audited_recovery_source_interlock_v1_path(state):
     )
 
 
+def audited_recovery_source_interlock_v2_path(state):
+    return (
+        pathlib.Path(state["manifest_path"]).parent
+        / "coordinator"
+        / AUDITED_QUARANTINED_SOURCE_INTERLOCK_V2_FILENAME
+    )
+
+
 def audited_recovery_source_transition_v1_path(state):
     return (
         pathlib.Path(state["manifest_path"]).parent
         / "orchestrator"
         / AUDITED_QUARANTINED_SOURCE_TRANSITION_V1_FILENAME
+    )
+
+
+def audited_recovery_source_transition_v2_path(state):
+    return (
+        pathlib.Path(state["manifest_path"]).parent
+        / "orchestrator"
+        / AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_FILENAME
     )
 
 
@@ -3187,6 +3346,31 @@ def audited_recovery_transition_audit_configuration(static_sql_sha256=None):
     return value
 
 
+def audited_recovery_keychain_anchor_inventory_sha256():
+    return sha256_bytes(
+        canonical_json(AUDITED_QUARANTINED_KEYCHAIN_ANCHORS).encode("utf-8")
+    )
+
+
+def audited_recovery_keychain_inventory(manifest):
+    services = manifest.get("keychain_services")
+    suffix = manifest.get("run_id", "").rsplit("-", 1)[-1]
+    if (
+        not isinstance(services, dict)
+        or set(services) != set(AUDITED_QUARANTINED_KEYCHAIN_ACCOUNTS)
+        or any(
+            services.get(name) != f"starring.d2.{suffix}.{name}"
+            for name in AUDITED_QUARANTINED_KEYCHAIN_ACCOUNTS
+        )
+    ):
+        fail("audited_recovery_cleanup_keychain_baseline_invalid")
+    return [
+        (services[name], account)
+        for name, accounts in AUDITED_QUARANTINED_KEYCHAIN_ACCOUNTS.items()
+        for account in accounts
+    ]
+
+
 def validate_audited_transition_common(
     transition,
     intent,
@@ -3267,6 +3451,189 @@ def validate_audited_transition_common(
         fail("audited_recovery_source_transition_invalid")
 
 
+def validate_audited_cleanup_journal(state):
+    path = pathlib.Path(state["manifest_path"]).parent / "orchestrator" / "lifecycle.jsonl"
+    raw = private_file_bytes(path, "audited_recovery_cleanup_journal")
+    lines = raw.splitlines(keepends=True)
+    boundary_rows = AUDITED_QUARANTINED_INCIDENT["cleanup_journal_rows"]
+    baseline_rows = AUDITED_QUARANTINED_INCIDENT["journal_rows"]
+    if (
+        len(lines) < boundary_rows
+        or boundary_rows != baseline_rows + 2
+        or any(not line.endswith(b"\n") for line in lines)
+        or sha256_bytes(b"".join(lines[:baseline_rows]))
+        != AUDITED_QUARANTINED_INCIDENT["journal_sha256"]
+        or sha256_bytes(b"".join(lines[:boundary_rows]))
+        != AUDITED_QUARANTINED_INCIDENT["cleanup_journal_sha256"]
+    ):
+        fail("audited_recovery_cleanup_journal_invalid")
+    rows = []
+    for index, line in enumerate(lines, 1):
+        try:
+            row = json.loads(
+                line,
+                object_pairs_hook=strict_object,
+                parse_constant=reject_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            fail("audited_recovery_cleanup_journal_invalid")
+        if (
+            not isinstance(row, dict)
+            or set(row)
+            != {
+                "schema_version", "sequence", "manifest_sha256", "action",
+                "status", "target", "recorded_at",
+            }
+            or line != (canonical_json(row) + "\n").encode("utf-8")
+            or row.get("schema_version") != 1
+            or row.get("sequence") != index
+            or row.get("manifest_sha256") != state["manifest_sha256"]
+            or not valid_recovery_timestamp(row.get("recorded_at"))
+        ):
+            fail("audited_recovery_cleanup_journal_invalid")
+        rows.append(row)
+    expected_boundary = (("intent", 45), ("failed", 46))
+    if any(
+        rows[sequence - 1].get("action") != "cleanup"
+        or rows[sequence - 1].get("status") != status
+        or rows[sequence - 1].get("target") != "run"
+        for status, sequence in expected_boundary
+    ):
+        fail("audited_recovery_cleanup_journal_invalid")
+    suffix = rows[boundary_rows:]
+    for index, row in enumerate(suffix):
+        if (
+            row.get("action") != "cleanup"
+            or row.get("status") not in {"intent", "failed", "complete"}
+            or row.get("target") != "run"
+            or (
+                row.get("status") != "intent"
+                and (
+                    index == 0
+                    or suffix[index - 1].get("status") != "intent"
+                )
+            )
+            or (
+                row.get("status") == "complete"
+                and index != len(suffix) - 1
+            )
+        ):
+            fail("audited_recovery_cleanup_journal_invalid")
+    if not suffix or suffix[-1].get("status") != "complete":
+        fail("audited_recovery_cleanup_journal_invalid")
+    return AUDITED_QUARANTINED_INCIDENT["cleanup_journal_sha256"]
+
+
+def validate_audited_cleanup_root_identity(state, manifest):
+    path = (
+        pathlib.Path(state["manifest_path"]).parent
+        / "orchestrator"
+        / "cleanup-root-identity.json"
+    )
+    _path, identity, digest = read_canonical_private_json(
+        path, "audited_recovery_cleanup_root_identity"
+    )
+    expected_root = str(pathlib.Path(manifest["database"]["cluster_root"]).parent)
+    if (
+        digest
+        != AUDITED_QUARANTINED_INCIDENT["cleanup_root_identity_sha256"]
+        or not isinstance(identity, dict)
+        or set(identity)
+        != {
+            "schema_version", "kind", "manifest_sha256", "run_id",
+            "root_path", "root_device", "root_inode", "parent_device",
+            "owner_uid",
+        }
+        or identity.get("schema_version") != 1
+        or identity.get("kind") != "starring.d2.cleanup-root-identity.v1"
+        or identity.get("manifest_sha256") != state["manifest_sha256"]
+        or identity.get("run_id") != state["run_id"]
+        or identity.get("root_path") != expected_root
+        or type(identity.get("root_device")) is not int
+        or identity["root_device"] < 0
+        or type(identity.get("root_inode")) is not int
+        or identity["root_inode"] <= 0
+        or type(identity.get("parent_device")) is not int
+        or identity["parent_device"] != identity["root_device"]
+        or identity.get("owner_uid") != os.getuid()
+    ):
+        fail("audited_recovery_cleanup_root_identity_invalid")
+    return identity, digest
+
+
+def validate_audited_cleanup_terminal_artifacts(
+    state, manifest, transition, root_identity, evidence
+):
+    artifact_directory = pathlib.Path(state["manifest_path"]).parent / "orchestrator"
+    baseline_path = artifact_directory / "cleanup-keychain-baseline.json"
+    _path, baseline, baseline_sha256 = read_canonical_private_json(
+        baseline_path, "audited_recovery_cleanup_keychain_baseline"
+    )
+    expected_inventory = audited_recovery_keychain_inventory(manifest)
+    inventory = baseline.get("inventory") if isinstance(baseline, dict) else None
+    if (
+        not isinstance(baseline, dict)
+        or set(baseline)
+        != {"schema_version", "kind", "manifest_sha256", "run_id", "inventory"}
+        or type(baseline.get("schema_version")) is not int
+        or baseline.get("schema_version") != 1
+        or baseline.get("kind")
+        != "starring.d2.cleanup-keychain-baseline.v1"
+        or baseline.get("manifest_sha256") != state["manifest_sha256"]
+        or baseline.get("run_id") != state["run_id"]
+        or not isinstance(inventory, list)
+        or len(inventory) != transition["keychain_item_count"]
+        or len(inventory) != len(expected_inventory)
+        or any(
+            not isinstance(entry, dict)
+            or set(entry) != {"service", "account", "identity_sha256"}
+            or (entry.get("service"), entry.get("account"))
+            != expected_inventory[index]
+            or DIGEST.fullmatch(entry.get("identity_sha256", "")) is None
+            for index, entry in enumerate(inventory)
+        )
+        or sha256_bytes(canonical_json(inventory).encode("utf-8"))
+        != transition["keychain_inventory_sha256"]
+        or evidence.get("cleanup_keychain_baseline_sha256")
+        != baseline_sha256
+    ):
+        fail("audited_recovery_cleanup_keychain_baseline_invalid")
+
+    progress_path = artifact_directory / "cleanup-root-progress.json"
+    _path, progress, progress_sha256 = read_canonical_private_json(
+        progress_path, "audited_recovery_cleanup_root_progress"
+    )
+    root = pathlib.Path(manifest["database"]["cluster_root"]).parent
+    expected_root = pathlib.Path("/private/tmp") / f"starring-d2-{state['run_id']}"
+    quarantine_name = f".{root.name}.cleanup-{state['manifest_sha256'][:16]}"
+    quarantine = root.parent / quarantine_name
+    if (
+        root != expected_root
+        or not isinstance(progress, dict)
+        or set(progress)
+        != {
+            "schema_version", "kind", "manifest_sha256", "run_id",
+            "root_device", "root_inode", "quarantine_name", "phase",
+        }
+        or type(progress.get("schema_version")) is not int
+        or progress.get("schema_version") != 1
+        or progress.get("kind") != "starring.d2.cleanup-root-progress.v1"
+        or progress.get("manifest_sha256") != state["manifest_sha256"]
+        or progress.get("run_id") != state["run_id"]
+        or type(progress.get("root_device")) is not int
+        or progress.get("root_device") != root_identity["root_device"]
+        or type(progress.get("root_inode")) is not int
+        or progress.get("root_inode") != root_identity["root_inode"]
+        or progress.get("quarantine_name") != quarantine_name
+        or progress.get("phase") != "deleted"
+        or evidence.get("cleanup_root_progress_sha256") != progress_sha256
+        or os.path.lexists(root)
+        or os.path.lexists(quarantine)
+    ):
+        fail("audited_recovery_cleanup_root_progress_invalid")
+    return baseline_sha256, progress_sha256
+
+
 def validate_audited_quarantined_recovery_output(
     value,
     state,
@@ -3330,8 +3697,7 @@ def validate_audited_quarantined_recovery_output(
             not isinstance(artifact, dict)
             or set(artifact) != fields[name]
             or type(artifact.get("schema_version")) is not int
-            or artifact.get("schema_version")
-            != (2 if name == "source_transition" else 1)
+            or artifact.get("schema_version") != 1
             or artifact.get("kind") != AUDITED_QUARANTINED_RECOVERY_KINDS[name]
             or artifact.get("run_id") != state["run_id"]
             or artifact.get("manifest_sha256") != state["manifest_sha256"]
@@ -3525,6 +3891,109 @@ def validate_audited_quarantined_recovery_output(
         ),
     )
 
+    transition_v2_interlock_path = audited_recovery_source_interlock_v2_path(
+        state
+    )
+    _path, transition_v2_interlock, transition_v2_interlock_sha256 = (
+        read_canonical_private_json(
+            transition_v2_interlock_path,
+            "audited_recovery_source_interlock_v2",
+        )
+    )
+    transition_v2_path = audited_recovery_source_transition_v2_path(state)
+    _path, transition_v2, transition_v2_sha256 = read_canonical_private_json(
+        transition_v2_path, "audited_recovery_source_transition_v2"
+    )
+    transition_v2_without_interlock = {
+        name: transition_v2[name]
+        for name in transition_v2
+        if name != "interlock_sha256"
+    }
+    audit_configuration = audited_recovery_transition_audit_configuration(
+        AUDITED_QUARANTINED_INCIDENT[
+            "source_transition_v2_static_sql_sha256"
+        ]
+    )
+    if (
+        transition_v2_interlock_sha256
+        != AUDITED_QUARANTINED_INCIDENT[
+            "source_transition_v2_interlock_sha256"
+        ]
+        or transition_v2_sha256
+        != AUDITED_QUARANTINED_INCIDENT["source_transition_v2_sha256"]
+        or not isinstance(transition_v2_interlock, dict)
+        or set(transition_v2_interlock)
+        != AUDITED_QUARANTINED_SOURCE_INTERLOCK_V2_FIELDS
+        or not isinstance(transition_v2, dict)
+        or set(transition_v2) != AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_FIELDS
+        or transition_v2_interlock.get("kind")
+        != AUDITED_QUARANTINED_SOURCE_INTERLOCK_V2_KIND
+        or transition_v2.get("kind")
+        != AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_KIND
+        or transition_v2.get("interlock_sha256")
+        != transition_v2_interlock_sha256
+        or transition_v2_interlock != {
+            **transition_v2_without_interlock,
+            "kind": AUDITED_QUARANTINED_SOURCE_INTERLOCK_V2_KIND,
+        }
+    ):
+        fail("audited_recovery_source_transition_invalid")
+    validate_audited_transition_common(
+        transition_v2,
+        intent,
+        artifact_digests["intent"],
+        state,
+        lifecycle_sha256,
+        2,
+        AUDITED_QUARANTINED_SOURCE_TRANSITION_V2_KIND,
+        transition_v1["to_source"],
+        AUDITED_QUARANTINED_INCIDENT["source_transition_v1_commit_sha"],
+        AUDITED_QUARANTINED_INCIDENT["source_transition_v1_to_file_sha256"],
+        AUDITED_QUARANTINED_REASON_CODES_V2,
+        audit_configuration,
+        transition_v1_sha256,
+    )
+    if any(
+        transition_v2["file_sha256"][path]["to_sha256"]
+        != AUDITED_QUARANTINED_INCIDENT[
+            "source_transition_v2_to_file_sha256"
+        ][path]
+        for path in AUDITED_QUARANTINED_CHANGED_PATHS
+    ):
+        fail("audited_recovery_source_transition_invalid")
+    validate_audited_transition_source(
+        transition_v2.get("to_source"), manifest, historical_source_trees,
+        AUDITED_QUARANTINED_INCIDENT["source_transition_v2_commit_sha"],
+        AUDITED_QUARANTINED_INCIDENT["source_transition_v2_tree_sha"],
+        source_root,
+        "audited_recovery_source_transition_invalid",
+    )
+    validate_audited_source_transition_git(
+        transition_v2,
+        AUDITED_QUARANTINED_INCIDENT["source_transition_v2_commit_sha"],
+        AUDITED_QUARANTINED_INCIDENT["source_transition_v2_tree_sha"],
+        source_root,
+        expected_parent_commit=(
+            AUDITED_QUARANTINED_INCIDENT["source_transition_v1_commit_sha"]
+        ),
+        expected_from_file_sha256=(
+            AUDITED_QUARANTINED_INCIDENT[
+                "source_transition_v1_to_file_sha256"
+            ]
+        ),
+    )
+    if (
+        artifact_digests["database_absence"]
+        != AUDITED_QUARANTINED_INCIDENT["database_absence_sha256"]
+        or artifact_digests["reconciliation"]
+        != AUDITED_QUARANTINED_INCIDENT["reconciliation_sha256"]
+    ):
+        fail("audited_recovery_source_transition_invalid")
+    cleanup_journal_sha256 = validate_audited_cleanup_journal(state)
+    cleanup_root_identity, cleanup_root_identity_sha256 = (
+        validate_audited_cleanup_root_identity(state, manifest)
+    )
+
     transition = artifacts["source_transition"]
     interlock_path = audited_recovery_source_interlock_path(state)
     _path, interlock, interlock_sha256 = read_canonical_private_json(
@@ -3535,11 +4004,13 @@ def validate_audited_quarantined_recovery_output(
         for name in transition
         if name != "interlock_sha256"
     }
-    audit_configuration = audited_recovery_transition_audit_configuration(
-        AUDITED_QUARANTINED_INCIDENT[
-            "source_transition_v2_static_sql_sha256"
-        ]
-    )
+    file_sha256 = transition.get("file_sha256")
+    boundary_boolean_fields = {
+        "producer_launchd_jobs_absent", "issuer_process_group_absent",
+        "postgres_absent", "postgres_process_absent", "isolated_root_retained",
+        "cleanup_keychain_baseline_absent", "cleanup_root_progress_absent",
+        "cleanup_evidence_absent", "protected_staging_unchanged",
+    }
     if (
         not isinstance(interlock, dict)
         or set(interlock) != AUDITED_QUARANTINED_SOURCE_INTERLOCK_FIELDS
@@ -3551,23 +4022,76 @@ def validate_audited_quarantined_recovery_output(
             **transition_without_interlock,
             "kind": AUDITED_QUARANTINED_SOURCE_INTERLOCK_KIND,
         }
+        or transition.get("schema_version") != 1
+        or transition.get("kind")
+        != AUDITED_QUARANTINED_RECOVERY_KINDS["source_transition"]
+        or transition.get("run_id") != state["run_id"]
+        or transition.get("manifest_sha256") != state["manifest_sha256"]
+        or transition.get("intent_sha256") != artifact_digests["intent"]
+        or transition.get("previous_source_transition_sha256")
+        != transition_v2_sha256
+        or transition.get("database_absence_sha256")
+        != artifact_digests["database_absence"]
+        or transition.get("reconciliation_sha256")
+        != artifact_digests["reconciliation"]
+        or transition.get("from_source") != transition_v2["to_source"]
+        or transition.get("to_source", {}).get("git_sha256")
+        != intent["current_source"]["git_sha256"]
+        or transition.get("parent_commit_sha")
+        != AUDITED_QUARANTINED_INCIDENT["source_transition_v2_commit_sha"]
+        or transition.get("parent_count") != 1
+        or transition.get("changed_paths") != AUDITED_QUARANTINED_CHANGED_PATHS
+        or not isinstance(file_sha256, dict)
+        or list(file_sha256) != sorted(AUDITED_QUARANTINED_CHANGED_PATHS)
+        or any(
+            not isinstance(file_sha256.get(path), dict)
+            or set(file_sha256[path]) != {"from_sha256", "to_sha256"}
+            or file_sha256[path].get("from_sha256")
+            != AUDITED_QUARANTINED_INCIDENT[
+                "source_transition_v2_to_file_sha256"
+            ][path]
+            or DIGEST.fullmatch(file_sha256[path].get("to_sha256", "")) is None
+            for path in AUDITED_QUARANTINED_CHANGED_PATHS
+        )
+        or transition.get("reason_codes") != AUDITED_QUARANTINED_REASON_CODES
+        or transition.get("audit_configuration") != audit_configuration
+        or transition.get("bootstrap_state_semantic_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["bootstrap_state_semantic_sha256"]
+        or transition.get("orchestrator_state_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["orchestrator_state_sha256"]
+        or transition.get("baseline_journal_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["journal_sha256"]
+        or transition.get("baseline_journal_rows")
+        != AUDITED_QUARANTINED_INCIDENT["journal_rows"]
+        or transition.get("lifecycle_sha256") != lifecycle_sha256
+        or transition.get("teardown_fence_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["closed_teardown_fence_sha256"]
+        or transition.get("cleanup_journal_sha256")
+        != cleanup_journal_sha256
+        or transition.get("cleanup_journal_rows")
+        != AUDITED_QUARANTINED_INCIDENT["cleanup_journal_rows"]
+        or transition.get("keychain_inventory_sha256")
+        != AUDITED_QUARANTINED_INCIDENT["keychain_inventory_sha256"]
+        or transition.get("keychain_item_count")
+        != AUDITED_QUARANTINED_INCIDENT["keychain_item_count"]
+        or transition.get("keychain_anchor_policy_kind")
+        != AUDITED_QUARANTINED_INCIDENT["keychain_anchor_policy_kind"]
+        or transition.get("keychain_anchor_inventory_sha256")
+        != AUDITED_QUARANTINED_INCIDENT[
+            "keychain_anchor_inventory_sha256"
+        ]
+        or transition.get("keychain_anchor_inventory_sha256")
+        != audited_recovery_keychain_anchor_inventory_sha256()
+        or transition.get("keychain_anchor_item_count")
+        != AUDITED_QUARANTINED_INCIDENT["keychain_anchor_item_count"]
+        or transition.get("keychain_anchor_item_count")
+        != len(AUDITED_QUARANTINED_KEYCHAIN_ANCHORS)
+        or transition.get("cleanup_root_identity_sha256")
+        != cleanup_root_identity_sha256
+        or any(transition.get(field) is not True for field in boundary_boolean_fields)
+        or not valid_recovery_timestamp(transition.get("created_at"))
     ):
         fail("audited_recovery_source_transition_invalid")
-    validate_audited_transition_common(
-        transition,
-        intent,
-        artifact_digests["intent"],
-        state,
-        lifecycle_sha256,
-        2,
-        AUDITED_QUARANTINED_RECOVERY_KINDS["source_transition"],
-        transition_v1["to_source"],
-        AUDITED_QUARANTINED_INCIDENT["source_transition_v1_commit_sha"],
-        AUDITED_QUARANTINED_INCIDENT["source_transition_v1_to_file_sha256"],
-        AUDITED_QUARANTINED_REASON_CODES,
-        audit_configuration,
-        transition_v1_sha256,
-    )
     validate_audited_transition_source(
         transition.get("to_source"), manifest, historical_source_trees,
         current_commit, current_tree, source_root,
@@ -3579,11 +4103,11 @@ def validate_audited_quarantined_recovery_output(
         current_tree,
         source_root,
         expected_parent_commit=(
-            AUDITED_QUARANTINED_INCIDENT["source_transition_v1_commit_sha"]
+            AUDITED_QUARANTINED_INCIDENT["source_transition_v2_commit_sha"]
         ),
         expected_from_file_sha256=(
             AUDITED_QUARANTINED_INCIDENT[
-                "source_transition_v1_to_file_sha256"
+                "source_transition_v2_to_file_sha256"
             ]
         ),
     )
@@ -3628,6 +4152,7 @@ def validate_audited_quarantined_recovery_output(
         if {path.name for path in coordinator_directory.iterdir()} != {
             "coordinator.lock",
             AUDITED_QUARANTINED_SOURCE_INTERLOCK_V1_FILENAME,
+            AUDITED_QUARANTINED_SOURCE_INTERLOCK_V2_FILENAME,
             AUDITED_QUARANTINED_SOURCE_INTERLOCK_FILENAME,
         }:
             fail("audited_recovery_intent_invalid")
@@ -3712,7 +4237,7 @@ def validate_audited_quarantined_recovery_output(
     if (
         database.get("intent_sha256") != artifact_digests["intent"]
         or database.get("source_transition_sha256")
-        != artifact_digests["source_transition"]
+        != transition_v2_sha256
         or database.get("post_drain_transport_inventory_sha256")
         != artifacts["reconciliation"].get(
             "post_drain_transport_inventory_sha256"
@@ -3765,7 +4290,7 @@ def validate_audited_quarantined_recovery_output(
     if (
         reconciliation.get("intent_sha256") != artifact_digests["intent"]
         or reconciliation.get("source_transition_sha256")
-        != artifact_digests["source_transition"]
+        != transition_v2_sha256
         or reconciliation.get("lifecycle_sha256") != lifecycle_sha256
         or reconciliation.get("transport_instance_id")
         != value["transport_instance_id"]
@@ -3798,14 +4323,18 @@ def validate_audited_quarantined_recovery_output(
     _path, cleanup, cleanup_sha256 = read_canonical_private_json(
         cleanup_path, "audited_recovery_cleanup_evidence"
     )
-    if fence != {
-        "kind": "starring.d2a.teardown-fence.v1",
-        "manifest_sha256": state["manifest_sha256"],
-        "run_id": state["run_id"],
-        "schema_version": 1,
-        "status": "closed",
-        "updated_at": fence.get("updated_at"),
-    } or not valid_recovery_timestamp(fence.get("updated_at")):
+    if (
+        fence != {
+            "kind": "starring.d2a.teardown-fence.v1",
+            "manifest_sha256": state["manifest_sha256"],
+            "run_id": state["run_id"],
+            "schema_version": 1,
+            "status": "closed",
+            "updated_at": fence.get("updated_at"),
+        }
+        or not valid_recovery_timestamp(fence.get("updated_at"))
+        or fence_sha256 != transition["teardown_fence_sha256"]
+    ):
         fail("audited_recovery_teardown_fence_invalid")
     if (
         not isinstance(cleanup, dict)
@@ -3825,6 +4354,9 @@ def validate_audited_quarantined_recovery_output(
         fail("audited_recovery_cleanup_evidence_invalid")
 
     evidence = artifacts["evidence"]
+    validate_audited_cleanup_terminal_artifacts(
+        state, manifest, transition, cleanup_root_identity, evidence
+    )
     if (
         evidence.get("intent_sha256") != artifact_digests["intent"]
         or evidence.get("source_transition_sha256")
