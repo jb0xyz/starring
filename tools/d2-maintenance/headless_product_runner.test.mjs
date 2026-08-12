@@ -503,6 +503,40 @@ test("scenario mismatch refuses approval but still revokes and verifies the sess
 });
 
 
+test("working-draft finalization failure remains a stable authoring diagnostic", async () => {
+  const server = fakeProductServer();
+  const productDriverSource = `
+    globalThis.StarringD2ProductDriver = Object.freeze({
+      create() {
+        return Object.freeze({
+          async me() {
+            return { status: 200, body: { principal_id: ${JSON.stringify(PRINCIPAL)} } };
+          },
+          async authorityCheck() {
+            return { status: 204, body: null };
+          },
+          async runOneShotProductFlow() {
+            throw new Error("authoring_finalization_not_preview_ready");
+          },
+        });
+      },
+    });
+  `;
+  await assert.rejects(
+    executeHeadless(input("one-shot"), {
+      ...dependencies(server),
+      productDriverSource,
+    }),
+    (error) => error.code === "authoring_finalization_not_preview_ready",
+  );
+  assert.equal(
+    server.requests.some((request) => request.url.pathname === "/v1/logout"),
+    true,
+  );
+  assert.equal(server.requests.at(-1).url.pathname, "/v1/me");
+});
+
+
 test("redirected responses fail closed and the credentials are still revoked", async () => {
   const server = fakeProductServer({ redirectFirst: true });
   await assert.rejects(

@@ -2,7 +2,7 @@
   "schema_version": 1,
   "kind": "starring.d2a.product-scenario.v1",
   "session_id_prefix": "d2a-study-room-v1",
-  "message": "Create a private study room automation with one creator-only room, a join button, a help button, and one moderator approval before applying changes.",
+  "message": "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English default copy and naming, leave room closing disabled, and do not ask a follow-up question.",
   "expected_generation": 0,
   "expected_summary": {
     "panels": 1,

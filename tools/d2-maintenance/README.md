@@ -96,6 +96,15 @@ The runner accepts at most 64 KiB and rejects empty input, concatenated JSON val
 
 The issuer resolves a new authoring session for every invocation as `<session_id_prefix>-<16 lowercase hex characters>`. Prefixes are at most 111 characters so the resolved product resource ID never exceeds 128 characters. Generation is fixed at zero for the new session. This prevents a second maintenance run against the same candidate from colliding with a prior session while preserving a checked-in, reviewable prefix. The six summary fields are matched exactly before approval. Unknown or missing scenario fields are rejected, so the checked-in summary is always the complete approval policy and cannot degrade into an empty or partial match.
 
+The checked-in request explicitly names the existing `community_hub` binding,
+asks for a validated preview, fixes the recipe defaults, and disallows a
+follow-up question. These are authoring inputs rather than implicit test
+assumptions: omitting the binding is a valid request for more input, while the
+one-shot driver requires generation one to be preview-ready. The mandatory
+single approval remains an independently checked promotion policy in
+`expected_summary`; it is not expressed as an automation feature in the
+authoring request.
+
 The scenario is compile-time bound into the issuer. Supplying a different path
 or changing its bytes without rebuilding the issuer fails before a session is
 issued. Schema v1 intentionally has no optional approval fields: a new semantic

@@ -93,6 +93,11 @@ enum RunnerFailureCategory {
     DependencyTimeout,
     DependencyUnavailable,
     ProductRequestFailed,
+    AuthoringFlowFailed,
+    ConfirmationFlowFailed,
+    DecisionFlowFailed,
+    ConvergenceFlowFailed,
+    DeploymentFlowFailed,
 }
 
 impl RunnerFailureCategory {
@@ -101,6 +106,11 @@ impl RunnerFailureCategory {
             Self::DependencyTimeout => "dependency_timeout",
             Self::DependencyUnavailable => "dependency_unavailable",
             Self::ProductRequestFailed => "product_request_failed",
+            Self::AuthoringFlowFailed => "authoring_flow_failed",
+            Self::ConfirmationFlowFailed => "confirmation_flow_failed",
+            Self::DecisionFlowFailed => "decision_flow_failed",
+            Self::ConvergenceFlowFailed => "convergence_flow_failed",
+            Self::DeploymentFlowFailed => "deployment_flow_failed",
         }
     }
 }
@@ -1098,6 +1108,36 @@ fn classify_product_request_error(error_code: &str) -> Option<RunnerFailureCateg
     }
 }
 
+fn classify_runner_error(error_code: &str) -> Option<RunnerFailureCategory> {
+    match error_code {
+        "network_request_failed" => Some(RunnerFailureCategory::DependencyUnavailable),
+        "authoring_not_preview_ready"
+        | "authoring_finalization_not_preview_ready"
+        | "authoring_http_status_invalid" => {
+            Some(RunnerFailureCategory::AuthoringFlowFailed)
+        }
+        "scenario_confirmation_mismatch"
+        | "approval_preview_not_pending"
+        | "promotion_preview_payload_mismatch"
+        | "preview_not_approved_by_operator" => {
+            Some(RunnerFailureCategory::ConfirmationFlowFailed)
+        }
+        "promotion_not_pending_approval"
+        | "promotion_not_approved"
+        | "promotion_not_applied" => Some(RunnerFailureCategory::DecisionFlowFailed),
+        "apply_resolution_timeout" | "runtime_drain_attempts_exhausted" => {
+            Some(RunnerFailureCategory::ConvergenceFlowFailed)
+        }
+        "deployment_failed"
+        | "deployment_live_timeout"
+        | "live_projection_identity_invalid"
+        | "live_evidence_binding_invalid" => {
+            Some(RunnerFailureCategory::DeploymentFlowFailed)
+        }
+        error_code => classify_product_request_error(error_code),
+    }
+}
+
 fn parse_runner_error(bytes: &[u8]) -> Option<RunnerFailureCategory> {
     if bytes.is_empty() || bytes.len() > MAX_RUNNER_ERROR_BYTES || !bytes.is_ascii() {
         return None;
@@ -1114,10 +1154,7 @@ fn parse_runner_error(bytes: &[u8]) -> Option<RunnerFailureCategory> {
     if bytes != expected.as_bytes() {
         return None;
     }
-    match envelope.error_code.as_str() {
-        "network_request_failed" => Some(RunnerFailureCategory::DependencyUnavailable),
-        error_code => classify_product_request_error(error_code),
-    }
+    classify_runner_error(&envelope.error_code)
 }
 
 async fn run_child(
@@ -1390,6 +1427,55 @@ mod tests {
             parse_runner_error(&runner_error_payload("network_request_failed")),
             Some(RunnerFailureCategory::DependencyUnavailable),
         );
+        let stage_failures: &[(&[&str], RunnerFailureCategory)] = &[
+            (
+                &[
+                    "authoring_not_preview_ready",
+                    "authoring_finalization_not_preview_ready",
+                    "authoring_http_status_invalid",
+                ],
+                RunnerFailureCategory::AuthoringFlowFailed,
+            ),
+            (
+                &[
+                    "scenario_confirmation_mismatch",
+                    "approval_preview_not_pending",
+                    "promotion_preview_payload_mismatch",
+                    "preview_not_approved_by_operator",
+                ],
+                RunnerFailureCategory::ConfirmationFlowFailed,
+            ),
+            (
+                &[
+                    "promotion_not_pending_approval",
+                    "promotion_not_approved",
+                    "promotion_not_applied",
+                ],
+                RunnerFailureCategory::DecisionFlowFailed,
+            ),
+            (
+                &["apply_resolution_timeout", "runtime_drain_attempts_exhausted"],
+                RunnerFailureCategory::ConvergenceFlowFailed,
+            ),
+            (
+                &[
+                    "deployment_failed",
+                    "deployment_live_timeout",
+                    "live_projection_identity_invalid",
+                    "live_evidence_binding_invalid",
+                ],
+                RunnerFailureCategory::DeploymentFlowFailed,
+            ),
+        ];
+        for (error_codes, category) in stage_failures {
+            for error_code in *error_codes {
+                assert_eq!(
+                    parse_runner_error(&runner_error_payload(error_code)),
+                    Some(*category),
+                    "{error_code}",
+                );
+            }
+        }
         for error_code in [
             "product_request_400_invalid_host",
             "product_request_400_invalid_idempotency_key",
@@ -1428,6 +1514,8 @@ mod tests {
         let invalid = [
             runner_error_payload("product_request_400_invalid_request"),
             runner_error_payload("product_request_503_untrusted_secret"),
+            runner_error_payload("operation_failed"),
+            runner_error_payload("logout_verification_failed"),
             b"{\"error_code\":\"product_request_504_dependency_timeout\",\"error_code\":\"product_request_503_dependency_unavailable\",\"kind\":\"starring.d2a.runner-error.v1\",\"ok\":false,\"schema_version\":1}\n".to_vec(),
             b"{\"kind\":\"starring.d2a.runner-error.v1\",\"error_code\":\"product_request_504_dependency_timeout\",\"ok\":false,\"schema_version\":1}\n".to_vec(),
             b"{\"error_code\":\"product_request_504_dependency_timeout\",\"extra\":true,\"kind\":\"starring.d2a.runner-error.v1\",\"ok\":false,\"schema_version\":1}\n".to_vec(),
@@ -1440,13 +1528,47 @@ mod tests {
             assert_eq!(parse_runner_error(&payload), None);
         }
 
-        assert_eq!(
-            issuer_command_error_json(RunnerFailure {
-                operation: Operation::OneShot,
-                category: RunnerFailureCategory::DependencyTimeout,
-            }),
-            "{\"error_code\":\"dependency_timeout\",\"kind\":\"starring.d2a.issuer-command-error.v1\",\"operation\":\"one-shot\",\"schema_version\":1}",
-        );
+        for (category, error_code) in [
+            (RunnerFailureCategory::DependencyTimeout, "dependency_timeout"),
+            (
+                RunnerFailureCategory::DependencyUnavailable,
+                "dependency_unavailable",
+            ),
+            (
+                RunnerFailureCategory::ProductRequestFailed,
+                "product_request_failed",
+            ),
+            (
+                RunnerFailureCategory::AuthoringFlowFailed,
+                "authoring_flow_failed",
+            ),
+            (
+                RunnerFailureCategory::ConfirmationFlowFailed,
+                "confirmation_flow_failed",
+            ),
+            (
+                RunnerFailureCategory::DecisionFlowFailed,
+                "decision_flow_failed",
+            ),
+            (
+                RunnerFailureCategory::ConvergenceFlowFailed,
+                "convergence_flow_failed",
+            ),
+            (
+                RunnerFailureCategory::DeploymentFlowFailed,
+                "deployment_flow_failed",
+            ),
+        ] {
+            assert_eq!(
+                issuer_command_error_json(RunnerFailure {
+                    operation: Operation::OneShot,
+                    category,
+                }),
+                format!(
+                    "{{\"error_code\":\"{error_code}\",\"kind\":\"starring.d2a.issuer-command-error.v1\",\"operation\":\"one-shot\",\"schema_version\":1}}"
+                ),
+            );
+        }
     }
 
     #[tokio::test]
@@ -1489,10 +1611,34 @@ mod tests {
             }))
         ));
 
+        let stage_payload = String::from_utf8(runner_error_payload(
+            "authoring_not_preview_ready",
+        ))
+        .expect("runner stage error payload is ASCII");
+        std::fs::write(
+            &script,
+            format!("/bin/cat >/dev/null\nprintf '%s' '{stage_payload}'\nexit 1\n"),
+        )
+        .expect("write runner stage-error test script");
+        let result = run_child_encoded_for_operation(
+            &child,
+            b"{}",
+            Duration::from_secs(1),
+            Operation::OneShot,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(IssuerCommandError::Runner(RunnerFailure {
+                operation: Operation::OneShot,
+                category: RunnerFailureCategory::AuthoringFlowFailed,
+            }))
+        ));
+
         std::fs::write(
             &script,
             format!(
-                "/bin/cat >/dev/null\nprintf '%s' '{payload}'\nprintf 'untrusted' >&2\nexit 1\n"
+                "/bin/cat >/dev/null\nprintf '%s' '{stage_payload}'\nprintf 'untrusted' >&2\nexit 1\n"
             ),
         )
         .expect("write stderr runner-error test script");

@@ -159,10 +159,17 @@ class D2AEvidenceTests(unittest.TestCase):
 
     def test_issuer_command_error_is_closed_canonical_and_coarsened(self):
         expected = {
+            "authoring_flow_failed": "d2a_one_shot_authoring_flow_failed",
+            "confirmation_flow_failed": "d2a_one_shot_confirmation_flow_failed",
+            "convergence_flow_failed": "d2a_one_shot_convergence_flow_failed",
+            "decision_flow_failed": "d2a_one_shot_decision_flow_failed",
             "dependency_timeout": "d2a_one_shot_dependency_timeout",
             "dependency_unavailable": "d2a_one_shot_dependency_unavailable",
+            "deployment_flow_failed": "d2a_one_shot_deployment_flow_failed",
             "product_request_failed": "d2a_one_shot_product_request_failed",
         }
+        self.assertEqual(D2A.ISSUER_COMMAND_ERROR_CODES, frozenset(expected))
+        self.assertEqual(D2A.ONE_SHOT_COMMAND_ERROR_CODES, expected)
         for issuer_code, command_code in expected.items():
             envelope = {
                 "error_code": issuer_code,
@@ -213,6 +220,12 @@ class D2AEvidenceTests(unittest.TestCase):
             ),
             (
                 b'{"error_code":"product_request_504_dependency_timeout",'
+                b'"kind":"starring.d2a.issuer-command-error.v1","operation":"one-shot",'
+                b'"schema_version":1}\n',
+                b"",
+            ),
+            (
+                b'{"error_code":"scenario_confirmation_mismatch",'
                 b'"kind":"starring.d2a.issuer-command-error.v1","operation":"one-shot",'
                 b'"schema_version":1}\n',
                 b"",

@@ -49,13 +49,23 @@ ISSUER_COMMAND_ERROR_FIELDS = {
     "schema_version",
 }
 ISSUER_COMMAND_ERROR_CODES = frozenset({
+    "authoring_flow_failed",
+    "confirmation_flow_failed",
+    "convergence_flow_failed",
+    "decision_flow_failed",
     "dependency_timeout",
     "dependency_unavailable",
+    "deployment_flow_failed",
     "product_request_failed",
 })
 ONE_SHOT_COMMAND_ERROR_CODES = {
+    "authoring_flow_failed": "d2a_one_shot_authoring_flow_failed",
+    "confirmation_flow_failed": "d2a_one_shot_confirmation_flow_failed",
+    "convergence_flow_failed": "d2a_one_shot_convergence_flow_failed",
+    "decision_flow_failed": "d2a_one_shot_decision_flow_failed",
     "dependency_timeout": "d2a_one_shot_dependency_timeout",
     "dependency_unavailable": "d2a_one_shot_dependency_unavailable",
+    "deployment_flow_failed": "d2a_one_shot_deployment_flow_failed",
     "product_request_failed": "d2a_one_shot_product_request_failed",
 }
 COMMERCIAL_MANIFEST_FIELDS = {

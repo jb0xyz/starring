@@ -600,6 +600,7 @@ function sanitizeFailure(error, fallback = "operation_failed") {
   }
   const stableMessages = new Set([
     "authoring_not_preview_ready",
+    "authoring_finalization_not_preview_ready",
     "promotion_not_pending_approval",
     "approval_preview_not_pending",
     "promotion_preview_payload_mismatch",

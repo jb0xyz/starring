@@ -3286,8 +3286,13 @@ class D2ABootstrapTests(unittest.TestCase):
             BOOTSTRAP.ONE_SHOT_COMMAND_ERROR_CODES,
             frozenset(
                 {
+                    "d2a_one_shot_authoring_flow_failed",
+                    "d2a_one_shot_confirmation_flow_failed",
+                    "d2a_one_shot_convergence_flow_failed",
+                    "d2a_one_shot_decision_flow_failed",
                     "d2a_one_shot_dependency_timeout",
                     "d2a_one_shot_dependency_unavailable",
+                    "d2a_one_shot_deployment_flow_failed",
                     "d2a_one_shot_product_request_failed",
                 }
             ),
@@ -3344,6 +3349,14 @@ class D2ABootstrapTests(unittest.TestCase):
             subprocess.CompletedProcess(
                 ["d2a"],
                 1,
+                b'{"error_code":"scenario_confirmation_mismatch",'
+                b'"kind":"starring.d2a.command-error.v1","operation":"one-shot",'
+                b'"schema_version":1}\n',
+                b"",
+            ),
+            subprocess.CompletedProcess(
+                ["d2a"],
+                1,
                 b'{"error_code":"d2a_one_shot_dependency_timeout","extra":"secret",'
                 b'"kind":"starring.d2a.command-error.v1","operation":"one-shot",'
                 b'"schema_version":1}\n',
@@ -3367,27 +3380,33 @@ class D2ABootstrapTests(unittest.TestCase):
             self.assertNotIn("secret", raised.exception.code)
 
     def test_one_shot_safe_error_survives_recovery_without_raw_diagnostics(self):
-        code = "d2a_one_shot_dependency_timeout"
-        executor = FakeExecutor(
-            self.fixture,
-            fail_once={"d2a_one_shot": 1},
-            one_shot_error_code=code,
-        )
-        result = self.fixture.controller(executor).run(
-            self.fixture.config_path,
-            self.fixture.candidate_spec_path,
-            "one-shot",
-        )
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["error_code"], code)
-        state_payload = pathlib.Path(result["state"]).read_bytes()
-        state = json.loads(state_payload)
-        self.assertEqual(state["last_error"], code)
-        self.assertNotIn(b"product_request_", state_payload)
-        self.assertTrue(result["discord_teardown_complete"])
-        self.assertTrue(result["cleanup_complete"])
-        self.assertTrue(result["total_local_absence"])
-        self.assertTrue(result["protected_staging_unchanged"])
+        for code in sorted(BOOTSTRAP.ONE_SHOT_COMMAND_ERROR_CODES):
+            executor = FakeExecutor(
+                self.fixture,
+                fail_once={"d2a_one_shot": 1},
+                one_shot_error_code=code,
+            )
+            result = self.fixture.controller(executor).run(
+                self.fixture.config_path,
+                self.fixture.candidate_spec_path,
+                "one-shot",
+            )
+            with self.subTest(code=code):
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["error_code"], code)
+                state_payload = pathlib.Path(result["state"]).read_bytes()
+                state = json.loads(state_payload)
+                self.assertEqual(state["last_error"], code)
+                self.assertNotIn(
+                    b"product_request_504_dependency_timeout", state_payload
+                )
+                self.assertNotIn(b"scenario_confirmation_mismatch", state_payload)
+                self.assertTrue(result["discord_teardown_complete"])
+                self.assertTrue(result["cleanup_complete"])
+                self.assertTrue(result["total_local_absence"])
+                self.assertTrue(result["protected_staging_unchanged"])
+            self.fixture.cleanup()
+            self.fixture = BootstrapFixture(self)
 
     def test_teardown_diagnostic_is_closed_canonical_and_durable(self):
         self.assertEqual(

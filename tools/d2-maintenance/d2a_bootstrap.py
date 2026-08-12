@@ -80,8 +80,13 @@ COMMAND_ERROR_FIELDS = {
     "schema_version",
 }
 ONE_SHOT_COMMAND_ERROR_CODES = frozenset({
+    "d2a_one_shot_authoring_flow_failed",
+    "d2a_one_shot_confirmation_flow_failed",
+    "d2a_one_shot_convergence_flow_failed",
+    "d2a_one_shot_decision_flow_failed",
     "d2a_one_shot_dependency_timeout",
     "d2a_one_shot_dependency_unavailable",
+    "d2a_one_shot_deployment_flow_failed",
     "d2a_one_shot_product_request_failed",
 })
 TEARDOWN_DIAGNOSTIC_FIELDS = {"code", "status"}

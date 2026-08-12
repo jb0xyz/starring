@@ -1844,8 +1844,17 @@ fn cancellation_during_model_prevents_commit() {
 }
 
 #[test]
-fn preview_ready_turn_commits_generation_one() {
+fn checked_in_d2_scenario_commits_preview_ready_generation_one() {
     block_on(async {
+        let scenario: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../../../tools/d2-maintenance/scenarios/study-room.v1.json"
+        ))
+        .unwrap();
+        let message = scenario["message"].as_str().unwrap();
+        assert_eq!(
+            message,
+            "Build a managed private study-room automation in community_hub and prepare its validated preview. Use English default copy and naming, leave room closing disabled, and do not ask a follow-up question."
+        );
         let store = Store::empty();
         let authentication = Authentication::new();
         let authority = Authority::stable();
@@ -1866,11 +1875,7 @@ fn preview_ready_turn_commits_generation_one() {
                     "credential",
                     "csrf",
                     &installation(),
-                    command(
-                        0,
-                        "ready-key",
-                        "Create private study rooms in community_hub and prepare a validated preview",
-                    ),
+                    command(0, "ready-key", message),
                 )
                 .await
                 .unwrap(),
@@ -1885,7 +1890,16 @@ fn preview_ready_turn_commits_generation_one() {
             receipt.projection().state(),
             SafeAuthoringTurnStateV1::PreviewReady
         );
-        assert!(receipt.projection().preview().is_some());
+        let draft = receipt.projection().preview().unwrap().draft();
+        let expected = &scenario["expected_summary"];
+        assert_eq!(draft.panels, expected["panels"].as_u64().unwrap() as usize);
+        assert_eq!(draft.modals, expected["modals"].as_u64().unwrap() as usize);
+        assert_eq!(draft.rules, expected["rules"].as_u64().unwrap() as usize);
+        assert_eq!(
+            draft.actions,
+            expected["actions"].as_u64().unwrap() as usize
+        );
+        assert!(draft.unresolved_references.is_empty());
         assert_eq!(client.calls(), 1);
         assert_eq!(admission.counts(), (1, 1));
         assert_eq!(store.counts(), (2, 1, 1));
