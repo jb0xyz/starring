@@ -1,15 +1,74 @@
 #!/usr/bin/env python3
 
 import argparse
+import datetime
 import hashlib
+import json
 import os
 import pathlib
 import plistlib
 import re
 import signal
 import stat
+import subprocess
 import sys
 import unicodedata
+
+
+D2A_TAINT_FIELDS = (
+    "schema_version",
+    "kind",
+    "run_id",
+    "manifest_sha256",
+    "certification_class",
+    "direct_auth_used",
+    "release_eligible",
+    "issuer_sha256",
+    "issuer_source_sha256",
+    "runner_sha256",
+    "product_driver_sha256",
+    "scenario_sha256",
+)
+D2A_SESSION_LIFECYCLE_FIELDS = (
+    "schema_version",
+    "kind",
+    "run_id",
+    "manifest_sha256",
+    "operation",
+    "origin",
+    "issuer_sha256",
+    "issuer_source_sha256",
+    "uid",
+    "boot_identity",
+    "process_group_id",
+    "started_at",
+    "status",
+    "session_revoked",
+    "revoked_at",
+    "quarantined_at",
+)
+D2A_TEARDOWN_FENCE_FIELDS = (
+    "kind",
+    "manifest_sha256",
+    "run_id",
+    "schema_version",
+    "status",
+    "updated_at",
+)
+D2A_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+D2A_BOOT_IDENTITY = re.compile(
+    r"^darwin-boottime:(?:[1-9][0-9]*):(?:0|[1-9][0-9]{0,5})$"
+)
+D2A_LIFECYCLE_TIMESTAMP = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{9}Z$"
+)
+D2A_MARKER_MAXIMUM_BYTES = 64 * 1024
+D2A_SYSCTL_PATH = pathlib.Path("/usr/sbin/sysctl")
+D2A_SYSCTL_BOOT_TIME = re.compile(
+    rb"^\{ sec = ([1-9][0-9]*), usec = (0|[1-9][0-9]{0,5}) \} "
+    rb"[A-Z][a-z]{2} [A-Z][a-z]{2} [ 0-9][0-9] "
+    rb"[0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}\n$"
+)
 
 from d2_certification import (
     CertificationError,
@@ -3265,6 +3324,477 @@ def validate_discord_teardown_evidence(
     return evidence
 
 
+def d2a_taint_path(context):
+    return context.run_directory / "d2a-taint.json"
+
+
+def d2a_session_lifecycle_path(context):
+    return context.run_directory / "d2a-session-lifecycle.json"
+
+
+def d2a_teardown_fence_path(context):
+    return context.run_directory / "d2a-teardown-fence.json"
+
+
+class D2aMarkerDecodeError(ValueError):
+    pass
+
+
+def strict_d2a_marker_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise D2aMarkerDecodeError("duplicate_key")
+        value[key] = item
+    return value
+
+
+def d2a_marker_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def load_strict_d2a_marker(path, code, fields, sorted_canonical=False):
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail(code)
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        fail(code)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_size <= 0
+            or before.st_size > D2A_MARKER_MAXIMUM_BYTES
+        ):
+            fail(code)
+        raw = bytearray()
+        while len(raw) <= D2A_MARKER_MAXIMUM_BYTES:
+            chunk = os.read(descriptor, min(64 * 1024, D2A_MARKER_MAXIMUM_BYTES + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(descriptor)
+        try:
+            named = os.stat(path, follow_symlinks=False)
+        except OSError:
+            fail(code)
+    except OSError:
+        fail(code)
+    finally:
+        os.close(descriptor)
+    if (
+        len(raw) != before.st_size
+        or len(raw) > D2A_MARKER_MAXIMUM_BYTES
+        or d2a_marker_identity(before) != d2a_marker_identity(after)
+        or d2a_marker_identity(after) != d2a_marker_identity(named)
+        or not stat.S_ISREG(named.st_mode)
+    ):
+        fail(code)
+    try:
+        observed = bytes(raw).decode("utf-8")
+        if (
+            not observed.endswith("\n")
+            or observed.endswith("\n\n")
+            or observed[:-1].endswith("\r")
+        ):
+            raise D2aMarkerDecodeError("newline")
+        payload = observed[:-1]
+        value = json.loads(payload, object_pairs_hook=strict_d2a_marker_object)
+        if not isinstance(value, dict) or tuple(value) != tuple(fields):
+            raise D2aMarkerDecodeError("fields")
+        expected = (
+            canonical_json(value)
+            if sorted_canonical
+            else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        )
+        if payload != expected:
+            raise D2aMarkerDecodeError("canonical")
+    except (UnicodeDecodeError, json.JSONDecodeError, D2aMarkerDecodeError):
+        fail(code)
+    return value
+
+
+def valid_d2a_digest(value):
+    return isinstance(value, str) and D2A_DIGEST.fullmatch(value) is not None
+
+
+def valid_d2a_boot_identity(value):
+    if not isinstance(value, str) or D2A_BOOT_IDENTITY.fullmatch(value) is None:
+        return False
+    microseconds = int(value.rsplit(":", 1)[1])
+    return microseconds < 1_000_000
+
+
+def d2a_sysctl_executable_identity():
+    for parent in (pathlib.Path("/usr"), pathlib.Path("/usr/sbin")):
+        try:
+            metadata = parent.lstat()
+        except OSError:
+            fail("d2a_boot_identity_invalid")
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or parent.is_symlink()
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            fail("d2a_boot_identity_invalid")
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail("d2a_boot_identity_invalid")
+    try:
+        descriptor = os.open(
+            D2A_SYSCTL_PATH,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError:
+        fail("d2a_boot_identity_invalid")
+    try:
+        opened = os.fstat(descriptor)
+        named = os.stat(D2A_SYSCTL_PATH, follow_symlinks=False)
+    except OSError:
+        fail("d2a_boot_identity_invalid")
+    finally:
+        os.close(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != 0
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) != 0o755
+        or d2a_marker_identity(opened) != d2a_marker_identity(named)
+    ):
+        fail("d2a_boot_identity_invalid")
+    return d2a_marker_identity(opened)
+
+
+def current_darwin_boot_identity():
+    before = d2a_sysctl_executable_identity()
+    try:
+        result = subprocess.run(
+            [str(D2A_SYSCTL_PATH), "-n", "kern.boottime"],
+            cwd="/",
+            env={"LANG": "C", "LC_ALL": "C"},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        fail("d2a_boot_identity_invalid")
+    after = d2a_sysctl_executable_identity()
+    if (
+        before != after
+        or result.returncode != 0
+        or result.stderr
+        or len(result.stdout) > 256
+    ):
+        fail("d2a_boot_identity_invalid")
+    match = D2A_SYSCTL_BOOT_TIME.fullmatch(result.stdout)
+    if match is None:
+        fail("d2a_boot_identity_invalid")
+    seconds = int(match.group(1))
+    microseconds = int(match.group(2))
+    if microseconds >= 1_000_000:
+        fail("d2a_boot_identity_invalid")
+    identity = f"darwin-boottime:{seconds}:{microseconds}"
+    if not valid_d2a_boot_identity(identity):
+        fail("d2a_boot_identity_invalid")
+    return identity
+
+
+def valid_d2a_lifecycle_timestamp(value):
+    if not isinstance(value, str) or D2A_LIFECYCLE_TIMESTAMP.fullmatch(value) is None:
+        return False
+    try:
+        # Python's datetime has microsecond precision.  Parse the calendar portion while
+        # retaining the separately validated exact nine-digit nanosecond spelling.
+        datetime.datetime.strptime(value[:19] + "Z", "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
+
+
+def require_d2a_session_revoked(context):
+    taint_path = d2a_taint_path(context)
+    lifecycle_path = d2a_session_lifecycle_path(context)
+    fence_path = d2a_teardown_fence_path(context)
+    markers = tuple(
+        os.path.lexists(path) for path in (taint_path, lifecycle_path, fence_path)
+    )
+    if not any(markers):
+        return False
+    if not os.path.lexists(taint_path) or not os.path.lexists(lifecycle_path):
+        fail("manual_recovery_required")
+    taint = load_strict_d2a_marker(
+        taint_path, "d2a_taint_invalid", D2A_TAINT_FIELDS
+    )
+    if (
+        type(taint.get("schema_version")) is not int
+        or taint.get("schema_version") != 1
+        or taint.get("kind") != "starring.d2a.run-taint.v1"
+        or taint.get("run_id") != context.manifest["run_id"]
+        or taint.get("manifest_sha256") != context.digest
+        or taint.get("certification_class") != "automated_maintenance_v1"
+        or taint.get("direct_auth_used") is not True
+        or taint.get("release_eligible") is not False
+        or any(
+            not valid_d2a_digest(taint.get(field))
+            for field in (
+                "issuer_sha256",
+                "issuer_source_sha256",
+                "runner_sha256",
+                "product_driver_sha256",
+                "scenario_sha256",
+            )
+        )
+    ):
+        fail("manual_recovery_required")
+    lifecycle = load_strict_d2a_marker(
+        lifecycle_path,
+        "d2a_session_lifecycle_invalid",
+        D2A_SESSION_LIFECYCLE_FIELDS,
+    )
+    issuer_origin = lifecycle.get("origin") == "issuer"
+    bootstrap_origin = lifecycle.get("origin") == "bootstrap"
+    process_group_id = lifecycle.get("process_group_id")
+    positive_process_group = (
+        type(process_group_id) is int and 1 < process_group_id <= 2_147_483_647
+    )
+    revoked = (
+        issuer_origin
+        and positive_process_group
+        and lifecycle.get("status") == "revoked"
+        and lifecycle.get("session_revoked") is True
+        and valid_d2a_lifecycle_timestamp(lifecycle.get("revoked_at"))
+        and lifecycle.get("quarantined_at") is None
+    )
+    issuer_not_issued = (
+        issuer_origin
+        and positive_process_group
+        and lifecycle.get("status") == "not_issued"
+        and lifecycle.get("session_revoked") is False
+        and lifecycle.get("revoked_at") is None
+        and lifecycle.get("quarantined_at") is None
+    )
+    bootstrap_not_issued = (
+        bootstrap_origin
+        and lifecycle.get("operation") == "direct-onboard"
+        and process_group_id is None
+        and lifecycle.get("status") == "not_issued"
+        and lifecycle.get("session_revoked") is False
+        and lifecycle.get("revoked_at") is None
+        and lifecycle.get("quarantined_at") is None
+    )
+    active = (
+        issuer_origin
+        and positive_process_group
+        and lifecycle.get("status") == "active"
+        and lifecycle.get("session_revoked") is False
+        and lifecycle.get("revoked_at") is None
+        and lifecycle.get("quarantined_at") is None
+    )
+    quarantined = (
+        issuer_origin
+        and positive_process_group
+        and lifecycle.get("status") == "quarantined"
+        and lifecycle.get("session_revoked") is False
+        and lifecycle.get("revoked_at") is None
+        and valid_d2a_lifecycle_timestamp(lifecycle.get("quarantined_at"))
+    )
+    if (
+        type(lifecycle.get("schema_version")) is not int
+        or lifecycle.get("schema_version") != 1
+        or lifecycle.get("kind") != "starring.d2a.session-lifecycle.v1"
+        or lifecycle.get("run_id") != context.manifest["run_id"]
+        or lifecycle.get("manifest_sha256") != context.digest
+        or lifecycle.get("operation") not in {"auth-smoke", "direct-onboard", "one-shot"}
+        or lifecycle.get("origin") not in {"bootstrap", "issuer"}
+        or lifecycle.get("issuer_sha256") != taint.get("issuer_sha256")
+        or lifecycle.get("issuer_source_sha256") != taint.get("issuer_source_sha256")
+        or not valid_d2a_digest(lifecycle.get("issuer_sha256"))
+        or not valid_d2a_digest(lifecycle.get("issuer_source_sha256"))
+        or type(lifecycle.get("uid")) is not int
+        or lifecycle.get("uid") != os.getuid()
+        or not valid_d2a_boot_identity(lifecycle.get("boot_identity"))
+        or not valid_d2a_lifecycle_timestamp(lifecycle.get("started_at"))
+        or not (
+            active
+            or issuer_not_issued
+            or bootstrap_not_issued
+            or revoked
+            or quarantined
+        )
+    ):
+        fail("manual_recovery_required")
+    if not (revoked or issuer_not_issued or bootstrap_not_issued):
+        fail("manual_recovery_required")
+    if bootstrap_not_issued:
+        return lifecycle
+    current_boot_identity = current_darwin_boot_identity()
+    if lifecycle["boot_identity"] == current_boot_identity:
+        try:
+            os.killpg(lifecycle["process_group_id"], 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            fail("manual_recovery_required")
+        else:
+            # macOS has no pidfd-like group identity handle. Never signal this group;
+            # live, EPERM, or numeric-identity reuse stays a manual boundary.
+            fail("manual_recovery_required")
+    # A different canonical boot identity proves every process group from the marker's
+    # boot is gone. Do not even probe the stale numeric pgid: it may have been reused.
+    return lifecycle
+
+
+def validate_d2a_teardown_fence(context, fence):
+    if (
+        not isinstance(fence, dict)
+        or set(fence) != set(D2A_TEARDOWN_FENCE_FIELDS)
+        or type(fence.get("schema_version")) is not int
+        or fence.get("schema_version") != 1
+        or fence.get("kind") != "starring.d2a.teardown-fence.v1"
+        or fence.get("run_id") != context.manifest["run_id"]
+        or fence.get("manifest_sha256") != context.digest
+        or fence.get("status") not in {"closing", "closed"}
+        or not validate_utc_timestamp(fence.get("updated_at"))
+    ):
+        fail("d2a_teardown_fence_invalid")
+    return fence
+
+
+def transition_d2a_teardown_fence(context, status):
+    if status not in {"closing", "closed"}:
+        fail("d2a_teardown_fence_invalid")
+    path = d2a_teardown_fence_path(context)
+    if os.path.lexists(path):
+        current = validate_d2a_teardown_fence(
+            context,
+            load_strict_d2a_marker(
+                path,
+                "d2a_teardown_fence_invalid",
+                D2A_TEARDOWN_FENCE_FIELDS,
+                sorted_canonical=True,
+            ),
+        )
+        if current["status"] == "closed" and status == "closing":
+            return True
+    fence = {
+        "schema_version": 1,
+        "kind": "starring.d2a.teardown-fence.v1",
+        "run_id": context.manifest["run_id"],
+        "manifest_sha256": context.digest,
+        "status": status,
+        "updated_at": utc_now(),
+    }
+    validate_d2a_teardown_fence(context, fence)
+    write_atomic(path, canonical_json(fence) + "\n")
+    return True
+
+
+def begin_d2a_teardown(context):
+    lifecycle = require_d2a_session_revoked(context)
+    if lifecycle:
+        transition_d2a_teardown_fence(context, "closing")
+        return True
+    return False
+
+
+def complete_d2a_teardown(context, automated):
+    if automated:
+        transition_d2a_teardown_fence(context, "closed")
+
+
+def close_bootstrap_prestart_teardown_fence(context, platform, lifecycle):
+    if not (
+        lifecycle.get("origin") == "bootstrap"
+        and lifecycle.get("operation") == "direct-onboard"
+        and lifecycle.get("status") == "not_issued"
+        and lifecycle.get("process_group_id") is None
+        and lifecycle.get("session_revoked") is False
+        and lifecycle.get("revoked_at") is None
+        and lifecycle.get("quarantined_at") is None
+    ):
+        fail("manual_recovery_required")
+    try:
+        state = load_state(context, {"prepared"})
+    except BaseException:
+        fail("manual_recovery_required")
+    mutation_paths = (
+        candidate_start_transition_path(context),
+        candidate_start_source_path(context),
+        candidate_start_retirement_path(context),
+        context.artifact_directory / "step-03-evidence.json",
+        context.artifact_directory / "onboarding-evidence.json",
+        context.artifact_directory / "transport-evidence",
+        discord_teardown_progress_path(context),
+        discord_teardown_progress_path(context, frozen=True),
+        discord_teardown_evidence_path(context),
+        discord_teardown_evidence_path(context, frozen=True),
+        abort_teardown_tombstone_path(context),
+    )
+    try:
+        services_absent = all(
+            platform.launchd_absent(service["label"])
+            for service in context.manifest["services"].values()
+        )
+        postgres_absent = not platform.postgres_running(context.cluster_root)
+    except BaseException:
+        fail("manual_recovery_required")
+    if (
+        state["phase"] != "prepared"
+        or candidate_start_commitment_present(context)
+        or not services_absent
+        or not postgres_absent
+        or any(os.path.lexists(path) for path in mutation_paths)
+    ):
+        fail("manual_recovery_required")
+    transition_d2a_teardown_fence(context, "closed")
+
+
+def require_d2a_cleanup_fence(context, platform):
+    marker_paths = (
+        d2a_taint_path(context),
+        d2a_session_lifecycle_path(context),
+        d2a_teardown_fence_path(context),
+    )
+    if not any(os.path.lexists(path) for path in marker_paths):
+        return
+    lifecycle = require_d2a_session_revoked(context)
+    path = d2a_teardown_fence_path(context)
+    if not os.path.lexists(path):
+        if not isinstance(lifecycle, dict):
+            fail("manual_recovery_required")
+        close_bootstrap_prestart_teardown_fence(context, platform, lifecycle)
+    fence = validate_d2a_teardown_fence(
+        context,
+        load_strict_d2a_marker(
+            path,
+            "d2a_teardown_fence_invalid",
+            D2A_TEARDOWN_FENCE_FIELDS,
+            sorted_canonical=True,
+        ),
+    )
+    if fence["status"] != "closed":
+        fail("manual_recovery_required")
+
+
 def command_teardown_discord_resources(context, platform, frozen=False):
     if frozen:
         require_certification_eligible_teardown(context)
@@ -3277,6 +3807,13 @@ def command_teardown_discord_resources(context, platform, frozen=False):
                 allow_abort_teardown=True,
             )
     _state, snapshot = boundary(context, platform)
+    # Production dispatch holds the global D2 lock around this entire command.
+    # Prove the candidate-start boundary before opening the durable teardown
+    # transaction: a bootstrap sentinel for a merely prepared run must fail
+    # here without leaving a `closing` fence that would brick its safe direct
+    # cleanup path.  Once the boundary is proven, write `closing` before the
+    # first inventory/tombstone/deletion mutation.
+    automated = begin_d2a_teardown(context)
     inventory = platform.transport_control(context, "resource_inventory")
     if inventory["instance_id"] != snapshot["instance_id"]:
         fail("transport_instance_changed")
@@ -3296,6 +3833,7 @@ def command_teardown_discord_resources(context, platform, frozen=False):
         if final_inventory["digest_sha256"] != inventory["digest_sha256"]:
             fail("discord_resource_teardown_replay_drift")
         boundary(context, platform)
+        complete_d2a_teardown(context, automated)
         return {
             "status": "exact_replay",
             "phase": "candidate_started",
@@ -3413,6 +3951,7 @@ def command_teardown_discord_resources(context, platform, frozen=False):
     )
     write_atomic(evidence_path, canonical_json(evidence) + "\n")
     append_journal(context, "discord_resource_teardown", "complete", "resources")
+    complete_d2a_teardown(context, automated)
     return {
         "status": "torn_down",
         "phase": "candidate_started",
@@ -4342,6 +4881,7 @@ def command_cleanup_internal(context, platform, retire_committed):
 
 
 def command_cleanup(context, platform):
+    require_d2a_cleanup_fence(context, platform)
     return command_cleanup_internal(context, platform, retire_committed=True)
 
 

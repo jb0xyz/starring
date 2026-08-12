@@ -62,5 +62,6 @@ tmpfs, and a 16 GiB container were rejected because this Mac's Colima VM has an
 18 GiB allocation and the host free-space boundary is tighter than the sparse
 VM disk reports.
 
-The final exact-tree D3 run must still pass all 31 gates, including the
-tracked-secret scan and D3 self-tests, with the 8 GiB policy.
+The final exact-tree D3 run must still pass all 36 gates, including the
+tracked-secret scan, D3 self-tests, D2A Python and Node tests, and D2A issuer
+format, test, and Clippy gates, with the 8 GiB policy.

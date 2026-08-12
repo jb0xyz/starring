@@ -46,6 +46,11 @@ gates=(
   'cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check'
   'cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml'
   'cargo clippy --locked --manifest-path tools/d2-certification-transport/Cargo.toml --all-targets -- -D warnings'
+  "python3 -m unittest discover -s tools/d2-maintenance -p 'test_*.py'"
+  'node --test tools/d2-maintenance/headless_product_runner.test.mjs'
+  'cargo fmt --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml -- --check'
+  'cargo test --locked --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml'
+  'cargo clippy --locked --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml --all-targets -- -D warnings'
   'cargo test --locked -p automation-ruleset-postgres -- --ignored --test-threads=1'
   'cargo test --locked -p automation-instance-postgres -- --ignored --test-threads=1'
   'cargo test --locked -p automation-panel-installation-postgres -- --ignored --test-threads=1'
@@ -78,8 +83,8 @@ Set `D3_STATE` to the absolute `state` value returned by `prepare`. The run
 root referred to below as `<D3_RUN>` is the directory containing that
 `state.json` file.
 
-`run-gates` executes the 31 commands above, in order, in the detached
-worktree. Candidate publication does not begin until all 31 pass. Completed
+`run-gates` executes the 36 commands above, in order, in the detached
+worktree. Candidate publication does not begin until all 36 pass. Completed
 gates replay without execution. A failed or interrupted gate resumes as a new
 or incomplete durable attempt. Gate 1 routes both plain Git commands used by
 the tracked-secret scanner and explicit `git -C /workspace` commands through
@@ -90,14 +95,16 @@ volume. It uses the image's unwrapped Git so the outer gate projection cannot
 intercept fixture repositories; the shared scratch tmpfs remains `noexec`.
 
 Before the first attempt, `run-gates` creates a bounded bootstrap while network
-access is available. Both Cargo lockfiles are first checked in a networkless
-container against the exact crates.io source and the single pinned Twilight Git
-revision. The workspace vendor is then materialized from the exact
-checksum-bearing crates.io packages in `Cargo.lock`; the transport vendor owns
-the pinned Git source. The generated workspace Cargo configuration maps
-crates.io and Twilight to those two distinct directories, while the transport
-configuration maps its complete graph to the transport vendor. Both mappings
-are verified with offline Cargo metadata. npm packages are accepted only from
+access is available. The workspace, certification-transport, and D2A session-
+issuer Cargo lockfiles are first checked in a networkless container against the
+exact crates.io source and the single pinned Twilight Git revision. The
+workspace vendor is then materialized from the exact checksum-bearing crates.io
+packages in `Cargo.lock`; the transport and issuer each receive a distinct
+vendor for their standalone locked graphs. The generated workspace Cargo
+configuration maps crates.io and Twilight to its two required directories,
+while the transport and issuer configurations map only their respective
+standalone vendors. All three mappings are verified with offline Cargo
+metadata. npm packages are accepted only from
 the registry named in the checked lockfile. Temporary homes, targets, package
 files, and staging configuration are removed before the exact bootstrap
 inventory is sealed read-only and tree-hashed. Bootstrap staging is capped at 4
@@ -118,7 +125,7 @@ exit. Gates are offline except the explicitly networked npm audit in gate 11.
 The PostgreSQL URL file remains a dedicated absolute mode-`0600` policy input.
 It must name an explicit loopback port and a `starring_test` or `starring_d3*`
 database with credentials, but those credentials and that server are not used
-by a gate. For each of gates 19 through 31, the runner derives only the approved
+by a gate. For each of gates 24 through 36, the runner derives only the approved
 database name, generates a fresh random password, and starts a digest-pinned,
 read-only PostgreSQL container with tmpfs storage, no published ports, and no
 host mounts. The gate container joins only that PostgreSQL container's network
@@ -230,7 +237,11 @@ their operator-supplied installed executable paths to D2 preparation; D3 does
 not build them or bind them to `candidate-bundle`.
 
 `bind-d2` rejects a D2 manifest unless `commit_sha` is the exact pinned merge
-commit and resolves to the pinned merge tree. It also requires the exact path
+commit and resolves to the pinned merge tree. It independently requires
+`certification_class: commercial_human_v1` and the exact ordered six human
+boundaries for disposable-guild creation, Discord OAuth, initial product-preview
+confirmation, real Discord interactions, replacement-preview confirmation, and
+disposable-guild deletion. It also requires the exact path
 and SHA-256 for all five sealed binaries and `codex-worker/worker.mjs`. The
 manifest source-tree identities must match the sealed seven-file worker tree
 and the fixed D2 toolchain and certification-transport inventories in the
@@ -244,7 +255,9 @@ more than 10,000 entries, or more than 64 MiB. Keep that evidence tree in place
 through `recheck` and `finalize`; both recapture the same tree identity. All
 three commands, including exact replays, reject a run containing
 `candidate-start-retirement.json` or the standalone teardown tombstone
-`discord-resource-teardown-abort.json`.
+`discord-resource-teardown-abort.json`. They also reject `d2a-taint.json`.
+Because the full D2 run tree remains identity-bound, a marker created after
+binding invalidates all later rechecks and finalization.
 
 Capture the canonical output of `d2_run.py verify` in an owned mode-`0600` JSON file, then bind its required 17-step coordinator ledger to the D2 manifest, all 17 chained receipts, and the pinned commit tree. Set `umask 077` before redirecting the verifier output so the record is never created with a permissive mode. The low-level receipt verifier is not release authority.
 

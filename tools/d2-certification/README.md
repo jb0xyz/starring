@@ -5,6 +5,17 @@ secret-free evidence ledger for the 17 D2 product E2E steps. It does not create
 or delete a Discord guild, read a credential, start a process, mutate the
 standing staging database, or claim that an incomplete run passed.
 
+Every current manifest is closed to the exact top-level field inventory, carries
+`certification_class: commercial_human_v1`, and pins the ordered human
+boundaries for disposable-guild creation, Discord OAuth, initial product-preview
+confirmation, real Discord interactions, replacement-preview confirmation, and
+disposable-guild deletion. Automated, missing, or reordered boundary claims are
+rejected rather than treated as commercial certification evidence.
+If the separate D2A maintenance issuer ever uses a commercial run, it first
+creates the durable run-local `d2a-taint.json` marker. Coordinator status,
+advance, verification, and D3 binding then reject that run permanently; only
+the normal isolated-resource cleanup path remains valid.
+
 The preparation command binds one run to an exact Git commit, immutable API
 and runtime binaries, the Codex worker and its executables, a unique resource
 prefix, unique loopback ports, unique launchd labels, unique Keychain service

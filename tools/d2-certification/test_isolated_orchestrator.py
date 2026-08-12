@@ -6385,6 +6385,460 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         self.assertNotIn("discord.bot-token", serialized)
         self.assertNotIn("Authorization", serialized)
 
+    def write_d2a_session_lifecycle(
+        self, status, origin="issuer", process_group_id=2_000_000_000
+    ):
+        taint = {
+            "schema_version": 1,
+            "kind": "starring.d2a.run-taint.v1",
+            "run_id": self.context.manifest["run_id"],
+            "manifest_sha256": self.context.digest,
+            "certification_class": "automated_maintenance_v1",
+            "direct_auth_used": True,
+            "release_eligible": False,
+            "issuer_sha256": "a" * 64,
+            "issuer_source_sha256": "b" * 64,
+            "runner_sha256": "c" * 64,
+            "product_driver_sha256": "d" * 64,
+            "scenario_sha256": "e" * 64,
+        }
+        taint_path = ORCHESTRATOR.d2a_taint_path(self.context)
+        taint_path.write_text(
+            json.dumps(taint, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        taint_path.chmod(0o600)
+        lifecycle = {
+            "schema_version": 1,
+            "kind": "starring.d2a.session-lifecycle.v1",
+            "run_id": self.context.manifest["run_id"],
+            "manifest_sha256": self.context.digest,
+            "operation": "direct-onboard" if origin == "bootstrap" else "auth-smoke",
+            "origin": origin,
+            "issuer_sha256": taint["issuer_sha256"],
+            "issuer_source_sha256": taint["issuer_source_sha256"],
+            "uid": os.getuid(),
+            "boot_identity": "darwin-boottime:1:0",
+            "process_group_id": process_group_id,
+            "started_at": "2026-08-12T00:00:00.000000000Z",
+            "status": status,
+            "session_revoked": status == "revoked",
+            "revoked_at": "2026-08-12T00:00:01.000000000Z"
+            if status == "revoked"
+            else None,
+            "quarantined_at": "2026-08-12T00:00:01.000000000Z"
+            if status == "quarantined"
+            else None,
+        }
+        lifecycle_path = ORCHESTRATOR.d2a_session_lifecycle_path(self.context)
+        lifecycle_path.write_text(
+            json.dumps(lifecycle, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        lifecycle_path.chmod(0o600)
+        return lifecycle_path
+
+    def test_d2a_active_quarantined_or_missing_lifecycle_blocks_before_mutation(self):
+        for status in (None, "active", "quarantined"):
+            with self.subTest(status=status):
+                self.start_candidate_with_discord_resources()
+                lifecycle = self.write_d2a_session_lifecycle(status or "active")
+                if status is None:
+                    lifecycle.unlink()
+                with self.assertRaisesRegex(
+                    ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+                ):
+                    ORCHESTRATOR.command_teardown_discord_resources(
+                        self.context, self.platform
+                    )
+                self.assertEqual(self.platform.proxy_deletions, [])
+                self.assertFalse(
+                    ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
+                )
+                self.tearDown()
+                self.setUp()
+
+    def test_d2a_marker_unlink_cannot_downgrade_to_commercial_cleanup(self):
+        for missing in ("taint", "lifecycle"):
+            with self.subTest(missing=missing):
+                self.start_candidate_with_discord_resources()
+                lifecycle = self.write_d2a_session_lifecycle("revoked")
+                target = (
+                    ORCHESTRATOR.d2a_taint_path(self.context)
+                    if missing == "taint"
+                    else lifecycle
+                )
+                target.unlink()
+                with self.assertRaisesRegex(
+                    ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+                ):
+                    ORCHESTRATOR.command_teardown_discord_resources(
+                        self.context, self.platform
+                    )
+                with self.assertRaisesRegex(
+                    ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+                ):
+                    ORCHESTRATOR.command_cleanup(self.context, self.platform)
+                self.assertEqual(self.platform.proxy_deletions, [])
+                self.tearDown()
+                self.setUp()
+
+    def test_d2a_strict_marker_reader_rejects_duplicates_hardlinks_and_noncanonical_bytes(self):
+        with self.subTest(case="duplicate_lifecycle_key"):
+            lifecycle = self.write_d2a_session_lifecycle("revoked")
+            raw = lifecycle.read_text(encoding="utf-8")
+            lifecycle.write_text(
+                raw.replace(
+                    '"status":"revoked"',
+                    '"status":"revoked","status":"revoked"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "d2a_session_lifecycle_invalid",
+            ):
+                ORCHESTRATOR.require_d2a_session_revoked(self.context)
+
+        with self.subTest(case="lifecycle_hardlink"):
+            lifecycle = self.write_d2a_session_lifecycle("revoked")
+            alias = lifecycle.with_name("d2a-session-lifecycle-hardlink.json")
+            os.link(lifecycle, alias)
+            try:
+                with self.assertRaisesRegex(
+                    ORCHESTRATOR.OrchestratorError,
+                    "d2a_session_lifecycle_invalid",
+                ):
+                    ORCHESTRATOR.require_d2a_session_revoked(self.context)
+            finally:
+                alias.unlink()
+
+        with self.subTest(case="noncanonical_taint"):
+            self.write_d2a_session_lifecycle("revoked")
+            taint_path = ORCHESTRATOR.d2a_taint_path(self.context)
+            taint = json.loads(taint_path.read_text(encoding="utf-8"))
+            taint_path.write_text(json.dumps(taint) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "d2a_taint_invalid"
+            ):
+                ORCHESTRATOR.require_d2a_session_revoked(self.context)
+
+        with self.subTest(case="missing_lifecycle"):
+            lifecycle = self.write_d2a_session_lifecycle("revoked")
+            lifecycle.unlink()
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+            ):
+                ORCHESTRATOR.require_d2a_session_revoked(self.context)
+
+    def test_d2a_strict_teardown_fence_rejects_duplicate_keys_and_hardlinks(self):
+        self.write_d2a_session_lifecycle("revoked")
+        ORCHESTRATOR.transition_d2a_teardown_fence(self.context, "closing")
+        fence = ORCHESTRATOR.d2a_teardown_fence_path(self.context)
+        raw = fence.read_text(encoding="utf-8")
+        fence.write_text(
+            raw.replace(
+                '"status":"closing"',
+                '"status":"closing","status":"closing"',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "d2a_teardown_fence_invalid"
+        ):
+            ORCHESTRATOR.transition_d2a_teardown_fence(self.context, "closed")
+
+        ORCHESTRATOR.write_atomic(
+            fence,
+            ORCHESTRATOR.canonical_json(
+                {
+                    "schema_version": 1,
+                    "kind": "starring.d2a.teardown-fence.v1",
+                    "run_id": self.context.manifest["run_id"],
+                    "manifest_sha256": self.context.digest,
+                    "status": "closing",
+                    "updated_at": "2026-08-12T00:00:00Z",
+                }
+            )
+            + "\n",
+        )
+        alias = fence.with_name("d2a-teardown-fence-hardlink.json")
+        os.link(fence, alias)
+        try:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "d2a_teardown_fence_invalid"
+            ):
+                ORCHESTRATOR.transition_d2a_teardown_fence(self.context, "closed")
+        finally:
+            alias.unlink()
+
+    def test_d2a_reboot_parity_probes_only_same_boot_process_groups(self):
+        lifecycle_path = self.write_d2a_session_lifecycle("revoked")
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "current_darwin_boot_identity",
+            return_value="darwin-boottime:2:0",
+        ), mock.patch.object(
+            os,
+            "killpg",
+            side_effect=AssertionError("prior-boot pgid must not be probed"),
+        ):
+            self.assertTrue(ORCHESTRATOR.require_d2a_session_revoked(self.context))
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "current_darwin_boot_identity",
+            return_value="darwin-boottime:1:0",
+        ), mock.patch.object(os, "killpg", return_value=None):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+            ):
+                ORCHESTRATOR.require_d2a_session_revoked(self.context)
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "current_darwin_boot_identity",
+            return_value="darwin-boottime:1:0",
+        ), mock.patch.object(os, "killpg", side_effect=PermissionError):
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+            ):
+                ORCHESTRATOR.require_d2a_session_revoked(self.context)
+
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "current_darwin_boot_identity",
+            return_value="darwin-boottime:1:0",
+        ), mock.patch.object(os, "killpg", side_effect=ProcessLookupError):
+            self.assertTrue(ORCHESTRATOR.require_d2a_session_revoked(self.context))
+        self.assertTrue(lifecycle_path.is_file())
+
+        self.write_d2a_session_lifecycle(
+            "not_issued", origin="bootstrap", process_group_id=None
+        )
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "current_darwin_boot_identity",
+            side_effect=AssertionError("bootstrap/null must not query the boot identity"),
+        ), mock.patch.object(
+            os,
+            "killpg",
+            side_effect=AssertionError("bootstrap/null must not probe a pgid"),
+        ):
+            self.assertTrue(ORCHESTRATOR.require_d2a_session_revoked(self.context))
+
+    def test_d2a_lifecycle_status_and_nanosecond_timestamps_are_exact(self):
+        def rewrite(**updates):
+            lifecycle = self.write_d2a_session_lifecycle("revoked")
+            value = json.loads(lifecycle.read_text(encoding="utf-8"))
+            value.update(updates)
+            lifecycle.write_text(
+                json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n",
+                encoding="utf-8",
+            )
+
+        cases = (
+            {
+                "status": "not_issued",
+                "session_revoked": True,
+                "revoked_at": None,
+                "quarantined_at": None,
+            },
+            {"started_at": "2026-08-12T00:00:00Z"},
+            {"revoked_at": "2026-08-12T00:00:01.00000000Z"},
+            {"boot_identity": "darwin-boottime:1:1000000"},
+            {
+                "status": "active",
+                "process_group_id": None,
+                "session_revoked": False,
+                "revoked_at": None,
+            },
+            {"process_group_id": None},
+            {
+                "status": "quarantined",
+                "process_group_id": None,
+                "session_revoked": False,
+                "revoked_at": None,
+                "quarantined_at": "2026-08-12T00:00:01.000000000Z",
+            },
+            {
+                "status": "not_issued",
+                "process_group_id": None,
+                "session_revoked": False,
+                "revoked_at": None,
+                "quarantined_at": None,
+            },
+            {
+                "origin": "bootstrap",
+                "status": "active",
+                "process_group_id": None,
+                "session_revoked": False,
+                "revoked_at": None,
+            },
+        )
+        for index, updates in enumerate(cases):
+            with self.subTest(index=index, updates=updates):
+                rewrite(**updates)
+                with self.assertRaisesRegex(
+                    ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+                ):
+                    ORCHESTRATOR.require_d2a_session_revoked(self.context)
+
+    def test_bootstrap_not_issued_prestart_cleanup_closes_no_discord_fence(self):
+        prepared = ORCHESTRATOR.command_prepare(self.context, self.platform)
+        self.assertEqual(prepared["phase"], "prepared")
+        self.write_d2a_session_lifecycle(
+            "not_issued", origin="bootstrap", process_group_id=None
+        )
+        with mock.patch.object(
+            ORCHESTRATOR,
+            "current_darwin_boot_identity",
+            side_effect=AssertionError("bootstrap/null must not query boot identity"),
+        ), mock.patch.object(
+            os,
+            "killpg",
+            side_effect=AssertionError("bootstrap/null must not probe a pgid"),
+        ):
+            result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+        fence = json.loads(
+            ORCHESTRATOR.d2a_teardown_fence_path(self.context).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(fence["status"], "closed")
+        self.assertEqual(self.platform.proxy_deletions, [])
+
+    def test_bootstrap_prestart_teardown_failure_does_not_brick_direct_cleanup(self):
+        prepared = ORCHESTRATOR.command_prepare(self.context, self.platform)
+        self.assertEqual(prepared["phase"], "prepared")
+        self.write_d2a_session_lifecycle(
+            "not_issued", origin="bootstrap", process_group_id=None
+        )
+        with self.assertRaises(ORCHESTRATOR.OrchestratorError):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform
+            )
+        self.assertFalse(
+            ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
+        )
+        self.assertEqual(self.platform.proxy_deletions, [])
+        result = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(result["phase"], "cleaned")
+        fence = json.loads(
+            ORCHESTRATOR.d2a_teardown_fence_path(self.context).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(fence["status"], "closed")
+
+    def test_bootstrap_sentinel_after_candidate_start_uses_full_teardown(self):
+        self.start_candidate_with_discord_resources()
+        self.write_d2a_session_lifecycle(
+            "not_issued", origin="bootstrap", process_group_id=None
+        )
+        torn_down = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform
+        )
+        self.assertEqual(torn_down["status"], "torn_down")
+        self.assertGreater(torn_down["resource_count"], 0)
+        self.assertEqual(
+            json.loads(
+                ORCHESTRATOR.d2a_teardown_fence_path(self.context).read_text(
+                    encoding="utf-8"
+                )
+            )["status"],
+            "closed",
+        )
+        cleaned = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertEqual(cleaned["phase"], "cleaned")
+
+    def test_prestart_cleanup_never_bypasses_for_issuer_terminal_or_mutation_evidence(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        self.write_d2a_session_lifecycle("not_issued")
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+        self.write_d2a_session_lifecycle(
+            "not_issued", origin="bootstrap", process_group_id=None
+        )
+        mutation = self.context.artifact_directory / "transport-evidence"
+        mutation.mkdir(mode=0o700)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_d2a_boot_identity_sysctl_output_contract_is_closed(self):
+        completed = subprocess.CompletedProcess(
+            ["/usr/sbin/sysctl", "-n", "kern.boottime"],
+            0,
+            b"{ sec = 1786435163, usec = 174871 } Tue Aug 11 16:59:23 2026\n",
+            b"",
+        )
+        with mock.patch.object(
+            ORCHESTRATOR, "d2a_sysctl_executable_identity", return_value=(1,)
+        ), mock.patch.object(
+            ORCHESTRATOR.subprocess, "run", return_value=completed
+        ):
+            self.assertEqual(
+                ORCHESTRATOR.current_darwin_boot_identity(),
+                "darwin-boottime:1786435163:174871",
+            )
+
+        for stdout in (
+            b"1786435163\n",
+            b"{ sec = 1786435163, usec = 1000000 } Tue Aug 11 16:59:23 2026\n",
+            completed.stdout + b"extra\n",
+        ):
+            invalid = subprocess.CompletedProcess(completed.args, 0, stdout, b"")
+            with self.subTest(stdout=stdout), mock.patch.object(
+                ORCHESTRATOR, "d2a_sysctl_executable_identity", return_value=(1,)
+            ), mock.patch.object(
+                ORCHESTRATOR.subprocess, "run", return_value=invalid
+            ):
+                with self.assertRaisesRegex(
+                    ORCHESTRATOR.OrchestratorError, "d2a_boot_identity_invalid"
+                ):
+                    ORCHESTRATOR.current_darwin_boot_identity()
+
+    def test_d2a_revoked_teardown_closes_fence_and_replay_remains_closed(self):
+        self.start_candidate_with_discord_resources()
+        self.write_d2a_session_lifecycle("revoked")
+        first = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform
+        )
+        fence_path = ORCHESTRATOR.d2a_teardown_fence_path(self.context)
+        self.assertEqual(json.loads(fence_path.read_bytes())["status"], "closed")
+        replay = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform
+        )
+        self.assertEqual(first["status"], "torn_down")
+        self.assertEqual(replay["status"], "exact_replay")
+        self.assertEqual(json.loads(fence_path.read_bytes())["status"], "closed")
+
+    def test_d2a_teardown_failure_leaves_closing_and_blocks_cleanup(self):
+        self.start_candidate_with_discord_resources()
+        self.write_d2a_session_lifecycle("revoked")
+        self.platform.proxy_failure_resource_id = "1524810437118525560"
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "injected_proxy_delete_failure"
+        ):
+            ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform
+            )
+        fence_path = ORCHESTRATOR.d2a_teardown_fence_path(self.context)
+        self.assertEqual(json.loads(fence_path.read_bytes())["status"], "closing")
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "manual_recovery_required"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
     def test_discord_teardown_partial_failure_resumes_without_redeleting_successes(self):
         self.start_candidate_with_discord_resources()
         self.platform.proxy_failure_resource_id = "1524810437118525560"

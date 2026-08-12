@@ -2963,9 +2963,10 @@ deletion and archive retention are separate reviewed follow-up operations.
 
 This infrastructure cutover and its acceptance record precede, but do not
 replace, D2 and D3. Freeze the final PR head and base, fetch GitHub's generated
-merge candidate through D3 `prepare`, and run the exact ordered 31-command local
+merge candidate through D3 `prepare`, and run the exact ordered 36-command local
 manifest, including the tracked-secret scan, D2 Python coordinator, D3
 self-tests, product-driver Node, standalone certification-transport
+format/test/Clippy, D2A Python and Node tests, D2A session-issuer
 format/test/Clippy, evaluator, workspace, and 13 serial PostgreSQL gates. Any
 missing, added, duplicated, changed, or reordered command invalidates the
 candidate. Only a successful `run-gates` may build and publish the sealed D3

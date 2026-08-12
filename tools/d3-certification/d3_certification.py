@@ -62,6 +62,16 @@ D2_STEP_CODES = (
     "test_resources_torn_down",
     "total_absence_confirmed",
 )
+D2_CERTIFICATION_CLASS = "commercial_human_v1"
+D2_HUMAN_BOUNDARIES = (
+    "create_disposable_discord_guild",
+    "complete_discord_oauth",
+    "confirm_product_preview",
+    "execute_real_discord_interactions",
+    "confirm_replacement_preview",
+    "delete_disposable_discord_guild",
+)
+D2A_TAINT_NAME = "d2a-taint.json"
 REQUIRED_ACTIONS_WORKFLOW = {
     "name": "CI",
     "path": ".github/workflows/ci.yml",
@@ -87,6 +97,11 @@ REQUIRED_GATE_COMMANDS = (
     "cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check",
     "cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml",
     "cargo clippy --locked --manifest-path tools/d2-certification-transport/Cargo.toml --all-targets -- -D warnings",
+    "python3 -m unittest discover -s tools/d2-maintenance -p 'test_*.py'",
+    "node --test tools/d2-maintenance/headless_product_runner.test.mjs",
+    "cargo fmt --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml -- --check",
+    "cargo test --locked --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml",
+    "cargo clippy --locked --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml --all-targets -- -D warnings",
     "cargo test --locked -p automation-ruleset-postgres -- --ignored --test-threads=1",
     "cargo test --locked -p automation-instance-postgres -- --ignored --test-threads=1",
     "cargo test --locked -p automation-panel-installation-postgres -- --ignored --test-threads=1",
@@ -118,6 +133,7 @@ GATE_BOOTSTRAP_DIRECTORIES = (
 )
 GATE_BOOTSTRAP_FILES = (
     "cargo-config.toml",
+    "issuer-cargo-config.toml",
     "native-cargo-config.toml",
     "native-transport-cargo-config.toml",
     "transport-cargo-config.toml",
@@ -125,6 +141,8 @@ GATE_BOOTSTRAP_FILES = (
 GATE_BOOTSTRAP_TEMPORARY_PATHS = (
     ("node-stage/package-lock.json", 0o400),
     ("node-stage/package.json", 0o400),
+    ("issuer-cargo-vendor-config.txt", 0o600),
+    ("issuer-staging-cargo-config.toml", 0o600),
     ("transport-cargo-vendor-config.txt", 0o600),
     ("transport-staging-cargo-config.toml", 0o600),
     ("workspace-cargo-config.toml", 0o600),
@@ -1732,7 +1750,7 @@ def require_gate_bootstrap_layout(bootstrap):
     expected_nested = {
         "bin": {"git", "promptfoo"},
         "node-stage": {"node_modules"},
-        "vendor": {"transport", "workspace"},
+        "vendor": {"issuer", "transport", "workspace"},
     }
     for name, expected_inventory in expected_nested.items():
         try:
@@ -1828,6 +1846,12 @@ def build_gate_bootstrap(root, worktree, runtime, bootstrap, staging):
             0o600,
             64 * 1024,
         )
+        issuer_vendor_raw = read_owned_bytes(
+            staging / "issuer-cargo-vendor-config.txt",
+            "gate_issuer_vendor_configuration",
+            0o600,
+            64 * 1024,
+        )
         workspace_staging_config = composite_vendor_configuration(
             pathlib.Path("/stage/vendor/workspace"),
             pathlib.Path("/stage/vendor/transport"),
@@ -1837,6 +1861,11 @@ def build_gate_bootstrap(root, worktree, runtime, bootstrap, staging):
             pathlib.Path("/stage/vendor/transport"),
             pathlib.Path("/stage/vendor/transport"),
         )
+        issuer_staging_config = normalize_vendor_configuration(
+            issuer_vendor_raw,
+            pathlib.Path("/stage/vendor/issuer"),
+            pathlib.Path("/stage/vendor/issuer"),
+        )
         write_new_file(
             staging / "workspace-cargo-config.toml",
             workspace_staging_config,
@@ -1844,6 +1873,10 @@ def build_gate_bootstrap(root, worktree, runtime, bootstrap, staging):
         write_new_file(
             staging / "transport-staging-cargo-config.toml",
             transport_staging_config,
+        )
+        write_new_file(
+            staging / "issuer-staging-cargo-config.toml",
+            issuer_staging_config,
         )
         gate_container.verify_cargo_vendor(
             root,
@@ -1880,6 +1913,15 @@ def build_gate_bootstrap(root, worktree, runtime, bootstrap, staging):
     write_new_file(
         staging / "transport-cargo-config.toml",
         transport_cargo_config,
+    )
+    issuer_cargo_config = normalize_vendor_configuration(
+        issuer_vendor_raw,
+        pathlib.Path("/stage/vendor/issuer"),
+        pathlib.Path("/vendor/issuer"),
+    )
+    write_new_file(
+        staging / "issuer-cargo-config.toml",
+        issuer_cargo_config,
     )
     native_cargo_config = composite_vendor_configuration(
         bootstrap / "vendor" / "workspace",
@@ -2357,6 +2399,9 @@ def capture_d2_run_identity(manifest_path, run_id, manifest_digest):
     if manifest_path.name != "manifest.json":
         fail("d2_manifest_path_invalid")
     run_directory = manifest_path.parent
+    taint_path = run_directory / D2A_TAINT_NAME
+    if os.path.lexists(taint_path):
+        fail("d2a_run_not_release_eligible")
     directory_before = require_directory(
         run_directory, "d2_run_directory", 0o700
     )
@@ -2430,6 +2475,7 @@ def capture_d2_run_identity(manifest_path, run_id, manifest_digest):
         != d2_metadata_identity(orchestrator_sealed)
         or tree_before != tree_after
         or tree_after != tree_final
+        or os.path.lexists(taint_path)
         or os.path.lexists(retirement_path)
         or os.path.lexists(abort_teardown_path)
     ):
@@ -2498,6 +2544,10 @@ def command_bind_d2(arguments):
         d2_manifest = load_json_file(d2_manifest_path, "d2_manifest", 0o600)
         if not isinstance(d2_manifest, dict):
             fail("d2_manifest_invalid")
+        if d2_manifest.get("certification_class") != D2_CERTIFICATION_CLASS:
+            fail("d2_certification_class_invalid")
+        if d2_manifest.get("human_boundaries") != list(D2_HUMAN_BOUNDARIES):
+            fail("d2_human_boundaries_invalid")
         manifest_digest_path = d2_manifest_path.with_name("manifest.sha256")
         manifest_digest = load_small_ascii(manifest_digest_path, "d2_manifest_digest")
         validate_digest(manifest_digest, "d2_manifest_digest")

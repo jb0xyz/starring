@@ -674,6 +674,42 @@ class D2RunCoordinatorTest(unittest.TestCase):
         path.chmod(0o600)
         return path
 
+    def write_d2a_taint(self):
+        path = d2_run.d2a_taint_path(self.manifest_path)
+        path.write_text(
+            d2_run.canonical_json(
+                {
+                    "schema_version": 1,
+                    "kind": "starring.d2a.run-taint.v1",
+                    "run_id": self.manifest["run_id"],
+                    "manifest_sha256": self.manifest_digest,
+                    "release_eligible": False,
+                    "direct_auth_used": True,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return path
+
+    def test_status_advance_and_verify_reject_d2a_tainted_run(self):
+        self.write_d2a_taint()
+        source = self.direct_source(1, d2_run.ORCHESTRATOR_BOOTSTRAP_KIND)
+        operations = (
+            lambda: d2_run.next_certification_action(self.manifest_path),
+            lambda: d2_run.advance_certification(
+                self.manifest_path, 1, [str(source)]
+            ),
+            lambda: d2_run.verify_certification(self.manifest_path),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                d2_run.CertificationError,
+                "d2a_run_not_release_eligible",
+            ):
+                operation()
+
     def test_status_rejects_candidate_start_retirement(self):
         self.write_candidate_start_retirement()
         with self.assertRaisesRegex(

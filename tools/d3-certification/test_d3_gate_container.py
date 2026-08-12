@@ -103,6 +103,101 @@ class D3GateContainerTests(unittest.TestCase):
         self.assertIn("mode=0700", scratch[0])
         self.assertNotIn(str(MODULE.DOCKER_SOCKET), " ".join(arguments))
 
+    def test_standalone_cargo_gates_use_separate_vendor_configurations(self):
+        expected = {
+            16: "transport-cargo-config.toml",
+            21: "issuer-cargo-config.toml",
+            24: "cargo-config.toml",
+        }
+        for index, filename in expected.items():
+            with self.subTest(index=index):
+                arguments = self.create_arguments(index, "none")
+                mounts = [
+                    arguments[position + 1]
+                    for position, value in enumerate(arguments[:-1])
+                    if value == "--mount"
+                    and "dst=/gate-cargo-config.toml" in arguments[position + 1]
+                ]
+                self.assertEqual(len(mounts), 1)
+                self.assertIn(str(self.bootstrap / filename), mounts[0])
+        self.assertEqual(
+            MODULE.RUNNER_POLICY["ordinary"]["gates"],
+            [[1, 9], [12, 23]],
+        )
+        self.assertEqual(MODULE.RUNNER_POLICY["postgres"]["gates"], [24, 36])
+
+    def test_cargo_bootstrap_binds_all_three_lockfiles_and_vendors(self):
+        observed = []
+
+        def record(arguments, _label, timeout=90, input_bytes=None):
+            observed.append((arguments, timeout, input_bytes))
+            return b"container\n"
+
+        with mock.patch.object(
+            MODULE,
+            "SHARED_ROOT",
+            self.root,
+        ), mock.patch.object(
+            MODULE,
+            "docker_success",
+            side_effect=record,
+        ), mock.patch.object(
+            MODULE,
+            "start_attached_container",
+            return_value=0,
+        ), mock.patch.object(
+            MODULE,
+            "remove_owned_container",
+        ):
+            MODULE.validate_cargo_lock_sources(
+                self.root,
+                self.source,
+                self.image_id,
+            )
+        validator = observed[-1][0]
+        self.assertIn("/workspace/Cargo.lock", validator)
+        self.assertIn(
+            "/workspace/tools/d2-certification-transport/Cargo.lock",
+            validator,
+        )
+        self.assertIn(
+            "/workspace/tools/d2-maintenance/session-issuer/Cargo.lock",
+            validator,
+        )
+
+        calls = []
+        with mock.patch.object(
+            MODULE,
+            "run_bootstrap_cargo_container",
+            side_effect=lambda *arguments: calls.append(arguments),
+        ):
+            MODULE.fetch_cargo_vendor(
+                self.root,
+                self.source,
+                self.bootstrap,
+                self.image_id,
+            )
+            MODULE.verify_cargo_vendor(
+                self.root,
+                self.source,
+                self.bootstrap,
+                self.image_id,
+            )
+        fetch = calls[0][-1]
+        verify = calls[1][-1]
+        self.assertIn("/stage/vendor/transport", fetch)
+        self.assertIn("/stage/vendor/issuer", fetch)
+        self.assertIn(
+            "/workspace/tools/d2-maintenance/session-issuer/Cargo.toml",
+            fetch,
+        )
+        self.assertEqual(verify.count("cargo metadata "), 3)
+        self.assertIn("/stage/issuer-staging-cargo-config.toml", verify)
+        self.assertIn(
+            "/workspace/tools/d2-maintenance/session-issuer/Cargo.toml",
+            verify,
+        )
+
     def test_secret_scan_uses_sealed_git_projection(self):
         secret_scan = self.create_arguments(1, "none")
         ordinary = self.create_arguments(2, "none")
@@ -140,7 +235,7 @@ class D3GateContainerTests(unittest.TestCase):
             11: "npm --prefix eval/design-harness audit --audit-level=high",
             13: "gate-thirteen",
             14: "gate-fourteen",
-            19: "gate-nineteen",
+            24: "gate-twenty-four",
         }
         for index, work in expected_work.items():
             with self.subTest(index=index):
@@ -150,7 +245,7 @@ class D3GateContainerTests(unittest.TestCase):
                         1: "gate-one",
                         13: "gate-thirteen",
                         14: "gate-fourteen",
-                        19: "gate-nineteen",
+                        24: "gate-twenty-four",
                     }.get(index, "unused"),
                 )
                 self.assertEqual(command.count(setup), 1)
@@ -456,6 +551,7 @@ class D3GateContainerTests(unittest.TestCase):
                 MODULE.CARGO_LOCK_VALIDATOR,
                 str(foreign),
                 str(allowed),
+                str(allowed),
                 *MODULE.ALLOWED_CARGO_LOCK_SOURCES,
             ],
             stdout=subprocess.PIPE,
@@ -468,6 +564,7 @@ class D3GateContainerTests(unittest.TestCase):
                 str(interpreter),
                 "-c",
                 MODULE.CARGO_LOCK_VALIDATOR,
+                str(allowed),
                 str(allowed),
                 str(allowed),
                 *MODULE.ALLOWED_CARGO_LOCK_SOURCES,
@@ -647,7 +744,7 @@ class D3GateContainerTests(unittest.TestCase):
 
     def test_database_gate_uses_only_postgres_network_namespace(self):
         network = "container:starring-d3-owned-postgres"
-        arguments = self.create_arguments(19, network)
+        arguments = self.create_arguments(24, network)
         network_index = arguments.index("--network")
         self.assertEqual(arguments[network_index + 1], network)
         self.assertNotIn("--publish", arguments)
@@ -657,12 +754,12 @@ class D3GateContainerTests(unittest.TestCase):
         calls = []
         expected = (
             (
-                MODULE.container_name(self.root, 19, 1, "gate"),
-                MODULE.container_labels(self.root, 19, 1, "gate"),
+                MODULE.container_name(self.root, 24, 1, "gate"),
+                MODULE.container_labels(self.root, 24, 1, "gate"),
             ),
             (
-                MODULE.container_name(self.root, 19, 1, "postgres"),
-                MODULE.container_labels(self.root, 19, 1, "postgres"),
+                MODULE.container_name(self.root, 24, 1, "postgres"),
+                MODULE.container_labels(self.root, 24, 1, "postgres"),
             ),
         )
 
@@ -688,7 +785,7 @@ class D3GateContainerTests(unittest.TestCase):
                     self.source,
                     self.bootstrap,
                     {"image_id": self.image_id},
-                    19,
+                    24,
                     1,
                     "true",
                     30,

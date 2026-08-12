@@ -740,7 +740,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         for name in ("git", "promptfoo"):
             write(bootstrap / "bin" / name, name, 0o555)
         (bootstrap / "node-stage" / "node_modules").mkdir(mode=0o500)
-        for name in ("transport", "workspace"):
+        for name in ("issuer", "transport", "workspace"):
             (bootstrap / "vendor" / name).mkdir(mode=0o500)
         for name in MODULE.GATE_BOOTSTRAP_DIRECTORIES:
             (bootstrap / name).chmod(0o500)
@@ -780,7 +780,7 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             database_url,
         ):
             observed.append(command)
-            database_urls.append(database_url if index > 18 else None)
+            database_urls.append(database_url if index > 23 else None)
             return next(outcomes, 0)
 
         def recording_runner(
@@ -1181,9 +1181,9 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         status, result, error, observed = self.invoke_gate_plan(state_path, gates)
         self.assertEqual(status, 0, error)
         self.assertEqual(observed, list(MODULE.REQUIRED_GATE_COMMANDS))
-        self.assertEqual(self.gate_database_urls[:18], [None] * 18)
+        self.assertEqual(self.gate_database_urls[:23], [None] * 23)
         self.assertEqual(
-            self.gate_database_urls[18:],
+            self.gate_database_urls[23:],
             [self.postgres_database_url] * 13,
         )
         self.assertEqual(result["gates"], len(MODULE.REQUIRED_GATE_COMMANDS))
@@ -1289,6 +1289,11 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 "cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check",
                 "cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml",
                 "cargo clippy --locked --manifest-path tools/d2-certification-transport/Cargo.toml --all-targets -- -D warnings",
+                "python3 -m unittest discover -s tools/d2-maintenance -p 'test_*.py'",
+                "node --test tools/d2-maintenance/headless_product_runner.test.mjs",
+                "cargo fmt --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml -- --check",
+                "cargo test --locked --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml",
+                "cargo clippy --locked --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml --all-targets -- -D warnings",
                 "cargo test --locked -p automation-ruleset-postgres -- --ignored --test-threads=1",
                 "cargo test --locked -p automation-instance-postgres -- --ignored --test-threads=1",
                 "cargo test --locked -p automation-panel-installation-postgres -- --ignored --test-threads=1",
@@ -1326,6 +1331,11 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             "cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check",
             "cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml",
             "cargo clippy --locked --manifest-path tools/d2-certification-transport/Cargo.toml --all-targets -- -D warnings",
+            "python3 -m unittest discover -s tools/d2-maintenance -p 'test_*.py'",
+            "node --test tools/d2-maintenance/headless_product_runner.test.mjs",
+            "cargo fmt --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml -- --check",
+            "cargo test --locked --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml",
+            "cargo clippy --locked --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml --all-targets -- -D warnings",
         )
         required = list(MODULE.REQUIRED_GATE_COMMANDS)
         for command in standalone:
@@ -2461,6 +2471,8 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             }
         manifest = {
             "schema_version": 1,
+            "certification_class": MODULE.D2_CERTIFICATION_CLASS,
+            "human_boundaries": list(MODULE.D2_HUMAN_BOUNDARIES),
             "run_id": "d2-20260804t120000z-123456789abc",
             "commit_sha": state["merge_commit"],
             "discord": {"resource_prefix": "d2-123456789abc"},
@@ -2586,6 +2598,109 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(status, 1)
         self.assertIn("d2_receipt_sequence_invalid", error)
         self.assertEqual(gates, list(MODULE.REQUIRED_GATE_COMMANDS))
+
+    def test_d2_binding_requires_commercial_human_certification_contract(self):
+        state_path, _, _ = self.prepare()
+        manifest_path, final_path = self.make_d2(state_path)
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            list(MODULE.D2_HUMAN_BOUNDARIES),
+            [
+                "create_disposable_discord_guild",
+                "complete_discord_oauth",
+                "confirm_product_preview",
+                "execute_real_discord_interactions",
+                "confirm_replacement_preview",
+                "delete_disposable_discord_guild",
+            ],
+        )
+        mutations = (
+            (
+                "wrong_class",
+                lambda value: value.__setitem__(
+                    "certification_class", "automated_integration_v1"
+                ),
+                "d2_certification_class_invalid",
+            ),
+            (
+                "missing_class",
+                lambda value: value.pop("certification_class"),
+                "d2_certification_class_invalid",
+            ),
+            (
+                "reordered_boundaries",
+                lambda value: value.__setitem__(
+                    "human_boundaries", list(reversed(MODULE.D2_HUMAN_BOUNDARIES))
+                ),
+                "d2_human_boundaries_invalid",
+            ),
+            (
+                "extra_boundary",
+                lambda value: value["human_boundaries"].append("automated_login"),
+                "d2_human_boundaries_invalid",
+            ),
+            (
+                "missing_boundary",
+                lambda value: value["human_boundaries"].remove(
+                    "confirm_replacement_preview"
+                ),
+                "d2_human_boundaries_invalid",
+            ),
+        )
+        for label, mutation, expected_error in mutations:
+            with self.subTest(label=label):
+                replacement = json.loads(json.dumps(original))
+                mutation(replacement)
+                self.rewrite_d2_manifest(
+                    manifest_path,
+                    lambda value, replacement=replacement: (
+                        value.clear(),
+                        value.update(replacement),
+                    ),
+                )
+                status, _, error = self.invoke(
+                    [
+                        "bind-d2",
+                        "--state",
+                        str(state_path),
+                        "--d2-manifest",
+                        str(manifest_path),
+                        "--d2-final-record",
+                        str(final_path),
+                    ]
+                )
+                self.assertEqual(status, 1)
+                self.assertIn(expected_error, error)
+
+    def test_d2_binding_rejects_direct_auth_tainted_commercial_run(self):
+        state_path, _, _ = self.prepare()
+        manifest_path, final_path = self.make_d2(state_path)
+        write(
+            manifest_path.with_name(MODULE.D2A_TAINT_NAME),
+            MODULE.canonical_json(
+                {
+                    "schema_version": 1,
+                    "kind": "starring.d2a.run-taint.v1",
+                    "release_eligible": False,
+                    "direct_auth_used": True,
+                }
+            )
+            + "\n",
+            0o600,
+        )
+        status, _, error = self.invoke(
+            [
+                "bind-d2",
+                "--state",
+                str(state_path),
+                "--d2-manifest",
+                str(manifest_path),
+                "--d2-final-record",
+                str(final_path),
+            ]
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("d2a_run_not_release_eligible", error)
 
     def test_d2_binding_rejects_bound_run_tree_drift(self):
         state_path, _, _ = self.prepare()
@@ -2884,6 +2999,27 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         self.assertEqual(self.invoke(["recheck", "--state", str(state_path)])[0], 0)
         return state_path
 
+    def write_bound_d2a_taint(self, state_path):
+        binding = json.loads(
+            state_path.with_name("d2-binding.json").read_text(encoding="utf-8")
+        )
+        manifest_path = pathlib.Path(binding["d2_manifest_path"])
+        taint_path = manifest_path.with_name(MODULE.D2A_TAINT_NAME)
+        write(
+            taint_path,
+            MODULE.canonical_json(
+                {
+                    "schema_version": 1,
+                    "kind": "starring.d2a.run-taint.v1",
+                    "release_eligible": False,
+                    "direct_auth_used": True,
+                }
+            )
+            + "\n",
+            0o600,
+        )
+        return taint_path
+
     def test_recheck_detects_base_movement(self):
         state_path = self.complete_prerequisites()
         write(self.seed / "new.txt", "new\n")
@@ -2933,6 +3069,18 @@ print(json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
         status, _, error = self.invoke(self.finalize_arguments(state_path))
         self.assertEqual(status, 1)
         self.assertIn("candidate_start_transition_retirement_required", error)
+
+    def test_recheck_and_finalize_reject_post_binding_d2a_taint(self):
+        state_path = self.complete_prerequisites()
+        self.write_bound_d2a_taint(state_path)
+        for arguments in (
+            ["recheck", "--state", str(state_path)],
+            self.finalize_arguments(state_path),
+        ):
+            with self.subTest(command=arguments[0]):
+                status, _, error = self.invoke(arguments)
+                self.assertEqual(status, 1)
+                self.assertEqual(error.strip(), "d2a_run_not_release_eligible")
 
     def test_recheck_and_finalize_reject_post_binding_abort_teardown(self):
         state_path = self.complete_prerequisites()
@@ -3297,6 +3445,22 @@ print(json.dumps(responses[endpoint]))
             status, _, error = self.invoke(arguments)
             self.assertEqual(status, 1)
             self.assertIn("final_record_mismatch", error)
+        finally:
+            os.environ["PATH"] = self.previous_path
+
+    def test_terminal_finalize_replay_rejects_post_final_d2a_taint(self):
+        state_path = self.complete_prerequisites()
+        git(self.seed, "push", "origin", f"{self.merge}:refs/heads/main")
+        self.install_fake_gh(self.merge)
+        try:
+            arguments = self.finalize_arguments(state_path)
+            status, result, error = self.invoke(arguments)
+            self.assertEqual(status, 0, error)
+            self.assertEqual(result["disposition"], "created")
+            self.write_bound_d2a_taint(state_path)
+            status, _, error = self.invoke(arguments)
+            self.assertEqual(status, 1)
+            self.assertEqual(error.strip(), "d2a_run_not_release_eligible")
         finally:
             os.environ["PATH"] = self.previous_path
 

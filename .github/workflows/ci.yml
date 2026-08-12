@@ -57,6 +57,16 @@ jobs:
           cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check
           cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml
           cargo clippy --locked --manifest-path tools/d2-certification-transport/Cargo.toml --all-targets -- -D warnings
+      - name: Test D2 automated maintenance controller
+        run: python3 -m unittest discover -s tools/d2-maintenance -p 'test_*.py'
+      - name: Test D2 automated maintenance runner
+        run: node --test tools/d2-maintenance/headless_product_runner.test.mjs
+      - name: Check D2 automated session issuer formatting
+        run: cargo fmt --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml -- --check
+      - name: Test D2 automated session issuer
+        run: cargo test --locked --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml
+      - name: Lint D2 automated session issuer
+        run: cargo clippy --locked --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml --all-targets -- -D warnings
       - name: Check Codex worker
         run: npm --prefix tools/codex-worker run check
       - name: Test Codex worker

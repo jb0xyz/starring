@@ -589,6 +589,13 @@ class D2CertificationTest(unittest.TestCase):
     def test_prepare_derives_isolated_names_and_hashes_without_mutating_staging(self):
         manifest_path = self.prepare()
         manifest = json.loads(manifest_path.read_text())
+        self.assertEqual(set(manifest), MODULE.D2_MANIFEST_FIELDS)
+        self.assertEqual(
+            manifest["certification_class"], MODULE.D2_CERTIFICATION_CLASS
+        )
+        self.assertEqual(
+            manifest["human_boundaries"], list(MODULE.D2_HUMAN_BOUNDARIES)
+        )
         self.assertEqual(manifest["run_id"], RUN_ID)
         self.assertEqual(manifest["protected_staging"]["mutation_allowed"], False)
         self.assertEqual(
@@ -621,6 +628,22 @@ class D2CertificationTest(unittest.TestCase):
         )
         self.assertEqual(oct(manifest_path.stat().st_mode & 0o777), "0o600")
         self.assertEqual(oct(manifest_path.parent.stat().st_mode & 0o777), "0o700")
+
+    def test_manifest_boundaries_match_the_full_commercial_lifecycle(self):
+        expected = [
+            "create_disposable_discord_guild",
+            "complete_discord_oauth",
+            "confirm_product_preview",
+            "execute_real_discord_interactions",
+            "confirm_replacement_preview",
+            "delete_disposable_discord_guild",
+        ]
+        self.assertEqual(list(MODULE.D2_HUMAN_BOUNDARIES), expected)
+        self.assertEqual(
+            expected,
+            ["create_disposable_discord_guild"]
+            + list(RUN_MODULE.HUMAN_BOUNDARIES.values()),
+        )
 
     def test_transport_inventory_prunes_the_build_target(self):
         root = self.root / "transport-inventory"
@@ -1091,6 +1114,56 @@ class D2CertificationTest(unittest.TestCase):
             MODULE.CertificationError, "manifest_candidate_api_invalid"
         ):
             MODULE.validate_manifest(manifest)
+
+    def test_manifest_requires_commercial_human_class_and_exact_boundaries(self):
+        manifest_path = self.prepare()
+        original = json.loads(manifest_path.read_text(encoding="utf-8"))
+        mutations = (
+            (
+                "missing_class",
+                lambda value: value.pop("certification_class"),
+                "manifest_certification_class_invalid",
+            ),
+            (
+                "wrong_class",
+                lambda value: value.__setitem__(
+                    "certification_class", "automated_integration_v1"
+                ),
+                "manifest_certification_class_invalid",
+            ),
+            (
+                "reordered_boundaries",
+                lambda value: value.__setitem__(
+                    "human_boundaries", list(reversed(MODULE.D2_HUMAN_BOUNDARIES))
+                ),
+                "manifest_human_boundaries_invalid",
+            ),
+            (
+                "extra_boundary",
+                lambda value: value["human_boundaries"].append("automated_login"),
+                "manifest_human_boundaries_invalid",
+            ),
+            (
+                "missing_boundary",
+                lambda value: value["human_boundaries"].remove(
+                    "confirm_product_preview"
+                ),
+                "manifest_human_boundaries_invalid",
+            ),
+            (
+                "extra_top_level_field",
+                lambda value: value.__setitem__("test_authentication", True),
+                "manifest_fields_invalid",
+            ),
+        )
+        for label, mutation, expected_error in mutations:
+            with self.subTest(label=label):
+                manifest = copy.deepcopy(original)
+                mutation(manifest)
+                with self.assertRaisesRegex(
+                    MODULE.CertificationError, expected_error
+                ):
+                    MODULE.validate_manifest(manifest)
 
     def test_manifest_requires_the_exact_pinned_hub_channel_shape(self):
         manifest_path = self.prepare()

@@ -89,6 +89,37 @@ REQUIRED_PORTS = {
     "transport_gateway",
     "transport_http",
 }
+D2_CERTIFICATION_CLASS = "commercial_human_v1"
+D2_HUMAN_BOUNDARIES = (
+    "create_disposable_discord_guild",
+    "complete_discord_oauth",
+    "confirm_product_preview",
+    "execute_real_discord_interactions",
+    "confirm_replacement_preview",
+    "delete_disposable_discord_guild",
+)
+D2_MANIFEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "certification_class",
+        "run_id",
+        "created_at",
+        "commit_sha",
+        "authoring",
+        "public_origin",
+        "cloudflare",
+        "candidates",
+        "source_trees",
+        "database",
+        "discord",
+        "services",
+        "keychain_services",
+        "external_keychain",
+        "protected_staging",
+        "human_boundaries",
+        "expected_steps",
+    }
+)
 
 
 def isolated_runtime_root(run_id):
@@ -867,6 +898,7 @@ def build_manifest(arguments):
     validate_certification_transport_inventory(transport_root)
     return {
         "schema_version": SCHEMA_VERSION,
+        "certification_class": D2_CERTIFICATION_CLASS,
         "run_id": run_id,
         "created_at": datetime.datetime.now(datetime.timezone.utc)
         .replace(microsecond=0)
@@ -946,12 +978,7 @@ def build_manifest(arguments):
             ],
             "mutation_allowed": False,
         },
-        "human_boundaries": [
-            "create_disposable_discord_guild",
-            "complete_discord_oauth",
-            "execute_real_discord_interactions",
-            "delete_disposable_discord_guild",
-        ],
+        "human_boundaries": list(D2_HUMAN_BOUNDARIES),
         "expected_steps": [
             {"step": number, "code": specification.code}
             for number, specification in STEP_SPECS.items()
@@ -1004,6 +1031,12 @@ def load_json_file(path, label, allow_empty=False):
 def validate_manifest(manifest):
     if not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA_VERSION:
         fail("manifest_schema_invalid")
+    if manifest.get("certification_class") != D2_CERTIFICATION_CLASS:
+        fail("manifest_certification_class_invalid")
+    if manifest.get("human_boundaries") != list(D2_HUMAN_BOUNDARIES):
+        fail("manifest_human_boundaries_invalid")
+    if set(manifest) != D2_MANIFEST_FIELDS:
+        fail("manifest_fields_invalid")
     validate_run_id(manifest.get("run_id", ""))
     validate_commit(manifest.get("commit_sha", ""))
     if manifest.get("authoring") != AUTHORING_CONFIG:

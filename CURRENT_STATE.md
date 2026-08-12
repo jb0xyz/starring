@@ -752,8 +752,8 @@ The current source inventory is exact at this checkpoint:
 | Crate manifests | 48 under `crates/` |
 | Workspace Rust tool manifests | 10 under `tools/` |
 | Workspace members | 58 |
-| Total Rust tool manifests | 11, including standalone `d2-certification-transport` |
-| Top-level tool directories | 15 |
+| Total Rust tool manifests | 12, including standalone `d2-certification-transport` and D2A `session-issuer` |
+| Top-level tool directories | 16 |
 | SQL migrations | 125 |
 | Migration head | `202608040004_refresh_serving_pending_product_drain_readiness_v1.sql` |
 | Owned user-schema relations | 198 |
@@ -765,14 +765,15 @@ The current source inventory is exact at this checkpoint:
 | Purpose-separated keyrings | 3 |
 | Final integrated HBA | 15 ordered rules |
 | PostgreSQL release commands | 13 explicit serial suites |
-| D3 ordered local gate commands | 31 exact commands before D2 preparation and evidence binding |
+| D3 ordered local gate commands | 36 exact commands before D2 preparation and evidence binding |
 | D2 Keychain boundary | 29 run-owned items plus 3 external read-only items |
 
 This is an implementation and inventory statement, not a Backend V1 release
 certificate. D3 must first `prepare` against GitHub's exact merge-candidate tree
-and pass the immutable 31-command manifest, including the tracked-secret scan,
+and pass the immutable 36-command manifest, including the tracked-secret scan,
 complete local, Node, evaluator, D2 and D3 Python, product-driver Node,
-standalone certification-transport, and 13 serial PostgreSQL gates. Only then
+standalone certification-transport, D2A controller/runner/session-issuer, and
+13 serial PostgreSQL gates. Only then
 may `run-gates` publish the sealed `candidate-bundle`. D2 preparation must use
 the pinned D3 merge commit and the exact API, runtime, database-bootstrap,
 sealed-provisioner, certification-transport, and Codex-worker artifacts from
@@ -1032,7 +1033,7 @@ green. D2 and D3 remain required.
 The accepted next sequence is:
 
 1. **Phase D — Backend V1 certification:** D3-prepare the exact merge candidate,
-   pass all 31 gates and publish its sealed bundle, run and bind the 17-step D2
+   pass all 36 gates and publish its sealed bundle, run and bind the 17-step D2
    disposable-guild E2E from only that bundle, then complete recheck, review,
    merge, exact merged-main CI, finalization, and source-of-truth/runbook
    closure.

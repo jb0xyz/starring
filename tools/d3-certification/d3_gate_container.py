@@ -44,9 +44,9 @@ ALLOWED_CARGO_LOCK_SOURCES = (
 )
 CARGO_LOCK_VALIDATOR = (
     "import pathlib,sys,tomllib\n"
-    "allowed=set(sys.argv[3:])\n"
+    "allowed=set(sys.argv[4:])\n"
     "observed=[]\n"
-    "for raw in sys.argv[1:3]:\n"
+    "for raw in sys.argv[1:4]:\n"
     " p=pathlib.Path(raw)\n"
     " if not p.is_file() or p.is_symlink() or p.stat().st_size>8388608: sys.exit(20)\n"
     " with p.open('rb') as handle: value=tomllib.load(handle)\n"
@@ -133,7 +133,7 @@ RUNNER_POLICY = {
         "cargo_target": f"owned-gate-attempt-disposable-tmpfs-volume:{GATE_TARGET_SIZE}",
     },
     "ordinary": {
-        "gates": [[1, 9], [12, 18]],
+        "gates": [[1, 9], [12, 23]],
         "network": "none",
         "read_only_mounts": [
             "/workspace",
@@ -173,7 +173,7 @@ RUNNER_POLICY = {
         ),
     },
     "postgres": {
-        "gates": [19, 31],
+        "gates": [24, 36],
         "server_network": "none",
         "gate_network": "container:postgres",
         "published_ports": False,
@@ -712,6 +712,7 @@ def validate_cargo_lock_sources(root, worktree, image_id):
             CARGO_LOCK_VALIDATOR,
             "/workspace/Cargo.lock",
             "/workspace/tools/d2-certification-transport/Cargo.lock",
+            "/workspace/tools/d2-maintenance/session-issuer/Cargo.lock",
             *ALLOWED_CARGO_LOCK_SOURCES,
         )
     )
@@ -799,11 +800,14 @@ def fetch_cargo_vendor(root, worktree, staging, image_id):
         "bridge",
         (
             "umask 077 && mkdir -p /stage/vendor/workspace "
-            "/stage/vendor/transport && "
+            "/stage/vendor/transport /stage/vendor/issuer && "
             "cargo fetch --locked --manifest-path /workspace/Cargo.toml && "
             "cargo vendor --locked --manifest-path "
             "/workspace/tools/d2-certification-transport/Cargo.toml "
-            "/stage/vendor/transport > /stage/transport-cargo-vendor-config.txt"
+            "/stage/vendor/transport > /stage/transport-cargo-vendor-config.txt && "
+            "cargo vendor --locked --manifest-path "
+            "/workspace/tools/d2-maintenance/session-issuer/Cargo.toml "
+            "/stage/vendor/issuer > /stage/issuer-cargo-vendor-config.txt"
         ),
     )
 
@@ -844,7 +848,10 @@ def verify_cargo_vendor(root, worktree, staging, image_id):
             "--manifest-path /workspace/Cargo.toml >/dev/null && "
             "cargo metadata --config /stage/transport-staging-cargo-config.toml "
             "--locked --offline --format-version=1 --manifest-path "
-            "/workspace/tools/d2-certification-transport/Cargo.toml >/dev/null"
+            "/workspace/tools/d2-certification-transport/Cargo.toml >/dev/null && "
+            "cargo metadata --config /stage/issuer-staging-cargo-config.toml "
+            "--locked --offline --format-version=1 --manifest-path "
+            "/workspace/tools/d2-maintenance/session-issuer/Cargo.toml >/dev/null"
         ),
     )
 
@@ -1257,6 +1264,8 @@ def create_gate_container(
                     / (
                         "transport-cargo-config.toml"
                         if 16 <= index <= 18
+                        else "issuer-cargo-config.toml"
+                        if 21 <= index <= 23
                         else "cargo-config.toml"
                     ),
                     "/gate-cargo-config.toml",
@@ -1348,7 +1357,7 @@ def run_gate(root, source, bootstrap, runtime, index, attempt, command, timeout,
     try:
         selected_database_url = None
         network = "bridge" if index == 11 else "none"
-        if index > 18:
+        if index > 23:
             postgres = start_postgres(root, index, attempt, database_url)
             network = f"container:{postgres_name}"
             selected_database_url = postgres[2]

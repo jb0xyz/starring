@@ -1259,9 +1259,10 @@ Acceptance:
 ### Task D2: Run the final disposable-guild product E2E
 
 Execution begins only after Task D3 `prepare` has pinned GitHub's generated
-merge candidate and `run-gates` has passed all 31 commands and published its
-sealed `candidate-bundle`. Prepare D2 with that exact D3 `merge_commit` and only
-the bundle's API, runtime, database-bootstrap, sealed-provisioner,
+merge candidate and `run-gates` has passed all 36 commands, including the D2A
+Python and Node tests plus issuer format, test, and Clippy gates, and published
+its sealed `candidate-bundle`. Prepare D2 with that exact D3 `merge_commit` and
+only the bundle's API, runtime, database-bootstrap, sealed-provisioner,
 certification-transport, and Codex-worker artifacts. D2 must not manually build,
 discover, or substitute candidate artifacts.
 
@@ -1332,7 +1333,7 @@ Evidence excludes:
 
 Create the final PR, update it onto the current main base, fetch the
 GitHub-generated merge candidate, and record its commit and tree identities.
-Use D3 `prepare`, then run the complete 31-command local and PostgreSQL manifest
+Use D3 `prepare`, then run the complete 36-command local and PostgreSQL manifest
 on that exact detached merge-candidate checkout:
 
 ```sh
@@ -1354,10 +1355,15 @@ node --test tools/d2-certification/product_driver.test.mjs
 cargo fmt --manifest-path tools/d2-certification-transport/Cargo.toml -- --check
 cargo test --locked --manifest-path tools/d2-certification-transport/Cargo.toml
 cargo clippy --locked --manifest-path tools/d2-certification-transport/Cargo.toml --all-targets -- -D warnings
+python3 -m unittest discover -s tools/d2-maintenance -p 'test_*.py'
+node --test tools/d2-maintenance/headless_product_runner.test.mjs
+cargo fmt --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml -- --check
+cargo test --locked --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml
+cargo clippy --locked --manifest-path tools/d2-maintenance/session-issuer/Cargo.toml --all-targets -- -D warnings
 ```
 
-These eighteen commands and the thirteen serial PostgreSQL commands below form
-one exact ordered 31-command D3 manifest. The manifest is immutable: a missing,
+These twenty-three commands and the thirteen serial PostgreSQL commands below
+form one exact ordered 36-command D3 manifest. The manifest is immutable: a missing,
 added, duplicated, changed, or reordered command fails certification. The
 release origin must also be a canonical `github.com` HTTPS or SSH repository
 whose owner and repository exactly match the D3 invocation.
@@ -1386,12 +1392,12 @@ storage, effect journals, and recovery belong to
 `automation-runtime-interaction-postgres`. If implementation creates a new
 standalone PostgreSQL test target, add its exact command to this manifest.
 
-Update `.github/workflows/ci.yml` so the first 18 commands are required in the
+Update `.github/workflows/ci.yml` so the first 23 commands are required in the
 `checks` job and the 13 PostgreSQL commands are required serially in the
 `postgres` job. Do not rely on an undocumented wildcard or prose claim that
 every integration test ran.
 
-All 31 commands must pass before `run-gates` builds and publishes its sealed
+All 36 commands must pass before `run-gates` builds and publishes its sealed
 `candidate-bundle`. Task D2 then prepares and executes its 17-step cohort using
 only that exact bundle and pinned D3 merge commit. After the completed D2 run is
 verified, D3 `bind-d2` must bind the exact D2 manifest, final record, receipt

@@ -68,6 +68,7 @@ PREFIX_SCAN_KIND = "starring.d2.browser-discord-resource-prefix-scan-evidence.v1
 GUILD_DELETION_KIND = (
     "starring.d2.browser-discord-guild-deletion-evidence.v1"
 )
+D2A_TAINT_NAME = "d2a-taint.json"
 DISCORD_RECONCILIATION_OBSERVATION_KIND = (
     "starring.d2.discord-reconciliation-role-observation.v1"
 )
@@ -191,6 +192,15 @@ def candidate_start_retirement_path(manifest_path):
 
 def abort_teardown_tombstone_path(manifest_path):
     return pathlib.Path(manifest_path).parent / "orchestrator" / "discord-resource-teardown-abort.json"
+
+
+def d2a_taint_path(manifest_path):
+    return pathlib.Path(manifest_path).parent / D2A_TAINT_NAME
+
+
+def require_commercial_run_untainted(manifest_path):
+    if os.path.lexists(d2a_taint_path(manifest_path)):
+        fail("d2a_run_not_release_eligible")
 
 
 def require_candidate_start_not_retired(manifest_path):
@@ -901,9 +911,11 @@ def coordinator_pending_step(manifest_path, manifest, digest, receipts):
 
 def next_certification_action(manifest_path):
     verified_path, manifest, digest = load_verified_manifest(manifest_path)
+    require_commercial_run_untainted(verified_path)
     require_candidate_start_not_retired(verified_path)
     preview_challenge = None
     with coordinator_lock(verified_path, False):
+        require_commercial_run_untainted(verified_path)
         require_candidate_start_not_retired(verified_path)
         receipts = load_receipts(verified_path, manifest, digest)
         pending_step = coordinator_pending_step(
@@ -932,6 +944,7 @@ def next_certification_action(manifest_path):
                 manifest, digest, completion
             )
         require_candidate_start_not_retired(verified_path)
+        require_commercial_run_untainted(verified_path)
     completed_steps = len(receipts)
     chain_head = ZERO_DIGEST if not receipts else receipts[-1]["receipt_sha256"]
     base = {
@@ -984,10 +997,12 @@ def next_certification_action(manifest_path):
 
 def advance_certification(manifest_path, step, raw_sources):
     verified_path, manifest, digest = load_verified_manifest(manifest_path)
+    require_commercial_run_untainted(verified_path)
     require_candidate_start_not_retired(verified_path)
     if step not in STEP_SPECS:
         fail("coordinator_step_invalid")
     with coordinator_lock(verified_path, True):
+        require_commercial_run_untainted(verified_path)
         require_candidate_start_not_retired(verified_path)
         receipts = load_receipts(verified_path, manifest, digest)
         completed_steps = len(receipts)
@@ -1099,6 +1114,7 @@ def advance_certification(manifest_path, step, raw_sources):
         else:
             write_private_json(completion_path, completion)
         require_candidate_start_not_retired(verified_path)
+        require_commercial_run_untainted(verified_path)
         return {
             "schema_version": SCHEMA_VERSION,
             "kind": "starring.d2.certification-advance-result.v1",
@@ -1114,8 +1130,10 @@ def advance_certification(manifest_path, step, raw_sources):
 
 def verify_certification(manifest_path):
     verified_path, manifest, digest = load_verified_manifest(manifest_path)
+    require_commercial_run_untainted(verified_path)
     require_candidate_start_not_retired(verified_path)
     with coordinator_lock(verified_path, False):
+        require_commercial_run_untainted(verified_path)
         require_candidate_start_not_retired(verified_path)
         receipts = load_receipts(verified_path, manifest, digest)
         pending_step = coordinator_pending_step(
@@ -1184,7 +1202,9 @@ def verify_certification(manifest_path):
             COORDINATOR_LEDGER_DOMAIN + canonical_json(ledger).encode("utf-8")
         )
         require_candidate_start_not_retired(verified_path)
+        require_commercial_run_untainted(verified_path)
     require_candidate_start_not_retired(verified_path)
+    require_commercial_run_untainted(verified_path)
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": COORDINATOR_FINAL_KIND,
