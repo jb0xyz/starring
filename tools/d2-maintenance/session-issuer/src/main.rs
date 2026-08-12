@@ -35,6 +35,9 @@ const DISCORD_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(13);
 const MAX_ONBOARDING_OUTPUT_BYTES: usize = 16 * 1024;
 const MAX_PROVISIONER_STDERR_BYTES: usize = 256;
 const MAX_DISCORD_OUTPUT_BYTES: usize = 20 * 1024;
+const MAX_RUNNER_ERROR_BYTES: usize = 4 * 1024;
+const RUNNER_ERROR_KIND: &str = "starring.d2a.runner-error.v1";
+const ISSUER_COMMAND_ERROR_KIND: &str = "starring.d2a.issuer-command-error.v1";
 
 type CreatedFlowRow = (
     String,
@@ -85,6 +88,58 @@ struct Capture {
     exceeded: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunnerFailureCategory {
+    DependencyTimeout,
+    DependencyUnavailable,
+    ProductRequestFailed,
+}
+
+impl RunnerFailureCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DependencyTimeout => "dependency_timeout",
+            Self::DependencyUnavailable => "dependency_unavailable",
+            Self::ProductRequestFailed => "product_request_failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RunnerFailure {
+    operation: Operation,
+    category: RunnerFailureCategory,
+}
+
+#[derive(Debug)]
+enum IssuerCommandError {
+    Issuer(IssuerError),
+    Runner(RunnerFailure),
+}
+
+impl From<IssuerError> for IssuerCommandError {
+    fn from(error: IssuerError) -> Self {
+        Self::Issuer(error)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunnerErrorEnvelope {
+    error_code: String,
+    kind: String,
+    ok: bool,
+    schema_version: u8,
+}
+
+#[derive(Serialize)]
+struct IssuerCommandErrorEnvelope<'a> {
+    error_code: &'a str,
+    kind: &'static str,
+    operation: &'static str,
+    schema_version: u8,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SealedOnboardingOutput {
@@ -110,26 +165,34 @@ impl ConfirmedRevocationMarker for SessionLifecycle {
     }
 }
 
-fn finish_after_confirmed_revocation<T, M>(
+fn finish_after_confirmed_revocation<T, E, M>(
     marker: &mut M,
-    operation_result: Result<T, IssuerError>,
-) -> Result<T, IssuerError>
+    operation_result: Result<T, E>,
+) -> Result<T, E>
 where
     M: ConfirmedRevocationMarker,
+    E: From<IssuerError>,
 {
-    marker.confirm_revoked()?;
+    marker.confirm_revoked().map_err(E::from)?;
     operation_result
 }
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("error: {error}");
-        std::process::exit(1);
+    match run().await {
+        Ok(()) => {}
+        Err(IssuerCommandError::Runner(failure)) => {
+            println!("{}", issuer_command_error_json(failure));
+            std::process::exit(1);
+        }
+        Err(IssuerCommandError::Issuer(error)) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
-async fn run() -> Result<(), IssuerError> {
+async fn run() -> Result<(), IssuerCommandError> {
     let arguments = parse_arguments(std::env::args().skip(1))?;
     // The controller must launch this issuer with a new process group and session.  Check
     // before any Keychain value, generated credential, or product session can enter memory.
@@ -163,7 +226,7 @@ async fn run_locked_operation(
     run: &ValidatedRun,
     arguments: Arguments,
     session_lifecycle: &mut SessionLifecycle,
-) -> Result<(), IssuerError> {
+) -> Result<(), IssuerCommandError> {
     if arguments.operation == Operation::DirectOnboard {
         require_d2a_taint(run)?;
         reject_commercial_onboarding_artifacts(run)?;
@@ -175,7 +238,8 @@ async fn run_locked_operation(
                 .ok_or(IssuerError::ArgumentsInvalid)?,
             session_lifecycle,
         )
-        .await;
+        .await
+        .map_err(IssuerCommandError::from);
     }
     require_direct_onboarding_evidence(run)?;
     validate_child_command(run, &arguments.child)?;
@@ -228,11 +292,11 @@ async fn run_locked_operation(
         terminate.recv(),
     )
     .await;
-    let raw_evidence = match lifecycle {
-        LifecycleDisposition::Completed(result) => result?,
+    let child_result = match lifecycle {
+        LifecycleDisposition::Completed(result) => result,
         LifecycleDisposition::Interrupted => {
             if !session_lifecycle.issuance_attempted() {
-                return Err(IssuerError::ChildInterrupted);
+                return Err(IssuerError::ChildInterrupted.into());
             }
             // The signal can race any issuance query or commit acknowledgement. Reconcile
             // with the run-scoped revoker; a confirmed result is safe even though the
@@ -240,10 +304,15 @@ async fn run_locked_operation(
             revoke_session_with_retry(run, &credentials.security, &session_digest, None).await?;
             return finish_after_confirmed_revocation(
                 session_lifecycle,
-                Err(IssuerError::ChildInterrupted),
+                Err(IssuerCommandError::from(IssuerError::ChildInterrupted)),
             );
         }
     };
+    // The runner and its product driver are sealed before spawn. Rehash both again after
+    // mandatory revocation and before either success evidence or a safe failure category can
+    // leave this process, so an in-flight replacement cannot forge the diagnostic boundary.
+    validate_child_command(run, &arguments.child)?;
+    let raw_evidence = child_result?;
 
     let oauth_redactions = credentials.oauth.redaction_values();
     let issuer_redactions = credentials.issuer.redaction_values();
@@ -365,7 +434,7 @@ async fn issue_run_and_revoke(
     child: &[String],
     session_lifecycle: &mut SessionLifecycle,
     child_input: ChildInput<'_>,
-) -> Result<Vec<u8>, IssuerError> {
+) -> Result<Vec<u8>, IssuerCommandError> {
     // From this exact boundary onward an acknowledgement failure may hide a committed
     // session, so every error requires either confirmed revocation or quarantine.
     session_lifecycle.mark_issuance_attempted()?;
@@ -387,13 +456,17 @@ async fn issue_run_and_revoke(
             return match revoke_session_with_retry(run, &credentials.security, session_digest, None)
                 .await
             {
-                Ok(()) => finish_after_confirmed_revocation(session_lifecycle, Err(error)),
-                Err(revocation_error) => Err(revocation_error),
+                Ok(()) => finish_after_confirmed_revocation(
+                    session_lifecycle,
+                    Err(IssuerCommandError::from(error)),
+                ),
+                Err(revocation_error) => Err(revocation_error.into()),
             };
         }
     };
 
-    let child_result = run_child(child, child_input).await;
+    let child_operation = Operation::parse(child_input.operation)?;
+    let child_result = run_child(child, child_input, child_operation).await;
     // Revocation is mandatory even when the child exits unsuccessfully or times out.
     // `already_revoked` is accepted when the child completed normal logout.
     revoke_session_with_retry(
@@ -977,19 +1050,103 @@ fn validate_issued_session(
     Ok(())
 }
 
-async fn run_child(child: &[String], input: ChildInput<'_>) -> Result<Vec<u8>, IssuerError> {
-    let encoded = Zeroizing::new(serde_json::to_vec(&input).map_err(|_| IssuerError::Child)?);
-    if encoded.len() > MAX_CHILD_INPUT_BYTES {
-        return Err(IssuerError::Child);
-    }
-    run_child_encoded(child, &encoded, CHILD_TIMEOUT).await
+fn issuer_command_error_json(failure: RunnerFailure) -> String {
+    serde_json::to_string(&IssuerCommandErrorEnvelope {
+        error_code: failure.category.as_str(),
+        kind: ISSUER_COMMAND_ERROR_KIND,
+        operation: failure.operation.as_str(),
+        schema_version: 1,
+    })
+    .expect("the fixed issuer command error envelope is serializable")
 }
 
+fn classify_product_request_error(error_code: &str) -> Option<RunnerFailureCategory> {
+    match error_code {
+        "product_request_504_dependency_timeout" | "product_request_504_request_timeout" => {
+            Some(RunnerFailureCategory::DependencyTimeout)
+        }
+        "product_request_503_dependency_unavailable" => {
+            Some(RunnerFailureCategory::DependencyUnavailable)
+        }
+        "product_request_400_invalid_host"
+        | "product_request_400_invalid_idempotency_key"
+        | "product_request_400_invalid_input"
+        | "product_request_400_invalid_json"
+        | "product_request_400_invalid_query"
+        | "product_request_401_authentication_required"
+        | "product_request_403_csrf_required"
+        | "product_request_403_forbidden"
+        | "product_request_403_origin_required"
+        | "product_request_404_not_found"
+        | "product_request_404_route_not_found"
+        | "product_request_405_method_not_allowed"
+        | "product_request_409_idempotency_conflict"
+        | "product_request_409_invalid_state"
+        | "product_request_409_runtime_drain_pending"
+        | "product_request_409_runtime_drain_required"
+        | "product_request_409_stale_generation"
+        | "product_request_409_stale_payload"
+        | "product_request_409_superseded"
+        | "product_request_413_body_too_large"
+        | "product_request_415_json_content_type_required"
+        | "product_request_422_invalid_server_candidate"
+        | "product_request_429_concurrency_exhausted"
+        | "product_request_502_upstream_invalid_response"
+        | "product_request_503_authoring_saturated"
+        | "product_request_500_internal_error" => Some(RunnerFailureCategory::ProductRequestFailed),
+        _ => None,
+    }
+}
+
+fn parse_runner_error(bytes: &[u8]) -> Option<RunnerFailureCategory> {
+    if bytes.is_empty() || bytes.len() > MAX_RUNNER_ERROR_BYTES || !bytes.is_ascii() {
+        return None;
+    }
+    let envelope: RunnerErrorEnvelope = serde_json::from_slice(bytes).ok()?;
+    if envelope.schema_version != 1 || envelope.kind != RUNNER_ERROR_KIND || envelope.ok {
+        return None;
+    }
+    let expected = format!(
+        "{{\"error_code\":{},\"kind\":\"{}\",\"ok\":false,\"schema_version\":1}}\n",
+        serde_json::to_string(&envelope.error_code).ok()?,
+        RUNNER_ERROR_KIND,
+    );
+    if bytes != expected.as_bytes() {
+        return None;
+    }
+    match envelope.error_code.as_str() {
+        "network_request_failed" => Some(RunnerFailureCategory::DependencyUnavailable),
+        error_code => classify_product_request_error(error_code),
+    }
+}
+
+async fn run_child(
+    child: &[String],
+    input: ChildInput<'_>,
+    operation: Operation,
+) -> Result<Vec<u8>, IssuerCommandError> {
+    let encoded = Zeroizing::new(serde_json::to_vec(&input).map_err(|_| IssuerError::Child)?);
+    if encoded.len() > MAX_CHILD_INPUT_BYTES {
+        return Err(IssuerError::Child.into());
+    }
+    run_child_encoded_for_operation(child, &encoded, CHILD_TIMEOUT, operation).await
+}
+
+#[cfg(test)]
 async fn run_child_encoded(
     child: &[String],
     encoded: &[u8],
     timeout: Duration,
-) -> Result<Vec<u8>, IssuerError> {
+) -> Result<Vec<u8>, IssuerCommandError> {
+    run_child_encoded_for_operation(child, encoded, timeout, Operation::AuthSmoke).await
+}
+
+async fn run_child_encoded_for_operation(
+    child: &[String],
+    encoded: &[u8],
+    timeout: Duration,
+    operation: Operation,
+) -> Result<Vec<u8>, IssuerCommandError> {
     let runner_parent = Path::new(&child[1])
         .parent()
         .ok_or(IssuerError::ChildRunner)?;
@@ -1024,27 +1181,35 @@ async fn run_child_encoded(
     };
     if let Some(error) = write_failure {
         terminate_child_and_capture_tasks(&mut process, stdout_task, stderr_task).await;
-        return Err(error);
+        return Err(error.into());
     }
 
     let status = match tokio::time::timeout_at(deadline, process.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(_)) => {
             terminate_child_and_capture_tasks(&mut process, stdout_task, stderr_task).await;
-            return Err(IssuerError::Child);
+            return Err(IssuerError::Child.into());
         }
         Err(_) => {
             terminate_child_and_capture_tasks(&mut process, stdout_task, stderr_task).await;
-            return Err(IssuerError::ChildTimeout);
+            return Err(IssuerError::ChildTimeout.into());
         }
     };
     let stdout = stdout_task.await.map_err(|_| IssuerError::Child)??;
-    let _stderr = stderr_task.await.map_err(|_| IssuerError::Child)??;
+    let stderr = stderr_task.await.map_err(|_| IssuerError::Child)??;
     if !status.success() {
-        return Err(IssuerError::Child);
+        if status.code() == Some(1) && !stdout.exceeded && !stderr.exceeded {
+            if let Some(category) = parse_runner_error(&stdout.bytes) {
+                return Err(IssuerCommandError::Runner(RunnerFailure {
+                    operation,
+                    category,
+                }));
+            }
+        }
+        return Err(IssuerError::Child.into());
     }
-    if stdout.exceeded {
-        return Err(IssuerError::EvidenceTooLarge);
+    if stdout.exceeded || stderr.exceeded {
+        return Err(IssuerError::EvidenceTooLarge.into());
     }
     Ok(stdout.bytes)
 }
@@ -1117,6 +1282,13 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect()
+    }
+
+    fn runner_error_payload(error_code: &str) -> Vec<u8> {
+        format!(
+            "{{\"error_code\":\"{error_code}\",\"kind\":\"{RUNNER_ERROR_KIND}\",\"ok\":false,\"schema_version\":1}}\n"
+        )
+        .into_bytes()
     }
 
     #[test]
@@ -1196,6 +1368,165 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runner_error_protocol_is_canonical_closed_and_coarsened() {
+        assert_eq!(
+            parse_runner_error(&runner_error_payload(
+                "product_request_504_dependency_timeout"
+            )),
+            Some(RunnerFailureCategory::DependencyTimeout),
+        );
+        assert_eq!(
+            parse_runner_error(&runner_error_payload("product_request_504_request_timeout")),
+            Some(RunnerFailureCategory::DependencyTimeout),
+        );
+        assert_eq!(
+            parse_runner_error(&runner_error_payload(
+                "product_request_503_dependency_unavailable"
+            )),
+            Some(RunnerFailureCategory::DependencyUnavailable),
+        );
+        assert_eq!(
+            parse_runner_error(&runner_error_payload("network_request_failed")),
+            Some(RunnerFailureCategory::DependencyUnavailable),
+        );
+        for error_code in [
+            "product_request_400_invalid_host",
+            "product_request_400_invalid_idempotency_key",
+            "product_request_400_invalid_input",
+            "product_request_400_invalid_json",
+            "product_request_400_invalid_query",
+            "product_request_401_authentication_required",
+            "product_request_403_csrf_required",
+            "product_request_403_forbidden",
+            "product_request_403_origin_required",
+            "product_request_404_not_found",
+            "product_request_404_route_not_found",
+            "product_request_405_method_not_allowed",
+            "product_request_409_idempotency_conflict",
+            "product_request_409_invalid_state",
+            "product_request_409_runtime_drain_pending",
+            "product_request_409_runtime_drain_required",
+            "product_request_409_stale_generation",
+            "product_request_409_stale_payload",
+            "product_request_409_superseded",
+            "product_request_413_body_too_large",
+            "product_request_415_json_content_type_required",
+            "product_request_422_invalid_server_candidate",
+            "product_request_429_concurrency_exhausted",
+            "product_request_500_internal_error",
+            "product_request_502_upstream_invalid_response",
+            "product_request_503_authoring_saturated",
+        ] {
+            assert_eq!(
+                parse_runner_error(&runner_error_payload(error_code)),
+                Some(RunnerFailureCategory::ProductRequestFailed),
+                "{error_code}",
+            );
+        }
+
+        let invalid = [
+            runner_error_payload("product_request_400_invalid_request"),
+            runner_error_payload("product_request_503_untrusted_secret"),
+            b"{\"error_code\":\"product_request_504_dependency_timeout\",\"error_code\":\"product_request_503_dependency_unavailable\",\"kind\":\"starring.d2a.runner-error.v1\",\"ok\":false,\"schema_version\":1}\n".to_vec(),
+            b"{\"kind\":\"starring.d2a.runner-error.v1\",\"error_code\":\"product_request_504_dependency_timeout\",\"ok\":false,\"schema_version\":1}\n".to_vec(),
+            b"{\"error_code\":\"product_request_504_dependency_timeout\",\"extra\":true,\"kind\":\"starring.d2a.runner-error.v1\",\"ok\":false,\"schema_version\":1}\n".to_vec(),
+            b"{\"error_code\":\"product_request_504_dependency_timeout\",\"kind\":\"starring.d2a.runner-error.v1\",\"ok\":true,\"schema_version\":1}\n".to_vec(),
+            b"{\"error_code\":\"product_request_504_dependency_timeout\",\"kind\":\"starring.d2a.runner-error.v1\",\"ok\":false,\"schema_version\":1}".to_vec(),
+            "{\"error_code\":\"비밀\",\"kind\":\"starring.d2a.runner-error.v1\",\"ok\":false,\"schema_version\":1}\n".as_bytes().to_vec(),
+            vec![b'x'; MAX_RUNNER_ERROR_BYTES + 1],
+        ];
+        for payload in invalid {
+            assert_eq!(parse_runner_error(&payload), None);
+        }
+
+        assert_eq!(
+            issuer_command_error_json(RunnerFailure {
+                operation: Operation::OneShot,
+                category: RunnerFailureCategory::DependencyTimeout,
+            }),
+            "{\"error_code\":\"dependency_timeout\",\"kind\":\"starring.d2a.issuer-command-error.v1\",\"operation\":\"one-shot\",\"schema_version\":1}",
+        );
+    }
+
+    #[tokio::test]
+    async fn child_failure_protocol_requires_exit_one_and_empty_stderr() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "starring-d2-session-issuer-runner-error-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create runner-error test directory");
+        let script = directory.join("runner.sh");
+        let payload = String::from_utf8(runner_error_payload(
+            "product_request_504_dependency_timeout",
+        ))
+        .expect("runner error payload is ASCII");
+        std::fs::write(
+            &script,
+            format!("/bin/cat >/dev/null\nprintf '%s' '{payload}'\nexit 1\n"),
+        )
+        .expect("write runner-error test script");
+        let child = [
+            "/bin/sh".to_string(),
+            script.to_str().expect("UTF-8 script path").to_string(),
+        ];
+        let result = run_child_encoded_for_operation(
+            &child,
+            b"{}",
+            Duration::from_secs(1),
+            Operation::OneShot,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(IssuerCommandError::Runner(RunnerFailure {
+                operation: Operation::OneShot,
+                category: RunnerFailureCategory::DependencyTimeout,
+            }))
+        ));
+
+        std::fs::write(
+            &script,
+            format!(
+                "/bin/cat >/dev/null\nprintf '%s' '{payload}'\nprintf 'untrusted' >&2\nexit 1\n"
+            ),
+        )
+        .expect("write stderr runner-error test script");
+        let result = run_child_encoded_for_operation(
+            &child,
+            b"{}",
+            Duration::from_secs(1),
+            Operation::OneShot,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(IssuerCommandError::Issuer(IssuerError::Child))
+        ));
+
+        std::fs::write(
+            &script,
+            b"/bin/cat >/dev/null\nprintf '{}'\nprintf 'untrusted' >&2\nexit 0\n",
+        )
+        .expect("write success-with-stderr test script");
+        let result = run_child_encoded_for_operation(
+            &child,
+            b"{}",
+            Duration::from_secs(1),
+            Operation::OneShot,
+        )
+        .await;
+        std::fs::remove_dir_all(&directory).expect("remove runner-error test directory");
+        assert!(matches!(
+            result,
+            Err(IssuerCommandError::Issuer(IssuerError::EvidenceTooLarge))
+        ));
+    }
+
     #[tokio::test]
     async fn lifecycle_signal_cancels_a_pending_issue_or_child_workflow() {
         let disposition = select_lifecycle(
@@ -1225,10 +1556,13 @@ mod tests {
             scenario_sha256: None,
         };
         let child = ["/bin/cat".to_string(), "/dev/stdin".to_string()];
-        let output = tokio::time::timeout(Duration::from_secs(1), run_child(&child, input))
-            .await
-            .expect("child must observe stdin EOF before the test timeout")
-            .expect("child must exit successfully after stdin EOF");
+        let output = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_child(&child, input, Operation::AuthSmoke),
+        )
+        .await
+        .expect("child must observe stdin EOF before the test timeout")
+        .expect("child must exit successfully after stdin EOF");
         let output: Value = serde_json::from_slice(&output).expect("child output JSON");
         assert_eq!(output["operation"], "auth-smoke");
     }
@@ -1269,7 +1603,10 @@ mod tests {
         let kill_error = std::io::Error::last_os_error().raw_os_error();
         std::fs::remove_dir_all(&directory).expect("remove non-reader test directory");
 
-        assert!(matches!(result, Err(IssuerError::ChildTimeout)));
+        assert!(matches!(
+            result,
+            Err(IssuerCommandError::Issuer(IssuerError::ChildTimeout))
+        ));
         assert_eq!(kill_result, -1);
         assert_eq!(kill_error, Some(libc::ESRCH));
     }
@@ -1419,6 +1756,21 @@ mod tests {
             assert!(marker.revoked);
         }
 
+        let mut marker = FakeMarker::default();
+        let runner_failure = RunnerFailure {
+            operation: Operation::OneShot,
+            category: RunnerFailureCategory::DependencyUnavailable,
+        };
+        let result: Result<(), IssuerCommandError> = finish_after_confirmed_revocation(
+            &mut marker,
+            Err(IssuerCommandError::Runner(runner_failure)),
+        );
+        assert!(matches!(
+            result,
+            Err(IssuerCommandError::Runner(failure)) if failure == runner_failure
+        ));
+        assert!(marker.revoked);
+
         let source = include_str!("main.rs");
         assert!(
             source.contains("finish_after_confirmed_revocation(session_lifecycle, child_result)")
@@ -1426,6 +1778,18 @@ mod tests {
         assert!(source.contains(
             "let result = finish_after_confirmed_revocation(session_lifecycle, onboarding);"
         ));
+        let child_outcome = source
+            .find("let child_result = match lifecycle")
+            .expect("completed child outcome");
+        let post_child_identity = source[child_outcome..]
+            .find("validate_child_command(run, &arguments.child)?")
+            .map(|offset| child_outcome + offset)
+            .expect("post-child runner and driver identity check");
+        let expose_result = source[post_child_identity..]
+            .find("let raw_evidence = child_result?")
+            .map(|offset| post_child_identity + offset)
+            .expect("child result propagation");
+        assert!(child_outcome < post_child_identity && post_child_identity < expose_result);
 
         let marker_schema = include_str!("lib.rs");
         assert!(!marker_schema.contains("session_digest: String"));

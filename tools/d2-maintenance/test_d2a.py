@@ -1,11 +1,15 @@
 import ast
 import hashlib
 import importlib.util
+import inspect
 import json
 import pathlib
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from contextlib import redirect_stdout
+from contextlib import redirect_stderr
 from io import StringIO
 
 
@@ -152,6 +156,134 @@ class D2AEvidenceTests(unittest.TestCase):
                 len(set(keys)),
                 f"duplicate dict key at line {node.lineno}",
             )
+
+    def test_issuer_command_error_is_closed_canonical_and_coarsened(self):
+        expected = {
+            "dependency_timeout": "d2a_one_shot_dependency_timeout",
+            "dependency_unavailable": "d2a_one_shot_dependency_unavailable",
+            "product_request_failed": "d2a_one_shot_product_request_failed",
+        }
+        for issuer_code, command_code in expected.items():
+            envelope = {
+                "error_code": issuer_code,
+                "kind": D2A.ISSUER_COMMAND_ERROR_KIND,
+                "operation": "one-shot",
+                "schema_version": 1,
+            }
+            completed = subprocess.CompletedProcess(
+                ["issuer"],
+                1,
+                stdout=(D2A.canonical_json(envelope) + "\n").encode("ascii"),
+                stderr=b"",
+            )
+            with self.subTest(issuer_code=issuer_code):
+                self.assertEqual(
+                    D2A.parse_issuer_command_error(completed, "one-shot"),
+                    command_code,
+                )
+                payload = D2A.command_error_payload("one-shot", command_code)
+                self.assertEqual(
+                    (D2A.canonical_json(payload) + "\n").encode("ascii"),
+                    (
+                        "{\"error_code\":\""
+                        + command_code
+                        + "\",\"kind\":\"starring.d2a.command-error.v1\","
+                        "\"operation\":\"one-shot\",\"schema_version\":1}\n"
+                    ).encode("ascii"),
+                )
+
+        valid = {
+            "error_code": "dependency_timeout",
+            "kind": D2A.ISSUER_COMMAND_ERROR_KIND,
+            "operation": "one-shot",
+            "schema_version": 1,
+        }
+        canonical = (D2A.canonical_json(valid) + "\n").encode("ascii")
+        malformed = [
+            (canonical, b"untrusted"),
+            (canonical, b"", 2),
+            (canonical, b"", True),
+            (canonical[:-1], b""),
+            (b" " + canonical, b""),
+            (
+                b'{"error_code":"dependency_timeout","error_code":"dependency_unavailable",'
+                b'"kind":"starring.d2a.issuer-command-error.v1","operation":"one-shot",'
+                b'"schema_version":1}\n',
+                b"",
+            ),
+            (
+                b'{"error_code":"product_request_504_dependency_timeout",'
+                b'"kind":"starring.d2a.issuer-command-error.v1","operation":"one-shot",'
+                b'"schema_version":1}\n',
+                b"",
+            ),
+            (
+                b'{"error_code":"dependency_timeout","extra":"secret",'
+                b'"kind":"starring.d2a.issuer-command-error.v1","operation":"one-shot",'
+                b'"schema_version":1}\n',
+                b"",
+            ),
+            ("비밀".encode("utf-8"), b""),
+            (b"x" * (D2A.MAX_COMMAND_ERROR_BYTES + 1), b""),
+        ]
+        for item in malformed:
+            stdout, stderr, *returncode = item
+            completed = subprocess.CompletedProcess(
+                ["issuer"],
+                returncode[0] if returncode else 1,
+                stdout=stdout,
+                stderr=stderr,
+            )
+            with self.subTest(stdout=stdout[:80], returncode=completed.returncode):
+                self.assertIsNone(
+                    D2A.parse_issuer_command_error(completed, "one-shot")
+                )
+        completed = subprocess.CompletedProcess(
+            ["issuer"], 1, stdout=canonical, stderr=b""
+        )
+        self.assertIsNone(
+            D2A.parse_issuer_command_error(completed, "auth-smoke")
+        )
+
+    def test_failure_diagnostic_is_trusted_only_after_all_tool_rehashes(self):
+        source = inspect.getsource(D2A.execute)
+        supervised = source.index("completed = supervise_issuer(command)")
+        rehashes = [
+            source.index('sha256_file(issuer, "issuer", 512 * 1024 * 1024)', supervised),
+            source.index('sha256_file(node, "node", 512 * 1024 * 1024)', supervised),
+            source.index("issuer_source_sha256(tool_root)", supervised),
+            source.index('sha256_file(runner, "runner", 4 * 1024 * 1024)', supervised),
+            source.index('sha256_file(product_driver, "product_driver", 4 * 1024 * 1024)', supervised),
+            source.index('sha256_file(expected_scenario, "trusted_scenario", 49_152)', supervised),
+            source.index('sha256_file(pathlib.Path(__file__), "controller", 4 * 1024 * 1024)', supervised),
+        ]
+        diagnostic = source.index("parse_issuer_command_error(completed, operation)")
+        self.assertTrue(all(supervised < rehash < diagnostic for rehash in rehashes))
+
+    def test_command_error_cli_uses_stdout_only_and_exit_one(self):
+        arguments = type("Arguments", (), {"command": "run"})()
+        parser = mock.Mock()
+        parser.parse_args.return_value = arguments
+        stdout = StringIO()
+        stderr = StringIO()
+        with mock.patch.object(D2A, "parser", return_value=parser), mock.patch.object(
+            D2A,
+            "execute",
+            side_effect=D2A.D2ACommandError(
+                "one-shot", "d2a_one_shot_dependency_timeout"
+            ),
+        ), redirect_stdout(stdout), redirect_stderr(stderr), self.assertRaises(
+            SystemExit
+        ) as raised:
+            D2A.main()
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(
+            stdout.getvalue(),
+            '{"error_code":"d2a_one_shot_dependency_timeout",'
+            '"kind":"starring.d2a.command-error.v1","operation":"one-shot",'
+            '"schema_version":1}\n',
+        )
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_direct_onboarding_file_is_required_private_single_link_and_canonical(self):
         evidence = self.direct_onboarding_evidence()

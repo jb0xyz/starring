@@ -71,6 +71,25 @@ FIXED_LINKERS = tuple(
 )
 MAX_INPUT_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 1024 * 1024
+MAX_COMMAND_ERROR_BYTES = 4 * 1024
+COMMAND_ERROR_KIND = "starring.d2a.command-error.v1"
+COMMAND_ERROR_FIELDS = {
+    "error_code",
+    "kind",
+    "operation",
+    "schema_version",
+}
+ONE_SHOT_COMMAND_ERROR_CODES = frozenset({
+    "d2a_one_shot_dependency_timeout",
+    "d2a_one_shot_dependency_unavailable",
+    "d2a_one_shot_product_request_failed",
+})
+TEARDOWN_DIAGNOSTIC_FIELDS = {"code", "status"}
+TEARDOWN_DIAGNOSTIC_CODES = frozenset({
+    "candidate_health_unready",
+    "transport_control_unavailable",
+    "discord_resource_teardown_final_drift",
+})
 MAX_CARGO_MANIFEST_BYTES = 1024 * 1024
 MAX_CARGO_LOCK_BYTES = 16 * 1024 * 1024
 MAX_CANDIDATE_DEPENDENCY_ENTRIES = 500000
@@ -4997,6 +5016,64 @@ def command_identity(argv):
     fail("forbidden_subprocess")
 
 
+def parse_one_shot_command_error(stdout):
+    if (
+        type(stdout) is not bytes
+        or not stdout
+        or len(stdout) > MAX_COMMAND_ERROR_BYTES
+        or not stdout.isascii()
+    ):
+        return None
+    try:
+        value = json.loads(
+            stdout,
+            object_pairs_hook=strict_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if (
+        not isinstance(value, dict)
+        or set(value) != COMMAND_ERROR_FIELDS
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+        or value.get("kind") != COMMAND_ERROR_KIND
+        or value.get("operation") != "one-shot"
+        or value.get("error_code") not in ONE_SHOT_COMMAND_ERROR_CODES
+        or stdout != (canonical_json(value) + "\n").encode("ascii")
+    ):
+        return None
+    return value["error_code"]
+
+
+def parse_teardown_diagnostic(stderr):
+    if (
+        type(stderr) is not bytes
+        or not stderr
+        or len(stderr) > MAX_COMMAND_ERROR_BYTES
+        or not stderr.isascii()
+    ):
+        return None
+    try:
+        value = json.loads(
+            stderr,
+            object_pairs_hook=strict_object,
+            parse_constant=reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if (
+        not isinstance(value, dict)
+        or set(value) != TEARDOWN_DIAGNOSTIC_FIELDS
+        or value.get("status") != "failed"
+        or value.get("code") not in TEARDOWN_DIAGNOSTIC_CODES
+        or stderr != (canonical_json(value) + "\n").encode("ascii")
+    ):
+        return None
+    code = f"teardown_discord_resources_{value['code']}"
+    return code if ERROR_CODE.fullmatch(code) is not None else None
+
+
 def parse_child_json(completed, label):
     returncode = getattr(completed, "returncode", None)
     stdout = getattr(completed, "stdout", b"")
@@ -5008,11 +5085,27 @@ def parse_child_json(completed, label):
     if getattr(completed, "timed_out", False):
         fail(f"{label}_timeout")
     if getattr(completed, "output_exceeded", False):
+        if label in {"d2a_one_shot", "teardown_discord_resources"} and returncode != 0:
+            fail(f"{label}_failed")
         fail(f"{label}_output_invalid")
     if getattr(completed, "process_group_quiescent", True) is not True:
         fail(f"{label}_process_group_active")
     if type(returncode) is not int or returncode != 0:
-        if label == "direct_onboard" and returncode == 1 and not stdout:
+        if (
+            label == "d2a_one_shot"
+            and type(returncode) is int
+            and returncode == 1
+            and not stderr
+        ):
+            code = parse_one_shot_command_error(stdout)
+            if code is not None:
+                fail(code)
+        if (
+            label == "direct_onboard"
+            and type(returncode) is int
+            and returncode == 1
+            and not stdout
+        ):
             try:
                 diagnostic = stderr.decode("ascii")
             except UnicodeDecodeError:
@@ -5022,6 +5115,15 @@ def parse_child_json(completed, label):
                 code = diagnostic[len(prefix):-1]
                 if "\n" not in code and code in DIRECT_ONBOARD_ISSUER_ERROR_CODES:
                     fail(code)
+        if (
+            label == "teardown_discord_resources"
+            and type(returncode) is int
+            and returncode == 1
+            and not stdout
+        ):
+            code = parse_teardown_diagnostic(stderr)
+            if code is not None:
+                fail(code)
         fail(f"{label}_failed")
     if not stdout or len(stdout) > MAX_OUTPUT_BYTES or stderr:
         fail(f"{label}_output_invalid")

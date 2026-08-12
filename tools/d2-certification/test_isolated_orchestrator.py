@@ -2079,6 +2079,22 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
             "keychain:starring.d2.credentials:discord.bot-token",
         )
         self.assertEqual(
+            api_environment["STARRING_API_DISCORD_REQUEST_TIMEOUT_MILLISECONDS"],
+            "4000",
+        )
+        self.assertEqual(
+            api_environment[
+                "STARRING_API_DISCORD_WRITE_AUTHORITY_LIFETIME_MILLISECONDS"
+            ],
+            "5000",
+        )
+        self.assertEqual(
+            api_environment[
+                "STARRING_API_DISCORD_READ_AUTHORITY_LIFETIME_MILLISECONDS"
+            ],
+            "15000",
+        )
+        self.assertEqual(
             values["runtime"]["EnvironmentVariables"][
                 "STARRING_RUNTIME_DISCORD_BOT_TOKEN_SECRET_REFERENCE"
             ],
@@ -7155,6 +7171,188 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         self.assertNotIn("Bot ", serialized)
         self.assertNotIn("discord.bot-token", serialized)
         self.assertNotIn("Authorization", serialized)
+
+    def test_discord_teardown_retries_one_final_health_observation(self):
+        self.start_candidate_with_discord_resources()
+        tunnel_url = f"{self.context.manifest['public_origin']}/health/live"
+        baseline = self.platform.http_status_call_counts.get(tunnel_url, 0)
+
+        def fail_once_at_final_boundary(url, count, status):
+            if url == tunnel_url and count == baseline + 2:
+                return 0
+            return status
+
+        self.platform.http_status_hook = fail_once_at_final_boundary
+        with mock.patch.object(ORCHESTRATOR.time, "sleep") as sleep:
+            result = ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform
+            )
+
+        self.assertEqual(result["status"], "torn_down")
+        self.assertTrue(self.platform.proxy_deletions)
+        self.assertTrue(
+            all(
+                self.platform.proxy_deletions.count(resource) == 1
+                for resource in self.platform.proxy_deletions
+            )
+        )
+        sleep.assert_called_once_with(
+            ORCHESTRATOR.DISCORD_TEARDOWN_FINAL_BOUNDARY_RETRY_INTERVAL_SECONDS
+        )
+        self.assertFalse(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).exists()
+        )
+        self.assertTrue(
+            ORCHESTRATOR.discord_teardown_evidence_path(self.context).is_file()
+        )
+
+    def test_discord_teardown_retries_one_final_transport_observation(self):
+        self.start_candidate_with_discord_resources()
+        original_transport_control = self.platform.transport_control
+        snapshot_calls = 0
+        failed = False
+
+        def fail_once_at_final_boundary(context, command, fields=None,
+                                        timeout_seconds=3):
+            nonlocal snapshot_calls, failed
+            if command == "snapshot":
+                snapshot_calls += 1
+                if snapshot_calls == 3 and not failed:
+                    failed = True
+                    ORCHESTRATOR.fail("transport_control_unavailable")
+            return original_transport_control(
+                context, command, fields, timeout_seconds
+            )
+
+        self.platform.transport_control = fail_once_at_final_boundary
+        with mock.patch.object(ORCHESTRATOR.time, "sleep") as sleep:
+            result = ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform
+            )
+
+        self.assertEqual(result["status"], "torn_down")
+        self.assertTrue(failed)
+        self.assertTrue(self.platform.proxy_deletions)
+        self.assertTrue(
+            all(
+                self.platform.proxy_deletions.count(resource) == 1
+                for resource in self.platform.proxy_deletions
+            )
+        )
+        sleep.assert_called_once_with(
+            ORCHESTRATOR.DISCORD_TEARDOWN_FINAL_BOUNDARY_RETRY_INTERVAL_SECONDS
+        )
+        self.assertFalse(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).exists()
+        )
+
+    def test_discord_teardown_exact_replay_retries_only_final_observation(self):
+        self.start_candidate_with_discord_resources()
+        first = ORCHESTRATOR.command_teardown_discord_resources(
+            self.context, self.platform
+        )
+        self.assertEqual(first["status"], "torn_down")
+        evidence_path = ORCHESTRATOR.discord_teardown_evidence_path(self.context)
+        evidence_before = evidence_path.read_bytes()
+        deletions_before = list(self.platform.proxy_deletions)
+        tunnel_url = f"{self.context.manifest['public_origin']}/health/live"
+        baseline = self.platform.http_status_call_counts.get(tunnel_url, 0)
+
+        def fail_once_at_replay_final_boundary(url, count, status):
+            if url == tunnel_url and count == baseline + 2:
+                return 0
+            return status
+
+        self.platform.http_status_hook = fail_once_at_replay_final_boundary
+        with mock.patch.object(ORCHESTRATOR.time, "sleep") as sleep:
+            replay = ORCHESTRATOR.command_teardown_discord_resources(
+                self.context, self.platform
+            )
+
+        self.assertEqual(replay["status"], "exact_replay")
+        self.assertEqual(self.platform.proxy_deletions, deletions_before)
+        self.assertEqual(evidence_path.read_bytes(), evidence_before)
+        sleep.assert_called_once_with(
+            ORCHESTRATOR.DISCORD_TEARDOWN_FINAL_BOUNDARY_RETRY_INTERVAL_SECONDS
+        )
+
+    def test_discord_teardown_final_retry_admission_fails_closed(self):
+        self.start_candidate_with_discord_resources()
+        self.write_d2a_session_lifecycle("revoked")
+        tunnel_url = f"{self.context.manifest['public_origin']}/health/live"
+        baseline = self.platform.http_status_call_counts.get(tunnel_url, 0)
+
+        def fail_at_final_boundaries(url, count, status):
+            if url == tunnel_url and count >= baseline + 2:
+                return 0
+            return status
+
+        self.platform.http_status_hook = fail_at_final_boundaries
+        with mock.patch.object(
+            ORCHESTRATOR.time, "monotonic", side_effect=(0.0, 0.0, 11.0)
+        ), mock.patch.object(ORCHESTRATOR.time, "sleep") as sleep:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError, "candidate_health_unready"
+            ):
+                ORCHESTRATOR.command_teardown_discord_resources(
+                    self.context, self.platform
+                )
+
+        sleep.assert_called_once_with(
+            ORCHESTRATOR.DISCORD_TEARDOWN_FINAL_BOUNDARY_RETRY_INTERVAL_SECONDS
+        )
+        self.assertFalse(
+            ORCHESTRATOR.discord_teardown_evidence_path(self.context).exists()
+        )
+        self.assertFalse(
+            ORCHESTRATOR.candidate_start_retirement_path(self.context).exists()
+        )
+        fence = json.loads(
+            ORCHESTRATOR.d2a_teardown_fence_path(self.context).read_bytes()
+        )
+        self.assertEqual(fence["status"], "closing")
+
+    def test_discord_teardown_final_retry_rechecks_standing_after_transient(self):
+        self.start_candidate_with_discord_resources()
+        original_standing_snapshot = ORCHESTRATOR.standing_snapshot
+        observations = 0
+        tunnel_url = f"{self.context.manifest['public_origin']}/health/live"
+        baseline = self.platform.http_status_call_counts.get(tunnel_url, 0)
+
+        def fail_once_at_final_boundary(url, count, status):
+            if url == tunnel_url and count == baseline + 2:
+                return 0
+            return status
+
+        def drift_after_final_boundary(context, platform):
+            nonlocal observations
+            observations += 1
+            snapshot = original_standing_snapshot(context, platform)
+            if observations == 3:
+                snapshot = copy.deepcopy(snapshot)
+                label = sorted(snapshot["launchd_loaded"])[0]
+                snapshot["launchd_loaded"][label] = not snapshot[
+                    "launchd_loaded"
+                ][label]
+            return snapshot
+
+        self.platform.http_status_hook = fail_once_at_final_boundary
+        with mock.patch.object(
+            ORCHESTRATOR, "standing_snapshot", side_effect=drift_after_final_boundary
+        ), mock.patch.object(ORCHESTRATOR.time, "sleep") as sleep:
+            with self.assertRaisesRegex(
+                ORCHESTRATOR.OrchestratorError,
+                "discord_resource_teardown_final_drift",
+            ):
+                ORCHESTRATOR.command_teardown_discord_resources(
+                    self.context, self.platform
+                )
+
+        self.assertEqual(observations, 3)
+        sleep.assert_not_called()
+        self.assertFalse(
+            ORCHESTRATOR.discord_teardown_evidence_path(self.context).exists()
+        )
 
     def write_d2a_session_lifecycle(
         self, status, origin="issuer", process_group_id=2_000_000_000

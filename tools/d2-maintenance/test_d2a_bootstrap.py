@@ -57,6 +57,8 @@ class FakeExecutor:
         candidate_launchd_overrides_absent=True,
         quarantined_direct_onboard=False,
         audited_recovery_tamper=None,
+        one_shot_error_code=None,
+        teardown_error_code=None,
     ):
         self.fixture = fixture
         self.fail_once = dict(fail_once or {})
@@ -75,6 +77,8 @@ class FakeExecutor:
         )
         self.quarantined_direct_onboard = quarantined_direct_onboard
         self.audited_recovery_tamper = audited_recovery_tamper
+        self.one_shot_error_code = one_shot_error_code
+        self.teardown_error_code = teardown_error_code
         self.source_snapshot_count = 0
         self.issuer_lock_acquired = False
         self.calls = []
@@ -153,6 +157,29 @@ class FakeExecutor:
             raise KeyboardInterrupt()
         if self.fail_once.get(identity, 0):
             self.fail_once[identity] -= 1
+            if identity == "d2a_one_shot" and self.one_shot_error_code is not None:
+                self.write_revoked_lifecycle("one-shot")
+                return self.completed(
+                    argv,
+                    {
+                        "error_code": self.one_shot_error_code,
+                        "kind": BOOTSTRAP.COMMAND_ERROR_KIND,
+                        "operation": "one-shot",
+                        "schema_version": 1,
+                    },
+                    1,
+                )
+            if (
+                identity == "teardown_discord_resources"
+                and self.teardown_error_code is not None
+            ):
+                diagnostic = (
+                    BOOTSTRAP.canonical_json(
+                        {"code": self.teardown_error_code, "status": "failed"}
+                    )
+                    + "\n"
+                ).encode("ascii")
+                return self.completed(argv, None, 1, diagnostic)
             return self.completed(argv, None, 1, self.secret_stderr or b"untrusted child diagnostics")
         if identity == "source_root":
             self.source_snapshot_count += 1
@@ -3253,6 +3280,216 @@ class D2ABootstrapTests(unittest.TestCase):
         with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
             BOOTSTRAP.parse_child_json(successful, "direct_onboard")
         self.assertEqual(raised.exception.code, "direct_onboard_output_invalid")
+
+    def test_one_shot_command_error_is_closed_canonical_and_exit_bound(self):
+        self.assertEqual(
+            BOOTSTRAP.ONE_SHOT_COMMAND_ERROR_CODES,
+            frozenset(
+                {
+                    "d2a_one_shot_dependency_timeout",
+                    "d2a_one_shot_dependency_unavailable",
+                    "d2a_one_shot_product_request_failed",
+                }
+            ),
+        )
+        for code in BOOTSTRAP.ONE_SHOT_COMMAND_ERROR_CODES:
+            envelope = {
+                "error_code": code,
+                "kind": BOOTSTRAP.COMMAND_ERROR_KIND,
+                "operation": "one-shot",
+                "schema_version": 1,
+            }
+            completed = subprocess.CompletedProcess(
+                ["d2a"],
+                1,
+                stdout=(BOOTSTRAP.canonical_json(envelope) + "\n").encode("ascii"),
+                stderr=b"",
+            )
+            with self.subTest(code=code), self.assertRaises(
+                BOOTSTRAP.BootstrapError
+            ) as raised:
+                BOOTSTRAP.parse_child_json(completed, "d2a_one_shot")
+            self.assertEqual(raised.exception.code, code)
+
+        valid = {
+            "error_code": "d2a_one_shot_dependency_timeout",
+            "kind": BOOTSTRAP.COMMAND_ERROR_KIND,
+            "operation": "one-shot",
+            "schema_version": 1,
+        }
+        canonical = (BOOTSTRAP.canonical_json(valid) + "\n").encode("ascii")
+        malformed = [
+            subprocess.CompletedProcess(["d2a"], 1, canonical, b"secret"),
+            subprocess.CompletedProcess(["d2a"], 2, canonical, b""),
+            subprocess.CompletedProcess(["d2a"], True, canonical, b""),
+            subprocess.CompletedProcess(["d2a"], 1, canonical[:-1], b""),
+            subprocess.CompletedProcess(["d2a"], 1, b" " + canonical, b""),
+            subprocess.CompletedProcess(
+                ["d2a"],
+                1,
+                b'{"error_code":"d2a_one_shot_dependency_timeout",'
+                b'"error_code":"d2a_one_shot_dependency_unavailable",'
+                b'"kind":"starring.d2a.command-error.v1","operation":"one-shot",'
+                b'"schema_version":1}\n',
+                b"",
+            ),
+            subprocess.CompletedProcess(
+                ["d2a"],
+                1,
+                b'{"error_code":"product_request_504_dependency_timeout",'
+                b'"kind":"starring.d2a.command-error.v1","operation":"one-shot",'
+                b'"schema_version":1}\n',
+                b"",
+            ),
+            subprocess.CompletedProcess(
+                ["d2a"],
+                1,
+                b'{"error_code":"d2a_one_shot_dependency_timeout","extra":"secret",'
+                b'"kind":"starring.d2a.command-error.v1","operation":"one-shot",'
+                b'"schema_version":1}\n',
+                b"",
+            ),
+            subprocess.CompletedProcess(["d2a"], 1, "비밀".encode(), b""),
+            subprocess.CompletedProcess(
+                ["d2a"], 1, b"x" * (BOOTSTRAP.MAX_COMMAND_ERROR_BYTES + 1), b""
+            ),
+        ]
+        exceeded = subprocess.CompletedProcess(["d2a"], 1, canonical, b"")
+        exceeded.output_exceeded = True
+        malformed.append(exceeded)
+        for completed in malformed:
+            with self.subTest(
+                returncode=completed.returncode,
+                stdout=completed.stdout[:80],
+            ), self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                BOOTSTRAP.parse_child_json(completed, "d2a_one_shot")
+            self.assertEqual(raised.exception.code, "d2a_one_shot_failed")
+            self.assertNotIn("secret", raised.exception.code)
+
+    def test_one_shot_safe_error_survives_recovery_without_raw_diagnostics(self):
+        code = "d2a_one_shot_dependency_timeout"
+        executor = FakeExecutor(
+            self.fixture,
+            fail_once={"d2a_one_shot": 1},
+            one_shot_error_code=code,
+        )
+        result = self.fixture.controller(executor).run(
+            self.fixture.config_path,
+            self.fixture.candidate_spec_path,
+            "one-shot",
+        )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], code)
+        state_payload = pathlib.Path(result["state"]).read_bytes()
+        state = json.loads(state_payload)
+        self.assertEqual(state["last_error"], code)
+        self.assertNotIn(b"product_request_", state_payload)
+        self.assertTrue(result["discord_teardown_complete"])
+        self.assertTrue(result["cleanup_complete"])
+        self.assertTrue(result["total_local_absence"])
+        self.assertTrue(result["protected_staging_unchanged"])
+
+    def test_teardown_diagnostic_is_closed_canonical_and_durable(self):
+        self.assertEqual(
+            BOOTSTRAP.TEARDOWN_DIAGNOSTIC_CODES,
+            frozenset(
+                {
+                    "candidate_health_unready",
+                    "transport_control_unavailable",
+                    "discord_resource_teardown_final_drift",
+                }
+            ),
+        )
+        for child_code in BOOTSTRAP.TEARDOWN_DIAGNOSTIC_CODES:
+            stderr = (
+                BOOTSTRAP.canonical_json({"code": child_code, "status": "failed"})
+                + "\n"
+            ).encode("ascii")
+            completed = subprocess.CompletedProcess(
+                ["orchestrator"], 1, stdout=b"", stderr=stderr
+            )
+            expected = f"teardown_discord_resources_{child_code}"
+            with self.subTest(child_code=child_code), self.assertRaises(
+                BOOTSTRAP.BootstrapError
+            ) as raised:
+                BOOTSTRAP.parse_child_json(completed, "teardown_discord_resources")
+            self.assertEqual(raised.exception.code, expected)
+
+        canonical = (
+            BOOTSTRAP.canonical_json(
+                {"code": "candidate_health_unready", "status": "failed"}
+            )
+            + "\n"
+        ).encode("ascii")
+        malformed = [
+            subprocess.CompletedProcess(["orchestrator"], 1, b"unexpected", canonical),
+            subprocess.CompletedProcess(["orchestrator"], 2, b"", canonical),
+            subprocess.CompletedProcess(["orchestrator"], 1, b"", canonical[:-1]),
+            subprocess.CompletedProcess(["orchestrator"], 1, b"", b" " + canonical),
+            subprocess.CompletedProcess(
+                ["orchestrator"],
+                1,
+                b"",
+                b'{"code":"candidate_health_unready","code":"transport_control_unavailable",'
+                b'"status":"failed"}\n',
+            ),
+            subprocess.CompletedProcess(
+                ["orchestrator"],
+                1,
+                b"",
+                b'{"code":"secret_token","status":"failed"}\n',
+            ),
+            subprocess.CompletedProcess(
+                ["orchestrator"],
+                1,
+                b"",
+                b'{"code":"candidate_health_unready","extra":"secret",'
+                b'"status":"failed"}\n',
+            ),
+            subprocess.CompletedProcess(
+                ["orchestrator"], 1, b"", "비밀".encode("utf-8")
+            ),
+            subprocess.CompletedProcess(
+                ["orchestrator"], 1, b"", b"x" * (BOOTSTRAP.MAX_COMMAND_ERROR_BYTES + 1)
+            ),
+        ]
+        exceeded = subprocess.CompletedProcess(
+            ["orchestrator"], 1, b"", canonical
+        )
+        exceeded.output_exceeded = True
+        malformed.append(exceeded)
+        for completed in malformed:
+            with self.subTest(stderr=completed.stderr[:80]), self.assertRaises(
+                BOOTSTRAP.BootstrapError
+            ) as raised:
+                BOOTSTRAP.parse_child_json(completed, "teardown_discord_resources")
+            self.assertEqual(
+                raised.exception.code,
+                "teardown_discord_resources_failed",
+            )
+            self.assertNotIn("secret", raised.exception.code)
+
+        child_code = "transport_control_unavailable"
+        executor = FakeExecutor(
+            self.fixture,
+            fail_once={"teardown_discord_resources": 1},
+            teardown_error_code=child_code,
+        )
+        first = self.fixture.controller(executor).run(
+            self.fixture.config_path,
+            self.fixture.candidate_spec_path,
+            "one-shot",
+        )
+        expected = f"teardown_discord_resources_{child_code}"
+        self.assertEqual(first["error_code"], expected)
+        state_path = pathlib.Path(first["state"])
+        self.assertEqual(json.loads(state_path.read_bytes())["last_error"], expected)
+        resumed = self.fixture.controller(FakeExecutor(self.fixture)).resume(state_path)
+        self.assertEqual(resumed["error_code"], expected)
+        self.assertTrue(resumed["discord_teardown_complete"])
+        self.assertTrue(resumed["cleanup_complete"])
+        self.assertTrue(resumed["total_local_absence"])
+        self.assertTrue(resumed["protected_staging_unchanged"])
 
     def test_teardown_failure_forbids_cleanup_and_resume_only_recovers(self):
         executor = FakeExecutor(

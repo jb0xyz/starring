@@ -73,6 +73,11 @@ D2A_SYSCTL_BOOT_TIME = re.compile(
     rb"[A-Z][a-z]{2} [A-Z][a-z]{2} [ 0-9][0-9] "
     rb"[0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}\n$"
 )
+DISCORD_TEARDOWN_FINAL_BOUNDARY_RETRY_ADMISSION_SECONDS = 10.0
+DISCORD_TEARDOWN_FINAL_BOUNDARY_RETRY_INTERVAL_SECONDS = 0.25
+DISCORD_TEARDOWN_FINAL_BOUNDARY_TRANSIENT_ERRORS = frozenset(
+    {"candidate_health_unready", "transport_control_unavailable"}
+)
 
 from d2_certification import (
     COMMIT_PATTERN,
@@ -4315,6 +4320,59 @@ def require_d2a_cleanup_fence(context, platform):
         fail("manual_recovery_required")
 
 
+def require_discord_teardown_final_boundary(
+    context, platform, boundary, expected_state, expected_transport_instance_id,
+    expected_inventory_digest_sha256,
+):
+    """Use a ten-second admission budget for transient read-only retries."""
+    deadline = (
+        time.monotonic()
+        + DISCORD_TEARDOWN_FINAL_BOUNDARY_RETRY_ADMISSION_SECONDS
+    )
+    while True:
+        try:
+            state, snapshot = boundary(context, platform)
+            confirmed_inventory = platform.transport_control(
+                context, "resource_inventory"
+            )
+            if (
+                state != expected_state
+                or snapshot["instance_id"] != expected_transport_instance_id
+                or confirmed_inventory["instance_id"]
+                != expected_transport_instance_id
+                or confirmed_inventory["digest_sha256"]
+                != expected_inventory_digest_sha256
+                or standing_snapshot(context, platform)
+                != expected_state["standing_snapshot"]
+            ):
+                fail("discord_resource_teardown_final_drift")
+            return state, snapshot, confirmed_inventory
+        except OrchestratorError as error:
+            if str(error) not in DISCORD_TEARDOWN_FINAL_BOUNDARY_TRANSIENT_ERRORS:
+                raise
+            # Both allowlisted errors occur after the boundary has proved the
+            # durable candidate identity and protected standing state.  A
+            # retry is safe only while that read-only attempt left the state
+            # and retirement boundary untouched; every retry then repeats the
+            # complete identity/standing checks from the beginning.
+            if (
+                os.path.lexists(candidate_start_retirement_path(context))
+                or load_state(context, {"candidate_started"}) != expected_state
+                or standing_snapshot(context, platform)
+                != expected_state["standing_snapshot"]
+            ):
+                fail("discord_resource_teardown_final_drift")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(
+                min(
+                    DISCORD_TEARDOWN_FINAL_BOUNDARY_RETRY_INTERVAL_SECONDS,
+                    remaining,
+                )
+            )
+
+
 def command_teardown_discord_resources(context, platform, frozen=False):
     if frozen:
         require_certification_eligible_teardown(context)
@@ -4326,7 +4384,7 @@ def command_teardown_discord_resources(context, platform, frozen=False):
                 boundary_platform,
                 allow_abort_teardown=True,
             )
-    _state, snapshot = boundary(context, platform)
+    initial_state, snapshot = boundary(context, platform)
     # Production dispatch holds the global D2 lock around this entire command.
     # Prove the candidate-start boundary before opening the durable teardown
     # transaction: a bootstrap sentinel for a merely prepared run must fail
@@ -4352,7 +4410,14 @@ def command_teardown_discord_resources(context, platform, frozen=False):
         final_inventory = platform.transport_control(context, "resource_inventory")
         if final_inventory["digest_sha256"] != inventory["digest_sha256"]:
             fail("discord_resource_teardown_replay_drift")
-        boundary(context, platform)
+        require_discord_teardown_final_boundary(
+            context,
+            platform,
+            boundary,
+            initial_state,
+            inventory["instance_id"],
+            final_inventory["digest_sha256"],
+        )
         complete_d2a_teardown(context, automated)
         return {
             "status": "exact_replay",
@@ -4437,14 +4502,16 @@ def command_teardown_discord_resources(context, platform, frozen=False):
     observations = observe_absent_discord_resources(
         context, platform, final_inventory
     )
-    _state, final_snapshot = boundary(context, platform)
-    confirmed_inventory = platform.transport_control(context, "resource_inventory")
-    if (
-        final_snapshot["instance_id"] != final_inventory["instance_id"]
-        or confirmed_inventory["digest_sha256"]
-        != final_inventory["digest_sha256"]
-    ):
-        fail("discord_resource_teardown_final_drift")
+    _state, final_snapshot, confirmed_inventory = (
+        require_discord_teardown_final_boundary(
+            context,
+            platform,
+            boundary,
+            initial_state,
+            final_inventory["instance_id"],
+            final_inventory["digest_sha256"],
+        )
+    )
     evidence = {
         "schema_version": 1,
         "kind": DISCORD_TEARDOWN_EVIDENCE_KIND,

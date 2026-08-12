@@ -487,6 +487,15 @@ fn runtime_adapter(
     )
 }
 
+fn d2_margin_config() -> DiscordAuthorityConfigV1 {
+    DiscordAuthorityConfigV1::new(
+        Duration::from_secs(4),
+        Duration::from_secs(5),
+        Duration::from_secs(15),
+    )
+    .unwrap()
+}
+
 fn adapter(
     record: InstallationAuthorityRecordV1,
     snapshot: DiscordGuildAuthoritySnapshotV1,
@@ -809,6 +818,92 @@ async fn author_write_window_starts_before_the_discord_fetch() {
 }
 
 #[tokio::test]
+async fn d2_author_margin_accepts_four_seconds_and_rejects_five_without_waiting() {
+    let started_at = Utc.with_ymd_and_hms(2026, 7, 19, 0, 0, 0).unwrap();
+
+    for (elapsed_seconds, succeeds) in [(4, true), (5, false)] {
+        let client = runtime_client(Err(DiscordAuthorityClientError::InvalidResponse));
+        let authority_calls = client.authority_calls.clone();
+        let apply_calls = client.apply_calls.clone();
+        let times = if succeeds {
+            vec![
+                started_at,
+                started_at + chrono::Duration::seconds(4),
+                started_at + chrono::Duration::seconds(4),
+                started_at + chrono::Duration::seconds(8),
+            ]
+        } else {
+            vec![
+                started_at,
+                started_at + chrono::Duration::seconds(elapsed_seconds),
+            ]
+        };
+        let adapter = DiscordGuildAuthorityAdapter::with_clock(
+            Source {
+                result: Ok(record()),
+                calls: Arc::new(Mutex::new(0)),
+            },
+            client,
+            SequenceClock::new(times),
+            d2_margin_config(),
+        );
+        let command = authoring_command();
+        let evidence = Arc::new(Mutex::new(None));
+        let store = AuthorReplayStore {
+            evidence: evidence.clone(),
+            stored: authoring_replay_generation(&command),
+        };
+        let keyed_calls = Arc::new(Mutex::new(0));
+        let model_calls = Arc::new(Mutex::new(0));
+        let admission = ReplayAdmission {
+            keyed_calls: keyed_calls.clone(),
+            model_calls: model_calls.clone(),
+        };
+
+        let result = ConversationApplication::new(
+            &Authentication,
+            &adapter,
+            &store,
+            &admission,
+            &NeverClient,
+            AuthoringConversationConfigV1::default(),
+        )
+        .start_or_advance_turn("valid-credential", "valid-csrf", &installation(), command)
+        .await;
+        if succeeds {
+            let receipt = result.unwrap().into_committed().unwrap();
+            assert_eq!(
+                receipt.disposition(),
+                AuthoringMutationDispositionV1::ExactReplay
+            );
+            let evidence = evidence.lock().unwrap().take().unwrap();
+            assert_eq!(evidence.capability(), CapabilityV1::Author);
+            assert_eq!(
+                evidence.observed_at(),
+                started_at + chrono::Duration::seconds(4)
+            );
+            assert_eq!(
+                evidence.expires_at(),
+                started_at + chrono::Duration::seconds(9)
+            );
+            assert_eq!(evidence.runtime_environment(), None);
+            assert_eq!(*authority_calls.lock().unwrap(), 2);
+            assert_eq!(*keyed_calls.lock().unwrap(), 1);
+        } else {
+            assert_eq!(
+                result.unwrap_err(),
+                AuthoringConversationError::Authority(FreshGuildAuthorityError::Stale)
+            );
+            assert!(evidence.lock().unwrap().is_none());
+            assert_eq!(*authority_calls.lock().unwrap(), 1);
+            assert_eq!(*keyed_calls.lock().unwrap(), 0);
+        }
+        assert_eq!(*apply_calls.lock().unwrap(), 0);
+        assert_eq!(*model_calls.lock().unwrap(), 0);
+    }
+}
+
+#[tokio::test]
 async fn ordinary_member_is_denied_authoring_before_replay_or_model_admission() {
     let observation = author_replay(snapshot(Permissions::VIEW_CHANNEL)).await;
     assert_eq!(
@@ -955,6 +1050,48 @@ async fn write_authority_window_starts_before_the_discord_fetch() {
         ProductApplicationError::FreshAuthority(FreshGuildAuthorityError::Stale)
     );
     assert_eq!(*apply_calls.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn d2_apply_margin_accepts_four_seconds_and_rejects_five_without_waiting() {
+    let started_at = Utc.with_ymd_and_hms(2026, 7, 19, 0, 0, 0).unwrap();
+
+    for (elapsed_seconds, succeeds) in [(4, true), (5, false)] {
+        let client = runtime_client(Ok(apply_snapshot(Permissions::MANAGE_ROLES)));
+        let authority_calls = client.authority_calls.clone();
+        let apply_calls = client.apply_calls.clone();
+        let adapter = DiscordGuildAuthorityAdapter::with_clock(
+            Source {
+                result: Ok(record()),
+                calls: Arc::new(Mutex::new(0)),
+            },
+            client,
+            SequenceClock::new([
+                started_at,
+                started_at + chrono::Duration::seconds(elapsed_seconds),
+            ]),
+            d2_margin_config(),
+        );
+
+        let result = capture_apply_evidence(&adapter).await;
+        if succeeds {
+            let evidence = result.unwrap();
+            assert_eq!(evidence.capability(), CapabilityV1::Apply);
+            assert_eq!(evidence.observed_at(), started_at);
+            assert_eq!(
+                evidence.expires_at(),
+                started_at + chrono::Duration::seconds(5)
+            );
+            assert!(evidence.apply_runtime_environment().is_some());
+        } else {
+            assert_eq!(
+                result.unwrap_err(),
+                ProductApplicationError::FreshAuthority(FreshGuildAuthorityError::Stale)
+            );
+        }
+        assert_eq!(*authority_calls.lock().unwrap(), 0);
+        assert_eq!(*apply_calls.lock().unwrap(), 1);
+    }
 }
 
 #[tokio::test]

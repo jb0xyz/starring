@@ -70,6 +70,12 @@ persistent enabled/disabled override. Dry-run, start, cleanup, and replay all
 require both the exact run labels to be unloaded and their override entries to
 be absent; unrelated historical labels do not affect a fresh run.
 
+The run-owned API plist uses a 4,000-millisecond Discord request deadline and
+a 5,000-millisecond write-authority lifetime, leaving one bounded second for
+post-response authority validation. The read-authority lifetime remains 15,000
+milliseconds. This D2-only composition gives fresh write checks bounded room
+for transient Discord latency without changing the product-wide timing ranges.
+
 The complete run-owned Keychain boundary is 25 secret items and four lifecycle
 ownership markers. The secret items are the 20 application database
 credentials, one cluster-administrator credential, three purpose-separated
@@ -87,6 +93,21 @@ inventory commit cannot be proved increments the lifetime uncertainty counter;
 finalization requires that counter to be exactly zero. Delete ownership and
 request admission are reserved atomically, so concurrent deletion of the same
 resource cannot be forwarded twice.
+
+After Discord resources are absent, the abort and replay teardown paths give
+only the final read-only candidate-health or transport-control observation a
+10-second retry-admission budget; each probe retains its own three-second
+deadline. Every attempt repeats the sealed candidate,
+run-state, transport-instance, inventory, and protected-standing checks. Any
+identity or standing drift, any retirement marker, or any other error remains
+an immediate fail-closed boundary; no Discord mutation is retried.
+
+When a one-shot child fails, the issuer may expose only one of three closed,
+non-secret categories after session revocation and sealed-tool revalidation:
+dependency timeout, dependency unavailable, or product request failed. The
+controller accepts only canonical, bounded, stderr-free envelopes and otherwise
+records the existing generic failure. Raw HTTP statuses, runner codes, URLs,
+response bodies, and secrets never cross this diagnostic boundary.
 
 The migration-ledger SHA-256 is reproducible. For each successful ledger row
 ordered by version, hash the signed 64-bit version in big-endian form, one

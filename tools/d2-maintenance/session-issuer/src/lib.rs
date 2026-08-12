@@ -2408,11 +2408,11 @@ fn api_environment(
         ),
         (
             "STARRING_API_DISCORD_REQUEST_TIMEOUT_MILLISECONDS".to_string(),
-            "3000".to_string(),
+            "4000".to_string(),
         ),
         (
             "STARRING_API_DISCORD_WRITE_AUTHORITY_LIFETIME_MILLISECONDS".to_string(),
-            "3000".to_string(),
+            "5000".to_string(),
         ),
         (
             "STARRING_API_DISCORD_READ_AUTHORITY_LIFETIME_MILLISECONDS".to_string(),
@@ -5095,6 +5095,19 @@ mod tests {
         assert_eq!(by_name["transport"].environment.len(), 2);
         assert_eq!(by_name["tunnel"].environment.len(), 7);
         assert_eq!(by_name["api"].expected_plist.as_object().unwrap().len(), 14);
+        assert_eq!(
+            by_name["api"].environment["STARRING_API_DISCORD_REQUEST_TIMEOUT_MILLISECONDS"],
+            "4000"
+        );
+        assert_eq!(
+            by_name["api"].environment
+                ["STARRING_API_DISCORD_WRITE_AUTHORITY_LIFETIME_MILLISECONDS"],
+            "5000"
+        );
+        assert_eq!(
+            by_name["api"].environment["STARRING_API_DISCORD_READ_AUTHORITY_LIFETIME_MILLISECONDS"],
+            "15000"
+        );
         assert_eq!(
             by_name["worker"].environment["STARRING_CODEX_PATH"],
             "/private/tmp/candidate-codex"

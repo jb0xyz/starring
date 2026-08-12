@@ -39,6 +39,25 @@ D2_HUMAN_BOUNDARIES = (
 )
 JS_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_SCENARIO_MESSAGE_BYTES = 16 * 1024
+MAX_COMMAND_ERROR_BYTES = 4 * 1024
+ISSUER_COMMAND_ERROR_KIND = "starring.d2a.issuer-command-error.v1"
+COMMAND_ERROR_KIND = "starring.d2a.command-error.v1"
+ISSUER_COMMAND_ERROR_FIELDS = {
+    "error_code",
+    "kind",
+    "operation",
+    "schema_version",
+}
+ISSUER_COMMAND_ERROR_CODES = frozenset({
+    "dependency_timeout",
+    "dependency_unavailable",
+    "product_request_failed",
+})
+ONE_SHOT_COMMAND_ERROR_CODES = {
+    "dependency_timeout": "d2a_one_shot_dependency_timeout",
+    "dependency_unavailable": "d2a_one_shot_dependency_unavailable",
+    "product_request_failed": "d2a_one_shot_product_request_failed",
+}
 COMMERCIAL_MANIFEST_FIELDS = {
     "schema_version",
     "certification_class",
@@ -280,6 +299,13 @@ class D2AError(Exception):
     pass
 
 
+class D2ACommandError(Exception):
+    def __init__(self, operation, error_code):
+        self.operation = operation
+        self.error_code = error_code
+        super().__init__(error_code)
+
+
 def fail(code):
     raise D2AError(code)
 
@@ -430,6 +456,59 @@ def strict_json_object(pairs):
 
 def reject_json_constant(_value):
     raise ValueError("non_finite_number")
+
+
+def parse_issuer_command_error(completed, operation):
+    stdout = getattr(completed, "stdout", b"")
+    stderr = getattr(completed, "stderr", b"")
+    if (
+        operation != "one-shot"
+        or getattr(completed, "timed_out", False)
+        or getattr(completed, "output_exceeded", False)
+        or type(getattr(completed, "returncode", None)) is not int
+        or completed.returncode != 1
+        or type(stdout) is not bytes
+        or type(stderr) is not bytes
+        or not stdout
+        or len(stdout) > MAX_COMMAND_ERROR_BYTES
+        or stderr
+        or not stdout.isascii()
+    ):
+        return None
+    try:
+        value = json.loads(
+            stdout,
+            object_pairs_hook=strict_json_object,
+            parse_constant=reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    if (
+        not isinstance(value, dict)
+        or set(value) != ISSUER_COMMAND_ERROR_FIELDS
+        or type(value.get("schema_version")) is not int
+        or value["schema_version"] != 1
+        or value.get("kind") != ISSUER_COMMAND_ERROR_KIND
+        or value.get("operation") != operation
+        or value.get("error_code") not in ISSUER_COMMAND_ERROR_CODES
+        or stdout != (canonical_json(value) + "\n").encode("ascii")
+    ):
+        return None
+    return ONE_SHOT_COMMAND_ERROR_CODES[value["error_code"]]
+
+
+def command_error_payload(operation, error_code):
+    if (
+        operation != "one-shot"
+        or error_code not in ONE_SHOT_COMMAND_ERROR_CODES.values()
+    ):
+        fail("command_error_invalid")
+    return {
+        "error_code": error_code,
+        "kind": COMMAND_ERROR_KIND,
+        "operation": operation,
+        "schema_version": 1,
+    }
 
 
 def sha256_bytes(value):
@@ -1262,12 +1341,6 @@ def execute(arguments):
         fail("issuer_timeout")
     if getattr(completed, "output_exceeded", False):
         fail("issuer_output_invalid")
-    if completed.returncode != 0:
-        # Never relay child diagnostics: a future dependency error could contain
-        # a URL or credential.  The issuer's stable exit code is sufficient.
-        fail(f"issuer_failed:{completed.returncode}")
-    if completed.stderr or not completed.stdout or len(completed.stdout) > MAX_JSON_BYTES:
-        fail("issuer_output_invalid")
     if (
         sha256_file(issuer, "issuer", 512 * 1024 * 1024) != issuer_sha
         or sha256_file(node, "node", 512 * 1024 * 1024) != node_sha
@@ -1296,6 +1369,14 @@ def execute(arguments):
         or onboarding_sha_after != onboarding_sha
     ):
         fail("direct_onboarding_evidence_changed")
+    if completed.returncode != 0:
+        error_code = parse_issuer_command_error(completed, operation)
+        if error_code is not None:
+            raise D2ACommandError(operation, error_code)
+        # All untrusted, malformed, unknown, or non-one-shot diagnostics stay flattened.
+        fail(f"issuer_failed:{completed.returncode}")
+    if completed.stderr or not completed.stdout or len(completed.stdout) > MAX_JSON_BYTES:
+        fail("issuer_output_invalid")
     try:
         evidence = json.loads(
             completed.stdout,
@@ -1614,6 +1695,9 @@ def main():
             execute(arguments)
         else:
             verify(arguments)
+    except D2ACommandError as error:
+        print(canonical_json(command_error_payload(error.operation, error.error_code)))
+        raise SystemExit(1) from None
     except D2AError as error:
         print(str(error), file=sys.stderr)
         raise SystemExit(1) from None

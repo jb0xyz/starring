@@ -1029,6 +1029,36 @@ mod tests {
     }
 
     #[test]
+    fn discord_timing_accepts_the_bounded_d2_write_margin() {
+        let mut source = valid_source();
+        source.insert(
+            ProductionConfigurationFieldV1::DiscordRequestTimeout,
+            "4000",
+        );
+        source.insert(
+            ProductionConfigurationFieldV1::DiscordWriteAuthorityLifetime,
+            "5000",
+        );
+        source.insert(
+            ProductionConfigurationFieldV1::DiscordReadAuthorityLifetime,
+            "15000",
+        );
+        let timing = ProductionConfigV1::from_source(&source)
+            .unwrap()
+            .discord()
+            .timing();
+        assert_eq!(timing.request_timeout(), Duration::from_millis(4000));
+        assert_eq!(
+            timing.write_authority_lifetime(),
+            Duration::from_millis(5000)
+        );
+        assert_eq!(
+            timing.read_authority_lifetime(),
+            Duration::from_millis(15000)
+        );
+    }
+
+    #[test]
     fn ambient_postgres_configuration_is_rejected_before_secret_resolution() {
         for name in FORBIDDEN_POSTGRES_ENVIRONMENT {
             let mut source = valid_source();
