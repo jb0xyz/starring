@@ -849,7 +849,7 @@ pub fn disable_core_dumps() -> Result<(), IssuerError> {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 enum SessionLifecycleStatus {
     Active,
     NotIssued,
@@ -5862,6 +5862,29 @@ mod tests {
         let observed = read_session_lifecycle_marker(&path, uid).unwrap();
         assert_eq!(observed.status, SessionLifecycleStatus::Active);
         assert_eq!(observed.process_group_id, Some(5252));
+    }
+
+    #[test]
+    fn bootstrap_not_issued_status_uses_the_cross_language_snake_case_contract() {
+        let uid = current_uid().unwrap();
+        let mut marker = active_session_lifecycle_marker(uid);
+        marker.operation = "direct-onboard".to_string();
+        marker.origin = SessionLifecycleOrigin::Bootstrap;
+        marker.status = SessionLifecycleStatus::NotIssued;
+        marker.process_group_id = None;
+        assert!(valid_session_lifecycle_state(&marker));
+
+        let payload = serde_json::to_vec(&marker).unwrap();
+        assert!(payload
+            .windows(b"\"status\":\"not_issued\"".len())
+            .any(|window| window == b"\"status\":\"not_issued\""));
+        let parsed: SessionLifecycleMarker = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed, marker);
+
+        let legacy = String::from_utf8(payload)
+            .unwrap()
+            .replace("\"status\":\"not_issued\"", "\"status\":\"notissued\"");
+        assert!(serde_json::from_str::<SessionLifecycleMarker>(&legacy).is_err());
     }
 
     #[test]
