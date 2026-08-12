@@ -384,6 +384,7 @@ class BootstrapFixture:
         self.run_id = None
         self.resource_prefix = None
         self.create_tools()
+        self.dependencies = self.create_dependencies()
         self.candidates = self.create_candidates()
         self.config = self.valid_config()
         self.config_path = write_file(self.root / "sandbox.json", self.config, 0o600)
@@ -403,6 +404,17 @@ class BootstrapFixture:
         self.testcase = testcase
 
     def cleanup(self):
+        if hasattr(self, "dependency_bootstrap") and self.dependency_bootstrap.exists():
+            for path in sorted(
+                self.dependency_bootstrap.rglob("*"),
+                key=lambda item: len(item.parts),
+                reverse=True,
+            ):
+                if path.is_dir():
+                    path.chmod(0o700)
+                else:
+                    path.chmod(0o600)
+            self.dependency_bootstrap.chmod(0o700)
         candidate_parent = self.root / "candidate-artifacts"
         if candidate_parent.exists():
             candidate_parent.chmod(0o700)
@@ -421,6 +433,8 @@ class BootstrapFixture:
         write_file(self.tool_root / "d2a_candidate.py", "# sealed candidate builder\n", 0o644)
         write_file(self.tool_root / "headless_product_runner.mjs", "export {};\n", 0o644)
         write_file(self.tool_root / "scenarios" / "study-room.v1.json", "{}\n", 0o644)
+        for relative in BOOTSTRAP.CANDIDATE_DEPENDENCY_SOURCE_INPUTS.values():
+            write_file(self.root / relative, f"fixture:{relative}\n", 0o644)
         issuer_root = self.tool_root / "session-issuer"
         for name in ("Cargo.toml", "Cargo.lock", "src/lib.rs", "src/main.rs"):
             write_file(issuer_root / name, f"fixture:{name}\n", 0o644)
@@ -458,6 +472,67 @@ class BootstrapFixture:
             "mode": stat.S_IMODE(metadata.st_mode),
             "uid": metadata.st_uid,
             "links": metadata.st_nlink,
+        }
+
+    def create_dependencies(self):
+        state_root = self.root / "d3-state"
+        state_root.mkdir(mode=0o700)
+        bootstrap = state_root / "gate-bootstrap"
+        bootstrap.mkdir(mode=0o700)
+        vendor = bootstrap / "vendor"
+        vendor.mkdir(mode=0o700)
+        workspace_vendor = vendor / "workspace"
+        transport_vendor = vendor / "transport"
+        workspace_vendor.mkdir(mode=0o700)
+        transport_vendor.mkdir(mode=0o700)
+        workspace_config = write_file(
+            bootstrap / "native-cargo-config.toml",
+            BOOTSTRAP.workspace_dependency_cargo_configuration(bootstrap),
+            0o400,
+        )
+        transport_config = write_file(
+            bootstrap / "native-transport-cargo-config.toml",
+            BOOTSTRAP.transport_dependency_cargo_configuration(bootstrap),
+            0o400,
+        )
+        workspace_vendor.chmod(0o500)
+        transport_vendor.chmod(0o500)
+        vendor.chmod(0o500)
+        bootstrap.chmod(0o555)
+        self.dependency_bootstrap = bootstrap
+        tree = BOOTSTRAP.candidate_dependency_tree_identity(bootstrap)
+        record = {
+            "schema_version": 1,
+            "kind": "starring.d3.gate-bootstrap.v1",
+            "gate_runtime_sha256": "e" * 64,
+            **tree,
+        }
+        record["record_sha256"] = hashlib.sha256(
+            BOOTSTRAP.canonical_json(record).encode("utf-8")
+        ).hexdigest()
+        record_path = write_file(state_root / "gate-bootstrap.json", record, 0o600)
+        return {
+            "schema_version": 1,
+            "kind": BOOTSTRAP.CANDIDATE_DEPENDENCY_SNAPSHOT_KIND,
+            "bootstrap_root": str(bootstrap),
+            "record": self.identity(record_path),
+            "gate_runtime_sha256": record["gate_runtime_sha256"],
+            "record_sha256": record["record_sha256"],
+            "tree_sha256": record["tree_sha256"],
+            "entries": record["entries"],
+            "total_bytes": record["total_bytes"],
+            "workspace": {
+                "vendor_root": str(workspace_vendor),
+                "cargo_config": self.identity(workspace_config),
+            },
+            "transport": {
+                "vendor_root": str(transport_vendor),
+                "cargo_config": self.identity(transport_config),
+            },
+            "source_inputs": {
+                name: self.identity(self.root / relative)
+                for name, relative in BOOTSTRAP.CANDIDATE_DEPENDENCY_SOURCE_INPUTS.items()
+            },
         }
 
     def valid_config(self):
@@ -535,7 +610,8 @@ class BootstrapFixture:
         transport_target = build_root / "transport-target"
         cargo = str(self.rust_toolchain_bin / "cargo")
         commands = [
-            [cargo, "build", "--frozen", "--release", "--target-dir", str(workspace_target),
+            [cargo, "--config", self.dependencies["workspace"]["cargo_config"]["path"],
+             "build", "--frozen", "--release", "--target-dir", str(workspace_target),
              "-p", package, "--bin", binary]
             for package, binary in (
                 ("starring-api", "starring-api"),
@@ -545,7 +621,8 @@ class BootstrapFixture:
             )
         ]
         commands.append([
-            cargo, "build", "--frozen", "--release", "--manifest-path",
+            cargo, "--config", self.dependencies["transport"]["cargo_config"]["path"],
+            "build", "--frozen", "--release", "--manifest-path",
             "tools/d2-certification-transport/Cargo.toml", "--target-dir",
             str(transport_target),
         ])
@@ -569,6 +646,7 @@ class BootstrapFixture:
                 "git": self.identity(self.git_path),
             },
             "commands": commands,
+            "dependencies": self.dependencies,
             "environment": {
                 "HOME": str(pathlib.Path.home()),
                 "PATH": f"{self.rust_toolchain_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -866,6 +944,13 @@ class D2ABootstrapTests(unittest.TestCase):
                 "candidate_provenance_recipe_invalid",
             ),
             (
+                "recipe_dependency_config",
+                lambda value: value["commands"][0].__setitem__(
+                    2, value["dependencies"]["transport"]["cargo_config"]["path"]
+                ),
+                "candidate_provenance_recipe_invalid",
+            ),
+            (
                 "toolchain",
                 lambda value: value["toolchain"]["darwin"]["fixed_tools"]["xcrun"].pop("links"),
                 "candidate_provenance_toolchain_invalid",
@@ -895,6 +980,57 @@ class D2ABootstrapTests(unittest.TestCase):
                 self.assertEqual(raised.exception.code, expected)
                 self.fixture.cleanup()
                 self.fixture = BootstrapFixture(self)
+
+    def test_candidate_dependency_snapshot_exact_schema_and_drift_negatives(self):
+        self.assertIs(
+            BOOTSTRAP.validate_candidate_dependencies(
+                self.fixture.dependencies, self.fixture.root
+            ),
+            self.fixture.dependencies,
+        )
+        mutations = (
+            (
+                "extra_field",
+                lambda value: value.__setitem__("unexpected", True),
+                "candidate_dependency_snapshot_invalid",
+            ),
+            (
+                "record_identity",
+                lambda value: value["record"].__setitem__("sha256", "0" * 64),
+                "candidate_dependency_snapshot_changed",
+            ),
+            (
+                "record_self_seal",
+                lambda value: value.__setitem__("record_sha256", "0" * 64),
+                "candidate_dependency_snapshot_changed",
+            ),
+            (
+                "tree_digest",
+                lambda value: value.__setitem__("tree_sha256", "0" * 64),
+                "candidate_dependency_snapshot_changed",
+            ),
+            (
+                "cargo_config_identity",
+                lambda value: value["workspace"]["cargo_config"].__setitem__(
+                    "sha256", "0" * 64
+                ),
+                "candidate_dependency_config_invalid",
+            ),
+            (
+                "source_lock_identity",
+                lambda value: value["source_inputs"]["workspace_lock"].__setitem__(
+                    "sha256", "0" * 64
+                ),
+                "candidate_dependency_source_changed",
+            ),
+        )
+        for name, mutate, expected in mutations:
+            with self.subTest(name=name):
+                changed = copy.deepcopy(self.fixture.dependencies)
+                mutate(changed)
+                with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                    BOOTSTRAP.validate_candidate_dependencies(changed, self.fixture.root)
+                self.assertEqual(raised.exception.code, expected)
 
     def test_one_shot_sequence_writes_byte_exact_taint_before_orchestration(self):
         executor = FakeExecutor(self.fixture)
@@ -1015,6 +1151,21 @@ class D2ABootstrapTests(unittest.TestCase):
         )
         self.assertEqual(state["source_commit_sha"], self.fixture.candidate_spec["commit_sha"])
         self.assertEqual(state["source_tree_sha"], self.fixture.candidate_spec["source_tree_sha"])
+        self.assertEqual(
+            state["candidate_dependency_record_sha256"],
+            self.fixture.dependencies["record_sha256"],
+        )
+        self.assertEqual(
+            state["candidate_dependency_tree_sha256"],
+            self.fixture.dependencies["tree_sha256"],
+        )
+        self.assertEqual(
+            result["candidate_dependencies"],
+            {
+                "record_sha256": self.fixture.dependencies["record_sha256"],
+                "tree_sha256": self.fixture.dependencies["tree_sha256"],
+            },
+        )
         self.assertEqual(
             result["source_revision"],
             {
@@ -1632,6 +1783,7 @@ class D2ABootstrapTests(unittest.TestCase):
         self.assertEqual(set(result), BOOTSTRAP.RESULT_FIELDS)
         self.assertIsNone(result["onboarding_evidence"])
         self.assertIsNone(result["source_revision"])
+        self.assertIsNone(result["candidate_dependencies"])
         self.assertIsNone(result["issuer_toolchain"])
 
     def test_boolean_schema_versions_are_rejected(self):

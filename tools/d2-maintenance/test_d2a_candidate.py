@@ -40,6 +40,7 @@ class FakeExecutor:
         build_failure=None,
         interrupt_at=None,
         source_changes=False,
+        dependency_changes_at=None,
     ):
         self.fixture = fixture
         self.dirty = dirty
@@ -47,8 +48,10 @@ class FakeExecutor:
         self.build_failure = build_failure
         self.interrupt_at = interrupt_at
         self.source_changes = source_changes
+        self.dependency_changes_at = dependency_changes_at
         self.calls = []
         self.builds = []
+        self.metadata = []
         self.head_reads = 0
 
     def complete(self, argv, code=0, stdout=b"", stderr=b""):
@@ -94,7 +97,10 @@ class FakeExecutor:
                     b"release: 1.97.0\nLLVM version: 21.1.0\n"
                 ),
             )
-        if executable == "cargo" and argv[1] == "build":
+        if executable == "cargo" and "metadata" in argv[1:5]:
+            self.metadata.append({"argv": list(argv), "env": dict(environment)})
+            return self.complete(argv, stdout=b'{"packages":[],"version":1}\n')
+        if executable == "cargo" and "build" in argv[1:5]:
             number = len(self.builds) + 1
             self.builds.append({"argv": list(argv), "cwd": pathlib.Path(cwd), "env": dict(environment)})
             if self.interrupt_at == number:
@@ -113,6 +119,17 @@ class FakeExecutor:
                     "starring-staging-provisioner": "starring-d2-sealed-provisioner",
                 }[package]
             write_file(target / "release" / binary, f"binary:{binary}\n", 0o755)
+            if self.dependency_changes_at == number:
+                dependency = (
+                    self.fixture.bootstrap
+                    / "vendor"
+                    / "workspace"
+                    / "jobserver-0.1.35"
+                    / "Cargo.toml"
+                )
+                dependency.chmod(0o600)
+                dependency.write_text("[package]\nname='drift'\n", encoding="utf-8")
+                dependency.chmod(0o400)
             return self.complete(argv, stderr=b"Finished release build\n")
         if executable == "otool" and argv[1] == "-L":
             path = pathlib.Path(argv[2])
@@ -169,10 +186,53 @@ class Fixture:
         for name in CANDIDATE.OPERATOR_NAMES:
             self.operators[name] = str(write_file(self.operator_root / name, f"operator:{name}\n", 0o555))
         self.operator_root.chmod(0o555)
-        self.config = {
+        self.dependency_state = self.root / "d3-state"
+        self.dependency_state.mkdir(mode=0o700)
+        self.bootstrap = self.dependency_state / "gate-bootstrap"
+        self.bootstrap.mkdir(mode=0o700)
+        workspace_vendor = self.bootstrap / "vendor" / "workspace"
+        transport_vendor = self.bootstrap / "vendor" / "transport"
+        write_file(workspace_vendor / "jobserver-0.1.35" / "Cargo.toml", "[package]\n", 0o400)
+        write_file(transport_vendor / "twilight-0.1.0" / "Cargo.toml", "[package]\n", 0o400)
+        write_file(
+            self.bootstrap / "native-cargo-config.toml",
+            CANDIDATE.workspace_cargo_configuration(self.bootstrap),
+            0o400,
+        )
+        write_file(
+            self.bootstrap / "native-transport-cargo-config.toml",
+            CANDIDATE.transport_cargo_configuration(self.bootstrap),
+            0o400,
+        )
+        for path in sorted(
+            self.bootstrap.rglob("*"), key=lambda value: len(value.parts), reverse=True
+        ):
+            if path.is_dir():
+                path.chmod(0o500)
+        self.bootstrap.chmod(0o555)
+        tree = CANDIDATE.gate_bootstrap_tree_identity(self.bootstrap)
+        record = {
             "schema_version": 1,
+            "kind": "starring.d3.gate-bootstrap.v1",
+            "gate_runtime_sha256": "e" * 64,
+            **tree,
+        }
+        record["record_sha256"] = hashlib.sha256(
+            CANDIDATE.canonical_json(record).encode("utf-8")
+        ).hexdigest()
+        self.dependency_record = write_file(
+            self.dependency_state / "gate-bootstrap.json", record, 0o600
+        )
+        self.config = {
+            "schema_version": 2,
             "kind": CANDIDATE.CONFIG_KIND,
             "operators": dict(self.operators),
+            "dependencies": {
+                "bootstrap_root": str(self.bootstrap),
+                "record_path": str(self.dependency_record),
+                "record_sha256": record["record_sha256"],
+                "tree_sha256": record["tree_sha256"],
+            },
         }
         self.config_path = write_file(self.root / "candidate-config.json", self.config, 0o600)
         self.lock = self.root / "candidate-builder.lock"
@@ -250,6 +310,10 @@ class Fixture:
             for directory in [bundle / "codex-worker", bundle]:
                 if directory.exists():
                     directory.chmod(0o700)
+        if self.bootstrap.exists():
+            self.bootstrap.chmod(0o700)
+            for path in self.bootstrap.rglob("*"):
+                path.chmod(0o700 if path.is_dir() else 0o600)
         self.temporary.cleanup()
 
 
@@ -267,6 +331,17 @@ class CandidateBuilderTests(unittest.TestCase):
         self.assertFalse(result["release_eligible"])
         self.assertFalse(result["commercial_certification"])
         self.assertEqual(len(executor.builds), 5)
+        self.assertEqual(len(executor.metadata), 2)
+        self.assertEqual(
+            [call["argv"][2] for call in executor.metadata],
+            [
+                str(self.fixture.bootstrap / "native-cargo-config.toml"),
+                str(self.fixture.bootstrap / "native-transport-cargo-config.toml"),
+            ],
+        )
+        self.assertTrue(
+            all(call["env"]["CARGO_NET_OFFLINE"] == "true" for call in executor.metadata)
+        )
         expected_packages = [
             ("starring-api", "starring-api"),
             ("starring-runtime", "starring-runtime"),
@@ -275,12 +350,18 @@ class CandidateBuilderTests(unittest.TestCase):
         ]
         for build, (package, binary) in zip(executor.builds[:4], expected_packages):
             argv = build["argv"]
-            self.assertEqual(argv[1:4], ["build", "--frozen", "--release"])
+            self.assertEqual(argv[1], "--config")
+            self.assertEqual(argv[2], str(self.fixture.bootstrap / "native-cargo-config.toml"))
+            self.assertEqual(argv[3:6], ["build", "--frozen", "--release"])
             self.assertEqual(argv[argv.index("-p") + 1], package)
             self.assertEqual(argv[argv.index("--bin") + 1], binary)
             self.assertEqual(build["env"]["STARRING_RUNTIME_BUILD_REVISION"], self.fixture.commit)
         transport = executor.builds[4]["argv"]
-        self.assertEqual(transport[1:4], ["build", "--frozen", "--release"])
+        self.assertEqual(transport[1], "--config")
+        self.assertEqual(
+            transport[2], str(self.fixture.bootstrap / "native-transport-cargo-config.toml")
+        )
+        self.assertEqual(transport[3:6], ["build", "--frozen", "--release"])
         self.assertEqual(
             transport[transport.index("--manifest-path") + 1],
             "tools/d2-certification-transport/Cargo.toml",
@@ -319,6 +400,13 @@ class CandidateBuilderTests(unittest.TestCase):
         self.assertEqual(provenance["source"]["tree"], self.fixture.tree)
         self.assertIs(provenance["source"]["clean"], True)
         self.assertEqual(provenance["environment"]["STARRING_RUNTIME_BUILD_REVISION"], self.fixture.commit)
+        self.assertEqual(
+            set(provenance["dependencies"]), CANDIDATE.DEPENDENCY_SNAPSHOT_FIELDS
+        )
+        self.assertEqual(
+            provenance["dependencies"]["record_sha256"],
+            self.fixture.config["dependencies"]["record_sha256"],
+        )
         self.assertFalse(provenance["release_eligible"])
         self.assertFalse(provenance["commercial_certification"])
         state_path, state = CANDIDATE.load_state(result["state"])
@@ -418,6 +506,11 @@ class CandidateBuilderTests(unittest.TestCase):
         extra["unexpected"] = True
         with self.assertRaises(CANDIDATE.CandidateError):
             CANDIDATE.validate_config(extra)
+        legacy = dict(self.fixture.config)
+        legacy["schema_version"] = 1
+        legacy["kind"] = "starring.d2a.candidate-operator-config.v1"
+        with self.assertRaises(CANDIDATE.CandidateError):
+            CANDIDATE.validate_config(legacy)
         loose = write_file(self.fixture.root / "loose.json", self.fixture.config, 0o644)
         with self.assertRaises(CANDIDATE.CandidateError):
             CANDIDATE.read_private_json(loose, "candidate_config")
@@ -425,6 +518,50 @@ class CandidateBuilderTests(unittest.TestCase):
         pathlib.Path(self.fixture.operators["node"]).chmod(0o755)
         with self.assertRaises(CANDIDATE.CandidateError):
             CANDIDATE.validate_config(self.fixture.config)
+
+    def test_dependency_record_tree_and_source_inputs_are_exactly_bound(self):
+        snapshot = CANDIDATE.load_dependency_snapshot(
+            self.fixture.config["dependencies"], self.fixture.repo
+        )
+        self.assertEqual(set(snapshot), CANDIDATE.DEPENDENCY_SNAPSHOT_FIELDS)
+        self.assertEqual(
+            set(snapshot["source_inputs"]), set(CANDIDATE.DEPENDENCY_SOURCE_INPUTS)
+        )
+        self.assertEqual(snapshot["record"]["path"], str(self.fixture.dependency_record))
+        self.assertEqual(snapshot["tree_sha256"], self.fixture.config["dependencies"]["tree_sha256"])
+        self.assertIs(CANDIDATE.validate_dependency_snapshot(snapshot, self.fixture.repo), snapshot)
+
+        changed = dict(self.fixture.config["dependencies"])
+        changed["tree_sha256"] = "0" * 64
+        with self.assertRaises(CANDIDATE.CandidateError) as raised:
+            CANDIDATE.load_dependency_snapshot(changed, self.fixture.repo)
+        self.assertEqual(raised.exception.code, "candidate_dependencies_invalid")
+
+    def test_dependency_tree_drift_fails_before_state_or_build_output(self):
+        target = (
+            self.fixture.bootstrap
+            / "vendor"
+            / "workspace"
+            / "jobserver-0.1.35"
+            / "Cargo.toml"
+        )
+        target.chmod(0o600)
+        target.write_text("[package]\nname='changed'\n", encoding="utf-8")
+        target.chmod(0o400)
+        executor = FakeExecutor(self.fixture)
+        with self.assertRaises(CANDIDATE.CandidateError) as raised:
+            self.fixture.builder(executor).build(self.fixture.config_path)
+        self.assertEqual(raised.exception.code, "dependency_tree_mismatch")
+        self.assertEqual(executor.builds, [])
+        self.assertFalse(self.fixture.output.exists())
+
+    def test_dependency_tree_is_rechecked_after_every_build(self):
+        executor = FakeExecutor(self.fixture, dependency_changes_at=2)
+        result = self.fixture.builder(executor).build(self.fixture.config_path)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error_code"], "dependency_tree_mismatch")
+        self.assertEqual(len(executor.builds), 2)
+        self.assertIsNone(result["candidate_spec"])
 
     def test_operator_identity_must_match_initial_config_validation(self):
         class ChangedOperatorBuilder(CANDIDATE.CandidateBuilder):

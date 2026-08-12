@@ -239,9 +239,11 @@ bundle. Unknown, missing, duplicate, boolean-as-version, mutable, or mismatched
 fields fail closed.
 
 Both the candidate and issuer builds reject every Cargo config discoverable
-from the real build directory through the filesystem root, use a private
-`CARGO_HOME` containing only validated cache links, force offline Cargo, and
-bind the complete Cargo environment. They recursively bind the pinned Rust
+from the real build directory through the filesystem root and force offline
+Cargo. The candidate uses an initially empty private `CARGO_HOME` plus the
+explicit sealed D3 vendor configuration; the issuer uses a private
+`CARGO_HOME` containing only validated cache links. Both bind the complete
+Cargo environment. They recursively bind the pinned Rust
 sysroot and system linker shims before and after compilation. On macOS they
 also bind `/usr/bin/xcrun`, `xcode-select`, the resolved clang/ld/ar/ranlib/
 otool files, OS build, and the root-owned non-writable SDK tree (including
@@ -364,16 +366,23 @@ files are dirty. Source HEAD, the worker sources, operator inputs, and Rust
 toolchain identities are checked again after all five builds and before any
 bundle is published.
 
-Its exact `0600` input has only three operator paths:
+Its exact `0600` v2 input has three operator paths and one sealed D3 dependency
+boundary:
 
 ```json
 {
-  "schema_version": 1,
-  "kind": "starring.d2a.candidate-operator-config.v1",
+  "schema_version": 2,
+  "kind": "starring.d2a.candidate-operator-config.v2",
   "operators": {
     "codex": "/absolute/immutable/codex",
     "node": "/absolute/immutable/node",
     "cloudflared": "/absolute/immutable/cloudflared"
+  },
+  "dependencies": {
+    "bootstrap_root": "/absolute/d3-state/gate-bootstrap",
+    "record_path": "/absolute/d3-state/gate-bootstrap.json",
+    "record_sha256": "<parsed D3 record self-seal>",
+    "tree_sha256": "<D3 sealed bootstrap tree digest>"
   }
 }
 ```
@@ -382,6 +391,17 @@ Each operator must be a distinct canonical, owner-held, single-link `0555`
 regular file in an owner-held non-writable directory. The builder accepts no
 credential fields.
 
+The dependency paths must name one D3 `gate-bootstrap` and its sibling
+`gate-bootstrap.json`. The builder verifies the record's canonical bytes and
+self-seal, then reproduces the complete D3 tree digest with owner, mode,
+single-link, symlink, entry-count, byte-count, and stable-read checks. It
+requires the exact native workspace and transport Cargo configurations and
+their read-only vendor roots. The current workspace/transport manifests and
+lockfiles are identity-bound, and bounded offline `cargo metadata --locked`
+checks prove they resolve against that vendor before compilation. The whole
+dependency snapshot is revalidated before and after every build and on both
+sides of publication; it is embedded verbatim in provenance.
+
 The Rust boundary is fixed to the canonical owner-held
 `~/.rustup/toolchains/stable-aarch64-apple-darwin/bin/{cargo,rustc}`. It rejects
 rustup proxies and verifies Cargo 1.97.0 plus Rust 1.97.0 with host
@@ -389,11 +409,11 @@ rustup proxies and verifies Cargo 1.97.0 plus Rust 1.97.0 with host
 package/bin boundaries:
 
 ```text
-cargo build --frozen --release --target-dir <workspace-target> -p starring-api --bin starring-api
-cargo build --frozen --release --target-dir <workspace-target> -p starring-runtime --bin starring-runtime
-cargo build --frozen --release --target-dir <workspace-target> -p starring-db-bootstrap --bin starring-d2-db-bootstrap
-cargo build --frozen --release --target-dir <workspace-target> -p starring-staging-provisioner --bin starring-d2-sealed-provisioner
-cargo build --frozen --release --manifest-path tools/d2-certification-transport/Cargo.toml --target-dir <transport-target>
+cargo --config <sealed-workspace-config> build --frozen --release --target-dir <workspace-target> -p starring-api --bin starring-api
+cargo --config <sealed-workspace-config> build --frozen --release --target-dir <workspace-target> -p starring-runtime --bin starring-runtime
+cargo --config <sealed-workspace-config> build --frozen --release --target-dir <workspace-target> -p starring-db-bootstrap --bin starring-d2-db-bootstrap
+cargo --config <sealed-workspace-config> build --frozen --release --target-dir <workspace-target> -p starring-staging-provisioner --bin starring-d2-sealed-provisioner
+cargo --config <sealed-transport-config> build --frozen --release --manifest-path tools/d2-certification-transport/Cargo.toml --target-dir <transport-target>
 ```
 
 Every command receives `STARRING_RUNTIME_BUILD_REVISION=<exact HEAD>`, frozen
@@ -409,7 +429,7 @@ Run it only after committing the complete maintenance implementation:
 
 ```sh
 python3 tools/d2-maintenance/d2a_candidate.py build \
-  --config /absolute/private/d2a-candidate-operators.v1.json
+  --config /absolute/private/d2a-candidate-operators.v2.json
 ```
 
 Successful bundles are unique children of
@@ -420,7 +440,7 @@ cloudflared files are `0555`; the seven worker files are `0444`; and
 files. The spec has the exact `starring.d2a.candidate-spec.v2` shape and binds
 the source tree, immutable bundle path, nine path/hash records, and raw
 `provenance.json` SHA-256. Provenance binds the source commit/tree and
-`clean: true`, exact commands, toolchain
+`clean: true`, exact commands, the sealed dependency snapshot, toolchain
 versions and hashes, builder identity, source/destination artifact hashes, and
 the non-certifying flags.
 

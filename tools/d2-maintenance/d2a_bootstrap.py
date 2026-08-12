@@ -41,6 +41,7 @@ CONFIG_KIND = "starring.d2a.persistent-sandbox-config.v1"
 CANDIDATE_SCHEMA_VERSION = 2
 CANDIDATE_KIND = "starring.d2a.candidate-spec.v2"
 CANDIDATE_PROVENANCE_KIND = "starring.d2a.candidate-provenance.v1"
+CANDIDATE_DEPENDENCY_SNAPSHOT_KIND = "starring.d2a.candidate-dependency-snapshot.v1"
 STATE_KIND = "starring.d2a.bootstrap-state.v1"
 RESULT_KIND = "starring.d2a.bootstrap-result.v1"
 GLOBAL_LOCK_PATH = pathlib.Path("/private/tmp/starring-d2a-bootstrap.lock")
@@ -70,6 +71,8 @@ FIXED_LINKERS = tuple(
 )
 MAX_INPUT_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 1024 * 1024
+MAX_CANDIDATE_DEPENDENCY_ENTRIES = 500000
+MAX_CANDIDATE_DEPENDENCY_BYTES = 4 * 1024 * 1024 * 1024
 BUILD_TIMEOUT_SECONDS = 60 * 60
 COMMAND_TIMEOUT_SECONDS = 20 * 60
 TOOL_TIMEOUT_SECONDS = 60
@@ -129,8 +132,8 @@ CANDIDATE_RECORD_FIELDS = {"path", "sha256"}
 CANDIDATE_PROVENANCE_FIELDS = {
     "schema_version", "kind", "status", "release_eligible",
     "commercial_certification", "source", "commands", "environment",
-    "toolchain", "artifacts", "worker", "operators", "bundle", "builder",
-    "built_at",
+    "dependencies", "toolchain", "artifacts", "worker", "operators",
+    "bundle", "builder", "built_at",
 }
 CANDIDATE_PROVENANCE_SOURCE_FIELDS = {"root", "commit", "tree", "clean", "git"}
 CANDIDATE_PROVENANCE_ENVIRONMENT_FIELDS = {
@@ -140,6 +143,22 @@ CANDIDATE_PROVENANCE_ENVIRONMENT_FIELDS = {
     "RANLIB", "RUSTC", "SDKROOT", "STARRING_RUNTIME_BUILD_REVISION", "TMPDIR",
 }
 CANDIDATE_IDENTITY_FIELDS = {"path", "sha256", "size", "mode", "uid", "links"}
+CANDIDATE_DEPENDENCY_RECORD_FIELDS = {
+    "schema_version", "kind", "gate_runtime_sha256", "entries",
+    "total_bytes", "tree_sha256", "record_sha256",
+}
+CANDIDATE_DEPENDENCY_SNAPSHOT_FIELDS = {
+    "schema_version", "kind", "bootstrap_root", "record",
+    "gate_runtime_sha256", "record_sha256", "tree_sha256", "entries",
+    "total_bytes", "workspace", "transport", "source_inputs",
+}
+CANDIDATE_DEPENDENCY_SOURCE_FIELDS = {"vendor_root", "cargo_config"}
+CANDIDATE_DEPENDENCY_SOURCE_INPUTS = {
+    "workspace_manifest": pathlib.Path("Cargo.toml"),
+    "workspace_lock": pathlib.Path("Cargo.lock"),
+    "transport_manifest": pathlib.Path("tools/d2-certification-transport/Cargo.toml"),
+    "transport_lock": pathlib.Path("tools/d2-certification-transport/Cargo.lock"),
+}
 CANDIDATE_TOOL_IDENTITY_FIELDS = CANDIDATE_IDENTITY_FIELDS | {"version"}
 CANDIDATE_DARWIN_SELECTED_FIELDS = {
     "selected_path", "selected_link_target", "resolved_path", "sha256",
@@ -251,6 +270,8 @@ STATE_FIELDS = {
     "candidate_spec_sha256",
     "candidate_provenance_path",
     "candidate_provenance_sha256",
+    "candidate_dependency_record_sha256",
+    "candidate_dependency_tree_sha256",
     "source_commit_sha",
     "source_tree_sha",
     "run_id",
@@ -284,6 +305,7 @@ RESULT_FIELDS = {
     "records",
     "onboarding_evidence",
     "source_revision",
+    "candidate_dependencies",
     "issuer_toolchain",
     "release_eligible",
     "persistent_sandbox_retained",
@@ -1174,18 +1196,338 @@ def valid_candidate_identity(value, *, tool=False):
     )
 
 
+def workspace_dependency_cargo_configuration(bootstrap_root):
+    workspace = bootstrap_root / "vendor" / "workspace"
+    transport = bootstrap_root / "vendor" / "transport"
+    return (
+        '[source.crates-io]\nreplace-with = "workspace-vendored-sources"\n\n'
+        '[source."git+https://github.com/twilight-rs/twilight.git?rev='
+        'b4ce13b727e7731b917576ad977300ab6926bb6b"]\n'
+        'git = "https://github.com/twilight-rs/twilight.git"\n'
+        'rev = "b4ce13b727e7731b917576ad977300ab6926bb6b"\n'
+        'replace-with = "twilight-vendored-sources"\n\n'
+        '[source.workspace-vendored-sources]\n'
+        f'directory = "{workspace}"\n\n'
+        '[source.twilight-vendored-sources]\n'
+        f'directory = "{transport}"\n\n'
+        '[net]\noffline = true\n'
+    ).encode("utf-8")
+
+
+def transport_dependency_cargo_configuration(bootstrap_root):
+    transport = bootstrap_root / "vendor" / "transport"
+    return (
+        '[source.crates-io]\nreplace-with = "vendored-sources"\n\n'
+        '[source."git+https://github.com/twilight-rs/twilight.git?rev='
+        'b4ce13b727e7731b917576ad977300ab6926bb6b"]\n'
+        'git = "https://github.com/twilight-rs/twilight.git"\n'
+        'rev = "b4ce13b727e7731b917576ad977300ab6926bb6b"\n'
+        'replace-with = "vendored-sources"\n\n'
+        '[source.vendored-sources]\n'
+        f'directory = "{transport}"\n\n'
+        '[net]\noffline = true\n'
+    ).encode("utf-8")
+
+
+def candidate_dependency_file(raw, label, expected_mode, maximum=MAX_INPUT_BYTES):
+    path = absolute_normal_path(raw, label, must_exist=True)
+    try:
+        expected = path.lstat()
+    except OSError:
+        fail(f"{label}_invalid")
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(expected.st_mode)
+        or expected.st_uid != os.getuid()
+        or expected.st_nlink != 1
+        or stat.S_IMODE(expected.st_mode) != expected_mode
+        or not 0 < expected.st_size <= maximum
+    ):
+        fail(f"{label}_invalid")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        fail(f"{label}_unavailable")
+    try:
+        before = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (expected.st_dev, expected.st_ino):
+            fail(f"{label}_invalid")
+        payload = bytearray()
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+            digest.update(chunk)
+            if len(payload) > maximum:
+                fail(f"{label}_invalid")
+        after = os.fstat(descriptor)
+        if (
+            len(payload) != before.st_size
+            or (
+                before.st_dev, before.st_ino, before.st_uid, before.st_gid,
+                before.st_mode, before.st_nlink, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns,
+            )
+            != (
+                after.st_dev, after.st_ino, after.st_uid, after.st_gid,
+                after.st_mode, after.st_nlink, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns,
+            )
+        ):
+            fail(f"{label}_changed")
+        return bytes(payload), {
+            "path": str(path),
+            "sha256": digest.hexdigest(),
+            "size": before.st_size,
+            "mode": stat.S_IMODE(before.st_mode),
+            "uid": before.st_uid,
+            "links": before.st_nlink,
+        }
+    finally:
+        os.close(descriptor)
+
+
+def candidate_dependency_tree_identity(raw_root):
+    root = absolute_normal_path(raw_root, "candidate_dependency_bootstrap", must_exist=True)
+    try:
+        root_before = root.lstat()
+    except OSError:
+        fail("candidate_dependency_bootstrap_invalid")
+    if (
+        root.name != "gate-bootstrap"
+        or root.is_symlink()
+        or not stat.S_ISDIR(root_before.st_mode)
+        or root_before.st_uid != os.getuid()
+        or stat.S_IMODE(root_before.st_mode) != 0o555
+    ):
+        fail("candidate_dependency_bootstrap_invalid")
+    try:
+        paths = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+    except OSError:
+        fail("candidate_dependency_tree_unavailable")
+    digest = hashlib.sha256()
+    entries = 0
+    total_bytes = 0
+    inventory = []
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        inventory.append(relative)
+        try:
+            before = path.lstat()
+        except OSError:
+            fail("candidate_dependency_tree_unavailable")
+        mode = stat.S_IMODE(before.st_mode)
+        if stat.S_ISLNK(before.st_mode) or before.st_uid != os.getuid() or mode & 0o222:
+            fail("candidate_dependency_tree_invalid")
+        entries += 1
+        if entries > MAX_CANDIDATE_DEPENDENCY_ENTRIES:
+            fail("candidate_dependency_tree_too_large")
+        if stat.S_ISDIR(before.st_mode):
+            kind = "directory"
+            size = 0
+        elif stat.S_ISREG(before.st_mode) and before.st_nlink == 1:
+            kind = "file"
+            size = before.st_size
+        else:
+            fail("candidate_dependency_tree_invalid")
+        header = canonical_json(
+            {"path": relative, "kind": kind, "mode": mode, "size": size}
+        ).encode("utf-8")
+        digest.update(len(header).to_bytes(8, "big"))
+        digest.update(header)
+        if kind == "directory":
+            continue
+        total_bytes += size
+        if total_bytes > MAX_CANDIDATE_DEPENDENCY_BYTES:
+            fail("candidate_dependency_tree_too_large")
+        try:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            fail("candidate_dependency_tree_unavailable")
+        observed = 0
+        try:
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                observed += len(chunk)
+                if observed > size:
+                    fail("candidate_dependency_tree_changed")
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (
+            observed != size
+            or (
+                before.st_dev, before.st_ino, before.st_uid, before.st_gid,
+                before.st_mode, before.st_nlink, before.st_size,
+                before.st_mtime_ns, before.st_ctime_ns,
+            )
+            != (
+                after.st_dev, after.st_ino, after.st_uid, after.st_gid,
+                after.st_mode, after.st_nlink, after.st_size,
+                after.st_mtime_ns, after.st_ctime_ns,
+            )
+        ):
+            fail("candidate_dependency_tree_changed")
+    try:
+        final_inventory = [
+            path.relative_to(root).as_posix()
+            for path in sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+        ]
+        root_after = root.lstat()
+    except OSError:
+        fail("candidate_dependency_tree_unavailable")
+    if (
+        inventory != final_inventory
+        or (
+            root_before.st_dev, root_before.st_ino, root_before.st_uid,
+            root_before.st_gid, root_before.st_mode, root_before.st_mtime_ns,
+            root_before.st_ctime_ns,
+        )
+        != (
+            root_after.st_dev, root_after.st_ino, root_after.st_uid,
+            root_after.st_gid, root_after.st_mode, root_after.st_mtime_ns,
+            root_after.st_ctime_ns,
+        )
+    ):
+        fail("candidate_dependency_tree_changed")
+    return {
+        "entries": entries,
+        "total_bytes": total_bytes,
+        "tree_sha256": digest.hexdigest(),
+    }
+
+
+def validate_candidate_dependencies(value, source_root):
+    if (
+        not isinstance(value, dict)
+        or set(value) != CANDIDATE_DEPENDENCY_SNAPSHOT_FIELDS
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+        or value.get("kind") != CANDIDATE_DEPENDENCY_SNAPSHOT_KIND
+        or not valid_candidate_identity(value.get("record"))
+        or not isinstance(value.get("workspace"), dict)
+        or set(value["workspace"]) != CANDIDATE_DEPENDENCY_SOURCE_FIELDS
+        or not isinstance(value.get("transport"), dict)
+        or set(value["transport"]) != CANDIDATE_DEPENDENCY_SOURCE_FIELDS
+        or not isinstance(value.get("source_inputs"), dict)
+        or set(value["source_inputs"]) != set(CANDIDATE_DEPENDENCY_SOURCE_INPUTS)
+        or not valid_candidate_identity(value["workspace"].get("cargo_config"))
+        or not valid_candidate_identity(value["transport"].get("cargo_config"))
+        or any(not valid_candidate_identity(record) for record in value["source_inputs"].values())
+        or not DIGEST.fullmatch(value.get("gate_runtime_sha256", ""))
+        or not DIGEST.fullmatch(value.get("record_sha256", ""))
+        or not DIGEST.fullmatch(value.get("tree_sha256", ""))
+        or type(value.get("entries")) is not int
+        or not 0 < value["entries"] <= MAX_CANDIDATE_DEPENDENCY_ENTRIES
+        or type(value.get("total_bytes")) is not int
+        or not 0 < value["total_bytes"] <= MAX_CANDIDATE_DEPENDENCY_BYTES
+    ):
+        fail("candidate_dependency_snapshot_invalid")
+    bootstrap = absolute_normal_path(
+        value.get("bootstrap_root"), "candidate_dependency_bootstrap", must_exist=True
+    )
+    require_owned(bootstrap.parent, "candidate_dependency_state_root", 0o700, directory=True)
+    record_path = bootstrap.parent / "gate-bootstrap.json"
+    if pathlib.Path(value["record"]["path"]) != record_path:
+        fail("candidate_dependency_record_invalid")
+    raw_record, observed_record_identity = candidate_dependency_file(
+        record_path, "candidate_dependency_record", 0o600
+    )
+    if observed_record_identity != value["record"]:
+        fail("candidate_dependency_snapshot_changed")
+    try:
+        record = json.loads(
+            raw_record, object_pairs_hook=strict_object, parse_constant=reject_constant
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        fail("candidate_dependency_record_invalid")
+    if (
+        not isinstance(record, dict)
+        or set(record) != CANDIDATE_DEPENDENCY_RECORD_FIELDS
+        or type(record.get("schema_version")) is not int
+        or record.get("schema_version") != 1
+        or record.get("kind") != "starring.d3.gate-bootstrap.v1"
+        or not DIGEST.fullmatch(record.get("gate_runtime_sha256", ""))
+        or type(record.get("entries")) is not int
+        or not 0 < record["entries"] <= MAX_CANDIDATE_DEPENDENCY_ENTRIES
+        or type(record.get("total_bytes")) is not int
+        or not 0 < record["total_bytes"] <= MAX_CANDIDATE_DEPENDENCY_BYTES
+        or not DIGEST.fullmatch(record.get("tree_sha256", ""))
+        or not DIGEST.fullmatch(record.get("record_sha256", ""))
+    ):
+        fail("candidate_dependency_record_invalid")
+    record_payload = dict(record)
+    record_seal = record_payload.pop("record_sha256")
+    if (
+        sha256_bytes(canonical_json(record_payload).encode("utf-8")) != record_seal
+        or raw_record != (canonical_json(record) + "\n").encode("utf-8")
+    ):
+        fail("candidate_dependency_record_invalid")
+    tree = candidate_dependency_tree_identity(bootstrap)
+    if any(tree[name] != record[name] for name in tree):
+        fail("candidate_dependency_tree_mismatch")
+    if any(
+        value[name] != record[name]
+        for name in (
+            "gate_runtime_sha256", "record_sha256", "tree_sha256",
+            "entries", "total_bytes",
+        )
+    ):
+        fail("candidate_dependency_snapshot_changed")
+    workspace_vendor = bootstrap / "vendor" / "workspace"
+    transport_vendor = bootstrap / "vendor" / "transport"
+    require_owned(workspace_vendor, "candidate_dependency_workspace_vendor", 0o500, directory=True)
+    require_owned(transport_vendor, "candidate_dependency_transport_vendor", 0o500, directory=True)
+    workspace_config = bootstrap / "native-cargo-config.toml"
+    transport_config = bootstrap / "native-transport-cargo-config.toml"
+    workspace_raw, workspace_identity = candidate_dependency_file(
+        workspace_config, "candidate_dependency_workspace_config", 0o400
+    )
+    transport_raw, transport_identity = candidate_dependency_file(
+        transport_config, "candidate_dependency_transport_config", 0o400
+    )
+    if (
+        workspace_raw != workspace_dependency_cargo_configuration(bootstrap)
+        or transport_raw != transport_dependency_cargo_configuration(bootstrap)
+        or value["workspace"] != {
+            "vendor_root": str(workspace_vendor), "cargo_config": workspace_identity,
+        }
+        or value["transport"] != {
+            "vendor_root": str(transport_vendor), "cargo_config": transport_identity,
+        }
+    ):
+        fail("candidate_dependency_config_invalid")
+    source = absolute_normal_path(source_root, "candidate_dependency_source", must_exist=True)
+    observed_inputs = {}
+    for name, relative in CANDIDATE_DEPENDENCY_SOURCE_INPUTS.items():
+        _raw, observed_inputs[name] = candidate_dependency_file(
+            source / relative, f"candidate_dependency_{name}", 0o644
+        )
+    if observed_inputs != value["source_inputs"]:
+        fail("candidate_dependency_source_changed")
+    return value
+
+
 def validate_candidate_recipe(provenance):
     source = provenance["source"]
     toolchain = provenance["toolchain"]
     tools = toolchain["tools"]
     cargo = tools["cargo"]["path"]
     commands = provenance["commands"]
-    first_target = pathlib.Path(commands[0][5]) if len(commands[0]) > 5 else pathlib.Path(".")
+    dependencies = provenance["dependencies"]
+    workspace_config = dependencies["workspace"]["cargo_config"]["path"]
+    transport_config = dependencies["transport"]["cargo_config"]["path"]
+    first_target = pathlib.Path(commands[0][7]) if len(commands[0]) > 7 else pathlib.Path(".")
     build_root = first_target.parent
     workspace_target = build_root / "workspace-target"
     transport_target = build_root / "transport-target"
     expected = [
-        [cargo, *(
+        [cargo, "--config", workspace_config, *(
             str(workspace_target) if item == "{workspace_target}" else item
             for item in command
         )]
@@ -1197,7 +1539,7 @@ def validate_candidate_recipe(provenance):
         )
     ]
     expected.append([
-        cargo, "build", "--frozen", "--release", "--manifest-path",
+        cargo, "--config", transport_config, "build", "--frozen", "--release", "--manifest-path",
         "tools/d2-certification-transport/Cargo.toml", "--target-dir",
         str(transport_target),
     ])
@@ -1451,6 +1793,7 @@ def validate_candidate_publication(
         or not UTC_TIMESTAMP.fullmatch(provenance["built_at"])
     ):
         fail("candidate_provenance_binding_invalid")
+    validate_candidate_dependencies(provenance.get("dependencies"), source["root"])
     validate_candidate_toolchain(provenance)
     validate_candidate_recipe(provenance)
     expected_records = {
@@ -1653,6 +1996,8 @@ def validate_state(value):
         "config_sha256",
         "candidate_spec_sha256",
         "candidate_provenance_sha256",
+        "candidate_dependency_record_sha256",
+        "candidate_dependency_tree_sha256",
     ):
         if not isinstance(value.get(field), str) or not DIGEST.fullmatch(value[field]):
             fail("bootstrap_state_invalid")
@@ -3677,6 +4022,10 @@ class BootstrapController:
                 "commit_sha": state["source_commit_sha"],
                 "tree_sha": state["source_tree_sha"],
             },
+            "candidate_dependencies": {
+                "record_sha256": state["candidate_dependency_record_sha256"],
+                "tree_sha256": state["candidate_dependency_tree_sha256"],
+            },
             "issuer_toolchain": {
                 "cargo_sha256": state["tool_digests"]["cargo_sha256"],
                 "rustc_sha256": state["tool_digests"]["rustc_sha256"],
@@ -3708,7 +4057,7 @@ class BootstrapController:
             candidate_spec,
             spec_digest,
             provenance_path,
-            _provenance,
+            provenance,
             provenance_digest,
         ) = load_candidate_publication(candidate_spec_path)
         if pathlib.Path(config["release_run_root"]) != absolute_normal_path(
@@ -3748,6 +4097,8 @@ class BootstrapController:
             "candidate_spec_sha256": spec_digest,
             "candidate_provenance_path": str(provenance_path),
             "candidate_provenance_sha256": provenance_digest,
+            "candidate_dependency_record_sha256": provenance["dependencies"]["record_sha256"],
+            "candidate_dependency_tree_sha256": provenance["dependencies"]["tree_sha256"],
             "source_commit_sha": source_revision["commit"],
             "source_tree_sha": source_revision["tree"],
             "run_id": run_id,
@@ -3900,6 +4251,7 @@ def error_result(code):
         "records": [],
         "onboarding_evidence": None,
         "source_revision": None,
+        "candidate_dependencies": None,
         "issuer_toolchain": None,
         "release_eligible": False,
         "persistent_sandbox_retained": True,
