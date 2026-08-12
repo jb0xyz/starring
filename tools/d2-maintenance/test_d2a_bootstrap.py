@@ -434,7 +434,10 @@ class BootstrapFixture:
         write_file(self.tool_root / "headless_product_runner.mjs", "export {};\n", 0o644)
         write_file(self.tool_root / "scenarios" / "study-room.v1.json", "{}\n", 0o644)
         for relative in BOOTSTRAP.CANDIDATE_DEPENDENCY_SOURCE_INPUTS.values():
-            write_file(self.root / relative, f"fixture:{relative}\n", 0o644)
+            payload = f"fixture:{relative}\n".encode()
+            if relative.name == "Cargo.lock":
+                payload += b"# bounded fixture entry\n" * 4096
+            write_file(self.root / relative, payload, 0o644)
         issuer_root = self.tool_root / "session-issuer"
         for name in ("Cargo.toml", "Cargo.lock", "src/lib.rs", "src/main.rs"):
             write_file(issuer_root / name, f"fixture:{name}\n", 0o644)

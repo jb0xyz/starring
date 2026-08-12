@@ -71,6 +71,8 @@ FIXED_LINKERS = tuple(
 )
 MAX_INPUT_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 1024 * 1024
+MAX_CARGO_MANIFEST_BYTES = 1024 * 1024
+MAX_CARGO_LOCK_BYTES = 16 * 1024 * 1024
 MAX_CANDIDATE_DEPENDENCY_ENTRIES = 500000
 MAX_CANDIDATE_DEPENDENCY_BYTES = 4 * 1024 * 1024 * 1024
 BUILD_TIMEOUT_SECONDS = 60 * 60
@@ -158,6 +160,12 @@ CANDIDATE_DEPENDENCY_SOURCE_INPUTS = {
     "workspace_lock": pathlib.Path("Cargo.lock"),
     "transport_manifest": pathlib.Path("tools/d2-certification-transport/Cargo.toml"),
     "transport_lock": pathlib.Path("tools/d2-certification-transport/Cargo.lock"),
+}
+CANDIDATE_DEPENDENCY_SOURCE_LIMITS = {
+    "workspace_manifest": MAX_CARGO_MANIFEST_BYTES,
+    "workspace_lock": MAX_CARGO_LOCK_BYTES,
+    "transport_manifest": MAX_CARGO_MANIFEST_BYTES,
+    "transport_lock": MAX_CARGO_LOCK_BYTES,
 }
 CANDIDATE_TOOL_IDENTITY_FIELDS = CANDIDATE_IDENTITY_FIELDS | {"version"}
 CANDIDATE_DARWIN_SELECTED_FIELDS = {
@@ -1506,7 +1514,10 @@ def validate_candidate_dependencies(value, source_root):
     observed_inputs = {}
     for name, relative in CANDIDATE_DEPENDENCY_SOURCE_INPUTS.items():
         _raw, observed_inputs[name] = candidate_dependency_file(
-            source / relative, f"candidate_dependency_{name}", 0o644
+            source / relative,
+            f"candidate_dependency_{name}",
+            0o644,
+            CANDIDATE_DEPENDENCY_SOURCE_LIMITS[name],
         )
     if observed_inputs != value["source_inputs"]:
         fail("candidate_dependency_source_changed")

@@ -54,6 +54,8 @@ FIXED_LINKERS = tuple(
 )
 MAX_INPUT_BYTES = 64 * 1024
 MAX_OUTPUT_BYTES = 1024 * 1024
+MAX_CARGO_MANIFEST_BYTES = 1024 * 1024
+MAX_CARGO_LOCK_BYTES = 16 * 1024 * 1024
 MAX_DEPENDENCY_ENTRIES = 500000
 MAX_DEPENDENCY_BYTES = 4 * 1024 * 1024 * 1024
 BUILD_TIMEOUT_SECONDS = 60 * 60
@@ -155,6 +157,12 @@ DEPENDENCY_SOURCE_INPUTS = {
     "workspace_lock": pathlib.Path("Cargo.lock"),
     "transport_manifest": pathlib.Path("tools/d2-certification-transport/Cargo.toml"),
     "transport_lock": pathlib.Path("tools/d2-certification-transport/Cargo.lock"),
+}
+DEPENDENCY_SOURCE_LIMITS = {
+    "workspace_manifest": MAX_CARGO_MANIFEST_BYTES,
+    "workspace_lock": MAX_CARGO_LOCK_BYTES,
+    "transport_manifest": MAX_CARGO_MANIFEST_BYTES,
+    "transport_lock": MAX_CARGO_LOCK_BYTES,
 }
 IDENTITY_FIELDS = {"path", "sha256", "size", "mode", "uid", "links"}
 PROVENANCE_FIELDS = {
@@ -937,8 +945,8 @@ def dependency_record(raw_path, expected_root):
     return value, identity
 
 
-def dependency_file_identity(path, label, mode):
-    _raw, identity = read_file(path, label, expected_mode=mode)
+def dependency_file_identity(path, label, mode, maximum):
+    _raw, identity = read_file(path, label, maximum=maximum, expected_mode=mode)
     if set(identity) != IDENTITY_FIELDS:
         fail(f"{label}_invalid")
     return identity
@@ -984,7 +992,10 @@ def load_dependency_snapshot(value, source_root):
     source_root = absolute_normal(source_root, "source_root", True)
     source_inputs = {
         name: dependency_file_identity(
-            source_root / relative, f"dependency_source_{name}", 0o644
+            source_root / relative,
+            f"dependency_source_{name}",
+            0o644,
+            DEPENDENCY_SOURCE_LIMITS[name],
         )
         for name, relative in DEPENDENCY_SOURCE_INPUTS.items()
     }

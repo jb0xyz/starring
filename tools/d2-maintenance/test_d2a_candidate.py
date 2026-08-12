@@ -164,7 +164,11 @@ class Fixture:
         for name in ("ignored.test.mjs",):
             write_file(worker / name, "test only\n", 0o644)
         write_file(self.repo / "Cargo.toml", "[workspace]\n", 0o644)
-        write_file(self.repo / "Cargo.lock", "# lock\n", 0o644)
+        write_file(
+            self.repo / "Cargo.lock",
+            b"# lock\n" + b"# bounded fixture entry\n" * 4096,
+            0o644,
+        )
         write_file(
             self.repo / "tools" / "d2-certification-transport" / "Cargo.toml",
             "[package]\nname='d2-certification-transport'\n",
