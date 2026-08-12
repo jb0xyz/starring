@@ -1606,6 +1606,7 @@ class CandidateBuilder:
                     "metadata",
                     "--locked",
                     "--offline",
+                    "--no-deps",
                     "--format-version=1",
                     "--manifest-path",
                     str(manifest),

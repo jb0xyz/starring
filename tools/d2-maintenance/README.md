@@ -397,7 +397,8 @@ self-seal, then reproduces the complete D3 tree digest with owner, mode,
 single-link, symlink, entry-count, byte-count, and stable-read checks. It
 requires the exact native workspace and transport Cargo configurations and
 their read-only vendor roots. The current workspace/transport manifests and
-lockfiles are identity-bound, and bounded offline `cargo metadata --locked`
+lockfiles are identity-bound, and bounded offline
+`cargo metadata --locked --no-deps`
 checks prove they resolve against that vendor before compilation. The whole
 dependency snapshot is revalidated before and after every build and on both
 sides of publication; it is embedded verbatim in provenance.

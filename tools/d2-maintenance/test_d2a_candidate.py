@@ -342,6 +342,9 @@ class CandidateBuilderTests(unittest.TestCase):
         self.assertTrue(
             all(call["env"]["CARGO_NET_OFFLINE"] == "true" for call in executor.metadata)
         )
+        self.assertTrue(
+            all("--no-deps" in call["argv"] for call in executor.metadata)
+        )
         expected_packages = [
             ("starring-api", "starring-api"),
             ("starring-runtime", "starring-runtime"),
