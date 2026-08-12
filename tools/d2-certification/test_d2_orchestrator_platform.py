@@ -488,6 +488,94 @@ class PlatformAbsenceObservationTests(unittest.TestCase):
             lambda: CommandPlatform([command_response(1)]).launchd_absent("job"),
         )
 
+    def test_launchd_override_absence_is_exact_for_enabled_and_disabled_entries(self):
+        target = "local.starring.d2.0123456789ab.api"
+
+        def output(*rows):
+            return (
+                "\n\tdisabled services = {\n"
+                + "".join(f'\t\t"{label}" => {state}\n' for label, state in rows)
+                + "\t}\n"
+            ).encode("utf-8")
+
+        absent = CommandPlatform(
+            [
+                command_response(
+                    0,
+                    output(
+                        ("local.starring.d2.0123456789ab.api.extra", "enabled"),
+                        ("unrelated.service@16", "disabled"),
+                        ("unrelated app: helper", "enabled"),
+                    ),
+                )
+            ]
+        )
+        self.assertTrue(absent.launchd_overrides_absent((target,)))
+        self.assertEqual(
+            absent.calls,
+            [["/bin/launchctl", "print-disabled", f"gui/{os.getuid()}"]],
+        )
+        for state in ("enabled", "disabled"):
+            with self.subTest(state=state):
+                present = CommandPlatform(
+                    [command_response(0, output((target, state)))]
+                )
+                self.assertFalse(present.launchd_overrides_absent((target,)))
+
+    def test_launchd_override_observation_fails_closed(self):
+        valid = b'\n\tdisabled services = {\n\t\t"other.job" => enabled\n\t}\n'
+        cases = (
+            (command_response(1), "launchd_override_observation_failed"),
+            (
+                command_response(0, valid, b"unexpected"),
+                "launchd_override_observation_invalid",
+            ),
+            (command_response(0, b"\xff"), "launchd_override_observation_invalid"),
+            (
+                command_response(
+                    0,
+                    b'\n\tdisabled services = {\n\t\t"other.job" => unknown\n\t}\n',
+                ),
+                "launchd_override_observation_invalid",
+            ),
+            (
+                command_response(
+                    0,
+                    b'\n\tdisabled services = {\n'
+                    b'\t\t"other.job" => enabled\n'
+                    b'\t\t"other.job" => disabled\n\t}\n',
+                ),
+                "launchd_override_observation_invalid",
+            ),
+            (
+                command_response(
+                    0, b"x" * (PLATFORM.MAX_LAUNCHD_OVERRIDE_OUTPUT_BYTES + 1)
+                ),
+                "launchd_override_observation_invalid",
+            ),
+        )
+        for response, code in cases:
+            with self.subTest(code=code, stdout=response.stdout[:40]):
+                self.assert_platform_failure(
+                    code,
+                    lambda response=response: CommandPlatform([response])
+                    .launchd_overrides_absent(("local.starring.d2.test.api",)),
+                )
+
+    def test_launchd_override_targets_are_closed_and_unique(self):
+        for labels in (
+            (),
+            ("duplicate", "duplicate"),
+            ("invalid/label",),
+            ("x" * 193,),
+        ):
+            with self.subTest(labels=labels):
+                self.assert_platform_failure(
+                    "launchd_override_target_invalid",
+                    lambda labels=labels: CommandPlatform([])
+                    .launchd_overrides_absent(labels),
+                )
+
     def test_postgres_absence_requires_exact_status_process_and_open_file_absence(self):
         with tempfile.TemporaryDirectory() as temporary:
             cluster = pathlib.Path(temporary)

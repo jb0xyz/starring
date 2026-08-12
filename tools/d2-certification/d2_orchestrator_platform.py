@@ -15,6 +15,7 @@ from d2_orchestrator_contract import OWNER_ACCOUNT, REQUIRED_PROGRAMS, fail
 
 MAX_TRANSPORT_CONTROL_BYTES = 64 * 1024
 MAX_DISCORD_RESPONSE_BYTES = 256 * 1024
+MAX_LAUNCHD_OVERRIDE_OUTPUT_BYTES = 256 * 1024
 RUNTIME_PROCESS_INSTANCE_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 TRANSPORT_INSTANCE_PATTERN = re.compile(r"^d2ti-[0-9a-f]{32}$")
 TRANSPORT_OPERATION_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.:-]{7,95}$")
@@ -48,6 +49,12 @@ LAUNCHD_STATE_NORMALIZATION = {
     "exited": "exited",
     "not running": "exited",
 }
+LAUNCHD_OVERRIDE_TARGET_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,191}$"
+)
+LAUNCHD_OVERRIDE_ENTRY_PATTERN = re.compile(
+    r'^\t\t"([^"\\\r\n]{1,192})" => (enabled|disabled)$'
+)
 PROC_PIDTBSDINFO = 3
 PROC_PIDPATHINFO_MAXSIZE = 4096
 
@@ -184,6 +191,60 @@ class Platform:
         if result.returncode == 0:
             return False
         fail("launchd_observation_failed")
+
+    def launchd_overrides_absent(self, labels):
+        if isinstance(labels, (str, bytes)):
+            fail("launchd_override_target_invalid")
+        try:
+            labels = tuple(labels)
+        except TypeError:
+            fail("launchd_override_target_invalid")
+        if (
+            not labels
+            or len(labels) > 64
+            or len(set(labels)) != len(labels)
+            or any(
+                not isinstance(label, str)
+                or not LAUNCHD_OVERRIDE_TARGET_PATTERN.fullmatch(label)
+                for label in labels
+            )
+        ):
+            fail("launchd_override_target_invalid")
+        result = self.run(
+            [REQUIRED_PROGRAMS["launchctl"], "print-disabled", f"gui/{os.getuid()}"],
+            timeout=5,
+        )
+        if result.returncode != 0:
+            fail("launchd_override_observation_failed")
+        if (
+            not isinstance(result.stdout, bytes)
+            or not isinstance(result.stderr, bytes)
+            or result.stderr
+            or not result.stdout
+            or len(result.stdout) > MAX_LAUNCHD_OVERRIDE_OUTPUT_BYTES
+        ):
+            fail("launchd_override_observation_invalid")
+        try:
+            output = result.stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            fail("launchd_override_observation_invalid")
+        lines = output.split("\n")
+        if (
+            len(lines) < 4
+            or lines[:2] != ["", "\tdisabled services = {"]
+            or lines[-2:] != ["\t}", ""]
+        ):
+            fail("launchd_override_observation_invalid")
+        observed = set()
+        for line in lines[2:-2]:
+            match = LAUNCHD_OVERRIDE_ENTRY_PATTERN.fullmatch(line)
+            if match is None:
+                fail("launchd_override_observation_invalid")
+            label = match.group(1)
+            if label in observed:
+                fail("launchd_override_observation_invalid")
+            observed.add(label)
+        return not observed.intersection(labels)
 
     def launchd_job(self, label):
         result = self.run(
@@ -1039,6 +1100,8 @@ class Platform:
     def launchd_start(self, label, plist_path):
         if self.launchd_loaded(label):
             fail("launchd_label_busy")
+        if not self.launchd_overrides_absent((label,)):
+            fail("launchd_override_present")
         domain = f"gui/{os.getuid()}"
         try:
             result = self.run(
@@ -1047,12 +1110,6 @@ class Platform:
             )
             if result.returncode != 0 or not self.launchd_loaded(label):
                 fail("launchd_bootstrap_failed")
-            result = self.run(
-                [REQUIRED_PROGRAMS["launchctl"], "enable", f"{domain}/{label}"],
-                timeout=10,
-            )
-            if result.returncode != 0:
-                fail("launchd_enable_failed")
             result = self.run(
                 [
                     REQUIRED_PROGRAMS["launchctl"],
@@ -1063,6 +1120,8 @@ class Platform:
             )
             if result.returncode != 0 or not self.launchd_loaded(label):
                 fail("launchd_kickstart_failed")
+            if not self.launchd_overrides_absent((label,)):
+                fail("launchd_override_present")
         except BaseException:
             if self.launchd_loaded(label):
                 self.launchd_bootout(label)

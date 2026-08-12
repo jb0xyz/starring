@@ -300,6 +300,10 @@ cleanup, and final absence/protected-standing checks. Commercial orchestrator
 `onboard` is never called. Before and after direct onboarding, the bootstrap
 rejects both commercial onboarding evidence paths.
 
+Final launchd absence means both that the five run-owned jobs are unloaded and
+that their exact labels have no persistent enabled/disabled override. The
+bootstrap re-observes this after cleanup before it reports total local absence.
+
 Direct onboarding invokes only the fixed issuer binary with the manifest,
 `--operation direct-onboard`, and the configured display name. Its stdout must
 equal the persisted `d2a-onboarding-evidence.json` object. The bootstrap
@@ -337,6 +341,10 @@ python3 tools/d2-maintenance/d2a_bootstrap.py resume \
   --state /absolute/private/d2a-bootstrap-runs/bootstrap-d2-....json
 ```
 
+Even a previously completed resume replays the idempotent cleanup observer and
+the live launchd/PostgreSQL/protected-standing status checks before reporting
+total local absence; the stored terminal flags alone are never trusted.
+
 Discord teardown transitions a private `d2a-teardown-fence.json` from open to
 `closing` under the same global D2 lock used for lifecycle validation, then to
 `closed` only after successful run-owned teardown. Cleanup independently
@@ -346,7 +354,8 @@ exception is the exact `origin:bootstrap` sentinel: cleanup may close the fence
 without Discord teardown only after the orchestrator proves the run is still
 merely prepared, no candidate-start commitment or mutation/transport/teardown
 artifact exists, every run-owned launchd service is absent, and PostgreSQL is
-not running. If candidate start was already committed before issuer handoff
+not running. Launchd absence includes the exact-label override check above. If
+candidate start was already committed before issuer handoff
 failed, that sentinel follows the normal full run-owned Discord teardown and
 closed-fence path instead. Any other bootstrap-shaped, malformed, incoherent, hard-linked, or
 non-canonical marker fails closed as `manual_recovery_required`. A teardown

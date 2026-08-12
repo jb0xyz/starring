@@ -6083,6 +6083,10 @@ mod tests {
                 "api_loopback_status_invalid",
             ),
             (
+                IssuerError::DiscordHubPreflight,
+                "discord_hub_preflight_failed",
+            ),
+            (
                 IssuerError::SessionLifecycleBinary,
                 "session_lifecycle_binary_invalid",
             ),

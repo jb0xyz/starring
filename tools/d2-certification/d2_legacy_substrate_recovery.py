@@ -735,6 +735,33 @@ def metadata_matches(metadata, progress):
     )
 
 
+def legacy_launchd_labels(context):
+    return tuple(
+        context.manifest["services"][name]["label"]
+        for name in sorted(context.manifest["services"])
+    )
+
+
+def legacy_launchd_status(context, platform):
+    loaded = [
+        name
+        for name, service in sorted(context.manifest["services"].items())
+        if not platform.launchd_absent(service["label"])
+    ]
+    overrides_absent = platform.launchd_overrides_absent(
+        legacy_launchd_labels(context)
+    )
+    return loaded, overrides_absent
+
+
+def require_legacy_launchd_inert(context, platform):
+    loaded, overrides_absent = legacy_launchd_status(context, platform)
+    if loaded:
+        fail("legacy_substrate_launchd_active")
+    if not overrides_absent:
+        fail("legacy_substrate_launchd_override_present")
+
+
 def remove_tree_contents(descriptor, expected_device):
     try:
         entries = list(os.scandir(descriptor))
@@ -844,11 +871,7 @@ def remove_quarantined_root(context, progress):
 
 
 def recover_runtime_root(context, provenance, platform):
-    if any(
-        not platform.launchd_absent(service["label"])
-        for service in context.manifest["services"].values()
-    ):
-        fail("legacy_substrate_launchd_active")
+    require_legacy_launchd_inert(context, platform)
     progress = ensure_recovery_progress(context, provenance)
     root_metadata = path_metadata(context.root)
     quarantined = quarantine_path(context)
@@ -896,11 +919,7 @@ def recover_runtime_root(context, provenance, platform):
         finally:
             os.close(parent)
         cluster_root = quarantined / "postgres"
-        if any(
-            not platform.launchd_absent(service["label"])
-            for service in context.manifest["services"].values()
-        ):
-            fail("legacy_substrate_launchd_active")
+        require_legacy_launchd_inert(context, platform)
         if not platform.postgres_absent(cluster_root):
             fail("legacy_substrate_postgres_active")
         progress = save_recovery_progress(context, progress, "quarantined")
@@ -911,11 +930,7 @@ def recover_runtime_root(context, provenance, platform):
         } or not metadata_matches(quarantine_metadata, progress):
             fail("legacy_substrate_root_swap_detected")
         cluster_root = quarantined / "postgres"
-        if any(
-            not platform.launchd_absent(service["label"])
-            for service in context.manifest["services"].values()
-        ):
-            fail("legacy_substrate_launchd_active")
+        require_legacy_launchd_inert(context, platform)
         if not platform.postgres_absent(cluster_root):
             fail("legacy_substrate_postgres_active")
         progress = save_recovery_progress(context, progress, "quarantined")
@@ -1127,11 +1142,7 @@ def legacy_substrate_status(context, state, platform):
     registry_sha256 = require_registry_unowned(context)
     inventory, present, _identities = keychain_state(context, platform)
     current_snapshot = standing_snapshot(context, platform)
-    loaded = [
-        name
-        for name, service in sorted(context.manifest["services"].items())
-        if not platform.launchd_absent(service["label"])
-    ]
+    loaded, overrides_absent = legacy_launchd_status(context, platform)
     cluster_root = (
         quarantined / "postgres"
         if quarantine_metadata is not None
@@ -1149,6 +1160,7 @@ def legacy_substrate_status(context, state, platform):
         "quarantine_present": quarantine_metadata is not None,
         "postgres_running": postgres_running,
         "loaded_services": loaded,
+        "launchd_overrides_absent": overrides_absent,
         "keychain_items_present": len(present),
         "keychain_items_expected": len(inventory),
         "protected_staging_unchanged": current_snapshot
@@ -1166,6 +1178,8 @@ def require_inert(context, state, platform):
         fail("legacy_substrate_postgres_active")
     if status["loaded_services"]:
         fail("legacy_substrate_launchd_active")
+    if not status["launchd_overrides_absent"]:
+        fail("legacy_substrate_launchd_override_present")
     return status
 
 
@@ -1185,7 +1199,10 @@ def recovery_evidence(
         "recovered_from_phase": state["phase"],
         "database_absent": root_absent,
         "postgres_process_absent": not observed_status["postgres_running"],
-        "launchd_jobs_absent": not observed_status["loaded_services"],
+        "launchd_jobs_absent": (
+            not observed_status["loaded_services"]
+            and observed_status["launchd_overrides_absent"]
+        ),
         "keychain_items_absent": observed_status["keychain_items_present"] == 0,
         "isolated_root_absent": root_absent,
         "quarantine_absent": root_absent,

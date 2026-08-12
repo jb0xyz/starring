@@ -54,6 +54,7 @@ class FakeExecutor:
         source_drift_at_snapshot=None,
         preexisting_lifecycle=None,
         direct_onboard_error_code=None,
+        candidate_launchd_overrides_absent=True,
     ):
         self.fixture = fixture
         self.fail_once = dict(fail_once or {})
@@ -67,6 +68,9 @@ class FakeExecutor:
         self.source_drift_at_snapshot = source_drift_at_snapshot
         self.preexisting_lifecycle = preexisting_lifecycle
         self.direct_onboard_error_code = direct_onboard_error_code
+        self.candidate_launchd_overrides_absent = (
+            candidate_launchd_overrides_absent
+        )
         self.source_snapshot_count = 0
         self.issuer_lock_acquired = False
         self.calls = []
@@ -368,6 +372,9 @@ class FakeExecutor:
                     "phase": "cleaned",
                     "postgres_running": False,
                     "candidate_launchd_jobs_loaded": 0,
+                    "candidate_launchd_overrides_absent": (
+                        self.candidate_launchd_overrides_absent
+                    ),
                     "protected_staging_unchanged": True,
                 },
             )
@@ -1386,7 +1393,7 @@ class D2ABootstrapTests(unittest.TestCase):
     def test_direct_onboarding_allowlisted_diagnostic_is_durable_and_secret_safe(self):
         executor = FakeExecutor(
             self.fixture,
-            direct_onboard_error_code="api_loopback_response_empty",
+            direct_onboard_error_code="discord_hub_preflight_failed",
         )
         result = self.fixture.controller(executor).run(
             self.fixture.config_path,
@@ -1394,12 +1401,35 @@ class D2ABootstrapTests(unittest.TestCase):
             "auth-smoke",
         )
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["error_code"], "api_loopback_response_empty")
+        self.assertEqual(result["error_code"], "discord_hub_preflight_failed")
         state = json.loads(pathlib.Path(result["state"]).read_bytes())
-        self.assertEqual(state["last_error"], "api_loopback_response_empty")
+        self.assertEqual(state["last_error"], "discord_hub_preflight_failed")
         self.assertNotIn("error:", pathlib.Path(result["state"]).read_text())
         self.assertTrue(result["discord_teardown_complete"])
         self.assertTrue(result["cleanup_complete"])
+
+    def test_direct_onboarding_diagnostic_allowlist_is_exact(self):
+        self.assertEqual(
+            BOOTSTRAP.DIRECT_ONBOARD_ISSUER_ERROR_CODES,
+            frozenset(
+                {
+                    "api_loopback_origin_invalid",
+                    "api_loopback_connect_failed",
+                    "api_loopback_write_failed",
+                    "api_loopback_read_failed",
+                    "api_loopback_response_empty",
+                    "api_loopback_status_invalid",
+                    "discord_hub_preflight_failed",
+                    "session_lifecycle_binary_invalid",
+                    "session_lifecycle_source_invalid",
+                    "session_lifecycle_boot_identity_invalid",
+                    "session_lifecycle_existing_marker_invalid",
+                    "session_lifecycle_handoff_invalid",
+                    "session_lifecycle_reentry_invalid",
+                    "session_lifecycle_cas_failed",
+                }
+            ),
+        )
 
     def test_direct_onboarding_unknown_or_multiline_stderr_remains_flattened(self):
         for diagnostic in (
@@ -1480,6 +1510,191 @@ class D2ABootstrapTests(unittest.TestCase):
             resume_executor.calls,
             ["teardown_discord_resources", "cleanup", "status"],
         )
+
+    def test_postconditions_require_current_manifest_launchd_overrides_absent(self):
+        controller = self.fixture.controller(FakeExecutor(self.fixture))
+        status = {
+            "status": "observed",
+            "phase": "cleaned",
+            "postgres_running": False,
+            "candidate_launchd_jobs_loaded": 0,
+            "candidate_launchd_overrides_absent": False,
+            "protected_staging_unchanged": True,
+        }
+        with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+            controller.validate_postconditions(
+                status,
+                {"run_id": "d2-20260812t000000z-000000000000"},
+            )
+        self.assertEqual(raised.exception.code, "postconditions_invalid")
+
+    def test_passed_terminal_resume_replays_cleanup_and_live_status(self):
+        first = self.fixture.controller(FakeExecutor(self.fixture)).run(
+            self.fixture.config_path,
+            self.fixture.candidate_spec_path,
+            "one-shot",
+        )
+        self.assertEqual(first["status"], "passed")
+        self.assertTrue(first["total_local_absence"])
+
+        resume_executor = FakeExecutor(self.fixture)
+        resumed = self.fixture.controller(resume_executor).resume(
+            pathlib.Path(first["state"])
+        )
+        self.assertEqual(resumed["status"], "passed")
+        self.assertIsNone(resumed["error_code"])
+        self.assertTrue(resumed["cleanup_complete"])
+        self.assertTrue(resumed["total_local_absence"])
+        self.assertEqual(resume_executor.calls, ["cleanup", "status"])
+        state = json.loads(pathlib.Path(first["state"]).read_bytes())
+        self.assertEqual(state["status"], "passed")
+        self.assertEqual(state["phase"], "complete")
+
+    def test_passed_terminal_resume_rejects_live_launchd_override(self):
+        first = self.fixture.controller(FakeExecutor(self.fixture)).run(
+            self.fixture.config_path,
+            self.fixture.candidate_spec_path,
+            "one-shot",
+        )
+        resume_executor = FakeExecutor(
+            self.fixture,
+            candidate_launchd_overrides_absent=False,
+        )
+        resumed = self.fixture.controller(resume_executor).resume(
+            pathlib.Path(first["state"])
+        )
+        self.assertEqual(resumed["status"], "failed")
+        self.assertEqual(resumed["error_code"], "postconditions_invalid")
+        self.assertTrue(resumed["cleanup_complete"])
+        self.assertFalse(resumed["total_local_absence"])
+        self.assertFalse(resumed["protected_staging_unchanged"])
+        self.assertEqual(resume_executor.calls, ["cleanup", "status"])
+        state = json.loads(pathlib.Path(first["state"]).read_bytes())
+        self.assertEqual(state["status"], "passed")
+        self.assertEqual(state["phase"], "complete")
+        self.assertIsNone(state["last_error"])
+        self.assertFalse(state["postconditions_complete"])
+
+        retry_executor = FakeExecutor(self.fixture)
+        retried = self.fixture.controller(retry_executor).resume(
+            pathlib.Path(first["state"])
+        )
+        self.assertEqual(retried["status"], "passed")
+        self.assertIsNone(retried["error_code"])
+        self.assertTrue(retried["cleanup_complete"])
+        self.assertTrue(retried["total_local_absence"])
+        self.assertEqual(retry_executor.calls, ["cleanup", "status"])
+
+    def test_failed_terminal_resume_replays_cleanup_and_preserves_error(self):
+        first = self.fixture.controller(
+            FakeExecutor(
+                self.fixture,
+                direct_onboard_error_code="discord_hub_preflight_failed",
+            )
+        ).run(
+            self.fixture.config_path,
+            self.fixture.candidate_spec_path,
+            "auth-smoke",
+        )
+        self.assertEqual(first["error_code"], "discord_hub_preflight_failed")
+        self.assertTrue(first["total_local_absence"])
+
+        resume_executor = FakeExecutor(self.fixture)
+        resumed = self.fixture.controller(resume_executor).resume(
+            pathlib.Path(first["state"])
+        )
+        self.assertEqual(resumed["status"], "failed")
+        self.assertEqual(resumed["error_code"], "discord_hub_preflight_failed")
+        self.assertTrue(resumed["cleanup_complete"])
+        self.assertTrue(resumed["total_local_absence"])
+        self.assertEqual(resume_executor.calls, ["cleanup", "status"])
+
+    def test_failed_terminal_resume_rejects_live_launchd_override(self):
+        first = self.fixture.controller(
+            FakeExecutor(
+                self.fixture,
+                direct_onboard_error_code="discord_hub_preflight_failed",
+            )
+        ).run(
+            self.fixture.config_path,
+            self.fixture.candidate_spec_path,
+            "auth-smoke",
+        )
+        resume_executor = FakeExecutor(
+            self.fixture,
+            candidate_launchd_overrides_absent=False,
+        )
+        resumed = self.fixture.controller(resume_executor).resume(
+            pathlib.Path(first["state"])
+        )
+        self.assertEqual(resumed["status"], "failed")
+        self.assertEqual(resumed["error_code"], "postconditions_invalid")
+        self.assertTrue(resumed["cleanup_complete"])
+        self.assertFalse(resumed["total_local_absence"])
+        state = json.loads(pathlib.Path(first["state"]).read_bytes())
+        self.assertEqual(state["last_error"], "discord_hub_preflight_failed")
+        self.assertFalse(state["postconditions_complete"])
+        self.assertEqual(resume_executor.calls, ["cleanup", "status"])
+
+        retry_executor = FakeExecutor(self.fixture)
+        retried = self.fixture.controller(retry_executor).resume(
+            pathlib.Path(first["state"])
+        )
+        self.assertEqual(retried["status"], "failed")
+        self.assertEqual(
+            retried["error_code"],
+            "discord_hub_preflight_failed",
+        )
+        self.assertTrue(retried["cleanup_complete"])
+        self.assertTrue(retried["total_local_absence"])
+        self.assertEqual(retry_executor.calls, ["cleanup", "status"])
+
+    def test_resume_missing_orchestrator_state_does_not_claim_local_absence(self):
+        executor = FakeExecutor(
+            self.fixture,
+            fail_once={"teardown_discord_resources": 2},
+        )
+        first = self.fixture.controller(executor).run(
+            self.fixture.config_path,
+            self.fixture.candidate_spec_path,
+            "one-shot",
+        )
+        orchestrator_state = (
+            self.fixture.manifest_path.parent / "orchestrator" / "state.json"
+        )
+        orchestrator_state.unlink()
+
+        resume_executor = FakeExecutor(self.fixture)
+        resumed = self.fixture.controller(resume_executor).resume(
+            pathlib.Path(first["state"])
+        )
+        self.assertEqual(resumed["error_code"], "orchestrator_state_missing")
+        self.assertFalse(resumed["discord_teardown_complete"])
+        self.assertFalse(resumed["cleanup_complete"])
+        self.assertFalse(resumed["total_local_absence"])
+        self.assertEqual(resume_executor.calls, [])
+
+    def test_resume_missing_manifest_does_not_claim_local_absence(self):
+        executor = FakeExecutor(
+            self.fixture,
+            fail_once={"teardown_discord_resources": 2},
+        )
+        first = self.fixture.controller(executor).run(
+            self.fixture.config_path,
+            self.fixture.candidate_spec_path,
+            "one-shot",
+        )
+        self.fixture.manifest_path.unlink()
+
+        resume_executor = FakeExecutor(self.fixture)
+        resumed = self.fixture.controller(resume_executor).resume(
+            pathlib.Path(first["state"])
+        )
+        self.assertEqual(resumed["error_code"], "manifest_missing")
+        self.assertFalse(resumed["discord_teardown_complete"])
+        self.assertFalse(resumed["cleanup_complete"])
+        self.assertFalse(resumed["total_local_absence"])
+        self.assertEqual(resume_executor.calls, [])
 
     def test_interrupt_is_redacted_and_cleanup_still_runs(self):
         credential = b"__Host-starring_session=THIS_MUST_NOT_LEAK"

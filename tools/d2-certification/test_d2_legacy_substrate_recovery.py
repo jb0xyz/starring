@@ -16,6 +16,9 @@ from d2_orchestrator_contract import OrchestratorError, keychain_inventory
 class FakePlatform:
     def __init__(self):
         self.loaded = set()
+        self.launchd_overrides = set()
+        self.launchd_override_error = None
+        self.launchd_override_observations = []
         self.postgres = False
         self.launchd_error = None
         self.postgres_error = None
@@ -38,6 +41,13 @@ class FakePlatform:
         if self.launchd_error is not None:
             raise OrchestratorError(self.launchd_error)
         return label not in self.loaded
+
+    def launchd_overrides_absent(self, labels):
+        labels = tuple(labels)
+        self.launchd_override_observations.append(labels)
+        if self.launchd_override_error is not None:
+            raise OrchestratorError(self.launchd_override_error)
+        return not self.launchd_overrides.intersection(labels)
 
     def postgres_absent(self, cluster_root):
         if self.postgres_error is not None:
@@ -409,6 +419,24 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
         self.assertTrue(result["runtime_root_present"])
         self.assertFalse(result["postgres_running"])
         self.assertEqual(result["loaded_services"], [])
+        self.assertTrue(result["launchd_overrides_absent"])
+
+    def test_status_observes_only_exact_current_manifest_launchd_overrides(self):
+        expected = tuple(
+            self.manifest["services"][name]["label"]
+            for name in sorted(self.manifest["services"])
+        )
+        self.platform.launchd_overrides.add("local.starring.d2.unrelated.api")
+        result = recovery.command_status(self.context, self.state, self.platform)
+        self.assertTrue(result["launchd_overrides_absent"])
+        self.assertEqual(self.platform.launchd_override_observations[-1], expected)
+
+        self.platform.launchd_overrides.add(
+            self.manifest["services"]["api"]["label"]
+        )
+        result = recovery.command_status(self.context, self.state, self.platform)
+        self.assertFalse(result["launchd_overrides_absent"])
+        self.assertEqual(self.platform.launchd_override_observations[-1], expected)
 
     def test_recovery_removes_only_owned_inert_substrate_and_is_idempotent(self):
         result = self.recover()
@@ -429,6 +457,8 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
         )
         self.assertEqual(evidence["kind"], recovery.LEGACY_RECOVERY_KIND)
         self.assertTrue(evidence["isolated_root_absent"])
+        self.assertTrue(evidence["launchd_jobs_absent"])
+        self.assertNotIn("launchd_overrides_absent", evidence)
         context, cleaned = recovery.load_legacy_context(self.manifest_path)
         again = recovery.command_recover(
             context, cleaned, self.platform, self.run_id, self.digest
@@ -464,6 +494,49 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
         ):
             self.recover()
         self.assertEqual(len(self.platform.keychain), 29)
+
+    def test_recovery_rejects_current_launchd_override_before_mutation(self):
+        self.platform.launchd_overrides.add(
+            self.manifest["services"]["transport"]["label"]
+        )
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_launchd_override_present"
+        ):
+            self.recover()
+        self.assertTrue(self.root.exists())
+        self.assertEqual(len(self.platform.keychain), 29)
+        self.assertFalse(recovery.recovery_progress_path(self.context).exists())
+        self.assertFalse(
+            (self.artifact_directory / "legacy-substrate-recovery.json").exists()
+        )
+
+    def test_recovery_ignores_unrelated_launchd_override(self):
+        self.platform.launchd_overrides.add("local.starring.d2.unrelated.api")
+        result = self.recover()
+        self.assertEqual(result["status"], "recovered")
+        self.assertTrue(result["launchd_jobs_absent"])
+
+    def test_v1_evidence_folds_live_override_observation_into_launchd_absence(self):
+        self.platform.launchd_overrides.add(
+            self.manifest["services"]["api"]["label"]
+        )
+        observed = recovery.command_status(
+            self.context, self.state, self.platform
+        )
+        evidence = recovery.recovery_evidence(
+            self.context,
+            self.state,
+            observed,
+            True,
+            {
+                "provenance_sha256": "a" * 64,
+                "database_system_identifier": "1",
+                "root_device": 1,
+                "root_inode": 1,
+            },
+        )
+        self.assertFalse(evidence["launchd_jobs_absent"])
+        self.assertNotIn("launchd_overrides_absent", evidence)
 
     def test_recovery_rejects_keychain_without_matching_owner(self):
         service = self.manifest["keychain_services"]["api"]
@@ -697,6 +770,44 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
         self.assertTrue(self.root.exists())
         self.assertEqual(len(self.platform.keychain), 29)
 
+    def test_recovery_fails_closed_on_launchd_override_observation_error(self):
+        self.platform.launchd_override_error = (
+            "launchd_override_observation_failed"
+        )
+        with self.assertRaisesRegex(
+            OrchestratorError, "launchd_override_observation_failed"
+        ):
+            self.recover()
+        self.assertTrue(self.root.exists())
+        self.assertEqual(len(self.platform.keychain), 29)
+        self.assertFalse(recovery.recovery_progress_path(self.context).exists())
+
+    def test_runtime_root_rechecks_override_before_quarantine_deletion(self):
+        provenance = recovery.require_recovery_provenance(
+            self.context, self.platform
+        )
+        current = self.manifest["services"]["runtime"]["label"]
+        original = self.platform.launchd_overrides_absent
+        observations = 0
+
+        def override_appears(labels):
+            nonlocal observations
+            observations += 1
+            if observations == 2:
+                self.platform.launchd_overrides.add(current)
+            return original(labels)
+
+        self.platform.launchd_overrides_absent = override_appears
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_launchd_override_present"
+        ):
+            recovery.recover_runtime_root(
+                self.context, provenance, self.platform
+            )
+        self.assertFalse(self.root.exists())
+        self.assertTrue(recovery.quarantine_path(self.context).exists())
+        self.assertEqual(observations, 2)
+
     def test_recovery_revalidates_keychain_identity_before_delete(self):
         service = self.manifest["keychain_services"]["api"]
         target = (service, "database.apply-executor")
@@ -774,6 +885,19 @@ class LegacySubstrateRecoveryTest(unittest.TestCase):
         context, cleaned = recovery.load_legacy_context(self.manifest_path)
         with self.assertRaisesRegex(
             OrchestratorError, "legacy_substrate_recovery_evidence_invalid"
+        ):
+            recovery.command_recover(
+                context, cleaned, self.platform, self.run_id, self.digest
+            )
+
+    def test_cleaned_replay_rejects_new_current_launchd_override(self):
+        self.recover()
+        self.platform.launchd_overrides.add(
+            self.manifest["services"]["worker"]["label"]
+        )
+        context, cleaned = recovery.load_legacy_context(self.manifest_path)
+        with self.assertRaisesRegex(
+            OrchestratorError, "legacy_substrate_launchd_override_present"
         ):
             recovery.command_recover(
                 context, cleaned, self.platform, self.run_id, self.digest

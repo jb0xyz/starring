@@ -63,7 +63,10 @@ run instead of silently resetting the in-memory fault counters. Direct `stop`
 and `cleanup` are idempotent abort and recovery commands. After candidate-start
 commitment they durably retire the run, operate only on manifest-derived
 identities, and require the standing launchd, plist, and port snapshot to
-remain unchanged.
+remain unchanged. Candidate launchd jobs are bootstrapped without writing a
+persistent enabled/disabled override. Dry-run, start, cleanup, and replay all
+require both the exact run labels to be unloaded and their override entries to
+be absent; unrelated historical labels do not affect a fresh run.
 
 The complete run-owned Keychain boundary is 25 secret items and four lifecycle
 ownership markers. The secret items are the 20 application database

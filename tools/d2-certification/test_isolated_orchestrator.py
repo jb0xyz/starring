@@ -44,6 +44,10 @@ class RecordingLaunchdPlatform(PLATFORM.Platform):
     def launchd_loaded(self, label):
         return self.loaded
 
+    def launchd_overrides_absent(self, labels):
+        self.commands.append(["observe-overrides", *labels])
+        return True
+
     def run(self, arguments, input_bytes=None, timeout=30, environment=None):
         command = [str(argument) for argument in arguments]
         self.commands.append(command)
@@ -77,6 +81,8 @@ class FakePlatform:
         self.postgres_observation_error = False
         self.postgres_process_observations = []
         self.launchd_observation_error = False
+        self.launchd_override_observation_error = False
+        self.launchd_overrides = set()
         self.keychain_writes = []
         self.keychain_deletes = []
         self.keychain_identity_versions = {}
@@ -147,6 +153,11 @@ class FakePlatform:
         if self.launchd_observation_error:
             ORCHESTRATOR.fail("launchd_observation_failed")
         return label not in self.loaded
+
+    def launchd_overrides_absent(self, labels):
+        if self.launchd_override_observation_error:
+            ORCHESTRATOR.fail("launchd_override_observation_failed")
+        return not self.launchd_overrides.intersection(labels)
 
     def launchd_job(self, label):
         if label not in self.loaded:
@@ -1136,6 +1147,33 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.assertEqual(self.platform.keychain_writes, [])
         self.assertEqual(self.platform.bootouts, [])
         self.assertFalse(self.isolated_root.exists())
+
+    def test_dry_run_rejects_only_a_current_manifest_launchd_override(self):
+        current = self.context.manifest["services"]["api"]["label"]
+        self.platform.launchd_overrides.add("local.starring.d2.historical.api")
+        self.assertEqual(
+            ORCHESTRATOR.command_dry_run(self.context, self.platform)["status"],
+            "ready",
+        )
+        self.platform.launchd_overrides.add(current)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "isolated_launchd_label_busy"
+        ):
+            ORCHESTRATOR.command_dry_run(self.context, self.platform)
+
+    def test_start_rejects_a_current_manifest_launchd_override_before_mutation(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        current = self.context.manifest["services"]["runtime"]["label"]
+        self.platform.launchd_overrides.add(current)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "isolated_launchd_label_busy"
+        ):
+            ORCHESTRATOR.command_start(self.context, self.platform)
+        self.assertEqual(ORCHESTRATOR.load_state(self.context)["phase"], "prepared")
+        self.assertFalse(self.platform.postgres)
+        self.assertEqual(self.platform.start_order, [])
+        self.platform.launchd_overrides.remove(current)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
     def test_restart_drained_runtime_parser_requires_manifest(self):
         arguments = ORCHESTRATOR.build_parser().parse_args(
@@ -4936,6 +4974,46 @@ class D2IsolatedOrchestratorTest(unittest.TestCase):
         self.platform.launchd_observation_error = False
         ORCHESTRATOR.command_cleanup(self.context, self.platform)
 
+    def test_launchd_override_blocks_cleanup_evidence_and_root_deletion(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        current = self.context.manifest["services"]["transport"]["label"]
+        self.platform.launchd_overrides.add(current)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertTrue(self.isolated_root.exists())
+        self.assertFalse(
+            (self.context.artifact_directory / "cleanup-evidence.json").exists()
+        )
+        self.platform.launchd_overrides.remove(current)
+        cleaned = ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        self.assertTrue(cleaned["launchd_jobs_absent"])
+
+    def test_cleaned_replay_rejects_a_new_current_manifest_launchd_override(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+        current = self.context.manifest["services"]["worker"]["label"]
+        self.platform.launchd_overrides.add(current)
+        with self.assertRaisesRegex(
+            ORCHESTRATOR.OrchestratorError, "cleanup_incomplete"
+        ):
+            ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
+    def test_status_observes_overrides_for_exact_current_manifest_labels(self):
+        ORCHESTRATOR.command_prepare(self.context, self.platform)
+        self.platform.launchd_overrides.add("local.starring.d2.historical.api")
+        status = ORCHESTRATOR.command_status(self.context, self.platform)
+        self.assertIs(status["candidate_launchd_overrides_absent"], True)
+
+        current = self.context.manifest["services"]["api"]["label"]
+        self.platform.launchd_overrides.add(current)
+        status = ORCHESTRATOR.command_status(self.context, self.platform)
+        self.assertIs(status["candidate_launchd_overrides_absent"], False)
+
+        self.platform.launchd_overrides.remove(current)
+        ORCHESTRATOR.command_cleanup(self.context, self.platform)
+
     def test_missing_root_still_requires_process_path_observation(self):
         ORCHESTRATOR.command_prepare(self.context, self.platform)
         preserved = self.isolated_root.with_name(
@@ -5538,11 +5616,35 @@ class LaunchdPlatformTests(unittest.TestCase):
         self.assertEqual(
             actions,
             [
+                ["local.starring.d2.test"],
                 ["bootstrap", f"gui/{ORCHESTRATOR.os.getuid()}", "/tmp/test.plist"],
-                ["enable", f"gui/{ORCHESTRATOR.os.getuid()}/local.starring.d2.test"],
                 ["kickstart", f"gui/{ORCHESTRATOR.os.getuid()}/local.starring.d2.test"],
+                ["local.starring.d2.test"],
             ],
         )
+
+    def test_start_rejects_a_preexisting_launchd_override_without_bootstrap(self):
+        platform = RecordingLaunchdPlatform()
+        platform.launchd_overrides_absent = lambda labels: False
+        with self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "launchd_override_present"
+        ):
+            platform.launchd_start(
+                "local.starring.d2.test", pathlib.Path("/tmp/test.plist")
+            )
+        self.assertEqual(platform.commands, [])
+
+    def test_start_boots_out_if_a_launchd_override_appears_after_kickstart(self):
+        platform = RecordingLaunchdPlatform()
+        observations = iter((True, False))
+        platform.launchd_overrides_absent = lambda labels: next(observations)
+        with self.assertRaisesRegex(
+            CONTRACT.OrchestratorError, "launchd_override_present"
+        ):
+            platform.launchd_start(
+                "local.starring.d2.test", pathlib.Path("/tmp/test.plist")
+            )
+        self.assertEqual(platform.bootouts, ["local.starring.d2.test"])
 
     def test_kickstart_failure_boots_out_the_loaded_job_once(self):
         platform = RecordingLaunchdPlatform()
@@ -6825,11 +6927,13 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
         protected_label = self.context.manifest["protected_staging"][
             "launchd_labels"
         ][0]
-        cases = ("candidate_service", "postgres", "protected")
+        cases = ("candidate_service", "candidate_override", "postgres", "protected")
         for case in cases:
             with self.subTest(case=case):
                 if case == "candidate_service":
                     self.platform.loaded.add(candidate_label)
+                elif case == "candidate_override":
+                    self.platform.launchd_overrides.add(candidate_label)
                 elif case == "postgres":
                     self.platform.postgres = True
                 else:
@@ -6848,6 +6952,7 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
                     ORCHESTRATOR.d2a_teardown_fence_path(self.context).exists()
                 )
                 self.platform.loaded.discard(candidate_label)
+                self.platform.launchd_overrides.discard(candidate_label)
                 self.platform.postgres = False
                 self.platform.loaded.add(protected_label)
 

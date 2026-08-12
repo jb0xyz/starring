@@ -530,11 +530,11 @@ async fn preflight_discord_hub(run: &ValidatedRun, bot_token: &str) -> Result<()
         .ok_or(IssuerError::DiscordHubPreflight)?;
     let stdout_task = tokio::spawn(read_bounded(stdout, MAX_DISCORD_OUTPUT_BYTES));
     let stderr_task = tokio::spawn(read_bounded(stderr, 4 * 1024));
-    let mut stdin = process
+    let stdin = process
         .stdin
         .take()
         .ok_or(IssuerError::DiscordHubPreflight)?;
-    if stdin.write_all(&input).await.is_err() || stdin.shutdown().await.is_err() {
+    if write_discord_config_and_close(stdin, &input).await.is_err() {
         let _ = process.kill().await;
         let _ = process.wait().await;
         return Err(IssuerError::DiscordHubPreflight);
@@ -575,6 +575,22 @@ async fn preflight_discord_hub(run: &ValidatedRun, bot_token: &str) -> Result<()
     {
         return Err(IssuerError::DiscordHubPreflight);
     }
+    Ok(())
+}
+
+async fn write_discord_config_and_close(
+    mut stdin: tokio::process::ChildStdin,
+    input: &[u8],
+) -> Result<(), IssuerError> {
+    stdin
+        .write_all(input)
+        .await
+        .map_err(|_| IssuerError::DiscordHubPreflight)?;
+    stdin
+        .shutdown()
+        .await
+        .map_err(|_| IssuerError::DiscordHubPreflight)?;
+    drop(stdin);
     Ok(())
 }
 
@@ -1144,6 +1160,39 @@ mod tests {
         )
         .await;
         assert!(matches!(disposition, LifecycleDisposition::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn discord_preflight_closes_config_stdin_before_waiting_on_curl() {
+        let mut command = Command::new("/usr/bin/curl");
+        command
+            .args([
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                "2",
+                "--config",
+                "-",
+                "file:///dev/null",
+            ])
+            .env_clear()
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut process = command.spawn().expect("spawn curl EOF probe");
+        let stdin = process.stdin.take().expect("curl stdin");
+        write_discord_config_and_close(stdin, b"header = \"Accept: application/json\"\n")
+            .await
+            .expect("write and close curl config");
+        let status = tokio::time::timeout(Duration::from_secs(1), process.wait())
+            .await
+            .expect("curl must observe EOF before the wait timeout")
+            .expect("wait for curl EOF probe");
+        assert!(status.success());
     }
 
     #[test]

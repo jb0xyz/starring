@@ -337,6 +337,19 @@ AUDITED_PREISSUER_ROLLBACK_EVIDENCE_FIELDS = tuple(
 )
 
 
+def candidate_launchd_labels(context):
+    return tuple(
+        context.manifest["services"][name]["label"] for name in SERVICE_START_ORDER
+    )
+
+
+def candidate_launchd_absent(context, platform):
+    labels = candidate_launchd_labels(context)
+    return all(platform.launchd_absent(label) for label in labels) and (
+        platform.launchd_overrides_absent(labels)
+    )
+
+
 def command_dry_run(context, platform):
     validate_programs(platform)
     validate_candidate_programs(context, platform)
@@ -345,9 +358,8 @@ def command_dry_run(context, platform):
     validate_ports(context, platform, require_available=True)
     if context.root.exists():
         fail("isolated_root_busy")
-    for service in context.manifest["services"].values():
-        if platform.launchd_loaded(service["label"]):
-            fail("isolated_launchd_label_busy")
+    if not candidate_launchd_absent(context, platform):
+        fail("isolated_launchd_label_busy")
     for service, account in keychain_inventory(context):
         if platform.keychain_present(service, account):
             fail("isolated_keychain_identity_busy")
@@ -1633,6 +1645,8 @@ def command_start(context, platform):
     if platform.postgres_running(context.cluster_root):
         fail("postgres_state_drift")
     rollback_candidate_services(context, platform)
+    if not candidate_launchd_absent(context, platform):
+        fail("isolated_launchd_label_busy")
     validate_ports(context, platform, require_available=True)
     if standing_snapshot(context, platform) != state["standing_snapshot"]:
         fail("protected_staging_state_changed")
@@ -3879,10 +3893,7 @@ def close_bootstrap_prestart_teardown_fence(context, platform, lifecycle):
         abort_teardown_tombstone_path(context),
     )
     try:
-        services_absent = all(
-            platform.launchd_absent(service["label"])
-            for service in context.manifest["services"].values()
-        )
+        services_absent = candidate_launchd_absent(context, platform)
         postgres_absent = not platform.postgres_running(context.cluster_root)
     except BaseException:
         fail("manual_recovery_required")
@@ -4407,10 +4418,7 @@ def remove_cleanup_quarantine(context, progress):
 def require_quarantined_cleanup_substrate_inert(context, platform):
     if not cleanup_postgres_absent(context, platform):
         fail("cleanup_postgres_active_after_quarantine")
-    if any(
-        not platform.launchd_absent(service["label"])
-        for service in context.manifest["services"].values()
-    ):
+    if not candidate_launchd_absent(context, platform):
         fail("cleanup_launchd_active_after_quarantine")
 
 
@@ -4599,10 +4607,7 @@ def cleanup_absence(context, platform, expected_snapshot):
     return {
         "database_absent": not root_present,
         "postgres_process_absent": cleanup_postgres_absent(context, platform),
-        "launchd_jobs_absent": all(
-            platform.launchd_absent(service["label"])
-            for service in context.manifest["services"].values()
-        ),
+        "launchd_jobs_absent": candidate_launchd_absent(context, platform),
         "keychain_items_absent": all(
             not platform.keychain_present(service, account)
             for service, account in keychain_inventory(context)
@@ -4919,10 +4924,7 @@ def cleanup(context, platform, expected_snapshot, from_failure=False):
         failures.append("postgres_observation")
         postgres_inert = False
     try:
-        launchd_inert = all(
-            platform.launchd_absent(service["label"])
-            for service in context.manifest["services"].values()
-        )
+        launchd_inert = candidate_launchd_absent(context, platform)
     except BaseException:
         failures.append("launchd_observation")
         launchd_inert = False
@@ -5489,10 +5491,7 @@ def require_audited_recovery_inert_boundary(context, platform, state, lifecycle)
     ):
         fail("audited_recovery_boundary_invalid")
     try:
-        launchd_absent = all(
-            platform.launchd_absent(service["label"])
-            for service in context.manifest["services"].values()
-        )
+        launchd_absent = candidate_launchd_absent(context, platform)
         postgres_absent = cleanup_postgres_absent(context, platform)
         protected_unchanged = (
             standing_snapshot(context, platform) == state["standing_snapshot"]
@@ -6002,6 +6001,7 @@ def command_recover_audited_preissuer_rollback(
 
 def command_status(context, platform):
     state = load_state(context)
+    labels = candidate_launchd_labels(context)
     return {
         "status": "observed",
         "phase": state["phase"],
@@ -6011,6 +6011,9 @@ def command_status(context, platform):
             1
             for service in context.manifest["services"].values()
             if platform.launchd_loaded(service["label"])
+        ),
+        "candidate_launchd_overrides_absent": platform.launchd_overrides_absent(
+            labels
         ),
         "protected_staging_unchanged": standing_snapshot(context, platform)
         == state["standing_snapshot"],

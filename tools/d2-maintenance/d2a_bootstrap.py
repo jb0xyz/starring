@@ -329,6 +329,7 @@ DIRECT_ONBOARD_ISSUER_ERROR_CODES = frozenset({
     "api_loopback_read_failed",
     "api_loopback_response_empty",
     "api_loopback_status_invalid",
+    "discord_hub_preflight_failed",
     "session_lifecycle_binary_invalid",
     "session_lifecycle_source_invalid",
     "session_lifecycle_boot_identity_invalid",
@@ -3970,6 +3971,7 @@ class BootstrapController:
             "phase": "cleaned",
             "postgres_running": False,
             "candidate_launchd_jobs_loaded": 0,
+            "candidate_launchd_overrides_absent": True,
             "protected_staging_unchanged": True,
         }:
             fail("postconditions_invalid")
@@ -4012,31 +4014,18 @@ class BootstrapController:
                 if not state["cleanup_complete"] or not state["postconditions_complete"]:
                     self.cleanup(state_path, state)
             else:
-                runtime_root = pathlib.Path("/private/tmp") / f"starring-d2-{state['run_id']}"
-                if os.path.lexists(runtime_root):
-                    fail("orchestrator_state_missing")
-                # Even without an orchestrator state, taint means this run may
-                # have entered the issuer.  Only the exact bootstrap sentinel
-                # or a quiescent issuer terminal proves cleanup is safe.
+                # Preserve lifecycle-tamper diagnostics ahead of the missing
+                # observer-state boundary, but never convert either case into
+                # cleanup or absence proof.
                 require_revoked_session_lifecycle(state)
-                self.save(
-                    state_path,
-                    state,
-                    discord_teardown_complete=True,
-                    cleanup_complete=True,
-                    postconditions_complete=True,
-                )
+                if state["last_error"] == "manual_recovery_required":
+                    fail("manual_recovery_required")
+                fail("orchestrator_state_missing")
         else:
             runtime_root = pathlib.Path("/private/tmp") / f"starring-d2-{state['run_id']}"
             if os.path.lexists(runtime_root):
                 fail("manifest_missing_with_runtime")
-            self.save(
-                state_path,
-                state,
-                discord_teardown_complete=True,
-                cleanup_complete=True,
-                postconditions_complete=True,
-            )
+            fail("manifest_missing")
 
     def result(self, state_path, state, status=None, error_code=None):
         output = {
@@ -4244,15 +4233,59 @@ class BootstrapController:
 
     def resume_locked(self, state_path):
         state_path, state = load_state(state_path)
-        if state["status"] == "passed" and state["postconditions_complete"]:
-            return self.result(state_path, state, status="passed")
+        # Keep the original terminal outcome across the durable flag clear and
+        # a process stop before replay records its outcome.  A `passed` status
+        # alone never skips the live checks below.
+        passed_result = state["status"] == "passed"
+        terminal_result = (
+            state["status"] in {"passed", "failed"}
+            and state["phase"] == "complete"
+        )
         original = state["last_error"] or "bootstrap_recovery_requested"
+        if terminal_result or state["postconditions_complete"]:
+            # A persisted terminal observation is historical evidence, not a
+            # live absence proof.  Clear both success flags durably so a failed
+            # replay cannot return stale total_local_absence, then force the
+            # orchestrator's idempotent cleanup and status observers below.
+            self.save(
+                state_path,
+                state,
+                cleanup_complete=False,
+                postconditions_complete=False,
+            )
         try:
             self.recover(state_path, state)
         except BaseException as error:
             code = error.code if isinstance(error, BootstrapError) else "recovery_failed"
+            if passed_result:
+                # The live observation failed, but that does not rewrite the
+                # historical product outcome.  Preserve `passed` durably with
+                # absence still unproved so a later resume can retry only the
+                # cleanup/status replay.
+                self.save(
+                    state_path,
+                    state,
+                    phase="complete",
+                    status="passed",
+                    last_error=None,
+                )
+                return self.result(
+                    state_path,
+                    state,
+                    status="failed",
+                    error_code=code,
+                )
             self.save(state_path, state, status="recovery_required", last_error=original)
             return self.result(state_path, state, status="failed", error_code=code)
+        if passed_result:
+            self.save(
+                state_path,
+                state,
+                phase="complete",
+                status="passed",
+                last_error=None,
+            )
+            return self.result(state_path, state, status="passed")
         self.save(state_path, state, phase="complete", status="failed", last_error=original)
         return self.result(state_path, state, status="failed", error_code=original)
 
