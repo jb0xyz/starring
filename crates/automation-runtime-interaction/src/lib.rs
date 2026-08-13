@@ -1,3 +1,4 @@
+mod custom_id;
 mod digest;
 mod effect;
 mod effect_digest;
@@ -6,19 +7,27 @@ mod effect_recovery;
 mod identity;
 mod state;
 mod token;
+mod verified_request;
 
 #[cfg(test)]
 mod test_support;
 
+pub use custom_id::{
+    decode_interaction_custom_id_v1, encode_interaction_button_custom_id_v1,
+    encode_interaction_instance_action_custom_id_v1, encode_interaction_modal_custom_id_v1,
+    InteractionComponentKindV1, InteractionCustomIdErrorV1, ParsedInteractionCustomIdV1,
+    MAX_INTERACTION_CUSTOM_ID_BYTES_V1,
+};
 pub use digest::{
-    build_interaction_preflight_certificate_digest_v1, build_interaction_request_digest_v1,
+    build_interaction_preflight_certificate_digest_v1,
+    build_interaction_receipt_claim_root_digest_v1, build_interaction_request_digest_v1,
     InteractionActionPlanDigestBuilderErrorV1, InteractionActionPlanDigestBuilderV1,
     InteractionActionPlanDigestV1, InteractionDigestErrorV1, InteractionInstanceManifestDigestV1,
     InteractionPreflightCertificateDigestInputV1, InteractionPreflightCertificateDigestV1,
     InteractionPreflightPlanDigestV1, InteractionPreflightSnapshotDigestV1,
-    InteractionRequestDigestErrorV1, InteractionRequestDigestInputV1, InteractionRequestDigestV1,
-    InteractionRequestPayloadV1, InteractionRouteAttestationDigestV1,
-    InteractionTokenAuthenticatedDataDigestV1,
+    InteractionReceiptClaimRootDigestV1, InteractionRequestDigestErrorV1,
+    InteractionRequestDigestInputV1, InteractionRequestDigestV1, InteractionRequestPayloadV1,
+    InteractionRouteAttestationDigestV1, InteractionTokenAuthenticatedDataDigestV1,
 };
 pub use effect::{
     validate_interaction_effect_transition_v1, InteractionEffectActionIdentityV1,
@@ -120,4 +129,8 @@ pub use token::{
     XCHACHA20_POLY1305_INTERACTION_TOKEN_NONCE_BYTES_V1,
     XCHACHA20_POLY1305_INTERACTION_TOKEN_SUITE_V1,
     XCHACHA20_POLY1305_INTERACTION_TOKEN_SUITE_VERSION_V1,
+};
+pub use verified_request::{
+    InteractionRequestMaterialV1, VerifiedInteractionRequestErrorV1,
+    VerifiedInteractionRequestKindV1, VerifiedInteractionRequestV1,
 };

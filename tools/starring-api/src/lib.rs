@@ -8,6 +8,7 @@ mod projection;
 mod secret;
 mod server;
 mod telemetry;
+mod web;
 
 pub use authoring_admission::{
     AuthoringAdmissionConfigErrorV1, AuthoringAdmissionConfigV1, AuthoringAdmissionV1,
@@ -53,3 +54,4 @@ pub use server::{
     LoopbackServeReportV1, LoopbackServerConfigErrorV1, LoopbackServerConfigInputV1,
     LoopbackServerConfigV1, MAX_GRACEFUL_DRAIN_TIMEOUT,
 };
+pub use web::product_web_router_v1;

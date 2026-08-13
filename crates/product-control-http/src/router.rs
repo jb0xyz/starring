@@ -1,5 +1,6 @@
 mod abuse_budget;
 mod authoring;
+mod automation_spec;
 mod boundary;
 mod response_validation;
 
@@ -27,6 +28,9 @@ use crate::{
 };
 use abuse_budget::{OAuthStartAdmission, OAuthStartBudget};
 use authoring::{authoring_session, authoring_turn};
+use automation_spec::{
+    automation_spec_descriptor, automation_spec_preview, automation_spec_simulation,
+};
 use boundary::*;
 use response_validation::{
     valid_apply_view, valid_approval_view, valid_current_principal,
@@ -38,6 +42,12 @@ pub(super) const AUTHORING_TURN_PATH_V1: &str =
     "/v1/installations/{installation_id}/authoring/sessions/{session_id}/turns";
 pub(super) const AUTHORING_SESSION_PATH_V1: &str =
     "/v1/installations/{installation_id}/authoring/sessions/{session_id}";
+pub(super) const AUTOMATION_SPEC_DESCRIPTOR_PATH_V1: &str =
+    "/v1/installations/{installation_id}/authoring/automation-spec/descriptor";
+pub(super) const AUTOMATION_SPEC_PREVIEW_PATH_V1: &str =
+    "/v1/installations/{installation_id}/authoring/automation-spec/previews";
+pub(super) const AUTOMATION_SPEC_SIMULATION_PATH_V1: &str =
+    "/v1/installations/{installation_id}/authoring/automation-spec/simulations";
 
 struct HttpState<F> {
     facade: Arc<F>,
@@ -147,6 +157,32 @@ where
 {
     let state = http_state_with_authoring(facade, config, authoring_config, readiness_gate);
     finish_product_control_router(product_control_authoring_routes::<F>(), state)
+}
+
+pub fn product_control_router_with_automation_spec_v1<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+) -> Router
+where
+    F: crate::ProductControlAutomationSpecFacadeV1,
+{
+    product_control_router_with_automation_spec_v1_and_readiness_gate(
+        facade,
+        config,
+        crate::ProductApiReadinessGate::always_ready(),
+    )
+}
+
+pub fn product_control_router_with_automation_spec_v1_and_readiness_gate<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+    readiness_gate: crate::ProductApiReadinessGate,
+) -> Router
+where
+    F: crate::ProductControlAutomationSpecFacadeV1,
+{
+    let state = http_state(facade, config, readiness_gate);
+    finish_product_control_router(product_control_automation_spec_routes::<F>(), state)
 }
 
 pub fn product_control_router_with_operational_v2<F>(
@@ -274,6 +310,45 @@ where
     finish_product_control_router(routes, state)
 }
 
+pub fn product_control_router_with_full_authoring_v1<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+    authoring_config: AuthoringHttpBoundaryConfigV1,
+) -> Router
+where
+    F: ProductControlOperationalFacadeV2
+        + ProductControlLifecycleFacadeV1
+        + ProductControlAuthoringFacadeV1
+        + crate::ProductControlAutomationSpecFacadeV1,
+{
+    product_control_router_with_full_authoring_v1_and_readiness_gate(
+        facade,
+        config,
+        authoring_config,
+        crate::ProductApiReadinessGate::always_ready(),
+    )
+}
+
+pub fn product_control_router_with_full_authoring_v1_and_readiness_gate<F>(
+    facade: Arc<F>,
+    config: HttpBoundaryConfig,
+    authoring_config: AuthoringHttpBoundaryConfigV1,
+    readiness_gate: crate::ProductApiReadinessGate,
+) -> Router
+where
+    F: ProductControlOperationalFacadeV2
+        + ProductControlLifecycleFacadeV1
+        + ProductControlAuthoringFacadeV1
+        + crate::ProductControlAutomationSpecFacadeV1,
+{
+    let state = http_state_with_authoring(facade, config, authoring_config, readiness_gate);
+    let routes = product_control_full_authoring_routes::<F>().route(
+        "/v2/installations/{installation_id}/promotions/{promotion_id}/deployment",
+        get(deployment_operational_v2::<F>),
+    );
+    finish_product_control_router(routes, state)
+}
+
 fn http_state<F>(
     facade: Arc<F>,
     config: HttpBoundaryConfig,
@@ -368,6 +443,29 @@ where
         .route(AUTHORING_SESSION_PATH_V1, get(authoring_session::<F>))
 }
 
+fn product_control_automation_spec_routes<F>() -> Router<HttpState<F>>
+where
+    F: crate::ProductControlAutomationSpecFacadeV1,
+{
+    product_control_routes::<F>()
+        .route(
+            AUTOMATION_SPEC_DESCRIPTOR_PATH_V1,
+            get(automation_spec_descriptor::<F>),
+        )
+        .route(
+            AUTOMATION_SPEC_PREVIEW_PATH_V1,
+            post(automation_spec_preview::<F>).layer(DefaultBodyLimit::max(
+                ::automation_spec::MAX_AUTOMATION_SPEC_PREVIEW_REQUEST_BYTES_V1,
+            )),
+        )
+        .route(
+            AUTOMATION_SPEC_SIMULATION_PATH_V1,
+            post(automation_spec_simulation::<F>).layer(DefaultBodyLimit::max(
+                ::automation_spec::MAX_AUTOMATION_SPEC_SIMULATION_REQUEST_BYTES_V1,
+            )),
+        )
+}
+
 fn product_control_authoring_lifecycle_routes<F>() -> Router<HttpState<F>>
 where
     F: ProductControlAuthoringFacadeV1 + ProductControlLifecycleFacadeV1,
@@ -376,6 +474,21 @@ where
         "/v1/installations/{installation_id}/promotions/{promotion_id}/lifecycle-cancellations",
         post(cancel_lifecycle::<F>),
     )
+}
+
+fn product_control_full_authoring_routes<F>() -> Router<HttpState<F>>
+where
+    F: ProductControlAuthoringFacadeV1
+        + ProductControlLifecycleFacadeV1
+        + crate::ProductControlAutomationSpecFacadeV1,
+{
+    product_control_automation_spec_routes::<F>()
+        .route(AUTHORING_TURN_PATH_V1, post(authoring_turn::<F>))
+        .route(AUTHORING_SESSION_PATH_V1, get(authoring_session::<F>))
+        .route(
+            "/v1/installations/{installation_id}/promotions/{promotion_id}/lifecycle-cancellations",
+            post(cancel_lifecycle::<F>),
+        )
 }
 
 fn finish_product_control_router<F>(routes: Router<HttpState<F>>, state: HttpState<F>) -> Router

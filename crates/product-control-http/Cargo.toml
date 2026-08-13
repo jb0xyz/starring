@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 async-trait = "0.1"
 authoring-application = { path = "../authoring-application" }
+automation-spec = { path = "../automation-spec" }
 axum = { version = "0.8", features = ["json", "query", "tokio", "http1"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"

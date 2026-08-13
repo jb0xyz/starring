@@ -12,6 +12,7 @@ use crate::{
 };
 
 const REQUEST_DIGEST_DOMAIN_V1: &[u8] = b"starring.runtime.interaction.request.v1\0";
+const CLAIM_ROOT_DIGEST_DOMAIN_V1: &[u8] = b"starring.runtime.interaction.claim_root.v1\0";
 const ACTION_PLAN_DIGEST_DOMAIN_V1: &[u8] = b"starring.runtime.interaction.action_plan.v1\0";
 const PREFLIGHT_CERTIFICATE_DIGEST_DOMAIN_V1: &[u8] =
     b"starring.runtime.interaction.preflight_certificate.v1\0";
@@ -59,6 +60,7 @@ macro_rules! define_digest {
 }
 
 define_digest!(InteractionRequestDigestV1);
+define_digest!(InteractionReceiptClaimRootDigestV1);
 define_digest!(InteractionActionPlanDigestV1);
 define_digest!(InteractionPreflightPlanDigestV1);
 define_digest!(InteractionPreflightSnapshotDigestV1);
@@ -71,6 +73,25 @@ impl InteractionRequestDigestV1 {
     fn from_sha256(bytes: &[u8]) -> Self {
         Self(lower_hex(Sha256::digest(bytes).as_slice()))
     }
+}
+
+impl InteractionReceiptClaimRootDigestV1 {
+    fn from_sha256(bytes: &[u8]) -> Self {
+        Self(lower_hex(Sha256::digest(bytes).as_slice()))
+    }
+}
+
+/// Commits the complete authoritative receipt claim using the same canonical encoder consumed by
+/// the action-plan and preflight identities. This includes product scope, active process identity,
+/// static or instance execution-route pins, serving and gateway fences, receipt identity, and the
+/// verified request digest.
+pub fn build_interaction_receipt_claim_root_digest_v1(
+    claim_root: &InteractionReceiptClaimRootV1,
+) -> InteractionReceiptClaimRootDigestV1 {
+    let mut bytes = Vec::with_capacity(2_048);
+    append_frame(&mut bytes, CLAIM_ROOT_DIGEST_DOMAIN_V1);
+    append_claim_root_v1(&mut bytes, claim_root);
+    InteractionReceiptClaimRootDigestV1::from_sha256(&bytes)
 }
 
 impl InteractionActionPlanDigestV1 {
@@ -572,7 +593,8 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        static_route, static_route_with_build_revision, static_route_with_gateway_owner,
+        instance_route, static_route, static_route_with_build_revision,
+        static_route_with_gateway_owner,
     };
 
     fn receipt() -> InteractionReceiptIdentityV1 {
@@ -672,6 +694,32 @@ mod tests {
 
         assert_ne!(first, reordered);
         assert_ne!(first, changed.finish().unwrap());
+    }
+
+    #[test]
+    fn claim_root_digest_binds_static_and_instance_execution_routes() {
+        let request = button_request("join");
+        let bind = |route: crate::InteractionRouteBindingV1| {
+            crate::InteractionReceiptClaimCandidateV1::new(
+                receipt(),
+                crate::InteractionExpectedRouteV1::from_authoritative(&route),
+                request.clone(),
+            )
+            .bind_authoritative(route)
+            .unwrap()
+        };
+        let static_claim = bind(static_route(1));
+        let instance_claim = bind(instance_route(1));
+
+        let first = build_interaction_receipt_claim_root_digest_v1(&static_claim);
+        assert_eq!(
+            first,
+            build_interaction_receipt_claim_root_digest_v1(&static_claim)
+        );
+        assert_ne!(
+            first,
+            build_interaction_receipt_claim_root_digest_v1(&instance_claim)
+        );
     }
 
     #[test]

@@ -421,6 +421,7 @@ dependencies = [
  "automation-ruleset-dispatch",
  "automation-ruleset-readiness",
  "automation-runtime-convergence",
+ "automation-runtime-effect-contract",
  "automation-runtime-interaction",
  "automation-runtime-registry",
  "automation-state",
@@ -487,6 +488,22 @@ dependencies = [
  "sqlx",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "automation-runtime-effect-contract"
+version = "0.1.0"
+dependencies = [
+ "automation-instance",
+ "automation-ruleset",
+ "automation-runtime-convergence",
+ "automation-runtime-interaction",
+ "discord-model",
+ "resource-resolution",
+ "sha2",
+ "static_assertions",
+ "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]
@@ -624,6 +641,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "automation-spec"
+version = "0.1.0"
+dependencies = [
+ "automation-core",
+ "automation-ruleset",
+ "automation-state",
+ "desired-state",
+ "discord-model",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "automation-state"
 version = "0.1.0"
 dependencies = [
@@ -632,6 +664,52 @@ dependencies = [
  "discord-model",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "automation-stateful-compiler"
+version = "0.1.0"
+dependencies = [
+ "automation-core",
+ "automation-spec",
+ "automation-state",
+ "automation-stateful-spec",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "automation-stateful-runtime"
+version = "0.1.0"
+dependencies = [
+ "automation-instance",
+ "automation-ruleset",
+ "automation-runtime-convergence",
+ "automation-runtime-interaction",
+ "automation-spec",
+ "automation-stateful-compiler",
+ "automation-stateful-spec",
+ "discord-model",
+ "resource-resolution",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
+name = "automation-stateful-spec"
+version = "0.1.0"
+dependencies = [
+ "automation-spec",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]
@@ -2377,6 +2455,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "authoring-application",
+ "automation-spec",
  "axum",
  "chrono",
  "futures-util",
@@ -3296,6 +3375,7 @@ dependencies = [
  "chrono",
  "design-harness-codex-worker-client",
  "discord-model",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "product-control-http",

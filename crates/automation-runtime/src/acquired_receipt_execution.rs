@@ -1007,9 +1007,8 @@ where
             .await;
         }
     };
-    let journal_plan = InteractionEffectJournalPlanV1::new(
-        preflight.certificate.digest().clone(),
-        effect_plan.snapshot_digest().clone(),
+    let journal_plan = match InteractionEffectJournalPlanV1::bind(
+        &preflight.certificate,
         effect_plan
             .entries()
             .iter()
@@ -1020,7 +1019,18 @@ where
                 )
             })
             .collect(),
-    );
+    ) {
+        Ok(plan) => plan,
+        Err(_) => {
+            return finish_terminal_v1(
+                permit,
+                Some(action_plan_digest),
+                AcquiredInteractionTerminalOutcomeV1::ExecutionFailedBeforeEffect,
+                tracking.any_external_attempt_v1(),
+            )
+            .await;
+        }
+    };
     let journaled_services = JournaledActionExecutionServicesV1 {
         journal: tracking,
         mutation: services.mutation,

@@ -65,6 +65,49 @@ fn authority_check_authenticates_and_requires_fresh_apply_authority_only() {
     });
 }
 
+#[test]
+fn automation_spec_checks_require_fresh_author_authority_for_reads_and_computes() {
+    block_on(async {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let authentication = Authentication {
+            events: events.clone(),
+            failure: None,
+        };
+        let authority = ApplyAuthorityCheck {
+            events: events.clone(),
+            capability: Mutex::new(None),
+        };
+        let application = ProductControlApplication::new(&authentication, &authority, &(), &());
+
+        application
+            .check_author_authority("opaque-session-token", &installation())
+            .await
+            .unwrap();
+        assert_eq!(
+            *authority.capability.lock().unwrap(),
+            Some(CapabilityV1::Author)
+        );
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["authenticate", "authorize"]
+        );
+
+        events.lock().unwrap().clear();
+        application
+            .check_author_mutation_authority("opaque-session-token", "csrf-proof", &installation())
+            .await
+            .unwrap();
+        assert_eq!(
+            *authority.capability.lock().unwrap(),
+            Some(CapabilityV1::Author)
+        );
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["authenticate_mutation", "authorize"]
+        );
+    });
+}
+
 fn approve_command() -> ApproveProductPromotionV1 {
     ApproveProductPromotionV1 {
         promotion: authoring_application::PromotionSelectorV1::new(promotion_id()),

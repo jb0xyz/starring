@@ -5,6 +5,30 @@ use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AutomationSpecInstallationReadinessV1 {
+    NotEvaluated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AutomationSpecPreviewResponseV1 {
+    pub schema_version: u16,
+    pub valid: bool,
+    pub diagnostics: Vec<automation_spec::AutomationSpecDiagnosticV1>,
+    pub installation_readiness: AutomationSpecInstallationReadinessV1,
+    pub preview: Option<automation_spec::AutomationPreviewV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AutomationSpecSimulationResponseV1 {
+    pub schema_version: u16,
+    pub valid: bool,
+    pub diagnostics: Vec<automation_spec::AutomationSpecDiagnosticV1>,
+    pub spec_digest: Option<automation_spec::AutomationSpecDigestV1>,
+    pub trace: Option<automation_spec::AutomationSimulationTraceV1>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AuthoringTurnDispositionV1 {
     Created,
     ExactReplay,

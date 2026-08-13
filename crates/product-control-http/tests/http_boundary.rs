@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
 use product_control_http::{
     product_control_router, product_control_router_with_authoring_v1,
-    product_control_router_with_operational_v2,
+    product_control_router_with_automation_spec_v1, product_control_router_with_operational_v2,
     product_control_router_with_operational_v2_and_lifecycle_v1,
     product_control_router_with_operational_v2_and_readiness_gate, ApplyCommand, ApplyView,
     ApprovalPreviewView, AuthoringHttpBoundaryConfigV1, AuthoringSessionViewV1,
@@ -22,9 +22,10 @@ use product_control_http::{
     FacadeError, FacadeErrorCode, HttpBoundaryConfig, IdempotencyKey, LifecycleCancellationCommand,
     LifecycleCancellationView, OAuthCallbackCommand, OAuthCallbackResult, OAuthStartCommand,
     OAuthStartResult, ProductApiReadinessGate, ProductControlAuthoringFacadeV1,
-    ProductControlFacade, ProductControlLifecycleFacadeV1, ProductControlOperationalFacadeV2,
-    ProductRequestId, ProductState, ProductStatusView, PromoteCommand, PromotionView,
-    RejectCommand, RuntimeDeploymentOperationalViewV2, SafeApprovalSummary, SessionCredential,
+    ProductControlAutomationSpecFacadeV1, ProductControlFacade, ProductControlLifecycleFacadeV1,
+    ProductControlOperationalFacadeV2, ProductRequestId, ProductState, ProductStatusView,
+    PromoteCommand, PromotionView, RejectCommand, RuntimeDeploymentOperationalViewV2,
+    SafeApprovalSummary, SessionCredential,
 };
 use tokio::sync::Notify;
 use tower::ServiceExt;
@@ -78,6 +79,9 @@ struct FakeFacade {
     authoring_delay_millis: AtomicUsize,
     authoring_entered: Notify,
     authoring_messages: Mutex<Vec<String>>,
+    automation_spec_read_calls: AtomicUsize,
+    automation_spec_compute_calls: AtomicUsize,
+    automation_spec_authority_failure: AtomicUsize,
 }
 
 impl FakeFacade {
@@ -583,6 +587,48 @@ impl ProductControlAuthoringFacadeV1 for FakeFacade {
 }
 
 #[async_trait]
+impl ProductControlAutomationSpecFacadeV1 for FakeFacade {
+    async fn automation_spec_read_authority(
+        &self,
+        credential: &SessionCredential,
+        _installation_id: &str,
+    ) -> Result<(), FacadeError> {
+        if credential.expose_secret() != SESSION {
+            return Err(FacadeError::new(FacadeErrorCode::AuthenticationRequired));
+        }
+        self.automation_spec_read_calls
+            .fetch_add(1, Ordering::SeqCst);
+        match self
+            .automation_spec_authority_failure
+            .load(Ordering::SeqCst)
+        {
+            1 => Err(FacadeError::new(FacadeErrorCode::Forbidden)),
+            2 => Err(FacadeError::new(FacadeErrorCode::DependencyTimeout)),
+            _ => Ok(()),
+        }
+    }
+
+    async fn automation_spec_compute_authority(
+        &self,
+        credential: &SessionCredential,
+        csrf: &CsrfSecret,
+        _installation_id: &str,
+    ) -> Result<(), FacadeError> {
+        self.verify_mutation_inputs(credential, csrf)?;
+        self.automation_spec_compute_calls
+            .fetch_add(1, Ordering::SeqCst);
+        match self
+            .automation_spec_authority_failure
+            .load(Ordering::SeqCst)
+        {
+            1 => Err(FacadeError::new(FacadeErrorCode::Forbidden)),
+            2 => Err(FacadeError::new(FacadeErrorCode::DependencyTimeout)),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[async_trait]
 impl ProductControlOperationalFacadeV2 for FakeFacade {
     async fn deployment_operational_v2(
         &self,
@@ -749,6 +795,20 @@ fn operational_app_with_gate(
 
 fn lifecycle_app(facade: Arc<FakeFacade>) -> axum::Router {
     product_control_router_with_operational_v2_and_lifecycle_v1(
+        facade,
+        HttpBoundaryConfig::new(
+            ORIGIN,
+            1_024,
+            8,
+            Duration::from_secs(2),
+            ["/app".to_string()],
+        )
+        .unwrap(),
+    )
+}
+
+fn automation_spec_app(facade: Arc<FakeFacade>) -> axum::Router {
+    product_control_router_with_automation_spec_v1(
         facade,
         HttpBoundaryConfig::new(
             ORIGIN,
@@ -1284,6 +1344,55 @@ fn authoring_session_request() -> Request<Body> {
     .header("cookie", format!("__Host-starring_session={SESSION}"))
     .body(Body::empty())
     .unwrap()
+}
+
+fn automation_spec_request(method: &str, suffix: &str, body: impl Into<Body>) -> Request<Body> {
+    request_builder(
+        method,
+        &format!("/v1/installations/install-1/authoring/automation-spec/{suffix}"),
+    )
+    .header("content-type", "application/json")
+    .header("origin", ORIGIN)
+    .header(
+        "cookie",
+        format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+    )
+    .header("x-csrf-token", CSRF)
+    .body(body.into())
+    .unwrap()
+}
+
+fn valid_automation_spec_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "kind": "starring.automation-spec.v1",
+        "key": "member_onboarding",
+        "display_name": "Member onboarding",
+        "description": "Grant a member role from a button.",
+        "panels": [{
+            "id": "onboarding",
+            "channel": "welcome_channel",
+            "content": "Join the community",
+            "buttons": [{"label": "Join", "trigger_id": "join"}]
+        }],
+        "modals": [],
+        "workflows": [{
+            "id": "grant_member",
+            "trigger": {"type": "button_click", "trigger_id": "join"},
+            "condition": {"type": "always"},
+            "actions": [{
+                "id": "grant_member_role",
+                "action": {
+                    "type": "grant_role",
+                    "role": {"type": "existing", "binding": "member_role"},
+                    "target": "actor"
+                }
+            }, {
+                "id": "confirm_membership",
+                "action": {"type": "respond_ephemeral", "content": "Welcome"}
+            }]
+        }]
+    })
 }
 
 async fn body_text(response: axum::response::Response) -> String {
@@ -2976,6 +3085,249 @@ async fn panic_and_wrong_method_have_redacted_problem_responses() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     assert!(body_text(response).await.contains("method_not_allowed"));
+}
+
+#[tokio::test]
+async fn automation_spec_descriptor_is_session_and_fresh_author_bound() {
+    let facade = Arc::new(FakeFacade::default());
+    let router = automation_spec_app(Arc::clone(&facade));
+    let missing = request_builder(
+        "GET",
+        "/v1/installations/install-1/authoring/automation-spec/descriptor",
+    )
+    .body(Body::empty())
+    .unwrap();
+    assert_eq!(
+        router.clone().oneshot(missing).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let request = request_builder(
+        "GET",
+        "/v1/installations/install-1/authoring/automation-spec/descriptor",
+    )
+    .header("cookie", format!("__Host-starring_session={SESSION}"))
+    .body(Body::empty())
+    .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["triggers"].as_array().unwrap().len(), 3);
+    assert_eq!(body["conditions"].as_array().unwrap().len(), 6);
+    assert_eq!(body["actions"].as_array().unwrap().len(), 11);
+    assert_eq!(body["installation_readiness"], "not_evaluated");
+    assert_eq!(facade.automation_spec_read_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn automation_spec_preview_is_pure_csrf_bound_and_requires_no_idempotency_key() {
+    let facade = Arc::new(FakeFacade::default());
+    let body = serde_json::to_vec(&serde_json::json!({
+        "spec": valid_automation_spec_json()
+    }))
+    .unwrap();
+    let response = automation_spec_app(Arc::clone(&facade))
+        .oneshot(automation_spec_request("POST", "previews", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["valid"], true, "{body:#}");
+    assert_eq!(body["diagnostics"], serde_json::json!([]));
+    assert_eq!(body["installation_readiness"], "not_evaluated");
+    assert_eq!(
+        body["preview"]["static_eligibility"],
+        "compatible_with_interaction_runtime_v1"
+    );
+    assert_eq!(body["preview"]["compilation"]["status"], "available");
+    assert_eq!(
+        facade.automation_spec_compute_calls.load(Ordering::SeqCst),
+        1
+    );
+    assert_eq!(facade.promote_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn automation_spec_preview_returns_structured_semantic_diagnostics() {
+    let facade = Arc::new(FakeFacade::default());
+    let mut spec = valid_automation_spec_json();
+    spec["workflows"][0]["actions"][0]["id"] = serde_json::json!("Bad ID");
+    let body = serde_json::to_vec(&serde_json::json!({"spec": spec})).unwrap();
+    let response = automation_spec_app(Arc::clone(&facade))
+        .oneshot(automation_spec_request("POST", "previews", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["valid"], false);
+    assert!(body["preview"].is_null());
+    assert!(body["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|diagnostic| diagnostic["code"] == "invalid_identifier"));
+
+    let malformed = serde_json::to_vec(&serde_json::json!({
+        "spec": valid_automation_spec_json(),
+        "unknown": true
+    }))
+    .unwrap();
+    let response = automation_spec_app(facade)
+        .oneshot(automation_spec_request("POST", "previews", malformed))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(body_text(response).await.contains("invalid_json"));
+}
+
+#[tokio::test]
+async fn automation_spec_simulation_returns_digest_trace_and_event_diagnostics() {
+    let facade = Arc::new(FakeFacade::default());
+    let body = serde_json::to_vec(&serde_json::json!({
+        "spec": valid_automation_spec_json(),
+        "event": {
+            "trigger": {"type": "button_click", "trigger_id": "join"},
+            "inputs": {}
+        }
+    }))
+    .unwrap();
+    let response = automation_spec_app(Arc::clone(&facade))
+        .oneshot(automation_spec_request("POST", "simulations", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["valid"], true, "{body:#}");
+    assert_eq!(body["trace"]["outcome"], "actions_planned");
+    assert_eq!(body["spec_digest"].as_str().unwrap().len(), 64);
+
+    let invalid = serde_json::to_vec(&serde_json::json!({
+        "spec": valid_automation_spec_json(),
+        "event": {
+            "trigger": {"type": "button_click", "trigger_id": "join"},
+            "inputs": {"unexpected": "value"}
+        }
+    }))
+    .unwrap();
+    let response = automation_spec_app(facade)
+        .oneshot(automation_spec_request("POST", "simulations", invalid))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["valid"], false);
+    assert!(body["trace"].is_null());
+    assert_eq!(
+        body["diagnostics"][0]["code"],
+        "inputs_require_modal_trigger"
+    );
+}
+
+#[tokio::test]
+async fn automation_spec_simulation_transport_admits_the_descriptor_maximum_shape() {
+    let facade = Arc::new(FakeFacade::default());
+    let mut spec = valid_automation_spec_json();
+    spec["panels"] = serde_json::json!([]);
+    spec["modals"] = serde_json::json!([{
+        "id": "application",
+        "title": "Application",
+        "fields": (0..5).map(|index| serde_json::json!({
+            "id": format!("field_{index}"),
+            "label": format!("Field {index}"),
+            "style": "paragraph",
+            "required": false
+        })).collect::<Vec<_>>()
+    }]);
+    spec["workflows"][0]["trigger"] =
+        serde_json::json!({"type": "modal_submit", "modal_id": "application"});
+    let escaped = "\u{0001}".repeat(3_990);
+    let inputs = (0..5)
+        .map(|index| {
+            (
+                format!("field_{index}"),
+                serde_json::Value::String(escaped.clone()),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "spec": spec,
+        "event": {
+            "trigger": {"type": "modal_submit", "modal_id": "application"},
+            "inputs": inputs
+        }
+    }))
+    .unwrap();
+    assert!(body.len() > 64 * 1_024);
+    assert!(body.len() < automation_spec::MAX_AUTOMATION_SPEC_SIMULATION_REQUEST_BYTES_V1);
+    let response = automation_spec_app(facade)
+        .oneshot(automation_spec_request("POST", "simulations", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+    assert_eq!(body["valid"], true, "{body:#}");
+    assert_eq!(body["trace"]["outcome"], "actions_planned");
+}
+
+#[tokio::test]
+async fn automation_spec_boundary_fails_closed_on_origin_csrf_query_and_authority() {
+    let facade = Arc::new(FakeFacade::default());
+    let body = serde_json::to_vec(&serde_json::json!({
+        "spec": valid_automation_spec_json()
+    }))
+    .unwrap();
+    let missing_origin = request_builder(
+        "POST",
+        "/v1/installations/install-1/authoring/automation-spec/previews",
+    )
+    .header("content-type", "application/json")
+    .header(
+        "cookie",
+        format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+    )
+    .header("x-csrf-token", CSRF)
+    .body(Body::from(body.clone()))
+    .unwrap();
+    assert_eq!(
+        automation_spec_app(Arc::clone(&facade))
+            .oneshot(missing_origin)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let query = request_builder(
+        "POST",
+        "/v1/installations/install-1/authoring/automation-spec/previews?unsafe=true",
+    )
+    .header("content-type", "application/json")
+    .header("origin", ORIGIN)
+    .header(
+        "cookie",
+        format!("__Host-starring_session={SESSION}; __Host-starring_csrf={CSRF}"),
+    )
+    .header("x-csrf-token", CSRF)
+    .body(Body::from(body.clone()))
+    .unwrap();
+    assert_eq!(
+        automation_spec_app(Arc::clone(&facade))
+            .oneshot(query)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    facade
+        .automation_spec_authority_failure
+        .store(1, Ordering::SeqCst);
+    let response = automation_spec_app(facade)
+        .oneshot(automation_spec_request("POST", "previews", body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[test]

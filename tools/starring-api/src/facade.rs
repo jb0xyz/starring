@@ -27,8 +27,9 @@ use product_control_http::{
     DeploymentOperationalViewV2, DeploymentView, FacadeError, FacadeErrorCode,
     LifecycleCancellationCommand, LifecycleCancellationView, OAuthCallbackCommand,
     OAuthCallbackResult, OAuthStartCommand, OAuthStartResult, ProductControlAuthoringFacadeV1,
-    ProductControlFacade, ProductControlLifecycleFacadeV1, ProductControlOperationalFacadeV2,
-    ProductStatusView, PromoteCommand, PromotionView, RejectCommand, SessionCredential,
+    ProductControlAutomationSpecFacadeV1, ProductControlFacade, ProductControlLifecycleFacadeV1,
+    ProductControlOperationalFacadeV2, ProductStatusView, PromoteCommand, PromotionView,
+    RejectCommand, SessionCredential,
 };
 
 use crate::composition::ProductionAuthoringLlmClientV1;
@@ -670,6 +671,38 @@ impl ProductControlAuthoringFacadeV1 for ProductionProductControlFacadeV1 {
 }
 
 #[async_trait]
+impl ProductControlAutomationSpecFacadeV1 for ProductionProductControlFacadeV1 {
+    async fn automation_spec_read_authority(
+        &self,
+        credential: &SessionCredential,
+        installation_id: &str,
+    ) -> Result<(), FacadeError> {
+        let installation = parse_installation(installation_id)?;
+        self.control_application()
+            .check_author_authority(credential.expose_secret(), &installation)
+            .await
+            .map_err(map_product_application_error)
+    }
+
+    async fn automation_spec_compute_authority(
+        &self,
+        credential: &SessionCredential,
+        csrf: &CsrfSecret,
+        installation_id: &str,
+    ) -> Result<(), FacadeError> {
+        let installation = parse_installation(installation_id)?;
+        self.control_application()
+            .check_author_mutation_authority(
+                credential.expose_secret(),
+                csrf.expose_secret(),
+                &installation,
+            )
+            .await
+            .map_err(map_product_application_error)
+    }
+}
+
+#[async_trait]
 impl ProductControlOperationalFacadeV2 for ProductionProductControlFacadeV1 {
     async fn deployment_operational_v2(
         &self,
@@ -742,12 +775,14 @@ mod tests {
     fn assert_operational_facade<T: ProductControlOperationalFacadeV2>() {}
     fn assert_lifecycle_facade<T: ProductControlLifecycleFacadeV1>() {}
     fn assert_authoring_facade<T: ProductControlAuthoringFacadeV1>() {}
+    fn assert_automation_spec_facade<T: ProductControlAutomationSpecFacadeV1>() {}
 
     #[test]
     fn production_facade_closes_the_complete_http_contract() {
         assert_operational_facade::<ProductionProductControlFacadeV1>();
         assert_lifecycle_facade::<ProductionProductControlFacadeV1>();
         assert_authoring_facade::<ProductionProductControlFacadeV1>();
+        assert_automation_spec_facade::<ProductionProductControlFacadeV1>();
     }
 
     #[test]

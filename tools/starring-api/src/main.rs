@@ -4,11 +4,11 @@ use std::task::Poll;
 use std::time::Duration;
 
 use product_control_http::{
-    product_control_router_with_operational_v2_and_lifecycle_v1_and_authoring_v1_and_readiness_gate,
-    ProductApiReadinessGate, ProductControlFacade,
+    product_control_router_with_full_authoring_v1_and_readiness_gate, ProductApiReadinessGate,
+    ProductControlFacade,
 };
 use starring_api::{
-    compose_production_service_v1, resolve_production_secrets_v1,
+    compose_production_service_v1, product_web_router_v1, resolve_production_secrets_v1,
     serve_verified_loopback_with_runtime_readiness, ComposedProductionServiceV1, DatabaseRoleV1,
     LoopbackServeErrorV1, LoopbackServerConfigV1, ProductionCompositionErrorV1, ProductionConfigV1,
     ProductionReadinessPhaseV1,
@@ -100,13 +100,13 @@ async fn serve(
     let authoring_http_boundary = service.authoring_http_boundary_config();
     let (facade, http_boundary, bind_addr, database_shutdown) = service.into_parts();
     let readiness_gate = ProductApiReadinessGate::initially_unready();
-    let router =
-        product_control_router_with_operational_v2_and_lifecycle_v1_and_authoring_v1_and_readiness_gate(
-            facade.clone(),
-            http_boundary,
-            authoring_http_boundary,
-            readiness_gate.clone(),
-        );
+    let api_router = product_control_router_with_full_authoring_v1_and_readiness_gate(
+        facade.clone(),
+        http_boundary,
+        authoring_http_boundary,
+        readiness_gate.clone(),
+    );
+    let router = product_web_router_v1(api_router);
     let startup_facade = facade.clone();
     let startup_probe = async move { startup_facade.readiness().await.is_ok() };
     let runtime_facade = facade.clone();

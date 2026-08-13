@@ -62,8 +62,9 @@ pub use discord_original_response::{
 };
 pub use effect_journal::{
     InteractionEffectIntentDispositionV1, InteractionEffectJournalIntendV1,
-    InteractionEffectJournalPlanEntryV1, InteractionEffectJournalPlanV1,
-    InteractionEffectJournalPortV1, InteractionEffectPlanBindDispositionV1,
+    InteractionEffectJournalPlanBindErrorV1, InteractionEffectJournalPlanEntryV1,
+    InteractionEffectJournalPlanV1, InteractionEffectJournalPortV1,
+    InteractionEffectPlanBindDispositionV1,
 };
 pub use error::classify_error;
 pub use gateway::{

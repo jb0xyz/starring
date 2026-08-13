@@ -12,8 +12,8 @@ Detailed rationale lives in the per-topic specs, plans, and runbooks under
 ## System Summary
 
 Starring is an AI-based Discord control plane: "Terraform / Kubernetes for
-Discord with a natural-language frontend." A Rust workspace of **48 crates, 10
-Rust tools, and 58 workspace members**, PostgreSQL-backed at its durable runtime
+Discord with a natural-language frontend." A Rust workspace of **53 crates, 10
+Rust tools, and 63 workspace members**, PostgreSQL-backed at its durable runtime
 boundaries, organized into three layers. The defining safety principle is
 constant across all layers:
 
@@ -129,9 +129,77 @@ projection, rechecks authentication and fresh `Author` authority after the model
 call, and commits by generation compare-and-set. Keyed single flight and bounded
 model capacity prevent duplicate calls without holding a database transaction
 across Luna. The product HTTP surface exposes authenticated POST-turn and
-GET-session routes; there is no frontend UI yet. The only implemented product
-recipe is the private study room recipe. Typed-planner fallback is classified
-but not yet handed off to an actual typed-planner session.
+GET-session routes plus a same-origin `/app` console for conversation, generic
+projection rendering, preview, approval, Apply, and deployment status. The
+console temporarily requires a manually supplied installation ID because
+installation discovery is not yet a product API. The only implemented live
+product recipe is the private study room recipe. Typed-planner fallback is
+classified but not yet handed off to an actual typed-planner session.
+
+The separate `automation-spec` crate defines the first recipe-independent,
+closed AutomationSpec V1 authoring contract. It owns its versioned wire types,
+canonical digest, static validator, condition simulator, deployment preview,
+and source-map/compilation binding for the existing interaction runtime. Pure,
+fresh-authorized HTTP routes expose its descriptor, previews, and simulations;
+they cannot persist, publish, promote, approve, Apply, or call Discord. This is
+the backend-first compatibility surface for a schema-driven UI and future
+natural-language planner. It does not yet add durable state, conditions in the
+live runtime, timers, arbitrary connectors, or a generic NL-to-spec compiler.
+
+The separate `automation-stateful-spec` crate defines the non-deployable
+StatefulSpec R0 source contract. It owns bounded Boolean, integer, and text
+state declarations; installation, actor, instance, and actor-instance scopes;
+typed conditions and checked arithmetic; explicit true and false branches;
+parallel pre-state assignment semantics; canonical identity; exact modal-input
+normalization; and deterministic simulation with defaults and a separate trace
+digest. Stateful effects use one implicit deferred acknowledgement and one
+explicit final response shape. Validation unions both branches when proving
+instance-resource requirements, and it rejects stateful workflows that could
+be silently reinterpreted as unconditional legacy rules. The separate pure
+`automation-stateful-compiler` emits an immutable, identity-bound bundle with a
+filtered legacy target containing only assets and explicitly stateless rules,
+a separate state schema and stateful workflow artifact, an exact union source
+map, and a compilation binding. It supports conservative append-only state
+schema compatibility and verifies decoded bundles by recompiling their source.
+Deployment remains blocked: R0 exposes no publication, promotion, approval,
+Apply, durable activation, persistence adapter, or live runtime path.
+
+Simulation and runtime proof evaluation now share one pure expression/branch
+core. Simulation keeps its transport fixture/trace size limits, while the core
+can evaluate a complete bounded authoritative snapshot without inheriting the
+64 KiB preview-fixture cap. This structurally preserves checked arithmetic,
+branch selection, parallel pre-state assignments, and external-node ordering
+across both surfaces.
+
+The lower `automation-runtime-interaction` contract now also owns the shared
+Discord custom-ID codec, a canonical full receipt-claim digest, and a token-free
+verified-request proof that recomputes the exact durable request digest before
+an event can be interpreted. The `automation-stateful-runtime` crate is a pure,
+non-integrated protocol/reference-store scaffold for authoritative event
+envelopes, scoped state keys, compare-and-set transitions, atomic state plus
+durable-dispatch acceptance, replay, and leased recovery. It does not have a
+PostgreSQL adapter, worker integration, live artifact compiler, or activation
+capability, and therefore makes no live stateful-runtime claim.
+
+The scaffold also owns an opaque compiler-driven evaluation proof. It binds the
+complete bundle/binding/source-map/artifact/schema identity, verified claim and
+event, exact compiler dependency snapshot including revisions/default evidence,
+selected workflow/branch, source ordinals, parallel writes, and ordered
+external projection. Prepared reference commits consume that proof and reject
+an outbox projection with skipped, duplicated, or reordered nodes. The required
+control-plane publication binding has no production constructor; a verified
+legacy route by itself is explicitly insufficient to authorize a bundle.
+
+The lower pure `automation-runtime-effect-contract` crate owns the shared
+preflight certificate, certificate-bound journal-plan validation, and an opaque
+typed dispatch contract for the existing interaction effect kinds. The legacy
+runtime consumes the same certificate and journal-plan types through exact
+re-exports. Stateful dispatch integration is deliberately reported unavailable:
+there is no public arbitrary-byte or digest constructor, no database adapter,
+and no live path that can treat this protocol contract as execution authority.
+Prepared-dispatch construction is compiled only for contract tests until every
+effect kind proves exact equality between its typed Discord body, source-map
+identity, journal recovery target, payload digest, and expected postimage.
 
 Committed Phase A code contains the trusted authoring path from an authenticated
 turn to an encrypted durable generation. The 2026-07-30 A6 live milestone is
@@ -358,7 +426,7 @@ Compiler, persistence, runtime, and server checkpoint.
 
 ## Workspace Topology
 
-48 crates and 10 Rust tools form 58 workspace members. The recurring pattern is
+53 crates and 10 Rust tools form 63 workspace members. The recurring pattern is
 **pure core + edge adapter**: pure crates hold the domain and logic and are
 forbidden `sqlx`/`twilight` dependencies (guarded by `dependency_guard` tests);
 a paired `*-postgres` adapter (or a dedicated runtime or Discord edge) provides
@@ -749,9 +817,9 @@ The current source inventory is exact at this checkpoint:
 
 | Item | Source contract |
 | --- | --- |
-| Crate manifests | 48 under `crates/` |
+| Crate manifests | 53 under `crates/` |
 | Workspace Rust tool manifests | 10 under `tools/` |
-| Workspace members | 58 |
+| Workspace members | 63 |
 | Total Rust tool manifests | 12, including standalone `d2-certification-transport` and D2A `session-issuer` |
 | Top-level tool directories | 16 |
 | SQL migrations | 125 |
@@ -856,19 +924,34 @@ envelopes plus their canonical digests. It must not retain credentials,
 database URLs, cookies, CSRF values, interaction tokens, prompts, transcripts,
 RuleSet payloads, or raw effect inputs and preimages.
 
-Backend V1 scope is one Mac mini, one canonical Discord shard, one product
+Backend V1 scope is one Mac mini, one canonical Discord shard, one live product
 recipe (`starring.private_study_room@1`), synchronous bounded Luna-medium
-authoring, and the existing human preview, approval, and Apply boundaries. It
-does not include a frontend, arbitrary recipes or Discord games, an
-installation-management API, multi-shard serving, multi-host high
+authoring, the existing human preview, approval, and Apply boundaries, the pure
+AutomationSpec V1 descriptor/preview/simulation surface, and the thin same-origin
+`/app` console. StatefulSpec R0 is included only as a non-deployable pure
+validation/simulation, immutable compiler-artifact, typed evaluation-proof,
+and reference-protocol contract. It does not include
+arbitrary live recipes or Discord games, a live stateful persistence/dispatch
+adapter, an
+installation-management/discovery API, multi-shard serving, multi-host high
 availability, a durable asynchronous authoring queue, full production secret
 isolation, or a high-volume production SLO certificate.
 
 ## What Is Not Yet Built
 
-- A frontend authoring UI. The authenticated conversational authoring API exists,
-  but the current user surfaces are the product HTTP contract and the separate
-  CLI/evaluation edge.
+- Installation discovery and administration in the web console. The thin
+  same-origin `/app` authoring UI exists, but it currently requires an exact
+  installation ID supplied by the operator.
+- A generic NL-to-AutomationSpec/StatefulSpec compiler and the live stateful
+  execution plane. AutomationSpec V1 and StatefulSpec R0 are currently pure
+  typed contracts. The latter validates, simulates, and compiles bounded state,
+  branches, and transitions into a separate immutable artifact, then evaluates
+  an exact compiler-derived state snapshot into a non-live opaque proof. It is
+  deliberately non-deployable. A control-plane publication verifier, typed
+  evaluation-to-preflight/effect integration, composite PostgreSQL commit, durable dispatch
+  worker, persisted activation pin for the stateful artifact, activation
+  capability, timers, connector capabilities, migrations, and version-pinned
+  long-running workflows remain future milestones.
 - A high-volume or disaster-recovery production deployment certificate for
   `tools/starring-api`. Its fourteen core pools plus isolated writer pool and
   staging capability inventory exist, but non-interactive reboot,

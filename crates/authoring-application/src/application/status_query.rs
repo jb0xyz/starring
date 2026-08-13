@@ -8,9 +8,10 @@ use crate::{
     AuthenticatedActorV1, AuthenticationPort, AuthorizedDeploymentStatusV1,
     AuthorizedInstallationV1, AuthorizedProductStatusV1, CapabilityV1,
     DeploymentOperationalStatusPortV2, DeploymentStatusObservationPort, DeploymentStatusPort,
-    DeploymentStatusV1, FreshGuildAuthorityPort, InstallationSelectorV1, ProductApplicationError,
-    ProductDecisionObservationPort, ProductDecisionObservationV1, ProductDecisionPhaseV1,
-    ProductDecisionProjectionV1, ProductDecisionQueryPort, ProductDeploymentOperationalStatusV2,
+    DeploymentStatusV1, FreshGuildAuthorityPort, InstallationSelectorV1,
+    MutationAuthenticationPort, ProductApplicationError, ProductDecisionObservationPort,
+    ProductDecisionObservationV1, ProductDecisionPhaseV1, ProductDecisionProjectionV1,
+    ProductDecisionQueryPort, ProductDeploymentOperationalStatusV2,
     ProductDeploymentStatusObservationV1, ProductStatusObservationV1, ProductStatusQueryV1,
     ProductStatusV1, RuntimeDeploymentQueryV1,
 };
@@ -20,6 +21,35 @@ where
     A: AuthenticationPort,
     G: FreshGuildAuthorityPort,
 {
+    pub async fn check_author_authority(
+        &self,
+        credential: &A::Credential,
+        installation: &InstallationSelectorV1,
+    ) -> Result<(), ProductApplicationError> {
+        self.authenticate_and_authorize(credential, installation, CapabilityV1::Author)
+            .await
+            .map(drop)
+    }
+
+    pub async fn check_author_mutation_authority(
+        &self,
+        credential: &A::Credential,
+        csrf: &A::CsrfProof,
+        installation: &InstallationSelectorV1,
+    ) -> Result<(), ProductApplicationError>
+    where
+        A: MutationAuthenticationPort,
+    {
+        self.authenticate_mutation_and_authorize(
+            credential,
+            csrf,
+            installation,
+            CapabilityV1::Author,
+        )
+        .await
+        .map(drop)
+    }
+
     pub async fn check_apply_authority(
         &self,
         credential: &A::Credential,

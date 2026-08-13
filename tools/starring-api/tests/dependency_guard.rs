@@ -204,6 +204,7 @@ fn direct_dependencies_are_closed_to_reviewed_architecture_inputs() {
                     | "discord-model"
                     | "hyper"
                     | "hyper-util"
+                    | "http-body-util"
                     | "product-control-http"
                     | "serde"
                     | "serde_json"
@@ -285,6 +286,7 @@ fn package_is_registered_once_and_source_modules_are_exactly_classified() {
                 | "composition.rs"
                 | "server.rs"
                 | "telemetry.rs"
+                | "web.rs"
                 | "authoring_admission.rs"
                 | "main.rs"
         ));
@@ -311,6 +313,18 @@ fn infrastructure_dependencies_are_confined_to_exact_modules() {
                     "PostgresProductDecisions",
                     "PostgresProductActionDigest",
                     "PostgresProductRuntimeStatus",
+                ],
+            ),
+            "web.rs" => assert_identifiers_absent(
+                path,
+                source,
+                &[
+                    "sqlx",
+                    "twilight_http",
+                    "hyper",
+                    "hyper_util",
+                    "tower",
+                    "TcpListener",
                 ],
             ),
             "main.rs" => assert_identifiers_absent(
@@ -386,11 +400,11 @@ fn executable_and_listener_cannot_name_adapter_families() {
 }
 
 #[test]
-fn executable_is_pinned_to_the_lifecycle_gated_operational_router() {
+fn executable_is_pinned_to_the_complete_authoring_and_readiness_router() {
     let sources = source_files();
     let main = source_named(&sources, "main.rs");
     for required in [
-        "product_control_router_with_operational_v2_and_lifecycle_v1_and_authoring_v1_and_readiness_gate",
+        "product_control_router_with_full_authoring_v1_and_readiness_gate",
         "ProductApiReadinessGate",
         "initially_unready",
         "serve_verified_loopback_with_runtime_readiness",

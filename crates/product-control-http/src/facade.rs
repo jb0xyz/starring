@@ -376,6 +376,22 @@ pub trait ProductControlAuthoringFacadeV1: ProductControlFacade {
 }
 
 #[async_trait::async_trait]
+pub trait ProductControlAutomationSpecFacadeV1: ProductControlFacade {
+    async fn automation_spec_read_authority(
+        &self,
+        credential: &SessionCredential,
+        installation_id: &str,
+    ) -> Result<(), FacadeError>;
+
+    async fn automation_spec_compute_authority(
+        &self,
+        credential: &SessionCredential,
+        csrf: &CsrfSecret,
+        installation_id: &str,
+    ) -> Result<(), FacadeError>;
+}
+
+#[async_trait::async_trait]
 pub trait ProductControlOperationalFacadeV2: ProductControlFacade {
     async fn deployment_operational_v2(
         &self,

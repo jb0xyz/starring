@@ -12,7 +12,8 @@ pub use config::{
 };
 pub use dto::{
     ApplyView, ApprovalPreviewView, AuthoringSessionViewV1, AuthoringTurnDispositionV1,
-    AuthoringTurnViewV1, CurrentPrincipal, CurrentPrincipalView, DecisionView,
+    AuthoringTurnViewV1, AutomationSpecInstallationReadinessV1, AutomationSpecPreviewResponseV1,
+    AutomationSpecSimulationResponseV1, CurrentPrincipal, CurrentPrincipalView, DecisionView,
     DeploymentAttestationViewV2, DeploymentFailureViewV2, DeploymentOperationalStateV2,
     DeploymentOperationalViewV2, DeploymentOperatorActionV2, DeploymentRetryStateV2,
     DeploymentRetryViewV2, DeploymentRuntimePhaseV2, DeploymentServingFreshnessStateV2,
@@ -24,9 +25,9 @@ pub use error::{FacadeError, FacadeErrorCode};
 pub use facade::{
     ApplyCommand, AuthoringTurnCommandV1, DecisionCommand, DiscordAuthorizationRequest,
     LifecycleCancellationCommand, OAuthCallbackCommand, OAuthCallbackResult, OAuthStartCommand,
-    OAuthStartResult, ProductControlAuthoringFacadeV1, ProductControlFacade,
-    ProductControlLifecycleFacadeV1, ProductControlOperationalFacadeV2, ProductRequestId,
-    ProductRequestIdParseError, PromoteCommand, RejectCommand,
+    OAuthStartResult, ProductControlAuthoringFacadeV1, ProductControlAutomationSpecFacadeV1,
+    ProductControlFacade, ProductControlLifecycleFacadeV1, ProductControlOperationalFacadeV2,
+    ProductRequestId, ProductRequestIdParseError, PromoteCommand, RejectCommand,
 };
 pub use readiness::{
     ProductApiReadinessClaimErrorV1, ProductApiReadinessGate, ProductApiReadinessLeaseV1,
@@ -34,6 +35,10 @@ pub use readiness::{
 pub use router::{
     product_control_router, product_control_router_with_authoring_v1,
     product_control_router_with_authoring_v1_and_readiness_gate,
+    product_control_router_with_automation_spec_v1,
+    product_control_router_with_automation_spec_v1_and_readiness_gate,
+    product_control_router_with_full_authoring_v1,
+    product_control_router_with_full_authoring_v1_and_readiness_gate,
     product_control_router_with_lifecycle_v1,
     product_control_router_with_lifecycle_v1_and_readiness_gate,
     product_control_router_with_operational_v2,
