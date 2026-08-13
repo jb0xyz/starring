@@ -162,7 +162,7 @@ class PreflightEvidenceTests(unittest.TestCase):
             (FakePlatform(b"1 0 launchd\n"), "owner"),
             (
                 FakePlatform(
-                    f"1 0 runtime {self.context.manifest['run_id']}\n".encode()
+                    f"424242 0 runtime {self.context.manifest['run_id']}\n".encode()
                 ),
                 "process",
             ),
