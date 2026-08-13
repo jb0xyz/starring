@@ -1113,27 +1113,21 @@ fn classify_runner_error(error_code: &str) -> Option<RunnerFailureCategory> {
         "network_request_failed" => Some(RunnerFailureCategory::DependencyUnavailable),
         "authoring_not_preview_ready"
         | "authoring_finalization_not_preview_ready"
-        | "authoring_http_status_invalid" => {
-            Some(RunnerFailureCategory::AuthoringFlowFailed)
-        }
+        | "authoring_http_status_invalid" => Some(RunnerFailureCategory::AuthoringFlowFailed),
         "scenario_confirmation_mismatch"
         | "approval_preview_not_pending"
         | "promotion_preview_payload_mismatch"
-        | "preview_not_approved_by_operator" => {
-            Some(RunnerFailureCategory::ConfirmationFlowFailed)
+        | "preview_not_approved_by_operator" => Some(RunnerFailureCategory::ConfirmationFlowFailed),
+        "promotion_not_pending_approval" | "promotion_not_approved" | "promotion_not_applied" => {
+            Some(RunnerFailureCategory::DecisionFlowFailed)
         }
-        "promotion_not_pending_approval"
-        | "promotion_not_approved"
-        | "promotion_not_applied" => Some(RunnerFailureCategory::DecisionFlowFailed),
         "apply_resolution_timeout" | "runtime_drain_attempts_exhausted" => {
             Some(RunnerFailureCategory::ConvergenceFlowFailed)
         }
         "deployment_failed"
         | "deployment_live_timeout"
         | "live_projection_identity_invalid"
-        | "live_evidence_binding_invalid" => {
-            Some(RunnerFailureCategory::DeploymentFlowFailed)
-        }
+        | "live_evidence_binding_invalid" => Some(RunnerFailureCategory::DeploymentFlowFailed),
         error_code => classify_product_request_error(error_code),
     }
 }
@@ -1454,7 +1448,10 @@ mod tests {
                 RunnerFailureCategory::DecisionFlowFailed,
             ),
             (
-                &["apply_resolution_timeout", "runtime_drain_attempts_exhausted"],
+                &[
+                    "apply_resolution_timeout",
+                    "runtime_drain_attempts_exhausted",
+                ],
                 RunnerFailureCategory::ConvergenceFlowFailed,
             ),
             (
@@ -1529,7 +1526,10 @@ mod tests {
         }
 
         for (category, error_code) in [
-            (RunnerFailureCategory::DependencyTimeout, "dependency_timeout"),
+            (
+                RunnerFailureCategory::DependencyTimeout,
+                "dependency_timeout",
+            ),
             (
                 RunnerFailureCategory::DependencyUnavailable,
                 "dependency_unavailable",
@@ -1611,10 +1611,8 @@ mod tests {
             }))
         ));
 
-        let stage_payload = String::from_utf8(runner_error_payload(
-            "authoring_not_preview_ready",
-        ))
-        .expect("runner stage error payload is ASCII");
+        let stage_payload = String::from_utf8(runner_error_payload("authoring_not_preview_ready"))
+            .expect("runner stage error payload is ASCII");
         std::fs::write(
             &script,
             format!("/bin/cat >/dev/null\nprintf '%s' '{stage_payload}'\nexit 1\n"),
