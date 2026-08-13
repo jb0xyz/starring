@@ -2896,14 +2896,23 @@ def publish_issuer_binary(source, destination):
         current = os.open(base, directory_flags)
         descriptors.append(current)
         for component in ("target", "release"):
+            created = False
             try:
                 os.mkdir(component, mode=0o755, dir_fd=current)
-                os.fsync(current)
+                created = True
             except FileExistsError:
                 pass
             child = os.open(component, directory_flags, dir_fd=current)
-            metadata = os.fstat(child)
             descriptors.append(child)
+            if created:
+                # mkdir applies the process umask.  The fixed credential-
+                # capable path has an exact 0755 contract, so normalize only
+                # the directory created by this invocation; pre-existing
+                # paths still have to pass the fail-closed check below.
+                os.fchmod(child, 0o755)
+                os.fsync(child)
+                os.fsync(current)
+            metadata = os.fstat(child)
             if (
                 not stat.S_ISDIR(metadata.st_mode)
                 or metadata.st_uid != os.getuid()

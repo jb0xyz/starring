@@ -156,6 +156,7 @@ class Fixture:
         self.output = self.root / "Application Support" / "Starring" / "d2a-candidates"
         self.toolchain = self.root / "rust" / "bin"
         self.toolchain.mkdir(mode=0o755, parents=True)
+        self.toolchain.chmod(0o755)
         self.git = write_file(self.root / "system" / "git", b"fixture git", 0o555)
         write_file(self.toolchain / "cargo", b"fixture cargo", 0o755)
         write_file(self.toolchain / "rustc", b"fixture rustc", 0o755)
@@ -337,6 +338,16 @@ class CandidateBuilderTests(unittest.TestCase):
 
     def tearDown(self):
         self.fixture.cleanup()
+
+    def test_write_new_preserves_exact_mode_under_restrictive_umask(self):
+        path = self.fixture.root / "immutable-candidate"
+        previous = os.umask(0o077)
+        try:
+            CANDIDATE.write_new(path, b"candidate\n", 0o555)
+        finally:
+            os.umask(previous)
+        self.assertEqual(stat.S_IMODE(path.lstat().st_mode), 0o555)
+        self.assertEqual(path.read_bytes(), b"candidate\n")
 
     def test_success_uses_exact_five_commands_and_atomically_publishes_immutable_bundle(self):
         executor = FakeExecutor(self.fixture)

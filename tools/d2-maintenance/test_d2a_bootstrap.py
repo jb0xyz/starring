@@ -550,6 +550,7 @@ class BootstrapFixture:
 
     def create_tools(self):
         self.rust_toolchain_bin.mkdir(mode=0o755, parents=True)
+        self.rust_toolchain_bin.chmod(0o755)
         write_file(self.rust_toolchain_bin / "cargo", b"fixture-cargo", 0o755)
         write_file(self.rust_toolchain_bin / "rustc", b"fixture-rustc", 0o755)
         write_file(self.tool_root / "d2a.py", "# controller\n", 0o644)
@@ -4064,6 +4065,78 @@ class D2ABootstrapTests(unittest.TestCase):
             {"issuer_publish_destination_path_invalid", "issuer_publish_root_invalid"},
         )
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_issuer_publish_creates_exact_path_under_restrictive_umask(self):
+        issuer_root = self.fixture.tool_root / "session-issuer"
+        source = write_file(self.fixture.root / "built-issuer", b"issuer", 0o755)
+        destination = (
+            issuer_root / "target" / "release" / "starring-d2-session-issuer"
+        )
+        previous = os.umask(0o077)
+        try:
+            BOOTSTRAP.publish_issuer_binary(source, destination)
+        finally:
+            os.umask(previous)
+        self.assertEqual(stat.S_IMODE((issuer_root / "target").lstat().st_mode), 0o755)
+        self.assertEqual(
+            stat.S_IMODE((issuer_root / "target" / "release").lstat().st_mode),
+            0o755,
+        )
+        self.assertEqual(stat.S_IMODE(destination.lstat().st_mode), 0o755)
+        self.assertEqual(destination.read_bytes(), b"issuer")
+
+    def test_issuer_publish_closes_directory_fds_when_mode_fix_fails(self):
+        issuer_root = self.fixture.tool_root / "session-issuer"
+        source = write_file(self.fixture.root / "built-issuer", b"issuer", 0o755)
+        destination = (
+            issuer_root / "target" / "release" / "starring-d2-session-issuer"
+        )
+        real_open = os.open
+        opened = []
+
+        def tracking_open(*args, **kwargs):
+            descriptor = real_open(*args, **kwargs)
+            opened.append(descriptor)
+            return descriptor
+
+        with mock.patch.object(BOOTSTRAP.os, "open", side_effect=tracking_open):
+            with mock.patch.object(
+                BOOTSTRAP.os,
+                "fchmod",
+                side_effect=OSError("injected mode failure"),
+            ):
+                with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                    BOOTSTRAP.publish_issuer_binary(source, destination)
+        self.assertEqual(raised.exception.code, "issuer_publish_root_invalid")
+        self.assertGreaterEqual(len(opened), 2)
+        for descriptor in opened:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_issuer_publish_never_repairs_existing_wrong_mode_directories(self):
+        source = write_file(self.fixture.root / "built-issuer", b"issuer", 0o755)
+        for invalid_component in ("target", "release"):
+            with self.subTest(invalid_component=invalid_component):
+                issuer_root = self.fixture.root / f"issuer-{invalid_component}"
+                issuer_root.mkdir(mode=0o755)
+                issuer_root.chmod(0o755)
+                target = issuer_root / "target"
+                target.mkdir(mode=0o755)
+                target.chmod(0o700 if invalid_component == "target" else 0o755)
+                release = target / "release"
+                if invalid_component == "release":
+                    release.mkdir(mode=0o755)
+                    release.chmod(0o700)
+                destination = release / "starring-d2-session-issuer"
+                with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                    BOOTSTRAP.publish_issuer_binary(source, destination)
+                self.assertEqual(
+                    raised.exception.code,
+                    "issuer_publish_root_invalid",
+                )
+                invalid = target if invalid_component == "target" else release
+                self.assertEqual(stat.S_IMODE(invalid.lstat().st_mode), 0o700)
+                self.assertFalse(destination.exists())
 
     def test_source_drift_before_auth_fails_and_runs_cleanup(self):
         # Two extra sealed snapshots bracket the final issuer publication.
