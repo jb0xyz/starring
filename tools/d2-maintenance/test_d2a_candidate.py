@@ -12,12 +12,15 @@ import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("d2a_candidate.py")
 SPEC = importlib.util.spec_from_file_location("d2a_candidate", MODULE_PATH)
 CANDIDATE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CANDIDATE)
+
+TEST_FIXED_LINKER = pathlib.Path("/usr/bin/true")
 
 
 def write_file(path, payload, mode):
@@ -323,6 +326,13 @@ class Fixture:
 
 class CandidateBuilderTests(unittest.TestCase):
     def setUp(self):
+        self.fixed_linker_patch = mock.patch.object(
+            CANDIDATE,
+            "FIXED_LINKERS",
+            (TEST_FIXED_LINKER,) * len(CANDIDATE.FIXED_LINKERS),
+        )
+        self.fixed_linker_patch.start()
+        self.addCleanup(self.fixed_linker_patch.stop)
         self.fixture = Fixture()
 
     def tearDown(self):
@@ -675,6 +685,13 @@ class CandidateBuilderTests(unittest.TestCase):
         with self.assertRaises(CANDIDATE.CandidateError) as raised:
             CANDIDATE.validate_state(state)
         self.assertEqual(raised.exception.code, "candidate_state_invalid")
+
+    def test_rust_toolchain_manifest_rejects_untrusted_linker(self):
+        linker = write_file(self.fixture.root / "linker", b"fixture linker", 0o777)
+        with mock.patch.object(CANDIDATE, "FIXED_LINKERS", (linker,)):
+            with self.assertRaises(CANDIDATE.CandidateError) as raised:
+                CANDIDATE.rust_toolchain_manifest(self.fixture.toolchain)
+        self.assertEqual(raised.exception.code, "rust_linker_invalid")
 
     def test_bounded_subprocess_stops_at_cap_plus_one(self):
         result = CANDIDATE.bounded_subprocess(

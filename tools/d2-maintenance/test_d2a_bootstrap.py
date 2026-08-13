@@ -21,6 +21,8 @@ SPEC = importlib.util.spec_from_file_location("d2a_bootstrap", MODULE_PATH)
 BOOTSTRAP = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BOOTSTRAP)
 
+TEST_FIXED_LINKER = pathlib.Path("/usr/bin/true")
+
 
 def write_file(path, value, mode, *, sort_keys=True):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1005,7 +1007,35 @@ class BootstrapFixture:
 
 class D2ABootstrapTests(unittest.TestCase):
     def setUp(self):
+        self.fixed_linker_patch = mock.patch.object(
+            BOOTSTRAP,
+            "FIXED_LINKERS",
+            (TEST_FIXED_LINKER,) * len(BOOTSTRAP.FIXED_LINKERS),
+        )
+        self.fixed_linker_patch.start()
+        self.addCleanup(self.fixed_linker_patch.stop)
+        self.boot_identity_patch = mock.patch.object(
+            BOOTSTRAP,
+            "current_boot_identity",
+            return_value="darwin-boottime:1:0",
+        )
+        self.boot_identity_patch.start()
+        self.addCleanup(self.boot_identity_patch.stop)
         self.fixture = BootstrapFixture(self)
+        real_d2_global_marker_lock = BOOTSTRAP.d2_global_marker_lock
+
+        def fixture_d2_global_marker_lock(path=None):
+            return real_d2_global_marker_lock(
+                self.fixture.issuer_lock_path if path is None else path
+            )
+
+        self.issuer_lock_patch = mock.patch.object(
+            BOOTSTRAP,
+            "d2_global_marker_lock",
+            side_effect=fixture_d2_global_marker_lock,
+        )
+        self.issuer_lock_patch.start()
+        self.addCleanup(self.issuer_lock_patch.stop)
 
     def tearDown(self):
         self.fixture.cleanup()
@@ -4305,6 +4335,13 @@ class D2ABootstrapTests(unittest.TestCase):
         with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
             BOOTSTRAP.rust_toolchain_manifest(self.fixture.rust_toolchain_bin)
         self.assertEqual(raised.exception.code, "rust_sysroot_invalid")
+
+    def test_rust_toolchain_manifest_rejects_untrusted_linker(self):
+        linker = write_file(self.fixture.root / "linker", b"fixture-linker", 0o777)
+        with mock.patch.object(BOOTSTRAP, "FIXED_LINKERS", (linker,)):
+            with self.assertRaises(BOOTSTRAP.BootstrapError) as raised:
+                BOOTSTRAP.rust_toolchain_manifest(self.fixture.rust_toolchain_bin)
+        self.assertEqual(raised.exception.code, "rust_linker_invalid")
 
     def test_real_bounded_supervisor_caps_and_reaps_process_groups(self):
         environment = {
