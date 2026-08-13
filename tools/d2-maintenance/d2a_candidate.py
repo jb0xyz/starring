@@ -508,6 +508,10 @@ def write_new(path, payload, mode):
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             mode,
         )
+        # The caller's umask must not silently change the immutable bundle
+        # contract.  This descriptor names a newly created O_EXCL file, so
+        # fixing its exact mode before publication is race-free.
+        os.fchmod(descriptor, mode)
         offset = 0
         while offset < len(payload):
             offset += os.write(descriptor, payload[offset:])

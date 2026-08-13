@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import inspect
 import json
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -325,7 +326,7 @@ class D2AEvidenceTests(unittest.TestCase):
                 )
             path.chmod(0o600)
             link = root / "onboarding-hardlink.json"
-            path.link_to(link)
+            os.link(path, link)
             with self.assertRaises(D2A.D2AError):
                 D2A.load_direct_onboarding_evidence(
                     root,

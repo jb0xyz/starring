@@ -26,6 +26,9 @@ DIRECTORY = pathlib.Path(__file__).parent
 sys.path.insert(0, str(DIRECTORY))
 import d2_certification as CERTIFICATION
 import isolated_orchestrator as ORCHESTRATOR
+REAL_CURRENT_DARWIN_BOOT_IDENTITY = (
+    ORCHESTRATOR.current_darwin_boot_identity
+)
 COMPOSITION = sys.modules["d2_orchestrator_composition"]
 CONTRACT = sys.modules["d2_orchestrator_contract"]
 PLATFORM = sys.modules["d2_orchestrator_platform"]
@@ -886,6 +889,13 @@ class FakePlatform:
 
 class D2IsolatedOrchestratorTest(unittest.TestCase):
     def setUp(self):
+        self.current_darwin_boot_identity_patch = mock.patch.object(
+            ORCHESTRATOR,
+            "current_darwin_boot_identity",
+            return_value="darwin-boottime:2:0",
+        )
+        self.current_darwin_boot_identity_patch.start()
+        self.addCleanup(self.current_darwin_boot_identity_patch.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temporary.name).resolve()
         self.registry_path = self.root / "discord-ownership-registry.json"
@@ -5756,6 +5766,24 @@ class LaunchdPlatformTests(unittest.TestCase):
         ), mock.patch.object(
             platform, "_quarantined_recovery_psql_ancestry", return_value=((1,),)
         ), mock.patch.object(
+            platform,
+            "_quarantined_recovery_login_keychain_identity",
+            return_value=(
+                "95a270a538f67d82a235593400bc7baf9ee8f6cb6b40665e6388398389113b69",
+                {
+                    "login_keychain_path": str(
+                        PLATFORM.QUARANTINED_RECOVERY_LOGIN_KEYCHAIN
+                    ),
+                    "login_keychain_policy_kind": (
+                        "starring.d2.keychain-path-policy.v1"
+                    ),
+                    "login_keychain_policy_sha256": (
+                        "95a270a538f67d82a235593400bc7baf9ee8f6cb6b40665e6388398389113b69"
+                    ),
+                    "login_keychain_policy_verified": True,
+                },
+            ),
+        ), mock.patch.object(
             platform, "_run_quarantined_recovery_secret_leaf", side_effect=secret_leaf
         ), mock.patch.object(
             PLATFORM.pathlib.Path, "resolve", return_value=PLATFORM.QUARANTINED_RECOVERY_PSQL
@@ -5808,7 +5836,70 @@ class LaunchdPlatformTests(unittest.TestCase):
 
     def test_quarantined_recovery_login_keychain_policy_is_exact_and_stable(self):
         platform = PLATFORM.Platform()
-        digest, evidence = platform._quarantined_recovery_login_keychain_identity()
+        keychain = PLATFORM.QUARANTINED_RECOVERY_LOGIN_KEYCHAIN
+        metadata = {
+            pathlib.Path("/"): SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o755,
+                st_uid=0,
+                st_gid=0,
+                st_nlink=1,
+                st_size=0,
+            ),
+            pathlib.Path("/Users"): SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o755,
+                st_uid=0,
+                st_gid=80,
+                st_nlink=1,
+                st_size=0,
+            ),
+            pathlib.Path("/Users/jungbogeon"): SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o750,
+                st_uid=501,
+                st_gid=20,
+                st_nlink=1,
+                st_size=0,
+            ),
+            pathlib.Path("/Users/jungbogeon/Library"): SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o700,
+                st_uid=501,
+                st_gid=20,
+                st_nlink=1,
+                st_size=0,
+            ),
+            pathlib.Path("/Users/jungbogeon/Library/Keychains"): SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o755,
+                st_uid=501,
+                st_gid=20,
+                st_nlink=1,
+                st_size=0,
+            ),
+            keychain: SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o644,
+                st_uid=501,
+                st_gid=20,
+                st_nlink=1,
+                st_size=1,
+            ),
+        }
+
+        with mock.patch.object(
+            PLATFORM.pathlib.Path,
+            "lstat",
+            autospec=True,
+            side_effect=lambda path: metadata[path],
+        ), mock.patch.object(
+            PLATFORM.pathlib.Path,
+            "is_symlink",
+            autospec=True,
+            return_value=False,
+        ), mock.patch.object(
+            PLATFORM.os,
+            "getuid",
+            return_value=501,
+        ):
+            digest, evidence = (
+                platform._quarantined_recovery_login_keychain_identity()
+            )
         self.assertEqual(
             digest,
             "95a270a538f67d82a235593400bc7baf9ee8f6cb6b40665e6388398389113b69",
@@ -5823,9 +5914,7 @@ class LaunchdPlatformTests(unittest.TestCase):
             "login_keychain_policy_sha256": digest,
             "login_keychain_policy_verified": True,
         })
-        keychain_metadata = (
-            PLATFORM.QUARANTINED_RECOVERY_LOGIN_KEYCHAIN.lstat()
-        )
+        keychain_metadata = metadata[keychain]
         writable_metadata = SimpleNamespace(
             st_mode=keychain_metadata.st_mode | stat.S_IWOTH,
             st_uid=keychain_metadata.st_uid,
@@ -5833,22 +5922,34 @@ class LaunchdPlatformTests(unittest.TestCase):
             st_nlink=keychain_metadata.st_nlink,
             st_size=keychain_metadata.st_size,
         )
-        real_lstat = PLATFORM.pathlib.Path.lstat
-
-        def writable_other(path=None):
-            if path == PLATFORM.QUARANTINED_RECOVERY_LOGIN_KEYCHAIN:
+        def writable_other(path):
+            if path == keychain:
                 return writable_metadata
-            return real_lstat(path)
+            return metadata[path]
 
         with mock.patch.object(
             PLATFORM.pathlib.Path, "lstat", autospec=True,
             side_effect=writable_other,
+        ), mock.patch.object(
+            PLATFORM.pathlib.Path,
+            "is_symlink",
+            autospec=True,
+            return_value=False,
+        ), mock.patch.object(
+            PLATFORM.os,
+            "getuid",
+            return_value=501,
         ), self.assertRaisesRegex(
             CONTRACT.OrchestratorError,
             "quarantined_recovery_login_keychain_invalid",
         ):
             platform._quarantined_recovery_login_keychain_identity()
 
+    @unittest.skipUnless(
+        sys.platform == "darwin"
+        and PLATFORM.QUARANTINED_RECOVERY_SECURITY.is_file(),
+        "requires the Darwin security CLI",
+    )
     def test_quarantined_recovery_security_accepts_positional_keychain(self):
         keychain = self.root / "isolated.keychain-db"
         service = "starring.d2.test." + secrets.token_hex(8)
@@ -5975,6 +6076,10 @@ class LaunchdPlatformTests(unittest.TestCase):
         )
         self.assertNotIn("-k", arguments)
 
+    @unittest.skipUnless(
+        PLATFORM.QUARANTINED_RECOVERY_ZSH.is_file(),
+        "requires the production zsh executable",
+    )
     def test_quarantined_recovery_zsh_ignores_malicious_user_zshenv(self):
         zdotdir = self.root / "malicious-zdotdir"
         zdotdir.mkdir()
@@ -6023,7 +6128,7 @@ class LaunchdPlatformTests(unittest.TestCase):
             CONTRACT.OrchestratorError, "quarantined_recovery_audit_failed"
         ):
             platform._run_quarantined_recovery_secret_leaf(
-                ["/bin/zsh", "-c", "printf '%04096d' 0; /bin/sleep 30"]
+                ["/bin/sh", "-c", "while :; do printf '%04096d' 0; done"]
             )
         self.assertGreaterEqual(terminate.call_count, 1)
 
@@ -6047,7 +6152,7 @@ class LaunchdPlatformTests(unittest.TestCase):
             wraps=platform._terminate_recovery_process_group,
         ) as terminate, self.assertRaises(KeyboardInterrupt):
             platform._run_quarantined_recovery_secret_leaf(
-                ["/bin/zsh", "-c", "/bin/sleep 30"]
+                ["/bin/sh", "-c", "while :; do :; done"]
             )
         self.assertGreaterEqual(terminate.call_count, 1)
 
@@ -6060,7 +6165,7 @@ class LaunchdPlatformTests(unittest.TestCase):
             wraps=platform._terminate_recovery_process_group,
         ) as terminate, self.assertRaises(KeyboardInterrupt):
             platform._run_quarantined_recovery_secret_leaf(
-                ["/bin/zsh", "-c", "/bin/sleep 30"]
+                ["/bin/sh", "-c", "while :; do :; done"]
             )
         self.assertGreaterEqual(terminate.call_count, 1)
 
@@ -6082,7 +6187,7 @@ class LaunchdPlatformTests(unittest.TestCase):
             CONTRACT.OrchestratorError, "quarantined_recovery_audit_failed"
         ):
             platform._run_quarantined_recovery_secret_leaf([
-                "/bin/zsh", "-c", "trap '' TERM; /bin/sleep 30 & wait"
+                "/bin/sh", "-c", "trap '' TERM; while :; do :; done"
             ])
 
     def test_candidate_process_identity_binds_kernel_path_start_and_fd_digest(self):
@@ -10155,7 +10260,7 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
             ORCHESTRATOR.subprocess, "run", return_value=completed
         ):
             self.assertEqual(
-                ORCHESTRATOR.current_darwin_boot_identity(),
+                REAL_CURRENT_DARWIN_BOOT_IDENTITY(),
                 "darwin-boottime:1786435163:174871",
             )
 
@@ -10173,7 +10278,7 @@ class D2DiscordResourceOrchestratorTest(unittest.TestCase):
                 with self.assertRaisesRegex(
                     ORCHESTRATOR.OrchestratorError, "d2a_boot_identity_invalid"
                 ):
-                    ORCHESTRATOR.current_darwin_boot_identity()
+                    REAL_CURRENT_DARWIN_BOOT_IDENTITY()
 
     def test_d2a_revoked_teardown_closes_fence_and_replay_remains_closed(self):
         self.start_candidate_with_discord_resources()
